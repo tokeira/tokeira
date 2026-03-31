@@ -1,0 +1,20 @@
+[package]
+name = "tokeira-proto"
+version = "0.1.0"
+edition = "2024"
+description = "Temporal-compatible and Tokeira-internal protobuf bindings"
+license = "Apache-2.0"
+
+[dependencies]
+prost = "0.12"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+tonic = { version = "0.11", features = ["transport"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[dependencies.tokeira-types]
+path = "../tokeira-types"
+
+[build-dependencies]
+tonic-build = "0.11"

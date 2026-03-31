@@ -1,0 +1,17 @@
+[package]
+name = "tokeirad"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokeira-kernel = { path = "../../crates/tokeira-kernel" }
+tokeira-projection = { path = "../../crates/tokeira-projection" }
+tokeira-runtime = { path = "../../crates/tokeira-runtime" }
+tokeira-storage = { path = "../../crates/tokeira-storage" }
+tokeira-types = { path = "../../crates/tokeira-types" }

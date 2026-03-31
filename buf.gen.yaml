@@ -1,0 +1,6 @@
+version: v2
+plugins:
+  - remote: buf.build/protocolbuffers/rust
+    out: crates/tokeira-proto/src/gen
+  - remote: buf.build/grpc/rust
+    out: crates/tokeira-proto/src/gen

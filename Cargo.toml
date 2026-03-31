@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tokeira-types",
+    "crates/tokeira-proto",
+    "crates/tokeira-kernel",
+    "crates/tokeira-storage",
+    "crates/tokeira-runtime",
+    "crates/tokeira-projection",
+    "crates/tokeira-edge",
+    "apps/tokeirad",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["OpenAI"]
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+smallvec = "1.13"
+thiserror = "2.0"
+time = { version = "0.3", features = ["serde", "macros", "formatting", "parsing"] }
+tokio = { version = "1.41", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+uuid = { version = "1.10", features = ["serde", "v4"] }

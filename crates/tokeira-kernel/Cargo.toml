@@ -1,0 +1,12 @@
+[package]
+name = "tokeira-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+smallvec.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tracing.workspace = true
+tokeira-types = { path = "../tokeira-types" }

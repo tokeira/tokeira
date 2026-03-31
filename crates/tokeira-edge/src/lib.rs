@@ -7,6 +7,7 @@
 //! `tokeira-kernel`, `tokeira-runtime`, or `tokeira-storage` instead.
 
 pub mod errors;
+pub mod grpc;
 pub mod health_service;
 pub mod http_proxy;
 pub mod interceptors;
@@ -19,6 +20,7 @@ pub mod translate;
 pub mod workflow_service;
 
 pub use errors::*;
+pub use grpc::*;
 pub use health_service::*;
 pub use http_proxy::*;
 pub use interceptors::*;

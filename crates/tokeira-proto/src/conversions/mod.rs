@@ -4,8 +4,6 @@
 //! magical translation layer. Their job is to make the important wire/domain boundaries obvious.
 
 pub mod common;
-pub mod operator;
-pub mod workflow;
 
 use thiserror::Error;
 

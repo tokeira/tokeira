@@ -11,6 +11,7 @@
 
 pub mod internal;
 pub mod public;
+pub mod conversions;
 
 pub use internal::{admin, runtime};
 pub use public::{common, enums, operatorservice, workflowservice};

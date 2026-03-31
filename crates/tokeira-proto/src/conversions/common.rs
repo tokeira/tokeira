@@ -1,45 +1,49 @@
-//! Conversions for payloads, memo, headers, search attributes, task queue names, and tokens.
-//!
-//! These are the values that appear in many API messages. Keeping them in one place prevents
-//! a lot of duplicated map/oneof plumbing elsewhere in the workspace.
+//! Small shared conversions for public protobuf common types.
 
 use crate::conversions::ProtoConversionError;
 use crate::public::common;
-use std::collections::BTreeMap;
 use time::OffsetDateTime;
 use tokeira_types::{
-    Headers, Memo, Payload as DomainPayload, Payloads as DomainPayloads, RunId, SearchAttrName,
-    SearchAttrValue, SearchAttributes as DomainSearchAttributes, TaskQueueName, TaskToken,
-    WorkflowId,
+    Headers, Memo, Payload as DomainPayload, Payloads as DomainPayloads, RunId, SearchAttrValue,
+    SearchAttributes as DomainSearchAttributes, TaskQueueName, TaskToken, WorkflowId,
 };
 
 pub fn payload_from_domain(value: &DomainPayload) -> common::Payload {
     common::Payload {
-        metadata: value.metadata.clone(),
+        metadata: value
+            .metadata
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
+            .collect(),
         data: value.data.clone(),
     }
 }
 
 pub fn payload_to_domain(value: &common::Payload) -> DomainPayload {
     DomainPayload {
-        metadata: value.metadata.clone(),
+        metadata: value
+            .metadata
+            .iter()
+            .map(|(k, v)| (k.clone(), String::from_utf8_lossy(v).into_owned()))
+            .collect(),
         data: value.data.clone(),
     }
 }
 
 pub fn payloads_from_domain(values: &DomainPayloads) -> common::Payloads {
     common::Payloads {
-        payloads: values.iter().map(payload_from_domain).collect(),
+        payloads: values.0.iter().map(payload_from_domain).collect(),
     }
 }
 
 pub fn payloads_to_domain(values: &common::Payloads) -> DomainPayloads {
-    values.payloads.iter().map(payload_to_domain).collect()
+    DomainPayloads(values.payloads.iter().map(payload_to_domain).collect())
 }
 
 pub fn headers_from_domain(value: &Headers) -> common::Header {
     common::Header {
         fields: value
+            .0
             .iter()
             .map(|(k, v)| (k.clone(), payload_from_domain(v)))
             .collect(),
@@ -47,15 +51,19 @@ pub fn headers_from_domain(value: &Headers) -> common::Header {
 }
 
 pub fn headers_to_domain(value: &common::Header) -> Headers {
-    value.fields
-        .iter()
-        .map(|(k, v)| (k.clone(), payload_to_domain(v)))
-        .collect()
+    Headers(
+        value
+            .fields
+            .iter()
+            .map(|(k, v)| (k.clone(), payload_to_domain(v)))
+            .collect(),
+    )
 }
 
 pub fn memo_from_domain(value: &Memo) -> common::Memo {
     common::Memo {
         fields: value
+            .0
             .iter()
             .map(|(k, v)| (k.clone(), payload_from_domain(v)))
             .collect(),
@@ -63,17 +71,21 @@ pub fn memo_from_domain(value: &Memo) -> common::Memo {
 }
 
 pub fn memo_to_domain(value: &common::Memo) -> Memo {
-    value.fields
-        .iter()
-        .map(|(k, v)| (k.clone(), payload_to_domain(v)))
-        .collect()
+    Memo(
+        value
+            .fields
+            .iter()
+            .map(|(k, v)| (k.clone(), payload_to_domain(v)))
+            .collect(),
+    )
 }
 
 pub fn search_attributes_from_domain(value: &DomainSearchAttributes) -> common::SearchAttributes {
     common::SearchAttributes {
         indexed_fields: value
+            .0
             .iter()
-            .map(|(name, val)| (name.as_str().to_owned(), search_attr_value_from_domain(val)))
+            .map(|(name, val)| (name.clone(), search_attr_value_from_domain(val)))
             .collect(),
     }
 }
@@ -81,11 +93,13 @@ pub fn search_attributes_from_domain(value: &DomainSearchAttributes) -> common::
 pub fn search_attributes_to_domain(
     value: &common::SearchAttributes,
 ) -> Result<DomainSearchAttributes, ProtoConversionError> {
-    let mut out = DomainSearchAttributes::new();
-    for (name, val) in &value.indexed_fields {
-        out.insert(SearchAttrName::from(name.clone()), search_attr_value_to_domain(val)?);
-    }
-    Ok(out)
+    Ok(DomainSearchAttributes(
+        value
+            .indexed_fields
+            .iter()
+            .map(|(name, val)| Ok((name.clone(), search_attr_value_to_domain(val)?)))
+            .collect::<Result<_, ProtoConversionError>>()?,
+    ))
 }
 
 pub fn search_attr_value_from_domain(value: &SearchAttrValue) -> common::SearchAttributeValue {
@@ -128,27 +142,27 @@ pub fn workflow_execution_from_ids(
     run_id: RunId,
 ) -> common::WorkflowExecution {
     common::WorkflowExecution {
-        workflow_id: workflow_id.as_str().to_owned(),
-        run_id: run_id.to_string(),
+        workflow_id: workflow_id.0.clone(),
+        run_id: run_id.0.to_string(),
     }
 }
 
 pub fn task_queue_from_domain(value: &TaskQueueName) -> common::TaskQueue {
     common::TaskQueue {
-        name: value.as_str().to_owned(),
+        name: value.0.clone(),
     }
 }
 
 pub fn task_queue_to_domain(value: &common::TaskQueue) -> TaskQueueName {
-    TaskQueueName::from(value.name.clone())
+    TaskQueueName(value.name.clone())
 }
 
 pub fn encode_task_token(value: &TaskToken) -> Vec<u8> {
-    value.encode()
+    serde_json::to_vec(value).unwrap_or_default()
 }
 
 pub fn decode_task_token(value: &[u8]) -> Result<TaskToken, ProtoConversionError> {
-    TaskToken::decode(value)
+    serde_json::from_slice(value)
         .map_err(|err| ProtoConversionError::InvalidTaskToken(err.to_string()))
 }
 

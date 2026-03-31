@@ -48,6 +48,10 @@ where
         self.broker.clone()
     }
 
+    pub fn repo(&self) -> Arc<R> {
+        self.repo.clone()
+    }
+
     pub async fn start_workflow(&self, request: StartRequest) -> Result<CommitResult> {
         let result = self.submit(request.run_key, Command::Start(request)).await?;
         self.publish_pending_workflow_task(&result).await;

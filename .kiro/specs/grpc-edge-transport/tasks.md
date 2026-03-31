@@ -6,59 +6,59 @@ Wire the existing `tokeira-edge` service layer and `tokeira-proto` generated bin
 
 ## Tasks
 
-- [ ] 1. Add workspace and crate dependencies
-  - [ ] 1.1 Update workspace `Cargo.toml` with tonic and tonic-reflection
+- [x] 1. Add workspace and crate dependencies
+  - [x] 1.1 Update workspace `Cargo.toml` with tonic and tonic-reflection
     - Add `tonic = { version = "0.11", features = ["transport"] }` and `tonic-reflection = "0.11"` to `[workspace.dependencies]`
     - _Requirements: 5.1, 5.4_
-  - [ ] 1.2 Update `tokeira-edge/Cargo.toml` with tokeira-proto and tonic
+  - [x] 1.2 Update `tokeira-edge/Cargo.toml` with tokeira-proto and tonic
     - Add `tokeira-proto = { path = "../tokeira-proto" }` and `tonic = { version = "0.11", features = ["transport"] }` to dependencies
     - _Requirements: 1.1, 3.1_
-  - [ ] 1.3 Update `tokeirad/Cargo.toml` with tokeira-edge, tokeira-proto, tonic, and tonic-reflection
+  - [x] 1.3 Update `tokeirad/Cargo.toml` with tokeira-edge, tokeira-proto, tonic, and tonic-reflection
     - Add `tokeira-edge`, `tokeira-proto`, `tonic`, and `tonic-reflection` to dependencies
     - _Requirements: 5.1, 5.4, 8.3_
 
-- [ ] 2. Implement proto-to-edge translation layer (`tokeira-edge::grpc::translate`)
-  - [ ] 2.1 Create `crates/tokeira-edge/src/grpc/translate.rs` with proto→edge request converters
+- [x] 2. Implement proto-to-edge translation layer (`tokeira-edge::grpc::translate`)
+  - [x] 2.1 Create `crates/tokeira-edge/src/grpc/translate.rs` with proto→edge request converters
     - Implement `start_request_to_edge`, `signal_request_to_edge`, `poll_request_to_edge`, `respond_completed_request_to_edge`, `describe_request_to_edge`, `list_request_to_edge`, `count_request_to_edge`
     - Implement or colocate the payload, memo, search_attributes, and task_queue conversion helpers inside `tokeira-edge::grpc::translate` rather than depending on a `tokeira_proto::conversions` module
     - Apply default timeout (60s) and sticky_ttl (30s) for poll requests
     - _Requirements: 6.1, 6.3, 6.5, 6.6, 6.7_
-  - [ ] 2.2 Add edge→proto response converters to the same module
+  - [x] 2.2 Add edge→proto response converters to the same module
     - Implement `start_response_to_proto`, `poll_response_to_proto`, `signal_response_to_proto`, `completed_response_to_proto`, `describe_response_to_proto`, `list_response_to_proto`, `count_response_to_proto`
     - Poll response populates task token bytes, workflow execution identity, started event ID, and attempt from existing `StartedWorkflowTask` fields; history is empty (deferred)
     - _Requirements: 6.2, 6.4, 6.8_
-  - [ ] 2.3 Add `WorkflowCommand` ↔ proto `Command` translation
+  - [x] 2.3 Add `WorkflowCommand` ↔ proto `Command` translation
     - Implement `proto_command_to_workflow_command` and `workflow_command_to_proto`
     - Handle `schedule_activity`, `start_timer`, `complete_workflow`, `fail_workflow`, `upsert_search_attributes`, `upsert_memo` variants
     - Return `ProtoConversionError::MissingField("Command.attributes")` when no recognized variant is set
     - _Requirements: 6.5, 6.6, 6.7_
-  - [ ] 2.4 Register the `translate` module in `grpc/mod.rs`
+  - [x] 2.4 Register the `translate` module in `grpc/mod.rs`
     - Add `pub mod translate;` to `crates/tokeira-edge/src/grpc/mod.rs`
     - _Requirements: 6.1_
 
-- [ ] 3. Implement gRPC metadata extraction and error mapping (`tokeira-edge::grpc`)
-  - [ ] 3.1 Create `crates/tokeira-edge/src/grpc/metadata.rs`
+- [x] 3. Implement gRPC metadata extraction and error mapping (`tokeira-edge::grpc`)
+  - [x] 3.1 Create `crates/tokeira-edge/src/grpc/metadata.rs`
     - Implement `metadata_to_header_map(metadata: &tonic::metadata::MetadataMap) -> http::HeaderMap`
     - Iterate metadata entries and insert into a fresh HeaderMap, preserving `x-request-id`, `authorization`, and all custom headers
     - _Requirements: 4.1, 4.2, 4.3_
-  - [ ] 3.2 Create `crates/tokeira-edge/src/grpc/errors.rs`
+  - [x] 3.2 Create `crates/tokeira-edge/src/grpc/errors.rs`
     - Implement `From<EdgeError> for tonic::Status` with the mapping: BadRequest→INVALID_ARGUMENT, Unauthorized→UNAUTHENTICATED, Forbidden→PERMISSION_DENIED, NamespaceNotFound/WorkflowNotFound→NOT_FOUND, NamespaceDeleted→FAILED_PRECONDITION, TooManyLongPolls→RESOURCE_EXHAUSTED, LongPollAdmissionTimeout→DEADLINE_EXCEEDED, RemoteRouteUnsupported→UNAVAILABLE, Internal→INTERNAL
     - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8_
-  - [ ] 3.3 Create `crates/tokeira-edge/src/grpc/mod.rs`
+  - [x] 3.3 Create `crates/tokeira-edge/src/grpc/mod.rs`
     - Declare `pub mod metadata;`, `pub mod errors;`, `pub mod translate;` (and later `workflow_service`, `operator_service`, `runtime_adapter`)
     - Register `pub mod grpc;` in `crates/tokeira-edge/src/lib.rs`
     - _Requirements: 1.1, 3.1_
 
-- [ ] 4. Checkpoint — Ensure dependency and foundation modules compile
+- [x] 4. Checkpoint — Ensure dependency and foundation modules compile
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 5. Implement RuntimeAdapter (`tokeira-edge::grpc::runtime_adapter`)
-  - [ ] 5.1 Create `crates/tokeira-edge/src/grpc/runtime_adapter.rs`
+- [x] 5. Implement RuntimeAdapter (`tokeira-edge::grpc::runtime_adapter`)
+  - [x] 5.1 Create `crates/tokeira-edge/src/grpc/runtime_adapter.rs`
     - Implement `RuntimeAdapter<R>` struct wrapping `Arc<TokeiraRuntime<R>>`
     - Implement `WorkflowRuntimeApi` for `RuntimeAdapter<R>` delegating `start_workflow`, `signal_workflow`, `poll_workflow_task`, `complete_workflow_task` to the runtime
     - Implement `commit_result_to_outcome` helper converting `CommitResult` → `WorkflowMutationOutcome` (using `new_state.last_event_id`, not `history_length` which does not exist)
     - _Requirements: 8.1, 8.2_
-  - [ ] 5.2 Register `runtime_adapter` in `grpc/mod.rs`
+  - [x] 5.2 Register `runtime_adapter` in `grpc/mod.rs`
     - Add `pub mod runtime_adapter;`
     - _Requirements: 8.1_
 

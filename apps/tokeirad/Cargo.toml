@@ -8,9 +8,13 @@ license.workspace = true
 anyhow.workspace = true
 time.workspace = true
 tokio.workspace = true
+tonic.workspace = true
+tonic-reflection.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tokeira-edge = { path = "../../crates/tokeira-edge" }
 tokeira-kernel = { path = "../../crates/tokeira-kernel" }
+tokeira-proto = { path = "../../crates/tokeira-proto" }
 tokeira-projection = { path = "../../crates/tokeira-projection" }
 tokeira-runtime = { path = "../../crates/tokeira-runtime" }
 tokeira-storage = { path = "../../crates/tokeira-storage" }

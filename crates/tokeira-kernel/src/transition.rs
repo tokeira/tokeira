@@ -1,3 +1,4 @@
+use time::Duration;
 use smallvec::SmallVec;
 use time::OffsetDateTime;
 use tokeira_types::{
@@ -60,6 +61,10 @@ pub enum DispatchOp {
         activity_id: String,
         schedule_event_id: i64,
         attempt: u32,
+        schedule_to_close_timeout: Option<Duration>,
+        schedule_to_start_timeout: Option<Duration>,
+        start_to_close_timeout: Option<Duration>,
+        heartbeat_timeout: Option<Duration>,
     },
 }
 

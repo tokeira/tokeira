@@ -63,6 +63,11 @@ impl BasicKernel {
             sticky: None,
             memo: req.memo.clone(),
             search_attributes: req.search_attributes.clone(),
+            workflow_execution_timeout: req.workflow_execution_timeout,
+            workflow_run_timeout: req.workflow_run_timeout,
+            workflow_task_timeout: req.workflow_task_timeout,
+            retry_policy: req.retry_policy.clone(),
+            attempt: req.attempt,
             activities: BTreeMap::new(),
             timers: BTreeMap::new(),
             started_at: req.now,
@@ -80,6 +85,13 @@ impl BasicKernel {
             memo: req.memo.clone(),
             search_attributes: req.search_attributes.clone(),
             request_id: req.request.request_id.0,
+            continued_execution_run_id: req.continued_execution_run_id,
+            first_execution_run_id: req.first_execution_run_id,
+            retry_policy: req.retry_policy,
+            attempt: req.attempt,
+            workflow_execution_timeout: req.workflow_execution_timeout,
+            workflow_run_timeout: req.workflow_run_timeout,
+            workflow_task_timeout: req.workflow_task_timeout,
         });
         builder.projection_ops.push(ProjectionOp::UpsertExecution {
             status: ExecutionStatus::Running,
@@ -240,6 +252,18 @@ impl BasicKernel {
                     message,
                 });
             }
+            ActivityResolution::TimedOut { timeout_type } => {
+                builder.emit(HistoryEventKind::ActivityTaskTimedOut {
+                    activity_id: activity.activity_id.clone(),
+                    timeout_type,
+                });
+            }
+            ActivityResolution::Canceled { details } => {
+                builder.emit(HistoryEventKind::ActivityTaskCanceled {
+                    activity_id: activity.activity_id.clone(),
+                    details,
+                });
+            }
         }
 
         builder.state.activities.remove(&activity.activity_id);
@@ -298,6 +322,10 @@ fn apply_workflow_command(builder: &mut TransitionBuilder, command: WorkflowComm
             activity_id,
             task_queue,
             input,
+            schedule_to_close_timeout,
+            schedule_to_start_timeout,
+            start_to_close_timeout,
+            heartbeat_timeout,
         } => {
             if builder.state.activities.contains_key(&activity_id) {
                 return Err(Reject::DuplicateActivityId(activity_id));
@@ -307,6 +335,10 @@ fn apply_workflow_command(builder: &mut TransitionBuilder, command: WorkflowComm
                 activity_id: activity_id.clone(),
                 task_queue: task_queue.clone(),
                 input,
+                schedule_to_close_timeout,
+                schedule_to_start_timeout,
+                start_to_close_timeout,
+                heartbeat_timeout,
             });
 
             let activity = ActivityState {
@@ -314,6 +346,10 @@ fn apply_workflow_command(builder: &mut TransitionBuilder, command: WorkflowComm
                 schedule_event_id,
                 task_queue: task_queue.clone(),
                 attempt: 1,
+                schedule_to_close_timeout,
+                schedule_to_start_timeout,
+                start_to_close_timeout,
+                heartbeat_timeout,
             };
             builder.state.activities.insert(activity_id.clone(), activity.clone());
             builder.activity_ops.push(ActivityOp::Upsert(activity));
@@ -328,6 +364,10 @@ fn apply_workflow_command(builder: &mut TransitionBuilder, command: WorkflowComm
                 activity_id,
                 schedule_event_id,
                 attempt: 1,
+                schedule_to_close_timeout,
+                schedule_to_start_timeout,
+                start_to_close_timeout,
+                heartbeat_timeout,
             });
             Ok(false)
         }

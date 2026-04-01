@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 time.workspace = true
 tokio.workspace = true
 tonic.workspace = true
@@ -19,3 +20,6 @@ tokeira-projection = { path = "../../crates/tokeira-projection" }
 tokeira-runtime = { path = "../../crates/tokeira-runtime" }
 tokeira-storage = { path = "../../crates/tokeira-storage" }
 tokeira-types = { path = "../../crates/tokeira-types" }
+
+[dev-dependencies]
+tokio-stream = { version = "0.1", features = ["net"] }

@@ -1,6 +1,6 @@
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
-    Memo, NamespaceId, Payload, Payloads, QueueKey, RequestContext, SearchAttributes,
+    Memo, NamespaceId, Payload, Payloads, RequestContext, RetryPolicy, SearchAttributes,
     TaskQueueName, WorkerIdentity, WorkflowId, WorkflowTaskToken, WorkflowType, RunId, RunKey,
 };
 
@@ -32,6 +32,13 @@ pub struct StartRequest {
     pub input: Payloads,
     pub memo: Memo,
     pub search_attributes: SearchAttributes,
+    pub workflow_execution_timeout: Option<Duration>,
+    pub workflow_run_timeout: Option<Duration>,
+    pub workflow_task_timeout: Duration,
+    pub retry_policy: Option<RetryPolicy>,
+    pub attempt: u32,
+    pub continued_execution_run_id: Option<RunId>,
+    pub first_execution_run_id: Option<RunId>,
     pub request: RequestContext,
     pub now: OffsetDateTime,
 }
@@ -85,6 +92,10 @@ pub enum WorkflowCommand {
         activity_id: String,
         task_queue: TaskQueueName,
         input: Payloads,
+        schedule_to_close_timeout: Option<Duration>,
+        schedule_to_start_timeout: Option<Duration>,
+        start_to_close_timeout: Option<Duration>,
+        heartbeat_timeout: Option<Duration>,
     },
     StartTimer {
         timer_id: String,

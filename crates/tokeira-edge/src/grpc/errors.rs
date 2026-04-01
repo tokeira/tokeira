@@ -1,4 +1,5 @@
 use tonic::Status;
+use tokeira_proto::conversions::ProtoConversionError;
 
 use crate::errors::EdgeError;
 
@@ -36,4 +37,61 @@ impl From<EdgeError> for Status {
 
 fn err_static(message: &'static str) -> &'static str {
     message
+}
+
+pub fn proto_conversion_status(err: ProtoConversionError) -> Status {
+    Status::invalid_argument(err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tonic::Code;
+
+    #[test]
+    fn edge_errors_map_to_expected_grpc_codes() {
+        let cases = [
+            (EdgeError::BadRequest("bad".to_string()), Code::InvalidArgument),
+            (EdgeError::Unauthorized("nope".to_string()), Code::Unauthenticated),
+            (
+                EdgeError::Forbidden {
+                    action: "operator_read",
+                    namespace: Some("default".to_string()),
+                },
+                Code::PermissionDenied,
+            ),
+            (
+                EdgeError::NamespaceNotFound("missing".to_string()),
+                Code::NotFound,
+            ),
+            (
+                EdgeError::WorkflowNotFound {
+                    namespace: "default".to_string(),
+                    workflow_id: "wf".to_string(),
+                },
+                Code::NotFound,
+            ),
+            (
+                EdgeError::NamespaceDeleted("default".to_string()),
+                Code::FailedPrecondition,
+            ),
+            (EdgeError::TooManyLongPolls, Code::ResourceExhausted),
+            (
+                EdgeError::LongPollAdmissionTimeout,
+                Code::DeadlineExceeded,
+            ),
+            (
+                EdgeError::RemoteRouteUnsupported {
+                    target: "other".to_string(),
+                },
+                Code::Unavailable,
+            ),
+            (EdgeError::Internal("boom".to_string()), Code::Internal),
+        ];
+
+        for (err, code) in cases {
+            let status: Status = err.into();
+            assert_eq!(status.code(), code);
+        }
+    }
 }

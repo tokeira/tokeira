@@ -62,24 +62,24 @@ Wire the existing `tokeira-edge` service layer and `tokeira-proto` generated bin
     - Add `pub mod runtime_adapter;`
     - _Requirements: 8.1_
 
-- [ ] 6. Implement gRPC service adapters
-  - [ ] 6.1 Create `crates/tokeira-edge/src/grpc/workflow_service.rs`
+- [x] 6. Implement gRPC service adapters
+  - [x] 6.1 Create `crates/tokeira-edge/src/grpc/workflow_service.rs`
     - Implement `WorkflowServiceGrpc` struct wrapping `WorkflowService`
     - Implement `workflowservice::workflow_service_server::WorkflowService` tonic trait
     - Each method: extract metadata→HeaderMap, convert proto→edge DTO, call edge service, convert result→proto response or EdgeError→tonic::Status
     - For `poll_workflow_task_queue`: return default empty proto response when edge returns `None`
     - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 7.1, 7.2, 7.3_
-  - [ ] 6.2 Create `crates/tokeira-edge/src/grpc/operator_service.rs`
+  - [x] 6.2 Create `crates/tokeira-edge/src/grpc/operator_service.rs`
     - Implement `OperatorServiceGrpc` struct wrapping `OperatorService`
     - Implement `operatorservice::operator_service_server::OperatorService` tonic trait
     - Handle `get_cluster_info`, `add_search_attributes` (iterate attribute map, call upsert for each), `list_search_attributes`
     - _Requirements: 2.1, 2.2, 2.3_
-  - [ ] 6.3 Register all service modules in `grpc/mod.rs`
+  - [x] 6.3 Register all service modules in `grpc/mod.rs`
     - Add `pub mod workflow_service;`, `pub mod operator_service;`
     - _Requirements: 1.1, 2.1_
 
-- [ ] 7. Update `tokeirad` server bootstrap
-  - [ ] 7.1 Rewrite `apps/tokeirad/src/main.rs` to start the gRPC server
+- [x] 7. Update `tokeirad` server bootstrap
+  - [x] 7.1 Rewrite `apps/tokeirad/src/main.rs` to start the gRPC server
     - Construct `InMemoryStore`, `TokeiraRuntime`, `RuntimeAdapter`, a storage-backed `ExecutionResolver`, `EmptyVisibilityApi`, `InMemoryOperatorApi`, `EdgeInterceptors::permissive`, `LongPollGate`, `LocalOnlyRouter` directly in `main()`
     - Construct `WorkflowService`, `OperatorService` from the above
     - Wrap in `WorkflowServiceGrpc`, `OperatorServiceGrpc`
@@ -88,49 +88,49 @@ Wire the existing `tokeira-edge` service layer and `tokeira-proto` generated bin
     - Return descriptive error if bind fails
     - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 8.1, 8.2, 8.3_
 
-- [ ] 8. Checkpoint — Ensure full stack compiles and server boots
+- [x] 8. Checkpoint — Ensure full stack compiles and server boots
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 9. Property-based tests
-  - [ ]* 9.1 Write property test: Proto-to-edge DTO round-trip
+- [x] 9. Property-based tests
+  - [x]* 9.1 Write property test: Proto-to-edge DTO round-trip
     - **Property 1: Proto-to-edge DTO round-trip for in-scope phase-1 fields**
     - Generate arbitrary edge DTOs (StartWorkflowExecutionRequest, StartWorkflowExecutionResponse, SignalWorkflowExecutionRequest, PollWorkflowTaskQueueRequest, PollWorkflowTaskQueueResponse, etc.), convert to proto and back, assert equality for the fields represented by the initial transport
     - Exclude fields intentionally deferred in this milestone, such as poll-response history payloads
     - Use `proptest` with minimum 100 cases
     - **Validates: Requirements 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 6.1, 6.2, 6.3, 6.4, 6.5, 6.8**
-  - [ ]* 9.2 Write property test: WorkflowCommand round-trip
+  - [x]* 9.2 Write property test: WorkflowCommand round-trip
     - **Property 2: WorkflowCommand round-trip**
     - Generate arbitrary `WorkflowCommand` variants (ScheduleActivity, StartTimer, CompleteWorkflow, FailWorkflow, UpsertSearchAttributes, UpsertMemo), convert to proto Command and back, assert equality
     - Use `proptest` with minimum 100 cases
     - **Validates: Requirements 6.5, 6.6**
-  - [ ]* 9.3 Write property test: EdgeError to gRPC status code mapping
+  - [x]* 9.3 Write property test: EdgeError to gRPC status code mapping
     - **Property 3: EdgeError to gRPC status code mapping**
     - Generate arbitrary `EdgeError` variants with random message strings, convert to `tonic::Status`, assert correct status code and message preservation
     - Use `proptest` with minimum 100 cases
     - **Validates: Requirements 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8**
-  - [ ]* 9.4 Write property test: gRPC metadata to HeaderMap preservation
+  - [x]* 9.4 Write property test: gRPC metadata to HeaderMap preservation
     - **Property 4: gRPC metadata to HeaderMap preservation**
     - Generate arbitrary sets of ASCII key-value pairs, insert into `MetadataMap`, convert via `metadata_to_header_map`, assert all pairs present in resulting HeaderMap
     - Use `proptest` with minimum 100 cases
     - **Validates: Requirements 4.1, 4.2, 4.3**
 
-- [ ] 10. Unit tests
-  - [ ]* 10.1 Write unit tests for proto-to-edge translation
+- [x] 10. Unit tests
+  - [x]* 10.1 Write unit tests for proto-to-edge translation
     - Test empty poll response: edge returns `None` → adapter returns default empty proto response
     - Test command with no attributes: proto `Command` with `attributes: None` → `ProtoConversionError::MissingField`
     - Test default poll timeout: adapter applies 60s timeout and 30s sticky TTL defaults
     - _Requirements: 6.3, 6.7, 7.2_
-  - [ ]* 10.2 Write unit tests for error mapping and metadata extraction
+  - [x]* 10.2 Write unit tests for error mapping and metadata extraction
     - Test specific metadata keys: `x-request-id` and `authorization` preserved through metadata extraction
     - Test each EdgeError variant maps to the correct gRPC status code
     - _Requirements: 3.1–3.8, 4.2, 4.3_
-  - [ ]* 10.3 Write unit tests for operator service adapter
+  - [x]* 10.3 Write unit tests for operator service adapter
     - Test ClusterInfo response mapping (cluster_name, server_version fields)
     - Test AddSearchAttributes with multiple attributes results in multiple upsert calls
     - _Requirements: 2.1, 2.2, 2.3_
 
-- [ ] 11. Integration test
-  - [ ]* 11.1 Write integration test for full gRPC round-trip
+- [x] 11. Integration test
+  - [x]* 11.1 Write integration test for full gRPC round-trip
     - Boot full server stack with `InMemoryStore` (inline construction, same as tokeirad)
     - Connect a tonic client
     - Call `StartWorkflowExecution` and verify a `run_id` is returned
@@ -138,7 +138,7 @@ Wire the existing `tokeira-edge` service layer and `tokeira-proto` generated bin
     - Verify gRPC reflection lists available services
     - _Requirements: 1.1, 1.5, 5.1, 5.4, 8.3_
 
-- [ ] 12. Final checkpoint — Ensure all tests pass
+- [x] 12. Final checkpoint — Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
 ## Notes

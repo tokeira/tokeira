@@ -23,3 +23,19 @@ pub fn metadata_to_header_map(metadata: &MetadataMap) -> HeaderMap {
 
     headers
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_request_id_and_authorization() {
+        let mut metadata = MetadataMap::new();
+        metadata.insert("x-request-id", "req-123".parse().unwrap());
+        metadata.insert("authorization", "Bearer token".parse().unwrap());
+
+        let headers = metadata_to_header_map(&metadata);
+        assert_eq!(headers.get("x-request-id").unwrap(), "req-123");
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer token");
+    }
+}

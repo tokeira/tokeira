@@ -2,7 +2,7 @@
 
 **Status:** draft for architecture review  
 **Decision direction:** preferred  
-**Related docs:** [000-overview](000-overview.md), [030-runtime-lanes](030-runtime-lanes.md), [040-delivery-broker](040-delivery-broker.md), [050-dsql-storage](050-dsql-storage.md), [055-admission-control](055-admission-control.md), [060-connection-management](060-connection-management.md), [065-runtime-auto-tune](065-runtime-auto-tune.md)
+**Related docs:** [000-overview](000-overview.md), [030-runtime-lanes](030-runtime-lanes.md), [040-delivery-broker](040-delivery-broker.md), [050-dsql-storage](050-dsql-storage.md), [060-connection-management](060-connection-management.md), [065-runtime-auto-tune](065-runtime-auto-tune.md)
 
 ## Intent
 
@@ -23,8 +23,6 @@ The operator should describe:
 and Tokeira should infer or tune the rest.
 
 This is a deliberate reaction against the operational pattern seen in Temporal today, where worker and queue performance often depends on tuning combinations of task slots, pollers, sticky cache, rate limits, and queue metrics such as schedule-to-start and sync-match rate.[^temporal-worker-performance][^temporal-worker-tuning][^temporal-worker-health][^temporal-task-queue]
-
-Admission control in Tokeira should therefore be expressed primarily as **policy class and capacity envelope**, with the detailed mechanics owned by the platform itself. See [055-admission-control](055-admission-control.md).
 
 ## Problem statement
 

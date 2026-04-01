@@ -1,11 +1,11 @@
 # 000 Overview
 
 **Status:** draft for architecture review  
-**Related docs:** [010-history-as-authority](010-history-as-authority.md), [015-configuration](015-configuration.md), [020-kernel](020-kernel.md), [025-system-services](025-system-services.md), [030-runtime-lanes](030-runtime-lanes.md), [035-placement-and-membership](035-placement-and-membership.md), [040-delivery-broker](040-delivery-broker.md), [045-autoscaling-on-ecs-ec2](045-autoscaling-on-ecs-ec2.md), [050-dsql-storage](050-dsql-storage.md), [055-admission-control](055-admission-control.md), [060-connection-management](060-connection-management.md), [065-runtime-auto-tune](065-runtime-auto-tune.md), [070-projection-plane](070-projection-plane.md), [075-archival-to-s3](075-archival-to-s3.md), [080-sql-visibility](080-sql-visibility.md), [090-failover-and-recovery](090-failover-and-recovery.md)
+**Related docs:** [010-history-as-authority](010-history-as-authority.md), [015-configuration](015-configuration.md), [020-kernel](020-kernel.md), [025-system-services](025-system-services.md), [030-runtime-lanes](030-runtime-lanes.md), [035-placement-and-membership](035-placement-and-membership.md), [037-dynamic-placement](037-dynamic-placement.md), [040-delivery-broker](040-delivery-broker.md), [045-autoscaling-on-ecs-ec2](045-autoscaling-on-ecs-ec2.md), [050-dsql-storage](050-dsql-storage.md), [055-admission-control](055-admission-control.md), [060-connection-management](060-connection-management.md), [065-runtime-auto-tune](065-runtime-auto-tune.md), [070-projection-plane](070-projection-plane.md), [075-archival-to-s3](075-archival-to-s3.md), [080-sql-visibility](080-sql-visibility.md), [090-failover-and-recovery](090-failover-and-recovery.md)
 
 ## Intent
 
-**Tokeira** is a Temporal-compatible durable execution engine implemented in Rust and specialized for **Aurora DSQL** as its only persistence backend. The design goal is to preserve the public Temporal contract that SDKs, operators, and tooling care about, while changing the internal architecture enough to make ordering, delivery, and persistence materially simpler and more efficient.
+**Tokeira** is a Temporal-compatible durable execution engine implemented in Rust and specialized for **Aurora DSQL**. The design goal is to preserve the public Temporal contract that SDKs, operators, and tooling care about, while changing the internal architecture enough to make ordering, delivery, and persistence materially simpler and more efficient.
 
 This repo is **not** aiming for a service-by-service port of Temporal’s current Frontend / History / Matching / Worker layout. Temporal documents that server layout today, but it also documents a more important truth for this redesign: a single Task Queue can contain work for many Workflow Executions, task ordering on partitioned queues is not the same thing as workflow event ordering, and the Worker Service exists to run internal background Workflows rather than user code.[^temporal-server][^matching][^task-queue][^event-history] Workflow durability comes from event history, while queue delivery is an implementation detail with weaker ordering guarantees.
 
@@ -21,6 +21,7 @@ In practical terms, that means:
 - **Visibility is a projection plane, not part of the correctness core.**
 - **Archival is a separate durability/retention service, not part of the hot path.**
 - **Aurora DSQL constraints shape the storage design directly.**
+- **If Tokeira uses multiple workflow cells, placement is queue-aware and storage-aware, while authority remains execution-scoped.**
 
 ## Why this architecture exists
 
@@ -72,7 +73,7 @@ This plane owns correctness:
 
 Responsibilities:
 
-- shard ownership and fencing,
+- shard / bundle ownership and fencing,
 - lane-local execution of workflow actors,
 - durable state transitions,
 - durable timers, activity state, and task-start validation,
@@ -131,11 +132,15 @@ Worker polling and sync matching should live primarily in memory. Durable backlo
 
 Temporal’s visibility model already distinguishes a visibility store from the core persistence store, supports SQL backends, List Filters, custom Search Attributes, and dual visibility for migration.[^visibility][^dual-visibility][^list-filter][^search-attributes] Tokeira generalizes this into a typed projection log with replayable sinks.
 
-### 6. Archival is separate from hot retention
+### 6. Multi-cell placement is dynamic, but authority is stable
+
+If Tokeira uses multiple workflow DSQL clusters, the system should adapt placement based on storage pressure, queue health, and locality. That adaptation is **dynamic for new work and queue partitions**, but **deliberate for existing executions**. Queue placement may move every few tens of seconds; execution-home should normally move only at safe boundaries such as `ContinueAsNew`, dormant-run rebalance, or controlled maintenance.[^dsql-cw][^worker-health]
+
+### 7. Archival is separate from hot retention
 
 Temporal’s self-hosted archival backs up closed Workflow Execution histories and visibility records to blob storage.[^archival] Tokeira should support the same category of outcome, but treat it as an explicit asynchronous service with its own pacing, retries, and S3 object model. DSQL hot retention can remain generous if cost and operational posture allow it; archival exists for long-tail durability, compliance, migration, and storage tiering, not because every closed execution must be evicted immediately.
 
-### 7. System workflows are optional and deliberate
+### 8. System workflows are optional and deliberate
 
 Temporal’s Worker Service runs internal background workflows.[^temporal-server] Tokeira should keep the equivalent function, but not as a fourth core correctness service. Internal workflows are a good fit for long-running, auditable operator jobs; they are a poor fit for hot-path routing, delivery, or lease control.
 
@@ -199,7 +204,7 @@ A typical workflow mutation should look like this:
 ```text
 public request
   -> edge translation
-  -> shard routing
+  -> placement lookup (execution-home or start-placement)
   -> lane-local run actor
   -> kernel.apply(loaded_state, command)
   -> one fenced DSQL commit
@@ -212,7 +217,7 @@ A typical long poll should look like this:
 ```text
 long poll
   -> edge gate
-  -> delivery broker
+  -> queue-home delivery broker
   -> sticky waiter? live-ready task? backlog?
   -> start-task transaction
   -> worker receives task token + history delta
@@ -248,6 +253,7 @@ It does **not** mean preserving internal service boundaries or today’s exact q
 - Read [020-kernel](020-kernel.md) for the deterministic state transition contract.
 - Read [025-system-services](025-system-services.md) for the replacement of a Temporal-style Worker Service.
 - Read [030-runtime-lanes](030-runtime-lanes.md) and [040-delivery-broker](040-delivery-broker.md) for execution and polling.
+- Read [035-placement-and-membership](035-placement-and-membership.md) and [037-dynamic-placement](037-dynamic-placement.md) for queue-aware placement, cell routing, and storage-aware rebalance.
 - Read [050-dsql-storage](050-dsql-storage.md) and [060-connection-management](060-connection-management.md) for persistence and DSQL-specific control.
 - Read [070-projection-plane](070-projection-plane.md), [075-archival-to-s3](075-archival-to-s3.md), and [080-sql-visibility](080-sql-visibility.md) for read models, archival, and visibility.
 - Read [090-failover-and-recovery](090-failover-and-recovery.md) for fencing, sweepers, and rebuild paths.
@@ -257,21 +263,23 @@ It does **not** mean preserving internal service boundaries or today’s exact q
 1. Is the compatibility boundary stated tightly enough, or should it explicitly enumerate more Temporal APIs?
 2. Are we comfortable stating “history as authority” even though `workflow_hot` remains a persisted summary?
 3. Do we want to treat delivery backlog as purely derived from run state, or do we want a stronger durable outbox abstraction inside storage?
-4. Should archival be triggered immediately on close, or by a later retention window and policy engine?
+4. Is the queue-aware / execution-scoped split clear enough to reason about multi-cell routing?
 5. Which internal jobs truly justify running as durable system workflows, and which should remain plain control services?
 
 ## References
 
-[^temporal-server]: Temporal Server, official docs: https://docs.temporal.io/temporal-service/temporal-server  
-[^matching]: Temporal Matching Service architecture doc: https://github.com/temporalio/temporal/blob/main/docs/architecture/matching-service.md  
-[^task-queue]: Temporal Task Queues docs: https://docs.temporal.io/task-queue  
-[^event-history]: Temporal Event History docs: https://docs.temporal.io/workflow-execution/event  
-[^visibility]: Temporal Visibility docs: https://docs.temporal.io/visibility  
-[^dual-visibility]: Temporal Dual Visibility docs: https://docs.temporal.io/dual-visibility  
-[^list-filter]: Temporal List Filter docs: https://docs.temporal.io/list-filter  
-[^search-attributes]: Temporal Search Attributes docs: https://docs.temporal.io/search-attribute  
-[^archival]: Temporal self-hosted Archival docs: https://docs.temporal.io/self-hosted-guide/archival  
-[^dsql-migration]: Aurora DSQL migration guide: https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-postgresql-compatibility-migration-guide.html  
-[^dsql-quotas]: Aurora DSQL quotas and limits: https://docs.aws.amazon.com/aurora-dsql/latest/userguide/CHAP_quotas.html  
-[^dsql-pk]: Aurora DSQL primary key guidance: https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-primary-keys.html  
+[^temporal-server]: Temporal Server, official docs: https://docs.temporal.io/temporal-service/temporal-server
+[^matching]: Temporal Matching Service architecture doc: https://github.com/temporalio/temporal/blob/main/docs/architecture/matching-service.md
+[^task-queue]: Temporal Task Queues docs: https://docs.temporal.io/task-queue
+[^event-history]: Temporal Event History docs: https://docs.temporal.io/workflow-execution/event
+[^visibility]: Temporal Visibility docs: https://docs.temporal.io/visibility
+[^dual-visibility]: Temporal Dual Visibility docs: https://docs.temporal.io/dual-visibility
+[^list-filter]: Temporal List Filter docs: https://docs.temporal.io/list-filter
+[^search-attributes]: Temporal Search Attributes docs: https://docs.temporal.io/search-attribute
+[^archival]: Temporal self-hosted Archival docs: https://docs.temporal.io/self-hosted-guide/archival
+[^dsql-migration]: Aurora DSQL migration guide: https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-postgresql-compatibility-migration-guide.html
+[^dsql-quotas]: Aurora DSQL quotas and limits: https://docs.aws.amazon.com/aurora-dsql/latest/userguide/CHAP_quotas.html
+[^dsql-pk]: Aurora DSQL primary key guidance: https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-primary-keys.html
+[^dsql-cw]: Aurora DSQL monitoring metrics: https://docs.aws.amazon.com/aurora-dsql/latest/userguide/cloudwatch-monitoring.html
+[^worker-health]: Temporal worker health guidance: https://docs.temporal.io/cloud/worker-health
 [^lamport]: Lamport, *Time, Clocks, and the Ordering of Events in a Distributed System* (1978): https://lamport.azurewebsites.net/pubs/time-clocks.pdf

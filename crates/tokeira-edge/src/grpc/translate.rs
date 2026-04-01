@@ -248,6 +248,10 @@ pub fn proto_command_to_workflow_command(
                     .as_ref()
                     .map(payloads_to_domain)
                     .unwrap_or_default(),
+                schedule_to_close_timeout: None,
+                schedule_to_start_timeout: None,
+                start_to_close_timeout: None,
+                heartbeat_timeout: None,
             })
         }
         Some(Attributes::StartTimer(attrs)) => Ok(WorkflowCommand::StartTimer {
@@ -297,6 +301,7 @@ pub fn workflow_command_to_proto(
             activity_id,
             task_queue,
             input,
+            ..
         } => Some(Attributes::ScheduleActivity(
             workflowservice::ScheduleActivityCommandAttributes {
                 activity_id: activity_id.clone(),
@@ -440,6 +445,41 @@ fn run_id_from_run_key(run_key: RunKey) -> RunId {
 
 fn history_blob(_history: &[HistoryEvent]) -> Vec<u8> {
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_request_applies_default_timeout_and_sticky_ttl() {
+        let req = workflowservice::PollWorkflowTaskQueueRequest {
+            namespace: "default".to_string(),
+            task_queue: Some(tokeira_proto::common::TaskQueue {
+                name: "queue".to_string(),
+            }),
+            identity: "worker-1".to_string(),
+            deployment: String::new(),
+            build_id: String::new(),
+        };
+
+        let edge = poll_request_to_edge(req).expect("poll request should convert");
+        assert_eq!(edge.timeout, Duration::from_secs(60));
+        assert_eq!(edge.sticky_ttl, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn command_without_attributes_returns_missing_field() {
+        let err = proto_command_to_workflow_command(workflowservice::Command { attributes: None })
+            .expect_err("missing attributes should fail");
+
+        match err {
+            ProtoConversionError::MissingField(field) => {
+                assert_eq!(field, "Command.attributes");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
 }
 
 trait Pipe: Sized {

@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use tokeira_types::{
-    ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, QueueKey, RunId, RunKey, SearchAttributes,
-    StickyAffinity, TaskQueueName, TransitionSeq, WorkflowId, WorkflowType,
+    ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, RetryPolicy, RunId, RunKey,
+    SearchAttributes, StickyAffinity, TaskQueueName, TransitionSeq, WorkflowId, WorkflowType,
 };
 
 /// Durable state for an open or closed workflow run.
@@ -29,6 +29,11 @@ pub struct WorkflowState {
 
     pub memo: Memo,
     pub search_attributes: SearchAttributes,
+    pub workflow_execution_timeout: Option<Duration>,
+    pub workflow_run_timeout: Option<Duration>,
+    pub workflow_task_timeout: Duration,
+    pub retry_policy: Option<RetryPolicy>,
+    pub attempt: u32,
     pub activities: BTreeMap<String, ActivityState>,
     pub timers: BTreeMap<String, TimerState>,
 
@@ -56,6 +61,10 @@ pub struct ActivityState {
     pub schedule_event_id: i64,
     pub task_queue: TaskQueueName,
     pub attempt: u32,
+    pub schedule_to_close_timeout: Option<Duration>,
+    pub schedule_to_start_timeout: Option<Duration>,
+    pub start_to_close_timeout: Option<Duration>,
+    pub heartbeat_timeout: Option<Duration>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

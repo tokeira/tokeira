@@ -30,3 +30,6 @@ path = "../tokeira-storage"
 
 [dependencies.tokeira-types]
 path = "../tokeira-types"
+
+[dev-dependencies]
+proptest = "1"

@@ -7,12 +7,14 @@ use tokeira_kernel::{
     ActivityResolvedRequest, ActivityState, BasicKernel, Command, DispatchOp, LoadedRun,
     PendingWorkflowTask, RequestDedupeOp, SignalRequest, StartRequest, StartWorkflowTaskRequest,
     TimerDueRequest, TimerOp, TimerState, WorkflowCommand, WorkflowState,
-    WorkflowTaskCompletedRequest,
+    WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
+    WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType,
 };
 use tokeira_types::{
     ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RequestContext,
     RequestId, RetryPolicy, RunId, RunKey, SearchAttrValue, SearchAttributes, ShardEpoch,
-    TaskQueueName, TransitionSeq, WorkerIdentity, WorkflowId, WorkflowTaskToken, WorkflowType,
+    StickyAffinity, TaskQueueName, TransitionSeq, WorkerIdentity, WorkflowId, WorkflowTaskToken,
+    WorkflowType,
 };
 
 fn fixed_now() -> OffsetDateTime {
@@ -98,6 +100,14 @@ fn with_pending_wft(mut state: WorkflowState, logical_seq: u64, started_event_id
     state
 }
 
+fn with_sticky(mut state: WorkflowState, worker_identity: &str, now: OffsetDateTime) -> WorkflowState {
+    state.sticky = Some(StickyAffinity {
+        worker_identity: WorkerIdentity(worker_identity.into()),
+        expires_at: now + Duration::seconds(30),
+    });
+    state
+}
+
 fn with_activity(mut state: WorkflowState, activity_id: &str) -> WorkflowState {
     state.activities.insert(
         activity_id.into(),
@@ -126,6 +136,8 @@ fn with_timer(mut state: WorkflowState, timer_id: &str, now: OffsetDateTime) -> 
     );
     state
 }
+
+// --- Arbitrary strategies ---
 
 fn arb_duration() -> impl Strategy<Value = Duration> {
     (1i64..600).prop_map(Duration::seconds)
@@ -245,6 +257,50 @@ fn arb_schedule_activity_command() -> impl Strategy<Value = WorkflowCommand> {
         )
 }
 
+fn arb_wft_failed_cause() -> impl Strategy<Value = WorkflowTaskFailedCause> {
+    prop_oneof![
+        Just(WorkflowTaskFailedCause::NonDeterminismError),
+        Just(WorkflowTaskFailedCause::BadScheduleActivityAttributes),
+        Just(WorkflowTaskFailedCause::BadStartTimerAttributes),
+        Just(WorkflowTaskFailedCause::UnhandledCommand),
+        Just(WorkflowTaskFailedCause::BadRequestCancelActivityAttributes),
+        Just(WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure),
+        Just(WorkflowTaskFailedCause::BadSignalWorkflowExecutionAttributes),
+    ]
+}
+
+fn arb_wft_failed_request(
+    logical_seq: LogicalTaskSeq,
+    started_event_id: i64,
+    now: OffsetDateTime,
+) -> impl Strategy<Value = WorkflowTaskFailedRequest> {
+    (
+        arb_wft_failed_cause(),
+        prop::option::of(arb_payload()),
+        arb_small_string(),
+    ).prop_map(move |(failure_cause, failure_details, worker_identity)| WorkflowTaskFailedRequest {
+        logical_seq,
+        started_event_id,
+        failure_cause,
+        failure_details,
+        worker_identity: WorkerIdentity(worker_identity),
+        now,
+    })
+}
+
+fn arb_wft_timed_out_request(
+    logical_seq: LogicalTaskSeq,
+    started_event_id: i64,
+    now: OffsetDateTime,
+) -> impl Strategy<Value = WorkflowTaskTimedOutRequest> {
+    Just(WorkflowTaskTimedOutRequest {
+        logical_seq,
+        started_event_id,
+        timeout_type: WorkflowTaskTimeoutType::StartToClose,
+        now,
+    })
+}
+
 fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
     let now = fixed_now();
     prop_oneof![
@@ -310,6 +366,26 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 fired_at: now,
             };
             (LoadedRun::Existing(state), Command::TimerDue(req))
+        }),
+        prop::bool::ANY.prop_flat_map(move |sticky| {
+            let logical_seq = LogicalTaskSeq(40);
+            let started_event_id = 15;
+            let mut state = with_pending_wft(make_open_state(now), logical_seq.0, Some(started_event_id), 1);
+            if sticky {
+                state = with_sticky(state, "sticky-worker", now);
+            }
+            arb_wft_failed_request(logical_seq, started_event_id, now)
+                .prop_map(move |req| (LoadedRun::Existing(state.clone()), Command::WorkflowTaskFailed(req)))
+        }),
+        prop::bool::ANY.prop_flat_map(move |sticky| {
+            let logical_seq = LogicalTaskSeq(41);
+            let started_event_id = 16;
+            let mut state = with_pending_wft(make_open_state(now), logical_seq.0, Some(started_event_id), 1);
+            if sticky {
+                state = with_sticky(state, "sticky-worker", now);
+            }
+            arb_wft_timed_out_request(logical_seq, started_event_id, now)
+                .prop_map(move |req| (LoadedRun::Existing(state.clone()), Command::WorkflowTaskTimedOut(req)))
         }),
     ]
 }
@@ -416,36 +492,24 @@ proptest! {
 
         let (expected_id, expected_s2c, expected_s2s, expected_stc, expected_hb) = match cmd {
             WorkflowCommand::ScheduleActivity {
-                activity_id,
-                schedule_to_close_timeout,
-                schedule_to_start_timeout,
-                start_to_close_timeout,
-                heartbeat_timeout,
-                ..
+                activity_id, schedule_to_close_timeout, schedule_to_start_timeout,
+                start_to_close_timeout, heartbeat_timeout, ..
             } => (activity_id, schedule_to_close_timeout, schedule_to_start_timeout, start_to_close_timeout, heartbeat_timeout),
             _ => unreachable!(),
         };
 
         let scheduled = transition.history_events.iter().find_map(|event| match &event.kind {
             HistoryEventKind::ActivityTaskScheduled {
-                activity_id,
-                schedule_to_close_timeout,
-                schedule_to_start_timeout,
-                start_to_close_timeout,
-                heartbeat_timeout,
-                ..
+                activity_id, schedule_to_close_timeout, schedule_to_start_timeout,
+                start_to_close_timeout, heartbeat_timeout, ..
             } => Some((activity_id.clone(), *schedule_to_close_timeout, *schedule_to_start_timeout, *start_to_close_timeout, *heartbeat_timeout)),
             _ => None,
         }).unwrap();
         let activity = transition.next_state.activities.get(&expected_id).unwrap();
         let dispatch = transition.dispatch_ops.iter().find_map(|op| match op {
             DispatchOp::EnqueueActivityTask {
-                activity_id,
-                schedule_to_close_timeout,
-                schedule_to_start_timeout,
-                start_to_close_timeout,
-                heartbeat_timeout,
-                ..
+                activity_id, schedule_to_close_timeout, schedule_to_start_timeout,
+                start_to_close_timeout, heartbeat_timeout, ..
             } => Some((activity_id.clone(), *schedule_to_close_timeout, *schedule_to_start_timeout, *start_to_close_timeout, *heartbeat_timeout)),
             _ => None,
         }).unwrap();
@@ -505,10 +569,7 @@ proptest! {
         ).unwrap();
         prop_assert_eq!(signal_transition.next_state.pending_workflow_task.as_ref().unwrap().logical_seq, LogicalTaskSeq(99));
         prop_assert_eq!(
-            signal_transition
-                .dispatch_ops
-                .iter()
-                .all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. })),
+            signal_transition.dispatch_ops.iter().all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. })),
             true
         );
 
@@ -523,10 +584,7 @@ proptest! {
         ).unwrap();
         prop_assert_eq!(activity_transition.next_state.pending_workflow_task.as_ref().unwrap().logical_seq, LogicalTaskSeq(99));
         prop_assert_eq!(
-            activity_transition
-                .dispatch_ops
-                .iter()
-                .all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. })),
+            activity_transition.dispatch_ops.iter().all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. })),
             true
         );
 
@@ -539,10 +597,7 @@ proptest! {
         ).unwrap();
         prop_assert_eq!(timer_transition.next_state.pending_workflow_task.as_ref().unwrap().logical_seq, LogicalTaskSeq(99));
         prop_assert_eq!(
-            timer_transition
-                .dispatch_ops
-                .iter()
-                .all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. })),
+            timer_transition.dispatch_ops.iter().all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. })),
             true
         );
     }
@@ -552,10 +607,7 @@ proptest! {
         let transition = kernel().apply(loaded, command).unwrap();
         if transition.next_state.status != ExecutionStatus::Running {
             prop_assert_eq!(
-                transition
-                    .dispatch_ops
-                    .iter()
-                    .all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. } | DispatchOp::EnqueueActivityTask { .. })),
+                transition.dispatch_ops.iter().all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. } | DispatchOp::EnqueueActivityTask { .. })),
                 true
             );
             prop_assert!(transition.next_state.pending_workflow_task.is_none());
@@ -608,5 +660,140 @@ proptest! {
             }
             _ => prop_assert!(transition.request_dedupe_ops.is_empty()),
         }
+    }
+
+    #[test]
+    fn property_11_wft_failed_event_field_pass_through(req in arb_wft_failed_request(LogicalTaskSeq(50), 21, fixed_now())) {
+        let now = fixed_now();
+        let state = with_pending_wft(make_open_state(now), 50, Some(21), 1);
+        let transition = kernel().apply(LoadedRun::Existing(state), Command::WorkflowTaskFailed(req.clone())).unwrap();
+        match &transition.history_events[0].kind {
+            HistoryEventKind::WorkflowTaskFailed { logical_seq, scheduled_event_id, started_event_id, failure_cause, failure_details, identity } => {
+                prop_assert_eq!(*logical_seq, LogicalTaskSeq(50));
+                prop_assert_eq!(*scheduled_event_id, 13);
+                prop_assert_eq!(*started_event_id, 21);
+                prop_assert_eq!(failure_cause, &req.failure_cause);
+                prop_assert_eq!(failure_details, &req.failure_details);
+                prop_assert_eq!(identity, &req.worker_identity);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn property_12_wft_timed_out_event_field_pass_through(req in arb_wft_timed_out_request(LogicalTaskSeq(51), 22, fixed_now())) {
+        let now = fixed_now();
+        let state = with_pending_wft(make_open_state(now), 51, Some(22), 1);
+        let transition = kernel().apply(LoadedRun::Existing(state), Command::WorkflowTaskTimedOut(req.clone())).unwrap();
+        match &transition.history_events[0].kind {
+            HistoryEventKind::WorkflowTaskTimedOut { logical_seq, scheduled_event_id, started_event_id, timeout_type } => {
+                prop_assert_eq!(*logical_seq, LogicalTaskSeq(51));
+                prop_assert_eq!(*scheduled_event_id, 13);
+                prop_assert_eq!(*started_event_id, 22);
+                prop_assert_eq!(timeout_type, &req.timeout_type);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn property_13_failure_timeout_preserve_pending_wft_identity(req in arb_wft_failed_request(LogicalTaskSeq(60), 30, fixed_now())) {
+        let now = fixed_now();
+        let failed_transition = kernel().apply(
+            LoadedRun::Existing(with_pending_wft(make_open_state(now), 60, Some(30), 1)),
+            Command::WorkflowTaskFailed(req),
+        ).unwrap();
+        let failed_pending = failed_transition.next_state.pending_workflow_task.unwrap();
+        prop_assert_eq!(failed_pending.logical_seq, LogicalTaskSeq(60));
+        prop_assert_eq!(failed_pending.scheduled_event_id, 13);
+        prop_assert_eq!(failed_pending.started_event_id, None);
+
+        let timed_out_transition = kernel().apply(
+            LoadedRun::Existing(with_pending_wft(make_open_state(now), 61, Some(31), 1)),
+            Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+                logical_seq: LogicalTaskSeq(61),
+                started_event_id: 31,
+                timeout_type: WorkflowTaskTimeoutType::StartToClose,
+                now,
+            }),
+        ).unwrap();
+        let timed_out_pending = timed_out_transition.next_state.pending_workflow_task.unwrap();
+        prop_assert_eq!(timed_out_pending.logical_seq, LogicalTaskSeq(61));
+        prop_assert_eq!(timed_out_pending.scheduled_event_id, 13);
+        prop_assert_eq!(timed_out_pending.started_event_id, None);
+    }
+
+    #[test]
+    fn property_14_wft_failed_preserves_sticky(req in arb_wft_failed_request(LogicalTaskSeq(70), 40, fixed_now())) {
+        let now = fixed_now();
+        let state = with_sticky(with_pending_wft(make_open_state(now), 70, Some(40), 1), "sticky-worker", now);
+        let transition = kernel().apply(LoadedRun::Existing(state.clone()), Command::WorkflowTaskFailed(req)).unwrap();
+        prop_assert_eq!(transition.next_state.sticky, state.sticky);
+        match &transition.dispatch_ops[0] {
+            DispatchOp::EnqueueWorkflowTask { sticky_preferred, .. } => {
+                prop_assert_eq!(sticky_preferred, &Some(WorkerIdentity("sticky-worker".into())));
+            }
+            other => panic!("unexpected dispatch op: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn property_16_failure_timeout_minimal_side_effects(req in arb_wft_failed_request(LogicalTaskSeq(80), 50, fixed_now())) {
+        let now = fixed_now();
+        let failed_transition = kernel().apply(
+            LoadedRun::Existing(with_pending_wft(make_open_state(now), 80, Some(50), 1)),
+            Command::WorkflowTaskFailed(req),
+        ).unwrap();
+        prop_assert_eq!(failed_transition.history_events.len(), 1);
+        prop_assert_eq!(failed_transition.dispatch_ops.len(), 1);
+        prop_assert_eq!(matches!(failed_transition.history_events[0].kind, HistoryEventKind::WorkflowTaskFailed { .. }), true);
+        prop_assert_eq!(matches!(failed_transition.dispatch_ops[0], DispatchOp::EnqueueWorkflowTask { logical_seq: LogicalTaskSeq(80), .. }), true);
+        prop_assert!(failed_transition.request_dedupe_ops.is_empty());
+        prop_assert!(failed_transition.activity_ops.is_empty());
+        prop_assert!(failed_transition.timer_ops.is_empty());
+        prop_assert!(failed_transition.projection_ops.is_empty());
+        prop_assert_eq!(failed_transition.next_state.status, ExecutionStatus::Running);
+
+        let timed_out_transition = kernel().apply(
+            LoadedRun::Existing(with_pending_wft(make_open_state(now), 81, Some(51), 1)),
+            Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+                logical_seq: LogicalTaskSeq(81),
+                started_event_id: 51,
+                timeout_type: WorkflowTaskTimeoutType::StartToClose,
+                now,
+            }),
+        ).unwrap();
+        prop_assert_eq!(timed_out_transition.history_events.len(), 1);
+        prop_assert_eq!(timed_out_transition.dispatch_ops.len(), 1);
+        prop_assert_eq!(matches!(timed_out_transition.history_events[0].kind, HistoryEventKind::WorkflowTaskTimedOut { .. }), true);
+        prop_assert_eq!(matches!(timed_out_transition.dispatch_ops[0], DispatchOp::EnqueueWorkflowTask { logical_seq: LogicalTaskSeq(81), .. }), true);
+        prop_assert!(timed_out_transition.request_dedupe_ops.is_empty());
+        prop_assert!(timed_out_transition.activity_ops.is_empty());
+        prop_assert!(timed_out_transition.timer_ops.is_empty());
+        prop_assert!(timed_out_transition.projection_ops.is_empty());
+        prop_assert_eq!(timed_out_transition.next_state.status, ExecutionStatus::Running);
+    }
+}
+
+// Property 15 is not property-based (deterministic single case), so it lives outside the proptest! block.
+#[test]
+fn property_15_wft_timed_out_clears_sticky() {
+    let now = fixed_now();
+    let state = with_sticky(with_pending_wft(make_open_state(now), 71, Some(41), 1), "sticky-worker", now);
+    let transition = kernel().apply(
+        LoadedRun::Existing(state),
+        Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+            logical_seq: LogicalTaskSeq(71),
+            started_event_id: 41,
+            timeout_type: WorkflowTaskTimeoutType::StartToClose,
+            now,
+        }),
+    ).unwrap();
+    assert_eq!(transition.next_state.sticky, None);
+    match &transition.dispatch_ops[0] {
+        DispatchOp::EnqueueWorkflowTask { sticky_preferred, .. } => {
+            assert_eq!(sticky_preferred, &None);
+        }
+        other => panic!("unexpected dispatch op: {other:?}"),
     }
 }

@@ -1,7 +1,8 @@
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
-    Memo, NamespaceId, Payload, Payloads, RequestContext, RetryPolicy, SearchAttributes,
-    TaskQueueName, WorkerIdentity, WorkflowId, WorkflowTaskToken, WorkflowType, RunId, RunKey,
+    LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RequestContext, RetryPolicy,
+    SearchAttributes, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowTaskToken, WorkflowType,
+    RunId, RunKey,
 };
 
 use crate::event::ActivityResolution;
@@ -17,8 +18,26 @@ pub enum Command {
     Signal(SignalRequest),
     WorkflowTaskStarted(StartWorkflowTaskRequest),
     WorkflowTaskCompleted(WorkflowTaskCompletedRequest),
+    WorkflowTaskFailed(WorkflowTaskFailedRequest),
+    WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest),
     ActivityResolved(ActivityResolvedRequest),
     TimerDue(TimerDueRequest),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum WorkflowTaskFailedCause {
+    NonDeterminismError,
+    BadScheduleActivityAttributes,
+    BadStartTimerAttributes,
+    UnhandledCommand,
+    BadRequestCancelActivityAttributes,
+    WorkflowWorkerUnhandledFailure,
+    BadSignalWorkflowExecutionAttributes,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum WorkflowTaskTimeoutType {
+    StartToClose,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -65,6 +84,24 @@ pub struct WorkflowTaskCompletedRequest {
     pub identity: WorkerIdentity,
     pub commands: Vec<WorkflowCommand>,
     pub force_new_workflow_task: bool,
+    pub now: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkflowTaskFailedRequest {
+    pub logical_seq: LogicalTaskSeq,
+    pub started_event_id: i64,
+    pub failure_cause: WorkflowTaskFailedCause,
+    pub failure_details: Option<Payload>,
+    pub worker_identity: WorkerIdentity,
+    pub now: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkflowTaskTimedOutRequest {
+    pub logical_seq: LogicalTaskSeq,
+    pub started_event_id: i64,
+    pub timeout_type: WorkflowTaskTimeoutType,
     pub now: OffsetDateTime,
 }
 

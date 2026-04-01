@@ -10,7 +10,8 @@ use tokeira_types::{
 use crate::{
     command::{
         ActivityResolvedRequest, Command, SignalRequest, StartRequest, StartWorkflowTaskRequest,
-        TimerDueRequest, WorkflowCommand, WorkflowTaskCompletedRequest,
+        TimerDueRequest, WorkflowCommand, WorkflowTaskCompletedRequest, WorkflowTaskFailedRequest,
+        WorkflowTaskTimedOutRequest,
     },
     event::{ActivityResolution, HistoryEvent, HistoryEventKind},
     state::{
@@ -36,6 +37,8 @@ impl Kernel for BasicKernel {
             Command::Signal(req) => self.apply_signal(loaded, req),
             Command::WorkflowTaskStarted(req) => self.apply_workflow_task_started(loaded, req),
             Command::WorkflowTaskCompleted(req) => self.apply_workflow_task_completed(loaded, req),
+            Command::WorkflowTaskFailed(req) => self.apply_workflow_task_failed(loaded, req),
+            Command::WorkflowTaskTimedOut(req) => self.apply_workflow_task_timed_out(loaded, req),
             Command::ActivityResolved(req) => self.apply_activity_resolved(loaded, req),
             Command::TimerDue(req) => self.apply_timer_due(loaded, req),
         }
@@ -275,6 +278,120 @@ impl BasicKernel {
             builder.schedule_workflow_task();
         }
 
+        Ok(builder.finish())
+    }
+
+    fn apply_workflow_task_failed(
+        &self,
+        loaded: LoadedRun,
+        req: WorkflowTaskFailedRequest,
+    ) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+        let pending = state
+            .pending_workflow_task
+            .clone()
+            .ok_or(Reject::NoPendingWorkflowTask)?;
+        let started_event_id = pending
+            .started_event_id
+            .ok_or(Reject::WorkflowTaskNotStarted {
+                logical_seq: pending.logical_seq.0,
+            })?;
+
+        if pending.logical_seq != req.logical_seq {
+            return Err(Reject::WorkflowTaskSeqMismatch {
+                expected: pending.logical_seq.0,
+                got: req.logical_seq.0,
+            });
+        }
+        if started_event_id != req.started_event_id {
+            return Err(Reject::WorkflowTaskTokenMismatch);
+        }
+
+        let mut builder = TransitionBuilder::new(state, req.now);
+        builder.emit(HistoryEventKind::WorkflowTaskFailed {
+            logical_seq: pending.logical_seq,
+            scheduled_event_id: pending.scheduled_event_id,
+            started_event_id,
+            failure_cause: req.failure_cause,
+            failure_details: req.failure_details,
+            identity: req.worker_identity,
+        });
+        let sticky_preferred = builder
+            .state
+            .sticky
+            .as_ref()
+            .map(|sticky| sticky.worker_identity.clone());
+        let current = builder
+            .state
+            .pending_workflow_task
+            .as_mut()
+            .expect("validated pending workflow task must still exist");
+        current.started_event_id = None;
+        builder.dispatch_ops.push(DispatchOp::EnqueueWorkflowTask {
+            queue: QueueKey {
+                namespace_id: builder.state.namespace_id,
+                task_queue: builder.state.task_queue.clone(),
+                task_kind: tokeira_types::TaskKind::Workflow,
+                deployment: None,
+                build_id: None,
+            },
+            logical_seq: pending.logical_seq,
+            sticky_preferred,
+        });
+        Ok(builder.finish())
+    }
+
+    fn apply_workflow_task_timed_out(
+        &self,
+        loaded: LoadedRun,
+        req: WorkflowTaskTimedOutRequest,
+    ) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+        let pending = state
+            .pending_workflow_task
+            .clone()
+            .ok_or(Reject::NoPendingWorkflowTask)?;
+        let started_event_id = pending
+            .started_event_id
+            .ok_or(Reject::WorkflowTaskNotStarted {
+                logical_seq: pending.logical_seq.0,
+            })?;
+
+        if pending.logical_seq != req.logical_seq {
+            return Err(Reject::WorkflowTaskSeqMismatch {
+                expected: pending.logical_seq.0,
+                got: req.logical_seq.0,
+            });
+        }
+        if started_event_id != req.started_event_id {
+            return Err(Reject::WorkflowTaskTokenMismatch);
+        }
+
+        let mut builder = TransitionBuilder::new(state, req.now);
+        builder.emit(HistoryEventKind::WorkflowTaskTimedOut {
+            logical_seq: pending.logical_seq,
+            scheduled_event_id: pending.scheduled_event_id,
+            started_event_id,
+            timeout_type: req.timeout_type,
+        });
+        let current = builder
+            .state
+            .pending_workflow_task
+            .as_mut()
+            .expect("validated pending workflow task must still exist");
+        current.started_event_id = None;
+        builder.state.sticky = None;
+        builder.dispatch_ops.push(DispatchOp::EnqueueWorkflowTask {
+            queue: QueueKey {
+                namespace_id: builder.state.namespace_id,
+                task_queue: builder.state.task_queue.clone(),
+                task_kind: tokeira_types::TaskKind::Workflow,
+                deployment: None,
+                build_id: None,
+            },
+            logical_seq: pending.logical_seq,
+            sticky_preferred: None,
+        });
         Ok(builder.finish())
     }
 

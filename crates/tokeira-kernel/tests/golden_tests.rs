@@ -5,12 +5,14 @@ use tokeira_kernel::{
     event::HistoryEventKind, kernel::Kernel, ActivityResolvedRequest, ActivityState, BasicKernel,
     Command, DispatchOp, LoadedRun, PendingWorkflowTask, ProjectionOp, Reject, SignalRequest,
     StartRequest, StartWorkflowTaskRequest, TimerDueRequest, TimerState, WorkflowCommand,
-    WorkflowState, WorkflowTaskCompletedRequest,
+    WorkflowState, WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
+    WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType,
 };
 use tokeira_types::{
     ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RequestContext,
     RequestId, RetryPolicy, RunId, RunKey, SearchAttrValue, SearchAttributes, ShardEpoch,
-    TaskQueueName, TransitionSeq, WorkerIdentity, WorkflowId, WorkflowTaskToken, WorkflowType,
+    StickyAffinity, TaskQueueName, TransitionSeq, WorkerIdentity, WorkflowId, WorkflowTaskToken,
+    WorkflowType,
 };
 
 fn now() -> OffsetDateTime {
@@ -124,6 +126,15 @@ fn make_open_state_with_started_wft() -> WorkflowState {
         scheduled_event_id: 8,
         started_event_id: Some(9),
         attempt: 1,
+    });
+    state
+}
+
+fn make_open_state_with_started_wft_and_sticky() -> WorkflowState {
+    let mut state = make_open_state_with_started_wft();
+    state.sticky = Some(StickyAffinity {
+        worker_identity: WorkerIdentity("sticky-worker".into()),
+        expires_at: now() + Duration::seconds(30),
     });
     state
 }
@@ -435,6 +446,155 @@ fn timer_due_schedules_wft() {
 }
 
 #[test]
+fn wft_failed_with_started_wft() {
+    let state = make_open_state_with_started_wft_and_sticky();
+    let transition = kernel().apply(
+        LoadedRun::Existing(state.clone()),
+        Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+            logical_seq: LogicalTaskSeq(3),
+            started_event_id: 9,
+            failure_cause: WorkflowTaskFailedCause::NonDeterminismError,
+            failure_details: Some(payload("details")),
+            worker_identity: WorkerIdentity("worker".into()),
+            now: now(),
+        }),
+    ).unwrap();
+
+    assert_eq!(transition.history_events.len(), 1);
+    assert!(matches!(
+        &transition.history_events[0].kind,
+        HistoryEventKind::WorkflowTaskFailed {
+            logical_seq,
+            scheduled_event_id,
+            started_event_id,
+            failure_cause,
+            failure_details,
+            identity,
+        }
+        if *logical_seq == LogicalTaskSeq(3)
+            && *scheduled_event_id == 8
+            && *started_event_id == 9
+            && *failure_cause == WorkflowTaskFailedCause::NonDeterminismError
+            && *failure_details == Some(payload("details"))
+            && *identity == WorkerIdentity("worker".into())
+    ));
+    let pending = transition.next_state.pending_workflow_task.unwrap();
+    assert_eq!(pending.logical_seq, LogicalTaskSeq(3));
+    assert_eq!(pending.scheduled_event_id, 8);
+    assert_eq!(pending.started_event_id, None);
+    assert_eq!(transition.next_state.sticky, state.sticky);
+    assert_eq!(transition.dispatch_ops.len(), 1);
+    assert!(matches!(
+        &transition.dispatch_ops[0],
+        DispatchOp::EnqueueWorkflowTask {
+            logical_seq,
+            sticky_preferred,
+            ..
+        } if *logical_seq == LogicalTaskSeq(3)
+            && *sticky_preferred == Some(WorkerIdentity("sticky-worker".into()))
+    ));
+    assert!(transition.request_dedupe_ops.is_empty());
+    assert!(transition.activity_ops.is_empty());
+    assert!(transition.timer_ops.is_empty());
+    assert!(transition.projection_ops.is_empty());
+}
+
+#[test]
+fn wft_timed_out_with_started_wft() {
+    let state = make_open_state_with_started_wft_and_sticky();
+    let transition = kernel().apply(
+        LoadedRun::Existing(state),
+        Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+            logical_seq: LogicalTaskSeq(3),
+            started_event_id: 9,
+            timeout_type: WorkflowTaskTimeoutType::StartToClose,
+            now: now(),
+        }),
+    ).unwrap();
+
+    assert_eq!(transition.history_events.len(), 1);
+    assert!(matches!(
+        &transition.history_events[0].kind,
+        HistoryEventKind::WorkflowTaskTimedOut {
+            logical_seq,
+            scheduled_event_id,
+            started_event_id,
+            timeout_type,
+        }
+        if *logical_seq == LogicalTaskSeq(3)
+            && *scheduled_event_id == 8
+            && *started_event_id == 9
+            && *timeout_type == WorkflowTaskTimeoutType::StartToClose
+    ));
+    let pending = transition.next_state.pending_workflow_task.unwrap();
+    assert_eq!(pending.logical_seq, LogicalTaskSeq(3));
+    assert_eq!(pending.scheduled_event_id, 8);
+    assert_eq!(pending.started_event_id, None);
+    assert!(transition.next_state.sticky.is_none());
+    assert_eq!(transition.dispatch_ops.len(), 1);
+    assert!(matches!(
+        &transition.dispatch_ops[0],
+        DispatchOp::EnqueueWorkflowTask {
+            logical_seq,
+            sticky_preferred,
+            ..
+        } if *logical_seq == LogicalTaskSeq(3) && sticky_preferred.is_none()
+    ));
+    assert!(transition.request_dedupe_ops.is_empty());
+    assert!(transition.activity_ops.is_empty());
+    assert!(transition.timer_ops.is_empty());
+    assert!(transition.projection_ops.is_empty());
+}
+
+#[test]
+fn wft_failed_no_sticky() {
+    let state = make_open_state_with_started_wft();
+    let transition = kernel().apply(
+        LoadedRun::Existing(state),
+        Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+            logical_seq: LogicalTaskSeq(3),
+            started_event_id: 9,
+            failure_cause: WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+            failure_details: None,
+            worker_identity: WorkerIdentity("worker".into()),
+            now: now(),
+        }),
+    ).unwrap();
+
+    assert!(transition.next_state.sticky.is_none());
+    assert!(matches!(
+        &transition.dispatch_ops[0],
+        DispatchOp::EnqueueWorkflowTask {
+            sticky_preferred,
+            ..
+        } if sticky_preferred.is_none()
+    ));
+}
+
+#[test]
+fn wft_timed_out_no_sticky() {
+    let state = make_open_state_with_started_wft();
+    let transition = kernel().apply(
+        LoadedRun::Existing(state),
+        Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+            logical_seq: LogicalTaskSeq(3),
+            started_event_id: 9,
+            timeout_type: WorkflowTaskTimeoutType::StartToClose,
+            now: now(),
+        }),
+    ).unwrap();
+
+    assert!(transition.next_state.sticky.is_none());
+    assert!(matches!(
+        &transition.dispatch_ops[0],
+        DispatchOp::EnqueueWorkflowTask {
+            sticky_preferred,
+            ..
+        } if sticky_preferred.is_none()
+    ));
+}
+
+#[test]
 fn reject_start_on_existing_run() {
     assert_eq!(
         kernel().apply(LoadedRun::Existing(make_open_state()), Command::Start(make_start_request())),
@@ -615,6 +775,174 @@ fn reject_duplicate_timer_id() {
             now: now(),
         })),
         Err(Reject::DuplicateTimerId("dup".into()))
+    );
+}
+
+#[test]
+fn reject_wft_failed_absent_run() {
+    assert_eq!(
+        kernel().apply(LoadedRun::Absent, Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+            logical_seq: LogicalTaskSeq(3),
+            started_event_id: 9,
+            failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
+            failure_details: None,
+            worker_identity: WorkerIdentity("worker".into()),
+            now: now(),
+        })),
+        Err(Reject::MissingRun)
+    );
+}
+
+#[test]
+fn reject_wft_failed_closed_run() {
+    assert_eq!(
+        kernel().apply(LoadedRun::Existing(make_closed_state()), Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+            logical_seq: LogicalTaskSeq(3),
+            started_event_id: 9,
+            failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
+            failure_details: None,
+            worker_identity: WorkerIdentity("worker".into()),
+            now: now(),
+        })),
+        Err(Reject::RunClosed(ExecutionStatus::Completed))
+    );
+}
+
+#[test]
+fn reject_wft_failed_no_pending() {
+    assert_eq!(
+        kernel().apply(LoadedRun::Existing(make_open_state()), Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+            logical_seq: LogicalTaskSeq(3),
+            started_event_id: 9,
+            failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
+            failure_details: None,
+            worker_identity: WorkerIdentity("worker".into()),
+            now: now(),
+        })),
+        Err(Reject::NoPendingWorkflowTask)
+    );
+}
+
+#[test]
+fn reject_wft_failed_not_started() {
+    assert_eq!(
+        kernel().apply(LoadedRun::Existing(make_open_state_with_pending_wft()), Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+            logical_seq: LogicalTaskSeq(3),
+            started_event_id: 9,
+            failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
+            failure_details: None,
+            worker_identity: WorkerIdentity("worker".into()),
+            now: now(),
+        })),
+        Err(Reject::WorkflowTaskNotStarted { logical_seq: 3 })
+    );
+}
+
+#[test]
+fn reject_wft_failed_seq_mismatch() {
+    assert_eq!(
+        kernel().apply(LoadedRun::Existing(make_open_state_with_started_wft()), Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+            logical_seq: LogicalTaskSeq(4),
+            started_event_id: 9,
+            failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
+            failure_details: None,
+            worker_identity: WorkerIdentity("worker".into()),
+            now: now(),
+        })),
+        Err(Reject::WorkflowTaskSeqMismatch { expected: 3, got: 4 })
+    );
+}
+
+#[test]
+fn reject_wft_failed_started_event_mismatch() {
+    assert_eq!(
+        kernel().apply(LoadedRun::Existing(make_open_state_with_started_wft()), Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+            logical_seq: LogicalTaskSeq(3),
+            started_event_id: 10,
+            failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
+            failure_details: None,
+            worker_identity: WorkerIdentity("worker".into()),
+            now: now(),
+        })),
+        Err(Reject::WorkflowTaskTokenMismatch)
+    );
+}
+
+#[test]
+fn reject_wft_timed_out_absent_run() {
+    assert_eq!(
+        kernel().apply(LoadedRun::Absent, Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+            logical_seq: LogicalTaskSeq(3),
+            started_event_id: 9,
+            timeout_type: WorkflowTaskTimeoutType::StartToClose,
+            now: now(),
+        })),
+        Err(Reject::MissingRun)
+    );
+}
+
+#[test]
+fn reject_wft_timed_out_closed_run() {
+    assert_eq!(
+        kernel().apply(LoadedRun::Existing(make_closed_state()), Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+            logical_seq: LogicalTaskSeq(3),
+            started_event_id: 9,
+            timeout_type: WorkflowTaskTimeoutType::StartToClose,
+            now: now(),
+        })),
+        Err(Reject::RunClosed(ExecutionStatus::Completed))
+    );
+}
+
+#[test]
+fn reject_wft_timed_out_no_pending() {
+    assert_eq!(
+        kernel().apply(LoadedRun::Existing(make_open_state()), Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+            logical_seq: LogicalTaskSeq(3),
+            started_event_id: 9,
+            timeout_type: WorkflowTaskTimeoutType::StartToClose,
+            now: now(),
+        })),
+        Err(Reject::NoPendingWorkflowTask)
+    );
+}
+
+#[test]
+fn reject_wft_timed_out_not_started() {
+    assert_eq!(
+        kernel().apply(LoadedRun::Existing(make_open_state_with_pending_wft()), Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+            logical_seq: LogicalTaskSeq(3),
+            started_event_id: 9,
+            timeout_type: WorkflowTaskTimeoutType::StartToClose,
+            now: now(),
+        })),
+        Err(Reject::WorkflowTaskNotStarted { logical_seq: 3 })
+    );
+}
+
+#[test]
+fn reject_wft_timed_out_seq_mismatch() {
+    assert_eq!(
+        kernel().apply(LoadedRun::Existing(make_open_state_with_started_wft()), Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+            logical_seq: LogicalTaskSeq(4),
+            started_event_id: 9,
+            timeout_type: WorkflowTaskTimeoutType::StartToClose,
+            now: now(),
+        })),
+        Err(Reject::WorkflowTaskSeqMismatch { expected: 3, got: 4 })
+    );
+}
+
+#[test]
+fn reject_wft_timed_out_started_event_mismatch() {
+    assert_eq!(
+        kernel().apply(LoadedRun::Existing(make_open_state_with_started_wft()), Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+            logical_seq: LogicalTaskSeq(3),
+            started_event_id: 10,
+            timeout_type: WorkflowTaskTimeoutType::StartToClose,
+            now: now(),
+        })),
+        Err(Reject::WorkflowTaskTokenMismatch)
     );
 }
 

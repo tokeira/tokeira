@@ -4,6 +4,8 @@ use tokeira_types::{
     SearchAttributes, TaskQueueName, WorkerIdentity, WorkflowType,
 };
 
+use crate::command::{WorkflowTaskFailedCause, WorkflowTaskTimeoutType};
+
 /// Authoritative history event.
 ///
 /// The exact storage encoding may change, but the semantic shape matters. Event
@@ -52,6 +54,20 @@ pub enum HistoryEventKind {
         scheduled_event_id: i64,
         started_event_id: i64,
         identity: WorkerIdentity,
+    },
+    WorkflowTaskFailed {
+        logical_seq: LogicalTaskSeq,
+        scheduled_event_id: i64,
+        started_event_id: i64,
+        failure_cause: WorkflowTaskFailedCause,
+        failure_details: Option<Payload>,
+        identity: WorkerIdentity,
+    },
+    WorkflowTaskTimedOut {
+        logical_seq: LogicalTaskSeq,
+        scheduled_event_id: i64,
+        started_event_id: i64,
+        timeout_type: WorkflowTaskTimeoutType,
     },
     ActivityTaskScheduled {
         activity_id: String,

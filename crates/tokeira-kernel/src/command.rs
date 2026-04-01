@@ -6,7 +6,7 @@ use tokeira_types::{
 };
 
 use crate::event::ActivityResolution;
-use crate::state::ParentClosePolicy;
+use crate::state::{CompletionCallback, ParentClosePolicy, VersioningOverride};
 
 /// Commands are authoritative things that the server has decided happened.
 ///
@@ -20,6 +20,7 @@ pub enum Command {
     Signal(SignalRequest),
     Cancel(CancelRequest),
     Terminate(TerminateRequest),
+    UpdateExecutionOptions(UpdateExecutionOptionsRequest),
     WorkflowExecutionTimedOut(WorkflowExecutionTimedOutRequest),
     WorkflowTaskStarted(StartWorkflowTaskRequest),
     WorkflowTaskCompleted(WorkflowTaskCompletedRequest),
@@ -31,6 +32,13 @@ pub enum Command {
     ExternalSignalResolved(ExternalSignalResolvedRequest),
     ExternalCancelResolved(ExternalCancelResolvedRequest),
     TimerDue(TimerDueRequest),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FieldChange<T> {
+    Unchanged,
+    Set(T),
+    Clear,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -125,6 +133,15 @@ pub struct TerminateRequest {
     pub reason: String,
     pub details: Option<Payloads>,
     pub identity: String,
+    pub request: RequestContext,
+    pub now: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateExecutionOptionsRequest {
+    pub versioning_override: FieldChange<VersioningOverride>,
+    pub completion_callbacks: FieldChange<Vec<CompletionCallback>>,
+    pub attached_request_id: Option<String>,
     pub request: RequestContext,
     pub now: OffsetDateTime,
 }
@@ -284,6 +301,12 @@ pub enum WorkflowCommand {
     },
     UpsertMemo(Memo),
     UpsertSearchAttributes(SearchAttributes),
+    RecordMarker {
+        marker_name: String,
+        details: std::collections::BTreeMap<String, Payloads>,
+        failure: Option<Payload>,
+        header: Option<std::collections::BTreeMap<String, Payload>>,
+    },
     CompleteWorkflow {
         result: Payloads,
     },

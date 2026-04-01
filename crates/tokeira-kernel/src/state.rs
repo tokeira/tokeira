@@ -40,6 +40,8 @@ pub struct WorkflowState {
     pub pending_external_signals: BTreeMap<i64, PendingExternalSignal>,
     pub pending_external_cancels: BTreeMap<i64, PendingExternalCancel>,
     pub pending_updates: BTreeMap<String, PendingUpdate>,
+    pub versioning_override: Option<VersioningOverride>,
+    pub completion_callbacks: Vec<CompletionCallback>,
 
     pub started_at: OffsetDateTime,
     pub closed_at: Option<OffsetDateTime>,
@@ -115,6 +117,12 @@ pub struct PendingUpdate {
     pub accepted_event_id: i64,
     pub name: String,
 }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VersioningOverride;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompletionCallback;
 
 /// Either the run does not yet exist or it already has durable state.
 #[derive(Clone, Debug, PartialEq)]

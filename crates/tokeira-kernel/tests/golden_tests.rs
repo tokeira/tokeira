@@ -2,17 +2,18 @@ use std::collections::BTreeMap;
 
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    event::HistoryEventKind, kernel::Kernel, ActivityResolvedRequest, ActivityState, BasicKernel,
-    CancelRequest, ChildResolution, ChildResolvedRequest, ChildStartConfirmedRequest,
-    ChildStartResult, ChildWorkflowState, Command, DispatchOp, ExternalCancelResolvedRequest,
-    ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult,
-    ExternalWorkflowExecution, LoadedRun, ParentClosePolicy, PendingExternalCancel,
-    PendingExternalSignal, PendingUpdate, PendingWorkflowTask, ProjectionOp, Reject,
-    RetryState, SignalRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest,
-    TimerDueRequest, TimerState, UpdateProtocolBody, UpdateRequest, WorkflowCommand,
-    WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
-    WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
-    WorkflowTaskTimeoutType, WorkflowTimeoutType,
+    event::HistoryEventKind, kernel::Kernel, ActivityResolvedRequest, ActivityState,
+    BasicKernel, CancelRequest, ChildResolution, ChildResolvedRequest,
+    ChildStartConfirmedRequest, ChildStartResult, ChildWorkflowState, Command,
+    CompletionCallback, DispatchOp, ExternalCancelResolvedRequest, ExternalCancelResult,
+    ExternalSignalResolvedRequest, ExternalSignalResult, ExternalWorkflowExecution, FieldChange,
+    LoadedRun, ParentClosePolicy, PendingExternalCancel, PendingExternalSignal, PendingUpdate,
+    PendingWorkflowTask, ProjectionOp, Reject, RetryState, SignalRequest, StartRequest,
+    StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerState,
+    UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, VersioningOverride,
+    WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowState,
+    WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
+    WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType, WorkflowTimeoutType,
 };
 use tokeira_types::{
     ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RequestContext,
@@ -113,6 +114,8 @@ fn make_open_state() -> WorkflowState {
         pending_external_signals: BTreeMap::new(),
         pending_external_cancels: BTreeMap::new(),
         pending_updates: BTreeMap::new(),
+        versioning_override: None,
+        completion_callbacks: Vec::new(),
         started_at: now() - Duration::minutes(3),
         closed_at: None,
     }
@@ -233,6 +236,12 @@ fn make_closed_state() -> WorkflowState {
     let mut state = make_open_state();
     state.status = ExecutionStatus::Completed;
     state.closed_at = Some(now());
+    state
+}
+
+fn with_execution_options(mut state: WorkflowState) -> WorkflowState {
+    state.versioning_override = Some(VersioningOverride);
+    state.completion_callbacks = vec![CompletionCallback];
     state
 }
 
@@ -2576,4 +2585,190 @@ fn complete_workflow_clears_pending_updates() {
         )
         .unwrap();
     assert!(transition.next_state.pending_updates.is_empty());
+}
+
+#[test]
+fn record_marker_happy_path() {
+    let state = make_open_state_with_started_wft();
+    let pending = state.pending_workflow_task.clone().unwrap();
+    let details = BTreeMap::from([("side-effect".into(), payloads("value"))]);
+    let header = Some(BTreeMap::from([("encoding".into(), payload("json"))]));
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: pending.logical_seq,
+                    started_event_id: pending.started_event_id.unwrap(),
+                    attempt: pending.attempt,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::RecordMarker {
+                    marker_name: "marker".into(),
+                    details: details.clone(),
+                    failure: Some(payload("failure")),
+                    header: header.clone(),
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert_eq!(transition.history_events.len(), 2);
+    assert!(matches!(
+        &transition.history_events[1].kind,
+        HistoryEventKind::MarkerRecorded {
+            marker_name,
+            details: event_details,
+            failure: Some(_),
+            header: event_header,
+        } if marker_name == "marker" && event_details == &details && event_header == &header
+    ));
+    assert!(transition.next_state.is_open());
+    assert!(transition.dispatch_ops.is_empty());
+    assert!(transition.projection_ops.is_empty());
+    assert!(transition.request_dedupe_ops.is_empty());
+}
+
+#[test]
+fn record_marker_after_close_rejected() {
+    let state = make_open_state_with_started_wft();
+    let pending = state.pending_workflow_task.clone().unwrap();
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: pending.logical_seq,
+                    started_event_id: pending.started_event_id.unwrap(),
+                    attempt: pending.attempt,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![
+                    WorkflowCommand::CompleteWorkflow {
+                        result: payloads("done"),
+                    },
+                    WorkflowCommand::RecordMarker {
+                        marker_name: "marker".into(),
+                        details: BTreeMap::new(),
+                        failure: None,
+                        header: None,
+                    },
+                ],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap_err();
+
+    assert_eq!(reject, Reject::CommandsAfterClose { index: 1 });
+}
+
+#[test]
+fn update_execution_options_happy_path() {
+    let state = make_open_state();
+    let req = UpdateExecutionOptionsRequest {
+        versioning_override: FieldChange::Set(VersioningOverride),
+        completion_callbacks: FieldChange::Set(vec![CompletionCallback]),
+        attached_request_id: Some("attached-1".into()),
+        request: request_context("options-req"),
+        now: now(),
+    };
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::UpdateExecutionOptions(req.clone()),
+        )
+        .unwrap();
+
+    assert_eq!(transition.request_dedupe_ops.len(), 1);
+    assert!(matches!(
+        &transition.history_events[0].kind,
+        HistoryEventKind::WorkflowExecutionOptionsUpdated {
+            versioning_override,
+            completion_callbacks,
+            attached_request_id,
+        } if versioning_override == &req.versioning_override
+            && completion_callbacks == &req.completion_callbacks
+            && attached_request_id == &req.attached_request_id
+    ));
+    assert_eq!(transition.next_state.versioning_override, Some(VersioningOverride));
+    assert_eq!(transition.next_state.completion_callbacks, vec![CompletionCallback]);
+    assert!(transition.dispatch_ops.is_empty());
+    assert!(transition.next_state.is_open());
+}
+
+#[test]
+fn update_execution_options_clear_versioning() {
+    let state = with_execution_options(make_open_state());
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::UpdateExecutionOptions(UpdateExecutionOptionsRequest {
+                versioning_override: FieldChange::Clear,
+                completion_callbacks: FieldChange::Unchanged,
+                attached_request_id: None,
+                request: request_context("options-clear"),
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert_eq!(transition.next_state.versioning_override, None);
+    assert_eq!(transition.next_state.completion_callbacks, vec![CompletionCallback]);
+}
+
+#[test]
+fn update_execution_options_missing_run() {
+    let reject = kernel()
+        .apply(
+            LoadedRun::Absent,
+            Command::UpdateExecutionOptions(UpdateExecutionOptionsRequest {
+                versioning_override: FieldChange::Unchanged,
+                completion_callbacks: FieldChange::Unchanged,
+                attached_request_id: None,
+                request: request_context("options-missing"),
+                now: now(),
+            }),
+        )
+        .unwrap_err();
+
+    assert_eq!(reject, Reject::MissingRun);
+}
+
+#[test]
+fn update_execution_options_closed_run() {
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(make_closed_state()),
+            Command::UpdateExecutionOptions(UpdateExecutionOptionsRequest {
+                versioning_override: FieldChange::Unchanged,
+                completion_callbacks: FieldChange::Unchanged,
+                attached_request_id: None,
+                request: request_context("options-closed"),
+                now: now(),
+            }),
+        )
+        .unwrap_err();
+
+    assert_eq!(reject, Reject::RunClosed(ExecutionStatus::Completed));
+}
+
+#[test]
+fn close_preserves_execution_options() {
+    let state = with_execution_options(make_open_state());
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::Terminate(make_terminate_request()),
+        )
+        .unwrap();
+
+    assert_eq!(transition.next_state.versioning_override, Some(VersioningOverride));
+    assert_eq!(transition.next_state.completion_callbacks, vec![CompletionCallback]);
 }

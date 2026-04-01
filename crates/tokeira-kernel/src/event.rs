@@ -5,10 +5,10 @@ use tokeira_types::{
 };
 
 use crate::command::{
-    ExternalWorkflowExecution, RetryState, WorkflowTaskFailedCause, WorkflowTaskTimeoutType,
-    WorkflowTimeoutType,
+    ExternalWorkflowExecution, FieldChange, RetryState, WorkflowTaskFailedCause,
+    WorkflowTaskTimeoutType, WorkflowTimeoutType,
 };
-use crate::state::ParentClosePolicy;
+use crate::state::{CompletionCallback, ParentClosePolicy, VersioningOverride};
 
 /// Authoritative history event.
 ///
@@ -116,6 +116,12 @@ pub enum HistoryEventKind {
         timer_id: String,
         fire_at: OffsetDateTime,
     },
+    MarkerRecorded {
+        marker_name: String,
+        details: std::collections::BTreeMap<String, Payloads>,
+        failure: Option<Payload>,
+        header: Option<std::collections::BTreeMap<String, Payload>>,
+    },
     TimerCanceled {
         timer_id: String,
     },
@@ -199,6 +205,11 @@ pub enum HistoryEventKind {
     WorkflowExecutionUpdateRejected {
         update_id: String,
         failure: String,
+    },
+    WorkflowExecutionOptionsUpdated {
+        versioning_override: FieldChange<VersioningOverride>,
+        completion_callbacks: FieldChange<Vec<CompletionCallback>>,
+        attached_request_id: Option<String>,
     },
     WorkflowExecutionCompleted {
         result: Payloads,

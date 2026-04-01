@@ -151,6 +151,7 @@ proptest! {
                 prop_assert_eq!(roundtrip, cmd);
             }
             WorkflowCommand::CancelWorkflow
+            | WorkflowCommand::RecordMarker { .. }
             | WorkflowCommand::ContinueAsNew { .. }
             | WorkflowCommand::RequestCancelActivity { .. }
             | WorkflowCommand::CancelTimer { .. }
@@ -550,6 +551,17 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
         }),
         arb_memo().prop_map(WorkflowCommand::UpsertMemo),
         arb_search_attributes().prop_map(WorkflowCommand::UpsertSearchAttributes),
+        (
+            arb_small_string(),
+            prop::collection::btree_map(arb_small_string(), arb_payloads(), 0..3),
+            prop::option::of(arb_payload()),
+            prop::option::of(prop::collection::btree_map(arb_small_string(), arb_payload(), 0..3)),
+        ).prop_map(|(marker_name, details, failure, header)| WorkflowCommand::RecordMarker {
+            marker_name,
+            details,
+            failure,
+            header,
+        }),
         arb_payloads().prop_map(|result| WorkflowCommand::CompleteWorkflow { result }),
         (arb_small_string(), prop::option::of(arb_payload())).prop_map(|(message, details)| WorkflowCommand::FailWorkflow { message, details }),
         (

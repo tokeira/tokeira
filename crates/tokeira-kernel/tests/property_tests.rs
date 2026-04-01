@@ -6,15 +6,16 @@ use tokeira_kernel::{
     event::HistoryEventKind, kernel::Kernel, ActivityOp, ActivityResolution,
     ActivityResolvedRequest, ActivityState, BasicKernel, CancelRequest, ChildResolution,
     ChildResolvedRequest, ChildStartConfirmedRequest, ChildStartResult, ChildWorkflowState,
-    Command, DispatchOp, ExternalCancelResolvedRequest, ExternalCancelResult,
-    ExternalSignalResolvedRequest, ExternalSignalResult, ExternalWorkflowExecution, LoadedRun,
-    ParentClosePolicy, PendingExternalCancel, PendingExternalSignal, PendingUpdate,
-    PendingWorkflowTask, RequestDedupeOp, RetryState, SignalRequest, StartRequest,
-    StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerOp, TimerState,
-    UpdateProtocolBody, UpdateRequest, WorkflowCommand, WorkflowExecutionTimedOutRequest,
-    WorkflowState, WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
-    WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType,
-    WorkflowTimeoutType,
+    Command, CompletionCallback, DispatchOp, ExternalCancelResolvedRequest,
+    ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult,
+    ExternalWorkflowExecution, FieldChange, LoadedRun, ParentClosePolicy,
+    PendingExternalCancel, PendingExternalSignal, PendingUpdate, PendingWorkflowTask,
+    RequestDedupeOp, RetryState, SignalRequest, StartRequest, StartWorkflowTaskRequest,
+    TerminateRequest, TimerDueRequest, TimerOp, TimerState, UpdateExecutionOptionsRequest,
+    UpdateProtocolBody, UpdateRequest, VersioningOverride, WorkflowCommand,
+    WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
+    WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
+    WorkflowTaskTimeoutType, WorkflowTimeoutType,
 };
 use tokeira_types::{
     ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RequestContext,
@@ -95,6 +96,8 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         pending_external_signals: BTreeMap::new(),
         pending_external_cancels: BTreeMap::new(),
         pending_updates: BTreeMap::new(),
+        versioning_override: None,
+        completion_callbacks: Vec::new(),
         started_at: now - Duration::minutes(10),
         closed_at: None,
     }
@@ -204,6 +207,12 @@ fn with_pending_update(mut state: WorkflowState, update_id: &str) -> WorkflowSta
     state
 }
 
+fn with_execution_options(mut state: WorkflowState, callbacks: usize) -> WorkflowState {
+    state.versioning_override = Some(VersioningOverride);
+    state.completion_callbacks = vec![CompletionCallback; callbacks];
+    state
+}
+
 // --- Arbitrary strategies ---
 
 fn arb_duration() -> impl Strategy<Value = Duration> {
@@ -234,6 +243,59 @@ fn arb_search_attributes() -> impl Strategy<Value = SearchAttributes> {
                 .collect(),
         )
     })
+}
+
+fn arb_record_marker_command() -> impl Strategy<Value = WorkflowCommand> {
+    (
+        arb_small_string(),
+        prop::collection::btree_map(arb_small_string(), arb_payloads(), 0..3),
+        prop::option::of(arb_payload()),
+        prop::option::of(prop::collection::btree_map(arb_small_string(), arb_payload(), 0..3)),
+    )
+        .prop_map(|(marker_name, details, failure, header)| WorkflowCommand::RecordMarker {
+            marker_name,
+            details,
+            failure,
+            header,
+        })
+}
+
+fn arb_field_change<T: Strategy>(
+    strategy: T,
+) -> impl Strategy<Value = FieldChange<T::Value>>
+where
+    T::Value: Clone + std::fmt::Debug,
+{
+    prop_oneof![
+        Just(FieldChange::Unchanged),
+        strategy.prop_map(FieldChange::Set),
+        Just(FieldChange::Clear),
+    ]
+}
+
+fn arb_update_execution_options_request(
+    now: OffsetDateTime,
+) -> impl Strategy<Value = UpdateExecutionOptionsRequest> {
+    (
+        arb_field_change(Just(VersioningOverride)),
+        arb_field_change(prop::collection::vec(Just(CompletionCallback), 0..3)),
+        prop::option::of(arb_small_string()),
+        arb_small_string(),
+    )
+        .prop_map(
+            move |(
+                versioning_override,
+                completion_callbacks,
+                attached_request_id,
+                request_id,
+            )| UpdateExecutionOptionsRequest {
+                versioning_override,
+                completion_callbacks,
+                attached_request_id,
+                request: request_context(&request_id, now),
+                now,
+            },
+        )
 }
 
 fn arb_retry_policy() -> impl Strategy<Value = RetryPolicy> {
@@ -559,6 +621,10 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
             let state = make_open_state(now);
             (LoadedRun::Existing(state), Command::Terminate(req))
         }),
+        arb_update_execution_options_request(now).prop_map(move |req| {
+            let state = make_open_state(now);
+            (LoadedRun::Existing(state), Command::UpdateExecutionOptions(req))
+        }),
         arb_workflow_execution_timed_out_request(now).prop_map(move |req| {
             let state = with_sticky(
                 with_timer(with_activity(make_open_state(now), "activity-1"), "timer-1", now),
@@ -581,6 +647,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
         prop_oneof![
             Just(vec![WorkflowCommand::RequestNewWorkflowTask]),
             arb_schedule_activity_command().prop_map(|cmd| vec![cmd]),
+            arb_record_marker_command().prop_map(|cmd| vec![cmd]),
             arb_payloads().prop_map(|result| vec![WorkflowCommand::CompleteWorkflow { result }]),
             (arb_small_string(), prop::option::of(arb_payload())).prop_map(|(message, details)| vec![WorkflowCommand::FailWorkflow { message, details }]),
             arb_continue_as_new_command().prop_map(|cmd| vec![cmd]),
@@ -804,6 +871,8 @@ proptest! {
         prop_assert_eq!(transition.next_state.retry_policy.clone(), req.retry_policy);
         prop_assert_eq!(transition.next_state.attempt, req.attempt);
         prop_assert!(transition.next_state.pending_updates.is_empty());
+        prop_assert_eq!(transition.next_state.versioning_override, None);
+        prop_assert!(transition.next_state.completion_callbacks.is_empty());
         prop_assert_eq!(started.0, req.continued_execution_run_id);
         prop_assert_eq!(started.1, req.first_execution_run_id);
         prop_assert_eq!(started.2, transition.next_state.retry_policy.clone());
@@ -1046,6 +1115,10 @@ proptest! {
                 prop_assert_eq!(transition.request_dedupe_ops[0].clone(), RequestDedupeOp { request_id: req.request.request_id });
             }
             Command::Terminate(req) => {
+                prop_assert_eq!(transition.request_dedupe_ops.len(), 1);
+                prop_assert_eq!(transition.request_dedupe_ops[0].clone(), RequestDedupeOp { request_id: req.request.request_id });
+            }
+            Command::UpdateExecutionOptions(req) => {
                 prop_assert_eq!(transition.request_dedupe_ops.len(), 1);
                 prop_assert_eq!(transition.request_dedupe_ops[0].clone(), RequestDedupeOp { request_id: req.request.request_id });
             }
@@ -2128,5 +2201,229 @@ fn property_57_close_clears_pending_updates() {
 
     for transition in transitions {
         assert!(transition.next_state.pending_updates.is_empty());
+    }
+}
+
+proptest! {
+    #[test]
+    fn property_58_record_marker_event_field_pass_through(cmd in arb_record_marker_command()) {
+        let now = fixed_now();
+        let state = with_pending_wft(make_open_state(now), 80, Some(30), 1);
+        let transition = kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(80),
+                    started_event_id: 30,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![cmd.clone()],
+                force_new_workflow_task: false,
+                now,
+            }),
+        ).unwrap();
+
+        let marker = transition.history_events.iter().find_map(|event| match &event.kind {
+            HistoryEventKind::MarkerRecorded { marker_name, details, failure, header } => {
+                Some((marker_name.clone(), details.clone(), failure.clone(), header.clone()))
+            }
+            _ => None,
+        }).unwrap();
+
+        match cmd {
+            WorkflowCommand::RecordMarker { marker_name, details, failure, header } => {
+                prop_assert_eq!(marker.0, marker_name);
+                prop_assert_eq!(marker.1, details);
+                prop_assert_eq!(marker.2, failure);
+                prop_assert_eq!(marker.3, header);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn property_59_record_marker_is_pure_event_emission(cmd in arb_record_marker_command()) {
+        let now = fixed_now();
+        let state = with_pending_wft(make_open_state(now), 81, Some(31), 1);
+        let transition = kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(81),
+                    started_event_id: 31,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![cmd],
+                force_new_workflow_task: false,
+                now,
+            }),
+        ).unwrap();
+
+        prop_assert_eq!(transition.dispatch_ops.len(), 0);
+        prop_assert_eq!(transition.projection_ops.len(), 0);
+        prop_assert_eq!(transition.request_dedupe_ops.len(), 0);
+        prop_assert!(transition.next_state.is_open());
+        prop_assert_eq!(transition.next_state.memo, state.memo);
+        prop_assert_eq!(transition.next_state.search_attributes, state.search_attributes);
+        prop_assert_eq!(transition.next_state.activities, state.activities);
+        prop_assert_eq!(transition.next_state.timers, state.timers);
+        prop_assert_eq!(transition.next_state.children, state.children);
+        prop_assert_eq!(transition.next_state.pending_external_signals, state.pending_external_signals);
+        prop_assert_eq!(transition.next_state.pending_external_cancels, state.pending_external_cancels);
+        prop_assert_eq!(transition.next_state.pending_updates, state.pending_updates);
+        prop_assert_eq!(transition.next_state.versioning_override, state.versioning_override);
+        prop_assert_eq!(transition.next_state.completion_callbacks, state.completion_callbacks);
+    }
+
+    #[test]
+    fn property_60_update_execution_options_event_and_dedup(req in arb_update_execution_options_request(fixed_now())) {
+        let now = fixed_now();
+        let transition = kernel().apply(
+            LoadedRun::Existing(make_open_state(now)),
+            Command::UpdateExecutionOptions(req.clone()),
+        ).unwrap();
+
+        prop_assert_eq!(transition.request_dedupe_ops.len(), 1);
+        prop_assert_eq!(transition.request_dedupe_ops[0].clone(), RequestDedupeOp { request_id: req.request.request_id.clone() });
+
+        match &transition.history_events[0].kind {
+            HistoryEventKind::WorkflowExecutionOptionsUpdated {
+                versioning_override,
+                completion_callbacks,
+                attached_request_id,
+            } => {
+                prop_assert_eq!(versioning_override, &req.versioning_override);
+                prop_assert_eq!(completion_callbacks, &req.completion_callbacks);
+                prop_assert_eq!(attached_request_id, &req.attached_request_id);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn property_61_update_execution_options_state_mutation(req in arb_update_execution_options_request(fixed_now()), callback_count in 0usize..3usize) {
+        let now = fixed_now();
+        let base = with_execution_options(make_open_state(now), callback_count);
+        let transition = kernel().apply(
+            LoadedRun::Existing(base.clone()),
+            Command::UpdateExecutionOptions(req.clone()),
+        ).unwrap();
+
+        let expected_versioning_override = match req.versioning_override {
+            FieldChange::Unchanged => base.versioning_override,
+            FieldChange::Set(versioning_override) => Some(versioning_override),
+            FieldChange::Clear => None,
+        };
+        let expected_completion_callbacks = match req.completion_callbacks {
+            FieldChange::Unchanged => base.completion_callbacks,
+            FieldChange::Set(completion_callbacks) => completion_callbacks,
+            FieldChange::Clear => Vec::new(),
+        };
+
+        prop_assert_eq!(transition.next_state.versioning_override, expected_versioning_override);
+        prop_assert_eq!(transition.next_state.completion_callbacks, expected_completion_callbacks);
+    }
+
+    #[test]
+    fn property_62_update_execution_options_does_not_schedule_wft_or_close(
+        req in arb_update_execution_options_request(fixed_now()),
+        with_pending in any::<bool>(),
+    ) {
+        let now = fixed_now();
+        let state = if with_pending {
+            with_pending_wft(make_open_state(now), 82, None, 0)
+        } else {
+            make_open_state(now)
+        };
+        let pending = state.pending_workflow_task.clone();
+        let transition = kernel().apply(
+            LoadedRun::Existing(state),
+            Command::UpdateExecutionOptions(req),
+        ).unwrap();
+
+        prop_assert_eq!(
+            transition
+                .dispatch_ops
+                .iter()
+                .all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. })),
+            true
+        );
+        prop_assert_eq!(transition.next_state.pending_workflow_task, pending);
+        prop_assert_eq!(transition.next_state.status, ExecutionStatus::Running);
+    }
+}
+
+#[test]
+fn property_63_close_preserves_execution_options() {
+    let now = fixed_now();
+    let direct_close = |command| {
+        kernel()
+            .apply(
+                LoadedRun::Existing(with_execution_options(make_open_state(now), 2)),
+                command,
+            )
+            .unwrap()
+    };
+
+    let wf_close = |command| {
+        let started = with_pending_wft(with_execution_options(make_open_state(now), 2), 83, Some(32), 1);
+        kernel()
+            .apply(
+                LoadedRun::Existing(started.clone()),
+                Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                    token: WorkflowTaskToken {
+                        run_key: started.run_key,
+                        logical_seq: LogicalTaskSeq(83),
+                        started_event_id: 32,
+                        attempt: 1,
+                        shard_epoch: ShardEpoch::ZERO,
+                    },
+                    identity: WorkerIdentity("worker".into()),
+                    commands: vec![command],
+                    force_new_workflow_task: false,
+                    now,
+                }),
+            )
+            .unwrap()
+    };
+
+    let transitions = vec![
+        direct_close(Command::Terminate(TerminateRequest {
+            reason: "reason".into(),
+            details: None,
+            identity: "tester".into(),
+            request: request_context("term-options", now),
+            now,
+        })),
+        direct_close(Command::WorkflowExecutionTimedOut(WorkflowExecutionTimedOutRequest {
+            timeout_type: WorkflowTimeoutType::RunTimeout,
+            retry_state: RetryState::Timeout,
+            now,
+        })),
+        wf_close(WorkflowCommand::CompleteWorkflow { result: payloads("done") }),
+        wf_close(WorkflowCommand::FailWorkflow { message: "fail".into(), details: None }),
+        wf_close(WorkflowCommand::CancelWorkflow),
+        wf_close(WorkflowCommand::ContinueAsNew {
+            new_run_id: RunId::new(),
+            workflow_type: WorkflowType("next".into()),
+            task_queue: TaskQueueName("queue".into()),
+            input: payloads("input"),
+            memo: memo_with("memo"),
+            search_attributes: search_attrs_with("search"),
+            workflow_execution_timeout: None,
+            workflow_run_timeout: None,
+            workflow_task_timeout: default_workflow_task_timeout(),
+        }),
+    ];
+
+    for transition in transitions {
+        assert_eq!(transition.next_state.versioning_override, Some(VersioningOverride));
+        assert_eq!(transition.next_state.completion_callbacks, vec![CompletionCallback, CompletionCallback]);
     }
 }

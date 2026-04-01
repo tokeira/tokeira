@@ -347,6 +347,7 @@ pub fn workflow_command_to_proto(
             },
         )),
         WorkflowCommand::CancelWorkflow
+        | WorkflowCommand::RecordMarker { .. }
         | WorkflowCommand::ContinueAsNew { .. }
         | WorkflowCommand::RequestCancelActivity { .. }
         | WorkflowCommand::CancelTimer { .. }

@@ -11,9 +11,10 @@ use crate::{
     command::{
         ActivityResolvedRequest, CancelRequest, ChildResolution, ChildResolvedRequest,
         ChildStartConfirmedRequest, ChildStartResult, Command, ExternalCancelResolvedRequest,
-        ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult, RetryState,
-        SignalRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest,
-        UpdateProtocolBody, UpdateRequest, WorkflowCommand, WorkflowExecutionTimedOutRequest,
+        ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult,
+        FieldChange, RetryState, SignalRequest, StartRequest, StartWorkflowTaskRequest,
+        TerminateRequest, TimerDueRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody,
+        UpdateRequest, WorkflowCommand, WorkflowExecutionTimedOutRequest,
         WorkflowTaskCompletedRequest, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
     },
     event::{ActivityResolution, HistoryEvent, HistoryEventKind},
@@ -42,6 +43,9 @@ impl Kernel for BasicKernel {
             Command::Signal(req) => self.apply_signal(loaded, req),
             Command::Cancel(req) => self.apply_cancel(loaded, req),
             Command::Terminate(req) => self.apply_terminate(loaded, req),
+            Command::UpdateExecutionOptions(req) => {
+                self.apply_update_execution_options(loaded, req)
+            }
             Command::WorkflowExecutionTimedOut(req) => {
                 self.apply_workflow_execution_timed_out(loaded, req)
             }
@@ -91,6 +95,8 @@ impl BasicKernel {
             pending_external_signals: BTreeMap::new(),
             pending_external_cancels: BTreeMap::new(),
             pending_updates: BTreeMap::new(),
+            versioning_override: None,
+            completion_callbacks: Vec::new(),
             started_at: req.now,
             closed_at: None,
         };
@@ -225,6 +231,45 @@ impl BasicKernel {
         }
 
         builder.apply_parent_close_policy();
+
+        Ok(builder.finish())
+    }
+
+    fn apply_update_execution_options(
+        &self,
+        loaded: LoadedRun,
+        req: UpdateExecutionOptionsRequest,
+    ) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+        let mut builder = TransitionBuilder::new(state, req.now);
+        builder.request_dedupe_ops.push(RequestDedupeOp {
+            request_id: req.request.request_id.clone(),
+        });
+        builder.emit(HistoryEventKind::WorkflowExecutionOptionsUpdated {
+            versioning_override: req.versioning_override.clone(),
+            completion_callbacks: req.completion_callbacks.clone(),
+            attached_request_id: req.attached_request_id,
+        });
+
+        match req.versioning_override {
+            FieldChange::Set(versioning_override) => {
+                builder.state.versioning_override = Some(versioning_override);
+            }
+            FieldChange::Clear => {
+                builder.state.versioning_override = None;
+            }
+            FieldChange::Unchanged => {}
+        }
+
+        match req.completion_callbacks {
+            FieldChange::Set(completion_callbacks) => {
+                builder.state.completion_callbacks = completion_callbacks;
+            }
+            FieldChange::Clear => {
+                builder.state.completion_callbacks.clear();
+            }
+            FieldChange::Unchanged => {}
+        }
 
         Ok(builder.finish())
     }
@@ -838,6 +883,20 @@ fn apply_workflow_command(builder: &mut TransitionBuilder, command: WorkflowComm
                 status: builder.state.status,
                 memo_patch: builder.state.memo.clone(),
                 search_attr_patch: search_attributes,
+            });
+            Ok(false)
+        }
+        WorkflowCommand::RecordMarker {
+            marker_name,
+            details,
+            failure,
+            header,
+        } => {
+            builder.emit(HistoryEventKind::MarkerRecorded {
+                marker_name,
+                details,
+                failure,
+                header,
             });
             Ok(false)
         }

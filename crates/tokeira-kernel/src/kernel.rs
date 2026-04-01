@@ -11,7 +11,8 @@ use crate::{
     command::{
         ActivityResolvedRequest, CancelRequest, Command, SignalRequest, StartRequest,
         StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, WorkflowCommand,
-        WorkflowTaskCompletedRequest, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
+        WorkflowExecutionTimedOutRequest, WorkflowTaskCompletedRequest, WorkflowTaskFailedRequest,
+        WorkflowTaskTimedOutRequest, RetryState,
     },
     event::{ActivityResolution, HistoryEvent, HistoryEventKind},
     state::{
@@ -37,6 +38,9 @@ impl Kernel for BasicKernel {
             Command::Signal(req) => self.apply_signal(loaded, req),
             Command::Cancel(req) => self.apply_cancel(loaded, req),
             Command::Terminate(req) => self.apply_terminate(loaded, req),
+            Command::WorkflowExecutionTimedOut(req) => {
+                self.apply_workflow_execution_timed_out(loaded, req)
+            }
             Command::WorkflowTaskStarted(req) => self.apply_workflow_task_started(loaded, req),
             Command::WorkflowTaskCompleted(req) => self.apply_workflow_task_completed(loaded, req),
             Command::WorkflowTaskFailed(req) => self.apply_workflow_task_failed(loaded, req),
@@ -166,6 +170,32 @@ impl BasicKernel {
             identity: req.identity,
         });
         builder.close(ExecutionStatus::Terminated);
+
+        let activities = std::mem::take(&mut builder.state.activities);
+        for (activity_id, _) in activities {
+            builder.activity_ops.push(ActivityOp::Delete { activity_id });
+        }
+
+        let timers = std::mem::take(&mut builder.state.timers);
+        for (timer_id, _) in timers {
+            builder.timer_ops.push(TimerOp::Delete { timer_id });
+        }
+
+        Ok(builder.finish())
+    }
+
+    fn apply_workflow_execution_timed_out(
+        &self,
+        loaded: LoadedRun,
+        req: WorkflowExecutionTimedOutRequest,
+    ) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+        let mut builder = TransitionBuilder::new(state, req.now);
+        builder.emit(HistoryEventKind::WorkflowExecutionTimedOut {
+            timeout_type: req.timeout_type,
+            retry_state: req.retry_state,
+        });
+        builder.close(ExecutionStatus::TimedOut);
 
         let activities = std::mem::take(&mut builder.state.activities);
         for (activity_id, _) in activities {
@@ -580,8 +610,44 @@ fn apply_workflow_command(builder: &mut TransitionBuilder, command: WorkflowComm
             Ok(true)
         }
         WorkflowCommand::FailWorkflow { message, details } => {
-            builder.emit(HistoryEventKind::WorkflowExecutionFailed { message, details });
+            let retry_state = if builder.state.retry_policy.is_some() {
+                RetryState::InProgress
+            } else {
+                RetryState::RetryPolicyNotSet
+            };
+            let attempt = builder.state.attempt;
+            builder.emit(HistoryEventKind::WorkflowExecutionFailed {
+                message,
+                details,
+                retry_state,
+                attempt,
+            });
             builder.close(ExecutionStatus::Failed);
+            Ok(true)
+        }
+        WorkflowCommand::ContinueAsNew {
+            new_run_id,
+            workflow_type,
+            task_queue,
+            input,
+            memo,
+            search_attributes,
+            workflow_execution_timeout,
+            workflow_run_timeout,
+            workflow_task_timeout,
+        } => {
+            builder.emit(HistoryEventKind::WorkflowExecutionContinuedAsNew {
+                new_run_id,
+                workflow_type,
+                task_queue,
+                input,
+                memo,
+                search_attributes,
+                workflow_execution_timeout,
+                workflow_run_timeout,
+                workflow_task_timeout,
+            });
+            builder.close(ExecutionStatus::ContinuedAsNew);
             Ok(true)
         }
         WorkflowCommand::CancelWorkflow => {

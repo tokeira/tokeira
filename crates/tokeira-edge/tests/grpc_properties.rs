@@ -151,6 +151,7 @@ proptest! {
                 prop_assert_eq!(roundtrip, cmd);
             }
             WorkflowCommand::CancelWorkflow
+            | WorkflowCommand::ContinueAsNew { .. }
             | WorkflowCommand::RequestCancelActivity { .. }
             | WorkflowCommand::CancelTimer { .. }
             | WorkflowCommand::RequestNewWorkflowTask => {
@@ -241,6 +242,8 @@ fn execution_status_to_proto(status: ExecutionStatus) -> i32 {
         ExecutionStatus::Failed => WorkflowExecutionStatus::Failed as i32,
         ExecutionStatus::Cancelled => WorkflowExecutionStatus::Canceled as i32,
         ExecutionStatus::Terminated => WorkflowExecutionStatus::Terminated as i32,
+        ExecutionStatus::ContinuedAsNew => WorkflowExecutionStatus::ContinuedAsNew as i32,
+        ExecutionStatus::TimedOut => WorkflowExecutionStatus::TimedOut as i32,
     }
 }
 
@@ -523,6 +526,8 @@ fn arb_execution_status() -> impl Strategy<Value = ExecutionStatus> {
         Just(ExecutionStatus::Failed),
         Just(ExecutionStatus::Cancelled),
         Just(ExecutionStatus::Terminated),
+        Just(ExecutionStatus::ContinuedAsNew),
+        Just(ExecutionStatus::TimedOut),
     ]
 }
 
@@ -541,6 +546,23 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
         arb_search_attributes().prop_map(WorkflowCommand::UpsertSearchAttributes),
         arb_payloads().prop_map(|result| WorkflowCommand::CompleteWorkflow { result }),
         (arb_small_string(), prop::option::of(arb_payload())).prop_map(|(message, details)| WorkflowCommand::FailWorkflow { message, details }),
+        (
+            arb_small_string(),
+            arb_small_string(),
+            arb_payloads(),
+            arb_memo(),
+            arb_search_attributes(),
+        ).prop_map(|(workflow_type, task_queue, input, memo, search_attributes)| WorkflowCommand::ContinueAsNew {
+            new_run_id: tokeira_types::RunId::new(),
+            workflow_type: tokeira_types::WorkflowType(workflow_type),
+            task_queue: tokeira_types::TaskQueueName(task_queue),
+            input,
+            memo,
+            search_attributes,
+            workflow_execution_timeout: None,
+            workflow_run_timeout: None,
+            workflow_task_timeout: time::Duration::seconds(10),
+        }),
         Just(WorkflowCommand::CancelWorkflow),
         arb_small_string().prop_map(|activity_id| WorkflowCommand::RequestCancelActivity { activity_id }),
         arb_small_string().prop_map(|timer_id| WorkflowCommand::CancelTimer { timer_id }),

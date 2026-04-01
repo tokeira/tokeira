@@ -784,7 +784,7 @@ Continue-As-New is expressed as a workflow command within `WorkflowTaskCompleted
 
 **Behavior:**
 
-1. Emit `WorkflowExecutionContinuedAsNew` event carrying the new run ID, workflow type, task queue, input, memo, and search attributes.
+1. Emit `WorkflowExecutionContinuedAsNew` event carrying the new run ID, workflow type, task queue, input, memo, search attributes, workflow execution timeout, workflow run timeout, and workflow task timeout.
 2. Close the current run with `ExecutionStatus::ContinuedAsNew`.
 3. Emit `ProjectionOp::CloseExecution` with `ContinuedAsNew` status.
 

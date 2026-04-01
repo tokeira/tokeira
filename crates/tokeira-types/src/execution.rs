@@ -20,6 +20,8 @@ pub enum ExecutionStatus {
     Failed,
     Cancelled,
     Terminated,
+    ContinuedAsNew,
+    TimedOut,
 }
 
 impl ExecutionStatus {

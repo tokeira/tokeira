@@ -6,10 +6,10 @@ use tokeira_kernel::{
     event::HistoryEventKind, kernel::Kernel, ActivityOp, ActivityResolution,
     ActivityResolvedRequest, ActivityState, BasicKernel, CancelRequest, Command, DispatchOp,
     ExternalWorkflowExecution, LoadedRun, PendingWorkflowTask, RequestDedupeOp, SignalRequest,
-    StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerOp,
-    TimerState, WorkflowCommand, WorkflowState,
+    RetryState, StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerOp,
+    TimerState, WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowState,
     WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
-    WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType,
+    WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType, WorkflowTimeoutType,
 };
 use tokeira_types::{
     ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RequestContext,
@@ -340,6 +340,71 @@ fn arb_terminate_request(now: OffsetDateTime) -> impl Strategy<Value = Terminate
         })
 }
 
+fn arb_workflow_timeout_type() -> impl Strategy<Value = WorkflowTimeoutType> {
+    prop_oneof![
+        Just(WorkflowTimeoutType::ExecutionTimeout),
+        Just(WorkflowTimeoutType::RunTimeout),
+    ]
+}
+
+fn arb_retry_state() -> impl Strategy<Value = RetryState> {
+    prop_oneof![
+        Just(RetryState::InProgress),
+        Just(RetryState::NonRetryableFailure),
+        Just(RetryState::Timeout),
+        Just(RetryState::MaximumAttemptsReached),
+        Just(RetryState::RetryPolicyNotSet),
+        Just(RetryState::InternalServerError),
+        Just(RetryState::CancelRequested),
+    ]
+}
+
+fn arb_continue_as_new_command() -> impl Strategy<Value = WorkflowCommand> {
+    (
+        arb_small_string(),
+        arb_small_string(),
+        arb_payloads(),
+        arb_memo(),
+        arb_search_attributes(),
+        prop::option::of(arb_duration()),
+        prop::option::of(arb_duration()),
+        arb_duration(),
+    ).prop_map(
+        |(
+            workflow_type,
+            task_queue,
+            input,
+            memo,
+            search_attributes,
+            workflow_execution_timeout,
+            workflow_run_timeout,
+            workflow_task_timeout,
+        )| WorkflowCommand::ContinueAsNew {
+            new_run_id: RunId::new(),
+            workflow_type: WorkflowType(workflow_type),
+            task_queue: TaskQueueName(task_queue),
+            input,
+            memo,
+            search_attributes,
+            workflow_execution_timeout,
+            workflow_run_timeout,
+            workflow_task_timeout,
+        },
+    )
+}
+
+fn arb_workflow_execution_timed_out_request(
+    now: OffsetDateTime,
+) -> impl Strategy<Value = WorkflowExecutionTimedOutRequest> {
+    (arb_workflow_timeout_type(), arb_retry_state()).prop_map(move |(timeout_type, retry_state)| {
+        WorkflowExecutionTimedOutRequest {
+            timeout_type,
+            retry_state,
+            now,
+        }
+    })
+}
+
 fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
     let now = fixed_now();
     prop_oneof![
@@ -362,6 +427,14 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
             let state = make_open_state(now);
             (LoadedRun::Existing(state), Command::Terminate(req))
         }),
+        arb_workflow_execution_timed_out_request(now).prop_map(move |req| {
+            let state = with_sticky(
+                with_timer(with_activity(make_open_state(now), "activity-1"), "timer-1", now),
+                "sticky-worker",
+                now,
+            );
+            (LoadedRun::Existing(state), Command::WorkflowExecutionTimedOut(req))
+        }),
         (0u64..10u64).prop_map(move |offset| {
             let logical_seq = 20 + offset;
             let state = with_pending_wft(make_open_state(now), logical_seq, None, 0);
@@ -378,6 +451,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
             arb_schedule_activity_command().prop_map(|cmd| vec![cmd]),
             arb_payloads().prop_map(|result| vec![WorkflowCommand::CompleteWorkflow { result }]),
             (arb_small_string(), prop::option::of(arb_payload())).prop_map(|(message, details)| vec![WorkflowCommand::FailWorkflow { message, details }]),
+            arb_continue_as_new_command().prop_map(|cmd| vec![cmd]),
         ]
         .prop_map(move |commands| {
             let state = with_pending_wft(make_open_state(now), 30, Some(13), 1);
@@ -1005,6 +1079,229 @@ proptest! {
         match &transition.timer_ops[0] {
             TimerOp::Delete { timer_id } => prop_assert_eq!(timer_id, "timer-1"),
             _ => panic!("unexpected timer op"),
+        }
+    }
+
+    #[test]
+    fn property_25_continue_as_new_closes_with_terminal_invariants(cmd in arb_continue_as_new_command()) {
+        let now = fixed_now();
+        let state = with_sticky(with_pending_wft(make_open_state(now), 94, Some(22), 1), "sticky-worker", now);
+        let transition = kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(94),
+                    started_event_id: 22,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![cmd],
+                force_new_workflow_task: false,
+                now,
+            }),
+        ).unwrap();
+        prop_assert_eq!(transition.next_state.status, ExecutionStatus::ContinuedAsNew);
+        prop_assert!(transition.next_state.closed_at.is_some());
+        prop_assert!(transition.next_state.pending_workflow_task.is_none());
+        prop_assert!(transition.next_state.sticky.is_none());
+        prop_assert!(transition.dispatch_ops.is_empty());
+    }
+
+    #[test]
+    fn property_26_continue_as_new_field_pass_through(cmd in arb_continue_as_new_command()) {
+        let now = fixed_now();
+        let state = with_pending_wft(make_open_state(now), 95, Some(23), 1);
+        let transition = kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(95),
+                    started_event_id: 23,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![cmd.clone()],
+                force_new_workflow_task: false,
+                now,
+            }),
+        ).unwrap();
+        match (&transition.history_events[1].kind, &cmd) {
+            (
+                HistoryEventKind::WorkflowExecutionContinuedAsNew {
+                    new_run_id,
+                    workflow_type,
+                    task_queue,
+                    input,
+                    memo,
+                    search_attributes,
+                    workflow_execution_timeout,
+                    workflow_run_timeout,
+                    workflow_task_timeout,
+                },
+                WorkflowCommand::ContinueAsNew {
+                    new_run_id: expected_new_run_id,
+                    workflow_type: expected_workflow_type,
+                    task_queue: expected_task_queue,
+                    input: expected_input,
+                    memo: expected_memo,
+                    search_attributes: expected_search_attributes,
+                    workflow_execution_timeout: expected_execution_timeout,
+                    workflow_run_timeout: expected_run_timeout,
+                    workflow_task_timeout: expected_task_timeout,
+                },
+            ) => {
+                prop_assert_eq!(new_run_id, expected_new_run_id);
+                prop_assert_eq!(workflow_type, expected_workflow_type);
+                prop_assert_eq!(task_queue, expected_task_queue);
+                prop_assert_eq!(input, expected_input);
+                prop_assert_eq!(memo, expected_memo);
+                prop_assert_eq!(search_attributes, expected_search_attributes);
+                prop_assert_eq!(workflow_execution_timeout, expected_execution_timeout);
+                prop_assert_eq!(workflow_run_timeout, expected_run_timeout);
+                prop_assert_eq!(workflow_task_timeout, expected_task_timeout);
+            }
+            other => panic!("unexpected continue-as-new event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn property_27_continue_as_new_is_terminal(cmd in arb_continue_as_new_command()) {
+        let now = fixed_now();
+        let state = with_pending_wft(make_open_state(now), 96, Some(24), 1);
+        prop_assert_eq!(
+            kernel().apply(
+                LoadedRun::Existing(state.clone()),
+                Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                    token: WorkflowTaskToken {
+                        run_key: state.run_key,
+                        logical_seq: LogicalTaskSeq(96),
+                        started_event_id: 24,
+                        attempt: 1,
+                        shard_epoch: ShardEpoch::ZERO,
+                    },
+                    identity: WorkerIdentity("worker".into()),
+                    commands: vec![cmd, WorkflowCommand::RequestNewWorkflowTask],
+                    force_new_workflow_task: false,
+                    now,
+                }),
+            ),
+            Err(tokeira_kernel::Reject::CommandsAfterClose { index: 1 })
+        );
+    }
+
+    #[test]
+    fn property_28_timeout_closes_with_terminal_invariants(req in arb_workflow_execution_timed_out_request(fixed_now())) {
+        let now = fixed_now();
+        let state = with_sticky(
+            with_pending_wft(with_timer(with_activity(make_open_state(now), "activity-1"), "timer-1", now), 97, None, 0),
+            "sticky-worker",
+            now,
+        );
+        let transition = kernel().apply(LoadedRun::Existing(state), Command::WorkflowExecutionTimedOut(req)).unwrap();
+        prop_assert_eq!(transition.next_state.status, ExecutionStatus::TimedOut);
+        prop_assert!(transition.next_state.closed_at.is_some());
+        prop_assert!(transition.next_state.pending_workflow_task.is_none());
+        prop_assert!(transition.next_state.sticky.is_none());
+        prop_assert!(transition.next_state.activities.is_empty());
+        prop_assert!(transition.next_state.timers.is_empty());
+        prop_assert!(transition.dispatch_ops.is_empty());
+    }
+
+    #[test]
+    fn property_29_timeout_entity_cleanup(req in arb_workflow_execution_timed_out_request(fixed_now())) {
+        let now = fixed_now();
+        let mut state = with_activity(make_open_state(now), "activity-1");
+        state.activities.insert(
+            "activity-2".into(),
+            ActivityState {
+                activity_id: "activity-2".into(),
+                schedule_event_id: 11,
+                task_queue: TaskQueueName("activity-q".into()),
+                attempt: 1,
+                schedule_to_close_timeout: Some(Duration::minutes(2)),
+                schedule_to_start_timeout: Some(Duration::seconds(30)),
+                start_to_close_timeout: Some(Duration::minutes(1)),
+                heartbeat_timeout: Some(Duration::seconds(20)),
+            },
+        );
+        state = with_timer(state, "timer-1", now);
+        let transition = kernel().apply(LoadedRun::Existing(state), Command::WorkflowExecutionTimedOut(req)).unwrap();
+        prop_assert_eq!(transition.activity_ops.len(), 2);
+        prop_assert_eq!(transition.timer_ops.len(), 1);
+        prop_assert!(transition.next_state.activities.is_empty());
+        prop_assert!(transition.next_state.timers.is_empty());
+    }
+
+    #[test]
+    fn property_30_timeout_event_field_pass_through(req in arb_workflow_execution_timed_out_request(fixed_now())) {
+        let now = fixed_now();
+        let transition = kernel().apply(
+            LoadedRun::Existing(make_open_state(now)),
+            Command::WorkflowExecutionTimedOut(req.clone()),
+        ).unwrap();
+        match &transition.history_events[0].kind {
+            HistoryEventKind::WorkflowExecutionTimedOut { timeout_type, retry_state } => {
+                prop_assert_eq!(timeout_type, &req.timeout_type);
+                prop_assert_eq!(retry_state, &req.retry_state);
+            }
+            other => panic!("unexpected timeout event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn property_31_timeout_no_request_dedupe(req in arb_workflow_execution_timed_out_request(fixed_now())) {
+        let now = fixed_now();
+        let transition = kernel().apply(
+            LoadedRun::Existing(make_open_state(now)),
+            Command::WorkflowExecutionTimedOut(req),
+        ).unwrap();
+        prop_assert!(transition.request_dedupe_ops.is_empty());
+    }
+
+    #[test]
+    fn property_32_fail_workflow_retry_metadata(has_retry_policy in prop::bool::ANY) {
+        let now = fixed_now();
+        let mut state = with_pending_wft(make_open_state(now), 98, Some(25), 1);
+        state.attempt = 7;
+        if !has_retry_policy {
+            state.retry_policy = None;
+        }
+        let transition = kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(98),
+                    started_event_id: 25,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::FailWorkflow {
+                    message: "failed".into(),
+                    details: Some(payload("details")),
+                }],
+                force_new_workflow_task: false,
+                now,
+            }),
+        ).unwrap();
+        match &transition.history_events[1].kind {
+            HistoryEventKind::WorkflowExecutionFailed { retry_state, attempt, .. } => {
+                prop_assert_eq!(*attempt, 7);
+                prop_assert_eq!(
+                    retry_state,
+                    &(if has_retry_policy {
+                        RetryState::InProgress
+                    } else {
+                        RetryState::RetryPolicyNotSet
+                    })
+                );
+            }
+            other => panic!("unexpected failure event: {other:?}"),
         }
     }
 

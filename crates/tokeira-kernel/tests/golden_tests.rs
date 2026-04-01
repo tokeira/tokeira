@@ -5,9 +5,10 @@ use tokeira_kernel::{
     event::HistoryEventKind, kernel::Kernel, ActivityResolvedRequest, ActivityState, BasicKernel,
     CancelRequest, Command, DispatchOp, ExternalWorkflowExecution, LoadedRun, PendingWorkflowTask,
     ProjectionOp, Reject, SignalRequest, StartRequest, StartWorkflowTaskRequest,
-    TerminateRequest, TimerDueRequest, TimerState, WorkflowCommand, WorkflowState,
-    WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
-    WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType,
+    TerminateRequest, TimerDueRequest, TimerState, WorkflowCommand, WorkflowExecutionTimedOutRequest,
+    WorkflowState, WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
+    WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType,
+    WorkflowTimeoutType, RetryState,
 };
 use tokeira_types::{
     ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RequestContext,
@@ -195,6 +196,28 @@ fn make_terminate_request() -> TerminateRequest {
         identity: "operator".into(),
         request: request_context("terminate-req"),
         now: now(),
+    }
+}
+
+fn make_timeout_request() -> WorkflowExecutionTimedOutRequest {
+    WorkflowExecutionTimedOutRequest {
+        timeout_type: WorkflowTimeoutType::RunTimeout,
+        retry_state: RetryState::Timeout,
+        now: now(),
+    }
+}
+
+fn make_continue_as_new_command() -> WorkflowCommand {
+    WorkflowCommand::ContinueAsNew {
+        new_run_id: RunId::new(),
+        workflow_type: WorkflowType("wf-next".into()),
+        task_queue: TaskQueueName("queue-next".into()),
+        input: payloads("continue-input"),
+        memo: memo(),
+        search_attributes: search_attributes(),
+        workflow_execution_timeout: Some(Duration::minutes(12)),
+        workflow_run_timeout: Some(Duration::minutes(6)),
+        workflow_task_timeout: Duration::seconds(11),
     }
 }
 
@@ -548,12 +571,295 @@ fn workflow_task_completed_with_fail_workflow() {
         }),
     ).unwrap();
 
-    assert!(transition.history_events.iter().any(|event| matches!(event.kind, HistoryEventKind::WorkflowExecutionFailed { .. })));
+    assert!(transition.history_events.iter().any(|event| matches!(
+        event.kind,
+        HistoryEventKind::WorkflowExecutionFailed {
+            retry_state: RetryState::InProgress,
+            attempt: 1,
+            ..
+        }
+    )));
     assert_eq!(transition.projection_ops.last(), Some(&ProjectionOp::CloseExecution { status: ExecutionStatus::Failed, closed_at: now() }));
     assert_eq!(transition.next_state.status, ExecutionStatus::Failed);
     assert!(transition.next_state.closed_at.is_some());
     assert!(transition.next_state.pending_workflow_task.is_none());
     assert!(transition.next_state.sticky.is_none());
+}
+
+#[test]
+fn continue_as_new_closes_run() {
+    let state = make_open_state_with_started_wft_and_sticky();
+    let command = make_continue_as_new_command();
+    let (
+        expected_new_run_id,
+        expected_workflow_type,
+        expected_task_queue,
+        expected_input,
+        expected_memo,
+        expected_search_attributes,
+        expected_execution_timeout,
+        expected_run_timeout,
+        expected_task_timeout,
+    ) = match &command {
+        WorkflowCommand::ContinueAsNew {
+            new_run_id,
+            workflow_type,
+            task_queue,
+            input,
+            memo,
+            search_attributes,
+            workflow_execution_timeout,
+            workflow_run_timeout,
+            workflow_task_timeout,
+        } => (
+            new_run_id.clone(),
+            workflow_type.clone(),
+            task_queue.clone(),
+            input.clone(),
+            memo.clone(),
+            search_attributes.clone(),
+            *workflow_execution_timeout,
+            *workflow_run_timeout,
+            *workflow_task_timeout,
+        ),
+        _ => unreachable!(),
+    };
+    let transition = kernel().apply(
+        LoadedRun::Existing(state.clone()),
+        Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+            token: WorkflowTaskToken {
+                run_key: state.run_key,
+                logical_seq: LogicalTaskSeq(3),
+                started_event_id: 9,
+                attempt: 1,
+                shard_epoch: ShardEpoch::ZERO,
+            },
+            identity: WorkerIdentity("worker".into()),
+            commands: vec![command.clone()],
+            force_new_workflow_task: false,
+            now: now(),
+        }),
+    ).unwrap();
+
+    assert_eq!(transition.next_state.status, ExecutionStatus::ContinuedAsNew);
+    assert!(transition.next_state.closed_at.is_some());
+    assert!(transition.next_state.pending_workflow_task.is_none());
+    assert!(transition.next_state.sticky.is_none());
+    assert!(transition.dispatch_ops.is_empty());
+    assert!(matches!(
+        &transition.history_events[1].kind,
+        HistoryEventKind::WorkflowExecutionContinuedAsNew {
+            new_run_id,
+            workflow_type,
+            task_queue,
+            input,
+            memo,
+            search_attributes,
+            workflow_execution_timeout,
+            workflow_run_timeout,
+            workflow_task_timeout,
+        } if *new_run_id == expected_new_run_id
+            && *workflow_type == expected_workflow_type
+            && *task_queue == expected_task_queue
+            && *input == expected_input
+            && *memo == expected_memo
+            && *search_attributes == expected_search_attributes
+            && *workflow_execution_timeout == expected_execution_timeout
+            && *workflow_run_timeout == expected_run_timeout
+            && *workflow_task_timeout == expected_task_timeout
+    ));
+}
+
+#[test]
+fn continue_as_new_then_another_command() {
+    let state = make_open_state_with_started_wft();
+    assert_eq!(
+        kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 9,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![
+                    make_continue_as_new_command(),
+                    WorkflowCommand::RequestNewWorkflowTask,
+                ],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        ),
+        Err(Reject::CommandsAfterClose { index: 1 })
+    );
+}
+
+#[test]
+fn workflow_execution_timed_out_no_entities() {
+    let transition = kernel().apply(
+        LoadedRun::Existing(make_open_state()),
+        Command::WorkflowExecutionTimedOut(make_timeout_request()),
+    ).unwrap();
+
+    assert_eq!(transition.next_state.status, ExecutionStatus::TimedOut);
+    assert!(transition.next_state.closed_at.is_some());
+    assert!(transition.next_state.pending_workflow_task.is_none());
+    assert!(transition.next_state.sticky.is_none());
+    assert!(transition.next_state.activities.is_empty());
+    assert!(transition.next_state.timers.is_empty());
+    assert!(transition.dispatch_ops.is_empty());
+    assert!(transition.request_dedupe_ops.is_empty());
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::WorkflowExecutionTimedOut {
+            timeout_type: WorkflowTimeoutType::RunTimeout,
+            retry_state: RetryState::Timeout
+        }
+    ));
+}
+
+#[test]
+fn workflow_execution_timed_out_with_entities() {
+    let mut state = make_open_state_with_activity("activity-1");
+    state.activities.insert(
+        "activity-2".into(),
+        ActivityState {
+            activity_id: "activity-2".into(),
+            schedule_event_id: 6,
+            task_queue: TaskQueueName("activity-q".into()),
+            attempt: 1,
+            schedule_to_close_timeout: Some(Duration::minutes(2)),
+            schedule_to_start_timeout: Some(Duration::seconds(30)),
+            start_to_close_timeout: Some(Duration::minutes(1)),
+            heartbeat_timeout: Some(Duration::seconds(20)),
+        },
+    );
+    state.timers.insert(
+        "timer-1".into(),
+        TimerState {
+            timer_id: "timer-1".into(),
+            started_event_id: 7,
+            fire_at: now(),
+        },
+    );
+    let transition = kernel().apply(
+        LoadedRun::Existing(state),
+        Command::WorkflowExecutionTimedOut(make_timeout_request()),
+    ).unwrap();
+
+    assert!(transition.next_state.activities.is_empty());
+    assert!(transition.next_state.timers.is_empty());
+    assert_eq!(transition.activity_ops.len(), 2);
+    assert_eq!(transition.timer_ops.len(), 1);
+}
+
+#[test]
+fn workflow_execution_timed_out_with_pending_wft() {
+    let mut state = make_open_state_with_pending_wft();
+    state.sticky = Some(StickyAffinity {
+        worker_identity: WorkerIdentity("sticky-worker".into()),
+        expires_at: now() + Duration::seconds(30),
+    });
+    let transition = kernel().apply(
+        LoadedRun::Existing(state),
+        Command::WorkflowExecutionTimedOut(make_timeout_request()),
+    ).unwrap();
+
+    assert!(transition.next_state.pending_workflow_task.is_none());
+    assert!(transition.next_state.sticky.is_none());
+    assert!(transition.dispatch_ops.is_empty());
+}
+
+#[test]
+fn reject_timeout_absent_run() {
+    assert_eq!(
+        kernel().apply(
+            LoadedRun::Absent,
+            Command::WorkflowExecutionTimedOut(make_timeout_request()),
+        ),
+        Err(Reject::MissingRun)
+    );
+}
+
+#[test]
+fn reject_timeout_closed_run() {
+    assert_eq!(
+        kernel().apply(
+            LoadedRun::Existing(make_closed_state()),
+            Command::WorkflowExecutionTimedOut(make_timeout_request()),
+        ),
+        Err(Reject::RunClosed(ExecutionStatus::Completed))
+    );
+}
+
+#[test]
+fn fail_workflow_with_retry_policy() {
+    let state = make_open_state_with_started_wft();
+    let transition = kernel().apply(
+        LoadedRun::Existing(state.clone()),
+        Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+            token: WorkflowTaskToken {
+                run_key: state.run_key,
+                logical_seq: LogicalTaskSeq(3),
+                started_event_id: 9,
+                attempt: 1,
+                shard_epoch: ShardEpoch::ZERO,
+            },
+            identity: WorkerIdentity("worker".into()),
+            commands: vec![WorkflowCommand::FailWorkflow {
+                message: "nope".into(),
+                details: Some(payload("details")),
+            }],
+            force_new_workflow_task: false,
+            now: now(),
+        }),
+    ).unwrap();
+
+    assert!(transition.history_events.iter().any(|event| matches!(
+        event.kind,
+        HistoryEventKind::WorkflowExecutionFailed {
+            retry_state: RetryState::InProgress,
+            attempt: 1,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn fail_workflow_without_retry_policy() {
+    let mut state = make_open_state_with_started_wft();
+    state.retry_policy = None;
+    let transition = kernel().apply(
+        LoadedRun::Existing(state.clone()),
+        Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+            token: WorkflowTaskToken {
+                run_key: state.run_key,
+                logical_seq: LogicalTaskSeq(3),
+                started_event_id: 9,
+                attempt: 1,
+                shard_epoch: ShardEpoch::ZERO,
+            },
+            identity: WorkerIdentity("worker".into()),
+            commands: vec![WorkflowCommand::FailWorkflow {
+                message: "nope".into(),
+                details: Some(payload("details")),
+            }],
+            force_new_workflow_task: false,
+            now: now(),
+        }),
+    ).unwrap();
+
+    assert!(transition.history_events.iter().any(|event| matches!(
+        event.kind,
+        HistoryEventKind::WorkflowExecutionFailed {
+            retry_state: RetryState::RetryPolicyNotSet,
+            attempt: 1,
+            ..
+        }
+    )));
 }
 
 #[test]

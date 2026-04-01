@@ -347,6 +347,7 @@ pub fn workflow_command_to_proto(
             },
         )),
         WorkflowCommand::CancelWorkflow
+        | WorkflowCommand::ContinueAsNew { .. }
         | WorkflowCommand::RequestCancelActivity { .. }
         | WorkflowCommand::CancelTimer { .. }
         | WorkflowCommand::RequestNewWorkflowTask
@@ -409,6 +410,8 @@ fn execution_status_to_proto(value: ExecutionStatus) -> i32 {
         ExecutionStatus::Failed => Proto::Failed as i32,
         ExecutionStatus::Cancelled => Proto::Canceled as i32,
         ExecutionStatus::Terminated => Proto::Terminated as i32,
+        ExecutionStatus::ContinuedAsNew => Proto::ContinuedAsNew as i32,
+        ExecutionStatus::TimedOut => Proto::TimedOut as i32,
     }
 }
 

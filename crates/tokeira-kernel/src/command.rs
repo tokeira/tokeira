@@ -18,6 +18,7 @@ pub enum Command {
     Signal(SignalRequest),
     Cancel(CancelRequest),
     Terminate(TerminateRequest),
+    WorkflowExecutionTimedOut(WorkflowExecutionTimedOutRequest),
     WorkflowTaskStarted(StartWorkflowTaskRequest),
     WorkflowTaskCompleted(WorkflowTaskCompletedRequest),
     WorkflowTaskFailed(WorkflowTaskFailedRequest),
@@ -40,6 +41,23 @@ pub enum WorkflowTaskFailedCause {
 #[derive(Clone, Debug, PartialEq)]
 pub enum WorkflowTaskTimeoutType {
     StartToClose,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum WorkflowTimeoutType {
+    ExecutionTimeout,
+    RunTimeout,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum RetryState {
+    InProgress,
+    NonRetryableFailure,
+    Timeout,
+    MaximumAttemptsReached,
+    RetryPolicyNotSet,
+    InternalServerError,
+    CancelRequested,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -132,6 +150,13 @@ pub struct WorkflowTaskTimedOutRequest {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct WorkflowExecutionTimedOutRequest {
+    pub timeout_type: WorkflowTimeoutType,
+    pub retry_state: RetryState,
+    pub now: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct ActivityResolvedRequest {
     pub activity_id: String,
     pub resolution: ActivityResolution,
@@ -172,6 +197,17 @@ pub enum WorkflowCommand {
     FailWorkflow {
         message: String,
         details: Option<Payload>,
+    },
+    ContinueAsNew {
+        new_run_id: RunId,
+        workflow_type: WorkflowType,
+        task_queue: TaskQueueName,
+        input: Payloads,
+        memo: Memo,
+        search_attributes: SearchAttributes,
+        workflow_execution_timeout: Option<Duration>,
+        workflow_run_timeout: Option<Duration>,
+        workflow_task_timeout: Duration,
     },
     CancelWorkflow,
     RequestCancelActivity {

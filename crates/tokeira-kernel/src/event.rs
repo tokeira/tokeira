@@ -4,7 +4,10 @@ use tokeira_types::{
     SearchAttributes, TaskQueueName, WorkerIdentity, WorkflowType,
 };
 
-use crate::command::{ExternalWorkflowExecution, WorkflowTaskFailedCause, WorkflowTaskTimeoutType};
+use crate::command::{
+    ExternalWorkflowExecution, RetryState, WorkflowTaskFailedCause, WorkflowTaskTimeoutType,
+    WorkflowTimeoutType,
+};
 
 /// Authoritative history event.
 ///
@@ -49,6 +52,10 @@ pub enum HistoryEventKind {
         reason: String,
         details: Option<Payloads>,
         identity: String,
+    },
+    WorkflowExecutionTimedOut {
+        timeout_type: WorkflowTimeoutType,
+        retry_state: RetryState,
     },
     WorkflowTaskScheduled {
         logical_seq: LogicalTaskSeq,
@@ -123,6 +130,19 @@ pub enum HistoryEventKind {
     WorkflowExecutionFailed {
         message: String,
         details: Option<Payload>,
+        retry_state: RetryState,
+        attempt: u32,
+    },
+    WorkflowExecutionContinuedAsNew {
+        new_run_id: RunId,
+        workflow_type: WorkflowType,
+        task_queue: TaskQueueName,
+        input: Payloads,
+        memo: Memo,
+        search_attributes: SearchAttributes,
+        workflow_execution_timeout: Option<Duration>,
+        workflow_run_timeout: Option<Duration>,
+        workflow_task_timeout: Duration,
     },
     WorkflowExecutionCanceled,
 }

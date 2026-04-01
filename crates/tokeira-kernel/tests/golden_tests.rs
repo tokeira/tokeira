@@ -3,10 +3,11 @@ use std::collections::BTreeMap;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     event::HistoryEventKind, kernel::Kernel, ActivityResolvedRequest, ActivityState, BasicKernel,
-    Command, DispatchOp, LoadedRun, PendingWorkflowTask, ProjectionOp, Reject, SignalRequest,
-    StartRequest, StartWorkflowTaskRequest, TimerDueRequest, TimerState, WorkflowCommand,
-    WorkflowState, WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
-    WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType,
+    CancelRequest, Command, DispatchOp, ExternalWorkflowExecution, LoadedRun, PendingWorkflowTask,
+    ProjectionOp, Reject, SignalRequest, StartRequest, StartWorkflowTaskRequest,
+    TerminateRequest, TimerDueRequest, TimerState, WorkflowCommand, WorkflowState,
+    WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
+    WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType,
 };
 use tokeira_types::{
     ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RequestContext,
@@ -170,6 +171,33 @@ fn make_open_state_with_timer(id: &str) -> WorkflowState {
     state
 }
 
+fn external_workflow_execution() -> ExternalWorkflowExecution {
+    ExternalWorkflowExecution {
+        namespace_id: NamespaceId::new(),
+        workflow_id: WorkflowId("parent".into()),
+        run_id: RunId::new(),
+    }
+}
+
+fn make_cancel_request() -> CancelRequest {
+    CancelRequest {
+        reason: "cancel requested".into(),
+        external_initiator: None,
+        request: request_context("cancel-req"),
+        now: now(),
+    }
+}
+
+fn make_terminate_request() -> TerminateRequest {
+    TerminateRequest {
+        reason: "terminated".into(),
+        details: Some(payloads("term-details")),
+        identity: "operator".into(),
+        request: request_context("terminate-req"),
+        now: now(),
+    }
+}
+
 fn make_closed_state() -> WorkflowState {
     let mut state = make_open_state();
     state.status = ExecutionStatus::Completed;
@@ -248,6 +276,161 @@ fn signal_with_pending_wft() {
     assert_eq!(transition.request_dedupe_ops.len(), 1);
     assert!(transition.dispatch_ops.is_empty());
     assert_eq!(transition.next_state.pending_workflow_task.unwrap().logical_seq, pending.logical_seq);
+}
+
+#[test]
+fn cancel_with_no_pending_wft() {
+    let state = make_open_state();
+    let req = make_cancel_request();
+    let transition = kernel()
+        .apply(LoadedRun::Existing(state), Command::Cancel(req.clone()))
+        .unwrap();
+
+    assert_eq!(transition.history_events.len(), 2);
+    assert!(matches!(
+        &transition.history_events[0].kind,
+        HistoryEventKind::WorkflowExecutionCancelRequested {
+            reason,
+            external_workflow_execution,
+            request_id,
+        } if reason == &req.reason
+            && external_workflow_execution == &None
+            && request_id == "cancel-req"
+    ));
+    assert!(matches!(
+        transition.history_events[1].kind,
+        HistoryEventKind::WorkflowTaskScheduled { .. }
+    ));
+    assert_eq!(transition.request_dedupe_ops.len(), 1);
+    assert_eq!(transition.activity_ops.len(), 0);
+    assert_eq!(transition.timer_ops.len(), 0);
+    assert_eq!(transition.projection_ops.len(), 0);
+    assert_eq!(transition.dispatch_ops.len(), 1);
+    assert!(transition.next_state.pending_workflow_task.is_some());
+    assert_eq!(transition.next_state.status, ExecutionStatus::Running);
+}
+
+#[test]
+fn cancel_with_pending_wft() {
+    let state = make_open_state_with_pending_wft();
+    let pending = state.pending_workflow_task.clone();
+    let transition = kernel()
+        .apply(LoadedRun::Existing(state), Command::Cancel(make_cancel_request()))
+        .unwrap();
+
+    assert_eq!(transition.history_events.len(), 1);
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::WorkflowExecutionCancelRequested { .. }
+    ));
+    assert_eq!(transition.request_dedupe_ops.len(), 1);
+    assert!(transition.dispatch_ops.is_empty());
+    assert_eq!(transition.activity_ops.len(), 0);
+    assert_eq!(transition.timer_ops.len(), 0);
+    assert_eq!(transition.projection_ops.len(), 0);
+    assert_eq!(transition.next_state.pending_workflow_task, pending);
+}
+
+#[test]
+fn cancel_with_external_initiator() {
+    let state = make_open_state();
+    let mut req = make_cancel_request();
+    req.external_initiator = Some(external_workflow_execution());
+
+    let transition = kernel()
+        .apply(LoadedRun::Existing(state), Command::Cancel(req.clone()))
+        .unwrap();
+
+    assert!(matches!(
+        &transition.history_events[0].kind,
+        HistoryEventKind::WorkflowExecutionCancelRequested {
+            external_workflow_execution,
+            ..
+        } if *external_workflow_execution == req.external_initiator
+    ));
+}
+
+#[test]
+fn terminate_no_open_entities() {
+    let state = make_open_state();
+    let req = make_terminate_request();
+    let transition = kernel()
+        .apply(LoadedRun::Existing(state), Command::Terminate(req.clone()))
+        .unwrap();
+
+    assert_eq!(transition.history_events.len(), 1);
+    assert!(matches!(
+        &transition.history_events[0].kind,
+        HistoryEventKind::WorkflowExecutionTerminated { reason, details, identity }
+        if reason == &req.reason && details == &req.details && identity == &req.identity
+    ));
+    assert_eq!(transition.next_state.status, ExecutionStatus::Terminated);
+    assert!(transition.next_state.closed_at.is_some());
+    assert!(transition.next_state.pending_workflow_task.is_none());
+    assert!(transition.next_state.sticky.is_none());
+    assert!(transition.next_state.activities.is_empty());
+    assert!(transition.next_state.timers.is_empty());
+    assert_eq!(transition.request_dedupe_ops.len(), 1);
+    assert_eq!(
+        transition.projection_ops.last(),
+        Some(&ProjectionOp::CloseExecution {
+            status: ExecutionStatus::Terminated,
+            closed_at: now(),
+        })
+    );
+    assert!(transition.dispatch_ops.is_empty());
+    assert!(transition.activity_ops.is_empty());
+    assert!(transition.timer_ops.is_empty());
+}
+
+#[test]
+fn terminate_with_activities_and_timers() {
+    let mut state = make_open_state_with_activity("activity-1");
+    state.activities.insert(
+        "activity-2".into(),
+        ActivityState {
+            activity_id: "activity-2".into(),
+            schedule_event_id: 6,
+            task_queue: TaskQueueName("activity-q".into()),
+            attempt: 1,
+            schedule_to_close_timeout: Some(Duration::minutes(2)),
+            schedule_to_start_timeout: Some(Duration::seconds(30)),
+            start_to_close_timeout: Some(Duration::minutes(1)),
+            heartbeat_timeout: Some(Duration::seconds(20)),
+        },
+    );
+    state.timers.insert(
+        "timer-1".into(),
+        TimerState {
+            timer_id: "timer-1".into(),
+            started_event_id: 7,
+            fire_at: now(),
+        },
+    );
+    let transition = kernel()
+        .apply(LoadedRun::Existing(state), Command::Terminate(make_terminate_request()))
+        .unwrap();
+
+    assert!(transition.next_state.activities.is_empty());
+    assert!(transition.next_state.timers.is_empty());
+    assert_eq!(transition.activity_ops.len(), 2);
+    assert_eq!(transition.timer_ops.len(), 1);
+    assert!(matches!(
+        transition.activity_ops[0],
+        tokeira_kernel::ActivityOp::Delete { .. }
+    ));
+    assert!(matches!(transition.timer_ops[0], tokeira_kernel::TimerOp::Delete { .. }));
+}
+
+#[test]
+fn terminate_with_pending_wft() {
+    let state = make_open_state_with_pending_wft();
+    let transition = kernel()
+        .apply(LoadedRun::Existing(state), Command::Terminate(make_terminate_request()))
+        .unwrap();
+
+    assert!(transition.next_state.pending_workflow_task.is_none());
+    assert!(transition.dispatch_ops.is_empty());
 }
 
 #[test]
@@ -629,6 +812,44 @@ fn reject_signal_on_closed_run() {
 }
 
 #[test]
+fn reject_cancel_absent_run() {
+    assert_eq!(
+        kernel().apply(LoadedRun::Absent, Command::Cancel(make_cancel_request())),
+        Err(Reject::MissingRun)
+    );
+}
+
+#[test]
+fn reject_cancel_closed_run() {
+    assert_eq!(
+        kernel().apply(
+            LoadedRun::Existing(make_closed_state()),
+            Command::Cancel(make_cancel_request()),
+        ),
+        Err(Reject::RunClosed(ExecutionStatus::Completed))
+    );
+}
+
+#[test]
+fn reject_terminate_absent_run() {
+    assert_eq!(
+        kernel().apply(LoadedRun::Absent, Command::Terminate(make_terminate_request())),
+        Err(Reject::MissingRun)
+    );
+}
+
+#[test]
+fn reject_terminate_closed_run() {
+    assert_eq!(
+        kernel().apply(
+            LoadedRun::Existing(make_closed_state()),
+            Command::Terminate(make_terminate_request()),
+        ),
+        Err(Reject::RunClosed(ExecutionStatus::Completed))
+    );
+}
+
+#[test]
 fn reject_wft_started_no_pending() {
     assert_eq!(
         kernel().apply(LoadedRun::Existing(make_open_state()), Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
@@ -986,4 +1207,329 @@ fn reject_commands_after_close() {
         })),
         Err(Reject::CommandsAfterClose { index: 1 })
     );
+}
+
+#[test]
+fn cancel_workflow_command() {
+    let state = make_open_state_with_started_wft_and_sticky();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 9,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::CancelWorkflow],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::WorkflowTaskCompleted { .. }
+    ));
+    assert!(matches!(
+        transition.history_events[1].kind,
+        HistoryEventKind::WorkflowExecutionCanceled
+    ));
+    assert_eq!(transition.next_state.status, ExecutionStatus::Cancelled);
+    assert!(transition.next_state.closed_at.is_some());
+    assert!(transition.next_state.pending_workflow_task.is_none());
+    assert!(transition.next_state.sticky.is_none());
+    assert_eq!(
+        transition.projection_ops.last(),
+        Some(&ProjectionOp::CloseExecution {
+            status: ExecutionStatus::Cancelled,
+            closed_at: now(),
+        })
+    );
+    assert!(transition.request_dedupe_ops.is_empty());
+    assert!(transition.activity_ops.is_empty());
+    assert!(transition.timer_ops.is_empty());
+}
+
+#[test]
+fn cancel_workflow_then_another_command() {
+    let state = make_open_state_with_started_wft();
+    assert_eq!(
+        kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 9,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![
+                    WorkflowCommand::CancelWorkflow,
+                    WorkflowCommand::RequestNewWorkflowTask,
+                ],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        ),
+        Err(Reject::CommandsAfterClose { index: 1 })
+    );
+}
+
+#[test]
+fn request_cancel_activity() {
+    let state = with_pending_activity_started_wft();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 9,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::RequestCancelActivity {
+                    activity_id: "activity-1".into(),
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert!(transition.history_events.iter().any(|event| matches!(
+        &event.kind,
+        HistoryEventKind::ActivityTaskCancelRequested { activity_id } if activity_id == "activity-1"
+    )));
+    assert!(transition.next_state.activities.contains_key("activity-1"));
+    assert!(transition.activity_ops.is_empty());
+}
+
+#[test]
+fn request_cancel_activity_unknown() {
+    let state = make_open_state_with_started_wft();
+    assert_eq!(
+        kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 9,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::RequestCancelActivity {
+                    activity_id: "missing".into(),
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        ),
+        Err(Reject::UnknownActivity("missing".into()))
+    );
+}
+
+#[test]
+fn cancel_timer() {
+    let state = with_pending_timer_started_wft();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 9,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::CancelTimer {
+                    timer_id: "timer-1".into(),
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert!(transition.history_events.iter().any(|event| matches!(
+        &event.kind,
+        HistoryEventKind::TimerCanceled { timer_id } if timer_id == "timer-1"
+    )));
+    assert!(!transition.next_state.timers.contains_key("timer-1"));
+    assert!(matches!(
+        transition.timer_ops[0],
+        tokeira_kernel::TimerOp::Delete { ref timer_id } if timer_id == "timer-1"
+    ));
+}
+
+#[test]
+fn cancel_timer_unknown() {
+    let state = make_open_state_with_started_wft();
+    assert_eq!(
+        kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 9,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::CancelTimer {
+                    timer_id: "missing".into(),
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        ),
+        Err(Reject::UnknownTimer("missing".into()))
+    );
+}
+
+#[test]
+fn request_cancel_activity_then_resolved_canceled() {
+    let state = with_pending_activity_started_wft();
+    let first = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 9,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::RequestCancelActivity {
+                    activity_id: "activity-1".into(),
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
+    assert!(first.next_state.activities.contains_key("activity-1"));
+    assert!(first.history_events.iter().any(|event| matches!(
+        event.kind,
+        HistoryEventKind::ActivityTaskCancelRequested { .. }
+    )));
+
+    let second = kernel()
+        .apply(
+            LoadedRun::Existing(first.next_state),
+            Command::ActivityResolved(ActivityResolvedRequest {
+                activity_id: "activity-1".into(),
+                resolution: tokeira_kernel::ActivityResolution::Canceled {
+                    details: Some(payloads("cancel")),
+                },
+                worker_identity: None,
+                now: now(),
+            }),
+        )
+        .unwrap();
+    assert!(second.history_events.iter().any(|event| matches!(
+        event.kind,
+        HistoryEventKind::ActivityTaskCanceled { .. }
+    )));
+    assert!(!second.next_state.activities.contains_key("activity-1"));
+    assert!(second.activity_ops.iter().any(|op| matches!(
+        op,
+        tokeira_kernel::ActivityOp::Delete { activity_id } if activity_id == "activity-1"
+    )));
+}
+
+#[test]
+fn cancel_then_cancel_workflow_e2e() {
+    let cancel = kernel()
+        .apply(
+            LoadedRun::Existing(make_open_state()),
+            Command::Cancel(make_cancel_request()),
+        )
+        .unwrap();
+    let started = kernel()
+        .apply(
+            LoadedRun::Existing(cancel.next_state.clone()),
+            Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                logical_seq: cancel.next_state.pending_workflow_task.unwrap().logical_seq,
+                worker_identity: WorkerIdentity("worker".into()),
+                sticky_ttl: None,
+                now: now(),
+            }),
+        )
+        .unwrap();
+    let state = started.next_state.clone();
+    let pending = state.pending_workflow_task.clone().unwrap_or(PendingWorkflowTask {
+        logical_seq: LogicalTaskSeq(4),
+        scheduled_event_id: 11,
+        started_event_id: Some(12),
+        attempt: 1,
+    });
+    let final_transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: pending.logical_seq,
+                    started_event_id: pending.started_event_id.unwrap(),
+                    attempt: pending.attempt,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::CancelWorkflow],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
+    assert_eq!(final_transition.next_state.status, ExecutionStatus::Cancelled);
+}
+
+fn with_pending_activity_started_wft() -> WorkflowState {
+    let state = make_open_state_with_started_wft();
+    let mut state = state;
+    state.activities.insert(
+        "activity-1".into(),
+        ActivityState {
+            activity_id: "activity-1".into(),
+            schedule_event_id: 7,
+            task_queue: TaskQueueName("activity-q".into()),
+            attempt: 1,
+            schedule_to_close_timeout: Some(Duration::minutes(2)),
+            schedule_to_start_timeout: Some(Duration::seconds(30)),
+            start_to_close_timeout: Some(Duration::minutes(1)),
+            heartbeat_timeout: Some(Duration::seconds(20)),
+        },
+    );
+    state
+}
+
+fn with_pending_timer_started_wft() -> WorkflowState {
+    let state = make_open_state_with_started_wft();
+    let mut state = state;
+    state.timers.insert(
+        "timer-1".into(),
+        TimerState {
+            timer_id: "timer-1".into(),
+            started_event_id: 7,
+            fire_at: now(),
+        },
+    );
+    state
 }

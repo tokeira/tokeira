@@ -139,9 +139,24 @@ proptest! {
 
     #[test]
     fn property_workflow_command_roundtrip(cmd in arb_workflow_command()) {
-        let proto = workflow_command_to_proto(&cmd).unwrap();
-        let roundtrip = proto_command_to_workflow_command(proto).unwrap();
-        prop_assert_eq!(roundtrip, cmd);
+        match &cmd {
+            WorkflowCommand::ScheduleActivity { .. }
+            | WorkflowCommand::StartTimer { .. }
+            | WorkflowCommand::UpsertMemo(_)
+            | WorkflowCommand::UpsertSearchAttributes(_)
+            | WorkflowCommand::CompleteWorkflow { .. }
+            | WorkflowCommand::FailWorkflow { .. } => {
+                let proto = workflow_command_to_proto(&cmd).unwrap();
+                let roundtrip = proto_command_to_workflow_command(proto).unwrap();
+                prop_assert_eq!(roundtrip, cmd);
+            }
+            WorkflowCommand::CancelWorkflow
+            | WorkflowCommand::RequestCancelActivity { .. }
+            | WorkflowCommand::CancelTimer { .. }
+            | WorkflowCommand::RequestNewWorkflowTask => {
+                prop_assert!(workflow_command_to_proto(&cmd).is_err());
+            }
+        }
     }
 
     #[test]
@@ -526,6 +541,9 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
         arb_search_attributes().prop_map(WorkflowCommand::UpsertSearchAttributes),
         arb_payloads().prop_map(|result| WorkflowCommand::CompleteWorkflow { result }),
         (arb_small_string(), prop::option::of(arb_payload())).prop_map(|(message, details)| WorkflowCommand::FailWorkflow { message, details }),
+        Just(WorkflowCommand::CancelWorkflow),
+        arb_small_string().prop_map(|activity_id| WorkflowCommand::RequestCancelActivity { activity_id }),
+        arb_small_string().prop_map(|timer_id| WorkflowCommand::CancelTimer { timer_id }),
     ]
 }
 

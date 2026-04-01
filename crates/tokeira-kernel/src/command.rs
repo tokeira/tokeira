@@ -16,6 +16,8 @@ use crate::event::ActivityResolution;
 pub enum Command {
     Start(StartRequest),
     Signal(SignalRequest),
+    Cancel(CancelRequest),
+    Terminate(TerminateRequest),
     WorkflowTaskStarted(StartWorkflowTaskRequest),
     WorkflowTaskCompleted(WorkflowTaskCompletedRequest),
     WorkflowTaskFailed(WorkflowTaskFailedRequest),
@@ -66,6 +68,30 @@ pub struct StartRequest {
 pub struct SignalRequest {
     pub signal_name: String,
     pub input: Payloads,
+    pub request: RequestContext,
+    pub now: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExternalWorkflowExecution {
+    pub namespace_id: NamespaceId,
+    pub workflow_id: WorkflowId,
+    pub run_id: RunId,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CancelRequest {
+    pub reason: String,
+    pub external_initiator: Option<ExternalWorkflowExecution>,
+    pub request: RequestContext,
+    pub now: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TerminateRequest {
+    pub reason: String,
+    pub details: Option<Payloads>,
+    pub identity: String,
     pub request: RequestContext,
     pub now: OffsetDateTime,
 }
@@ -146,6 +172,13 @@ pub enum WorkflowCommand {
     FailWorkflow {
         message: String,
         details: Option<Payload>,
+    },
+    CancelWorkflow,
+    RequestCancelActivity {
+        activity_id: String,
+    },
+    CancelTimer {
+        timer_id: String,
     },
     RequestNewWorkflowTask,
 }

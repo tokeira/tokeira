@@ -9,9 +9,9 @@ use tokeira_types::{
 
 use crate::{
     command::{
-        ActivityResolvedRequest, Command, SignalRequest, StartRequest, StartWorkflowTaskRequest,
-        TimerDueRequest, WorkflowCommand, WorkflowTaskCompletedRequest, WorkflowTaskFailedRequest,
-        WorkflowTaskTimedOutRequest,
+        ActivityResolvedRequest, CancelRequest, Command, SignalRequest, StartRequest,
+        StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, WorkflowCommand,
+        WorkflowTaskCompletedRequest, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
     },
     event::{ActivityResolution, HistoryEvent, HistoryEventKind},
     state::{
@@ -35,6 +35,8 @@ impl Kernel for BasicKernel {
         match command {
             Command::Start(req) => self.apply_start(loaded, req),
             Command::Signal(req) => self.apply_signal(loaded, req),
+            Command::Cancel(req) => self.apply_cancel(loaded, req),
+            Command::Terminate(req) => self.apply_terminate(loaded, req),
             Command::WorkflowTaskStarted(req) => self.apply_workflow_task_started(loaded, req),
             Command::WorkflowTaskCompleted(req) => self.apply_workflow_task_completed(loaded, req),
             Command::WorkflowTaskFailed(req) => self.apply_workflow_task_failed(loaded, req),
@@ -124,6 +126,55 @@ impl BasicKernel {
         // signal floods without weakening per-run correctness.
         if builder.state.pending_workflow_task.is_none() {
             builder.schedule_workflow_task();
+        }
+
+        Ok(builder.finish())
+    }
+
+    fn apply_cancel(&self, loaded: LoadedRun, req: CancelRequest) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+        let mut builder = TransitionBuilder::new(state, req.now);
+        builder.request_dedupe_ops.push(RequestDedupeOp {
+            request_id: req.request.request_id.clone(),
+        });
+        builder.emit(HistoryEventKind::WorkflowExecutionCancelRequested {
+            reason: req.reason,
+            external_workflow_execution: req.external_initiator,
+            request_id: req.request.request_id.0,
+        });
+
+        if builder.state.pending_workflow_task.is_none() {
+            builder.schedule_workflow_task();
+        }
+
+        Ok(builder.finish())
+    }
+
+    fn apply_terminate(
+        &self,
+        loaded: LoadedRun,
+        req: TerminateRequest,
+    ) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+        let mut builder = TransitionBuilder::new(state, req.now);
+        builder.request_dedupe_ops.push(RequestDedupeOp {
+            request_id: req.request.request_id.clone(),
+        });
+        builder.emit(HistoryEventKind::WorkflowExecutionTerminated {
+            reason: req.reason,
+            details: req.details,
+            identity: req.identity,
+        });
+        builder.close(ExecutionStatus::Terminated);
+
+        let activities = std::mem::take(&mut builder.state.activities);
+        for (activity_id, _) in activities {
+            builder.activity_ops.push(ActivityOp::Delete { activity_id });
+        }
+
+        let timers = std::mem::take(&mut builder.state.timers);
+        for (timer_id, _) in timers {
+            builder.timer_ops.push(TimerOp::Delete { timer_id });
         }
 
         Ok(builder.finish())
@@ -532,6 +583,29 @@ fn apply_workflow_command(builder: &mut TransitionBuilder, command: WorkflowComm
             builder.emit(HistoryEventKind::WorkflowExecutionFailed { message, details });
             builder.close(ExecutionStatus::Failed);
             Ok(true)
+        }
+        WorkflowCommand::CancelWorkflow => {
+            builder.emit(HistoryEventKind::WorkflowExecutionCanceled);
+            builder.close(ExecutionStatus::Cancelled);
+            Ok(true)
+        }
+        WorkflowCommand::RequestCancelActivity { activity_id } => {
+            if !builder.state.activities.contains_key(&activity_id) {
+                return Err(Reject::UnknownActivity(activity_id));
+            }
+            builder.emit(HistoryEventKind::ActivityTaskCancelRequested { activity_id });
+            Ok(false)
+        }
+        WorkflowCommand::CancelTimer { timer_id } => {
+            if !builder.state.timers.contains_key(&timer_id) {
+                return Err(Reject::UnknownTimer(timer_id));
+            }
+            builder.emit(HistoryEventKind::TimerCanceled {
+                timer_id: timer_id.clone(),
+            });
+            builder.state.timers.remove(&timer_id);
+            builder.timer_ops.push(TimerOp::Delete { timer_id });
+            Ok(false)
         }
         WorkflowCommand::RequestNewWorkflowTask => {
             if builder.state.pending_workflow_task.is_none() && builder.state.is_open() {

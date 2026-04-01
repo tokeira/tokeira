@@ -4,9 +4,10 @@ use proptest::prelude::*;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     event::HistoryEventKind, kernel::Kernel, ActivityOp, ActivityResolution,
-    ActivityResolvedRequest, ActivityState, BasicKernel, Command, DispatchOp, LoadedRun,
-    PendingWorkflowTask, RequestDedupeOp, SignalRequest, StartRequest, StartWorkflowTaskRequest,
-    TimerDueRequest, TimerOp, TimerState, WorkflowCommand, WorkflowState,
+    ActivityResolvedRequest, ActivityState, BasicKernel, CancelRequest, Command, DispatchOp,
+    ExternalWorkflowExecution, LoadedRun, PendingWorkflowTask, RequestDedupeOp, SignalRequest,
+    StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerOp,
+    TimerState, WorkflowCommand, WorkflowState,
     WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
     WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType,
 };
@@ -301,6 +302,44 @@ fn arb_wft_timed_out_request(
     })
 }
 
+fn arb_external_workflow_execution() -> impl Strategy<Value = ExternalWorkflowExecution> {
+    arb_small_string().prop_map(|workflow_id| ExternalWorkflowExecution {
+        namespace_id: NamespaceId::new(),
+        workflow_id: WorkflowId(workflow_id),
+        run_id: RunId::new(),
+    })
+}
+
+fn arb_cancel_request(now: OffsetDateTime) -> impl Strategy<Value = CancelRequest> {
+    (
+        arb_small_string(),
+        prop::option::of(arb_external_workflow_execution()),
+        arb_small_string(),
+    )
+        .prop_map(move |(reason, external_initiator, request_id)| CancelRequest {
+            reason,
+            external_initiator,
+            request: request_context(&request_id, now),
+            now,
+        })
+}
+
+fn arb_terminate_request(now: OffsetDateTime) -> impl Strategy<Value = TerminateRequest> {
+    (
+        arb_small_string(),
+        prop::option::of(arb_payloads()),
+        arb_small_string(),
+        arb_small_string(),
+    )
+        .prop_map(move |(reason, details, identity, request_id)| TerminateRequest {
+            reason,
+            details,
+            identity,
+            request: request_context(&request_id, now),
+            now,
+        })
+}
+
 fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
     let now = fixed_now();
     prop_oneof![
@@ -314,6 +353,14 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 now,
             };
             (LoadedRun::Existing(state), Command::Signal(req))
+        }),
+        arb_cancel_request(now).prop_map(move |req| {
+            let state = make_open_state(now);
+            (LoadedRun::Existing(state), Command::Cancel(req))
+        }),
+        arb_terminate_request(now).prop_map(move |req| {
+            let state = make_open_state(now);
+            (LoadedRun::Existing(state), Command::Terminate(req))
         }),
         (0u64..10u64).prop_map(move |offset| {
             let logical_seq = 20 + offset;
@@ -386,6 +433,61 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
             }
             arb_wft_timed_out_request(logical_seq, started_event_id, now)
                 .prop_map(move |req| (LoadedRun::Existing(state.clone()), Command::WorkflowTaskTimedOut(req)))
+        }),
+        Just(()).prop_map(move |_| {
+            let state = with_pending_wft(make_open_state(now), 42, Some(17), 1);
+            let req = WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(42),
+                    started_event_id: 17,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::CancelWorkflow],
+                force_new_workflow_task: false,
+                now,
+            };
+            (LoadedRun::Existing(state), Command::WorkflowTaskCompleted(req))
+        }),
+        Just(()).prop_map(move |_| {
+            let state = with_activity(with_pending_wft(make_open_state(now), 43, Some(18), 1), "activity-1");
+            let req = WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(43),
+                    started_event_id: 18,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::RequestCancelActivity {
+                    activity_id: "activity-1".into(),
+                }],
+                force_new_workflow_task: false,
+                now,
+            };
+            (LoadedRun::Existing(state), Command::WorkflowTaskCompleted(req))
+        }),
+        Just(()).prop_map(move |_| {
+            let state = with_timer(with_pending_wft(make_open_state(now), 44, Some(19), 1), "timer-1", now);
+            let req = WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(44),
+                    started_event_id: 19,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::CancelTimer {
+                    timer_id: "timer-1".into(),
+                }],
+                force_new_workflow_task: false,
+                now,
+            };
+            (LoadedRun::Existing(state), Command::WorkflowTaskCompleted(req))
         }),
     ]
 }
@@ -658,6 +760,14 @@ proptest! {
                 prop_assert_eq!(transition.request_dedupe_ops.len(), 1);
                 prop_assert_eq!(transition.request_dedupe_ops[0].clone(), RequestDedupeOp { request_id: req.request.request_id });
             }
+            Command::Cancel(req) => {
+                prop_assert_eq!(transition.request_dedupe_ops.len(), 1);
+                prop_assert_eq!(transition.request_dedupe_ops[0].clone(), RequestDedupeOp { request_id: req.request.request_id });
+            }
+            Command::Terminate(req) => {
+                prop_assert_eq!(transition.request_dedupe_ops.len(), 1);
+                prop_assert_eq!(transition.request_dedupe_ops[0].clone(), RequestDedupeOp { request_id: req.request.request_id });
+            }
             _ => prop_assert!(transition.request_dedupe_ops.is_empty()),
         }
     }
@@ -773,9 +883,135 @@ proptest! {
         prop_assert!(timed_out_transition.projection_ops.is_empty());
         prop_assert_eq!(timed_out_transition.next_state.status, ExecutionStatus::Running);
     }
+
+    #[test]
+    fn property_17_cancel_event_field_pass_through(req in arb_cancel_request(fixed_now())) {
+        let now = fixed_now();
+        let transition = kernel().apply(
+            LoadedRun::Existing(make_open_state(now)),
+            Command::Cancel(req.clone()),
+        ).unwrap();
+        match &transition.history_events[0].kind {
+            HistoryEventKind::WorkflowExecutionCancelRequested {
+                reason,
+                external_workflow_execution,
+                request_id,
+            } => {
+                prop_assert_eq!(reason, &req.reason);
+                prop_assert_eq!(external_workflow_execution, &req.external_initiator);
+                prop_assert_eq!(request_id, &req.request.request_id.0);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn property_18_cancel_does_not_close(req in arb_cancel_request(fixed_now())) {
+        let now = fixed_now();
+        let transition = kernel().apply(
+            LoadedRun::Existing(with_activity(with_timer(make_open_state(now), "timer-1", now), "activity-1")),
+            Command::Cancel(req),
+        ).unwrap();
+        prop_assert_eq!(transition.next_state.status, ExecutionStatus::Running);
+        prop_assert_eq!(transition.next_state.closed_at, None);
+        prop_assert!(transition.projection_ops.is_empty());
+        prop_assert!(transition.activity_ops.is_empty());
+        prop_assert!(transition.timer_ops.is_empty());
+    }
+
+    #[test]
+    fn property_19_cancel_wft_coalescing(no_pending in prop::bool::ANY, req in arb_cancel_request(fixed_now())) {
+        let now = fixed_now();
+        let state = if no_pending {
+            make_open_state(now)
+        } else {
+            with_pending_wft(make_open_state(now), 90, None, 0)
+        };
+        let transition = kernel().apply(LoadedRun::Existing(state), Command::Cancel(req)).unwrap();
+        if no_pending {
+            prop_assert!(transition.next_state.pending_workflow_task.is_some());
+            prop_assert_eq!(transition.dispatch_ops.len(), 1);
+        } else {
+            prop_assert!(transition.dispatch_ops.is_empty());
+            prop_assert_eq!(
+                transition.next_state.pending_workflow_task.as_ref().unwrap().logical_seq,
+                LogicalTaskSeq(90)
+            );
+        }
+    }
+
+    #[test]
+    fn property_20_terminate_event_field_pass_through(req in arb_terminate_request(fixed_now())) {
+        let now = fixed_now();
+        let transition = kernel().apply(
+            LoadedRun::Existing(make_open_state(now)),
+            Command::Terminate(req.clone()),
+        ).unwrap();
+        match &transition.history_events[0].kind {
+            HistoryEventKind::WorkflowExecutionTerminated { reason, details, identity } => {
+                prop_assert_eq!(reason, &req.reason);
+                prop_assert_eq!(details, &req.details);
+                prop_assert_eq!(identity, &req.identity);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn property_21_terminate_closes_with_terminal_invariants(req in arb_terminate_request(fixed_now())) {
+        let now = fixed_now();
+        let state = with_sticky(
+            with_pending_wft(with_activity(with_timer(make_open_state(now), "timer-1", now), "activity-1"), 91, None, 0),
+            "sticky-worker",
+            now,
+        );
+        let transition = kernel().apply(LoadedRun::Existing(state), Command::Terminate(req)).unwrap();
+        prop_assert_eq!(transition.next_state.status, ExecutionStatus::Terminated);
+        prop_assert!(transition.next_state.closed_at.is_some());
+        prop_assert!(transition.next_state.pending_workflow_task.is_none());
+        prop_assert!(transition.next_state.sticky.is_none());
+        prop_assert!(transition.next_state.activities.is_empty());
+        prop_assert!(transition.next_state.timers.is_empty());
+        prop_assert!(transition.dispatch_ops.is_empty());
+    }
+
+    #[test]
+    fn property_22_terminate_entity_cleanup(req in arb_terminate_request(fixed_now())) {
+        let now = fixed_now();
+        let mut state = with_activity(make_open_state(now), "activity-1");
+        state.activities.insert(
+            "activity-2".into(),
+            ActivityState {
+                activity_id: "activity-2".into(),
+                schedule_event_id: 11,
+                task_queue: TaskQueueName("activity-q".into()),
+                attempt: 1,
+                schedule_to_close_timeout: Some(Duration::minutes(2)),
+                schedule_to_start_timeout: Some(Duration::seconds(30)),
+                start_to_close_timeout: Some(Duration::minutes(1)),
+                heartbeat_timeout: Some(Duration::seconds(20)),
+            },
+        );
+        state = with_timer(state, "timer-1", now);
+        let transition = kernel().apply(LoadedRun::Existing(state), Command::Terminate(req)).unwrap();
+        prop_assert_eq!(transition.activity_ops.len(), 2);
+        prop_assert_eq!(transition.timer_ops.len(), 1);
+        for op in &transition.activity_ops {
+            match op {
+                ActivityOp::Delete { activity_id } => prop_assert!(activity_id == "activity-1" || activity_id == "activity-2"),
+                _ => panic!("unexpected activity op"),
+            }
+        }
+        match &transition.timer_ops[0] {
+            TimerOp::Delete { timer_id } => prop_assert_eq!(timer_id, "timer-1"),
+            _ => panic!("unexpected timer op"),
+        }
+    }
+
 }
 
-// Property 15 is not property-based (deterministic single case), so it lives outside the proptest! block.
+// Properties 15, 23, and 24 are deterministic single-case checks, so they live
+// outside the proptest! block.
 #[test]
 fn property_15_wft_timed_out_clears_sticky() {
     let now = fixed_now();
@@ -796,4 +1032,77 @@ fn property_15_wft_timed_out_clears_sticky() {
         }
         other => panic!("unexpected dispatch op: {other:?}"),
     }
+}
+
+#[test]
+fn property_23_request_cancel_activity_preserves_activity() {
+    let now = fixed_now();
+    let state = with_activity(
+        with_pending_wft(make_open_state(now), 92, Some(20), 1),
+        "activity-1",
+    );
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: RunKey::new(),
+                    logical_seq: LogicalTaskSeq(92),
+                    started_event_id: 20,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::RequestCancelActivity {
+                    activity_id: "activity-1".into(),
+                }],
+                force_new_workflow_task: false,
+                now,
+            }),
+        )
+        .unwrap();
+    assert!(transition.next_state.activities.contains_key("activity-1"));
+    assert!(
+        transition
+            .activity_ops
+            .iter()
+            .all(|op| !matches!(op, ActivityOp::Delete { .. }))
+    );
+}
+
+#[test]
+fn property_24_cancel_timer_removes_timer() {
+    let now = fixed_now();
+    let state = with_timer(
+        with_pending_wft(make_open_state(now), 93, Some(21), 1),
+        "timer-1",
+        now,
+    );
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: RunKey::new(),
+                    logical_seq: LogicalTaskSeq(93),
+                    started_event_id: 21,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::CancelTimer {
+                    timer_id: "timer-1".into(),
+                }],
+                force_new_workflow_task: false,
+                now,
+            }),
+        )
+        .unwrap();
+    assert!(!transition.next_state.timers.contains_key("timer-1"));
+    assert!(
+        transition
+            .timer_ops
+            .iter()
+            .any(|op| matches!(op, TimerOp::Delete { timer_id } if timer_id == "timer-1"))
+    );
 }

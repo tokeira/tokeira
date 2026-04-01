@@ -4,7 +4,7 @@ use tokeira_types::{
     SearchAttributes, TaskQueueName, WorkerIdentity, WorkflowType,
 };
 
-use crate::command::{WorkflowTaskFailedCause, WorkflowTaskTimeoutType};
+use crate::command::{ExternalWorkflowExecution, WorkflowTaskFailedCause, WorkflowTaskTimeoutType};
 
 /// Authoritative history event.
 ///
@@ -39,6 +39,16 @@ pub enum HistoryEventKind {
         input: Payloads,
         request_id: String,
         identity: Option<String>,
+    },
+    WorkflowExecutionCancelRequested {
+        reason: String,
+        external_workflow_execution: Option<ExternalWorkflowExecution>,
+        request_id: String,
+    },
+    WorkflowExecutionTerminated {
+        reason: String,
+        details: Option<Payloads>,
+        identity: String,
     },
     WorkflowTaskScheduled {
         logical_seq: LogicalTaskSeq,
@@ -98,8 +108,14 @@ pub enum HistoryEventKind {
         timer_id: String,
         fire_at: OffsetDateTime,
     },
+    TimerCanceled {
+        timer_id: String,
+    },
     TimerFired {
         timer_id: String,
+    },
+    ActivityTaskCancelRequested {
+        activity_id: String,
     },
     WorkflowExecutionCompleted {
         result: Payloads,
@@ -108,6 +124,7 @@ pub enum HistoryEventKind {
         message: String,
         details: Option<Payload>,
     },
+    WorkflowExecutionCanceled,
 }
 
 #[derive(Clone, Debug, PartialEq)]

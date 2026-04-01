@@ -346,7 +346,11 @@ pub fn workflow_command_to_proto(
                 details: Some(payloads_from_optional_payload(details.clone())),
             },
         )),
-        WorkflowCommand::RequestNewWorkflowTask => {
+        WorkflowCommand::CancelWorkflow
+        | WorkflowCommand::RequestCancelActivity { .. }
+        | WorkflowCommand::CancelTimer { .. }
+        | WorkflowCommand::RequestNewWorkflowTask
+            => {
             return Err(ProtoConversionError::MissingField(
                 "WorkflowCommand has no proto Command equivalent",
             ))

@@ -200,7 +200,7 @@ The kernel does not enforce sticky routing. It only records the preference. The 
 
 ## WorkflowState: complete target shape
 
-The kernel's view of a single run is captured in `WorkflowState`. The following is the target shape including fields for features not yet implemented:
+The kernel's view of a single run is captured in `WorkflowState`. The following is the current shape:
 
 ```rust
 pub struct WorkflowState {
@@ -233,29 +233,26 @@ pub struct WorkflowState {
     pub memo: Memo,
     pub search_attributes: SearchAttributes,
 
-    // Open entities (implemented)
+    // Retry (recorded at start, evaluated by runtime)
+    pub retry_policy: Option<RetryPolicy>,
+    pub attempt: u32,
+
+    // Open entities
     pub activities: BTreeMap<String, ActivityState>,
     pub timers: BTreeMap<String, TimerState>,
-
-    // Open entities (not yet implemented)
     pub children: BTreeMap<WorkflowId, ChildWorkflowState>,
-    pub pending_updates: BTreeMap<String, PendingUpdate>,
     pub pending_external_signals: BTreeMap<i64, PendingExternalSignal>,
     pub pending_external_cancels: BTreeMap<i64, PendingExternalCancel>,
+
+    // Open entities (not yet implemented)
+    pub pending_updates: BTreeMap<String, PendingUpdate>,
     pub pending_nexus_operations: BTreeMap<String, PendingNexusOperation>,
 
     // Execution options (not yet implemented)
     pub versioning_override: Option<VersioningOverride>,
     pub completion_callbacks: Vec<CompletionCallback>,
-
-    // Retry (not yet implemented)
-    pub retry_policy: Option<RetryPolicy>,
-    pub attempt: u32,
-    pub cron_schedule: Option<String>,
 }
 ```
-
-Fields in the "not yet implemented" groups are part of the target design. They will be added to the implementation as the corresponding commands are built.
 
 ## Determinism rules
 
@@ -766,15 +763,17 @@ The operation remains pending until it resolves.
 
 ### `ProtocolMessage` (workflow command)
 
-This is an internal ordering primitive used by the Update feature to guarantee that update acceptance/rejection events appear at the correct position in history relative to other events in the same WFT completion.[^update]
+ProtocolMessage is the carrier mechanism for update events within a WFT completion. It controls where update acceptance, completion, and rejection events appear in history relative to other workflow commands in the same transition.[^update]
 
-**Behavior (within WorkflowTaskCompleted):**
+The worker sends `ProtocolMessage` commands interleaved with other workflow commands (ScheduleActivity, StartTimer, etc.). Each ProtocolMessage carries an `UpdateProtocolBody` that determines what event to emit:
 
-1. The protocol message references a specific message ID mapping to an update acceptance or rejection.
-2. The kernel uses this to determine the correct position in the event sequence for the corresponding update event.
-3. No standalone event is emitted; it is a sequencing directive.
+- `UpdateProtocolBody::Accepted { update_id, update_name, input }` — emit `WorkflowExecutionUpdateAccepted`, add `PendingUpdate` to state. Reject with `DuplicateUpdateId` if the update_id is already pending.
+- `UpdateProtocolBody::Completed { update_id, result }` — emit `WorkflowExecutionUpdateCompleted`, remove from pending. Reject with `UnknownUpdate` if not found.
+- `UpdateProtocolBody::Rejected { update_id, failure }` — emit `WorkflowExecutionUpdateRejected`, remove from pending. Reject with `UnknownUpdate` if not found.
 
-**Rationale:** Without protocol messages, the kernel would have no way to interleave update results with other workflow commands in the correct order.
+Since the kernel processes workflow commands sequentially, the position of the ProtocolMessage in the command list directly determines where the update event lands in the event sequence. No buffering or reordering is needed.
+
+`UpdateCompleted` and `UpdateRejected` also exist as standalone workflow commands for cases where ordering relative to other commands doesn't matter. Both paths produce the same events and state changes.
 
 ### `ContinueAsNew` (workflow command)
 
@@ -843,18 +842,22 @@ The kernel's `Reject` error type is a precise, enumerated set of rejection reaso
 
 - `CommandsAfterClose { index }`: a workflow command was issued after a preceding command in the same WFT completion already closed the run.
 
+### Implemented additions (Features 2-6)
+
+- `DuplicateChildWorkflowId(WorkflowId)`: a `StartChildWorkflow` command references a child workflow ID already in the open set. (Feature 5)
+- `UnknownChild(WorkflowId)`: child resolution or confirmation for a child not in the open set. (Feature 5)
+- `StaleChildConfirmation { child_workflow_id, expected_initiated_event_id }`: child start confirmation with mismatched initiated_event_id. (Feature 5)
+- `UnknownExternalSignal(i64)`: external signal resolution for a signal not in the pending set. (Feature 6)
+- `UnknownExternalCancel(i64)`: external cancel resolution for a cancel not in the pending set. (Feature 6)
+
 ### Future additions
 
-- `UnknownUpdate(id)`: update completion for an update not in the pending set.
-- `UnknownChild(id)`: child resolution for a child not in the open set.
-- `UnknownExternalSignal(id)`: external signal resolution for a signal not in the pending set.
-- `UnknownNexusOperation(id)`: Nexus operation resolution for an operation not in the pending set.
-- `DuplicateChildWorkflowId(id)`: a `StartChildWorkflow` command references a child workflow ID already in the open set.
+- `UnknownUpdate(String)`: update completion for an update not in the pending set. (Feature 7, in progress)
+- `DuplicateUpdateId(String)`: duplicate update acceptance. (Feature 7, in progress)
 - `DuplicateNexusOperationId(id)`: a `ScheduleNexusOperation` command references an operation ID already pending.
 - `ContinueAsNewConstraintViolation`: e.g., open children that cannot be abandoned.
 - `CancellationRace`: concurrent cancel/terminate/complete conflicts.
 - `ResetConstraintViolation`: invalid fork event ID or incompatible history.
-- `WorkflowTaskFailureCause(cause)`: structured cause for WFT failures.
 
 ## Activity retry and heartbeat boundary
 
@@ -905,12 +908,14 @@ Current dispatch ops:
 
 - `EnqueueWorkflowTask { queue, logical_seq, sticky_preferred }`: a WFT needs to reach a worker.
 - `EnqueueActivityTask { queue, activity_id, schedule_event_id, attempt }`: an activity task needs to reach a worker.
+- `StartChildWorkflow { child_workflow_id, namespace_id, workflow_type, task_queue, input }`: the runtime should create a child run.
+- `TerminateChild { child_workflow_id, child_run_id, reason }`: terminate a child per Parent Close Policy.
+- `CancelChild { child_workflow_id, child_run_id, reason }`: cancel a child per Parent Close Policy.
+- `SignalExternalWorkflow { target_workflow_id, target_run_id, signal_name, input }`: send a signal to another workflow.
+- `RequestCancelExternalWorkflow { target_workflow_id, target_run_id }`: send a cancel request to another workflow.
 
 Future dispatch ops:
 
-- `StartChildWorkflow { ... }`: the runtime should create a child run.
-- `RequestCancelExternalWorkflow { ... }`: send a cancel request to another workflow.
-- `SignalExternalWorkflow { ... }`: send a signal to another workflow.
 - `ScheduleNexusOperation { ... }`: invoke a Nexus endpoint.
 - `CancelNexusOperation { ... }`: cancel a pending Nexus operation.
 
@@ -922,53 +927,60 @@ Not all commands and workflow commands described in this document are implemente
 
 | Command / Feature | Status |
 |---|---|
-| `Start` | Implemented |
-| `Signal` | Implemented |
-| `WorkflowTaskStarted` | Implemented |
-| `WorkflowTaskCompleted` | Implemented |
-| `WorkflowTaskFailed` | Not yet implemented |
-| `WorkflowTaskTimedOut` | Not yet implemented |
-| `ActivityResolved` | Implemented |
-| `TimerDue` | Implemented |
-| `WorkflowExecutionTimedOut` | Not yet implemented |
+| `Start` | Implemented (F1) |
+| `Signal` | Implemented (F1) |
+| `WorkflowTaskStarted` | Implemented (F1) |
+| `WorkflowTaskCompleted` | Implemented (F1) |
+| `WorkflowTaskFailed` | Implemented (F2) |
+| `WorkflowTaskTimedOut` | Implemented (F2) |
+| `ActivityResolved` | Implemented (F1) |
+| `TimerDue` | Implemented (F1) |
+| `Cancel` | Implemented (F3) |
+| `Terminate` | Implemented (F3) |
+| `WorkflowExecutionTimedOut` | Implemented (F4) |
+| `ChildStartConfirmed` | Implemented (F5) |
+| `ChildResolved` | Implemented (F5) |
+| `ExternalSignalResolved` | Implemented (F6) |
+| `ExternalCancelResolved` | Implemented (F6) |
 | `UpdateExecutionOptions` | Not yet implemented |
-| `Update` | Not yet implemented |
-| `Cancel` | Not yet implemented |
-| `Terminate` | Not yet implemented |
-| `ChildStartConfirmed` | Not yet implemented |
-| `ChildResolved` | Not yet implemented |
-| `ExternalSignalResolved` | Not yet implemented |
-| `ExternalCancelResolved` | Not yet implemented |
+| `Update` | In progress (F7) |
 | `NexusOperationResolved` | Not yet implemented |
-| `ContinueAsNew` | Not yet implemented |
 | `Reset` | Not yet implemented |
-| `ScheduleActivity` (workflow cmd) | Implemented |
-| `StartTimer` (workflow cmd) | Implemented |
-| `CompleteWorkflow` (workflow cmd) | Implemented |
-| `FailWorkflow` (workflow cmd) | Implemented |
-| `CancelWorkflow` (workflow cmd) | Not yet implemented |
-| `RequestNewWorkflowTask` (workflow cmd) | Implemented |
-| `UpsertMemo` (workflow cmd) | Implemented |
-| `UpsertSearchAttributes` (workflow cmd) | Implemented |
-| `StartChildWorkflow` (workflow cmd) | Not yet implemented |
-| `RequestCancelActivity` (workflow cmd) | Not yet implemented |
-| `CancelTimer` (workflow cmd) | Not yet implemented |
-| `SignalExternalWorkflow` (workflow cmd) | Not yet implemented |
-| `RequestCancelExternalWorkflow` (workflow cmd) | Not yet implemented |
+| `ScheduleActivity` (workflow cmd) | Implemented (F1) |
+| `StartTimer` (workflow cmd) | Implemented (F1) |
+| `CompleteWorkflow` (workflow cmd) | Implemented (F1) |
+| `FailWorkflow` (workflow cmd) | Implemented (F1, enhanced F4 with retry metadata) |
+| `CancelWorkflow` (workflow cmd) | Implemented (F3) |
+| `ContinueAsNew` (workflow cmd) | Implemented (F4) |
+| `RequestNewWorkflowTask` (workflow cmd) | Implemented (F1) |
+| `UpsertMemo` (workflow cmd) | Implemented (F1) |
+| `UpsertSearchAttributes` (workflow cmd) | Implemented (F1) |
+| `StartChildWorkflow` (workflow cmd) | Implemented (F5) |
+| `RequestCancelActivity` (workflow cmd) | Implemented (F3) |
+| `CancelTimer` (workflow cmd) | Implemented (F3) |
+| `SignalExternalWorkflow` (workflow cmd) | Implemented (F6) |
+| `RequestCancelExternalWorkflow` (workflow cmd) | Implemented (F6) |
 | `RecordMarker` (workflow cmd) | Not yet implemented |
 | `ScheduleNexusOperation` (workflow cmd) | Not yet implemented |
 | `CancelNexusOperation` (workflow cmd) | Not yet implemented |
-| `ProtocolMessage` (workflow cmd) | Not yet implemented |
-| `UpdateCompleted` (workflow cmd) | Not yet implemented |
-| `UpdateRejected` (workflow cmd) | Not yet implemented |
-| Request deduplication | Implemented |
-| Sticky execution affinity | Implemented |
-| Pending updates tracking | Not yet implemented |
-| Open children tracking | Not yet implemented |
-| Pending external signals tracking | Not yet implemented |
-| Pending external cancel requests tracking | Not yet implemented |
+| `ProtocolMessage` (workflow cmd) | In progress (F7) |
+| `UpdateCompleted` (workflow cmd) | In progress (F7) |
+| `UpdateRejected` (workflow cmd) | In progress (F7) |
+| Request deduplication | Implemented (F1) |
+| Sticky execution affinity | Implemented (F1) |
+| Timeout configuration | Implemented (F1) |
+| Retry policy recording | Implemented (F1, enhanced F4) |
+| Activity timeout pass-through | Implemented (F1) |
+| ActivityResolution TimedOut/Canceled | Implemented (F1) |
+| WFT failure/timeout fencing | Implemented (F2) |
+| WorkflowTaskFailedCause enum | Implemented (F2) |
+| WorkflowTaskTimeoutType enum | Implemented (F2) |
+| Open children tracking | Implemented (F5) |
+| Parent Close Policy | Implemented (F5) |
+| Pending external signals tracking | Implemented (F6) |
+| Pending external cancel requests tracking | Implemented (F6) |
+| Pending updates tracking | In progress (F7) |
 | Pending Nexus operations tracking | Not yet implemented |
-| Parent Close Policy | Not yet implemented |
 
 ## Test strategy
 
@@ -1027,7 +1039,7 @@ Key properties to model:
 7. Should `WorkflowTaskFailed` always reschedule the WFT, or should there be a maximum attempt count after which the workflow is considered stuck and requires operator intervention?
 8. Should `RecordMarker` remain fully opaque to the kernel, or should the kernel understand local activity markers enough to track them as a distinct pending entity type?
 9. Is Nexus support a near-term priority, or should it be deferred until the core command set (activities, timers, children, signals, updates) is fully implemented?
-10. Should `ProtocolMessage` be modeled as a first-class workflow command in the kernel, or should the kernel handle update ordering internally without exposing the protocol message abstraction?
+10. ~~Should `ProtocolMessage` be modeled as a first-class workflow command in the kernel, or should the kernel handle update ordering internally without exposing the protocol message abstraction?~~ **Resolved:** ProtocolMessage is a first-class workflow command that carries an `UpdateProtocolBody` inline. Its position in the command list determines where the update event lands in history.
 
 ## References
 

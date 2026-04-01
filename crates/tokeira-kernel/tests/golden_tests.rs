@@ -7,11 +7,12 @@ use tokeira_kernel::{
     ChildStartResult, ChildWorkflowState, Command, DispatchOp, ExternalCancelResolvedRequest,
     ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult,
     ExternalWorkflowExecution, LoadedRun, ParentClosePolicy, PendingExternalCancel,
-    PendingExternalSignal, PendingWorkflowTask, ProjectionOp, Reject, SignalRequest, StartRequest,
-    StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerState, WorkflowCommand,
+    PendingExternalSignal, PendingUpdate, PendingWorkflowTask, ProjectionOp, Reject,
+    RetryState, SignalRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest,
+    TimerDueRequest, TimerState, UpdateProtocolBody, UpdateRequest, WorkflowCommand,
     WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
     WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
-    WorkflowTaskTimeoutType, WorkflowTimeoutType, RetryState,
+    WorkflowTaskTimeoutType, WorkflowTimeoutType,
 };
 use tokeira_types::{
     ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RequestContext,
@@ -111,6 +112,7 @@ fn make_open_state() -> WorkflowState {
         children: BTreeMap::new(),
         pending_external_signals: BTreeMap::new(),
         pending_external_cancels: BTreeMap::new(),
+        pending_updates: BTreeMap::new(),
         started_at: now() - Duration::minutes(3),
         closed_at: None,
     }
@@ -1899,6 +1901,18 @@ fn with_pending_external_cancel(
     state
 }
 
+fn with_pending_update(mut state: WorkflowState, update_id: &str) -> WorkflowState {
+    state.pending_updates.insert(
+        update_id.into(),
+        PendingUpdate {
+            update_id: update_id.into(),
+            accepted_event_id: 10,
+            name: "handler".into(),
+        },
+    );
+    state
+}
+
 #[test]
 fn start_child_workflow_happy_path() {
     let state = make_open_state_with_started_wft();
@@ -2193,4 +2207,373 @@ fn terminate_clears_pending_externals() {
         op,
         DispatchOp::SignalExternalWorkflow { .. } | DispatchOp::RequestCancelExternalWorkflow { .. }
     )));
+}
+
+#[test]
+fn update_with_no_pending_wft() {
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(make_open_state()),
+            Command::Update(UpdateRequest {
+                update_id: "update-1".into(),
+                update_name: "handler".into(),
+                input: payloads("input"),
+                request: request_context("update-req"),
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::WorkflowExecutionUpdateAccepted { .. }
+    ));
+    assert_eq!(transition.request_dedupe_ops.len(), 1);
+    assert!(transition.next_state.pending_updates.contains_key("update-1"));
+    assert!(matches!(
+        transition.history_events[1].kind,
+        HistoryEventKind::WorkflowTaskScheduled { .. }
+    ));
+}
+
+#[test]
+fn update_with_pending_wft() {
+    let state = make_open_state_with_pending_wft();
+    let pending = state.pending_workflow_task.clone();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::Update(UpdateRequest {
+                update_id: "update-1".into(),
+                update_name: "handler".into(),
+                input: payloads("input"),
+                request: request_context("update-req"),
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::WorkflowExecutionUpdateAccepted { .. }
+    ));
+    assert_eq!(transition.dispatch_ops.len(), 0);
+    assert_eq!(transition.next_state.pending_workflow_task, pending);
+}
+
+#[test]
+fn update_rejected_missing_run() {
+    let reject = kernel()
+        .apply(
+            LoadedRun::Absent,
+            Command::Update(UpdateRequest {
+                update_id: "update-1".into(),
+                update_name: "handler".into(),
+                input: payloads("input"),
+                request: request_context("missing"),
+                now: now(),
+            }),
+        )
+        .unwrap_err();
+    assert_eq!(reject, Reject::MissingRun);
+}
+
+#[test]
+fn update_rejected_closed_run() {
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(make_closed_state()),
+            Command::Update(UpdateRequest {
+                update_id: "update-1".into(),
+                update_name: "handler".into(),
+                input: payloads("input"),
+                request: request_context("closed"),
+                now: now(),
+            }),
+        )
+        .unwrap_err();
+    assert_eq!(reject, Reject::RunClosed(ExecutionStatus::Completed));
+}
+
+#[test]
+fn update_duplicate_update_id() {
+    let state = with_pending_update(make_open_state(), "update-1");
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::Update(UpdateRequest {
+                update_id: "update-1".into(),
+                update_name: "handler".into(),
+                input: payloads("input"),
+                request: request_context("dup-update"),
+                now: now(),
+            }),
+        )
+        .unwrap_err();
+    assert_eq!(reject, Reject::DuplicateUpdateId("update-1".into()));
+}
+
+#[test]
+fn update_completed_happy_path() {
+    let state = with_pending_update(make_open_state_with_started_wft(), "update-1");
+    let pending = state.pending_workflow_task.clone().unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: pending.logical_seq,
+                    started_event_id: pending.started_event_id.unwrap(),
+                    attempt: pending.attempt,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::UpdateCompleted {
+                    update_id: "update-1".into(),
+                    result: payloads("done"),
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        transition.history_events[1].kind,
+        HistoryEventKind::WorkflowExecutionUpdateCompleted { .. }
+    ));
+    assert!(!transition.next_state.pending_updates.contains_key("update-1"));
+}
+
+#[test]
+fn update_rejected_happy_path() {
+    let state = with_pending_update(make_open_state_with_started_wft(), "update-1");
+    let pending = state.pending_workflow_task.clone().unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: pending.logical_seq,
+                    started_event_id: pending.started_event_id.unwrap(),
+                    attempt: pending.attempt,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::UpdateRejected {
+                    update_id: "update-1".into(),
+                    failure: "nope".into(),
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        transition.history_events[1].kind,
+        HistoryEventKind::WorkflowExecutionUpdateRejected { .. }
+    ));
+    assert!(!transition.next_state.pending_updates.contains_key("update-1"));
+}
+
+#[test]
+fn update_completed_unknown_update() {
+    let state = make_open_state_with_started_wft();
+    let pending = state.pending_workflow_task.clone().unwrap();
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: pending.logical_seq,
+                    started_event_id: pending.started_event_id.unwrap(),
+                    attempt: pending.attempt,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::UpdateCompleted {
+                    update_id: "missing".into(),
+                    result: payloads("done"),
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap_err();
+    assert_eq!(reject, Reject::UnknownUpdate("missing".into()));
+}
+
+#[test]
+fn update_rejected_unknown_update() {
+    let state = make_open_state_with_started_wft();
+    let pending = state.pending_workflow_task.clone().unwrap();
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: pending.logical_seq,
+                    started_event_id: pending.started_event_id.unwrap(),
+                    attempt: pending.attempt,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::UpdateRejected {
+                    update_id: "missing".into(),
+                    failure: "nope".into(),
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap_err();
+    assert_eq!(reject, Reject::UnknownUpdate("missing".into()));
+}
+
+#[test]
+fn protocol_message_accepted_body() {
+    let state = make_open_state_with_started_wft();
+    let pending = state.pending_workflow_task.clone().unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: pending.logical_seq,
+                    started_event_id: pending.started_event_id.unwrap(),
+                    attempt: pending.attempt,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::ProtocolMessage {
+                    message_id: "msg-1".into(),
+                    body: UpdateProtocolBody::Accepted {
+                        update_id: "update-1".into(),
+                        update_name: "handler".into(),
+                        input: payloads("input"),
+                    },
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        transition.history_events[1].kind,
+        HistoryEventKind::WorkflowExecutionUpdateAccepted { .. }
+    ));
+    assert!(transition.next_state.pending_updates.contains_key("update-1"));
+}
+
+#[test]
+fn protocol_message_completed_body() {
+    let state = with_pending_update(make_open_state_with_started_wft(), "update-1");
+    let pending = state.pending_workflow_task.clone().unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: pending.logical_seq,
+                    started_event_id: pending.started_event_id.unwrap(),
+                    attempt: pending.attempt,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::ProtocolMessage {
+                    message_id: "msg-2".into(),
+                    body: UpdateProtocolBody::Completed {
+                        update_id: "update-1".into(),
+                        result: payloads("done"),
+                    },
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
+    assert!(matches!(
+        transition.history_events[1].kind,
+        HistoryEventKind::WorkflowExecutionUpdateCompleted { .. }
+    ));
+    assert!(!transition.next_state.pending_updates.contains_key("update-1"));
+}
+
+#[test]
+fn protocol_message_rejected_body() {
+    let state = with_pending_update(make_open_state_with_started_wft(), "update-1");
+    let pending = state.pending_workflow_task.clone().unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: pending.logical_seq,
+                    started_event_id: pending.started_event_id.unwrap(),
+                    attempt: pending.attempt,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::ProtocolMessage {
+                    message_id: "msg-3".into(),
+                    body: UpdateProtocolBody::Rejected {
+                        update_id: "update-1".into(),
+                        failure: "nope".into(),
+                    },
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
+    assert!(matches!(
+        transition.history_events[1].kind,
+        HistoryEventKind::WorkflowExecutionUpdateRejected { .. }
+    ));
+    assert!(!transition.next_state.pending_updates.contains_key("update-1"));
+}
+
+#[test]
+fn terminate_clears_pending_updates() {
+    let state = with_pending_update(make_open_state(), "update-1");
+    let transition = kernel()
+        .apply(LoadedRun::Existing(state), Command::Terminate(make_terminate_request()))
+        .unwrap();
+    assert!(transition.next_state.pending_updates.is_empty());
+}
+
+#[test]
+fn complete_workflow_clears_pending_updates() {
+    let state = with_pending_update(make_open_state_with_started_wft(), "update-1");
+    let pending = state.pending_workflow_task.clone().unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: pending.logical_seq,
+                    started_event_id: pending.started_event_id.unwrap(),
+                    attempt: pending.attempt,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::CompleteWorkflow {
+                    result: payloads("done"),
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
+    assert!(transition.next_state.pending_updates.is_empty());
 }

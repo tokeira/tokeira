@@ -8,12 +8,13 @@ use tokeira_kernel::{
     ChildResolvedRequest, ChildStartConfirmedRequest, ChildStartResult, ChildWorkflowState,
     Command, DispatchOp, ExternalCancelResolvedRequest, ExternalCancelResult,
     ExternalSignalResolvedRequest, ExternalSignalResult, ExternalWorkflowExecution, LoadedRun,
-    ParentClosePolicy, PendingExternalCancel, PendingExternalSignal, PendingWorkflowTask,
-    RequestDedupeOp, RetryState, SignalRequest, StartRequest, StartWorkflowTaskRequest,
-    TerminateRequest, TimerDueRequest, TimerOp, TimerState, WorkflowCommand,
-    WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
-    WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
-    WorkflowTaskTimeoutType, WorkflowTimeoutType,
+    ParentClosePolicy, PendingExternalCancel, PendingExternalSignal, PendingUpdate,
+    PendingWorkflowTask, RequestDedupeOp, RetryState, SignalRequest, StartRequest,
+    StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerOp, TimerState,
+    UpdateProtocolBody, UpdateRequest, WorkflowCommand, WorkflowExecutionTimedOutRequest,
+    WorkflowState, WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
+    WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType,
+    WorkflowTimeoutType,
 };
 use tokeira_types::{
     ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RequestContext,
@@ -93,6 +94,7 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         children: BTreeMap::new(),
         pending_external_signals: BTreeMap::new(),
         pending_external_cancels: BTreeMap::new(),
+        pending_updates: BTreeMap::new(),
         started_at: now - Duration::minutes(10),
         closed_at: None,
     }
@@ -185,6 +187,18 @@ fn with_pending_external_cancel(mut state: WorkflowState, initiated_event_id: i6
             initiated_event_id,
             target_workflow_id: WorkflowId("target-cancel".into()),
             target_run_id: Some(RunId::new()),
+        },
+    );
+    state
+}
+
+fn with_pending_update(mut state: WorkflowState, update_id: &str) -> WorkflowState {
+    state.pending_updates.insert(
+        update_id.into(),
+        PendingUpdate {
+            update_id: update_id.into(),
+            accepted_event_id: 10,
+            name: "handler".into(),
         },
     );
     state
@@ -487,6 +501,30 @@ fn arb_external_cancel_result() -> impl Strategy<Value = ExternalCancelResult> {
     ]
 }
 
+fn arb_update_request(now: OffsetDateTime) -> impl Strategy<Value = UpdateRequest> {
+    (arb_small_string(), arb_small_string(), arb_payloads(), arb_small_string()).prop_map(
+        move |(update_id, update_name, input, request_id)| UpdateRequest {
+            update_id,
+            update_name,
+            input,
+            request: request_context(&request_id, now),
+            now,
+        },
+    )
+}
+
+fn arb_update_completed_command() -> impl Strategy<Value = WorkflowCommand> {
+    (arb_small_string(), arb_payloads()).prop_map(|(update_id, result)| {
+        WorkflowCommand::UpdateCompleted { update_id, result }
+    })
+}
+
+fn arb_update_rejected_command() -> impl Strategy<Value = WorkflowCommand> {
+    (arb_small_string(), arb_small_string()).prop_map(|(update_id, failure)| {
+        WorkflowCommand::UpdateRejected { update_id, failure }
+    })
+}
+
 fn arb_workflow_execution_timed_out_request(
     now: OffsetDateTime,
 ) -> impl Strategy<Value = WorkflowExecutionTimedOutRequest> {
@@ -718,6 +756,15 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
             };
             (LoadedRun::Existing(state), Command::ExternalCancelResolved(req))
         }),
+        arb_update_request(now).prop_map(move |req| {
+            (LoadedRun::Existing(make_open_state(now)), Command::Update(req))
+        }),
+        arb_update_request(now).prop_map(move |req| {
+            (
+                LoadedRun::Existing(with_pending_wft(make_open_state(now), 58, None, 0)),
+                Command::Update(req),
+            )
+        }),
     ]
 }
 
@@ -756,6 +803,7 @@ proptest! {
         prop_assert_eq!(transition.next_state.workflow_task_timeout, req.workflow_task_timeout);
         prop_assert_eq!(transition.next_state.retry_policy.clone(), req.retry_policy);
         prop_assert_eq!(transition.next_state.attempt, req.attempt);
+        prop_assert!(transition.next_state.pending_updates.is_empty());
         prop_assert_eq!(started.0, req.continued_execution_run_id);
         prop_assert_eq!(started.1, req.first_execution_run_id);
         prop_assert_eq!(started.2, transition.next_state.retry_policy.clone());
@@ -982,6 +1030,10 @@ proptest! {
         let transition = kernel().apply(loaded, command.clone()).unwrap();
         match command {
             Command::Start(req) => {
+                prop_assert_eq!(transition.request_dedupe_ops.len(), 1);
+                prop_assert_eq!(transition.request_dedupe_ops[0].clone(), RequestDedupeOp { request_id: req.request.request_id });
+            }
+            Command::Update(req) => {
                 prop_assert_eq!(transition.request_dedupe_ops.len(), 1);
                 prop_assert_eq!(transition.request_dedupe_ops[0].clone(), RequestDedupeOp { request_id: req.request.request_id });
             }
@@ -1835,5 +1887,246 @@ fn property_42_parent_close_policy_all_paths() {
                 }
             }
         }
+    }
+}
+
+proptest! {
+    #[test]
+    fn property_53_update_acceptance(req in arb_update_request(fixed_now())) {
+        let transition = kernel().apply(
+            LoadedRun::Existing(make_open_state(fixed_now())),
+            Command::Update(req.clone()),
+        ).unwrap();
+
+        prop_assert_eq!(transition.request_dedupe_ops.len(), 1);
+        match &transition.history_events[0].kind {
+            HistoryEventKind::WorkflowExecutionUpdateAccepted { update_id, update_name, input } => {
+                prop_assert_eq!(update_id, &req.update_id);
+                prop_assert_eq!(update_name, &req.update_name);
+                prop_assert_eq!(input, &req.input);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        let pending = transition.next_state.pending_updates.get(&req.update_id).unwrap();
+        prop_assert_eq!(&pending.name, &req.update_name);
+        prop_assert_eq!(pending.accepted_event_id, transition.history_events[0].event_id);
+    }
+
+    #[test]
+    fn property_54_update_wft_coalescing(req in arb_update_request(fixed_now()), with_wft in any::<bool>()) {
+        let now = fixed_now();
+        let state = if with_wft {
+            with_pending_wft(make_open_state(now), 59, None, 0)
+        } else {
+            make_open_state(now)
+        };
+        let transition = kernel().apply(LoadedRun::Existing(state), Command::Update(req)).unwrap();
+        let enqueued = transition.dispatch_ops.iter().filter(|op| matches!(op, DispatchOp::EnqueueWorkflowTask { .. })).count();
+        if with_wft {
+            prop_assert_eq!(enqueued, 0);
+        } else {
+            prop_assert_eq!(enqueued, 1);
+        }
+    }
+
+    #[test]
+    fn property_55_update_completion_and_rejection_remove_pending(
+        completed_cmd in arb_update_completed_command(),
+        rejected_cmd in arb_update_rejected_command(),
+    ) {
+        let now = fixed_now();
+        let update_id = match &completed_cmd {
+            WorkflowCommand::UpdateCompleted { update_id, .. } => update_id.clone(),
+            _ => unreachable!(),
+        };
+        let started = with_pending_wft(with_pending_update(make_open_state(now), &update_id), 60, Some(20), 1);
+        let token = WorkflowTaskToken {
+            run_key: started.run_key,
+            logical_seq: LogicalTaskSeq(60),
+            started_event_id: 20,
+            attempt: 1,
+            shard_epoch: ShardEpoch::ZERO,
+        };
+
+        let completed = kernel().apply(
+            LoadedRun::Existing(started.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: token.clone(),
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![completed_cmd],
+                force_new_workflow_task: false,
+                now,
+            }),
+        ).unwrap();
+        prop_assert!(!completed.next_state.pending_updates.contains_key(&update_id));
+
+        let rejected_update_id = match &rejected_cmd {
+            WorkflowCommand::UpdateRejected { update_id, .. } => update_id.clone(),
+            _ => unreachable!(),
+        };
+        let started = with_pending_wft(with_pending_update(make_open_state(now), &rejected_update_id), 60, Some(20), 1);
+        let rejected = kernel().apply(
+            LoadedRun::Existing(started),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token,
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![rejected_cmd],
+                force_new_workflow_task: false,
+                now,
+            }),
+        ).unwrap();
+        prop_assert!(!rejected.next_state.pending_updates.contains_key(&rejected_update_id));
+    }
+
+    #[test]
+    fn property_56_protocol_message_bodies(
+        input in arb_payloads(),
+        result in arb_payloads(),
+        failure in arb_small_string(),
+    ) {
+        let now = fixed_now();
+        let base = with_pending_wft(make_open_state(now), 61, Some(21), 1);
+        let accepted = kernel().apply(
+            LoadedRun::Existing(base.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: base.run_key,
+                    logical_seq: LogicalTaskSeq(61),
+                    started_event_id: 21,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::ProtocolMessage {
+                    message_id: "msg-1".into(),
+                    body: UpdateProtocolBody::Accepted {
+                        update_id: "update-1".into(),
+                        update_name: "handler".into(),
+                        input,
+                    },
+                }],
+                force_new_workflow_task: false,
+                now,
+            }),
+        ).unwrap();
+        prop_assert!(accepted.next_state.pending_updates.contains_key("update-1"));
+
+        let started = with_pending_wft(with_pending_update(make_open_state(now), "update-1"), 62, Some(22), 1);
+        let completed = kernel().apply(
+            LoadedRun::Existing(started.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: started.run_key,
+                    logical_seq: LogicalTaskSeq(62),
+                    started_event_id: 22,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::ProtocolMessage {
+                    message_id: "msg-2".into(),
+                    body: UpdateProtocolBody::Completed {
+                        update_id: "update-1".into(),
+                        result,
+                    },
+                }],
+                force_new_workflow_task: false,
+                now,
+            }),
+        ).unwrap();
+        prop_assert!(!completed.next_state.pending_updates.contains_key("update-1"));
+
+        let started = with_pending_wft(with_pending_update(make_open_state(now), "update-1"), 63, Some(23), 1);
+        let rejected = kernel().apply(
+            LoadedRun::Existing(started.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: started.run_key,
+                    logical_seq: LogicalTaskSeq(63),
+                    started_event_id: 23,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::ProtocolMessage {
+                    message_id: "msg-3".into(),
+                    body: UpdateProtocolBody::Rejected {
+                        update_id: "update-1".into(),
+                        failure,
+                    },
+                }],
+                force_new_workflow_task: false,
+                now,
+            }),
+        ).unwrap();
+        prop_assert!(!rejected.next_state.pending_updates.contains_key("update-1"));
+    }
+}
+
+#[test]
+fn property_57_close_clears_pending_updates() {
+    let now = fixed_now();
+    let direct_close = |command| {
+        kernel()
+            .apply(
+                LoadedRun::Existing(with_pending_update(make_open_state(now), "update-1")),
+                command,
+            )
+            .unwrap()
+    };
+
+    let wf_close = |command| {
+        let started = with_pending_wft(with_pending_update(make_open_state(now), "update-1"), 64, Some(24), 1);
+        kernel()
+            .apply(
+                LoadedRun::Existing(started.clone()),
+                Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                    token: WorkflowTaskToken {
+                        run_key: started.run_key,
+                        logical_seq: LogicalTaskSeq(64),
+                        started_event_id: 24,
+                        attempt: 1,
+                        shard_epoch: ShardEpoch::ZERO,
+                    },
+                    identity: WorkerIdentity("worker".into()),
+                    commands: vec![command],
+                    force_new_workflow_task: false,
+                    now,
+                }),
+            )
+            .unwrap()
+    };
+
+    let transitions = vec![
+        direct_close(Command::Terminate(TerminateRequest {
+            reason: "reason".into(),
+            details: None,
+            identity: "tester".into(),
+            request: request_context("term", now),
+            now,
+        })),
+        direct_close(Command::WorkflowExecutionTimedOut(WorkflowExecutionTimedOutRequest {
+            timeout_type: WorkflowTimeoutType::RunTimeout,
+            retry_state: RetryState::Timeout,
+            now,
+        })),
+        wf_close(WorkflowCommand::CompleteWorkflow { result: payloads("done") }),
+        wf_close(WorkflowCommand::FailWorkflow { message: "fail".into(), details: None }),
+        wf_close(WorkflowCommand::CancelWorkflow),
+        wf_close(WorkflowCommand::ContinueAsNew {
+            new_run_id: RunId::new(),
+            workflow_type: WorkflowType("next".into()),
+            task_queue: TaskQueueName("queue".into()),
+            input: payloads("input"),
+            memo: memo_with("memo"),
+            search_attributes: search_attrs_with("search"),
+            workflow_execution_timeout: None,
+            workflow_run_timeout: None,
+            workflow_task_timeout: default_workflow_task_timeout(),
+        }),
+    ];
+
+    for transition in transitions {
+        assert!(transition.next_state.pending_updates.is_empty());
     }
 }

@@ -187,6 +187,19 @@ pub enum HistoryEventKind {
         target_workflow_id: WorkflowId,
         cause: String,
     },
+    WorkflowExecutionUpdateAccepted {
+        update_id: String,
+        update_name: String,
+        input: Payloads,
+    },
+    WorkflowExecutionUpdateCompleted {
+        update_id: String,
+        result: Payloads,
+    },
+    WorkflowExecutionUpdateRejected {
+        update_id: String,
+        failure: String,
+    },
     WorkflowExecutionCompleted {
         result: Payloads,
     },

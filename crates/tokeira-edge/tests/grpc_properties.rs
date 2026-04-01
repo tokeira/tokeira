@@ -157,6 +157,9 @@ proptest! {
             | WorkflowCommand::StartChildWorkflow { .. }
             | WorkflowCommand::SignalExternalWorkflowExecution { .. }
             | WorkflowCommand::RequestCancelExternalWorkflowExecution { .. }
+            | WorkflowCommand::UpdateCompleted { .. }
+            | WorkflowCommand::UpdateRejected { .. }
+            | WorkflowCommand::ProtocolMessage { .. }
             | WorkflowCommand::RequestNewWorkflowTask => {
                 prop_assert!(workflow_command_to_proto(&cmd).is_err());
             }
@@ -594,6 +597,22 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
         arb_small_string().prop_map(|target_workflow_id| WorkflowCommand::RequestCancelExternalWorkflowExecution {
             target_workflow_id: tokeira_types::WorkflowId(target_workflow_id),
             target_run_id: Some(tokeira_types::RunId::new()),
+        }),
+        arb_payloads().prop_map(|result| WorkflowCommand::UpdateCompleted {
+            update_id: "update-1".into(),
+            result,
+        }),
+        arb_small_string().prop_map(|failure| WorkflowCommand::UpdateRejected {
+            update_id: "update-1".into(),
+            failure,
+        }),
+        arb_payloads().prop_map(|input| WorkflowCommand::ProtocolMessage {
+            message_id: "msg-1".into(),
+            body: tokeira_kernel::UpdateProtocolBody::Accepted {
+                update_id: "update-1".into(),
+                update_name: "handler".into(),
+                input,
+            },
         }),
     ]
 }

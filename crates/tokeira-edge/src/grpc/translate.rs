@@ -353,6 +353,9 @@ pub fn workflow_command_to_proto(
         | WorkflowCommand::StartChildWorkflow { .. }
         | WorkflowCommand::SignalExternalWorkflowExecution { .. }
         | WorkflowCommand::RequestCancelExternalWorkflowExecution { .. }
+        | WorkflowCommand::UpdateCompleted { .. }
+        | WorkflowCommand::UpdateRejected { .. }
+        | WorkflowCommand::ProtocolMessage { .. }
         | WorkflowCommand::RequestNewWorkflowTask
             => {
             return Err(ProtoConversionError::MissingField(

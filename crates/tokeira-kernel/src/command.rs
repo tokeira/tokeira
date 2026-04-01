@@ -16,6 +16,7 @@ use crate::state::ParentClosePolicy;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     Start(StartRequest),
+    Update(UpdateRequest),
     Signal(SignalRequest),
     Cancel(CancelRequest),
     Terminate(TerminateRequest),
@@ -90,6 +91,15 @@ pub struct StartRequest {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SignalRequest {
     pub signal_name: String,
+    pub input: Payloads,
+    pub request: RequestContext,
+    pub now: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateRequest {
+    pub update_id: String,
+    pub update_name: String,
     pub input: Payloads,
     pub request: RequestContext,
     pub now: OffsetDateTime,
@@ -231,6 +241,23 @@ pub enum ExternalCancelResult {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub enum UpdateProtocolBody {
+    Accepted {
+        update_id: String,
+        update_name: String,
+        input: Payloads,
+    },
+    Completed {
+        update_id: String,
+        result: Payloads,
+    },
+    Rejected {
+        update_id: String,
+        failure: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct TimerDueRequest {
     pub timer_id: String,
     pub fired_at: OffsetDateTime,
@@ -299,6 +326,18 @@ pub enum WorkflowCommand {
     RequestCancelExternalWorkflowExecution {
         target_workflow_id: WorkflowId,
         target_run_id: Option<RunId>,
+    },
+    UpdateCompleted {
+        update_id: String,
+        result: Payloads,
+    },
+    UpdateRejected {
+        update_id: String,
+        failure: String,
+    },
+    ProtocolMessage {
+        message_id: String,
+        body: UpdateProtocolBody,
     },
     RequestNewWorkflowTask,
 }

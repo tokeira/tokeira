@@ -13,13 +13,13 @@ use crate::{
         ChildStartConfirmedRequest, ChildStartResult, Command, ExternalCancelResolvedRequest,
         ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult, RetryState,
         SignalRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest,
-        WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowTaskCompletedRequest,
-        WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
+        UpdateProtocolBody, UpdateRequest, WorkflowCommand, WorkflowExecutionTimedOutRequest,
+        WorkflowTaskCompletedRequest, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
     },
     event::{ActivityResolution, HistoryEvent, HistoryEventKind},
     state::{
         ActivityState, ChildWorkflowState, LoadedRun, ParentClosePolicy, PendingExternalCancel,
-        PendingExternalSignal, PendingWorkflowTask, TimerState, WorkflowState,
+        PendingExternalSignal, PendingUpdate, PendingWorkflowTask, TimerState, WorkflowState,
     },
     transition::{
         ActivityOp, DispatchOp, ProjectionOp, RequestDedupeOp, TimerOp, Transition,
@@ -38,6 +38,7 @@ impl Kernel for BasicKernel {
     fn apply(&self, loaded: LoadedRun, command: Command) -> Result<Transition, Reject> {
         match command {
             Command::Start(req) => self.apply_start(loaded, req),
+            Command::Update(req) => self.apply_update(loaded, req),
             Command::Signal(req) => self.apply_signal(loaded, req),
             Command::Cancel(req) => self.apply_cancel(loaded, req),
             Command::Terminate(req) => self.apply_terminate(loaded, req),
@@ -89,6 +90,7 @@ impl BasicKernel {
             children: BTreeMap::new(),
             pending_external_signals: BTreeMap::new(),
             pending_external_cancels: BTreeMap::new(),
+            pending_updates: BTreeMap::new(),
             started_at: req.now,
             closed_at: None,
         };
@@ -138,6 +140,37 @@ impl BasicKernel {
         // Insight: Tokeira keeps the "at most one outstanding workflow task"
         // invariant because it dramatically reduces wakeup amplification during
         // signal floods without weakening per-run correctness.
+        if builder.state.pending_workflow_task.is_none() {
+            builder.schedule_workflow_task();
+        }
+
+        Ok(builder.finish())
+    }
+
+    fn apply_update(&self, loaded: LoadedRun, req: UpdateRequest) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+        if state.pending_updates.contains_key(&req.update_id) {
+            return Err(Reject::DuplicateUpdateId(req.update_id));
+        }
+
+        let mut builder = TransitionBuilder::new(state, req.now);
+        builder.request_dedupe_ops.push(RequestDedupeOp {
+            request_id: req.request.request_id.clone(),
+        });
+        let accepted_event_id = builder.emit(HistoryEventKind::WorkflowExecutionUpdateAccepted {
+            update_id: req.update_id.clone(),
+            update_name: req.update_name.clone(),
+            input: req.input,
+        });
+        builder.state.pending_updates.insert(
+            req.update_id.clone(),
+            PendingUpdate {
+                update_id: req.update_id,
+                accepted_event_id,
+                name: req.update_name,
+            },
+        );
+
         if builder.state.pending_workflow_task.is_none() {
             builder.schedule_workflow_task();
         }
@@ -982,6 +1015,76 @@ fn apply_workflow_command(builder: &mut TransitionBuilder, command: WorkflowComm
                 });
             Ok(false)
         }
+        WorkflowCommand::UpdateCompleted { update_id, result } => {
+            if !builder.state.pending_updates.contains_key(&update_id) {
+                return Err(Reject::UnknownUpdate(update_id));
+            }
+            builder.emit(HistoryEventKind::WorkflowExecutionUpdateCompleted {
+                update_id: update_id.clone(),
+                result,
+            });
+            builder.state.pending_updates.remove(&update_id);
+            Ok(false)
+        }
+        WorkflowCommand::UpdateRejected { update_id, failure } => {
+            if !builder.state.pending_updates.contains_key(&update_id) {
+                return Err(Reject::UnknownUpdate(update_id));
+            }
+            builder.emit(HistoryEventKind::WorkflowExecutionUpdateRejected {
+                update_id: update_id.clone(),
+                failure,
+            });
+            builder.state.pending_updates.remove(&update_id);
+            Ok(false)
+        }
+        WorkflowCommand::ProtocolMessage { message_id: _, body } => {
+            match body {
+                UpdateProtocolBody::Accepted {
+                    update_id,
+                    update_name,
+                    input,
+                } => {
+                    if builder.state.pending_updates.contains_key(&update_id) {
+                        return Err(Reject::DuplicateUpdateId(update_id));
+                    }
+                    let accepted_event_id =
+                        builder.emit(HistoryEventKind::WorkflowExecutionUpdateAccepted {
+                            update_id: update_id.clone(),
+                            update_name: update_name.clone(),
+                            input,
+                        });
+                    builder.state.pending_updates.insert(
+                        update_id.clone(),
+                        PendingUpdate {
+                            update_id,
+                            accepted_event_id,
+                            name: update_name,
+                        },
+                    );
+                }
+                UpdateProtocolBody::Completed { update_id, result } => {
+                    if !builder.state.pending_updates.contains_key(&update_id) {
+                        return Err(Reject::UnknownUpdate(update_id));
+                    }
+                    builder.emit(HistoryEventKind::WorkflowExecutionUpdateCompleted {
+                        update_id: update_id.clone(),
+                        result,
+                    });
+                    builder.state.pending_updates.remove(&update_id);
+                }
+                UpdateProtocolBody::Rejected { update_id, failure } => {
+                    if !builder.state.pending_updates.contains_key(&update_id) {
+                        return Err(Reject::UnknownUpdate(update_id));
+                    }
+                    builder.emit(HistoryEventKind::WorkflowExecutionUpdateRejected {
+                        update_id: update_id.clone(),
+                        failure,
+                    });
+                    builder.state.pending_updates.remove(&update_id);
+                }
+            }
+            Ok(false)
+        }
     }
 }
 
@@ -1054,6 +1157,7 @@ impl TransitionBuilder {
         self.state.sticky = None;
         self.state.pending_external_signals.clear();
         self.state.pending_external_cancels.clear();
+        self.state.pending_updates.clear();
         self.projection_ops.push(ProjectionOp::CloseExecution {
             status,
             closed_at: self.now,
@@ -1140,6 +1244,10 @@ pub enum Reject {
     UnknownExternalSignal(i64),
     #[error("unknown external cancel: initiated_event_id={0}")]
     UnknownExternalCancel(i64),
+    #[error("unknown update: {0}")]
+    UnknownUpdate(String),
+    #[error("duplicate update id: {0}")]
+    DuplicateUpdateId(String),
     #[error("commands after close at index {index}")]
     CommandsAfterClose { index: usize },
 

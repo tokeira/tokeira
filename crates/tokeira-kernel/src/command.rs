@@ -6,6 +6,7 @@ use tokeira_types::{
 };
 
 use crate::event::ActivityResolution;
+use crate::state::ParentClosePolicy;
 
 /// Commands are authoritative things that the server has decided happened.
 ///
@@ -24,6 +25,8 @@ pub enum Command {
     WorkflowTaskFailed(WorkflowTaskFailedRequest),
     WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest),
     ActivityResolved(ActivityResolvedRequest),
+    ChildStartConfirmed(ChildStartConfirmedRequest),
+    ChildResolved(ChildResolvedRequest),
     TimerDue(TimerDueRequest),
 }
 
@@ -165,6 +168,41 @@ pub struct ActivityResolvedRequest {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct ChildStartConfirmedRequest {
+    pub child_workflow_id: WorkflowId,
+    pub initiated_event_id: i64,
+    pub result: ChildStartResult,
+    pub now: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChildStartResult {
+    Started {
+        child_run_id: RunId,
+        workflow_type: WorkflowType,
+    },
+    Failed {
+        cause: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChildResolvedRequest {
+    pub child_workflow_id: WorkflowId,
+    pub resolution: ChildResolution,
+    pub now: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChildResolution {
+    Completed { result: Payloads },
+    Failed { failure: String },
+    Canceled,
+    Terminated,
+    TimedOut,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct TimerDueRequest {
     pub timer_id: String,
     pub fired_at: OffsetDateTime,
@@ -215,6 +253,14 @@ pub enum WorkflowCommand {
     },
     CancelTimer {
         timer_id: String,
+    },
+    StartChildWorkflow {
+        child_workflow_id: WorkflowId,
+        namespace_id: NamespaceId,
+        workflow_type: WorkflowType,
+        task_queue: TaskQueueName,
+        input: Payloads,
+        parent_close_policy: ParentClosePolicy,
     },
     RequestNewWorkflowTask,
 }

@@ -9,14 +9,16 @@ use tokeira_types::{
 
 use crate::{
     command::{
-        ActivityResolvedRequest, CancelRequest, Command, SignalRequest, StartRequest,
-        StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, WorkflowCommand,
-        WorkflowExecutionTimedOutRequest, WorkflowTaskCompletedRequest, WorkflowTaskFailedRequest,
-        WorkflowTaskTimedOutRequest, RetryState,
+        ActivityResolvedRequest, CancelRequest, ChildResolution, ChildResolvedRequest,
+        ChildStartConfirmedRequest, ChildStartResult, Command, RetryState, SignalRequest,
+        StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest,
+        WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowTaskCompletedRequest,
+        WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
     },
     event::{ActivityResolution, HistoryEvent, HistoryEventKind},
     state::{
-        ActivityState, LoadedRun, PendingWorkflowTask, TimerState, WorkflowState,
+        ActivityState, ChildWorkflowState, LoadedRun, ParentClosePolicy, PendingWorkflowTask,
+        TimerState, WorkflowState,
     },
     transition::{
         ActivityOp, DispatchOp, ProjectionOp, RequestDedupeOp, TimerOp, Transition,
@@ -46,6 +48,8 @@ impl Kernel for BasicKernel {
             Command::WorkflowTaskFailed(req) => self.apply_workflow_task_failed(loaded, req),
             Command::WorkflowTaskTimedOut(req) => self.apply_workflow_task_timed_out(loaded, req),
             Command::ActivityResolved(req) => self.apply_activity_resolved(loaded, req),
+            Command::ChildStartConfirmed(req) => self.apply_child_start_confirmed(loaded, req),
+            Command::ChildResolved(req) => self.apply_child_resolved(loaded, req),
             Command::TimerDue(req) => self.apply_timer_due(loaded, req),
         }
     }
@@ -79,6 +83,7 @@ impl BasicKernel {
             attempt: req.attempt,
             activities: BTreeMap::new(),
             timers: BTreeMap::new(),
+            children: BTreeMap::new(),
             started_at: req.now,
             closed_at: None,
         };
@@ -181,6 +186,8 @@ impl BasicKernel {
             builder.timer_ops.push(TimerOp::Delete { timer_id });
         }
 
+        builder.apply_parent_close_policy();
+
         Ok(builder.finish())
     }
 
@@ -206,6 +213,8 @@ impl BasicKernel {
         for (timer_id, _) in timers {
             builder.timer_ops.push(TimerOp::Delete { timer_id });
         }
+
+        builder.apply_parent_close_policy();
 
         Ok(builder.finish())
     }
@@ -354,6 +363,112 @@ impl BasicKernel {
         builder.activity_ops.push(ActivityOp::Delete {
             activity_id: activity.activity_id,
         });
+
+        if builder.state.pending_workflow_task.is_none() {
+            builder.schedule_workflow_task();
+        }
+
+        Ok(builder.finish())
+    }
+
+    fn apply_child_start_confirmed(
+        &self,
+        loaded: LoadedRun,
+        req: ChildStartConfirmedRequest,
+    ) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+        let mut builder = TransitionBuilder::new(state, req.now);
+        let child = builder
+            .state
+            .children
+            .get(&req.child_workflow_id)
+            .cloned()
+            .ok_or_else(|| Reject::UnknownChild(req.child_workflow_id.clone()))?;
+
+        if child.initiated_event_id != req.initiated_event_id {
+            return Err(Reject::StaleChildConfirmation {
+                child_workflow_id: req.child_workflow_id,
+                expected_initiated_event_id: child.initiated_event_id,
+            });
+        }
+
+        match req.result {
+            ChildStartResult::Started {
+                child_run_id,
+                workflow_type,
+            } => {
+                let child_run_id_for_state = child_run_id;
+                let started_event_id = builder.emit(HistoryEventKind::ChildWorkflowExecutionStarted {
+                    child_workflow_id: child.child_workflow_id.clone(),
+                    child_run_id,
+                    workflow_type,
+                });
+                if let Some(current) = builder.state.children.get_mut(&child.child_workflow_id) {
+                    current.child_run_id = Some(child_run_id_for_state);
+                    current.started_event_id = Some(started_event_id);
+                }
+            }
+            ChildStartResult::Failed { cause } => {
+                builder.emit(HistoryEventKind::StartChildWorkflowExecutionFailed {
+                    child_workflow_id: child.child_workflow_id.clone(),
+                    cause,
+                });
+                builder.state.children.remove(&child.child_workflow_id);
+            }
+        }
+
+        if builder.state.pending_workflow_task.is_none() {
+            builder.schedule_workflow_task();
+        }
+
+        Ok(builder.finish())
+    }
+
+    fn apply_child_resolved(
+        &self,
+        loaded: LoadedRun,
+        req: ChildResolvedRequest,
+    ) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+        let mut builder = TransitionBuilder::new(state, req.now);
+        let child = builder
+            .state
+            .children
+            .get(&req.child_workflow_id)
+            .cloned()
+            .ok_or_else(|| Reject::UnknownChild(req.child_workflow_id.clone()))?;
+
+        match req.resolution {
+            ChildResolution::Completed { result } => {
+                builder.emit(HistoryEventKind::ChildWorkflowExecutionCompleted {
+                    child_workflow_id: child.child_workflow_id.clone(),
+                    result,
+                });
+            }
+            ChildResolution::Failed { failure } => {
+                builder.emit(HistoryEventKind::ChildWorkflowExecutionFailed {
+                    child_workflow_id: child.child_workflow_id.clone(),
+                    failure,
+                });
+            }
+            ChildResolution::Canceled => {
+                builder.emit(HistoryEventKind::ChildWorkflowExecutionCanceled {
+                    child_workflow_id: child.child_workflow_id.clone(),
+                });
+            }
+            ChildResolution::Terminated => {
+                builder.emit(HistoryEventKind::ChildWorkflowExecutionTerminated {
+                    child_workflow_id: child.child_workflow_id.clone(),
+                });
+            }
+            ChildResolution::TimedOut => {
+                builder.emit(HistoryEventKind::ChildWorkflowExecutionTimedOut {
+                    child_workflow_id: child.child_workflow_id.clone(),
+                });
+            }
+        }
+
+        builder.state.children.remove(&child.child_workflow_id);
 
         if builder.state.pending_workflow_task.is_none() {
             builder.schedule_workflow_task();
@@ -607,6 +722,7 @@ fn apply_workflow_command(builder: &mut TransitionBuilder, command: WorkflowComm
         WorkflowCommand::CompleteWorkflow { result } => {
             builder.emit(HistoryEventKind::WorkflowExecutionCompleted { result });
             builder.close(ExecutionStatus::Completed);
+            builder.apply_parent_close_policy();
             Ok(true)
         }
         WorkflowCommand::FailWorkflow { message, details } => {
@@ -623,6 +739,7 @@ fn apply_workflow_command(builder: &mut TransitionBuilder, command: WorkflowComm
                 attempt,
             });
             builder.close(ExecutionStatus::Failed);
+            builder.apply_parent_close_policy();
             Ok(true)
         }
         WorkflowCommand::ContinueAsNew {
@@ -648,11 +765,13 @@ fn apply_workflow_command(builder: &mut TransitionBuilder, command: WorkflowComm
                 workflow_task_timeout,
             });
             builder.close(ExecutionStatus::ContinuedAsNew);
+            builder.apply_parent_close_policy();
             Ok(true)
         }
         WorkflowCommand::CancelWorkflow => {
             builder.emit(HistoryEventKind::WorkflowExecutionCanceled);
             builder.close(ExecutionStatus::Cancelled);
+            builder.apply_parent_close_policy();
             Ok(true)
         }
         WorkflowCommand::RequestCancelActivity { activity_id } => {
@@ -677,6 +796,44 @@ fn apply_workflow_command(builder: &mut TransitionBuilder, command: WorkflowComm
             if builder.state.pending_workflow_task.is_none() && builder.state.is_open() {
                 builder.schedule_workflow_task();
             }
+            Ok(false)
+        }
+        WorkflowCommand::StartChildWorkflow {
+            child_workflow_id,
+            namespace_id,
+            workflow_type,
+            task_queue,
+            input,
+            parent_close_policy,
+        } => {
+            if builder.state.children.contains_key(&child_workflow_id) {
+                return Err(Reject::DuplicateChildWorkflowId(child_workflow_id));
+            }
+            let initiated_event_id = builder.emit(HistoryEventKind::StartChildWorkflowExecutionInitiated {
+                child_workflow_id: child_workflow_id.clone(),
+                workflow_type: workflow_type.clone(),
+                task_queue: task_queue.clone(),
+                input: input.clone(),
+                namespace_id,
+                parent_close_policy,
+            });
+            builder.state.children.insert(
+                child_workflow_id.clone(),
+                ChildWorkflowState {
+                    child_workflow_id: child_workflow_id.clone(),
+                    child_run_id: None,
+                    initiated_event_id,
+                    started_event_id: None,
+                    parent_close_policy,
+                },
+            );
+            builder.dispatch_ops.push(DispatchOp::StartChildWorkflow {
+                child_workflow_id,
+                namespace_id,
+                workflow_type,
+                task_queue,
+                input,
+            });
             Ok(false)
         }
     }
@@ -755,6 +912,32 @@ impl TransitionBuilder {
         });
     }
 
+    fn apply_parent_close_policy(&mut self) {
+        let children = std::mem::take(&mut self.state.children);
+        for (_, child) in children {
+            let Some(child_run_id) = child.child_run_id else {
+                continue;
+            };
+            match child.parent_close_policy {
+                ParentClosePolicy::Terminate => {
+                    self.dispatch_ops.push(DispatchOp::TerminateChild {
+                        child_workflow_id: child.child_workflow_id,
+                        child_run_id,
+                        reason: "parent workflow closed".into(),
+                    });
+                }
+                ParentClosePolicy::RequestCancel => {
+                    self.dispatch_ops.push(DispatchOp::CancelChild {
+                        child_workflow_id: child.child_workflow_id,
+                        child_run_id,
+                        reason: "parent workflow closed".into(),
+                    });
+                }
+                ParentClosePolicy::Abandon => {}
+            }
+        }
+    }
+
     fn finish(mut self) -> Transition {
         self.state.transition_seq = self.state.transition_seq.next();
         Transition {
@@ -796,6 +979,15 @@ pub enum Reject {
     UnknownActivity(String),
     #[error("unknown timer: {0}")]
     UnknownTimer(String),
+    #[error("duplicate child workflow id: {0:?}")]
+    DuplicateChildWorkflowId(tokeira_types::WorkflowId),
+    #[error("unknown child: {0:?}")]
+    UnknownChild(tokeira_types::WorkflowId),
+    #[error("stale child confirmation for {child_workflow_id:?}: expected initiated_event_id {expected_initiated_event_id}")]
+    StaleChildConfirmation {
+        child_workflow_id: tokeira_types::WorkflowId,
+        expected_initiated_event_id: i64,
+    },
     #[error("commands after close at index {index}")]
     CommandsAfterClose { index: usize },
 

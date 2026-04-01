@@ -4,12 +4,14 @@ use proptest::prelude::*;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     event::HistoryEventKind, kernel::Kernel, ActivityOp, ActivityResolution,
-    ActivityResolvedRequest, ActivityState, BasicKernel, CancelRequest, Command, DispatchOp,
-    ExternalWorkflowExecution, LoadedRun, PendingWorkflowTask, RequestDedupeOp, SignalRequest,
-    RetryState, StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerOp,
-    TimerState, WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowState,
-    WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
-    WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType, WorkflowTimeoutType,
+    ActivityResolvedRequest, ActivityState, BasicKernel, CancelRequest, ChildResolution,
+    ChildResolvedRequest, ChildStartConfirmedRequest, ChildStartResult, ChildWorkflowState,
+    Command, DispatchOp, ExternalWorkflowExecution, LoadedRun, ParentClosePolicy,
+    PendingWorkflowTask, RequestDedupeOp, RetryState, SignalRequest, StartRequest,
+    StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerOp, TimerState,
+    WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
+    WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
+    WorkflowTaskTimeoutType, WorkflowTimeoutType,
 };
 use tokeira_types::{
     ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RequestContext,
@@ -86,6 +88,7 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         attempt: 2,
         activities: BTreeMap::new(),
         timers: BTreeMap::new(),
+        children: BTreeMap::new(),
         started_at: now - Duration::minutes(10),
         closed_at: None,
     }
@@ -133,6 +136,26 @@ fn with_timer(mut state: WorkflowState, timer_id: &str, now: OffsetDateTime) -> 
             timer_id: timer_id.into(),
             started_event_id: state.last_event_id - 2,
             fire_at: now,
+        },
+    );
+    state
+}
+
+fn with_child(
+    mut state: WorkflowState,
+    child_workflow_id: &str,
+    initiated_event_id: i64,
+    parent_close_policy: ParentClosePolicy,
+    started: bool,
+) -> WorkflowState {
+    state.children.insert(
+        WorkflowId(child_workflow_id.into()),
+        ChildWorkflowState {
+            child_workflow_id: WorkflowId(child_workflow_id.into()),
+            child_run_id: started.then(RunId::new),
+            initiated_event_id,
+            started_event_id: started.then_some(initiated_event_id + 1),
+            parent_close_policy,
         },
     );
     state
@@ -393,6 +416,34 @@ fn arb_continue_as_new_command() -> impl Strategy<Value = WorkflowCommand> {
     )
 }
 
+fn arb_parent_close_policy() -> impl Strategy<Value = ParentClosePolicy> {
+    prop_oneof![
+        Just(ParentClosePolicy::Terminate),
+        Just(ParentClosePolicy::RequestCancel),
+        Just(ParentClosePolicy::Abandon),
+    ]
+}
+
+fn arb_child_start_result() -> impl Strategy<Value = ChildStartResult> {
+    prop_oneof![
+        arb_small_string().prop_map(|workflow_type| ChildStartResult::Started {
+            child_run_id: RunId::new(),
+            workflow_type: WorkflowType(workflow_type),
+        }),
+        arb_small_string().prop_map(|cause| ChildStartResult::Failed { cause }),
+    ]
+}
+
+fn arb_child_resolution() -> impl Strategy<Value = ChildResolution> {
+    prop_oneof![
+        arb_payloads().prop_map(|result| ChildResolution::Completed { result }),
+        arb_small_string().prop_map(|failure| ChildResolution::Failed { failure }),
+        Just(ChildResolution::Canceled),
+        Just(ChildResolution::Terminated),
+        Just(ChildResolution::TimedOut),
+    ]
+}
+
 fn arb_workflow_execution_timed_out_request(
     now: OffsetDateTime,
 ) -> impl Strategy<Value = WorkflowExecutionTimedOutRequest> {
@@ -452,6 +503,16 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
             arb_payloads().prop_map(|result| vec![WorkflowCommand::CompleteWorkflow { result }]),
             (arb_small_string(), prop::option::of(arb_payload())).prop_map(|(message, details)| vec![WorkflowCommand::FailWorkflow { message, details }]),
             arb_continue_as_new_command().prop_map(|cmd| vec![cmd]),
+            (arb_small_string(), arb_small_string(), arb_small_string(), arb_payloads(), arb_parent_close_policy()).prop_map(|(child_workflow_id, workflow_type, task_queue, input, parent_close_policy)| {
+                vec![WorkflowCommand::StartChildWorkflow {
+                    child_workflow_id: WorkflowId(child_workflow_id),
+                    namespace_id: NamespaceId::new(),
+                    workflow_type: WorkflowType(workflow_type),
+                    task_queue: TaskQueueName(task_queue),
+                    input,
+                    parent_close_policy,
+                }]
+            }),
         ]
         .prop_map(move |commands| {
             let state = with_pending_wft(make_open_state(now), 30, Some(13), 1);
@@ -562,6 +623,25 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 now,
             };
             (LoadedRun::Existing(state), Command::WorkflowTaskCompleted(req))
+        }),
+        (arb_small_string(), arb_child_start_result()).prop_map(move |(child_workflow_id, result)| {
+            let state = with_child(make_open_state(now), &child_workflow_id, 21, ParentClosePolicy::Terminate, false);
+            let req = ChildStartConfirmedRequest {
+                child_workflow_id: WorkflowId(child_workflow_id),
+                initiated_event_id: 21,
+                result,
+                now,
+            };
+            (LoadedRun::Existing(state), Command::ChildStartConfirmed(req))
+        }),
+        (arb_small_string(), arb_child_resolution()).prop_map(move |(child_workflow_id, resolution)| {
+            let state = with_child(make_open_state(now), &child_workflow_id, 21, ParentClosePolicy::Terminate, true);
+            let req = ChildResolvedRequest {
+                child_workflow_id: WorkflowId(child_workflow_id),
+                resolution,
+                now,
+            };
+            (LoadedRun::Existing(state), Command::ChildResolved(req))
         }),
     ]
 }
@@ -1402,4 +1482,176 @@ fn property_24_cancel_timer_removes_timer() {
             .iter()
             .any(|op| matches!(op, TimerOp::Delete { timer_id } if timer_id == "timer-1"))
     );
+}
+
+proptest! {
+    #[test]
+    fn property_33_start_child_workflow_happy_path(
+        child_workflow_id in arb_small_string(),
+        workflow_type in arb_small_string(),
+        task_queue in arb_small_string(),
+        input in arb_payloads(),
+        parent_close_policy in arb_parent_close_policy(),
+    ) {
+        let now = fixed_now();
+        let state = with_pending_wft(make_open_state(now), 30, Some(13), 1);
+        let transition = kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(30),
+                    started_event_id: 13,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::StartChildWorkflow {
+                    child_workflow_id: WorkflowId(child_workflow_id.clone()),
+                    namespace_id: NamespaceId::new(),
+                    workflow_type: WorkflowType(workflow_type),
+                    task_queue: TaskQueueName(task_queue),
+                    input,
+                    parent_close_policy,
+                }],
+                force_new_workflow_task: false,
+                now,
+            }),
+        ).unwrap();
+
+        let child = transition.next_state.children.get(&WorkflowId(child_workflow_id)).unwrap();
+        prop_assert_eq!(child.child_run_id, None);
+        prop_assert_eq!(child.started_event_id, None);
+        prop_assert_eq!(child.parent_close_policy, parent_close_policy);
+        prop_assert_eq!(transition.history_events.iter().any(|event| matches!(
+            event.kind,
+            HistoryEventKind::StartChildWorkflowExecutionInitiated { .. }
+        )), true);
+        prop_assert_eq!(transition.dispatch_ops.iter().any(|op| matches!(
+            op,
+            DispatchOp::StartChildWorkflow { .. }
+        )), true);
+    }
+
+    #[test]
+    fn property_40_child_resolved_removes_child(
+        child_workflow_id in arb_small_string(),
+        resolution in arb_child_resolution(),
+    ) {
+        let now = fixed_now();
+        let state = with_child(make_open_state(now), &child_workflow_id, 22, ParentClosePolicy::Terminate, true);
+        let transition = kernel().apply(
+            LoadedRun::Existing(state),
+            Command::ChildResolved(ChildResolvedRequest {
+                child_workflow_id: WorkflowId(child_workflow_id.clone()),
+                resolution,
+                now,
+            }),
+        ).unwrap();
+
+        prop_assert!(!transition.next_state.children.contains_key(&WorkflowId(child_workflow_id)));
+    }
+}
+
+#[test]
+fn property_42_parent_close_policy_all_paths() {
+    let now = fixed_now();
+    for policy in [
+        ParentClosePolicy::Terminate,
+        ParentClosePolicy::RequestCancel,
+        ParentClosePolicy::Abandon,
+    ] {
+        let direct_close = |command| {
+            kernel()
+                .apply(
+                    LoadedRun::Existing(with_child(make_open_state(now), "child-1", 10, policy, true)),
+                    command,
+                )
+                .unwrap()
+        };
+
+        let wf_close = |command| {
+            let started = with_pending_wft(
+                with_child(make_open_state(now), "child-1", 10, policy, true),
+                31,
+                Some(14),
+                1,
+            );
+            kernel()
+                .apply(
+                    LoadedRun::Existing(started.clone()),
+                    Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                        token: WorkflowTaskToken {
+                            run_key: started.run_key,
+                            logical_seq: LogicalTaskSeq(31),
+                            started_event_id: 14,
+                            attempt: 1,
+                            shard_epoch: ShardEpoch::ZERO,
+                        },
+                        identity: WorkerIdentity("worker".into()),
+                        commands: vec![command],
+                        force_new_workflow_task: false,
+                        now,
+                    }),
+                )
+                .unwrap()
+        };
+
+        let transitions = vec![
+            direct_close(Command::Terminate(TerminateRequest {
+                reason: "reason".into(),
+                details: None,
+                identity: "tester".into(),
+                request: request_context("term", now),
+                now,
+            })),
+            direct_close(Command::WorkflowExecutionTimedOut(WorkflowExecutionTimedOutRequest {
+                timeout_type: WorkflowTimeoutType::RunTimeout,
+                retry_state: RetryState::Timeout,
+                now,
+            })),
+            wf_close(WorkflowCommand::CompleteWorkflow { result: payloads("done") }),
+            wf_close(WorkflowCommand::FailWorkflow { message: "fail".into(), details: None }),
+            wf_close(WorkflowCommand::CancelWorkflow),
+            wf_close(WorkflowCommand::ContinueAsNew {
+                new_run_id: RunId::new(),
+                workflow_type: WorkflowType("next".into()),
+                task_queue: TaskQueueName("queue".into()),
+                input: payloads("input"),
+                memo: memo_with("memo"),
+                search_attributes: search_attrs_with("search"),
+                workflow_execution_timeout: None,
+                workflow_run_timeout: None,
+                workflow_task_timeout: default_workflow_task_timeout(),
+            }),
+        ];
+
+        for transition in transitions {
+            assert!(transition.next_state.children.is_empty());
+            let terminate_count = transition
+                .dispatch_ops
+                .iter()
+                .filter(|op| matches!(op, DispatchOp::TerminateChild { .. }))
+                .count();
+            let cancel_count = transition
+                .dispatch_ops
+                .iter()
+                .filter(|op| matches!(op, DispatchOp::CancelChild { .. }))
+                .count();
+            match policy {
+                ParentClosePolicy::Terminate => {
+                    assert_eq!(terminate_count, 1);
+                    assert_eq!(cancel_count, 0);
+                }
+                ParentClosePolicy::RequestCancel => {
+                    assert_eq!(terminate_count, 0);
+                    assert_eq!(cancel_count, 1);
+                }
+                ParentClosePolicy::Abandon => {
+                    assert_eq!(terminate_count, 0);
+                    assert_eq!(cancel_count, 0);
+                }
+            }
+        }
+    }
 }

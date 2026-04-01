@@ -1,13 +1,14 @@
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
-    ExecutionStatus, LogicalTaskSeq, Memo, Payload, Payloads, RetryPolicy, RunId,
-    SearchAttributes, TaskQueueName, WorkerIdentity, WorkflowType,
+    ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RetryPolicy, RunId,
+    SearchAttributes, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
 };
 
 use crate::command::{
     ExternalWorkflowExecution, RetryState, WorkflowTaskFailedCause, WorkflowTaskTimeoutType,
     WorkflowTimeoutType,
 };
+use crate::state::ParentClosePolicy;
 
 /// Authoritative history event.
 ///
@@ -123,6 +124,40 @@ pub enum HistoryEventKind {
     },
     ActivityTaskCancelRequested {
         activity_id: String,
+    },
+    StartChildWorkflowExecutionInitiated {
+        child_workflow_id: WorkflowId,
+        workflow_type: WorkflowType,
+        task_queue: TaskQueueName,
+        input: Payloads,
+        namespace_id: NamespaceId,
+        parent_close_policy: ParentClosePolicy,
+    },
+    ChildWorkflowExecutionStarted {
+        child_workflow_id: WorkflowId,
+        child_run_id: RunId,
+        workflow_type: WorkflowType,
+    },
+    StartChildWorkflowExecutionFailed {
+        child_workflow_id: WorkflowId,
+        cause: String,
+    },
+    ChildWorkflowExecutionCompleted {
+        child_workflow_id: WorkflowId,
+        result: Payloads,
+    },
+    ChildWorkflowExecutionFailed {
+        child_workflow_id: WorkflowId,
+        failure: String,
+    },
+    ChildWorkflowExecutionCanceled {
+        child_workflow_id: WorkflowId,
+    },
+    ChildWorkflowExecutionTerminated {
+        child_workflow_id: WorkflowId,
+    },
+    ChildWorkflowExecutionTimedOut {
+        child_workflow_id: WorkflowId,
     },
     WorkflowExecutionCompleted {
         result: Payloads,

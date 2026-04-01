@@ -2,7 +2,8 @@ use time::Duration;
 use smallvec::SmallVec;
 use time::OffsetDateTime;
 use tokeira_types::{
-    ExecutionStatus, Memo, QueueKey, RequestId, SearchAttributes, TransitionSeq,
+    ExecutionStatus, Memo, NamespaceId, Payloads, QueueKey, RequestId, RunId, SearchAttributes,
+    TaskQueueName, TransitionSeq, WorkflowId, WorkflowType,
 };
 
 use crate::{event::HistoryEvent, state::{ActivityState, TimerState, WorkflowState}};
@@ -65,6 +66,23 @@ pub enum DispatchOp {
         schedule_to_start_timeout: Option<Duration>,
         start_to_close_timeout: Option<Duration>,
         heartbeat_timeout: Option<Duration>,
+    },
+    StartChildWorkflow {
+        child_workflow_id: WorkflowId,
+        namespace_id: NamespaceId,
+        workflow_type: WorkflowType,
+        task_queue: TaskQueueName,
+        input: Payloads,
+    },
+    TerminateChild {
+        child_workflow_id: WorkflowId,
+        child_run_id: RunId,
+        reason: String,
+    },
+    CancelChild {
+        child_workflow_id: WorkflowId,
+        child_run_id: RunId,
+        reason: String,
     },
 }
 

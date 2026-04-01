@@ -350,6 +350,7 @@ pub fn workflow_command_to_proto(
         | WorkflowCommand::ContinueAsNew { .. }
         | WorkflowCommand::RequestCancelActivity { .. }
         | WorkflowCommand::CancelTimer { .. }
+        | WorkflowCommand::StartChildWorkflow { .. }
         | WorkflowCommand::RequestNewWorkflowTask
             => {
             return Err(ProtoConversionError::MissingField(

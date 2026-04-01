@@ -154,6 +154,7 @@ proptest! {
             | WorkflowCommand::ContinueAsNew { .. }
             | WorkflowCommand::RequestCancelActivity { .. }
             | WorkflowCommand::CancelTimer { .. }
+            | WorkflowCommand::StartChildWorkflow { .. }
             | WorkflowCommand::RequestNewWorkflowTask => {
                 prop_assert!(workflow_command_to_proto(&cmd).is_err());
             }
@@ -566,6 +567,19 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
         Just(WorkflowCommand::CancelWorkflow),
         arb_small_string().prop_map(|activity_id| WorkflowCommand::RequestCancelActivity { activity_id }),
         arb_small_string().prop_map(|timer_id| WorkflowCommand::CancelTimer { timer_id }),
+        (
+            arb_small_string(),
+            arb_small_string(),
+            arb_small_string(),
+            arb_payloads(),
+        ).prop_map(|(child_workflow_id, workflow_type, task_queue, input)| WorkflowCommand::StartChildWorkflow {
+            child_workflow_id: tokeira_types::WorkflowId(child_workflow_id),
+            namespace_id: tokeira_types::NamespaceId::new(),
+            workflow_type: tokeira_types::WorkflowType(workflow_type),
+            task_queue: tokeira_types::TaskQueueName(task_queue),
+            input,
+            parent_close_policy: tokeira_kernel::ParentClosePolicy::Terminate,
+        }),
     ]
 }
 

@@ -36,6 +36,7 @@ pub struct WorkflowState {
     pub attempt: u32,
     pub activities: BTreeMap<String, ActivityState>,
     pub timers: BTreeMap<String, TimerState>,
+    pub children: BTreeMap<WorkflowId, ChildWorkflowState>,
 
     pub started_at: OffsetDateTime,
     pub closed_at: Option<OffsetDateTime>,
@@ -72,6 +73,22 @@ pub struct TimerState {
     pub timer_id: String,
     pub started_event_id: i64,
     pub fire_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChildWorkflowState {
+    pub child_workflow_id: WorkflowId,
+    pub child_run_id: Option<RunId>,
+    pub initiated_event_id: i64,
+    pub started_event_id: Option<i64>,
+    pub parent_close_policy: ParentClosePolicy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParentClosePolicy {
+    Terminate,
+    RequestCancel,
+    Abandon,
 }
 
 /// Either the run does not yet exist or it already has durable state.

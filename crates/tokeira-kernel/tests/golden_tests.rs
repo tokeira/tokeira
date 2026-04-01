@@ -4,10 +4,12 @@ use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     event::HistoryEventKind, kernel::Kernel, ActivityResolvedRequest, ActivityState, BasicKernel,
     CancelRequest, ChildResolution, ChildResolvedRequest, ChildStartConfirmedRequest,
-    ChildStartResult, ChildWorkflowState, Command, DispatchOp, ExternalWorkflowExecution,
-    LoadedRun, ParentClosePolicy, PendingWorkflowTask, ProjectionOp, Reject, SignalRequest,
-    StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerState,
-    WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
+    ChildStartResult, ChildWorkflowState, Command, DispatchOp, ExternalCancelResolvedRequest,
+    ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult,
+    ExternalWorkflowExecution, LoadedRun, ParentClosePolicy, PendingExternalCancel,
+    PendingExternalSignal, PendingWorkflowTask, ProjectionOp, Reject, SignalRequest, StartRequest,
+    StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerState, WorkflowCommand,
+    WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
     WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
     WorkflowTaskTimeoutType, WorkflowTimeoutType, RetryState,
 };
@@ -107,6 +109,8 @@ fn make_open_state() -> WorkflowState {
         activities: BTreeMap::new(),
         timers: BTreeMap::new(),
         children: BTreeMap::new(),
+        pending_external_signals: BTreeMap::new(),
+        pending_external_cancels: BTreeMap::new(),
         started_at: now() - Duration::minutes(3),
         closed_at: None,
     }
@@ -1862,6 +1866,39 @@ fn with_child(
     state
 }
 
+fn with_pending_external_signal(
+    mut state: WorkflowState,
+    initiated_event_id: i64,
+    workflow_id: &str,
+) -> WorkflowState {
+    state.pending_external_signals.insert(
+        initiated_event_id,
+        PendingExternalSignal {
+            initiated_event_id,
+            target_workflow_id: WorkflowId(workflow_id.into()),
+            target_run_id: Some(RunId::new()),
+            signal_name: "sig".into(),
+        },
+    );
+    state
+}
+
+fn with_pending_external_cancel(
+    mut state: WorkflowState,
+    initiated_event_id: i64,
+    workflow_id: &str,
+) -> WorkflowState {
+    state.pending_external_cancels.insert(
+        initiated_event_id,
+        PendingExternalCancel {
+            initiated_event_id,
+            target_workflow_id: WorkflowId(workflow_id.into()),
+            target_run_id: Some(RunId::new()),
+        },
+    );
+    state
+}
+
 #[test]
 fn start_child_workflow_happy_path() {
     let state = make_open_state_with_started_wft();
@@ -2007,5 +2044,153 @@ fn terminate_applies_parent_close_policy_to_started_children() {
             child_workflow_id,
             ..
         } if child_workflow_id == &WorkflowId("child-1".into())
+    )));
+}
+
+#[test]
+fn signal_external_workflow_happy_path() {
+    let state = make_open_state_with_started_wft();
+    let pending = state.pending_workflow_task.clone().unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: pending.logical_seq,
+                    started_event_id: pending.started_event_id.unwrap(),
+                    attempt: pending.attempt,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::SignalExternalWorkflowExecution {
+                    target_workflow_id: WorkflowId("target".into()),
+                    target_run_id: Some(RunId::new()),
+                    signal_name: "sig".into(),
+                    input: payloads("payload"),
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        transition.history_events[1].kind,
+        HistoryEventKind::SignalExternalWorkflowExecutionInitiated { .. }
+    ));
+    assert!(matches!(
+        transition.dispatch_ops[0],
+        DispatchOp::SignalExternalWorkflow { .. }
+    ));
+    assert_eq!(transition.next_state.pending_external_signals.len(), 1);
+}
+
+#[test]
+fn external_signal_resolved_signaled_no_wft() {
+    let state = with_pending_external_signal(make_open_state(), 10, "target");
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::ExternalSignalResolved(ExternalSignalResolvedRequest {
+                initiated_event_id: 10,
+                result: ExternalSignalResult::Signaled,
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::ExternalWorkflowExecutionSignaled { .. }
+    ));
+    assert!(transition.next_state.pending_external_signals.is_empty());
+    assert!(matches!(
+        transition.history_events[1].kind,
+        HistoryEventKind::WorkflowTaskScheduled { .. }
+    ));
+}
+
+#[test]
+fn request_cancel_external_workflow_happy_path() {
+    let state = make_open_state_with_started_wft();
+    let pending = state.pending_workflow_task.clone().unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: pending.logical_seq,
+                    started_event_id: pending.started_event_id.unwrap(),
+                    attempt: pending.attempt,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::RequestCancelExternalWorkflowExecution {
+                    target_workflow_id: WorkflowId("target".into()),
+                    target_run_id: Some(RunId::new()),
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        transition.history_events[1].kind,
+        HistoryEventKind::RequestCancelExternalWorkflowExecutionInitiated { .. }
+    ));
+    assert!(matches!(
+        transition.dispatch_ops[0],
+        DispatchOp::RequestCancelExternalWorkflow { .. }
+    ));
+    assert_eq!(transition.next_state.pending_external_cancels.len(), 1);
+}
+
+#[test]
+fn external_cancel_resolved_success_no_wft() {
+    let state = with_pending_external_cancel(make_open_state(), 10, "target");
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::ExternalCancelResolved(ExternalCancelResolvedRequest {
+                initiated_event_id: 10,
+                result: ExternalCancelResult::CancelRequested,
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::ExternalWorkflowExecutionCancelRequested { .. }
+    ));
+    assert!(transition.next_state.pending_external_cancels.is_empty());
+    assert!(matches!(
+        transition.history_events[1].kind,
+        HistoryEventKind::WorkflowTaskScheduled { .. }
+    ));
+}
+
+#[test]
+fn terminate_clears_pending_externals() {
+    let state = with_pending_external_cancel(
+        with_pending_external_signal(make_open_state(), 10, "target-sig"),
+        11,
+        "target-cancel",
+    );
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::Terminate(make_terminate_request()),
+        )
+        .unwrap();
+
+    assert!(transition.next_state.pending_external_signals.is_empty());
+    assert!(transition.next_state.pending_external_cancels.is_empty());
+    assert!(transition.dispatch_ops.iter().all(|op| !matches!(
+        op,
+        DispatchOp::SignalExternalWorkflow { .. } | DispatchOp::RequestCancelExternalWorkflow { .. }
     )));
 }

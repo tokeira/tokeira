@@ -10,15 +10,16 @@ use tokeira_types::{
 use crate::{
     command::{
         ActivityResolvedRequest, CancelRequest, ChildResolution, ChildResolvedRequest,
-        ChildStartConfirmedRequest, ChildStartResult, Command, RetryState, SignalRequest,
-        StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest,
+        ChildStartConfirmedRequest, ChildStartResult, Command, ExternalCancelResolvedRequest,
+        ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult, RetryState,
+        SignalRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest,
         WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowTaskCompletedRequest,
         WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
     },
     event::{ActivityResolution, HistoryEvent, HistoryEventKind},
     state::{
-        ActivityState, ChildWorkflowState, LoadedRun, ParentClosePolicy, PendingWorkflowTask,
-        TimerState, WorkflowState,
+        ActivityState, ChildWorkflowState, LoadedRun, ParentClosePolicy, PendingExternalCancel,
+        PendingExternalSignal, PendingWorkflowTask, TimerState, WorkflowState,
     },
     transition::{
         ActivityOp, DispatchOp, ProjectionOp, RequestDedupeOp, TimerOp, Transition,
@@ -50,6 +51,8 @@ impl Kernel for BasicKernel {
             Command::ActivityResolved(req) => self.apply_activity_resolved(loaded, req),
             Command::ChildStartConfirmed(req) => self.apply_child_start_confirmed(loaded, req),
             Command::ChildResolved(req) => self.apply_child_resolved(loaded, req),
+            Command::ExternalSignalResolved(req) => self.apply_external_signal_resolved(loaded, req),
+            Command::ExternalCancelResolved(req) => self.apply_external_cancel_resolved(loaded, req),
             Command::TimerDue(req) => self.apply_timer_due(loaded, req),
         }
     }
@@ -84,6 +87,8 @@ impl BasicKernel {
             activities: BTreeMap::new(),
             timers: BTreeMap::new(),
             children: BTreeMap::new(),
+            pending_external_signals: BTreeMap::new(),
+            pending_external_cancels: BTreeMap::new(),
             started_at: req.now,
             closed_at: None,
         };
@@ -477,6 +482,90 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    fn apply_external_signal_resolved(
+        &self,
+        loaded: LoadedRun,
+        req: ExternalSignalResolvedRequest,
+    ) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+        let mut builder = TransitionBuilder::new(state, req.now);
+        let pending = builder
+            .state
+            .pending_external_signals
+            .get(&req.initiated_event_id)
+            .cloned()
+            .ok_or(Reject::UnknownExternalSignal(req.initiated_event_id))?;
+
+        match req.result {
+            ExternalSignalResult::Signaled => {
+                builder.emit(HistoryEventKind::ExternalWorkflowExecutionSignaled {
+                    initiated_event_id: pending.initiated_event_id,
+                    target_workflow_id: pending.target_workflow_id,
+                });
+            }
+            ExternalSignalResult::Failed { cause } => {
+                builder.emit(HistoryEventKind::SignalExternalWorkflowExecutionFailed {
+                    initiated_event_id: pending.initiated_event_id,
+                    target_workflow_id: pending.target_workflow_id,
+                    cause,
+                });
+            }
+        }
+
+        builder
+            .state
+            .pending_external_signals
+            .remove(&req.initiated_event_id);
+
+        if builder.state.pending_workflow_task.is_none() {
+            builder.schedule_workflow_task();
+        }
+
+        Ok(builder.finish())
+    }
+
+    fn apply_external_cancel_resolved(
+        &self,
+        loaded: LoadedRun,
+        req: ExternalCancelResolvedRequest,
+    ) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+        let mut builder = TransitionBuilder::new(state, req.now);
+        let pending = builder
+            .state
+            .pending_external_cancels
+            .get(&req.initiated_event_id)
+            .cloned()
+            .ok_or(Reject::UnknownExternalCancel(req.initiated_event_id))?;
+
+        match req.result {
+            ExternalCancelResult::CancelRequested => {
+                builder.emit(HistoryEventKind::ExternalWorkflowExecutionCancelRequested {
+                    initiated_event_id: pending.initiated_event_id,
+                    target_workflow_id: pending.target_workflow_id,
+                });
+            }
+            ExternalCancelResult::Failed { cause } => {
+                builder.emit(HistoryEventKind::RequestCancelExternalWorkflowExecutionFailed {
+                    initiated_event_id: pending.initiated_event_id,
+                    target_workflow_id: pending.target_workflow_id,
+                    cause,
+                });
+            }
+        }
+
+        builder
+            .state
+            .pending_external_cancels
+            .remove(&req.initiated_event_id);
+
+        if builder.state.pending_workflow_task.is_none() {
+            builder.schedule_workflow_task();
+        }
+
+        Ok(builder.finish())
+    }
+
     fn apply_workflow_task_failed(
         &self,
         loaded: LoadedRun,
@@ -836,6 +925,63 @@ fn apply_workflow_command(builder: &mut TransitionBuilder, command: WorkflowComm
             });
             Ok(false)
         }
+        WorkflowCommand::SignalExternalWorkflowExecution {
+            target_workflow_id,
+            target_run_id,
+            signal_name,
+            input,
+        } => {
+            let initiated_event_id = builder.emit(
+                HistoryEventKind::SignalExternalWorkflowExecutionInitiated {
+                    target_workflow_id: target_workflow_id.clone(),
+                    target_run_id,
+                    signal_name: signal_name.clone(),
+                    input: input.clone(),
+                },
+            );
+            builder.state.pending_external_signals.insert(
+                initiated_event_id,
+                PendingExternalSignal {
+                    initiated_event_id,
+                    target_workflow_id: target_workflow_id.clone(),
+                    target_run_id,
+                    signal_name: signal_name.clone(),
+                },
+            );
+            builder.dispatch_ops.push(DispatchOp::SignalExternalWorkflow {
+                target_workflow_id,
+                target_run_id,
+                signal_name,
+                input,
+            });
+            Ok(false)
+        }
+        WorkflowCommand::RequestCancelExternalWorkflowExecution {
+            target_workflow_id,
+            target_run_id,
+        } => {
+            let initiated_event_id = builder.emit(
+                HistoryEventKind::RequestCancelExternalWorkflowExecutionInitiated {
+                    target_workflow_id: target_workflow_id.clone(),
+                    target_run_id,
+                },
+            );
+            builder.state.pending_external_cancels.insert(
+                initiated_event_id,
+                PendingExternalCancel {
+                    initiated_event_id,
+                    target_workflow_id: target_workflow_id.clone(),
+                    target_run_id,
+                },
+            );
+            builder
+                .dispatch_ops
+                .push(DispatchOp::RequestCancelExternalWorkflow {
+                    target_workflow_id,
+                    target_run_id,
+                });
+            Ok(false)
+        }
     }
 }
 
@@ -906,6 +1052,8 @@ impl TransitionBuilder {
         self.state.closed_at = Some(self.now);
         self.state.pending_workflow_task = None;
         self.state.sticky = None;
+        self.state.pending_external_signals.clear();
+        self.state.pending_external_cancels.clear();
         self.projection_ops.push(ProjectionOp::CloseExecution {
             status,
             closed_at: self.now,
@@ -988,6 +1136,10 @@ pub enum Reject {
         child_workflow_id: tokeira_types::WorkflowId,
         expected_initiated_event_id: i64,
     },
+    #[error("unknown external signal: initiated_event_id={0}")]
+    UnknownExternalSignal(i64),
+    #[error("unknown external cancel: initiated_event_id={0}")]
+    UnknownExternalCancel(i64),
     #[error("commands after close at index {index}")]
     CommandsAfterClose { index: usize },
 

@@ -84,6 +84,16 @@ pub enum DispatchOp {
         child_run_id: RunId,
         reason: String,
     },
+    SignalExternalWorkflow {
+        target_workflow_id: WorkflowId,
+        target_run_id: Option<RunId>,
+        signal_name: String,
+        input: Payloads,
+    },
+    RequestCancelExternalWorkflow {
+        target_workflow_id: WorkflowId,
+        target_run_id: Option<RunId>,
+    },
 }
 
 /// Projection operations are the contract between the correctness path and the

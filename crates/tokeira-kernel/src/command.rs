@@ -27,6 +27,8 @@ pub enum Command {
     ActivityResolved(ActivityResolvedRequest),
     ChildStartConfirmed(ChildStartConfirmedRequest),
     ChildResolved(ChildResolvedRequest),
+    ExternalSignalResolved(ExternalSignalResolvedRequest),
+    ExternalCancelResolved(ExternalCancelResolvedRequest),
     TimerDue(TimerDueRequest),
 }
 
@@ -203,6 +205,32 @@ pub enum ChildResolution {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct ExternalSignalResolvedRequest {
+    pub initiated_event_id: i64,
+    pub result: ExternalSignalResult,
+    pub now: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExternalSignalResult {
+    Signaled,
+    Failed { cause: String },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExternalCancelResolvedRequest {
+    pub initiated_event_id: i64,
+    pub result: ExternalCancelResult,
+    pub now: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExternalCancelResult {
+    CancelRequested,
+    Failed { cause: String },
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct TimerDueRequest {
     pub timer_id: String,
     pub fired_at: OffsetDateTime,
@@ -261,6 +289,16 @@ pub enum WorkflowCommand {
         task_queue: TaskQueueName,
         input: Payloads,
         parent_close_policy: ParentClosePolicy,
+    },
+    SignalExternalWorkflowExecution {
+        target_workflow_id: WorkflowId,
+        target_run_id: Option<RunId>,
+        signal_name: String,
+        input: Payloads,
+    },
+    RequestCancelExternalWorkflowExecution {
+        target_workflow_id: WorkflowId,
+        target_run_id: Option<RunId>,
     },
     RequestNewWorkflowTask,
 }

@@ -159,6 +159,34 @@ pub enum HistoryEventKind {
     ChildWorkflowExecutionTimedOut {
         child_workflow_id: WorkflowId,
     },
+    SignalExternalWorkflowExecutionInitiated {
+        target_workflow_id: WorkflowId,
+        target_run_id: Option<RunId>,
+        signal_name: String,
+        input: Payloads,
+    },
+    ExternalWorkflowExecutionSignaled {
+        initiated_event_id: i64,
+        target_workflow_id: WorkflowId,
+    },
+    SignalExternalWorkflowExecutionFailed {
+        initiated_event_id: i64,
+        target_workflow_id: WorkflowId,
+        cause: String,
+    },
+    RequestCancelExternalWorkflowExecutionInitiated {
+        target_workflow_id: WorkflowId,
+        target_run_id: Option<RunId>,
+    },
+    ExternalWorkflowExecutionCancelRequested {
+        initiated_event_id: i64,
+        target_workflow_id: WorkflowId,
+    },
+    RequestCancelExternalWorkflowExecutionFailed {
+        initiated_event_id: i64,
+        target_workflow_id: WorkflowId,
+        cause: String,
+    },
     WorkflowExecutionCompleted {
         result: Payloads,
     },

@@ -37,6 +37,8 @@ pub struct WorkflowState {
     pub activities: BTreeMap<String, ActivityState>,
     pub timers: BTreeMap<String, TimerState>,
     pub children: BTreeMap<WorkflowId, ChildWorkflowState>,
+    pub pending_external_signals: BTreeMap<i64, PendingExternalSignal>,
+    pub pending_external_cancels: BTreeMap<i64, PendingExternalCancel>,
 
     pub started_at: OffsetDateTime,
     pub closed_at: Option<OffsetDateTime>,
@@ -89,6 +91,21 @@ pub enum ParentClosePolicy {
     Terminate,
     RequestCancel,
     Abandon,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingExternalSignal {
+    pub initiated_event_id: i64,
+    pub target_workflow_id: WorkflowId,
+    pub target_run_id: Option<RunId>,
+    pub signal_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingExternalCancel {
+    pub initiated_event_id: i64,
+    pub target_workflow_id: WorkflowId,
+    pub target_run_id: Option<RunId>,
 }
 
 /// Either the run does not yet exist or it already has durable state.

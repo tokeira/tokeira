@@ -155,6 +155,8 @@ proptest! {
             | WorkflowCommand::RequestCancelActivity { .. }
             | WorkflowCommand::CancelTimer { .. }
             | WorkflowCommand::StartChildWorkflow { .. }
+            | WorkflowCommand::SignalExternalWorkflowExecution { .. }
+            | WorkflowCommand::RequestCancelExternalWorkflowExecution { .. }
             | WorkflowCommand::RequestNewWorkflowTask => {
                 prop_assert!(workflow_command_to_proto(&cmd).is_err());
             }
@@ -579,6 +581,19 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
             task_queue: tokeira_types::TaskQueueName(task_queue),
             input,
             parent_close_policy: tokeira_kernel::ParentClosePolicy::Terminate,
+        }),
+        (
+            arb_small_string(),
+            arb_payloads(),
+        ).prop_map(|(target_workflow_id, input)| WorkflowCommand::SignalExternalWorkflowExecution {
+            target_workflow_id: tokeira_types::WorkflowId(target_workflow_id),
+            target_run_id: Some(tokeira_types::RunId::new()),
+            signal_name: "sig".into(),
+            input,
+        }),
+        arb_small_string().prop_map(|target_workflow_id| WorkflowCommand::RequestCancelExternalWorkflowExecution {
+            target_workflow_id: tokeira_types::WorkflowId(target_workflow_id),
+            target_run_id: Some(tokeira_types::RunId::new()),
         }),
     ]
 }

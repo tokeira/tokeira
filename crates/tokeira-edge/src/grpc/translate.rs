@@ -351,6 +351,8 @@ pub fn workflow_command_to_proto(
         | WorkflowCommand::RequestCancelActivity { .. }
         | WorkflowCommand::CancelTimer { .. }
         | WorkflowCommand::StartChildWorkflow { .. }
+        | WorkflowCommand::SignalExternalWorkflowExecution { .. }
+        | WorkflowCommand::RequestCancelExternalWorkflowExecution { .. }
         | WorkflowCommand::RequestNewWorkflowTask
             => {
             return Err(ProtoConversionError::MissingField(

@@ -6,10 +6,12 @@ use tokeira_kernel::{
     event::HistoryEventKind, kernel::Kernel, ActivityOp, ActivityResolution,
     ActivityResolvedRequest, ActivityState, BasicKernel, CancelRequest, ChildResolution,
     ChildResolvedRequest, ChildStartConfirmedRequest, ChildStartResult, ChildWorkflowState,
-    Command, DispatchOp, ExternalWorkflowExecution, LoadedRun, ParentClosePolicy,
-    PendingWorkflowTask, RequestDedupeOp, RetryState, SignalRequest, StartRequest,
-    StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerOp, TimerState,
-    WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
+    Command, DispatchOp, ExternalCancelResolvedRequest, ExternalCancelResult,
+    ExternalSignalResolvedRequest, ExternalSignalResult, ExternalWorkflowExecution, LoadedRun,
+    ParentClosePolicy, PendingExternalCancel, PendingExternalSignal, PendingWorkflowTask,
+    RequestDedupeOp, RetryState, SignalRequest, StartRequest, StartWorkflowTaskRequest,
+    TerminateRequest, TimerDueRequest, TimerOp, TimerState, WorkflowCommand,
+    WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
     WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
     WorkflowTaskTimeoutType, WorkflowTimeoutType,
 };
@@ -89,6 +91,8 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         activities: BTreeMap::new(),
         timers: BTreeMap::new(),
         children: BTreeMap::new(),
+        pending_external_signals: BTreeMap::new(),
+        pending_external_cancels: BTreeMap::new(),
         started_at: now - Duration::minutes(10),
         closed_at: None,
     }
@@ -156,6 +160,31 @@ fn with_child(
             initiated_event_id,
             started_event_id: started.then_some(initiated_event_id + 1),
             parent_close_policy,
+        },
+    );
+    state
+}
+
+fn with_pending_external_signal(mut state: WorkflowState, initiated_event_id: i64) -> WorkflowState {
+    state.pending_external_signals.insert(
+        initiated_event_id,
+        PendingExternalSignal {
+            initiated_event_id,
+            target_workflow_id: WorkflowId("target-signal".into()),
+            target_run_id: Some(RunId::new()),
+            signal_name: "sig".into(),
+        },
+    );
+    state
+}
+
+fn with_pending_external_cancel(mut state: WorkflowState, initiated_event_id: i64) -> WorkflowState {
+    state.pending_external_cancels.insert(
+        initiated_event_id,
+        PendingExternalCancel {
+            initiated_event_id,
+            target_workflow_id: WorkflowId("target-cancel".into()),
+            target_run_id: Some(RunId::new()),
         },
     );
     state
@@ -444,6 +473,20 @@ fn arb_child_resolution() -> impl Strategy<Value = ChildResolution> {
     ]
 }
 
+fn arb_external_signal_result() -> impl Strategy<Value = ExternalSignalResult> {
+    prop_oneof![
+        Just(ExternalSignalResult::Signaled),
+        arb_small_string().prop_map(|cause| ExternalSignalResult::Failed { cause }),
+    ]
+}
+
+fn arb_external_cancel_result() -> impl Strategy<Value = ExternalCancelResult> {
+    prop_oneof![
+        Just(ExternalCancelResult::CancelRequested),
+        arb_small_string().prop_map(|cause| ExternalCancelResult::Failed { cause }),
+    ]
+}
+
 fn arb_workflow_execution_timed_out_request(
     now: OffsetDateTime,
 ) -> impl Strategy<Value = WorkflowExecutionTimedOutRequest> {
@@ -511,6 +554,20 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                     task_queue: TaskQueueName(task_queue),
                     input,
                     parent_close_policy,
+                }]
+            }),
+            (arb_small_string(), any::<bool>(), arb_small_string(), arb_payloads()).prop_map(|(target_workflow_id, with_run_id, signal_name, input)| {
+                vec![WorkflowCommand::SignalExternalWorkflowExecution {
+                    target_workflow_id: WorkflowId(target_workflow_id),
+                    target_run_id: with_run_id.then(RunId::new),
+                    signal_name,
+                    input,
+                }]
+            }),
+            (arb_small_string(), any::<bool>()).prop_map(|(target_workflow_id, with_run_id)| {
+                vec![WorkflowCommand::RequestCancelExternalWorkflowExecution {
+                    target_workflow_id: WorkflowId(target_workflow_id),
+                    target_run_id: with_run_id.then(RunId::new),
                 }]
             }),
         ]
@@ -642,6 +699,24 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 now,
             };
             (LoadedRun::Existing(state), Command::ChildResolved(req))
+        }),
+        arb_external_signal_result().prop_map(move |result| {
+            let state = with_pending_external_signal(make_open_state(now), 55);
+            let req = ExternalSignalResolvedRequest {
+                initiated_event_id: 55,
+                result,
+                now,
+            };
+            (LoadedRun::Existing(state), Command::ExternalSignalResolved(req))
+        }),
+        arb_external_cancel_result().prop_map(move |result| {
+            let state = with_pending_external_cancel(make_open_state(now), 56);
+            let req = ExternalCancelResolvedRequest {
+                initiated_event_id: 56,
+                result,
+                now,
+            };
+            (LoadedRun::Existing(state), Command::ExternalCancelResolved(req))
         }),
     ]
 }
@@ -1550,6 +1625,113 @@ proptest! {
         ).unwrap();
 
         prop_assert!(!transition.next_state.children.contains_key(&WorkflowId(child_workflow_id)));
+    }
+
+    #[test]
+    fn property_44_signal_external_workflow_happy_path(
+        target_workflow_id in arb_small_string(),
+        signal_name in arb_small_string(),
+        input in arb_payloads(),
+    ) {
+        let now = fixed_now();
+        let state = with_pending_wft(make_open_state(now), 32, Some(15), 1);
+        let transition = kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(32),
+                    started_event_id: 15,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::SignalExternalWorkflowExecution {
+                    target_workflow_id: WorkflowId(target_workflow_id.clone()),
+                    target_run_id: Some(RunId::new()),
+                    signal_name: signal_name.clone(),
+                    input,
+                }],
+                force_new_workflow_task: false,
+                now,
+            }),
+        ).unwrap();
+
+        let pending = transition.next_state.pending_external_signals.values().next().unwrap();
+        prop_assert_eq!(&pending.target_workflow_id, &WorkflowId(target_workflow_id));
+        prop_assert_eq!(&pending.signal_name, &signal_name);
+        prop_assert_eq!(transition.dispatch_ops.iter().any(|op| matches!(op, DispatchOp::SignalExternalWorkflow { .. })), true);
+    }
+
+    #[test]
+    fn property_46_external_signal_resolved_event_and_removal(result in arb_external_signal_result()) {
+        let now = fixed_now();
+        let transition = kernel().apply(
+            LoadedRun::Existing(with_pending_external_signal(make_open_state(now), 60)),
+            Command::ExternalSignalResolved(ExternalSignalResolvedRequest {
+                initiated_event_id: 60,
+                result: result.clone(),
+                now,
+            }),
+        ).unwrap();
+
+        match (&transition.history_events[0].kind, result) {
+            (HistoryEventKind::ExternalWorkflowExecutionSignaled { .. }, ExternalSignalResult::Signaled) => {}
+            (HistoryEventKind::SignalExternalWorkflowExecutionFailed { cause, .. }, ExternalSignalResult::Failed { cause: expected }) => {
+                prop_assert_eq!(cause, &expected);
+            }
+            other => panic!("unexpected event/result pair: {other:?}"),
+        }
+        prop_assert!(transition.next_state.pending_external_signals.is_empty());
+    }
+
+    #[test]
+    fn property_47_external_cancel_resolved_event_and_removal(result in arb_external_cancel_result()) {
+        let now = fixed_now();
+        let transition = kernel().apply(
+            LoadedRun::Existing(with_pending_external_cancel(make_open_state(now), 61)),
+            Command::ExternalCancelResolved(ExternalCancelResolvedRequest {
+                initiated_event_id: 61,
+                result: result.clone(),
+                now,
+            }),
+        ).unwrap();
+
+        match (&transition.history_events[0].kind, result) {
+            (HistoryEventKind::ExternalWorkflowExecutionCancelRequested { .. }, ExternalCancelResult::CancelRequested) => {}
+            (HistoryEventKind::RequestCancelExternalWorkflowExecutionFailed { cause, .. }, ExternalCancelResult::Failed { cause: expected }) => {
+                prop_assert_eq!(cause, &expected);
+            }
+            other => panic!("unexpected event/result pair: {other:?}"),
+        }
+        prop_assert!(transition.next_state.pending_external_cancels.is_empty());
+    }
+
+    #[test]
+    fn property_50_no_dedup_for_resolution(
+        signal_result in arb_external_signal_result(),
+        cancel_result in arb_external_cancel_result(),
+    ) {
+        let now = fixed_now();
+        let signal_transition = kernel().apply(
+            LoadedRun::Existing(with_pending_external_signal(make_open_state(now), 70)),
+            Command::ExternalSignalResolved(ExternalSignalResolvedRequest {
+                initiated_event_id: 70,
+                result: signal_result,
+                now,
+            }),
+        ).unwrap();
+        prop_assert!(signal_transition.request_dedupe_ops.is_empty());
+
+        let cancel_transition = kernel().apply(
+            LoadedRun::Existing(with_pending_external_cancel(make_open_state(now), 71)),
+            Command::ExternalCancelResolved(ExternalCancelResolvedRequest {
+                initiated_event_id: 71,
+                result: cancel_result,
+                now,
+            }),
+        ).unwrap();
+        prop_assert!(cancel_transition.request_dedupe_ops.is_empty());
     }
 }
 

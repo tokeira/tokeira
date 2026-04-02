@@ -30,7 +30,28 @@ tokeira-storage/src/
   memory.rs  — in-memory development store for tests and examples
 ```
 
-The in-memory store is useful for tests and Codex-driven feature work. A production DSQL implementation is planned but not yet written.
+## In-Memory Store
+
+The `InMemoryStore` implements all storage traits (`RunRepository`, `ProjectionLog`, `LeaseRepository`, `ConnectionDirector`) using in-memory data structures protected by `tokio::sync::Mutex`. It is the primary storage backend for:
+
+- **Kernel property and golden tests** — verifying transition commit semantics without DSQL
+- **Edge integration tests** — end-to-end gRPC roundtrip testing
+- **Local development** — running `tokeirad` without a DSQL cluster
+- **Codex-driven feature work** — fast iteration without infrastructure dependencies
+
+The in-memory store faithfully implements the storage contract:
+
+- **OCC fencing** — `commit_transition` checks `expected_seq` against the stored `transition_seq` and returns `CommitResult::Conflict` on mismatch
+- **Request dedup** — tracks request IDs per run and returns `CommitResult::Duplicate` for already-committed requests
+- **History append** — stores history events in order, supports `read_history` with `after_event_id` pagination
+- **Activity/timer state** — applies `ActivityOp` and `TimerOp` from transitions
+- **Dispatch tracking** — stores dispatchable workflow tasks and due timers for sweep queries
+- **Projection log** — records `ProjectionOp`s with partition/fanout for projection workers
+- **Lease management** — tracks bundle ownership with epoch fencing
+- **Transition audit** — stores full transition records for test assertions (may become test-only in production)
+- **Sticky expiry** — clears expired sticky affinity on load
+
+The in-memory store is not designed for production use. It has no persistence, no connection budgeting, and no DSQL-specific optimizations. A production DSQL implementation is planned but not yet written.
 
 ## DSQL-Specific Constraints
 

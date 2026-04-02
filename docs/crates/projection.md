@@ -26,9 +26,26 @@ See [070-projection-plane](../architecture/070-projection-plane.md) for the proj
 ```
 tokeira-projection/src/
   sink.rs        — sink trait and abstractions
-  visibility.rs  — canonical DSQL visibility applier and query support
+  visibility.rs  — in-memory visibility sink and canonical visibility applier
   worker.rs      — projector worker loop
 ```
+
+## In-Memory Visibility Sink
+
+The `InMemoryVisibilitySink` implements the `ProjectionSink` trait using an in-memory `HashMap<RunKey, VisibilityRow>` protected by `tokio::sync::Mutex`. It is the primary projection backend for:
+
+- **Integration tests** — verifying that kernel transitions produce correct visibility effects
+- **Local development** — running `tokeirad` without a DSQL cluster or SQL visibility tables
+- **End-to-end testing** — confirming that the runtime→storage→projection pipeline works
+
+The in-memory sink processes `ProjectionOp`s from committed transitions:
+
+- `UpsertExecution { status, .. }` — creates or updates a visibility row with the execution status
+- `CloseExecution { status, .. }` — marks the row as closed with the terminal status
+
+The sink exposes a `get(run_key)` method for test assertions, returning the current `VisibilityRow` (status + closed flag).
+
+This is not the final SQL visibility design. It does not support list/filter/count queries, search attributes, or the full query compiler pipeline described in the architecture docs. Those will be implemented when the canonical SQL visibility sink is built against DSQL.
 
 ## How It Consumes ProjectionOps
 

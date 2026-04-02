@@ -1035,7 +1035,7 @@ Key properties to model:
 3. Do we want the kernel to assign final event IDs directly, or only event-count deltas while storage stamps final IDs? (This document currently specifies direct assignment.)
 4. Should `Update` acceptance and WFT scheduling be atomic within a single `apply` call, or should acceptance be a separate transition from WFT scheduling?
 5. Should `Terminate` clean up open children inline (emitting ops for each child), or should it emit a single "terminate all children" op and let the runtime handle fan-out?
-6. Should `Reset` be a kernel command or purely a runtime orchestration that composes `Terminate` + `Start`?
+6. ~~Should `Reset` be a kernel command or purely a runtime orchestration that composes `Terminate` + `Start`?~~ **Resolved:** Reset is a top-level kernel command (`Command::Reset`) with its own `apply_reset` handler. It emits a `WorkflowTaskFailed` event with `RESET_WORKFLOW` cause and reset metadata (`base_run_id`, `new_run_id`, `fork_event_id`), closes the run, and cleans up all entities. The runtime reads the committed event to create the successor.
 7. Should `WorkflowTaskFailed` always reschedule the WFT, or should there be a maximum attempt count after which the workflow is considered stuck and requires operator intervention?
 8. Should `RecordMarker` remain fully opaque to the kernel, or should the kernel understand local activity markers enough to track them as a distinct pending entity type?
 9. Is Nexus support a near-term priority, or should it be deferred until the core command set (activities, timers, children, signals, updates) is fully implemented?

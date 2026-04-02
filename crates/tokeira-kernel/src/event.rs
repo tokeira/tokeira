@@ -80,6 +80,10 @@ pub enum HistoryEventKind {
         failure_cause: WorkflowTaskFailedCause,
         failure_details: Option<Payload>,
         identity: WorkerIdentity,
+        base_run_id: Option<RunId>,
+        new_run_id: Option<RunId>,
+        fork_event_version: Option<i64>,
+        fork_event_id: Option<i64>,
     },
     WorkflowTaskTimedOut {
         logical_seq: LogicalTaskSeq,

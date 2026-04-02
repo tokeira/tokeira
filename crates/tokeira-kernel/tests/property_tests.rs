@@ -10,8 +10,8 @@ use tokeira_kernel::{
     ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult,
     ExternalWorkflowExecution, FieldChange, LoadedRun, NexusOperationResolvedRequest,
     NexusResolution, ParentClosePolicy, PendingExternalCancel, PendingExternalSignal,
-    PendingNexusOperation, PendingUpdate, PendingWorkflowTask, RequestDedupeOp, RetryState,
-    SignalRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest,
+    PendingNexusOperation, PendingUpdate, PendingWorkflowTask, Reject, RequestDedupeOp, RetryState,
+    ResetRequest, SignalRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest,
     TimerOp, TimerState, UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest,
     VersioningOverride, WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowState,
     WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
@@ -229,6 +229,66 @@ fn with_pending_nexus_operation(mut state: WorkflowState, operation_id: &str) ->
     state
 }
 
+fn arb_open_state_for_reset(now: OffsetDateTime) -> impl Strategy<Value = WorkflowState> {
+    (
+        any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
+    )
+        .prop_map(move |(started_wft, sticky, activity, timer, child, ext_signal, ext_cancel, update, nexus)| {
+            let mut state = make_open_state(now);
+            if started_wft {
+                state = with_pending_wft(state, 90, Some(30), 1);
+            }
+            if sticky {
+                state = with_sticky(state, "sticky-worker", now);
+            }
+            if activity {
+                state = with_activity(state, "activity-1");
+            }
+            if timer {
+                state = with_timer(state, "timer-1", now);
+            }
+            if child {
+                state = with_child(state, "child-1", 22, ParentClosePolicy::Terminate, true);
+            }
+            if ext_signal {
+                state = with_pending_external_signal(state, 31);
+            }
+            if ext_cancel {
+                state = with_pending_external_cancel(state, 32);
+            }
+            if update {
+                state = with_pending_update(state, "update-1");
+            }
+            if nexus {
+                state = with_pending_nexus_operation(state, "op-1");
+            }
+            state
+        })
+}
+
+fn arb_reset_request(state: WorkflowState, now: OffsetDateTime) -> impl Strategy<Value = ResetRequest> {
+    (
+        1i64..=state.last_event_id,
+        arb_small_string(),
+        arb_small_string(),
+    )
+        .prop_map(move |(fork_event_id, reason, request_id)| ResetRequest {
+            fork_event_id,
+            new_run_id: RunId::new(),
+            reason,
+            request: request_context(&request_id, now),
+            now,
+        })
+}
+
 // --- Arbitrary strategies ---
 
 fn arb_duration() -> impl Strategy<Value = Duration> {
@@ -434,6 +494,7 @@ fn arb_wft_failed_cause() -> impl Strategy<Value = WorkflowTaskFailedCause> {
         Just(WorkflowTaskFailedCause::BadRequestCancelActivityAttributes),
         Just(WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure),
         Just(WorkflowTaskFailedCause::BadSignalWorkflowExecutionAttributes),
+        Just(WorkflowTaskFailedCause::ResetWorkflow),
     ]
 }
 
@@ -669,6 +730,10 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
         arb_terminate_request(now).prop_map(move |req| {
             let state = make_open_state(now);
             (LoadedRun::Existing(state), Command::Terminate(req))
+        }),
+        arb_open_state_for_reset(now).prop_flat_map(move |state| {
+            arb_reset_request(state.clone(), now)
+                .prop_map(move |req| (LoadedRun::Existing(state.clone()), Command::Reset(req)))
         }),
         arb_update_execution_options_request(now).prop_map(move |req| {
             let state = make_open_state(now);
@@ -1199,6 +1264,10 @@ proptest! {
                 prop_assert_eq!(transition.request_dedupe_ops.len(), 1);
                 prop_assert_eq!(transition.request_dedupe_ops[0].clone(), RequestDedupeOp { request_id: req.request.request_id });
             }
+            Command::Reset(req) => {
+                prop_assert_eq!(transition.request_dedupe_ops.len(), 1);
+                prop_assert_eq!(transition.request_dedupe_ops[0].clone(), RequestDedupeOp { request_id: req.request.request_id });
+            }
             Command::UpdateExecutionOptions(req) => {
                 prop_assert_eq!(transition.request_dedupe_ops.len(), 1);
                 prop_assert_eq!(transition.request_dedupe_ops[0].clone(), RequestDedupeOp { request_id: req.request.request_id });
@@ -1213,13 +1282,17 @@ proptest! {
         let state = with_pending_wft(make_open_state(now), 50, Some(21), 1);
         let transition = kernel().apply(LoadedRun::Existing(state), Command::WorkflowTaskFailed(req.clone())).unwrap();
         match &transition.history_events[0].kind {
-            HistoryEventKind::WorkflowTaskFailed { logical_seq, scheduled_event_id, started_event_id, failure_cause, failure_details, identity } => {
+            HistoryEventKind::WorkflowTaskFailed { logical_seq, scheduled_event_id, started_event_id, failure_cause, failure_details, identity, base_run_id, new_run_id, fork_event_version, fork_event_id } => {
                 prop_assert_eq!(*logical_seq, LogicalTaskSeq(50));
                 prop_assert_eq!(*scheduled_event_id, 13);
                 prop_assert_eq!(*started_event_id, 21);
                 prop_assert_eq!(failure_cause, &req.failure_cause);
                 prop_assert_eq!(failure_details, &req.failure_details);
                 prop_assert_eq!(identity, &req.worker_identity);
+                prop_assert!(base_run_id.is_none());
+                prop_assert!(new_run_id.is_none());
+                prop_assert!(fork_event_version.is_none());
+                prop_assert!(fork_event_id.is_none());
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -2753,5 +2826,201 @@ fn property_70_close_clears_pending_nexus_operations_without_dispatch_ops() {
     for transition in transitions {
         assert!(transition.next_state.pending_nexus_operations.is_empty());
         assert_eq!(transition.dispatch_ops.iter().filter(|op| matches!(op, DispatchOp::ScheduleNexusOperation { .. } | DispatchOp::CancelNexusOperation { .. })).count(), 0);
+    }
+}
+
+proptest! {
+    #[test]
+    fn property_71_reset_closes_run_with_terminal_state_invariants(
+        state in arb_open_state_for_reset(fixed_now())
+    ) {
+        let now = fixed_now();
+        let transition = kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::Reset(ResetRequest {
+                fork_event_id: 1,
+                new_run_id: RunId::new(),
+                reason: "reset".into(),
+                request: request_context("reset-prop-1", now),
+                now,
+            }),
+        ).unwrap();
+
+        prop_assert_eq!(transition.next_state.status, ExecutionStatus::Terminated);
+        prop_assert!(transition.next_state.closed_at.is_some());
+        prop_assert!(transition.next_state.pending_workflow_task.is_none());
+        prop_assert!(transition.next_state.sticky.is_none());
+        prop_assert!(transition.next_state.activities.is_empty());
+        prop_assert!(transition.next_state.timers.is_empty());
+        prop_assert!(transition.next_state.children.is_empty());
+        prop_assert!(transition.next_state.pending_external_signals.is_empty());
+        prop_assert!(transition.next_state.pending_external_cancels.is_empty());
+        prop_assert!(transition.next_state.pending_updates.is_empty());
+        prop_assert!(transition.next_state.pending_nexus_operations.is_empty());
+    }
+
+    #[test]
+    fn property_72_reset_entity_cleanup_ops_match_input_state(
+        state in arb_open_state_for_reset(fixed_now())
+    ) {
+        let now = fixed_now();
+        let expected_activity_ids: Vec<_> = state.activities.keys().cloned().collect();
+        let expected_timer_ids: Vec<_> = state.timers.keys().cloned().collect();
+        let transition = kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::Reset(ResetRequest {
+                fork_event_id: state.last_event_id,
+                new_run_id: RunId::new(),
+                reason: "reset".into(),
+                request: request_context("reset-prop-2", now),
+                now,
+            }),
+        ).unwrap();
+
+        prop_assert_eq!(transition.activity_ops.len(), expected_activity_ids.len());
+        prop_assert_eq!(transition.timer_ops.len(), expected_timer_ids.len());
+        for op in &transition.activity_ops {
+            match op {
+                ActivityOp::Delete { activity_id } => prop_assert!(expected_activity_ids.contains(activity_id)),
+                _ => prop_assert!(false),
+            }
+        }
+        for op in &transition.timer_ops {
+            match op {
+                TimerOp::Delete { timer_id } => prop_assert!(expected_timer_ids.contains(timer_id)),
+                _ => prop_assert!(false),
+            }
+        }
+    }
+
+    #[test]
+    fn property_73_reset_emits_exactly_one_request_dedupe_op(
+        state in arb_open_state_for_reset(fixed_now()),
+        request_id in arb_small_string()
+    ) {
+        let now = fixed_now();
+        let req = ResetRequest {
+            fork_event_id: 1,
+            new_run_id: RunId::new(),
+            reason: "reset".into(),
+            request: request_context(&request_id, now),
+            now,
+        };
+        let transition = kernel().apply(LoadedRun::Existing(state), Command::Reset(req.clone())).unwrap();
+        prop_assert_eq!(transition.request_dedupe_ops.len(), 1);
+        prop_assert_eq!(transition.request_dedupe_ops[0].clone(), RequestDedupeOp { request_id: req.request.request_id });
+    }
+
+    #[test]
+    fn property_74_reset_fork_event_id_validation_rejects_invalid_values(
+        state in arb_open_state_for_reset(fixed_now())
+    ) {
+        let now = fixed_now();
+        let invalids = [0, -1, state.last_event_id + 1];
+        for fork_event_id in invalids {
+            let result = kernel().apply(
+                LoadedRun::Existing(state.clone()),
+                Command::Reset(ResetRequest {
+                    fork_event_id,
+                    new_run_id: RunId::new(),
+                    reason: "reset".into(),
+                    request: request_context("reset-prop-4", now),
+                    now,
+                }),
+            );
+            prop_assert_eq!(matches!(result, Err(Reject::ResetConstraintViolation { .. })), true);
+        }
+    }
+
+    #[test]
+    fn property_75_reset_wft_failed_event_carries_correct_metadata(
+        state in arb_open_state_for_reset(fixed_now()),
+        request_id in arb_small_string(),
+        reason in arb_small_string()
+    ) {
+        let now = fixed_now();
+        let req = ResetRequest {
+            fork_event_id: state.last_event_id,
+            new_run_id: RunId::new(),
+            reason,
+            request: request_context(&request_id, now),
+            now,
+        };
+        let transition = kernel().apply(LoadedRun::Existing(state.clone()), Command::Reset(req.clone())).unwrap();
+
+        match &transition.history_events[0].kind {
+            HistoryEventKind::WorkflowTaskFailed {
+                logical_seq,
+                failure_cause,
+                failure_details,
+                identity,
+                base_run_id,
+                new_run_id,
+                fork_event_version,
+                fork_event_id,
+                ..
+            } => {
+                prop_assert_eq!(*logical_seq, state.next_workflow_task_seq);
+                prop_assert_eq!(failure_cause, &WorkflowTaskFailedCause::ResetWorkflow);
+                prop_assert!(failure_details.is_none());
+                prop_assert_eq!(identity, &WorkerIdentity("reset".into()));
+                prop_assert_eq!(*base_run_id, Some(state.run_id));
+                prop_assert_eq!(*new_run_id, Some(req.new_run_id));
+                prop_assert!(fork_event_version.is_none());
+                prop_assert_eq!(*fork_event_id, Some(req.fork_event_id));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn property_76_reset_emits_no_wft_dispatch_ops(
+        state in arb_open_state_for_reset(fixed_now())
+    ) {
+        let now = fixed_now();
+        let transition = kernel().apply(
+            LoadedRun::Existing(state),
+            Command::Reset(ResetRequest {
+                fork_event_id: 1,
+                new_run_id: RunId::new(),
+                reason: "reset".into(),
+                request: request_context("reset-prop-6", now),
+                now,
+            }),
+        ).unwrap();
+
+        prop_assert_eq!(
+            transition
+                .dispatch_ops
+                .iter()
+                .all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. })),
+            true
+        );
+    }
+
+    #[test]
+    fn property_77_regular_wft_failed_events_carry_no_reset_metadata(
+        req in arb_wft_failed_request(LogicalTaskSeq(91), 41, fixed_now())
+    ) {
+        prop_assume!(req.failure_cause != WorkflowTaskFailedCause::ResetWorkflow);
+        let now = fixed_now();
+        let state = with_pending_wft(make_open_state(now), 91, Some(41), 1);
+        let transition = kernel().apply(LoadedRun::Existing(state), Command::WorkflowTaskFailed(req)).unwrap();
+
+        match &transition.history_events[0].kind {
+            HistoryEventKind::WorkflowTaskFailed {
+                base_run_id,
+                new_run_id,
+                fork_event_version,
+                fork_event_id,
+                ..
+            } => {
+                prop_assert!(base_run_id.is_none());
+                prop_assert!(new_run_id.is_none());
+                prop_assert!(fork_event_version.is_none());
+                prop_assert!(fork_event_id.is_none());
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 }

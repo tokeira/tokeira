@@ -103,13 +103,13 @@ pub struct Transition {
 Precise, enumerated rejection reasons the runtime can act on programmatically:
 
 - **Existence:** `RunAlreadyExists`, `MissingRun`, `RunClosed(status)`
-- **Sequence fencing:** `WorkflowTaskSeqMismatch`, `WorkflowTaskAlreadyStarted`, `WorkflowTaskNotStarted`
+- **Sequence fencing:** `WorkflowTaskSeqMismatch`, `WorkflowTaskAlreadyStarted`, `WorkflowTaskNotStarted`, `WorkflowTaskStartedEventMismatch`
 - **Token validation:** `WorkflowTaskTokenMismatch`
-- **Uniqueness:** `DuplicateActivityId`, `DuplicateTimerId`
-- **Entity resolution:** `UnknownActivity`, `UnknownTimer`
+- **Uniqueness:** `DuplicateActivityId`, `DuplicateTimerId`, `DuplicateUpdateId`, `DuplicateNexusOperationId`
+- **Entity resolution:** `UnknownActivity`, `UnknownTimer`, `UnknownUpdate`, `UnknownExternalSignal`, `UnknownExternalCancel`, `UnknownNexusOperation`
 - **Ordering:** `CommandsAfterClose`
-
-See [020-kernel § Reject taxonomy](../architecture/020-kernel.md) for the full list including future additions.
+- **Nexus:** `NexusOperationAlreadyStarted`
+- **Reset:** `ResetConstraintViolation`
 
 ## Key Invariants
 
@@ -124,18 +124,20 @@ The kernel is analogous to the core state-transition logic inside Temporal's His
 
 ## Implementation Status
 
-| Feature | Status |
-|---|---|
-| Start, Signal, WFT lifecycle | ✅ Implemented |
-| Activities, Timers | ✅ Implemented |
-| CompleteWorkflow, FailWorkflow | ✅ Implemented |
-| Request dedup, Sticky affinity | ✅ Implemented |
-| UpsertMemo, UpsertSearchAttributes | ✅ Implemented |
-| Cancel, Terminate | 🔧 In progress |
-| WFT Failed, WFT Timed Out | 🔧 In progress |
-| WorkflowExecutionTimedOut | Not yet |
-| Update, Children, Nexus, ContinueAsNew | Not yet |
-| External signals/cancels, Reset | Not yet |
+| Feature | Spec | Status |
+|---|---|---|
+| F1: Foundation + WFT lifecycle | `kernel-foundation-wft-lifecycle` | ✅ Implemented |
+| F2: WFT failure and timeout recovery | `kernel-wft-failure-timeout` | ✅ Implemented |
+| F3: Cancel and terminate | `kernel-cancel-terminate` | ✅ Implemented |
+| F4: ContinueAsNew and workflow timeout | `kernel-continue-as-new-timeout` | ✅ Implemented |
+| F5: Child workflows | `kernel-child-workflows` | ✅ Implemented |
+| F6: External signals and cancel requests | `kernel-external-signals-cancels` | ✅ Implemented |
+| F7: Updates | `kernel-updates` | ✅ Implemented |
+| F8: Markers and execution options | `kernel-markers-execution-options` | ✅ Implemented |
+| F9: Nexus operations | `kernel-nexus-operations` | ✅ Implemented |
+| F10: Reset | `kernel-reset` | ✅ Implemented |
+
+All 10 kernel features are complete. 192 tests (128 golden + 64 property).
 
 ## Temporal Feature Coverage
 
@@ -152,5 +154,6 @@ The kernel is analogous to the core state-transition logic inside Temporal's His
 | Continue-As-New | Closes current run, emits linkage for runtime |
 | Queries | **Not involved** — queries are read-only, handled by runtime |
 | Visibility | Emits `ProjectionOp`s; does not write visibility rows |
-| Nexus | Schedules/resolves operations (future) |
+| Nexus | Schedules, cancels, resolves operations |
+| Reset | Terminates run, emits metadata for runtime successor |
 | Markers | Pass-through to history; no state change |

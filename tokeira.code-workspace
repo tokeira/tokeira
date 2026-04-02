@@ -5,6 +5,9 @@
 		},
 		{
 			"path": "../prototyping-crates"
+		},
+		{
+			"path": "../../temporalio/temporal-dsql"
 		}
 	],
 	"settings": {

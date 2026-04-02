@@ -9,7 +9,7 @@ use tokeira_kernel::{
     ExternalSignalResolvedRequest, ExternalSignalResult, ExternalWorkflowExecution, FieldChange,
     LoadedRun, NexusOperationResolvedRequest, NexusResolution, ParentClosePolicy,
     PendingExternalCancel, PendingExternalSignal, PendingNexusOperation, PendingUpdate,
-    PendingWorkflowTask, ProjectionOp, Reject, RetryState, SignalRequest, StartRequest,
+    PendingWorkflowTask, ProjectionOp, Reject, ResetRequest, RetryState, SignalRequest, StartRequest,
     StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerState,
     UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, VersioningOverride,
     WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowState,
@@ -208,6 +208,16 @@ fn make_terminate_request() -> TerminateRequest {
         details: Some(payloads("term-details")),
         identity: "operator".into(),
         request: request_context("terminate-req"),
+        now: now(),
+    }
+}
+
+fn make_reset_request() -> ResetRequest {
+    ResetRequest {
+        fork_event_id: 5,
+        new_run_id: RunId::new(),
+        reason: "operator reset".into(),
+        request: request_context("reset-req"),
         now: now(),
     }
 }
@@ -496,6 +506,220 @@ fn terminate_with_pending_wft() {
 
     assert!(transition.next_state.pending_workflow_task.is_none());
     assert!(transition.dispatch_ops.is_empty());
+}
+
+#[test]
+fn reset_happy_path_no_pending_wft() {
+    let state = make_open_state();
+    let req = make_reset_request();
+    let transition = kernel()
+        .apply(LoadedRun::Existing(state.clone()), Command::Reset(req.clone()))
+        .unwrap();
+
+    assert_eq!(transition.history_events.len(), 1);
+    assert!(matches!(
+        &transition.history_events[0].kind,
+        HistoryEventKind::WorkflowTaskFailed {
+            scheduled_event_id,
+            started_event_id,
+            failure_cause,
+            failure_details,
+            identity,
+            base_run_id,
+            new_run_id,
+            fork_event_version,
+            fork_event_id,
+            ..
+        }
+        if *scheduled_event_id == 0
+            && *started_event_id == 0
+            && *failure_cause == WorkflowTaskFailedCause::ResetWorkflow
+            && failure_details.is_none()
+            && *identity == WorkerIdentity("reset".into())
+            && *base_run_id == Some(state.run_id)
+            && *new_run_id == Some(req.new_run_id)
+            && fork_event_version.is_none()
+            && *fork_event_id == Some(req.fork_event_id)
+    ));
+    assert_eq!(transition.request_dedupe_ops.len(), 1);
+    assert_eq!(transition.next_state.status, ExecutionStatus::Terminated);
+    assert!(transition.next_state.closed_at.is_some());
+    assert!(transition.next_state.pending_workflow_task.is_none());
+    assert!(transition.next_state.sticky.is_none());
+    assert!(transition
+        .dispatch_ops
+        .iter()
+        .all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. })));
+}
+
+#[test]
+fn reset_happy_path_with_started_wft() {
+    let state = make_open_state_with_started_wft();
+    let transition = kernel()
+        .apply(LoadedRun::Existing(state), Command::Reset(make_reset_request()))
+        .unwrap();
+
+    assert!(matches!(
+        &transition.history_events[0].kind,
+        HistoryEventKind::WorkflowTaskFailed {
+            scheduled_event_id,
+            started_event_id,
+            failure_cause,
+            ..
+        } if *scheduled_event_id == 8
+            && *started_event_id == 9
+            && *failure_cause == WorkflowTaskFailedCause::ResetWorkflow
+    ));
+}
+
+#[test]
+fn reset_happy_path_with_scheduled_wft() {
+    let state = make_open_state_with_pending_wft();
+    let transition = kernel()
+        .apply(LoadedRun::Existing(state), Command::Reset(make_reset_request()))
+        .unwrap();
+
+    assert!(matches!(
+        &transition.history_events[0].kind,
+        HistoryEventKind::WorkflowTaskFailed {
+            scheduled_event_id,
+            started_event_id,
+            failure_cause,
+            ..
+        } if *scheduled_event_id == 8
+            && *started_event_id == 0
+            && *failure_cause == WorkflowTaskFailedCause::ResetWorkflow
+    ));
+}
+
+#[test]
+fn reset_cleans_up_activities_and_timers() {
+    let mut state = make_open_state_with_activity("activity-1");
+    state.activities.insert(
+        "activity-2".into(),
+        ActivityState {
+            activity_id: "activity-2".into(),
+            schedule_event_id: 6,
+            task_queue: TaskQueueName("activity-q".into()),
+            attempt: 1,
+            schedule_to_close_timeout: Some(Duration::minutes(2)),
+            schedule_to_start_timeout: Some(Duration::seconds(30)),
+            start_to_close_timeout: Some(Duration::minutes(1)),
+            heartbeat_timeout: Some(Duration::seconds(20)),
+        },
+    );
+    state.timers.insert(
+        "timer-1".into(),
+        TimerState {
+            timer_id: "timer-1".into(),
+            started_event_id: 7,
+            fire_at: now(),
+        },
+    );
+
+    let transition = kernel()
+        .apply(LoadedRun::Existing(state), Command::Reset(make_reset_request()))
+        .unwrap();
+
+    assert!(transition.next_state.activities.is_empty());
+    assert!(transition.next_state.timers.is_empty());
+    assert_eq!(transition.activity_ops.len(), 2);
+    assert_eq!(transition.timer_ops.len(), 1);
+    assert!(transition
+        .activity_ops
+        .iter()
+        .all(|op| matches!(op, tokeira_kernel::ActivityOp::Delete { .. })));
+    assert!(transition
+        .timer_ops
+        .iter()
+        .all(|op| matches!(op, tokeira_kernel::TimerOp::Delete { .. })));
+}
+
+#[test]
+fn reset_applies_parent_close_policy() {
+    let state = with_child(
+        make_open_state(),
+        "child-1",
+        10,
+        ParentClosePolicy::Terminate,
+        true,
+    );
+    let transition = kernel()
+        .apply(LoadedRun::Existing(state), Command::Reset(make_reset_request()))
+        .unwrap();
+
+    assert!(transition.next_state.children.is_empty());
+    assert!(transition.dispatch_ops.iter().any(|op| matches!(
+        op,
+        DispatchOp::TerminateChild { child_workflow_id, .. }
+            if child_workflow_id == &WorkflowId("child-1".into())
+    )));
+}
+
+#[test]
+fn reset_rejects_fork_event_id_zero() {
+    let mut req = make_reset_request();
+    req.fork_event_id = 0;
+    let reject = kernel()
+        .apply(LoadedRun::Existing(make_open_state()), Command::Reset(req))
+        .unwrap_err();
+    assert!(matches!(reject, Reject::ResetConstraintViolation { .. }));
+}
+
+#[test]
+fn reset_rejects_fork_event_id_negative() {
+    let mut req = make_reset_request();
+    req.fork_event_id = -1;
+    let reject = kernel()
+        .apply(LoadedRun::Existing(make_open_state()), Command::Reset(req))
+        .unwrap_err();
+    assert!(matches!(reject, Reject::ResetConstraintViolation { .. }));
+}
+
+#[test]
+fn reset_rejects_fork_event_id_exceeds_last() {
+    let mut req = make_reset_request();
+    req.fork_event_id = 10;
+    let reject = kernel()
+        .apply(LoadedRun::Existing(make_open_state()), Command::Reset(req))
+        .unwrap_err();
+    assert!(matches!(reject, Reject::ResetConstraintViolation { .. }));
+}
+
+#[test]
+fn reset_accepts_fork_event_id_one() {
+    let mut req = make_reset_request();
+    req.fork_event_id = 1;
+    let transition = kernel()
+        .apply(LoadedRun::Existing(make_open_state()), Command::Reset(req))
+        .unwrap();
+    assert_eq!(transition.next_state.status, ExecutionStatus::Terminated);
+}
+
+#[test]
+fn reset_accepts_fork_event_id_equals_last() {
+    let mut req = make_reset_request();
+    req.fork_event_id = 9;
+    let transition = kernel()
+        .apply(LoadedRun::Existing(make_open_state()), Command::Reset(req))
+        .unwrap();
+    assert_eq!(transition.next_state.status, ExecutionStatus::Terminated);
+}
+
+#[test]
+fn reset_rejects_absent_run() {
+    let reject = kernel()
+        .apply(LoadedRun::Absent, Command::Reset(make_reset_request()))
+        .unwrap_err();
+    assert_eq!(reject, Reject::MissingRun);
+}
+
+#[test]
+fn reset_rejects_closed_run() {
+    let reject = kernel()
+        .apply(LoadedRun::Existing(make_closed_state()), Command::Reset(make_reset_request()))
+        .unwrap_err();
+    assert_eq!(reject, Reject::RunClosed(ExecutionStatus::Completed));
 }
 
 #[test]
@@ -1001,6 +1225,10 @@ fn wft_failed_with_started_wft() {
             failure_cause,
             failure_details,
             identity,
+            base_run_id,
+            new_run_id,
+            fork_event_version,
+            fork_event_id,
         }
         if *logical_seq == LogicalTaskSeq(3)
             && *scheduled_event_id == 8
@@ -1008,6 +1236,10 @@ fn wft_failed_with_started_wft() {
             && *failure_cause == WorkflowTaskFailedCause::NonDeterminismError
             && *failure_details == Some(payload("details"))
             && *identity == WorkerIdentity("worker".into())
+            && base_run_id.is_none()
+            && new_run_id.is_none()
+            && fork_event_version.is_none()
+            && fork_event_id.is_none()
     ));
     let pending = transition.next_state.pending_workflow_task.unwrap();
     assert_eq!(pending.logical_seq, LogicalTaskSeq(3));

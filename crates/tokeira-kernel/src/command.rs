@@ -20,6 +20,7 @@ pub enum Command {
     Signal(SignalRequest),
     Cancel(CancelRequest),
     Terminate(TerminateRequest),
+    Reset(ResetRequest),
     UpdateExecutionOptions(UpdateExecutionOptionsRequest),
     WorkflowExecutionTimedOut(WorkflowExecutionTimedOutRequest),
     WorkflowTaskStarted(StartWorkflowTaskRequest),
@@ -51,6 +52,7 @@ pub enum WorkflowTaskFailedCause {
     BadRequestCancelActivityAttributes,
     WorkflowWorkerUnhandledFailure,
     BadSignalWorkflowExecutionAttributes,
+    ResetWorkflow,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -134,6 +136,15 @@ pub struct TerminateRequest {
     pub reason: String,
     pub details: Option<Payloads>,
     pub identity: String,
+    pub request: RequestContext,
+    pub now: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResetRequest {
+    pub fork_event_id: i64,
+    pub new_run_id: RunId,
+    pub reason: String,
     pub request: RequestContext,
     pub now: OffsetDateTime,
 }

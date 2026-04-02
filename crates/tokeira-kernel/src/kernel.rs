@@ -12,8 +12,8 @@ use crate::{
         ActivityResolvedRequest, CancelRequest, ChildResolution, ChildResolvedRequest,
         ChildStartConfirmedRequest, ChildStartResult, Command, ExternalCancelResolvedRequest,
         ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult,
-        FieldChange, NexusOperationResolvedRequest, NexusResolution, RetryState, SignalRequest,
-        StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest,
+        FieldChange, NexusOperationResolvedRequest, NexusResolution, ResetRequest, RetryState,
+        SignalRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest,
         UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, WorkflowCommand,
         WorkflowExecutionTimedOutRequest,
         WorkflowTaskCompletedRequest, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
@@ -45,6 +45,7 @@ impl Kernel for BasicKernel {
             Command::Signal(req) => self.apply_signal(loaded, req),
             Command::Cancel(req) => self.apply_cancel(loaded, req),
             Command::Terminate(req) => self.apply_terminate(loaded, req),
+            Command::Reset(req) => self.apply_reset(loaded, req),
             Command::UpdateExecutionOptions(req) => {
                 self.apply_update_execution_options(loaded, req)
             }
@@ -221,6 +222,67 @@ impl BasicKernel {
             reason: req.reason,
             details: req.details,
             identity: req.identity,
+        });
+        builder.close(ExecutionStatus::Terminated);
+
+        let activities = std::mem::take(&mut builder.state.activities);
+        for (activity_id, _) in activities {
+            builder.activity_ops.push(ActivityOp::Delete { activity_id });
+        }
+
+        let timers = std::mem::take(&mut builder.state.timers);
+        for (timer_id, _) in timers {
+            builder.timer_ops.push(TimerOp::Delete { timer_id });
+        }
+
+        builder.apply_parent_close_policy();
+
+        Ok(builder.finish())
+    }
+
+    fn apply_reset(&self, loaded: LoadedRun, req: ResetRequest) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+
+        if req.fork_event_id <= 0 {
+            return Err(Reject::ResetConstraintViolation {
+                reason: format!("fork_event_id must be positive, got {}", req.fork_event_id),
+            });
+        }
+        if req.fork_event_id > state.last_event_id {
+            return Err(Reject::ResetConstraintViolation {
+                reason: format!(
+                    "fork_event_id {} exceeds last_event_id {}",
+                    req.fork_event_id, state.last_event_id
+                ),
+            });
+        }
+
+        let (scheduled_event_id, started_event_id) = match &state.pending_workflow_task {
+            Some(pending) => (
+                pending.scheduled_event_id,
+                pending.started_event_id.unwrap_or(0),
+            ),
+            None => (0, 0),
+        };
+
+        let logical_seq = state.next_workflow_task_seq;
+        let base_run_id = state.run_id;
+
+        let mut builder = TransitionBuilder::new(state, req.now);
+        builder.request_dedupe_ops.push(RequestDedupeOp {
+            request_id: req.request.request_id.clone(),
+        });
+        builder.emit(HistoryEventKind::WorkflowTaskFailed {
+            logical_seq,
+            scheduled_event_id,
+            started_event_id,
+            failure_cause: crate::command::WorkflowTaskFailedCause::ResetWorkflow,
+            failure_details: None,
+            identity: tokeira_types::WorkerIdentity("reset".into()),
+            base_run_id: Some(base_run_id),
+            new_run_id: Some(req.new_run_id),
+            fork_event_version: None,
+            fork_event_id: Some(req.fork_event_id),
         });
         builder.close(ExecutionStatus::Terminated);
 
@@ -780,6 +842,10 @@ impl BasicKernel {
             failure_cause: req.failure_cause,
             failure_details: req.failure_details,
             identity: req.worker_identity,
+            base_run_id: None,
+            new_run_id: None,
+            fork_event_version: None,
+            fork_event_id: None,
         });
         let sticky_preferred = builder
             .state
@@ -1488,6 +1554,8 @@ pub enum Reject {
     },
     #[error("nexus operation already started: {0}")]
     NexusOperationAlreadyStarted(String),
+    #[error("reset constraint violation: {reason}")]
+    ResetConstraintViolation { reason: String },
     #[error("commands after close at index {index}")]
     CommandsAfterClose { index: usize },
 

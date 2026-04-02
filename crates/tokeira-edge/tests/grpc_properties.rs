@@ -158,6 +158,8 @@ proptest! {
             | WorkflowCommand::StartChildWorkflow { .. }
             | WorkflowCommand::SignalExternalWorkflowExecution { .. }
             | WorkflowCommand::RequestCancelExternalWorkflowExecution { .. }
+            | WorkflowCommand::ScheduleNexusOperation { .. }
+            | WorkflowCommand::CancelNexusOperation { .. }
             | WorkflowCommand::UpdateCompleted { .. }
             | WorkflowCommand::UpdateRejected { .. }
             | WorkflowCommand::ProtocolMessage { .. }
@@ -609,6 +611,23 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
         arb_small_string().prop_map(|target_workflow_id| WorkflowCommand::RequestCancelExternalWorkflowExecution {
             target_workflow_id: tokeira_types::WorkflowId(target_workflow_id),
             target_run_id: Some(tokeira_types::RunId::new()),
+        }),
+        (
+            arb_small_string(),
+            arb_small_string(),
+            arb_small_string(),
+            arb_small_string(),
+            arb_payloads(),
+        ).prop_map(|(operation_id, endpoint, service, operation, input)| WorkflowCommand::ScheduleNexusOperation {
+            operation_id,
+            endpoint,
+            service,
+            operation,
+            input,
+            schedule_to_close_timeout: None,
+        }),
+        (1i64..100i64).prop_map(|scheduled_event_id| WorkflowCommand::CancelNexusOperation {
+            scheduled_event_id,
         }),
         arb_payloads().prop_map(|result| WorkflowCommand::UpdateCompleted {
             update_id: "update-1".into(),

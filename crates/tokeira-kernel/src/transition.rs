@@ -94,6 +94,17 @@ pub enum DispatchOp {
         target_workflow_id: WorkflowId,
         target_run_id: Option<RunId>,
     },
+    ScheduleNexusOperation {
+        operation_id: String,
+        endpoint: String,
+        service: String,
+        operation: String,
+        input: Payloads,
+        schedule_to_close_timeout: Option<Duration>,
+    },
+    CancelNexusOperation {
+        scheduled_event_id: i64,
+    },
 }
 
 /// Projection operations are the contract between the correctness path and the

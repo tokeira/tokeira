@@ -31,6 +31,7 @@ pub enum Command {
     ChildResolved(ChildResolvedRequest),
     ExternalSignalResolved(ExternalSignalResolvedRequest),
     ExternalCancelResolved(ExternalCancelResolvedRequest),
+    NexusOperationResolved(NexusOperationResolvedRequest),
     TimerDue(TimerDueRequest),
 }
 
@@ -258,6 +259,23 @@ pub enum ExternalCancelResult {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub enum NexusResolution {
+    Started,
+    Completed { result: Payloads },
+    Failed { failure: String },
+    Canceled,
+    TimedOut,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NexusOperationResolvedRequest {
+    pub operation_id: String,
+    pub scheduled_event_id: i64,
+    pub resolution: NexusResolution,
+    pub now: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum UpdateProtocolBody {
     Accepted {
         update_id: String,
@@ -349,6 +367,17 @@ pub enum WorkflowCommand {
     RequestCancelExternalWorkflowExecution {
         target_workflow_id: WorkflowId,
         target_run_id: Option<RunId>,
+    },
+    ScheduleNexusOperation {
+        operation_id: String,
+        endpoint: String,
+        service: String,
+        operation: String,
+        input: Payloads,
+        schedule_to_close_timeout: Option<Duration>,
+    },
+    CancelNexusOperation {
+        scheduled_event_id: i64,
     },
     UpdateCompleted {
         update_id: String,

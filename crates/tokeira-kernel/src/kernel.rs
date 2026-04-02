@@ -12,15 +12,17 @@ use crate::{
         ActivityResolvedRequest, CancelRequest, ChildResolution, ChildResolvedRequest,
         ChildStartConfirmedRequest, ChildStartResult, Command, ExternalCancelResolvedRequest,
         ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult,
-        FieldChange, RetryState, SignalRequest, StartRequest, StartWorkflowTaskRequest,
-        TerminateRequest, TimerDueRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody,
-        UpdateRequest, WorkflowCommand, WorkflowExecutionTimedOutRequest,
+        FieldChange, NexusOperationResolvedRequest, NexusResolution, RetryState, SignalRequest,
+        StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest,
+        UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, WorkflowCommand,
+        WorkflowExecutionTimedOutRequest,
         WorkflowTaskCompletedRequest, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
     },
     event::{ActivityResolution, HistoryEvent, HistoryEventKind},
     state::{
         ActivityState, ChildWorkflowState, LoadedRun, ParentClosePolicy, PendingExternalCancel,
-        PendingExternalSignal, PendingUpdate, PendingWorkflowTask, TimerState, WorkflowState,
+        PendingExternalSignal, PendingNexusOperation, PendingUpdate, PendingWorkflowTask,
+        TimerState, WorkflowState,
     },
     transition::{
         ActivityOp, DispatchOp, ProjectionOp, RequestDedupeOp, TimerOp, Transition,
@@ -58,6 +60,7 @@ impl Kernel for BasicKernel {
             Command::ChildResolved(req) => self.apply_child_resolved(loaded, req),
             Command::ExternalSignalResolved(req) => self.apply_external_signal_resolved(loaded, req),
             Command::ExternalCancelResolved(req) => self.apply_external_cancel_resolved(loaded, req),
+            Command::NexusOperationResolved(req) => self.apply_nexus_operation_resolved(loaded, req),
             Command::TimerDue(req) => self.apply_timer_due(loaded, req),
         }
     }
@@ -95,6 +98,7 @@ impl BasicKernel {
             pending_external_signals: BTreeMap::new(),
             pending_external_cancels: BTreeMap::new(),
             pending_updates: BTreeMap::new(),
+            pending_nexus_operations: BTreeMap::new(),
             versioning_override: None,
             completion_callbacks: Vec::new(),
             started_at: req.now,
@@ -644,6 +648,104 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    fn apply_nexus_operation_resolved(
+        &self,
+        loaded: LoadedRun,
+        req: NexusOperationResolvedRequest,
+    ) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+        let pending = state
+            .pending_nexus_operations
+            .get(&req.operation_id)
+            .cloned()
+            .ok_or_else(|| Reject::UnknownNexusOperation(req.operation_id.clone()))?;
+
+        if pending.scheduled_event_id != req.scheduled_event_id {
+            return Err(Reject::StaleNexusResolution {
+                operation_id: req.operation_id,
+                expected_scheduled_event_id: pending.scheduled_event_id,
+            });
+        }
+
+        let mut builder = TransitionBuilder::new(state, req.now);
+        match req.resolution {
+            NexusResolution::Started => {
+                if pending.started {
+                    return Err(Reject::NexusOperationAlreadyStarted(
+                        pending.operation_id.clone(),
+                    ));
+                }
+                builder.emit(HistoryEventKind::NexusOperationStarted {
+                    operation_id: pending.operation_id.clone(),
+                    scheduled_event_id: pending.scheduled_event_id,
+                });
+                if let Some(current) = builder
+                    .state
+                    .pending_nexus_operations
+                    .get_mut(&pending.operation_id)
+                {
+                    current.started = true;
+                }
+            }
+            NexusResolution::Completed { result } => {
+                builder.emit(HistoryEventKind::NexusOperationCompleted {
+                    operation_id: pending.operation_id.clone(),
+                    scheduled_event_id: pending.scheduled_event_id,
+                    result,
+                });
+                builder
+                    .state
+                    .pending_nexus_operations
+                    .remove(&pending.operation_id);
+                if builder.state.pending_workflow_task.is_none() {
+                    builder.schedule_workflow_task();
+                }
+            }
+            NexusResolution::Failed { failure } => {
+                builder.emit(HistoryEventKind::NexusOperationFailed {
+                    operation_id: pending.operation_id.clone(),
+                    scheduled_event_id: pending.scheduled_event_id,
+                    failure,
+                });
+                builder
+                    .state
+                    .pending_nexus_operations
+                    .remove(&pending.operation_id);
+                if builder.state.pending_workflow_task.is_none() {
+                    builder.schedule_workflow_task();
+                }
+            }
+            NexusResolution::Canceled => {
+                builder.emit(HistoryEventKind::NexusOperationCanceled {
+                    operation_id: pending.operation_id.clone(),
+                    scheduled_event_id: pending.scheduled_event_id,
+                });
+                builder
+                    .state
+                    .pending_nexus_operations
+                    .remove(&pending.operation_id);
+                if builder.state.pending_workflow_task.is_none() {
+                    builder.schedule_workflow_task();
+                }
+            }
+            NexusResolution::TimedOut => {
+                builder.emit(HistoryEventKind::NexusOperationTimedOut {
+                    operation_id: pending.operation_id.clone(),
+                    scheduled_event_id: pending.scheduled_event_id,
+                });
+                builder
+                    .state
+                    .pending_nexus_operations
+                    .remove(&pending.operation_id);
+                if builder.state.pending_workflow_task.is_none() {
+                    builder.schedule_workflow_task();
+                }
+            }
+        }
+
+        Ok(builder.finish())
+    }
+
     fn apply_workflow_task_failed(
         &self,
         loaded: LoadedRun,
@@ -1074,6 +1176,73 @@ fn apply_workflow_command(builder: &mut TransitionBuilder, command: WorkflowComm
                 });
             Ok(false)
         }
+        WorkflowCommand::ScheduleNexusOperation {
+            operation_id,
+            endpoint,
+            service,
+            operation,
+            input,
+            schedule_to_close_timeout,
+        } => {
+            if builder
+                .state
+                .pending_nexus_operations
+                .contains_key(&operation_id)
+            {
+                return Err(Reject::DuplicateNexusOperationId(operation_id));
+            }
+            let scheduled_event_id = builder.emit(HistoryEventKind::NexusOperationScheduled {
+                operation_id: operation_id.clone(),
+                endpoint: endpoint.clone(),
+                service: service.clone(),
+                operation: operation.clone(),
+                input: input.clone(),
+                schedule_to_close_timeout,
+            });
+            builder.state.pending_nexus_operations.insert(
+                operation_id.clone(),
+                PendingNexusOperation {
+                    operation_id: operation_id.clone(),
+                    scheduled_event_id,
+                    endpoint: endpoint.clone(),
+                    service: service.clone(),
+                    operation: operation.clone(),
+                    started: false,
+                },
+            );
+            builder
+                .dispatch_ops
+                .push(DispatchOp::ScheduleNexusOperation {
+                    operation_id,
+                    endpoint,
+                    service,
+                    operation,
+                    input,
+                    schedule_to_close_timeout,
+                });
+            Ok(false)
+        }
+        WorkflowCommand::CancelNexusOperation { scheduled_event_id } => {
+            let known = builder
+                .state
+                .pending_nexus_operations
+                .values()
+                .find(|pending| pending.scheduled_event_id == scheduled_event_id)
+                .map(|pending| pending.operation_id.clone())
+                .ok_or_else(|| {
+                    Reject::UnknownNexusOperation(format!(
+                        "scheduled_event_id={scheduled_event_id}"
+                    ))
+                })?;
+            let _ = known;
+            builder.emit(HistoryEventKind::NexusOperationCancelRequested {
+                scheduled_event_id,
+            });
+            builder
+                .dispatch_ops
+                .push(DispatchOp::CancelNexusOperation { scheduled_event_id });
+            Ok(false)
+        }
         WorkflowCommand::UpdateCompleted { update_id, result } => {
             if !builder.state.pending_updates.contains_key(&update_id) {
                 return Err(Reject::UnknownUpdate(update_id));
@@ -1217,6 +1386,7 @@ impl TransitionBuilder {
         self.state.pending_external_signals.clear();
         self.state.pending_external_cancels.clear();
         self.state.pending_updates.clear();
+        self.state.pending_nexus_operations.clear();
         self.projection_ops.push(ProjectionOp::CloseExecution {
             status,
             closed_at: self.now,
@@ -1307,6 +1477,17 @@ pub enum Reject {
     UnknownUpdate(String),
     #[error("duplicate update id: {0}")]
     DuplicateUpdateId(String),
+    #[error("duplicate nexus operation id: {0}")]
+    DuplicateNexusOperationId(String),
+    #[error("unknown nexus operation: {0}")]
+    UnknownNexusOperation(String),
+    #[error("stale nexus resolution for {operation_id}: expected scheduled_event_id {expected_scheduled_event_id}")]
+    StaleNexusResolution {
+        operation_id: String,
+        expected_scheduled_event_id: i64,
+    },
+    #[error("nexus operation already started: {0}")]
+    NexusOperationAlreadyStarted(String),
     #[error("commands after close at index {index}")]
     CommandsAfterClose { index: usize },
 

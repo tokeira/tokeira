@@ -193,6 +193,39 @@ pub enum HistoryEventKind {
         target_workflow_id: WorkflowId,
         cause: String,
     },
+    NexusOperationScheduled {
+        operation_id: String,
+        endpoint: String,
+        service: String,
+        operation: String,
+        input: Payloads,
+        schedule_to_close_timeout: Option<Duration>,
+    },
+    NexusOperationStarted {
+        operation_id: String,
+        scheduled_event_id: i64,
+    },
+    NexusOperationCompleted {
+        operation_id: String,
+        scheduled_event_id: i64,
+        result: Payloads,
+    },
+    NexusOperationFailed {
+        operation_id: String,
+        scheduled_event_id: i64,
+        failure: String,
+    },
+    NexusOperationCanceled {
+        operation_id: String,
+        scheduled_event_id: i64,
+    },
+    NexusOperationTimedOut {
+        operation_id: String,
+        scheduled_event_id: i64,
+    },
+    NexusOperationCancelRequested {
+        scheduled_event_id: i64,
+    },
     WorkflowExecutionUpdateAccepted {
         update_id: String,
         update_name: String,

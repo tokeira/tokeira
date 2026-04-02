@@ -4,10 +4,11 @@ use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     event::HistoryEventKind, kernel::Kernel, ActivityResolvedRequest, ActivityState,
     BasicKernel, CancelRequest, ChildResolution, ChildResolvedRequest,
-    ChildStartConfirmedRequest, ChildStartResult, ChildWorkflowState, Command,
-    CompletionCallback, DispatchOp, ExternalCancelResolvedRequest, ExternalCancelResult,
+    ChildStartConfirmedRequest, ChildStartResult, ChildWorkflowState, Command, CompletionCallback,
+    DispatchOp, ExternalCancelResolvedRequest, ExternalCancelResult,
     ExternalSignalResolvedRequest, ExternalSignalResult, ExternalWorkflowExecution, FieldChange,
-    LoadedRun, ParentClosePolicy, PendingExternalCancel, PendingExternalSignal, PendingUpdate,
+    LoadedRun, NexusOperationResolvedRequest, NexusResolution, ParentClosePolicy,
+    PendingExternalCancel, PendingExternalSignal, PendingNexusOperation, PendingUpdate,
     PendingWorkflowTask, ProjectionOp, Reject, RetryState, SignalRequest, StartRequest,
     StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerState,
     UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, VersioningOverride,
@@ -114,6 +115,7 @@ fn make_open_state() -> WorkflowState {
         pending_external_signals: BTreeMap::new(),
         pending_external_cancels: BTreeMap::new(),
         pending_updates: BTreeMap::new(),
+        pending_nexus_operations: BTreeMap::new(),
         versioning_override: None,
         completion_callbacks: Vec::new(),
         started_at: now() - Duration::minutes(3),
@@ -242,6 +244,29 @@ fn make_closed_state() -> WorkflowState {
 fn with_execution_options(mut state: WorkflowState) -> WorkflowState {
     state.versioning_override = Some(VersioningOverride);
     state.completion_callbacks = vec![CompletionCallback];
+    state
+}
+
+fn with_pending_nexus_operation(mut state: WorkflowState, operation_id: &str) -> WorkflowState {
+    state.pending_nexus_operations.insert(
+        operation_id.into(),
+        PendingNexusOperation {
+            operation_id: operation_id.into(),
+            scheduled_event_id: 12,
+            endpoint: "endpoint".into(),
+            service: "service".into(),
+            operation: "operation".into(),
+            started: false,
+        },
+    );
+    state
+}
+
+fn with_started_nexus_operation(mut state: WorkflowState, operation_id: &str) -> WorkflowState {
+    state = with_pending_nexus_operation(state, operation_id);
+    if let Some(pending) = state.pending_nexus_operations.get_mut(operation_id) {
+        pending.started = true;
+    }
     state
 }
 
@@ -2771,4 +2796,374 @@ fn close_preserves_execution_options() {
 
     assert_eq!(transition.next_state.versioning_override, Some(VersioningOverride));
     assert_eq!(transition.next_state.completion_callbacks, vec![CompletionCallback]);
+}
+
+#[test]
+fn schedule_nexus_operation_happy_path() {
+    let state = make_open_state_with_started_wft();
+    let pending = state.pending_workflow_task.clone().unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: pending.logical_seq,
+                    started_event_id: pending.started_event_id.unwrap(),
+                    attempt: pending.attempt,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::ScheduleNexusOperation {
+                    operation_id: "op-1".into(),
+                    endpoint: "endpoint".into(),
+                    service: "service".into(),
+                    operation: "method".into(),
+                    input: payloads("input"),
+                    schedule_to_close_timeout: Some(Duration::seconds(30)),
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        &transition.history_events[1].kind,
+        HistoryEventKind::NexusOperationScheduled { operation_id, endpoint, service, operation, .. }
+            if operation_id == "op-1" && endpoint == "endpoint" && service == "service" && operation == "method"
+    ));
+    let pending_nexus = transition.next_state.pending_nexus_operations.get("op-1").unwrap();
+    assert_eq!(pending_nexus.scheduled_event_id, 11);
+    assert_eq!(pending_nexus.endpoint, "endpoint");
+    assert_eq!(pending_nexus.service, "service");
+    assert_eq!(pending_nexus.operation, "method");
+    assert!(!pending_nexus.started);
+    assert!(transition.dispatch_ops.iter().any(|op| matches!(op, DispatchOp::ScheduleNexusOperation { operation_id, .. } if operation_id == "op-1")));
+}
+
+#[test]
+fn schedule_nexus_operation_duplicate_rejected() {
+    let state = with_pending_nexus_operation(make_open_state_with_started_wft(), "op-1");
+    let pending = state.pending_workflow_task.clone().unwrap();
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: pending.logical_seq,
+                    started_event_id: pending.started_event_id.unwrap(),
+                    attempt: pending.attempt,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::ScheduleNexusOperation {
+                    operation_id: "op-1".into(),
+                    endpoint: "endpoint".into(),
+                    service: "service".into(),
+                    operation: "method".into(),
+                    input: payloads("input"),
+                    schedule_to_close_timeout: None,
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap_err();
+
+    assert_eq!(reject, Reject::DuplicateNexusOperationId("op-1".into()));
+}
+
+#[test]
+fn cancel_nexus_operation_happy_path() {
+    let state = with_pending_nexus_operation(make_open_state_with_started_wft(), "op-1");
+    let pending = state.pending_workflow_task.clone().unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: pending.logical_seq,
+                    started_event_id: pending.started_event_id.unwrap(),
+                    attempt: pending.attempt,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::CancelNexusOperation {
+                    scheduled_event_id: 12,
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        transition.history_events[1].kind,
+        HistoryEventKind::NexusOperationCancelRequested { scheduled_event_id: 12 }
+    ));
+    assert!(transition.dispatch_ops.iter().any(|op| matches!(op, DispatchOp::CancelNexusOperation { scheduled_event_id: 12 })));
+    assert!(transition.next_state.pending_nexus_operations.contains_key("op-1"));
+}
+
+#[test]
+fn cancel_nexus_operation_unknown() {
+    let state = make_open_state_with_started_wft();
+    let pending = state.pending_workflow_task.clone().unwrap();
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: pending.logical_seq,
+                    started_event_id: pending.started_event_id.unwrap(),
+                    attempt: pending.attempt,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::CancelNexusOperation {
+                    scheduled_event_id: 12,
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap_err();
+
+    assert_eq!(reject, Reject::UnknownNexusOperation("scheduled_event_id=12".into()));
+}
+
+#[test]
+fn nexus_operation_resolved_started() {
+    let state = with_pending_nexus_operation(make_open_state(), "op-1");
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                operation_id: "op-1".into(),
+                scheduled_event_id: 12,
+                resolution: NexusResolution::Started,
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::NexusOperationStarted { scheduled_event_id: 12, .. }
+    ));
+    assert!(transition.next_state.pending_nexus_operations.get("op-1").unwrap().started);
+    assert!(transition.next_state.pending_workflow_task.is_none());
+    assert!(transition.request_dedupe_ops.is_empty());
+}
+
+#[test]
+fn nexus_operation_resolved_started_duplicate() {
+    let state = with_started_nexus_operation(with_pending_nexus_operation(make_open_state(), "op-1"), "op-1");
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                operation_id: "op-1".into(),
+                scheduled_event_id: 12,
+                resolution: NexusResolution::Started,
+                now: now(),
+            }),
+        )
+        .unwrap_err();
+
+    assert_eq!(reject, Reject::NexusOperationAlreadyStarted("op-1".into()));
+}
+
+#[test]
+fn nexus_operation_resolved_completed() {
+    let state = with_pending_nexus_operation(make_open_state(), "op-1");
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                operation_id: "op-1".into(),
+                scheduled_event_id: 12,
+                resolution: NexusResolution::Completed {
+                    result: payloads("done"),
+                },
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert!(matches!(transition.history_events[0].kind, HistoryEventKind::NexusOperationCompleted { scheduled_event_id: 12, .. }));
+    assert!(!transition.next_state.pending_nexus_operations.contains_key("op-1"));
+    assert!(transition.next_state.pending_workflow_task.is_some());
+}
+
+#[test]
+fn nexus_operation_resolved_completed_with_pending_wft() {
+    let state = with_pending_nexus_operation(make_open_state_with_pending_wft(), "op-1");
+    let existing = state.pending_workflow_task.clone();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                operation_id: "op-1".into(),
+                scheduled_event_id: 12,
+                resolution: NexusResolution::Completed {
+                    result: payloads("done"),
+                },
+                now: now(),
+            }),
+        )
+        .unwrap();
+    assert_eq!(transition.next_state.pending_workflow_task, existing);
+    assert_eq!(transition.dispatch_ops.iter().filter(|op| matches!(op, DispatchOp::EnqueueWorkflowTask { .. })).count(), 0);
+}
+
+#[test]
+fn nexus_operation_resolved_failed() {
+    let state = with_pending_nexus_operation(make_open_state(), "op-1");
+    let transition = kernel().apply(
+        LoadedRun::Existing(state),
+        Command::NexusOperationResolved(NexusOperationResolvedRequest {
+            operation_id: "op-1".into(),
+            scheduled_event_id: 12,
+            resolution: NexusResolution::Failed { failure: "nope".into() },
+            now: now(),
+        }),
+    ).unwrap();
+    assert!(matches!(transition.history_events[0].kind, HistoryEventKind::NexusOperationFailed { scheduled_event_id: 12, .. }));
+    assert!(transition.next_state.pending_workflow_task.is_some());
+}
+
+#[test]
+fn nexus_operation_resolved_canceled() {
+    let state = with_pending_nexus_operation(make_open_state(), "op-1");
+    let transition = kernel().apply(
+        LoadedRun::Existing(state),
+        Command::NexusOperationResolved(NexusOperationResolvedRequest {
+            operation_id: "op-1".into(),
+            scheduled_event_id: 12,
+            resolution: NexusResolution::Canceled,
+            now: now(),
+        }),
+    ).unwrap();
+    assert!(matches!(transition.history_events[0].kind, HistoryEventKind::NexusOperationCanceled { scheduled_event_id: 12, .. }));
+    assert!(transition.next_state.pending_workflow_task.is_some());
+}
+
+#[test]
+fn nexus_operation_resolved_timed_out() {
+    let state = with_pending_nexus_operation(make_open_state(), "op-1");
+    let transition = kernel().apply(
+        LoadedRun::Existing(state),
+        Command::NexusOperationResolved(NexusOperationResolvedRequest {
+            operation_id: "op-1".into(),
+            scheduled_event_id: 12,
+            resolution: NexusResolution::TimedOut,
+            now: now(),
+        }),
+    ).unwrap();
+    assert!(matches!(transition.history_events[0].kind, HistoryEventKind::NexusOperationTimedOut { scheduled_event_id: 12, .. }));
+    assert!(transition.next_state.pending_workflow_task.is_some());
+}
+
+#[test]
+fn nexus_operation_resolved_unknown_operation() {
+    let reject = kernel().apply(
+        LoadedRun::Existing(make_open_state()),
+        Command::NexusOperationResolved(NexusOperationResolvedRequest {
+            operation_id: "missing".into(),
+            scheduled_event_id: 12,
+            resolution: NexusResolution::Started,
+            now: now(),
+        }),
+    ).unwrap_err();
+    assert_eq!(reject, Reject::UnknownNexusOperation("missing".into()));
+}
+
+#[test]
+fn nexus_operation_resolved_stale() {
+    let state = with_pending_nexus_operation(make_open_state(), "op-1");
+    let reject = kernel().apply(
+        LoadedRun::Existing(state),
+        Command::NexusOperationResolved(NexusOperationResolvedRequest {
+            operation_id: "op-1".into(),
+            scheduled_event_id: 99,
+            resolution: NexusResolution::Started,
+            now: now(),
+        }),
+    ).unwrap_err();
+    assert_eq!(
+        reject,
+        Reject::StaleNexusResolution {
+            operation_id: "op-1".into(),
+            expected_scheduled_event_id: 12,
+        }
+    );
+}
+
+#[test]
+fn nexus_operation_resolved_absent_run() {
+    let reject = kernel().apply(
+        LoadedRun::Absent,
+        Command::NexusOperationResolved(NexusOperationResolvedRequest {
+            operation_id: "op-1".into(),
+            scheduled_event_id: 12,
+            resolution: NexusResolution::Started,
+            now: now(),
+        }),
+    ).unwrap_err();
+    assert_eq!(reject, Reject::MissingRun);
+}
+
+#[test]
+fn nexus_operation_resolved_closed_run() {
+    let reject = kernel().apply(
+        LoadedRun::Existing(make_closed_state()),
+        Command::NexusOperationResolved(NexusOperationResolvedRequest {
+            operation_id: "op-1".into(),
+            scheduled_event_id: 12,
+            resolution: NexusResolution::Started,
+            now: now(),
+        }),
+    ).unwrap_err();
+    assert_eq!(reject, Reject::RunClosed(ExecutionStatus::Completed));
+}
+
+#[test]
+fn terminate_clears_pending_nexus_operations() {
+    let state = with_pending_nexus_operation(make_open_state(), "op-1");
+    let transition = kernel()
+        .apply(LoadedRun::Existing(state), Command::Terminate(make_terminate_request()))
+        .unwrap();
+    assert!(transition.next_state.pending_nexus_operations.is_empty());
+    assert_eq!(transition.dispatch_ops.iter().filter(|op| matches!(op, DispatchOp::ScheduleNexusOperation { .. } | DispatchOp::CancelNexusOperation { .. })).count(), 0);
+}
+
+#[test]
+fn close_via_complete_clears_pending_nexus_operations() {
+    let state = with_pending_nexus_operation(make_open_state_with_started_wft(), "op-1");
+    let pending = state.pending_workflow_task.clone().unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: pending.logical_seq,
+                    started_event_id: pending.started_event_id.unwrap(),
+                    attempt: pending.attempt,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::CompleteWorkflow { result: payloads("done") }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
+    assert!(transition.next_state.pending_nexus_operations.is_empty());
+    assert_eq!(transition.dispatch_ops.iter().filter(|op| matches!(op, DispatchOp::ScheduleNexusOperation { .. } | DispatchOp::CancelNexusOperation { .. })).count(), 0);
 }

@@ -40,6 +40,7 @@ pub struct WorkflowState {
     pub pending_external_signals: BTreeMap<i64, PendingExternalSignal>,
     pub pending_external_cancels: BTreeMap<i64, PendingExternalCancel>,
     pub pending_updates: BTreeMap<String, PendingUpdate>,
+    pub pending_nexus_operations: BTreeMap<String, PendingNexusOperation>,
     pub versioning_override: Option<VersioningOverride>,
     pub completion_callbacks: Vec<CompletionCallback>,
 
@@ -116,6 +117,16 @@ pub struct PendingUpdate {
     pub update_id: String,
     pub accepted_event_id: i64,
     pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingNexusOperation {
+    pub operation_id: String,
+    pub scheduled_event_id: i64,
+    pub endpoint: String,
+    pub service: String,
+    pub operation: String,
+    pub started: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

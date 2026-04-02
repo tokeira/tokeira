@@ -8,14 +8,14 @@ use tokeira_kernel::{
     ChildResolvedRequest, ChildStartConfirmedRequest, ChildStartResult, ChildWorkflowState,
     Command, CompletionCallback, DispatchOp, ExternalCancelResolvedRequest,
     ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult,
-    ExternalWorkflowExecution, FieldChange, LoadedRun, ParentClosePolicy,
-    PendingExternalCancel, PendingExternalSignal, PendingUpdate, PendingWorkflowTask,
-    RequestDedupeOp, RetryState, SignalRequest, StartRequest, StartWorkflowTaskRequest,
-    TerminateRequest, TimerDueRequest, TimerOp, TimerState, UpdateExecutionOptionsRequest,
-    UpdateProtocolBody, UpdateRequest, VersioningOverride, WorkflowCommand,
-    WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
-    WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
-    WorkflowTaskTimeoutType, WorkflowTimeoutType,
+    ExternalWorkflowExecution, FieldChange, LoadedRun, NexusOperationResolvedRequest,
+    NexusResolution, ParentClosePolicy, PendingExternalCancel, PendingExternalSignal,
+    PendingNexusOperation, PendingUpdate, PendingWorkflowTask, RequestDedupeOp, RetryState,
+    SignalRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest,
+    TimerOp, TimerState, UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest,
+    VersioningOverride, WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowState,
+    WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
+    WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType, WorkflowTimeoutType,
 };
 use tokeira_types::{
     ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RequestContext,
@@ -96,6 +96,7 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         pending_external_signals: BTreeMap::new(),
         pending_external_cancels: BTreeMap::new(),
         pending_updates: BTreeMap::new(),
+        pending_nexus_operations: BTreeMap::new(),
         versioning_override: None,
         completion_callbacks: Vec::new(),
         started_at: now - Duration::minutes(10),
@@ -213,6 +214,21 @@ fn with_execution_options(mut state: WorkflowState, callbacks: usize) -> Workflo
     state
 }
 
+fn with_pending_nexus_operation(mut state: WorkflowState, operation_id: &str) -> WorkflowState {
+    state.pending_nexus_operations.insert(
+        operation_id.into(),
+        PendingNexusOperation {
+            operation_id: operation_id.into(),
+            scheduled_event_id: 12,
+            endpoint: "endpoint".into(),
+            service: "service".into(),
+            operation: "operation".into(),
+            started: false,
+        },
+    );
+    state
+}
+
 // --- Arbitrary strategies ---
 
 fn arb_duration() -> impl Strategy<Value = Duration> {
@@ -258,6 +274,29 @@ fn arb_record_marker_command() -> impl Strategy<Value = WorkflowCommand> {
             failure,
             header,
         })
+}
+
+fn arb_schedule_nexus_operation_command() -> impl Strategy<Value = WorkflowCommand> {
+    (
+        arb_small_string(),
+        arb_small_string(),
+        arb_small_string(),
+        arb_small_string(),
+        arb_payloads(),
+        prop::option::of(arb_duration()),
+    )
+        .prop_map(
+            |(operation_id, endpoint, service, operation, input, schedule_to_close_timeout)| {
+                WorkflowCommand::ScheduleNexusOperation {
+                    operation_id,
+                    endpoint,
+                    service,
+                    operation,
+                    input,
+                    schedule_to_close_timeout,
+                }
+            },
+        )
 }
 
 fn arb_field_change<T: Strategy>(
@@ -599,6 +638,16 @@ fn arb_workflow_execution_timed_out_request(
     })
 }
 
+fn arb_nexus_resolution() -> impl Strategy<Value = NexusResolution> {
+    prop_oneof![
+        Just(NexusResolution::Started),
+        arb_payloads().prop_map(|result| NexusResolution::Completed { result }),
+        arb_small_string().prop_map(|failure| NexusResolution::Failed { failure }),
+        Just(NexusResolution::Canceled),
+        Just(NexusResolution::TimedOut),
+    ]
+}
+
 fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
     let now = fixed_now();
     prop_oneof![
@@ -648,6 +697,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
             Just(vec![WorkflowCommand::RequestNewWorkflowTask]),
             arb_schedule_activity_command().prop_map(|cmd| vec![cmd]),
             arb_record_marker_command().prop_map(|cmd| vec![cmd]),
+            arb_schedule_nexus_operation_command().prop_map(|cmd| vec![cmd]),
             arb_payloads().prop_map(|result| vec![WorkflowCommand::CompleteWorkflow { result }]),
             (arb_small_string(), prop::option::of(arb_payload())).prop_map(|(message, details)| vec![WorkflowCommand::FailWorkflow { message, details }]),
             arb_continue_as_new_command().prop_map(|cmd| vec![cmd]),
@@ -786,6 +836,26 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
             };
             (LoadedRun::Existing(state), Command::WorkflowTaskCompleted(req))
         }),
+        arb_small_string().prop_map(move |operation_id| {
+            let state = with_pending_nexus_operation(
+                with_pending_wft(make_open_state(now), 45, Some(20), 1),
+                &operation_id,
+            );
+            let req = WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(45),
+                    started_event_id: 20,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::CancelNexusOperation { scheduled_event_id: 12 }],
+                force_new_workflow_task: false,
+                now,
+            };
+            (LoadedRun::Existing(state), Command::WorkflowTaskCompleted(req))
+        }),
         (arb_small_string(), arb_child_start_result()).prop_map(move |(child_workflow_id, result)| {
             let state = with_child(make_open_state(now), &child_workflow_id, 21, ParentClosePolicy::Terminate, false);
             let req = ChildStartConfirmedRequest {
@@ -822,6 +892,16 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 now,
             };
             (LoadedRun::Existing(state), Command::ExternalCancelResolved(req))
+        }),
+        (arb_small_string(), arb_nexus_resolution()).prop_map(move |(operation_id, resolution)| {
+            let state = with_pending_nexus_operation(make_open_state(now), &operation_id);
+            let req = NexusOperationResolvedRequest {
+                operation_id,
+                scheduled_event_id: 12,
+                resolution,
+                now,
+            };
+            (LoadedRun::Existing(state), Command::NexusOperationResolved(req))
         }),
         arb_update_request(now).prop_map(move |req| {
             (LoadedRun::Existing(make_open_state(now)), Command::Update(req))
@@ -871,6 +951,7 @@ proptest! {
         prop_assert_eq!(transition.next_state.retry_policy.clone(), req.retry_policy);
         prop_assert_eq!(transition.next_state.attempt, req.attempt);
         prop_assert!(transition.next_state.pending_updates.is_empty());
+        prop_assert!(transition.next_state.pending_nexus_operations.is_empty());
         prop_assert_eq!(transition.next_state.versioning_override, None);
         prop_assert!(transition.next_state.completion_callbacks.is_empty());
         prop_assert_eq!(started.0, req.continued_execution_run_id);
@@ -2425,5 +2506,252 @@ fn property_63_close_preserves_execution_options() {
     for transition in transitions {
         assert_eq!(transition.next_state.versioning_override, Some(VersioningOverride));
         assert_eq!(transition.next_state.completion_callbacks, vec![CompletionCallback, CompletionCallback]);
+    }
+}
+
+proptest! {
+    #[test]
+    fn property_64_schedule_nexus_operation_event_and_state_pass_through(cmd in arb_schedule_nexus_operation_command()) {
+        let now = fixed_now();
+        let state = with_pending_wft(make_open_state(now), 84, Some(33), 1);
+        let transition = kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(84),
+                    started_event_id: 33,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![cmd.clone()],
+                force_new_workflow_task: false,
+                now,
+            }),
+        ).unwrap();
+
+        match cmd {
+            WorkflowCommand::ScheduleNexusOperation { operation_id, endpoint, service, operation, input, schedule_to_close_timeout } => {
+                let pending = transition.next_state.pending_nexus_operations.get(&operation_id).unwrap();
+                prop_assert_eq!(&pending.endpoint, &endpoint);
+                prop_assert_eq!(&pending.service, &service);
+                prop_assert_eq!(&pending.operation, &operation);
+                prop_assert!(!pending.started);
+                prop_assert_eq!(
+                    transition.dispatch_ops.iter().any(|op| matches!(op, DispatchOp::ScheduleNexusOperation { operation_id: id, endpoint: ep, service: svc, operation: opn, input: inp, schedule_to_close_timeout: sto } if id == &operation_id && ep == &endpoint && svc == &service && opn == &operation && inp == &input && sto == &schedule_to_close_timeout)),
+                    true
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn property_65_schedule_nexus_operation_duplicate_rejection(operation_id in arb_small_string()) {
+        let now = fixed_now();
+        let state = with_pending_nexus_operation(with_pending_wft(make_open_state(now), 85, Some(34), 1), &operation_id);
+        let result = kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(85),
+                    started_event_id: 34,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::ScheduleNexusOperation {
+                    operation_id: operation_id.clone(),
+                    endpoint: "endpoint".into(),
+                    service: "service".into(),
+                    operation: "method".into(),
+                    input: payloads("input"),
+                    schedule_to_close_timeout: None,
+                }],
+                force_new_workflow_task: false,
+                now,
+            }),
+        );
+        prop_assert_eq!(result, Err(tokeira_kernel::Reject::DuplicateNexusOperationId(operation_id)));
+    }
+
+    #[test]
+    fn property_66_cancel_nexus_operation_event_and_dispatch(operation_id in arb_small_string()) {
+        let now = fixed_now();
+        let state = with_pending_nexus_operation(with_pending_wft(make_open_state(now), 86, Some(35), 1), &operation_id);
+        let transition = kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(86),
+                    started_event_id: 35,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::CancelNexusOperation {
+                    scheduled_event_id: 12,
+                }],
+                force_new_workflow_task: false,
+                now,
+            }),
+        ).unwrap();
+        prop_assert_eq!(
+            matches!(transition.history_events[1].kind, HistoryEventKind::NexusOperationCancelRequested { scheduled_event_id: 12 }),
+            true
+        );
+        prop_assert_eq!(
+            transition.dispatch_ops.iter().any(|op| matches!(op, DispatchOp::CancelNexusOperation { scheduled_event_id: 12 })),
+            true
+        );
+        prop_assert!(transition.next_state.pending_nexus_operations.contains_key(&operation_id));
+    }
+
+    #[test]
+    fn property_67_started_resolution_is_non_terminal(operation_id in arb_small_string()) {
+        let now = fixed_now();
+        let transition = kernel().apply(
+            LoadedRun::Existing(with_pending_nexus_operation(make_open_state(now), &operation_id)),
+            Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                operation_id: operation_id.clone(),
+                scheduled_event_id: 12,
+                resolution: NexusResolution::Started,
+                now,
+            }),
+        ).unwrap();
+        prop_assert_eq!(
+            matches!(transition.history_events[0].kind, HistoryEventKind::NexusOperationStarted { scheduled_event_id: 12, .. }),
+            true
+        );
+        prop_assert!(transition.next_state.pending_nexus_operations.contains_key(&operation_id));
+        prop_assert!(transition.next_state.pending_workflow_task.is_none());
+        prop_assert_eq!(
+            transition.dispatch_ops.iter().all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. })),
+            true
+        );
+        prop_assert!(transition.request_dedupe_ops.is_empty());
+    }
+
+    #[test]
+    fn property_68_terminal_resolution_removes_from_pending_and_schedules_wft(operation_id in arb_small_string(), resolution in prop_oneof![
+        arb_payloads().prop_map(|result| NexusResolution::Completed { result }),
+        arb_small_string().prop_map(|failure| NexusResolution::Failed { failure }),
+        Just(NexusResolution::Canceled),
+        Just(NexusResolution::TimedOut),
+    ]) {
+        let now = fixed_now();
+        let transition = kernel().apply(
+            LoadedRun::Existing(with_pending_nexus_operation(make_open_state(now), &operation_id)),
+            Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                operation_id: operation_id.clone(),
+                scheduled_event_id: 12,
+                resolution,
+                now,
+            }),
+        ).unwrap();
+        prop_assert!(!transition.next_state.pending_nexus_operations.contains_key(&operation_id));
+        prop_assert!(transition.next_state.pending_workflow_task.is_some());
+        prop_assert!(transition.request_dedupe_ops.is_empty());
+    }
+
+    #[test]
+    fn property_69_nexus_resolution_rejection_paths(operation_id in arb_small_string()) {
+        let now = fixed_now();
+        let unknown = kernel().apply(
+            LoadedRun::Existing(make_open_state(now)),
+            Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                operation_id: operation_id.clone(),
+                scheduled_event_id: 12,
+                resolution: NexusResolution::Started,
+                now,
+            }),
+        );
+        prop_assert_eq!(unknown, Err(tokeira_kernel::Reject::UnknownNexusOperation(operation_id.clone())));
+
+        let stale = kernel().apply(
+            LoadedRun::Existing(with_pending_nexus_operation(make_open_state(now), &operation_id)),
+            Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                operation_id: operation_id.clone(),
+                scheduled_event_id: 99,
+                resolution: NexusResolution::Started,
+                now,
+            }),
+        );
+        prop_assert_eq!(stale, Err(tokeira_kernel::Reject::StaleNexusResolution {
+            operation_id,
+            expected_scheduled_event_id: 12,
+        }));
+    }
+}
+
+#[test]
+fn property_70_close_clears_pending_nexus_operations_without_dispatch_ops() {
+    let now = fixed_now();
+    let direct_close = |command| {
+        kernel()
+            .apply(
+                LoadedRun::Existing(with_pending_nexus_operation(make_open_state(now), "op-1")),
+                command,
+            )
+            .unwrap()
+    };
+
+    let wf_close = |command| {
+        let started = with_pending_wft(with_pending_nexus_operation(make_open_state(now), "op-1"), 87, Some(36), 1);
+        kernel()
+            .apply(
+                LoadedRun::Existing(started.clone()),
+                Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                    token: WorkflowTaskToken {
+                        run_key: started.run_key,
+                        logical_seq: LogicalTaskSeq(87),
+                        started_event_id: 36,
+                        attempt: 1,
+                        shard_epoch: ShardEpoch::ZERO,
+                    },
+                    identity: WorkerIdentity("worker".into()),
+                    commands: vec![command],
+                    force_new_workflow_task: false,
+                    now,
+                }),
+            )
+            .unwrap()
+    };
+
+    let transitions = vec![
+        direct_close(Command::Terminate(TerminateRequest {
+            reason: "reason".into(),
+            details: None,
+            identity: "tester".into(),
+            request: request_context("term-nexus", now),
+            now,
+        })),
+        direct_close(Command::WorkflowExecutionTimedOut(WorkflowExecutionTimedOutRequest {
+            timeout_type: WorkflowTimeoutType::RunTimeout,
+            retry_state: RetryState::Timeout,
+            now,
+        })),
+        wf_close(WorkflowCommand::CompleteWorkflow { result: payloads("done") }),
+        wf_close(WorkflowCommand::FailWorkflow { message: "fail".into(), details: None }),
+        wf_close(WorkflowCommand::CancelWorkflow),
+        wf_close(WorkflowCommand::ContinueAsNew {
+            new_run_id: RunId::new(),
+            workflow_type: WorkflowType("next".into()),
+            task_queue: TaskQueueName("queue".into()),
+            input: payloads("input"),
+            memo: memo_with("memo"),
+            search_attributes: search_attrs_with("search"),
+            workflow_execution_timeout: None,
+            workflow_run_timeout: None,
+            workflow_task_timeout: default_workflow_task_timeout(),
+        }),
+    ];
+
+    for transition in transitions {
+        assert!(transition.next_state.pending_nexus_operations.is_empty());
+        assert_eq!(transition.dispatch_ops.iter().filter(|op| matches!(op, DispatchOp::ScheduleNexusOperation { .. } | DispatchOp::CancelNexusOperation { .. })).count(), 0);
     }
 }

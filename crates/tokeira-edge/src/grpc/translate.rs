@@ -354,6 +354,8 @@ pub fn workflow_command_to_proto(
         | WorkflowCommand::StartChildWorkflow { .. }
         | WorkflowCommand::SignalExternalWorkflowExecution { .. }
         | WorkflowCommand::RequestCancelExternalWorkflowExecution { .. }
+        | WorkflowCommand::ScheduleNexusOperation { .. }
+        | WorkflowCommand::CancelNexusOperation { .. }
         | WorkflowCommand::UpdateCompleted { .. }
         | WorkflowCommand::UpdateRejected { .. }
         | WorkflowCommand::ProtocolMessage { .. }

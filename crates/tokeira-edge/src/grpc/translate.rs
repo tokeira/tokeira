@@ -1,14 +1,14 @@
 use std::time::Duration;
 
 use time::OffsetDateTime;
-use tokeira_kernel::{event::HistoryEvent, WorkflowCommand};
+use tokeira_kernel::{WorkflowCommand, event::HistoryEvent};
 use tokeira_proto::{
     conversions::{
         ProtoConversionError,
         common::{
             memo_from_domain, memo_to_domain, payloads_from_domain, payloads_to_domain,
-            search_attributes_from_domain, search_attributes_to_domain, task_queue_from_domain,
-            task_queue_to_domain, workflow_execution_from_ids,
+            search_attributes_from_domain, search_attributes_to_domain,
+            task_queue_from_domain, task_queue_to_domain, workflow_execution_from_ids,
         },
     },
     enums, workflowservice,
@@ -16,12 +16,13 @@ use tokeira_proto::{
 use tokeira_types::{ExecutionStatus, Payload, Payloads, RunId, RunKey, WorkflowId};
 
 use crate::translate::{
-    CountWorkflowExecutionsRequest, CountWorkflowExecutionsResponse, DescribeWorkflowExecutionRequest,
-    ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, PollWorkflowTaskQueueRequest,
-    PollWorkflowTaskQueueResponse,
-    RespondWorkflowTaskCompletedRequest, RespondWorkflowTaskCompletedResponse,
-    SignalWorkflowExecutionRequest, SignalWorkflowExecutionResponse,
-    StartWorkflowExecutionRequest, StartWorkflowExecutionResponse, WorkflowExecutionDescription,
+    CountWorkflowExecutionsRequest, CountWorkflowExecutionsResponse,
+    DescribeWorkflowExecutionRequest, ListWorkflowExecutionsRequest,
+    ListWorkflowExecutionsResponse, PollWorkflowTaskQueueRequest,
+    PollWorkflowTaskQueueResponse, RespondWorkflowTaskCompletedRequest,
+    RespondWorkflowTaskCompletedResponse, SignalWorkflowExecutionRequest,
+    SignalWorkflowExecutionResponse, StartWorkflowExecutionRequest,
+    StartWorkflowExecutionResponse, WorkflowExecutionDescription,
     WorkflowExecutionSummary,
 };
 
@@ -31,12 +32,12 @@ const DEFAULT_STICKY_TTL: Duration = Duration::from_secs(30);
 pub fn start_request_to_edge(
     req: workflowservice::StartWorkflowExecutionRequest,
 ) -> Result<StartWorkflowExecutionRequest, ProtoConversionError> {
-    let task_queue = req
-        .task_queue
-        .as_ref()
-        .ok_or(ProtoConversionError::MissingField(
-            "StartWorkflowExecutionRequest.task_queue",
-        ))?;
+    let task_queue =
+        req.task_queue
+            .as_ref()
+            .ok_or(ProtoConversionError::MissingField(
+                "StartWorkflowExecutionRequest.task_queue",
+            ))?;
 
     Ok(StartWorkflowExecutionRequest {
         namespace: req.namespace,
@@ -84,12 +85,12 @@ pub fn signal_request_to_edge(
 pub fn poll_request_to_edge(
     req: workflowservice::PollWorkflowTaskQueueRequest,
 ) -> Result<PollWorkflowTaskQueueRequest, ProtoConversionError> {
-    let task_queue = req
-        .task_queue
-        .as_ref()
-        .ok_or(ProtoConversionError::MissingField(
-            "PollWorkflowTaskQueueRequest.task_queue",
-        ))?;
+    let task_queue =
+        req.task_queue
+            .as_ref()
+            .ok_or(ProtoConversionError::MissingField(
+                "PollWorkflowTaskQueueRequest.task_queue",
+            ))?;
 
     Ok(PollWorkflowTaskQueueRequest {
         namespace: req.namespace,
@@ -237,9 +238,13 @@ pub fn proto_command_to_workflow_command(
 
     match cmd.attributes {
         Some(Attributes::ScheduleActivity(attrs)) => {
-            let task_queue = attrs.task_queue.as_ref().ok_or(ProtoConversionError::MissingField(
-                "ScheduleActivityCommandAttributes.task_queue",
-            ))?;
+            let task_queue =
+                attrs
+                    .task_queue
+                    .as_ref()
+                    .ok_or(ProtoConversionError::MissingField(
+                        "ScheduleActivityCommandAttributes.task_queue",
+                    ))?;
             Ok(WorkflowCommand::ScheduleActivity {
                 activity_id: attrs.activity_id,
                 task_queue: task_queue_to_domain(task_queue),
@@ -248,6 +253,7 @@ pub fn proto_command_to_workflow_command(
                     .as_ref()
                     .map(payloads_to_domain)
                     .unwrap_or_default(),
+                retry_policy: None,
                 schedule_to_close_timeout: None,
                 schedule_to_start_timeout: None,
                 start_to_close_timeout: None,
@@ -259,24 +265,28 @@ pub fn proto_command_to_workflow_command(
             fire_at: OffsetDateTime::now_utc()
                 + time::Duration::milliseconds(attrs.delay_millis.max(0)),
         }),
-        Some(Attributes::UpsertSearchAttributes(attrs)) => Ok(WorkflowCommand::UpsertSearchAttributes(
-            attrs
-                .search_attributes
-                .as_ref()
-                .map(search_attributes_to_domain)
-                .transpose()?
-                .unwrap_or_default(),
-        )),
+        Some(Attributes::UpsertSearchAttributes(attrs)) => {
+            Ok(WorkflowCommand::UpsertSearchAttributes(
+                attrs
+                    .search_attributes
+                    .as_ref()
+                    .map(search_attributes_to_domain)
+                    .transpose()?
+                    .unwrap_or_default(),
+            ))
+        }
         Some(Attributes::UpsertMemo(attrs)) => Ok(WorkflowCommand::UpsertMemo(
             attrs.memo.as_ref().map(memo_to_domain).unwrap_or_default(),
         )),
-        Some(Attributes::CompleteWorkflow(attrs)) => Ok(WorkflowCommand::CompleteWorkflow {
-            result: attrs
-                .result
-                .as_ref()
-                .map(payloads_to_domain)
-                .unwrap_or_default(),
-        }),
+        Some(Attributes::CompleteWorkflow(attrs)) => {
+            Ok(WorkflowCommand::CompleteWorkflow {
+                result: attrs
+                    .result
+                    .as_ref()
+                    .map(payloads_to_domain)
+                    .unwrap_or_default(),
+            })
+        }
         Some(Attributes::FailWorkflow(attrs)) => Ok(WorkflowCommand::FailWorkflow {
             message: attrs.message,
             details: first_payload(
@@ -305,9 +315,11 @@ pub fn workflow_command_to_proto(
         } => Some(Attributes::ScheduleActivity(
             workflowservice::ScheduleActivityCommandAttributes {
                 activity_id: activity_id.clone(),
-                task_queue: Some(tokeira_proto::conversions::common::task_queue_from_domain(
-                    task_queue,
-                )),
+                task_queue: Some(
+                    tokeira_proto::conversions::common::task_queue_from_domain(
+                        task_queue,
+                    ),
+                ),
                 input: Some(payloads_from_domain(input)),
             },
         )),
@@ -323,29 +335,35 @@ pub fn workflow_command_to_proto(
                 },
             ))
         }
-        WorkflowCommand::UpsertSearchAttributes(search_attributes) => Some(
-            Attributes::UpsertSearchAttributes(
+        WorkflowCommand::UpsertSearchAttributes(search_attributes) => {
+            Some(Attributes::UpsertSearchAttributes(
                 workflowservice::UpsertSearchAttributesCommandAttributes {
-                    search_attributes: Some(search_attributes_from_domain(search_attributes)),
+                    search_attributes: Some(search_attributes_from_domain(
+                        search_attributes,
+                    )),
                 },
-            ),
-        ),
+            ))
+        }
         WorkflowCommand::UpsertMemo(memo) => Some(Attributes::UpsertMemo(
             workflowservice::UpsertMemoCommandAttributes {
                 memo: Some(memo_from_domain(memo)),
             },
         )),
-        WorkflowCommand::CompleteWorkflow { result } => Some(Attributes::CompleteWorkflow(
-            workflowservice::CompleteWorkflowExecutionCommandAttributes {
-                result: Some(payloads_from_domain(result)),
-            },
-        )),
-        WorkflowCommand::FailWorkflow { message, details } => Some(Attributes::FailWorkflow(
-            workflowservice::FailWorkflowExecutionCommandAttributes {
-                message: message.clone(),
-                details: Some(payloads_from_optional_payload(details.clone())),
-            },
-        )),
+        WorkflowCommand::CompleteWorkflow { result } => {
+            Some(Attributes::CompleteWorkflow(
+                workflowservice::CompleteWorkflowExecutionCommandAttributes {
+                    result: Some(payloads_from_domain(result)),
+                },
+            ))
+        }
+        WorkflowCommand::FailWorkflow { message, details } => {
+            Some(Attributes::FailWorkflow(
+                workflowservice::FailWorkflowExecutionCommandAttributes {
+                    message: message.clone(),
+                    details: Some(payloads_from_optional_payload(details.clone())),
+                },
+            ))
+        }
         WorkflowCommand::CancelWorkflow
         | WorkflowCommand::RecordMarker { .. }
         | WorkflowCommand::ContinueAsNew { .. }
@@ -359,11 +377,10 @@ pub fn workflow_command_to_proto(
         | WorkflowCommand::UpdateCompleted { .. }
         | WorkflowCommand::UpdateRejected { .. }
         | WorkflowCommand::ProtocolMessage { .. }
-        | WorkflowCommand::RequestNewWorkflowTask
-            => {
+        | WorkflowCommand::RequestNewWorkflowTask => {
             return Err(ProtoConversionError::MissingField(
                 "WorkflowCommand has no proto Command equivalent",
-            ))
+            ));
         }
     };
 
@@ -378,7 +395,9 @@ fn workflow_execution_info_from_description(
         workflow_id: value.workflow_id,
         run_id: value.run_id.0.to_string(),
         workflow_type: value.workflow_type,
-        task_queue: Some(task_queue_from_domain(&tokeira_types::TaskQueueName(value.task_queue))),
+        task_queue: Some(task_queue_from_domain(&tokeira_types::TaskQueueName(
+            value.task_queue,
+        ))),
         status: execution_status_to_proto(value.status),
         start_time_unix_nanos: value.start_time.map(to_unix_nanos).unwrap_or_default(),
         execution_time_unix_nanos: None,
@@ -398,7 +417,9 @@ fn workflow_execution_info_from_summary(
         workflow_id: value.workflow_id,
         run_id: value.run_id.0.to_string(),
         workflow_type: value.workflow_type,
-        task_queue: Some(task_queue_from_domain(&tokeira_types::TaskQueueName(value.task_queue))),
+        task_queue: Some(task_queue_from_domain(&tokeira_types::TaskQueueName(
+            value.task_queue,
+        ))),
         status: execution_status_to_proto(value.status),
         start_time_unix_nanos: value.start_time.map(to_unix_nanos).unwrap_or_default(),
         execution_time_unix_nanos: None,
@@ -415,6 +436,7 @@ fn execution_status_to_proto(value: ExecutionStatus) -> i32 {
 
     match value {
         ExecutionStatus::Running => Proto::Running as i32,
+        ExecutionStatus::Paused => Proto::Unspecified as i32,
         ExecutionStatus::Completed => Proto::Completed as i32,
         ExecutionStatus::Failed => Proto::Failed as i32,
         ExecutionStatus::Cancelled => Proto::Canceled as i32,
@@ -424,7 +446,9 @@ fn execution_status_to_proto(value: ExecutionStatus) -> i32 {
     }
 }
 
-fn payloads_from_optional_payload(value: Option<Payload>) -> tokeira_proto::common::Payloads {
+fn payloads_from_optional_payload(
+    value: Option<Payload>,
+) -> tokeira_proto::common::Payloads {
     match value {
         Some(payload) => Payloads(vec![payload]),
         None => Payloads::default(),
@@ -437,11 +461,7 @@ fn first_payload(payloads: Payloads) -> Option<Payload> {
 }
 
 fn non_empty(value: String) -> Option<String> {
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    if value.is_empty() { None } else { Some(value) }
 }
 
 fn to_unix_nanos(value: OffsetDateTime) -> i64 {
@@ -486,8 +506,10 @@ mod tests {
 
     #[test]
     fn command_without_attributes_returns_missing_field() {
-        let err = proto_command_to_workflow_command(workflowservice::Command { attributes: None })
-            .expect_err("missing attributes should fail");
+        let err = proto_command_to_workflow_command(workflowservice::Command {
+            attributes: None,
+        })
+        .expect_err("missing attributes should fail");
 
         match err {
             ProtoConversionError::MissingField(field) => {

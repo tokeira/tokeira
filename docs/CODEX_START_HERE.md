@@ -32,6 +32,7 @@ Good first work:
 - improve broker fairness,
 - add a durable backlog abstraction,
 - implement timer and activity pumps,
+- record activity task heartbeat
 - add work admission and backpressure policies.
 
 Why this is safe:

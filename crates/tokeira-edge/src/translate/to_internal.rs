@@ -3,15 +3,16 @@ use time::OffsetDateTime;
 use tokeira_kernel::{SignalRequest, StartRequest, WorkflowTaskCompletedRequest};
 use tokeira_types::{
     NamespaceId, QueueKey, RequestContext, RequestId as CoreRequestId, RunId, RunKey,
-    ShardEpoch, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowTaskToken, WorkflowType,
+    ShardEpoch, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowTaskToken,
+    WorkflowType,
 };
 use uuid::Uuid;
 
 use crate::{
     request_id::RequestId,
     translate::{
-        PollWorkflowTaskQueueRequest, RespondWorkflowTaskCompletedRequest, SignalWorkflowExecutionRequest,
-        StartWorkflowExecutionRequest,
+        PollWorkflowTaskQueueRequest, RespondWorkflowTaskCompletedRequest,
+        SignalWorkflowExecutionRequest, StartWorkflowExecutionRequest,
     },
 };
 
@@ -33,7 +34,10 @@ pub fn namespace_id_for(name: &str) -> NamespaceId {
     NamespaceId(Uuid::from_bytes(bytes))
 }
 
-pub fn start_request(req: StartWorkflowExecutionRequest, request_id: &RequestId) -> StartRequest {
+pub fn start_request(
+    req: StartWorkflowExecutionRequest,
+    request_id: &RequestId,
+) -> StartRequest {
     let now = req.now.unwrap_or_else(OffsetDateTime::now_utc);
     let run_id = req.run_id.unwrap_or_else(RunId::new);
     StartRequest {
@@ -54,7 +58,10 @@ pub fn start_request(req: StartWorkflowExecutionRequest, request_id: &RequestId)
         continued_execution_run_id: None,
         first_execution_run_id: Some(run_id),
         request: RequestContext {
-            request_id: CoreRequestId(req.request_id.unwrap_or_else(|| request_id.as_str().to_string())),
+            request_id: CoreRequestId(
+                req.request_id
+                    .unwrap_or_else(|| request_id.as_str().to_string()),
+            ),
             caller_identity: req.identity,
             received_at: now,
         },
@@ -71,7 +78,10 @@ pub fn signal_request(
         signal_name: req.signal_name,
         input: req.input,
         request: RequestContext {
-            request_id: CoreRequestId(req.request_id.unwrap_or_else(|| request_id.as_str().to_string())),
+            request_id: CoreRequestId(
+                req.request_id
+                    .unwrap_or_else(|| request_id.as_str().to_string()),
+            ),
             caller_identity: req.identity,
             received_at: now,
         },

@@ -45,7 +45,10 @@ impl RequestIdGenerator for UuidRequestIdGenerator {
 ///
 /// Preserving an incoming request id is extremely useful in distributed systems
 /// because it ties together ingress logs, downstream runtime logs, and client logs.
-pub fn extract_or_generate(headers: &HeaderMap, generator: &dyn RequestIdGenerator) -> RequestId {
+pub fn extract_or_generate(
+    headers: &HeaderMap,
+    generator: &dyn RequestIdGenerator,
+) -> RequestId {
     headers
         .get(REQUEST_ID_HEADER)
         .and_then(|value| value.to_str().ok())

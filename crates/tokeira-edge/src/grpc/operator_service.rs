@@ -2,7 +2,10 @@ use tonic::{Request, Response, Status};
 
 use tokeira_proto::{
     enums::IndexedValueType,
-    operatorservice::{self, operator_service_server::OperatorService as OperatorServiceGrpcApi, operator_service_server::OperatorServiceServer},
+    operatorservice::{
+        self, operator_service_server::OperatorService as OperatorServiceGrpcApi,
+        operator_service_server::OperatorServiceServer,
+    },
 };
 
 use crate::{
@@ -53,7 +56,9 @@ impl OperatorServiceGrpcApi for OperatorServiceGrpc {
                 .await?;
         }
 
-        Ok(Response::new(operatorservice::AddSearchAttributesResponse {}))
+        Ok(Response::new(
+            operatorservice::AddSearchAttributesResponse {},
+        ))
     }
 
     async fn list_search_attributes(
@@ -67,19 +72,31 @@ impl OperatorServiceGrpcApi for OperatorServiceGrpc {
         } else {
             Some(req.namespace.as_str())
         };
-        let attrs = self.inner.list_search_attributes(&headers, namespace).await?;
+        let attrs = self
+            .inner
+            .list_search_attributes(&headers, namespace)
+            .await?;
 
-        Ok(Response::new(operatorservice::ListSearchAttributesResponse {
-            system_attributes: Default::default(),
-            custom_attributes: attrs
-                .into_iter()
-                .map(|attr| Ok((attr.name, indexed_value_type_from_edge(&attr.attr_type)? as i32)))
-                .collect::<Result<_, Status>>()?,
-        }))
+        Ok(Response::new(
+            operatorservice::ListSearchAttributesResponse {
+                system_attributes: Default::default(),
+                custom_attributes: attrs
+                    .into_iter()
+                    .map(|attr| {
+                        Ok((
+                            attr.name,
+                            indexed_value_type_from_edge(&attr.attr_type)? as i32,
+                        ))
+                    })
+                    .collect::<Result<_, Status>>()?,
+            },
+        ))
     }
 }
 
-fn cluster_info_to_proto(cluster: ClusterInfo) -> operatorservice::GetClusterInfoResponse {
+fn cluster_info_to_proto(
+    cluster: ClusterInfo,
+) -> operatorservice::GetClusterInfoResponse {
     operatorservice::GetClusterInfoResponse {
         cluster_name: cluster.cluster_name,
         server_version: cluster.version,
@@ -88,12 +105,13 @@ fn cluster_info_to_proto(cluster: ClusterInfo) -> operatorservice::GetClusterInf
 }
 
 fn indexed_value_type_to_edge(value: i32) -> Result<String, Status> {
-    let value = IndexedValueType::try_from(value)
-        .map_err(|_| Status::invalid_argument(format!("unknown IndexedValueType: {value}")))?;
+    let value = IndexedValueType::try_from(value).map_err(|_| {
+        Status::invalid_argument(format!("unknown IndexedValueType: {value}"))
+    })?;
 
     let name = match value {
         IndexedValueType::Unspecified => {
-            return Err(Status::invalid_argument("unspecified IndexedValueType"))
+            return Err(Status::invalid_argument("unspecified IndexedValueType"));
         }
         IndexedValueType::Keyword => "keyword",
         IndexedValueType::KeywordList => "keyword_list",
@@ -110,7 +128,9 @@ fn indexed_value_type_to_edge(value: i32) -> Result<String, Status> {
 fn indexed_value_type_from_edge(value: &str) -> Result<IndexedValueType, Status> {
     match value {
         "keyword" | "INDEXED_VALUE_TYPE_KEYWORD" => Ok(IndexedValueType::Keyword),
-        "keyword_list" | "INDEXED_VALUE_TYPE_KEYWORD_LIST" => Ok(IndexedValueType::KeywordList),
+        "keyword_list" | "INDEXED_VALUE_TYPE_KEYWORD_LIST" => {
+            Ok(IndexedValueType::KeywordList)
+        }
         "int" | "INDEXED_VALUE_TYPE_INT" => Ok(IndexedValueType::Int),
         "bool" | "INDEXED_VALUE_TYPE_BOOL" => Ok(IndexedValueType::Bool),
         "double" | "INDEXED_VALUE_TYPE_DOUBLE" => Ok(IndexedValueType::Double),
@@ -138,7 +158,9 @@ mod tests {
         let api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
         let service = OperatorService::new(
             api,
-            Arc::new(EdgeInterceptors::permissive(Arc::new(InMemoryNamespaceCache::new()))),
+            Arc::new(EdgeInterceptors::permissive(Arc::new(
+                InMemoryNamespaceCache::new(),
+            ))),
         );
         let grpc = OperatorServiceGrpc::new(service);
 
@@ -166,15 +188,20 @@ mod tests {
         );
         let grpc = OperatorServiceGrpc::new(service);
 
-        grpc.add_search_attributes(Request::new(operatorservice::AddSearchAttributesRequest {
-            namespace: "default".to_string(),
-            custom_attributes: [
-                ("CustomKeyword".to_string(), IndexedValueType::Keyword as i32),
-                ("CustomInt".to_string(), IndexedValueType::Int as i32),
-            ]
-            .into_iter()
-            .collect(),
-        }))
+        grpc.add_search_attributes(Request::new(
+            operatorservice::AddSearchAttributesRequest {
+                namespace: "default".to_string(),
+                custom_attributes: [
+                    (
+                        "CustomKeyword".to_string(),
+                        IndexedValueType::Keyword as i32,
+                    ),
+                    ("CustomInt".to_string(), IndexedValueType::Int as i32),
+                ]
+                .into_iter()
+                .collect(),
+            },
+        ))
         .await
         .expect("add search attributes should succeed");
 
@@ -184,7 +211,15 @@ mod tests {
             .expect("list search attributes should succeed");
 
         assert_eq!(attrs.len(), 2);
-        assert!(attrs.iter().any(|attr| attr.name == "CustomKeyword" && attr.attr_type == "keyword"));
-        assert!(attrs.iter().any(|attr| attr.name == "CustomInt" && attr.attr_type == "int"));
+        assert!(
+            attrs
+                .iter()
+                .any(|attr| attr.name == "CustomKeyword" && attr.attr_type == "keyword")
+        );
+        assert!(
+            attrs
+                .iter()
+                .any(|attr| attr.name == "CustomInt" && attr.attr_type == "int")
+        );
     }
 }

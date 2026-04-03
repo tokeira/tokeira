@@ -2,10 +2,10 @@ use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use tokio::sync::Mutex;
 use tokeira_kernel::ProjectionOp;
 use tokeira_storage::ProjectionRecord;
 use tokeira_types::{ExecutionStatus, ExecutionSummary, ProjectionCursor, RunId, RunKey};
+use tokio::sync::Mutex;
 
 use crate::sink::ProjectionSink;
 

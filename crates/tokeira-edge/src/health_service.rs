@@ -46,13 +46,11 @@ impl HealthReporter for StaticHealthReporter {
         Ok(HealthSnapshot {
             observed_at: OffsetDateTime::now_utc(),
             overall: HealthState::Serving,
-            components: vec![
-                ComponentHealth {
-                    component: "edge".to_string(),
-                    state: HealthState::Serving,
-                    detail: Some("request admission operational".to_string()),
-                },
-            ],
+            components: vec![ComponentHealth {
+                component: "edge".to_string(),
+                state: HealthState::Serving,
+                detail: Some("request admission operational".to_string()),
+            }],
         })
     }
 }
@@ -74,7 +72,10 @@ impl std::fmt::Debug for HealthService {
 }
 
 impl HealthService {
-    pub fn new(reporter: Arc<dyn HealthReporter>, interceptors: Arc<EdgeInterceptors>) -> Self {
+    pub fn new(
+        reporter: Arc<dyn HealthReporter>,
+        interceptors: Arc<EdgeInterceptors>,
+    ) -> Self {
         Self {
             reporter,
             interceptors,

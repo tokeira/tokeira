@@ -10,15 +10,14 @@ use tokeira_edge::{
     LocalOnlyRouter, LongPollConfig, LongPollGate, OperatorService, ResolvedNamespace,
     WorkflowExecutionDescription, WorkflowService,
     grpc::{
-        operator_service::OperatorServiceGrpc,
-        runtime_adapter::RuntimeAdapter,
+        operator_service::OperatorServiceGrpc, runtime_adapter::RuntimeAdapter,
         workflow_service::WorkflowServiceGrpc,
     },
     translate::to_internal::namespace_id_for,
     workflow_service::ExecutionResolver,
 };
 use tokeira_kernel::LoadedRun;
-use tokeira_runtime::TokeiraRuntime;
+use tokeira_runtime::{LaneConfig, TokeiraRuntime};
 use tokeira_storage::{InMemoryStore, RunRepository};
 use tokeira_types::{ExecutionRef, NamespaceId, WorkflowId};
 
@@ -31,7 +30,7 @@ async fn main() -> Result<()> {
     let addr = grpc_addr_from_env()?;
 
     let store = Arc::new(InMemoryStore::default());
-    let runtime = Arc::new(TokeiraRuntime::new(store.clone(), 4));
+    let runtime = Arc::new(TokeiraRuntime::new(store.clone(), 4, LaneConfig::default()));
 
     let default_namespace = ResolvedNamespace::active("default");
     let default_namespace_id = namespace_id_for("default");
@@ -84,7 +83,8 @@ async fn main() -> Result<()> {
 }
 
 fn grpc_addr_from_env() -> Result<SocketAddr> {
-    let raw = std::env::var("TOKEIRA_GRPC_ADDR").unwrap_or_else(|_| "[::1]:7233".to_string());
+    let raw =
+        std::env::var("TOKEIRA_GRPC_ADDR").unwrap_or_else(|_| "[::1]:7233".to_string());
     raw.parse()
         .with_context(|| format!("invalid TOKEIRA_GRPC_ADDR value: {raw}"))
 }
@@ -105,7 +105,11 @@ impl<R> ExecutionResolver for StoreExecutionResolver<R>
 where
     R: RunRepository + 'static,
 {
-    async fn current_run_key(&self, _namespace: &str, workflow_id: &str) -> Result<Option<tokeira_types::RunKey>> {
+    async fn current_run_key(
+        &self,
+        _namespace: &str,
+        workflow_id: &str,
+    ) -> Result<Option<tokeira_types::RunKey>> {
         self.repo
             .resolve_execution(&ExecutionRef {
                 namespace_id: self.namespace_id,
@@ -148,7 +152,9 @@ where
                 memo: state.memo,
                 search_attributes: state.search_attributes,
             })),
-            LoadedRun::Absent => Err(anyhow!("resolved run missing from storage: {:?}", run_key)),
+            LoadedRun::Absent => {
+                Err(anyhow!("resolved run missing from storage: {:?}", run_key))
+            }
         }
     }
 }

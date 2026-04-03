@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use tokeira_kernel::{LoadedRun, SignalRequest, StartRequest, WorkflowTaskCompletedRequest};
+use tokeira_kernel::{
+    LoadedRun, SignalRequest, StartRequest, WorkflowTaskCompletedRequest,
+};
 use tokeira_runtime::TokeiraRuntime;
 use tokeira_storage::{CommitResult, RunRepository};
 use tokeira_types::ExecutionRef;
@@ -76,7 +78,10 @@ pub fn commit_result_to_outcome(result: CommitResult) -> Result<WorkflowMutation
     }
 }
 
-async fn execution_for_run<R>(runtime: &TokeiraRuntime<R>, run_key: tokeira_types::RunKey) -> Result<ExecutionRef>
+async fn execution_for_run<R>(
+    runtime: &TokeiraRuntime<R>,
+    run_key: tokeira_types::RunKey,
+) -> Result<ExecutionRef>
 where
     R: RunRepository + 'static,
 {

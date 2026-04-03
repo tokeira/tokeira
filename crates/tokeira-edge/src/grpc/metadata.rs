@@ -7,8 +7,12 @@ pub fn metadata_to_header_map(metadata: &MetadataMap) -> HeaderMap {
 
     for entry in metadata.iter() {
         let (name, value) = match entry {
-            KeyAndValueRef::Ascii(name, value) => (name.as_str(), value.as_encoded_bytes()),
-            KeyAndValueRef::Binary(name, value) => (name.as_str(), value.as_encoded_bytes()),
+            KeyAndValueRef::Ascii(name, value) => {
+                (name.as_str(), value.as_encoded_bytes())
+            }
+            KeyAndValueRef::Binary(name, value) => {
+                (name.as_str(), value.as_encoded_bytes())
+            }
         };
 
         let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {

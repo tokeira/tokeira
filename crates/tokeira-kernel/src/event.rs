@@ -1,7 +1,7 @@
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
-    ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RetryPolicy, RunId,
-    SearchAttributes, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
+    ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RetryPolicy,
+    RunId, SearchAttributes, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
 };
 
 use crate::command::{
@@ -16,13 +16,29 @@ use crate::state::{CompletionCallback, ParentClosePolicy, VersioningOverride};
 /// IDs are client-observable and should remain stable within a run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HistoryEvent {
+    /// Monotonically increasing event ID within this run.
+    /// Contiguous and never reused.
     pub event_id: i64,
+    /// Wall-clock time the event was recorded.
     pub happened_at: OffsetDateTime,
+    /// Semantic content of the event.
     pub kind: HistoryEventKind,
 }
 
+/// Discriminant for the semantic content of a history event.
+///
+/// Each variant corresponds to one observable fact in the
+/// workflow's history. The variant set is intentionally
+/// aligned with the Temporal history event taxonomy so that
+/// SDK replay can consume Tokeira histories without
+/// translation.
+///
+/// See `docs/architecture/020-kernel.md` for the full command
+/// taxonomy and which commands produce which events.
 #[derive(Clone, Debug, PartialEq)]
 pub enum HistoryEventKind {
+    /// The workflow run was created. This is always the first
+    /// event in a run's history.
     WorkflowExecutionStarted {
         workflow_type: WorkflowType,
         task_queue: TaskQueueName,
@@ -38,41 +54,65 @@ pub enum HistoryEventKind {
         workflow_run_timeout: Option<Duration>,
         workflow_task_timeout: Duration,
     },
+    /// An external signal was delivered to the workflow.
     WorkflowExecutionSignaled {
         signal_name: String,
         input: Payloads,
         request_id: String,
         identity: Option<String>,
     },
+    /// A cancellation was requested (cooperative — the
+    /// workflow code decides whether to honour it).
     WorkflowExecutionCancelRequested {
         reason: String,
         external_workflow_execution: Option<ExternalWorkflowExecution>,
         request_id: String,
     },
+    /// The workflow was paused by an operator or API call.
+    WorkflowExecutionPaused {
+        identity: String,
+        reason: String,
+        request_id: String,
+    },
+    /// The workflow was resumed after a pause.
+    WorkflowExecutionUnpaused {
+        identity: String,
+        reason: String,
+        request_id: String,
+    },
+    /// The workflow was forcibly terminated without running
+    /// cancellation logic.
     WorkflowExecutionTerminated {
         reason: String,
         details: Option<Payloads>,
         identity: String,
     },
+    /// The workflow exceeded its execution or run timeout.
     WorkflowExecutionTimedOut {
         timeout_type: WorkflowTimeoutType,
         retry_state: RetryState,
     },
-    WorkflowTaskScheduled {
-        logical_seq: LogicalTaskSeq,
-    },
+    /// A workflow task was placed on the task queue. The
+    /// kernel maintains at most one pending WFT per run.
+    WorkflowTaskScheduled { logical_seq: LogicalTaskSeq },
+    /// A worker picked up the workflow task and began
+    /// processing it.
     WorkflowTaskStarted {
         logical_seq: LogicalTaskSeq,
         scheduled_event_id: i64,
         attempt: u32,
         identity: WorkerIdentity,
     },
+    /// The worker successfully completed the workflow task
+    /// and returned a batch of workflow commands.
     WorkflowTaskCompleted {
         logical_seq: LogicalTaskSeq,
         scheduled_event_id: i64,
         started_event_id: i64,
         identity: WorkerIdentity,
     },
+    /// The workflow task failed (e.g. non-determinism error,
+    /// bad command attributes, or a reset).
     WorkflowTaskFailed {
         logical_seq: LogicalTaskSeq,
         scheduled_event_id: i64,
@@ -85,12 +125,15 @@ pub enum HistoryEventKind {
         fork_event_version: Option<i64>,
         fork_event_id: Option<i64>,
     },
+    /// The workflow task exceeded its start-to-close timeout
+    /// without the worker responding.
     WorkflowTaskTimedOut {
         logical_seq: LogicalTaskSeq,
         scheduled_event_id: i64,
         started_event_id: i64,
         timeout_type: WorkflowTaskTimeoutType,
     },
+    /// An activity task was scheduled by a workflow command.
     ActivityTaskScheduled {
         activity_id: String,
         task_queue: TaskQueueName,
@@ -100,41 +143,48 @@ pub enum HistoryEventKind {
         start_to_close_timeout: Option<Duration>,
         heartbeat_timeout: Option<Duration>,
     },
+    /// The activity completed successfully with a result.
     ActivityTaskCompleted {
         activity_id: String,
         result: Payloads,
     },
+    /// The activity failed with an application-level error.
     ActivityTaskFailed {
         activity_id: String,
         message: String,
     },
+    /// The activity exceeded one of its configured timeouts.
     ActivityTaskTimedOut {
         activity_id: String,
         timeout_type: String,
     },
+    /// The activity was canceled (cooperative cancellation).
     ActivityTaskCanceled {
         activity_id: String,
         details: Option<Payloads>,
     },
+    /// A timer was started by a workflow command.
     TimerStarted {
         timer_id: String,
         fire_at: OffsetDateTime,
     },
+    /// A side-effect marker was recorded in history. Markers
+    /// are opaque to the kernel; SDKs use them for
+    /// side-effect replay, version gates, and local
+    /// activities.
     MarkerRecorded {
         marker_name: String,
         details: std::collections::BTreeMap<String, Payloads>,
         failure: Option<Payload>,
         header: Option<std::collections::BTreeMap<String, Payload>>,
     },
-    TimerCanceled {
-        timer_id: String,
-    },
-    TimerFired {
-        timer_id: String,
-    },
-    ActivityTaskCancelRequested {
-        activity_id: String,
-    },
+    /// A timer was canceled before it fired.
+    TimerCanceled { timer_id: String },
+    /// A timer's deadline was reached and it fired.
+    TimerFired { timer_id: String },
+    /// A cancel was requested for a pending activity.
+    ActivityTaskCancelRequested { activity_id: String },
+    /// A child workflow start was requested by the parent.
     StartChildWorkflowExecutionInitiated {
         child_workflow_id: WorkflowId,
         workflow_type: WorkflowType,
@@ -143,60 +193,70 @@ pub enum HistoryEventKind {
         namespace_id: NamespaceId,
         parent_close_policy: ParentClosePolicy,
     },
+    /// The child workflow was successfully started and
+    /// assigned a run ID.
     ChildWorkflowExecutionStarted {
         child_workflow_id: WorkflowId,
         child_run_id: RunId,
         workflow_type: WorkflowType,
     },
+    /// The child workflow could not be started (e.g. already
+    /// exists).
     StartChildWorkflowExecutionFailed {
         child_workflow_id: WorkflowId,
         cause: String,
     },
+    /// The child workflow completed successfully.
     ChildWorkflowExecutionCompleted {
         child_workflow_id: WorkflowId,
         result: Payloads,
     },
+    /// The child workflow failed with an application error.
     ChildWorkflowExecutionFailed {
         child_workflow_id: WorkflowId,
         failure: String,
     },
-    ChildWorkflowExecutionCanceled {
-        child_workflow_id: WorkflowId,
-    },
-    ChildWorkflowExecutionTerminated {
-        child_workflow_id: WorkflowId,
-    },
-    ChildWorkflowExecutionTimedOut {
-        child_workflow_id: WorkflowId,
-    },
+    /// The child workflow was canceled.
+    ChildWorkflowExecutionCanceled { child_workflow_id: WorkflowId },
+    /// The child workflow was forcibly terminated.
+    ChildWorkflowExecutionTerminated { child_workflow_id: WorkflowId },
+    /// The child workflow exceeded its timeout.
+    ChildWorkflowExecutionTimedOut { child_workflow_id: WorkflowId },
+    /// A signal to an external workflow was initiated.
     SignalExternalWorkflowExecutionInitiated {
         target_workflow_id: WorkflowId,
         target_run_id: Option<RunId>,
         signal_name: String,
         input: Payloads,
     },
+    /// The external signal was successfully delivered.
     ExternalWorkflowExecutionSignaled {
         initiated_event_id: i64,
         target_workflow_id: WorkflowId,
     },
+    /// The external signal delivery failed.
     SignalExternalWorkflowExecutionFailed {
         initiated_event_id: i64,
         target_workflow_id: WorkflowId,
         cause: String,
     },
+    /// A cancel request to an external workflow was initiated.
     RequestCancelExternalWorkflowExecutionInitiated {
         target_workflow_id: WorkflowId,
         target_run_id: Option<RunId>,
     },
+    /// The external cancel request was successfully delivered.
     ExternalWorkflowExecutionCancelRequested {
         initiated_event_id: i64,
         target_workflow_id: WorkflowId,
     },
+    /// The external cancel request delivery failed.
     RequestCancelExternalWorkflowExecutionFailed {
         initiated_event_id: i64,
         target_workflow_id: WorkflowId,
         cause: String,
     },
+    /// A Nexus operation was scheduled.
     NexusOperationScheduled {
         operation_id: String,
         endpoint: String,
@@ -205,58 +265,64 @@ pub enum HistoryEventKind {
         input: Payloads,
         schedule_to_close_timeout: Option<Duration>,
     },
+    /// The Nexus operation transitioned to started (async).
     NexusOperationStarted {
         operation_id: String,
         scheduled_event_id: i64,
     },
+    /// The Nexus operation completed successfully.
     NexusOperationCompleted {
         operation_id: String,
         scheduled_event_id: i64,
         result: Payloads,
     },
+    /// The Nexus operation failed.
     NexusOperationFailed {
         operation_id: String,
         scheduled_event_id: i64,
         failure: String,
     },
+    /// The Nexus operation was canceled.
     NexusOperationCanceled {
         operation_id: String,
         scheduled_event_id: i64,
     },
+    /// The Nexus operation exceeded its timeout.
     NexusOperationTimedOut {
         operation_id: String,
         scheduled_event_id: i64,
     },
-    NexusOperationCancelRequested {
-        scheduled_event_id: i64,
-    },
+    /// A cancel was requested for a pending Nexus operation.
+    NexusOperationCancelRequested { scheduled_event_id: i64 },
+    /// A workflow update was accepted and is awaiting
+    /// completion by the worker.
     WorkflowExecutionUpdateAccepted {
         update_id: String,
         update_name: String,
         input: Payloads,
     },
-    WorkflowExecutionUpdateCompleted {
-        update_id: String,
-        result: Payloads,
-    },
-    WorkflowExecutionUpdateRejected {
-        update_id: String,
-        failure: String,
-    },
+    /// A workflow update completed with a result.
+    WorkflowExecutionUpdateCompleted { update_id: String, result: Payloads },
+    /// A workflow update was rejected by the worker.
+    WorkflowExecutionUpdateRejected { update_id: String, failure: String },
+    /// Execution-level options (versioning, callbacks) were
+    /// updated by an operator or API call.
     WorkflowExecutionOptionsUpdated {
         versioning_override: FieldChange<VersioningOverride>,
         completion_callbacks: FieldChange<Vec<CompletionCallback>>,
         attached_request_id: Option<String>,
     },
-    WorkflowExecutionCompleted {
-        result: Payloads,
-    },
+    /// The workflow returned a successful result.
+    WorkflowExecutionCompleted { result: Payloads },
+    /// The workflow failed with an application-level error.
     WorkflowExecutionFailed {
         message: String,
         details: Option<Payload>,
         retry_state: RetryState,
         attempt: u32,
     },
+    /// The workflow ended by spawning a new run via
+    /// continue-as-new.
     WorkflowExecutionContinuedAsNew {
         new_run_id: RunId,
         workflow_type: WorkflowType,
@@ -268,19 +334,35 @@ pub enum HistoryEventKind {
         workflow_run_timeout: Option<Duration>,
         workflow_task_timeout: Duration,
     },
+    /// The workflow was canceled via a `CancelWorkflow`
+    /// workflow command (cooperative cancellation completed).
     WorkflowExecutionCanceled,
 }
 
+/// How an activity task was resolved by the runtime.
+///
+/// The kernel uses this to emit the correct terminal activity
+/// event and remove the activity from the open set.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ActivityResolution {
+    /// The activity returned a successful result.
     Completed { result: Payloads },
+    /// The activity failed with an application-level error.
     Failed { message: String },
+    /// The activity exceeded one of its configured timeouts.
     TimedOut { timeout_type: String },
+    /// The activity was canceled (cooperative cancellation).
     Canceled { details: Option<Payloads> },
 }
 
+/// Summary of how and when a workflow execution closed.
+///
+/// Used by the projection plane to record the terminal state
+/// without reading the full history.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CloseInfo {
+    /// Terminal status the execution reached.
     pub status: ExecutionStatus,
+    /// Wall-clock time the execution was closed.
     pub closed_at: OffsetDateTime,
 }

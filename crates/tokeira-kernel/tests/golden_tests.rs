@@ -2,25 +2,28 @@ use std::collections::BTreeMap;
 
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    event::HistoryEventKind, kernel::Kernel, ActivityResolvedRequest, ActivityState,
-    BasicKernel, CancelRequest, ChildResolution, ChildResolvedRequest,
-    ChildStartConfirmedRequest, ChildStartResult, ChildWorkflowState, Command, CompletionCallback,
-    DispatchOp, ExternalCancelResolvedRequest, ExternalCancelResult,
-    ExternalSignalResolvedRequest, ExternalSignalResult, ExternalWorkflowExecution, FieldChange,
-    LoadedRun, NexusOperationResolvedRequest, NexusResolution, ParentClosePolicy,
-    PendingExternalCancel, PendingExternalSignal, PendingNexusOperation, PendingUpdate,
-    PendingWorkflowTask, ProjectionOp, Reject, ResetRequest, RetryState, SignalRequest, StartRequest,
-    StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerState,
-    UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, VersioningOverride,
-    WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowState,
-    WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
-    WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType, WorkflowTimeoutType,
+    ActivityOp, ActivityPauseInfo, ActivityResolvedRequest, ActivityState, BasicKernel,
+    CancelRequest, ChildResolution, ChildResolvedRequest, ChildStartConfirmedRequest,
+    ChildStartResult, ChildWorkflowState, Command, CompletionCallback, DispatchOp,
+    ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
+    ExternalSignalResult, ExternalWorkflowExecution, FieldChange, LoadedRun,
+    NexusOperationResolvedRequest, NexusResolution, ParentClosePolicy,
+    PauseActivityRequest, PauseInfo, PauseWorkflowRequest, PendingExternalCancel,
+    PendingExternalSignal, PendingNexusOperation, PendingUpdate, PendingWorkflowTask,
+    ProjectionOp, Reject, ResetActivityRequest, ResetRequest, RetryState, SignalRequest,
+    StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest,
+    TimerState, UnpauseActivityRequest, UnpauseWorkflowRequest,
+    UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody,
+    UpdateRequest, VersioningOverride, WorkflowCommand, WorkflowExecutionTimedOutRequest,
+    WorkflowState, WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
+    WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType,
+    WorkflowTimeoutType, event::HistoryEventKind, kernel::Kernel,
 };
 use tokeira_types::{
-    ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RequestContext,
-    RequestId, RetryPolicy, RunId, RunKey, SearchAttrValue, SearchAttributes, ShardEpoch,
-    StickyAffinity, TaskQueueName, TransitionSeq, WorkerIdentity, WorkflowId, WorkflowTaskToken,
-    WorkflowType,
+    ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads,
+    RequestContext, RequestId, RetryPolicy, RunId, RunKey, SearchAttrValue,
+    SearchAttributes, ShardEpoch, StickyAffinity, TaskQueueName, TransitionSeq,
+    WorkerIdentity, WorkflowId, WorkflowTaskToken, WorkflowType,
 };
 
 fn now() -> OffsetDateTime {
@@ -102,6 +105,8 @@ fn make_open_state() -> WorkflowState {
         next_workflow_task_seq: LogicalTaskSeq(4),
         pending_workflow_task: None,
         sticky: None,
+        pause_info: None,
+        wft_stamp: 0,
         memo: memo(),
         search_attributes: search_attributes(),
         workflow_execution_timeout: Some(Duration::minutes(10)),
@@ -154,6 +159,41 @@ fn make_open_state_with_started_wft_and_sticky() -> WorkflowState {
     state
 }
 
+fn make_paused_state() -> WorkflowState {
+    let mut state = make_open_state();
+    state.status = ExecutionStatus::Paused;
+    state.pause_info = Some(PauseInfo {
+        pause_time: now(),
+        identity: "operator".into(),
+        reason: "paused".into(),
+        request_id: "pause-req".into(),
+    });
+    state.wft_stamp = 1;
+    state
+}
+
+fn make_paused_state_with_activity(id: &str) -> WorkflowState {
+    let mut state = make_paused_state();
+    state.activities.insert(
+        id.into(),
+        ActivityState {
+            activity_id: id.into(),
+            schedule_event_id: 7,
+            task_queue: TaskQueueName("activity-q".into()),
+            input: Payloads::default(),
+            attempt: 1,
+            retry_policy: None,
+            schedule_to_close_timeout: Some(Duration::minutes(2)),
+            schedule_to_start_timeout: Some(Duration::seconds(30)),
+            start_to_close_timeout: Some(Duration::minutes(1)),
+            heartbeat_timeout: Some(Duration::seconds(20)),
+            pause_info: None,
+            stamp: 0,
+        },
+    );
+    state
+}
+
 fn make_open_state_with_activity(id: &str) -> WorkflowState {
     let mut state = make_open_state();
     state.activities.insert(
@@ -162,11 +202,15 @@ fn make_open_state_with_activity(id: &str) -> WorkflowState {
             activity_id: id.into(),
             schedule_event_id: 7,
             task_queue: TaskQueueName("activity-q".into()),
+            input: Payloads::default(),
             attempt: 1,
+            retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
             schedule_to_start_timeout: Some(Duration::seconds(30)),
             start_to_close_timeout: Some(Duration::minutes(1)),
             heartbeat_timeout: Some(Duration::seconds(20)),
+            pause_info: None,
+            stamp: 0,
         },
     );
     state
@@ -222,6 +266,66 @@ fn make_reset_request() -> ResetRequest {
     }
 }
 
+fn make_pause_workflow_request() -> PauseWorkflowRequest {
+    PauseWorkflowRequest {
+        identity: "operator".into(),
+        reason: "paused for maintenance".into(),
+        request: request_context("pause-req"),
+        now: now(),
+    }
+}
+
+fn make_unpause_workflow_request() -> UnpauseWorkflowRequest {
+    UnpauseWorkflowRequest {
+        identity: "operator".into(),
+        reason: "resume".into(),
+        request: request_context("unpause-req"),
+        now: now(),
+    }
+}
+
+fn make_update_activity_options_request(
+    activity_id: &str,
+) -> UpdateActivityOptionsRequest {
+    UpdateActivityOptionsRequest {
+        activity_id: activity_id.into(),
+        task_queue: FieldChange::Set(TaskQueueName("activity-updated".into())),
+        schedule_to_close_timeout: FieldChange::Set(Some(Duration::minutes(3))),
+        schedule_to_start_timeout: FieldChange::Set(Some(Duration::seconds(45))),
+        start_to_close_timeout: FieldChange::Set(Some(Duration::minutes(2))),
+        heartbeat_timeout: FieldChange::Set(Some(Duration::seconds(30))),
+        request: request_context("update-activity-req"),
+        now: now(),
+    }
+}
+
+fn make_pause_activity_request(activity_id: &str) -> PauseActivityRequest {
+    PauseActivityRequest {
+        activity_id: activity_id.into(),
+        identity: "operator".into(),
+        reason: "pause activity".into(),
+        request: request_context("pause-activity-req"),
+        now: now(),
+    }
+}
+
+fn make_unpause_activity_request(activity_id: &str) -> UnpauseActivityRequest {
+    UnpauseActivityRequest {
+        activity_id: activity_id.into(),
+        request: request_context("unpause-activity-req"),
+        now: now(),
+    }
+}
+
+fn make_reset_activity_request(activity_id: &str) -> ResetActivityRequest {
+    ResetActivityRequest {
+        activity_id: activity_id.into(),
+        reset_heartbeat: true,
+        request: request_context("reset-activity-req"),
+        now: now(),
+    }
+}
+
 fn make_timeout_request() -> WorkflowExecutionTimedOutRequest {
     WorkflowExecutionTimedOutRequest {
         timeout_type: WorkflowTimeoutType::RunTimeout,
@@ -257,7 +361,10 @@ fn with_execution_options(mut state: WorkflowState) -> WorkflowState {
     state
 }
 
-fn with_pending_nexus_operation(mut state: WorkflowState, operation_id: &str) -> WorkflowState {
+fn with_pending_nexus_operation(
+    mut state: WorkflowState,
+    operation_id: &str,
+) -> WorkflowState {
     state.pending_nexus_operations.insert(
         operation_id.into(),
         PendingNexusOperation {
@@ -272,7 +379,10 @@ fn with_pending_nexus_operation(mut state: WorkflowState, operation_id: &str) ->
     state
 }
 
-fn with_started_nexus_operation(mut state: WorkflowState, operation_id: &str) -> WorkflowState {
+fn with_started_nexus_operation(
+    mut state: WorkflowState,
+    operation_id: &str,
+) -> WorkflowState {
     state = with_pending_nexus_operation(state, operation_id);
     if let Some(pending) = state.pending_nexus_operations.get_mut(operation_id) {
         pending.started = true;
@@ -287,27 +397,47 @@ fn kernel() -> BasicKernel {
 #[test]
 fn start_from_absent() {
     let req = make_start_request();
-    let transition = kernel().apply(LoadedRun::Absent, Command::Start(req.clone())).unwrap();
+    let transition = kernel()
+        .apply(LoadedRun::Absent, Command::Start(req.clone()))
+        .unwrap();
 
     assert_eq!(transition.expected_seq, TransitionSeq::ZERO);
     assert_eq!(transition.next_state.status, ExecutionStatus::Running);
     assert_eq!(transition.next_state.transition_seq, TransitionSeq(1));
     assert_eq!(transition.next_state.last_event_id, 2);
-    assert_eq!(transition.next_state.workflow_execution_timeout, req.workflow_execution_timeout);
-    assert_eq!(transition.next_state.workflow_run_timeout, req.workflow_run_timeout);
-    assert_eq!(transition.next_state.workflow_task_timeout, req.workflow_task_timeout);
+    assert_eq!(
+        transition.next_state.workflow_execution_timeout,
+        req.workflow_execution_timeout
+    );
+    assert_eq!(
+        transition.next_state.workflow_run_timeout,
+        req.workflow_run_timeout
+    );
+    assert_eq!(
+        transition.next_state.workflow_task_timeout,
+        req.workflow_task_timeout
+    );
     assert_eq!(transition.next_state.retry_policy, req.retry_policy);
     assert_eq!(transition.next_state.attempt, req.attempt);
     assert_eq!(transition.history_events.len(), 2);
-    assert!(matches!(transition.history_events[0].kind, HistoryEventKind::WorkflowExecutionStarted { .. }));
-    assert!(matches!(transition.history_events[1].kind, HistoryEventKind::WorkflowTaskScheduled { .. }));
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::WorkflowExecutionStarted { .. }
+    ));
+    assert!(matches!(
+        transition.history_events[1].kind,
+        HistoryEventKind::WorkflowTaskScheduled { .. }
+    ));
     assert_eq!(transition.request_dedupe_ops.len(), 1);
     assert_eq!(transition.projection_ops.len(), 1);
-    assert_eq!(transition.projection_ops[0], ProjectionOp::UpsertExecution {
-        status: ExecutionStatus::Running,
-        memo_patch: req.memo,
-        search_attr_patch: req.search_attributes,
-    });
+    assert_eq!(
+        transition.projection_ops[0],
+        ProjectionOp::UpsertExecution {
+            status: ExecutionStatus::Running,
+            memo_patch: req.memo,
+            search_attr_patch: req.search_attributes,
+        }
+    );
     assert_eq!(transition.dispatch_ops.len(), 1);
     assert!(transition.next_state.pending_workflow_task.is_some());
 }
@@ -315,20 +445,33 @@ fn start_from_absent() {
 #[test]
 fn signal_with_no_pending_wft() {
     let state = make_open_state();
-    let transition = kernel().apply(
-        LoadedRun::Existing(state),
-        Command::Signal(SignalRequest {
-            signal_name: "sig".into(),
-            input: payloads("signal"),
-            request: request_context("signal-req"),
-            now: now(),
-        }),
-    ).unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::Signal(SignalRequest {
+                signal_name: "sig".into(),
+                input: payloads("signal"),
+                request: request_context("signal-req"),
+                now: now(),
+            }),
+        )
+        .unwrap();
 
-    assert!(matches!(transition.history_events[0].kind, HistoryEventKind::WorkflowExecutionSignaled { .. }));
-    assert!(matches!(transition.history_events[1].kind, HistoryEventKind::WorkflowTaskScheduled { .. }));
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::WorkflowExecutionSignaled { .. }
+    ));
+    assert!(matches!(
+        transition.history_events[1].kind,
+        HistoryEventKind::WorkflowTaskScheduled { .. }
+    ));
     assert_eq!(transition.request_dedupe_ops.len(), 1);
-    assert!(transition.dispatch_ops.iter().any(|op| matches!(op, DispatchOp::EnqueueWorkflowTask { .. })));
+    assert!(
+        transition
+            .dispatch_ops
+            .iter()
+            .any(|op| matches!(op, DispatchOp::EnqueueWorkflowTask { .. }))
+    );
     assert!(transition.next_state.pending_workflow_task.is_some());
 }
 
@@ -336,21 +479,33 @@ fn signal_with_no_pending_wft() {
 fn signal_with_pending_wft() {
     let state = make_open_state_with_pending_wft();
     let pending = state.pending_workflow_task.clone().unwrap();
-    let transition = kernel().apply(
-        LoadedRun::Existing(state),
-        Command::Signal(SignalRequest {
-            signal_name: "sig".into(),
-            input: payloads("signal"),
-            request: request_context("signal-req"),
-            now: now(),
-        }),
-    ).unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::Signal(SignalRequest {
+                signal_name: "sig".into(),
+                input: payloads("signal"),
+                request: request_context("signal-req"),
+                now: now(),
+            }),
+        )
+        .unwrap();
 
     assert_eq!(transition.history_events.len(), 1);
-    assert!(matches!(transition.history_events[0].kind, HistoryEventKind::WorkflowExecutionSignaled { .. }));
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::WorkflowExecutionSignaled { .. }
+    ));
     assert_eq!(transition.request_dedupe_ops.len(), 1);
     assert!(transition.dispatch_ops.is_empty());
-    assert_eq!(transition.next_state.pending_workflow_task.unwrap().logical_seq, pending.logical_seq);
+    assert_eq!(
+        transition
+            .next_state
+            .pending_workflow_task
+            .unwrap()
+            .logical_seq,
+        pending.logical_seq
+    );
 }
 
 #[test]
@@ -390,7 +545,10 @@ fn cancel_with_pending_wft() {
     let state = make_open_state_with_pending_wft();
     let pending = state.pending_workflow_task.clone();
     let transition = kernel()
-        .apply(LoadedRun::Existing(state), Command::Cancel(make_cancel_request()))
+        .apply(
+            LoadedRun::Existing(state),
+            Command::Cancel(make_cancel_request()),
+        )
         .unwrap();
 
     assert_eq!(transition.history_events.len(), 1);
@@ -467,11 +625,15 @@ fn terminate_with_activities_and_timers() {
             activity_id: "activity-2".into(),
             schedule_event_id: 6,
             task_queue: TaskQueueName("activity-q".into()),
+            input: Payloads::default(),
             attempt: 1,
+            retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
             schedule_to_start_timeout: Some(Duration::seconds(30)),
             start_to_close_timeout: Some(Duration::minutes(1)),
             heartbeat_timeout: Some(Duration::seconds(20)),
+            pause_info: None,
+            stamp: 0,
         },
     );
     state.timers.insert(
@@ -483,7 +645,10 @@ fn terminate_with_activities_and_timers() {
         },
     );
     let transition = kernel()
-        .apply(LoadedRun::Existing(state), Command::Terminate(make_terminate_request()))
+        .apply(
+            LoadedRun::Existing(state),
+            Command::Terminate(make_terminate_request()),
+        )
         .unwrap();
 
     assert!(transition.next_state.activities.is_empty());
@@ -494,14 +659,20 @@ fn terminate_with_activities_and_timers() {
         transition.activity_ops[0],
         tokeira_kernel::ActivityOp::Delete { .. }
     ));
-    assert!(matches!(transition.timer_ops[0], tokeira_kernel::TimerOp::Delete { .. }));
+    assert!(matches!(
+        transition.timer_ops[0],
+        tokeira_kernel::TimerOp::Delete { .. }
+    ));
 }
 
 #[test]
 fn terminate_with_pending_wft() {
     let state = make_open_state_with_pending_wft();
     let transition = kernel()
-        .apply(LoadedRun::Existing(state), Command::Terminate(make_terminate_request()))
+        .apply(
+            LoadedRun::Existing(state),
+            Command::Terminate(make_terminate_request()),
+        )
         .unwrap();
 
     assert!(transition.next_state.pending_workflow_task.is_none());
@@ -513,7 +684,10 @@ fn reset_happy_path_no_pending_wft() {
     let state = make_open_state();
     let req = make_reset_request();
     let transition = kernel()
-        .apply(LoadedRun::Existing(state.clone()), Command::Reset(req.clone()))
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::Reset(req.clone()),
+        )
         .unwrap();
 
     assert_eq!(transition.history_events.len(), 1);
@@ -546,17 +720,22 @@ fn reset_happy_path_no_pending_wft() {
     assert!(transition.next_state.closed_at.is_some());
     assert!(transition.next_state.pending_workflow_task.is_none());
     assert!(transition.next_state.sticky.is_none());
-    assert!(transition
-        .dispatch_ops
-        .iter()
-        .all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. })));
+    assert!(
+        transition
+            .dispatch_ops
+            .iter()
+            .all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. }))
+    );
 }
 
 #[test]
 fn reset_happy_path_with_started_wft() {
     let state = make_open_state_with_started_wft();
     let transition = kernel()
-        .apply(LoadedRun::Existing(state), Command::Reset(make_reset_request()))
+        .apply(
+            LoadedRun::Existing(state),
+            Command::Reset(make_reset_request()),
+        )
         .unwrap();
 
     assert!(matches!(
@@ -576,7 +755,10 @@ fn reset_happy_path_with_started_wft() {
 fn reset_happy_path_with_scheduled_wft() {
     let state = make_open_state_with_pending_wft();
     let transition = kernel()
-        .apply(LoadedRun::Existing(state), Command::Reset(make_reset_request()))
+        .apply(
+            LoadedRun::Existing(state),
+            Command::Reset(make_reset_request()),
+        )
         .unwrap();
 
     assert!(matches!(
@@ -601,11 +783,15 @@ fn reset_cleans_up_activities_and_timers() {
             activity_id: "activity-2".into(),
             schedule_event_id: 6,
             task_queue: TaskQueueName("activity-q".into()),
+            input: Payloads::default(),
             attempt: 1,
+            retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
             schedule_to_start_timeout: Some(Duration::seconds(30)),
             start_to_close_timeout: Some(Duration::minutes(1)),
             heartbeat_timeout: Some(Duration::seconds(20)),
+            pause_info: None,
+            stamp: 0,
         },
     );
     state.timers.insert(
@@ -618,21 +804,28 @@ fn reset_cleans_up_activities_and_timers() {
     );
 
     let transition = kernel()
-        .apply(LoadedRun::Existing(state), Command::Reset(make_reset_request()))
+        .apply(
+            LoadedRun::Existing(state),
+            Command::Reset(make_reset_request()),
+        )
         .unwrap();
 
     assert!(transition.next_state.activities.is_empty());
     assert!(transition.next_state.timers.is_empty());
     assert_eq!(transition.activity_ops.len(), 2);
     assert_eq!(transition.timer_ops.len(), 1);
-    assert!(transition
-        .activity_ops
-        .iter()
-        .all(|op| matches!(op, tokeira_kernel::ActivityOp::Delete { .. })));
-    assert!(transition
-        .timer_ops
-        .iter()
-        .all(|op| matches!(op, tokeira_kernel::TimerOp::Delete { .. })));
+    assert!(
+        transition
+            .activity_ops
+            .iter()
+            .all(|op| matches!(op, tokeira_kernel::ActivityOp::Delete { .. }))
+    );
+    assert!(
+        transition
+            .timer_ops
+            .iter()
+            .all(|op| matches!(op, tokeira_kernel::TimerOp::Delete { .. }))
+    );
 }
 
 #[test]
@@ -645,7 +838,10 @@ fn reset_applies_parent_close_policy() {
         true,
     );
     let transition = kernel()
-        .apply(LoadedRun::Existing(state), Command::Reset(make_reset_request()))
+        .apply(
+            LoadedRun::Existing(state),
+            Command::Reset(make_reset_request()),
+        )
         .unwrap();
 
     assert!(transition.next_state.children.is_empty());
@@ -717,25 +913,565 @@ fn reset_rejects_absent_run() {
 #[test]
 fn reset_rejects_closed_run() {
     let reject = kernel()
-        .apply(LoadedRun::Existing(make_closed_state()), Command::Reset(make_reset_request()))
+        .apply(
+            LoadedRun::Existing(make_closed_state()),
+            Command::Reset(make_reset_request()),
+        )
         .unwrap_err();
     assert_eq!(reject, Reject::RunClosed(ExecutionStatus::Completed));
 }
 
 #[test]
+fn pause_workflow_happy_path() {
+    let mut state = make_open_state_with_activity("activity-1");
+    state.activities.insert(
+        "activity-2".into(),
+        ActivityState {
+            activity_id: "activity-2".into(),
+            schedule_event_id: 8,
+            task_queue: TaskQueueName("activity-q".into()),
+            input: Payloads::default(),
+            attempt: 1,
+            retry_policy: None,
+            schedule_to_close_timeout: Some(Duration::minutes(2)),
+            schedule_to_start_timeout: Some(Duration::seconds(30)),
+            start_to_close_timeout: Some(Duration::minutes(1)),
+            heartbeat_timeout: Some(Duration::seconds(20)),
+            pause_info: None,
+            stamp: 0,
+        },
+    );
+
+    let req = make_pause_workflow_request();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::PauseWorkflow(req.clone()),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        &transition.history_events[0].kind,
+        HistoryEventKind::WorkflowExecutionPaused { identity, reason, request_id }
+            if identity == &req.identity && reason == &req.reason && request_id == "pause-req"
+    ));
+    assert_eq!(transition.next_state.status, ExecutionStatus::Paused);
+    assert_eq!(transition.next_state.wft_stamp, 1);
+    assert!(matches!(
+        &transition.next_state.pause_info,
+        Some(PauseInfo { identity, reason, request_id, .. })
+            if identity == &req.identity && reason == &req.reason && request_id == "pause-req"
+    ));
+    assert_eq!(transition.activity_ops.len(), 2);
+    assert!(
+        transition
+            .activity_ops
+            .iter()
+            .all(|op| matches!(op, ActivityOp::Upsert(ActivityState { stamp: 1, .. })))
+    );
+    assert!(transition.dispatch_ops.is_empty());
+    assert_eq!(
+        transition.projection_ops.last(),
+        Some(&ProjectionOp::UpsertExecution {
+            status: ExecutionStatus::Paused,
+            memo_patch: transition.next_state.memo.clone(),
+            search_attr_patch: transition.next_state.search_attributes.clone(),
+        })
+    );
+}
+
+#[test]
+fn pause_workflow_idempotent_same_request_id() {
+    let state = make_paused_state();
+    let mut req = make_pause_workflow_request();
+    req.request = request_context("pause-req");
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::PauseWorkflow(req),
+        )
+        .unwrap();
+
+    assert!(transition.history_events.is_empty());
+    assert!(transition.activity_ops.is_empty());
+    assert!(transition.dispatch_ops.is_empty());
+    assert!(transition.projection_ops.is_empty());
+    assert_eq!(
+        transition.next_state.transition_seq,
+        state.transition_seq.next()
+    );
+    assert_eq!(transition.next_state.status, ExecutionStatus::Paused);
+    assert_eq!(transition.next_state.pause_info, state.pause_info);
+}
+
+#[test]
+fn pause_workflow_rejects_different_request_id() {
+    let mut req = make_pause_workflow_request();
+    req.request = request_context("different-pause-req");
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(make_paused_state()),
+            Command::PauseWorkflow(req),
+        )
+        .unwrap_err();
+    assert_eq!(reject, Reject::AlreadyPaused);
+}
+
+#[test]
+fn pause_workflow_rejects_absent_run() {
+    let reject = kernel()
+        .apply(
+            LoadedRun::Absent,
+            Command::PauseWorkflow(make_pause_workflow_request()),
+        )
+        .unwrap_err();
+    assert_eq!(reject, Reject::MissingRun);
+}
+
+#[test]
+fn pause_workflow_rejects_closed_run() {
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(make_closed_state()),
+            Command::PauseWorkflow(make_pause_workflow_request()),
+        )
+        .unwrap_err();
+    assert_eq!(reject, Reject::RunClosed(ExecutionStatus::Completed));
+}
+
+#[test]
+fn unpause_workflow_happy_path() {
+    let mut state = make_paused_state_with_activity("activity-1");
+    state.activities.insert(
+        "activity-2".into(),
+        ActivityState {
+            activity_id: "activity-2".into(),
+            schedule_event_id: 8,
+            task_queue: TaskQueueName("activity-q".into()),
+            input: Payloads::default(),
+            attempt: 1,
+            retry_policy: None,
+            schedule_to_close_timeout: Some(Duration::minutes(2)),
+            schedule_to_start_timeout: Some(Duration::seconds(30)),
+            start_to_close_timeout: Some(Duration::minutes(1)),
+            heartbeat_timeout: Some(Duration::seconds(20)),
+            pause_info: None,
+            stamp: 1,
+        },
+    );
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::UnpauseWorkflow(make_unpause_workflow_request()),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::WorkflowExecutionUnpaused { .. }
+    ));
+    assert!(matches!(
+        transition.history_events[1].kind,
+        HistoryEventKind::WorkflowTaskScheduled { .. }
+    ));
+    assert_eq!(transition.next_state.status, ExecutionStatus::Running);
+    assert!(transition.next_state.pause_info.is_none());
+    assert_eq!(transition.activity_ops.len(), 2);
+    assert_eq!(
+        transition
+            .dispatch_ops
+            .iter()
+            .filter(|op| matches!(op, DispatchOp::EnqueueActivityTask { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(
+        transition
+            .dispatch_ops
+            .iter()
+            .filter(|op| matches!(op, DispatchOp::EnqueueWorkflowTask { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn unpause_workflow_no_activities() {
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(make_paused_state()),
+            Command::UnpauseWorkflow(make_unpause_workflow_request()),
+        )
+        .unwrap();
+    assert_eq!(transition.activity_ops.len(), 0);
+    assert!(matches!(
+        transition.history_events[1].kind,
+        HistoryEventKind::WorkflowTaskScheduled { .. }
+    ));
+}
+
+#[test]
+fn unpause_workflow_rejects_running() {
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(make_open_state()),
+            Command::UnpauseWorkflow(make_unpause_workflow_request()),
+        )
+        .unwrap_err();
+    assert_eq!(reject, Reject::NotPaused);
+}
+
+#[test]
+fn signal_paused_workflow_no_wft() {
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(make_paused_state()),
+            Command::Signal(SignalRequest {
+                signal_name: "sig".into(),
+                input: payloads("signal"),
+                request: request_context("paused-signal"),
+                now: now(),
+            }),
+        )
+        .unwrap();
+    assert_eq!(transition.history_events.len(), 1);
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::WorkflowExecutionSignaled { .. }
+    ));
+    assert!(transition.dispatch_ops.is_empty());
+}
+
+#[test]
+fn cancel_paused_workflow_no_wft() {
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(make_paused_state()),
+            Command::Cancel(make_cancel_request()),
+        )
+        .unwrap();
+    assert_eq!(transition.history_events.len(), 1);
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::WorkflowExecutionCancelRequested { .. }
+    ));
+    assert!(transition.dispatch_ops.is_empty());
+}
+
+#[test]
+fn update_rejects_paused_workflow() {
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(make_paused_state()),
+            Command::Update(UpdateRequest {
+                update_id: "update-1".into(),
+                update_name: "handler".into(),
+                input: payloads("input"),
+                request: request_context("paused-update"),
+                now: now(),
+            }),
+        )
+        .unwrap_err();
+    assert_eq!(reject, Reject::WorkflowPaused);
+}
+
+#[test]
+fn terminate_paused_workflow() {
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(make_paused_state()),
+            Command::Terminate(make_terminate_request()),
+        )
+        .unwrap();
+    assert_eq!(transition.next_state.status, ExecutionStatus::Terminated);
+    assert!(transition.next_state.pause_info.is_none());
+}
+
+#[test]
+fn activity_resolved_paused_workflow_no_wft() {
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(make_paused_state_with_activity("activity-1")),
+            Command::ActivityResolved(ActivityResolvedRequest {
+                activity_id: "activity-1".into(),
+                resolution: tokeira_kernel::event::ActivityResolution::Completed {
+                    result: payloads("done"),
+                },
+                worker_identity: None,
+                now: now(),
+            }),
+        )
+        .unwrap();
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::ActivityTaskCompleted { .. }
+    ));
+    assert!(transition.next_state.activities.is_empty());
+    assert!(transition.dispatch_ops.is_empty());
+}
+
+#[test]
+fn wft_failed_paused_workflow_no_redispatch() {
+    let mut state = make_paused_state();
+    state.pending_workflow_task = Some(PendingWorkflowTask {
+        logical_seq: LogicalTaskSeq(3),
+        scheduled_event_id: 8,
+        started_event_id: Some(9),
+        attempt: 1,
+    });
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+                logical_seq: LogicalTaskSeq(3),
+                started_event_id: 9,
+                failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
+                failure_details: None,
+                worker_identity: WorkerIdentity("worker".into()),
+                now: now(),
+            }),
+        )
+        .unwrap();
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::WorkflowTaskFailed { .. }
+    ));
+    assert!(transition.dispatch_ops.is_empty());
+    assert_eq!(
+        transition
+            .next_state
+            .pending_workflow_task
+            .unwrap()
+            .started_event_id,
+        None
+    );
+}
+
+#[test]
+fn wft_timed_out_paused_workflow_no_redispatch() {
+    let mut state = make_paused_state();
+    state.pending_workflow_task = Some(PendingWorkflowTask {
+        logical_seq: LogicalTaskSeq(3),
+        scheduled_event_id: 8,
+        started_event_id: Some(9),
+        attempt: 1,
+    });
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+                logical_seq: LogicalTaskSeq(3),
+                started_event_id: 9,
+                timeout_type: WorkflowTaskTimeoutType::StartToClose,
+                now: now(),
+            }),
+        )
+        .unwrap();
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::WorkflowTaskTimedOut { .. }
+    ));
+    assert!(transition.dispatch_ops.is_empty());
+    assert_eq!(
+        transition
+            .next_state
+            .pending_workflow_task
+            .unwrap()
+            .started_event_id,
+        None
+    );
+}
+
+#[test]
+fn wft_completed_paused_workflow_no_force_wft() {
+    let mut state = make_paused_state();
+    state.pending_workflow_task = Some(PendingWorkflowTask {
+        logical_seq: LogicalTaskSeq(3),
+        scheduled_event_id: 8,
+        started_event_id: Some(9),
+        attempt: 1,
+    });
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 9,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![],
+                force_new_workflow_task: true,
+                now: now(),
+            }),
+        )
+        .unwrap();
+    assert!(transition.dispatch_ops.is_empty());
+    assert!(transition.next_state.pending_workflow_task.is_none());
+}
+
+#[test]
+fn update_activity_options_happy_path() {
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(make_open_state_with_activity("activity-1")),
+            Command::UpdateActivityOptions(make_update_activity_options_request(
+                "activity-1",
+            )),
+        )
+        .unwrap();
+    assert!(transition.history_events.is_empty());
+    assert_eq!(transition.request_dedupe_ops.len(), 1);
+    assert!(
+        matches!(&transition.activity_ops[0], ActivityOp::Upsert(ActivityState { stamp: 1, task_queue, .. }) if *task_queue == TaskQueueName("activity-updated".into()))
+    );
+    let activity = transition.next_state.activities.get("activity-1").unwrap();
+    assert_eq!(activity.stamp, 1);
+    assert_eq!(activity.heartbeat_timeout, Some(Duration::seconds(30)));
+}
+
+#[test]
+fn update_activity_options_unknown_activity() {
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(make_open_state()),
+            Command::UpdateActivityOptions(make_update_activity_options_request(
+                "missing",
+            )),
+        )
+        .unwrap_err();
+    assert_eq!(reject, Reject::UnknownActivity("missing".into()));
+}
+
+#[test]
+fn pause_activity_happy_path() {
+    let req = make_pause_activity_request("activity-1");
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(make_open_state_with_activity("activity-1")),
+            Command::PauseActivity(req.clone()),
+        )
+        .unwrap();
+    assert!(transition.history_events.is_empty());
+    let activity = transition.next_state.activities.get("activity-1").unwrap();
+    assert_eq!(activity.stamp, 1);
+    assert!(
+        matches!(&activity.pause_info, Some(ActivityPauseInfo { identity, reason, .. }) if identity == &req.identity && reason == &req.reason)
+    );
+}
+
+#[test]
+fn pause_activity_unknown_activity() {
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(make_open_state()),
+            Command::PauseActivity(make_pause_activity_request("missing")),
+        )
+        .unwrap_err();
+    assert_eq!(reject, Reject::UnknownActivity("missing".into()));
+}
+
+#[test]
+fn unpause_activity_happy_path() {
+    let mut state = make_open_state_with_activity("activity-1");
+    if let Some(activity) = state.activities.get_mut("activity-1") {
+        activity.pause_info = Some(ActivityPauseInfo {
+            pause_time: now(),
+            identity: "operator".into(),
+            reason: "pause".into(),
+        });
+        activity.stamp = 1;
+    }
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::UnpauseActivity(make_unpause_activity_request("activity-1")),
+        )
+        .unwrap();
+    let activity = transition.next_state.activities.get("activity-1").unwrap();
+    assert!(activity.pause_info.is_none());
+    assert_eq!(activity.stamp, 2);
+    assert_eq!(transition.dispatch_ops.len(), 1);
+    assert!(matches!(
+        transition.dispatch_ops[0],
+        DispatchOp::EnqueueActivityTask { .. }
+    ));
+}
+
+#[test]
+fn unpause_activity_not_paused() {
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(make_open_state_with_activity("activity-1")),
+            Command::UnpauseActivity(make_unpause_activity_request("activity-1")),
+        )
+        .unwrap_err();
+    assert_eq!(reject, Reject::ActivityNotPaused("activity-1".into()));
+}
+
+#[test]
+fn unpause_activity_unknown_activity() {
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(make_open_state()),
+            Command::UnpauseActivity(make_unpause_activity_request("missing")),
+        )
+        .unwrap_err();
+    assert_eq!(reject, Reject::UnknownActivity("missing".into()));
+}
+
+#[test]
+fn reset_activity_happy_path() {
+    let mut state = make_open_state_with_activity("activity-1");
+    if let Some(activity) = state.activities.get_mut("activity-1") {
+        activity.attempt = 5;
+    }
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::ResetActivity(make_reset_activity_request("activity-1")),
+        )
+        .unwrap();
+    let activity = transition.next_state.activities.get("activity-1").unwrap();
+    assert_eq!(activity.attempt, 1);
+    assert_eq!(activity.stamp, 1);
+    assert_eq!(transition.dispatch_ops.len(), 1);
+    assert!(transition.history_events.is_empty());
+}
+
+#[test]
+fn reset_activity_unknown_activity() {
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(make_open_state()),
+            Command::ResetActivity(make_reset_activity_request("missing")),
+        )
+        .unwrap_err();
+    assert_eq!(reject, Reject::UnknownActivity("missing".into()));
+}
+
+#[test]
 fn workflow_task_started_with_sticky() {
     let state = make_open_state_with_pending_wft();
-    let transition = kernel().apply(
-        LoadedRun::Existing(state),
-        Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
-            logical_seq: LogicalTaskSeq(3),
-            worker_identity: WorkerIdentity("worker-a".into()),
-            sticky_ttl: Some(Duration::seconds(30)),
-            now: now(),
-        }),
-    ).unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                logical_seq: LogicalTaskSeq(3),
+                worker_identity: WorkerIdentity("worker-a".into()),
+                sticky_ttl: Some(Duration::seconds(30)),
+                now: now(),
+            }),
+        )
+        .unwrap();
 
-    assert!(matches!(transition.history_events[0].kind, HistoryEventKind::WorkflowTaskStarted { attempt: 1, .. }));
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::WorkflowTaskStarted { attempt: 1, .. }
+    ));
     let pending = transition.next_state.pending_workflow_task.unwrap();
     assert_eq!(pending.started_event_id, Some(10));
     assert_eq!(pending.attempt, 1);
@@ -747,43 +1483,72 @@ fn workflow_task_started_with_sticky() {
 #[test]
 fn workflow_task_completed_with_activity_and_timer() {
     let state = make_open_state_with_started_wft();
-    let transition = kernel().apply(
-        LoadedRun::Existing(state.clone()),
-        Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
-            token: WorkflowTaskToken {
-                run_key: state.run_key,
-                logical_seq: LogicalTaskSeq(3),
-                started_event_id: 9,
-                attempt: 1,
-                shard_epoch: ShardEpoch::ZERO,
-            },
-            identity: WorkerIdentity("worker".into()),
-            commands: vec![
-                WorkflowCommand::ScheduleActivity {
-                    activity_id: "activity-1".into(),
-                    task_queue: TaskQueueName("activity-q".into()),
-                    input: payloads("act"),
-                    schedule_to_close_timeout: Some(Duration::minutes(2)),
-                    schedule_to_start_timeout: Some(Duration::seconds(30)),
-                    start_to_close_timeout: Some(Duration::minutes(1)),
-                    heartbeat_timeout: Some(Duration::seconds(20)),
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 9,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
                 },
-                WorkflowCommand::StartTimer {
-                    timer_id: "timer-1".into(),
-                    fire_at: now() + Duration::seconds(45),
-                },
-            ],
-            force_new_workflow_task: false,
-            now: now(),
-        }),
-    ).unwrap();
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![
+                    WorkflowCommand::ScheduleActivity {
+                        activity_id: "activity-1".into(),
+                        task_queue: TaskQueueName("activity-q".into()),
+                        input: payloads("act"),
+                        retry_policy: None,
+                        schedule_to_close_timeout: Some(Duration::minutes(2)),
+                        schedule_to_start_timeout: Some(Duration::seconds(30)),
+                        start_to_close_timeout: Some(Duration::minutes(1)),
+                        heartbeat_timeout: Some(Duration::seconds(20)),
+                    },
+                    WorkflowCommand::StartTimer {
+                        timer_id: "timer-1".into(),
+                        fire_at: now() + Duration::seconds(45),
+                    },
+                ],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
 
-    assert!(matches!(transition.history_events[0].kind, HistoryEventKind::WorkflowTaskCompleted { .. }));
-    assert!(transition.history_events.iter().any(|event| matches!(event.kind, HistoryEventKind::ActivityTaskScheduled { .. })));
-    assert!(transition.history_events.iter().any(|event| matches!(event.kind, HistoryEventKind::TimerStarted { .. })));
-    assert!(transition.activity_ops.iter().any(|op| matches!(op, tokeira_kernel::ActivityOp::Upsert(_))));
-    assert!(transition.timer_ops.iter().any(|op| matches!(op, tokeira_kernel::TimerOp::Upsert(_))));
-    assert!(transition.dispatch_ops.iter().any(|op| matches!(op, DispatchOp::EnqueueActivityTask { .. })));
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::WorkflowTaskCompleted { .. }
+    ));
+    assert!(transition.history_events.iter().any(|event| matches!(
+        event.kind,
+        HistoryEventKind::ActivityTaskScheduled { .. }
+    )));
+    assert!(
+        transition
+            .history_events
+            .iter()
+            .any(|event| matches!(event.kind, HistoryEventKind::TimerStarted { .. }))
+    );
+    assert!(
+        transition
+            .activity_ops
+            .iter()
+            .any(|op| matches!(op, tokeira_kernel::ActivityOp::Upsert(_)))
+    );
+    assert!(
+        transition
+            .timer_ops
+            .iter()
+            .any(|op| matches!(op, tokeira_kernel::TimerOp::Upsert(_)))
+    );
+    assert!(
+        transition
+            .dispatch_ops
+            .iter()
+            .any(|op| matches!(op, DispatchOp::EnqueueActivityTask { .. }))
+    );
     assert!(transition.next_state.activities.contains_key("activity-1"));
     assert!(transition.next_state.timers.contains_key("timer-1"));
     assert!(transition.next_state.pending_workflow_task.is_none());
@@ -792,25 +1557,38 @@ fn workflow_task_completed_with_activity_and_timer() {
 #[test]
 fn workflow_task_completed_with_complete_workflow() {
     let state = make_open_state_with_started_wft();
-    let transition = kernel().apply(
-        LoadedRun::Existing(state.clone()),
-        Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
-            token: WorkflowTaskToken {
-                run_key: state.run_key,
-                logical_seq: LogicalTaskSeq(3),
-                started_event_id: 9,
-                attempt: 1,
-                shard_epoch: ShardEpoch::ZERO,
-            },
-            identity: WorkerIdentity("worker".into()),
-            commands: vec![WorkflowCommand::CompleteWorkflow { result: payloads("done") }],
-            force_new_workflow_task: false,
-            now: now(),
-        }),
-    ).unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 9,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::CompleteWorkflow {
+                    result: payloads("done"),
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
 
-    assert!(transition.history_events.iter().any(|event| matches!(event.kind, HistoryEventKind::WorkflowExecutionCompleted { .. })));
-    assert_eq!(transition.projection_ops.last(), Some(&ProjectionOp::CloseExecution { status: ExecutionStatus::Completed, closed_at: now() }));
+    assert!(transition.history_events.iter().any(|event| matches!(
+        event.kind,
+        HistoryEventKind::WorkflowExecutionCompleted { .. }
+    )));
+    assert_eq!(
+        transition.projection_ops.last(),
+        Some(&ProjectionOp::CloseExecution {
+            status: ExecutionStatus::Completed,
+            closed_at: now()
+        })
+    );
     assert_eq!(transition.next_state.status, ExecutionStatus::Completed);
     assert!(transition.next_state.closed_at.is_some());
     assert!(transition.next_state.pending_workflow_task.is_none());
@@ -820,22 +1598,27 @@ fn workflow_task_completed_with_complete_workflow() {
 #[test]
 fn workflow_task_completed_with_fail_workflow() {
     let state = make_open_state_with_started_wft();
-    let transition = kernel().apply(
-        LoadedRun::Existing(state.clone()),
-        Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
-            token: WorkflowTaskToken {
-                run_key: state.run_key,
-                logical_seq: LogicalTaskSeq(3),
-                started_event_id: 9,
-                attempt: 1,
-                shard_epoch: ShardEpoch::ZERO,
-            },
-            identity: WorkerIdentity("worker".into()),
-            commands: vec![WorkflowCommand::FailWorkflow { message: "nope".into(), details: Some(payload("details")) }],
-            force_new_workflow_task: false,
-            now: now(),
-        }),
-    ).unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 9,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::FailWorkflow {
+                    message: "nope".into(),
+                    details: Some(payload("details")),
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
 
     assert!(transition.history_events.iter().any(|event| matches!(
         event.kind,
@@ -845,7 +1628,13 @@ fn workflow_task_completed_with_fail_workflow() {
             ..
         }
     )));
-    assert_eq!(transition.projection_ops.last(), Some(&ProjectionOp::CloseExecution { status: ExecutionStatus::Failed, closed_at: now() }));
+    assert_eq!(
+        transition.projection_ops.last(),
+        Some(&ProjectionOp::CloseExecution {
+            status: ExecutionStatus::Failed,
+            closed_at: now()
+        })
+    );
     assert_eq!(transition.next_state.status, ExecutionStatus::Failed);
     assert!(transition.next_state.closed_at.is_some());
     assert!(transition.next_state.pending_workflow_task.is_none());
@@ -890,24 +1679,29 @@ fn continue_as_new_closes_run() {
         ),
         _ => unreachable!(),
     };
-    let transition = kernel().apply(
-        LoadedRun::Existing(state.clone()),
-        Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
-            token: WorkflowTaskToken {
-                run_key: state.run_key,
-                logical_seq: LogicalTaskSeq(3),
-                started_event_id: 9,
-                attempt: 1,
-                shard_epoch: ShardEpoch::ZERO,
-            },
-            identity: WorkerIdentity("worker".into()),
-            commands: vec![command.clone()],
-            force_new_workflow_task: false,
-            now: now(),
-        }),
-    ).unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 9,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![command.clone()],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
 
-    assert_eq!(transition.next_state.status, ExecutionStatus::ContinuedAsNew);
+    assert_eq!(
+        transition.next_state.status,
+        ExecutionStatus::ContinuedAsNew
+    );
     assert!(transition.next_state.closed_at.is_some());
     assert!(transition.next_state.pending_workflow_task.is_none());
     assert!(transition.next_state.sticky.is_none());
@@ -965,10 +1759,12 @@ fn continue_as_new_then_another_command() {
 
 #[test]
 fn workflow_execution_timed_out_no_entities() {
-    let transition = kernel().apply(
-        LoadedRun::Existing(make_open_state()),
-        Command::WorkflowExecutionTimedOut(make_timeout_request()),
-    ).unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(make_open_state()),
+            Command::WorkflowExecutionTimedOut(make_timeout_request()),
+        )
+        .unwrap();
 
     assert_eq!(transition.next_state.status, ExecutionStatus::TimedOut);
     assert!(transition.next_state.closed_at.is_some());
@@ -996,11 +1792,15 @@ fn workflow_execution_timed_out_with_entities() {
             activity_id: "activity-2".into(),
             schedule_event_id: 6,
             task_queue: TaskQueueName("activity-q".into()),
+            input: Payloads::default(),
             attempt: 1,
+            retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
             schedule_to_start_timeout: Some(Duration::seconds(30)),
             start_to_close_timeout: Some(Duration::minutes(1)),
             heartbeat_timeout: Some(Duration::seconds(20)),
+            pause_info: None,
+            stamp: 0,
         },
     );
     state.timers.insert(
@@ -1011,10 +1811,12 @@ fn workflow_execution_timed_out_with_entities() {
             fire_at: now(),
         },
     );
-    let transition = kernel().apply(
-        LoadedRun::Existing(state),
-        Command::WorkflowExecutionTimedOut(make_timeout_request()),
-    ).unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::WorkflowExecutionTimedOut(make_timeout_request()),
+        )
+        .unwrap();
 
     assert!(transition.next_state.activities.is_empty());
     assert!(transition.next_state.timers.is_empty());
@@ -1029,10 +1831,12 @@ fn workflow_execution_timed_out_with_pending_wft() {
         worker_identity: WorkerIdentity("sticky-worker".into()),
         expires_at: now() + Duration::seconds(30),
     });
-    let transition = kernel().apply(
-        LoadedRun::Existing(state),
-        Command::WorkflowExecutionTimedOut(make_timeout_request()),
-    ).unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::WorkflowExecutionTimedOut(make_timeout_request()),
+        )
+        .unwrap();
 
     assert!(transition.next_state.pending_workflow_task.is_none());
     assert!(transition.next_state.sticky.is_none());
@@ -1064,25 +1868,27 @@ fn reject_timeout_closed_run() {
 #[test]
 fn fail_workflow_with_retry_policy() {
     let state = make_open_state_with_started_wft();
-    let transition = kernel().apply(
-        LoadedRun::Existing(state.clone()),
-        Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
-            token: WorkflowTaskToken {
-                run_key: state.run_key,
-                logical_seq: LogicalTaskSeq(3),
-                started_event_id: 9,
-                attempt: 1,
-                shard_epoch: ShardEpoch::ZERO,
-            },
-            identity: WorkerIdentity("worker".into()),
-            commands: vec![WorkflowCommand::FailWorkflow {
-                message: "nope".into(),
-                details: Some(payload("details")),
-            }],
-            force_new_workflow_task: false,
-            now: now(),
-        }),
-    ).unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 9,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::FailWorkflow {
+                    message: "nope".into(),
+                    details: Some(payload("details")),
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
 
     assert!(transition.history_events.iter().any(|event| matches!(
         event.kind,
@@ -1098,25 +1904,27 @@ fn fail_workflow_with_retry_policy() {
 fn fail_workflow_without_retry_policy() {
     let mut state = make_open_state_with_started_wft();
     state.retry_policy = None;
-    let transition = kernel().apply(
-        LoadedRun::Existing(state.clone()),
-        Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
-            token: WorkflowTaskToken {
-                run_key: state.run_key,
-                logical_seq: LogicalTaskSeq(3),
-                started_event_id: 9,
-                attempt: 1,
-                shard_epoch: ShardEpoch::ZERO,
-            },
-            identity: WorkerIdentity("worker".into()),
-            commands: vec![WorkflowCommand::FailWorkflow {
-                message: "nope".into(),
-                details: Some(payload("details")),
-            }],
-            force_new_workflow_task: false,
-            now: now(),
-        }),
-    ).unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 9,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::FailWorkflow {
+                    message: "nope".into(),
+                    details: Some(payload("details")),
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
 
     assert!(transition.history_events.iter().any(|event| matches!(
         event.kind,
@@ -1131,20 +1939,35 @@ fn fail_workflow_without_retry_policy() {
 #[test]
 fn activity_resolved_completed_schedules_wft() {
     let state = make_open_state_with_activity("activity-1");
-    let transition = kernel().apply(
-        LoadedRun::Existing(state),
-        Command::ActivityResolved(ActivityResolvedRequest {
-            activity_id: "activity-1".into(),
-            resolution: tokeira_kernel::ActivityResolution::Completed { result: payloads("done") },
-            worker_identity: None,
-            now: now(),
-        }),
-    ).unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::ActivityResolved(ActivityResolvedRequest {
+                activity_id: "activity-1".into(),
+                resolution: tokeira_kernel::ActivityResolution::Completed {
+                    result: payloads("done"),
+                },
+                worker_identity: None,
+                now: now(),
+            }),
+        )
+        .unwrap();
 
-    assert!(transition.history_events.iter().any(|event| matches!(event.kind, HistoryEventKind::ActivityTaskCompleted { .. })));
+    assert!(transition.history_events.iter().any(|event| matches!(
+        event.kind,
+        HistoryEventKind::ActivityTaskCompleted { .. }
+    )));
     assert!(transition.activity_ops.iter().any(|op| matches!(op, tokeira_kernel::ActivityOp::Delete { activity_id } if activity_id == "activity-1")));
-    assert!(transition.history_events.iter().any(|event| matches!(event.kind, HistoryEventKind::WorkflowTaskScheduled { .. })));
-    assert!(transition.dispatch_ops.iter().any(|op| matches!(op, DispatchOp::EnqueueWorkflowTask { .. })));
+    assert!(transition.history_events.iter().any(|event| matches!(
+        event.kind,
+        HistoryEventKind::WorkflowTaskScheduled { .. }
+    )));
+    assert!(
+        transition
+            .dispatch_ops
+            .iter()
+            .any(|op| matches!(op, DispatchOp::EnqueueWorkflowTask { .. }))
+    );
     assert!(!transition.next_state.activities.contains_key("activity-1"));
     assert!(transition.next_state.pending_workflow_task.is_some());
 }
@@ -1152,50 +1975,76 @@ fn activity_resolved_completed_schedules_wft() {
 #[test]
 fn activity_resolved_timed_out_schedules_wft() {
     let state = make_open_state_with_activity("activity-1");
-    let transition = kernel().apply(
-        LoadedRun::Existing(state),
-        Command::ActivityResolved(ActivityResolvedRequest {
-            activity_id: "activity-1".into(),
-            resolution: tokeira_kernel::ActivityResolution::TimedOut { timeout_type: "HEARTBEAT".into() },
-            worker_identity: None,
-            now: now(),
-        }),
-    ).unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::ActivityResolved(ActivityResolvedRequest {
+                activity_id: "activity-1".into(),
+                resolution: tokeira_kernel::ActivityResolution::TimedOut {
+                    timeout_type: "HEARTBEAT".into(),
+                },
+                worker_identity: None,
+                now: now(),
+            }),
+        )
+        .unwrap();
 
-    assert!(transition.history_events.iter().any(|event| matches!(event.kind, HistoryEventKind::ActivityTaskTimedOut { .. })));
+    assert!(transition.history_events.iter().any(|event| matches!(
+        event.kind,
+        HistoryEventKind::ActivityTaskTimedOut { .. }
+    )));
     assert!(transition.next_state.pending_workflow_task.is_some());
 }
 
 #[test]
 fn activity_resolved_canceled_schedules_wft() {
     let state = make_open_state_with_activity("activity-1");
-    let transition = kernel().apply(
-        LoadedRun::Existing(state),
-        Command::ActivityResolved(ActivityResolvedRequest {
-            activity_id: "activity-1".into(),
-            resolution: tokeira_kernel::ActivityResolution::Canceled { details: Some(payloads("cancel")) },
-            worker_identity: None,
-            now: now(),
-        }),
-    ).unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::ActivityResolved(ActivityResolvedRequest {
+                activity_id: "activity-1".into(),
+                resolution: tokeira_kernel::ActivityResolution::Canceled {
+                    details: Some(payloads("cancel")),
+                },
+                worker_identity: None,
+                now: now(),
+            }),
+        )
+        .unwrap();
 
-    assert!(transition.history_events.iter().any(|event| matches!(event.kind, HistoryEventKind::ActivityTaskCanceled { .. })));
+    assert!(transition.history_events.iter().any(|event| matches!(
+        event.kind,
+        HistoryEventKind::ActivityTaskCanceled { .. }
+    )));
     assert!(transition.next_state.pending_workflow_task.is_some());
 }
 
 #[test]
 fn timer_due_schedules_wft() {
     let state = make_open_state_with_timer("timer-1");
-    let transition = kernel().apply(
-        LoadedRun::Existing(state),
-        Command::TimerDue(TimerDueRequest {
-            timer_id: "timer-1".into(),
-            fired_at: now(),
-        }),
-    ).unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::TimerDue(TimerDueRequest {
+                timer_id: "timer-1".into(),
+                fired_at: now(),
+            }),
+        )
+        .unwrap();
 
-    assert!(transition.history_events.iter().any(|event| matches!(event.kind, HistoryEventKind::TimerFired { .. })));
-    assert!(transition.dispatch_ops.iter().any(|op| matches!(op, DispatchOp::EnqueueWorkflowTask { .. })));
+    assert!(
+        transition
+            .history_events
+            .iter()
+            .any(|event| matches!(event.kind, HistoryEventKind::TimerFired { .. }))
+    );
+    assert!(
+        transition
+            .dispatch_ops
+            .iter()
+            .any(|op| matches!(op, DispatchOp::EnqueueWorkflowTask { .. }))
+    );
     assert!(!transition.next_state.timers.contains_key("timer-1"));
     assert!(transition.next_state.pending_workflow_task.is_some());
 }
@@ -1203,17 +2052,19 @@ fn timer_due_schedules_wft() {
 #[test]
 fn wft_failed_with_started_wft() {
     let state = make_open_state_with_started_wft_and_sticky();
-    let transition = kernel().apply(
-        LoadedRun::Existing(state.clone()),
-        Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
-            logical_seq: LogicalTaskSeq(3),
-            started_event_id: 9,
-            failure_cause: WorkflowTaskFailedCause::NonDeterminismError,
-            failure_details: Some(payload("details")),
-            worker_identity: WorkerIdentity("worker".into()),
-            now: now(),
-        }),
-    ).unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+                logical_seq: LogicalTaskSeq(3),
+                started_event_id: 9,
+                failure_cause: WorkflowTaskFailedCause::NonDeterminismError,
+                failure_details: Some(payload("details")),
+                worker_identity: WorkerIdentity("worker".into()),
+                now: now(),
+            }),
+        )
+        .unwrap();
 
     assert_eq!(transition.history_events.len(), 1);
     assert!(matches!(
@@ -1265,15 +2116,17 @@ fn wft_failed_with_started_wft() {
 #[test]
 fn wft_timed_out_with_started_wft() {
     let state = make_open_state_with_started_wft_and_sticky();
-    let transition = kernel().apply(
-        LoadedRun::Existing(state),
-        Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
-            logical_seq: LogicalTaskSeq(3),
-            started_event_id: 9,
-            timeout_type: WorkflowTaskTimeoutType::StartToClose,
-            now: now(),
-        }),
-    ).unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+                logical_seq: LogicalTaskSeq(3),
+                started_event_id: 9,
+                timeout_type: WorkflowTaskTimeoutType::StartToClose,
+                now: now(),
+            }),
+        )
+        .unwrap();
 
     assert_eq!(transition.history_events.len(), 1);
     assert!(matches!(
@@ -1312,17 +2165,19 @@ fn wft_timed_out_with_started_wft() {
 #[test]
 fn wft_failed_no_sticky() {
     let state = make_open_state_with_started_wft();
-    let transition = kernel().apply(
-        LoadedRun::Existing(state),
-        Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
-            logical_seq: LogicalTaskSeq(3),
-            started_event_id: 9,
-            failure_cause: WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
-            failure_details: None,
-            worker_identity: WorkerIdentity("worker".into()),
-            now: now(),
-        }),
-    ).unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+                logical_seq: LogicalTaskSeq(3),
+                started_event_id: 9,
+                failure_cause: WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+                failure_details: None,
+                worker_identity: WorkerIdentity("worker".into()),
+                now: now(),
+            }),
+        )
+        .unwrap();
 
     assert!(transition.next_state.sticky.is_none());
     assert!(matches!(
@@ -1337,15 +2192,17 @@ fn wft_failed_no_sticky() {
 #[test]
 fn wft_timed_out_no_sticky() {
     let state = make_open_state_with_started_wft();
-    let transition = kernel().apply(
-        LoadedRun::Existing(state),
-        Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
-            logical_seq: LogicalTaskSeq(3),
-            started_event_id: 9,
-            timeout_type: WorkflowTaskTimeoutType::StartToClose,
-            now: now(),
-        }),
-    ).unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+                logical_seq: LogicalTaskSeq(3),
+                started_event_id: 9,
+                timeout_type: WorkflowTaskTimeoutType::StartToClose,
+                now: now(),
+            }),
+        )
+        .unwrap();
 
     assert!(transition.next_state.sticky.is_none());
     assert!(matches!(
@@ -1360,7 +2217,10 @@ fn wft_timed_out_no_sticky() {
 #[test]
 fn reject_start_on_existing_run() {
     assert_eq!(
-        kernel().apply(LoadedRun::Existing(make_open_state()), Command::Start(make_start_request())),
+        kernel().apply(
+            LoadedRun::Existing(make_open_state()),
+            Command::Start(make_start_request())
+        ),
         Err(Reject::RunAlreadyExists)
     );
 }
@@ -1368,12 +2228,15 @@ fn reject_start_on_existing_run() {
 #[test]
 fn reject_signal_on_absent_run() {
     assert_eq!(
-        kernel().apply(LoadedRun::Absent, Command::Signal(SignalRequest {
-            signal_name: "sig".into(),
-            input: payloads("signal"),
-            request: request_context("signal"),
-            now: now(),
-        })),
+        kernel().apply(
+            LoadedRun::Absent,
+            Command::Signal(SignalRequest {
+                signal_name: "sig".into(),
+                input: payloads("signal"),
+                request: request_context("signal"),
+                now: now(),
+            })
+        ),
         Err(Reject::MissingRun)
     );
 }
@@ -1381,12 +2244,15 @@ fn reject_signal_on_absent_run() {
 #[test]
 fn reject_signal_on_closed_run() {
     assert_eq!(
-        kernel().apply(LoadedRun::Existing(make_closed_state()), Command::Signal(SignalRequest {
-            signal_name: "sig".into(),
-            input: payloads("signal"),
-            request: request_context("signal"),
-            now: now(),
-        })),
+        kernel().apply(
+            LoadedRun::Existing(make_closed_state()),
+            Command::Signal(SignalRequest {
+                signal_name: "sig".into(),
+                input: payloads("signal"),
+                request: request_context("signal"),
+                now: now(),
+            })
+        ),
         Err(Reject::RunClosed(ExecutionStatus::Completed))
     );
 }
@@ -1413,7 +2279,10 @@ fn reject_cancel_closed_run() {
 #[test]
 fn reject_terminate_absent_run() {
     assert_eq!(
-        kernel().apply(LoadedRun::Absent, Command::Terminate(make_terminate_request())),
+        kernel().apply(
+            LoadedRun::Absent,
+            Command::Terminate(make_terminate_request())
+        ),
         Err(Reject::MissingRun)
     );
 }
@@ -1432,12 +2301,15 @@ fn reject_terminate_closed_run() {
 #[test]
 fn reject_wft_started_no_pending() {
     assert_eq!(
-        kernel().apply(LoadedRun::Existing(make_open_state()), Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
-            logical_seq: LogicalTaskSeq(3),
-            worker_identity: WorkerIdentity("worker".into()),
-            sticky_ttl: None,
-            now: now(),
-        })),
+        kernel().apply(
+            LoadedRun::Existing(make_open_state()),
+            Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                logical_seq: LogicalTaskSeq(3),
+                worker_identity: WorkerIdentity("worker".into()),
+                sticky_ttl: None,
+                now: now(),
+            })
+        ),
         Err(Reject::NoPendingWorkflowTask)
     );
 }
@@ -1445,27 +2317,40 @@ fn reject_wft_started_no_pending() {
 #[test]
 fn reject_wft_started_seq_mismatch() {
     assert_eq!(
-        kernel().apply(LoadedRun::Existing(make_open_state_with_pending_wft()), Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
-            logical_seq: LogicalTaskSeq(4),
-            worker_identity: WorkerIdentity("worker".into()),
-            sticky_ttl: None,
-            now: now(),
-        })),
-        Err(Reject::WorkflowTaskSeqMismatch { expected: 3, got: 4 })
+        kernel().apply(
+            LoadedRun::Existing(make_open_state_with_pending_wft()),
+            Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                logical_seq: LogicalTaskSeq(4),
+                worker_identity: WorkerIdentity("worker".into()),
+                sticky_ttl: None,
+                now: now(),
+            })
+        ),
+        Err(Reject::WorkflowTaskSeqMismatch {
+            expected: 3,
+            got: 4
+        })
     );
 }
 
 #[test]
 fn reject_wft_started_already_started() {
     let mut started = make_open_state_with_pending_wft();
-    started.pending_workflow_task.as_mut().unwrap().started_event_id = Some(9);
+    started
+        .pending_workflow_task
+        .as_mut()
+        .unwrap()
+        .started_event_id = Some(9);
     assert_eq!(
-        kernel().apply(LoadedRun::Existing(started), Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
-            logical_seq: LogicalTaskSeq(3),
-            worker_identity: WorkerIdentity("worker".into()),
-            sticky_ttl: None,
-            now: now(),
-        })),
+        kernel().apply(
+            LoadedRun::Existing(started),
+            Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                logical_seq: LogicalTaskSeq(3),
+                worker_identity: WorkerIdentity("worker".into()),
+                sticky_ttl: None,
+                now: now(),
+            })
+        ),
         Err(Reject::WorkflowTaskAlreadyStarted { logical_seq: 3 })
     );
 }
@@ -1473,13 +2358,22 @@ fn reject_wft_started_already_started() {
 #[test]
 fn reject_wft_completed_no_pending() {
     assert_eq!(
-        kernel().apply(LoadedRun::Existing(make_open_state()), Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
-            token: WorkflowTaskToken { run_key: RunKey::new(), logical_seq: LogicalTaskSeq(3), started_event_id: 9, attempt: 1, shard_epoch: ShardEpoch::ZERO },
-            identity: WorkerIdentity("worker".into()),
-            commands: vec![],
-            force_new_workflow_task: false,
-            now: now(),
-        })),
+        kernel().apply(
+            LoadedRun::Existing(make_open_state()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: RunKey::new(),
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 9,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![],
+                force_new_workflow_task: false,
+                now: now(),
+            })
+        ),
         Err(Reject::NoPendingWorkflowTask)
     );
 }
@@ -1487,13 +2381,22 @@ fn reject_wft_completed_no_pending() {
 #[test]
 fn reject_wft_completed_not_started() {
     assert_eq!(
-        kernel().apply(LoadedRun::Existing(make_open_state_with_pending_wft()), Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
-            token: WorkflowTaskToken { run_key: RunKey::new(), logical_seq: LogicalTaskSeq(3), started_event_id: 9, attempt: 1, shard_epoch: ShardEpoch::ZERO },
-            identity: WorkerIdentity("worker".into()),
-            commands: vec![],
-            force_new_workflow_task: false,
-            now: now(),
-        })),
+        kernel().apply(
+            LoadedRun::Existing(make_open_state_with_pending_wft()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: RunKey::new(),
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 9,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![],
+                force_new_workflow_task: false,
+                now: now(),
+            })
+        ),
         Err(Reject::WorkflowTaskNotStarted { logical_seq: 3 })
     );
 }
@@ -1502,14 +2405,26 @@ fn reject_wft_completed_not_started() {
 fn reject_wft_completed_seq_mismatch() {
     let state = make_open_state_with_started_wft();
     assert_eq!(
-        kernel().apply(LoadedRun::Existing(state.clone()), Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
-            token: WorkflowTaskToken { run_key: state.run_key, logical_seq: LogicalTaskSeq(4), started_event_id: 9, attempt: 1, shard_epoch: ShardEpoch::ZERO },
-            identity: WorkerIdentity("worker".into()),
-            commands: vec![],
-            force_new_workflow_task: false,
-            now: now(),
-        })),
-        Err(Reject::WorkflowTaskSeqMismatch { expected: 3, got: 4 })
+        kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(4),
+                    started_event_id: 9,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![],
+                force_new_workflow_task: false,
+                now: now(),
+            })
+        ),
+        Err(Reject::WorkflowTaskSeqMismatch {
+            expected: 3,
+            got: 4
+        })
     );
 }
 
@@ -1517,13 +2432,22 @@ fn reject_wft_completed_seq_mismatch() {
 fn reject_wft_completed_token_mismatch() {
     let state = make_open_state_with_started_wft();
     assert_eq!(
-        kernel().apply(LoadedRun::Existing(state.clone()), Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
-            token: WorkflowTaskToken { run_key: state.run_key, logical_seq: LogicalTaskSeq(3), started_event_id: 10, attempt: 2, shard_epoch: ShardEpoch::ZERO },
-            identity: WorkerIdentity("worker".into()),
-            commands: vec![],
-            force_new_workflow_task: false,
-            now: now(),
-        })),
+        kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 10,
+                    attempt: 2,
+                    shard_epoch: ShardEpoch::ZERO
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![],
+                force_new_workflow_task: false,
+                now: now(),
+            })
+        ),
         Err(Reject::WorkflowTaskTokenMismatch)
     );
 }
@@ -1532,32 +2456,49 @@ fn reject_wft_completed_token_mismatch() {
 fn reject_duplicate_activity_id() {
     let state = make_open_state_with_started_wft();
     let mut with_activity = state.clone();
-    with_activity.activities.insert("dup".into(), ActivityState {
-        activity_id: "dup".into(),
-        schedule_event_id: 1,
-        task_queue: TaskQueueName("activity-q".into()),
-        attempt: 1,
-        schedule_to_close_timeout: None,
-        schedule_to_start_timeout: None,
-        start_to_close_timeout: None,
-        heartbeat_timeout: None,
-    });
+    with_activity.activities.insert(
+        "dup".into(),
+        ActivityState {
+            activity_id: "dup".into(),
+            schedule_event_id: 1,
+            task_queue: TaskQueueName("activity-q".into()),
+            input: Payloads::default(),
+            attempt: 1,
+            retry_policy: None,
+            schedule_to_close_timeout: None,
+            schedule_to_start_timeout: None,
+            start_to_close_timeout: None,
+            heartbeat_timeout: None,
+            pause_info: None,
+            stamp: 0,
+        },
+    );
     assert_eq!(
-        kernel().apply(LoadedRun::Existing(with_activity), Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
-            token: WorkflowTaskToken { run_key: state.run_key, logical_seq: LogicalTaskSeq(3), started_event_id: 9, attempt: 1, shard_epoch: ShardEpoch::ZERO },
-            identity: WorkerIdentity("worker".into()),
-            commands: vec![WorkflowCommand::ScheduleActivity {
-                activity_id: "dup".into(),
-                task_queue: TaskQueueName("activity-q".into()),
-                input: payloads("a"),
-                schedule_to_close_timeout: None,
-                schedule_to_start_timeout: None,
-                start_to_close_timeout: None,
-                heartbeat_timeout: None,
-            }],
-            force_new_workflow_task: false,
-            now: now(),
-        })),
+        kernel().apply(
+            LoadedRun::Existing(with_activity),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 9,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::ScheduleActivity {
+                    activity_id: "dup".into(),
+                    task_queue: TaskQueueName("activity-q".into()),
+                    input: payloads("a"),
+                    retry_policy: None,
+                    schedule_to_close_timeout: None,
+                    schedule_to_start_timeout: None,
+                    start_to_close_timeout: None,
+                    heartbeat_timeout: None,
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            })
+        ),
         Err(Reject::DuplicateActivityId("dup".into()))
     );
 }
@@ -1566,15 +2507,34 @@ fn reject_duplicate_activity_id() {
 fn reject_duplicate_timer_id() {
     let state = make_open_state_with_started_wft();
     let mut with_timer = state.clone();
-    with_timer.timers.insert("dup".into(), TimerState { timer_id: "dup".into(), started_event_id: 1, fire_at: now() });
+    with_timer.timers.insert(
+        "dup".into(),
+        TimerState {
+            timer_id: "dup".into(),
+            started_event_id: 1,
+            fire_at: now(),
+        },
+    );
     assert_eq!(
-        kernel().apply(LoadedRun::Existing(with_timer), Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
-            token: WorkflowTaskToken { run_key: state.run_key, logical_seq: LogicalTaskSeq(3), started_event_id: 9, attempt: 1, shard_epoch: ShardEpoch::ZERO },
-            identity: WorkerIdentity("worker".into()),
-            commands: vec![WorkflowCommand::StartTimer { timer_id: "dup".into(), fire_at: now() }],
-            force_new_workflow_task: false,
-            now: now(),
-        })),
+        kernel().apply(
+            LoadedRun::Existing(with_timer),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 9,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::StartTimer {
+                    timer_id: "dup".into(),
+                    fire_at: now()
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            })
+        ),
         Err(Reject::DuplicateTimerId("dup".into()))
     );
 }
@@ -1582,14 +2542,17 @@ fn reject_duplicate_timer_id() {
 #[test]
 fn reject_wft_failed_absent_run() {
     assert_eq!(
-        kernel().apply(LoadedRun::Absent, Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
-            logical_seq: LogicalTaskSeq(3),
-            started_event_id: 9,
-            failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
-            failure_details: None,
-            worker_identity: WorkerIdentity("worker".into()),
-            now: now(),
-        })),
+        kernel().apply(
+            LoadedRun::Absent,
+            Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+                logical_seq: LogicalTaskSeq(3),
+                started_event_id: 9,
+                failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
+                failure_details: None,
+                worker_identity: WorkerIdentity("worker".into()),
+                now: now(),
+            })
+        ),
         Err(Reject::MissingRun)
     );
 }
@@ -1597,14 +2560,17 @@ fn reject_wft_failed_absent_run() {
 #[test]
 fn reject_wft_failed_closed_run() {
     assert_eq!(
-        kernel().apply(LoadedRun::Existing(make_closed_state()), Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
-            logical_seq: LogicalTaskSeq(3),
-            started_event_id: 9,
-            failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
-            failure_details: None,
-            worker_identity: WorkerIdentity("worker".into()),
-            now: now(),
-        })),
+        kernel().apply(
+            LoadedRun::Existing(make_closed_state()),
+            Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+                logical_seq: LogicalTaskSeq(3),
+                started_event_id: 9,
+                failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
+                failure_details: None,
+                worker_identity: WorkerIdentity("worker".into()),
+                now: now(),
+            })
+        ),
         Err(Reject::RunClosed(ExecutionStatus::Completed))
     );
 }
@@ -1612,14 +2578,17 @@ fn reject_wft_failed_closed_run() {
 #[test]
 fn reject_wft_failed_no_pending() {
     assert_eq!(
-        kernel().apply(LoadedRun::Existing(make_open_state()), Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
-            logical_seq: LogicalTaskSeq(3),
-            started_event_id: 9,
-            failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
-            failure_details: None,
-            worker_identity: WorkerIdentity("worker".into()),
-            now: now(),
-        })),
+        kernel().apply(
+            LoadedRun::Existing(make_open_state()),
+            Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+                logical_seq: LogicalTaskSeq(3),
+                started_event_id: 9,
+                failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
+                failure_details: None,
+                worker_identity: WorkerIdentity("worker".into()),
+                now: now(),
+            })
+        ),
         Err(Reject::NoPendingWorkflowTask)
     );
 }
@@ -1627,14 +2596,17 @@ fn reject_wft_failed_no_pending() {
 #[test]
 fn reject_wft_failed_not_started() {
     assert_eq!(
-        kernel().apply(LoadedRun::Existing(make_open_state_with_pending_wft()), Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
-            logical_seq: LogicalTaskSeq(3),
-            started_event_id: 9,
-            failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
-            failure_details: None,
-            worker_identity: WorkerIdentity("worker".into()),
-            now: now(),
-        })),
+        kernel().apply(
+            LoadedRun::Existing(make_open_state_with_pending_wft()),
+            Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+                logical_seq: LogicalTaskSeq(3),
+                started_event_id: 9,
+                failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
+                failure_details: None,
+                worker_identity: WorkerIdentity("worker".into()),
+                now: now(),
+            })
+        ),
         Err(Reject::WorkflowTaskNotStarted { logical_seq: 3 })
     );
 }
@@ -1642,29 +2614,38 @@ fn reject_wft_failed_not_started() {
 #[test]
 fn reject_wft_failed_seq_mismatch() {
     assert_eq!(
-        kernel().apply(LoadedRun::Existing(make_open_state_with_started_wft()), Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
-            logical_seq: LogicalTaskSeq(4),
-            started_event_id: 9,
-            failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
-            failure_details: None,
-            worker_identity: WorkerIdentity("worker".into()),
-            now: now(),
-        })),
-        Err(Reject::WorkflowTaskSeqMismatch { expected: 3, got: 4 })
+        kernel().apply(
+            LoadedRun::Existing(make_open_state_with_started_wft()),
+            Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+                logical_seq: LogicalTaskSeq(4),
+                started_event_id: 9,
+                failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
+                failure_details: None,
+                worker_identity: WorkerIdentity("worker".into()),
+                now: now(),
+            })
+        ),
+        Err(Reject::WorkflowTaskSeqMismatch {
+            expected: 3,
+            got: 4
+        })
     );
 }
 
 #[test]
 fn reject_wft_failed_started_event_mismatch() {
     assert_eq!(
-        kernel().apply(LoadedRun::Existing(make_open_state_with_started_wft()), Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
-            logical_seq: LogicalTaskSeq(3),
-            started_event_id: 10,
-            failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
-            failure_details: None,
-            worker_identity: WorkerIdentity("worker".into()),
-            now: now(),
-        })),
+        kernel().apply(
+            LoadedRun::Existing(make_open_state_with_started_wft()),
+            Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+                logical_seq: LogicalTaskSeq(3),
+                started_event_id: 10,
+                failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
+                failure_details: None,
+                worker_identity: WorkerIdentity("worker".into()),
+                now: now(),
+            })
+        ),
         Err(Reject::WorkflowTaskTokenMismatch)
     );
 }
@@ -1672,12 +2653,15 @@ fn reject_wft_failed_started_event_mismatch() {
 #[test]
 fn reject_wft_timed_out_absent_run() {
     assert_eq!(
-        kernel().apply(LoadedRun::Absent, Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
-            logical_seq: LogicalTaskSeq(3),
-            started_event_id: 9,
-            timeout_type: WorkflowTaskTimeoutType::StartToClose,
-            now: now(),
-        })),
+        kernel().apply(
+            LoadedRun::Absent,
+            Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+                logical_seq: LogicalTaskSeq(3),
+                started_event_id: 9,
+                timeout_type: WorkflowTaskTimeoutType::StartToClose,
+                now: now(),
+            })
+        ),
         Err(Reject::MissingRun)
     );
 }
@@ -1685,12 +2669,15 @@ fn reject_wft_timed_out_absent_run() {
 #[test]
 fn reject_wft_timed_out_closed_run() {
     assert_eq!(
-        kernel().apply(LoadedRun::Existing(make_closed_state()), Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
-            logical_seq: LogicalTaskSeq(3),
-            started_event_id: 9,
-            timeout_type: WorkflowTaskTimeoutType::StartToClose,
-            now: now(),
-        })),
+        kernel().apply(
+            LoadedRun::Existing(make_closed_state()),
+            Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+                logical_seq: LogicalTaskSeq(3),
+                started_event_id: 9,
+                timeout_type: WorkflowTaskTimeoutType::StartToClose,
+                now: now(),
+            })
+        ),
         Err(Reject::RunClosed(ExecutionStatus::Completed))
     );
 }
@@ -1698,12 +2685,15 @@ fn reject_wft_timed_out_closed_run() {
 #[test]
 fn reject_wft_timed_out_no_pending() {
     assert_eq!(
-        kernel().apply(LoadedRun::Existing(make_open_state()), Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
-            logical_seq: LogicalTaskSeq(3),
-            started_event_id: 9,
-            timeout_type: WorkflowTaskTimeoutType::StartToClose,
-            now: now(),
-        })),
+        kernel().apply(
+            LoadedRun::Existing(make_open_state()),
+            Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+                logical_seq: LogicalTaskSeq(3),
+                started_event_id: 9,
+                timeout_type: WorkflowTaskTimeoutType::StartToClose,
+                now: now(),
+            })
+        ),
         Err(Reject::NoPendingWorkflowTask)
     );
 }
@@ -1711,12 +2701,15 @@ fn reject_wft_timed_out_no_pending() {
 #[test]
 fn reject_wft_timed_out_not_started() {
     assert_eq!(
-        kernel().apply(LoadedRun::Existing(make_open_state_with_pending_wft()), Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
-            logical_seq: LogicalTaskSeq(3),
-            started_event_id: 9,
-            timeout_type: WorkflowTaskTimeoutType::StartToClose,
-            now: now(),
-        })),
+        kernel().apply(
+            LoadedRun::Existing(make_open_state_with_pending_wft()),
+            Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+                logical_seq: LogicalTaskSeq(3),
+                started_event_id: 9,
+                timeout_type: WorkflowTaskTimeoutType::StartToClose,
+                now: now(),
+            })
+        ),
         Err(Reject::WorkflowTaskNotStarted { logical_seq: 3 })
     );
 }
@@ -1724,25 +2717,34 @@ fn reject_wft_timed_out_not_started() {
 #[test]
 fn reject_wft_timed_out_seq_mismatch() {
     assert_eq!(
-        kernel().apply(LoadedRun::Existing(make_open_state_with_started_wft()), Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
-            logical_seq: LogicalTaskSeq(4),
-            started_event_id: 9,
-            timeout_type: WorkflowTaskTimeoutType::StartToClose,
-            now: now(),
-        })),
-        Err(Reject::WorkflowTaskSeqMismatch { expected: 3, got: 4 })
+        kernel().apply(
+            LoadedRun::Existing(make_open_state_with_started_wft()),
+            Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+                logical_seq: LogicalTaskSeq(4),
+                started_event_id: 9,
+                timeout_type: WorkflowTaskTimeoutType::StartToClose,
+                now: now(),
+            })
+        ),
+        Err(Reject::WorkflowTaskSeqMismatch {
+            expected: 3,
+            got: 4
+        })
     );
 }
 
 #[test]
 fn reject_wft_timed_out_started_event_mismatch() {
     assert_eq!(
-        kernel().apply(LoadedRun::Existing(make_open_state_with_started_wft()), Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
-            logical_seq: LogicalTaskSeq(3),
-            started_event_id: 10,
-            timeout_type: WorkflowTaskTimeoutType::StartToClose,
-            now: now(),
-        })),
+        kernel().apply(
+            LoadedRun::Existing(make_open_state_with_started_wft()),
+            Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+                logical_seq: LogicalTaskSeq(3),
+                started_event_id: 10,
+                timeout_type: WorkflowTaskTimeoutType::StartToClose,
+                now: now(),
+            })
+        ),
         Err(Reject::WorkflowTaskTokenMismatch)
     );
 }
@@ -1750,12 +2752,17 @@ fn reject_wft_timed_out_started_event_mismatch() {
 #[test]
 fn reject_unknown_activity() {
     assert_eq!(
-        kernel().apply(LoadedRun::Existing(make_open_state()), Command::ActivityResolved(ActivityResolvedRequest {
-            activity_id: "missing".into(),
-            resolution: tokeira_kernel::ActivityResolution::Completed { result: payloads("done") },
-            worker_identity: None,
-            now: now(),
-        })),
+        kernel().apply(
+            LoadedRun::Existing(make_open_state()),
+            Command::ActivityResolved(ActivityResolvedRequest {
+                activity_id: "missing".into(),
+                resolution: tokeira_kernel::ActivityResolution::Completed {
+                    result: payloads("done")
+                },
+                worker_identity: None,
+                now: now(),
+            })
+        ),
         Err(Reject::UnknownActivity("missing".into()))
     );
 }
@@ -1763,10 +2770,13 @@ fn reject_unknown_activity() {
 #[test]
 fn reject_unknown_timer() {
     assert_eq!(
-        kernel().apply(LoadedRun::Existing(make_open_state()), Command::TimerDue(TimerDueRequest {
-            timer_id: "missing".into(),
-            fired_at: now(),
-        })),
+        kernel().apply(
+            LoadedRun::Existing(make_open_state()),
+            Command::TimerDue(TimerDueRequest {
+                timer_id: "missing".into(),
+                fired_at: now(),
+            })
+        ),
         Err(Reject::UnknownTimer("missing".into()))
     );
 }
@@ -1775,16 +2785,27 @@ fn reject_unknown_timer() {
 fn reject_commands_after_close() {
     let state = make_open_state_with_started_wft();
     assert_eq!(
-        kernel().apply(LoadedRun::Existing(state.clone()), Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
-            token: WorkflowTaskToken { run_key: state.run_key, logical_seq: LogicalTaskSeq(3), started_event_id: 9, attempt: 1, shard_epoch: ShardEpoch::ZERO },
-            identity: WorkerIdentity("worker".into()),
-            commands: vec![
-                WorkflowCommand::CompleteWorkflow { result: payloads("done") },
-                WorkflowCommand::RequestNewWorkflowTask,
-            ],
-            force_new_workflow_task: false,
-            now: now(),
-        })),
+        kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 9,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![
+                    WorkflowCommand::CompleteWorkflow {
+                        result: payloads("done")
+                    },
+                    WorkflowCommand::RequestNewWorkflowTask,
+                ],
+                force_new_workflow_task: false,
+                now: now(),
+            })
+        ),
         Err(Reject::CommandsAfterClose { index: 1 })
     );
 }
@@ -2054,12 +3075,15 @@ fn cancel_then_cancel_workflow_e2e() {
         )
         .unwrap();
     let state = started.next_state.clone();
-    let pending = state.pending_workflow_task.clone().unwrap_or(PendingWorkflowTask {
-        logical_seq: LogicalTaskSeq(4),
-        scheduled_event_id: 11,
-        started_event_id: Some(12),
-        attempt: 1,
-    });
+    let pending = state
+        .pending_workflow_task
+        .clone()
+        .unwrap_or(PendingWorkflowTask {
+            logical_seq: LogicalTaskSeq(4),
+            scheduled_event_id: 11,
+            started_event_id: Some(12),
+            attempt: 1,
+        });
     let final_transition = kernel()
         .apply(
             LoadedRun::Existing(state.clone()),
@@ -2078,7 +3102,10 @@ fn cancel_then_cancel_workflow_e2e() {
             }),
         )
         .unwrap();
-    assert_eq!(final_transition.next_state.status, ExecutionStatus::Cancelled);
+    assert_eq!(
+        final_transition.next_state.status,
+        ExecutionStatus::Cancelled
+    );
 }
 
 fn with_pending_activity_started_wft() -> WorkflowState {
@@ -2090,11 +3117,15 @@ fn with_pending_activity_started_wft() -> WorkflowState {
             activity_id: "activity-1".into(),
             schedule_event_id: 7,
             task_queue: TaskQueueName("activity-q".into()),
+            input: Payloads::default(),
             attempt: 1,
+            retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
             schedule_to_start_timeout: Some(Duration::seconds(30)),
             start_to_close_timeout: Some(Duration::minutes(1)),
             heartbeat_timeout: Some(Duration::seconds(20)),
+            pause_info: None,
+            stamp: 0,
         },
     );
     state
@@ -2218,7 +3249,11 @@ fn start_child_workflow_happy_path() {
         transition.dispatch_ops[0],
         DispatchOp::StartChildWorkflow { .. }
     ));
-    let child = transition.next_state.children.get(&child_workflow_id).unwrap();
+    let child = transition
+        .next_state
+        .children
+        .get(&child_workflow_id)
+        .unwrap();
     assert_eq!(child.child_run_id, None);
     assert_eq!(child.started_event_id, None);
     assert_eq!(child.parent_close_policy, ParentClosePolicy::Terminate);
@@ -2256,13 +3291,15 @@ fn child_start_confirmed_started_no_wft() {
         transition.history_events[1].kind,
         HistoryEventKind::WorkflowTaskScheduled { .. }
     ));
-    assert!(transition
-        .next_state
-        .children
-        .get(&WorkflowId("child-1".into()))
-        .unwrap()
-        .child_run_id
-        .is_some());
+    assert!(
+        transition
+            .next_state
+            .children
+            .get(&WorkflowId("child-1".into()))
+            .unwrap()
+            .child_run_id
+            .is_some()
+    );
 }
 
 #[test]
@@ -2291,10 +3328,12 @@ fn child_resolved_completed() {
         transition.history_events[0].kind,
         HistoryEventKind::ChildWorkflowExecutionCompleted { .. }
     ));
-    assert!(!transition
-        .next_state
-        .children
-        .contains_key(&WorkflowId("child-1".into())));
+    assert!(
+        !transition
+            .next_state
+            .children
+            .contains_key(&WorkflowId("child-1".into()))
+    );
     assert!(matches!(
         transition.history_events[1].kind,
         HistoryEventKind::WorkflowTaskScheduled { .. }
@@ -2471,7 +3510,8 @@ fn terminate_clears_pending_externals() {
     assert!(transition.next_state.pending_external_cancels.is_empty());
     assert!(transition.dispatch_ops.iter().all(|op| !matches!(
         op,
-        DispatchOp::SignalExternalWorkflow { .. } | DispatchOp::RequestCancelExternalWorkflow { .. }
+        DispatchOp::SignalExternalWorkflow { .. }
+            | DispatchOp::RequestCancelExternalWorkflow { .. }
     )));
 }
 
@@ -2495,7 +3535,12 @@ fn update_with_no_pending_wft() {
         HistoryEventKind::WorkflowExecutionUpdateAccepted { .. }
     ));
     assert_eq!(transition.request_dedupe_ops.len(), 1);
-    assert!(transition.next_state.pending_updates.contains_key("update-1"));
+    assert!(
+        transition
+            .next_state
+            .pending_updates
+            .contains_key("update-1")
+    );
     assert!(matches!(
         transition.history_events[1].kind,
         HistoryEventKind::WorkflowTaskScheduled { .. }
@@ -2609,7 +3654,12 @@ fn update_completed_happy_path() {
         transition.history_events[1].kind,
         HistoryEventKind::WorkflowExecutionUpdateCompleted { .. }
     ));
-    assert!(!transition.next_state.pending_updates.contains_key("update-1"));
+    assert!(
+        !transition
+            .next_state
+            .pending_updates
+            .contains_key("update-1")
+    );
 }
 
 #[test]
@@ -2642,7 +3692,12 @@ fn update_rejected_happy_path() {
         transition.history_events[1].kind,
         HistoryEventKind::WorkflowExecutionUpdateRejected { .. }
     ));
-    assert!(!transition.next_state.pending_updates.contains_key("update-1"));
+    assert!(
+        !transition
+            .next_state
+            .pending_updates
+            .contains_key("update-1")
+    );
 }
 
 #[test]
@@ -2735,7 +3790,12 @@ fn protocol_message_accepted_body() {
         transition.history_events[1].kind,
         HistoryEventKind::WorkflowExecutionUpdateAccepted { .. }
     ));
-    assert!(transition.next_state.pending_updates.contains_key("update-1"));
+    assert!(
+        transition
+            .next_state
+            .pending_updates
+            .contains_key("update-1")
+    );
 }
 
 #[test]
@@ -2770,7 +3830,12 @@ fn protocol_message_completed_body() {
         transition.history_events[1].kind,
         HistoryEventKind::WorkflowExecutionUpdateCompleted { .. }
     ));
-    assert!(!transition.next_state.pending_updates.contains_key("update-1"));
+    assert!(
+        !transition
+            .next_state
+            .pending_updates
+            .contains_key("update-1")
+    );
 }
 
 #[test]
@@ -2805,14 +3870,22 @@ fn protocol_message_rejected_body() {
         transition.history_events[1].kind,
         HistoryEventKind::WorkflowExecutionUpdateRejected { .. }
     ));
-    assert!(!transition.next_state.pending_updates.contains_key("update-1"));
+    assert!(
+        !transition
+            .next_state
+            .pending_updates
+            .contains_key("update-1")
+    );
 }
 
 #[test]
 fn terminate_clears_pending_updates() {
     let state = with_pending_update(make_open_state(), "update-1");
     let transition = kernel()
-        .apply(LoadedRun::Existing(state), Command::Terminate(make_terminate_request()))
+        .apply(
+            LoadedRun::Existing(state),
+            Command::Terminate(make_terminate_request()),
+        )
         .unwrap();
     assert!(transition.next_state.pending_updates.is_empty());
 }
@@ -2954,8 +4027,14 @@ fn update_execution_options_happy_path() {
             && completion_callbacks == &req.completion_callbacks
             && attached_request_id == &req.attached_request_id
     ));
-    assert_eq!(transition.next_state.versioning_override, Some(VersioningOverride));
-    assert_eq!(transition.next_state.completion_callbacks, vec![CompletionCallback]);
+    assert_eq!(
+        transition.next_state.versioning_override,
+        Some(VersioningOverride)
+    );
+    assert_eq!(
+        transition.next_state.completion_callbacks,
+        vec![CompletionCallback]
+    );
     assert!(transition.dispatch_ops.is_empty());
     assert!(transition.next_state.is_open());
 }
@@ -2977,7 +4056,10 @@ fn update_execution_options_clear_versioning() {
         .unwrap();
 
     assert_eq!(transition.next_state.versioning_override, None);
-    assert_eq!(transition.next_state.completion_callbacks, vec![CompletionCallback]);
+    assert_eq!(
+        transition.next_state.completion_callbacks,
+        vec![CompletionCallback]
+    );
 }
 
 #[test]
@@ -3026,8 +4108,14 @@ fn close_preserves_execution_options() {
         )
         .unwrap();
 
-    assert_eq!(transition.next_state.versioning_override, Some(VersioningOverride));
-    assert_eq!(transition.next_state.completion_callbacks, vec![CompletionCallback]);
+    assert_eq!(
+        transition.next_state.versioning_override,
+        Some(VersioningOverride)
+    );
+    assert_eq!(
+        transition.next_state.completion_callbacks,
+        vec![CompletionCallback]
+    );
 }
 
 #[test]
@@ -3065,7 +4153,11 @@ fn schedule_nexus_operation_happy_path() {
         HistoryEventKind::NexusOperationScheduled { operation_id, endpoint, service, operation, .. }
             if operation_id == "op-1" && endpoint == "endpoint" && service == "service" && operation == "method"
     ));
-    let pending_nexus = transition.next_state.pending_nexus_operations.get("op-1").unwrap();
+    let pending_nexus = transition
+        .next_state
+        .pending_nexus_operations
+        .get("op-1")
+        .unwrap();
     assert_eq!(pending_nexus.scheduled_event_id, 11);
     assert_eq!(pending_nexus.endpoint, "endpoint");
     assert_eq!(pending_nexus.service, "service");
@@ -3134,10 +4226,22 @@ fn cancel_nexus_operation_happy_path() {
 
     assert!(matches!(
         transition.history_events[1].kind,
-        HistoryEventKind::NexusOperationCancelRequested { scheduled_event_id: 12 }
+        HistoryEventKind::NexusOperationCancelRequested {
+            scheduled_event_id: 12
+        }
     ));
-    assert!(transition.dispatch_ops.iter().any(|op| matches!(op, DispatchOp::CancelNexusOperation { scheduled_event_id: 12 })));
-    assert!(transition.next_state.pending_nexus_operations.contains_key("op-1"));
+    assert!(transition.dispatch_ops.iter().any(|op| matches!(
+        op,
+        DispatchOp::CancelNexusOperation {
+            scheduled_event_id: 12
+        }
+    )));
+    assert!(
+        transition
+            .next_state
+            .pending_nexus_operations
+            .contains_key("op-1")
+    );
 }
 
 #[test]
@@ -3165,7 +4269,10 @@ fn cancel_nexus_operation_unknown() {
         )
         .unwrap_err();
 
-    assert_eq!(reject, Reject::UnknownNexusOperation("scheduled_event_id=12".into()));
+    assert_eq!(
+        reject,
+        Reject::UnknownNexusOperation("scheduled_event_id=12".into())
+    );
 }
 
 #[test]
@@ -3185,16 +4292,29 @@ fn nexus_operation_resolved_started() {
 
     assert!(matches!(
         transition.history_events[0].kind,
-        HistoryEventKind::NexusOperationStarted { scheduled_event_id: 12, .. }
+        HistoryEventKind::NexusOperationStarted {
+            scheduled_event_id: 12,
+            ..
+        }
     ));
-    assert!(transition.next_state.pending_nexus_operations.get("op-1").unwrap().started);
+    assert!(
+        transition
+            .next_state
+            .pending_nexus_operations
+            .get("op-1")
+            .unwrap()
+            .started
+    );
     assert!(transition.next_state.pending_workflow_task.is_none());
     assert!(transition.request_dedupe_ops.is_empty());
 }
 
 #[test]
 fn nexus_operation_resolved_started_duplicate() {
-    let state = with_started_nexus_operation(with_pending_nexus_operation(make_open_state(), "op-1"), "op-1");
+    let state = with_started_nexus_operation(
+        with_pending_nexus_operation(make_open_state(), "op-1"),
+        "op-1",
+    );
     let reject = kernel()
         .apply(
             LoadedRun::Existing(state),
@@ -3227,8 +4347,19 @@ fn nexus_operation_resolved_completed() {
         )
         .unwrap();
 
-    assert!(matches!(transition.history_events[0].kind, HistoryEventKind::NexusOperationCompleted { scheduled_event_id: 12, .. }));
-    assert!(!transition.next_state.pending_nexus_operations.contains_key("op-1"));
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::NexusOperationCompleted {
+            scheduled_event_id: 12,
+            ..
+        }
+    ));
+    assert!(
+        !transition
+            .next_state
+            .pending_nexus_operations
+            .contains_key("op-1")
+    );
     assert!(transition.next_state.pending_workflow_task.is_some());
 }
 
@@ -3250,83 +4381,120 @@ fn nexus_operation_resolved_completed_with_pending_wft() {
         )
         .unwrap();
     assert_eq!(transition.next_state.pending_workflow_task, existing);
-    assert_eq!(transition.dispatch_ops.iter().filter(|op| matches!(op, DispatchOp::EnqueueWorkflowTask { .. })).count(), 0);
+    assert_eq!(
+        transition
+            .dispatch_ops
+            .iter()
+            .filter(|op| matches!(op, DispatchOp::EnqueueWorkflowTask { .. }))
+            .count(),
+        0
+    );
 }
 
 #[test]
 fn nexus_operation_resolved_failed() {
     let state = with_pending_nexus_operation(make_open_state(), "op-1");
-    let transition = kernel().apply(
-        LoadedRun::Existing(state),
-        Command::NexusOperationResolved(NexusOperationResolvedRequest {
-            operation_id: "op-1".into(),
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                operation_id: "op-1".into(),
+                scheduled_event_id: 12,
+                resolution: NexusResolution::Failed {
+                    failure: "nope".into(),
+                },
+                now: now(),
+            }),
+        )
+        .unwrap();
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::NexusOperationFailed {
             scheduled_event_id: 12,
-            resolution: NexusResolution::Failed { failure: "nope".into() },
-            now: now(),
-        }),
-    ).unwrap();
-    assert!(matches!(transition.history_events[0].kind, HistoryEventKind::NexusOperationFailed { scheduled_event_id: 12, .. }));
+            ..
+        }
+    ));
     assert!(transition.next_state.pending_workflow_task.is_some());
 }
 
 #[test]
 fn nexus_operation_resolved_canceled() {
     let state = with_pending_nexus_operation(make_open_state(), "op-1");
-    let transition = kernel().apply(
-        LoadedRun::Existing(state),
-        Command::NexusOperationResolved(NexusOperationResolvedRequest {
-            operation_id: "op-1".into(),
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                operation_id: "op-1".into(),
+                scheduled_event_id: 12,
+                resolution: NexusResolution::Canceled,
+                now: now(),
+            }),
+        )
+        .unwrap();
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::NexusOperationCanceled {
             scheduled_event_id: 12,
-            resolution: NexusResolution::Canceled,
-            now: now(),
-        }),
-    ).unwrap();
-    assert!(matches!(transition.history_events[0].kind, HistoryEventKind::NexusOperationCanceled { scheduled_event_id: 12, .. }));
+            ..
+        }
+    ));
     assert!(transition.next_state.pending_workflow_task.is_some());
 }
 
 #[test]
 fn nexus_operation_resolved_timed_out() {
     let state = with_pending_nexus_operation(make_open_state(), "op-1");
-    let transition = kernel().apply(
-        LoadedRun::Existing(state),
-        Command::NexusOperationResolved(NexusOperationResolvedRequest {
-            operation_id: "op-1".into(),
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                operation_id: "op-1".into(),
+                scheduled_event_id: 12,
+                resolution: NexusResolution::TimedOut,
+                now: now(),
+            }),
+        )
+        .unwrap();
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::NexusOperationTimedOut {
             scheduled_event_id: 12,
-            resolution: NexusResolution::TimedOut,
-            now: now(),
-        }),
-    ).unwrap();
-    assert!(matches!(transition.history_events[0].kind, HistoryEventKind::NexusOperationTimedOut { scheduled_event_id: 12, .. }));
+            ..
+        }
+    ));
     assert!(transition.next_state.pending_workflow_task.is_some());
 }
 
 #[test]
 fn nexus_operation_resolved_unknown_operation() {
-    let reject = kernel().apply(
-        LoadedRun::Existing(make_open_state()),
-        Command::NexusOperationResolved(NexusOperationResolvedRequest {
-            operation_id: "missing".into(),
-            scheduled_event_id: 12,
-            resolution: NexusResolution::Started,
-            now: now(),
-        }),
-    ).unwrap_err();
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(make_open_state()),
+            Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                operation_id: "missing".into(),
+                scheduled_event_id: 12,
+                resolution: NexusResolution::Started,
+                now: now(),
+            }),
+        )
+        .unwrap_err();
     assert_eq!(reject, Reject::UnknownNexusOperation("missing".into()));
 }
 
 #[test]
 fn nexus_operation_resolved_stale() {
     let state = with_pending_nexus_operation(make_open_state(), "op-1");
-    let reject = kernel().apply(
-        LoadedRun::Existing(state),
-        Command::NexusOperationResolved(NexusOperationResolvedRequest {
-            operation_id: "op-1".into(),
-            scheduled_event_id: 99,
-            resolution: NexusResolution::Started,
-            now: now(),
-        }),
-    ).unwrap_err();
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                operation_id: "op-1".into(),
+                scheduled_event_id: 99,
+                resolution: NexusResolution::Started,
+                now: now(),
+            }),
+        )
+        .unwrap_err();
     assert_eq!(
         reject,
         Reject::StaleNexusResolution {
@@ -3338,29 +4506,33 @@ fn nexus_operation_resolved_stale() {
 
 #[test]
 fn nexus_operation_resolved_absent_run() {
-    let reject = kernel().apply(
-        LoadedRun::Absent,
-        Command::NexusOperationResolved(NexusOperationResolvedRequest {
-            operation_id: "op-1".into(),
-            scheduled_event_id: 12,
-            resolution: NexusResolution::Started,
-            now: now(),
-        }),
-    ).unwrap_err();
+    let reject = kernel()
+        .apply(
+            LoadedRun::Absent,
+            Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                operation_id: "op-1".into(),
+                scheduled_event_id: 12,
+                resolution: NexusResolution::Started,
+                now: now(),
+            }),
+        )
+        .unwrap_err();
     assert_eq!(reject, Reject::MissingRun);
 }
 
 #[test]
 fn nexus_operation_resolved_closed_run() {
-    let reject = kernel().apply(
-        LoadedRun::Existing(make_closed_state()),
-        Command::NexusOperationResolved(NexusOperationResolvedRequest {
-            operation_id: "op-1".into(),
-            scheduled_event_id: 12,
-            resolution: NexusResolution::Started,
-            now: now(),
-        }),
-    ).unwrap_err();
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(make_closed_state()),
+            Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                operation_id: "op-1".into(),
+                scheduled_event_id: 12,
+                resolution: NexusResolution::Started,
+                now: now(),
+            }),
+        )
+        .unwrap_err();
     assert_eq!(reject, Reject::RunClosed(ExecutionStatus::Completed));
 }
 
@@ -3368,10 +4540,24 @@ fn nexus_operation_resolved_closed_run() {
 fn terminate_clears_pending_nexus_operations() {
     let state = with_pending_nexus_operation(make_open_state(), "op-1");
     let transition = kernel()
-        .apply(LoadedRun::Existing(state), Command::Terminate(make_terminate_request()))
+        .apply(
+            LoadedRun::Existing(state),
+            Command::Terminate(make_terminate_request()),
+        )
         .unwrap();
     assert!(transition.next_state.pending_nexus_operations.is_empty());
-    assert_eq!(transition.dispatch_ops.iter().filter(|op| matches!(op, DispatchOp::ScheduleNexusOperation { .. } | DispatchOp::CancelNexusOperation { .. })).count(), 0);
+    assert_eq!(
+        transition
+            .dispatch_ops
+            .iter()
+            .filter(|op| matches!(
+                op,
+                DispatchOp::ScheduleNexusOperation { .. }
+                    | DispatchOp::CancelNexusOperation { .. }
+            ))
+            .count(),
+        0
+    );
 }
 
 #[test]
@@ -3390,12 +4576,25 @@ fn close_via_complete_clears_pending_nexus_operations() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
-                commands: vec![WorkflowCommand::CompleteWorkflow { result: payloads("done") }],
+                commands: vec![WorkflowCommand::CompleteWorkflow {
+                    result: payloads("done"),
+                }],
                 force_new_workflow_task: false,
                 now: now(),
             }),
         )
         .unwrap();
     assert!(transition.next_state.pending_nexus_operations.is_empty());
-    assert_eq!(transition.dispatch_ops.iter().filter(|op| matches!(op, DispatchOp::ScheduleNexusOperation { .. } | DispatchOp::CancelNexusOperation { .. })).count(), 0);
+    assert_eq!(
+        transition
+            .dispatch_ops
+            .iter()
+            .filter(|op| matches!(
+                op,
+                DispatchOp::ScheduleNexusOperation { .. }
+                    | DispatchOp::CancelNexusOperation { .. }
+            ))
+            .count(),
+        0
+    );
 }

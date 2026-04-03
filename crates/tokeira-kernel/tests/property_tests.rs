@@ -3,25 +3,28 @@ use std::collections::BTreeMap;
 use proptest::prelude::*;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    event::HistoryEventKind, kernel::Kernel, ActivityOp, ActivityResolution,
-    ActivityResolvedRequest, ActivityState, BasicKernel, CancelRequest, ChildResolution,
-    ChildResolvedRequest, ChildStartConfirmedRequest, ChildStartResult, ChildWorkflowState,
-    Command, CompletionCallback, DispatchOp, ExternalCancelResolvedRequest,
-    ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult,
-    ExternalWorkflowExecution, FieldChange, LoadedRun, NexusOperationResolvedRequest,
-    NexusResolution, ParentClosePolicy, PendingExternalCancel, PendingExternalSignal,
-    PendingNexusOperation, PendingUpdate, PendingWorkflowTask, Reject, RequestDedupeOp, RetryState,
-    ResetRequest, SignalRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest,
-    TimerOp, TimerState, UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest,
-    VersioningOverride, WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowState,
-    WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
-    WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType, WorkflowTimeoutType,
+    ActivityOp, ActivityPauseInfo, ActivityResolution, ActivityResolvedRequest,
+    ActivityState, BasicKernel, CancelRequest, ChildResolution, ChildResolvedRequest,
+    ChildStartConfirmedRequest, ChildStartResult, ChildWorkflowState, Command,
+    CompletionCallback, DispatchOp, ExternalCancelResolvedRequest, ExternalCancelResult,
+    ExternalSignalResolvedRequest, ExternalSignalResult, ExternalWorkflowExecution,
+    FieldChange, LoadedRun, NexusOperationResolvedRequest, NexusResolution,
+    ParentClosePolicy, PauseActivityRequest, PauseInfo, PauseWorkflowRequest,
+    PendingExternalCancel, PendingExternalSignal, PendingNexusOperation, PendingUpdate,
+    PendingWorkflowTask, RequestDedupeOp, ResetActivityRequest, ResetRequest, RetryState,
+    SignalRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest,
+    TimerDueRequest, TimerOp, TimerState, UnpauseActivityRequest, UnpauseWorkflowRequest,
+    UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody,
+    UpdateRequest, VersioningOverride, WorkflowCommand, WorkflowExecutionTimedOutRequest,
+    WorkflowState, WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
+    WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType,
+    WorkflowTimeoutType, event::HistoryEventKind, kernel::Kernel,
 };
 use tokeira_types::{
-    ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RequestContext,
-    RequestId, RetryPolicy, RunId, RunKey, SearchAttrValue, SearchAttributes, ShardEpoch,
-    StickyAffinity, TaskQueueName, TransitionSeq, WorkerIdentity, WorkflowId, WorkflowTaskToken,
-    WorkflowType,
+    ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads,
+    RequestContext, RequestId, RetryPolicy, RunId, RunKey, SearchAttrValue,
+    SearchAttributes, ShardEpoch, StickyAffinity, TaskQueueName, TransitionSeq,
+    WorkerIdentity, WorkflowId, WorkflowTaskToken, WorkflowType,
 };
 
 fn fixed_now() -> OffsetDateTime {
@@ -83,6 +86,8 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         next_workflow_task_seq: LogicalTaskSeq(4),
         pending_workflow_task: None,
         sticky: None,
+        pause_info: None,
+        wft_stamp: 0,
         memo: memo_with("memo"),
         search_attributes: search_attrs_with("search"),
         workflow_execution_timeout: Some(Duration::minutes(5)),
@@ -104,7 +109,12 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
     }
 }
 
-fn with_pending_wft(mut state: WorkflowState, logical_seq: u64, started_event_id: Option<i64>, attempt: u32) -> WorkflowState {
+fn with_pending_wft(
+    mut state: WorkflowState,
+    logical_seq: u64,
+    started_event_id: Option<i64>,
+    attempt: u32,
+) -> WorkflowState {
     state.pending_workflow_task = Some(PendingWorkflowTask {
         logical_seq: LogicalTaskSeq(logical_seq),
         scheduled_event_id: state.last_event_id - 1,
@@ -114,11 +124,31 @@ fn with_pending_wft(mut state: WorkflowState, logical_seq: u64, started_event_id
     state
 }
 
-fn with_sticky(mut state: WorkflowState, worker_identity: &str, now: OffsetDateTime) -> WorkflowState {
+fn with_sticky(
+    mut state: WorkflowState,
+    worker_identity: &str,
+    now: OffsetDateTime,
+) -> WorkflowState {
     state.sticky = Some(StickyAffinity {
         worker_identity: WorkerIdentity(worker_identity.into()),
         expires_at: now + Duration::seconds(30),
     });
+    state
+}
+
+fn with_paused_status(
+    mut state: WorkflowState,
+    now: OffsetDateTime,
+    request_id: &str,
+) -> WorkflowState {
+    state.status = ExecutionStatus::Paused;
+    state.pause_info = Some(PauseInfo {
+        pause_time: now,
+        identity: "operator".into(),
+        reason: "paused".into(),
+        request_id: request_id.into(),
+    });
+    state.wft_stamp = 1;
     state
 }
 
@@ -129,17 +159,25 @@ fn with_activity(mut state: WorkflowState, activity_id: &str) -> WorkflowState {
             activity_id: activity_id.into(),
             schedule_event_id: state.last_event_id - 2,
             task_queue: TaskQueueName("activity-q".into()),
+            input: Payloads::default(),
             attempt: 1,
+            retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
             schedule_to_start_timeout: Some(Duration::seconds(30)),
             start_to_close_timeout: Some(Duration::minutes(1)),
             heartbeat_timeout: Some(Duration::seconds(20)),
+            pause_info: None,
+            stamp: 0,
         },
     );
     state
 }
 
-fn with_timer(mut state: WorkflowState, timer_id: &str, now: OffsetDateTime) -> WorkflowState {
+fn with_timer(
+    mut state: WorkflowState,
+    timer_id: &str,
+    now: OffsetDateTime,
+) -> WorkflowState {
     state.timers.insert(
         timer_id.into(),
         TimerState {
@@ -171,7 +209,10 @@ fn with_child(
     state
 }
 
-fn with_pending_external_signal(mut state: WorkflowState, initiated_event_id: i64) -> WorkflowState {
+fn with_pending_external_signal(
+    mut state: WorkflowState,
+    initiated_event_id: i64,
+) -> WorkflowState {
     state.pending_external_signals.insert(
         initiated_event_id,
         PendingExternalSignal {
@@ -184,7 +225,10 @@ fn with_pending_external_signal(mut state: WorkflowState, initiated_event_id: i6
     state
 }
 
-fn with_pending_external_cancel(mut state: WorkflowState, initiated_event_id: i64) -> WorkflowState {
+fn with_pending_external_cancel(
+    mut state: WorkflowState,
+    initiated_event_id: i64,
+) -> WorkflowState {
     state.pending_external_cancels.insert(
         initiated_event_id,
         PendingExternalCancel {
@@ -214,7 +258,10 @@ fn with_execution_options(mut state: WorkflowState, callbacks: usize) -> Workflo
     state
 }
 
-fn with_pending_nexus_operation(mut state: WorkflowState, operation_id: &str) -> WorkflowState {
+fn with_pending_nexus_operation(
+    mut state: WorkflowState,
+    operation_id: &str,
+) -> WorkflowState {
     state.pending_nexus_operations.insert(
         operation_id.into(),
         PendingNexusOperation {
@@ -241,40 +288,61 @@ fn arb_open_state_for_reset(now: OffsetDateTime) -> impl Strategy<Value = Workfl
         any::<bool>(),
         any::<bool>(),
     )
-        .prop_map(move |(started_wft, sticky, activity, timer, child, ext_signal, ext_cancel, update, nexus)| {
-            let mut state = make_open_state(now);
-            if started_wft {
-                state = with_pending_wft(state, 90, Some(30), 1);
-            }
-            if sticky {
-                state = with_sticky(state, "sticky-worker", now);
-            }
-            if activity {
-                state = with_activity(state, "activity-1");
-            }
-            if timer {
-                state = with_timer(state, "timer-1", now);
-            }
-            if child {
-                state = with_child(state, "child-1", 22, ParentClosePolicy::Terminate, true);
-            }
-            if ext_signal {
-                state = with_pending_external_signal(state, 31);
-            }
-            if ext_cancel {
-                state = with_pending_external_cancel(state, 32);
-            }
-            if update {
-                state = with_pending_update(state, "update-1");
-            }
-            if nexus {
-                state = with_pending_nexus_operation(state, "op-1");
-            }
-            state
-        })
+        .prop_map(
+            move |(
+                started_wft,
+                sticky,
+                activity,
+                timer,
+                child,
+                ext_signal,
+                ext_cancel,
+                update,
+                nexus,
+            )| {
+                let mut state = make_open_state(now);
+                if started_wft {
+                    state = with_pending_wft(state, 90, Some(30), 1);
+                }
+                if sticky {
+                    state = with_sticky(state, "sticky-worker", now);
+                }
+                if activity {
+                    state = with_activity(state, "activity-1");
+                }
+                if timer {
+                    state = with_timer(state, "timer-1", now);
+                }
+                if child {
+                    state = with_child(
+                        state,
+                        "child-1",
+                        22,
+                        ParentClosePolicy::Terminate,
+                        true,
+                    );
+                }
+                if ext_signal {
+                    state = with_pending_external_signal(state, 31);
+                }
+                if ext_cancel {
+                    state = with_pending_external_cancel(state, 32);
+                }
+                if update {
+                    state = with_pending_update(state, "update-1");
+                }
+                if nexus {
+                    state = with_pending_nexus_operation(state, "op-1");
+                }
+                state
+            },
+        )
 }
 
-fn arb_reset_request(state: WorkflowState, now: OffsetDateTime) -> impl Strategy<Value = ResetRequest> {
+fn arb_reset_request(
+    state: WorkflowState,
+    now: OffsetDateTime,
+) -> impl Strategy<Value = ResetRequest> {
     (
         1i64..=state.last_event_id,
         arb_small_string(),
@@ -287,6 +355,98 @@ fn arb_reset_request(state: WorkflowState, now: OffsetDateTime) -> impl Strategy
             request: request_context(&request_id, now),
             now,
         })
+}
+
+fn arb_pause_workflow_request(
+    now: OffsetDateTime,
+) -> impl Strategy<Value = PauseWorkflowRequest> {
+    (arb_small_string(), arb_small_string(), arb_small_string()).prop_map(
+        move |(identity, reason, request_id)| PauseWorkflowRequest {
+            identity,
+            reason,
+            request: request_context(&request_id, now),
+            now,
+        },
+    )
+}
+
+fn arb_unpause_workflow_request(
+    now: OffsetDateTime,
+) -> impl Strategy<Value = UnpauseWorkflowRequest> {
+    (arb_small_string(), arb_small_string(), arb_small_string()).prop_map(
+        move |(identity, reason, request_id)| UnpauseWorkflowRequest {
+            identity,
+            reason,
+            request: request_context(&request_id, now),
+            now,
+        },
+    )
+}
+
+fn arb_update_activity_options_request(
+    activity_id: String,
+    now: OffsetDateTime,
+) -> impl Strategy<Value = UpdateActivityOptionsRequest> {
+    (
+        arb_field_change(arb_small_string().prop_map(TaskQueueName)),
+        arb_field_change(prop::option::of(arb_duration())),
+        arb_field_change(prop::option::of(arb_duration())),
+        arb_field_change(prop::option::of(arb_duration())),
+        arb_field_change(prop::option::of(arb_duration())),
+        arb_small_string(),
+    )
+        .prop_map(move |(task_queue, s2c, s2s, stc, hb, request_id)| {
+            UpdateActivityOptionsRequest {
+                activity_id: activity_id.clone(),
+                task_queue,
+                schedule_to_close_timeout: s2c,
+                schedule_to_start_timeout: s2s,
+                start_to_close_timeout: stc,
+                heartbeat_timeout: hb,
+                request: request_context(&request_id, now),
+                now,
+            }
+        })
+}
+
+fn arb_pause_activity_request(
+    activity_id: String,
+    now: OffsetDateTime,
+) -> impl Strategy<Value = PauseActivityRequest> {
+    (arb_small_string(), arb_small_string(), arb_small_string()).prop_map(
+        move |(identity, reason, request_id)| PauseActivityRequest {
+            activity_id: activity_id.clone(),
+            identity,
+            reason,
+            request: request_context(&request_id, now),
+            now,
+        },
+    )
+}
+
+fn arb_unpause_activity_request(
+    activity_id: String,
+    now: OffsetDateTime,
+) -> impl Strategy<Value = UnpauseActivityRequest> {
+    arb_small_string().prop_map(move |request_id| UnpauseActivityRequest {
+        activity_id: activity_id.clone(),
+        request: request_context(&request_id, now),
+        now,
+    })
+}
+
+fn arb_reset_activity_request(
+    activity_id: String,
+    now: OffsetDateTime,
+) -> impl Strategy<Value = ResetActivityRequest> {
+    (any::<bool>(), arb_small_string()).prop_map(move |(reset_heartbeat, request_id)| {
+        ResetActivityRequest {
+            activity_id: activity_id.clone(),
+            reset_heartbeat,
+            request: request_context(&request_id, now),
+            now,
+        }
+    })
 }
 
 // --- Arbitrary strategies ---
@@ -312,13 +472,15 @@ fn arb_memo() -> impl Strategy<Value = Memo> {
 }
 
 fn arb_search_attributes() -> impl Strategy<Value = SearchAttributes> {
-    prop::collection::btree_map(arb_small_string(), arb_small_string(), 0..3).prop_map(|m| {
-        SearchAttributes(
-            m.into_iter()
-                .map(|(k, v)| (k, SearchAttrValue::Keyword(v)))
-                .collect(),
-        )
-    })
+    prop::collection::btree_map(arb_small_string(), arb_small_string(), 0..3).prop_map(
+        |m| {
+            SearchAttributes(
+                m.into_iter()
+                    .map(|(k, v)| (k, SearchAttrValue::Keyword(v)))
+                    .collect(),
+            )
+        },
+    )
 }
 
 fn arb_record_marker_command() -> impl Strategy<Value = WorkflowCommand> {
@@ -326,13 +488,19 @@ fn arb_record_marker_command() -> impl Strategy<Value = WorkflowCommand> {
         arb_small_string(),
         prop::collection::btree_map(arb_small_string(), arb_payloads(), 0..3),
         prop::option::of(arb_payload()),
-        prop::option::of(prop::collection::btree_map(arb_small_string(), arb_payload(), 0..3)),
+        prop::option::of(prop::collection::btree_map(
+            arb_small_string(),
+            arb_payload(),
+            0..3,
+        )),
     )
-        .prop_map(|(marker_name, details, failure, header)| WorkflowCommand::RecordMarker {
-            marker_name,
-            details,
-            failure,
-            header,
+        .prop_map(|(marker_name, details, failure, header)| {
+            WorkflowCommand::RecordMarker {
+                marker_name,
+                details,
+                failure,
+                header,
+            }
         })
 }
 
@@ -346,7 +514,14 @@ fn arb_schedule_nexus_operation_command() -> impl Strategy<Value = WorkflowComma
         prop::option::of(arb_duration()),
     )
         .prop_map(
-            |(operation_id, endpoint, service, operation, input, schedule_to_close_timeout)| {
+            |(
+                operation_id,
+                endpoint,
+                service,
+                operation,
+                input,
+                schedule_to_close_timeout,
+            )| {
                 WorkflowCommand::ScheduleNexusOperation {
                     operation_id,
                     endpoint,
@@ -406,7 +581,13 @@ fn arb_retry_policy() -> impl Strategy<Value = RetryPolicy> {
         prop::collection::vec(arb_small_string(), 0..3),
     )
         .prop_map(
-            |(initial_interval, backoff_coefficient, maximum_interval, maximum_attempts, non_retryable_error_types)| RetryPolicy {
+            |(
+                initial_interval,
+                backoff_coefficient,
+                maximum_interval,
+                maximum_attempts,
+                non_retryable_error_types,
+            )| RetryPolicy {
                 initial_interval,
                 backoff_coefficient,
                 maximum_interval,
@@ -427,16 +608,8 @@ fn arb_start_request() -> impl Strategy<Value = StartRequest> {
         prop::option::of(arb_retry_policy()),
         1u32..10u32,
     )
-        .prop_map(|(input, memo, search_attributes, workflow_execution_timeout, workflow_run_timeout, workflow_task_timeout, retry_policy, attempt)| {
-            let now = fixed_now();
-            let run_id = RunId::new();
-            StartRequest {
-                run_key: RunKey::new(),
-                namespace_id: NamespaceId::new(),
-                workflow_id: WorkflowId("workflow".into()),
-                run_id,
-                workflow_type: WorkflowType("wf".into()),
-                task_queue: TaskQueueName("queue".into()),
+        .prop_map(
+            |(
                 input,
                 memo,
                 search_attributes,
@@ -445,20 +618,41 @@ fn arb_start_request() -> impl Strategy<Value = StartRequest> {
                 workflow_task_timeout,
                 retry_policy,
                 attempt,
-                continued_execution_run_id: None,
-                first_execution_run_id: Some(run_id),
-                request: request_context("prop-start", now),
-                now,
-            }
-        })
+            )| {
+                let now = fixed_now();
+                let run_id = RunId::new();
+                StartRequest {
+                    run_key: RunKey::new(),
+                    namespace_id: NamespaceId::new(),
+                    workflow_id: WorkflowId("workflow".into()),
+                    run_id,
+                    workflow_type: WorkflowType("wf".into()),
+                    task_queue: TaskQueueName("queue".into()),
+                    input,
+                    memo,
+                    search_attributes,
+                    workflow_execution_timeout,
+                    workflow_run_timeout,
+                    workflow_task_timeout,
+                    retry_policy,
+                    attempt,
+                    continued_execution_run_id: None,
+                    first_execution_run_id: Some(run_id),
+                    request: request_context("prop-start", now),
+                    now,
+                }
+            },
+        )
 }
 
 fn arb_activity_resolution() -> impl Strategy<Value = ActivityResolution> {
     prop_oneof![
         arb_payloads().prop_map(|result| ActivityResolution::Completed { result }),
         arb_small_string().prop_map(|message| ActivityResolution::Failed { message }),
-        arb_small_string().prop_map(|timeout_type| ActivityResolution::TimedOut { timeout_type }),
-        prop::option::of(arb_payloads()).prop_map(|details| ActivityResolution::Canceled { details }),
+        arb_small_string()
+            .prop_map(|timeout_type| ActivityResolution::TimedOut { timeout_type }),
+        prop::option::of(arb_payloads())
+            .prop_map(|details| ActivityResolution::Canceled { details }),
     ]
 }
 
@@ -473,10 +667,19 @@ fn arb_schedule_activity_command() -> impl Strategy<Value = WorkflowCommand> {
         prop::option::of(arb_duration()),
     )
         .prop_map(
-            |(activity_id, task_queue, input, schedule_to_close_timeout, schedule_to_start_timeout, start_to_close_timeout, heartbeat_timeout)| WorkflowCommand::ScheduleActivity {
+            |(
+                activity_id,
+                task_queue,
+                input,
+                schedule_to_close_timeout,
+                schedule_to_start_timeout,
+                start_to_close_timeout,
+                heartbeat_timeout,
+            )| WorkflowCommand::ScheduleActivity {
                 activity_id,
                 task_queue: TaskQueueName(task_queue),
                 input,
+                retry_policy: None,
                 schedule_to_close_timeout,
                 schedule_to_start_timeout,
                 start_to_close_timeout,
@@ -507,14 +710,17 @@ fn arb_wft_failed_request(
         arb_wft_failed_cause(),
         prop::option::of(arb_payload()),
         arb_small_string(),
-    ).prop_map(move |(failure_cause, failure_details, worker_identity)| WorkflowTaskFailedRequest {
-        logical_seq,
-        started_event_id,
-        failure_cause,
-        failure_details,
-        worker_identity: WorkerIdentity(worker_identity),
-        now,
-    })
+    )
+        .prop_map(move |(failure_cause, failure_details, worker_identity)| {
+            WorkflowTaskFailedRequest {
+                logical_seq,
+                started_event_id,
+                failure_cause,
+                failure_details,
+                worker_identity: WorkerIdentity(worker_identity),
+                now,
+            }
+        })
 }
 
 fn arb_wft_timed_out_request(
@@ -544,12 +750,14 @@ fn arb_cancel_request(now: OffsetDateTime) -> impl Strategy<Value = CancelReques
         prop::option::of(arb_external_workflow_execution()),
         arb_small_string(),
     )
-        .prop_map(move |(reason, external_initiator, request_id)| CancelRequest {
-            reason,
-            external_initiator,
-            request: request_context(&request_id, now),
-            now,
-        })
+        .prop_map(
+            move |(reason, external_initiator, request_id)| CancelRequest {
+                reason,
+                external_initiator,
+                request: request_context(&request_id, now),
+                now,
+            },
+        )
 }
 
 fn arb_terminate_request(now: OffsetDateTime) -> impl Strategy<Value = TerminateRequest> {
@@ -559,13 +767,15 @@ fn arb_terminate_request(now: OffsetDateTime) -> impl Strategy<Value = Terminate
         arb_small_string(),
         arb_small_string(),
     )
-        .prop_map(move |(reason, details, identity, request_id)| TerminateRequest {
-            reason,
-            details,
-            identity,
-            request: request_context(&request_id, now),
-            now,
-        })
+        .prop_map(
+            move |(reason, details, identity, request_id)| TerminateRequest {
+                reason,
+                details,
+                identity,
+                request: request_context(&request_id, now),
+                now,
+            },
+        )
 }
 
 fn arb_workflow_timeout_type() -> impl Strategy<Value = WorkflowTimeoutType> {
@@ -597,28 +807,29 @@ fn arb_continue_as_new_command() -> impl Strategy<Value = WorkflowCommand> {
         prop::option::of(arb_duration()),
         prop::option::of(arb_duration()),
         arb_duration(),
-    ).prop_map(
-        |(
-            workflow_type,
-            task_queue,
-            input,
-            memo,
-            search_attributes,
-            workflow_execution_timeout,
-            workflow_run_timeout,
-            workflow_task_timeout,
-        )| WorkflowCommand::ContinueAsNew {
-            new_run_id: RunId::new(),
-            workflow_type: WorkflowType(workflow_type),
-            task_queue: TaskQueueName(task_queue),
-            input,
-            memo,
-            search_attributes,
-            workflow_execution_timeout,
-            workflow_run_timeout,
-            workflow_task_timeout,
-        },
     )
+        .prop_map(
+            |(
+                workflow_type,
+                task_queue,
+                input,
+                memo,
+                search_attributes,
+                workflow_execution_timeout,
+                workflow_run_timeout,
+                workflow_task_timeout,
+            )| WorkflowCommand::ContinueAsNew {
+                new_run_id: RunId::new(),
+                workflow_type: WorkflowType(workflow_type),
+                task_queue: TaskQueueName(task_queue),
+                input,
+                memo,
+                search_attributes,
+                workflow_execution_timeout,
+                workflow_run_timeout,
+                workflow_task_timeout,
+            },
+        )
 }
 
 fn arb_parent_close_policy() -> impl Strategy<Value = ParentClosePolicy> {
@@ -664,15 +875,21 @@ fn arb_external_cancel_result() -> impl Strategy<Value = ExternalCancelResult> {
 }
 
 fn arb_update_request(now: OffsetDateTime) -> impl Strategy<Value = UpdateRequest> {
-    (arb_small_string(), arb_small_string(), arb_payloads(), arb_small_string()).prop_map(
-        move |(update_id, update_name, input, request_id)| UpdateRequest {
-            update_id,
-            update_name,
-            input,
-            request: request_context(&request_id, now),
-            now,
-        },
+    (
+        arb_small_string(),
+        arb_small_string(),
+        arb_payloads(),
+        arb_small_string(),
     )
+        .prop_map(
+            move |(update_id, update_name, input, request_id)| UpdateRequest {
+                update_id,
+                update_name,
+                input,
+                request: request_context(&request_id, now),
+                now,
+            },
+        )
 }
 
 fn arb_update_completed_command() -> impl Strategy<Value = WorkflowCommand> {
@@ -690,13 +907,13 @@ fn arb_update_rejected_command() -> impl Strategy<Value = WorkflowCommand> {
 fn arb_workflow_execution_timed_out_request(
     now: OffsetDateTime,
 ) -> impl Strategy<Value = WorkflowExecutionTimedOutRequest> {
-    (arb_workflow_timeout_type(), arb_retry_state()).prop_map(move |(timeout_type, retry_state)| {
-        WorkflowExecutionTimedOutRequest {
+    (arb_workflow_timeout_type(), arb_retry_state()).prop_map(
+        move |(timeout_type, retry_state)| WorkflowExecutionTimedOutRequest {
             timeout_type,
             retry_state,
             now,
-        }
-    })
+        },
+    )
 }
 
 fn arb_nexus_resolution() -> impl Strategy<Value = NexusResolution> {
@@ -731,21 +948,72 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
             let state = make_open_state(now);
             (LoadedRun::Existing(state), Command::Terminate(req))
         }),
+        arb_pause_workflow_request(now).prop_map(move |req| {
+            let state = with_activity(make_open_state(now), "activity-1");
+            (LoadedRun::Existing(state), Command::PauseWorkflow(req))
+        }),
+        arb_unpause_workflow_request(now).prop_map(move |req| {
+            let state = with_activity(
+                with_paused_status(make_open_state(now), now, "pause-req"),
+                "activity-1",
+            );
+            (LoadedRun::Existing(state), Command::UnpauseWorkflow(req))
+        }),
         arb_open_state_for_reset(now).prop_flat_map(move |state| {
-            arb_reset_request(state.clone(), now)
-                .prop_map(move |req| (LoadedRun::Existing(state.clone()), Command::Reset(req)))
+            arb_reset_request(state.clone(), now).prop_map(move |req| {
+                (LoadedRun::Existing(state.clone()), Command::Reset(req))
+            })
+        }),
+        arb_update_activity_options_request("activity-1".into(), now).prop_map(
+            move |req| {
+                let state = with_activity(make_open_state(now), "activity-1");
+                (
+                    LoadedRun::Existing(state),
+                    Command::UpdateActivityOptions(req),
+                )
+            }
+        ),
+        arb_pause_activity_request("activity-1".into(), now).prop_map(move |req| {
+            let state = with_activity(make_open_state(now), "activity-1");
+            (LoadedRun::Existing(state), Command::PauseActivity(req))
+        }),
+        arb_unpause_activity_request("activity-1".into(), now).prop_map(move |req| {
+            let mut state = with_activity(make_open_state(now), "activity-1");
+            if let Some(activity) = state.activities.get_mut("activity-1") {
+                activity.pause_info = Some(ActivityPauseInfo {
+                    pause_time: now,
+                    identity: "operator".into(),
+                    reason: "pause".into(),
+                });
+                activity.stamp = 1;
+            }
+            (LoadedRun::Existing(state), Command::UnpauseActivity(req))
+        }),
+        arb_reset_activity_request("activity-1".into(), now).prop_map(move |req| {
+            let state = with_activity(make_open_state(now), "activity-1");
+            (LoadedRun::Existing(state), Command::ResetActivity(req))
         }),
         arb_update_execution_options_request(now).prop_map(move |req| {
             let state = make_open_state(now);
-            (LoadedRun::Existing(state), Command::UpdateExecutionOptions(req))
+            (
+                LoadedRun::Existing(state),
+                Command::UpdateExecutionOptions(req),
+            )
         }),
         arb_workflow_execution_timed_out_request(now).prop_map(move |req| {
             let state = with_sticky(
-                with_timer(with_activity(make_open_state(now), "activity-1"), "timer-1", now),
+                with_timer(
+                    with_activity(make_open_state(now), "activity-1"),
+                    "timer-1",
+                    now,
+                ),
                 "sticky-worker",
                 now,
             );
-            (LoadedRun::Existing(state), Command::WorkflowExecutionTimedOut(req))
+            (
+                LoadedRun::Existing(state),
+                Command::WorkflowExecutionTimedOut(req),
+            )
         }),
         (0u64..10u64).prop_map(move |offset| {
             let logical_seq = 20 + offset;
@@ -756,40 +1024,74 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 sticky_ttl: Some(Duration::seconds(30)),
                 now,
             };
-            (LoadedRun::Existing(state), Command::WorkflowTaskStarted(req))
+            (
+                LoadedRun::Existing(state),
+                Command::WorkflowTaskStarted(req),
+            )
         }),
         prop_oneof![
             Just(vec![WorkflowCommand::RequestNewWorkflowTask]),
             arb_schedule_activity_command().prop_map(|cmd| vec![cmd]),
             arb_record_marker_command().prop_map(|cmd| vec![cmd]),
             arb_schedule_nexus_operation_command().prop_map(|cmd| vec![cmd]),
-            arb_payloads().prop_map(|result| vec![WorkflowCommand::CompleteWorkflow { result }]),
-            (arb_small_string(), prop::option::of(arb_payload())).prop_map(|(message, details)| vec![WorkflowCommand::FailWorkflow { message, details }]),
+            arb_payloads()
+                .prop_map(|result| vec![WorkflowCommand::CompleteWorkflow { result }]),
+            (arb_small_string(), prop::option::of(arb_payload())).prop_map(
+                |(message, details)| vec![WorkflowCommand::FailWorkflow {
+                    message,
+                    details
+                }]
+            ),
             arb_continue_as_new_command().prop_map(|cmd| vec![cmd]),
-            (arb_small_string(), arb_small_string(), arb_small_string(), arb_payloads(), arb_parent_close_policy()).prop_map(|(child_workflow_id, workflow_type, task_queue, input, parent_close_policy)| {
-                vec![WorkflowCommand::StartChildWorkflow {
-                    child_workflow_id: WorkflowId(child_workflow_id),
-                    namespace_id: NamespaceId::new(),
-                    workflow_type: WorkflowType(workflow_type),
-                    task_queue: TaskQueueName(task_queue),
-                    input,
-                    parent_close_policy,
-                }]
-            }),
-            (arb_small_string(), any::<bool>(), arb_small_string(), arb_payloads()).prop_map(|(target_workflow_id, with_run_id, signal_name, input)| {
-                vec![WorkflowCommand::SignalExternalWorkflowExecution {
-                    target_workflow_id: WorkflowId(target_workflow_id),
-                    target_run_id: with_run_id.then(RunId::new),
-                    signal_name,
-                    input,
-                }]
-            }),
-            (arb_small_string(), any::<bool>()).prop_map(|(target_workflow_id, with_run_id)| {
-                vec![WorkflowCommand::RequestCancelExternalWorkflowExecution {
-                    target_workflow_id: WorkflowId(target_workflow_id),
-                    target_run_id: with_run_id.then(RunId::new),
-                }]
-            }),
+            (
+                arb_small_string(),
+                arb_small_string(),
+                arb_small_string(),
+                arb_payloads(),
+                arb_parent_close_policy()
+            )
+                .prop_map(
+                    |(
+                        child_workflow_id,
+                        workflow_type,
+                        task_queue,
+                        input,
+                        parent_close_policy,
+                    )| {
+                        vec![WorkflowCommand::StartChildWorkflow {
+                            child_workflow_id: WorkflowId(child_workflow_id),
+                            namespace_id: NamespaceId::new(),
+                            workflow_type: WorkflowType(workflow_type),
+                            task_queue: TaskQueueName(task_queue),
+                            input,
+                            parent_close_policy,
+                        }]
+                    }
+                ),
+            (
+                arb_small_string(),
+                any::<bool>(),
+                arb_small_string(),
+                arb_payloads()
+            )
+                .prop_map(
+                    |(target_workflow_id, with_run_id, signal_name, input)| {
+                        vec![WorkflowCommand::SignalExternalWorkflowExecution {
+                            target_workflow_id: WorkflowId(target_workflow_id),
+                            target_run_id: with_run_id.then(RunId::new),
+                            signal_name,
+                            input,
+                        }]
+                    }
+                ),
+            (arb_small_string(), any::<bool>()).prop_map(
+                |(target_workflow_id, with_run_id)| {
+                    vec![WorkflowCommand::RequestCancelExternalWorkflowExecution {
+                        target_workflow_id: WorkflowId(target_workflow_id),
+                        target_run_id: with_run_id.then(RunId::new),
+                    }]
+                }
+            ),
         ]
         .prop_map(move |commands| {
             let state = with_pending_wft(make_open_state(now), 30, Some(13), 1);
@@ -806,7 +1108,10 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 force_new_workflow_task: false,
                 now,
             };
-            (LoadedRun::Existing(state), Command::WorkflowTaskCompleted(req))
+            (
+                LoadedRun::Existing(state),
+                Command::WorkflowTaskCompleted(req),
+            )
         }),
         arb_activity_resolution().prop_map(move |resolution| {
             let state = with_activity(make_open_state(now), "activity-1");
@@ -829,22 +1134,44 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
         prop::bool::ANY.prop_flat_map(move |sticky| {
             let logical_seq = LogicalTaskSeq(40);
             let started_event_id = 15;
-            let mut state = with_pending_wft(make_open_state(now), logical_seq.0, Some(started_event_id), 1);
+            let mut state = with_pending_wft(
+                make_open_state(now),
+                logical_seq.0,
+                Some(started_event_id),
+                1,
+            );
             if sticky {
                 state = with_sticky(state, "sticky-worker", now);
             }
-            arb_wft_failed_request(logical_seq, started_event_id, now)
-                .prop_map(move |req| (LoadedRun::Existing(state.clone()), Command::WorkflowTaskFailed(req)))
+            arb_wft_failed_request(logical_seq, started_event_id, now).prop_map(
+                move |req| {
+                    (
+                        LoadedRun::Existing(state.clone()),
+                        Command::WorkflowTaskFailed(req),
+                    )
+                },
+            )
         }),
         prop::bool::ANY.prop_flat_map(move |sticky| {
             let logical_seq = LogicalTaskSeq(41);
             let started_event_id = 16;
-            let mut state = with_pending_wft(make_open_state(now), logical_seq.0, Some(started_event_id), 1);
+            let mut state = with_pending_wft(
+                make_open_state(now),
+                logical_seq.0,
+                Some(started_event_id),
+                1,
+            );
             if sticky {
                 state = with_sticky(state, "sticky-worker", now);
             }
-            arb_wft_timed_out_request(logical_seq, started_event_id, now)
-                .prop_map(move |req| (LoadedRun::Existing(state.clone()), Command::WorkflowTaskTimedOut(req)))
+            arb_wft_timed_out_request(logical_seq, started_event_id, now).prop_map(
+                move |req| {
+                    (
+                        LoadedRun::Existing(state.clone()),
+                        Command::WorkflowTaskTimedOut(req),
+                    )
+                },
+            )
         }),
         Just(()).prop_map(move |_| {
             let state = with_pending_wft(make_open_state(now), 42, Some(17), 1);
@@ -861,10 +1188,16 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 force_new_workflow_task: false,
                 now,
             };
-            (LoadedRun::Existing(state), Command::WorkflowTaskCompleted(req))
+            (
+                LoadedRun::Existing(state),
+                Command::WorkflowTaskCompleted(req),
+            )
         }),
         Just(()).prop_map(move |_| {
-            let state = with_activity(with_pending_wft(make_open_state(now), 43, Some(18), 1), "activity-1");
+            let state = with_activity(
+                with_pending_wft(make_open_state(now), 43, Some(18), 1),
+                "activity-1",
+            );
             let req = WorkflowTaskCompletedRequest {
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
@@ -880,10 +1213,17 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 force_new_workflow_task: false,
                 now,
             };
-            (LoadedRun::Existing(state), Command::WorkflowTaskCompleted(req))
+            (
+                LoadedRun::Existing(state),
+                Command::WorkflowTaskCompleted(req),
+            )
         }),
         Just(()).prop_map(move |_| {
-            let state = with_timer(with_pending_wft(make_open_state(now), 44, Some(19), 1), "timer-1", now);
+            let state = with_timer(
+                with_pending_wft(make_open_state(now), 44, Some(19), 1),
+                "timer-1",
+                now,
+            );
             let req = WorkflowTaskCompletedRequest {
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
@@ -899,7 +1239,10 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 force_new_workflow_task: false,
                 now,
             };
-            (LoadedRun::Existing(state), Command::WorkflowTaskCompleted(req))
+            (
+                LoadedRun::Existing(state),
+                Command::WorkflowTaskCompleted(req),
+            )
         }),
         arb_small_string().prop_map(move |operation_id| {
             let state = with_pending_nexus_operation(
@@ -915,31 +1258,55 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
-                commands: vec![WorkflowCommand::CancelNexusOperation { scheduled_event_id: 12 }],
+                commands: vec![WorkflowCommand::CancelNexusOperation {
+                    scheduled_event_id: 12,
+                }],
                 force_new_workflow_task: false,
                 now,
             };
-            (LoadedRun::Existing(state), Command::WorkflowTaskCompleted(req))
+            (
+                LoadedRun::Existing(state),
+                Command::WorkflowTaskCompleted(req),
+            )
         }),
-        (arb_small_string(), arb_child_start_result()).prop_map(move |(child_workflow_id, result)| {
-            let state = with_child(make_open_state(now), &child_workflow_id, 21, ParentClosePolicy::Terminate, false);
-            let req = ChildStartConfirmedRequest {
-                child_workflow_id: WorkflowId(child_workflow_id),
-                initiated_event_id: 21,
-                result,
-                now,
-            };
-            (LoadedRun::Existing(state), Command::ChildStartConfirmed(req))
-        }),
-        (arb_small_string(), arb_child_resolution()).prop_map(move |(child_workflow_id, resolution)| {
-            let state = with_child(make_open_state(now), &child_workflow_id, 21, ParentClosePolicy::Terminate, true);
-            let req = ChildResolvedRequest {
-                child_workflow_id: WorkflowId(child_workflow_id),
-                resolution,
-                now,
-            };
-            (LoadedRun::Existing(state), Command::ChildResolved(req))
-        }),
+        (arb_small_string(), arb_child_start_result()).prop_map(
+            move |(child_workflow_id, result)| {
+                let state = with_child(
+                    make_open_state(now),
+                    &child_workflow_id,
+                    21,
+                    ParentClosePolicy::Terminate,
+                    false,
+                );
+                let req = ChildStartConfirmedRequest {
+                    child_workflow_id: WorkflowId(child_workflow_id),
+                    initiated_event_id: 21,
+                    result,
+                    now,
+                };
+                (
+                    LoadedRun::Existing(state),
+                    Command::ChildStartConfirmed(req),
+                )
+            }
+        ),
+        (arb_small_string(), arb_child_resolution()).prop_map(
+            move |(child_workflow_id, resolution)| {
+                let state = with_child(
+                    make_open_state(now),
+                    &child_workflow_id,
+                    21,
+                    ParentClosePolicy::Terminate,
+                    true,
+                );
+                let req = ChildResolvedRequest {
+                    child_workflow_id: WorkflowId(child_workflow_id),
+                    resolution,
+                    now,
+                };
+                (LoadedRun::Existing(state), Command::ChildResolved(req))
+            }
+        ),
         arb_external_signal_result().prop_map(move |result| {
             let state = with_pending_external_signal(make_open_state(now), 55);
             let req = ExternalSignalResolvedRequest {
@@ -947,7 +1314,10 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 result,
                 now,
             };
-            (LoadedRun::Existing(state), Command::ExternalSignalResolved(req))
+            (
+                LoadedRun::Existing(state),
+                Command::ExternalSignalResolved(req),
+            )
         }),
         arb_external_cancel_result().prop_map(move |result| {
             let state = with_pending_external_cancel(make_open_state(now), 56);
@@ -956,20 +1326,32 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 result,
                 now,
             };
-            (LoadedRun::Existing(state), Command::ExternalCancelResolved(req))
+            (
+                LoadedRun::Existing(state),
+                Command::ExternalCancelResolved(req),
+            )
         }),
-        (arb_small_string(), arb_nexus_resolution()).prop_map(move |(operation_id, resolution)| {
-            let state = with_pending_nexus_operation(make_open_state(now), &operation_id);
-            let req = NexusOperationResolvedRequest {
-                operation_id,
-                scheduled_event_id: 12,
-                resolution,
-                now,
-            };
-            (LoadedRun::Existing(state), Command::NexusOperationResolved(req))
-        }),
+        (arb_small_string(), arb_nexus_resolution()).prop_map(
+            move |(operation_id, resolution)| {
+                let state =
+                    with_pending_nexus_operation(make_open_state(now), &operation_id);
+                let req = NexusOperationResolvedRequest {
+                    operation_id,
+                    scheduled_event_id: 12,
+                    resolution,
+                    now,
+                };
+                (
+                    LoadedRun::Existing(state),
+                    Command::NexusOperationResolved(req),
+                )
+            }
+        ),
         arb_update_request(now).prop_map(move |req| {
-            (LoadedRun::Existing(make_open_state(now)), Command::Update(req))
+            (
+                LoadedRun::Existing(make_open_state(now)),
+                Command::Update(req),
+            )
         }),
         arb_update_request(now).prop_map(move |req| {
             (
@@ -1199,7 +1581,7 @@ proptest! {
     #[test]
     fn property_7_closed_workflow_no_schedule((loaded, command) in arb_valid_pair()) {
         let transition = kernel().apply(loaded, command).unwrap();
-        if transition.next_state.status != ExecutionStatus::Running {
+        if !transition.next_state.status.is_open() {
             prop_assert_eq!(
                 transition.dispatch_ops.iter().all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. } | DispatchOp::EnqueueActivityTask { .. })),
                 true
@@ -1265,6 +1647,30 @@ proptest! {
                 prop_assert_eq!(transition.request_dedupe_ops[0].clone(), RequestDedupeOp { request_id: req.request.request_id });
             }
             Command::Reset(req) => {
+                prop_assert_eq!(transition.request_dedupe_ops.len(), 1);
+                prop_assert_eq!(transition.request_dedupe_ops[0].clone(), RequestDedupeOp { request_id: req.request.request_id });
+            }
+            Command::PauseWorkflow(req) => {
+                prop_assert_eq!(transition.request_dedupe_ops.len(), 1);
+                prop_assert_eq!(transition.request_dedupe_ops[0].clone(), RequestDedupeOp { request_id: req.request.request_id });
+            }
+            Command::UnpauseWorkflow(req) => {
+                prop_assert_eq!(transition.request_dedupe_ops.len(), 1);
+                prop_assert_eq!(transition.request_dedupe_ops[0].clone(), RequestDedupeOp { request_id: req.request.request_id });
+            }
+            Command::UpdateActivityOptions(req) => {
+                prop_assert_eq!(transition.request_dedupe_ops.len(), 1);
+                prop_assert_eq!(transition.request_dedupe_ops[0].clone(), RequestDedupeOp { request_id: req.request.request_id });
+            }
+            Command::PauseActivity(req) => {
+                prop_assert_eq!(transition.request_dedupe_ops.len(), 1);
+                prop_assert_eq!(transition.request_dedupe_ops[0].clone(), RequestDedupeOp { request_id: req.request.request_id });
+            }
+            Command::UnpauseActivity(req) => {
+                prop_assert_eq!(transition.request_dedupe_ops.len(), 1);
+                prop_assert_eq!(transition.request_dedupe_ops[0].clone(), RequestDedupeOp { request_id: req.request.request_id });
+            }
+            Command::ResetActivity(req) => {
                 prop_assert_eq!(transition.request_dedupe_ops.len(), 1);
                 prop_assert_eq!(transition.request_dedupe_ops[0].clone(), RequestDedupeOp { request_id: req.request.request_id });
             }
@@ -1493,11 +1899,15 @@ proptest! {
                 activity_id: "activity-2".into(),
                 schedule_event_id: 11,
                 task_queue: TaskQueueName("activity-q".into()),
+                input: Payloads::default(),
                 attempt: 1,
+                retry_policy: None,
                 schedule_to_close_timeout: Some(Duration::minutes(2)),
                 schedule_to_start_timeout: Some(Duration::seconds(30)),
                 start_to_close_timeout: Some(Duration::minutes(1)),
                 heartbeat_timeout: Some(Duration::seconds(20)),
+                pause_info: None,
+                stamp: 0,
             },
         );
         state = with_timer(state, "timer-1", now);
@@ -1655,11 +2065,15 @@ proptest! {
                 activity_id: "activity-2".into(),
                 schedule_event_id: 11,
                 task_queue: TaskQueueName("activity-q".into()),
+                input: Payloads::default(),
                 attempt: 1,
+                retry_policy: None,
                 schedule_to_close_timeout: Some(Duration::minutes(2)),
                 schedule_to_start_timeout: Some(Duration::seconds(30)),
                 start_to_close_timeout: Some(Duration::minutes(1)),
                 heartbeat_timeout: Some(Duration::seconds(20)),
+                pause_info: None,
+                stamp: 0,
             },
         );
         state = with_timer(state, "timer-1", now);
@@ -1741,24 +2155,337 @@ proptest! {
 
 }
 
+proptest! {
+    #[test]
+    fn property_58_pause_workflow_produces_correct_state_and_event(
+        req in arb_pause_workflow_request(fixed_now()),
+        extra_activities in 0usize..3usize,
+    ) {
+        let now = fixed_now();
+        let mut state = make_open_state(now);
+        for idx in 0..extra_activities {
+            state = with_activity(state, &format!("activity-{idx}"));
+        }
+
+        let transition = kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::PauseWorkflow(req.clone()),
+        ).unwrap();
+
+        prop_assert_eq!(transition.next_state.status, ExecutionStatus::Paused);
+        prop_assert_eq!(transition.next_state.wft_stamp, state.wft_stamp + 1);
+        let pause_info = transition.next_state.pause_info.clone().unwrap();
+        prop_assert_eq!(pause_info.pause_time, req.now);
+        prop_assert_eq!(pause_info.identity, req.identity);
+        prop_assert_eq!(pause_info.reason, req.reason);
+        prop_assert_eq!(pause_info.request_id, req.request.request_id.0);
+        prop_assert_eq!(transition.history_events.len(), 1);
+        prop_assert_eq!(matches!(transition.history_events[0].kind, HistoryEventKind::WorkflowExecutionPaused { .. }), true);
+        prop_assert_eq!(transition.request_dedupe_ops.len(), 1);
+        prop_assert_eq!(transition.activity_ops.len(), state.activities.len());
+        prop_assert_eq!(transition.dispatch_ops.iter().all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. })), true);
+    }
+
+    #[test]
+    fn property_59_unpause_workflow_produces_correct_state_and_dispatches(
+        req in arb_unpause_workflow_request(fixed_now()),
+        extra_activities in 0usize..3usize,
+        has_pending_wft in any::<bool>(),
+    ) {
+        let now = fixed_now();
+        let mut state = with_paused_status(make_open_state(now), now, "pause-req");
+        for idx in 0..extra_activities {
+            state = with_activity(state, &format!("activity-{idx}"));
+        }
+        if has_pending_wft {
+            state = with_pending_wft(state, 77, None, 0);
+        }
+
+        let transition = kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::UnpauseWorkflow(req),
+        ).unwrap();
+
+        prop_assert_eq!(transition.next_state.status, ExecutionStatus::Running);
+        prop_assert_eq!(transition.next_state.pause_info, None);
+        prop_assert_eq!(transition.next_state.wft_stamp, state.wft_stamp + 1);
+        prop_assert_eq!(matches!(transition.history_events[0].kind, HistoryEventKind::WorkflowExecutionUnpaused { .. }), true);
+        prop_assert_eq!(
+            transition.dispatch_ops.iter().filter(|op| matches!(op, DispatchOp::EnqueueActivityTask { .. })).count(),
+            state.activities.len()
+        );
+        let workflow_task_dispatches = transition.dispatch_ops.iter().filter(|op| matches!(op, DispatchOp::EnqueueWorkflowTask { .. })).count();
+        prop_assert_eq!(workflow_task_dispatches, if has_pending_wft { 0 } else { 1 });
+    }
+
+    #[test]
+    fn property_60_pause_workflow_idempotency(req in arb_pause_workflow_request(fixed_now())) {
+        let now = fixed_now();
+        let paused = with_paused_status(make_open_state(now), now, &req.request.request_id.0);
+        let idempotent = kernel().apply(
+            LoadedRun::Existing(paused.clone()),
+            Command::PauseWorkflow(req.clone()),
+        ).unwrap();
+        prop_assert!(idempotent.history_events.is_empty());
+        prop_assert!(idempotent.request_dedupe_ops.is_empty());
+        prop_assert!(idempotent.activity_ops.is_empty());
+        prop_assert!(idempotent.dispatch_ops.is_empty());
+        prop_assert!(idempotent.projection_ops.is_empty());
+
+        let conflicting = kernel().apply(
+            LoadedRun::Existing(paused),
+            Command::PauseWorkflow(PauseWorkflowRequest {
+                request: request_context("different-request", now),
+                ..req
+            }),
+        );
+        prop_assert_eq!(conflicting, Err(tokeira_kernel::Reject::AlreadyPaused));
+    }
+
+    #[test]
+    fn property_61_paused_workflows_suppress_wft_scheduling(
+        signal_input in arb_payloads(),
+        completed in arb_payloads(),
+    ) {
+        let now = fixed_now();
+        let paused = with_paused_status(make_open_state(now), now, "pause-req");
+
+        let signal_transition = kernel().apply(
+            LoadedRun::Existing(paused.clone()),
+            Command::Signal(SignalRequest {
+                signal_name: "sig".into(),
+                input: signal_input,
+                request: request_context("sig-req", now),
+                now,
+            }),
+        ).unwrap();
+        prop_assert_eq!(signal_transition.dispatch_ops.iter().all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. })), true);
+
+        let cancel_transition = kernel().apply(
+            LoadedRun::Existing(paused.clone()),
+            Command::Cancel(CancelRequest {
+                reason: "cancel".into(),
+                external_initiator: None,
+                request: request_context("cancel-req", now),
+                now,
+            }),
+        ).unwrap();
+        prop_assert_eq!(cancel_transition.dispatch_ops.iter().all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. })), true);
+
+        let activity_transition = kernel().apply(
+            LoadedRun::Existing(with_activity(paused, "activity-1")),
+            Command::ActivityResolved(ActivityResolvedRequest {
+                activity_id: "activity-1".into(),
+                resolution: ActivityResolution::Completed { result: completed },
+                worker_identity: None,
+                now,
+            }),
+        ).unwrap();
+        prop_assert_eq!(activity_transition.dispatch_ops.iter().all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. })), true);
+    }
+
+    #[test]
+    fn property_62_activity_management_emits_no_history_and_no_wft(
+        update_req in arb_update_activity_options_request("activity-1".into(), fixed_now()),
+        pause_req in arb_pause_activity_request("activity-1".into(), fixed_now()),
+        reset_req in arb_reset_activity_request("activity-1".into(), fixed_now()),
+    ) {
+        let now = fixed_now();
+        let base = with_activity(make_open_state(now), "activity-1");
+
+        let update_transition = kernel().apply(
+            LoadedRun::Existing(base.clone()),
+            Command::UpdateActivityOptions(update_req),
+        ).unwrap();
+        let pause_transition = kernel().apply(
+            LoadedRun::Existing(base.clone()),
+            Command::PauseActivity(pause_req),
+        ).unwrap();
+        let reset_transition = kernel().apply(
+            LoadedRun::Existing(base),
+            Command::ResetActivity(reset_req),
+        ).unwrap();
+
+        for transition in [update_transition, pause_transition, reset_transition] {
+            prop_assert!(transition.history_events.is_empty());
+            prop_assert_eq!(transition.dispatch_ops.iter().all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. })), true);
+            prop_assert_eq!(transition.request_dedupe_ops.len(), 1);
+            prop_assert_eq!(transition.activity_ops.len(), 1);
+        }
+    }
+
+    #[test]
+    fn property_63_update_activity_options_mutates_specified_fields_correctly(
+        req in arb_update_activity_options_request("activity-1".into(), fixed_now())
+    ) {
+        let now = fixed_now();
+        let state = with_activity(make_open_state(now), "activity-1");
+        let before = state.activities.get("activity-1").unwrap().clone();
+        let transition = kernel().apply(
+            LoadedRun::Existing(state),
+            Command::UpdateActivityOptions(req.clone()),
+        ).unwrap();
+        let after = transition.next_state.activities.get("activity-1").unwrap();
+
+        match req.task_queue {
+            FieldChange::Set(ref v) => prop_assert_eq!(&after.task_queue, v),
+            FieldChange::Unchanged | FieldChange::Clear => prop_assert_eq!(&after.task_queue, &before.task_queue),
+        }
+        match req.schedule_to_close_timeout {
+            FieldChange::Set(v) => prop_assert_eq!(after.schedule_to_close_timeout, v),
+            FieldChange::Clear => prop_assert_eq!(after.schedule_to_close_timeout, None),
+            FieldChange::Unchanged => prop_assert_eq!(after.schedule_to_close_timeout, before.schedule_to_close_timeout),
+        }
+        match req.schedule_to_start_timeout {
+            FieldChange::Set(v) => prop_assert_eq!(after.schedule_to_start_timeout, v),
+            FieldChange::Clear => prop_assert_eq!(after.schedule_to_start_timeout, None),
+            FieldChange::Unchanged => prop_assert_eq!(after.schedule_to_start_timeout, before.schedule_to_start_timeout),
+        }
+        match req.start_to_close_timeout {
+            FieldChange::Set(v) => prop_assert_eq!(after.start_to_close_timeout, v),
+            FieldChange::Clear => prop_assert_eq!(after.start_to_close_timeout, None),
+            FieldChange::Unchanged => prop_assert_eq!(after.start_to_close_timeout, before.start_to_close_timeout),
+        }
+        match req.heartbeat_timeout {
+            FieldChange::Set(v) => prop_assert_eq!(after.heartbeat_timeout, v),
+            FieldChange::Clear => prop_assert_eq!(after.heartbeat_timeout, None),
+            FieldChange::Unchanged => prop_assert_eq!(after.heartbeat_timeout, before.heartbeat_timeout),
+        }
+    }
+
+    #[test]
+    fn property_64_pause_and_unpause_activity_manage_pause_info(
+        pause_req in arb_pause_activity_request("activity-1".into(), fixed_now()),
+        unpause_req in arb_unpause_activity_request("activity-1".into(), fixed_now()),
+        workflow_paused in any::<bool>(),
+    ) {
+        let now = fixed_now();
+        let mut state = with_activity(make_open_state(now), "activity-1");
+        if workflow_paused {
+            state = with_paused_status(state, now, "pause-req");
+        }
+
+        let paused = kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::PauseActivity(pause_req.clone()),
+        ).unwrap();
+        let paused_activity = paused.next_state.activities.get("activity-1").unwrap();
+        prop_assert_eq!(paused_activity.pause_info.clone(), Some(ActivityPauseInfo {
+            pause_time: pause_req.now,
+            identity: pause_req.identity,
+            reason: pause_req.reason,
+        }));
+
+        let unpaused = kernel().apply(
+            LoadedRun::Existing(paused.next_state),
+            Command::UnpauseActivity(unpause_req),
+        ).unwrap();
+        let unpaused_activity = unpaused.next_state.activities.get("activity-1").unwrap();
+        prop_assert_eq!(unpaused_activity.pause_info.clone(), None);
+        let activity_dispatches = unpaused.dispatch_ops.iter().filter(|op| matches!(op, DispatchOp::EnqueueActivityTask { .. })).count();
+        prop_assert_eq!(activity_dispatches, if workflow_paused { 0 } else { 1 });
+    }
+
+    #[test]
+    fn property_65_unpause_activity_rejects_non_paused_activity(req in arb_unpause_activity_request("activity-1".into(), fixed_now())) {
+        let now = fixed_now();
+        let result = kernel().apply(
+            LoadedRun::Existing(with_activity(make_open_state(now), "activity-1")),
+            Command::UnpauseActivity(req),
+        );
+        prop_assert_eq!(result, Err(tokeira_kernel::Reject::ActivityNotPaused("activity-1".into())));
+    }
+
+    #[test]
+    fn property_66_reset_activity_resets_attempt_and_dispatches_conditionally(
+        req in arb_reset_activity_request("activity-1".into(), fixed_now()),
+        workflow_paused in any::<bool>(),
+        attempt in 2u32..10u32,
+    ) {
+        let now = fixed_now();
+        let mut state = with_activity(make_open_state(now), "activity-1");
+        if workflow_paused {
+            state = with_paused_status(state, now, "pause-req");
+        }
+        state.activities.get_mut("activity-1").unwrap().attempt = attempt;
+
+        let transition = kernel().apply(
+            LoadedRun::Existing(state),
+            Command::ResetActivity(req),
+        ).unwrap();
+        let activity = transition.next_state.activities.get("activity-1").unwrap();
+        prop_assert_eq!(activity.attempt, 1);
+        let activity_dispatches = transition.dispatch_ops.iter().filter(|op| matches!(op, DispatchOp::EnqueueActivityTask { .. })).count();
+        prop_assert_eq!(activity_dispatches, if workflow_paused { 0 } else { 1 });
+    }
+
+    #[test]
+    fn property_67_schedule_activity_initializes_pause_fields(cmd in arb_schedule_activity_command()) {
+        let now = fixed_now();
+        let state = with_pending_wft(make_open_state(now), 101, Some(27), 1);
+        let transition = kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(101),
+                    started_event_id: 27,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![cmd.clone()],
+                force_new_workflow_task: false,
+                now,
+            }),
+        ).unwrap();
+
+        let expected_activity_id = match cmd {
+            WorkflowCommand::ScheduleActivity { activity_id, .. } => activity_id,
+            _ => unreachable!(),
+        };
+        let activity = transition.next_state.activities.get(&expected_activity_id).unwrap();
+        prop_assert_eq!(activity.pause_info.clone(), None);
+        prop_assert_eq!(activity.stamp, 0);
+    }
+
+    #[test]
+    fn property_68_unpause_workflow_rejects_non_paused(req in arb_unpause_workflow_request(fixed_now())) {
+        let now = fixed_now();
+        let result = kernel().apply(
+            LoadedRun::Existing(make_open_state(now)),
+            Command::UnpauseWorkflow(req),
+        );
+        prop_assert_eq!(result, Err(tokeira_kernel::Reject::NotPaused));
+    }
+}
+
 // Properties 15, 23, and 24 are deterministic single-case checks, so they live
 // outside the proptest! block.
 #[test]
 fn property_15_wft_timed_out_clears_sticky() {
     let now = fixed_now();
-    let state = with_sticky(with_pending_wft(make_open_state(now), 71, Some(41), 1), "sticky-worker", now);
-    let transition = kernel().apply(
-        LoadedRun::Existing(state),
-        Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
-            logical_seq: LogicalTaskSeq(71),
-            started_event_id: 41,
-            timeout_type: WorkflowTaskTimeoutType::StartToClose,
-            now,
-        }),
-    ).unwrap();
+    let state = with_sticky(
+        with_pending_wft(make_open_state(now), 71, Some(41), 1),
+        "sticky-worker",
+        now,
+    );
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+                logical_seq: LogicalTaskSeq(71),
+                started_event_id: 41,
+                timeout_type: WorkflowTaskTimeoutType::StartToClose,
+                now,
+            }),
+        )
+        .unwrap();
     assert_eq!(transition.next_state.sticky, None);
     match &transition.dispatch_ops[0] {
-        DispatchOp::EnqueueWorkflowTask { sticky_preferred, .. } => {
+        DispatchOp::EnqueueWorkflowTask {
+            sticky_preferred, ..
+        } => {
             assert_eq!(sticky_preferred, &None);
         }
         other => panic!("unexpected dispatch op: {other:?}"),
@@ -1831,10 +2558,9 @@ fn property_24_cancel_timer_removes_timer() {
         .unwrap();
     assert!(!transition.next_state.timers.contains_key("timer-1"));
     assert!(
-        transition
-            .timer_ops
-            .iter()
-            .any(|op| matches!(op, TimerOp::Delete { timer_id } if timer_id == "timer-1"))
+        transition.timer_ops.iter().any(
+            |op| matches!(op, TimerOp::Delete { timer_id } if timer_id == "timer-1")
+        )
     );
 }
 
@@ -2025,7 +2751,13 @@ fn property_42_parent_close_policy_all_paths() {
         let direct_close = |command| {
             kernel()
                 .apply(
-                    LoadedRun::Existing(with_child(make_open_state(now), "child-1", 10, policy, true)),
+                    LoadedRun::Existing(with_child(
+                        make_open_state(now),
+                        "child-1",
+                        10,
+                        policy,
+                        true,
+                    )),
                     command,
                 )
                 .unwrap()
@@ -2066,13 +2798,20 @@ fn property_42_parent_close_policy_all_paths() {
                 request: request_context("term", now),
                 now,
             })),
-            direct_close(Command::WorkflowExecutionTimedOut(WorkflowExecutionTimedOutRequest {
-                timeout_type: WorkflowTimeoutType::RunTimeout,
-                retry_state: RetryState::Timeout,
-                now,
-            })),
-            wf_close(WorkflowCommand::CompleteWorkflow { result: payloads("done") }),
-            wf_close(WorkflowCommand::FailWorkflow { message: "fail".into(), details: None }),
+            direct_close(Command::WorkflowExecutionTimedOut(
+                WorkflowExecutionTimedOutRequest {
+                    timeout_type: WorkflowTimeoutType::RunTimeout,
+                    retry_state: RetryState::Timeout,
+                    now,
+                },
+            )),
+            wf_close(WorkflowCommand::CompleteWorkflow {
+                result: payloads("done"),
+            }),
+            wf_close(WorkflowCommand::FailWorkflow {
+                message: "fail".into(),
+                details: None,
+            }),
             wf_close(WorkflowCommand::CancelWorkflow),
             wf_close(WorkflowCommand::ContinueAsNew {
                 new_run_id: RunId::new(),
@@ -2296,14 +3035,22 @@ fn property_57_close_clears_pending_updates() {
     let direct_close = |command| {
         kernel()
             .apply(
-                LoadedRun::Existing(with_pending_update(make_open_state(now), "update-1")),
+                LoadedRun::Existing(with_pending_update(
+                    make_open_state(now),
+                    "update-1",
+                )),
                 command,
             )
             .unwrap()
     };
 
     let wf_close = |command| {
-        let started = with_pending_wft(with_pending_update(make_open_state(now), "update-1"), 64, Some(24), 1);
+        let started = with_pending_wft(
+            with_pending_update(make_open_state(now), "update-1"),
+            64,
+            Some(24),
+            1,
+        );
         kernel()
             .apply(
                 LoadedRun::Existing(started.clone()),
@@ -2332,13 +3079,20 @@ fn property_57_close_clears_pending_updates() {
             request: request_context("term", now),
             now,
         })),
-        direct_close(Command::WorkflowExecutionTimedOut(WorkflowExecutionTimedOutRequest {
-            timeout_type: WorkflowTimeoutType::RunTimeout,
-            retry_state: RetryState::Timeout,
-            now,
-        })),
-        wf_close(WorkflowCommand::CompleteWorkflow { result: payloads("done") }),
-        wf_close(WorkflowCommand::FailWorkflow { message: "fail".into(), details: None }),
+        direct_close(Command::WorkflowExecutionTimedOut(
+            WorkflowExecutionTimedOutRequest {
+                timeout_type: WorkflowTimeoutType::RunTimeout,
+                retry_state: RetryState::Timeout,
+                now,
+            },
+        )),
+        wf_close(WorkflowCommand::CompleteWorkflow {
+            result: payloads("done"),
+        }),
+        wf_close(WorkflowCommand::FailWorkflow {
+            message: "fail".into(),
+            details: None,
+        }),
         wf_close(WorkflowCommand::CancelWorkflow),
         wf_close(WorkflowCommand::ContinueAsNew {
             new_run_id: RunId::new(),
@@ -2526,7 +3280,12 @@ fn property_63_close_preserves_execution_options() {
     };
 
     let wf_close = |command| {
-        let started = with_pending_wft(with_execution_options(make_open_state(now), 2), 83, Some(32), 1);
+        let started = with_pending_wft(
+            with_execution_options(make_open_state(now), 2),
+            83,
+            Some(32),
+            1,
+        );
         kernel()
             .apply(
                 LoadedRun::Existing(started.clone()),
@@ -2555,13 +3314,20 @@ fn property_63_close_preserves_execution_options() {
             request: request_context("term-options", now),
             now,
         })),
-        direct_close(Command::WorkflowExecutionTimedOut(WorkflowExecutionTimedOutRequest {
-            timeout_type: WorkflowTimeoutType::RunTimeout,
-            retry_state: RetryState::Timeout,
-            now,
-        })),
-        wf_close(WorkflowCommand::CompleteWorkflow { result: payloads("done") }),
-        wf_close(WorkflowCommand::FailWorkflow { message: "fail".into(), details: None }),
+        direct_close(Command::WorkflowExecutionTimedOut(
+            WorkflowExecutionTimedOutRequest {
+                timeout_type: WorkflowTimeoutType::RunTimeout,
+                retry_state: RetryState::Timeout,
+                now,
+            },
+        )),
+        wf_close(WorkflowCommand::CompleteWorkflow {
+            result: payloads("done"),
+        }),
+        wf_close(WorkflowCommand::FailWorkflow {
+            message: "fail".into(),
+            details: None,
+        }),
         wf_close(WorkflowCommand::CancelWorkflow),
         wf_close(WorkflowCommand::ContinueAsNew {
             new_run_id: RunId::new(),
@@ -2577,8 +3343,14 @@ fn property_63_close_preserves_execution_options() {
     ];
 
     for transition in transitions {
-        assert_eq!(transition.next_state.versioning_override, Some(VersioningOverride));
-        assert_eq!(transition.next_state.completion_callbacks, vec![CompletionCallback, CompletionCallback]);
+        assert_eq!(
+            transition.next_state.versioning_override,
+            Some(VersioningOverride)
+        );
+        assert_eq!(
+            transition.next_state.completion_callbacks,
+            vec![CompletionCallback, CompletionCallback]
+        );
     }
 }
 
@@ -2766,14 +3538,22 @@ fn property_70_close_clears_pending_nexus_operations_without_dispatch_ops() {
     let direct_close = |command| {
         kernel()
             .apply(
-                LoadedRun::Existing(with_pending_nexus_operation(make_open_state(now), "op-1")),
+                LoadedRun::Existing(with_pending_nexus_operation(
+                    make_open_state(now),
+                    "op-1",
+                )),
                 command,
             )
             .unwrap()
     };
 
     let wf_close = |command| {
-        let started = with_pending_wft(with_pending_nexus_operation(make_open_state(now), "op-1"), 87, Some(36), 1);
+        let started = with_pending_wft(
+            with_pending_nexus_operation(make_open_state(now), "op-1"),
+            87,
+            Some(36),
+            1,
+        );
         kernel()
             .apply(
                 LoadedRun::Existing(started.clone()),
@@ -2802,13 +3582,20 @@ fn property_70_close_clears_pending_nexus_operations_without_dispatch_ops() {
             request: request_context("term-nexus", now),
             now,
         })),
-        direct_close(Command::WorkflowExecutionTimedOut(WorkflowExecutionTimedOutRequest {
-            timeout_type: WorkflowTimeoutType::RunTimeout,
-            retry_state: RetryState::Timeout,
-            now,
-        })),
-        wf_close(WorkflowCommand::CompleteWorkflow { result: payloads("done") }),
-        wf_close(WorkflowCommand::FailWorkflow { message: "fail".into(), details: None }),
+        direct_close(Command::WorkflowExecutionTimedOut(
+            WorkflowExecutionTimedOutRequest {
+                timeout_type: WorkflowTimeoutType::RunTimeout,
+                retry_state: RetryState::Timeout,
+                now,
+            },
+        )),
+        wf_close(WorkflowCommand::CompleteWorkflow {
+            result: payloads("done"),
+        }),
+        wf_close(WorkflowCommand::FailWorkflow {
+            message: "fail".into(),
+            details: None,
+        }),
         wf_close(WorkflowCommand::CancelWorkflow),
         wf_close(WorkflowCommand::ContinueAsNew {
             new_run_id: RunId::new(),
@@ -2825,202 +3612,17 @@ fn property_70_close_clears_pending_nexus_operations_without_dispatch_ops() {
 
     for transition in transitions {
         assert!(transition.next_state.pending_nexus_operations.is_empty());
-        assert_eq!(transition.dispatch_ops.iter().filter(|op| matches!(op, DispatchOp::ScheduleNexusOperation { .. } | DispatchOp::CancelNexusOperation { .. })).count(), 0);
-    }
-}
-
-proptest! {
-    #[test]
-    fn property_71_reset_closes_run_with_terminal_state_invariants(
-        state in arb_open_state_for_reset(fixed_now())
-    ) {
-        let now = fixed_now();
-        let transition = kernel().apply(
-            LoadedRun::Existing(state.clone()),
-            Command::Reset(ResetRequest {
-                fork_event_id: 1,
-                new_run_id: RunId::new(),
-                reason: "reset".into(),
-                request: request_context("reset-prop-1", now),
-                now,
-            }),
-        ).unwrap();
-
-        prop_assert_eq!(transition.next_state.status, ExecutionStatus::Terminated);
-        prop_assert!(transition.next_state.closed_at.is_some());
-        prop_assert!(transition.next_state.pending_workflow_task.is_none());
-        prop_assert!(transition.next_state.sticky.is_none());
-        prop_assert!(transition.next_state.activities.is_empty());
-        prop_assert!(transition.next_state.timers.is_empty());
-        prop_assert!(transition.next_state.children.is_empty());
-        prop_assert!(transition.next_state.pending_external_signals.is_empty());
-        prop_assert!(transition.next_state.pending_external_cancels.is_empty());
-        prop_assert!(transition.next_state.pending_updates.is_empty());
-        prop_assert!(transition.next_state.pending_nexus_operations.is_empty());
-    }
-
-    #[test]
-    fn property_72_reset_entity_cleanup_ops_match_input_state(
-        state in arb_open_state_for_reset(fixed_now())
-    ) {
-        let now = fixed_now();
-        let expected_activity_ids: Vec<_> = state.activities.keys().cloned().collect();
-        let expected_timer_ids: Vec<_> = state.timers.keys().cloned().collect();
-        let transition = kernel().apply(
-            LoadedRun::Existing(state.clone()),
-            Command::Reset(ResetRequest {
-                fork_event_id: state.last_event_id,
-                new_run_id: RunId::new(),
-                reason: "reset".into(),
-                request: request_context("reset-prop-2", now),
-                now,
-            }),
-        ).unwrap();
-
-        prop_assert_eq!(transition.activity_ops.len(), expected_activity_ids.len());
-        prop_assert_eq!(transition.timer_ops.len(), expected_timer_ids.len());
-        for op in &transition.activity_ops {
-            match op {
-                ActivityOp::Delete { activity_id } => prop_assert!(expected_activity_ids.contains(activity_id)),
-                _ => prop_assert!(false),
-            }
-        }
-        for op in &transition.timer_ops {
-            match op {
-                TimerOp::Delete { timer_id } => prop_assert!(expected_timer_ids.contains(timer_id)),
-                _ => prop_assert!(false),
-            }
-        }
-    }
-
-    #[test]
-    fn property_73_reset_emits_exactly_one_request_dedupe_op(
-        state in arb_open_state_for_reset(fixed_now()),
-        request_id in arb_small_string()
-    ) {
-        let now = fixed_now();
-        let req = ResetRequest {
-            fork_event_id: 1,
-            new_run_id: RunId::new(),
-            reason: "reset".into(),
-            request: request_context(&request_id, now),
-            now,
-        };
-        let transition = kernel().apply(LoadedRun::Existing(state), Command::Reset(req.clone())).unwrap();
-        prop_assert_eq!(transition.request_dedupe_ops.len(), 1);
-        prop_assert_eq!(transition.request_dedupe_ops[0].clone(), RequestDedupeOp { request_id: req.request.request_id });
-    }
-
-    #[test]
-    fn property_74_reset_fork_event_id_validation_rejects_invalid_values(
-        state in arb_open_state_for_reset(fixed_now())
-    ) {
-        let now = fixed_now();
-        let invalids = [0, -1, state.last_event_id + 1];
-        for fork_event_id in invalids {
-            let result = kernel().apply(
-                LoadedRun::Existing(state.clone()),
-                Command::Reset(ResetRequest {
-                    fork_event_id,
-                    new_run_id: RunId::new(),
-                    reason: "reset".into(),
-                    request: request_context("reset-prop-4", now),
-                    now,
-                }),
-            );
-            prop_assert_eq!(matches!(result, Err(Reject::ResetConstraintViolation { .. })), true);
-        }
-    }
-
-    #[test]
-    fn property_75_reset_wft_failed_event_carries_correct_metadata(
-        state in arb_open_state_for_reset(fixed_now()),
-        request_id in arb_small_string(),
-        reason in arb_small_string()
-    ) {
-        let now = fixed_now();
-        let req = ResetRequest {
-            fork_event_id: state.last_event_id,
-            new_run_id: RunId::new(),
-            reason,
-            request: request_context(&request_id, now),
-            now,
-        };
-        let transition = kernel().apply(LoadedRun::Existing(state.clone()), Command::Reset(req.clone())).unwrap();
-
-        match &transition.history_events[0].kind {
-            HistoryEventKind::WorkflowTaskFailed {
-                logical_seq,
-                failure_cause,
-                failure_details,
-                identity,
-                base_run_id,
-                new_run_id,
-                fork_event_version,
-                fork_event_id,
-                ..
-            } => {
-                prop_assert_eq!(*logical_seq, state.next_workflow_task_seq);
-                prop_assert_eq!(failure_cause, &WorkflowTaskFailedCause::ResetWorkflow);
-                prop_assert!(failure_details.is_none());
-                prop_assert_eq!(identity, &WorkerIdentity("reset".into()));
-                prop_assert_eq!(*base_run_id, Some(state.run_id));
-                prop_assert_eq!(*new_run_id, Some(req.new_run_id));
-                prop_assert!(fork_event_version.is_none());
-                prop_assert_eq!(*fork_event_id, Some(req.fork_event_id));
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn property_76_reset_emits_no_wft_dispatch_ops(
-        state in arb_open_state_for_reset(fixed_now())
-    ) {
-        let now = fixed_now();
-        let transition = kernel().apply(
-            LoadedRun::Existing(state),
-            Command::Reset(ResetRequest {
-                fork_event_id: 1,
-                new_run_id: RunId::new(),
-                reason: "reset".into(),
-                request: request_context("reset-prop-6", now),
-                now,
-            }),
-        ).unwrap();
-
-        prop_assert_eq!(
+        assert_eq!(
             transition
                 .dispatch_ops
                 .iter()
-                .all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. })),
-            true
+                .filter(|op| matches!(
+                    op,
+                    DispatchOp::ScheduleNexusOperation { .. }
+                        | DispatchOp::CancelNexusOperation { .. }
+                ))
+                .count(),
+            0
         );
-    }
-
-    #[test]
-    fn property_77_regular_wft_failed_events_carry_no_reset_metadata(
-        req in arb_wft_failed_request(LogicalTaskSeq(91), 41, fixed_now())
-    ) {
-        prop_assume!(req.failure_cause != WorkflowTaskFailedCause::ResetWorkflow);
-        let now = fixed_now();
-        let state = with_pending_wft(make_open_state(now), 91, Some(41), 1);
-        let transition = kernel().apply(LoadedRun::Existing(state), Command::WorkflowTaskFailed(req)).unwrap();
-
-        match &transition.history_events[0].kind {
-            HistoryEventKind::WorkflowTaskFailed {
-                base_run_id,
-                new_run_id,
-                fork_event_version,
-                fork_event_id,
-                ..
-            } => {
-                prop_assert!(base_run_id.is_none());
-                prop_assert!(new_run_id.is_none());
-                prop_assert!(fork_event_version.is_none());
-                prop_assert!(fork_event_id.is_none());
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
     }
 }

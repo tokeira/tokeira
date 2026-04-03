@@ -7,7 +7,8 @@ use tokio_stream::{StreamExt, wrappers::TcpListenerStream};
 use tonic::{Request, transport::Server};
 use tonic_reflection::pb::{
     ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
-    server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
+    server_reflection_request::MessageRequest,
+    server_reflection_response::MessageResponse,
 };
 
 use tokeira_edge::{
@@ -15,8 +16,7 @@ use tokeira_edge::{
     LocalOnlyRouter, LongPollConfig, LongPollGate, OperatorService, ResolvedNamespace,
     WorkflowExecutionDescription, WorkflowService,
     grpc::{
-        operator_service::OperatorServiceGrpc,
-        runtime_adapter::RuntimeAdapter,
+        operator_service::OperatorServiceGrpc, runtime_adapter::RuntimeAdapter,
         workflow_service::WorkflowServiceGrpc,
     },
     translate::to_internal::namespace_id_for,
@@ -31,7 +31,7 @@ use tokeira_proto::{
         workflow_service_client::WorkflowServiceClient,
     },
 };
-use tokeira_runtime::TokeiraRuntime;
+use tokeira_runtime::{LaneConfig, TokeiraRuntime};
 use tokeira_storage::{InMemoryStore, RunRepository};
 use tokeira_types::{ExecutionRef, WorkflowId};
 
@@ -106,8 +106,16 @@ async fn grpc_roundtrip_start_describe_and_reflection() -> Result<()> {
     };
 
     let names: Vec<_> = services.into_iter().map(|svc| svc.name).collect();
-    assert!(names.iter().any(|name| name == "temporal.api.workflowservice.v1.WorkflowService"));
-    assert!(names.iter().any(|name| name == "temporal.api.operatorservice.v1.OperatorService"));
+    assert!(
+        names
+            .iter()
+            .any(|name| name == "temporal.api.workflowservice.v1.WorkflowService")
+    );
+    assert!(
+        names
+            .iter()
+            .any(|name| name == "temporal.api.operatorservice.v1.OperatorService")
+    );
 
     let _ = shutdown_tx.send(());
     server.await??;
@@ -115,17 +123,18 @@ async fn grpc_roundtrip_start_describe_and_reflection() -> Result<()> {
     Ok(())
 }
 
-async fn spawn_test_server(
-) -> Result<(
+async fn spawn_test_server() -> Result<(
     std::net::SocketAddr,
     oneshot::Sender<()>,
     tokio::task::JoinHandle<Result<()>>,
 )> {
     let store = Arc::new(InMemoryStore::default());
-    let runtime = Arc::new(TokeiraRuntime::new(store.clone(), 4));
+    let runtime = Arc::new(TokeiraRuntime::new(store.clone(), 4, LaneConfig::default()));
 
     let namespaces = Arc::new(InMemoryNamespaceCache::new());
-    namespaces.insert(ResolvedNamespace::active("default")).await;
+    namespaces
+        .insert(ResolvedNamespace::active("default"))
+        .await;
 
     let interceptors = Arc::new(EdgeInterceptors::permissive(namespaces));
     let workflow_service = WorkflowService::new(
@@ -181,7 +190,11 @@ impl<R> ExecutionResolver for StoreExecutionResolver<R>
 where
     R: RunRepository + 'static,
 {
-    async fn current_run_key(&self, namespace: &str, workflow_id: &str) -> Result<Option<tokeira_types::RunKey>> {
+    async fn current_run_key(
+        &self,
+        namespace: &str,
+        workflow_id: &str,
+    ) -> Result<Option<tokeira_types::RunKey>> {
         self.repo
             .resolve_execution(&ExecutionRef {
                 namespace_id: namespace_id_for(namespace),
@@ -224,7 +237,9 @@ where
                 memo: state.memo,
                 search_attributes: state.search_attributes,
             })),
-            LoadedRun::Absent => Err(anyhow!("resolved run missing from storage: {:?}", run_key)),
+            LoadedRun::Absent => {
+                Err(anyhow!("resolved run missing from storage: {:?}", run_key))
+            }
         }
     }
 }

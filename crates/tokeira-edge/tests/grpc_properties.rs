@@ -11,27 +11,32 @@ use tokeira_edge::{
         translate::{
             count_request_to_edge, count_response_to_proto, describe_request_to_edge,
             describe_response_to_proto, list_request_to_edge, list_response_to_proto,
-            poll_request_to_edge, poll_response_to_proto, proto_command_to_workflow_command,
-            signal_request_to_edge, start_request_to_edge, start_response_to_proto,
-            workflow_command_to_proto,
+            poll_request_to_edge, poll_response_to_proto,
+            proto_command_to_workflow_command, signal_request_to_edge,
+            start_request_to_edge, start_response_to_proto, workflow_command_to_proto,
         },
     },
     translate::{
         CountWorkflowExecutionsRequest, CountWorkflowExecutionsResponse,
         DescribeWorkflowExecutionRequest, GroupCount, ListWorkflowExecutionsRequest,
-        ListWorkflowExecutionsResponse, PollWorkflowTaskQueueRequest, PollWorkflowTaskQueueResponse,
-        SignalWorkflowExecutionRequest, StartWorkflowExecutionRequest,
-        StartWorkflowExecutionResponse, WorkflowExecutionDescription, WorkflowExecutionSummary,
-        WorkflowTaskPayloadDto,
+        ListWorkflowExecutionsResponse, PollWorkflowTaskQueueRequest,
+        PollWorkflowTaskQueueResponse, SignalWorkflowExecutionRequest,
+        StartWorkflowExecutionRequest, StartWorkflowExecutionResponse,
+        WorkflowExecutionDescription, WorkflowExecutionSummary, WorkflowTaskPayloadDto,
     },
 };
 use tokeira_kernel::WorkflowCommand;
 use tokeira_proto::{
-    conversions::common::{memo_from_domain, payloads_from_domain, search_attributes_from_domain},
+    conversions::common::{
+        memo_from_domain, payloads_from_domain, search_attributes_from_domain,
+    },
     enums::WorkflowExecutionStatus,
     workflowservice,
 };
-use tokeira_types::{ExecutionStatus, Memo, Payload, Payloads, RunId, RunKey, SearchAttrValue, SearchAttributes};
+use tokeira_types::{
+    ExecutionStatus, Memo, Payload, Payloads, RunId, RunKey, SearchAttrValue,
+    SearchAttributes,
+};
 use tonic::{Code, metadata::MetadataMap};
 use uuid::Uuid;
 
@@ -201,11 +206,15 @@ proptest! {
 
 #[test]
 fn property_proto_conversion_status_maps_to_invalid_argument() {
-    let status = proto_conversion_status(tokeira_proto::conversions::ProtoConversionError::MissingField("field"));
+    let status = proto_conversion_status(
+        tokeira_proto::conversions::ProtoConversionError::MissingField("field"),
+    );
     assert_eq!(status.code(), Code::InvalidArgument);
 }
 
-fn start_request_to_proto(edge: &StartWorkflowExecutionRequest) -> workflowservice::StartWorkflowExecutionRequest {
+fn start_request_to_proto(
+    edge: &StartWorkflowExecutionRequest,
+) -> workflowservice::StartWorkflowExecutionRequest {
     workflowservice::StartWorkflowExecutionRequest {
         namespace: edge.namespace.clone(),
         workflow_id: edge.workflow_id.clone(),
@@ -220,7 +229,9 @@ fn start_request_to_proto(edge: &StartWorkflowExecutionRequest) -> workflowservi
     }
 }
 
-fn signal_request_to_proto(edge: &SignalWorkflowExecutionRequest) -> workflowservice::SignalWorkflowExecutionRequest {
+fn signal_request_to_proto(
+    edge: &SignalWorkflowExecutionRequest,
+) -> workflowservice::SignalWorkflowExecutionRequest {
     workflowservice::SignalWorkflowExecutionRequest {
         namespace: edge.namespace.clone(),
         workflow_id: edge.workflow_id.clone(),
@@ -232,7 +243,9 @@ fn signal_request_to_proto(edge: &SignalWorkflowExecutionRequest) -> workflowser
     }
 }
 
-fn poll_request_to_proto(edge: &PollWorkflowTaskQueueRequest) -> workflowservice::PollWorkflowTaskQueueRequest {
+fn poll_request_to_proto(
+    edge: &PollWorkflowTaskQueueRequest,
+) -> workflowservice::PollWorkflowTaskQueueRequest {
     workflowservice::PollWorkflowTaskQueueRequest {
         namespace: edge.namespace.clone(),
         task_queue: Some(tokeira_proto::common::TaskQueue {
@@ -247,6 +260,7 @@ fn poll_request_to_proto(edge: &PollWorkflowTaskQueueRequest) -> workflowservice
 fn execution_status_to_proto(status: ExecutionStatus) -> i32 {
     match status {
         ExecutionStatus::Running => WorkflowExecutionStatus::Running as i32,
+        ExecutionStatus::Paused => WorkflowExecutionStatus::Unspecified as i32,
         ExecutionStatus::Completed => WorkflowExecutionStatus::Completed as i32,
         ExecutionStatus::Failed => WorkflowExecutionStatus::Failed as i32,
         ExecutionStatus::Cancelled => WorkflowExecutionStatus::Canceled as i32,
@@ -261,7 +275,9 @@ fn expected_code(err: &EdgeError) -> Code {
         EdgeError::BadRequest(_) => Code::InvalidArgument,
         EdgeError::Unauthorized(_) => Code::Unauthenticated,
         EdgeError::Forbidden { .. } => Code::PermissionDenied,
-        EdgeError::NamespaceNotFound(_) | EdgeError::WorkflowNotFound { .. } => Code::NotFound,
+        EdgeError::NamespaceNotFound(_) | EdgeError::WorkflowNotFound { .. } => {
+            Code::NotFound
+        }
         EdgeError::NamespaceDeleted(_) => Code::FailedPrecondition,
         EdgeError::TooManyLongPolls => Code::ResourceExhausted,
         EdgeError::LongPollAdmissionTimeout => Code::DeadlineExceeded,
@@ -276,8 +292,13 @@ fn arb_small_string() -> impl Strategy<Value = String> {
 }
 
 fn arb_header_key() -> impl Strategy<Value = String> {
-    prop::collection::vec(prop::char::range('a', 'z'), 1..8)
-        .prop_map(|chars| format!("x-{}", chars.into_iter().collect::<String>()))
+    prop::collection::vec(prop::char::range('a', 'z'), 1..8).prop_filter_map(
+        "avoid grpc binary metadata suffix",
+        |chars| {
+            let suffix: String = chars.into_iter().collect();
+            (!suffix.ends_with("bin")).then(|| format!("x-{suffix}"))
+        },
+    )
 }
 
 fn arb_header_value() -> impl Strategy<Value = String> {
@@ -304,11 +325,15 @@ fn arb_memo() -> impl Strategy<Value = Memo> {
 fn arb_search_attr_value() -> impl Strategy<Value = SearchAttrValue> {
     prop_oneof![
         arb_small_string().prop_map(SearchAttrValue::Keyword),
-        prop::collection::vec(arb_small_string(), 0..4).prop_map(SearchAttrValue::KeywordList),
+        prop::collection::vec(arb_small_string(), 0..4)
+            .prop_map(SearchAttrValue::KeywordList),
         any::<i64>().prop_map(SearchAttrValue::Int),
         any::<bool>().prop_map(SearchAttrValue::Bool),
-        (-1_000_000i64..1_000_000i64).prop_map(|v| SearchAttrValue::Double(v as f64 / 10.0)),
-        (0i64..4_000_000_000i64).prop_map(|secs| SearchAttrValue::Datetime(OffsetDateTime::from_unix_timestamp(secs).unwrap())),
+        (-1_000_000i64..1_000_000i64)
+            .prop_map(|v| SearchAttrValue::Double(v as f64 / 10.0)),
+        (0i64..4_000_000_000i64).prop_map(|secs| SearchAttrValue::Datetime(
+            OffsetDateTime::from_unix_timestamp(secs).unwrap()
+        )),
         arb_small_string().prop_map(SearchAttrValue::Text),
     ]
 }
@@ -329,20 +354,31 @@ fn arb_start_request() -> impl Strategy<Value = StartWorkflowExecutionRequest> {
         arb_memo(),
         arb_search_attributes(),
     )
-        .prop_map(|(namespace, workflow_id, workflow_type, task_queue, input, request_id, memo, search_attributes)| StartWorkflowExecutionRequest {
-            namespace,
-            workflow_id,
-            workflow_type,
-            task_queue,
-            input,
-            request_id,
-            memo,
-            search_attributes,
-            identity: None,
-            run_key: None,
-            run_id: None,
-            now: None,
-        })
+        .prop_map(
+            |(
+                namespace,
+                workflow_id,
+                workflow_type,
+                task_queue,
+                input,
+                request_id,
+                memo,
+                search_attributes,
+            )| StartWorkflowExecutionRequest {
+                namespace,
+                workflow_id,
+                workflow_type,
+                task_queue,
+                input,
+                request_id,
+                memo,
+                search_attributes,
+                identity: None,
+                run_key: None,
+                run_id: None,
+                now: None,
+            },
+        )
 }
 
 fn arb_signal_request() -> impl Strategy<Value = SignalWorkflowExecutionRequest> {
@@ -354,33 +390,40 @@ fn arb_signal_request() -> impl Strategy<Value = SignalWorkflowExecutionRequest>
         prop::option::of(arb_small_string()),
         prop::option::of(arb_small_string()),
     )
-        .prop_map(|(namespace, workflow_id, signal_name, input, request_id, identity)| SignalWorkflowExecutionRequest {
-            namespace,
-            workflow_id,
-            signal_name,
-            input,
-            request_id,
-            identity,
-            now: None,
-        })
+        .prop_map(
+            |(namespace, workflow_id, signal_name, input, request_id, identity)| {
+                SignalWorkflowExecutionRequest {
+                    namespace,
+                    workflow_id,
+                    signal_name,
+                    input,
+                    request_id,
+                    identity,
+                    now: None,
+                }
+            },
+        )
 }
 
 fn arb_poll_request() -> impl Strategy<Value = PollWorkflowTaskQueueRequest> {
-    (arb_small_string(), arb_small_string(), arb_small_string())
-        .prop_map(|(namespace, task_queue, worker_identity)| PollWorkflowTaskQueueRequest {
+    (arb_small_string(), arb_small_string(), arb_small_string()).prop_map(
+        |(namespace, task_queue, worker_identity)| PollWorkflowTaskQueueRequest {
             namespace,
             task_queue,
             worker_identity,
             sticky_run: None,
             timeout: Duration::from_secs(60),
             sticky_ttl: Duration::from_secs(30),
-        })
+        },
+    )
 }
 
 fn arb_describe_request() -> impl Strategy<Value = DescribeWorkflowExecutionRequest> {
-    (arb_small_string(), arb_small_string()).prop_map(|(namespace, workflow_id)| DescribeWorkflowExecutionRequest {
-        namespace,
-        workflow_id,
+    (arb_small_string(), arb_small_string()).prop_map(|(namespace, workflow_id)| {
+        DescribeWorkflowExecutionRequest {
+            namespace,
+            workflow_id,
+        }
     })
 }
 
@@ -391,11 +434,13 @@ fn arb_list_request() -> impl Strategy<Value = ListWorkflowExecutionsRequest> {
         0usize..32usize,
         prop::option::of(arb_small_string()),
     )
-        .prop_map(|(namespace, query, page_size, next_page_token)| ListWorkflowExecutionsRequest {
-            namespace,
-            query,
-            page_size,
-            next_page_token,
+        .prop_map(|(namespace, query, page_size, next_page_token)| {
+            ListWorkflowExecutionsRequest {
+                namespace,
+                query,
+                page_size,
+                next_page_token,
+            }
         })
 }
 
@@ -405,20 +450,26 @@ fn arb_count_request() -> impl Strategy<Value = CountWorkflowExecutionsRequest> 
         prop::option::of(arb_small_string()),
         prop::option::of(arb_small_string()),
     )
-        .prop_map(|(namespace, query, group_by)| CountWorkflowExecutionsRequest {
-            namespace,
-            query,
-            group_by,
-        })
+        .prop_map(
+            |(namespace, query, group_by)| CountWorkflowExecutionsRequest {
+                namespace,
+                query,
+                group_by,
+            },
+        )
 }
 
 fn arb_start_response() -> impl Strategy<Value = StartWorkflowExecutionResponse> {
-    (any::<u128>(), any::<u128>(), any::<u64>(), any::<i64>()).prop_map(|(run_key, run_id, transition_seq, last_event_id)| StartWorkflowExecutionResponse {
-        run_key: RunKey(Uuid::from_u128(run_key)),
-        run_id: RunId(Uuid::from_u128(run_id)),
-        transition_seq,
-        last_event_id,
-    })
+    (any::<u128>(), any::<u128>(), any::<u64>(), any::<i64>()).prop_map(
+        |(run_key, run_id, transition_seq, last_event_id)| {
+            StartWorkflowExecutionResponse {
+                run_key: RunKey(Uuid::from_u128(run_key)),
+                run_id: RunId(Uuid::from_u128(run_id)),
+                transition_seq,
+                last_event_id,
+            }
+        },
+    )
 }
 
 fn arb_poll_response() -> impl Strategy<Value = PollWorkflowTaskQueueResponse> {
@@ -430,17 +481,26 @@ fn arb_poll_response() -> impl Strategy<Value = PollWorkflowTaskQueueResponse> {
         any::<u128>(),
         arb_small_string(),
     )
-        .prop_map(|(task_token, started_event_id, attempt, workflow_id, run_key, task_queue)| PollWorkflowTaskQueueResponse {
-            task_token,
-            started_event_id,
-            attempt,
-            payload: WorkflowTaskPayloadDto {
+        .prop_map(
+            |(
+                task_token,
+                started_event_id,
+                attempt,
                 workflow_id,
-                run_key: RunKey(Uuid::from_u128(run_key)),
+                run_key,
                 task_queue,
-                history: Vec::new(),
+            )| PollWorkflowTaskQueueResponse {
+                task_token,
+                started_event_id,
+                attempt,
+                payload: WorkflowTaskPayloadDto {
+                    workflow_id,
+                    run_key: RunKey(Uuid::from_u128(run_key)),
+                    task_queue,
+                    history: Vec::new(),
+                },
             },
-        })
+        )
 }
 
 fn arb_description() -> impl Strategy<Value = WorkflowExecutionDescription> {
@@ -463,21 +523,43 @@ fn arb_description() -> impl Strategy<Value = WorkflowExecutionDescription> {
             arb_search_attributes(),
         ),
     )
-        .prop_map(|((namespace, workflow_id, run_key, run_id, workflow_type, task_queue, status), (start_time, close_time, history_length, state_transition_count, memo, search_attributes))| WorkflowExecutionDescription {
-            namespace,
-            workflow_id,
-            run_key: RunKey(Uuid::from_u128(run_key)),
-            run_id: RunId(Uuid::from_u128(run_id)),
-            workflow_type,
-            task_queue,
-            status,
-            start_time: start_time.map(|secs| OffsetDateTime::from_unix_timestamp(secs).unwrap()),
-            close_time: close_time.map(|secs| OffsetDateTime::from_unix_timestamp(secs).unwrap()),
-            history_length,
-            state_transition_count,
-            memo,
-            search_attributes,
-        })
+        .prop_map(
+            |(
+                (
+                    namespace,
+                    workflow_id,
+                    run_key,
+                    run_id,
+                    workflow_type,
+                    task_queue,
+                    status,
+                ),
+                (
+                    start_time,
+                    close_time,
+                    history_length,
+                    state_transition_count,
+                    memo,
+                    search_attributes,
+                ),
+            )| WorkflowExecutionDescription {
+                namespace,
+                workflow_id,
+                run_key: RunKey(Uuid::from_u128(run_key)),
+                run_id: RunId(Uuid::from_u128(run_id)),
+                workflow_type,
+                task_queue,
+                status,
+                start_time: start_time
+                    .map(|secs| OffsetDateTime::from_unix_timestamp(secs).unwrap()),
+                close_time: close_time
+                    .map(|secs| OffsetDateTime::from_unix_timestamp(secs).unwrap()),
+                history_length,
+                state_transition_count,
+                memo,
+                search_attributes,
+            },
+        )
 }
 
 fn arb_list_response() -> impl Strategy<Value = ListWorkflowExecutionsResponse> {
@@ -485,10 +567,12 @@ fn arb_list_response() -> impl Strategy<Value = ListWorkflowExecutionsResponse> 
         prop::collection::vec(arb_summary(), 0..4),
         prop::option::of(arb_small_string()),
     )
-        .prop_map(|(executions, next_page_token)| ListWorkflowExecutionsResponse {
-            executions,
-            next_page_token,
-        })
+        .prop_map(
+            |(executions, next_page_token)| ListWorkflowExecutionsResponse {
+                executions,
+                next_page_token,
+            },
+        )
 }
 
 fn arb_summary() -> impl Strategy<Value = WorkflowExecutionSummary> {
@@ -502,16 +586,29 @@ fn arb_summary() -> impl Strategy<Value = WorkflowExecutionSummary> {
         prop::option::of(0i64..4_000_000_000i64),
         prop::option::of(0i64..4_000_000_000i64),
     )
-        .prop_map(|(namespace, workflow_id, run_id, workflow_type, task_queue, status, start_time, close_time)| WorkflowExecutionSummary {
-            namespace,
-            workflow_id,
-            run_id: RunId(Uuid::from_u128(run_id)),
-            workflow_type,
-            task_queue,
-            status,
-            start_time: start_time.map(|secs| OffsetDateTime::from_unix_timestamp(secs).unwrap()),
-            close_time: close_time.map(|secs| OffsetDateTime::from_unix_timestamp(secs).unwrap()),
-        })
+        .prop_map(
+            |(
+                namespace,
+                workflow_id,
+                run_id,
+                workflow_type,
+                task_queue,
+                status,
+                start_time,
+                close_time,
+            )| WorkflowExecutionSummary {
+                namespace,
+                workflow_id,
+                run_id: RunId(Uuid::from_u128(run_id)),
+                workflow_type,
+                task_queue,
+                status,
+                start_time: start_time
+                    .map(|secs| OffsetDateTime::from_unix_timestamp(secs).unwrap()),
+                close_time: close_time
+                    .map(|secs| OffsetDateTime::from_unix_timestamp(secs).unwrap()),
+            },
+        )
 }
 
 fn arb_count_response() -> impl Strategy<Value = CountWorkflowExecutionsResponse> {
@@ -531,6 +628,7 @@ fn arb_count_response() -> impl Strategy<Value = CountWorkflowExecutionsResponse
 fn arb_execution_status() -> impl Strategy<Value = ExecutionStatus> {
     prop_oneof![
         Just(ExecutionStatus::Running),
+        Just(ExecutionStatus::Paused),
         Just(ExecutionStatus::Completed),
         Just(ExecutionStatus::Failed),
         Just(ExecutionStatus::Cancelled),
@@ -542,92 +640,118 @@ fn arb_execution_status() -> impl Strategy<Value = ExecutionStatus> {
 
 fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
     prop_oneof![
-        (arb_small_string(), arb_small_string(), arb_payloads()).prop_map(|(activity_id, task_queue, input)| WorkflowCommand::ScheduleActivity {
-            activity_id,
-            task_queue: tokeira_types::TaskQueueName(task_queue),
-            input,
-            schedule_to_close_timeout: None,
-            schedule_to_start_timeout: None,
-            start_to_close_timeout: None,
-            heartbeat_timeout: None,
-        }),
+        (arb_small_string(), arb_small_string(), arb_payloads()).prop_map(
+            |(activity_id, task_queue, input)| WorkflowCommand::ScheduleActivity {
+                activity_id,
+                task_queue: tokeira_types::TaskQueueName(task_queue),
+                input,
+                retry_policy: None,
+                schedule_to_close_timeout: None,
+                schedule_to_start_timeout: None,
+                start_to_close_timeout: None,
+                heartbeat_timeout: None,
+            }
+        ),
         arb_memo().prop_map(WorkflowCommand::UpsertMemo),
         arb_search_attributes().prop_map(WorkflowCommand::UpsertSearchAttributes),
         (
             arb_small_string(),
             prop::collection::btree_map(arb_small_string(), arb_payloads(), 0..3),
             prop::option::of(arb_payload()),
-            prop::option::of(prop::collection::btree_map(arb_small_string(), arb_payload(), 0..3)),
-        ).prop_map(|(marker_name, details, failure, header)| WorkflowCommand::RecordMarker {
-            marker_name,
-            details,
-            failure,
-            header,
-        }),
+            prop::option::of(prop::collection::btree_map(
+                arb_small_string(),
+                arb_payload(),
+                0..3
+            )),
+        )
+            .prop_map(|(marker_name, details, failure, header)| {
+                WorkflowCommand::RecordMarker {
+                    marker_name,
+                    details,
+                    failure,
+                    header,
+                }
+            }),
         arb_payloads().prop_map(|result| WorkflowCommand::CompleteWorkflow { result }),
-        (arb_small_string(), prop::option::of(arb_payload())).prop_map(|(message, details)| WorkflowCommand::FailWorkflow { message, details }),
+        (arb_small_string(), prop::option::of(arb_payload())).prop_map(
+            |(message, details)| WorkflowCommand::FailWorkflow { message, details }
+        ),
         (
             arb_small_string(),
             arb_small_string(),
             arb_payloads(),
             arb_memo(),
             arb_search_attributes(),
-        ).prop_map(|(workflow_type, task_queue, input, memo, search_attributes)| WorkflowCommand::ContinueAsNew {
-            new_run_id: tokeira_types::RunId::new(),
-            workflow_type: tokeira_types::WorkflowType(workflow_type),
-            task_queue: tokeira_types::TaskQueueName(task_queue),
-            input,
-            memo,
-            search_attributes,
-            workflow_execution_timeout: None,
-            workflow_run_timeout: None,
-            workflow_task_timeout: time::Duration::seconds(10),
-        }),
+        )
+            .prop_map(
+                |(workflow_type, task_queue, input, memo, search_attributes)| {
+                    WorkflowCommand::ContinueAsNew {
+                        new_run_id: tokeira_types::RunId::new(),
+                        workflow_type: tokeira_types::WorkflowType(workflow_type),
+                        task_queue: tokeira_types::TaskQueueName(task_queue),
+                        input,
+                        memo,
+                        search_attributes,
+                        workflow_execution_timeout: None,
+                        workflow_run_timeout: None,
+                        workflow_task_timeout: time::Duration::seconds(10),
+                    }
+                }
+            ),
         Just(WorkflowCommand::CancelWorkflow),
-        arb_small_string().prop_map(|activity_id| WorkflowCommand::RequestCancelActivity { activity_id }),
+        arb_small_string().prop_map(|activity_id| {
+            WorkflowCommand::RequestCancelActivity { activity_id }
+        }),
         arb_small_string().prop_map(|timer_id| WorkflowCommand::CancelTimer { timer_id }),
         (
             arb_small_string(),
             arb_small_string(),
             arb_small_string(),
             arb_payloads(),
-        ).prop_map(|(child_workflow_id, workflow_type, task_queue, input)| WorkflowCommand::StartChildWorkflow {
-            child_workflow_id: tokeira_types::WorkflowId(child_workflow_id),
-            namespace_id: tokeira_types::NamespaceId::new(),
-            workflow_type: tokeira_types::WorkflowType(workflow_type),
-            task_queue: tokeira_types::TaskQueueName(task_queue),
-            input,
-            parent_close_policy: tokeira_kernel::ParentClosePolicy::Terminate,
+        )
+            .prop_map(|(child_workflow_id, workflow_type, task_queue, input)| {
+                WorkflowCommand::StartChildWorkflow {
+                    child_workflow_id: tokeira_types::WorkflowId(child_workflow_id),
+                    namespace_id: tokeira_types::NamespaceId::new(),
+                    workflow_type: tokeira_types::WorkflowType(workflow_type),
+                    task_queue: tokeira_types::TaskQueueName(task_queue),
+                    input,
+                    parent_close_policy: tokeira_kernel::ParentClosePolicy::Terminate,
+                }
+            }),
+        (arb_small_string(), arb_payloads(),).prop_map(|(target_workflow_id, input)| {
+            WorkflowCommand::SignalExternalWorkflowExecution {
+                target_workflow_id: tokeira_types::WorkflowId(target_workflow_id),
+                target_run_id: Some(tokeira_types::RunId::new()),
+                signal_name: "sig".into(),
+                input,
+            }
+        }),
+        arb_small_string().prop_map(|target_workflow_id| {
+            WorkflowCommand::RequestCancelExternalWorkflowExecution {
+                target_workflow_id: tokeira_types::WorkflowId(target_workflow_id),
+                target_run_id: Some(tokeira_types::RunId::new()),
+            }
         }),
         (
             arb_small_string(),
-            arb_payloads(),
-        ).prop_map(|(target_workflow_id, input)| WorkflowCommand::SignalExternalWorkflowExecution {
-            target_workflow_id: tokeira_types::WorkflowId(target_workflow_id),
-            target_run_id: Some(tokeira_types::RunId::new()),
-            signal_name: "sig".into(),
-            input,
-        }),
-        arb_small_string().prop_map(|target_workflow_id| WorkflowCommand::RequestCancelExternalWorkflowExecution {
-            target_workflow_id: tokeira_types::WorkflowId(target_workflow_id),
-            target_run_id: Some(tokeira_types::RunId::new()),
-        }),
-        (
-            arb_small_string(),
             arb_small_string(),
             arb_small_string(),
             arb_small_string(),
             arb_payloads(),
-        ).prop_map(|(operation_id, endpoint, service, operation, input)| WorkflowCommand::ScheduleNexusOperation {
-            operation_id,
-            endpoint,
-            service,
-            operation,
-            input,
-            schedule_to_close_timeout: None,
-        }),
-        (1i64..100i64).prop_map(|scheduled_event_id| WorkflowCommand::CancelNexusOperation {
-            scheduled_event_id,
+        )
+            .prop_map(|(operation_id, endpoint, service, operation, input)| {
+                WorkflowCommand::ScheduleNexusOperation {
+                    operation_id,
+                    endpoint,
+                    service,
+                    operation,
+                    input,
+                    schedule_to_close_timeout: None,
+                }
+            }),
+        (1i64..100i64).prop_map(|scheduled_event_id| {
+            WorkflowCommand::CancelNexusOperation { scheduled_event_id }
         }),
         arb_payloads().prop_map(|result| WorkflowCommand::UpdateCompleted {
             update_id: "update-1".into(),
@@ -652,14 +776,27 @@ fn arb_edge_error() -> impl Strategy<Value = EdgeError> {
     prop_oneof![
         arb_small_string().prop_map(EdgeError::BadRequest),
         arb_small_string().prop_map(EdgeError::Unauthorized),
-        (prop_oneof![Just("operator_read"), Just("operator_write"), Just("start_workflow_execution")], prop::option::of(arb_small_string()))
+        (
+            prop_oneof![
+                Just("operator_read"),
+                Just("operator_write"),
+                Just("start_workflow_execution")
+            ],
+            prop::option::of(arb_small_string())
+        )
             .prop_map(|(action, namespace)| EdgeError::Forbidden { action, namespace }),
         arb_small_string().prop_map(EdgeError::NamespaceNotFound),
         arb_small_string().prop_map(EdgeError::NamespaceDeleted),
-        (arb_small_string(), arb_small_string()).prop_map(|(namespace, workflow_id)| EdgeError::WorkflowNotFound { namespace, workflow_id }),
+        (arb_small_string(), arb_small_string()).prop_map(|(namespace, workflow_id)| {
+            EdgeError::WorkflowNotFound {
+                namespace,
+                workflow_id,
+            }
+        }),
         any::<bool>().prop_map(|_| EdgeError::TooManyLongPolls),
         any::<bool>().prop_map(|_| EdgeError::LongPollAdmissionTimeout),
-        arb_small_string().prop_map(|target| EdgeError::RemoteRouteUnsupported { target }),
+        arb_small_string()
+            .prop_map(|target| EdgeError::RemoteRouteUnsupported { target }),
         arb_small_string().prop_map(EdgeError::Internal),
     ]
 }

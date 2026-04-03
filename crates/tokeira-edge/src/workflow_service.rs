@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use http::HeaderMap;
 use tokeira_kernel::{SignalRequest, StartRequest, WorkflowTaskCompletedRequest};
@@ -11,16 +11,16 @@ use crate::{
     errors::{EdgeError, EdgeResult},
     interceptors::{Action, EdgeInterceptors},
     long_poll::LongPollGate,
-    routing::{ensure_local, EdgeRouter},
+    routing::{EdgeRouter, ensure_local},
     translate::{
-        self, from_internal, to_internal, CountWorkflowExecutionsRequest,
-        CountWorkflowExecutionsResponse, DescribeWorkflowExecutionRequest,
-        ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse,
-        PollWorkflowTaskQueueRequest, PollWorkflowTaskQueueResponse,
-        RespondWorkflowTaskCompletedRequest, RespondWorkflowTaskCompletedResponse,
-        SignalWorkflowExecutionRequest, SignalWorkflowExecutionResponse,
-        StartWorkflowExecutionRequest, StartWorkflowExecutionResponse,
-        WorkflowExecutionDescription,
+        self, CountWorkflowExecutionsRequest, CountWorkflowExecutionsResponse,
+        DescribeWorkflowExecutionRequest, ListWorkflowExecutionsRequest,
+        ListWorkflowExecutionsResponse, PollWorkflowTaskQueueRequest,
+        PollWorkflowTaskQueueResponse, RespondWorkflowTaskCompletedRequest,
+        RespondWorkflowTaskCompletedResponse, SignalWorkflowExecutionRequest,
+        SignalWorkflowExecutionResponse, StartWorkflowExecutionRequest,
+        StartWorkflowExecutionResponse, WorkflowExecutionDescription, from_internal,
+        to_internal,
     },
 };
 
@@ -35,7 +35,11 @@ pub struct WorkflowMutationOutcome {
 pub trait WorkflowRuntimeApi: Send + Sync + 'static {
     async fn start_workflow(&self, req: StartRequest) -> Result<WorkflowMutationOutcome>;
 
-    async fn signal_workflow(&self, run_key: RunKey, req: SignalRequest) -> Result<WorkflowMutationOutcome>;
+    async fn signal_workflow(
+        &self,
+        run_key: RunKey,
+        req: SignalRequest,
+    ) -> Result<WorkflowMutationOutcome>;
 
     async fn poll_workflow_task(
         &self,
@@ -52,7 +56,11 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
 
 #[async_trait]
 pub trait ExecutionResolver: Send + Sync + 'static {
-    async fn current_run_key(&self, namespace: &str, workflow_id: &str) -> Result<Option<RunKey>>;
+    async fn current_run_key(
+        &self,
+        namespace: &str,
+        workflow_id: &str,
+    ) -> Result<Option<RunKey>>;
 
     async fn describe_execution(
         &self,
@@ -77,8 +85,9 @@ pub trait VisibilityApi: Send + Sync + 'static {
 #[derive(Debug, Default)]
 pub struct InMemoryExecutionResolver {
     current: tokio::sync::RwLock<std::collections::HashMap<(String, String), RunKey>>,
-    descriptions:
-        tokio::sync::RwLock<std::collections::HashMap<(String, String), WorkflowExecutionDescription>>,
+    descriptions: tokio::sync::RwLock<
+        std::collections::HashMap<(String, String), WorkflowExecutionDescription>,
+    >,
 }
 
 impl InMemoryExecutionResolver {
@@ -100,7 +109,10 @@ impl InMemoryExecutionResolver {
 
     pub async fn set_description(&self, description: WorkflowExecutionDescription) {
         self.descriptions.write().await.insert(
-            (description.namespace.clone(), description.workflow_id.clone()),
+            (
+                description.namespace.clone(),
+                description.workflow_id.clone(),
+            ),
             description,
         );
     }
@@ -108,7 +120,11 @@ impl InMemoryExecutionResolver {
 
 #[async_trait]
 impl ExecutionResolver for InMemoryExecutionResolver {
-    async fn current_run_key(&self, namespace: &str, workflow_id: &str) -> Result<Option<RunKey>> {
+    async fn current_run_key(
+        &self,
+        namespace: &str,
+        workflow_id: &str,
+    ) -> Result<Option<RunKey>> {
         Ok(self
             .current
             .read()
@@ -291,12 +307,18 @@ impl WorkflowService {
         let internal = to_internal::poll_request(req);
         let started = self
             .runtime
-            .poll_workflow_task(internal.queue, internal.worker_identity, internal.timeout)
+            .poll_workflow_task(
+                internal.queue,
+                internal.worker_identity,
+                internal.timeout,
+            )
             .await
             .map_err(EdgeError::from)?;
 
         match started {
-            Some(started) => Ok(Some(from_internal::poll_response(started).map_err(EdgeError::from)?)),
+            Some(started) => Ok(Some(
+                from_internal::poll_response(started).map_err(EdgeError::from)?,
+            )),
             None => Ok(None),
         }
     }
@@ -308,15 +330,11 @@ impl WorkflowService {
     ) -> EdgeResult<RespondWorkflowTaskCompletedResponse> {
         let _ctx = self
             .interceptors
-            .begin(
-                headers,
-                None,
-                Action::RespondWorkflowTaskCompleted,
-                false,
-            )
+            .begin(headers, None, Action::RespondWorkflowTaskCompleted, false)
             .await?;
 
-        let internal = to_internal::workflow_task_completed_request(req).map_err(EdgeError::from)?;
+        let internal =
+            to_internal::workflow_task_completed_request(req).map_err(EdgeError::from)?;
         let outcome = self
             .runtime
             .complete_workflow_task(internal)

@@ -228,6 +228,8 @@ pub struct WorkflowState {
     pub next_workflow_task_seq: LogicalTaskSeq,
     pub pending_workflow_task: Option<PendingWorkflowTask>,
     pub sticky: Option<StickyAffinity>,
+    pub pause_info: Option<PauseInfo>,
+    pub wft_stamp: u64,
 
     // User-mutable metadata
     pub memo: Memo,
@@ -251,6 +253,23 @@ pub struct WorkflowState {
     // Execution options (not yet implemented)
     pub versioning_override: Option<VersioningOverride>,
     pub completion_callbacks: Vec<CompletionCallback>,
+}
+```
+
+Activity delivery state also carries pause-local invalidation metadata:
+
+```rust
+pub struct ActivityState {
+    pub activity_id: String,
+    pub schedule_event_id: i64,
+    pub task_queue: TaskQueueName,
+    pub attempt: u32,
+    pub schedule_to_close_timeout: Option<Duration>,
+    pub schedule_to_start_timeout: Option<Duration>,
+    pub start_to_close_timeout: Option<Duration>,
+    pub heartbeat_timeout: Option<Duration>,
+    pub pause_info: Option<ActivityPauseInfo>,
+    pub stamp: u64,
 }
 ```
 
@@ -326,6 +345,12 @@ The full command set is:
 | `NexusOperationResolved` | Runtime (Nexus op completed/failed/canceled) | Yes | No |
 | `WorkflowExecutionTimedOut` | Runtime (execution/run timeout) | Yes | No |
 | `UpdateExecutionOptions` | External caller or operator | Yes | Yes |
+| `PauseWorkflow` | External caller or operator | Yes | Yes |
+| `UnpauseWorkflow` | External caller or operator | Yes | Yes |
+| `UpdateActivityOptions` | External caller or operator | Yes | Yes |
+| `PauseActivity` | External caller or operator | Yes | Yes |
+| `UnpauseActivity` | External caller or operator | Yes | Yes |
+| `ResetActivity` | External caller or operator | Yes | Yes |
 | `Reset` | Operator (eventually) | Yes | Yes |
 
 `ContinueAsNew` is not a top-level kernel command. It is expressed exclusively as a workflow command within `WorkflowTaskCompleted` (see dedicated section below).
@@ -599,6 +624,85 @@ This command allows updating workflow execution options on a running workflow, s
 
 **Rationale:** This is a server-side mutation that does not come from workflow code. It allows operators to modify execution behavior without a WFT round-trip.
 
+### `PauseWorkflow`
+
+**Precondition:** Run must exist and be open.
+
+**Behavior:**
+
+1. If the run is already paused with the same request ID, treat the command as an idempotent no-op.
+2. If the run is already paused with a different request ID, reject with `AlreadyPaused`.
+3. Emit `RequestDedupeOp` for the request ID.
+4. Emit `WorkflowExecutionPaused` carrying identity, reason, and request ID.
+5. Set `status = Paused`, populate `pause_info`, and increment `wft_stamp`.
+6. Increment every open activity's `stamp` and emit `ActivityOp::Upsert` for each so stale deliveries can be invalidated.
+7. Emit `ProjectionOp::UpsertExecution` with `Paused` status.
+8. Do not schedule or redispatch a workflow task.
+
+### `UnpauseWorkflow`
+
+**Precondition:** Run must exist and be open with `ExecutionStatus::Paused`.
+
+**Behavior:**
+
+1. Reject with `NotPaused` if the run is not paused.
+2. Emit `RequestDedupeOp` for the request ID.
+3. Emit `WorkflowExecutionUnpaused` carrying identity, reason, and request ID.
+4. Set `status = Running`, clear `pause_info`, and increment `wft_stamp`.
+5. Increment every open activity's `stamp`, emit `ActivityOp::Upsert`, and emit `DispatchOp::EnqueueActivityTask` for each activity.
+6. Emit `ProjectionOp::UpsertExecution` with `Running` status.
+7. Schedule a new WFT only if no WFT is already pending.
+
+### `UpdateActivityOptions`
+
+**Precondition:** Run must exist and be open. The referenced activity must exist in the open activities map.
+
+**Behavior:**
+
+1. Emit `RequestDedupeOp` for the request ID.
+2. Apply `FieldChange` updates to the activity task queue and timeout fields.
+3. Increment the activity's `stamp`.
+4. Emit `ActivityOp::Upsert`.
+5. Emit no history event and do not schedule a WFT.
+
+### `PauseActivity`
+
+**Precondition:** Run must exist and be open. The referenced activity must exist in the open activities map.
+
+**Behavior:**
+
+1. Emit `RequestDedupeOp` for the request ID.
+2. Set `pause_info` on the activity using the provided identity, reason, and time.
+3. Increment the activity's `stamp`.
+4. Emit `ActivityOp::Upsert`.
+5. Emit no history event and do not schedule a WFT.
+
+### `UnpauseActivity`
+
+**Precondition:** Run must exist and be open. The referenced activity must exist in the open activities map.
+
+**Behavior:**
+
+1. Reject with `ActivityNotPaused` if the activity is not paused.
+2. Emit `RequestDedupeOp` for the request ID.
+3. Clear the activity's `pause_info`.
+4. Increment the activity's `stamp`.
+5. Emit `ActivityOp::Upsert`.
+6. If the workflow itself is not paused, emit `DispatchOp::EnqueueActivityTask`. If the workflow is paused, defer redispatch until `UnpauseWorkflow`.
+
+### `ResetActivity`
+
+**Precondition:** Run must exist and be open. The referenced activity must exist in the open activities map.
+
+**Behavior:**
+
+1. Emit `RequestDedupeOp` for the request ID.
+2. Reset the activity attempt counter to `1`.
+3. Accept `reset_heartbeat` for API compatibility, but treat it as a no-op until heartbeat details are persisted in state.
+4. Increment the activity's `stamp`.
+5. Emit `ActivityOp::Upsert`.
+6. If the workflow itself is not paused, emit `DispatchOp::EnqueueActivityTask`. If the workflow is paused, defer redispatch until `UnpauseWorkflow`.
+
 ### `ChildStartConfirmed`
 
 **Precondition:** Run must exist and be open. The referenced child must exist in the open children map with no `started_event_id` yet.
@@ -842,19 +946,24 @@ The kernel's `Reject` error type is a precise, enumerated set of rejection reaso
 
 - `CommandsAfterClose { index }`: a workflow command was issued after a preceding command in the same WFT completion already closed the run.
 
-### Implemented additions (Features 2-6)
+### Implemented additions (Features 2-11)
 
 - `DuplicateChildWorkflowId(WorkflowId)`: a `StartChildWorkflow` command references a child workflow ID already in the open set. (Feature 5)
 - `UnknownChild(WorkflowId)`: child resolution or confirmation for a child not in the open set. (Feature 5)
 - `StaleChildConfirmation { child_workflow_id, expected_initiated_event_id }`: child start confirmation with mismatched initiated_event_id. (Feature 5)
 - `UnknownExternalSignal(i64)`: external signal resolution for a signal not in the pending set. (Feature 6)
 - `UnknownExternalCancel(i64)`: external cancel resolution for a cancel not in the pending set. (Feature 6)
+- `UnknownUpdate(String)`: update completion for an update not in the pending set. (Feature 7)
+- `DuplicateUpdateId(String)`: duplicate update acceptance. (Feature 7)
+- `DuplicateNexusOperationId(id)`: a `ScheduleNexusOperation` command references an operation ID already pending. (Feature 9)
+- `NexusOperationAlreadyStarted(id)`: duplicate `Started` callback for a pending Nexus operation. (Feature 9)
+- `WorkflowPaused`: update rejected while workflow status is paused. (Feature 11)
+- `AlreadyPaused`: duplicate pause request with a different request ID. (Feature 11)
+- `NotPaused`: unpause request against a non-paused workflow. (Feature 11)
+- `ActivityNotPaused(String)`: unpause request against an activity that is not paused. (Feature 11)
 
 ### Future additions
 
-- `UnknownUpdate(String)`: update completion for an update not in the pending set. (Feature 7, in progress)
-- `DuplicateUpdateId(String)`: duplicate update acceptance. (Feature 7, in progress)
-- `DuplicateNexusOperationId(id)`: a `ScheduleNexusOperation` command references an operation ID already pending.
 - `ContinueAsNewConstraintViolation`: e.g., open children that cannot be abandoned.
 - `CancellationRace`: concurrent cancel/terminate/complete conflicts.
 - `ResetConstraintViolation`: invalid fork event ID or incompatible history.
@@ -942,10 +1051,16 @@ Not all commands and workflow commands described in this document are implemente
 | `ChildResolved` | Implemented (F5) |
 | `ExternalSignalResolved` | Implemented (F6) |
 | `ExternalCancelResolved` | Implemented (F6) |
-| `UpdateExecutionOptions` | Not yet implemented |
-| `Update` | In progress (F7) |
-| `NexusOperationResolved` | Not yet implemented |
-| `Reset` | Not yet implemented |
+| `UpdateExecutionOptions` | Implemented (F8) |
+| `PauseWorkflow` | Implemented (F11) |
+| `UnpauseWorkflow` | Implemented (F11) |
+| `UpdateActivityOptions` | Implemented (F11) |
+| `PauseActivity` | Implemented (F11) |
+| `UnpauseActivity` | Implemented (F11) |
+| `ResetActivity` | Implemented (F11) |
+| `Update` | Implemented (F7) |
+| `NexusOperationResolved` | Implemented (F9) |
+| `Reset` | Implemented (F10) |
 | `ScheduleActivity` (workflow cmd) | Implemented (F1) |
 | `StartTimer` (workflow cmd) | Implemented (F1) |
 | `CompleteWorkflow` (workflow cmd) | Implemented (F1) |
@@ -960,12 +1075,12 @@ Not all commands and workflow commands described in this document are implemente
 | `CancelTimer` (workflow cmd) | Implemented (F3) |
 | `SignalExternalWorkflow` (workflow cmd) | Implemented (F6) |
 | `RequestCancelExternalWorkflow` (workflow cmd) | Implemented (F6) |
-| `RecordMarker` (workflow cmd) | Not yet implemented |
-| `ScheduleNexusOperation` (workflow cmd) | Not yet implemented |
-| `CancelNexusOperation` (workflow cmd) | Not yet implemented |
-| `ProtocolMessage` (workflow cmd) | In progress (F7) |
-| `UpdateCompleted` (workflow cmd) | In progress (F7) |
-| `UpdateRejected` (workflow cmd) | In progress (F7) |
+| `RecordMarker` (workflow cmd) | Implemented (F8) |
+| `ScheduleNexusOperation` (workflow cmd) | Implemented (F9) |
+| `CancelNexusOperation` (workflow cmd) | Implemented (F9) |
+| `ProtocolMessage` (workflow cmd) | Implemented (F7) |
+| `UpdateCompleted` (workflow cmd) | Implemented (F7) |
+| `UpdateRejected` (workflow cmd) | Implemented (F7) |
 | Request deduplication | Implemented (F1) |
 | Sticky execution affinity | Implemented (F1) |
 | Timeout configuration | Implemented (F1) |
@@ -979,8 +1094,10 @@ Not all commands and workflow commands described in this document are implemente
 | Parent Close Policy | Implemented (F5) |
 | Pending external signals tracking | Implemented (F6) |
 | Pending external cancel requests tracking | Implemented (F6) |
-| Pending updates tracking | In progress (F7) |
-| Pending Nexus operations tracking | Not yet implemented |
+| Pending updates tracking | Implemented (F7) |
+| Pending Nexus operations tracking | Implemented (F9) |
+| Pause / unpause workflow lifecycle | Implemented (F11) |
+| Activity pause / reset / mutable options | Implemented (F11) |
 
 ## Test strategy
 

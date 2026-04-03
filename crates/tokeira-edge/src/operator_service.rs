@@ -39,7 +39,11 @@ pub trait OperatorApi: Send + Sync + 'static {
         attr: SearchAttributeDefinition,
     ) -> Result<()>;
 
-    async fn remove_search_attribute(&self, namespace: &str, attr_name: &str) -> Result<()>;
+    async fn remove_search_attribute(
+        &self,
+        namespace: &str,
+        attr_name: &str,
+    ) -> Result<()>;
 }
 
 /// A compact in-memory implementation that makes the service easy to exercise in tests.
@@ -79,10 +83,7 @@ impl OperatorApi for InMemoryOperatorApi {
                 .into_iter()
                 .flat_map(|m| m.values().cloned())
                 .collect(),
-            None => attrs
-                .values()
-                .flat_map(|m| m.values().cloned())
-                .collect(),
+            None => attrs.values().flat_map(|m| m.values().cloned()).collect(),
         };
         Ok(values)
     }
@@ -101,7 +102,11 @@ impl OperatorApi for InMemoryOperatorApi {
         Ok(())
     }
 
-    async fn remove_search_attribute(&self, namespace: &str, attr_name: &str) -> Result<()> {
+    async fn remove_search_attribute(
+        &self,
+        namespace: &str,
+        attr_name: &str,
+    ) -> Result<()> {
         if let Some(attrs) = self.attrs.write().await.get_mut(namespace) {
             attrs.remove(attr_name);
         }

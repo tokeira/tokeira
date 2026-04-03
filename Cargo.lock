@@ -1138,12 +1138,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "proptest",
+ "smallvec",
  "time",
  "tokeira-kernel",
  "tokeira-storage",
  "tokeira-types",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1152,6 +1155,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "proptest",
  "time",
  "tokeira-kernel",
  "tokeira-types",

@@ -4,8 +4,9 @@ use crate::conversions::ProtoConversionError;
 use crate::public::common;
 use time::OffsetDateTime;
 use tokeira_types::{
-    Headers, Memo, Payload as DomainPayload, Payloads as DomainPayloads, RunId, SearchAttrValue,
-    SearchAttributes as DomainSearchAttributes, TaskQueueName, TaskToken, WorkflowId,
+    Headers, Memo, Payload as DomainPayload, Payloads as DomainPayloads, RunId,
+    SearchAttrValue, SearchAttributes as DomainSearchAttributes, TaskQueueName,
+    TaskToken, WorkflowId,
 };
 
 pub fn payload_from_domain(value: &DomainPayload) -> common::Payload {
@@ -80,7 +81,9 @@ pub fn memo_to_domain(value: &common::Memo) -> Memo {
     )
 }
 
-pub fn search_attributes_from_domain(value: &DomainSearchAttributes) -> common::SearchAttributes {
+pub fn search_attributes_from_domain(
+    value: &DomainSearchAttributes,
+) -> common::SearchAttributes {
     common::SearchAttributes {
         indexed_fields: value
             .0
@@ -102,14 +105,16 @@ pub fn search_attributes_to_domain(
     ))
 }
 
-pub fn search_attr_value_from_domain(value: &SearchAttrValue) -> common::SearchAttributeValue {
+pub fn search_attr_value_from_domain(
+    value: &SearchAttrValue,
+) -> common::SearchAttributeValue {
     use common::search_attribute_value::Kind;
 
     let kind = match value {
         SearchAttrValue::Keyword(v) => Kind::Keyword(v.clone()),
-        SearchAttrValue::KeywordList(v) => Kind::KeywordList(common::KeywordList {
-            values: v.clone(),
-        }),
+        SearchAttrValue::KeywordList(v) => {
+            Kind::KeywordList(common::KeywordList { values: v.clone() })
+        }
         SearchAttrValue::Int(v) => Kind::IntValue(*v),
         SearchAttrValue::Bool(v) => Kind::BoolValue(*v),
         SearchAttrValue::Double(v) => Kind::DoubleValue(*v),
@@ -131,9 +136,13 @@ pub fn search_attr_value_to_domain(
         Some(Kind::IntValue(v)) => Ok(SearchAttrValue::Int(*v)),
         Some(Kind::BoolValue(v)) => Ok(SearchAttrValue::Bool(*v)),
         Some(Kind::DoubleValue(v)) => Ok(SearchAttrValue::Double(*v)),
-        Some(Kind::DatetimeUnixNanos(v)) => from_unix_nanos(*v).map(SearchAttrValue::Datetime),
+        Some(Kind::DatetimeUnixNanos(v)) => {
+            from_unix_nanos(*v).map(SearchAttrValue::Datetime)
+        }
         Some(Kind::Text(v)) => Ok(SearchAttrValue::Text(v.clone())),
-        None => Err(ProtoConversionError::MissingField("SearchAttributeValue.kind")),
+        None => Err(ProtoConversionError::MissingField(
+            "SearchAttributeValue.kind",
+        )),
     }
 }
 

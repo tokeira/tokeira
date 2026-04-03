@@ -10,19 +10,24 @@ use tokeira_types::{
 use crate::{
     command::{
         ActivityResolvedRequest, CancelRequest, ChildResolution, ChildResolvedRequest,
-        ChildStartConfirmedRequest, ChildStartResult, Command, ExternalCancelResolvedRequest,
-        ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult,
-        FieldChange, NexusOperationResolvedRequest, NexusResolution, ResetRequest, RetryState,
-        SignalRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest,
-        UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, WorkflowCommand,
-        WorkflowExecutionTimedOutRequest,
-        WorkflowTaskCompletedRequest, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
+        ChildStartConfirmedRequest, ChildStartResult, Command,
+        ExternalCancelResolvedRequest, ExternalCancelResult,
+        ExternalSignalResolvedRequest, ExternalSignalResult, FieldChange,
+        NexusOperationResolvedRequest, NexusResolution, PauseActivityRequest,
+        PauseWorkflowRequest, ResetActivityRequest, ResetRequest, RetryState,
+        SignalRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest,
+        TimerDueRequest, UnpauseActivityRequest, UnpauseWorkflowRequest,
+        UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody,
+        UpdateRequest, WorkflowCommand, WorkflowExecutionTimedOutRequest,
+        WorkflowTaskCompletedRequest, WorkflowTaskFailedRequest,
+        WorkflowTaskTimedOutRequest,
     },
     event::{ActivityResolution, HistoryEvent, HistoryEventKind},
     state::{
-        ActivityState, ChildWorkflowState, LoadedRun, ParentClosePolicy, PendingExternalCancel,
-        PendingExternalSignal, PendingNexusOperation, PendingUpdate, PendingWorkflowTask,
-        TimerState, WorkflowState,
+        ActivityPauseInfo, ActivityState, ChildWorkflowState, LoadedRun,
+        ParentClosePolicy, PauseInfo, PendingExternalCancel, PendingExternalSignal,
+        PendingNexusOperation, PendingUpdate, PendingWorkflowTask, TimerState,
+        WorkflowState,
     },
     transition::{
         ActivityOp, DispatchOp, ProjectionOp, RequestDedupeOp, TimerOp, Transition,
@@ -30,10 +35,25 @@ use crate::{
 };
 
 /// Pure transition engine.
+///
+/// Given a loaded run state and one validated command, the
+/// kernel computes the exact transition that should happen
+/// next — with no hidden I/O and no side effects.
+///
+/// See `docs/architecture/020-kernel.md` for the full design
+/// rationale.
 pub trait Kernel {
+    /// Apply a single command to a loaded run and return the
+    /// authoritative transition, or reject the command.
     fn apply(&self, loaded: LoadedRun, command: Command) -> Result<Transition, Reject>;
 }
 
+/// Default kernel implementation.
+///
+/// Stateless — all inputs arrive via `apply` arguments and
+/// all outputs leave via the returned `Transition`. This
+/// makes the kernel trivially testable with golden-file and
+/// property-based tests.
 #[derive(Default)]
 pub struct BasicKernel;
 
@@ -46,29 +66,57 @@ impl Kernel for BasicKernel {
             Command::Cancel(req) => self.apply_cancel(loaded, req),
             Command::Terminate(req) => self.apply_terminate(loaded, req),
             Command::Reset(req) => self.apply_reset(loaded, req),
+            Command::PauseWorkflow(req) => self.apply_pause_workflow(loaded, req),
+            Command::UnpauseWorkflow(req) => self.apply_unpause_workflow(loaded, req),
+            Command::UpdateActivityOptions(req) => {
+                self.apply_update_activity_options(loaded, req)
+            }
+            Command::PauseActivity(req) => self.apply_pause_activity(loaded, req),
+            Command::UnpauseActivity(req) => self.apply_unpause_activity(loaded, req),
+            Command::ResetActivity(req) => self.apply_reset_activity(loaded, req),
             Command::UpdateExecutionOptions(req) => {
                 self.apply_update_execution_options(loaded, req)
             }
             Command::WorkflowExecutionTimedOut(req) => {
                 self.apply_workflow_execution_timed_out(loaded, req)
             }
-            Command::WorkflowTaskStarted(req) => self.apply_workflow_task_started(loaded, req),
-            Command::WorkflowTaskCompleted(req) => self.apply_workflow_task_completed(loaded, req),
-            Command::WorkflowTaskFailed(req) => self.apply_workflow_task_failed(loaded, req),
-            Command::WorkflowTaskTimedOut(req) => self.apply_workflow_task_timed_out(loaded, req),
+            Command::WorkflowTaskStarted(req) => {
+                self.apply_workflow_task_started(loaded, req)
+            }
+            Command::WorkflowTaskCompleted(req) => {
+                self.apply_workflow_task_completed(loaded, req)
+            }
+            Command::WorkflowTaskFailed(req) => {
+                self.apply_workflow_task_failed(loaded, req)
+            }
+            Command::WorkflowTaskTimedOut(req) => {
+                self.apply_workflow_task_timed_out(loaded, req)
+            }
             Command::ActivityResolved(req) => self.apply_activity_resolved(loaded, req),
-            Command::ChildStartConfirmed(req) => self.apply_child_start_confirmed(loaded, req),
+            Command::ChildStartConfirmed(req) => {
+                self.apply_child_start_confirmed(loaded, req)
+            }
             Command::ChildResolved(req) => self.apply_child_resolved(loaded, req),
-            Command::ExternalSignalResolved(req) => self.apply_external_signal_resolved(loaded, req),
-            Command::ExternalCancelResolved(req) => self.apply_external_cancel_resolved(loaded, req),
-            Command::NexusOperationResolved(req) => self.apply_nexus_operation_resolved(loaded, req),
+            Command::ExternalSignalResolved(req) => {
+                self.apply_external_signal_resolved(loaded, req)
+            }
+            Command::ExternalCancelResolved(req) => {
+                self.apply_external_cancel_resolved(loaded, req)
+            }
+            Command::NexusOperationResolved(req) => {
+                self.apply_nexus_operation_resolved(loaded, req)
+            }
             Command::TimerDue(req) => self.apply_timer_due(loaded, req),
         }
     }
 }
 
 impl BasicKernel {
-    fn apply_start(&self, loaded: LoadedRun, req: StartRequest) -> Result<Transition, Reject> {
+    fn apply_start(
+        &self,
+        loaded: LoadedRun,
+        req: StartRequest,
+    ) -> Result<Transition, Reject> {
         if !matches!(loaded, LoadedRun::Absent) {
             return Err(Reject::RunAlreadyExists);
         }
@@ -86,6 +134,8 @@ impl BasicKernel {
             next_workflow_task_seq: LogicalTaskSeq::ONE,
             pending_workflow_task: None,
             sticky: None,
+            pause_info: None,
+            wft_stamp: 0,
             memo: req.memo.clone(),
             search_attributes: req.search_attributes.clone(),
             workflow_execution_timeout: req.workflow_execution_timeout,
@@ -134,7 +184,11 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
-    fn apply_signal(&self, loaded: LoadedRun, req: SignalRequest) -> Result<Transition, Reject> {
+    fn apply_signal(
+        &self,
+        loaded: LoadedRun,
+        req: SignalRequest,
+    ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
         let mut builder = TransitionBuilder::new(state, req.now);
         builder.request_dedupe_ops.push(RequestDedupeOp {
@@ -158,8 +212,15 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
-    fn apply_update(&self, loaded: LoadedRun, req: UpdateRequest) -> Result<Transition, Reject> {
+    fn apply_update(
+        &self,
+        loaded: LoadedRun,
+        req: UpdateRequest,
+    ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
+        if state.status == ExecutionStatus::Paused {
+            return Err(Reject::WorkflowPaused);
+        }
         if state.pending_updates.contains_key(&req.update_id) {
             return Err(Reject::DuplicateUpdateId(req.update_id));
         }
@@ -168,11 +229,12 @@ impl BasicKernel {
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
-        let accepted_event_id = builder.emit(HistoryEventKind::WorkflowExecutionUpdateAccepted {
-            update_id: req.update_id.clone(),
-            update_name: req.update_name.clone(),
-            input: req.input,
-        });
+        let accepted_event_id =
+            builder.emit(HistoryEventKind::WorkflowExecutionUpdateAccepted {
+                update_id: req.update_id.clone(),
+                update_name: req.update_name.clone(),
+                input: req.input,
+            });
         builder.state.pending_updates.insert(
             req.update_id.clone(),
             PendingUpdate {
@@ -189,7 +251,11 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
-    fn apply_cancel(&self, loaded: LoadedRun, req: CancelRequest) -> Result<Transition, Reject> {
+    fn apply_cancel(
+        &self,
+        loaded: LoadedRun,
+        req: CancelRequest,
+    ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
         let mut builder = TransitionBuilder::new(state, req.now);
         builder.request_dedupe_ops.push(RequestDedupeOp {
@@ -227,7 +293,9 @@ impl BasicKernel {
 
         let activities = std::mem::take(&mut builder.state.activities);
         for (activity_id, _) in activities {
-            builder.activity_ops.push(ActivityOp::Delete { activity_id });
+            builder
+                .activity_ops
+                .push(ActivityOp::Delete { activity_id });
         }
 
         let timers = std::mem::take(&mut builder.state.timers);
@@ -240,12 +308,314 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
-    fn apply_reset(&self, loaded: LoadedRun, req: ResetRequest) -> Result<Transition, Reject> {
+    fn apply_pause_workflow(
+        &self,
+        loaded: LoadedRun,
+        req: PauseWorkflowRequest,
+    ) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+
+        if state.status == ExecutionStatus::Paused {
+            if let Some(info) = &state.pause_info {
+                if info.request_id == req.request.request_id.0 {
+                    return Ok(TransitionBuilder::new(state, req.now).finish());
+                }
+            }
+            return Err(Reject::AlreadyPaused);
+        }
+
+        let mut builder = TransitionBuilder::new(state, req.now);
+        builder.request_dedupe_ops.push(RequestDedupeOp {
+            request_id: req.request.request_id.clone(),
+        });
+        builder.emit(HistoryEventKind::WorkflowExecutionPaused {
+            identity: req.identity.clone(),
+            reason: req.reason.clone(),
+            request_id: req.request.request_id.0.clone(),
+        });
+        builder.state.status = ExecutionStatus::Paused;
+        builder.state.pause_info = Some(PauseInfo {
+            pause_time: req.now,
+            identity: req.identity,
+            reason: req.reason,
+            request_id: req.request.request_id.0,
+        });
+        builder.state.wft_stamp += 1;
+
+        let activity_ids: Vec<_> = builder.state.activities.keys().cloned().collect();
+        for activity_id in activity_ids {
+            if let Some(activity) = builder.state.activities.get_mut(&activity_id) {
+                activity.stamp += 1;
+                builder
+                    .activity_ops
+                    .push(ActivityOp::Upsert(activity.clone()));
+            }
+        }
+
+        builder.projection_ops.push(ProjectionOp::UpsertExecution {
+            status: ExecutionStatus::Paused,
+            memo_patch: builder.state.memo.clone(),
+            search_attr_patch: builder.state.search_attributes.clone(),
+        });
+        Ok(builder.finish())
+    }
+
+    fn apply_unpause_workflow(
+        &self,
+        loaded: LoadedRun,
+        req: UnpauseWorkflowRequest,
+    ) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+        if state.status != ExecutionStatus::Paused {
+            return Err(Reject::NotPaused);
+        }
+
+        let mut builder = TransitionBuilder::new(state, req.now);
+        builder.request_dedupe_ops.push(RequestDedupeOp {
+            request_id: req.request.request_id.clone(),
+        });
+        builder.emit(HistoryEventKind::WorkflowExecutionUnpaused {
+            identity: req.identity,
+            reason: req.reason,
+            request_id: req.request.request_id.0,
+        });
+        builder.state.status = ExecutionStatus::Running;
+        builder.state.pause_info = None;
+        builder.state.wft_stamp += 1;
+
+        let activity_ids: Vec<_> = builder.state.activities.keys().cloned().collect();
+        for activity_id in activity_ids {
+            let snapshot = {
+                let activity = builder
+                    .state
+                    .activities
+                    .get_mut(&activity_id)
+                    .expect("activity must exist");
+                activity.stamp += 1;
+                activity.clone()
+            };
+            builder
+                .activity_ops
+                .push(ActivityOp::Upsert(snapshot.clone()));
+            builder.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
+                queue: QueueKey {
+                    namespace_id: builder.state.namespace_id,
+                    task_queue: snapshot.task_queue.clone(),
+                    task_kind: tokeira_types::TaskKind::Activity,
+                    deployment: None,
+                    build_id: None,
+                },
+                activity_id: snapshot.activity_id.clone(),
+                input: snapshot.input.clone(),
+                schedule_event_id: snapshot.schedule_event_id,
+                attempt: snapshot.attempt,
+                schedule_to_close_timeout: snapshot.schedule_to_close_timeout,
+                schedule_to_start_timeout: snapshot.schedule_to_start_timeout,
+                start_to_close_timeout: snapshot.start_to_close_timeout,
+                heartbeat_timeout: snapshot.heartbeat_timeout,
+            });
+        }
+
+        builder.projection_ops.push(ProjectionOp::UpsertExecution {
+            status: ExecutionStatus::Running,
+            memo_patch: builder.state.memo.clone(),
+            search_attr_patch: builder.state.search_attributes.clone(),
+        });
+        if builder.state.pending_workflow_task.is_none() {
+            builder.schedule_workflow_task();
+        }
+        Ok(builder.finish())
+    }
+
+    fn apply_update_activity_options(
+        &self,
+        loaded: LoadedRun,
+        req: UpdateActivityOptionsRequest,
+    ) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+        let mut builder = TransitionBuilder::new(state, req.now);
+        builder
+            .state
+            .activities
+            .get(&req.activity_id)
+            .ok_or_else(|| Reject::UnknownActivity(req.activity_id.clone()))?;
+        builder.request_dedupe_ops.push(RequestDedupeOp {
+            request_id: req.request.request_id.clone(),
+        });
+
+        let snapshot = {
+            let activity = builder
+                .state
+                .activities
+                .get_mut(&req.activity_id)
+                .expect("activity must exist");
+            match req.task_queue {
+                FieldChange::Set(task_queue) => activity.task_queue = task_queue,
+                FieldChange::Clear | FieldChange::Unchanged => {}
+            }
+            match req.schedule_to_close_timeout {
+                FieldChange::Set(v) => activity.schedule_to_close_timeout = v,
+                FieldChange::Clear => activity.schedule_to_close_timeout = None,
+                FieldChange::Unchanged => {}
+            }
+            match req.schedule_to_start_timeout {
+                FieldChange::Set(v) => activity.schedule_to_start_timeout = v,
+                FieldChange::Clear => activity.schedule_to_start_timeout = None,
+                FieldChange::Unchanged => {}
+            }
+            match req.start_to_close_timeout {
+                FieldChange::Set(v) => activity.start_to_close_timeout = v,
+                FieldChange::Clear => activity.start_to_close_timeout = None,
+                FieldChange::Unchanged => {}
+            }
+            match req.heartbeat_timeout {
+                FieldChange::Set(v) => activity.heartbeat_timeout = v,
+                FieldChange::Clear => activity.heartbeat_timeout = None,
+                FieldChange::Unchanged => {}
+            }
+            activity.stamp += 1;
+            activity.clone()
+        };
+        builder.activity_ops.push(ActivityOp::Upsert(snapshot));
+        Ok(builder.finish())
+    }
+
+    fn apply_pause_activity(
+        &self,
+        loaded: LoadedRun,
+        req: PauseActivityRequest,
+    ) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+        let mut builder = TransitionBuilder::new(state, req.now);
+        builder
+            .state
+            .activities
+            .get(&req.activity_id)
+            .ok_or_else(|| Reject::UnknownActivity(req.activity_id.clone()))?;
+        builder.request_dedupe_ops.push(RequestDedupeOp {
+            request_id: req.request.request_id.clone(),
+        });
+        let snapshot = {
+            let activity = builder
+                .state
+                .activities
+                .get_mut(&req.activity_id)
+                .expect("activity must exist");
+            activity.pause_info = Some(ActivityPauseInfo {
+                pause_time: req.now,
+                identity: req.identity,
+                reason: req.reason,
+            });
+            activity.stamp += 1;
+            activity.clone()
+        };
+        builder.activity_ops.push(ActivityOp::Upsert(snapshot));
+        Ok(builder.finish())
+    }
+
+    fn apply_unpause_activity(
+        &self,
+        loaded: LoadedRun,
+        req: UnpauseActivityRequest,
+    ) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+        let mut builder = TransitionBuilder::new(state, req.now);
+        builder.request_dedupe_ops.push(RequestDedupeOp {
+            request_id: req.request.request_id.clone(),
+        });
+        let snapshot = {
+            let activity = builder
+                .state
+                .activities
+                .get_mut(&req.activity_id)
+                .ok_or_else(|| Reject::UnknownActivity(req.activity_id.clone()))?;
+            if activity.pause_info.is_none() {
+                return Err(Reject::ActivityNotPaused(req.activity_id));
+            }
+            activity.pause_info = None;
+            activity.stamp += 1;
+            activity.clone()
+        };
+        if builder.state.status != ExecutionStatus::Paused {
+            builder.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
+                queue: QueueKey {
+                    namespace_id: builder.state.namespace_id,
+                    task_queue: snapshot.task_queue.clone(),
+                    task_kind: tokeira_types::TaskKind::Activity,
+                    deployment: None,
+                    build_id: None,
+                },
+                activity_id: snapshot.activity_id.clone(),
+                input: snapshot.input.clone(),
+                schedule_event_id: snapshot.schedule_event_id,
+                attempt: snapshot.attempt,
+                schedule_to_close_timeout: snapshot.schedule_to_close_timeout,
+                schedule_to_start_timeout: snapshot.schedule_to_start_timeout,
+                start_to_close_timeout: snapshot.start_to_close_timeout,
+                heartbeat_timeout: snapshot.heartbeat_timeout,
+            });
+        }
+        builder.activity_ops.push(ActivityOp::Upsert(snapshot));
+        Ok(builder.finish())
+    }
+
+    fn apply_reset_activity(
+        &self,
+        loaded: LoadedRun,
+        req: ResetActivityRequest,
+    ) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+        let mut builder = TransitionBuilder::new(state, req.now);
+        builder.request_dedupe_ops.push(RequestDedupeOp {
+            request_id: req.request.request_id.clone(),
+        });
+        let snapshot = {
+            let activity = builder
+                .state
+                .activities
+                .get_mut(&req.activity_id)
+                .ok_or_else(|| Reject::UnknownActivity(req.activity_id.clone()))?;
+            let _ = req.reset_heartbeat;
+            activity.attempt = 1;
+            activity.stamp += 1;
+            activity.clone()
+        };
+        if builder.state.status != ExecutionStatus::Paused {
+            builder.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
+                queue: QueueKey {
+                    namespace_id: builder.state.namespace_id,
+                    task_queue: snapshot.task_queue.clone(),
+                    task_kind: tokeira_types::TaskKind::Activity,
+                    deployment: None,
+                    build_id: None,
+                },
+                activity_id: snapshot.activity_id.clone(),
+                input: snapshot.input.clone(),
+                schedule_event_id: snapshot.schedule_event_id,
+                attempt: snapshot.attempt,
+                schedule_to_close_timeout: snapshot.schedule_to_close_timeout,
+                schedule_to_start_timeout: snapshot.schedule_to_start_timeout,
+                start_to_close_timeout: snapshot.start_to_close_timeout,
+                heartbeat_timeout: snapshot.heartbeat_timeout,
+            });
+        }
+        builder.activity_ops.push(ActivityOp::Upsert(snapshot));
+        Ok(builder.finish())
+    }
+
+    fn apply_reset(
+        &self,
+        loaded: LoadedRun,
+        req: ResetRequest,
+    ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
 
         if req.fork_event_id <= 0 {
             return Err(Reject::ResetConstraintViolation {
-                reason: format!("fork_event_id must be positive, got {}", req.fork_event_id),
+                reason: format!(
+                    "fork_event_id must be positive, got {}",
+                    req.fork_event_id
+                ),
             });
         }
         if req.fork_event_id > state.last_event_id {
@@ -288,7 +658,9 @@ impl BasicKernel {
 
         let activities = std::mem::take(&mut builder.state.activities);
         for (activity_id, _) in activities {
-            builder.activity_ops.push(ActivityOp::Delete { activity_id });
+            builder
+                .activity_ops
+                .push(ActivityOp::Delete { activity_id });
         }
 
         let timers = std::mem::take(&mut builder.state.timers);
@@ -355,7 +727,9 @@ impl BasicKernel {
 
         let activities = std::mem::take(&mut builder.state.activities);
         for (activity_id, _) in activities {
-            builder.activity_ops.push(ActivityOp::Delete { activity_id });
+            builder
+                .activity_ops
+                .push(ActivityOp::Delete { activity_id });
         }
 
         let timers = std::mem::take(&mut builder.state.timers);
@@ -428,11 +802,12 @@ impl BasicKernel {
             .pending_workflow_task
             .clone()
             .ok_or(Reject::NoPendingWorkflowTask)?;
-        let started_event_id = pending
-            .started_event_id
-            .ok_or(Reject::WorkflowTaskNotStarted {
-                logical_seq: pending.logical_seq.0,
-            })?;
+        let started_event_id =
+            pending
+                .started_event_id
+                .ok_or(Reject::WorkflowTaskNotStarted {
+                    logical_seq: pending.logical_seq.0,
+                })?;
 
         if pending.logical_seq != req.token.logical_seq {
             return Err(Reject::WorkflowTaskSeqMismatch {
@@ -440,7 +815,9 @@ impl BasicKernel {
                 got: req.token.logical_seq.0,
             });
         }
-        if pending.attempt != req.token.attempt || started_event_id != req.token.started_event_id {
+        if pending.attempt != req.token.attempt
+            || started_event_id != req.token.started_event_id
+        {
             return Err(Reject::WorkflowTaskTokenMismatch);
         }
 
@@ -461,7 +838,10 @@ impl BasicKernel {
             closed = apply_workflow_command(&mut builder, command)?;
         }
 
-        if req.force_new_workflow_task && builder.state.is_open() && builder.state.pending_workflow_task.is_none() {
+        if req.force_new_workflow_task
+            && builder.state.is_open()
+            && builder.state.pending_workflow_task.is_none()
+        {
             builder.schedule_workflow_task();
         }
 
@@ -547,12 +927,15 @@ impl BasicKernel {
                 workflow_type,
             } => {
                 let child_run_id_for_state = child_run_id;
-                let started_event_id = builder.emit(HistoryEventKind::ChildWorkflowExecutionStarted {
-                    child_workflow_id: child.child_workflow_id.clone(),
-                    child_run_id,
-                    workflow_type,
-                });
-                if let Some(current) = builder.state.children.get_mut(&child.child_workflow_id) {
+                let started_event_id =
+                    builder.emit(HistoryEventKind::ChildWorkflowExecutionStarted {
+                        child_workflow_id: child.child_workflow_id.clone(),
+                        child_run_id,
+                        workflow_type,
+                    });
+                if let Some(current) =
+                    builder.state.children.get_mut(&child.child_workflow_id)
+                {
                     current.child_run_id = Some(child_run_id_for_state);
                     current.started_event_id = Some(started_event_id);
                 }
@@ -684,17 +1067,21 @@ impl BasicKernel {
 
         match req.result {
             ExternalCancelResult::CancelRequested => {
-                builder.emit(HistoryEventKind::ExternalWorkflowExecutionCancelRequested {
-                    initiated_event_id: pending.initiated_event_id,
-                    target_workflow_id: pending.target_workflow_id,
-                });
+                builder.emit(
+                    HistoryEventKind::ExternalWorkflowExecutionCancelRequested {
+                        initiated_event_id: pending.initiated_event_id,
+                        target_workflow_id: pending.target_workflow_id,
+                    },
+                );
             }
             ExternalCancelResult::Failed { cause } => {
-                builder.emit(HistoryEventKind::RequestCancelExternalWorkflowExecutionFailed {
-                    initiated_event_id: pending.initiated_event_id,
-                    target_workflow_id: pending.target_workflow_id,
-                    cause,
-                });
+                builder.emit(
+                    HistoryEventKind::RequestCancelExternalWorkflowExecutionFailed {
+                        initiated_event_id: pending.initiated_event_id,
+                        target_workflow_id: pending.target_workflow_id,
+                        cause,
+                    },
+                );
             }
         }
 
@@ -818,11 +1205,12 @@ impl BasicKernel {
             .pending_workflow_task
             .clone()
             .ok_or(Reject::NoPendingWorkflowTask)?;
-        let started_event_id = pending
-            .started_event_id
-            .ok_or(Reject::WorkflowTaskNotStarted {
-                logical_seq: pending.logical_seq.0,
-            })?;
+        let started_event_id =
+            pending
+                .started_event_id
+                .ok_or(Reject::WorkflowTaskNotStarted {
+                    logical_seq: pending.logical_seq.0,
+                })?;
 
         if pending.logical_seq != req.logical_seq {
             return Err(Reject::WorkflowTaskSeqMismatch {
@@ -858,17 +1246,19 @@ impl BasicKernel {
             .as_mut()
             .expect("validated pending workflow task must still exist");
         current.started_event_id = None;
-        builder.dispatch_ops.push(DispatchOp::EnqueueWorkflowTask {
-            queue: QueueKey {
-                namespace_id: builder.state.namespace_id,
-                task_queue: builder.state.task_queue.clone(),
-                task_kind: tokeira_types::TaskKind::Workflow,
-                deployment: None,
-                build_id: None,
-            },
-            logical_seq: pending.logical_seq,
-            sticky_preferred,
-        });
+        if builder.state.status != ExecutionStatus::Paused {
+            builder.dispatch_ops.push(DispatchOp::EnqueueWorkflowTask {
+                queue: QueueKey {
+                    namespace_id: builder.state.namespace_id,
+                    task_queue: builder.state.task_queue.clone(),
+                    task_kind: tokeira_types::TaskKind::Workflow,
+                    deployment: None,
+                    build_id: None,
+                },
+                logical_seq: pending.logical_seq,
+                sticky_preferred,
+            });
+        }
         Ok(builder.finish())
     }
 
@@ -882,11 +1272,12 @@ impl BasicKernel {
             .pending_workflow_task
             .clone()
             .ok_or(Reject::NoPendingWorkflowTask)?;
-        let started_event_id = pending
-            .started_event_id
-            .ok_or(Reject::WorkflowTaskNotStarted {
-                logical_seq: pending.logical_seq.0,
-            })?;
+        let started_event_id =
+            pending
+                .started_event_id
+                .ok_or(Reject::WorkflowTaskNotStarted {
+                    logical_seq: pending.logical_seq.0,
+                })?;
 
         if pending.logical_seq != req.logical_seq {
             return Err(Reject::WorkflowTaskSeqMismatch {
@@ -912,21 +1303,27 @@ impl BasicKernel {
             .expect("validated pending workflow task must still exist");
         current.started_event_id = None;
         builder.state.sticky = None;
-        builder.dispatch_ops.push(DispatchOp::EnqueueWorkflowTask {
-            queue: QueueKey {
-                namespace_id: builder.state.namespace_id,
-                task_queue: builder.state.task_queue.clone(),
-                task_kind: tokeira_types::TaskKind::Workflow,
-                deployment: None,
-                build_id: None,
-            },
-            logical_seq: pending.logical_seq,
-            sticky_preferred: None,
-        });
+        if builder.state.status != ExecutionStatus::Paused {
+            builder.dispatch_ops.push(DispatchOp::EnqueueWorkflowTask {
+                queue: QueueKey {
+                    namespace_id: builder.state.namespace_id,
+                    task_queue: builder.state.task_queue.clone(),
+                    task_kind: tokeira_types::TaskKind::Workflow,
+                    deployment: None,
+                    build_id: None,
+                },
+                logical_seq: pending.logical_seq,
+                sticky_preferred: None,
+            });
+        }
         Ok(builder.finish())
     }
 
-    fn apply_timer_due(&self, loaded: LoadedRun, req: TimerDueRequest) -> Result<Transition, Reject> {
+    fn apply_timer_due(
+        &self,
+        loaded: LoadedRun,
+        req: TimerDueRequest,
+    ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
         let timer = state
             .timers
@@ -951,6 +1348,8 @@ impl BasicKernel {
     }
 }
 
+/// Extract an open `WorkflowState` from a `LoadedRun`,
+/// rejecting absent or closed runs.
 fn expect_open(loaded: LoadedRun) -> Result<WorkflowState, Reject> {
     let state = match loaded {
         LoadedRun::Absent => return Err(Reject::MissingRun),
@@ -964,12 +1363,20 @@ fn expect_open(loaded: LoadedRun) -> Result<WorkflowState, Reject> {
     Ok(state)
 }
 
-fn apply_workflow_command(builder: &mut TransitionBuilder, command: WorkflowCommand) -> Result<bool, Reject> {
+/// Process a single workflow command from a
+/// `WorkflowTaskCompleted` batch. Returns `true` if the
+/// command closed the run (no further commands should be
+/// processed).
+fn apply_workflow_command(
+    builder: &mut TransitionBuilder,
+    command: WorkflowCommand,
+) -> Result<bool, Reject> {
     match command {
         WorkflowCommand::ScheduleActivity {
             activity_id,
             task_queue,
             input,
+            retry_policy,
             schedule_to_close_timeout,
             schedule_to_start_timeout,
             start_to_close_timeout,
@@ -979,27 +1386,35 @@ fn apply_workflow_command(builder: &mut TransitionBuilder, command: WorkflowComm
                 return Err(Reject::DuplicateActivityId(activity_id));
             }
 
-            let schedule_event_id = builder.emit(HistoryEventKind::ActivityTaskScheduled {
-                activity_id: activity_id.clone(),
-                task_queue: task_queue.clone(),
-                input,
-                schedule_to_close_timeout,
-                schedule_to_start_timeout,
-                start_to_close_timeout,
-                heartbeat_timeout,
-            });
+            let schedule_event_id =
+                builder.emit(HistoryEventKind::ActivityTaskScheduled {
+                    activity_id: activity_id.clone(),
+                    task_queue: task_queue.clone(),
+                    input: input.clone(),
+                    schedule_to_close_timeout,
+                    schedule_to_start_timeout,
+                    start_to_close_timeout,
+                    heartbeat_timeout,
+                });
 
             let activity = ActivityState {
                 activity_id: activity_id.clone(),
                 schedule_event_id,
                 task_queue: task_queue.clone(),
+                input: input.clone(),
                 attempt: 1,
+                retry_policy: retry_policy.clone(),
                 schedule_to_close_timeout,
                 schedule_to_start_timeout,
                 start_to_close_timeout,
                 heartbeat_timeout,
+                pause_info: None,
+                stamp: 0,
             };
-            builder.state.activities.insert(activity_id.clone(), activity.clone());
+            builder
+                .state
+                .activities
+                .insert(activity_id.clone(), activity.clone());
             builder.activity_ops.push(ActivityOp::Upsert(activity));
             builder.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
                 queue: QueueKey {
@@ -1010,6 +1425,7 @@ fn apply_workflow_command(builder: &mut TransitionBuilder, command: WorkflowComm
                     build_id: None,
                 },
                 activity_id,
+                input,
                 schedule_event_id,
                 attempt: 1,
                 schedule_to_close_timeout,
@@ -1158,14 +1574,15 @@ fn apply_workflow_command(builder: &mut TransitionBuilder, command: WorkflowComm
             if builder.state.children.contains_key(&child_workflow_id) {
                 return Err(Reject::DuplicateChildWorkflowId(child_workflow_id));
             }
-            let initiated_event_id = builder.emit(HistoryEventKind::StartChildWorkflowExecutionInitiated {
-                child_workflow_id: child_workflow_id.clone(),
-                workflow_type: workflow_type.clone(),
-                task_queue: task_queue.clone(),
-                input: input.clone(),
-                namespace_id,
-                parent_close_policy,
-            });
+            let initiated_event_id =
+                builder.emit(HistoryEventKind::StartChildWorkflowExecutionInitiated {
+                    child_workflow_id: child_workflow_id.clone(),
+                    workflow_type: workflow_type.clone(),
+                    task_queue: task_queue.clone(),
+                    input: input.clone(),
+                    namespace_id,
+                    parent_close_policy,
+                });
             builder.state.children.insert(
                 child_workflow_id.clone(),
                 ChildWorkflowState {
@@ -1208,12 +1625,14 @@ fn apply_workflow_command(builder: &mut TransitionBuilder, command: WorkflowComm
                     signal_name: signal_name.clone(),
                 },
             );
-            builder.dispatch_ops.push(DispatchOp::SignalExternalWorkflow {
-                target_workflow_id,
-                target_run_id,
-                signal_name,
-                input,
-            });
+            builder
+                .dispatch_ops
+                .push(DispatchOp::SignalExternalWorkflow {
+                    target_workflow_id,
+                    target_run_id,
+                    signal_name,
+                    input,
+                });
             Ok(false)
         }
         WorkflowCommand::RequestCancelExternalWorkflowExecution {
@@ -1257,14 +1676,15 @@ fn apply_workflow_command(builder: &mut TransitionBuilder, command: WorkflowComm
             {
                 return Err(Reject::DuplicateNexusOperationId(operation_id));
             }
-            let scheduled_event_id = builder.emit(HistoryEventKind::NexusOperationScheduled {
-                operation_id: operation_id.clone(),
-                endpoint: endpoint.clone(),
-                service: service.clone(),
-                operation: operation.clone(),
-                input: input.clone(),
-                schedule_to_close_timeout,
-            });
+            let scheduled_event_id =
+                builder.emit(HistoryEventKind::NexusOperationScheduled {
+                    operation_id: operation_id.clone(),
+                    endpoint: endpoint.clone(),
+                    service: service.clone(),
+                    operation: operation.clone(),
+                    input: input.clone(),
+                    schedule_to_close_timeout,
+                });
             builder.state.pending_nexus_operations.insert(
                 operation_id.clone(),
                 PendingNexusOperation {
@@ -1331,7 +1751,10 @@ fn apply_workflow_command(builder: &mut TransitionBuilder, command: WorkflowComm
             builder.state.pending_updates.remove(&update_id);
             Ok(false)
         }
-        WorkflowCommand::ProtocolMessage { message_id: _, body } => {
+        WorkflowCommand::ProtocolMessage {
+            message_id: _,
+            body,
+        } => {
             match body {
                 UpdateProtocolBody::Accepted {
                     update_id,
@@ -1382,8 +1805,19 @@ fn apply_workflow_command(builder: &mut TransitionBuilder, command: WorkflowComm
     }
 }
 
+/// Internal builder that assembles a [`Transition`] from a
+/// sequence of mutations.
+///
+/// Takes ownership of the current `WorkflowState`, provides
+/// helpers for emitting events, scheduling workflow tasks,
+/// and closing the run, then produces the final `Transition`
+/// on `finish()`.
+///
+/// See `docs/architecture/020-kernel.md` §Transition builder.
 struct TransitionBuilder {
+    /// Mutable working copy of the run state.
     state: WorkflowState,
+    /// Wall-clock time for all events in this transition.
     now: OffsetDateTime,
     history_events: SmallVec<[HistoryEvent; 8]>,
     request_dedupe_ops: SmallVec<[RequestDedupeOp; 1]>,
@@ -1391,10 +1825,14 @@ struct TransitionBuilder {
     timer_ops: SmallVec<[TimerOp; 4]>,
     dispatch_ops: SmallVec<[DispatchOp; 4]>,
     projection_ops: SmallVec<[ProjectionOp; 8]>,
+    /// The `TransitionSeq` captured at construction time,
+    /// used as the optimistic concurrency fence.
     expected_seq: TransitionSeq,
 }
 
 impl TransitionBuilder {
+    /// Create a new builder from the current state and a
+    /// wall-clock timestamp.
     fn new(state: WorkflowState, now: OffsetDateTime) -> Self {
         let expected_seq = state.transition_seq;
         Self {
@@ -1410,6 +1848,8 @@ impl TransitionBuilder {
         }
     }
 
+    /// Append a history event and return its assigned event
+    /// ID. Event IDs are contiguous within a transition.
     fn emit(&mut self, kind: HistoryEventKind) -> i64 {
         let event_id = self.state.last_event_id + 1;
         self.state.last_event_id = event_id;
@@ -1421,10 +1861,17 @@ impl TransitionBuilder {
         event_id
     }
 
+    /// Schedule a workflow task: emit the scheduled event,
+    /// set the pending WFT on state, and push a dispatch op.
+    /// No-ops if the workflow is paused.
     fn schedule_workflow_task(&mut self) {
+        if self.state.status == ExecutionStatus::Paused {
+            return;
+        }
         let logical_seq = self.state.next_workflow_task_seq;
         self.state.next_workflow_task_seq = logical_seq.next();
-        let scheduled_event_id = self.emit(HistoryEventKind::WorkflowTaskScheduled { logical_seq });
+        let scheduled_event_id =
+            self.emit(HistoryEventKind::WorkflowTaskScheduled { logical_seq });
         self.state.pending_workflow_task = Some(PendingWorkflowTask {
             logical_seq,
             scheduled_event_id,
@@ -1440,15 +1887,23 @@ impl TransitionBuilder {
                 build_id: None,
             },
             logical_seq,
-            sticky_preferred: self.state.sticky.as_ref().map(|s| s.worker_identity.clone()),
+            sticky_preferred: self
+                .state
+                .sticky
+                .as_ref()
+                .map(|s| s.worker_identity.clone()),
         });
     }
 
+    /// Transition the run to a terminal status: set the
+    /// status, clear pending WFT and sticky affinity, and
+    /// emit a `ProjectionOp::CloseExecution`.
     fn close(&mut self, status: ExecutionStatus) {
         self.state.status = status;
         self.state.closed_at = Some(self.now);
         self.state.pending_workflow_task = None;
         self.state.sticky = None;
+        self.state.pause_info = None;
         self.state.pending_external_signals.clear();
         self.state.pending_external_cancels.clear();
         self.state.pending_updates.clear();
@@ -1459,6 +1914,9 @@ impl TransitionBuilder {
         });
     }
 
+    /// Apply parent close policy to all open child workflows.
+    /// Emits `TerminateChild` or `CancelChild` dispatch ops
+    /// as appropriate; `Abandon` children are left alone.
     fn apply_parent_close_policy(&mut self) {
         let children = std::mem::take(&mut self.state.children);
         for (_, child) in children {
@@ -1485,6 +1943,9 @@ impl TransitionBuilder {
         }
     }
 
+    /// Consume the builder and produce the final
+    /// [`Transition`]. Increments `transition_seq` exactly
+    /// once.
     fn finish(mut self) -> Transition {
         self.state.transition_seq = self.state.transition_seq.next();
         Transition {
@@ -1500,66 +1961,138 @@ impl TransitionBuilder {
     }
 }
 
+/// Reasons the kernel rejects a command.
+///
+/// Each variant describes a precondition violation or
+/// constraint that prevents the transition from proceeding.
+/// The runtime translates these into appropriate gRPC status
+/// codes or internal retry decisions.
 #[derive(Debug, Error, PartialEq)]
 pub enum Reject {
+    /// A `Start` command was issued but the run already
+    /// exists in durable storage.
     #[error("run already exists")]
     RunAlreadyExists,
+    /// The run does not exist (expected `LoadedRun::Existing`).
     #[error("run not found")]
     MissingRun,
+    /// The run has already reached a terminal status.
     #[error("run closed: {0:?}")]
     RunClosed(ExecutionStatus),
+    /// A workflow task operation was attempted but no WFT is
+    /// currently pending.
     #[error("no pending workflow task")]
     NoPendingWorkflowTask,
+    /// The logical task sequence in the request does not match
+    /// the pending WFT.
     #[error("workflow task sequence mismatch: expected {expected}, got {got}")]
     WorkflowTaskSeqMismatch { expected: u64, got: u64 },
+    /// A `WorkflowTaskStarted` was issued but the pending WFT
+    /// has already been started.
     #[error("workflow task already started: logical_seq={logical_seq}")]
     WorkflowTaskAlreadyStarted { logical_seq: u64 },
+    /// The completion token does not match the pending WFT's
+    /// attempt or started event ID.
     #[error("workflow task token mismatch")]
     WorkflowTaskTokenMismatch,
+    /// A completion or failure was issued but the pending WFT
+    /// has not been started yet.
     #[error("workflow task not started: logical_seq={logical_seq}")]
     WorkflowTaskNotStarted { logical_seq: u64 },
+    /// A `ScheduleActivity` command used an activity ID that
+    /// is already in the open set.
     #[error("duplicate activity id: {0}")]
     DuplicateActivityId(String),
+    /// A `StartTimer` command used a timer ID that is already
+    /// in the open set.
     #[error("duplicate timer id: {0}")]
     DuplicateTimerId(String),
+    /// An operation referenced an activity that does not exist
+    /// in the open set.
     #[error("unknown activity: {0}")]
     UnknownActivity(String),
+    /// An operation referenced a timer that does not exist in
+    /// the open set.
     #[error("unknown timer: {0}")]
     UnknownTimer(String),
+    /// A `StartChildWorkflow` command used a child workflow ID
+    /// that is already in the open set.
     #[error("duplicate child workflow id: {0:?}")]
     DuplicateChildWorkflowId(tokeira_types::WorkflowId),
+    /// An operation referenced a child workflow that does not
+    /// exist in the open set.
     #[error("unknown child: {0:?}")]
     UnknownChild(tokeira_types::WorkflowId),
-    #[error("stale child confirmation for {child_workflow_id:?}: expected initiated_event_id {expected_initiated_event_id}")]
+    /// A child start confirmation referenced a stale
+    /// initiated event ID.
+    #[error(
+        "stale child confirmation for {child_workflow_id:?}: expected initiated_event_id {expected_initiated_event_id}"
+    )]
     StaleChildConfirmation {
         child_workflow_id: tokeira_types::WorkflowId,
         expected_initiated_event_id: i64,
     },
+    /// An external signal resolution referenced an unknown
+    /// initiated event ID.
     #[error("unknown external signal: initiated_event_id={0}")]
     UnknownExternalSignal(i64),
+    /// An external cancel resolution referenced an unknown
+    /// initiated event ID.
     #[error("unknown external cancel: initiated_event_id={0}")]
     UnknownExternalCancel(i64),
+    /// An update completion/rejection referenced an unknown
+    /// update ID.
     #[error("unknown update: {0}")]
     UnknownUpdate(String),
+    /// An update acceptance used an update ID that is already
+    /// in the pending set.
     #[error("duplicate update id: {0}")]
     DuplicateUpdateId(String),
+    /// A `ScheduleNexusOperation` command used an operation ID
+    /// that is already in the pending set.
     #[error("duplicate nexus operation id: {0}")]
     DuplicateNexusOperationId(String),
+    /// An operation referenced a Nexus operation that does not
+    /// exist in the pending set.
     #[error("unknown nexus operation: {0}")]
     UnknownNexusOperation(String),
-    #[error("stale nexus resolution for {operation_id}: expected scheduled_event_id {expected_scheduled_event_id}")]
+    /// A Nexus resolution referenced a stale scheduled event
+    /// ID.
+    #[error(
+        "stale nexus resolution for {operation_id}: expected scheduled_event_id {expected_scheduled_event_id}"
+    )]
     StaleNexusResolution {
         operation_id: String,
         expected_scheduled_event_id: i64,
     },
+    /// A Nexus operation was already marked as started.
     #[error("nexus operation already started: {0}")]
     NexusOperationAlreadyStarted(String),
+    /// The command requires the workflow to not be paused, but
+    /// it is.
+    #[error("workflow is paused")]
+    WorkflowPaused,
+    /// A pause was requested but the workflow is already
+    /// paused.
+    #[error("workflow is already paused")]
+    AlreadyPaused,
+    /// An unpause was requested but the workflow is not
+    /// paused.
+    #[error("workflow is not paused")]
+    NotPaused,
+    /// An activity unpause was requested but the activity is
+    /// not paused.
+    #[error("activity is not paused: {0}")]
+    ActivityNotPaused(String),
+    /// A reset command violated a structural constraint (e.g.
+    /// invalid fork event ID).
     #[error("reset constraint violation: {reason}")]
     ResetConstraintViolation { reason: String },
+    /// Workflow commands were issued after a close command
+    /// within the same task completion.
     #[error("commands after close at index {index}")]
     CommandsAfterClose { index: usize },
-
-    // TODO(correctness): add richer rejection reasons for updates,
-    // continue-as-new constraints, child workflow resolution mismatches, and
-    // cancellation races.
+    // TODO(correctness): add richer rejection reasons for
+    // updates, continue-as-new constraints, child workflow
+    // resolution mismatches, and cancellation races.
 }

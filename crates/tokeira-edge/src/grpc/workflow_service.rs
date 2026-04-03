@@ -6,7 +6,9 @@ use tokeira_proto::workflowservice::{
 };
 
 use crate::{
-    grpc::{errors::proto_conversion_status, metadata::metadata_to_header_map, translate},
+    grpc::{
+        errors::proto_conversion_status, metadata::metadata_to_header_map, translate,
+    },
     workflow_service::WorkflowService,
 };
 
@@ -32,9 +34,12 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         request: Request<workflowservice::StartWorkflowExecutionRequest>,
     ) -> Result<Response<workflowservice::StartWorkflowExecutionResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
-        let edge_req =
-            translate::start_request_to_edge(request.into_inner()).map_err(proto_conversion_status)?;
-        let edge_resp = self.inner.start_workflow_execution(&headers, edge_req).await?;
+        let edge_req = translate::start_request_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let edge_resp = self
+            .inner
+            .start_workflow_execution(&headers, edge_req)
+            .await?;
         Ok(Response::new(translate::start_response_to_proto(edge_resp)))
     }
 
@@ -45,8 +50,13 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         let headers = metadata_to_header_map(request.metadata());
         let edge_req = translate::signal_request_to_edge(request.into_inner())
             .map_err(proto_conversion_status)?;
-        let edge_resp = self.inner.signal_workflow_execution(&headers, edge_req).await?;
-        Ok(Response::new(translate::signal_response_to_proto(edge_resp)))
+        let edge_resp = self
+            .inner
+            .signal_workflow_execution(&headers, edge_req)
+            .await?;
+        Ok(Response::new(translate::signal_response_to_proto(
+            edge_resp,
+        )))
     }
 
     async fn poll_workflow_task_queue(
@@ -54,9 +64,12 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         request: Request<workflowservice::PollWorkflowTaskQueueRequest>,
     ) -> Result<Response<workflowservice::PollWorkflowTaskQueueResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
-        let edge_req =
-            translate::poll_request_to_edge(request.into_inner()).map_err(proto_conversion_status)?;
-        let edge_resp = self.inner.poll_workflow_task_queue(&headers, edge_req).await?;
+        let edge_req = translate::poll_request_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let edge_resp = self
+            .inner
+            .poll_workflow_task_queue(&headers, edge_req)
+            .await?;
 
         Ok(Response::new(match edge_resp {
             Some(resp) => translate::poll_response_to_proto(resp),
@@ -67,7 +80,8 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn respond_workflow_task_completed(
         &self,
         request: Request<workflowservice::RespondWorkflowTaskCompletedRequest>,
-    ) -> Result<Response<workflowservice::RespondWorkflowTaskCompletedResponse>, Status> {
+    ) -> Result<Response<workflowservice::RespondWorkflowTaskCompletedResponse>, Status>
+    {
         let headers = metadata_to_header_map(request.metadata());
         let edge_req = translate::respond_completed_request_to_edge(request.into_inner())
             .map_err(proto_conversion_status)?;
@@ -75,13 +89,16 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             .inner
             .respond_workflow_task_completed(&headers, edge_req)
             .await?;
-        Ok(Response::new(translate::completed_response_to_proto(edge_resp)))
+        Ok(Response::new(translate::completed_response_to_proto(
+            edge_resp,
+        )))
     }
 
     async fn describe_workflow_execution(
         &self,
         request: Request<workflowservice::DescribeWorkflowExecutionRequest>,
-    ) -> Result<Response<workflowservice::DescribeWorkflowExecutionResponse>, Status> {
+    ) -> Result<Response<workflowservice::DescribeWorkflowExecutionResponse>, Status>
+    {
         let headers = metadata_to_header_map(request.metadata());
         let edge_req = translate::describe_request_to_edge(request.into_inner())
             .map_err(proto_conversion_status)?;
@@ -89,7 +106,9 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             .inner
             .describe_workflow_execution(&headers, edge_req)
             .await?;
-        Ok(Response::new(translate::describe_response_to_proto(edge_resp)))
+        Ok(Response::new(translate::describe_response_to_proto(
+            edge_resp,
+        )))
     }
 
     async fn list_workflow_executions(
@@ -97,9 +116,12 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         request: Request<workflowservice::ListWorkflowExecutionsRequest>,
     ) -> Result<Response<workflowservice::ListWorkflowExecutionsResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
-        let edge_req =
-            translate::list_request_to_edge(request.into_inner()).map_err(proto_conversion_status)?;
-        let edge_resp = self.inner.list_workflow_executions(&headers, edge_req).await?;
+        let edge_req = translate::list_request_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let edge_resp = self
+            .inner
+            .list_workflow_executions(&headers, edge_req)
+            .await?;
         Ok(Response::new(translate::list_response_to_proto(edge_resp)))
     }
 
@@ -110,7 +132,10 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         let headers = metadata_to_header_map(request.metadata());
         let edge_req = translate::count_request_to_edge(request.into_inner())
             .map_err(proto_conversion_status)?;
-        let edge_resp = self.inner.count_workflow_executions(&headers, edge_req).await?;
+        let edge_resp = self
+            .inner
+            .count_workflow_executions(&headers, edge_req)
+            .await?;
         Ok(Response::new(translate::count_response_to_proto(edge_resp)))
     }
 }
@@ -129,7 +154,10 @@ mod tests {
         long_poll::{LongPollConfig, LongPollGate},
         namespace_cache::{InMemoryNamespaceCache, ResolvedNamespace},
         routing::LocalOnlyRouter,
-        workflow_service::{EmptyVisibilityApi, ExecutionResolver, WorkflowMutationOutcome, WorkflowRuntimeApi},
+        workflow_service::{
+            EmptyVisibilityApi, ExecutionResolver, WorkflowMutationOutcome,
+            WorkflowRuntimeApi,
+        },
     };
 
     struct PollNoneRuntime;
@@ -173,7 +201,11 @@ mod tests {
 
     #[async_trait]
     impl ExecutionResolver for NoopResolver {
-        async fn current_run_key(&self, _namespace: &str, _workflow_id: &str) -> Result<Option<tokeira_types::RunKey>> {
+        async fn current_run_key(
+            &self,
+            _namespace: &str,
+            _workflow_id: &str,
+        ) -> Result<Option<tokeira_types::RunKey>> {
             Ok(None)
         }
 
@@ -202,19 +234,24 @@ mod tests {
         let grpc = WorkflowServiceGrpc::new(service);
 
         let response = grpc
-            .poll_workflow_task_queue(Request::new(workflowservice::PollWorkflowTaskQueueRequest {
-                namespace: "default".to_string(),
-                task_queue: Some(tokeira_proto::common::TaskQueue {
-                    name: "queue".to_string(),
-                }),
-                identity: "worker".to_string(),
-                deployment: String::new(),
-                build_id: String::new(),
-            }))
+            .poll_workflow_task_queue(Request::new(
+                workflowservice::PollWorkflowTaskQueueRequest {
+                    namespace: "default".to_string(),
+                    task_queue: Some(tokeira_proto::common::TaskQueue {
+                        name: "queue".to_string(),
+                    }),
+                    identity: "worker".to_string(),
+                    deployment: String::new(),
+                    build_id: String::new(),
+                },
+            ))
             .await
             .expect("poll should succeed")
             .into_inner();
 
-        assert_eq!(response, workflowservice::PollWorkflowTaskQueueResponse::default());
+        assert_eq!(
+            response,
+            workflowservice::PollWorkflowTaskQueueResponse::default()
+        );
     }
 }

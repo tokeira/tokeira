@@ -49,7 +49,7 @@ tokeira-kernel/src/
 
 ## Command Taxonomy
 
-19 top-level commands, 20+ workflow commands within `WorkflowTaskCompleted`.
+25 top-level commands, 20+ workflow commands within `WorkflowTaskCompleted`.
 
 ### Top-Level Commands
 
@@ -73,6 +73,12 @@ tokeira-kernel/src/
 | `NexusOperationResolved` | Runtime | Yes | No |
 | `WorkflowExecutionTimedOut` | Runtime | Yes | No |
 | `UpdateExecutionOptions` | External / operator | Yes | Yes |
+| `PauseWorkflow` | External / operator | Yes | Yes |
+| `UnpauseWorkflow` | External / operator | Yes | Yes |
+| `UpdateActivityOptions` | External / operator | Yes | Yes |
+| `PauseActivity` | External / operator | Yes | Yes |
+| `UnpauseActivity` | External / operator | Yes | Yes |
+| `ResetActivity` | External / operator | Yes | Yes |
 | `Reset` | Operator | Yes | Yes |
 
 ### Workflow Commands (within WorkflowTaskCompleted)
@@ -105,9 +111,10 @@ Precise, enumerated rejection reasons the runtime can act on programmatically:
 - **Existence:** `RunAlreadyExists`, `MissingRun`, `RunClosed(status)`
 - **Sequence fencing:** `WorkflowTaskSeqMismatch`, `WorkflowTaskAlreadyStarted`, `WorkflowTaskNotStarted`, `WorkflowTaskStartedEventMismatch`
 - **Token validation:** `WorkflowTaskTokenMismatch`
-- **Uniqueness:** `DuplicateActivityId`, `DuplicateTimerId`, `DuplicateUpdateId`, `DuplicateNexusOperationId`
-- **Entity resolution:** `UnknownActivity`, `UnknownTimer`, `UnknownUpdate`, `UnknownExternalSignal`, `UnknownExternalCancel`, `UnknownNexusOperation`
+- **Uniqueness:** `DuplicateActivityId`, `DuplicateTimerId`, `DuplicateChildWorkflowId`, `DuplicateUpdateId`, `DuplicateNexusOperationId`
+- **Entity resolution:** `UnknownActivity`, `UnknownTimer`, `UnknownChild`, `UnknownUpdate`, `UnknownExternalSignal`, `UnknownExternalCancel`, `UnknownNexusOperation`
 - **Ordering:** `CommandsAfterClose`
+- **Pause control:** `WorkflowPaused`, `AlreadyPaused`, `NotPaused`, `ActivityNotPaused`
 - **Nexus:** `NexusOperationAlreadyStarted`
 - **Reset:** `ResetConstraintViolation`
 
@@ -136,8 +143,9 @@ The kernel is analogous to the core state-transition logic inside Temporal's His
 | F8: Markers and execution options | `kernel-markers-execution-options` | ✅ Implemented |
 | F9: Nexus operations | `kernel-nexus-operations` | ✅ Implemented |
 | F10: Reset | `kernel-reset` | ✅ Implemented |
+| F11: Pause / activity management | `kernel-pause-activity-management` | ✅ Implemented |
 
-All 10 kernel features are complete. 192 tests (128 golden + 64 property).
+All 11 kernel features are complete.
 
 ## Temporal Feature Coverage
 
@@ -157,3 +165,5 @@ All 10 kernel features are complete. 192 tests (128 golden + 64 property).
 | Nexus | Schedules, cancels, resolves operations |
 | Reset | Terminates run, emits metadata for runtime successor |
 | Markers | Pass-through to history; no state change |
+| Pause / unpause | Owns pause state, WFT suppression, and unpause redispatch |
+| Activity management | Owns activity pause state, option updates, and reset redispatch |

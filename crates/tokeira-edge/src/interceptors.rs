@@ -7,7 +7,9 @@ use time::OffsetDateTime;
 use crate::{
     errors::{EdgeError, EdgeResult},
     namespace_cache::{NamespaceCache, ResolvedNamespace},
-    request_id::{extract_or_generate, RequestId, RequestIdGenerator, UuidRequestIdGenerator},
+    request_id::{
+        RequestId, RequestIdGenerator, UuidRequestIdGenerator, extract_or_generate,
+    },
 };
 
 /// High-level action names used for authorization.
@@ -166,7 +168,9 @@ impl EdgeInterceptors {
 
         let namespace = match namespace_name {
             Some(name) => {
-                let Some(ns) = self.namespaces.get(name).await.map_err(EdgeError::from)? else {
+                let Some(ns) =
+                    self.namespaces.get(name).await.map_err(EdgeError::from)?
+                else {
                     return Err(EdgeError::NamespaceNotFound(name.to_string()));
                 };
 

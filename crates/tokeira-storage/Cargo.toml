@@ -12,3 +12,6 @@ tokio.workspace = true
 tracing.workspace = true
 tokeira-kernel = { path = "../tokeira-kernel" }
 tokeira-types = { path = "../tokeira-types" }
+
+[dev-dependencies]
+proptest = "1"

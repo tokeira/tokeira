@@ -1,8 +1,6 @@
 use http::{Response, StatusCode};
 
-use crate::{
-    errors::{EdgeError, EdgeResult},
-};
+use crate::errors::{EdgeError, EdgeResult};
 
 /// Service names exposed by the Temporal-style HTTP proxy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,7 +59,7 @@ impl HttpProxy {
             other => {
                 return Err(EdgeError::BadRequest(format!(
                     "unknown proxy service `{other}`"
-                )))
+                )));
             }
         };
 
@@ -72,7 +70,11 @@ impl HttpProxy {
     }
 
     pub fn path_for(route: &ProxyRoute) -> String {
-        format!("/api/v1/{}/{}", route.service.as_path_segment(), route.method)
+        format!(
+            "/api/v1/{}/{}",
+            route.service.as_path_segment(),
+            route.method
+        )
     }
 
     pub fn into_call(path: &str, body: Vec<u8>) -> EdgeResult<ProxyCall> {

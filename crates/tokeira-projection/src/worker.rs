@@ -1,7 +1,7 @@
 use anyhow::Result;
-use tracing::{debug, info};
 use tokeira_storage::ProjectionLog;
 use tokeira_types::ProjectionCursor;
+use tracing::{debug, info};
 
 use crate::sink::ProjectionSink;
 
@@ -24,7 +24,11 @@ where
     pub async fn run_once(&self, cursor: ProjectionCursor) -> Result<ProjectionCursor> {
         let batch = self.log.read_from(&cursor, self.batch_size).await?;
         if batch.records.is_empty() {
-            debug!(partition = cursor.partition_id, fanout = cursor.fanout, "projection substream idle");
+            debug!(
+                partition = cursor.partition_id,
+                fanout = cursor.fanout,
+                "projection substream idle"
+            );
             return Ok(cursor);
         }
 

@@ -1,5 +1,5 @@
-use tonic::Status;
 use tokeira_proto::conversions::ProtoConversionError;
+use tonic::Status;
 
 use crate::errors::EdgeError;
 
@@ -18,15 +18,19 @@ impl From<EdgeError> for Status {
                 Status::permission_denied(message)
             }
             EdgeError::NamespaceNotFound(namespace) => Status::not_found(namespace),
-            EdgeError::NamespaceDeleted(namespace) => Status::failed_precondition(namespace),
+            EdgeError::NamespaceDeleted(namespace) => {
+                Status::failed_precondition(namespace)
+            }
             EdgeError::WorkflowNotFound {
                 namespace,
                 workflow_id,
             } => Status::not_found(format!("{namespace}/{workflow_id}")),
-            EdgeError::TooManyLongPolls => Status::resource_exhausted(err_static("too many concurrent long polls")),
-            EdgeError::LongPollAdmissionTimeout => {
-                Status::deadline_exceeded(err_static("long poll timed out while waiting for admission"))
+            EdgeError::TooManyLongPolls => {
+                Status::resource_exhausted(err_static("too many concurrent long polls"))
             }
+            EdgeError::LongPollAdmissionTimeout => Status::deadline_exceeded(err_static(
+                "long poll timed out while waiting for admission",
+            )),
             EdgeError::RemoteRouteUnsupported { target } => Status::unavailable(format!(
                 "request routed to remote target `{target}` but forwarding is not wired yet"
             )),
@@ -51,8 +55,14 @@ mod tests {
     #[test]
     fn edge_errors_map_to_expected_grpc_codes() {
         let cases = [
-            (EdgeError::BadRequest("bad".to_string()), Code::InvalidArgument),
-            (EdgeError::Unauthorized("nope".to_string()), Code::Unauthenticated),
+            (
+                EdgeError::BadRequest("bad".to_string()),
+                Code::InvalidArgument,
+            ),
+            (
+                EdgeError::Unauthorized("nope".to_string()),
+                Code::Unauthenticated,
+            ),
             (
                 EdgeError::Forbidden {
                     action: "operator_read",
@@ -76,10 +86,7 @@ mod tests {
                 Code::FailedPrecondition,
             ),
             (EdgeError::TooManyLongPolls, Code::ResourceExhausted),
-            (
-                EdgeError::LongPollAdmissionTimeout,
-                Code::DeadlineExceeded,
-            ),
+            (EdgeError::LongPollAdmissionTimeout, Code::DeadlineExceeded),
             (
                 EdgeError::RemoteRouteUnsupported {
                     target: "other".to_string(),

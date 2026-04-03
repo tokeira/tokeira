@@ -9,9 +9,9 @@
 //! Keeping these concerns together prevents the rest of the workspace from depending directly on
 //! generated protobuf details.
 
+pub mod conversions;
 pub mod internal;
 pub mod public;
-pub mod conversions;
 
 pub use internal::{admin, runtime};
 pub use public::{common, enums, operatorservice, workflowservice};

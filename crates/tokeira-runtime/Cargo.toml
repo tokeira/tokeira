@@ -10,6 +10,7 @@ async-trait.workspace = true
 smallvec.workspace = true
 time.workspace = true
 tokio.workspace = true
+tokio-util = { version = "0.7", features = ["rt"] }
 tracing.workspace = true
 tokeira-kernel = { path = "../tokeira-kernel" }
 tokeira-storage = { path = "../tokeira-storage" }
@@ -17,4 +18,5 @@ tokeira-types = { path = "../tokeira-types" }
 
 [dev-dependencies]
 proptest = "1"
+tokio-util = { version = "0.7", features = ["rt"] }
 uuid.workspace = true

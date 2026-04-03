@@ -4,7 +4,9 @@ use anyhow::Result;
 use time::{Duration, OffsetDateTime};
 
 use tokeira_kernel::{StartRequest, WorkflowTaskCompletedRequest};
-use tokeira_runtime::{LaneConfig, TokeiraRuntime};
+use tokeira_runtime::{
+    LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
+};
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
     ExecutionRef, LogicalTaskSeq, Memo, NamespaceId, Payloads, QueueKey, RequestContext,
@@ -15,7 +17,13 @@ use tokeira_types::{
 #[tokio::test]
 async fn start_and_signal_publish_workflow_tasks() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
-    let runtime = TokeiraRuntime::new(store.clone(), 2, LaneConfig::default());
+    let runtime = TokeiraRuntime::new(
+        store.clone(),
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+    );
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("workflow-1".to_string());
     let queue = queue(namespace_id, "queue-a");
@@ -84,6 +92,8 @@ async fn occ_conflicts_are_retried_for_signals() -> Result<()> {
             max_occ_retries: 5,
             max_drain_per_activation: 16,
         },
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
     ));
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("workflow-conflict".to_string());
@@ -127,7 +137,13 @@ async fn occ_conflicts_are_retried_for_signals() -> Result<()> {
 #[tokio::test]
 async fn burst_signals_produce_complete_history() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
-    let runtime = Arc::new(TokeiraRuntime::new(store.clone(), 2, LaneConfig::default()));
+    let runtime = Arc::new(TokeiraRuntime::new(
+        store.clone(),
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+    ));
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("workflow-burst".to_string());
     let run_key = applied_state(

@@ -31,7 +31,9 @@ use tokeira_proto::{
         workflow_service_client::WorkflowServiceClient,
     },
 };
-use tokeira_runtime::{LaneConfig, TokeiraRuntime};
+use tokeira_runtime::{
+    LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
+};
 use tokeira_storage::{InMemoryStore, RunRepository};
 use tokeira_types::{ExecutionRef, WorkflowId};
 
@@ -129,7 +131,13 @@ async fn spawn_test_server() -> Result<(
     tokio::task::JoinHandle<Result<()>>,
 )> {
     let store = Arc::new(InMemoryStore::default());
-    let runtime = Arc::new(TokeiraRuntime::new(store.clone(), 4, LaneConfig::default()));
+    let runtime = Arc::new(TokeiraRuntime::new(
+        store.clone(),
+        4,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+    ));
 
     let namespaces = Arc::new(InMemoryNamespaceCache::new());
     namespaces

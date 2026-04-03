@@ -6,7 +6,9 @@ use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     HistoryEventKind, StartRequest, WorkflowCommand, WorkflowTaskCompletedRequest,
 };
-use tokeira_runtime::{LaneConfig, TokeiraRuntime};
+use tokeira_runtime::{
+    LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
+};
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
     Memo, NamespaceId, Payloads, QueueKey, RequestContext, RequestId, RetryPolicy,
@@ -16,7 +18,13 @@ use tokeira_types::{
 #[tokio::test]
 async fn schedule_poll_complete_activity_produces_completed_history() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
-    let runtime = TokeiraRuntime::new(store.clone(), 2, LaneConfig::default());
+    let runtime = TokeiraRuntime::new(
+        store.clone(),
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+    );
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("activity-complete".to_string());
     let run_key = start_and_schedule_activity(
@@ -53,7 +61,13 @@ async fn schedule_poll_complete_activity_produces_completed_history() -> Result<
 #[tokio::test]
 async fn retryable_activity_failure_redispatches_next_attempt() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
-    let runtime = TokeiraRuntime::new(store.clone(), 2, LaneConfig::default());
+    let runtime = TokeiraRuntime::new(
+        store.clone(),
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+    );
     let namespace_id = NamespaceId::new();
 
     let policy = RetryPolicy {
@@ -106,7 +120,13 @@ async fn retryable_activity_failure_redispatches_next_attempt() -> Result<()> {
 #[tokio::test]
 async fn non_retryable_activity_failure_submits_failed_resolution() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
-    let runtime = TokeiraRuntime::new(store.clone(), 2, LaneConfig::default());
+    let runtime = TokeiraRuntime::new(
+        store.clone(),
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+    );
     let namespace_id = NamespaceId::new();
     let run_key = start_and_schedule_activity(
         &runtime,
@@ -149,7 +169,13 @@ async fn republish_activity_queue_after_restart_restores_pollability() -> Result
     let store = Arc::new(InMemoryStore::default());
     let namespace_id = NamespaceId::new();
 
-    let runtime = TokeiraRuntime::new(store.clone(), 2, LaneConfig::default());
+    let runtime = TokeiraRuntime::new(
+        store.clone(),
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+    );
     let _ = start_and_schedule_activity(
         &runtime,
         namespace_id,
@@ -159,7 +185,13 @@ async fn republish_activity_queue_after_restart_restores_pollability() -> Result
     )
     .await?;
 
-    let restarted = TokeiraRuntime::new(store.clone(), 2, LaneConfig::default());
+    let restarted = TokeiraRuntime::new(
+        store.clone(),
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+    );
     let count = restarted
         .republish_activity_queue(activity_queue(namespace_id), 10)
         .await?;

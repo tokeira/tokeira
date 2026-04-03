@@ -17,7 +17,9 @@ use tokeira_edge::{
     workflow_service::ExecutionResolver,
 };
 use tokeira_kernel::LoadedRun;
-use tokeira_runtime::{LaneConfig, TokeiraRuntime};
+use tokeira_runtime::{
+    LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
+};
 use tokeira_storage::{InMemoryStore, RunRepository};
 use tokeira_types::{ExecutionRef, NamespaceId, WorkflowId};
 
@@ -30,7 +32,13 @@ async fn main() -> Result<()> {
     let addr = grpc_addr_from_env()?;
 
     let store = Arc::new(InMemoryStore::default());
-    let runtime = Arc::new(TokeiraRuntime::new(store.clone(), 4, LaneConfig::default()));
+    let runtime = Arc::new(TokeiraRuntime::new(
+        store.clone(),
+        4,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+    ));
 
     let default_namespace = ResolvedNamespace::active("default");
     let default_namespace_id = namespace_id_for("default");

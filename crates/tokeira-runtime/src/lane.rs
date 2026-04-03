@@ -48,6 +48,7 @@ pub trait DispatchPublisher: Send + Sync {
 /// and make it obvious which piece of code serializes commands for a run, but
 /// they do not define correctness. If a run moves between lanes later, the run's
 /// durable state remains the source of truth.
+#[derive(Clone)]
 pub struct LaneHandle {
     tx: mpsc::Sender<LaneMessage>,
 }
@@ -95,6 +96,7 @@ pub fn spawn_lane<K, R, P>(
     kernel: K,
     repo: R,
     publisher: P,
+    workflow_timeout_tracking: crate::runtime::WorkflowTimeoutTrackingState,
     config: LaneConfig,
 ) -> LaneHandle
 where
@@ -107,8 +109,16 @@ where
     tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
             let buffered =
-                run_activation(&kernel, &repo, &publisher, &mut rx, message, &config)
-                    .await;
+                run_activation(
+                    &kernel,
+                    &repo,
+                    &publisher,
+                    &workflow_timeout_tracking,
+                    &mut rx,
+                    message,
+                    &config,
+                )
+                .await;
             for message in buffered {
                 if requeue_tx.send(message).await.is_err() {
                     break;
@@ -123,6 +133,7 @@ async fn run_activation<K, R, P>(
     kernel: &K,
     repo: &R,
     publisher: &P,
+    workflow_timeout_tracking: &crate::runtime::WorkflowTimeoutTrackingState,
     rx: &mut mpsc::Receiver<LaneMessage>,
     first_message: LaneMessage,
     config: &LaneConfig,
@@ -151,6 +162,11 @@ where
         let stop_draining = result.is_err();
         let reply = match result {
             Ok((commit_result, dispatch_ops)) => {
+                if let CommitResult::Applied { new_state } = &commit_result {
+                    if new_state.closed_at.is_some() {
+                        workflow_timeout_tracking.remove(message.run_key);
+                    }
+                }
                 if !dispatch_ops.is_empty() {
                     if let Err(error) =
                         publisher.publish(message.run_key, &dispatch_ops).await
@@ -781,6 +797,7 @@ mod tests {
         let (_foreign, _foreign_reply) = lane_message(RunKey::new(), "foreign");
         let (second, second_reply) = lane_message(run_key, "second");
         let (tx, mut rx) = mpsc::channel(8);
+        let tracking = crate::runtime::WorkflowTimeoutTrackingState::default();
         tx.send(second).await.unwrap();
         tx.send(_foreign).await.unwrap();
 
@@ -788,6 +805,7 @@ mod tests {
             &kernel,
             &repo,
             &publisher,
+            &tracking,
             &mut rx,
             first,
             &LaneConfig {
@@ -843,6 +861,7 @@ mod tests {
         let (second, second_reply) = lane_message(run_key, "second");
         let (third, _third_reply) = lane_message(run_key, "third");
         let (tx, mut rx) = mpsc::channel(8);
+        let tracking = crate::runtime::WorkflowTimeoutTrackingState::default();
         tx.send(second).await.unwrap();
         tx.send(third).await.unwrap();
 
@@ -850,6 +869,7 @@ mod tests {
             &kernel,
             &repo,
             &publisher,
+            &tracking,
             &mut rx,
             first,
             &LaneConfig {
@@ -889,6 +909,7 @@ mod tests {
         let (second, second_reply) = lane_message(run_key, "second");
         let (third, _third_reply) = lane_message(run_key, "third");
         let (tx, mut rx) = mpsc::channel(8);
+        let tracking = crate::runtime::WorkflowTimeoutTrackingState::default();
         tx.send(second).await.unwrap();
         tx.send(third).await.unwrap();
 
@@ -896,6 +917,7 @@ mod tests {
             &kernel,
             &repo,
             &publisher,
+            &tracking,
             &mut rx,
             first,
             &LaneConfig::default(),
@@ -924,11 +946,13 @@ mod tests {
         let publisher = MockPublisher::new().with_failure().await;
         let (first, first_reply) = lane_message(run_key, "first");
         let (_tx, mut rx) = mpsc::channel(8);
+        let tracking = crate::runtime::WorkflowTimeoutTrackingState::default();
 
         let buffered = run_activation(
             &kernel,
             &repo,
             &publisher,
+            &tracking,
             &mut rx,
             first,
             &LaneConfig::default(),
@@ -958,11 +982,13 @@ mod tests {
         let publisher = MockPublisher::new();
         let (first, first_reply) = lane_message(run_key, "first");
         let (_tx, mut rx) = mpsc::channel(8);
+        let tracking = crate::runtime::WorkflowTimeoutTrackingState::default();
 
         let _ = run_activation(
             &kernel,
             &repo,
             &publisher,
+            &tracking,
             &mut rx,
             first,
             &LaneConfig {

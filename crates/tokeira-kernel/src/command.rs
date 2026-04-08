@@ -202,6 +202,9 @@ pub struct StartRequest {
     pub parent_run_key: Option<RunKey>,
     /// Parent workflow ID if this start creates a child workflow.
     pub parent_workflow_id: Option<WorkflowId>,
+    /// Wall-clock `started_at` of the very first run in the
+    /// execution chain.
+    pub first_run_started_at: Option<OffsetDateTime>,
     /// Caller-supplied request context for dedupe and tracing.
     pub request: RequestContext,
     /// Wall-clock time the command was accepted.

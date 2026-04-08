@@ -278,6 +278,7 @@ fn start_request(
         first_execution_run_id: None,
         parent_run_key: None,
         parent_workflow_id: None,
+        first_run_started_at: None,
         request: RequestContext {
             request_id: RequestId("req-start".to_string()),
             caller_identity: None,

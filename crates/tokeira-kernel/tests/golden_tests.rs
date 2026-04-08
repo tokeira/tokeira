@@ -88,6 +88,7 @@ fn make_start_request() -> StartRequest {
         first_execution_run_id: Some(run_id),
         parent_run_key: None,
         parent_workflow_id: None,
+        first_run_started_at: Some(now()),
         request: request_context("start-req"),
         now: now(),
     }
@@ -116,6 +117,7 @@ fn make_open_state() -> WorkflowState {
         workflow_task_timeout: Duration::seconds(10),
         retry_policy: Some(retry_policy()),
         attempt: 1,
+        first_execution_run_id: Some(RunId::new()),
         parent_run_key: None,
         parent_workflow_id: None,
         activities: BTreeMap::new(),
@@ -128,6 +130,7 @@ fn make_open_state() -> WorkflowState {
         versioning_override: None,
         completion_callbacks: Vec::new(),
         started_at: now() - Duration::minutes(3),
+        first_run_started_at: Some(now() - Duration::minutes(3)),
         closed_at: None,
         close_result: None,
         close_failure: None,

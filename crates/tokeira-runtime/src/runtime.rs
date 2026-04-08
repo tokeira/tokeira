@@ -90,6 +90,7 @@ pub struct WorkflowTimeoutEntry {
     pub workflow_execution_timeout: Option<Duration>,
     pub workflow_run_timeout: Option<Duration>,
     pub started_at: OffsetDateTime,
+    pub first_run_started_at: Option<OffsetDateTime>,
     pub has_retry_policy: bool,
 }
 
@@ -148,8 +149,11 @@ pub fn evaluate_workflow_timeout(
     entry: &WorkflowTimeoutEntry,
     now: OffsetDateTime,
 ) -> Option<WorkflowTimeoutViolation> {
+    let execution_started_at = entry.first_run_started_at.unwrap_or(entry.started_at);
     if let Some(timeout) = entry.workflow_execution_timeout {
-        if now - entry.started_at > timeout || timeout.is_zero() && now >= entry.started_at {
+        if now - execution_started_at > timeout
+            || timeout.is_zero() && now >= execution_started_at
+        {
             return Some(WorkflowTimeoutViolation::ExecutionTimeout);
         }
     }
@@ -444,6 +448,7 @@ where
                 workflow_execution_timeout: request.workflow_execution_timeout,
                 workflow_run_timeout: request.workflow_run_timeout,
                 started_at: request.now,
+                first_run_started_at: request.first_run_started_at,
                 has_retry_policy: request.retry_policy.is_some(),
             });
         }
@@ -1050,6 +1055,7 @@ where
             first_execution_run_id: None,
             parent_run_key: Some(parent_run_key),
             parent_workflow_id: Some(parent_workflow_id),
+            first_run_started_at: None,
             request: RequestContext {
                 request_id: RequestId(format!("child-start-{child_run_key:?}")),
                 caller_identity: Some("runtime-child-orchestrator".to_string()),
@@ -1846,6 +1852,7 @@ mod tests {
             workflow_execution_timeout: Some(Duration::seconds(1)),
             workflow_run_timeout: Some(Duration::seconds(2)),
             started_at,
+            first_run_started_at: None,
             has_retry_policy: true,
         };
         assert_eq!(
@@ -1858,6 +1865,7 @@ mod tests {
             workflow_execution_timeout: Some(Duration::ZERO),
             workflow_run_timeout: None,
             started_at: OffsetDateTime::now_utc(),
+            first_run_started_at: None,
             has_retry_policy: false,
         };
         assert_eq!(
@@ -1870,6 +1878,7 @@ mod tests {
             workflow_execution_timeout: None,
             workflow_run_timeout: None,
             started_at,
+            first_run_started_at: None,
             has_retry_policy: false,
         };
         assert_eq!(evaluate_workflow_timeout(&none, OffsetDateTime::now_utc()), None);
@@ -1879,6 +1888,7 @@ mod tests {
             workflow_execution_timeout: None,
             workflow_run_timeout: Some(Duration::seconds(1)),
             started_at,
+            first_run_started_at: None,
             has_retry_policy: false,
         };
         assert_eq!(
@@ -1891,6 +1901,7 @@ mod tests {
             workflow_execution_timeout: Some(Duration::seconds(1)),
             workflow_run_timeout: None,
             started_at,
+            first_run_started_at: None,
             has_retry_policy: false,
         };
         assert_eq!(
@@ -1903,6 +1914,7 @@ mod tests {
             workflow_execution_timeout: Some(Duration::seconds(30)),
             workflow_run_timeout: Some(Duration::seconds(20)),
             started_at,
+            first_run_started_at: None,
             has_retry_policy: false,
         };
         assert_eq!(
@@ -1926,6 +1938,7 @@ mod tests {
             workflow_execution_timeout: Some(Duration::seconds(1)),
             workflow_run_timeout: None,
             started_at: OffsetDateTime::now_utc(),
+            first_run_started_at: None,
             has_retry_policy: true,
         };
         tracking.insert(entry.clone());
@@ -1939,21 +1952,31 @@ mod tests {
         fn property_workflow_timeout_evaluation_correctness(
             exec_secs in proptest::option::of(0i64..20),
             run_secs in proptest::option::of(0i64..20),
-            elapsed_secs in 0i64..40
+            elapsed_secs in 0i64..40,
+            chain_extra_secs in 0i64..40,
+            use_chain_origin in any::<bool>(),
         ) {
             let now = OffsetDateTime::now_utc();
             let started_at = now - Duration::seconds(elapsed_secs);
+            let first_run_started_at = use_chain_origin.then(|| {
+                started_at - Duration::seconds(chain_extra_secs)
+            });
             let entry = WorkflowTimeoutEntry {
                 run_key: RunKey::new(),
                 workflow_execution_timeout: exec_secs.map(Duration::seconds),
                 workflow_run_timeout: run_secs.map(Duration::seconds),
                 started_at,
+                first_run_started_at,
                 has_retry_policy: false,
             };
 
             let result = evaluate_workflow_timeout(&entry, now);
+            let execution_origin =
+                entry.first_run_started_at.unwrap_or(entry.started_at);
             if let Some(exec) = entry.workflow_execution_timeout {
-                if now - started_at > exec || (exec.is_zero() && now >= started_at) {
+                if now - execution_origin > exec
+                    || (exec.is_zero() && now >= execution_origin)
+                {
                     prop_assert_eq!(result, Some(WorkflowTimeoutViolation::ExecutionTimeout));
                     return Ok(());
                 }
@@ -1976,6 +1999,7 @@ mod tests {
                 workflow_execution_timeout: Some(Duration::seconds(1)),
                 workflow_run_timeout: None,
                 started_at: OffsetDateTime::now_utc() - Duration::seconds(10),
+                first_run_started_at: None,
                 has_retry_policy,
             };
             let expected = if has_retry_policy {
@@ -2355,6 +2379,7 @@ mod tests {
                         workflow_execution_timeout: Some(Duration::seconds(1)),
                         workflow_run_timeout: None,
                         started_at: OffsetDateTime::now_utc() - Duration::seconds(10 + index as i64),
+                        first_run_started_at: None,
                         has_retry_policy: index % 2 == 0,
                     });
                 }
@@ -2402,6 +2427,7 @@ mod tests {
                         workflow_execution_timeout: Some(Duration::seconds(1)),
                         workflow_run_timeout: None,
                         started_at: OffsetDateTime::now_utc() - Duration::seconds(10),
+                        first_run_started_at: None,
                         has_retry_policy: false,
                     };
                     tracking.insert(entry.clone());
@@ -2465,6 +2491,7 @@ mod tests {
             first_execution_run_id: None,
             parent_run_key: None,
             parent_workflow_id: None,
+            first_run_started_at: None,
             request: RequestContext {
                 request_id: RequestId("req-timeout".to_string()),
                 caller_identity: None,

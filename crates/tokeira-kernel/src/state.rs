@@ -64,6 +64,8 @@ pub struct WorkflowState {
     pub retry_policy: Option<RetryPolicy>,
     /// Current retry attempt number (1-based).
     pub attempt: u32,
+    /// Run ID of the very first run in the execution chain.
+    pub first_execution_run_id: Option<RunId>,
     /// Parent run identity if this execution is a child.
     pub parent_run_key: Option<RunKey>,
     /// Parent workflow identity if this execution is a child.
@@ -91,6 +93,9 @@ pub struct WorkflowState {
 
     /// Timestamp when the first event was recorded.
     pub started_at: OffsetDateTime,
+    /// Timestamp when the very first run in the execution
+    /// chain started.
+    pub first_run_started_at: Option<OffsetDateTime>,
     /// Timestamp when the execution reached a terminal state.
     /// `None` while the execution is still open.
     pub closed_at: Option<OffsetDateTime>,

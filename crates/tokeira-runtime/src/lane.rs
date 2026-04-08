@@ -1,9 +1,12 @@
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use smallvec::SmallVec;
-use tokeira_kernel::{Command, DispatchOp, Kernel};
+use time::OffsetDateTime;
+use tokeira_kernel::{
+    Command, DispatchOp, HistoryEvent, HistoryEventKind, Kernel, StartRequest,
+};
 use tokeira_storage::{CommitResult, RunRepository};
-use tokeira_types::RunKey;
+use tokeira_types::{ExecutionStatus, RunKey};
 use tokio::sync::{mpsc, oneshot};
 
 /// Configuration knobs for a single lane executor.
@@ -111,7 +114,7 @@ pub fn spawn_lane<K, R, P>(
 where
     K: Kernel + Send + Sync + 'static,
     R: RunRepository + 'static,
-    P: DispatchPublisher + 'static,
+    P: DispatchPublisher + Clone + 'static,
 {
     let (tx, mut rx) = mpsc::channel::<LaneMessage>(1024);
     let requeue_tx = tx.clone();
@@ -150,7 +153,7 @@ async fn run_activation<K, R, P>(
 where
     K: Kernel + Send + Sync + 'static,
     R: RunRepository + 'static,
-    P: DispatchPublisher + 'static,
+    P: DispatchPublisher + Clone + 'static,
 {
     let active_run_key = first_message.run_key;
     let mut current = Some(first_message);
@@ -170,7 +173,7 @@ where
 
         let stop_draining = result.is_err();
         let reply = match result {
-            Ok((commit_result, dispatch_ops)) => {
+            Ok((commit_result, dispatch_ops, history_events)) => {
                 if let CommitResult::Applied { new_state } = &commit_result {
                     if new_state.closed_at.is_some() {
                         workflow_timeout_tracking.remove(message.run_key);
@@ -210,14 +213,166 @@ where
                                         now: time::OffsetDateTime::now_utc(),
                                     },
                                 );
-                                if let Err(error) = publisher.submit_to_run(parent_run_key, command).await {
-                                    let error_message = error.to_string();
-                                    if error_message.contains("kernel rejected") || error_message.contains("not found") {
-                                        tracing::debug!(?error, parent_run_key = ?parent_run_key, child_run_key = ?message.run_key, "failed to deliver child resolution to parent");
-                                    } else {
-                                        tracing::warn!(?error, parent_run_key = ?parent_run_key, child_run_key = ?message.run_key, "failed to deliver child resolution to parent");
+                                let publisher = publisher.clone();
+                                let child_run_key = message.run_key;
+                                tokio::spawn(async move {
+                                    if let Err(error) = publisher.submit_to_run(parent_run_key, command).await {
+                                        let error_message = error.to_string();
+                                        if error_message.contains("kernel rejected") || error_message.contains("not found") {
+                                            tracing::debug!(?error, parent_run_key = ?parent_run_key, child_run_key = ?child_run_key, "failed to deliver child resolution to parent");
+                                        } else {
+                                            tracing::warn!(?error, parent_run_key = ?parent_run_key, child_run_key = ?child_run_key, "failed to deliver child resolution to parent");
+                                        }
                                     }
+                                });
+                            }
+                        }
+                        if new_state.status == ExecutionStatus::ContinuedAsNew {
+                            let successor_event = history_events.iter().find_map(|event| {
+                                match &event.kind {
+                                    HistoryEventKind::WorkflowExecutionContinuedAsNew {
+                                        new_run_id,
+                                        workflow_type,
+                                        task_queue,
+                                        input,
+                                        memo,
+                                        search_attributes,
+                                        workflow_execution_timeout,
+                                        workflow_run_timeout,
+                                        workflow_task_timeout,
+                                    } => Some((
+                                        *new_run_id,
+                                        workflow_type.clone(),
+                                        task_queue.clone(),
+                                        input.clone(),
+                                        memo.clone(),
+                                        search_attributes.clone(),
+                                        *workflow_execution_timeout,
+                                        *workflow_run_timeout,
+                                        *workflow_task_timeout,
+                                    )),
+                                    _ => None,
                                 }
+                            });
+                            if let Some((
+                                successor_run_id,
+                                workflow_type,
+                                task_queue,
+                                input,
+                                memo,
+                                search_attributes,
+                                workflow_execution_timeout,
+                                workflow_run_timeout,
+                                workflow_task_timeout,
+                            )) = successor_event
+                            {
+                                let first_execution_run_id = Some(
+                                    new_state
+                                        .first_execution_run_id
+                                        .unwrap_or(new_state.run_id),
+                                );
+                                let first_run_started_at = Some(
+                                    new_state
+                                        .first_run_started_at
+                                        .unwrap_or(new_state.started_at),
+                                );
+                                let successor_run_key = RunKey::new();
+                                let start_request = StartRequest {
+                                    run_key: successor_run_key,
+                                    namespace_id: new_state.namespace_id,
+                                    workflow_id: new_state.workflow_id.clone(),
+                                    run_id: successor_run_id,
+                                    workflow_type,
+                                    task_queue,
+                                    input,
+                                    memo,
+                                    search_attributes,
+                                    workflow_execution_timeout,
+                                    workflow_run_timeout,
+                                    workflow_task_timeout,
+                                    retry_policy: new_state.retry_policy.clone(),
+                                    attempt: 1,
+                                    continued_execution_run_id: Some(new_state.run_id),
+                                    first_execution_run_id,
+                                    parent_run_key: None,
+                                    parent_workflow_id: None,
+                                    first_run_started_at,
+                                    request: tokeira_types::RequestContext {
+                                        request_id: tokeira_types::RequestId(format!(
+                                            "continue-as-new:{}:{}",
+                                            new_state.run_id.0,
+                                            successor_run_id.0
+                                        )),
+                                        caller_identity: None,
+                                        received_at: OffsetDateTime::now_utc(),
+                                    },
+                                    now: OffsetDateTime::now_utc(),
+                                };
+                                let publisher = publisher.clone();
+                                let workflow_timeout_tracking =
+                                    workflow_timeout_tracking.clone();
+                                let predecessor_run_key = message.run_key;
+                                tokio::spawn(async move {
+                                    match publisher
+                                        .submit_to_run(
+                                            successor_run_key,
+                                            Command::Start(start_request),
+                                        )
+                                        .await
+                                    {
+                                        Ok(CommitResult::Applied { new_state }) => {
+                                            if new_state
+                                                .workflow_execution_timeout
+                                                .is_some()
+                                                || new_state.workflow_run_timeout.is_some()
+                                            {
+                                                workflow_timeout_tracking.insert(
+                                                    crate::runtime::WorkflowTimeoutEntry {
+                                                        run_key: new_state.run_key,
+                                                        workflow_execution_timeout: new_state
+                                                            .workflow_execution_timeout,
+                                                        workflow_run_timeout: new_state
+                                                            .workflow_run_timeout,
+                                                        started_at: new_state.started_at,
+                                                        first_run_started_at: new_state
+                                                            .first_run_started_at,
+                                                        has_retry_policy: new_state
+                                                            .retry_policy
+                                                            .is_some(),
+                                                    },
+                                                );
+                                            }
+                                        }
+                                        Ok(CommitResult::Duplicate) => {
+                                            tracing::error!(
+                                                predecessor_run_key = ?predecessor_run_key,
+                                                successor_run_key = ?successor_run_key,
+                                                "unexpected duplicate when starting continue-as-new successor"
+                                            );
+                                        }
+                                        Ok(CommitResult::Conflict { reason }) => {
+                                            tracing::error!(
+                                                predecessor_run_key = ?predecessor_run_key,
+                                                successor_run_key = ?successor_run_key,
+                                                %reason,
+                                                "unexpected conflict when starting continue-as-new successor"
+                                            );
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(
+                                                ?error,
+                                                predecessor_run_key = ?predecessor_run_key,
+                                                successor_run_key = ?successor_run_key,
+                                                "failed to start continue-as-new successor"
+                                            );
+                                        }
+                                    }
+                                });
+                            } else {
+                                tracing::error!(
+                                    predecessor_run_key = ?message.run_key,
+                                    "continued-as-new close missing WorkflowExecutionContinuedAsNew history event"
+                                );
                             }
                         }
                     }
@@ -255,7 +410,7 @@ async fn handle_message<K, R>(
     run_key: RunKey,
     command: Command,
     max_retries: u32,
-) -> Result<(CommitResult, SmallVec<[DispatchOp; 4]>)>
+) -> Result<(CommitResult, SmallVec<[DispatchOp; 4]>, SmallVec<[HistoryEvent; 8]>)>
 where
     K: Kernel + Send + Sync + 'static,
     R: RunRepository + 'static,
@@ -267,13 +422,22 @@ where
             .apply(loaded, command.clone())
             .map_err(|reject| anyhow!("kernel rejected command: {reject}"))?;
         let dispatch_ops = transition.dispatch_ops.clone();
+        let history_events = transition.history_events.clone();
 
         match repo.commit_transition(run_key, transition).await? {
             CommitResult::Applied { new_state } => {
-                return Ok((CommitResult::Applied { new_state }, dispatch_ops));
+                return Ok((
+                    CommitResult::Applied { new_state },
+                    dispatch_ops,
+                    history_events,
+                ));
             }
             CommitResult::Duplicate => {
-                return Ok((CommitResult::Duplicate, SmallVec::new()));
+                return Ok((
+                    CommitResult::Duplicate,
+                    SmallVec::new(),
+                    SmallVec::new(),
+                ));
             }
             CommitResult::Conflict { reason } => {
                 if attempts >= max_retries {
@@ -585,6 +749,7 @@ mod tests {
     struct MockPublisherState {
         publishes: Vec<(RunKey, Vec<DispatchOp>)>,
         submits: Vec<(RunKey, Command)>,
+        submit_result: Option<CommitResult>,
         fail: bool,
     }
 
@@ -597,6 +762,11 @@ mod tests {
 
         async fn with_failure(self) -> Self {
             self.state.lock().await.fail = true;
+            self
+        }
+
+        async fn with_submit_result(self, submit_result: CommitResult) -> Self {
+            self.state.lock().await.submit_result = Some(submit_result);
             self
         }
 
@@ -636,7 +806,86 @@ mod tests {
             if state.fail {
                 return Err(anyhow!("publisher failed"));
             }
-            Ok(CommitResult::Duplicate)
+            Ok(state.submit_result.clone().unwrap_or(CommitResult::Duplicate))
+        }
+    }
+
+    #[derive(Clone)]
+    struct ContinueAsNewKernel {
+        status: ExecutionStatus,
+        include_continue_event: bool,
+        workflow_execution_timeout: Option<Duration>,
+        workflow_run_timeout: Option<Duration>,
+        first_run_started_at: Option<OffsetDateTime>,
+    }
+
+    impl ContinueAsNewKernel {
+        fn continued_as_new() -> Self {
+            Self {
+                status: ExecutionStatus::ContinuedAsNew,
+                include_continue_event: true,
+                workflow_execution_timeout: Some(Duration::minutes(30)),
+                workflow_run_timeout: Some(Duration::minutes(5)),
+                first_run_started_at: None,
+            }
+        }
+    }
+
+    impl Kernel for ContinueAsNewKernel {
+        fn apply(
+            &self,
+            loaded: LoadedRun,
+            _command: Command,
+        ) -> Result<Transition, Reject> {
+            let LoadedRun::Existing(current) = loaded else {
+                panic!("tests expect an existing run");
+            };
+
+            let mut next_state = current.clone();
+            next_state.transition_seq = current.transition_seq.next();
+            next_state.last_event_id += 1;
+            next_state.status = self.status;
+            next_state.closed_at = Some(OffsetDateTime::now_utc());
+            next_state.first_run_started_at =
+                self.first_run_started_at.or(current.first_run_started_at);
+            next_state.pending_workflow_task = None;
+
+            let history_events = if self.include_continue_event {
+                smallvec![HistoryEvent {
+                    event_id: current.last_event_id + 1,
+                    happened_at: OffsetDateTime::now_utc(),
+                    kind: tokeira_kernel::HistoryEventKind::WorkflowExecutionContinuedAsNew {
+                        new_run_id: RunId::new(),
+                        workflow_type: WorkflowType("continued".to_string()),
+                        task_queue: TaskQueueName("continued-q".to_string()),
+                        input: Payloads(vec![]),
+                        memo: Memo::default(),
+                        search_attributes: SearchAttributes::default(),
+                        workflow_execution_timeout: self.workflow_execution_timeout,
+                        workflow_run_timeout: self.workflow_run_timeout,
+                        workflow_task_timeout: Duration::seconds(15),
+                    },
+                }]
+            } else {
+                smallvec![HistoryEvent {
+                    event_id: current.last_event_id + 1,
+                    happened_at: OffsetDateTime::now_utc(),
+                    kind: tokeira_kernel::HistoryEventKind::WorkflowExecutionCompleted {
+                        result: Payloads::default(),
+                    },
+                }]
+            };
+
+            Ok(Transition {
+                expected_seq: current.transition_seq,
+                next_state,
+                history_events,
+                request_dedupe_ops: SmallVec::new(),
+                activity_ops: SmallVec::new(),
+                timer_ops: SmallVec::new(),
+                dispatch_ops: SmallVec::new(),
+                projection_ops: SmallVec::new(),
+            })
         }
     }
 
@@ -669,6 +918,7 @@ mod tests {
             workflow_task_timeout: Duration::seconds(10),
             retry_policy: None,
             attempt: 1,
+            first_execution_run_id: None,
             parent_run_key: None,
             parent_workflow_id: None,
             activities: BTreeMap::<String, ActivityState>::new(),
@@ -681,6 +931,7 @@ mod tests {
             versioning_override: None,
             completion_callbacks: Vec::new(),
             started_at: OffsetDateTime::now_utc(),
+            first_run_started_at: None,
             closed_at: None,
             close_result: None,
             close_failure: None,
@@ -762,7 +1013,7 @@ mod tests {
                 );
                 let kernel = MockKernel::new(sample_dispatch_ops(state.namespace_id));
 
-                let (result, _) = handle_message(&kernel, &repo, run_key, sample_command("a"), 8).await.unwrap();
+                let (result, _, _) = handle_message(&kernel, &repo, run_key, sample_command("a"), 8).await.unwrap();
                 let (load_calls, commit_calls, _) = repo.snapshot().await;
                 let (commands, loaded_runs) = kernel.snapshot();
                 (result, load_calls, commit_calls, commands.len(), loaded_runs.len())
@@ -838,7 +1089,7 @@ mod tests {
                 );
                 let kernel = MockKernel::new(sample_dispatch_ops(state.namespace_id));
 
-                let (result, ops) = handle_message(
+                let (result, ops, _) = handle_message(
                     &kernel,
                     &repo,
                     run_key,
@@ -1119,6 +1370,7 @@ mod tests {
             CommitResult::Applied { .. }
         ));
 
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
         let snapshot = publisher.snapshot().await;
         assert_eq!(snapshot.publishes.len(), 0);
         assert_eq!(snapshot.submits.len(), 1);
@@ -1171,6 +1423,174 @@ mod tests {
 
         let snapshot = publisher.snapshot().await;
         assert!(snapshot.submits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_activation_submits_continue_as_new_successor_with_chain_fields() {
+        let run_key = RunKey::new();
+        let mut state = sample_state(run_key);
+        let chain_start = OffsetDateTime::now_utc() - Duration::hours(2);
+        let first_run_id = RunId::new();
+        state.run_id = RunId::new();
+        state.first_execution_run_id = Some(first_run_id);
+        state.first_run_started_at = Some(chain_start);
+        state.retry_policy = Some(tokeira_types::RetryPolicy {
+            initial_interval: Duration::seconds(1),
+            backoff_coefficient: 2.0,
+            maximum_interval: Some(Duration::seconds(30)),
+            maximum_attempts: 3,
+            non_retryable_error_types: vec![],
+        });
+
+        let successor_run_key = RunKey::new();
+        let mut successor_state = sample_state(successor_run_key);
+        successor_state.run_key = successor_run_key;
+        successor_state.started_at = OffsetDateTime::now_utc();
+        successor_state.first_run_started_at = Some(chain_start);
+        successor_state.first_execution_run_id = Some(first_run_id);
+        successor_state.workflow_execution_timeout = Some(Duration::minutes(30));
+        successor_state.workflow_run_timeout = Some(Duration::minutes(5));
+
+        let repo = MockRepo::new(
+            LoadedRun::Existing(state.clone()),
+            vec![CommitBehavior::Applied],
+        );
+        let kernel = ContinueAsNewKernel::continued_as_new();
+        let publisher = MockPublisher::new()
+            .with_submit_result(CommitResult::Applied {
+                new_state: successor_state.clone(),
+            })
+            .await;
+        let (first, first_reply) = lane_message(run_key, "continue");
+        let (_tx, mut rx) = mpsc::channel(8);
+        let tracking = crate::runtime::WorkflowTimeoutTrackingState::default();
+
+        let buffered = run_activation(
+            &kernel,
+            &repo,
+            &publisher,
+            &tracking,
+            &mut rx,
+            first,
+            &LaneConfig::default(),
+        )
+        .await;
+
+        assert!(buffered.is_empty());
+        assert!(matches!(
+            first_reply.await.unwrap().unwrap(),
+            CommitResult::Applied { .. }
+        ));
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        let snapshot = publisher.snapshot().await;
+        assert_eq!(snapshot.submits.len(), 1);
+        match &snapshot.submits[0].1 {
+            Command::Start(request) => {
+                assert_eq!(request.workflow_id, state.workflow_id);
+                assert_eq!(request.namespace_id, state.namespace_id);
+                assert_eq!(request.continued_execution_run_id, Some(state.run_id));
+                assert_eq!(request.first_execution_run_id, Some(first_run_id));
+                assert_eq!(request.first_run_started_at, Some(chain_start));
+                assert_eq!(request.retry_policy, state.retry_policy);
+                assert_eq!(request.attempt, 1);
+                assert_eq!(
+                    request.workflow_execution_timeout,
+                    Some(Duration::minutes(30))
+                );
+                assert_eq!(
+                    request.workflow_run_timeout,
+                    Some(Duration::minutes(5))
+                );
+            }
+            other => panic!("expected successor Start request, got {other:?}"),
+        }
+
+        let tracking_snapshot = tracking.snapshot();
+        assert_eq!(tracking_snapshot.len(), 1);
+        assert_eq!(tracking_snapshot[0].run_key, successor_run_key);
+        assert_eq!(tracking_snapshot[0].first_run_started_at, Some(chain_start));
+    }
+
+    proptest! {
+        #[test]
+        fn property_continue_as_new_detection_triggers_only_for_continued_as_new(
+            is_continued_as_new in any::<bool>(),
+        ) {
+            let rt = Runtime::new().unwrap();
+            rt.block_on(async move {
+                let run_key = RunKey::new();
+                let state = sample_state(run_key);
+                let repo = MockRepo::new(
+                    LoadedRun::Existing(state.clone()),
+                    vec![CommitBehavior::Applied],
+                );
+                let mut kernel = ContinueAsNewKernel::continued_as_new();
+                kernel.status = if is_continued_as_new {
+                    ExecutionStatus::ContinuedAsNew
+                } else {
+                    ExecutionStatus::Completed
+                };
+                kernel.include_continue_event = is_continued_as_new;
+                let publisher = MockPublisher::new();
+                let (first, first_reply) = lane_message(run_key, "continue");
+                let (_tx, mut rx) = mpsc::channel(8);
+                let tracking = crate::runtime::WorkflowTimeoutTrackingState::default();
+
+                let _ = run_activation(
+                    &kernel,
+                    &repo,
+                    &publisher,
+                    &tracking,
+                    &mut rx,
+                    first,
+                    &LaneConfig::default(),
+                ).await;
+
+                let _ = first_reply.await.unwrap().unwrap();
+                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                let snapshot = publisher.snapshot().await;
+                if is_continued_as_new {
+                    prop_assert_eq!(snapshot.submits.len(), 1);
+                } else {
+                    prop_assert!(snapshot.submits.is_empty());
+                }
+                Ok::<(), proptest::test_runner::TestCaseError>(())
+            })?;
+        }
+    }
+
+    #[tokio::test]
+    async fn run_activation_returns_predecessor_commit_even_when_successor_start_fails() {
+        let run_key = RunKey::new();
+        let state = sample_state(run_key);
+        let repo = MockRepo::new(
+            LoadedRun::Existing(state.clone()),
+            vec![CommitBehavior::Applied],
+        );
+        let kernel = ContinueAsNewKernel::continued_as_new();
+        let publisher = MockPublisher::new().with_failure().await;
+        let (first, first_reply) = lane_message(run_key, "continue");
+        let (_tx, mut rx) = mpsc::channel(8);
+        let tracking = crate::runtime::WorkflowTimeoutTrackingState::default();
+
+        let _ = run_activation(
+            &kernel,
+            &repo,
+            &publisher,
+            &tracking,
+            &mut rx,
+            first,
+            &LaneConfig::default(),
+        )
+        .await;
+
+        assert!(matches!(
+            first_reply.await.unwrap().unwrap(),
+            CommitResult::Applied { .. }
+        ));
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        assert!(tracking.snapshot().is_empty());
     }
 
     #[tokio::test]

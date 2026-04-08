@@ -95,6 +95,7 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         workflow_task_timeout: default_workflow_task_timeout(),
         retry_policy: Some(sample_retry_policy()),
         attempt: 2,
+        first_execution_run_id: Some(RunId::new()),
         parent_run_key: None,
         parent_workflow_id: None,
         activities: BTreeMap::new(),
@@ -107,6 +108,7 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         versioning_override: None,
         completion_callbacks: Vec::new(),
         started_at: now - Duration::minutes(10),
+        first_run_started_at: Some(now - Duration::minutes(10)),
         closed_at: None,
         close_result: None,
         close_failure: None,
@@ -612,6 +614,10 @@ fn arb_start_request() -> impl Strategy<Value = StartRequest> {
         arb_duration(),
         prop::option::of(arb_retry_policy()),
         1u32..10u32,
+        prop::option::of(any::<i64>().prop_map(|secs| {
+            OffsetDateTime::from_unix_timestamp(secs.clamp(-2_000_000_000, 4_000_000_000))
+                .unwrap()
+        })),
     )
         .prop_map(
             |(
@@ -623,6 +629,7 @@ fn arb_start_request() -> impl Strategy<Value = StartRequest> {
                 workflow_task_timeout,
                 retry_policy,
                 attempt,
+                first_run_started_at,
             )| {
                 let now = fixed_now();
                 let run_id = RunId::new();
@@ -645,6 +652,7 @@ fn arb_start_request() -> impl Strategy<Value = StartRequest> {
                     first_execution_run_id: Some(run_id),
                     parent_run_key: None,
                     parent_workflow_id: None,
+                    first_run_started_at,
                     request: request_context("prop-start", now),
                     now,
                 }
@@ -1406,6 +1414,8 @@ proptest! {
         prop_assert_eq!(transition.next_state.workflow_task_timeout, req.workflow_task_timeout);
         prop_assert_eq!(transition.next_state.retry_policy.clone(), req.retry_policy);
         prop_assert_eq!(transition.next_state.attempt, req.attempt);
+        prop_assert_eq!(transition.next_state.first_execution_run_id, req.first_execution_run_id);
+        prop_assert_eq!(transition.next_state.first_run_started_at, req.first_run_started_at);
         prop_assert!(transition.next_state.pending_updates.is_empty());
         prop_assert!(transition.next_state.pending_nexus_operations.is_empty());
         prop_assert_eq!(transition.next_state.versioning_override, None);

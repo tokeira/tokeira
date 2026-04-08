@@ -3,6 +3,7 @@ use time::Duration;
 use time::OffsetDateTime;
 use tokeira_types::{
     ExecutionStatus, Memo, NamespaceId, Payloads, QueueKey, RequestId, RunId,
+    RunKey,
     SearchAttributes, TaskQueueName, TransitionSeq, WorkflowId, WorkflowType,
 };
 
@@ -107,10 +108,14 @@ pub enum DispatchOp {
         workflow_type: WorkflowType,
         task_queue: TaskQueueName,
         input: Payloads,
+        parent_run_key: RunKey,
+        parent_workflow_id: WorkflowId,
+        initiated_event_id: i64,
     },
     /// Forcibly terminate a child workflow (parent close
     /// policy).
     TerminateChild {
+        namespace_id: NamespaceId,
         child_workflow_id: WorkflowId,
         child_run_id: RunId,
         reason: String,
@@ -118,12 +123,16 @@ pub enum DispatchOp {
     /// Send a cooperative cancel to a child workflow (parent
     /// close policy).
     CancelChild {
+        namespace_id: NamespaceId,
         child_workflow_id: WorkflowId,
         child_run_id: RunId,
         reason: String,
     },
     /// Deliver a signal to an external workflow.
     SignalExternalWorkflow {
+        originator_run_key: RunKey,
+        namespace_id: NamespaceId,
+        initiated_event_id: i64,
         target_workflow_id: WorkflowId,
         target_run_id: Option<RunId>,
         signal_name: String,
@@ -131,6 +140,13 @@ pub enum DispatchOp {
     },
     /// Request cancellation of an external workflow.
     RequestCancelExternalWorkflow {
+        originator_run_key: RunKey,
+        originator_namespace_id: NamespaceId,
+        originator_workflow_id: WorkflowId,
+        originator_run_id: RunId,
+        namespace_id: NamespaceId,
+        initiated_event_id: i64,
+        reason: String,
         target_workflow_id: WorkflowId,
         target_run_id: Option<RunId>,
     },

@@ -64,6 +64,10 @@ pub struct WorkflowState {
     pub retry_policy: Option<RetryPolicy>,
     /// Current retry attempt number (1-based).
     pub attempt: u32,
+    /// Parent run identity if this execution is a child.
+    pub parent_run_key: Option<RunKey>,
+    /// Parent workflow identity if this execution is a child.
+    pub parent_workflow_id: Option<WorkflowId>,
     /// Open activities keyed by activity ID.
     pub activities: BTreeMap<String, ActivityState>,
     /// Open timers keyed by timer ID.
@@ -90,6 +94,10 @@ pub struct WorkflowState {
     /// Timestamp when the execution reached a terminal state.
     /// `None` while the execution is still open.
     pub closed_at: Option<OffsetDateTime>,
+    /// Result payload retained for terminal completion.
+    pub close_result: Option<Payloads>,
+    /// Failure message retained for terminal failure.
+    pub close_failure: Option<String>,
 }
 
 impl WorkflowState {
@@ -199,6 +207,8 @@ pub struct TimerState {
 pub struct ChildWorkflowState {
     /// Workflow ID of the child.
     pub child_workflow_id: WorkflowId,
+    /// Namespace that owns the child workflow.
+    pub namespace_id: NamespaceId,
     /// Run ID assigned to the child, once started.
     pub child_run_id: Option<RunId>,
     /// Event ID of the initiation event in the parent's

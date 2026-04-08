@@ -1,8 +1,8 @@
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
-    LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RequestContext, RetryPolicy,
-    RunId, RunKey, SearchAttributes, TaskQueueName, WorkerIdentity, WorkflowId,
-    WorkflowTaskToken, WorkflowType,
+    LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RequestContext,
+    RetryPolicy, RunId, RunKey, SearchAttributes, TaskQueueName, WorkerIdentity,
+    WorkflowId, WorkflowTaskToken, WorkflowType,
 };
 
 use crate::event::ActivityResolution;
@@ -198,6 +198,10 @@ pub struct StartRequest {
     pub continued_execution_run_id: Option<RunId>,
     /// Run ID of the very first run in the execution chain.
     pub first_execution_run_id: Option<RunId>,
+    /// Parent run identity if this start creates a child workflow.
+    pub parent_run_key: Option<RunKey>,
+    /// Parent workflow ID if this start creates a child workflow.
+    pub parent_workflow_id: Option<WorkflowId>,
     /// Caller-supplied request context for dedupe and tracing.
     pub request: RequestContext,
     /// Wall-clock time the command was accepted.
@@ -730,6 +734,7 @@ pub enum WorkflowCommand {
     },
     /// Send a signal to an external workflow.
     SignalExternalWorkflowExecution {
+        target_namespace_id: NamespaceId,
         target_workflow_id: WorkflowId,
         target_run_id: Option<RunId>,
         signal_name: String,
@@ -737,6 +742,7 @@ pub enum WorkflowCommand {
     },
     /// Request cancellation of an external workflow.
     RequestCancelExternalWorkflowExecution {
+        target_namespace_id: NamespaceId,
         target_workflow_id: WorkflowId,
         target_run_id: Option<RunId>,
     },

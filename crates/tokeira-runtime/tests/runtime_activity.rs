@@ -280,6 +280,8 @@ fn start_request(
         attempt: 1,
         continued_execution_run_id: None,
         first_execution_run_id: None,
+        parent_run_key: None,
+        parent_workflow_id: None,
         request: RequestContext {
             request_id: RequestId(request_id.to_string()),
             caller_identity: None,

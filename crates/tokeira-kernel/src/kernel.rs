@@ -143,6 +143,8 @@ impl BasicKernel {
             workflow_task_timeout: req.workflow_task_timeout,
             retry_policy: req.retry_policy.clone(),
             attempt: req.attempt,
+            parent_run_key: req.parent_run_key,
+            parent_workflow_id: req.parent_workflow_id,
             activities: BTreeMap::new(),
             timers: BTreeMap::new(),
             children: BTreeMap::new(),
@@ -154,6 +156,8 @@ impl BasicKernel {
             completion_callbacks: Vec::new(),
             started_at: req.now,
             closed_at: None,
+            close_result: None,
+            close_failure: None,
         };
 
         let mut builder = TransitionBuilder::new(initial, req.now);
@@ -1485,12 +1489,14 @@ fn apply_workflow_command(
             Ok(false)
         }
         WorkflowCommand::CompleteWorkflow { result } => {
+            builder.state.close_result = Some(result.clone());
             builder.emit(HistoryEventKind::WorkflowExecutionCompleted { result });
             builder.close(ExecutionStatus::Completed);
             builder.apply_parent_close_policy();
             Ok(true)
         }
         WorkflowCommand::FailWorkflow { message, details } => {
+            builder.state.close_failure = Some(message.clone());
             let retry_state = if builder.state.retry_policy.is_some() {
                 RetryState::InProgress
             } else {
@@ -1587,6 +1593,7 @@ fn apply_workflow_command(
                 child_workflow_id.clone(),
                 ChildWorkflowState {
                     child_workflow_id: child_workflow_id.clone(),
+                    namespace_id,
                     child_run_id: None,
                     initiated_event_id,
                     started_event_id: None,
@@ -1599,10 +1606,14 @@ fn apply_workflow_command(
                 workflow_type,
                 task_queue,
                 input,
+                parent_run_key: builder.state.run_key,
+                parent_workflow_id: builder.state.workflow_id.clone(),
+                initiated_event_id,
             });
             Ok(false)
         }
         WorkflowCommand::SignalExternalWorkflowExecution {
+            target_namespace_id,
             target_workflow_id,
             target_run_id,
             signal_name,
@@ -1628,6 +1639,9 @@ fn apply_workflow_command(
             builder
                 .dispatch_ops
                 .push(DispatchOp::SignalExternalWorkflow {
+                    originator_run_key: builder.state.run_key,
+                    namespace_id: target_namespace_id,
+                    initiated_event_id,
                     target_workflow_id,
                     target_run_id,
                     signal_name,
@@ -1636,6 +1650,7 @@ fn apply_workflow_command(
             Ok(false)
         }
         WorkflowCommand::RequestCancelExternalWorkflowExecution {
+            target_namespace_id,
             target_workflow_id,
             target_run_id,
         } => {
@@ -1656,6 +1671,16 @@ fn apply_workflow_command(
             builder
                 .dispatch_ops
                 .push(DispatchOp::RequestCancelExternalWorkflow {
+                    originator_run_key: builder.state.run_key,
+                    originator_namespace_id: builder.state.namespace_id,
+                    originator_workflow_id: builder.state.workflow_id.clone(),
+                    originator_run_id: builder.state.run_id,
+                    namespace_id: target_namespace_id,
+                    initiated_event_id,
+                    reason: format!(
+                        "cancel requested by external workflow {}",
+                        builder.state.workflow_id.0
+                    ),
                     target_workflow_id,
                     target_run_id,
                 });
@@ -1926,6 +1951,7 @@ impl TransitionBuilder {
             match child.parent_close_policy {
                 ParentClosePolicy::Terminate => {
                     self.dispatch_ops.push(DispatchOp::TerminateChild {
+                        namespace_id: child.namespace_id,
                         child_workflow_id: child.child_workflow_id,
                         child_run_id,
                         reason: "parent workflow closed".into(),
@@ -1933,6 +1959,7 @@ impl TransitionBuilder {
                 }
                 ParentClosePolicy::RequestCancel => {
                     self.dispatch_ops.push(DispatchOp::CancelChild {
+                        namespace_id: child.namespace_id,
                         child_workflow_id: child.child_workflow_id,
                         child_run_id,
                         reason: "parent workflow closed".into(),

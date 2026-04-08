@@ -40,6 +40,15 @@ impl Default for LaneConfig {
 pub trait DispatchPublisher: Send + Sync {
     /// Publish a batch of [`DispatchOp`]s for `run_key`.
     async fn publish(&self, run_key: RunKey, ops: &[DispatchOp]) -> Result<()>;
+
+    /// Submit a command to a specific run, used by
+    /// orchestration follow-up paths such as child
+    /// resolution delivery.
+    async fn submit_to_run(
+        &self,
+        run_key: RunKey,
+        command: Command,
+    ) -> Result<CommitResult>;
 }
 
 /// A lane is a single serial command processor.
@@ -172,6 +181,45 @@ where
                         publisher.publish(message.run_key, &dispatch_ops).await
                     {
                         tracing::warn!(?error, run_key = ?message.run_key, "failed to publish dispatch ops");
+                    }
+                }
+                if let CommitResult::Applied { new_state } = &commit_result {
+                    if new_state.closed_at.is_some() {
+                        if let Some(parent_run_key) = new_state.parent_run_key {
+                            let maybe_resolution = match new_state.status {
+                                tokeira_types::ExecutionStatus::Completed => {
+                                    Some(tokeira_kernel::ChildResolution::Completed {
+                                        result: new_state.close_result.clone().unwrap_or_default(),
+                                    })
+                                }
+                                tokeira_types::ExecutionStatus::Failed => {
+                                    Some(tokeira_kernel::ChildResolution::Failed {
+                                        failure: new_state.close_failure.clone().unwrap_or_else(|| "child workflow failed".to_string()),
+                                    })
+                                }
+                                tokeira_types::ExecutionStatus::Cancelled => Some(tokeira_kernel::ChildResolution::Canceled),
+                                tokeira_types::ExecutionStatus::Terminated => Some(tokeira_kernel::ChildResolution::Terminated),
+                                tokeira_types::ExecutionStatus::TimedOut => Some(tokeira_kernel::ChildResolution::TimedOut),
+                                _ => None,
+                            };
+                            if let Some(resolution) = maybe_resolution {
+                                let command = tokeira_kernel::Command::ChildResolved(
+                                    tokeira_kernel::ChildResolvedRequest {
+                                        child_workflow_id: new_state.workflow_id.clone(),
+                                        resolution,
+                                        now: time::OffsetDateTime::now_utc(),
+                                    },
+                                );
+                                if let Err(error) = publisher.submit_to_run(parent_run_key, command).await {
+                                    let error_message = error.to_string();
+                                    if error_message.contains("kernel rejected") || error_message.contains("not found") {
+                                        tracing::debug!(?error, parent_run_key = ?parent_run_key, child_run_key = ?message.run_key, "failed to deliver child resolution to parent");
+                                    } else {
+                                        tracing::warn!(?error, parent_run_key = ?parent_run_key, child_run_key = ?message.run_key, "failed to deliver child resolution to parent");
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 Ok(commit_result)
@@ -536,6 +584,7 @@ mod tests {
     #[derive(Default)]
     struct MockPublisherState {
         publishes: Vec<(RunKey, Vec<DispatchOp>)>,
+        submits: Vec<(RunKey, Command)>,
         fail: bool,
     }
 
@@ -551,9 +600,19 @@ mod tests {
             self
         }
 
-        async fn snapshot(&self) -> Vec<(RunKey, Vec<DispatchOp>)> {
-            self.state.lock().await.publishes.clone()
+        async fn snapshot(&self) -> MockPublisherStateSnapshot {
+            let state = self.state.lock().await;
+            MockPublisherStateSnapshot {
+                publishes: state.publishes.clone(),
+                submits: state.submits.clone(),
+            }
         }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct MockPublisherStateSnapshot {
+        publishes: Vec<(RunKey, Vec<DispatchOp>)>,
+        submits: Vec<(RunKey, Command)>,
     }
 
     #[async_trait]
@@ -565,6 +624,19 @@ mod tests {
                 return Err(anyhow!("publisher failed"));
             }
             Ok(())
+        }
+
+        async fn submit_to_run(
+            &self,
+            run_key: RunKey,
+            command: Command,
+        ) -> Result<CommitResult> {
+            let mut state = self.state.lock().await;
+            state.submits.push((run_key, command));
+            if state.fail {
+                return Err(anyhow!("publisher failed"));
+            }
+            Ok(CommitResult::Duplicate)
         }
     }
 
@@ -597,6 +669,8 @@ mod tests {
             workflow_task_timeout: Duration::seconds(10),
             retry_policy: None,
             attempt: 1,
+            parent_run_key: None,
+            parent_workflow_id: None,
             activities: BTreeMap::<String, ActivityState>::new(),
             timers: BTreeMap::new(),
             children: BTreeMap::new(),
@@ -608,6 +682,8 @@ mod tests {
             completion_callbacks: Vec::new(),
             started_at: OffsetDateTime::now_utc(),
             closed_at: None,
+            close_result: None,
+            close_failure: None,
         }
     }
 
@@ -840,7 +916,7 @@ mod tests {
                 }),
             ]
         );
-        assert_eq!(publisher.snapshot().await.len(), 2);
+        assert_eq!(publisher.snapshot().await.publishes.len(), 2);
     }
 
     #[tokio::test]
@@ -965,7 +1041,7 @@ mod tests {
             CommitResult::Applied { .. }
         ));
         assert_eq!(
-            publisher.snapshot().await,
+            publisher.snapshot().await.publishes,
             vec![(run_key, dispatch_ops.into_vec())]
         );
     }
@@ -999,7 +1075,102 @@ mod tests {
         .await;
 
         assert!(first_reply.await.unwrap().is_err());
-        assert!(publisher.snapshot().await.is_empty());
+        let snapshot = publisher.snapshot().await;
+        assert!(snapshot.publishes.is_empty());
+        assert!(snapshot.submits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_activation_delivers_child_resolution_to_parent_on_child_close() {
+        let child_run_key = RunKey::new();
+        let parent_run_key = RunKey::new();
+        let mut state = sample_state(child_run_key);
+        state.workflow_id = WorkflowId("child-workflow".to_string());
+        state.status = ExecutionStatus::Completed;
+        state.parent_run_key = Some(parent_run_key);
+        state.parent_workflow_id = Some(WorkflowId("parent-workflow".to_string()));
+        state.close_result = Some(Payloads::default());
+        state.closed_at = Some(OffsetDateTime::now_utc());
+
+        let repo = MockRepo::new(
+            LoadedRun::Existing(state.clone()),
+            vec![CommitBehavior::Applied],
+        );
+        let kernel = MockKernel::new(SmallVec::new());
+        let publisher = MockPublisher::new();
+        let (first, first_reply) = lane_message(child_run_key, "first");
+        let (_tx, mut rx) = mpsc::channel(8);
+        let tracking = crate::runtime::WorkflowTimeoutTrackingState::default();
+
+        let buffered = run_activation(
+            &kernel,
+            &repo,
+            &publisher,
+            &tracking,
+            &mut rx,
+            first,
+            &LaneConfig::default(),
+        )
+        .await;
+
+        assert!(buffered.is_empty());
+        assert!(matches!(
+            first_reply.await.unwrap().unwrap(),
+            CommitResult::Applied { .. }
+        ));
+
+        let snapshot = publisher.snapshot().await;
+        assert_eq!(snapshot.publishes.len(), 0);
+        assert_eq!(snapshot.submits.len(), 1);
+        assert_eq!(snapshot.submits[0].0, parent_run_key);
+        match &snapshot.submits[0].1 {
+            Command::ChildResolved(request) => {
+                assert_eq!(request.child_workflow_id, WorkflowId("child-workflow".to_string()));
+                assert!(matches!(
+                    request.resolution,
+                    tokeira_kernel::ChildResolution::Completed { .. }
+                ));
+            }
+            other => panic!("expected ChildResolved command, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_activation_does_not_deliver_child_resolution_for_non_child_run() {
+        let run_key = RunKey::new();
+        let mut state = sample_state(run_key);
+        state.status = ExecutionStatus::Completed;
+        state.closed_at = Some(OffsetDateTime::now_utc());
+
+        let repo = MockRepo::new(
+            LoadedRun::Existing(state.clone()),
+            vec![CommitBehavior::Applied],
+        );
+        let kernel = MockKernel::new(SmallVec::new());
+        let publisher = MockPublisher::new();
+        let (first, first_reply) = lane_message(run_key, "first");
+        let (_tx, mut rx) = mpsc::channel(8);
+        let tracking = crate::runtime::WorkflowTimeoutTrackingState::default();
+
+        let buffered = run_activation(
+            &kernel,
+            &repo,
+            &publisher,
+            &tracking,
+            &mut rx,
+            first,
+            &LaneConfig::default(),
+        )
+        .await;
+
+        assert!(buffered.is_empty());
+        assert!(matches!(
+            first_reply.await.unwrap().unwrap(),
+            CommitResult::Applied { .. }
+        ));
+
+        let snapshot = publisher.snapshot().await;
+        assert!(snapshot.submits.is_empty());
     }
 
     #[tokio::test]

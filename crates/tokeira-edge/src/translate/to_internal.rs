@@ -57,6 +57,8 @@ pub fn start_request(
         attempt: 1,
         continued_execution_run_id: None,
         first_execution_run_id: Some(run_id),
+        parent_run_key: None,
+        parent_workflow_id: None,
         request: RequestContext {
             request_id: CoreRequestId(
                 req.request_id

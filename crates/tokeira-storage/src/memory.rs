@@ -655,6 +655,8 @@ mod tests {
             workflow_task_timeout: Duration::seconds(10),
             retry_policy: None,
             attempt: 1,
+            parent_run_key: None,
+            parent_workflow_id: None,
             activities: Default::default(),
             timers: Default::default(),
             children: Default::default(),
@@ -666,6 +668,8 @@ mod tests {
             completion_callbacks: Vec::new(),
             started_at: fixed_now(),
             closed_at: None,
+            close_result: None,
+            close_failure: None,
         }
     }
 

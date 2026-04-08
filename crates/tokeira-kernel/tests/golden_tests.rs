@@ -86,6 +86,8 @@ fn make_start_request() -> StartRequest {
         attempt: 1,
         continued_execution_run_id: None,
         first_execution_run_id: Some(run_id),
+        parent_run_key: None,
+        parent_workflow_id: None,
         request: request_context("start-req"),
         now: now(),
     }
@@ -114,6 +116,8 @@ fn make_open_state() -> WorkflowState {
         workflow_task_timeout: Duration::seconds(10),
         retry_policy: Some(retry_policy()),
         attempt: 1,
+        parent_run_key: None,
+        parent_workflow_id: None,
         activities: BTreeMap::new(),
         timers: BTreeMap::new(),
         children: BTreeMap::new(),
@@ -125,6 +129,8 @@ fn make_open_state() -> WorkflowState {
         completion_callbacks: Vec::new(),
         started_at: now() - Duration::minutes(3),
         closed_at: None,
+        close_result: None,
+        close_failure: None,
     }
 }
 
@@ -3156,6 +3162,7 @@ fn with_child(
         WorkflowId(child_workflow_id.into()),
         ChildWorkflowState {
             child_workflow_id: WorkflowId(child_workflow_id.into()),
+            namespace_id: state.namespace_id,
             child_run_id: started.then(RunId::new),
             initiated_event_id,
             started_event_id: started.then_some(initiated_event_id + 1),
@@ -3383,6 +3390,7 @@ fn signal_external_workflow_happy_path() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 commands: vec![WorkflowCommand::SignalExternalWorkflowExecution {
+                    target_namespace_id: state.namespace_id,
                     target_workflow_id: WorkflowId("target".into()),
                     target_run_id: Some(RunId::new()),
                     signal_name: "sig".into(),
@@ -3447,6 +3455,7 @@ fn request_cancel_external_workflow_happy_path() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 commands: vec![WorkflowCommand::RequestCancelExternalWorkflowExecution {
+                    target_namespace_id: state.namespace_id,
                     target_workflow_id: WorkflowId("target".into()),
                     target_run_id: Some(RunId::new()),
                 }],

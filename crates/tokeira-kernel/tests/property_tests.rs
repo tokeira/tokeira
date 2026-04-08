@@ -95,6 +95,8 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         workflow_task_timeout: default_workflow_task_timeout(),
         retry_policy: Some(sample_retry_policy()),
         attempt: 2,
+        parent_run_key: None,
+        parent_workflow_id: None,
         activities: BTreeMap::new(),
         timers: BTreeMap::new(),
         children: BTreeMap::new(),
@@ -106,6 +108,8 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         completion_callbacks: Vec::new(),
         started_at: now - Duration::minutes(10),
         closed_at: None,
+        close_result: None,
+        close_failure: None,
     }
 }
 
@@ -200,6 +204,7 @@ fn with_child(
         WorkflowId(child_workflow_id.into()),
         ChildWorkflowState {
             child_workflow_id: WorkflowId(child_workflow_id.into()),
+            namespace_id: state.namespace_id,
             child_run_id: started.then(RunId::new),
             initiated_event_id,
             started_event_id: started.then_some(initiated_event_id + 1),
@@ -638,6 +643,8 @@ fn arb_start_request() -> impl Strategy<Value = StartRequest> {
                     attempt,
                     continued_execution_run_id: None,
                     first_execution_run_id: Some(run_id),
+                    parent_run_key: None,
+                    parent_workflow_id: None,
                     request: request_context("prop-start", now),
                     now,
                 }
@@ -1077,6 +1084,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 .prop_map(
                     |(target_workflow_id, with_run_id, signal_name, input)| {
                         vec![WorkflowCommand::SignalExternalWorkflowExecution {
+                            target_namespace_id: NamespaceId::new(),
                             target_workflow_id: WorkflowId(target_workflow_id),
                             target_run_id: with_run_id.then(RunId::new),
                             signal_name,
@@ -1087,6 +1095,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
             (arb_small_string(), any::<bool>()).prop_map(
                 |(target_workflow_id, with_run_id)| {
                     vec![WorkflowCommand::RequestCancelExternalWorkflowExecution {
+                        target_namespace_id: NamespaceId::new(),
                         target_workflow_id: WorkflowId(target_workflow_id),
                         target_run_id: with_run_id.then(RunId::new),
                     }]
@@ -2652,6 +2661,7 @@ proptest! {
                 },
                 identity: WorkerIdentity("worker".into()),
                 commands: vec![WorkflowCommand::SignalExternalWorkflowExecution {
+                    target_namespace_id: state.namespace_id,
                     target_workflow_id: WorkflowId(target_workflow_id.clone()),
                     target_run_id: Some(RunId::new()),
                     signal_name: signal_name.clone(),

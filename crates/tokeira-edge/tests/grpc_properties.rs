@@ -721,6 +721,7 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
             }),
         (arb_small_string(), arb_payloads(),).prop_map(|(target_workflow_id, input)| {
             WorkflowCommand::SignalExternalWorkflowExecution {
+                target_namespace_id: tokeira_types::NamespaceId::new(),
                 target_workflow_id: tokeira_types::WorkflowId(target_workflow_id),
                 target_run_id: Some(tokeira_types::RunId::new()),
                 signal_name: "sig".into(),
@@ -729,6 +730,7 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
         }),
         arb_small_string().prop_map(|target_workflow_id| {
             WorkflowCommand::RequestCancelExternalWorkflowExecution {
+                target_namespace_id: tokeira_types::NamespaceId::new(),
                 target_workflow_id: tokeira_types::WorkflowId(target_workflow_id),
                 target_run_id: Some(tokeira_types::RunId::new()),
             }

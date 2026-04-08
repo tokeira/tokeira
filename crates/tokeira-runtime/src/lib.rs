@@ -9,8 +9,18 @@
 
 pub mod broker;
 pub mod lane;
+pub mod nexus;
+pub mod publisher;
+pub mod retry;
 pub mod runtime;
+pub mod scanner;
+pub mod timeout;
 
 pub use broker::*;
 pub use lane::*;
+pub use nexus::*;
+pub use publisher::*;
+pub use retry::*;
 pub use runtime::*;
+pub use scanner::*;
+pub use timeout::*;

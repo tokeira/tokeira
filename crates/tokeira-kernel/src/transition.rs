@@ -158,9 +158,18 @@ pub enum DispatchOp {
         operation: String,
         input: Payloads,
         schedule_to_close_timeout: Option<Duration>,
+        originator_run_key: RunKey,
+        scheduled_event_id: i64,
+        scheduled_at: OffsetDateTime,
     },
     /// Cancel a previously scheduled Nexus operation.
-    CancelNexusOperation { scheduled_event_id: i64 },
+    CancelNexusOperation {
+        scheduled_event_id: i64,
+        originator_run_key: RunKey,
+        operation_id: String,
+        endpoint: String,
+        service: String,
+    },
 }
 
 /// Projection operations are the contract between the correctness path and the

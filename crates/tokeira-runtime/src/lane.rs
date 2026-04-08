@@ -108,7 +108,8 @@ pub fn spawn_lane<K, R, P>(
     kernel: K,
     repo: R,
     publisher: P,
-    workflow_timeout_tracking: crate::runtime::WorkflowTimeoutTrackingState,
+    workflow_timeout_tracking: crate::timeout::WorkflowTimeoutTrackingState,
+    nexus_timeout_tracking: crate::nexus::NexusTimeoutTrackingState,
     config: LaneConfig,
 ) -> LaneHandle
 where
@@ -120,17 +121,17 @@ where
     let requeue_tx = tx.clone();
     tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
-            let buffered =
-                run_activation(
-                    &kernel,
-                    &repo,
-                    &publisher,
-                    &workflow_timeout_tracking,
-                    &mut rx,
-                    message,
-                    &config,
-                )
-                .await;
+            let buffered = run_activation(
+                &kernel,
+                &repo,
+                &publisher,
+                &workflow_timeout_tracking,
+                &nexus_timeout_tracking,
+                &mut rx,
+                message,
+                &config,
+            )
+            .await;
             for message in buffered {
                 if requeue_tx.send(message).await.is_err() {
                     break;
@@ -145,7 +146,8 @@ async fn run_activation<K, R, P>(
     kernel: &K,
     repo: &R,
     publisher: &P,
-    workflow_timeout_tracking: &crate::runtime::WorkflowTimeoutTrackingState,
+    workflow_timeout_tracking: &crate::timeout::WorkflowTimeoutTrackingState,
+    nexus_timeout_tracking: &crate::nexus::NexusTimeoutTrackingState,
     rx: &mut mpsc::Receiver<LaneMessage>,
     first_message: LaneMessage,
     config: &LaneConfig,
@@ -162,6 +164,7 @@ where
     let drain_limit = config.max_drain_per_activation.max(1) as usize;
 
     while let Some(message) = current.take() {
+        let committed_command = message.command.clone();
         let result = handle_message(
             kernel,
             repo,
@@ -177,6 +180,7 @@ where
                 if let CommitResult::Applied { new_state } = &commit_result {
                     if new_state.closed_at.is_some() {
                         workflow_timeout_tracking.remove(message.run_key);
+                        nexus_timeout_tracking.remove_all_for_run(message.run_key);
                     }
                 }
                 if !dispatch_ops.is_empty() {
@@ -187,22 +191,48 @@ where
                     }
                 }
                 if let CommitResult::Applied { new_state } = &commit_result {
+                    if let Command::NexusOperationResolved(request) = &committed_command {
+                        if matches!(
+                            request.resolution,
+                            tokeira_kernel::NexusResolution::Completed { .. }
+                                | tokeira_kernel::NexusResolution::Failed { .. }
+                                | tokeira_kernel::NexusResolution::Canceled
+                                | tokeira_kernel::NexusResolution::TimedOut
+                        ) {
+                            nexus_timeout_tracking
+                                .remove(message.run_key, &request.operation_id);
+                        }
+                    }
                     if new_state.closed_at.is_some() {
                         if let Some(parent_run_key) = new_state.parent_run_key {
                             let maybe_resolution = match new_state.status {
                                 tokeira_types::ExecutionStatus::Completed => {
                                     Some(tokeira_kernel::ChildResolution::Completed {
-                                        result: new_state.close_result.clone().unwrap_or_default(),
+                                        result: new_state
+                                            .close_result
+                                            .clone()
+                                            .unwrap_or_default(),
                                     })
                                 }
                                 tokeira_types::ExecutionStatus::Failed => {
                                     Some(tokeira_kernel::ChildResolution::Failed {
-                                        failure: new_state.close_failure.clone().unwrap_or_else(|| "child workflow failed".to_string()),
+                                        failure: new_state
+                                            .close_failure
+                                            .clone()
+                                            .unwrap_or_else(|| {
+                                                "child workflow failed".to_string()
+                                            }),
                                     })
                                 }
-                                tokeira_types::ExecutionStatus::Cancelled => Some(tokeira_kernel::ChildResolution::Canceled),
-                                tokeira_types::ExecutionStatus::Terminated => Some(tokeira_kernel::ChildResolution::Terminated),
-                                tokeira_types::ExecutionStatus::TimedOut => Some(tokeira_kernel::ChildResolution::TimedOut),
+                                tokeira_types::ExecutionStatus::Cancelled => {
+                                    Some(tokeira_kernel::ChildResolution::Canceled)
+                                }
+                                tokeira_types::ExecutionStatus::Terminated => {
+                                    Some(tokeira_kernel::ChildResolution::Terminated)
+                                }
+                                tokeira_types::ExecutionStatus::TimedOut => {
+                                    Some(tokeira_kernel::ChildResolution::TimedOut)
+                                }
                                 _ => None,
                             };
                             if let Some(resolution) = maybe_resolution {
@@ -216,9 +246,14 @@ where
                                 let publisher = publisher.clone();
                                 let child_run_key = message.run_key;
                                 tokio::spawn(async move {
-                                    if let Err(error) = publisher.submit_to_run(parent_run_key, command).await {
+                                    if let Err(error) = publisher
+                                        .submit_to_run(parent_run_key, command)
+                                        .await
+                                    {
                                         let error_message = error.to_string();
-                                        if error_message.contains("kernel rejected") || error_message.contains("not found") {
+                                        if error_message.contains("kernel rejected")
+                                            || error_message.contains("not found")
+                                        {
                                             tracing::debug!(?error, parent_run_key = ?parent_run_key, child_run_key = ?child_run_key, "failed to deliver child resolution to parent");
                                         } else {
                                             tracing::warn!(?error, parent_run_key = ?parent_run_key, child_run_key = ?child_run_key, "failed to deliver child resolution to parent");
@@ -228,8 +263,9 @@ where
                             }
                         }
                         if new_state.status == ExecutionStatus::ContinuedAsNew {
-                            let successor_event = history_events.iter().find_map(|event| {
-                                match &event.kind {
+                            let successor_event =
+                                history_events.iter().find_map(|event| {
+                                    match &event.kind {
                                     HistoryEventKind::WorkflowExecutionContinuedAsNew {
                                         new_run_id,
                                         workflow_type,
@@ -253,7 +289,7 @@ where
                                     )),
                                     _ => None,
                                 }
-                            });
+                                });
                             if let Some((
                                 successor_run_id,
                                 workflow_type,
@@ -300,8 +336,7 @@ where
                                     request: tokeira_types::RequestContext {
                                         request_id: tokeira_types::RequestId(format!(
                                             "continue-as-new:{}:{}",
-                                            new_state.run_id.0,
-                                            successor_run_id.0
+                                            new_state.run_id.0, successor_run_id.0
                                         )),
                                         caller_identity: None,
                                         received_at: OffsetDateTime::now_utc(),
@@ -324,10 +359,12 @@ where
                                             if new_state
                                                 .workflow_execution_timeout
                                                 .is_some()
-                                                || new_state.workflow_run_timeout.is_some()
+                                                || new_state
+                                                    .workflow_run_timeout
+                                                    .is_some()
                                             {
                                                 workflow_timeout_tracking.insert(
-                                                    crate::runtime::WorkflowTimeoutEntry {
+                                                    crate::timeout::WorkflowTimeoutEntry {
                                                         run_key: new_state.run_key,
                                                         workflow_execution_timeout: new_state
                                                             .workflow_execution_timeout,
@@ -410,7 +447,11 @@ async fn handle_message<K, R>(
     run_key: RunKey,
     command: Command,
     max_retries: u32,
-) -> Result<(CommitResult, SmallVec<[DispatchOp; 4]>, SmallVec<[HistoryEvent; 8]>)>
+) -> Result<(
+    CommitResult,
+    SmallVec<[DispatchOp; 4]>,
+    SmallVec<[HistoryEvent; 8]>,
+)>
 where
     K: Kernel + Send + Sync + 'static,
     R: RunRepository + 'static,
@@ -433,11 +474,7 @@ where
                 ));
             }
             CommitResult::Duplicate => {
-                return Ok((
-                    CommitResult::Duplicate,
-                    SmallVec::new(),
-                    SmallVec::new(),
-                ));
+                return Ok((CommitResult::Duplicate, SmallVec::new(), SmallVec::new()));
             }
             CommitResult::Conflict { reason } => {
                 if attempts >= max_retries {
@@ -806,7 +843,10 @@ mod tests {
             if state.fail {
                 return Err(anyhow!("publisher failed"));
             }
-            Ok(state.submit_result.clone().unwrap_or(CommitResult::Duplicate))
+            Ok(state
+                .submit_result
+                .clone()
+                .unwrap_or(CommitResult::Duplicate))
         }
     }
 
@@ -1124,7 +1164,8 @@ mod tests {
         let (_foreign, _foreign_reply) = lane_message(RunKey::new(), "foreign");
         let (second, second_reply) = lane_message(run_key, "second");
         let (tx, mut rx) = mpsc::channel(8);
-        let tracking = crate::runtime::WorkflowTimeoutTrackingState::default();
+        let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
+        let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
         tx.send(second).await.unwrap();
         tx.send(_foreign).await.unwrap();
 
@@ -1133,6 +1174,7 @@ mod tests {
             &repo,
             &publisher,
             &tracking,
+            &nexus_tracking,
             &mut rx,
             first,
             &LaneConfig {
@@ -1188,7 +1230,8 @@ mod tests {
         let (second, second_reply) = lane_message(run_key, "second");
         let (third, _third_reply) = lane_message(run_key, "third");
         let (tx, mut rx) = mpsc::channel(8);
-        let tracking = crate::runtime::WorkflowTimeoutTrackingState::default();
+        let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
+        let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
         tx.send(second).await.unwrap();
         tx.send(third).await.unwrap();
 
@@ -1197,6 +1240,7 @@ mod tests {
             &repo,
             &publisher,
             &tracking,
+            &nexus_tracking,
             &mut rx,
             first,
             &LaneConfig {
@@ -1236,7 +1280,8 @@ mod tests {
         let (second, second_reply) = lane_message(run_key, "second");
         let (third, _third_reply) = lane_message(run_key, "third");
         let (tx, mut rx) = mpsc::channel(8);
-        let tracking = crate::runtime::WorkflowTimeoutTrackingState::default();
+        let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
+        let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
         tx.send(second).await.unwrap();
         tx.send(third).await.unwrap();
 
@@ -1245,6 +1290,7 @@ mod tests {
             &repo,
             &publisher,
             &tracking,
+            &nexus_tracking,
             &mut rx,
             first,
             &LaneConfig::default(),
@@ -1273,13 +1319,15 @@ mod tests {
         let publisher = MockPublisher::new().with_failure().await;
         let (first, first_reply) = lane_message(run_key, "first");
         let (_tx, mut rx) = mpsc::channel(8);
-        let tracking = crate::runtime::WorkflowTimeoutTrackingState::default();
+        let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
+        let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
 
         let buffered = run_activation(
             &kernel,
             &repo,
             &publisher,
             &tracking,
+            &nexus_tracking,
             &mut rx,
             first,
             &LaneConfig::default(),
@@ -1309,13 +1357,15 @@ mod tests {
         let publisher = MockPublisher::new();
         let (first, first_reply) = lane_message(run_key, "first");
         let (_tx, mut rx) = mpsc::channel(8);
-        let tracking = crate::runtime::WorkflowTimeoutTrackingState::default();
+        let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
+        let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
 
         let _ = run_activation(
             &kernel,
             &repo,
             &publisher,
             &tracking,
+            &nexus_tracking,
             &mut rx,
             first,
             &LaneConfig {
@@ -1351,13 +1401,15 @@ mod tests {
         let publisher = MockPublisher::new();
         let (first, first_reply) = lane_message(child_run_key, "first");
         let (_tx, mut rx) = mpsc::channel(8);
-        let tracking = crate::runtime::WorkflowTimeoutTrackingState::default();
+        let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
+        let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
 
         let buffered = run_activation(
             &kernel,
             &repo,
             &publisher,
             &tracking,
+            &nexus_tracking,
             &mut rx,
             first,
             &LaneConfig::default(),
@@ -1377,7 +1429,10 @@ mod tests {
         assert_eq!(snapshot.submits[0].0, parent_run_key);
         match &snapshot.submits[0].1 {
             Command::ChildResolved(request) => {
-                assert_eq!(request.child_workflow_id, WorkflowId("child-workflow".to_string()));
+                assert_eq!(
+                    request.child_workflow_id,
+                    WorkflowId("child-workflow".to_string())
+                );
                 assert!(matches!(
                     request.resolution,
                     tokeira_kernel::ChildResolution::Completed { .. }
@@ -1402,13 +1457,15 @@ mod tests {
         let publisher = MockPublisher::new();
         let (first, first_reply) = lane_message(run_key, "first");
         let (_tx, mut rx) = mpsc::channel(8);
-        let tracking = crate::runtime::WorkflowTimeoutTrackingState::default();
+        let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
+        let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
 
         let buffered = run_activation(
             &kernel,
             &repo,
             &publisher,
             &tracking,
+            &nexus_tracking,
             &mut rx,
             first,
             &LaneConfig::default(),
@@ -1463,13 +1520,15 @@ mod tests {
             .await;
         let (first, first_reply) = lane_message(run_key, "continue");
         let (_tx, mut rx) = mpsc::channel(8);
-        let tracking = crate::runtime::WorkflowTimeoutTrackingState::default();
+        let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
+        let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
 
         let buffered = run_activation(
             &kernel,
             &repo,
             &publisher,
             &tracking,
+            &nexus_tracking,
             &mut rx,
             first,
             &LaneConfig::default(),
@@ -1498,10 +1557,7 @@ mod tests {
                     request.workflow_execution_timeout,
                     Some(Duration::minutes(30))
                 );
-                assert_eq!(
-                    request.workflow_run_timeout,
-                    Some(Duration::minutes(5))
-                );
+                assert_eq!(request.workflow_run_timeout, Some(Duration::minutes(5)));
             }
             other => panic!("expected successor Start request, got {other:?}"),
         }
@@ -1535,13 +1591,15 @@ mod tests {
                 let publisher = MockPublisher::new();
                 let (first, first_reply) = lane_message(run_key, "continue");
                 let (_tx, mut rx) = mpsc::channel(8);
-                let tracking = crate::runtime::WorkflowTimeoutTrackingState::default();
+                let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
+                let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
 
                 let _ = run_activation(
                     &kernel,
                     &repo,
                     &publisher,
                     &tracking,
+                    &nexus_tracking,
                     &mut rx,
                     first,
                     &LaneConfig::default(),
@@ -1572,13 +1630,15 @@ mod tests {
         let publisher = MockPublisher::new().with_failure().await;
         let (first, first_reply) = lane_message(run_key, "continue");
         let (_tx, mut rx) = mpsc::channel(8);
-        let tracking = crate::runtime::WorkflowTimeoutTrackingState::default();
+        let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
+        let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
 
         let _ = run_activation(
             &kernel,
             &repo,
             &publisher,
             &tracking,
+            &nexus_tracking,
             &mut rx,
             first,
             &LaneConfig::default(),

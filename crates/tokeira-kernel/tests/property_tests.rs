@@ -3404,7 +3404,7 @@ proptest! {
                 prop_assert_eq!(&pending.operation, &operation);
                 prop_assert!(!pending.started);
                 prop_assert_eq!(
-                    transition.dispatch_ops.iter().any(|op| matches!(op, DispatchOp::ScheduleNexusOperation { operation_id: id, endpoint: ep, service: svc, operation: opn, input: inp, schedule_to_close_timeout: sto } if id == &operation_id && ep == &endpoint && svc == &service && opn == &operation && inp == &input && sto == &schedule_to_close_timeout)),
+                    transition.dispatch_ops.iter().any(|op| matches!(op, DispatchOp::ScheduleNexusOperation { operation_id: id, endpoint: ep, service: svc, operation: opn, input: inp, schedule_to_close_timeout: sto, originator_run_key, scheduled_event_id, scheduled_at } if id == &operation_id && ep == &endpoint && svc == &service && opn == &operation && inp == &input && sto == &schedule_to_close_timeout && originator_run_key == &state.run_key && *scheduled_event_id == pending.scheduled_event_id && *scheduled_at == now)),
                     true
                 );
             }
@@ -3469,7 +3469,7 @@ proptest! {
             true
         );
         prop_assert_eq!(
-            transition.dispatch_ops.iter().any(|op| matches!(op, DispatchOp::CancelNexusOperation { scheduled_event_id: 12 })),
+            transition.dispatch_ops.iter().any(|op| matches!(op, DispatchOp::CancelNexusOperation { scheduled_event_id: 12, originator_run_key, operation_id: id, endpoint, service } if originator_run_key == &state.run_key && id == &operation_id && endpoint == "endpoint" && service == "service")),
             true
         );
         prop_assert!(transition.next_state.pending_nexus_operations.contains_key(&operation_id));

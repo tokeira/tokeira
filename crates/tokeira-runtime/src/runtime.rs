@@ -1,37 +1,37 @@
-use std::{
-    collections::HashMap,
-    hash::{Hash, Hasher},
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
-use async_trait::async_trait;
 use smallvec::{SmallVec, smallvec};
 use time::{Duration, OffsetDateTime};
-use tokio_util::sync::CancellationToken;
 use tokeira_kernel::{
-    ActivityOp, ActivityResolution, ActivityResolvedRequest, BasicKernel,
-    CancelRequest, ChildStartConfirmedRequest, ChildStartResult, Command,
-    DispatchOp, ExternalCancelResolvedRequest, ExternalCancelResult,
-    ExternalSignalResolvedRequest, ExternalSignalResult,
-    ExternalWorkflowExecution, LoadedRun, RetryState, SignalRequest,
-    StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest,
-    Transition, WorkflowExecutionTimedOutRequest, WorkflowTaskCompletedRequest,
-    WorkflowTimeoutType,
+    ActivityOp, ActivityResolution, ActivityResolvedRequest, BasicKernel, Command,
+    DispatchOp, LoadedRun, SignalRequest, StartRequest, StartWorkflowTaskRequest,
+    TerminateRequest, Transition, WorkflowTaskCompletedRequest,
 };
 use tokeira_storage::{
-    CommitResult, DispatchableActivityTask, DispatchableWorkflowTask, DueTimer,
-    RunRepository,
+    CommitResult, DispatchableActivityTask, DispatchableWorkflowTask, RunRepository,
 };
 use tokeira_types::{
-    ActivityTaskToken, ExecutionRef, Memo, NamespaceId, Payloads, QueueKey,
-    RequestContext, RequestId, RetryPolicy, RunId, RunKey, SearchAttributes,
-    ShardEpoch, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowTaskToken,
+    ActivityTaskToken, ExecutionRef, Payloads, QueueKey, RetryPolicy, RunKey, ShardEpoch,
+    TaskQueueName, WorkerIdentity, WorkflowTaskToken,
 };
+use tokio_util::sync::CancellationToken;
 
+use crate::nexus::run_nexus_timeout_scanner;
 use crate::{
     broker::{InMemoryActivityBroker, InMemoryBroker},
-    lane::{DispatchPublisher, LaneConfig, LaneHandle, spawn_lane},
+    lane::{LaneConfig, LaneHandle, spawn_lane},
+    nexus::{
+        NexusEndpointRegistry, NexusHttpClient, NexusTimeoutScannerConfig,
+        NexusTimeoutTrackingState, NoopNexusHttpClient,
+    },
+    publisher::RuntimeDispatchPublisher,
+    retry::{RetryDecision, evaluate_activity_retry},
+    scanner::{TimerScannerConfig, pick_lane, run_timer_scanner},
+    timeout::{
+        WorkflowTimeoutEntry, WorkflowTimeoutScannerConfig, WorkflowTimeoutTrackingState,
+        run_workflow_timeout_scanner,
+    },
 };
 
 /// Public runtime facade.
@@ -63,287 +63,12 @@ pub struct TokeiraRuntime<R> {
     workflow_timeout_scanner_handle: Option<tokio::task::JoinHandle<()>>,
     /// Cancellation token for the workflow-timeout scanner.
     workflow_timeout_scanner_cancel: CancellationToken,
-}
-
-/// Configuration knobs for the background timer scanner.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TimerScannerConfig {
-    /// Delay between storage scans for due timers.
-    pub scan_interval: tokio::time::Duration,
-    /// Maximum timers loaded from storage per scan cycle.
-    pub max_timers_per_scan: usize,
-}
-
-impl Default for TimerScannerConfig {
-    fn default() -> Self {
-        Self {
-            scan_interval: tokio::time::Duration::from_millis(200),
-            max_timers_per_scan: 100,
-        }
-    }
-}
-
-/// Runtime-local timeout tracking entry for one open run.
-#[derive(Clone, Debug, PartialEq)]
-pub struct WorkflowTimeoutEntry {
-    pub run_key: RunKey,
-    pub workflow_execution_timeout: Option<Duration>,
-    pub workflow_run_timeout: Option<Duration>,
-    pub started_at: OffsetDateTime,
-    pub first_run_started_at: Option<OffsetDateTime>,
-    pub has_retry_policy: bool,
-}
-
-/// Shared in-memory tracking state for workflow timeouts.
-#[derive(Clone, Default)]
-pub struct WorkflowTimeoutTrackingState {
-    inner: Arc<Mutex<HashMap<RunKey, WorkflowTimeoutEntry>>>,
-}
-
-impl WorkflowTimeoutTrackingState {
-    pub fn insert(&self, entry: WorkflowTimeoutEntry) {
-        self.inner.lock().unwrap().insert(entry.run_key, entry);
-    }
-
-    pub fn remove(&self, run_key: RunKey) {
-        self.inner.lock().unwrap().remove(&run_key);
-    }
-
-    pub fn snapshot(&self) -> Vec<WorkflowTimeoutEntry> {
-        self.inner.lock().unwrap().values().cloned().collect()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WorkflowTimeoutScannerConfig {
-    pub scan_interval: tokio::time::Duration,
-    pub max_timeouts_per_scan: usize,
-}
-
-impl Default for WorkflowTimeoutScannerConfig {
-    fn default() -> Self {
-        Self {
-            scan_interval: tokio::time::Duration::from_secs(1),
-            max_timeouts_per_scan: 100,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum WorkflowTimeoutViolation {
-    ExecutionTimeout,
-    RunTimeout,
-}
-
-/// Outcome of evaluating an activity retry policy.
-#[derive(Clone, Debug, PartialEq)]
-pub enum RetryDecision {
-    /// The activity should be retried at `next_attempt`.
-    Retry { next_attempt: u32 },
-    /// All retry attempts have been exhausted (or the
-    /// error is non-retryable).
-    Exhausted,
-}
-
-pub fn evaluate_workflow_timeout(
-    entry: &WorkflowTimeoutEntry,
-    now: OffsetDateTime,
-) -> Option<WorkflowTimeoutViolation> {
-    let execution_started_at = entry.first_run_started_at.unwrap_or(entry.started_at);
-    if let Some(timeout) = entry.workflow_execution_timeout {
-        if now - execution_started_at > timeout
-            || timeout.is_zero() && now >= execution_started_at
-        {
-            return Some(WorkflowTimeoutViolation::ExecutionTimeout);
-        }
-    }
-
-    if let Some(timeout) = entry.workflow_run_timeout {
-        if now - entry.started_at > timeout || timeout.is_zero() && now >= entry.started_at {
-            return Some(WorkflowTimeoutViolation::RunTimeout);
-        }
-    }
-
-    None
-}
-
-fn workflow_timeout_retry_state(entry: &WorkflowTimeoutEntry) -> RetryState {
-    if entry.has_retry_policy {
-        RetryState::Timeout
-    } else {
-        RetryState::RetryPolicyNotSet
-    }
-}
-
-fn lane_index_for(run_key: RunKey, lane_count: usize) -> usize {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    run_key.hash(&mut hasher);
-    (hasher.finish() as usize) % lane_count.max(1)
-}
-
-fn pick_lane(
-    lanes: &[LaneHandle],
-    lane_count: usize,
-    run_key: RunKey,
-) -> &LaneHandle {
-    debug_assert!(!lanes.is_empty());
-    debug_assert_eq!(lanes.len(), lane_count.max(1));
-    &lanes[lane_index_for(run_key, lane_count.max(1)) % lanes.len()]
-}
-
-async fn scan_due_timers_once<R, F, Fut>(
-    repo: &R,
-    config: &TimerScannerConfig,
-    mut submit_due_timer: F,
-) where
-    R: RunRepository + ?Sized,
-    F: FnMut(DueTimer, OffsetDateTime) -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
-{
-    let fired_at = OffsetDateTime::now_utc();
-    let due_timers = match repo
-        .list_due_timers(fired_at, config.max_timers_per_scan)
-        .await
-    {
-        Ok(due_timers) => due_timers,
-        Err(error) => {
-            tracing::warn!(?error, "timer scanner failed to list due timers");
-            return;
-        }
-    };
-
-    for due in due_timers {
-        if let Err(error) = submit_due_timer(due.clone(), fired_at).await {
-            let message = error.to_string();
-            if message.contains("kernel rejected") {
-                tracing::debug!(
-                    ?error,
-                    run_key = ?due.run_key,
-                    timer_id = due.timer_id,
-                    "timer scanner due timer rejected by kernel"
-                );
-            } else {
-                tracing::warn!(
-                    ?error,
-                    run_key = ?due.run_key,
-                    timer_id = due.timer_id,
-                    "timer scanner failed to submit due timer"
-                );
-            }
-        }
-    }
-}
-
-async fn scan_workflow_timeouts_once<F, Fut>(
-    tracking: &WorkflowTimeoutTrackingState,
-    config: &WorkflowTimeoutScannerConfig,
-    mut submit_timeout: F,
-) where
-    F: FnMut(WorkflowTimeoutEntry, WorkflowTimeoutViolation, OffsetDateTime) -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
-{
-    let now = OffsetDateTime::now_utc();
-    let entries = tracking.snapshot();
-    let mut submitted = 0usize;
-
-    for entry in entries {
-        if submitted >= config.max_timeouts_per_scan {
-            break;
-        }
-        let Some(violation) = evaluate_workflow_timeout(&entry, now) else {
-            continue;
-        };
-
-        match submit_timeout(entry.clone(), violation, now).await {
-            Ok(()) => tracking.remove(entry.run_key),
-            Err(error) => {
-                let message = error.to_string();
-                if message.contains("kernel rejected") {
-                    tracing::debug!(
-                        ?error,
-                        run_key = ?entry.run_key,
-                        "workflow timeout scanner timeout rejected by kernel"
-                    );
-                    tracking.remove(entry.run_key);
-                } else {
-                    tracing::warn!(
-                        ?error,
-                        run_key = ?entry.run_key,
-                        "workflow timeout scanner failed to submit timeout"
-                    );
-                }
-            }
-        }
-        submitted += 1;
-    }
-}
-
-async fn run_timer_scanner<R>(
-    repo: Arc<R>,
-    lanes: Vec<LaneHandle>,
-    lane_count: usize,
-    config: TimerScannerConfig,
-    cancel: CancellationToken,
-) where
-    R: RunRepository + 'static,
-{
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            _ = tokio::time::sleep(config.scan_interval) => {}
-        }
-
-        scan_due_timers_once(&*repo, &config, |due, fired_at| {
-            let lane = pick_lane(&lanes, lane_count, due.run_key).clone();
-            async move {
-                lane.submit(
-                    due.run_key,
-                    Command::TimerDue(TimerDueRequest {
-                        timer_id: due.timer_id,
-                        fired_at,
-                    }),
-                )
-                .await
-                .map(|_| ())
-            }
-        })
-        .await;
-    }
-}
-
-async fn run_workflow_timeout_scanner(
-    tracking: WorkflowTimeoutTrackingState,
-    lanes: Vec<LaneHandle>,
-    lane_count: usize,
-    config: WorkflowTimeoutScannerConfig,
-    cancel: CancellationToken,
-) {
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            _ = tokio::time::sleep(config.scan_interval) => {}
-        }
-
-        scan_workflow_timeouts_once(&tracking, &config, |entry, violation, now| {
-            let lane = pick_lane(&lanes, lane_count, entry.run_key).clone();
-            async move {
-                lane.submit(
-                    entry.run_key,
-                    Command::WorkflowExecutionTimedOut(WorkflowExecutionTimedOutRequest {
-                        timeout_type: match violation {
-                            WorkflowTimeoutViolation::ExecutionTimeout => WorkflowTimeoutType::ExecutionTimeout,
-                            WorkflowTimeoutViolation::RunTimeout => WorkflowTimeoutType::RunTimeout,
-                        },
-                        retry_state: workflow_timeout_retry_state(&entry),
-                        now,
-                    }),
-                )
-                .await
-                .map(|_| ())
-            }
-        })
-        .await;
-    }
+    /// Runtime-local Nexus timeout tracking.
+    nexus_timeout_tracking: NexusTimeoutTrackingState,
+    /// Background Nexus-timeout scanner task.
+    nexus_timeout_scanner_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Cancellation token for the Nexus-timeout scanner.
+    nexus_timeout_scanner_cancel: CancellationToken,
 }
 
 impl<R> TokeiraRuntime<R>
@@ -359,9 +84,32 @@ where
         timer_config: TimerScannerConfig,
         workflow_timeout_config: WorkflowTimeoutScannerConfig,
     ) -> Self {
+        Self::new_with_nexus(
+            repo,
+            lane_count,
+            config,
+            timer_config,
+            workflow_timeout_config,
+            NexusTimeoutScannerConfig::default(),
+            NexusEndpointRegistry::default(),
+            Arc::new(NoopNexusHttpClient),
+        )
+    }
+
+    pub fn new_with_nexus(
+        repo: Arc<R>,
+        lane_count: usize,
+        config: LaneConfig,
+        timer_config: TimerScannerConfig,
+        workflow_timeout_config: WorkflowTimeoutScannerConfig,
+        nexus_timeout_config: NexusTimeoutScannerConfig,
+        nexus_registry: NexusEndpointRegistry,
+        nexus_client: Arc<dyn NexusHttpClient>,
+    ) -> Self {
         let broker = InMemoryBroker::default();
         let activity_broker = InMemoryActivityBroker::default();
         let workflow_timeout_tracking = WorkflowTimeoutTrackingState::default();
+        let nexus_timeout_tracking = NexusTimeoutTrackingState::default();
         let lane_count = lane_count.max(1);
         let shared_lanes = Arc::new(Mutex::new(Vec::with_capacity(lane_count)));
         let lanes: Vec<_> = (0..lane_count)
@@ -372,12 +120,16 @@ where
                     repo.clone(),
                     shared_lanes.clone(),
                     lane_count,
+                    nexus_client.clone(),
+                    nexus_registry.clone(),
+                    nexus_timeout_tracking.clone(),
                 );
                 spawn_lane(
                     BasicKernel::default(),
                     repo.clone(),
                     publisher,
                     workflow_timeout_tracking.clone(),
+                    nexus_timeout_tracking.clone(),
                     config.clone(),
                 )
             })
@@ -392,15 +144,22 @@ where
             timer_scanner_cancel.clone(),
         )));
         let workflow_timeout_scanner_cancel = CancellationToken::new();
-        let workflow_timeout_scanner_handle = Some(tokio::spawn(
-            run_workflow_timeout_scanner(
+        let workflow_timeout_scanner_handle =
+            Some(tokio::spawn(run_workflow_timeout_scanner(
                 workflow_timeout_tracking.clone(),
                 lanes.clone(),
                 lane_count,
                 workflow_timeout_config,
                 workflow_timeout_scanner_cancel.clone(),
-            ),
-        ));
+            )));
+        let nexus_timeout_scanner_cancel = CancellationToken::new();
+        let nexus_timeout_scanner_handle = Some(tokio::spawn(run_nexus_timeout_scanner(
+            nexus_timeout_tracking.clone(),
+            lanes.clone(),
+            lane_count,
+            nexus_timeout_config,
+            nexus_timeout_scanner_cancel.clone(),
+        )));
         Self {
             repo,
             broker,
@@ -412,6 +171,9 @@ where
             workflow_timeout_tracking,
             workflow_timeout_scanner_handle,
             workflow_timeout_scanner_cancel,
+            nexus_timeout_tracking,
+            nexus_timeout_scanner_handle,
+            nexus_timeout_scanner_cancel,
         }
     }
 
@@ -432,6 +194,10 @@ where
 
     pub fn workflow_timeout_tracking(&self) -> WorkflowTimeoutTrackingState {
         self.workflow_timeout_tracking.clone()
+    }
+
+    pub fn nexus_timeout_tracking(&self) -> NexusTimeoutTrackingState {
+        self.nexus_timeout_tracking.clone()
     }
 
     /// Start a new workflow execution.
@@ -662,7 +428,7 @@ where
 
     #[cfg(test)]
     fn lane_index(&self, run_key: RunKey) -> usize {
-        lane_index_for(run_key, self.lanes.len())
+        crate::scanner::lane_index_for(run_key, self.lanes.len())
     }
 
     /// Cancel the background timer scanner and wait for
@@ -684,7 +450,20 @@ where
             tokio::time::timeout(tokio::time::Duration::from_secs(5), handle)
                 .await
                 .map_err(|_| anyhow!("workflow timeout scanner shutdown timed out"))?
-                .map_err(|error| anyhow!("workflow timeout scanner join failed: {error}"))?;
+                .map_err(|error| {
+                    anyhow!("workflow timeout scanner join failed: {error}")
+                })?;
+        }
+        Ok(())
+    }
+
+    pub async fn shutdown_nexus_timeout_scanner(&mut self) -> Result<()> {
+        self.nexus_timeout_scanner_cancel.cancel();
+        if let Some(handle) = self.nexus_timeout_scanner_handle.take() {
+            tokio::time::timeout(tokio::time::Duration::from_secs(5), handle)
+                .await
+                .map_err(|_| anyhow!("nexus timeout scanner shutdown timed out"))?
+                .map_err(|error| anyhow!("nexus timeout scanner join failed: {error}"))?;
         }
         Ok(())
     }
@@ -960,709 +739,6 @@ pub struct StartedActivityTask {
     pub heartbeat_timeout: Option<Duration>,
 }
 
-/// [`DispatchPublisher`] that forwards dispatch ops to
-/// the runtime's in-memory brokers.
-pub struct RuntimeDispatchPublisher<R> {
-    broker: InMemoryBroker,
-    activity_broker: InMemoryActivityBroker,
-    repo: Arc<R>,
-    lanes: Arc<Mutex<Vec<LaneHandle>>>,
-    lane_count: usize,
-}
-
-impl<R> Clone for RuntimeDispatchPublisher<R> {
-    fn clone(&self) -> Self {
-        Self {
-            broker: self.broker.clone(),
-            activity_broker: self.activity_broker.clone(),
-            repo: self.repo.clone(),
-            lanes: self.lanes.clone(),
-            lane_count: self.lane_count,
-        }
-    }
-}
-
-impl<R> RuntimeDispatchPublisher<R>
-where
-    R: RunRepository + 'static,
-{
-    /// Create a publisher wired to the given brokers.
-    pub fn new(
-        broker: InMemoryBroker,
-        activity_broker: InMemoryActivityBroker,
-        repo: Arc<R>,
-        lanes: Arc<Mutex<Vec<LaneHandle>>>,
-        lane_count: usize,
-    ) -> Self {
-        Self {
-            broker,
-            activity_broker,
-            repo,
-            lanes,
-            lane_count,
-        }
-    }
-
-    fn pick_lane(&self, run_key: RunKey) -> LaneHandle {
-        let lanes = self.lanes.lock().unwrap();
-        pick_lane(&lanes, self.lane_count, run_key).clone()
-    }
-
-    async fn resolve_child_run_key(
-        &self,
-        namespace_id: NamespaceId,
-        child_workflow_id: &WorkflowId,
-        child_run_id: RunId,
-    ) -> Result<Option<RunKey>> {
-        self.repo
-            .resolve_execution(&ExecutionRef {
-                namespace_id,
-                workflow_id: child_workflow_id.clone(),
-                run_id: Some(child_run_id),
-            })
-            .await
-    }
-
-    async fn handle_start_child_workflow(
-        &self,
-        child_workflow_id: WorkflowId,
-        namespace_id: NamespaceId,
-        workflow_type: tokeira_types::WorkflowType,
-        task_queue: TaskQueueName,
-        input: Payloads,
-        parent_run_key: RunKey,
-        parent_workflow_id: WorkflowId,
-        initiated_event_id: i64,
-    ) {
-        let child_run_key = RunKey::new();
-        let child_run_id = RunId::new();
-        let start_request = StartRequest {
-            run_key: child_run_key,
-            namespace_id,
-            workflow_id: child_workflow_id.clone(),
-            run_id: child_run_id,
-            workflow_type: workflow_type.clone(),
-            task_queue,
-            input,
-            memo: Memo::default(),
-            search_attributes: SearchAttributes::default(),
-            workflow_execution_timeout: None,
-            workflow_run_timeout: None,
-            workflow_task_timeout: Duration::seconds(10),
-            retry_policy: None,
-            attempt: 1,
-            continued_execution_run_id: None,
-            first_execution_run_id: None,
-            parent_run_key: Some(parent_run_key),
-            parent_workflow_id: Some(parent_workflow_id),
-            first_run_started_at: None,
-            request: RequestContext {
-                request_id: RequestId(format!("child-start-{child_run_key:?}")),
-                caller_identity: Some("runtime-child-orchestrator".to_string()),
-                received_at: OffsetDateTime::now_utc(),
-            },
-            now: OffsetDateTime::now_utc(),
-        };
-
-        let result = self
-            .pick_lane(child_run_key)
-            .submit(child_run_key, Command::Start(start_request))
-            .await;
-        let confirmation = match result {
-            Ok(CommitResult::Applied { .. }) => ChildStartResult::Started {
-                child_run_id,
-                workflow_type,
-            },
-            Ok(CommitResult::Conflict { reason }) => ChildStartResult::Failed {
-                cause: reason,
-            },
-            Ok(CommitResult::Duplicate) => ChildStartResult::Failed {
-                cause: "duplicate start request".to_string(),
-            },
-            Err(error) => ChildStartResult::Failed {
-                cause: error.to_string(),
-            },
-        };
-
-        let confirm = Command::ChildStartConfirmed(ChildStartConfirmedRequest {
-            child_workflow_id: child_workflow_id.clone(),
-            initiated_event_id,
-            result: confirmation,
-            now: OffsetDateTime::now_utc(),
-        });
-        if let Err(error) = self
-            .pick_lane(parent_run_key)
-            .submit(parent_run_key, confirm)
-            .await
-        {
-            tracing::warn!(
-                ?error,
-                parent_run_key = ?parent_run_key,
-                child_workflow_id = ?child_workflow_id,
-                "failed to deliver child start confirmation"
-            );
-        }
-    }
-
-    async fn handle_terminate_child(
-        &self,
-        namespace_id: NamespaceId,
-        child_workflow_id: WorkflowId,
-        child_run_id: RunId,
-        reason: String,
-    ) {
-        match self
-            .resolve_child_run_key(namespace_id, &child_workflow_id, child_run_id)
-            .await
-        {
-            Ok(Some(child_run_key)) => {
-                let command = Command::Terminate(TerminateRequest {
-                    reason,
-                    details: None,
-                    identity: "parent-close-policy".to_string(),
-                    request: RequestContext {
-                        request_id: RequestId(format!("terminate-child-{child_run_id:?}")),
-                        caller_identity: Some("runtime-child-orchestrator".to_string()),
-                        received_at: OffsetDateTime::now_utc(),
-                    },
-                    now: OffsetDateTime::now_utc(),
-                });
-                if let Err(error) = self
-                    .pick_lane(child_run_key)
-                    .submit(child_run_key, command)
-                    .await
-                {
-                    let message = error.to_string();
-                    if message.contains("kernel rejected")
-                        || message.contains("not found")
-                    {
-                        tracing::debug!(
-                            ?error,
-                            child_run_key = ?child_run_key,
-                            child_workflow_id = ?child_workflow_id,
-                            "terminate child no-op"
-                        );
-                    } else {
-                        tracing::warn!(
-                            ?error,
-                            child_run_key = ?child_run_key,
-                            child_workflow_id = ?child_workflow_id,
-                            "terminate child dispatch failed"
-                        );
-                    }
-                }
-            }
-            Ok(None) => {
-                tracing::debug!(
-                    child_workflow_id = ?child_workflow_id,
-                    child_run_id = ?child_run_id,
-                    "terminate child skipped because child was not found"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    ?error,
-                    child_workflow_id = ?child_workflow_id,
-                    child_run_id = ?child_run_id,
-                    "terminate child resolution failed"
-                );
-            }
-        }
-    }
-
-    async fn handle_cancel_child(
-        &self,
-        namespace_id: NamespaceId,
-        child_workflow_id: WorkflowId,
-        child_run_id: RunId,
-        reason: String,
-    ) {
-        match self
-            .resolve_child_run_key(namespace_id, &child_workflow_id, child_run_id)
-            .await
-        {
-            Ok(Some(child_run_key)) => {
-                let command = Command::Cancel(CancelRequest {
-                    reason,
-                    external_initiator: None,
-                    request: RequestContext {
-                        request_id: RequestId(format!("cancel-child-{child_run_id:?}")),
-                        caller_identity: Some("runtime-child-orchestrator".to_string()),
-                        received_at: OffsetDateTime::now_utc(),
-                    },
-                    now: OffsetDateTime::now_utc(),
-                });
-                if let Err(error) = self
-                    .pick_lane(child_run_key)
-                    .submit(child_run_key, command)
-                    .await
-                {
-                    let message = error.to_string();
-                    if message.contains("kernel rejected")
-                        || message.contains("not found")
-                    {
-                        tracing::debug!(
-                            ?error,
-                            child_run_key = ?child_run_key,
-                            child_workflow_id = ?child_workflow_id,
-                            "cancel child no-op"
-                        );
-                    } else {
-                        tracing::warn!(
-                            ?error,
-                            child_run_key = ?child_run_key,
-                            child_workflow_id = ?child_workflow_id,
-                            "cancel child dispatch failed"
-                        );
-                    }
-                }
-            }
-            Ok(None) => {
-                tracing::debug!(
-                    child_workflow_id = ?child_workflow_id,
-                    child_run_id = ?child_run_id,
-                    "cancel child skipped because child was not found"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    ?error,
-                    child_workflow_id = ?child_workflow_id,
-                    child_run_id = ?child_run_id,
-                    "cancel child resolution failed"
-                );
-            }
-        }
-    }
-
-    async fn handle_signal_external_workflow(
-        &self,
-        target_workflow_id: WorkflowId,
-        target_run_id: Option<RunId>,
-        signal_name: String,
-        input: Payloads,
-        originator_run_key: RunKey,
-        namespace_id: NamespaceId,
-        initiated_event_id: i64,
-    ) {
-        let signal_result = match self
-            .repo
-            .resolve_execution(&ExecutionRef {
-                namespace_id,
-                workflow_id: target_workflow_id.clone(),
-                run_id: target_run_id,
-            })
-            .await
-        {
-            Ok(Some(target_run_key)) => {
-                let command = Command::Signal(SignalRequest {
-                    signal_name,
-                    input,
-                    request: RequestContext {
-                        request_id: RequestId(format!(
-                            "ext-signal-{originator_run_key:?}-{initiated_event_id}"
-                        )),
-                        caller_identity: Some(
-                            "runtime-external-signal-orchestrator".to_string(),
-                        ),
-                        received_at: OffsetDateTime::now_utc(),
-                    },
-                    now: OffsetDateTime::now_utc(),
-                });
-                match self
-                    .pick_lane(target_run_key)
-                    .submit(target_run_key, command)
-                    .await
-                {
-                    Ok(CommitResult::Applied { .. }) | Ok(CommitResult::Duplicate) => {
-                        ExternalSignalResult::Signaled
-                    }
-                    Ok(CommitResult::Conflict { reason }) => {
-                        ExternalSignalResult::Failed { cause: reason }
-                    }
-                    Err(error) => ExternalSignalResult::Failed {
-                        cause: error.to_string(),
-                    },
-                }
-            }
-            Ok(None) => ExternalSignalResult::Failed {
-                cause: format!(
-                    "target workflow not found: {}",
-                    target_workflow_id.0
-                ),
-            },
-            Err(error) => ExternalSignalResult::Failed {
-                cause: error.to_string(),
-            },
-        };
-
-        let resolve = Command::ExternalSignalResolved(ExternalSignalResolvedRequest {
-            initiated_event_id,
-            result: signal_result,
-            now: OffsetDateTime::now_utc(),
-        });
-        if let Err(error) = self
-            .pick_lane(originator_run_key)
-            .submit(originator_run_key, resolve)
-            .await
-        {
-            tracing::warn!(
-                ?error,
-                originator_run_key = ?originator_run_key,
-                initiated_event_id,
-                "failed to deliver ExternalSignalResolved to originator"
-            );
-        }
-    }
-
-    async fn handle_cancel_external_workflow(
-        &self,
-        target_workflow_id: WorkflowId,
-        target_run_id: Option<RunId>,
-        originator_run_key: RunKey,
-        originator_namespace_id: NamespaceId,
-        originator_workflow_id: WorkflowId,
-        originator_run_id: RunId,
-        namespace_id: NamespaceId,
-        initiated_event_id: i64,
-        reason: String,
-    ) {
-        let cancel_result = match self
-            .repo
-            .resolve_execution(&ExecutionRef {
-                namespace_id,
-                workflow_id: target_workflow_id.clone(),
-                run_id: target_run_id,
-            })
-            .await
-        {
-            Ok(Some(target_run_key)) => {
-                let command = Command::Cancel(CancelRequest {
-                    reason,
-                    external_initiator: Some(ExternalWorkflowExecution {
-                        namespace_id: originator_namespace_id,
-                        workflow_id: originator_workflow_id,
-                        run_id: originator_run_id,
-                    }),
-                    request: RequestContext {
-                        request_id: RequestId(format!(
-                            "ext-cancel-{originator_run_key:?}-{initiated_event_id}"
-                        )),
-                        caller_identity: Some(
-                            "runtime-external-cancel-orchestrator".to_string(),
-                        ),
-                        received_at: OffsetDateTime::now_utc(),
-                    },
-                    now: OffsetDateTime::now_utc(),
-                });
-                match self
-                    .pick_lane(target_run_key)
-                    .submit(target_run_key, command)
-                    .await
-                {
-                    Ok(CommitResult::Applied { .. }) | Ok(CommitResult::Duplicate) => {
-                        ExternalCancelResult::CancelRequested
-                    }
-                    Ok(CommitResult::Conflict { reason }) => {
-                        ExternalCancelResult::Failed { cause: reason }
-                    }
-                    Err(error) => ExternalCancelResult::Failed {
-                        cause: error.to_string(),
-                    },
-                }
-            }
-            Ok(None) => ExternalCancelResult::Failed {
-                cause: format!(
-                    "target workflow not found: {}",
-                    target_workflow_id.0
-                ),
-            },
-            Err(error) => ExternalCancelResult::Failed {
-                cause: error.to_string(),
-            },
-        };
-
-        let resolve = Command::ExternalCancelResolved(ExternalCancelResolvedRequest {
-            initiated_event_id,
-            result: cancel_result,
-            now: OffsetDateTime::now_utc(),
-        });
-        if let Err(error) = self
-            .pick_lane(originator_run_key)
-            .submit(originator_run_key, resolve)
-            .await
-        {
-            tracing::warn!(
-                ?error,
-                originator_run_key = ?originator_run_key,
-                initiated_event_id,
-                "failed to deliver ExternalCancelResolved to originator"
-            );
-        }
-    }
-}
-
-#[async_trait]
-impl<R> DispatchPublisher for RuntimeDispatchPublisher<R>
-where
-    R: RunRepository + 'static,
-{
-    async fn publish(&self, run_key: RunKey, ops: &[DispatchOp]) -> Result<()> {
-        for op in ops {
-            match op {
-                DispatchOp::EnqueueWorkflowTask {
-                    queue,
-                    logical_seq,
-                    sticky_preferred,
-                } => {
-                    self.broker
-                        .publish_workflow_task(DispatchableWorkflowTask {
-                            run_key,
-                            queue: queue.clone(),
-                            logical_seq: *logical_seq,
-                            sticky_preferred: sticky_preferred.clone(),
-                            sticky_expires_at: None,
-                        })
-                        .await;
-                }
-                DispatchOp::EnqueueActivityTask { .. } => {
-                    if let DispatchOp::EnqueueActivityTask {
-                        queue,
-                        activity_id,
-                        input,
-                        schedule_event_id,
-                        attempt,
-                        ..
-                    } = op
-                    {
-                        if let Err(error) = self
-                            .activity_broker
-                            .publish_activity_task(DispatchableActivityTask {
-                                run_key,
-                                queue: queue.clone(),
-                                activity_id: activity_id.clone(),
-                                input: input.clone(),
-                                schedule_event_id: *schedule_event_id,
-                                attempt: *attempt,
-                            })
-                            .await
-                        {
-                            tracing::warn!(?error, run_key = ?run_key, activity_id, "failed to publish activity task");
-                        }
-                    }
-                }
-                DispatchOp::StartChildWorkflow {
-                    child_workflow_id,
-                    namespace_id,
-                    workflow_type,
-                    task_queue,
-                    input,
-                    parent_run_key,
-                    parent_workflow_id,
-                    initiated_event_id,
-                } => {
-                    let publisher = RuntimeDispatchPublisher::clone(self);
-                    let child_workflow_id = child_workflow_id.clone();
-                    let workflow_type = workflow_type.clone();
-                    let task_queue = task_queue.clone();
-                    let input = input.clone();
-                    let parent_workflow_id = parent_workflow_id.clone();
-                    let namespace_id = *namespace_id;
-                    let parent_run_key = *parent_run_key;
-                    let initiated_event_id = *initiated_event_id;
-                    tokio::spawn(async move {
-                        publisher
-                            .handle_start_child_workflow(
-                                child_workflow_id,
-                                namespace_id,
-                                workflow_type,
-                                task_queue,
-                                input,
-                                parent_run_key,
-                                parent_workflow_id,
-                                initiated_event_id,
-                            )
-                            .await;
-                    });
-                }
-                DispatchOp::TerminateChild {
-                    namespace_id,
-                    child_workflow_id,
-                    child_run_id,
-                    reason,
-                } => {
-                    let publisher = RuntimeDispatchPublisher::clone(self);
-                    let namespace_id = *namespace_id;
-                    let child_workflow_id = child_workflow_id.clone();
-                    let child_run_id = *child_run_id;
-                    let reason = reason.clone();
-                    tokio::spawn(async move {
-                        publisher
-                            .handle_terminate_child(
-                                namespace_id,
-                                child_workflow_id,
-                                child_run_id,
-                                reason,
-                            )
-                            .await;
-                    });
-                }
-                DispatchOp::CancelChild {
-                    namespace_id,
-                    child_workflow_id,
-                    child_run_id,
-                    reason,
-                } => {
-                    let publisher = RuntimeDispatchPublisher::clone(self);
-                    let namespace_id = *namespace_id;
-                    let child_workflow_id = child_workflow_id.clone();
-                    let child_run_id = *child_run_id;
-                    let reason = reason.clone();
-                    tokio::spawn(async move {
-                        publisher
-                            .handle_cancel_child(
-                                namespace_id,
-                                child_workflow_id,
-                                child_run_id,
-                                reason,
-                            )
-                            .await;
-                    });
-                }
-                DispatchOp::SignalExternalWorkflow {
-                    originator_run_key,
-                    namespace_id,
-                    initiated_event_id,
-                    target_workflow_id,
-                    target_run_id,
-                    signal_name,
-                    input,
-                } => {
-                    let publisher = RuntimeDispatchPublisher::clone(self);
-                    let target_workflow_id = target_workflow_id.clone();
-                    let target_run_id = *target_run_id;
-                    let signal_name = signal_name.clone();
-                    let input = input.clone();
-                    let originator_run_key = *originator_run_key;
-                    let namespace_id = *namespace_id;
-                    let initiated_event_id = *initiated_event_id;
-                    tokio::spawn(async move {
-                        publisher
-                            .handle_signal_external_workflow(
-                                target_workflow_id,
-                                target_run_id,
-                                signal_name,
-                                input,
-                                originator_run_key,
-                                namespace_id,
-                                initiated_event_id,
-                            )
-                            .await;
-                    });
-                }
-                DispatchOp::RequestCancelExternalWorkflow {
-                    originator_run_key,
-                    originator_namespace_id,
-                    originator_workflow_id,
-                    originator_run_id,
-                    namespace_id,
-                    initiated_event_id,
-                    reason,
-                    target_workflow_id,
-                    target_run_id,
-                } => {
-                    let publisher = RuntimeDispatchPublisher::clone(self);
-                    let target_workflow_id = target_workflow_id.clone();
-                    let target_run_id = *target_run_id;
-                    let originator_run_key = *originator_run_key;
-                    let originator_namespace_id = *originator_namespace_id;
-                    let originator_workflow_id = originator_workflow_id.clone();
-                    let originator_run_id = *originator_run_id;
-                    let namespace_id = *namespace_id;
-                    let initiated_event_id = *initiated_event_id;
-                    let reason = reason.clone();
-                    tokio::spawn(async move {
-                        publisher
-                            .handle_cancel_external_workflow(
-                                target_workflow_id,
-                                target_run_id,
-                                originator_run_key,
-                                originator_namespace_id,
-                                originator_workflow_id,
-                                originator_run_id,
-                                namespace_id,
-                                initiated_event_id,
-                                reason,
-                            )
-                            .await;
-                    });
-                }
-                other => {
-                    tracing::info!(?other, run_key = ?run_key, "orchestration dispatch op (handler not yet wired)");
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn submit_to_run(
-        &self,
-        run_key: RunKey,
-        command: Command,
-    ) -> Result<CommitResult> {
-        self.pick_lane(run_key).submit(run_key, command).await
-    }
-}
-
-/// Evaluate whether a failed activity should be retried.
-///
-/// Returns [`RetryDecision::Exhausted`] when the attempt
-/// count has reached `maximum_attempts` or the error type
-/// is listed in `non_retryable_error_types`.
-pub fn evaluate_activity_retry(
-    policy: &RetryPolicy,
-    current_attempt: u32,
-    failure_error_type: Option<&str>,
-) -> RetryDecision {
-    if let Some(error_type) = failure_error_type {
-        if policy
-            .non_retryable_error_types
-            .iter()
-            .any(|candidate| candidate == error_type)
-        {
-            return RetryDecision::Exhausted;
-        }
-    }
-
-    if policy.maximum_attempts > 0 && current_attempt >= policy.maximum_attempts {
-        return RetryDecision::Exhausted;
-    }
-
-    RetryDecision::Retry {
-        next_attempt: current_attempt.saturating_add(1),
-    }
-}
-
-/// Compute the backoff duration for a retry attempt
-/// using exponential backoff with an optional cap.
-pub fn compute_retry_backoff(policy: &RetryPolicy, attempt: u32) -> Duration {
-    if policy.initial_interval.is_zero() {
-        return Duration::ZERO;
-    }
-
-    let coefficient = policy.backoff_coefficient.max(1.0);
-    let exponent = attempt.saturating_sub(1) as i32;
-    let millis = (policy.initial_interval.whole_milliseconds() as f64)
-        * coefficient.powi(exponent);
-    let mut computed = Duration::milliseconds(millis.round() as i64);
-    if let Some(maximum) = policy.maximum_interval {
-        if computed > maximum {
-            computed = maximum;
-        }
-    }
-    computed
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1676,13 +752,31 @@ mod tests {
 
     use super::*;
     use crate::broker::InMemoryBroker;
+    use crate::lane::DispatchPublisher;
+    use crate::nexus::{
+        NexusEndpointConfig, NexusEndpointRegistry, NexusTimeoutEntry,
+        NexusTimeoutScannerConfig, NexusTimeoutTrackingState, NoopNexusHttpClient,
+        evaluate_nexus_timeout,
+    };
+    use crate::publisher::RuntimeDispatchPublisher;
+    use crate::retry::{RetryDecision, compute_retry_backoff, evaluate_activity_retry};
+    use crate::scanner::{
+        TimerScannerConfig, lane_index_for, pick_lane, scan_due_timers_once,
+    };
+    use crate::timeout::{
+        WorkflowTimeoutEntry, WorkflowTimeoutScannerConfig, WorkflowTimeoutTrackingState,
+        WorkflowTimeoutViolation, evaluate_workflow_timeout, scan_workflow_timeouts_once,
+        workflow_timeout_retry_state,
+    };
+    use std::collections::HashMap;
+    use tokeira_kernel::RetryState;
     use tokeira_storage::{
         BacklogEntry, CommitResult, DispatchableWorkflowTask, InMemoryStore,
         RequestRecord, TransitionAuditRecord,
     };
     use tokeira_types::{
-        ExecutionRef, LogicalTaskSeq, Memo, NamespaceId, Payloads,
-        RequestContext, RequestId, SearchAttributes, TaskKind, WorkflowId,
+        ExecutionRef, LogicalTaskSeq, Memo, NamespaceId, Payloads, RequestContext,
+        RequestId, SearchAttributes, TaskKind, WorkflowId,
     };
 
     proptest! {
@@ -1798,6 +892,9 @@ mod tests {
             repo,
             Arc::new(Mutex::new(Vec::new())),
             1,
+            Arc::new(NoopNexusHttpClient),
+            NexusEndpointRegistry::default(),
+            NexusTimeoutTrackingState::default(),
         );
         let queue = QueueKey {
             namespace_id: NamespaceId::new(),
@@ -1839,7 +936,10 @@ mod tests {
     #[test]
     fn timer_scanner_config_default_values() {
         let config = TimerScannerConfig::default();
-        assert_eq!(config.scan_interval, tokio::time::Duration::from_millis(200));
+        assert_eq!(
+            config.scan_interval,
+            tokio::time::Duration::from_millis(200)
+        );
         assert_eq!(config.max_timers_per_scan, 100);
     }
 
@@ -1881,7 +981,10 @@ mod tests {
             first_run_started_at: None,
             has_retry_policy: false,
         };
-        assert_eq!(evaluate_workflow_timeout(&none, OffsetDateTime::now_utc()), None);
+        assert_eq!(
+            evaluate_workflow_timeout(&none, OffsetDateTime::now_utc()),
+            None
+        );
 
         let run_only = WorkflowTimeoutEntry {
             run_key: RunKey::new(),
@@ -1928,6 +1031,64 @@ mod tests {
         let config = WorkflowTimeoutScannerConfig::default();
         assert_eq!(config.scan_interval, tokio::time::Duration::from_secs(1));
         assert_eq!(config.max_timeouts_per_scan, 100);
+    }
+
+    #[test]
+    fn nexus_timeout_scanner_config_default_values() {
+        let config = NexusTimeoutScannerConfig::default();
+        assert_eq!(config.scan_interval, tokio::time::Duration::from_secs(1));
+        assert_eq!(config.max_timeouts_per_scan, 100);
+    }
+
+    #[test]
+    fn endpoint_registry_lookup_returns_registered_address() {
+        let registry = NexusEndpointRegistry::new(HashMap::from([(
+            "payments".to_string(),
+            NexusEndpointConfig {
+                address: "http://payments".to_string(),
+            },
+        )]));
+        assert_eq!(
+            registry
+                .resolve("payments")
+                .map(|config| config.address.as_str()),
+            Some("http://payments")
+        );
+        assert!(registry.resolve("missing").is_none());
+    }
+
+    #[test]
+    fn evaluate_nexus_timeout_cases() {
+        let scheduled_at = OffsetDateTime::now_utc() - Duration::seconds(10);
+        let expired = NexusTimeoutEntry {
+            run_key: RunKey::new(),
+            operation_id: "op-1".to_string(),
+            scheduled_event_id: 11,
+            schedule_to_close_timeout: Duration::seconds(1),
+            scheduled_at,
+        };
+        assert!(evaluate_nexus_timeout(&expired, OffsetDateTime::now_utc()));
+
+        let zero = NexusTimeoutEntry {
+            run_key: RunKey::new(),
+            operation_id: "op-2".to_string(),
+            scheduled_event_id: 12,
+            schedule_to_close_timeout: Duration::ZERO,
+            scheduled_at: OffsetDateTime::now_utc(),
+        };
+        assert!(evaluate_nexus_timeout(&zero, zero.scheduled_at));
+
+        let pending = NexusTimeoutEntry {
+            run_key: RunKey::new(),
+            operation_id: "op-3".to_string(),
+            scheduled_event_id: 13,
+            schedule_to_close_timeout: Duration::seconds(30),
+            scheduled_at,
+        };
+        assert!(!evaluate_nexus_timeout(
+            &pending,
+            scheduled_at + Duration::seconds(5)
+        ));
     }
 
     #[test]
@@ -2298,15 +1459,22 @@ mod tests {
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
         );
-        let request = sample_start_request(Some(Duration::seconds(5)), Some(Duration::seconds(3)));
+        let request =
+            sample_start_request(Some(Duration::seconds(5)), Some(Duration::seconds(3)));
         let result = runtime.start_workflow(request.clone()).await.unwrap();
         assert!(matches!(result, CommitResult::Applied { .. }));
 
         let snapshot = runtime.workflow_timeout_tracking().snapshot();
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].run_key, request.run_key);
-        assert_eq!(snapshot[0].workflow_execution_timeout, request.workflow_execution_timeout);
-        assert_eq!(snapshot[0].workflow_run_timeout, request.workflow_run_timeout);
+        assert_eq!(
+            snapshot[0].workflow_execution_timeout,
+            request.workflow_execution_timeout
+        );
+        assert_eq!(
+            snapshot[0].workflow_run_timeout,
+            request.workflow_run_timeout
+        );
         assert_eq!(snapshot[0].started_at, request.now);
         assert!(snapshot[0].has_retry_policy == request.retry_policy.is_some());
 
@@ -2523,6 +1691,10 @@ mod tests {
             self.limits.lock().unwrap().clone()
         }
     }
+
+    use async_trait::async_trait;
+    use tokeira_kernel::Transition;
+    use tokeira_storage::DueTimer;
 
     #[async_trait]
     impl RunRepository for MockTimerRepo {

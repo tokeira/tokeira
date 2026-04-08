@@ -4245,8 +4245,15 @@ fn cancel_nexus_operation_happy_path() {
     assert!(transition.dispatch_ops.iter().any(|op| matches!(
         op,
         DispatchOp::CancelNexusOperation {
-            scheduled_event_id: 12
-        }
+            scheduled_event_id: 12,
+            originator_run_key,
+            operation_id,
+            endpoint,
+            service,
+        } if originator_run_key == &state.run_key
+            && operation_id == "op-1"
+            && endpoint == "endpoint"
+            && service == "service"
     )));
     assert!(
         transition

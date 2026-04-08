@@ -12,9 +12,8 @@ use tokeira_runtime::{
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
-    Memo, NamespaceId, Payloads, QueueKey, RequestContext, RequestId,
-    SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId,
-    WorkflowType,
+    Memo, NamespaceId, Payloads, QueueKey, RequestContext, RequestId, SearchAttributes,
+    TaskKind, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
 };
 
 #[tokio::test]
@@ -32,7 +31,8 @@ async fn timer_scanner_fires_due_timer_end_to_end() -> Result<()> {
     );
     let namespace_id = NamespaceId::new();
 
-    let run_key = start_workflow(&runtime, namespace_id, WorkflowId("timer-fire".into())).await?;
+    let run_key =
+        start_workflow(&runtime, namespace_id, WorkflowId("timer-fire".into())).await?;
     complete_with_commands(
         &runtime,
         namespace_id,

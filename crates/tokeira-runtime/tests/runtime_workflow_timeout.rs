@@ -67,20 +67,15 @@ async fn run_timeout_fires_end_to_end() -> Result<()> {
     )
     .await?;
 
-    wait_for_run(
-        &store,
-        run_key,
-        |state, history| {
-            state.status == ExecutionStatus::TimedOut
-                && history.iter().any(|event| {
-                    matches!(
-                        &event.kind,
-                        HistoryEventKind::WorkflowExecutionTimedOut { timeout_type, .. }
-                            if *timeout_type == tokeira_kernel::WorkflowTimeoutType::RunTimeout
-                    )
-                })
-        },
-    )
+    wait_for_run(&store, run_key, |state, history| {
+        state.status == ExecutionStatus::TimedOut && history.iter().any(|event| {
+            matches!(
+                &event.kind,
+                HistoryEventKind::WorkflowExecutionTimedOut { timeout_type, .. }
+                    if *timeout_type == tokeira_kernel::WorkflowTimeoutType::RunTimeout
+            )
+        })
+    })
     .await?;
 
     shutdown(&mut runtime).await
@@ -103,24 +98,19 @@ async fn execution_timeout_takes_precedence_when_both_expire() -> Result<()> {
     )
     .await?;
 
-    wait_for_run(
-        &store,
-        run_key,
-        |_state, history| {
-            let timeout_events: Vec<_> = history
-                .iter()
-                .filter_map(|event| match &event.kind {
-                    HistoryEventKind::WorkflowExecutionTimedOut { timeout_type, .. } => {
-                        Some(timeout_type.clone())
-                    }
-                    _ => None,
-                })
-                .collect();
-            timeout_events.len() == 1
-                && timeout_events[0]
-                    == tokeira_kernel::WorkflowTimeoutType::ExecutionTimeout
-        },
-    )
+    wait_for_run(&store, run_key, |_state, history| {
+        let timeout_events: Vec<_> = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                HistoryEventKind::WorkflowExecutionTimedOut { timeout_type, .. } => {
+                    Some(timeout_type.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        timeout_events.len() == 1
+            && timeout_events[0] == tokeira_kernel::WorkflowTimeoutType::ExecutionTimeout
+    })
     .await?;
 
     shutdown(&mut runtime).await
@@ -134,19 +124,17 @@ async fn no_timeout_configuration_produces_no_timeout_event() -> Result<()> {
 
     let run_key = start_workflow(
         &runtime,
-        start_request(
-            namespace_id,
-            WorkflowId("wf-no-timeout".into()),
-            None,
-            None,
-        ),
+        start_request(namespace_id, WorkflowId("wf-no-timeout".into()), None, None),
     )
     .await?;
 
     tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
     let history = store.read_history(run_key, 0, 128).await?;
     assert!(!history.iter().any(|event| {
-        matches!(event.kind, HistoryEventKind::WorkflowExecutionTimedOut { .. })
+        matches!(
+            event.kind,
+            HistoryEventKind::WorkflowExecutionTimedOut { .. }
+        )
     }));
 
     shutdown(&mut runtime).await
@@ -194,7 +182,10 @@ async fn manually_terminated_workflow_does_not_timeout() -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
     let history = store.read_history(run_key, 0, 128).await?;
     assert!(!history.iter().any(|event| {
-        matches!(event.kind, HistoryEventKind::WorkflowExecutionTimedOut { .. })
+        matches!(
+            event.kind,
+            HistoryEventKind::WorkflowExecutionTimedOut { .. }
+        )
     }));
 
     shutdown(&mut runtime).await
@@ -227,7 +218,10 @@ async fn start_workflow(
 async fn wait_for_run(
     store: &Arc<InMemoryStore>,
     run_key: tokeira_types::RunKey,
-    predicate: impl Fn(&tokeira_kernel::WorkflowState, &[tokeira_kernel::HistoryEvent]) -> bool,
+    predicate: impl Fn(
+        &tokeira_kernel::WorkflowState,
+        &[tokeira_kernel::HistoryEvent],
+    ) -> bool,
 ) -> Result<()> {
     let deadline = Instant::now() + tokio::time::Duration::from_secs(2);
     loop {

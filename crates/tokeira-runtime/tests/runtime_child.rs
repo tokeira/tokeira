@@ -12,12 +12,12 @@ use tokeira_runtime::{
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
     ExecutionRef, Memo, NamespaceId, Payloads, QueueKey, RequestContext, RequestId,
-    SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId,
-    WorkflowType,
+    SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
 };
 
 #[tokio::test]
-async fn child_workflow_happy_path_delivers_start_and_completion_back_to_parent() -> Result<()> {
+async fn child_workflow_happy_path_delivers_start_and_completion_back_to_parent()
+-> Result<()> {
     let store = Arc::new(InMemoryStore::default());
     let runtime = TokeiraRuntime::new(
         store.clone(),
@@ -41,7 +41,8 @@ async fn child_workflow_happy_path_delivers_start_and_completion_back_to_parent(
             .await?,
     )
     .run_key;
-    let parent_task = poll_wft(&runtime, workflow_queue(namespace_id, "parent-q")).await?;
+    let parent_task =
+        poll_wft(&runtime, workflow_queue(namespace_id, "parent-q")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: parent_task.token,
@@ -150,7 +151,8 @@ async fn parent_close_policy_terminate_closes_started_child() -> Result<()> {
         .await?
         .expect("child run should exist");
 
-    let parent_task = poll_wft(&runtime, workflow_queue(namespace_id, "parent-q")).await?;
+    let parent_task =
+        poll_wft(&runtime, workflow_queue(namespace_id, "parent-q")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: parent_task.token,
@@ -209,7 +211,8 @@ async fn parent_close_policy_request_cancel_requests_cancel_on_child() -> Result
         .await?
         .expect("child run should exist");
 
-    let parent_task = poll_wft(&runtime, workflow_queue(namespace_id, "parent-q")).await?;
+    let parent_task =
+        poll_wft(&runtime, workflow_queue(namespace_id, "parent-q")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: parent_task.token,
@@ -271,7 +274,8 @@ async fn duplicate_child_start_delivers_failed_confirmation_to_parent() -> Resul
     )
     .run_key;
 
-    let parent_task = poll_wft(&runtime, workflow_queue(namespace_id, "parent-q")).await?;
+    let parent_task =
+        poll_wft(&runtime, workflow_queue(namespace_id, "parent-q")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: parent_task.token,

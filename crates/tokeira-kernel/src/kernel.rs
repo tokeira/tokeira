@@ -1732,28 +1732,34 @@ fn apply_workflow_command(
                     operation,
                     input,
                     schedule_to_close_timeout,
+                    originator_run_key: builder.state.run_key,
+                    scheduled_event_id,
+                    scheduled_at: builder.now,
                 });
             Ok(false)
         }
         WorkflowCommand::CancelNexusOperation { scheduled_event_id } => {
-            let known = builder
+            let pending = builder
                 .state
                 .pending_nexus_operations
                 .values()
                 .find(|pending| pending.scheduled_event_id == scheduled_event_id)
-                .map(|pending| pending.operation_id.clone())
+                .cloned()
                 .ok_or_else(|| {
                     Reject::UnknownNexusOperation(format!(
                         "scheduled_event_id={scheduled_event_id}"
                     ))
                 })?;
-            let _ = known;
             builder.emit(HistoryEventKind::NexusOperationCancelRequested {
                 scheduled_event_id,
             });
-            builder
-                .dispatch_ops
-                .push(DispatchOp::CancelNexusOperation { scheduled_event_id });
+            builder.dispatch_ops.push(DispatchOp::CancelNexusOperation {
+                scheduled_event_id,
+                originator_run_key: builder.state.run_key,
+                operation_id: pending.operation_id,
+                endpoint: pending.endpoint,
+                service: pending.service,
+            });
             Ok(false)
         }
         WorkflowCommand::UpdateCompleted { update_id, result } => {

@@ -481,6 +481,8 @@ where
                                     workflow_run_timeout,
                                     workflow_task_timeout,
                                     retry_policy: new_state.retry_policy.clone(),
+                                    conflict_policy: tokeira_kernel::WorkflowIdConflictPolicy::Fail,
+                                    reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
                                     attempt: 1,
                                     continued_execution_run_id: Some(new_state.run_id),
                                     first_execution_run_id,
@@ -819,6 +821,14 @@ mod tests {
         async fn resolve_execution(
             &self,
             _execution: &ExecutionRef,
+        ) -> Result<Option<RunKey>> {
+            Ok(None)
+        }
+
+        async fn find_latest_run(
+            &self,
+            _namespace_id: tokeira_types::NamespaceId,
+            _workflow_id: &tokeira_types::WorkflowId,
         ) -> Result<Option<RunKey>> {
             Ok(None)
         }

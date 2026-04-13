@@ -110,13 +110,21 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         let headers = metadata_to_header_map(request.metadata());
         let edge_req = translate::describe_request_to_edge(request.into_inner())
             .map_err(proto_conversion_status)?;
+        debug!(workflow_id = %edge_req.workflow_id, "describe_workflow_execution");
         let edge_resp = self
             .inner
             .describe_workflow_execution(&headers, edge_req)
-            .await?;
-        Ok(Response::new(translate::describe_response_to_proto(
-            edge_resp,
-        )))
+            .await;
+        match edge_resp {
+            Ok(resp) => {
+                debug!("describe_workflow_execution success");
+                Ok(Response::new(translate::describe_response_to_proto(resp)))
+            }
+            Err(e) => {
+                debug!(error = %e, "describe_workflow_execution failed");
+                Err(e.into())
+            }
+        }
     }
 
     async fn list_workflow_executions(
@@ -684,6 +692,20 @@ mod tests {
             unreachable!()
         }
 
+        async fn start_workflow_with_policy(
+            &self,
+            _req: tokeira_kernel::StartRequest,
+        ) -> Result<tokeira_runtime::StartWorkflowResult> {
+            unreachable!()
+        }
+
+        async fn signal_with_start_workflow(
+            &self,
+            _req: tokeira_kernel::SignalWithStartRequest,
+        ) -> Result<tokeira_runtime::SignalWithStartResult> {
+            unreachable!()
+        }
+
         async fn signal_workflow(
             &self,
             _run_key: tokeira_types::RunKey,
@@ -795,6 +817,20 @@ mod tests {
             &self,
             _req: tokeira_kernel::StartRequest,
         ) -> Result<WorkflowMutationOutcome> {
+            unreachable!()
+        }
+
+        async fn start_workflow_with_policy(
+            &self,
+            _req: tokeira_kernel::StartRequest,
+        ) -> Result<tokeira_runtime::StartWorkflowResult> {
+            unreachable!()
+        }
+
+        async fn signal_with_start_workflow(
+            &self,
+            _req: tokeira_kernel::SignalWithStartRequest,
+        ) -> Result<tokeira_runtime::SignalWithStartResult> {
             unreachable!()
         }
 
@@ -1348,6 +1384,8 @@ mod tests {
             workflow_run_timeout: None,
             workflow_task_timeout: time::Duration::seconds(10),
             retry_policy: None,
+            conflict_policy: tokeira_kernel::WorkflowIdConflictPolicy::Fail,
+            reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
             attempt: 1,
             continued_execution_run_id: None,
             first_execution_run_id: Some(run_id),

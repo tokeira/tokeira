@@ -17,6 +17,8 @@ use crate::state::{CompletionCallback, ParentClosePolicy, VersioningOverride};
 pub enum Command {
     /// Create a brand-new workflow execution.
     Start(StartRequest),
+    /// Create a workflow and deliver a signal atomically.
+    SignalWithStart(SignalWithStartRequest),
     /// Deliver a synchronous update to the workflow.
     Update(UpdateRequest),
     /// Deliver an asynchronous signal to the workflow.
@@ -153,6 +155,22 @@ pub enum RetryState {
     CancelRequested,
 }
 
+/// Policy for handling workflow ID conflicts with running workflows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkflowIdConflictPolicy {
+    Fail,
+    UseExisting,
+    TerminateExisting,
+}
+
+/// Policy for handling workflow ID reuse with closed workflows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkflowIdReusePolicy {
+    AllowDuplicate,
+    AllowDuplicateFailedOnly,
+    RejectDuplicate,
+}
+
 /// Request to create a brand-new workflow execution.
 ///
 /// By the time this reaches the kernel, the runtime has
@@ -191,6 +209,10 @@ pub struct StartRequest {
     pub workflow_task_timeout: Duration,
     /// Retry policy governing automatic retries on failure.
     pub retry_policy: Option<RetryPolicy>,
+    /// Conflict policy to apply when a running execution already exists.
+    pub conflict_policy: WorkflowIdConflictPolicy,
+    /// Reuse policy to apply when a closed execution already exists.
+    pub reuse_policy: WorkflowIdReusePolicy,
     /// Optional deployment for versioned task routing.
     pub deployment: Option<DeploymentId>,
     /// Optional build identifier for versioned task routing.
@@ -213,6 +235,38 @@ pub struct StartRequest {
     pub request: RequestContext,
     /// Wall-clock time the command was accepted.
     pub now: OffsetDateTime,
+}
+
+/// Request to create a brand-new workflow and immediately deliver a signal.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SignalWithStartRequest {
+    pub run_key: RunKey,
+    pub namespace_id: NamespaceId,
+    pub workflow_id: WorkflowId,
+    pub run_id: RunId,
+    pub workflow_type: WorkflowType,
+    pub task_queue: TaskQueueName,
+    pub input: Payloads,
+    pub memo: Memo,
+    pub search_attributes: SearchAttributes,
+    pub workflow_execution_timeout: Option<Duration>,
+    pub workflow_run_timeout: Option<Duration>,
+    pub workflow_task_timeout: Duration,
+    pub retry_policy: Option<RetryPolicy>,
+    pub conflict_policy: WorkflowIdConflictPolicy,
+    pub reuse_policy: WorkflowIdReusePolicy,
+    pub deployment: Option<DeploymentId>,
+    pub build_id: Option<BuildId>,
+    pub attempt: u32,
+    pub continued_execution_run_id: Option<RunId>,
+    pub first_execution_run_id: Option<RunId>,
+    pub parent_run_key: Option<RunKey>,
+    pub parent_workflow_id: Option<WorkflowId>,
+    pub first_run_started_at: Option<OffsetDateTime>,
+    pub request: RequestContext,
+    pub now: OffsetDateTime,
+    pub signal_name: String,
+    pub signal_input: Payloads,
 }
 
 /// Request to deliver a signal to a running workflow.

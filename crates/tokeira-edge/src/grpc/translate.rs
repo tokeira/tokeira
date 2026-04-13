@@ -143,6 +143,47 @@ fn parse_run_id(value: &str) -> Result<RunId, ProtoConversionError> {
     Ok(RunId(Uuid::parse_str(value)?))
 }
 
+fn extract_conflict_policy(value: i32) -> tokeira_kernel::WorkflowIdConflictPolicy {
+    match enums::WorkflowIdConflictPolicy::try_from(value).ok() {
+        Some(enums::WorkflowIdConflictPolicy::UseExisting) => {
+            tokeira_kernel::WorkflowIdConflictPolicy::UseExisting
+        }
+        Some(enums::WorkflowIdConflictPolicy::TerminateExisting) => {
+            tokeira_kernel::WorkflowIdConflictPolicy::TerminateExisting
+        }
+        _ => tokeira_kernel::WorkflowIdConflictPolicy::Fail,
+    }
+}
+
+fn extract_reuse_policy(value: i32) -> tokeira_kernel::WorkflowIdReusePolicy {
+    match enums::WorkflowIdReusePolicy::try_from(value).ok() {
+        Some(enums::WorkflowIdReusePolicy::AllowDuplicateFailedOnly) => {
+            tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+        }
+        Some(enums::WorkflowIdReusePolicy::RejectDuplicate) => {
+            tokeira_kernel::WorkflowIdReusePolicy::RejectDuplicate
+        }
+        Some(enums::WorkflowIdReusePolicy::TerminateIfRunning) => {
+            tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate
+        }
+        _ => tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
+    }
+}
+
+fn migrate_reuse_policy(
+    reuse: &mut tokeira_kernel::WorkflowIdReusePolicy,
+    conflict: &mut tokeira_kernel::WorkflowIdConflictPolicy,
+    raw_reuse_value: i32,
+) {
+    if matches!(
+        enums::WorkflowIdReusePolicy::try_from(raw_reuse_value).ok(),
+        Some(enums::WorkflowIdReusePolicy::TerminateIfRunning)
+    ) {
+        *reuse = tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate;
+        *conflict = tokeira_kernel::WorkflowIdConflictPolicy::TerminateExisting;
+    }
+}
+
 pub fn start_request_to_edge(
     req: workflowservice::StartWorkflowExecutionRequest,
 ) -> Result<StartWorkflowExecutionRequest, ProtoConversionError> {
@@ -152,6 +193,15 @@ pub fn start_request_to_edge(
             .ok_or(ProtoConversionError::MissingField(
                 "StartWorkflowExecutionRequest.task_queue",
             ))?;
+
+    let mut conflict_policy =
+        extract_conflict_policy(req.workflow_id_conflict_policy);
+    let mut reuse_policy = extract_reuse_policy(req.workflow_id_reuse_policy);
+    migrate_reuse_policy(
+        &mut reuse_policy,
+        &mut conflict_policy,
+        req.workflow_id_reuse_policy,
+    );
 
     Ok(StartWorkflowExecutionRequest {
         namespace: req.namespace,
@@ -178,6 +228,8 @@ pub fn start_request_to_edge(
         workflow_run_timeout: proto_duration_to_time(req.workflow_run_timeout.as_ref()),
         workflow_task_timeout: proto_duration_to_time(req.workflow_task_timeout.as_ref()),
         retry_policy: req.retry_policy.as_ref().map(retry_policy_to_domain),
+        conflict_policy,
+        reuse_policy,
         header: req.header.as_ref().map(headers_to_domain),
         run_key: None,
         run_id: None,
@@ -724,6 +776,21 @@ pub fn signal_with_start_request_to_edge(
                 "SignalWithStartWorkflowExecutionRequest.task_queue",
             ))?;
 
+    let mut conflict_policy = if matches!(
+        enums::WorkflowIdConflictPolicy::try_from(req.workflow_id_conflict_policy).ok(),
+        None | Some(enums::WorkflowIdConflictPolicy::Unspecified)
+    ) {
+        tokeira_kernel::WorkflowIdConflictPolicy::UseExisting
+    } else {
+        extract_conflict_policy(req.workflow_id_conflict_policy)
+    };
+    let mut reuse_policy = extract_reuse_policy(req.workflow_id_reuse_policy);
+    migrate_reuse_policy(
+        &mut reuse_policy,
+        &mut conflict_policy,
+        req.workflow_id_reuse_policy,
+    );
+
     Ok(EdgeSignalWithStartWorkflowExecutionRequest {
         namespace: req.namespace,
         workflow_id: req.workflow_id,
@@ -749,6 +816,8 @@ pub fn signal_with_start_request_to_edge(
         workflow_run_timeout: proto_duration_to_time(req.workflow_run_timeout.as_ref()),
         workflow_task_timeout: proto_duration_to_time(req.workflow_task_timeout.as_ref()),
         retry_policy: req.retry_policy.as_ref().map(retry_policy_to_domain),
+        conflict_policy,
+        reuse_policy,
         header: req.header.as_ref().map(headers_to_domain),
         signal_name: req.signal_name,
         signal_input: req

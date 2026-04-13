@@ -29,11 +29,10 @@ These policies apply to both `StartWorkflowExecution` and `SignalWithStartWorkfl
 
 #### Acceptance Criteria
 
-1. THE Kernel SHALL accept a `SignalWithStartRequest` containing all `StartRequest` fields plus `signal_name`, `signal_input`, and `signal_header`.
+1. THE Kernel SHALL accept a `SignalWithStartRequest` containing all `StartRequest` fields plus `signal_name` and `signal_input`. Signal header support is deferred — `HistoryEventKind::WorkflowExecutionSignaled` does not currently carry a header field.
 2. WHEN applied with `LoadedRun::Absent`, THE Kernel SHALL produce a `Transition` with exactly three history events: `WorkflowExecutionStarted` (event_id=1), `WorkflowExecutionSignaled` (event_id=2), `WorkflowTaskScheduled` (event_id=3).
 3. WHEN applied with `LoadedRun::Absent`, THE Transition SHALL have `next_state.status == Running`, `pending_workflow_task` populated, one `DispatchOp::EnqueueWorkflowTask`, one `RequestDedupeOp`, and one `ProjectionOp::UpsertExecution`.
-4. WHEN applied with `LoadedRun::Existing` where the workflow is running, THE Kernel SHALL produce a transition equivalent to `apply_signal` (emit `WorkflowExecutionSignaled`, schedule WFT if needed).
-5. WHEN applied with `LoadedRun::Existing` where the workflow is closed, THE Kernel SHALL return `Err(Reject::WorkflowNotRunning)`.
+4. WHEN applied with `LoadedRun::Existing` (any state), THE Kernel SHALL return `Err(Reject::RunAlreadyExists)`. The kernel method only handles the absent case — the runtime owns all existing-run branching (signal delivery, conflict resolution, terminate-and-restart) before calling the kernel.
 
 ### Requirement 2: WorkflowIdConflictPolicy for running workflows
 
@@ -46,8 +45,8 @@ These policies apply to both `StartWorkflowExecution` and `SignalWithStartWorkfl
    - `UseExisting` — return the existing run_id without modification
    - `TerminateExisting` — terminate the running workflow and start a new one
 2. WHEN `ConflictPolicy::Fail` and a running workflow exists, THE runtime SHALL return an error without modifying the existing workflow.
-3. WHEN `ConflictPolicy::UseExisting` and a running workflow exists, THE runtime SHALL return the existing `run_id` without starting a new workflow.
-4. WHEN `ConflictPolicy::TerminateExisting` and a running workflow exists, THE runtime SHALL terminate the existing workflow (emitting `WorkflowExecutionTerminated`) and start a new workflow in a single operation.
+3. WHEN `ConflictPolicy::UseExisting` and a running workflow exists, THE runtime SHALL return the existing `run_id` without starting a new workflow. For `StartWorkflowExecution`, the runtime's `start_workflow` method SHALL return a `StartWorkflowResult` that can indicate either `Created { run_id }` or `AlreadyRunning { run_id }`, so the edge layer can distinguish the two cases.
+4. WHEN `ConflictPolicy::TerminateExisting` and a running workflow exists, THE runtime SHALL terminate the existing workflow (emitting `WorkflowExecutionTerminated`) and then start a new workflow. These are two sequential commits, not one atomic operation. The runtime SHALL NOT return success until both the termination and the new start have committed successfully.
 5. FOR `SignalWithStartWorkflowExecution` with `ConflictPolicy::UseExisting`, THE runtime SHALL deliver the signal to the existing running workflow and return its `run_id`.
 6. FOR `SignalWithStartWorkflowExecution` with `ConflictPolicy::TerminateExisting`, THE runtime SHALL terminate the existing workflow, start a new one with the signal delivered atomically, and return the new `run_id`.
 7. THE default conflict policy (when unspecified) SHALL be `UseExisting` for `SignalWithStart` and `Fail` for `StartWorkflowExecution`.
@@ -86,5 +85,5 @@ These policies apply to both `StartWorkflowExecution` and `SignalWithStartWorkfl
 #### Acceptance Criteria
 
 1. FOR ALL valid `SignalWithStartRequest` values applied to `LoadedRun::Absent`, `WorkflowExecutionStarted.event_id < WorkflowExecutionSignaled.event_id < WorkflowTaskScheduled.event_id`.
-2. THE `WorkflowExecutionSignaled` event SHALL contain the exact `signal_name`, `signal_input`, and `signal_header` from the request.
+2. THE `WorkflowExecutionSignaled` event SHALL contain the exact `signal_name` and `signal_input` from the request. Signal header fidelity is deferred until `HistoryEventKind::WorkflowExecutionSignaled` gains a header field.
 3. THE `WorkflowExecutionStarted` event SHALL contain the exact `workflow_type`, `task_queue`, and `input` from the request.

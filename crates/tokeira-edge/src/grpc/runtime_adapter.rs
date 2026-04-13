@@ -7,8 +7,8 @@ use tokeira_kernel::{
     TerminateRequest, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    QueryResult, ResetWorkflowResult, StartedActivityTask, TokeiraRuntime,
-    UpdateOutcome, UpdateWaitPolicy,
+    QueryResult, ResetWorkflowResult, SignalWithStartResult, StartWorkflowResult,
+    StartedActivityTask, TokeiraRuntime, UpdateOutcome, UpdateWaitPolicy,
 };
 use tokeira_storage::{CommitResult, RunRepository};
 use tokeira_types::{
@@ -39,6 +39,20 @@ where
     async fn start_workflow(&self, req: StartRequest) -> Result<WorkflowMutationOutcome> {
         let result = self.runtime.start_workflow(req).await?;
         commit_result_to_outcome(result)
+    }
+
+    async fn start_workflow_with_policy(
+        &self,
+        req: StartRequest,
+    ) -> Result<StartWorkflowResult> {
+        self.runtime.start_workflow_with_policy(req).await
+    }
+
+    async fn signal_with_start_workflow(
+        &self,
+        req: tokeira_kernel::SignalWithStartRequest,
+    ) -> Result<SignalWithStartResult> {
+        self.runtime.signal_with_start_workflow(req).await
     }
 
     async fn signal_workflow(

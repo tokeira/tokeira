@@ -5,8 +5,9 @@ use smallvec::{SmallVec, smallvec};
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     ActivityOp, ActivityResolution, ActivityResolvedRequest, BasicKernel, Command,
-    DispatchOp, HistoryEvent, HistoryEventKind, LoadedRun, SignalRequest, StartRequest,
-    StartWorkflowTaskRequest, TerminateRequest, Transition, UpdateRequest,
+    DispatchOp, HistoryEvent, HistoryEventKind, LoadedRun, SignalRequest,
+    SignalWithStartRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest,
+    Transition, UpdateRequest, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
     WorkflowTaskCompletedRequest,
 };
 use tokeira_storage::{
@@ -122,6 +123,29 @@ pub struct TokeiraRuntime<R> {
 pub struct ResetWorkflowResult {
     pub successor_run_key: RunKey,
     pub successor_run_id: RunId,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum StartWorkflowResult {
+    Started { run_key: RunKey, run_id: RunId },
+    UsedExisting { run_key: RunKey, run_id: RunId },
+    Rejected { run_key: RunKey, run_id: RunId },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SignalWithStartResult {
+    Started { run_key: RunKey, run_id: RunId },
+    Signaled { run_key: RunKey, run_id: RunId },
+    Rejected { run_key: RunKey, run_id: RunId },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ConflictResolution {
+    Absent,
+    UseExisting { run_key: RunKey, run_id: RunId },
+    TerminateAndStart { run_key: RunKey },
+    ClosedAllowReuse,
+    Rejected { run_key: RunKey, run_id: RunId },
 }
 
 impl<R> TokeiraRuntime<R>
@@ -588,6 +612,143 @@ where
         Ok(result)
     }
 
+    pub async fn start_workflow_with_policy(
+        &self,
+        request: StartRequest,
+    ) -> Result<StartWorkflowResult> {
+        let resolution = self
+            .resolve_conflict(
+                request.namespace_id,
+                &request.workflow_id,
+                request.conflict_policy,
+                request.reuse_policy,
+            )
+            .await?;
+        match resolution {
+            ConflictResolution::Absent | ConflictResolution::ClosedAllowReuse => {
+                match self.start_workflow(request.clone()).await? {
+                    CommitResult::Applied { .. } => Ok(StartWorkflowResult::Started {
+                        run_key: request.run_key,
+                        run_id: request.run_id,
+                    }),
+                    CommitResult::Duplicate => Err(anyhow!(
+                        "unexpected duplicate start commit for {:?}",
+                        request.run_key
+                    )),
+                    CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
+                }
+            }
+            ConflictResolution::UseExisting { run_key, run_id } => {
+                Ok(StartWorkflowResult::UsedExisting { run_key, run_id })
+            }
+            ConflictResolution::TerminateAndStart { run_key } => {
+                self.terminate_existing_for_conflict(
+                    request.namespace_id,
+                    request.workflow_id.clone(),
+                    run_key,
+                    request.request.clone(),
+                )
+                .await?;
+                match self.start_workflow(request.clone()).await? {
+                    CommitResult::Applied { .. } => Ok(StartWorkflowResult::Started {
+                        run_key: request.run_key,
+                        run_id: request.run_id,
+                    }),
+                    CommitResult::Duplicate => Err(anyhow!(
+                        "unexpected duplicate start commit for {:?}",
+                        request.run_key
+                    )),
+                    CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
+                }
+            }
+            ConflictResolution::Rejected { run_key, run_id } => {
+                Ok(StartWorkflowResult::Rejected { run_key, run_id })
+            }
+        }
+    }
+
+    pub async fn signal_with_start_workflow(
+        &self,
+        request: SignalWithStartRequest,
+    ) -> Result<SignalWithStartResult> {
+        let resolution = self
+            .resolve_conflict(
+                request.namespace_id,
+                &request.workflow_id,
+                request.conflict_policy,
+                request.reuse_policy,
+            )
+            .await?;
+        match resolution {
+            ConflictResolution::Absent | ConflictResolution::ClosedAllowReuse => {
+                match self
+                    .submit(request.run_key, Command::SignalWithStart(request.clone()))
+                    .await?
+                {
+                    CommitResult::Applied { .. } => Ok(SignalWithStartResult::Started {
+                        run_key: request.run_key,
+                        run_id: request.run_id,
+                    }),
+                    CommitResult::Duplicate => Err(anyhow!(
+                        "unexpected duplicate signal-with-start commit for {:?}",
+                        request.run_key
+                    )),
+                    CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
+                }
+            }
+            ConflictResolution::UseExisting { run_key, run_id } => {
+                let execution = ExecutionRef {
+                    namespace_id: request.namespace_id,
+                    workflow_id: request.workflow_id.clone(),
+                    run_id: Some(run_id),
+                };
+                match self
+                    .signal_workflow(
+                        execution,
+                        SignalRequest {
+                            signal_name: request.signal_name,
+                            input: request.signal_input,
+                            request: request.request,
+                            now: request.now,
+                        },
+                    )
+                    .await?
+                {
+                    CommitResult::Applied { .. } | CommitResult::Duplicate => {
+                        Ok(SignalWithStartResult::Signaled { run_key, run_id })
+                    }
+                    CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
+                }
+            }
+            ConflictResolution::TerminateAndStart { run_key } => {
+                self.terminate_existing_for_conflict(
+                    request.namespace_id,
+                    request.workflow_id.clone(),
+                    run_key,
+                    request.request.clone(),
+                )
+                .await?;
+                match self
+                    .submit(request.run_key, Command::SignalWithStart(request.clone()))
+                    .await?
+                {
+                    CommitResult::Applied { .. } => Ok(SignalWithStartResult::Started {
+                        run_key: request.run_key,
+                        run_id: request.run_id,
+                    }),
+                    CommitResult::Duplicate => Err(anyhow!(
+                        "unexpected duplicate signal-with-start commit for {:?}",
+                        request.run_key
+                    )),
+                    CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
+                }
+            }
+            ConflictResolution::Rejected { run_key, run_id } => {
+                Ok(SignalWithStartResult::Rejected { run_key, run_id })
+            }
+        }
+    }
+
     /// Deliver an external signal to a running workflow.
     pub async fn signal_workflow(
         &self,
@@ -650,6 +811,126 @@ where
             CommitResult::Duplicate => {
                 Err(anyhow!("unexpected duplicate reset commit for {:?}", run_key))
             }
+            CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
+        }
+    }
+
+    async fn resolve_conflict(
+        &self,
+        namespace_id: NamespaceId,
+        workflow_id: &tokeira_types::WorkflowId,
+        conflict_policy: WorkflowIdConflictPolicy,
+        reuse_policy: WorkflowIdReusePolicy,
+    ) -> Result<ConflictResolution> {
+        let current_execution = ExecutionRef {
+            namespace_id,
+            workflow_id: workflow_id.clone(),
+            run_id: None,
+        };
+        if let Some(run_key) = self.repo.resolve_execution(&current_execution).await? {
+            let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
+                return Ok(ConflictResolution::Absent);
+            };
+            if state.status.is_open() {
+                return Ok(match conflict_policy {
+                    WorkflowIdConflictPolicy::Fail => ConflictResolution::Rejected {
+                        run_key,
+                        run_id: state.run_id,
+                    },
+                    WorkflowIdConflictPolicy::UseExisting => ConflictResolution::UseExisting {
+                        run_key,
+                        run_id: state.run_id,
+                    },
+                    WorkflowIdConflictPolicy::TerminateExisting => {
+                        ConflictResolution::TerminateAndStart { run_key }
+                    }
+                });
+            }
+        }
+
+        let Some(run_key) = self.repo.find_latest_run(namespace_id, workflow_id).await? else {
+            return Ok(ConflictResolution::Absent);
+        };
+        let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
+            return Ok(ConflictResolution::Absent);
+        };
+        if state.status.is_open() {
+            return Ok(match conflict_policy {
+                WorkflowIdConflictPolicy::Fail => ConflictResolution::Rejected {
+                    run_key,
+                    run_id: state.run_id,
+                },
+                WorkflowIdConflictPolicy::UseExisting => ConflictResolution::UseExisting {
+                    run_key,
+                    run_id: state.run_id,
+                },
+                WorkflowIdConflictPolicy::TerminateExisting => {
+                    ConflictResolution::TerminateAndStart { run_key }
+                }
+            });
+        }
+
+        Ok(match reuse_policy {
+            WorkflowIdReusePolicy::AllowDuplicate => ConflictResolution::ClosedAllowReuse,
+            WorkflowIdReusePolicy::AllowDuplicateFailedOnly => {
+                if matches!(
+                    state.status,
+                    tokeira_types::ExecutionStatus::Failed
+                        | tokeira_types::ExecutionStatus::Cancelled
+                        | tokeira_types::ExecutionStatus::Terminated
+                        | tokeira_types::ExecutionStatus::TimedOut
+                ) {
+                    ConflictResolution::ClosedAllowReuse
+                } else {
+                    ConflictResolution::Rejected {
+                        run_key,
+                        run_id: state.run_id,
+                    }
+                }
+            }
+            WorkflowIdReusePolicy::RejectDuplicate => ConflictResolution::Rejected {
+                run_key,
+                run_id: state.run_id,
+            },
+        })
+    }
+
+    async fn terminate_existing_for_conflict(
+        &self,
+        namespace_id: NamespaceId,
+        workflow_id: tokeira_types::WorkflowId,
+        run_key: RunKey,
+        request: RequestContext,
+    ) -> Result<()> {
+        let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
+            return Err(anyhow!("execution not found"));
+        };
+        let execution = ExecutionRef {
+            namespace_id,
+            workflow_id,
+            run_id: Some(state.run_id),
+        };
+        match self
+            .terminate_workflow(
+                execution,
+                TerminateRequest {
+                    reason: "terminated by workflow id conflict policy".to_string(),
+                    details: None,
+                    identity: request
+                        .caller_identity
+                        .clone()
+                        .unwrap_or_else(|| "workflow-id-conflict-policy".to_string()),
+                    request: RequestContext {
+                        request_id: request.request_id,
+                        caller_identity: request.caller_identity,
+                        received_at: request.received_at,
+                    },
+                    now: OffsetDateTime::now_utc(),
+                },
+            )
+            .await?
+        {
+            CommitResult::Applied { .. } | CommitResult::Duplicate => Ok(()),
             CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
         }
     }
@@ -2377,6 +2658,8 @@ mod tests {
             workflow_run_timeout,
             workflow_task_timeout: Duration::seconds(10),
             retry_policy: None,
+            conflict_policy: tokeira_kernel::WorkflowIdConflictPolicy::Fail,
+            reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
             attempt: 1,
             continued_execution_run_id: None,
             first_execution_run_id: None,
@@ -2424,6 +2707,14 @@ mod tests {
         async fn resolve_execution(
             &self,
             _execution: &ExecutionRef,
+        ) -> Result<Option<RunKey>> {
+            panic!("unused in timer scanner tests")
+        }
+
+        async fn find_latest_run(
+            &self,
+            _namespace_id: tokeira_types::NamespaceId,
+            _workflow_id: &tokeira_types::WorkflowId,
         ) -> Result<Option<RunKey>> {
             panic!("unused in timer scanner tests")
         }

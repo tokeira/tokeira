@@ -94,6 +94,16 @@ pub trait RunRepository: Send + Sync {
     async fn resolve_execution(&self, execution: &ExecutionRef)
     -> Result<Option<RunKey>>;
 
+    /// Resolve the latest known run for a workflow, whether open or closed.
+    ///
+    /// This is used by workflow-id reuse/conflict resolution paths that need
+    /// to distinguish "no run has ever existed" from "the last run is closed".
+    async fn find_latest_run(
+        &self,
+        namespace_id: NamespaceId,
+        workflow_id: &WorkflowId,
+    ) -> Result<Option<RunKey>>;
+
     /// Load the full durable state for a run, or
     /// [`LoadedRun::Absent`] if the key is unknown.
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun>;
@@ -568,6 +578,14 @@ where
         execution: &ExecutionRef,
     ) -> Result<Option<RunKey>> {
         (**self).resolve_execution(execution).await
+    }
+
+    async fn find_latest_run(
+        &self,
+        namespace_id: NamespaceId,
+        workflow_id: &WorkflowId,
+    ) -> Result<Option<RunKey>> {
+        (**self).find_latest_run(namespace_id, workflow_id).await
     }
 
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun> {

@@ -28,6 +28,13 @@ impl From<EdgeError> for Status {
                 namespace,
                 workflow_id,
             } => Status::not_found(format!("{namespace}/{workflow_id}")),
+            EdgeError::WorkflowAlreadyStarted {
+                namespace,
+                workflow_id,
+                run_id,
+            } => Status::already_exists(format!(
+                "{namespace}/{workflow_id} already started as {run_id}"
+            )),
             EdgeError::TooManyLongPolls => {
                 Status::resource_exhausted(err_static("too many concurrent long polls"))
             }
@@ -83,6 +90,14 @@ mod tests {
                     workflow_id: "wf".to_string(),
                 },
                 Code::NotFound,
+            ),
+            (
+                EdgeError::WorkflowAlreadyStarted {
+                    namespace: "default".to_string(),
+                    workflow_id: "wf".to_string(),
+                    run_id: "run".to_string(),
+                },
+                Code::AlreadyExists,
             ),
             (
                 EdgeError::NamespaceDeleted("default".to_string()),

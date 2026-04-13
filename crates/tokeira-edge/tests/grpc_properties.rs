@@ -3,6 +3,9 @@ use std::{collections::BTreeMap, time::Duration};
 use http::header::HeaderValue;
 use proptest::prelude::*;
 use time::OffsetDateTime;
+use tokeira_kernel::{
+    WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+};
 use tokeira_edge::{
     errors::EdgeError,
     grpc::{
@@ -341,6 +344,7 @@ fn expected_code(err: &EdgeError) -> Code {
         EdgeError::NamespaceNotFound(_) | EdgeError::WorkflowNotFound { .. } => {
             Code::NotFound
         }
+        EdgeError::WorkflowAlreadyStarted { .. } => Code::AlreadyExists,
         EdgeError::NamespaceDeleted(_) => Code::FailedPrecondition,
         EdgeError::NamespaceAlreadyExists(_) => Code::AlreadyExists,
         EdgeError::TooManyLongPolls => Code::ResourceExhausted,
@@ -442,6 +446,8 @@ fn arb_start_request() -> impl Strategy<Value = StartWorkflowExecutionRequest> {
                 workflow_run_timeout: None,
                 workflow_task_timeout: None,
                 retry_policy: None,
+                conflict_policy: WorkflowIdConflictPolicy::Fail,
+                reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
                 header: None,
                 run_key: None,
                 run_id: None,

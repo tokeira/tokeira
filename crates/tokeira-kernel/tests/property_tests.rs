@@ -660,6 +660,8 @@ fn arb_start_request() -> impl Strategy<Value = StartRequest> {
                     workflow_run_timeout,
                     workflow_task_timeout,
                     retry_policy,
+                    conflict_policy: tokeira_kernel::WorkflowIdConflictPolicy::Fail,
+                    reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
                     attempt,
                     continued_execution_run_id: None,
                     first_execution_run_id: Some(run_id),

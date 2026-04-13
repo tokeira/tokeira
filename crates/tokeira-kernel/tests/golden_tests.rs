@@ -11,7 +11,8 @@ use tokeira_kernel::{
     PauseActivityRequest, PauseInfo, PauseWorkflowRequest, PendingExternalCancel,
     PendingExternalSignal, PendingNexusOperation, PendingUpdate, PendingWorkflowTask,
     ProjectionOp, Reject, ReplayContext, ResetActivityRequest, ResetRequest,
-    RetryState, SignalRequest, StartRequest, StartWorkflowTaskRequest,
+    RetryState, SignalRequest, SignalWithStartRequest, StartRequest,
+    StartWorkflowTaskRequest,
     TerminateRequest, TimerDueRequest, TimerState, UnpauseActivityRequest,
     UnpauseWorkflowRequest,
     UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody,
@@ -86,6 +87,8 @@ fn make_start_request() -> StartRequest {
         workflow_run_timeout: Some(Duration::minutes(5)),
         workflow_task_timeout: Duration::seconds(10),
         retry_policy: Some(retry_policy()),
+        conflict_policy: tokeira_kernel::WorkflowIdConflictPolicy::Fail,
+        reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
         attempt: 1,
         continued_execution_run_id: None,
         first_execution_run_id: Some(run_id),
@@ -94,6 +97,39 @@ fn make_start_request() -> StartRequest {
         first_run_started_at: Some(now()),
         request: request_context("start-req"),
         now: now(),
+    }
+}
+
+fn make_signal_with_start_request() -> SignalWithStartRequest {
+    let start = make_start_request();
+    SignalWithStartRequest {
+        run_key: start.run_key,
+        namespace_id: start.namespace_id,
+        workflow_id: start.workflow_id,
+        run_id: start.run_id,
+        workflow_type: start.workflow_type,
+        task_queue: start.task_queue,
+        deployment: start.deployment,
+        build_id: start.build_id,
+        input: start.input,
+        memo: start.memo,
+        search_attributes: start.search_attributes,
+        workflow_execution_timeout: start.workflow_execution_timeout,
+        workflow_run_timeout: start.workflow_run_timeout,
+        workflow_task_timeout: start.workflow_task_timeout,
+        retry_policy: start.retry_policy,
+        conflict_policy: start.conflict_policy,
+        reuse_policy: start.reuse_policy,
+        attempt: start.attempt,
+        continued_execution_run_id: start.continued_execution_run_id,
+        first_execution_run_id: start.first_execution_run_id,
+        parent_run_key: start.parent_run_key,
+        parent_workflow_id: start.parent_workflow_id,
+        first_run_started_at: start.first_run_started_at,
+        request: start.request,
+        now: start.now,
+        signal_name: "sig".into(),
+        signal_input: payloads("signal-input"),
     }
 }
 
@@ -710,6 +746,48 @@ fn start_from_absent() {
     );
     assert_eq!(transition.dispatch_ops.len(), 1);
     assert!(transition.next_state.pending_workflow_task.is_some());
+}
+
+#[test]
+fn signal_with_start_from_absent() {
+    let req = make_signal_with_start_request();
+    let transition = kernel()
+        .apply(LoadedRun::Absent, Command::SignalWithStart(req.clone()))
+        .unwrap();
+
+    assert_eq!(transition.history_events.len(), 3);
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::WorkflowExecutionStarted { .. }
+    ));
+    assert!(matches!(
+        transition.history_events[1].kind,
+        HistoryEventKind::WorkflowExecutionSignaled { .. }
+    ));
+    assert!(matches!(
+        transition.history_events[2].kind,
+        HistoryEventKind::WorkflowTaskScheduled { .. }
+    ));
+    assert_eq!(transition.request_dedupe_ops.len(), 1);
+    assert_eq!(transition.projection_ops.len(), 1);
+    assert!(
+        transition
+            .dispatch_ops
+            .iter()
+            .any(|op| matches!(op, DispatchOp::EnqueueWorkflowTask { .. }))
+    );
+    assert!(transition.next_state.pending_workflow_task.is_some());
+}
+
+#[test]
+fn signal_with_start_rejects_existing_run() {
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(make_open_state()),
+            Command::SignalWithStart(make_signal_with_start_request()),
+        )
+        .unwrap_err();
+    assert_eq!(reject, Reject::RunAlreadyExists);
 }
 
 #[test]

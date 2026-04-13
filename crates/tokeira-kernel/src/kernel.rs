@@ -17,8 +17,9 @@ use crate::{
         ExternalSignalResolvedRequest, ExternalSignalResult, FieldChange,
         NexusOperationResolvedRequest, NexusResolution, PauseActivityRequest,
         PauseWorkflowRequest, ResetActivityRequest, ResetRequest, RetryState,
-        SignalRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest,
-        TimerDueRequest, UnpauseActivityRequest, UnpauseWorkflowRequest,
+        SignalRequest, SignalWithStartRequest, StartRequest,
+        StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest,
+        UnpauseActivityRequest, UnpauseWorkflowRequest,
         UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody,
         UpdateRequest, WorkflowCommand, WorkflowExecutionTimedOutRequest,
         WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
@@ -81,6 +82,9 @@ impl Kernel for BasicKernel {
     fn apply(&self, loaded: LoadedRun, command: Command) -> Result<Transition, Reject> {
         match command {
             Command::Start(req) => self.apply_start(loaded, req),
+            Command::SignalWithStart(req) => {
+                self.apply_signal_with_start(loaded, req)
+            }
             Command::Update(req) => self.apply_update(loaded, req),
             Command::Signal(req) => self.apply_signal(loaded, req),
             Command::Cancel(req) => self.apply_cancel(loaded, req),
@@ -281,6 +285,92 @@ impl BasicKernel {
             workflow_execution_timeout: req.workflow_execution_timeout,
             workflow_run_timeout: req.workflow_run_timeout,
             workflow_task_timeout: req.workflow_task_timeout,
+        });
+        builder.projection_ops.push(ProjectionOp::UpsertExecution {
+            status: ExecutionStatus::Running,
+            memo_patch: req.memo,
+            search_attr_patch: req.search_attributes,
+        });
+        builder.schedule_workflow_task();
+        Ok(builder.finish())
+    }
+
+    fn apply_signal_with_start(
+        &self,
+        loaded: LoadedRun,
+        req: SignalWithStartRequest,
+    ) -> Result<Transition, Reject> {
+        if !matches!(loaded, LoadedRun::Absent) {
+            return Err(Reject::RunAlreadyExists);
+        }
+
+        let initial = WorkflowState {
+            run_key: req.run_key,
+            namespace_id: req.namespace_id,
+            workflow_id: req.workflow_id,
+            run_id: req.run_id,
+            workflow_type: req.workflow_type.clone(),
+            task_queue: req.task_queue.clone(),
+            deployment: req.deployment,
+            build_id: req.build_id,
+            status: ExecutionStatus::Running,
+            transition_seq: TransitionSeq::ZERO,
+            last_event_id: 0,
+            next_workflow_task_seq: LogicalTaskSeq::ONE,
+            pending_workflow_task: None,
+            sticky: None,
+            pause_info: None,
+            wft_stamp: 0,
+            memo: req.memo.clone(),
+            search_attributes: req.search_attributes.clone(),
+            workflow_execution_timeout: req.workflow_execution_timeout,
+            workflow_run_timeout: req.workflow_run_timeout,
+            workflow_task_timeout: req.workflow_task_timeout,
+            retry_policy: req.retry_policy.clone(),
+            attempt: req.attempt,
+            first_execution_run_id: req.first_execution_run_id,
+            parent_run_key: req.parent_run_key,
+            parent_workflow_id: req.parent_workflow_id,
+            activities: BTreeMap::new(),
+            timers: BTreeMap::new(),
+            children: BTreeMap::new(),
+            pending_external_signals: BTreeMap::new(),
+            pending_external_cancels: BTreeMap::new(),
+            pending_updates: BTreeMap::new(),
+            pending_nexus_operations: BTreeMap::new(),
+            versioning_override: None,
+            completion_callbacks: Vec::new(),
+            started_at: req.now,
+            first_run_started_at: req.first_run_started_at,
+            closed_at: None,
+            close_result: None,
+            close_failure: None,
+        };
+
+        let mut builder = TransitionBuilder::new(initial, req.now);
+        builder.request_dedupe_ops.push(RequestDedupeOp {
+            request_id: req.request.request_id.clone(),
+        });
+        builder.emit(HistoryEventKind::WorkflowExecutionStarted {
+            workflow_type: req.workflow_type,
+            task_queue: req.task_queue,
+            input: req.input,
+            memo: req.memo.clone(),
+            search_attributes: req.search_attributes.clone(),
+            request_id: req.request.request_id.0.clone(),
+            continued_execution_run_id: req.continued_execution_run_id,
+            first_execution_run_id: req.first_execution_run_id,
+            retry_policy: req.retry_policy,
+            attempt: req.attempt,
+            workflow_execution_timeout: req.workflow_execution_timeout,
+            workflow_run_timeout: req.workflow_run_timeout,
+            workflow_task_timeout: req.workflow_task_timeout,
+        });
+        builder.emit(HistoryEventKind::WorkflowExecutionSignaled {
+            signal_name: req.signal_name,
+            input: req.signal_input,
+            request_id: req.request.request_id.0,
+            identity: req.request.caller_identity,
         });
         builder.projection_ops.push(ProjectionOp::UpsertExecution {
             status: ExecutionStatus::Running,

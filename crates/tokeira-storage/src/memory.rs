@@ -12,7 +12,7 @@ use tokeira_kernel::{
 };
 use tokeira_types::{
     ExecutionRef, NamespaceId, ProjectionCursor, QueueKey, RequestId, RunId, RunKey,
-    ShardEpoch, ShardId,
+    ShardEpoch, ShardId, WorkflowId,
 };
 use tokio::sync::Mutex;
 
@@ -128,6 +128,28 @@ impl RunRepository for InMemoryStore {
             .current_open
             .get(&(execution.namespace_id, execution.workflow_id.0.clone()))
             .copied())
+    }
+
+    async fn find_latest_run(
+        &self,
+        namespace_id: NamespaceId,
+        workflow_id: &WorkflowId,
+    ) -> Result<Option<RunKey>> {
+        let store = self.inner.lock().await;
+        Ok(store
+            .runs
+            .values()
+            .filter(|state| {
+                state.namespace_id == namespace_id
+                    && state.workflow_id == *workflow_id
+            })
+            .max_by(|left, right| {
+                left.started_at
+                    .cmp(&right.started_at)
+                    .then_with(|| left.transition_seq.0.cmp(&right.transition_seq.0))
+                    .then_with(|| left.last_event_id.cmp(&right.last_event_id))
+            })
+            .map(|state| state.run_key))
     }
 
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun> {

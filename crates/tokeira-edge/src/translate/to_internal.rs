@@ -1,7 +1,8 @@
 use anyhow::Result;
 use time::OffsetDateTime;
 use tokeira_kernel::{
-    ResetRequest, SignalRequest, StartRequest, WorkflowTaskCompletedRequest,
+    ResetRequest, SignalRequest, SignalWithStartRequest, StartRequest,
+    WorkflowTaskCompletedRequest,
 };
 use tokeira_types::{
     NamespaceId, QueueKey, RequestContext, RequestId as CoreRequestId, RunId, RunKey,
@@ -59,6 +60,8 @@ pub fn start_request(
             .workflow_task_timeout
             .unwrap_or(time::Duration::seconds(10)),
         retry_policy: req.retry_policy,
+        conflict_policy: req.conflict_policy,
+        reuse_policy: req.reuse_policy,
         deployment: None,
         build_id: None,
         attempt: 1,
@@ -76,6 +79,52 @@ pub fn start_request(
             received_at: now,
         },
         now,
+    }
+}
+
+pub fn signal_with_start_request(
+    req: crate::translate::SignalWithStartWorkflowExecutionRequest,
+    request_id: &RequestId,
+) -> SignalWithStartRequest {
+    let now = OffsetDateTime::now_utc();
+    let run_id = RunId::new();
+    SignalWithStartRequest {
+        run_key: RunKey::new(),
+        namespace_id: namespace_id_for(&req.namespace),
+        workflow_id: WorkflowId(req.workflow_id),
+        run_id,
+        workflow_type: WorkflowType(req.workflow_type),
+        task_queue: TaskQueueName(req.task_queue),
+        deployment: None,
+        build_id: None,
+        input: req.input,
+        memo: req.memo,
+        search_attributes: req.search_attributes,
+        workflow_execution_timeout: req.workflow_execution_timeout,
+        workflow_run_timeout: req.workflow_run_timeout,
+        workflow_task_timeout: req
+            .workflow_task_timeout
+            .unwrap_or(time::Duration::seconds(10)),
+        retry_policy: req.retry_policy,
+        conflict_policy: req.conflict_policy,
+        reuse_policy: req.reuse_policy,
+        attempt: 1,
+        continued_execution_run_id: None,
+        first_execution_run_id: Some(run_id),
+        parent_run_key: None,
+        parent_workflow_id: None,
+        first_run_started_at: None,
+        request: RequestContext {
+            request_id: CoreRequestId(
+                req.request_id
+                    .unwrap_or_else(|| request_id.as_str().to_string()),
+            ),
+            caller_identity: req.identity,
+            received_at: now,
+        },
+        now,
+        signal_name: req.signal_name,
+        signal_input: req.signal_input,
     }
 }
 

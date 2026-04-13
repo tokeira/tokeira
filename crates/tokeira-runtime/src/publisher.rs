@@ -153,6 +153,8 @@ where
             workflow_run_timeout: None,
             workflow_task_timeout: Duration::seconds(10),
             retry_policy: None,
+            conflict_policy: tokeira_kernel::WorkflowIdConflictPolicy::Fail,
+            reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
             attempt: 1,
             continued_execution_run_id: None,
             first_execution_run_id: None,

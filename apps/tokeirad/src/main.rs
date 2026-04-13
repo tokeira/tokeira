@@ -166,12 +166,20 @@ where
         _namespace: &str,
         workflow_id: &str,
     ) -> Result<Option<tokeira_types::RunKey>> {
-        self.repo
+        // Try current open run first, then fall back to latest run (including closed)
+        let result = self
+            .repo
             .resolve_execution(&ExecutionRef {
                 namespace_id: self.namespace_id,
                 workflow_id: WorkflowId(workflow_id.to_string()),
                 run_id: None,
             })
+            .await?;
+        if result.is_some() {
+            return Ok(result);
+        }
+        self.repo
+            .find_latest_run(self.namespace_id, &WorkflowId(workflow_id.to_string()))
             .await
     }
 
@@ -180,7 +188,8 @@ where
         _namespace: &str,
         workflow_id: &str,
     ) -> Result<Option<WorkflowExecutionDescription>> {
-        let Some(run_key) = self
+        // Try current open run first, then fall back to latest run (including closed)
+        let run_key = match self
             .repo
             .resolve_execution(&ExecutionRef {
                 namespace_id: self.namespace_id,
@@ -188,8 +197,19 @@ where
                 run_id: None,
             })
             .await?
-        else {
-            return Ok(None);
+        {
+            Some(rk) => rk,
+            None => {
+                // Workflow may be closed — find the latest run by scanning all runs
+                match self
+                    .repo
+                    .find_latest_run(self.namespace_id, &WorkflowId(workflow_id.to_string()))
+                    .await?
+                {
+                    Some(rk) => rk,
+                    None => return Ok(None),
+                }
+            }
         };
 
         match self.repo.load_run(run_key).await? {

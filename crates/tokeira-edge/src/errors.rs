@@ -35,6 +35,13 @@ pub enum EdgeError {
         workflow_id: String,
     },
 
+    #[error("workflow already started: {namespace}/{workflow_id} ({run_id})")]
+    WorkflowAlreadyStarted {
+        namespace: String,
+        workflow_id: String,
+        run_id: String,
+    },
+
     #[error("too many concurrent long polls")]
     TooManyLongPolls,
 
@@ -63,6 +70,7 @@ impl EdgeError {
             EdgeError::NamespaceNotFound(_) | EdgeError::WorkflowNotFound { .. } => {
                 StatusCode::NOT_FOUND
             }
+            EdgeError::WorkflowAlreadyStarted { .. } => StatusCode::CONFLICT,
             EdgeError::NamespaceDeleted(_) => StatusCode::GONE,
             EdgeError::NamespaceAlreadyExists(_) => StatusCode::CONFLICT,
             EdgeError::TooManyLongPolls => StatusCode::TOO_MANY_REQUESTS,
@@ -81,6 +89,7 @@ impl EdgeError {
             EdgeError::NamespaceDeleted(_) => "namespace_deleted",
             EdgeError::NamespaceAlreadyExists(_) => "namespace_already_exists",
             EdgeError::WorkflowNotFound { .. } => "workflow_not_found",
+            EdgeError::WorkflowAlreadyStarted { .. } => "workflow_already_started",
             EdgeError::TooManyLongPolls => "too_many_long_polls",
             EdgeError::LongPollAdmissionTimeout => "long_poll_admission_timeout",
             EdgeError::RemoteRouteUnsupported { .. } => "remote_route_unsupported",

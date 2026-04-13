@@ -350,6 +350,8 @@ fn start_request(
         workflow_run_timeout: None,
         workflow_task_timeout: Duration::seconds(10),
         retry_policy: None,
+        conflict_policy: tokeira_kernel::WorkflowIdConflictPolicy::Fail,
+        reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
         deployment: None,
         build_id: None,
         attempt: 1,

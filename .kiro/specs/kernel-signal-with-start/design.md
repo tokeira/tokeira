@@ -44,6 +44,8 @@ This matches the Temporal server's `ResolveDuplicateWorkflowID` function which b
 
 3. **Policy migration at the edge.** The deprecated `WORKFLOW_ID_REUSE_POLICY_TERMINATE_IF_RUNNING` is migrated to `ConflictPolicy::TerminateExisting` + `ReusePolicy::AllowDuplicate` at the edge layer, matching Temporal's `MigrateWorkflowIdReusePolicyForRunningWorkflow`.
 
+4. **TerminateExisting is sequential orchestration, not atomic.** The runtime terminates the existing workflow (first commit, clears current-execution mapping), then starts the new workflow (second commit, recreates current-execution mapping). There is a real intermediate state where the workflow ID has no current run. The runtime does not return success until both commits complete. If the second commit fails, the termination stands and the caller receives an error. This matches the strongest guarantee the current storage surface can provide without a cross-run atomic primitive.
+
 ## Components and Interfaces
 
 ### 1. Kernel Layer
@@ -79,7 +81,6 @@ pub struct SignalWithStartRequest {
     // Signal fields
     pub signal_name: String,
     pub signal_input: Payloads,
-    pub signal_header: Option<Headers>,
 }
 ```
 
@@ -130,27 +131,37 @@ enum ConflictResolution {
 
 #### Resolution Logic
 
+The runtime's conflict resolution is a two-step process that matches the current storage contract:
+
+1. **Resolve**: Call `repo.resolve_execution(ExecutionRef { namespace_id, workflow_id, run_id: None })` to get `Option<RunKey>`
+2. **Load**: If a `RunKey` exists, call `repo.load_run(run_key)` to get `LoadedRun::Existing(state)` with the current `ExecutionStatus`
+
+The resolution function then operates on the loaded state:
+
 ```rust
 fn resolve_conflict(
-    loaded: &LoadedRun,
+    existing_status: Option<ExecutionStatus>,  // None = absent, Some = loaded state
+    run_key: Option<RunKey>,
+    run_id: Option<RunId>,
     conflict_policy: WorkflowIdConflictPolicy,
     reuse_policy: WorkflowIdReusePolicy,
 ) -> ConflictResolution {
-    match loaded {
-        LoadedRun::Absent => ConflictResolution::Absent,
-        LoadedRun::Existing(state) if state.status == ExecutionStatus::Running => {
+    match existing_status {
+        None => ConflictResolution::Absent,
+        Some(status) if status.is_open() => {
+            // Running workflow — apply ConflictPolicy
             match conflict_policy {
                 WorkflowIdConflictPolicy::Fail => ConflictResolution::Rejected { ... },
-                WorkflowIdConflictPolicy::UseExisting => ConflictResolution::UseExisting { ... },
-                WorkflowIdConflictPolicy::TerminateExisting => ConflictResolution::TerminateAndStart { ... },
+                WorkflowIdConflictPolicy::UseExisting => ConflictResolution::UseExisting { run_key, run_id },
+                WorkflowIdConflictPolicy::TerminateExisting => ConflictResolution::TerminateAndStart { run_key },
             }
         }
-        LoadedRun::Existing(state) => {
-            // Closed workflow
+        Some(status) => {
+            // Closed workflow — apply ReusePolicy
             match reuse_policy {
                 WorkflowIdReusePolicy::AllowDuplicate => ConflictResolution::ClosedAllowReuse,
                 WorkflowIdReusePolicy::AllowDuplicateFailedOnly => {
-                    if is_failed_status(state.status) {
+                    if is_failed_status(status) {
                         ConflictResolution::ClosedAllowReuse
                     } else {
                         ConflictResolution::Rejected { ... }
@@ -167,13 +178,30 @@ This mirrors Temporal's `ResolveDuplicateWorkflowID` which branches on `currentS
 
 #### Runtime Methods
 
-`start_workflow` and `signal_with_start_workflow` both use the resolution logic:
+`start_workflow` and `signal_with_start_workflow` both use the two-step resolve → load → apply pattern:
 
 ```rust
 pub async fn signal_with_start_workflow(&self, req: SignalWithStartRequest) -> Result<SignalWithStartResult> {
-    let resolution = self.resolve_and_load(&req).await?;
+    // Step 1: Resolve execution to RunKey
+    let maybe_run_key = self.repo.resolve_execution(&execution_ref).await?;
+
+    // Step 2: Load state if run exists
+    let (existing_status, run_key, run_id) = match maybe_run_key {
+        Some(rk) => {
+            let loaded = self.repo.load_run(rk).await?;
+            match loaded {
+                LoadedRun::Existing(state) => (Some(state.status), Some(rk), Some(state.run_id)),
+                LoadedRun::Absent => (None, None, None),
+            }
+        }
+        None => (None, None, None),
+    };
+
+    // Step 3: Apply conflict resolution
+    let resolution = resolve_conflict(existing_status, run_key, run_id, req.conflict_policy, req.reuse_policy);
+
     match resolution {
-        ConflictResolution::Absent => {
+        ConflictResolution::Absent | ConflictResolution::ClosedAllowReuse => {
             // Kernel: apply_signal_with_start → 3-event transition
             let transition = self.kernel.apply_signal_with_start(LoadedRun::Absent, req)?;
             self.commit(transition).await?;
@@ -181,20 +209,18 @@ pub async fn signal_with_start_workflow(&self, req: SignalWithStartRequest) -> R
         }
         ConflictResolution::UseExisting { run_key, run_id } => {
             // Kernel: apply_signal → signal-only transition
+            let loaded = self.repo.load_run(run_key).await?;
             let signal_req = extract_signal(&req);
             let transition = self.kernel.apply_signal(loaded, signal_req)?;
             self.commit(transition).await?;
             Ok(SignalWithStartResult::Signaled { run_id })
         }
         ConflictResolution::TerminateAndStart { run_key } => {
-            // Kernel: apply_terminate → then apply_signal_with_start
+            // Two sequential commits:
+            // 1. Terminate existing (clears current-execution mapping)
+            // 2. Start new with signal (recreates current-execution mapping)
+            // Return success only after both commits complete.
             self.terminate_and_start_with_signal(run_key, req).await
-        }
-        ConflictResolution::ClosedAllowReuse => {
-            // Kernel: apply_signal_with_start with new run_key
-            let transition = self.kernel.apply_signal_with_start(LoadedRun::Absent, req)?;
-            self.commit(transition).await?;
-            Ok(SignalWithStartResult::Started { run_id })
         }
         ConflictResolution::Rejected { message } => {
             Err(anyhow!("WorkflowExecutionAlreadyStarted: {}", message))
@@ -270,7 +296,7 @@ No new persistent data models. The policies are transient request fields. The `C
 
 ### Property 2: Field pass-through
 
-*For any* valid `SignalWithStartRequest`, the `WorkflowExecutionSignaled` event contains the exact `signal_name`, `signal_input`, and `signal_header` from the request, and `WorkflowExecutionStarted` contains the exact `workflow_type`, `task_queue`, and `input`.
+*For any* valid `SignalWithStartRequest`, the `WorkflowExecutionSignaled` event contains the exact `signal_name` and `signal_input` from the request, and `WorkflowExecutionStarted` contains the exact `workflow_type`, `task_queue`, and `input`. Signal header fidelity is deferred.
 
 **Validates: Requirements 5.2, 5.3**
 

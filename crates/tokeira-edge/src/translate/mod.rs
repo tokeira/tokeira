@@ -2,7 +2,10 @@ use std::time::Duration;
 
 use time::OffsetDateTime;
 
-use tokeira_kernel::{WorkflowCommand, event::HistoryEvent};
+use tokeira_kernel::{
+    WorkflowCommand, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+    event::HistoryEvent,
+};
 use tokeira_types::{
     ActivityTaskToken, BuildId, DeploymentId, ExecutionStatus, Headers, Memo,
     Payloads, RetryPolicy, RunId, RunKey, SearchAttributes, TaskKind,
@@ -32,6 +35,8 @@ pub struct StartWorkflowExecutionRequest {
     pub workflow_run_timeout: Option<time::Duration>,
     pub workflow_task_timeout: Option<time::Duration>,
     pub retry_policy: Option<RetryPolicy>,
+    pub conflict_policy: WorkflowIdConflictPolicy,
+    pub reuse_policy: WorkflowIdReusePolicy,
     pub header: Option<Headers>,
     pub run_key: Option<RunKey>,
     pub run_id: Option<RunId>,
@@ -426,6 +431,8 @@ pub struct SignalWithStartWorkflowExecutionRequest {
     pub workflow_run_timeout: Option<time::Duration>,
     pub workflow_task_timeout: Option<time::Duration>,
     pub retry_policy: Option<RetryPolicy>,
+    pub conflict_policy: WorkflowIdConflictPolicy,
+    pub reuse_policy: WorkflowIdReusePolicy,
     pub header: Option<Headers>,
     pub signal_name: String,
     pub signal_input: Payloads,

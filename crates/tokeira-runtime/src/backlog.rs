@@ -279,6 +279,13 @@ mod tests {
         async fn resolve_execution(&self, _execution: &ExecutionRef) -> Result<Option<RunKey>> {
             Ok(None)
         }
+        async fn find_latest_run(
+            &self,
+            _namespace_id: NamespaceId,
+            _workflow_id: &tokeira_types::WorkflowId,
+        ) -> Result<Option<RunKey>> {
+            Ok(None)
+        }
         async fn load_run(&self, _run_key: RunKey) -> Result<LoadedRun> {
             Ok(LoadedRun::Absent)
         }

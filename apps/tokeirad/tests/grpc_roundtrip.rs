@@ -35,6 +35,7 @@ use tokeira_proto::{
         DescribeWorkflowExecutionRequest, ListWorkflowExecutionsRequest,
         PollWorkflowTaskQueueRequest, ResetWorkflowExecutionRequest,
         RespondWorkflowTaskCompletedRequest, StartWorkflowExecutionRequest,
+        SignalWithStartWorkflowExecutionRequest,
         TerminateWorkflowExecutionRequest,
         workflow_service_client::WorkflowServiceClient,
     },
@@ -258,6 +259,108 @@ async fn grpc_roundtrip_reset_returns_successor_and_updates_current_run() -> Res
     let _ = shutdown_tx.send(());
     server.await??;
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn grpc_roundtrip_signal_with_start_starts_new_run() -> Result<()> {
+    let (addr, shutdown_tx, server) = spawn_test_server().await?;
+
+    let endpoint = format!("http://{addr}");
+    let mut workflow = WorkflowServiceClient::connect(endpoint).await?;
+
+    let response = workflow
+        .signal_with_start_workflow_execution(SignalWithStartWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_id: "workflow-sws-new".to_string(),
+            workflow_type: Some(tokeira_proto::common::WorkflowType {
+                name: "example".to_string(),
+            }),
+            task_queue: Some(TaskQueue {
+                name: "queue-a".to_string(),
+                ..Default::default()
+            }),
+            signal_name: "sig".to_string(),
+            signal_input: Some(Payloads::default()),
+            request_id: "sws-new".to_string(),
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+
+    assert!(response.started);
+    assert!(!response.run_id.is_empty());
+
+    let describe = workflow
+        .describe_workflow_execution(DescribeWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            execution: Some(tokeira_proto::common::WorkflowExecution {
+                workflow_id: "workflow-sws-new".to_string(),
+                run_id: response.run_id.clone(),
+                ..Default::default()
+            }),
+        })
+        .await?
+        .into_inner();
+    let info = describe.workflow_execution_info.expect("execution info");
+    assert_eq!(
+        info.execution.expect("execution").run_id,
+        response.run_id
+    );
+
+    let _ = shutdown_tx.send(());
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn grpc_roundtrip_signal_with_start_uses_existing_run() -> Result<()> {
+    let (addr, shutdown_tx, server) = spawn_test_server().await?;
+
+    let endpoint = format!("http://{addr}");
+    let mut workflow = WorkflowServiceClient::connect(endpoint).await?;
+
+    let start = workflow
+        .start_workflow_execution(StartWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_id: "workflow-sws-existing".to_string(),
+            workflow_type: Some(tokeira_proto::common::WorkflowType {
+                name: "example".to_string(),
+            }),
+            task_queue: Some(TaskQueue {
+                name: "queue-a".to_string(),
+                ..Default::default()
+            }),
+            request_id: "sws-existing-start".to_string(),
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+
+    let response = workflow
+        .signal_with_start_workflow_execution(SignalWithStartWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_id: "workflow-sws-existing".to_string(),
+            workflow_type: Some(tokeira_proto::common::WorkflowType {
+                name: "example".to_string(),
+            }),
+            task_queue: Some(TaskQueue {
+                name: "queue-a".to_string(),
+                ..Default::default()
+            }),
+            signal_name: "sig".to_string(),
+            signal_input: Some(Payloads::default()),
+            request_id: "sws-existing-signal".to_string(),
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+
+    assert!(!response.started);
+    assert_eq!(response.run_id, start.run_id);
+
+    let _ = shutdown_tx.send(());
+    server.await??;
     Ok(())
 }
 

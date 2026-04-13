@@ -5,13 +5,13 @@ use async_trait::async_trait;
 use http::HeaderMap;
 use time::OffsetDateTime;
 use tokeira_kernel::{
-    CancelRequest, HistoryEvent, HistoryEventKind,
-    ResetRequest, SignalRequest, StartRequest, TerminateRequest,
+    CancelRequest, HistoryEvent, HistoryEventKind, ResetRequest, SignalRequest,
+    SignalWithStartRequest, StartRequest, TerminateRequest,
     WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    QueryResult, ResetWorkflowResult, StartedActivityTask, StartedWorkflowTask,
-    UpdateOutcome, UpdateWaitPolicy,
+    QueryResult, ResetWorkflowResult, SignalWithStartResult, StartWorkflowResult,
+    StartedActivityTask, StartedWorkflowTask, UpdateOutcome, UpdateWaitPolicy,
 };
 use tokeira_storage::RunRepository;
 use tokeira_types::{
@@ -87,6 +87,16 @@ pub struct WorkflowMutationOutcome {
 #[async_trait]
 pub trait WorkflowRuntimeApi: Send + Sync + 'static {
     async fn start_workflow(&self, req: StartRequest) -> Result<WorkflowMutationOutcome>;
+
+    async fn start_workflow_with_policy(
+        &self,
+        req: StartRequest,
+    ) -> Result<StartWorkflowResult>;
+
+    async fn signal_with_start_workflow(
+        &self,
+        req: SignalWithStartRequest,
+    ) -> Result<SignalWithStartResult>;
 
     async fn signal_workflow(
         &self,
@@ -376,11 +386,13 @@ impl WorkflowService {
         headers: &HeaderMap,
         req: StartWorkflowExecutionRequest,
     ) -> EdgeResult<StartWorkflowExecutionResponse> {
+        let namespace = req.namespace.clone();
+        let workflow_id = req.workflow_id.clone();
         let ctx = self
             .interceptors
             .begin(
                 headers,
-                Some(&req.namespace),
+                Some(&namespace),
                 Action::StartWorkflowExecution,
                 false,
             )
@@ -388,23 +400,51 @@ impl WorkflowService {
 
         ensure_local(
             self.router
-                .route_workflow(&req.namespace, &req.workflow_id)
+                .route_workflow(&namespace, &workflow_id)
                 .await?,
         )?;
 
         let internal = to_internal::start_request(req, &ctx.request_id);
         let outcome = self
             .runtime
-            .start_workflow(internal.clone())
+            .start_workflow_with_policy(internal.clone())
             .await
             .map_err(EdgeError::from)?;
-        self.notify_history_run_key(
-            internal.run_key,
-            outcome.last_event_id,
-        )
-        .await;
-
-        Ok(from_internal::start_response(&internal, outcome))
+        match outcome {
+            StartWorkflowResult::Started { .. } => {
+                let loaded = self
+                    .repo
+                    .load_run(internal.run_key)
+                    .await
+                    .map_err(EdgeError::from)?;
+                let tokeira_kernel::LoadedRun::Existing(state) = loaded else {
+                    return Err(EdgeError::Internal(format!(
+                        "started run {:?} not found after commit",
+                        internal.run_key
+                    )));
+                };
+                self.notify_history_run_key(internal.run_key, state.last_event_id)
+                    .await;
+                Ok(from_internal::start_response(
+                    &internal,
+                    WorkflowMutationOutcome {
+                        transition_seq: state.transition_seq.0,
+                        last_event_id: state.last_event_id,
+                        was_duplicate: false,
+                        execution_status: state.status,
+                        new_run_id: None,
+                    },
+                ))
+            }
+            StartWorkflowResult::UsedExisting { run_id, .. }
+            | StartWorkflowResult::Rejected { run_id, .. } => {
+                Err(EdgeError::WorkflowAlreadyStarted {
+                    namespace,
+                    workflow_id,
+                    run_id: run_id.0.to_string(),
+                })
+            }
+        }
     }
 
     pub async fn signal_workflow_execution(
@@ -939,121 +979,42 @@ impl WorkflowService {
                 .route_workflow(&req.namespace, &req.workflow_id)
                 .await?,
         )?;
-
-        if let Some(run_key) = self
-            .resolver
-            .current_run_key(&req.namespace, &req.workflow_id)
+        let internal =
+            to_internal::signal_with_start_request(req.clone(), &ctx.request_id);
+        match self
+            .runtime
+            .signal_with_start_workflow(internal)
             .await
             .map_err(EdgeError::from)?
         {
-            let internal = tokeira_kernel::SignalRequest {
-                signal_name: req.signal_name,
-                input: req.signal_input,
-                request: RequestContext {
-                    request_id: tokeira_types::RequestId(
-                        ctx.request_id.as_str().to_string(),
-                    ),
-                    caller_identity: req.identity.clone(),
-                    received_at: OffsetDateTime::now_utc(),
-                },
-                now: OffsetDateTime::now_utc(),
-            };
-            let outcome = self
-                .runtime
-                .signal_workflow(run_key, internal)
-                .await
-                .map_err(EdgeError::from)?;
-            self.notify_history_run_key(run_key, outcome.last_event_id)
-                .await;
-
-            let loaded = self
-                .repo
-                .load_run(run_key)
-                .await
-                .map_err(EdgeError::from)?;
-            let tokeira_kernel::LoadedRun::Existing(state) = loaded else {
-                return Err(EdgeError::WorkflowNotFound {
+            SignalWithStartResult::Started { run_key, run_id } => {
+                let last_event_id =
+                    read_last_event_id(self.repo.as_ref(), run_key).await?;
+                self.notify_history_run_key(run_key, last_event_id)
+                    .await;
+                Ok(SignalWithStartWorkflowExecutionResponse {
+                    run_id,
+                    started: true,
+                })
+            }
+            SignalWithStartResult::Signaled { run_key, run_id } => {
+                let last_event_id =
+                    read_last_event_id(self.repo.as_ref(), run_key).await?;
+                self.notify_history_run_key(run_key, last_event_id)
+                    .await;
+                Ok(SignalWithStartWorkflowExecutionResponse {
+                    run_id,
+                    started: false,
+                })
+            }
+            SignalWithStartResult::Rejected { run_id, .. } => {
+                Err(EdgeError::WorkflowAlreadyStarted {
                     namespace: req.namespace,
                     workflow_id: req.workflow_id,
-                });
-            };
-
-            return Ok(SignalWithStartWorkflowExecutionResponse {
-                run_id: state.run_id,
-                started: false,
-            });
+                    run_id: run_id.0.to_string(),
+                })
+            }
         }
-
-        let start_internal = StartRequest {
-            run_key: RunKey::new(),
-            namespace_id: to_internal::namespace_id_for(&req.namespace),
-            workflow_id: tokeira_types::WorkflowId(req.workflow_id.clone()),
-            run_id: RunId(uuid::Uuid::new_v4()),
-            workflow_type: tokeira_types::WorkflowType(req.workflow_type),
-            task_queue: TaskQueueName(req.task_queue),
-            deployment: None,
-            build_id: None,
-            input: req.input,
-            request: RequestContext {
-                request_id: tokeira_types::RequestId(
-                    req.request_id
-                        .clone()
-                        .unwrap_or_else(|| ctx.request_id.as_str().to_string()),
-                ),
-                caller_identity: req.identity.clone(),
-                received_at: OffsetDateTime::now_utc(),
-            },
-            now: OffsetDateTime::now_utc(),
-            workflow_execution_timeout: req.workflow_execution_timeout,
-            workflow_run_timeout: req.workflow_run_timeout,
-            workflow_task_timeout: req.workflow_task_timeout.unwrap_or(time::Duration::seconds(10)),
-            retry_policy: req.retry_policy,
-            attempt: 1,
-            first_execution_run_id: None,
-            continued_execution_run_id: None,
-            memo: req.memo,
-            search_attributes: req.search_attributes,
-            parent_run_key: None,
-            parent_workflow_id: None,
-            first_run_started_at: None,
-        };
-        let started_run_key = start_internal.run_key;
-        let started_run_id = start_internal.run_id;
-        let start_outcome = self
-            .runtime
-            .start_workflow(start_internal)
-            .await
-            .map_err(EdgeError::from)?;
-        self.notify_history_run_key(started_run_key, start_outcome.last_event_id)
-            .await;
-
-        let signal_outcome = self
-            .runtime
-            .signal_workflow(
-                started_run_key,
-                tokeira_kernel::SignalRequest {
-                    signal_name: req.signal_name,
-                    input: req.signal_input,
-                    request: RequestContext {
-                        request_id: tokeira_types::RequestId(format!(
-                            "{}:signal",
-                            ctx.request_id.as_str()
-                        )),
-                        caller_identity: req.identity,
-                        received_at: OffsetDateTime::now_utc(),
-                    },
-                    now: OffsetDateTime::now_utc(),
-                },
-            )
-            .await
-            .map_err(EdgeError::from)?;
-        self.notify_history_run_key(started_run_key, signal_outcome.last_event_id)
-            .await;
-
-        Ok(SignalWithStartWorkflowExecutionResponse {
-            run_id: started_run_id,
-            started: true,
-        })
     }
 
     // ── Activity endpoints ──

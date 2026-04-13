@@ -1,105 +1,42 @@
 # tokeira-types
 
-**Purpose:** Shared domain types and identities used across all crates.
+Shared durable-domain value types and identity newtypes used by every other crate in the workspace.
 
-## Why Types Are Separate
+## Purpose
 
-This crate exists to keep the rest of the workspace honest. The moment a crate invents its own notion of `RunKey` or `LogicalTaskSeq`, cross-crate contracts get fuzzy. The right level for these terms is a small shared crate.
+`tokeira-types` keeps cross-crate contracts honest. Every crate that needs to talk about a run, a namespace, a payload, or a task token imports these types rather than inventing its own. The crate carries no behaviour, no I/O, and no dependencies on storage or transport.
 
-The types here intentionally avoid storage-driver details and transport details. They are usable from the kernel, runtime, storage, edge, proto, and projection crates without pulling in any of their dependencies.
+## Dependencies
 
-## Module Map
+External only: `serde`, `time`, `uuid`. No other tokeira crates.
 
-```
-tokeira-types/src/
-  ids.rs               — RunKey, RunId, NamespaceId, WorkflowId, WorkflowType
-  execution.rs         — ExecutionStatus, TransitionSeq, LogicalTaskSeq
-  payload.rs           — Payload, Payloads, Memo
-  request.rs           — RequestContext, RequestId
-  retry.rs             — RetryPolicy
-  search_attributes.rs — SearchAttributes
-  task_queue.rs        — TaskQueueName, QueueKey, StickyAffinity
-  tokens.rs            — WorkflowTaskToken, ActivityTaskToken
-  visibility.rs        — Visibility-related summary types
-```
+## Module Structure
+
+| File | Contents |
+|---|---|
+| `ids.rs` | `NamespaceId`, `RunId`, `RunKey`, `ShardId`, `ShardEpoch`, `TransitionSeq`, `LogicalTaskSeq` |
+| `execution.rs` | `NamespaceName`, `WorkflowId`, `WorkflowType`, `ExecutionStatus` (8 variants), `ExecutionRef`, `ExecutionSummary` |
+| `payload.rs` | Codec-neutral `Payload`, `Payloads`, `Headers`, `Memo` |
+| `search_attributes.rs` | `SearchAttrValue` (7 typed variants), `SearchAttributes` map |
+| `task_queue.rs` | `TaskKind`, `TaskQueueName`, `WorkerIdentity`, `BuildId`, `DeploymentId`, `QueueKey`, `StickyAffinity` |
+| `tokens.rs` | `WorkflowTaskToken`, `ActivityTaskToken`, `TaskToken` enum |
+| `request.rs` | `RequestId`, `RequestContext` (idempotency + caller identity) |
+| `retry.rs` | `RetryPolicy` (exponential backoff config with non-retryable error types) |
+| `visibility.rs` | `ProjectionCursor` (partition-aware cursor for projection log consumption) |
 
 ## Key Types
 
-### Identity Types
-
-| Type | Purpose | Used by |
-|---|---|---|
-| `RunKey` | UUID primary key for a run in storage | All crates |
-| `RunId` | Temporal-visible run identifier | All crates |
-| `NamespaceId` | Internal namespace identifier | All crates |
-| `WorkflowId` | User-assigned workflow identifier | All crates |
-| `WorkflowType` | Workflow type name (maps to SDK handler) | kernel, runtime, edge |
-| `WorkerIdentity` | Worker self-reported identity string | kernel, runtime |
-
-### Execution Types
-
-| Type | Purpose | Used by |
-|---|---|---|
-| `ExecutionStatus` | Running, Completed, Failed, Canceled, Terminated, ContinuedAsNew, TimedOut | kernel, storage, projection |
-| `TransitionSeq` | Internal fence/checkpoint number; increments once per `apply` | kernel, storage, runtime |
-| `LogicalTaskSeq` | Monotonic WFT sequence for token validation | kernel, runtime |
-
-### Payload Types
-
-| Type | Purpose | Used by |
-|---|---|---|
-| `Payload` | Single serialized value with metadata | kernel, edge, proto |
-| `Payloads` | Collection of payloads | kernel, edge, proto |
-| `Memo` | User-attached key-value metadata | kernel, projection |
-| `SearchAttributes` | Typed search attribute map | kernel, projection |
-
-### Task Queue Types
-
-| Type | Purpose | Used by |
-|---|---|---|
-| `TaskQueueName` | Logical task queue name | kernel, runtime, edge |
-| `QueueKey` | Full queue identity: namespace + name + kind + deployment/build_id | runtime (broker) |
-| `StickyAffinity` | Worker identity + expiry for sticky routing | kernel, runtime |
-
-### Token Types
-
-| Type | Purpose | Used by |
-|---|---|---|
-| `WorkflowTaskToken` | Opaque token binding a WFT to a specific run/seq/attempt | runtime, edge |
-| `ActivityTaskToken` | Opaque token binding an activity task to a specific run/activity | runtime, edge |
-
-### Request Types
-
-| Type | Purpose | Used by |
-|---|---|---|
-| `RequestContext` | Carries request ID for dedup | kernel, edge |
-| `RequestId` | Unique identifier for idempotent external requests | kernel, storage |
-
-### Retry Types
-
-| Type | Purpose | Used by |
-|---|---|---|
-| `RetryPolicy` | Max attempts, backoff, non-retryable error types | kernel, runtime |
+- `RunKey` — internal durable row key (UUID); storage addresses runs by this, not by `RunId`
+- `TransitionSeq` — monotonic OCC fence; storage rejects writes with stale sequence
+- `ShardEpoch` — monotonic fence for shard lease ownership
+- `QueueKey` — composite key (namespace + queue name + task kind + optional deployment/build_id)
+- `ExecutionStatus` — 8-variant enum: Running, Paused, Completed, Failed, Cancelled, Terminated, ContinuedAsNew, TimedOut
+- `TaskToken` — unified enum wrapping `WorkflowTaskToken` and `ActivityTaskToken`, serialised as opaque bytes on the wire
 
 ## Design Principles
 
-1. **No behavior** — types are data, not services. No I/O, no side effects.
-2. **No storage details** — types don't know about DSQL columns or table names.
-3. **No transport details** — types don't know about protobuf or gRPC.
-4. **Strong typing** — newtypes prevent mixing up `RunId` with `WorkflowId` or `NamespaceId`.
-5. **Minimal dependencies** — this crate should have very few external dependencies.
-
-## Temporal Feature Coverage
-
-| Feature | Types participation |
-|---|---|
-| Workflow identity | `RunKey`, `RunId`, `WorkflowId`, `NamespaceId`, `WorkflowType` |
-| Execution lifecycle | `ExecutionStatus`, `TransitionSeq` |
-| Task queues | `TaskQueueName`, `QueueKey` |
-| Sticky execution | `StickyAffinity`, `WorkerIdentity` |
-| Payloads | `Payload`, `Payloads`, `Memo` |
-| Search attributes | `SearchAttributes` |
-| Task tokens | `WorkflowTaskToken`, `ActivityTaskToken` |
-| Request dedup | `RequestContext`, `RequestId` |
-| Retry | `RetryPolicy` |
-| Visibility | Visibility summary types |
+1. No behaviour — types are data, not services
+2. No storage details — types don't know about DSQL columns
+3. No transport details — types don't know about protobuf
+4. Strong typing — newtypes prevent mixing up `RunId` with `WorkflowId`
+5. Deterministic serialisation — `BTreeMap` used throughout for stable ordering

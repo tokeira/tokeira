@@ -1,167 +1,79 @@
 # tokeira-storage
 
-**Purpose:** Aurora DSQL persistence with OCC retry and fenced transactions.
+Storage interfaces and an in-memory development store. Defines the durable persistence contract that the runtime depends on, and provides `InMemoryStore` for tests, examples, and development. No real DSQL implementation yet — the goal is to make contracts explicit first.
 
-See [050-dsql-storage](../architecture/050-dsql-storage.md) for the full storage design and [060-connection-management](../architecture/060-connection-management.md) for connection budgeting.
+## Dependencies
 
-## What it owns
+- `tokeira-kernel` — `WorkflowState`, `HistoryEvent`, `Transition`, `LoadedRun`, `ActivityState`, `TimerState`
+- `tokeira-types` — identity types, queue keys, tokens
+- External: `anyhow`, `async-trait`, `time`, `tokio`, `tracing`
 
-- **Durable state commits** — fenced DSQL transactions for workflow transitions
-- **History append** — immutable event batch storage
-- **Activity/timer state** — normalized side tables for open entities
-- **Request dedup** — idempotency table for external request IDs
-- **Connection management** — node-local `ConnectionDirector` with class-based permits
-- **Shard lease persistence** — fenced shard ownership rows
-- **Current execution mapping** — `(namespace_id, workflow_id)` → run identity
-- **OCC retry classification** — success / duplicate / retryable conflict / fatal
+## Module Structure
 
-## What it does NOT own
-
-- **State transition logic** — that's the kernel
-- **Delivery** — that's the runtime broker
-- **Projection** — projection sinks write their own rows
-- **Connection budget allocation** — cluster-wide budgets are DynamoDB-backed
-
-## Module Map
-
-```
-tokeira-storage/src/
-  api.rs     — storage trait and contract definitions
-  memory.rs  — in-memory development store for tests and examples
-```
-
-## In-Memory Store
-
-The `InMemoryStore` implements all storage traits (`RunRepository`, `ProjectionLog`, `LeaseRepository`, `ConnectionDirector`) using in-memory data structures protected by `tokio::sync::Mutex`. It is the primary storage backend for:
-
-- **Kernel property and golden tests** — verifying transition commit semantics without DSQL
-- **Edge integration tests** — end-to-end gRPC roundtrip testing
-- **Local development** — running `tokeirad` without a DSQL cluster
-- **Codex-driven feature work** — fast iteration without infrastructure dependencies
-
-The in-memory store faithfully implements the storage contract:
-
-- **OCC fencing** — `commit_transition` checks `expected_seq` against the stored `transition_seq` and returns `CommitResult::Conflict` on mismatch
-- **Request dedup** — tracks request IDs per run and returns `CommitResult::Duplicate` for already-committed requests
-- **History append** — stores history events in order, supports `read_history` with `after_event_id` pagination
-- **Activity/timer state** — applies `ActivityOp` and `TimerOp` from transitions
-- **Dispatch tracking** — stores dispatchable workflow tasks and due timers for sweep queries
-- **Projection log** — records `ProjectionOp`s with partition/fanout for projection workers
-- **Lease management** — tracks bundle ownership with epoch fencing
-- **Transition audit** — stores full transition records for test assertions (may become test-only in production)
-- **Sticky expiry** — clears expired sticky affinity on load
-
-The in-memory store is not designed for production use. It has no persistence, no connection budgeting, and no DSQL-specific optimizations. A production DSQL implementation is planned but not yet written.
-
-## DSQL-Specific Constraints
-
-Aurora DSQL is not "PostgreSQL with infinite scale." The storage layer treats these constraints as first-class architecture inputs:
-
-| Constraint | Impact on storage design |
+| File | Contents |
 |---|---|
-| Fixed `Repeatable Read` isolation | OCC with commit-time conflict detection |
-| 3,000-row mutation limit per transaction | Narrow, bounded write sets per transition |
-| 5-minute max transaction time | Short-lived transactions only |
-| 60-minute max connection duration | Session recycling with jitter |
-| One database per cluster | Shared schemas, not table explosion |
-| No temporary tables | CTEs and subqueries instead |
-| No PL/pgSQL triggers | Application-managed state transitions |
-| Monotonic PK anti-pattern | Random/distributed primary keys on hot tables |
-| Async index creation | Schema migrations separate from hot path |
+| `api.rs` | `RunRepository` trait, `ProjectionLog` trait, `LeaseRepository` trait, `ConnectionDirector` trait, plus all supporting types |
+| `memory.rs` | `InMemoryStore` — full implementation of all repository traits |
 
-## Fenced Commit Model
+## RunRepository Trait
 
-Every state mutation is committed with explicit expectations:
+Core storage contract. Key methods:
 
-```
-expected_seq (TransitionSeq) → commit → conflict detection
-```
-
-1. Runtime loads run state with current `transition_seq`
-2. Kernel produces `Transition` with `expected_seq` matching the loaded seq
-3. Storage attempts commit: if durable seq has moved past `expected_seq`, the transaction aborts
-4. Runtime decides: retry (reload + recompute), reject to caller, or fail shard
-
-This fits DSQL's optimistic concurrency model directly.
-
-## Schema Overview
-
-```
-core/
-  shard_lease          — fenced shard ownership
-  current_execution    — (namespace_id, workflow_id) → run identity
-  workflow_hot         — small current summary row per open run
-  history_batch        — immutable append-only event batches
-  request_dedupe       — idempotency records
-  activity_state       — normalized open activity state
-  timer_bucket         — bucketed wakeup records for timer scanning
-
-delivery/
-  dispatch_backlog     — durable fallback for unmatched tasks
-
-proj/
-  projection_log       — typed durable mutations for sinks
-  projector_checkpoint — per-sink, per-substream progress
-  vis_execution        — canonical visibility rows
-  vis_attr_*           — typed search attribute indexes
-```
-
-## Primary Key Design
-
-Hot write tables use random/distributed keys per DSQL guidance:
-
-- `workflow_hot.run_key = UUID`
-- `history_batch(run_key, first_event_id)` — clusters by run
-- `activity_state(run_key, schedule_event_id)`
-
-Append-like system tables (`dispatch_backlog`, `projection_log`) use a fanout dimension before the time-like key to avoid hot-edge writes.
-
-## Connection Budget Management
-
-Connection management is split into three layers:
-
-1. **Node-local `ConnectionDirector`** — idle/warm session reservoirs, class-based permits, open-rate token bucket, session recycling
-2. **Cluster-wide `BudgetAllocator`** (DynamoDB-backed) — per-node active/open-rate budgets, heartbeat TTL
-3. **Runtime `WorkAdmission`** — demand reporting, priority-based throttling
-
-Workload classes in priority order: `Control` > `Commit` > `StartTask` > `VisibilityRead` > `Projection` > `Maintenance`.
-
-## Storage API Shape
-
-The storage API exposes the real contract, not a fake ORM:
-
-- `load_current_execution`
-- `load_hot`
-- `commit_transition`
-- `start_workflow_task`
-- `start_activity_task`
-- `renew_shard_lease`
-- `find_dispatchable_*`
-- `read_projection_substream`
-- `advance_projector_checkpoint`
-
-## OCC Retry Classification
-
-Storage classifies commit outcomes into:
-
-| Outcome | Runtime action |
+| Method | Purpose |
 |---|---|
-| Success | Proceed to publish effects |
-| Duplicate | Short-circuit (already committed) |
-| Retryable conflict | Reload state, recompute via kernel, retry |
-| Fatal validation conflict | Reject to caller or fail shard |
+| `resolve_execution` | Map `ExecutionRef` → `RunKey` (current open run lookup) |
+| `find_latest_run` | Resolve closed workflows by namespace + workflow_id |
+| `load_run` | Load `LoadedRun` (Absent or Existing with full `WorkflowState`) |
+| `read_history` | Paginated history read (after_event_id, limit) |
+| `lookup_request_dedupe` | Check if a request ID was already applied |
+| `read_transition_audit` | Read transition audit log for a run |
+| `commit_transition` | Fenced commit: OCC check on `TransitionSeq`, epoch validation on `ShardEpoch` |
+| `materialize_reset_successor` | Create a new run by replaying a history prefix up to a fork point |
+| `list_dispatchable_workflow_tasks` | Queue-scoped query for pending WFTs |
+| `list_dispatchable_activity_tasks` | Queue-scoped query for pending activity tasks |
+| `persist_to_backlog` / `drain_backlog` | Durable backlog for overflow dispatch |
+| `list_due_timers` | Global timer scan |
+| `list_*_for_shard` | Six shard-filtered sweep queries: workflow tasks, activity tasks, timers, workflow timeouts, open activities, pending Nexus operations |
 
-## Temporal Feature Coverage
+## Supporting Types
 
-| Feature | Storage participation |
-|---|---|
-| Workflow state | Persists `workflow_hot` summary row |
-| History | Appends immutable `history_batch` records |
-| Activities | Maintains `activity_state` side table |
-| Timers | Maintains `timer_bucket` for scanner |
-| Request dedup | Persists request IDs for idempotency |
-| Shard fencing | Maintains `shard_lease` with epoch |
-| Delivery backlog | Persists `dispatch_backlog` as fallback |
-| Visibility | Hosts projection tables (written by projection sinks) |
-| Connection management | Manages DSQL session lifecycle |
-| OCC | Fenced commits with conflict detection |
+- `CommitResult` — `Applied { transition_seq, last_event_id, execution_status, new_run_id }` or `Conflict`
+- `DispatchableWorkflowTask` / `DispatchableActivityTask` — task descriptors for broker dispatch
+- `BacklogEntry` / `BacklogPayload` — durable overflow entries
+- `DueTimer`, `WorkflowTimeoutSweepEntry`, `ActivitySweepEntry`, `NexusSweepEntry` — sweep query results
+- `CurrentExecutionConflictPolicy` — `Reject` (default) or `AllowAfterClose`
+- `ProjectionRecord`, `ProjectionContext`, `ProjectionBatch` — projection log types
+- `RequestRecord`, `TransitionAuditRecord` — dedup and audit types
+
+## ProjectionLog Trait
+
+- `read_from(cursor, limit)` → `ProjectionBatch` — ordered log consumption for the projection worker
+
+## LeaseRepository Trait
+
+- `try_acquire_bundle(shard_id, owner)` → `LeaseOutcome` — shard lease acquisition with epoch bumping
+- `renew_bundle(shard_id, owner, epoch)` → `LeaseOutcome` — lease renewal with epoch fencing
+
+## ConnectionDirector Trait
+
+- `acquire(DbClass)` → `DbPermit` — connection admission control (placeholder for DSQL reservoir)
+
+## InMemoryStore
+
+Full implementation of `RunRepository`, `ProjectionLog`, `LeaseRepository`, and `ConnectionDirector`. Features:
+
+- OCC fencing with `inject_conflict()` for test scenarios
+- Configurable `CurrentExecutionConflictPolicy` (Reject or AllowAfterClose)
+- Deterministic shard assignment via `run_key % shard_count`
+- Epoch validation on `commit_transition`
+- History append with pagination support
+- Independent activity state (with `started_event_id`) and timer bucket tables
+- Activity task dispatch tracking
+- Projection log with partition/fanout
+- Lease management with epoch fencing
+- Request dedup persistence
+- Transition audit log
+
+## Tests
+
+21 property and unit tests in `memory.rs` covering OCC conflicts, backlog ordering, reset materialisation, conflict policies, timer bucketing, and sweep queries.

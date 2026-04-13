@@ -616,3 +616,1202 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 Each property-based test runs with `proptest::test_runner::Config { cases: 100, .. }` minimum.
+
+---
+
+# Design Addendum: Requirements 9–12 (Activity Endpoints & Advanced Workflow Endpoints)
+
+## Overview
+
+This addendum extends the gRPC edge transport to cover activity task lifecycle endpoints (poll, complete, fail, heartbeat) and advanced workflow lifecycle endpoints (terminate, cancel, query, update). The design follows the same thin-adapter pattern established in Requirements 1–8: each new gRPC method extracts metadata, translates proto→edge DTO, calls the edge service, and translates the result back to proto.
+
+The key additions are:
+
+1. **Activity endpoints** — `PollActivityTaskQueue`, `RespondActivityTaskCompleted`, `RespondActivityTaskFailed`, `RecordActivityTaskHeartbeat`. These introduce `ActivityTaskToken` serialization/deserialization as a new concern in the translation layer.
+2. **Advanced workflow endpoints** — `TerminateWorkflowExecution`, `RequestCancelWorkflowExecution`, `QueryWorkflow`, `UpdateWorkflowExecution`. These introduce execution resolution (workflow ID → run key) at the edge layer for terminate/cancel, and long-poll-like behavior for query/update.
+3. **Extended `WorkflowRuntimeApi` trait** — eight new methods covering all activity and advanced workflow operations.
+4. **Extended `RuntimeAdapter`** — delegates each new trait method to the corresponding `TokeiraRuntime` method.
+5. **New edge DTOs and translation functions** — bidirectional proto↔edge conversion for all new endpoint types.
+
+### Traffic Classification
+
+The new endpoints fall into the existing api/poll traffic classes:
+
+| Endpoint | Traffic Class | Rationale |
+|---|---|---|
+| `PollActivityTaskQueue` | **poll** | Long-lived waiter, same pressure profile as `PollWorkflowTaskQueue` |
+| `RespondActivityTaskCompleted` | **api** | Short-lived request/response |
+| `RespondActivityTaskFailed` | **api** | Short-lived request/response |
+| `RecordActivityTaskHeartbeat` | **api** | Short-lived request/response, high frequency |
+| `TerminateWorkflowExecution` | **api** | Short-lived mutation |
+| `RequestCancelWorkflowExecution` | **api** | Short-lived mutation |
+| `QueryWorkflow` | **api** | Dispatched to worker, bounded timeout |
+| `UpdateWorkflowExecution` | **api** | May wait for completion, bounded timeout |
+
+`PollActivityTaskQueue` shares the `LongPollGate` with `PollWorkflowTaskQueue`. Both poll types compete for the same semaphore, which is the correct behavior: the gate limits total open poll connections regardless of task kind, preserving the blast-radius isolation invariant.
+
+## Architecture (Extended)
+
+The architecture diagram from the existing design extends naturally. The new endpoints follow the same request flow:
+
+```
+gRPC request (new endpoint)
+  → tonic extracts proto message + metadata
+  → WorkflowServiceGrpc adapter converts metadata → http::HeaderMap
+  → adapter converts proto request → edge DTO (via tokeira_edge::grpc::translate)
+  → adapter calls WorkflowService edge method
+    → interceptors fire (request ID, auth, namespace resolution, authz)
+    → for poll: LongPollGate acquire
+    → for terminate/cancel: ExecutionResolver resolves workflow_id → run_key
+    → for query/update: edge delegates to runtime which resolves internally
+    → runtime method executes
+  → edge returns EdgeResult<EdgeDTO>
+  → adapter converts edge DTO → proto response
+  → OR adapter converts EdgeError → tonic::Status
+  → tonic sends gRPC response
+```
+
+### Activity Task Token Flow
+
+Activity endpoints introduce a token-based correlation pattern:
+
+```
+PollActivityTaskQueue
+  → runtime returns StartedActivityTask with ActivityTaskToken
+  → edge serializes token to bytes (serde JSON)
+  → proto response carries task_token as opaque bytes
+
+RespondActivityTaskCompleted / RespondActivityTaskFailed / RecordActivityTaskHeartbeat
+  → proto request carries task_token as opaque bytes
+  → edge deserializes bytes → ActivityTaskToken (serde JSON)
+  → edge passes token to runtime method
+```
+
+The `ActivityTaskToken` contains `run_key`, `activity_id`, `schedule_event_id`, `attempt`, and `shard_epoch`. Serialization uses `serde_json` (matching the existing `WorkflowTaskToken` pattern). Invalid token bytes produce `ProtoConversionError::InvalidTaskToken`.
+
+
+## Components and Interfaces (Extended)
+
+### 10. Extended WorkflowRuntimeApi Trait
+
+The `WorkflowRuntimeApi` trait in `tokeira_edge::workflow_service` gains eight new methods:
+
+```rust
+#[async_trait]
+pub trait WorkflowRuntimeApi: Send + Sync + 'static {
+    // --- existing methods (unchanged) ---
+    async fn start_workflow(&self, req: StartRequest) -> Result<WorkflowMutationOutcome>;
+    async fn signal_workflow(&self, run_key: RunKey, req: SignalRequest) -> Result<WorkflowMutationOutcome>;
+    async fn poll_workflow_task(&self, queue: QueueKey, worker_identity: WorkerIdentity, timeout: Duration) -> Result<Option<StartedWorkflowTask>>;
+    async fn complete_workflow_task(&self, req: WorkflowTaskCompletedRequest) -> Result<WorkflowMutationOutcome>;
+
+    // --- new activity methods ---
+    async fn poll_activity_task(
+        &self,
+        queue: QueueKey,
+        worker_identity: WorkerIdentity,
+        timeout: Duration,
+    ) -> Result<Option<StartedActivityTask>>;
+
+    async fn complete_activity_task(
+        &self,
+        token: ActivityTaskToken,
+        result: Payloads,
+    ) -> Result<WorkflowMutationOutcome>;
+
+    async fn fail_activity_task(
+        &self,
+        token: ActivityTaskToken,
+        failure_message: String,
+        failure_error_type: Option<String>,
+    ) -> Result<()>;
+
+    async fn record_activity_heartbeat(
+        &self,
+        token: ActivityTaskToken,
+    ) -> Result<bool>;
+
+    // --- new advanced workflow methods ---
+    async fn terminate_workflow(
+        &self,
+        execution: ExecutionRef,
+        req: TerminateRequest,
+    ) -> Result<WorkflowMutationOutcome>;
+
+    async fn cancel_workflow(
+        &self,
+        execution: ExecutionRef,
+        req: CancelRequest,
+    ) -> Result<WorkflowMutationOutcome>;
+
+    async fn query_workflow(
+        &self,
+        execution: ExecutionRef,
+        query_type: String,
+        query_args: Payloads,
+        timeout: Duration,
+    ) -> Result<QueryResult>;
+
+    async fn update_workflow(
+        &self,
+        execution: ExecutionRef,
+        update_id: String,
+        update_name: String,
+        input: Payloads,
+        request: RequestContext,
+        timeout: Duration,
+        wait_policy: UpdateWaitPolicy,
+    ) -> Result<UpdateOutcome>;
+}
+```
+
+**Design decisions:**
+
+- `terminate_workflow` and `cancel_workflow` accept `ExecutionRef` rather than `RunKey`. The runtime resolves the execution internally (via `repo.resolve_execution`), matching the existing `terminate_workflow` and `signal_workflow` patterns on `TokeiraRuntime`. This keeps the edge layer from needing to resolve run keys for these operations.
+- `fail_activity_task` returns `Result<()>` rather than `Result<WorkflowMutationOutcome>` because the runtime may retry the activity internally (re-dispatching at the next attempt) rather than resolving it as failed. The caller doesn't need to know the outcome — only that the failure was accepted.
+- `record_activity_heartbeat` returns `Result<bool>` where `true` means cancellation has been requested. This matches the Temporal protocol where heartbeat responses carry a cancellation signal.
+- `query_workflow` and `update_workflow` accept `ExecutionRef` because the runtime resolves the execution internally and routes to the correct worker.
+
+### 11. Extended RuntimeAdapter
+
+The `RuntimeAdapter<R>` in `tokeira-edge::grpc::runtime_adapter` implements each new method:
+
+```rust
+#[async_trait]
+impl<R: RunRepository + 'static> WorkflowRuntimeApi for RuntimeAdapter<R> {
+    // ... existing methods unchanged ...
+
+    async fn poll_activity_task(
+        &self,
+        queue: QueueKey,
+        worker_identity: WorkerIdentity,
+        timeout: Duration,
+    ) -> Result<Option<StartedActivityTask>> {
+        self.runtime.poll_activity_task(queue, worker_identity, timeout).await
+    }
+
+    async fn complete_activity_task(
+        &self,
+        token: ActivityTaskToken,
+        result: Payloads,
+    ) -> Result<WorkflowMutationOutcome> {
+        let commit = self.runtime.complete_activity_task(token, result).await?;
+        commit_result_to_outcome(commit)
+    }
+
+    async fn fail_activity_task(
+        &self,
+        token: ActivityTaskToken,
+        failure_message: String,
+        failure_error_type: Option<String>,
+    ) -> Result<()> {
+        self.runtime.fail_activity_task(token, failure_message, failure_error_type).await
+    }
+
+    async fn record_activity_heartbeat(
+        &self,
+        token: ActivityTaskToken,
+    ) -> Result<bool> {
+        self.runtime.record_activity_heartbeat(token).await
+    }
+
+    async fn terminate_workflow(
+        &self,
+        execution: ExecutionRef,
+        req: TerminateRequest,
+    ) -> Result<WorkflowMutationOutcome> {
+        let commit = self.runtime.terminate_workflow(execution, req).await?;
+        commit_result_to_outcome(commit)
+    }
+
+    async fn cancel_workflow(
+        &self,
+        execution: ExecutionRef,
+        req: CancelRequest,
+    ) -> Result<WorkflowMutationOutcome> {
+        let commit = self.runtime.cancel_workflow(execution, req).await?;
+        commit_result_to_outcome(commit)
+    }
+
+    async fn query_workflow(
+        &self,
+        execution: ExecutionRef,
+        query_type: String,
+        query_args: Payloads,
+        timeout: Duration,
+    ) -> Result<QueryResult> {
+        self.runtime.query_workflow(execution, query_type, query_args, timeout).await
+    }
+
+    async fn update_workflow(
+        &self,
+        execution: ExecutionRef,
+        update_id: String,
+        update_name: String,
+        input: Payloads,
+        request: RequestContext,
+        timeout: Duration,
+        wait_policy: UpdateWaitPolicy,
+    ) -> Result<UpdateOutcome> {
+        self.runtime.update_workflow(
+            execution, update_id, update_name, input,
+            request, timeout, wait_policy,
+        ).await
+    }
+}
+```
+
+**Note on `cancel_workflow`:** The `TokeiraRuntime` does not currently expose a `cancel_workflow` method. The kernel supports `Command::Cancel(CancelRequest)`, so the runtime method follows the same pattern as `terminate_workflow`:
+
+```rust
+// TokeiraRuntime (new method to add)
+pub async fn cancel_workflow(
+    &self,
+    execution: ExecutionRef,
+    request: CancelRequest,
+) -> Result<CommitResult> {
+    let run_key = self.repo.resolve_execution(&execution).await?
+        .ok_or_else(|| anyhow!("execution not found"))?;
+    self.submit(run_key, Command::Cancel(request)).await
+}
+```
+
+
+### 12. New Edge Service Methods on WorkflowService
+
+The `WorkflowService` in `tokeira_edge::workflow_service` gains methods for each new endpoint. Each follows the established pattern: interceptors → routing → runtime delegation.
+
+```rust
+impl WorkflowService {
+    // --- Activity endpoints ---
+
+    pub async fn poll_activity_task_queue(
+        &self,
+        headers: &HeaderMap,
+        req: PollActivityTaskQueueRequest,
+    ) -> EdgeResult<Option<PollActivityTaskQueueResponse>> {
+        let _ctx = self.interceptors.begin(
+            headers, Some(&req.namespace),
+            Action::PollActivityTaskQueue, true,
+        ).await?;
+        ensure_local(self.router.route_task_queue(&req.namespace, &req.task_queue).await?)?;
+        let _permit = self.long_polls.acquire().await?;
+        let internal = to_internal::poll_activity_request(req);
+        let started = self.runtime
+            .poll_activity_task(internal.queue, internal.worker_identity, internal.timeout)
+            .await.map_err(EdgeError::from)?;
+        match started {
+            Some(task) => Ok(Some(from_internal::poll_activity_response(task)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn respond_activity_task_completed(
+        &self,
+        headers: &HeaderMap,
+        req: RespondActivityTaskCompletedRequest,
+    ) -> EdgeResult<RespondActivityTaskCompletedResponse> {
+        let _ctx = self.interceptors.begin(
+            headers, None,
+            Action::RespondActivityTaskCompleted, false,
+        ).await?;
+        let outcome = self.runtime
+            .complete_activity_task(req.token, req.result)
+            .await.map_err(EdgeError::from)?;
+        Ok(RespondActivityTaskCompletedResponse { outcome })
+    }
+
+    pub async fn respond_activity_task_failed(
+        &self,
+        headers: &HeaderMap,
+        req: RespondActivityTaskFailedRequest,
+    ) -> EdgeResult<RespondActivityTaskFailedResponse> {
+        let _ctx = self.interceptors.begin(
+            headers, None,
+            Action::RespondActivityTaskFailed, false,
+        ).await?;
+        self.runtime
+            .fail_activity_task(req.token, req.failure_message, req.failure_error_type)
+            .await.map_err(EdgeError::from)?;
+        Ok(RespondActivityTaskFailedResponse {})
+    }
+
+    pub async fn record_activity_task_heartbeat(
+        &self,
+        headers: &HeaderMap,
+        req: RecordActivityTaskHeartbeatRequest,
+    ) -> EdgeResult<RecordActivityTaskHeartbeatResponse> {
+        let _ctx = self.interceptors.begin(
+            headers, None,
+            Action::RecordActivityTaskHeartbeat, false,
+        ).await?;
+        let cancel_requested = self.runtime
+            .record_activity_heartbeat(req.token)
+            .await.map_err(EdgeError::from)?;
+        Ok(RecordActivityTaskHeartbeatResponse { cancel_requested })
+    }
+
+    // --- Advanced workflow endpoints ---
+
+    pub async fn terminate_workflow_execution(
+        &self,
+        headers: &HeaderMap,
+        req: TerminateWorkflowExecutionRequest,
+    ) -> EdgeResult<TerminateWorkflowExecutionResponse> {
+        let ctx = self.interceptors.begin(
+            headers, Some(&req.namespace),
+            Action::TerminateWorkflowExecution, false,
+        ).await?;
+        ensure_local(self.router.route_workflow(&req.namespace, &req.workflow_id).await?)?;
+        let execution = self.resolve_execution(&req.namespace, &req.workflow_id).await?;
+        let internal = to_internal::terminate_request(req, &ctx.request_id);
+        let outcome = self.runtime
+            .terminate_workflow(execution, internal)
+            .await.map_err(EdgeError::from)?;
+        Ok(from_internal::terminate_response(outcome))
+    }
+
+    pub async fn request_cancel_workflow_execution(
+        &self,
+        headers: &HeaderMap,
+        req: RequestCancelWorkflowExecutionRequest,
+    ) -> EdgeResult<RequestCancelWorkflowExecutionResponse> {
+        let ctx = self.interceptors.begin(
+            headers, Some(&req.namespace),
+            Action::RequestCancelWorkflowExecution, false,
+        ).await?;
+        ensure_local(self.router.route_workflow(&req.namespace, &req.workflow_id).await?)?;
+        let execution = self.resolve_execution(&req.namespace, &req.workflow_id).await?;
+        let internal = to_internal::cancel_request(req, &ctx.request_id);
+        let outcome = self.runtime
+            .cancel_workflow(execution, internal)
+            .await.map_err(EdgeError::from)?;
+        Ok(from_internal::cancel_response(outcome))
+    }
+
+    pub async fn query_workflow(
+        &self,
+        headers: &HeaderMap,
+        req: QueryWorkflowRequest,
+    ) -> EdgeResult<QueryWorkflowResponse> {
+        let _ctx = self.interceptors.begin(
+            headers, Some(&req.namespace),
+            Action::QueryWorkflow, false,
+        ).await?;
+        ensure_local(self.router.route_workflow(&req.namespace, &req.workflow_id).await?)?;
+        let execution = self.resolve_execution(&req.namespace, &req.workflow_id).await?;
+        let result = self.runtime
+            .query_workflow(execution, req.query_type, req.query_args, req.timeout)
+            .await.map_err(EdgeError::from)?;
+        Ok(from_internal::query_response(result))
+    }
+
+    pub async fn update_workflow_execution(
+        &self,
+        headers: &HeaderMap,
+        req: UpdateWorkflowExecutionRequest,
+    ) -> EdgeResult<UpdateWorkflowExecutionResponse> {
+        let ctx = self.interceptors.begin(
+            headers, Some(&req.namespace),
+            Action::UpdateWorkflowExecution, false,
+        ).await?;
+        ensure_local(self.router.route_workflow(&req.namespace, &req.workflow_id).await?)?;
+        let execution = self.resolve_execution(&req.namespace, &req.workflow_id).await?;
+        let request_context = RequestContext {
+            request_id: ctx.request_id.clone(),
+            caller_identity: Some(ctx.principal.subject.clone()),
+            received_at: ctx.received_at,
+        };
+        let outcome = self.runtime
+            .update_workflow(
+                execution, req.update_id, req.update_name, req.input,
+                request_context, req.timeout, req.wait_policy,
+            )
+            .await.map_err(EdgeError::from)?;
+        Ok(from_internal::update_response(outcome))
+    }
+
+    // --- helper ---
+
+    async fn resolve_execution(
+        &self,
+        namespace: &str,
+        workflow_id: &str,
+    ) -> EdgeResult<ExecutionRef> {
+        let run_key = self.resolver
+            .current_run_key(namespace, workflow_id)
+            .await.map_err(EdgeError::from)?;
+        match run_key {
+            Some(_) => Ok(ExecutionRef {
+                namespace_id: /* resolved from namespace cache */,
+                workflow_id: WorkflowId(workflow_id.to_string()),
+                run_id: None,
+            }),
+            None => Err(EdgeError::WorkflowNotFound {
+                namespace: namespace.to_string(),
+                workflow_id: workflow_id.to_string(),
+            }),
+        }
+    }
+}
+```
+
+**New `Action` variants** required in `interceptors.rs`:
+
+```rust
+pub enum Action {
+    // ... existing variants ...
+    PollActivityTaskQueue,
+    RespondActivityTaskCompleted,
+    RespondActivityTaskFailed,
+    RecordActivityTaskHeartbeat,
+    TerminateWorkflowExecution,
+    RequestCancelWorkflowExecution,
+    QueryWorkflow,
+    UpdateWorkflowExecution,
+}
+```
+
+### 13. New gRPC Adapter Methods on WorkflowServiceGrpc
+
+Each new endpoint follows the same thin-adapter pattern. The adapter extracts metadata, translates proto→edge, calls the edge service, and translates the result back.
+
+```rust
+#[tonic::async_trait]
+impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
+    // ... existing methods unchanged ...
+
+    async fn poll_activity_task_queue(
+        &self,
+        request: Request<workflowservice::PollActivityTaskQueueRequest>,
+    ) -> Result<Response<workflowservice::PollActivityTaskQueueResponse>, Status> {
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::poll_activity_request_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let edge_resp = self.inner.poll_activity_task_queue(&headers, edge_req).await?;
+        Ok(Response::new(match edge_resp {
+            Some(resp) => translate::poll_activity_response_to_proto(resp),
+            None => workflowservice::PollActivityTaskQueueResponse::default(),
+        }))
+    }
+
+    async fn respond_activity_task_completed(
+        &self,
+        request: Request<workflowservice::RespondActivityTaskCompletedRequest>,
+    ) -> Result<Response<workflowservice::RespondActivityTaskCompletedResponse>, Status> {
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::respond_activity_completed_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let edge_resp = self.inner.respond_activity_task_completed(&headers, edge_req).await?;
+        Ok(Response::new(translate::respond_activity_completed_to_proto(edge_resp)))
+    }
+
+    async fn respond_activity_task_failed(
+        &self,
+        request: Request<workflowservice::RespondActivityTaskFailedRequest>,
+    ) -> Result<Response<workflowservice::RespondActivityTaskFailedResponse>, Status> {
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::respond_activity_failed_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let edge_resp = self.inner.respond_activity_task_failed(&headers, edge_req).await?;
+        Ok(Response::new(translate::respond_activity_failed_to_proto(edge_resp)))
+    }
+
+    async fn record_activity_task_heartbeat(
+        &self,
+        request: Request<workflowservice::RecordActivityTaskHeartbeatRequest>,
+    ) -> Result<Response<workflowservice::RecordActivityTaskHeartbeatResponse>, Status> {
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::record_heartbeat_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let edge_resp = self.inner.record_activity_task_heartbeat(&headers, edge_req).await?;
+        Ok(Response::new(translate::record_heartbeat_to_proto(edge_resp)))
+    }
+
+    async fn terminate_workflow_execution(
+        &self,
+        request: Request<workflowservice::TerminateWorkflowExecutionRequest>,
+    ) -> Result<Response<workflowservice::TerminateWorkflowExecutionResponse>, Status> {
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::terminate_request_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let edge_resp = self.inner.terminate_workflow_execution(&headers, edge_req).await?;
+        Ok(Response::new(translate::terminate_response_to_proto(edge_resp)))
+    }
+
+    async fn request_cancel_workflow_execution(
+        &self,
+        request: Request<workflowservice::RequestCancelWorkflowExecutionRequest>,
+    ) -> Result<Response<workflowservice::RequestCancelWorkflowExecutionResponse>, Status> {
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::cancel_request_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let edge_resp = self.inner.request_cancel_workflow_execution(&headers, edge_req).await?;
+        Ok(Response::new(translate::cancel_response_to_proto(edge_resp)))
+    }
+
+    async fn query_workflow(
+        &self,
+        request: Request<workflowservice::QueryWorkflowRequest>,
+    ) -> Result<Response<workflowservice::QueryWorkflowResponse>, Status> {
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::query_request_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let edge_resp = self.inner.query_workflow(&headers, edge_req).await?;
+        Ok(Response::new(translate::query_response_to_proto(edge_resp)))
+    }
+
+    async fn update_workflow_execution(
+        &self,
+        request: Request<workflowservice::UpdateWorkflowExecutionRequest>,
+    ) -> Result<Response<workflowservice::UpdateWorkflowExecutionResponse>, Status> {
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::update_request_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let edge_resp = self.inner.update_workflow_execution(&headers, edge_req).await?;
+        Ok(Response::new(translate::update_response_to_proto(edge_resp)))
+    }
+}
+```
+
+
+### 14. Proto-to-Edge Translation for New Endpoints (`tokeira-edge::grpc::translate`)
+
+New translation functions follow the same patterns as the existing ones. The key new concern is `ActivityTaskToken` serialization/deserialization.
+
+```rust
+// --- Activity poll ---
+
+pub fn poll_activity_request_to_edge(
+    req: workflowservice::PollActivityTaskQueueRequest,
+) -> Result<PollActivityTaskQueueRequest, ProtoConversionError> {
+    let task_queue = req.task_queue.as_ref()
+        .ok_or(ProtoConversionError::MissingField("PollActivityTaskQueueRequest.task_queue"))?;
+    Ok(PollActivityTaskQueueRequest {
+        namespace: req.namespace,
+        task_queue: task_queue_to_domain(task_queue).0,
+        worker_identity: req.identity,
+        timeout: DEFAULT_POLL_TIMEOUT,
+    })
+}
+
+pub fn poll_activity_response_to_proto(
+    resp: PollActivityTaskQueueResponse,
+) -> workflowservice::PollActivityTaskQueueResponse {
+    workflowservice::PollActivityTaskQueueResponse {
+        task_token: resp.task_token,
+        activity_id: resp.activity_id,
+        activity_type: resp.activity_type,
+        input: Some(payloads_from_domain(&resp.input)),
+        attempt: resp.attempt as i32,
+        schedule_to_close_timeout: resp.schedule_to_close_timeout.map(duration_to_proto),
+        start_to_close_timeout: resp.start_to_close_timeout.map(duration_to_proto),
+        heartbeat_timeout: resp.heartbeat_timeout.map(duration_to_proto),
+        workflow_execution: Some(workflow_execution_from_ids(
+            &WorkflowId(resp.workflow_id),
+            RunId(resp.run_key.0),
+        )),
+    }
+}
+
+// --- Activity completion ---
+
+pub fn respond_activity_completed_to_edge(
+    req: workflowservice::RespondActivityTaskCompletedRequest,
+) -> Result<RespondActivityTaskCompletedRequest, ProtoConversionError> {
+    let token = deserialize_activity_token(&req.task_token)?;
+    Ok(RespondActivityTaskCompletedRequest {
+        token,
+        result: req.result.as_ref().map(payloads_to_domain).unwrap_or_default(),
+        identity: non_empty(req.identity),
+    })
+}
+
+pub fn respond_activity_completed_to_proto(
+    _resp: RespondActivityTaskCompletedResponse,
+) -> workflowservice::RespondActivityTaskCompletedResponse {
+    workflowservice::RespondActivityTaskCompletedResponse {}
+}
+
+// --- Activity failure ---
+
+pub fn respond_activity_failed_to_edge(
+    req: workflowservice::RespondActivityTaskFailedRequest,
+) -> Result<RespondActivityTaskFailedRequest, ProtoConversionError> {
+    let token = deserialize_activity_token(&req.task_token)?;
+    Ok(RespondActivityTaskFailedRequest {
+        token,
+        failure_message: req.failure_message,
+        failure_error_type: non_empty(req.failure_error_type),
+        identity: non_empty(req.identity),
+    })
+}
+
+pub fn respond_activity_failed_to_proto(
+    _resp: RespondActivityTaskFailedResponse,
+) -> workflowservice::RespondActivityTaskFailedResponse {
+    workflowservice::RespondActivityTaskFailedResponse {}
+}
+
+// --- Activity heartbeat ---
+
+pub fn record_heartbeat_to_edge(
+    req: workflowservice::RecordActivityTaskHeartbeatRequest,
+) -> Result<RecordActivityTaskHeartbeatRequest, ProtoConversionError> {
+    let token = deserialize_activity_token(&req.task_token)?;
+    Ok(RecordActivityTaskHeartbeatRequest {
+        token,
+        identity: non_empty(req.identity),
+    })
+}
+
+pub fn record_heartbeat_to_proto(
+    resp: RecordActivityTaskHeartbeatResponse,
+) -> workflowservice::RecordActivityTaskHeartbeatResponse {
+    workflowservice::RecordActivityTaskHeartbeatResponse {
+        cancel_requested: resp.cancel_requested,
+    }
+}
+
+// --- Terminate ---
+
+pub fn terminate_request_to_edge(
+    req: workflowservice::TerminateWorkflowExecutionRequest,
+) -> Result<TerminateWorkflowExecutionRequest, ProtoConversionError> {
+    Ok(TerminateWorkflowExecutionRequest {
+        namespace: req.namespace,
+        workflow_id: req.workflow_id,
+        reason: req.reason,
+        details: req.details.as_ref().map(payloads_to_domain),
+        identity: non_empty(req.identity),
+    })
+}
+
+pub fn terminate_response_to_proto(
+    _resp: TerminateWorkflowExecutionResponse,
+) -> workflowservice::TerminateWorkflowExecutionResponse {
+    workflowservice::TerminateWorkflowExecutionResponse {}
+}
+
+// --- Cancel ---
+
+pub fn cancel_request_to_edge(
+    req: workflowservice::RequestCancelWorkflowExecutionRequest,
+) -> Result<RequestCancelWorkflowExecutionRequest, ProtoConversionError> {
+    Ok(RequestCancelWorkflowExecutionRequest {
+        namespace: req.namespace,
+        workflow_id: req.workflow_id,
+        reason: non_empty(req.reason).unwrap_or_default(),
+        identity: non_empty(req.identity),
+    })
+}
+
+pub fn cancel_response_to_proto(
+    _resp: RequestCancelWorkflowExecutionResponse,
+) -> workflowservice::RequestCancelWorkflowExecutionResponse {
+    workflowservice::RequestCancelWorkflowExecutionResponse {}
+}
+
+// --- Query ---
+
+pub fn query_request_to_edge(
+    req: workflowservice::QueryWorkflowRequest,
+) -> Result<QueryWorkflowRequest, ProtoConversionError> {
+    Ok(QueryWorkflowRequest {
+        namespace: req.namespace,
+        workflow_id: req.workflow_id,
+        query_type: req.query_type,
+        query_args: req.query_args.as_ref().map(payloads_to_domain).unwrap_or_default(),
+        timeout: DEFAULT_QUERY_TIMEOUT,
+    })
+}
+
+pub fn query_response_to_proto(
+    resp: QueryWorkflowResponse,
+) -> workflowservice::QueryWorkflowResponse {
+    workflowservice::QueryWorkflowResponse {
+        query_result: resp.result.map(|r| payloads_from_domain(&r)),
+        query_rejected: resp.failure.map(|msg| workflowservice::QueryRejected {
+            message: msg,
+        }),
+    }
+}
+
+// --- Update ---
+
+pub fn update_request_to_edge(
+    req: workflowservice::UpdateWorkflowExecutionRequest,
+) -> Result<UpdateWorkflowExecutionRequest, ProtoConversionError> {
+    let wait_policy = match req.wait_policy {
+        0 => UpdateWaitPolicy::Accepted,
+        1 => UpdateWaitPolicy::Completed,
+        _ => UpdateWaitPolicy::Accepted,
+    };
+    Ok(UpdateWorkflowExecutionRequest {
+        namespace: req.namespace,
+        workflow_id: req.workflow_id,
+        update_id: req.update_id,
+        update_name: req.update_name,
+        input: req.input.as_ref().map(payloads_to_domain).unwrap_or_default(),
+        wait_policy,
+        timeout: DEFAULT_UPDATE_TIMEOUT,
+    })
+}
+
+pub fn update_response_to_proto(
+    resp: UpdateWorkflowExecutionResponse,
+) -> workflowservice::UpdateWorkflowExecutionResponse {
+    match resp.outcome {
+        UpdateOutcomeDto::Accepted { accepted_event_id } => {
+            workflowservice::UpdateWorkflowExecutionResponse {
+                accepted_event_id,
+                result: None,
+                failure: None,
+            }
+        }
+        UpdateOutcomeDto::Completed { accepted_event_id, result } => {
+            workflowservice::UpdateWorkflowExecutionResponse {
+                accepted_event_id,
+                result: Some(payloads_from_domain(&result)),
+                failure: None,
+            }
+        }
+        UpdateOutcomeDto::Rejected { accepted_event_id, failure } => {
+            workflowservice::UpdateWorkflowExecutionResponse {
+                accepted_event_id,
+                result: None,
+                failure: Some(failure),
+            }
+        }
+    }
+}
+
+// --- Token helpers ---
+
+fn serialize_activity_token(token: &ActivityTaskToken) -> Vec<u8> {
+    serde_json::to_vec(token).expect("ActivityTaskToken serialization should not fail")
+}
+
+fn deserialize_activity_token(bytes: &[u8]) -> Result<ActivityTaskToken, ProtoConversionError> {
+    serde_json::from_slice(bytes)
+        .map_err(|e| ProtoConversionError::InvalidTaskToken(e.to_string()))
+}
+
+// --- Constants ---
+
+const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
+```
+
+**New `ProtoConversionError` variant:**
+
+```rust
+pub enum ProtoConversionError {
+    MissingField(&'static str),
+    InvalidTaskToken(String),  // NEW
+}
+```
+
+
+## Data Models (Extended)
+
+### New Edge DTOs
+
+New DTOs in `tokeira_edge::translate::mod.rs`:
+
+```rust
+// --- Activity poll ---
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PollActivityTaskQueueRequest {
+    pub namespace: String,
+    pub task_queue: String,
+    pub worker_identity: String,
+    pub timeout: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PollActivityTaskQueueResponse {
+    pub task_token: Vec<u8>,
+    pub activity_id: String,
+    pub activity_type: String,
+    pub workflow_id: String,
+    pub run_key: RunKey,
+    pub input: Payloads,
+    pub attempt: u32,
+    pub schedule_to_close_timeout: Option<Duration>,
+    pub start_to_close_timeout: Option<Duration>,
+    pub heartbeat_timeout: Option<Duration>,
+}
+
+// --- Activity completion ---
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RespondActivityTaskCompletedRequest {
+    pub token: ActivityTaskToken,
+    pub result: Payloads,
+    pub identity: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RespondActivityTaskCompletedResponse {
+    pub outcome: WorkflowMutationOutcome,
+}
+
+// --- Activity failure ---
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RespondActivityTaskFailedRequest {
+    pub token: ActivityTaskToken,
+    pub failure_message: String,
+    pub failure_error_type: Option<String>,
+    pub identity: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RespondActivityTaskFailedResponse {}
+
+// --- Activity heartbeat ---
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordActivityTaskHeartbeatRequest {
+    pub token: ActivityTaskToken,
+    pub identity: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordActivityTaskHeartbeatResponse {
+    pub cancel_requested: bool,
+}
+
+// --- Terminate ---
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TerminateWorkflowExecutionRequest {
+    pub namespace: String,
+    pub workflow_id: String,
+    pub reason: String,
+    pub details: Option<Payloads>,
+    pub identity: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TerminateWorkflowExecutionResponse {}
+
+// --- Cancel ---
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RequestCancelWorkflowExecutionRequest {
+    pub namespace: String,
+    pub workflow_id: String,
+    pub reason: String,
+    pub identity: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RequestCancelWorkflowExecutionResponse {}
+
+// --- Query ---
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueryWorkflowRequest {
+    pub namespace: String,
+    pub workflow_id: String,
+    pub query_type: String,
+    pub query_args: Payloads,
+    pub timeout: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueryWorkflowResponse {
+    pub result: Option<Payloads>,
+    pub failure: Option<String>,
+}
+
+// --- Update ---
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateWorkflowExecutionRequest {
+    pub namespace: String,
+    pub workflow_id: String,
+    pub update_id: String,
+    pub update_name: String,
+    pub input: Payloads,
+    pub wait_policy: UpdateWaitPolicy,
+    pub timeout: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum UpdateOutcomeDto {
+    Accepted { accepted_event_id: i64 },
+    Completed { accepted_event_id: i64, result: Payloads },
+    Rejected { accepted_event_id: i64, failure: String },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateWorkflowExecutionResponse {
+    pub outcome: UpdateOutcomeDto,
+}
+```
+
+### New Proto-to-Edge DTO Mapping Table
+
+| Proto Type | Edge DTO | Key Conversions |
+|---|---|---|
+| `PollActivityTaskQueueRequest` | `PollActivityTaskQueueRequest` | `task_queue.name` → string, default timeout 60s |
+| `PollActivityTaskQueueResponse` | `PollActivityTaskQueueResponse` | `task_token` = serialized `ActivityTaskToken`, `activity_id`, `input` via `payloads_from_domain`, timeouts via `duration_to_proto` |
+| `RespondActivityTaskCompletedRequest` | `RespondActivityTaskCompletedRequest` | `task_token` bytes → `ActivityTaskToken` via serde JSON, `result` via `payloads_to_domain` |
+| `RespondActivityTaskCompletedResponse` | `RespondActivityTaskCompletedResponse` | Empty response |
+| `RespondActivityTaskFailedRequest` | `RespondActivityTaskFailedRequest` | `task_token` bytes → `ActivityTaskToken`, `failure_message`, `failure_error_type` |
+| `RespondActivityTaskFailedResponse` | `RespondActivityTaskFailedResponse` | Empty response |
+| `RecordActivityTaskHeartbeatRequest` | `RecordActivityTaskHeartbeatRequest` | `task_token` bytes → `ActivityTaskToken` |
+| `RecordActivityTaskHeartbeatResponse` | `RecordActivityTaskHeartbeatResponse` | `cancel_requested` boolean |
+| `TerminateWorkflowExecutionRequest` | `TerminateWorkflowExecutionRequest` | `namespace`, `workflow_id`, `reason`, `details` via `payloads_to_domain`, `identity` |
+| `TerminateWorkflowExecutionResponse` | `TerminateWorkflowExecutionResponse` | Empty response |
+| `RequestCancelWorkflowExecutionRequest` | `RequestCancelWorkflowExecutionRequest` | `namespace`, `workflow_id`, `reason` |
+| `RequestCancelWorkflowExecutionResponse` | `RequestCancelWorkflowExecutionResponse` | Empty response |
+| `QueryWorkflowRequest` | `QueryWorkflowRequest` | `namespace`, `workflow_id`, `query_type`, `query_args` via `payloads_to_domain`, default timeout 10s |
+| `QueryWorkflowResponse` | `QueryWorkflowResponse` | `query_result` via `payloads_from_domain`, `query_rejected.message` |
+| `UpdateWorkflowExecutionRequest` | `UpdateWorkflowExecutionRequest` | `namespace`, `workflow_id`, `update_id`, `update_name`, `input` via `payloads_to_domain`, `wait_policy` enum mapping, default timeout 30s |
+| `UpdateWorkflowExecutionResponse` | `UpdateWorkflowExecutionResponse` | `accepted_event_id`, `result` via `payloads_from_domain`, `failure` string |
+
+### Proto Service Extension
+
+The `service.proto` file gains eight new RPCs:
+
+```protobuf
+service WorkflowService {
+  // ... existing RPCs ...
+
+  // Activity endpoints
+  rpc PollActivityTaskQueue(PollActivityTaskQueueRequest) returns (PollActivityTaskQueueResponse);
+  rpc RespondActivityTaskCompleted(RespondActivityTaskCompletedRequest) returns (RespondActivityTaskCompletedResponse);
+  rpc RespondActivityTaskFailed(RespondActivityTaskFailedRequest) returns (RespondActivityTaskFailedResponse);
+  rpc RecordActivityTaskHeartbeat(RecordActivityTaskHeartbeatRequest) returns (RecordActivityTaskHeartbeatResponse);
+
+  // Advanced workflow endpoints
+  rpc TerminateWorkflowExecution(TerminateWorkflowExecutionRequest) returns (TerminateWorkflowExecutionResponse);
+  rpc RequestCancelWorkflowExecution(RequestCancelWorkflowExecutionRequest) returns (RequestCancelWorkflowExecutionResponse);
+  rpc QueryWorkflow(QueryWorkflowRequest) returns (QueryWorkflowResponse);
+  rpc UpdateWorkflowExecution(UpdateWorkflowExecutionRequest) returns (UpdateWorkflowExecutionResponse);
+}
+
+// --- Activity messages ---
+
+message PollActivityTaskQueueRequest {
+  string namespace = 1;
+  temporal.api.common.v1.TaskQueue task_queue = 2;
+  string identity = 3;
+}
+
+message PollActivityTaskQueueResponse {
+  bytes task_token = 1;
+  string activity_id = 2;
+  string activity_type = 3;
+  temporal.api.common.v1.Payloads input = 4;
+  int32 attempt = 5;
+  optional int64 schedule_to_close_timeout_ms = 6;
+  optional int64 start_to_close_timeout_ms = 7;
+  optional int64 heartbeat_timeout_ms = 8;
+  temporal.api.common.v1.WorkflowExecution workflow_execution = 9;
+}
+
+message RespondActivityTaskCompletedRequest {
+  bytes task_token = 1;
+  temporal.api.common.v1.Payloads result = 2;
+  string identity = 3;
+}
+
+message RespondActivityTaskCompletedResponse {}
+
+message RespondActivityTaskFailedRequest {
+  bytes task_token = 1;
+  string failure_message = 2;
+  string failure_error_type = 3;
+  string identity = 4;
+}
+
+message RespondActivityTaskFailedResponse {}
+
+message RecordActivityTaskHeartbeatRequest {
+  bytes task_token = 1;
+  string identity = 2;
+}
+
+message RecordActivityTaskHeartbeatResponse {
+  bool cancel_requested = 1;
+}
+
+// --- Advanced workflow messages ---
+
+message TerminateWorkflowExecutionRequest {
+  string namespace = 1;
+  string workflow_id = 2;
+  string run_id = 3;
+  string reason = 4;
+  temporal.api.common.v1.Payloads details = 5;
+  string identity = 6;
+}
+
+message TerminateWorkflowExecutionResponse {}
+
+message RequestCancelWorkflowExecutionRequest {
+  string namespace = 1;
+  string workflow_id = 2;
+  string run_id = 3;
+  string reason = 4;
+  string identity = 5;
+}
+
+message RequestCancelWorkflowExecutionResponse {}
+
+message QueryWorkflowRequest {
+  string namespace = 1;
+  string workflow_id = 2;
+  string run_id = 3;
+  string query_type = 4;
+  temporal.api.common.v1.Payloads query_args = 5;
+}
+
+message QueryWorkflowResponse {
+  temporal.api.common.v1.Payloads query_result = 1;
+  QueryRejected query_rejected = 2;
+}
+
+message QueryRejected {
+  string message = 1;
+}
+
+message UpdateWorkflowExecutionRequest {
+  string namespace = 1;
+  string workflow_id = 2;
+  string run_id = 3;
+  string update_id = 4;
+  string update_name = 5;
+  temporal.api.common.v1.Payloads input = 6;
+  int32 wait_policy = 7;  // 0 = Accepted, 1 = Completed
+}
+
+message UpdateWorkflowExecutionResponse {
+  int64 accepted_event_id = 1;
+  temporal.api.common.v1.Payloads result = 2;
+  string failure = 3;
+}
+```
+
+### ActivityTaskToken Serialization
+
+The `ActivityTaskToken` is serialized to/from bytes using `serde_json`. This matches the existing pattern for `WorkflowTaskToken` in the codebase. The token contains:
+
+| Field | Type | Purpose |
+|---|---|---|
+| `run_key` | `RunKey` | Identifies the parent workflow run |
+| `activity_id` | `String` | Activity identifier within the run |
+| `schedule_event_id` | `i64` | History event ID of the schedule event |
+| `attempt` | `u32` | Current attempt number (1-based) |
+| `shard_epoch` | `ShardEpoch` | Shard epoch for fencing stale completions |
+
+The token is opaque to the SDK — it receives bytes from `PollActivityTaskQueueResponse.task_token` and echoes them back in completion/failure/heartbeat requests. The edge layer deserializes the bytes to extract the `ActivityTaskToken` struct, which the runtime uses for validation and routing.
+
+
+## Correctness Properties (Extended)
+
+The existing design defines Properties 1–4. The new endpoints add two additional properties.
+
+### Property 5: Proto-to-edge DTO round-trip for new endpoints
+
+*For any* valid edge DTO for the new endpoints (PollActivityTaskQueueRequest, PollActivityTaskQueueResponse, RespondActivityTaskCompletedRequest, RespondActivityTaskFailedRequest, RecordActivityTaskHeartbeatRequest, RecordActivityTaskHeartbeatResponse, TerminateWorkflowExecutionRequest, RequestCancelWorkflowExecutionRequest, QueryWorkflowRequest, QueryWorkflowResponse, UpdateWorkflowExecutionRequest, UpdateWorkflowExecutionResponse), converting the edge DTO to its proto wire type and then converting back to the edge DTO should produce a value equivalent to the original. Fields explicitly deferred (such as activity heartbeat details payloads) are excluded from this round-trip requirement.
+
+**Validates: Requirements 12.1, 12.2, 12.3, 12.4, 12.5, 12.6, 12.7, 12.8, 12.9, 12.10, 12.11, 12.12, 12.15**
+
+### Property 6: ActivityTaskToken serialization round-trip
+
+*For any* valid `ActivityTaskToken` (with arbitrary `run_key`, `activity_id`, `schedule_event_id`, `attempt`, and `shard_epoch`), serializing the token to bytes via `serde_json::to_vec` and then deserializing back via `serde_json::from_slice` should produce a token equal to the original. Additionally, embedding the serialized bytes in a proto `RespondActivityTaskCompletedRequest`, `RespondActivityTaskFailedRequest`, or `RecordActivityTaskHeartbeatRequest` and translating to the edge DTO should recover the original token.
+
+**Validates: Requirements 12.3, 12.4, 12.5, 12.13**
+
+## Error Handling (Extended)
+
+### Activity Token Errors
+
+When a `RespondActivityTaskCompleted`, `RespondActivityTaskFailed`, or `RecordActivityTaskHeartbeat` request contains invalid task token bytes (not valid JSON, wrong structure, missing fields), the translation layer returns `ProtoConversionError::InvalidTaskToken(message)`. The gRPC adapter maps this to `Status::invalid_argument("invalid task token: {message}")`.
+
+This is the same error path as `ProtoConversionError::MissingField` — both are proto conversion errors that indicate a malformed client request.
+
+### Query and Update Timeout Errors
+
+`QueryWorkflow` and `UpdateWorkflowExecution` can time out waiting for a worker response. The runtime returns `anyhow::Error` with a "timed out" message. The edge layer maps this to `EdgeError::Internal`, which becomes `Status::internal`. This is acceptable for the initial implementation; a future milestone may introduce a dedicated `EdgeError::QueryTimeout` / `EdgeError::UpdateTimeout` variant mapped to `DEADLINE_EXCEEDED`.
+
+### Execution Not Found
+
+`TerminateWorkflowExecution`, `RequestCancelWorkflowExecution`, `QueryWorkflow`, and `UpdateWorkflowExecution` all require resolving a workflow ID to an execution. If the workflow is not found, the edge returns `EdgeError::WorkflowNotFound`, which maps to `Status::not_found`. This uses the existing `ExecutionResolver::current_run_key` path.
+
+### Activity Poll Timeout
+
+`PollActivityTaskQueue` follows the same timeout behavior as `PollWorkflowTaskQueue`: when the poll timeout expires without a task, the adapter returns a default empty `PollActivityTaskQueueResponse` (all fields at zero/empty values). This is NOT an error — it signals the SDK to re-poll.
+
+### Long-Poll Gate Exhaustion
+
+`PollActivityTaskQueue` shares the `LongPollGate` with `PollWorkflowTaskQueue`. When the gate is exhausted, the edge returns `EdgeError::TooManyLongPolls` → `Status::resource_exhausted`. Both poll types compete for the same semaphore, which correctly bounds total open poll connections.
+
+
+## Testing Strategy (Extended)
+
+### Property-Based Testing (New Properties)
+
+Property-based tests use the `proptest` crate with a minimum of 100 iterations per property.
+
+**5. New endpoint DTO round-trip** (Property 5): Generate arbitrary edge DTOs for each new endpoint type using proptest strategies, convert to proto and back, assert equality. This extends the existing Property 1 test with new DTO types.
+   - Tag: `// Feature: grpc-edge-transport, Property 5: Proto-to-edge DTO round-trip for new endpoints`
+   - Requires `Arbitrary`-like proptest strategies for:
+     - `PollActivityTaskQueueRequest` / `PollActivityTaskQueueResponse`
+     - `RespondActivityTaskCompletedRequest` / `RespondActivityTaskFailedRequest`
+     - `RecordActivityTaskHeartbeatRequest` / `RecordActivityTaskHeartbeatResponse`
+     - `TerminateWorkflowExecutionRequest` / `RequestCancelWorkflowExecutionRequest`
+     - `QueryWorkflowRequest` / `QueryWorkflowResponse`
+     - `UpdateWorkflowExecutionRequest` / `UpdateWorkflowExecutionResponse`
+
+**6. ActivityTaskToken serialization round-trip** (Property 6): Generate arbitrary `ActivityTaskToken` values, serialize to bytes, deserialize back, assert equality. Also test the full path: serialize token → embed in proto request → translate to edge DTO → verify token matches.
+   - Tag: `// Feature: grpc-edge-transport, Property 6: ActivityTaskToken serialization round-trip`
+   - Requires proptest strategy for `ActivityTaskToken` (arbitrary `RunKey`, `String` activity_id, `i64` schedule_event_id, `u32` attempt, `ShardEpoch`)
+
+### Unit Tests (New Endpoints)
+
+Unit tests complement property tests by covering specific examples and edge cases:
+
+- **Empty activity poll response**: Verify that when the edge service returns `None` for an activity poll, the adapter returns a default empty `PollActivityTaskQueueResponse`.
+- **Invalid task token bytes**: Verify that corrupt/invalid bytes in `RespondActivityTaskCompleted.task_token` produce `ProtoConversionError::InvalidTaskToken`.
+- **Empty task token bytes**: Verify that empty bytes produce `ProtoConversionError::InvalidTaskToken`.
+- **Heartbeat cancel_requested propagation**: Verify that when the runtime returns `true` from `record_activity_heartbeat`, the proto response has `cancel_requested = true`.
+- **Terminate with details**: Verify that a terminate request with details payloads correctly translates the payloads through the proto→edge→kernel path.
+- **Cancel with empty reason**: Verify that a cancel request with an empty reason string is handled correctly (defaults to empty string).
+- **Query timeout**: Verify that when the runtime returns a timeout error for `query_workflow`, the adapter maps it to an appropriate gRPC status.
+- **Update wait policy mapping**: Verify that proto `wait_policy` values 0 and 1 map to `UpdateWaitPolicy::Accepted` and `UpdateWaitPolicy::Completed` respectively.
+- **Default poll timeout for activity**: Verify that the adapter applies 60s timeout default for activity polls.
+- **Default query timeout**: Verify that the adapter applies 10s timeout default for queries.
+- **Default update timeout**: Verify that the adapter applies 30s timeout default for updates.
+- **Activity poll shares LongPollGate**: Verify that activity polls and workflow polls compete for the same semaphore by exhausting the gate with workflow polls and verifying activity polls are rejected with `RESOURCE_EXHAUSTED`.
+
+### Integration Tests (Extended)
+
+Extend the existing integration test to cover the new endpoints:
+
+1. Start a workflow with a `ScheduleActivity` command
+2. Poll for an activity task via `PollActivityTaskQueue` and verify the response contains the correct activity ID, input, and task token
+3. Complete the activity via `RespondActivityTaskCompleted` with a result payload
+4. Verify the workflow progresses (via `DescribeWorkflowExecution`)
+5. Start another workflow, schedule an activity, poll it, and fail it via `RespondActivityTaskFailed`
+6. Terminate a workflow via `TerminateWorkflowExecution` and verify it's terminated via `DescribeWorkflowExecution`
+7. Cancel a workflow via `RequestCancelWorkflowExecution` and verify the cancellation is recorded
+
+### Test Configuration (Unchanged)
+
+```toml
+[dev-dependencies]
+proptest = "1"
+tonic = { version = "0.11", features = ["transport"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+Each property-based test runs with `proptest::test_runner::Config { cases: 100, .. }` minimum.

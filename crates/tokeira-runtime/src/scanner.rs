@@ -6,17 +6,17 @@
 
 use std::{
     hash::{Hash, Hasher},
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 
 use anyhow::Result;
 use time::OffsetDateTime;
 use tokeira_kernel::{Command, TimerDueRequest};
 use tokeira_storage::{DueTimer, RunRepository};
-use tokeira_types::RunKey;
+use tokeira_types::{RunKey, ShardId};
 use tokio_util::sync::CancellationToken;
 
-use crate::lane::LaneHandle;
+use crate::{lane::LaneHandle, shard::ShardOwner};
 
 /// Configuration knobs for the background timer scanner.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,10 +95,61 @@ pub(crate) async fn scan_due_timers_once<R, F, Fut>(
     }
 }
 
+pub(crate) async fn scan_due_timers_once_for_shard<R, F, Fut>(
+    repo: &R,
+    shard_id: ShardId,
+    config: &TimerScannerConfig,
+    mut submit_due_timer: F,
+) where
+    R: RunRepository + ?Sized,
+    F: FnMut(DueTimer, OffsetDateTime) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let fired_at = OffsetDateTime::now_utc();
+    let due_timers = match repo
+        .list_due_timers_for_shard(shard_id, fired_at, config.max_timers_per_scan)
+        .await
+    {
+        Ok(due_timers) => due_timers,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                shard_id = ?shard_id,
+                "timer scanner failed to list due timers for shard"
+            );
+            return;
+        }
+    };
+
+    for due in due_timers {
+        if let Err(error) = submit_due_timer(due.clone(), fired_at).await {
+            let message = error.to_string();
+            if message.contains("kernel rejected") {
+                tracing::debug!(
+                    ?error,
+                    shard_id = ?shard_id,
+                    run_key = ?due.run_key,
+                    timer_id = due.timer_id,
+                    "timer scanner due timer rejected by kernel"
+                );
+            } else {
+                tracing::warn!(
+                    ?error,
+                    shard_id = ?shard_id,
+                    run_key = ?due.run_key,
+                    timer_id = due.timer_id,
+                    "timer scanner failed to submit due timer"
+                );
+            }
+        }
+    }
+}
+
 pub(crate) async fn run_timer_scanner<R>(
     repo: Arc<R>,
     lanes: Vec<LaneHandle>,
     lane_count: usize,
+    shard_owner: Arc<RwLock<ShardOwner>>,
     config: TimerScannerConfig,
     cancel: CancellationToken,
 ) where
@@ -110,20 +161,23 @@ pub(crate) async fn run_timer_scanner<R>(
             _ = tokio::time::sleep(config.scan_interval) => {}
         }
 
-        scan_due_timers_once(&*repo, &config, |due, fired_at| {
-            let lane = pick_lane(&lanes, lane_count, due.run_key).clone();
-            async move {
-                lane.submit(
-                    due.run_key,
-                    Command::TimerDue(TimerDueRequest {
-                        timer_id: due.timer_id,
-                        fired_at,
-                    }),
-                )
-                .await
-                .map(|_| ())
-            }
-        })
-        .await;
+        let active_shards: Vec<_> = shard_owner.read().unwrap().active_shards().collect();
+        for shard_id in active_shards {
+            scan_due_timers_once_for_shard(&*repo, shard_id, &config, |due, fired_at| {
+                let lane = pick_lane(&lanes, lane_count, due.run_key).clone();
+                async move {
+                    lane.submit(
+                        due.run_key,
+                        Command::TimerDue(TimerDueRequest {
+                            timer_id: due.timer_id,
+                            fired_at,
+                        }),
+                    )
+                    .await
+                    .map(|_| ())
+                }
+            })
+            .await;
+        }
     }
 }

@@ -10,14 +10,15 @@ use tokeira_kernel::{
     NexusOperationResolvedRequest, NexusResolution, ParentClosePolicy,
     PauseActivityRequest, PauseInfo, PauseWorkflowRequest, PendingExternalCancel,
     PendingExternalSignal, PendingNexusOperation, PendingUpdate, PendingWorkflowTask,
-    ProjectionOp, Reject, ResetActivityRequest, ResetRequest, RetryState, SignalRequest,
-    StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest,
-    TimerState, UnpauseActivityRequest, UnpauseWorkflowRequest,
+    ProjectionOp, Reject, ReplayContext, ResetActivityRequest, ResetRequest,
+    RetryState, SignalRequest, StartRequest, StartWorkflowTaskRequest,
+    TerminateRequest, TimerDueRequest, TimerState, UnpauseActivityRequest,
+    UnpauseWorkflowRequest,
     UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody,
     UpdateRequest, VersioningOverride, WorkflowCommand, WorkflowExecutionTimedOutRequest,
     WorkflowState, WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
     WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType,
-    WorkflowTimeoutType, event::HistoryEventKind, kernel::Kernel,
+    WorkflowTimeoutType, event::{HistoryEvent, HistoryEventKind}, kernel::Kernel,
 };
 use tokeira_types::{
     ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads,
@@ -76,6 +77,8 @@ fn make_start_request() -> StartRequest {
         run_id,
         workflow_type: WorkflowType("wf".into()),
         task_queue: TaskQueueName("queue".into()),
+        deployment: None,
+        build_id: None,
         input: payloads("start-input"),
         memo: memo(),
         search_attributes: search_attributes(),
@@ -94,6 +97,32 @@ fn make_start_request() -> StartRequest {
     }
 }
 
+fn replay_context_from_start(start: &StartRequest) -> ReplayContext {
+    ReplayContext {
+        run_key: start.run_key,
+        namespace_id: start.namespace_id,
+        workflow_id: start.workflow_id.clone(),
+        run_id: start.run_id,
+        deployment: start.deployment.clone(),
+        build_id: start.build_id.clone(),
+        parent_run_key: start.parent_run_key,
+        parent_workflow_id: start.parent_workflow_id.clone(),
+        first_run_started_at: start.first_run_started_at,
+    }
+}
+
+fn history_event(
+    event_id: i64,
+    happened_at: OffsetDateTime,
+    kind: HistoryEventKind,
+) -> HistoryEvent {
+    HistoryEvent {
+        event_id,
+        happened_at,
+        kind,
+    }
+}
+
 fn make_open_state() -> WorkflowState {
     WorkflowState {
         run_key: RunKey::new(),
@@ -102,6 +131,8 @@ fn make_open_state() -> WorkflowState {
         run_id: RunId::new(),
         workflow_type: WorkflowType("wf".into()),
         task_queue: TaskQueueName("queue".into()),
+        deployment: None,
+        build_id: None,
         status: ExecutionStatus::Running,
         transition_seq: TransitionSeq(5),
         last_event_id: 9,
@@ -135,6 +166,220 @@ fn make_open_state() -> WorkflowState {
         close_result: None,
         close_failure: None,
     }
+}
+
+#[test]
+fn replay_history_reconstructs_workflow_task_lifecycle() {
+    let kernel = BasicKernel;
+    let start = make_start_request();
+    let ctx = replay_context_from_start(&start);
+    let worker = WorkerIdentity("worker".into());
+    let started_at = now();
+    let events = vec![
+        history_event(
+            1,
+            started_at,
+            HistoryEventKind::WorkflowExecutionStarted {
+                workflow_type: start.workflow_type.clone(),
+                task_queue: start.task_queue.clone(),
+                input: start.input.clone(),
+                memo: start.memo.clone(),
+                search_attributes: start.search_attributes.clone(),
+                request_id: start.request.request_id.0.clone(),
+                continued_execution_run_id: start.continued_execution_run_id,
+                first_execution_run_id: start.first_execution_run_id,
+                retry_policy: start.retry_policy.clone(),
+                attempt: start.attempt,
+                workflow_execution_timeout: start.workflow_execution_timeout,
+                workflow_run_timeout: start.workflow_run_timeout,
+                workflow_task_timeout: start.workflow_task_timeout,
+            },
+        ),
+        history_event(
+            2,
+            started_at,
+            HistoryEventKind::WorkflowTaskScheduled {
+                logical_seq: LogicalTaskSeq::ONE,
+            },
+        ),
+        history_event(
+            3,
+            started_at,
+            HistoryEventKind::WorkflowTaskStarted {
+                logical_seq: LogicalTaskSeq::ONE,
+                scheduled_event_id: 2,
+                attempt: 1,
+                identity: worker.clone(),
+            },
+        ),
+        history_event(
+            4,
+            started_at,
+            HistoryEventKind::WorkflowTaskCompleted {
+                logical_seq: LogicalTaskSeq::ONE,
+                scheduled_event_id: 2,
+                started_event_id: 3,
+                identity: worker,
+            },
+        ),
+    ];
+
+    let state = kernel.replay_history_prefix(ctx, &events).unwrap();
+
+    assert_eq!(state.pending_workflow_task, None);
+    assert_eq!(state.next_workflow_task_seq, LogicalTaskSeq(2));
+    assert_eq!(state.transition_seq, TransitionSeq::ZERO);
+    assert_eq!(state.last_event_id, 4);
+    assert_eq!(state.started_at, started_at);
+}
+
+#[test]
+fn replay_history_reconstructs_activity_and_timer_state() {
+    let kernel = BasicKernel;
+    let start = make_start_request();
+    let ctx = replay_context_from_start(&start);
+    let t0 = now();
+    let events = vec![
+        history_event(
+            1,
+            t0,
+            HistoryEventKind::WorkflowExecutionStarted {
+                workflow_type: start.workflow_type.clone(),
+                task_queue: start.task_queue.clone(),
+                input: start.input.clone(),
+                memo: start.memo.clone(),
+                search_attributes: start.search_attributes.clone(),
+                request_id: start.request.request_id.0.clone(),
+                continued_execution_run_id: start.continued_execution_run_id,
+                first_execution_run_id: start.first_execution_run_id,
+                retry_policy: start.retry_policy.clone(),
+                attempt: start.attempt,
+                workflow_execution_timeout: start.workflow_execution_timeout,
+                workflow_run_timeout: start.workflow_run_timeout,
+                workflow_task_timeout: start.workflow_task_timeout,
+            },
+        ),
+        history_event(
+            2,
+            t0,
+            HistoryEventKind::ActivityTaskScheduled {
+                activity_id: "a1".into(),
+                activity_type: "activity".into(),
+                task_queue: TaskQueueName("activity-q".into()),
+                input: payloads("activity-input"),
+                header: None,
+                retry_policy: Some(retry_policy()),
+                schedule_to_close_timeout: Some(Duration::minutes(2)),
+                schedule_to_start_timeout: Some(Duration::seconds(30)),
+                start_to_close_timeout: Some(Duration::minutes(1)),
+                heartbeat_timeout: Some(Duration::seconds(20)),
+            },
+        ),
+        history_event(
+            3,
+            t0 + Duration::seconds(1),
+            HistoryEventKind::ActivityTaskStarted {
+                activity_id: "a1".into(),
+                scheduled_event_id: 2,
+                attempt: 1,
+                identity: WorkerIdentity("activity-worker".into()),
+            },
+        ),
+        history_event(
+            4,
+            t0,
+            HistoryEventKind::TimerStarted {
+                timer_id: "t1".into(),
+                fire_at: t0 + Duration::minutes(1),
+            },
+        ),
+    ];
+
+    let state = kernel.replay_history_prefix(ctx, &events).unwrap();
+
+    let activity = state.activities.get("a1").unwrap();
+    assert_eq!(activity.started_event_id, Some(3));
+    assert_eq!(activity.started_at, Some(t0 + Duration::seconds(1)));
+    let timer = state.timers.get("t1").unwrap();
+    assert_eq!(timer.started_event_id, 4);
+}
+
+#[test]
+fn replay_history_reconstructs_historical_execution_options_and_pause() {
+    let kernel = BasicKernel;
+    let start = make_start_request();
+    let ctx = replay_context_from_start(&start);
+    let t0 = now();
+    let events = vec![
+        history_event(
+            1,
+            t0,
+            HistoryEventKind::WorkflowExecutionStarted {
+                workflow_type: start.workflow_type.clone(),
+                task_queue: start.task_queue.clone(),
+                input: start.input.clone(),
+                memo: start.memo.clone(),
+                search_attributes: start.search_attributes.clone(),
+                request_id: start.request.request_id.0.clone(),
+                continued_execution_run_id: start.continued_execution_run_id,
+                first_execution_run_id: start.first_execution_run_id,
+                retry_policy: start.retry_policy.clone(),
+                attempt: start.attempt,
+                workflow_execution_timeout: start.workflow_execution_timeout,
+                workflow_run_timeout: start.workflow_run_timeout,
+                workflow_task_timeout: start.workflow_task_timeout,
+            },
+        ),
+        history_event(
+            2,
+            t0,
+            HistoryEventKind::WorkflowExecutionOptionsUpdated {
+                versioning_override: FieldChange::Set(VersioningOverride),
+                completion_callbacks: FieldChange::Set(vec![CompletionCallback]),
+                attached_request_id: Some("options-req".into()),
+            },
+        ),
+        history_event(
+            3,
+            t0 + Duration::seconds(1),
+            HistoryEventKind::WorkflowExecutionPaused {
+                identity: "operator".into(),
+                reason: "paused".into(),
+                request_id: "pause-req".into(),
+            },
+        ),
+    ];
+
+    let state = kernel.replay_history_prefix(ctx, &events).unwrap();
+
+    assert_eq!(state.status, ExecutionStatus::Paused);
+    assert!(state.pause_info.is_some());
+    assert_eq!(state.versioning_override, Some(VersioningOverride));
+    assert_eq!(state.completion_callbacks, vec![CompletionCallback]);
+    assert_eq!(state.sticky, None);
+    assert_eq!(state.wft_stamp, 0);
+}
+
+#[test]
+fn replay_history_rejects_empty_or_non_started_sequences() {
+    let kernel = BasicKernel;
+    let start = make_start_request();
+    let ctx = replay_context_from_start(&start);
+
+    let empty = kernel.replay_history_prefix(ctx.clone(), &[]);
+    assert_eq!(empty, Err(Reject::InvalidReplayHistory));
+
+    let invalid = kernel.replay_history_prefix(
+        ctx,
+        &[history_event(
+            1,
+            now(),
+            HistoryEventKind::WorkflowTaskScheduled {
+                logical_seq: LogicalTaskSeq::ONE,
+            },
+        )],
+    );
+    assert_eq!(invalid, Err(Reject::InvalidReplayHistory));
 }
 
 fn make_open_state_with_pending_wft() -> WorkflowState {
@@ -187,15 +432,22 @@ fn make_paused_state_with_activity(id: &str) -> WorkflowState {
         id.into(),
         ActivityState {
             activity_id: id.into(),
+            activity_type: "activity-type".into(),
             schedule_event_id: 7,
             task_queue: TaskQueueName("activity-q".into()),
+            deployment: None,
+            build_id: None,
             input: Payloads::default(),
+            header: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
             schedule_to_start_timeout: Some(Duration::seconds(30)),
             start_to_close_timeout: Some(Duration::minutes(1)),
             heartbeat_timeout: Some(Duration::seconds(20)),
+            scheduled_at: OffsetDateTime::UNIX_EPOCH,
+            started_at: None,
+            started_event_id: None,
             pause_info: None,
             stamp: 0,
         },
@@ -209,15 +461,22 @@ fn make_open_state_with_activity(id: &str) -> WorkflowState {
         id.into(),
         ActivityState {
             activity_id: id.into(),
+            activity_type: "activity-type".into(),
             schedule_event_id: 7,
             task_queue: TaskQueueName("activity-q".into()),
+            deployment: None,
+            build_id: None,
             input: Payloads::default(),
+            header: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
             schedule_to_start_timeout: Some(Duration::seconds(30)),
             start_to_close_timeout: Some(Duration::minutes(1)),
             heartbeat_timeout: Some(Duration::seconds(20)),
+            scheduled_at: OffsetDateTime::UNIX_EPOCH,
+            started_at: None,
+            started_event_id: None,
             pause_info: None,
             stamp: 0,
         },
@@ -382,6 +641,8 @@ fn with_pending_nexus_operation(
             endpoint: "endpoint".into(),
             service: "service".into(),
             operation: "operation".into(),
+            schedule_to_close_timeout: None,
+            scheduled_at: OffsetDateTime::UNIX_EPOCH,
             started: false,
         },
     );
@@ -632,15 +893,22 @@ fn terminate_with_activities_and_timers() {
         "activity-2".into(),
         ActivityState {
             activity_id: "activity-2".into(),
+            activity_type: "activity-type".into(),
             schedule_event_id: 6,
             task_queue: TaskQueueName("activity-q".into()),
+            deployment: None,
+            build_id: None,
             input: Payloads::default(),
+            header: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
             schedule_to_start_timeout: Some(Duration::seconds(30)),
             start_to_close_timeout: Some(Duration::minutes(1)),
             heartbeat_timeout: Some(Duration::seconds(20)),
+            scheduled_at: OffsetDateTime::UNIX_EPOCH,
+            started_at: None,
+            started_event_id: None,
             pause_info: None,
             stamp: 0,
         },
@@ -790,15 +1058,22 @@ fn reset_cleans_up_activities_and_timers() {
         "activity-2".into(),
         ActivityState {
             activity_id: "activity-2".into(),
+            activity_type: "activity-type".into(),
             schedule_event_id: 6,
             task_queue: TaskQueueName("activity-q".into()),
+            deployment: None,
+            build_id: None,
             input: Payloads::default(),
+            header: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
             schedule_to_start_timeout: Some(Duration::seconds(30)),
             start_to_close_timeout: Some(Duration::minutes(1)),
             heartbeat_timeout: Some(Duration::seconds(20)),
+            scheduled_at: OffsetDateTime::UNIX_EPOCH,
+            started_at: None,
+            started_event_id: None,
             pause_info: None,
             stamp: 0,
         },
@@ -937,15 +1212,22 @@ fn pause_workflow_happy_path() {
         "activity-2".into(),
         ActivityState {
             activity_id: "activity-2".into(),
+            activity_type: "activity-type".into(),
             schedule_event_id: 8,
             task_queue: TaskQueueName("activity-q".into()),
+            deployment: None,
+            build_id: None,
             input: Payloads::default(),
+            header: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
             schedule_to_start_timeout: Some(Duration::seconds(30)),
             start_to_close_timeout: Some(Duration::minutes(1)),
             heartbeat_timeout: Some(Duration::seconds(20)),
+            scheduled_at: OffsetDateTime::UNIX_EPOCH,
+            started_at: None,
+            started_event_id: None,
             pause_info: None,
             stamp: 0,
         },
@@ -1055,15 +1337,22 @@ fn unpause_workflow_happy_path() {
         "activity-2".into(),
         ActivityState {
             activity_id: "activity-2".into(),
+            activity_type: "activity-type".into(),
             schedule_event_id: 8,
             task_queue: TaskQueueName("activity-q".into()),
+            deployment: None,
+            build_id: None,
             input: Payloads::default(),
+            header: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
             schedule_to_start_timeout: Some(Duration::seconds(30)),
             start_to_close_timeout: Some(Duration::minutes(1)),
             heartbeat_timeout: Some(Duration::seconds(20)),
+            scheduled_at: OffsetDateTime::UNIX_EPOCH,
+            started_at: None,
+            started_event_id: None,
             pause_info: None,
             stamp: 1,
         },
@@ -1507,9 +1796,13 @@ fn workflow_task_completed_with_activity_and_timer() {
                 commands: vec![
                     WorkflowCommand::ScheduleActivity {
                         activity_id: "activity-1".into(),
+                        activity_type: "activity-type".into(),
                         task_queue: TaskQueueName("activity-q".into()),
                         input: payloads("act"),
+                        header: None,
                         retry_policy: None,
+                        deployment: None,
+                        build_id: None,
                         schedule_to_close_timeout: Some(Duration::minutes(2)),
                         schedule_to_start_timeout: Some(Duration::seconds(30)),
                         start_to_close_timeout: Some(Duration::minutes(1)),
@@ -1799,15 +2092,22 @@ fn workflow_execution_timed_out_with_entities() {
         "activity-2".into(),
         ActivityState {
             activity_id: "activity-2".into(),
+            activity_type: "activity-type".into(),
             schedule_event_id: 6,
             task_queue: TaskQueueName("activity-q".into()),
+            deployment: None,
+            build_id: None,
             input: Payloads::default(),
+            header: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
             schedule_to_start_timeout: Some(Duration::seconds(30)),
             start_to_close_timeout: Some(Duration::minutes(1)),
             heartbeat_timeout: Some(Duration::seconds(20)),
+            scheduled_at: OffsetDateTime::UNIX_EPOCH,
+            started_at: None,
+            started_event_id: None,
             pause_info: None,
             stamp: 0,
         },
@@ -2469,15 +2769,22 @@ fn reject_duplicate_activity_id() {
         "dup".into(),
         ActivityState {
             activity_id: "dup".into(),
+            activity_type: "activity-type".into(),
             schedule_event_id: 1,
             task_queue: TaskQueueName("activity-q".into()),
+            deployment: None,
+            build_id: None,
             input: Payloads::default(),
+            header: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: None,
             schedule_to_start_timeout: None,
             start_to_close_timeout: None,
             heartbeat_timeout: None,
+            scheduled_at: OffsetDateTime::UNIX_EPOCH,
+            started_at: None,
+            started_event_id: None,
             pause_info: None,
             stamp: 0,
         },
@@ -2496,9 +2803,13 @@ fn reject_duplicate_activity_id() {
                 identity: WorkerIdentity("worker".into()),
                 commands: vec![WorkflowCommand::ScheduleActivity {
                     activity_id: "dup".into(),
+                    activity_type: "activity-type".into(),
                     task_queue: TaskQueueName("activity-q".into()),
                     input: payloads("a"),
+                    header: None,
                     retry_policy: None,
+                    deployment: None,
+                    build_id: None,
                     schedule_to_close_timeout: None,
                     schedule_to_start_timeout: None,
                     start_to_close_timeout: None,
@@ -3124,15 +3435,22 @@ fn with_pending_activity_started_wft() -> WorkflowState {
         "activity-1".into(),
         ActivityState {
             activity_id: "activity-1".into(),
+            activity_type: "activity-type".into(),
             schedule_event_id: 7,
             task_queue: TaskQueueName("activity-q".into()),
+            deployment: None,
+            build_id: None,
             input: Payloads::default(),
+            header: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
             schedule_to_start_timeout: Some(Duration::seconds(30)),
             start_to_close_timeout: Some(Duration::minutes(1)),
             heartbeat_timeout: Some(Duration::seconds(20)),
+            scheduled_at: OffsetDateTime::UNIX_EPOCH,
+            started_at: None,
+            started_event_id: None,
             pause_info: None,
             stamp: 0,
         },

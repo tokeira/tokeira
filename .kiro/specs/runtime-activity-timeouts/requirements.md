@@ -22,7 +22,7 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 - **Schedule_To_Start_Timeout**: The maximum allowed time between activity scheduling and activity start. Configured per activity via `ActivityState.schedule_to_start_timeout`.
 - **Start_To_Close_Timeout**: The maximum allowed time between activity start and activity completion. Configured per activity via `ActivityState.start_to_close_timeout`.
 - **Schedule_To_Close_Timeout**: The maximum allowed time between activity scheduling and activity completion, regardless of start state. Configured per activity via `ActivityState.schedule_to_close_timeout`. This is the outer timeout that bounds the entire activity lifecycle.
-- **Activity_Tracking_State**: Runtime-local state that tracks per-activity timestamps (scheduled_at, started_at, last_heartbeat_at) and cancellation status needed for heartbeat processing and timeout detection. This state is not part of the kernel's `ActivityState`.
+- **Activity_Tracking_State**: Runtime-local state that tracks per-activity timestamps (original_scheduled_at, last_dispatched_at, started_at, last_heartbeat_at) and cancellation status needed for heartbeat processing and timeout detection. This state is ephemeral — it is not persisted and is lost on runtime restart. Reconstruction after restart is deferred to Feature 11 (Sweeper and Recovery).
 - **ActivityTaskToken**: Token encoding `run_key`, `activity_id`, `schedule_event_id`, `attempt`, and `shard_epoch`, used to validate heartbeat, completion, and failure requests.
 - **Cancellation_Indicator**: A boolean flag returned from `record_activity_heartbeat` indicating that the activity has a pending cancellation request. The worker uses this to initiate graceful shutdown.
 
@@ -51,12 +51,14 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 
 #### Acceptance Criteria
 
-1. WHEN an activity task is published to the Activity_Broker via a `DispatchOp::EnqueueActivityTask`, THE Runtime SHALL record the scheduled_at timestamp in the Activity_Tracking_State keyed by `(run_key, activity_id)`.
+1. WHEN an activity task is first published to the Activity_Broker via a `DispatchOp::EnqueueActivityTask` (attempt 1), THE Runtime SHALL record the `original_scheduled_at` and `last_dispatched_at` timestamps in the Activity_Tracking_State keyed by `(run_key, activity_id)`.
 2. WHEN an activity-task-start transaction succeeds, THE Runtime SHALL record the started_at timestamp in the Activity_Tracking_State for that activity.
 3. WHEN a valid heartbeat is received, THE Runtime SHALL update the last_heartbeat_at timestamp in the Activity_Tracking_State for that activity.
 4. WHEN an activity is resolved (completed, failed with exhausted retries, timed out, or canceled), THE Runtime SHALL remove the activity from the Activity_Tracking_State.
 5. WHEN an `ActivityTaskCancelRequested` history event is committed for an activity, THE Runtime SHALL mark the activity as cancel_requested in the Activity_Tracking_State.
 6. THE Activity_Tracking_State SHALL be keyed by `(run_key, activity_id)` to support lookup from both heartbeat processing and timeout scanning.
+7. WHEN an activity is re-dispatched for retry (attempt > 1), THE Runtime SHALL update `last_dispatched_at` to the current time and clear `started_at` and `last_heartbeat_at`, but SHALL NOT overwrite `original_scheduled_at`. This ensures `schedule_to_close_timeout` measures from the original scheduling, while `schedule_to_start_timeout` measures from the most recent dispatch.
+8. THE Activity_Tracking_State is ephemeral — it is not persisted and is lost on runtime restart. Reconstruction of tracking state after restart is deferred to Feature 11 (Sweeper and Recovery).
 
 ---
 
@@ -78,7 +80,7 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 
 #### Acceptance Criteria
 
-1. WHEN an activity has a configured schedule_to_start_timeout and the elapsed time since scheduled_at exceeds the timeout and the activity has no started_at timestamp, THE Activity_Timeout_Scanner SHALL submit an `ActivityResolved` command with a `TimedOut` resolution (timeout_type "SCHEDULE_TO_START") to the owning run via the lane.
+1. WHEN an activity has a configured schedule_to_start_timeout and the elapsed time since `last_dispatched_at` exceeds the timeout and the activity has no started_at timestamp, THE Activity_Timeout_Scanner SHALL submit an `ActivityResolved` command with a `TimedOut` resolution (timeout_type "SCHEDULE_TO_START") to the owning run via the lane.
 2. THE Activity_Timeout_Scanner SHALL NOT check schedule-to-start timeout for activities that already have a started_at timestamp.
 
 ---
@@ -100,7 +102,7 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 
 #### Acceptance Criteria
 
-1. WHEN an activity has a configured schedule_to_close_timeout and the elapsed time since scheduled_at exceeds the timeout, THE Activity_Timeout_Scanner SHALL submit an `ActivityResolved` command with a `TimedOut` resolution (timeout_type "SCHEDULE_TO_CLOSE") to the owning run via the lane, regardless of whether the activity has been started.
+1. WHEN an activity has a configured schedule_to_close_timeout and the elapsed time since `original_scheduled_at` exceeds the timeout, THE Activity_Timeout_Scanner SHALL submit an `ActivityResolved` command with a `TimedOut` resolution (timeout_type "SCHEDULE_TO_CLOSE") to the owning run via the lane, regardless of whether the activity has been started.
 2. WHEN both schedule-to-close timeout and another timeout type (heartbeat, schedule-to-start, or start-to-close) fire for the same activity in the same scan cycle, THE Activity_Timeout_Scanner SHALL submit only the schedule-to-close timeout resolution.
 
 ---

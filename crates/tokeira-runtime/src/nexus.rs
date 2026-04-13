@@ -6,18 +6,19 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::Command;
-use tokeira_types::{Payloads, RunKey};
+use tokeira_types::{Payloads, RunKey, ShardId};
 use tokio_util::sync::CancellationToken;
 
 use crate::lane::LaneHandle;
 use crate::scanner::pick_lane;
+use crate::shard::ShardOwner;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum NexusStartResult {
@@ -97,6 +98,7 @@ impl NexusHttpClient for NoopNexusHttpClient {
 #[derive(Clone, Debug, PartialEq)]
 pub struct NexusTimeoutEntry {
     pub run_key: RunKey,
+    pub shard_id: ShardId,
     pub operation_id: String,
     pub scheduled_event_id: i64,
     pub schedule_to_close_timeout: Duration,
@@ -130,8 +132,28 @@ impl NexusTimeoutTrackingState {
             .retain(|(candidate, _), _| *candidate != run_key);
     }
 
+    pub fn remove_all_for_shard(&self, shard_id: ShardId) {
+        self.inner
+            .lock()
+            .unwrap()
+            .retain(|_, entry| entry.shard_id != shard_id);
+    }
+
     pub fn snapshot(&self) -> Vec<NexusTimeoutEntry> {
         self.inner.lock().unwrap().values().cloned().collect()
+    }
+
+    pub fn snapshot_for_shard(
+        &self,
+        shard_id: ShardId,
+    ) -> Vec<NexusTimeoutEntry> {
+        self.inner
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|entry| entry.shard_id == shard_id)
+            .cloned()
+            .collect()
     }
 }
 
@@ -158,6 +180,7 @@ pub fn evaluate_nexus_timeout(entry: &NexusTimeoutEntry, now: OffsetDateTime) ->
 
 pub(crate) async fn scan_nexus_timeouts_once<F, Fut>(
     tracking: &NexusTimeoutTrackingState,
+    shard_id: Option<ShardId>,
     config: &NexusTimeoutScannerConfig,
     mut submit_timeout: F,
 ) where
@@ -165,7 +188,10 @@ pub(crate) async fn scan_nexus_timeouts_once<F, Fut>(
     Fut: std::future::Future<Output = Result<()>>,
 {
     let now = OffsetDateTime::now_utc();
-    let entries = tracking.snapshot();
+    let entries = match shard_id {
+        Some(shard_id) => tracking.snapshot_for_shard(shard_id),
+        None => tracking.snapshot(),
+    };
     let mut submitted = 0usize;
 
     for entry in entries {
@@ -206,6 +232,7 @@ pub(crate) async fn run_nexus_timeout_scanner(
     tracking: NexusTimeoutTrackingState,
     lanes: Vec<LaneHandle>,
     lane_count: usize,
+    shard_owner: Arc<RwLock<ShardOwner>>,
     config: NexusTimeoutScannerConfig,
     cancel: CancellationToken,
 ) {
@@ -215,24 +242,27 @@ pub(crate) async fn run_nexus_timeout_scanner(
             _ = tokio::time::sleep(config.scan_interval) => {}
         }
 
-        scan_nexus_timeouts_once(&tracking, &config, |entry, now| {
-            let lane = pick_lane(&lanes, lane_count, entry.run_key).clone();
-            async move {
-                lane.submit(
-                    entry.run_key,
-                    Command::NexusOperationResolved(
-                        tokeira_kernel::NexusOperationResolvedRequest {
-                            operation_id: entry.operation_id,
-                            scheduled_event_id: entry.scheduled_event_id,
-                            resolution: tokeira_kernel::NexusResolution::TimedOut,
-                            now,
-                        },
-                    ),
-                )
-                .await
-                .map(|_| ())
-            }
-        })
-        .await;
+        let active_shards: Vec<_> = shard_owner.read().unwrap().active_shards().collect();
+        for shard_id in active_shards {
+            scan_nexus_timeouts_once(&tracking, Some(shard_id), &config, |entry, now| {
+                let lane = pick_lane(&lanes, lane_count, entry.run_key).clone();
+                async move {
+                    lane.submit(
+                        entry.run_key,
+                        Command::NexusOperationResolved(
+                            tokeira_kernel::NexusOperationResolvedRequest {
+                                operation_id: entry.operation_id,
+                                scheduled_event_id: entry.scheduled_event_id,
+                                resolution: tokeira_kernel::NexusResolution::TimedOut,
+                                now,
+                            },
+                        ),
+                    )
+                    .await
+                    .map(|_| ())
+                }
+            })
+            .await;
+        }
     }
 }

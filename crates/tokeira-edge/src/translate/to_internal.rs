@@ -1,6 +1,8 @@
 use anyhow::Result;
 use time::OffsetDateTime;
-use tokeira_kernel::{SignalRequest, StartRequest, WorkflowTaskCompletedRequest};
+use tokeira_kernel::{
+    ResetRequest, SignalRequest, StartRequest, WorkflowTaskCompletedRequest,
+};
 use tokeira_types::{
     NamespaceId, QueueKey, RequestContext, RequestId as CoreRequestId, RunId, RunKey,
     ShardEpoch, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowTaskToken,
@@ -12,7 +14,8 @@ use crate::{
     request_id::RequestId,
     translate::{
         PollWorkflowTaskQueueRequest, RespondWorkflowTaskCompletedRequest,
-        SignalWorkflowExecutionRequest, StartWorkflowExecutionRequest,
+        ResetWorkflowExecutionRequest, SignalWorkflowExecutionRequest,
+        StartWorkflowExecutionRequest,
     },
 };
 
@@ -50,10 +53,14 @@ pub fn start_request(
         input: req.input,
         memo: req.memo,
         search_attributes: req.search_attributes,
-        workflow_execution_timeout: None,
-        workflow_run_timeout: None,
-        workflow_task_timeout: time::Duration::seconds(10),
-        retry_policy: None,
+        workflow_execution_timeout: req.workflow_execution_timeout,
+        workflow_run_timeout: req.workflow_run_timeout,
+        workflow_task_timeout: req
+            .workflow_task_timeout
+            .unwrap_or(time::Duration::seconds(10)),
+        retry_policy: req.retry_policy,
+        deployment: None,
+        build_id: None,
         attempt: 1,
         continued_execution_run_id: None,
         first_execution_run_id: Some(run_id),
@@ -98,8 +105,8 @@ pub fn poll_request(req: PollWorkflowTaskQueueRequest) -> PollInternalRequest {
             namespace_id: namespace_id_for(&req.namespace),
             task_queue: TaskQueueName(req.task_queue),
             task_kind: TaskKind::Workflow,
-            deployment: None,
-            build_id: None,
+            deployment: req.deployment,
+            build_id: req.build_id,
         },
         worker_identity: WorkerIdentity(req.worker_identity),
         timeout: req.timeout,
@@ -120,4 +127,80 @@ pub fn workflow_task_completed_request(
         force_new_workflow_task: req.force_new_workflow_task,
         now: OffsetDateTime::now_utc(),
     })
+}
+
+pub fn poll_activity_request(
+    req: crate::translate::PollActivityTaskQueueRequest,
+) -> PollInternalRequest {
+    PollInternalRequest {
+        queue: QueueKey {
+            namespace_id: namespace_id_for(&req.namespace),
+            task_queue: TaskQueueName(req.task_queue),
+            task_kind: TaskKind::Activity,
+            deployment: None,
+            build_id: None,
+        },
+        worker_identity: WorkerIdentity(req.worker_identity),
+        timeout: req.timeout,
+    }
+}
+
+pub fn terminate_request(
+    req: crate::translate::TerminateWorkflowExecutionRequest,
+    request_id: &RequestId,
+) -> tokeira_kernel::TerminateRequest {
+    let now = OffsetDateTime::now_utc();
+    tokeira_kernel::TerminateRequest {
+        reason: req.reason,
+        details: req.details,
+        identity: req.identity,
+        request: RequestContext {
+            request_id: CoreRequestId(
+                request_id.as_str().to_string(),
+            ),
+            caller_identity: None,
+            received_at: now,
+        },
+        now,
+    }
+}
+
+pub fn cancel_request(
+    req: crate::translate::RequestCancelWorkflowExecutionRequest,
+    request_id: &RequestId,
+) -> tokeira_kernel::CancelRequest {
+    let now = OffsetDateTime::now_utc();
+    tokeira_kernel::CancelRequest {
+        reason: req.reason,
+        external_initiator: None,
+        request: RequestContext {
+            request_id: CoreRequestId(
+                request_id.as_str().to_string(),
+            ),
+            caller_identity: None,
+            received_at: now,
+        },
+        now,
+    }
+}
+
+pub fn reset_request(
+    req: ResetWorkflowExecutionRequest,
+    request_id: &RequestId,
+) -> ResetRequest {
+    let now = OffsetDateTime::now_utc();
+    ResetRequest {
+        fork_event_id: req.workflow_task_finish_event_id,
+        new_run_id: RunId::new(),
+        reason: req.reason,
+        request: RequestContext {
+            request_id: CoreRequestId(
+                req.request_id
+                    .unwrap_or_else(|| request_id.as_str().to_string()),
+            ),
+            caller_identity: None,
+            received_at: now,
+        },
+        now,
+    }
 }

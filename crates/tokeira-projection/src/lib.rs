@@ -4,9 +4,21 @@
 //! lagging projector is a quality problem, not a correctness failure.
 
 pub mod sink;
-pub mod visibility;
+pub mod filter;
+pub mod memory;
+pub mod query_service;
+pub mod rollup;
+pub mod store;
+pub mod types;
+pub mod visibility_sink;
 pub mod worker;
 
+pub use filter::*;
+pub use memory::*;
+pub use query_service::*;
+pub use rollup::*;
 pub use sink::*;
-pub use visibility::*;
+pub use store::*;
+pub use types::*;
+pub use visibility_sink::*;
 pub use worker::*;

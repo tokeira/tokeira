@@ -1,0 +1,276 @@
+# Implementation Plan: Broker Fairness and Delivery Metrics
+
+## Overview
+
+Add a closed-loop fairness system to the backlog drain path in `tokeira-runtime`. The implementation introduces delivery metrics collection (sync match rate, poll success rate, schedule-to-start latency, backlog age), a per-QueueKey drain share budget maintained by a background control loop, and a budget gate in the drain loop. The fast path (sticky → live-ready → backlog) is unchanged. All fairness parameters are internal constants — no `FairnessConfig`, no operator knobs. The existing `BacklogConfig` is unchanged.
+
+## Tasks
+
+- [x] 1. Define metrics primitives and DeliveryMetrics
+  - [x] 1.1 Create `tokeira/crates/tokeira-runtime/src/fairness.rs` with `SlidingWindowCounter`, `LatencyHistogram`, `DeliveryMetrics`, `QueueMetricsSnapshot`, and `DeliveryMetricsSnapshot`
+    - `SlidingWindowCounter` struct (crate-internal): `current_success: u64`, `current_total: u64`, `previous_success: u64`, `previous_total: u64`
+    - Implement `SlidingWindowCounter::new()`, `record_success()`, `record_failure()`, `advance()`, `rate()` — rate returns 1.0 when total is zero
+    - `LatencyHistogram` struct (crate-internal): fixed-bucket histogram capped at 60 seconds
+    - Implement `LatencyHistogram::new()`, `record(duration)`, `percentile(p) -> Duration`, `reset()`, `count() -> u64` — percentile returns `Duration::ZERO` for empty histogram
+    - No `MetricsKey` type — all metrics are keyed by `QueueKey` directly to match the fairness granularity (deployment/build_id must not be merged)
+    - `DeliveryMetrics` struct (pub, `Clone`): `inner: Arc<Mutex<DeliveryMetricsInner>>`
+    - `DeliveryMetricsInner` struct: `latency: HashMap<QueueKey, LatencyHistogram>`, `sync_match: HashMap<QueueKey, SlidingWindowCounter>`, `poll_success: HashMap<QueueKey, SlidingWindowCounter>`, `backlog_age: HashMap<QueueKey, Duration>`
+    - Implement `DeliveryMetrics::new()`, `record_latency(&QueueKey, Duration)`, `record_sync_match(&QueueKey)`, `record_non_sync_match(&QueueKey)`, `record_poll_success(&QueueKey)`, `record_poll_timeout(&QueueKey)`, `set_backlog_age(&QueueKey, Duration)`, `take_snapshot()`, `peek_snapshot()`
+    - `take_snapshot` advances sliding windows and resets histograms; `peek_snapshot` does not
+    - `QueueMetricsSnapshot` struct (pub): `latency_p50`, `latency_p99`, `sync_match_rate`, `poll_success_rate`, `backlog_age`
+    - `DeliveryMetricsSnapshot` struct (pub): `queues: HashMap<QueueKey, QueueMetricsSnapshot>`, `taken_at: OffsetDateTime`
+    - _Requirements: 4.2, 5.1, 5.3, 5.4, 6.1, 6.2, 6.3, 6.4, 7.1, 7.2, 7.3, 7.4, 8.1, 8.2, 8.3, 8.4, 8.5, 9.1, 9.3_
+  - [x] 1.2 Register `pub mod fairness;` and `pub use fairness::*;` in `lib.rs`
+    - _Requirements: 9.1_
+
+- [x] 2. Define FairnessState and evaluate_drain_share
+  - [x] 2.1 Add `QueueFairnessState`, `FairnessState`, and internal constants to `fairness.rs`
+    - `QueueFairnessState` struct (pub): `drain_share: f64`, `remaining_budget: u32`, `last_adjusted_at: OffsetDateTime` — derives `Clone`, `Debug`
+    - `FairnessState` struct (pub, `Clone`): `inner: Arc<Mutex<FairnessStateInner>>`
+    - `FairnessStateInner` struct: `queues: HashMap<QueueKey, QueueFairnessState>`
+    - Implement `FairnessState::new()`, `remaining_budget(queue) -> u32`, `consume_budget(queue, count) -> u32`, `apply_adjustment(adjustments, recent_poll_counts, now)`, `snapshot() -> HashMap<QueueKey, QueueFairnessState>`
+    - `remaining_budget` returns a default budget when no entry exists
+    - `consume_budget` returns the number actually consumed (may be less than requested)
+    - Internal constants: `DEFAULT_DRAIN_SHARE = 0.1`, `MIN_DRAIN_SHARE = 0.0`, `MAX_DRAIN_SHARE = 0.8`, `MAX_DELTA_PER_INTERVAL = 0.10`, `DEFAULT_CONTROL_INTERVAL = 5s`, `MIN_CONTROL_INTERVAL = 2s`, `MAX_CONTROL_INTERVAL = 10s`
+    - No `FairnessConfig` struct — all parameters are internal constants
+    - _Requirements: 2.1, 2.2, 2.3, 2.5, 2.6, 3.3, 4.9, 11.1, 11.2, 11.3, 11.4_
+  - [x] 2.2 Implement `evaluate_drain_share` pure function in `fairness.rs`
+    - Signature: `pub(crate) fn evaluate_drain_share(current: f64, metrics: &QueueMetricsSnapshot) -> f64`
+    - Algorithm: backlog age pressure (+), sync match rate protection (-), poll success rate signal (+), latency pressure (+)
+    - Clamp delta to `±MAX_DELTA_PER_INTERVAL`, clamp result to `[MIN_DRAIN_SHARE, MAX_DRAIN_SHARE]`
+    - Follow the exact algorithm from the design document
+    - _Requirements: 2.3, 2.5, 3.1, 3.2, 3.3, 3.4, 4.3, 4.4, 4.5, 4.9_
+
+- [x] 3. Checkpoint — Verify metrics primitives and fairness types compile
+  - Ensure all tests pass, ask the user if questions arise.
+
+- [x] 4. Implement control loop background task
+  - [x] 4.1 Add `run_control_loop` and `control_loop_tick` to `fairness.rs`
+    - `run_control_loop(metrics, fairness, cancel)` — async background task following `CancellationToken` pattern (same as `run_timer_scanner`, `run_grace_scanner`, `run_drain_loop`)
+    - `control_loop_tick(metrics, fairness) -> Duration` — single tick separated for testing: calls `take_snapshot`, iterates queues, calls `evaluate_drain_share`, calls `apply_adjustment`, computes adaptive interval from metric volatility
+    - Adaptive interval: compute `max_delta` across all QueueKey drain share changes, derive `volatility = max_delta / MAX_DELTA_PER_INTERVAL`, interpolate between `MIN_CONTROL_INTERVAL` (2s) and `MAX_CONTROL_INTERVAL` (10s). High volatility → short interval, low volatility → long interval. Initial interval is `DEFAULT_CONTROL_INTERVAL` (5s).
+    - `run_control_loop` uses the returned interval for the next sleep duration
+    - Both functions are `pub(crate)`
+    - _Requirements: 4.1, 4.2, 4.6, 4.7, 4.8, 4.9_
+
+- [x] 5. Add `scheduled_at` timestamp to `BacklogEntry`
+  - [x] 5.1 Add `pub scheduled_at: OffsetDateTime` field to `BacklogEntry` in `tokeira-storage/src/api.rs`
+    - This records the wall-clock time when the task was originally published to the broker
+    - _Requirements: 8.1, 8.2_
+  - [x] 5.2 Update `workflow_to_backlog_entry` in `backlog.rs` to accept and populate `scheduled_at`
+    - The grace scanner has access to `TimestampedWorkflowTask::entered_at` — convert `Instant` to `OffsetDateTime` and pass it through
+    - _Requirements: 8.1_
+  - [x] 5.3 Update `activity_to_backlog_entry` in `backlog.rs` to accept and populate `scheduled_at`
+    - Same pattern as workflow, using `TimestampedActivityTask::entered_at`
+    - _Requirements: 8.1_
+  - [x] 5.4 Update all `BacklogEntry` construction sites in tests (`memory.rs`, `backlog.rs`, `lane.rs`, `runtime.rs`) to include `scheduled_at`
+    - Use `OffsetDateTime::now_utc()` or a fixed test timestamp
+    - _Requirements: 8.1_
+
+- [x] 6. Instrument broker with sync match counters
+  - [x] 6.1 Add `metrics: Option<&DeliveryMetrics>` parameter to `InMemoryBroker::publish_workflow_task`
+    - Detect sync match: check if `waiter_counts` has a waiting poller for the task's queue
+    - If waiter exists: call `metrics.record_sync_match(&task.queue)`; otherwise call `metrics.record_non_sync_match(&task.queue)`
+    - All metrics keyed by `QueueKey` directly (no reduced key type)
+    - Update all existing call sites to pass `None` (or the metrics reference where available)
+    - _Requirements: 6.1, 6.2_
+  - [x] 6.2 Add `metrics: Option<&DeliveryMetrics>` parameter to `InMemoryActivityBroker::publish_activity_task`
+    - Same sync match detection pattern as workflow broker
+    - Update all existing call sites
+    - _Requirements: 6.5_
+
+- [x] 7. Checkpoint — Verify broker instrumentation compiles and existing tests pass
+  - Ensure all tests pass, ask the user if questions arise.
+
+- [x] 8. Instrument runtime with poll success/timeout and schedule-to-start latency
+  - [x] 7.1 Add poll success/timeout recording to `poll_workflow_task` in `runtime.rs`
+    - After `broker.poll_workflow_task` returns: if `Some((task, entered_at))` → `delivery_metrics.record_poll_success(&queue)`; if `None` → `delivery_metrics.record_poll_timeout(&queue)`
+    - All metrics keyed by `QueueKey` directly
+    - _Requirements: 7.1, 7.2_
+  - [x] 7.2 Add poll success/timeout recording to `poll_activity_task` in `runtime.rs`
+    - Same pattern as workflow poll, keyed by `QueueKey`
+    - _Requirements: 7.5, 7.6_
+  - [x] 7.3 Extend broker `poll_workflow_task` to return `entered_at` alongside the task
+    - Change return type from `Option<DispatchableWorkflowTask>` to `Option<(DispatchableWorkflowTask, Instant)>` where `Instant` is the `TimestampedWorkflowTask::entered_at`
+    - The `try_take` method already has access to `entered_at` from the `TimestampedWorkflowTask` — return it alongside the task
+    - Update all call sites (`runtime.rs`, tests) to destructure the tuple
+    - _Requirements: 5.5_
+  - [x] 7.4 Add schedule-to-start latency recording to `start_polled_workflow_task` in `runtime.rs`
+    - Accept `entered_at: Instant` parameter (passed from `poll_workflow_task`)
+    - Compute elapsed time: `entered_at.elapsed()` (Instant-based, no clock skew)
+    - Call `delivery_metrics.record_latency(&queue, duration)`
+    - _Requirements: 5.1, 5.3, 5.5_
+  - [x] 7.5 Add schedule-to-start latency recording to `start_activity_task` in `runtime.rs`
+    - Same pattern as workflow task, using the activity broker's `entered_at`
+    - _Requirements: 5.2, 5.6_
+
+- [x] 9. Modify drain loop with budget gate
+  - [x] 8.1 Add `fairness: &FairnessState` and `metrics: &DeliveryMetrics` parameters to `drain_once` in `backlog.rs`
+    - Before draining each workflow queue: check `fairness.remaining_budget(&queue)`, skip if zero
+    - Limit drain to `min(budget as usize, config.drain_batch_limit)`
+    - After draining: call `fairness.consume_budget(&queue, drained_count as u32)`
+    - When drain returns fewer than limit: call `metrics.set_backlog_age(&queue, Duration::ZERO)`
+    - Activity drain path unchanged — no fairness budget for activities
+    - _Requirements: 2.1, 2.2, 2.4, 2.6, 8.1, 8.2, 8.3_
+  - [x] 8.2 Update `run_drain_loop` signature to accept `FairnessState` and `DeliveryMetrics`
+    - Pass through to `drain_once`
+    - _Requirements: 2.1_
+
+- [x] 10. Integrate into TokeiraRuntime
+  - [x] 9.1 Add `delivery_metrics: DeliveryMetrics` and `fairness_state: FairnessState` fields to `TokeiraRuntime`
+    - Initialize in `new_with_nexus_and_shards` with `DeliveryMetrics::new()` and `FairnessState::new()`
+    - Add `pub fn delivery_metrics(&self) -> DeliveryMetrics` accessor
+    - Add `pub fn fairness_state(&self) -> FairnessState` accessor
+    - _Requirements: 9.1, 9.2, 10.1, 10.2, 10.3_
+  - [x] 9.2 Add `control_loop_handle: Option<JoinHandle<()>>` and `control_loop_cancel: CancellationToken` fields
+    - Spawn `run_control_loop` in `new_with_nexus_and_shards` alongside existing background tasks
+    - _Requirements: 4.1, 4.8_
+  - [x] 9.3 Add `shutdown_control_loop` method following existing shutdown pattern
+    - Cancel token, take handle, timeout join — same pattern as `shutdown_drain_loop`
+    - _Requirements: 4.8_
+  - [x] 9.4 Wire `DeliveryMetrics` and `FairnessState` into `run_drain_loop` call
+    - Pass `delivery_metrics.clone()` and `fairness_state.clone()` to the drain loop spawn
+    - _Requirements: 2.1, 8.1_
+  - [x] 9.5 Wire `DeliveryMetrics` into broker publish calls from drain loop and publisher
+    - Pass metrics reference to `publish_workflow_task` and `publish_activity_task` calls in `drain_once`, `RuntimeDispatchPublisher`, and `republish_queue`
+    - _Requirements: 6.1, 6.2, 6.5_
+
+- [x] 11. Checkpoint — Verify full integration compiles and existing tests pass
+  - Ensure all tests pass, ask the user if questions arise.
+
+- [x] 12. Property tests for fairness correctness
+  - [x] 12.1 Write property test: poll path priority ordering
+    - **Property 1: Poll path priority ordering**
+    - Generate random broker states with tasks in multiple tiers (sticky-ready, live-ready, backlog-drained)
+    - Poll and verify the returned task comes from the highest-priority non-empty tier
+    - Include cases with exhausted fairness budgets to verify the fast path is unaffected
+    - **Validates: Requirements 1.1, 1.2, 1.3, 1.4, 1.5**
+  - [x] 12.2 Write property test: drain share budget enforcement
+    - **Property 2: Drain share budget enforcement**
+    - Generate random drain share values and task counts
+    - Run drain cycles with a mock repo, verify drained tasks never exceed budget
+    - Verify no draining occurs when budget is zero
+    - **Validates: Requirements 2.1, 2.2**
+  - [x] 12.3 Write property test: sync match rate protection
+    - **Property 3: Sync match rate protection**
+    - Generate pairs of `QueueMetricsSnapshot` differing only in `sync_match_rate`
+    - Verify `evaluate_drain_share` returns a lower or equal value for the lower sync match rate
+    - **Validates: Requirements 2.5, 4.4**
+  - [x] 12.4 Write property test: backlog age increases drain share
+    - **Property 4: Backlog age increases drain share**
+    - Generate pairs of `QueueMetricsSnapshot` differing only in `backlog_age`
+    - Verify `evaluate_drain_share` returns a higher or equal value for the higher backlog age
+    - **Validates: Requirements 3.1, 3.2**
+  - [x] 12.5 Write property test: drain share upper bound preserves fast path
+    - **Property 5: Drain share upper bound preserves fast path**
+    - Generate random `QueueMetricsSnapshot` values including extremes (max backlog age, zero sync match rate, zero poll success rate, max latency)
+    - Verify `evaluate_drain_share` always returns a value in `[MIN_DRAIN_SHARE, MAX_DRAIN_SHARE]` where `MAX_DRAIN_SHARE < 1.0`
+    - **Validates: Requirements 3.3**
+  - [x] 12.6 Write property test: oscillation bound
+    - **Property 6: Oscillation bound**
+    - Generate random current drain shares and `QueueMetricsSnapshot` values
+    - Verify `|evaluate_drain_share(current, metrics) - current| <= MAX_DELTA_PER_INTERVAL`
+    - **Validates: Requirements 4.9**
+  - [x] 12.7 Write property test: latency responsiveness
+    - **Property 7: Latency responsiveness**
+    - Generate pairs of `QueueMetricsSnapshot` differing only in `latency_p99`
+    - Verify `evaluate_drain_share` returns a higher or equal value for the higher latency
+    - **Validates: Requirements 4.3**
+  - [x] 12.8 Write property test: schedule-to-start latency recording accuracy
+    - **Property 8: Schedule-to-start latency recording accuracy**
+    - Generate random scheduling timestamps and start times
+    - Record latency in `LatencyHistogram`, verify the histogram contains the correct duration
+    - **Validates: Requirements 5.1, 5.2, 5.3, 5.5, 5.6**
+  - [x] 12.9 Write property test: sliding window rate computation
+    - **Property 9: Sliding window rate computation**
+    - Generate random sequences of success/failure events
+    - Record them in a `SlidingWindowCounter`, verify `rate()` equals the expected ratio
+    - Test window advancement preserves previous bucket
+    - Verify rate returns 1.0 for zero events
+    - **Validates: Requirements 6.1, 6.2, 6.3, 7.1, 7.2, 7.3**
+  - [x] 12.10 Write property test: backlog age gauge accuracy
+    - **Property 10: Backlog age gauge accuracy**
+    - Generate random sets of backlog task ages, set the gauge
+    - Verify it reflects the maximum age; verify empty drain sets age to zero
+    - **Validates: Requirements 8.1, 8.2, 8.3, 8.5**
+  - [x] 12.11 Write property test: convergence from defaults
+    - **Property 11: Convergence from defaults**
+    - Generate random stable `QueueMetricsSnapshot` values
+    - Iterate `evaluate_drain_share` from `DEFAULT_DRAIN_SHARE` up to 20 times
+    - Verify convergence: `|share[i+1] - share[i]| < 0.001` for some i ≤ 20
+    - **Validates: Requirements 10.2**
+  - [x] 12.12 Write property test: adaptive interval monotonicity
+    - **Property 12: Adaptive interval monotonicity**
+    - Generate pairs of `control_loop_tick` invocations with different metric volatility levels
+    - Verify higher volatility (larger max drain share delta) produces shorter or equal intervals
+    - Verify the interval is always in `[MIN_CONTROL_INTERVAL, MAX_CONTROL_INTERVAL]`
+    - **Validates: Requirements 4.6**
+
+- [x] 13. Checkpoint — Verify all property tests pass
+  - Ensure all tests pass, ask the user if questions arise.
+
+- [ ] 14. Unit tests and integration tests
+  - [ ]* 14.1 Write unit tests for `SlidingWindowCounter`
+    - `rate()` returns 1.0 for zero events (Req 6.3, 7.3)
+    - `advance()` moves current to previous and resets current
+    - Success/failure recording and rate computation
+    - _Requirements: 6.1, 6.2, 6.3, 7.1, 7.2, 7.3_
+  - [ ]* 14.2 Write unit tests for `LatencyHistogram`
+    - `percentile()` returns `Duration::ZERO` for empty histogram (Req 5.4)
+    - Recording samples and querying p50/p95/p99
+    - `reset()` clears all buckets
+    - _Requirements: 5.1, 5.3, 5.4_
+  - [ ]* 14.3 Write unit tests for `DeliveryMetrics`
+    - `take_snapshot` advances sliding windows and resets histograms (Req 4.2)
+    - `peek_snapshot` does not advance windows (Req 9.3)
+    - Recording sync match, poll success, latency, and backlog age
+    - _Requirements: 4.2, 9.1, 9.3_
+  - [ ]* 14.4 Write unit tests for `FairnessState`
+    - `consume_budget` returns 0 when budget is exhausted (Req 2.2)
+    - `apply_adjustment` resets budgets for the new interval (Req 4.1)
+    - `remaining_budget` returns default when no entry exists
+    - `snapshot` returns current state
+    - _Requirements: 2.1, 2.2, 4.1, 9.2_
+  - [ ]* 14.5 Write unit tests for `evaluate_drain_share`
+    - All-healthy metrics returns a value near `DEFAULT_DRAIN_SHARE` (Req 11.4)
+    - Zero backlog age returns a low drain share (Req 3.1)
+    - Maximum backlog age returns a high drain share capped at `MAX_DRAIN_SHARE` (Req 3.2, 3.3)
+    - _Requirements: 3.1, 3.2, 3.3, 11.4_
+  - [ ]* 14.6 Write unit tests for control loop shutdown
+    - Control loop shutdown via `CancellationToken` completes promptly (Req 4.8)
+    - _Requirements: 4.8_
+  - [ ]* 14.7 Write unit test: no `FairnessConfig` struct exists
+    - Compile-time check that no `FairnessConfig` type is defined (Req 11.1, 11.3)
+    - Verify `BacklogConfig` has no new fairness-related fields (Req 11.3)
+    - _Requirements: 11.1, 11.3_
+  - [ ]* 14.8 Write integration test: drain loop respects budget
+    - Publish tasks, set a low drain budget, run drain cycle, verify drained count does not exceed budget
+    - Control loop adjusts budget, verify next drain cycle uses new budget
+    - _Requirements: 2.1, 2.2, 4.1_
+  - [ ]* 14.9 Write integration test: fast path unaffected by exhausted budget
+    - Exhaust fairness budget for a QueueKey, verify sticky and live-ready tasks still deliver immediately via poll
+    - _Requirements: 1.3, 1.5_
+  - [ ]* 14.10 Write integration test: restart convergence
+    - Create runtime with default drain share, feed metrics, verify control loop converges within a few intervals
+    - _Requirements: 10.1, 10.2_
+  - [ ]* 14.11 Write integration test: observability snapshots
+    - Call `delivery_metrics().peek_snapshot()` and `fairness_state().snapshot()`, verify consistent data
+    - _Requirements: 9.1, 9.2, 9.3_
+
+- [x] 15. Final checkpoint
+  - Ensure all tests pass, ask the user if questions arise.
+
+## Notes
+
+- All property test tasks (12.1–12.12) are REQUIRED per project guidance — not marked optional
+- Unit tests (14.1–14.7) and integration tests (14.8–14.11) are marked optional with `*`
+- The design uses Rust — no language selection needed
+- No `FairnessConfig` struct is created. All fairness parameters are internal constants in `fairness.rs`
+- The existing `BacklogConfig` is unchanged — no new fields
+- `DeliveryMetrics` and `FairnessState` use `Arc<Mutex<...>>` matching the pattern of `WorkflowTimeoutTrackingState` and `ActivityTrackingState`
+- `rustfmt max_width = 90` — keep lines within 90 columns
+- Follow existing patterns in `broker.rs`, `backlog.rs`, `runtime.rs`, and `update.rs`
+- Property tests use `proptest` (already used in `broker.rs` and `backlog.rs` tests)
+- The poll path priority order (sticky → live-ready → backlog) is unchanged
+- Activity drain path does not get fairness budgets in this iteration
+- All fairness state is purely ephemeral — lost on restart, rebuilt by control loop convergence

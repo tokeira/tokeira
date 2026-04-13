@@ -6,7 +6,8 @@ use tokio::time::Instant;
 
 use tokeira_kernel::{HistoryEventKind, StartRequest, TerminateRequest};
 use tokeira_runtime::{
-    LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
+    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime,
+    WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -201,6 +202,7 @@ fn make_runtime(store: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {
             scan_interval: tokio::time::Duration::from_millis(10),
             max_timeouts_per_scan: 100,
         },
+        BacklogConfig::default(),
     )
 }
 
@@ -267,6 +269,8 @@ fn start_request(
         workflow_run_timeout,
         workflow_task_timeout: Duration::seconds(10),
         retry_policy: None,
+        deployment: None,
+        build_id: None,
         attempt: 1,
         continued_execution_run_id: None,
         first_execution_run_id: None,

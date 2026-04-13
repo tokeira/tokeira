@@ -1,0 +1,14 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 23063749b9fa4dc16ad322a98fc5dc3b26b5fc40f91152fa8d2459de82b943bf # shrinks to logical_seq = 1, attempt = 1
+cc 7dc34d1121c2eea48c6b1418f48df17f7cd3d44e2cd93a1e8a6e14208d5470a7 # shrinks to logical_seqs = [1]
+cc c5b2251a3d01c209beef377c6e25ba8979b43393280203c601a2d3ef1184c034 # shrinks to logical_seqs = [29, 9, 15, 20, 9]
+cc 111ab7b1065bbadd967480915a94b73bd103c42f465ee4bae8cdfdcfa1272584 # shrinks to logical_seqs = [23, 21]
+cc 00cf545d3329f3a7987e7fe27465c271f7ae737ac11320df161787ac98df6d2b # shrinks to logical_seq = 7, attempt = 1
+cc c483a84b2ef2d6d82c7f2a5c3eaa4f195008c61ed1afac0984e91fd225c462b7 # shrinks to logical_seqs = [24, 22, 18, 6, 17]
+cc d56130c6f48b02ce56942ca84a70ff6738f0cde639565307b77cb663f137d091 # shrinks to logical_seqs = [9, 21, 7]
+cc 91eff89c0544009aac32b7bdbe9520c9203ae5899661f67f1ce9ef25f1026283 # shrinks to logical_seqs = [31, 1]

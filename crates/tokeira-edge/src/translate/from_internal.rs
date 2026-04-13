@@ -1,11 +1,14 @@
 use anyhow::Result;
 use tokeira_kernel::StartRequest;
 use tokeira_runtime::StartedWorkflowTask;
+use tokeira_storage::RunRepository;
 
 use crate::{
     translate::{
-        PollWorkflowTaskQueueResponse, RespondWorkflowTaskCompletedResponse,
-        SignalWorkflowExecutionResponse, StartWorkflowExecutionResponse,
+        PollWorkflowTaskQueueResponse,
+        RespondWorkflowTaskCompletedResponse,
+        SignalWorkflowExecutionResponse,
+        StartWorkflowExecutionResponse,
         WorkflowTaskPayloadDto,
     },
     workflow_service::WorkflowMutationOutcome,
@@ -33,9 +36,13 @@ pub fn signal_response(
     }
 }
 
-pub fn poll_response(
+pub async fn poll_response(
     started: StartedWorkflowTask,
+    repo: &dyn RunRepository,
 ) -> Result<PollWorkflowTaskQueueResponse> {
+    let history = repo
+        .read_history(started.run_key, 0, usize::MAX)
+        .await?;
     Ok(PollWorkflowTaskQueueResponse {
         task_token: serde_json::to_vec(&started.token)?,
         started_event_id: started.token.started_event_id,
@@ -44,7 +51,7 @@ pub fn poll_response(
             workflow_id: started.workflow_id.0,
             run_key: started.run_key,
             task_queue: started.task_queue.0,
-            history: Vec::new(),
+            history,
         },
     })
 }
@@ -55,5 +62,104 @@ pub fn completed_response(
     RespondWorkflowTaskCompletedResponse {
         transition_seq: outcome.transition_seq,
         last_event_id: outcome.last_event_id,
+        execution_status: outcome.execution_status,
+        new_run_id: outcome.new_run_id,
+        was_duplicate: outcome.was_duplicate,
+    }
+}
+
+pub fn poll_activity_response(
+    started: tokeira_runtime::StartedActivityTask,
+) -> Result<crate::translate::PollActivityTaskQueueResponse> {
+    Ok(crate::translate::PollActivityTaskQueueResponse {
+        task_token: serde_json::to_vec(&started.token)?,
+        activity_id: started.activity_id,
+        activity_type: started.activity_type,
+        input: started.input,
+        attempt: started.attempt,
+        workflow_id: started.workflow_id,
+        workflow_type: started.workflow_type,
+        workflow_namespace: started.workflow_namespace,
+        run_key: started.run_key,
+        header: started.header,
+        retry_policy: started.retry_policy,
+        schedule_to_close_timeout: started
+            .schedule_to_close_timeout
+            .and_then(|d| d.try_into().ok()),
+        start_to_close_timeout: started
+            .start_to_close_timeout
+            .and_then(|d| d.try_into().ok()),
+        heartbeat_timeout: started
+            .heartbeat_timeout
+            .and_then(|d| d.try_into().ok()),
+    })
+}
+
+pub fn terminate_response(
+    _outcome: WorkflowMutationOutcome,
+) -> crate::translate::TerminateWorkflowExecutionResponse {
+    crate::translate::TerminateWorkflowExecutionResponse
+}
+
+pub fn cancel_response(
+    _outcome: WorkflowMutationOutcome,
+) -> crate::translate::RequestCancelWorkflowExecutionResponse
+{
+    crate::translate::RequestCancelWorkflowExecutionResponse
+}
+
+pub fn reset_response(
+    outcome: tokeira_runtime::ResetWorkflowResult,
+) -> crate::translate::ResetWorkflowExecutionResponse {
+    crate::translate::ResetWorkflowExecutionResponse {
+        run_id: outcome.successor_run_id,
+    }
+}
+
+pub fn query_response(
+    result: tokeira_runtime::QueryResult,
+) -> crate::translate::QueryWorkflowResponse {
+    match result {
+        tokeira_runtime::QueryResult::Completed {
+            result,
+        } => crate::translate::QueryWorkflowResponse {
+            result: Some(result),
+            rejected_status: None,
+        },
+        tokeira_runtime::QueryResult::Failed { message: _ } => {
+            crate::translate::QueryWorkflowResponse {
+                result: None,
+                rejected_status: None,
+            }
+        }
+    }
+}
+
+pub fn update_response(
+    outcome: tokeira_runtime::UpdateOutcome,
+) -> crate::translate::UpdateWorkflowExecutionResponse {
+    let dto = match outcome {
+        tokeira_runtime::UpdateOutcome::Accepted {
+            accepted_event_id,
+        } => crate::translate::UpdateOutcomeDto::Accepted {
+            accepted_event_id,
+        },
+        tokeira_runtime::UpdateOutcome::Completed {
+            accepted_event_id,
+            result,
+        } => crate::translate::UpdateOutcomeDto::Completed {
+            accepted_event_id,
+            result,
+        },
+        tokeira_runtime::UpdateOutcome::Rejected {
+            accepted_event_id,
+            failure,
+        } => crate::translate::UpdateOutcomeDto::Rejected {
+            accepted_event_id,
+            failure,
+        },
+    };
+    crate::translate::UpdateWorkflowExecutionResponse {
+        outcome: dto,
     }
 }

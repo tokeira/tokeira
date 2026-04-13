@@ -2,6 +2,8 @@
 
 use crate::conversions::ProtoConversionError;
 use crate::public::common;
+use crate::public::temporal::api::taskqueue::v1 as taskqueue;
+use prost_types::{Duration as ProtoDuration, Timestamp};
 use time::OffsetDateTime;
 use tokeira_types::{
     Headers, Memo, Payload as DomainPayload, Payloads as DomainPayloads, RunId,
@@ -17,6 +19,7 @@ pub fn payload_from_domain(value: &DomainPayload) -> common::Payload {
             .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
             .collect(),
         data: value.data.clone(),
+        ..Default::default()
     }
 }
 
@@ -34,6 +37,7 @@ pub fn payload_to_domain(value: &common::Payload) -> DomainPayload {
 pub fn payloads_from_domain(values: &DomainPayloads) -> common::Payloads {
     common::Payloads {
         payloads: values.0.iter().map(payload_from_domain).collect(),
+        ..Default::default()
     }
 }
 
@@ -48,6 +52,7 @@ pub fn headers_from_domain(value: &Headers) -> common::Header {
             .iter()
             .map(|(k, v)| (k.clone(), payload_from_domain(v)))
             .collect(),
+        ..Default::default()
     }
 }
 
@@ -68,6 +73,7 @@ pub fn memo_from_domain(value: &Memo) -> common::Memo {
             .iter()
             .map(|(k, v)| (k.clone(), payload_from_domain(v)))
             .collect(),
+        ..Default::default()
     }
 }
 
@@ -88,8 +94,9 @@ pub fn search_attributes_from_domain(
         indexed_fields: value
             .0
             .iter()
-            .map(|(name, val)| (name.clone(), search_attr_value_from_domain(val)))
+            .map(|(name, val)| (name.clone(), search_attr_value_to_payload(val)))
             .collect(),
+        ..Default::default()
     }
 }
 
@@ -100,50 +107,31 @@ pub fn search_attributes_to_domain(
         value
             .indexed_fields
             .iter()
-            .map(|(name, val)| Ok((name.clone(), search_attr_value_to_domain(val)?)))
+            .map(|(name, val)| Ok((name.clone(), search_attr_payload_to_domain(val)?)))
             .collect::<Result<_, ProtoConversionError>>()?,
     ))
 }
 
-pub fn search_attr_value_from_domain(
-    value: &SearchAttrValue,
-) -> common::SearchAttributeValue {
-    use common::search_attribute_value::Kind;
-
-    let kind = match value {
-        SearchAttrValue::Keyword(v) => Kind::Keyword(v.clone()),
-        SearchAttrValue::KeywordList(v) => {
-            Kind::KeywordList(common::KeywordList { values: v.clone() })
-        }
-        SearchAttrValue::Int(v) => Kind::IntValue(*v),
-        SearchAttrValue::Bool(v) => Kind::BoolValue(*v),
-        SearchAttrValue::Double(v) => Kind::DoubleValue(*v),
-        SearchAttrValue::Datetime(v) => Kind::DatetimeUnixNanos(to_unix_nanos(*v)),
-        SearchAttrValue::Text(v) => Kind::Text(v.clone()),
-    };
-
-    common::SearchAttributeValue { kind: Some(kind) }
+fn search_attr_value_to_payload(value: &SearchAttrValue) -> common::Payload {
+    let data = serde_json::to_vec(value).unwrap_or_default();
+    let mut metadata = std::collections::BTreeMap::new();
+    metadata.insert(
+        "encoding".to_string(),
+        b"json/plain".to_vec(),
+    );
+    common::Payload {
+        metadata,
+        data,
+        ..Default::default()
+    }
 }
 
-pub fn search_attr_value_to_domain(
-    value: &common::SearchAttributeValue,
+fn search_attr_payload_to_domain(
+    value: &common::Payload,
 ) -> Result<SearchAttrValue, ProtoConversionError> {
-    use common::search_attribute_value::Kind;
-
-    match value.kind.as_ref() {
-        Some(Kind::Keyword(v)) => Ok(SearchAttrValue::Keyword(v.clone())),
-        Some(Kind::KeywordList(v)) => Ok(SearchAttrValue::KeywordList(v.values.clone())),
-        Some(Kind::IntValue(v)) => Ok(SearchAttrValue::Int(*v)),
-        Some(Kind::BoolValue(v)) => Ok(SearchAttrValue::Bool(*v)),
-        Some(Kind::DoubleValue(v)) => Ok(SearchAttrValue::Double(*v)),
-        Some(Kind::DatetimeUnixNanos(v)) => {
-            from_unix_nanos(*v).map(SearchAttrValue::Datetime)
-        }
-        Some(Kind::Text(v)) => Ok(SearchAttrValue::Text(v.clone())),
-        None => Err(ProtoConversionError::MissingField(
-            "SearchAttributeValue.kind",
-        )),
-    }
+    serde_json::from_slice(&value.data).map_err(|_err| {
+        ProtoConversionError::MissingField("SearchAttributes: invalid payload data")
+    })
 }
 
 pub fn workflow_execution_from_ids(
@@ -153,16 +141,18 @@ pub fn workflow_execution_from_ids(
     common::WorkflowExecution {
         workflow_id: workflow_id.0.clone(),
         run_id: run_id.0.to_string(),
+        ..Default::default()
     }
 }
 
-pub fn task_queue_from_domain(value: &TaskQueueName) -> common::TaskQueue {
-    common::TaskQueue {
+pub fn task_queue_from_domain(value: &TaskQueueName) -> taskqueue::TaskQueue {
+    taskqueue::TaskQueue {
         name: value.0.clone(),
+        ..Default::default()
     }
 }
 
-pub fn task_queue_to_domain(value: &common::TaskQueue) -> TaskQueueName {
+pub fn task_queue_to_domain(value: &taskqueue::TaskQueue) -> TaskQueueName {
     TaskQueueName(value.name.clone())
 }
 
@@ -175,18 +165,27 @@ pub fn decode_task_token(value: &[u8]) -> Result<TaskToken, ProtoConversionError
         .map_err(|err| ProtoConversionError::InvalidTaskToken(err.to_string()))
 }
 
-fn to_unix_nanos(value: OffsetDateTime) -> i64 {
-    let nanos = value.unix_timestamp_nanos();
-    if nanos > i64::MAX as i128 {
-        i64::MAX
-    } else if nanos < i64::MIN as i128 {
-        i64::MIN
-    } else {
-        nanos as i64
+pub fn to_proto_timestamp(value: OffsetDateTime) -> Timestamp {
+    let nanos = value.nanosecond();
+    Timestamp {
+        seconds: value.unix_timestamp(),
+        nanos: nanos as i32,
     }
 }
 
-fn from_unix_nanos(value: i64) -> Result<OffsetDateTime, ProtoConversionError> {
-    OffsetDateTime::from_unix_timestamp_nanos(value as i128)
-        .map_err(|err| ProtoConversionError::InvalidTimestamp(err.to_string()))
+pub fn to_opt_proto_timestamp(value: Option<OffsetDateTime>) -> Option<Timestamp> {
+    value.map(to_proto_timestamp)
+}
+
+pub fn to_proto_duration(value: time::Duration) -> ProtoDuration {
+    let seconds = value.whole_seconds();
+    let nanos = (value - time::Duration::seconds(seconds)).whole_nanoseconds();
+    ProtoDuration {
+        seconds,
+        nanos: nanos as i32,
+    }
+}
+
+pub fn to_opt_proto_duration(value: Option<time::Duration>) -> Option<ProtoDuration> {
+    value.map(to_proto_duration)
 }

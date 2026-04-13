@@ -26,6 +26,9 @@ pub enum EdgeError {
     #[error("namespace is deleted: {0}")]
     NamespaceDeleted(String),
 
+    #[error("namespace already exists: {0}")]
+    NamespaceAlreadyExists(String),
+
     #[error("workflow not found: {namespace}/{workflow_id}")]
     WorkflowNotFound {
         namespace: String,
@@ -61,6 +64,7 @@ impl EdgeError {
                 StatusCode::NOT_FOUND
             }
             EdgeError::NamespaceDeleted(_) => StatusCode::GONE,
+            EdgeError::NamespaceAlreadyExists(_) => StatusCode::CONFLICT,
             EdgeError::TooManyLongPolls => StatusCode::TOO_MANY_REQUESTS,
             EdgeError::LongPollAdmissionTimeout => StatusCode::REQUEST_TIMEOUT,
             EdgeError::RemoteRouteUnsupported { .. } => StatusCode::BAD_GATEWAY,
@@ -75,6 +79,7 @@ impl EdgeError {
             EdgeError::Forbidden { .. } => "forbidden",
             EdgeError::NamespaceNotFound(_) => "namespace_not_found",
             EdgeError::NamespaceDeleted(_) => "namespace_deleted",
+            EdgeError::NamespaceAlreadyExists(_) => "namespace_already_exists",
             EdgeError::WorkflowNotFound { .. } => "workflow_not_found",
             EdgeError::TooManyLongPolls => "too_many_long_polls",
             EdgeError::LongPollAdmissionTimeout => "long_poll_admission_timeout",

@@ -10,7 +10,7 @@ use tokeira_proto::{
 
 use crate::{
     grpc::metadata::metadata_to_header_map,
-    operator_service::{ClusterInfo, OperatorService, SearchAttributeDefinition},
+    operator_service::{OperatorService, SearchAttributeDefinition},
 };
 
 #[derive(Clone)]
@@ -30,15 +30,6 @@ impl OperatorServiceGrpc {
 
 #[tonic::async_trait]
 impl OperatorServiceGrpcApi for OperatorServiceGrpc {
-    async fn get_cluster_info(
-        &self,
-        request: Request<operatorservice::GetClusterInfoRequest>,
-    ) -> Result<Response<operatorservice::GetClusterInfoResponse>, Status> {
-        let headers = metadata_to_header_map(request.metadata());
-        let cluster = self.inner.cluster_info(&headers).await?;
-        Ok(Response::new(cluster_info_to_proto(cluster)))
-    }
-
     async fn add_search_attributes(
         &self,
         request: Request<operatorservice::AddSearchAttributesRequest>,
@@ -46,7 +37,7 @@ impl OperatorServiceGrpcApi for OperatorServiceGrpc {
         let headers = metadata_to_header_map(request.metadata());
         let req = request.into_inner();
 
-        for (name, attr_type) in req.custom_attributes {
+        for (name, attr_type) in req.search_attributes {
             let attr = SearchAttributeDefinition {
                 name,
                 attr_type: indexed_value_type_to_edge(attr_type)?,
@@ -59,6 +50,13 @@ impl OperatorServiceGrpcApi for OperatorServiceGrpc {
         Ok(Response::new(
             operatorservice::AddSearchAttributesResponse {},
         ))
+    }
+
+    async fn remove_search_attributes(
+        &self,
+        _request: Request<operatorservice::RemoveSearchAttributesRequest>,
+    ) -> Result<Response<operatorservice::RemoveSearchAttributesResponse>, Status> {
+        Err(Status::unimplemented("remove_search_attributes"))
     }
 
     async fn list_search_attributes(
@@ -89,18 +87,72 @@ impl OperatorServiceGrpcApi for OperatorServiceGrpc {
                         ))
                     })
                     .collect::<Result<_, Status>>()?,
+                storage_schema: Default::default(),
             },
         ))
     }
-}
 
-fn cluster_info_to_proto(
-    cluster: ClusterInfo,
-) -> operatorservice::GetClusterInfoResponse {
-    operatorservice::GetClusterInfoResponse {
-        cluster_name: cluster.cluster_name,
-        server_version: cluster.version,
-        http_api_enabled: false,
+    async fn delete_namespace(
+        &self,
+        _request: Request<operatorservice::DeleteNamespaceRequest>,
+    ) -> Result<Response<operatorservice::DeleteNamespaceResponse>, Status> {
+        Err(Status::unimplemented("delete_namespace"))
+    }
+
+    async fn add_or_update_remote_cluster(
+        &self,
+        _request: Request<operatorservice::AddOrUpdateRemoteClusterRequest>,
+    ) -> Result<Response<operatorservice::AddOrUpdateRemoteClusterResponse>, Status> {
+        Err(Status::unimplemented("add_or_update_remote_cluster"))
+    }
+
+    async fn remove_remote_cluster(
+        &self,
+        _request: Request<operatorservice::RemoveRemoteClusterRequest>,
+    ) -> Result<Response<operatorservice::RemoveRemoteClusterResponse>, Status> {
+        Err(Status::unimplemented("remove_remote_cluster"))
+    }
+
+    async fn list_clusters(
+        &self,
+        _request: Request<operatorservice::ListClustersRequest>,
+    ) -> Result<Response<operatorservice::ListClustersResponse>, Status> {
+        Err(Status::unimplemented("list_clusters"))
+    }
+
+    async fn get_nexus_endpoint(
+        &self,
+        _request: Request<operatorservice::GetNexusEndpointRequest>,
+    ) -> Result<Response<operatorservice::GetNexusEndpointResponse>, Status> {
+        Err(Status::unimplemented("get_nexus_endpoint"))
+    }
+
+    async fn create_nexus_endpoint(
+        &self,
+        _request: Request<operatorservice::CreateNexusEndpointRequest>,
+    ) -> Result<Response<operatorservice::CreateNexusEndpointResponse>, Status> {
+        Err(Status::unimplemented("create_nexus_endpoint"))
+    }
+
+    async fn update_nexus_endpoint(
+        &self,
+        _request: Request<operatorservice::UpdateNexusEndpointRequest>,
+    ) -> Result<Response<operatorservice::UpdateNexusEndpointResponse>, Status> {
+        Err(Status::unimplemented("update_nexus_endpoint"))
+    }
+
+    async fn delete_nexus_endpoint(
+        &self,
+        _request: Request<operatorservice::DeleteNexusEndpointRequest>,
+    ) -> Result<Response<operatorservice::DeleteNexusEndpointResponse>, Status> {
+        Err(Status::unimplemented("delete_nexus_endpoint"))
+    }
+
+    async fn list_nexus_endpoints(
+        &self,
+        _request: Request<operatorservice::ListNexusEndpointsRequest>,
+    ) -> Result<Response<operatorservice::ListNexusEndpointsResponse>, Status> {
+        Err(Status::unimplemented("list_nexus_endpoints"))
     }
 }
 
@@ -149,38 +201,17 @@ mod tests {
     use super::*;
     use crate::{
         interceptors::EdgeInterceptors,
-        namespace_cache::InMemoryNamespaceCache,
+        namespace_cache::{InMemoryNamespaceCache, NamespaceCache},
         operator_service::{InMemoryOperatorApi, OperatorApi},
     };
-
-    #[tokio::test]
-    async fn cluster_info_maps_expected_fields() {
-        let api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
-        let service = OperatorService::new(
-            api,
-            Arc::new(EdgeInterceptors::permissive(Arc::new(
-                InMemoryNamespaceCache::new(),
-            ))),
-        );
-        let grpc = OperatorServiceGrpc::new(service);
-
-        let response = grpc
-            .get_cluster_info(Request::new(operatorservice::GetClusterInfoRequest {}))
-            .await
-            .expect("cluster info should succeed")
-            .into_inner();
-
-        assert_eq!(response.cluster_name, "tokeira-local");
-        assert_eq!(response.server_version, "0.1.0-dev");
-        assert!(!response.http_api_enabled);
-    }
 
     #[tokio::test]
     async fn add_search_attributes_upserts_multiple_attributes() {
         let namespaces = Arc::new(InMemoryNamespaceCache::new());
         namespaces
             .insert(crate::namespace_cache::ResolvedNamespace::active("default"))
-            .await;
+            .await
+            .unwrap();
         let api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
         let service = OperatorService::new(
             api.clone(),
@@ -191,7 +222,7 @@ mod tests {
         grpc.add_search_attributes(Request::new(
             operatorservice::AddSearchAttributesRequest {
                 namespace: "default".to_string(),
-                custom_attributes: [
+                search_attributes: [
                     (
                         "CustomKeyword".to_string(),
                         IndexedValueType::Keyword as i32,

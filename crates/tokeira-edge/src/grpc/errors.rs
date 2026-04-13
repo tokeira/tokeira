@@ -21,6 +21,9 @@ impl From<EdgeError> for Status {
             EdgeError::NamespaceDeleted(namespace) => {
                 Status::failed_precondition(namespace)
             }
+            EdgeError::NamespaceAlreadyExists(namespace) => {
+                Status::already_exists(namespace)
+            }
             EdgeError::WorkflowNotFound {
                 namespace,
                 workflow_id,
@@ -84,6 +87,10 @@ mod tests {
             (
                 EdgeError::NamespaceDeleted("default".to_string()),
                 Code::FailedPrecondition,
+            ),
+            (
+                EdgeError::NamespaceAlreadyExists("default".to_string()),
+                Code::AlreadyExists,
             ),
             (EdgeError::TooManyLongPolls, Code::ResourceExhausted),
             (EdgeError::LongPollAdmissionTimeout, Code::DeadlineExceeded),

@@ -21,8 +21,8 @@ use tokeira_kernel::{
     WorkflowTimeoutType, event::HistoryEventKind, kernel::Kernel,
 };
 use tokeira_types::{
-    ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads,
-    RequestContext, RequestId, RetryPolicy, RunId, RunKey, SearchAttrValue,
+    BuildId, DeploymentId, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload,
+    Payloads, RequestContext, RequestId, RetryPolicy, RunId, RunKey, SearchAttrValue,
     SearchAttributes, ShardEpoch, StickyAffinity, TaskQueueName, TransitionSeq,
     WorkerIdentity, WorkflowId, WorkflowTaskToken, WorkflowType,
 };
@@ -80,6 +80,8 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         run_id: RunId::new(),
         workflow_type: WorkflowType("wf".into()),
         task_queue: TaskQueueName("queue".into()),
+        deployment: None,
+        build_id: None,
         status: ExecutionStatus::Running,
         transition_seq: TransitionSeq(7),
         last_event_id: 14,
@@ -163,15 +165,22 @@ fn with_activity(mut state: WorkflowState, activity_id: &str) -> WorkflowState {
         activity_id.into(),
         ActivityState {
             activity_id: activity_id.into(),
+            activity_type: "activity-type".into(),
             schedule_event_id: state.last_event_id - 2,
             task_queue: TaskQueueName("activity-q".into()),
+            deployment: None,
+            build_id: None,
             input: Payloads::default(),
+            header: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
             schedule_to_start_timeout: Some(Duration::seconds(30)),
             start_to_close_timeout: Some(Duration::minutes(1)),
             heartbeat_timeout: Some(Duration::seconds(20)),
+            scheduled_at: OffsetDateTime::UNIX_EPOCH,
+            started_at: None,
+            started_event_id: None,
             pause_info: None,
             stamp: 0,
         },
@@ -277,6 +286,8 @@ fn with_pending_nexus_operation(
             endpoint: "endpoint".into(),
             service: "service".into(),
             operation: "operation".into(),
+            schedule_to_close_timeout: None,
+            scheduled_at: OffsetDateTime::UNIX_EPOCH,
             started: false,
         },
     );
@@ -640,6 +651,8 @@ fn arb_start_request() -> impl Strategy<Value = StartRequest> {
                     run_id,
                     workflow_type: WorkflowType("wf".into()),
                     task_queue: TaskQueueName("queue".into()),
+                    deployment: None,
+                    build_id: None,
                     input,
                     memo,
                     search_attributes,
@@ -692,9 +705,13 @@ fn arb_schedule_activity_command() -> impl Strategy<Value = WorkflowCommand> {
                 heartbeat_timeout,
             )| WorkflowCommand::ScheduleActivity {
                 activity_id,
+                activity_type: "activity-type".into(),
                 task_queue: TaskQueueName(task_queue),
                 input,
+                header: None,
                 retry_policy: None,
+                deployment: None,
+                build_id: None,
                 schedule_to_close_timeout,
                 schedule_to_start_timeout,
                 start_to_close_timeout,
@@ -1444,19 +1461,19 @@ proptest! {
 
         let terminal = &transition.history_events[0].kind;
         match (terminal, resolution) {
-            (HistoryEventKind::ActivityTaskCompleted { activity_id, result }, ActivityResolution::Completed { result: expected }) => {
+            (HistoryEventKind::ActivityTaskCompleted { activity_id, result, .. }, ActivityResolution::Completed { result: expected }) => {
                 prop_assert_eq!(activity_id, "activity-1");
                 prop_assert_eq!(result, &expected);
             }
-            (HistoryEventKind::ActivityTaskFailed { activity_id, message }, ActivityResolution::Failed { message: expected }) => {
+            (HistoryEventKind::ActivityTaskFailed { activity_id, message, .. }, ActivityResolution::Failed { message: expected }) => {
                 prop_assert_eq!(activity_id, "activity-1");
                 prop_assert_eq!(message, &expected);
             }
-            (HistoryEventKind::ActivityTaskTimedOut { activity_id, timeout_type }, ActivityResolution::TimedOut { timeout_type: expected }) => {
+            (HistoryEventKind::ActivityTaskTimedOut { activity_id, timeout_type, .. }, ActivityResolution::TimedOut { timeout_type: expected }) => {
                 prop_assert_eq!(activity_id, "activity-1");
                 prop_assert_eq!(timeout_type, &expected);
             }
-            (HistoryEventKind::ActivityTaskCanceled { activity_id, details }, ActivityResolution::Canceled { details: expected }) => {
+            (HistoryEventKind::ActivityTaskCanceled { activity_id, details, .. }, ActivityResolution::Canceled { details: expected }) => {
                 prop_assert_eq!(activity_id, "activity-1");
                 prop_assert_eq!(details, &expected);
             }
@@ -1523,6 +1540,84 @@ proptest! {
         prop_assert_eq!(dispatch.2, expected_s2s);
         prop_assert_eq!(dispatch.3, expected_stc);
         prop_assert_eq!(dispatch.4, expected_hb);
+    }
+
+    #[test]
+    fn property_3a_versioned_dispatch_queue_propagation(
+        workflow_deployment in prop::option::of(arb_small_string()),
+        workflow_build_id in prop::option::of(arb_small_string()),
+        activity_deployment in prop::option::of(arb_small_string()),
+        activity_build_id in prop::option::of(arb_small_string()),
+    ) {
+        let now = fixed_now();
+        let workflow_deployment = workflow_deployment.map(DeploymentId);
+        let workflow_build_id = workflow_build_id.map(BuildId);
+        let activity_deployment = activity_deployment.map(DeploymentId);
+        let activity_build_id = activity_build_id.map(BuildId);
+
+        let mut signal_state = make_open_state(now);
+        signal_state.deployment = workflow_deployment.clone();
+        signal_state.build_id = workflow_build_id.clone();
+        let signal_transition = kernel().apply(
+            LoadedRun::Existing(signal_state),
+            Command::Signal(SignalRequest {
+                signal_name: "sig".into(),
+                input: Payloads::default(),
+                request: request_context("versioned-signal", now),
+                now,
+            }),
+        ).unwrap();
+        prop_assert_eq!(
+            signal_transition.dispatch_ops.iter().any(|op| matches!(
+                op,
+                DispatchOp::EnqueueWorkflowTask { queue, .. }
+                    if queue.deployment == workflow_deployment && queue.build_id == workflow_build_id
+            )),
+            true
+        );
+
+        let mut activity_state = with_pending_wft(make_open_state(now), 84, Some(33), 1);
+        activity_state.deployment = workflow_deployment.clone();
+        activity_state.build_id = workflow_build_id.clone();
+        let activity_transition = kernel().apply(
+            LoadedRun::Existing(activity_state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: activity_state.run_key,
+                    logical_seq: LogicalTaskSeq(84),
+                    started_event_id: 33,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![WorkflowCommand::ScheduleActivity {
+                    activity_id: "activity-1".into(),
+                    activity_type: "activity-type".into(),
+                    task_queue: TaskQueueName("activity-q".into()),
+                    input: Payloads::default(),
+                    header: None,
+                    retry_policy: None,
+                    deployment: activity_deployment.clone(),
+                    build_id: activity_build_id.clone(),
+                    schedule_to_close_timeout: None,
+                    schedule_to_start_timeout: None,
+                    start_to_close_timeout: None,
+                    heartbeat_timeout: None,
+                }],
+                force_new_workflow_task: false,
+                now,
+            }),
+        ).unwrap();
+        let expected_deployment = activity_deployment.clone().or_else(|| workflow_deployment.clone());
+        let expected_build_id = activity_build_id.clone().or_else(|| workflow_build_id.clone());
+        prop_assert_eq!(
+            activity_transition.dispatch_ops.iter().any(|op| matches!(
+                op,
+                DispatchOp::EnqueueActivityTask { queue, .. }
+                    if queue.deployment == expected_deployment && queue.build_id == expected_build_id
+            )),
+            true
+        );
     }
 
     #[test]
@@ -1916,15 +2011,22 @@ proptest! {
             "activity-2".into(),
             ActivityState {
                 activity_id: "activity-2".into(),
+                activity_type: "activity-type".into(),
                 schedule_event_id: 11,
                 task_queue: TaskQueueName("activity-q".into()),
+                deployment: None,
+                build_id: None,
                 input: Payloads::default(),
+                header: None,
                 attempt: 1,
                 retry_policy: None,
                 schedule_to_close_timeout: Some(Duration::minutes(2)),
                 schedule_to_start_timeout: Some(Duration::seconds(30)),
                 start_to_close_timeout: Some(Duration::minutes(1)),
                 heartbeat_timeout: Some(Duration::seconds(20)),
+                scheduled_at: OffsetDateTime::UNIX_EPOCH,
+                started_at: None,
+                started_event_id: None,
                 pause_info: None,
                 stamp: 0,
             },
@@ -2082,15 +2184,22 @@ proptest! {
             "activity-2".into(),
             ActivityState {
                 activity_id: "activity-2".into(),
+                activity_type: "activity-type".into(),
                 schedule_event_id: 11,
                 task_queue: TaskQueueName("activity-q".into()),
+                deployment: None,
+                build_id: None,
                 input: Payloads::default(),
+                header: None,
                 attempt: 1,
                 retry_policy: None,
                 schedule_to_close_timeout: Some(Duration::minutes(2)),
                 schedule_to_start_timeout: Some(Duration::seconds(30)),
                 start_to_close_timeout: Some(Duration::minutes(1)),
                 heartbeat_timeout: Some(Duration::seconds(20)),
+                scheduled_at: OffsetDateTime::UNIX_EPOCH,
+                started_at: None,
+                started_event_id: None,
                 pause_info: None,
                 stamp: 0,
             },

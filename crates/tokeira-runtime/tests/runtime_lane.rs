@@ -5,7 +5,8 @@ use time::{Duration, OffsetDateTime};
 
 use tokeira_kernel::{StartRequest, WorkflowTaskCompletedRequest};
 use tokeira_runtime::{
-    LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
+    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime,
+    WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -23,6 +24,7 @@ async fn start_and_signal_publish_workflow_tasks() -> Result<()> {
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("workflow-1".to_string());
@@ -94,6 +96,7 @@ async fn occ_conflicts_are_retried_for_signals() -> Result<()> {
         },
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
     ));
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("workflow-conflict".to_string());
@@ -143,6 +146,7 @@ async fn burst_signals_produce_complete_history() -> Result<()> {
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
     ));
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("workflow-burst".to_string());
@@ -221,6 +225,8 @@ fn start_request(
         workflow_run_timeout: None,
         workflow_task_timeout: Duration::seconds(10),
         retry_policy: None,
+        deployment: None,
+        build_id: None,
         attempt: 1,
         continued_execution_run_id: None,
         first_execution_run_id: None,

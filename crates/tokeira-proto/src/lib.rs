@@ -14,4 +14,6 @@ pub mod internal;
 pub mod public;
 
 pub use internal::{admin, runtime};
-pub use public::{common, enums, operatorservice, workflowservice};
+pub use public::{
+    common, enums, failure, history, operatorservice, taskqueue, workflow, workflowservice,
+};

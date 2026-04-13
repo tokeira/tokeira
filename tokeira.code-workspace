@@ -8,6 +8,9 @@
 		},
 		{
 			"path": "../../temporalio/temporal-dsql"
+		},
+		{
+			"path": "../sdk-core"
 		}
 	],
 	"settings": {

@@ -1,8 +1,8 @@
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
-    LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RequestContext,
-    RetryPolicy, RunId, RunKey, SearchAttributes, TaskQueueName, WorkerIdentity,
-    WorkflowId, WorkflowTaskToken, WorkflowType,
+    BuildId, DeploymentId, Headers, LogicalTaskSeq, Memo, NamespaceId, Payload,
+    Payloads, RequestContext, RetryPolicy, RunId, RunKey, SearchAttributes,
+    TaskQueueName, WorkerIdentity, WorkflowId, WorkflowTaskToken, WorkflowType,
 };
 
 use crate::event::ActivityResolution;
@@ -191,6 +191,10 @@ pub struct StartRequest {
     pub workflow_task_timeout: Duration,
     /// Retry policy governing automatic retries on failure.
     pub retry_policy: Option<RetryPolicy>,
+    /// Optional deployment for versioned task routing.
+    pub deployment: Option<DeploymentId>,
+    /// Optional build identifier for versioned task routing.
+    pub build_id: Option<BuildId>,
     /// Current retry attempt number (1-based).
     pub attempt: u32,
     /// Run ID of the previous run if this is a continue-as-new
@@ -670,9 +674,13 @@ pub enum WorkflowCommand {
     /// Schedule an activity task for execution on a worker.
     ScheduleActivity {
         activity_id: String,
+        activity_type: String,
         task_queue: TaskQueueName,
         input: Payloads,
+        header: Option<Headers>,
         retry_policy: Option<RetryPolicy>,
+        deployment: Option<DeploymentId>,
+        build_id: Option<BuildId>,
         schedule_to_close_timeout: Option<Duration>,
         schedule_to_start_timeout: Option<Duration>,
         start_to_close_timeout: Option<Duration>,

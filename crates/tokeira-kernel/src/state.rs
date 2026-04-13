@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
-    ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payloads, RetryPolicy, RunId,
-    RunKey, SearchAttributes, StickyAffinity, TaskQueueName, TransitionSeq, WorkflowId,
-    WorkflowType,
+    BuildId, DeploymentId, ExecutionStatus, Headers, LogicalTaskSeq, Memo,
+    NamespaceId, Payloads, RetryPolicy, RunId, RunKey, SearchAttributes,
+    StickyAffinity, TaskQueueName, TransitionSeq, WorkflowId, WorkflowType,
 };
 
 /// Durable state for an open or closed workflow run.
@@ -26,6 +26,10 @@ pub struct WorkflowState {
     pub workflow_type: WorkflowType,
     /// Task queue where workflow tasks are dispatched.
     pub task_queue: TaskQueueName,
+    /// Optional deployment for versioned task routing.
+    pub deployment: Option<DeploymentId>,
+    /// Optional build identifier for versioned task routing.
+    pub build_id: Option<BuildId>,
 
     /// Current lifecycle status (Running, Paused, or a
     /// terminal state).
@@ -145,12 +149,20 @@ pub struct PendingWorkflowTask {
 pub struct ActivityState {
     /// User-assigned activity identifier.
     pub activity_id: String,
+    /// Activity type name (maps to an SDK handler).
+    pub activity_type: String,
     /// Event ID of the `ActivityTaskScheduled` event.
     pub schedule_event_id: i64,
     /// Task queue where the activity is dispatched.
     pub task_queue: TaskQueueName,
+    /// Optional deployment override for this activity.
+    pub deployment: Option<DeploymentId>,
+    /// Optional build identifier override for this activity.
+    pub build_id: Option<BuildId>,
     /// Arguments passed to the activity function.
     pub input: Payloads,
+    /// Transport headers carried with the activity task.
+    pub header: Option<Headers>,
     /// Current attempt number (1-based, incremented on retry).
     pub attempt: u32,
     /// Retry policy for this activity.
@@ -163,6 +175,14 @@ pub struct ActivityState {
     pub start_to_close_timeout: Option<Duration>,
     /// Maximum time between heartbeats.
     pub heartbeat_timeout: Option<Duration>,
+    /// When the activity was originally scheduled.
+    pub scheduled_at: OffsetDateTime,
+    /// When the activity was started by a worker, if it
+    /// has started.
+    pub started_at: Option<OffsetDateTime>,
+    /// Event ID of the `ActivityTaskStarted` event, if the
+    /// activity has been started.
+    pub started_event_id: Option<i64>,
     /// Pause metadata when the activity is individually
     /// paused.
     pub pause_info: Option<ActivityPauseInfo>,
@@ -289,6 +309,10 @@ pub struct PendingNexusOperation {
     pub service: String,
     /// Nexus operation name.
     pub operation: String,
+    /// Maximum time from schedule to completion.
+    pub schedule_to_close_timeout: Option<Duration>,
+    /// When the operation was scheduled.
+    pub scheduled_at: OffsetDateTime,
     /// Whether the operation has transitioned to async-started.
     pub started: bool,
 }

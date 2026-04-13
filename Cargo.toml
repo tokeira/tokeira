@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "tools/proto-sync",
     "crates/tokeira-types",
     "crates/tokeira-proto",
     "crates/tokeira-kernel",
@@ -9,6 +10,9 @@ members = [
     "crates/tokeira-projection",
     "crates/tokeira-edge",
     "apps/tokeirad",
+]
+exclude = [
+    "examples/hello-world",
 ]
 
 [workspace.package]
@@ -29,4 +33,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tonic = { version = "0.11", features = ["transport"] }
 tonic-reflection = "0.11"
+tonic-web = "0.11"
+tower-http = { version = "0.4", features = ["cors"] }
 uuid = { version = "1.10", features = ["serde", "v4"] }

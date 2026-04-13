@@ -6,7 +6,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use anyhow::Result;
@@ -14,16 +14,18 @@ use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     Command, RetryState, WorkflowExecutionTimedOutRequest, WorkflowTimeoutType,
 };
-use tokeira_types::RunKey;
+use tokeira_types::{RunKey, ShardId};
 use tokio_util::sync::CancellationToken;
 
 use crate::lane::LaneHandle;
 use crate::scanner::pick_lane;
+use crate::shard::ShardOwner;
 
 /// Runtime-local timeout tracking entry for one open run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkflowTimeoutEntry {
     pub run_key: RunKey,
+    pub shard_id: ShardId,
     pub workflow_execution_timeout: Option<Duration>,
     pub workflow_run_timeout: Option<Duration>,
     pub started_at: OffsetDateTime,
@@ -46,8 +48,28 @@ impl WorkflowTimeoutTrackingState {
         self.inner.lock().unwrap().remove(&run_key);
     }
 
+    pub fn remove_all_for_shard(&self, shard_id: ShardId) {
+        self.inner
+            .lock()
+            .unwrap()
+            .retain(|_, entry| entry.shard_id != shard_id);
+    }
+
     pub fn snapshot(&self) -> Vec<WorkflowTimeoutEntry> {
         self.inner.lock().unwrap().values().cloned().collect()
+    }
+
+    pub fn snapshot_for_shard(
+        &self,
+        shard_id: ShardId,
+    ) -> Vec<WorkflowTimeoutEntry> {
+        self.inner
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|entry| entry.shard_id == shard_id)
+            .cloned()
+            .collect()
     }
 }
 
@@ -106,6 +128,7 @@ pub(crate) fn workflow_timeout_retry_state(entry: &WorkflowTimeoutEntry) -> Retr
 
 pub(crate) async fn scan_workflow_timeouts_once<F, Fut>(
     tracking: &WorkflowTimeoutTrackingState,
+    shard_id: Option<ShardId>,
     config: &WorkflowTimeoutScannerConfig,
     mut submit_timeout: F,
 ) where
@@ -113,7 +136,10 @@ pub(crate) async fn scan_workflow_timeouts_once<F, Fut>(
     Fut: std::future::Future<Output = Result<()>>,
 {
     let now = OffsetDateTime::now_utc();
-    let entries = tracking.snapshot();
+    let entries = match shard_id {
+        Some(shard_id) => tracking.snapshot_for_shard(shard_id),
+        None => tracking.snapshot(),
+    };
     let mut submitted = 0usize;
 
     for entry in entries {
@@ -152,6 +178,7 @@ pub(crate) async fn run_workflow_timeout_scanner(
     tracking: WorkflowTimeoutTrackingState,
     lanes: Vec<LaneHandle>,
     lane_count: usize,
+    shard_owner: Arc<RwLock<ShardOwner>>,
     config: WorkflowTimeoutScannerConfig,
     cancel: CancellationToken,
 ) {
@@ -161,30 +188,38 @@ pub(crate) async fn run_workflow_timeout_scanner(
             _ = tokio::time::sleep(config.scan_interval) => {}
         }
 
-        scan_workflow_timeouts_once(&tracking, &config, |entry, violation, now| {
-            let lane = pick_lane(&lanes, lane_count, entry.run_key).clone();
-            async move {
-                lane.submit(
-                    entry.run_key,
-                    Command::WorkflowExecutionTimedOut(
-                        WorkflowExecutionTimedOutRequest {
-                            timeout_type: match violation {
-                                WorkflowTimeoutViolation::ExecutionTimeout => {
-                                    WorkflowTimeoutType::ExecutionTimeout
-                                }
-                                WorkflowTimeoutViolation::RunTimeout => {
-                                    WorkflowTimeoutType::RunTimeout
-                                }
-                            },
-                            retry_state: workflow_timeout_retry_state(&entry),
-                            now,
-                        },
-                    ),
-                )
-                .await
-                .map(|_| ())
-            }
-        })
-        .await;
+        let active_shards: Vec<_> = shard_owner.read().unwrap().active_shards().collect();
+        for shard_id in active_shards {
+            scan_workflow_timeouts_once(
+                &tracking,
+                Some(shard_id),
+                &config,
+                |entry, violation, now| {
+                    let lane = pick_lane(&lanes, lane_count, entry.run_key).clone();
+                    async move {
+                        lane.submit(
+                            entry.run_key,
+                            Command::WorkflowExecutionTimedOut(
+                                WorkflowExecutionTimedOutRequest {
+                                    timeout_type: match violation {
+                                        WorkflowTimeoutViolation::ExecutionTimeout => {
+                                            WorkflowTimeoutType::ExecutionTimeout
+                                        }
+                                        WorkflowTimeoutViolation::RunTimeout => {
+                                            WorkflowTimeoutType::RunTimeout
+                                        }
+                                    },
+                                    retry_state: workflow_timeout_retry_state(&entry),
+                                    now,
+                                },
+                            ),
+                        )
+                        .await
+                        .map(|_| ())
+                    }
+                },
+            )
+            .await;
+        }
     }
 }

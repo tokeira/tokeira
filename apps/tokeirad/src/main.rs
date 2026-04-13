@@ -2,26 +2,36 @@ use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use tonic_web::GrpcWebLayer;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+use tokio_util::sync::CancellationToken;
+use tower_http::cors::CorsLayer;
 
 use tokeira_edge::{
-    EdgeInterceptors, EmptyVisibilityApi, InMemoryNamespaceCache, InMemoryOperatorApi,
-    LocalOnlyRouter, LongPollConfig, LongPollGate, OperatorService, ResolvedNamespace,
-    WorkflowExecutionDescription, WorkflowService,
+    EdgeInterceptors, InMemoryNamespaceCache,
+    HistoryNotifyingRepository, HistoryWaitRegistry,
+    InMemoryOperatorApi, LocalOnlyRouter, LongPollConfig,
+    LongPollGate, OperatorService, PollerRegistry, ResolvedNamespace,
+    WorkflowExecutionDescription, WorkflowService, NamespaceCache,
     grpc::{
-        operator_service::OperatorServiceGrpc, runtime_adapter::RuntimeAdapter,
+        operator_service::OperatorServiceGrpc,
+        runtime_adapter::RuntimeAdapter,
         workflow_service::WorkflowServiceGrpc,
     },
     translate::to_internal::namespace_id_for,
     workflow_service::ExecutionResolver,
 };
 use tokeira_kernel::LoadedRun;
+use tokeira_projection::{
+    InMemoryVisibilityStore, ProjectionWorker, VisibilityQueryService, VisibilitySink,
+};
 use tokeira_runtime::{
-    LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
+    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime,
+    WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{InMemoryStore, RunRepository};
-use tokeira_types::{ExecutionRef, NamespaceId, WorkflowId};
+use tokeira_types::{ExecutionRef, NamespaceId, ProjectionCursor, WorkflowId};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -31,43 +41,78 @@ async fn main() -> Result<()> {
 
     let addr = grpc_addr_from_env()?;
 
-    let store = Arc::new(InMemoryStore::default());
+    let store = InMemoryStore::default();
+    let history_waits = HistoryWaitRegistry::default();
+    let repo = Arc::new(HistoryNotifyingRepository::new(
+        Arc::new(store.clone()),
+        history_waits.clone(),
+    ));
     let runtime = Arc::new(TokeiraRuntime::new(
-        store.clone(),
+        repo.clone(),
         4,
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
     ));
 
     let default_namespace = ResolvedNamespace::active("default");
     let default_namespace_id = namespace_id_for("default");
 
     let namespaces = Arc::new(InMemoryNamespaceCache::new());
-    namespaces.insert(default_namespace).await;
+    namespaces.insert(default_namespace).await?;
 
-    let interceptors = Arc::new(EdgeInterceptors::permissive(namespaces));
+    let interceptors = Arc::new(EdgeInterceptors::permissive(namespaces.clone()));
     let router = Arc::new(LocalOnlyRouter);
     let runtime_adapter = Arc::new(RuntimeAdapter::new(runtime));
     let resolver = Arc::new(StoreExecutionResolver::new(
-        store.clone(),
+        repo.clone(),
         default_namespace_id,
     ));
-    let visibility = Arc::new(EmptyVisibilityApi);
+    let visibility_store = InMemoryVisibilityStore::default();
+    let visibility = Arc::new(VisibilityQueryService::new(
+        visibility_store.clone(),
+    ));
     let long_polls = LongPollGate::new(LongPollConfig::default());
+    let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
+    for partition_id in 0..16 {
+        let projection_worker = ProjectionWorker {
+            log: store.clone(),
+            sink: VisibilitySink::new(
+                visibility_store.clone(),
+                format!("visibility-{partition_id}"),
+            ),
+            batch_size: 256,
+        };
+        tokio::spawn(async move {
+            let cancel = CancellationToken::new();
+            if let Err(error) = projection_worker
+                .run_from_cursor(
+                    &format!("visibility-{partition_id}"),
+                    cancel,
+                    ProjectionCursor::beginning(partition_id, 1),
+                )
+                .await
+            {
+                tracing::warn!(?error, partition_id, "projection worker exited");
+            }
+        });
+    }
 
-    let workflow_service = WorkflowService::new(
+    let workflow_service = WorkflowService::new_with_history_wait_registry(
         runtime_adapter,
         resolver,
         visibility,
+        repo.clone(),
+        operator_api.clone(),
+        namespaces,
         interceptors.clone(),
+        PollerRegistry::default(),
         long_polls,
         router,
+        history_waits,
     );
-    let operator_service = OperatorService::new(
-        Arc::new(InMemoryOperatorApi::new("tokeira-local")),
-        interceptors,
-    );
+    let operator_service = OperatorService::new(operator_api, interceptors);
 
     let workflow_grpc = WorkflowServiceGrpc::new(workflow_service);
     let operator_grpc = OperatorServiceGrpc::new(operator_service);
@@ -80,6 +125,9 @@ async fn main() -> Result<()> {
     info!("tokeirad gRPC server listening on {addr}");
 
     tonic::transport::Server::builder()
+        .accept_http1(true)
+        .layer(CorsLayer::permissive())
+        .layer(GrpcWebLayer::new())
         .add_service(workflow_grpc.into_service())
         .add_service(operator_grpc.into_service())
         .add_service(reflection)

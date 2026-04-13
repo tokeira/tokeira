@@ -33,6 +33,8 @@ impl ResolvedNamespace {
 #[async_trait]
 pub trait NamespaceCache: Send + Sync + 'static {
     async fn get(&self, name: &str) -> Result<Option<ResolvedNamespace>>;
+    async fn list_all(&self) -> Result<Vec<ResolvedNamespace>>;
+    async fn insert(&self, ns: ResolvedNamespace) -> Result<()>;
 }
 
 /// Simple in-memory cache useful for tests and local bring-up.
@@ -49,15 +51,20 @@ impl InMemoryNamespaceCache {
     pub fn new() -> Self {
         Self::default()
     }
-
-    pub async fn insert(&self, ns: ResolvedNamespace) {
-        self.inner.write().await.insert(ns.name.clone(), ns);
-    }
 }
 
 #[async_trait]
 impl NamespaceCache for InMemoryNamespaceCache {
     async fn get(&self, name: &str) -> Result<Option<ResolvedNamespace>> {
         Ok(self.inner.read().await.get(name).cloned())
+    }
+
+    async fn list_all(&self) -> Result<Vec<ResolvedNamespace>> {
+        Ok(self.inner.read().await.values().cloned().collect())
+    }
+
+    async fn insert(&self, ns: ResolvedNamespace) -> Result<()> {
+        self.inner.write().await.insert(ns.name.clone(), ns);
+        Ok(())
     }
 }

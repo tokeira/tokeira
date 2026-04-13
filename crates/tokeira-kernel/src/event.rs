@@ -1,7 +1,8 @@
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
-    ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RetryPolicy,
-    RunId, SearchAttributes, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
+    ExecutionStatus, Headers, LogicalTaskSeq, Memo, NamespaceId, Payload,
+    Payloads, RetryPolicy, RunId, SearchAttributes, TaskQueueName, WorkerIdentity,
+    WorkflowId, WorkflowType,
 };
 
 use crate::command::{
@@ -136,31 +137,50 @@ pub enum HistoryEventKind {
     /// An activity task was scheduled by a workflow command.
     ActivityTaskScheduled {
         activity_id: String,
+        activity_type: String,
         task_queue: TaskQueueName,
         input: Payloads,
+        header: Option<Headers>,
+        retry_policy: Option<RetryPolicy>,
         schedule_to_close_timeout: Option<Duration>,
         schedule_to_start_timeout: Option<Duration>,
         start_to_close_timeout: Option<Duration>,
         heartbeat_timeout: Option<Duration>,
     },
+    /// A worker picked up the activity task and began
+    /// processing it.
+    ActivityTaskStarted {
+        activity_id: String,
+        scheduled_event_id: i64,
+        attempt: u32,
+        identity: WorkerIdentity,
+    },
     /// The activity completed successfully with a result.
     ActivityTaskCompleted {
         activity_id: String,
+        scheduled_event_id: i64,
+        started_event_id: i64,
         result: Payloads,
     },
     /// The activity failed with an application-level error.
     ActivityTaskFailed {
         activity_id: String,
+        scheduled_event_id: i64,
+        started_event_id: i64,
         message: String,
     },
     /// The activity exceeded one of its configured timeouts.
     ActivityTaskTimedOut {
         activity_id: String,
+        scheduled_event_id: i64,
+        started_event_id: i64,
         timeout_type: String,
     },
     /// The activity was canceled (cooperative cancellation).
     ActivityTaskCanceled {
         activity_id: String,
+        scheduled_event_id: i64,
+        started_event_id: i64,
         details: Option<Payloads>,
     },
     /// A timer was started by a workflow command.

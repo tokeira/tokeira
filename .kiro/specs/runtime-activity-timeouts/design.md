@@ -54,7 +54,7 @@ flowchart TD
 
 ### Key design decisions
 
-**Runtime-local tracking state, not kernel state.** The kernel's `ActivityState` stores timeout *configuration* (durations), but not the timestamps needed for timeout *detection* (`scheduled_at`, `started_at`, `last_heartbeat_at`). Adding these to `ActivityState` would mean every heartbeat requires a storage commit, which defeats the purpose of lightweight heartbeats. Instead, the runtime maintains an in-memory `ActivityTrackingState` that is populated from lifecycle events. This state is ephemeral — if the runtime restarts, it is rebuilt from storage during the first scan cycle (activities without tracking entries are loaded from storage and re-populated).
+**Runtime-local tracking state, not kernel state.** The kernel's `ActivityState` stores timeout *configuration* (durations), but not the timestamps needed for timeout *detection* (`original_scheduled_at`, `last_dispatched_at`, `started_at`, `last_heartbeat_at`). Adding these to `ActivityState` would mean every heartbeat requires a storage commit, which defeats the purpose of lightweight heartbeats. Instead, the runtime maintains an in-memory `ActivityTrackingState` that is populated from lifecycle events. This state is ephemeral — if the runtime restarts, tracking state is lost and in-flight activities lose their timeout baselines. Reconstruction after restart is deferred to Feature 11 (Sweeper and Recovery).
 
 **Heartbeat is a pure runtime operation.** `record_activity_heartbeat` validates the token (reusing `validate_activity_token` from Feature 2), updates `last_heartbeat_at` in the tracking state, reads `cancel_requested`, and returns. No kernel command, no history event, no storage write. This keeps heartbeat latency minimal and avoids amplifying write pressure on storage.
 
@@ -84,7 +84,12 @@ In-memory state for timeout detection and heartbeat processing.
 pub struct ActivityTrackingEntry {
     pub run_key: RunKey,
     pub activity_id: String,
-    pub scheduled_at: OffsetDateTime,
+    /// Set once on first scheduling (attempt 1). Never
+    /// overwritten on retry. Used for schedule-to-close.
+    pub original_scheduled_at: OffsetDateTime,
+    /// Updated on each dispatch (including retries). Used
+    /// for schedule-to-start.
+    pub last_dispatched_at: OffsetDateTime,
     pub started_at: Option<OffsetDateTime>,
     pub last_heartbeat_at: Option<OffsetDateTime>,
     pub cancel_requested: bool,
@@ -227,7 +232,7 @@ The following existing methods are modified to update `ActivityTrackingState`:
 | `start_activity_task` (on successful commit) | `activity_tracking.record_started(...)` |
 | `complete_activity_task` (on success) | `activity_tracking.remove(...)` |
 | `fail_activity_task` (on terminal failure) | `activity_tracking.remove(...)` |
-| `fail_activity_task` (on retry) | entry stays in tracking (attempt changes are handled by re-scheduling) |
+| `fail_activity_task` (on retry) | Update `last_dispatched_at` to now, clear `started_at` and `last_heartbeat_at`. Do NOT overwrite `original_scheduled_at`. |
 
 The `cancel_requested` flag is set when the kernel commits an `ActivityTaskCancelRequested` history event. This requires a small hook in the lane's dispatch path: after a successful commit, if the transition's history events contain `ActivityTaskCancelRequested`, the runtime marks the activity in tracking state.
 
@@ -259,7 +264,8 @@ ActivityTrackingState:
 ActivityTrackingEntry:
   run_key: RunKey
   activity_id: String
-  scheduled_at: OffsetDateTime
+  original_scheduled_at: OffsetDateTime  // set once, never overwritten
+  last_dispatched_at: OffsetDateTime     // updated on each retry
   started_at: Option<OffsetDateTime>
   last_heartbeat_at: Option<OffsetDateTime>
   cancel_requested: bool
@@ -269,9 +275,9 @@ ActivityTrackingEntry:
 
 ```
 evaluate_activity_timeout(entry, activity_state, now):
-  // Schedule-to-close takes precedence
+  // Schedule-to-close takes precedence (uses original scheduling time)
   if activity_state.schedule_to_close_timeout is Some(d):
-    if now - entry.scheduled_at > d:
+    if now - entry.original_scheduled_at > d:
       return Some(ScheduleToClose)
 
   if entry.started_at is Some(started):
@@ -286,9 +292,9 @@ evaluate_activity_timeout(entry, activity_state, now):
       if now - started > d:
         return Some(StartToClose)
   else:
-    // Schedule-to-start timeout (only for unstarted activities)
+    // Schedule-to-start timeout (uses last dispatch time)
     if activity_state.schedule_to_start_timeout is Some(d):
-      if now - entry.scheduled_at > d:
+      if now - entry.last_dispatched_at > d:
         return Some(ScheduleToStart)
 
   return None

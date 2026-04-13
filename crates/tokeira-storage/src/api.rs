@@ -6,8 +6,9 @@ use tokeira_kernel::{
     WorkflowState,
 };
 use tokeira_types::{
-    ExecutionRef, NamespaceId, Payloads, ProjectionCursor, QueueKey, RequestId, RunId,
-    RunKey, ShardEpoch, ShardId, TransitionSeq, WorkerIdentity, WorkflowId,
+    ExecutionRef, ExecutionStatus, NamespaceId, Payloads, ProjectionCursor, QueueKey,
+    RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskQueueName, TransitionSeq,
+    WorkerIdentity, WorkflowId, WorkflowType,
 };
 
 /// Write result from persisting one authoritative
@@ -133,7 +134,19 @@ pub trait RunRepository: Send + Sync {
         &self,
         run_key: RunKey,
         transition: Transition,
+        epoch: ShardEpoch,
     ) -> Result<CommitResult>;
+
+    /// Materialize a reset successor by copying the base run's committed
+    /// history prefix through `fork_event_id` and deriving the successor state
+    /// by replaying that prefix.
+    async fn materialize_reset_successor(
+        &self,
+        base_run_key: RunKey,
+        fork_event_id: i64,
+        successor_run_key: RunKey,
+        successor_run_id: RunId,
+    ) -> Result<()>;
 
     /// Return workflow tasks that are scheduled but not
     /// yet started for the given queue, up to `limit`.
@@ -170,6 +183,56 @@ pub trait RunRepository: Send + Sync {
         now: OffsetDateTime,
         limit: usize,
     ) -> Result<Vec<DueTimer>>;
+
+    // ── Shard-filtered sweep queries ────────────────────
+
+    /// List dispatchable workflow tasks for a specific
+    /// shard.
+    async fn list_dispatchable_workflow_tasks_for_shard(
+        &self,
+        shard_id: ShardId,
+        limit: usize,
+    ) -> Result<Vec<DispatchableWorkflowTask>>;
+
+    /// List dispatchable activity tasks for a specific
+    /// shard.
+    async fn list_dispatchable_activity_tasks_for_shard(
+        &self,
+        shard_id: ShardId,
+        limit: usize,
+    ) -> Result<Vec<DispatchableActivityTask>>;
+
+    /// List due timers for a specific shard.
+    async fn list_due_timers_for_shard(
+        &self,
+        shard_id: ShardId,
+        now: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<DueTimer>>;
+
+    /// List open runs with workflow timeout configuration
+    /// for a shard (for sweep reconstruction).
+    async fn list_runs_with_workflow_timeouts_for_shard(
+        &self,
+        shard_id: ShardId,
+        limit: usize,
+    ) -> Result<Vec<WorkflowTimeoutSweepEntry>>;
+
+    /// List open activities for a shard (for timeout
+    /// tracking reconstruction).
+    async fn list_open_activities_for_shard(
+        &self,
+        shard_id: ShardId,
+        limit: usize,
+    ) -> Result<Vec<ActivitySweepEntry>>;
+
+    /// List pending Nexus operations with timeouts for a
+    /// shard (for timeout tracking reconstruction).
+    async fn list_pending_nexus_operations_for_shard(
+        &self,
+        shard_id: ShardId,
+        limit: usize,
+    ) -> Result<Vec<NexusSweepEntry>>;
 
     // TODO(storage): add sweep methods for activity tasks, archival eligibility,
     // namespace-scoped pagination, and explicit current-execution conflict
@@ -211,14 +274,25 @@ pub struct DispatchableActivityTask {
     pub attempt: u32,
 }
 
-/// Discriminant for the type of task stored in the
-/// dispatch backlog.
+/// Durable payload stored for one backlog task.
 #[derive(Clone, Debug, PartialEq)]
-pub enum BacklogTaskKind {
-    /// A workflow task awaiting dispatch.
-    Workflow,
-    /// An activity task awaiting dispatch.
-    Activity { activity_id: String },
+pub enum BacklogPayload {
+    /// Workflow backlog entry keyed by logical workflow-task sequence.
+    Workflow {
+        /// Monotonic workflow-task sequence.
+        logical_seq: tokeira_types::LogicalTaskSeq,
+    },
+    /// Activity backlog entry carrying the full dispatch payload.
+    Activity {
+        /// Application-level activity identifier.
+        activity_id: String,
+        /// Serialized input payloads for the activity.
+        input: Payloads,
+        /// History event id that scheduled this activity.
+        schedule_event_id: i64,
+        /// Current retry attempt.
+        attempt: u32,
+    },
 }
 
 /// A single entry in the durable dispatch backlog.
@@ -232,8 +306,10 @@ pub struct BacklogEntry {
     pub run_key: RunKey,
     /// Task queue this entry targets.
     pub queue: QueueKey,
-    /// Whether this is a workflow or activity task.
-    pub kind: BacklogTaskKind,
+    /// Serialized task payload.
+    pub payload: BacklogPayload,
+    /// Original broker publish time used for backlog age.
+    pub scheduled_at: OffsetDateTime,
     /// Monotonic insertion order within the backlog.
     pub insertion_seq: u64,
 }
@@ -261,6 +337,74 @@ pub struct DueTimer {
     pub timer_id: String,
 }
 
+/// Sweep entry for reconstructing workflow timeout tracking
+/// after shard acquisition.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkflowTimeoutSweepEntry {
+    /// Durable storage key for the run.
+    pub run_key: RunKey,
+    /// Maximum wall-clock time for the execution chain.
+    pub workflow_execution_timeout: Option<time::Duration>,
+    /// Maximum wall-clock time for a single run.
+    pub workflow_run_timeout: Option<time::Duration>,
+    /// When this run started.
+    pub started_at: OffsetDateTime,
+    /// When the first run in the chain started.
+    pub first_run_started_at: Option<OffsetDateTime>,
+    /// Whether the run has a retry policy configured.
+    pub has_retry_policy: bool,
+}
+
+/// Sweep entry for reconstructing activity timeout tracking
+/// after shard acquisition.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActivitySweepEntry {
+    /// Durable storage key for the owning run.
+    pub run_key: RunKey,
+    /// Application-level activity identifier.
+    pub activity_id: String,
+    /// History event ID of the schedule event.
+    pub schedule_event_id: i64,
+    /// Current retry attempt (1-based).
+    pub attempt: u32,
+    /// When the activity was originally scheduled.
+    pub original_scheduled_at: OffsetDateTime,
+    /// When the activity was started (None if not yet
+    /// started).
+    pub started_at: Option<OffsetDateTime>,
+    /// Maximum time from schedule to completion.
+    pub schedule_to_close_timeout: Option<time::Duration>,
+    /// Maximum time from schedule to worker pickup.
+    pub schedule_to_start_timeout: Option<time::Duration>,
+    /// Maximum time from worker pickup to completion.
+    pub start_to_close_timeout: Option<time::Duration>,
+    /// Maximum time between heartbeats.
+    pub heartbeat_timeout: Option<time::Duration>,
+}
+
+/// Sweep entry for reconstructing Nexus timeout tracking
+/// after shard acquisition.
+///
+/// Only Nexus operations that have a `schedule_to_close_timeout`
+/// configured are included — operations without a timeout do
+/// not need timeout tracking reconstruction. This is why
+/// `schedule_to_close_timeout` is non-optional here even though
+/// `PendingNexusOperation.schedule_to_close_timeout` is
+/// `Option<Duration>`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NexusSweepEntry {
+    /// Durable storage key for the owning run.
+    pub run_key: RunKey,
+    /// Nexus operation identifier.
+    pub operation_id: String,
+    /// History event ID of the scheduled event.
+    pub scheduled_event_id: i64,
+    /// Maximum time from schedule to completion.
+    pub schedule_to_close_timeout: time::Duration,
+    /// When the operation was scheduled.
+    pub scheduled_at: OffsetDateTime,
+}
+
 /// Read-only interface for projection workers.
 ///
 /// Projection sinks consume a partitioned log of
@@ -281,6 +425,23 @@ pub trait ProjectionLog: Send + Sync {
 /// One row in the projection log, grouping all
 /// projection ops from a single transition.
 #[derive(Clone, Debug, PartialEq)]
+pub struct ProjectionContext {
+    pub namespace_id: NamespaceId,
+    pub workflow_id: WorkflowId,
+    pub run_id: RunId,
+    pub workflow_type: WorkflowType,
+    pub task_queue: TaskQueueName,
+    pub execution_status: ExecutionStatus,
+    pub start_time: OffsetDateTime,
+    pub execution_time: Option<OffsetDateTime>,
+    pub close_time: Option<OffsetDateTime>,
+    pub history_length: i64,
+    pub state_transition_count: i64,
+}
+
+/// One row in the projection log, grouping all
+/// projection ops from a single transition.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProjectionRecord {
     /// Hash-based partition for fan-out distribution.
     pub partition_id: u32,
@@ -290,6 +451,8 @@ pub struct ProjectionRecord {
     pub run_key: RunKey,
     /// Transition that produced these ops.
     pub transition_seq: tokeira_types::TransitionSeq,
+    /// Execution metadata snapshot for visibility sinks.
+    pub context: ProjectionContext,
     /// The projection operations to apply.
     pub ops: Vec<tokeira_kernel::ProjectionOp>,
 }
@@ -439,8 +602,26 @@ where
         &self,
         run_key: RunKey,
         transition: Transition,
+        epoch: ShardEpoch,
     ) -> Result<CommitResult> {
-        (**self).commit_transition(run_key, transition).await
+        (**self).commit_transition(run_key, transition, epoch).await
+    }
+
+    async fn materialize_reset_successor(
+        &self,
+        base_run_key: RunKey,
+        fork_event_id: i64,
+        successor_run_key: RunKey,
+        successor_run_id: RunId,
+    ) -> Result<()> {
+        (**self)
+            .materialize_reset_successor(
+                base_run_key,
+                fork_event_id,
+                successor_run_key,
+                successor_run_id,
+            )
+            .await
     }
 
     async fn list_dispatchable_workflow_tasks(
@@ -481,6 +662,75 @@ where
         limit: usize,
     ) -> Result<Vec<DueTimer>> {
         (**self).list_due_timers(now, limit).await
+    }
+
+    async fn list_dispatchable_workflow_tasks_for_shard(
+        &self,
+        shard_id: ShardId,
+        limit: usize,
+    ) -> Result<Vec<DispatchableWorkflowTask>> {
+        (**self)
+            .list_dispatchable_workflow_tasks_for_shard(
+                shard_id, limit,
+            )
+            .await
+    }
+
+    async fn list_dispatchable_activity_tasks_for_shard(
+        &self,
+        shard_id: ShardId,
+        limit: usize,
+    ) -> Result<Vec<DispatchableActivityTask>> {
+        (**self)
+            .list_dispatchable_activity_tasks_for_shard(
+                shard_id, limit,
+            )
+            .await
+    }
+
+    async fn list_due_timers_for_shard(
+        &self,
+        shard_id: ShardId,
+        now: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<DueTimer>> {
+        (**self)
+            .list_due_timers_for_shard(shard_id, now, limit)
+            .await
+    }
+
+    async fn list_runs_with_workflow_timeouts_for_shard(
+        &self,
+        shard_id: ShardId,
+        limit: usize,
+    ) -> Result<Vec<WorkflowTimeoutSweepEntry>> {
+        (**self)
+            .list_runs_with_workflow_timeouts_for_shard(
+                shard_id, limit,
+            )
+            .await
+    }
+
+    async fn list_open_activities_for_shard(
+        &self,
+        shard_id: ShardId,
+        limit: usize,
+    ) -> Result<Vec<ActivitySweepEntry>> {
+        (**self)
+            .list_open_activities_for_shard(shard_id, limit)
+            .await
+    }
+
+    async fn list_pending_nexus_operations_for_shard(
+        &self,
+        shard_id: ShardId,
+        limit: usize,
+    ) -> Result<Vec<NexusSweepEntry>> {
+        (**self)
+            .list_pending_nexus_operations_for_shard(
+                shard_id, limit,
+            )
+            .await
     }
 }
 

@@ -7,12 +7,14 @@ use tokeira_kernel::{
     HistoryEventKind, StartRequest, WorkflowCommand, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
+    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime,
+    WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
-    Memo, NamespaceId, Payloads, QueueKey, RequestContext, RequestId, RetryPolicy,
-    SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
+    BuildId, DeploymentId, Memo, NamespaceId, Payloads, QueueKey, RequestContext,
+    RequestId, RetryPolicy, SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity,
+    WorkflowId, WorkflowType,
 };
 
 #[tokio::test]
@@ -24,6 +26,7 @@ async fn schedule_poll_complete_activity_produces_completed_history() -> Result<
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("activity-complete".to_string());
@@ -67,6 +70,7 @@ async fn retryable_activity_failure_redispatches_next_attempt() -> Result<()> {
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
 
@@ -118,6 +122,99 @@ async fn retryable_activity_failure_redispatches_next_attempt() -> Result<()> {
 }
 
 #[tokio::test]
+async fn retryable_activity_failure_preserves_versioned_queue() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = TokeiraRuntime::new(
+        store,
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
+    );
+    let namespace_id = NamespaceId::new();
+    let deployment = DeploymentId("deploy-a".to_string());
+    let build_id = BuildId("build-a".to_string());
+
+    let policy = RetryPolicy {
+        initial_interval: Duration::seconds(1),
+        backoff_coefficient: 2.0,
+        maximum_interval: Some(Duration::seconds(10)),
+        maximum_attempts: 3,
+        non_retryable_error_types: vec![],
+    };
+    let _ = start_and_schedule_activity_with_version(
+        &runtime,
+        namespace_id,
+        WorkflowId("activity-versioned-retry".to_string()),
+        "activity-1",
+        Some(policy),
+        Some(deployment.clone()),
+        Some(build_id.clone()),
+    )
+    .await?;
+
+    assert!(
+        runtime
+            .poll_activity_task(
+                activity_queue(namespace_id),
+                WorkerIdentity("worker-a".to_string()),
+                tokio::time::Duration::from_millis(5),
+            )
+            .await?
+            .is_none()
+    );
+
+    let first = runtime
+        .poll_activity_task(
+            activity_queue_with_version(
+                namespace_id,
+                Some(deployment.clone()),
+                Some(build_id.clone()),
+            ),
+            WorkerIdentity("worker-a".to_string()),
+            tokio::time::Duration::from_millis(5),
+        )
+        .await?
+        .expect("versioned first attempt should be pollable");
+    assert_eq!(first.attempt, 1);
+
+    runtime
+        .fail_activity_task(
+            first.token,
+            "boom".to_string(),
+            Some("retryable".to_string()),
+        )
+        .await?;
+
+    assert!(
+        runtime
+            .poll_activity_task(
+                activity_queue(namespace_id),
+                WorkerIdentity("worker-a".to_string()),
+                tokio::time::Duration::from_millis(5),
+            )
+            .await?
+            .is_none()
+    );
+
+    let second = runtime
+        .poll_activity_task(
+            activity_queue_with_version(
+                namespace_id,
+                Some(deployment),
+                Some(build_id),
+            ),
+            WorkerIdentity("worker-a".to_string()),
+            tokio::time::Duration::from_millis(5),
+        )
+        .await?
+        .expect("versioned retry should be pollable");
+    assert_eq!(second.attempt, 2);
+    Ok(())
+}
+
+#[tokio::test]
 async fn non_retryable_activity_failure_submits_failed_resolution() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
     let runtime = TokeiraRuntime::new(
@@ -126,6 +223,7 @@ async fn non_retryable_activity_failure_submits_failed_resolution() -> Result<()
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
     let run_key = start_and_schedule_activity(
@@ -159,7 +257,7 @@ async fn non_retryable_activity_failure_submits_failed_resolution() -> Result<()
     let history = store.read_history(run_key, 0, 64).await?;
     assert!(history.iter().any(|event| matches!(
         &event.kind,
-        HistoryEventKind::ActivityTaskFailed { activity_id, message } if activity_id == "activity-1" && message == "boom"
+        HistoryEventKind::ActivityTaskFailed { activity_id, message, .. } if activity_id == "activity-1" && message == "boom"
     )));
     Ok(())
 }
@@ -175,6 +273,7 @@ async fn republish_activity_queue_after_restart_restores_pollability() -> Result
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
     );
     let _ = start_and_schedule_activity(
         &runtime,
@@ -191,6 +290,7 @@ async fn republish_activity_queue_after_restart_restores_pollability() -> Result
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
     );
     let count = restarted
         .republish_activity_queue(activity_queue(namespace_id), 10)
@@ -214,6 +314,27 @@ async fn start_and_schedule_activity(
     workflow_id: WorkflowId,
     activity_id: &str,
     retry_policy: Option<RetryPolicy>,
+) -> Result<tokeira_types::RunKey> {
+    start_and_schedule_activity_with_version(
+        runtime,
+        namespace_id,
+        workflow_id,
+        activity_id,
+        retry_policy,
+        None,
+        None,
+    )
+    .await
+}
+
+async fn start_and_schedule_activity_with_version(
+    runtime: &TokeiraRuntime<InMemoryStore>,
+    namespace_id: NamespaceId,
+    workflow_id: WorkflowId,
+    activity_id: &str,
+    retry_policy: Option<RetryPolicy>,
+    deployment: Option<DeploymentId>,
+    build_id: Option<BuildId>,
 ) -> Result<tokeira_types::RunKey> {
     let start = runtime
         .start_workflow(start_request(
@@ -242,9 +363,13 @@ async fn start_and_schedule_activity(
             identity: WorkerIdentity("worker-a".to_string()),
             commands: vec![WorkflowCommand::ScheduleActivity {
                 activity_id: activity_id.to_string(),
+                activity_type: "activity-type".to_string(),
                 task_queue: TaskQueueName("activity-q".to_string()),
                 input: payloads("input"),
+                header: None,
                 retry_policy,
+                deployment,
+                build_id,
                 schedule_to_close_timeout: Some(Duration::minutes(5)),
                 schedule_to_start_timeout: Some(Duration::seconds(30)),
                 start_to_close_timeout: Some(Duration::minutes(1)),
@@ -277,6 +402,8 @@ fn start_request(
         workflow_run_timeout: None,
         workflow_task_timeout: Duration::seconds(10),
         retry_policy: None,
+        deployment: None,
+        build_id: None,
         attempt: 1,
         continued_execution_run_id: None,
         first_execution_run_id: None,
@@ -303,12 +430,20 @@ fn workflow_queue(namespace_id: NamespaceId) -> QueueKey {
 }
 
 fn activity_queue(namespace_id: NamespaceId) -> QueueKey {
+    activity_queue_with_version(namespace_id, None, None)
+}
+
+fn activity_queue_with_version(
+    namespace_id: NamespaceId,
+    deployment: Option<DeploymentId>,
+    build_id: Option<BuildId>,
+) -> QueueKey {
     QueueKey {
         namespace_id,
         task_queue: TaskQueueName("activity-q".to_string()),
         task_kind: TaskKind::Activity,
-        deployment: None,
-        build_id: None,
+        deployment,
+        build_id,
     }
 }
 

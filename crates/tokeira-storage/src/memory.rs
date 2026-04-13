@@ -7,7 +7,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use time::OffsetDateTime;
 use tokeira_kernel::{
-    ActivityOp, DispatchOp, LoadedRun, TimerOp, Transition, WorkflowState,
+    ActivityOp, BasicKernel, DispatchOp, LoadedRun, ReplayContext, TimerOp,
+    Transition, WorkflowState,
 };
 use tokeira_types::{
     ExecutionRef, NamespaceId, ProjectionCursor, QueueKey, RequestId, RunId, RunKey,
@@ -16,10 +17,12 @@ use tokeira_types::{
 use tokio::sync::Mutex;
 
 use crate::api::{
-    BacklogEntry, CommitResult, ConnectionDirector, CurrentExecutionConflictPolicy,
-    DbClass, DbPermit, DispatchableActivityTask, DispatchableWorkflowTask, DueTimer,
-    LeaseOutcome, LeaseRepository, ProjectionBatch, ProjectionLog, ProjectionRecord,
-    RequestRecord, RunRepository, TransitionAuditRecord,
+    ActivitySweepEntry, BacklogEntry, CommitResult, ConnectionDirector,
+    CurrentExecutionConflictPolicy, DbClass, DbPermit, DispatchableActivityTask,
+    DispatchableWorkflowTask, DueTimer, LeaseOutcome, LeaseRepository,
+    NexusSweepEntry, ProjectionBatch, ProjectionContext, ProjectionLog,
+    ProjectionRecord, RequestRecord, RunRepository, TransitionAuditRecord,
+    WorkflowTimeoutSweepEntry,
 };
 
 /// In-memory store intended for local development and semantic tests.
@@ -54,6 +57,10 @@ struct StoreState {
     conflict_policy: CurrentExecutionConflictPolicy,
     activity_state_table: HashMap<(RunKey, String), tokeira_kernel::ActivityState>,
     timer_bucket: HashMap<(RunKey, String), tokeira_kernel::TimerState>,
+    /// Deterministic run-to-shard mapping.
+    run_shard_map: HashMap<RunKey, ShardId>,
+    /// Total shard count for deterministic assignment.
+    shard_count: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -66,6 +73,16 @@ struct ActivityDispatchEntry {
 }
 
 impl InMemoryStore {
+    /// Create a store with a configured shard count for
+    /// shard-filtered queries.
+    pub fn with_shard_count(shard_count: u32) -> Self {
+        let mut state = StoreState::default();
+        state.shard_count = shard_count;
+        Self {
+            inner: Arc::new(Mutex::new(state)),
+        }
+    }
+
     /// Inject `count` synthetic OCC conflicts for
     /// `run_key`. Each subsequent `commit_transition`
     /// call for that key will return
@@ -82,6 +99,10 @@ impl InMemoryStore {
     pub async fn set_conflict_policy(&self, policy: CurrentExecutionConflictPolicy) {
         let mut store = self.inner.lock().await;
         store.conflict_policy = policy;
+    }
+
+    fn effective_shard_count(store: &StoreState) -> u32 {
+        store.shard_count.max(1)
     }
 }
 
@@ -173,8 +194,37 @@ impl RunRepository for InMemoryStore {
         &self,
         run_key: RunKey,
         transition: Transition,
+        epoch: ShardEpoch,
     ) -> Result<CommitResult> {
         let mut store = self.inner.lock().await;
+        if epoch != ShardEpoch::ZERO {
+            let shard_id = store
+                .run_shard_map
+                .get(&run_key)
+                .copied()
+                .unwrap_or_else(|| {
+                    shard_for_run_key(run_key, Self::effective_shard_count(&store))
+                });
+            match store.bundle_leases.get(&shard_id) {
+                Some((_owner, current_epoch)) if *current_epoch == epoch => {}
+                Some((_owner, current_epoch)) => {
+                    return Ok(CommitResult::Conflict {
+                        reason: format!(
+                            "stale shard epoch {:?} for shard {:?}; current {:?}",
+                            epoch, shard_id, current_epoch
+                        ),
+                    });
+                }
+                None => {
+                    return Ok(CommitResult::Conflict {
+                        reason: format!(
+                            "no active lease for shard {:?} at epoch {:?}",
+                            shard_id, epoch
+                        ),
+                    });
+                }
+            }
+        }
         if let Some(remaining) = store.conflict_injections.get_mut(&run_key) {
             if *remaining > 0 {
                 *remaining -= 1;
@@ -362,11 +412,127 @@ impl RunRepository for InMemoryStore {
                 fanout: 1,
                 run_key,
                 transition_seq: state.transition_seq,
+                context: ProjectionContext {
+                    namespace_id: state.namespace_id,
+                    workflow_id: state.workflow_id.clone(),
+                    run_id: state.run_id,
+                    workflow_type: state.workflow_type.clone(),
+                    task_queue: state.task_queue.clone(),
+                    execution_status: state.status,
+                    start_time: state.started_at,
+                    execution_time: None,
+                    close_time: state.closed_at,
+                    history_length: state.last_event_id,
+                    state_transition_count: state.transition_seq.0 as i64,
+                },
                 ops: transition.projection_ops.iter().cloned().collect(),
             });
         }
 
+        if transition.expected_seq == tokeira_types::TransitionSeq::ZERO {
+            let shard_id = shard_for_run_key(run_key, Self::effective_shard_count(&store));
+            store.run_shard_map.insert(run_key, shard_id);
+        }
+
         Ok(CommitResult::Applied { new_state: state })
+    }
+
+    async fn materialize_reset_successor(
+        &self,
+        base_run_key: RunKey,
+        fork_event_id: i64,
+        successor_run_key: RunKey,
+        successor_run_id: RunId,
+    ) -> Result<()> {
+        let mut store = self.inner.lock().await;
+
+        if store.runs.contains_key(&successor_run_key) {
+            anyhow::bail!(
+                "successor run already exists for {:?}: {:?}",
+                successor_run_id,
+                successor_run_key
+            );
+        }
+
+        let base_state = store
+            .runs
+            .get(&base_run_key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("base run not found: {:?}", base_run_key))?;
+
+        let base_history = store
+            .history
+            .get(&base_run_key)
+            .ok_or_else(|| anyhow::anyhow!("base history not found: {:?}", base_run_key))?;
+
+        let prefix_len = base_history
+            .iter()
+            .position(|event| event.event_id == fork_event_id)
+            .map(|idx| idx + 1)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "fork_event_id {} outside committed history for {:?}",
+                    fork_event_id,
+                    base_run_key
+                )
+            })?;
+        let copied_history: Vec<_> = base_history[..prefix_len].to_vec();
+
+        let kernel = BasicKernel;
+        let replay_ctx = ReplayContext {
+            run_key: successor_run_key,
+            namespace_id: base_state.namespace_id,
+            workflow_id: base_state.workflow_id.clone(),
+            run_id: successor_run_id,
+            deployment: base_state.deployment.clone(),
+            build_id: base_state.build_id.clone(),
+            parent_run_key: base_state.parent_run_key,
+            parent_workflow_id: base_state.parent_workflow_id.clone(),
+            first_run_started_at: base_state.first_run_started_at,
+        };
+        let successor_state = kernel.replay_history_prefix(replay_ctx, &copied_history)?;
+
+        store
+            .history
+            .insert(successor_run_key, copied_history);
+        store
+            .runs
+            .insert(successor_run_key, successor_state.clone());
+        store.execution_index.insert(
+            (
+                successor_state.namespace_id,
+                successor_state.workflow_id.0.clone(),
+                successor_state.run_id,
+            ),
+            successor_run_key,
+        );
+        if successor_state.status.is_open() {
+            store.current_open.insert(
+                (
+                    successor_state.namespace_id,
+                    successor_state.workflow_id.0.clone(),
+                ),
+                successor_run_key,
+            );
+        }
+
+        for activity in successor_state.activities.values() {
+            store.activity_state_table.insert(
+                (successor_run_key, activity.activity_id.clone()),
+                activity.clone(),
+            );
+        }
+        for timer in successor_state.timers.values() {
+            store
+                .timer_bucket
+                .insert((successor_run_key, timer.timer_id.clone()), timer.clone());
+        }
+
+        let shard_id =
+            shard_for_run_key(successor_run_key, Self::effective_shard_count(&store));
+        store.run_shard_map.insert(successor_run_key, shard_id);
+
+        Ok(())
     }
 
     async fn list_dispatchable_workflow_tasks(
@@ -481,6 +647,207 @@ impl RunRepository for InMemoryStore {
             }
         }
         Ok(due)
+    }
+
+    async fn list_dispatchable_workflow_tasks_for_shard(
+        &self,
+        shard_id: ShardId,
+        limit: usize,
+    ) -> Result<Vec<DispatchableWorkflowTask>> {
+        let mut store = self.inner.lock().await;
+        let now = OffsetDateTime::now_utc();
+
+        // Collect matching run keys first so we can do the
+        // mutable sticky cleanup without cloning the shard map.
+        let candidates: Vec<RunKey> = store
+            .runs
+            .keys()
+            .filter(|rk| {
+                store.run_shard_map.get(rk) == Some(&shard_id)
+            })
+            .copied()
+            .collect();
+
+        let mut out = Vec::new();
+        for run_key in candidates {
+            let Some(state) = store.runs.get_mut(&run_key) else {
+                continue;
+            };
+            clear_expired_sticky_if_needed(state, now);
+            let Some(pending) = &state.pending_workflow_task
+            else {
+                continue;
+            };
+            if pending.started_event_id.is_some() {
+                continue;
+            }
+            out.push(DispatchableWorkflowTask {
+                run_key: state.run_key,
+                queue: QueueKey {
+                    namespace_id: state.namespace_id,
+                    task_queue: state.task_queue.clone(),
+                    task_kind: tokeira_types::TaskKind::Workflow,
+                    deployment: None,
+                    build_id: None,
+                },
+                logical_seq: pending.logical_seq,
+                sticky_preferred: state
+                    .sticky
+                    .as_ref()
+                    .map(|s| s.worker_identity.clone()),
+                sticky_expires_at: state
+                    .sticky
+                    .as_ref()
+                    .map(|s| s.expires_at),
+            });
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    async fn list_dispatchable_activity_tasks_for_shard(
+        &self,
+        shard_id: ShardId,
+        limit: usize,
+    ) -> Result<Vec<DispatchableActivityTask>> {
+        let store = self.inner.lock().await;
+        Ok(store
+            .activity_dispatch
+            .values()
+            .filter(|entry| store.run_shard_map.get(&entry.task.run_key) == Some(&shard_id))
+            .take(limit)
+            .map(|entry| entry.task.clone())
+            .collect())
+    }
+
+    async fn list_due_timers_for_shard(
+        &self,
+        shard_id: ShardId,
+        now: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<DueTimer>> {
+        let store = self.inner.lock().await;
+        let mut due = Vec::new();
+        for ((run_key, _), timer) in &store.timer_bucket {
+            if store.run_shard_map.get(run_key) != Some(&shard_id) {
+                continue;
+            }
+            if timer.fire_at <= now {
+                due.push(DueTimer {
+                    run_key: *run_key,
+                    timer_id: timer.timer_id.clone(),
+                });
+                if due.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(due)
+    }
+
+    async fn list_runs_with_workflow_timeouts_for_shard(
+        &self,
+        shard_id: ShardId,
+        limit: usize,
+    ) -> Result<Vec<WorkflowTimeoutSweepEntry>> {
+        let store = self.inner.lock().await;
+        let mut out = Vec::new();
+        for state in store.runs.values() {
+            if store.run_shard_map.get(&state.run_key) != Some(&shard_id) {
+                continue;
+            }
+            if !state.is_open() {
+                continue;
+            }
+            if state.workflow_execution_timeout.is_none()
+                && state.workflow_run_timeout.is_none()
+            {
+                continue;
+            }
+            out.push(WorkflowTimeoutSweepEntry {
+                run_key: state.run_key,
+                workflow_execution_timeout: state.workflow_execution_timeout,
+                workflow_run_timeout: state.workflow_run_timeout,
+                started_at: state.started_at,
+                first_run_started_at: state.first_run_started_at,
+                has_retry_policy: state.retry_policy.is_some(),
+            });
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    async fn list_open_activities_for_shard(
+        &self,
+        shard_id: ShardId,
+        limit: usize,
+    ) -> Result<Vec<ActivitySweepEntry>> {
+        let store = self.inner.lock().await;
+        let mut out = Vec::new();
+        for ((run_key, _), activity) in &store.activity_state_table {
+            if store.run_shard_map.get(run_key) != Some(&shard_id) {
+                continue;
+            }
+            out.push(ActivitySweepEntry {
+                run_key: *run_key,
+                activity_id: activity.activity_id.clone(),
+                schedule_event_id: activity.schedule_event_id,
+                attempt: activity.attempt,
+                original_scheduled_at: activity.scheduled_at,
+                started_at: activity.started_at,
+                schedule_to_close_timeout: activity.schedule_to_close_timeout,
+                schedule_to_start_timeout: activity.schedule_to_start_timeout,
+                start_to_close_timeout: activity.start_to_close_timeout,
+                heartbeat_timeout: activity.heartbeat_timeout,
+            });
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    async fn list_pending_nexus_operations_for_shard(
+        &self,
+        shard_id: ShardId,
+        limit: usize,
+    ) -> Result<Vec<NexusSweepEntry>> {
+        let store = self.inner.lock().await;
+        let mut out = Vec::new();
+        for state in store.runs.values() {
+            if store.run_shard_map.get(&state.run_key)
+                != Some(&shard_id)
+            {
+                continue;
+            }
+            if !state.is_open() {
+                continue;
+            }
+            for op in state.pending_nexus_operations.values() {
+                // Only include operations that have a timeout
+                // configured — operations without a timeout
+                // don't need timeout tracking reconstruction.
+                let Some(timeout) = op.schedule_to_close_timeout
+                else {
+                    continue;
+                };
+                out.push(NexusSweepEntry {
+                    run_key: state.run_key,
+                    operation_id: op.operation_id.clone(),
+                    scheduled_event_id: op.scheduled_event_id,
+                    schedule_to_close_timeout: timeout,
+                    scheduled_at: op.scheduled_at,
+                });
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -599,20 +966,27 @@ fn partition_for(run_key: RunKey) -> u32 {
     (raw as u32) % 16
 }
 
+fn shard_for_run_key(run_key: RunKey, shard_count: u32) -> ShardId {
+    ShardId((run_key.0.as_u128() as u32) % shard_count.max(1))
+}
+
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
     use time::Duration;
-    use tokeira_kernel::{PendingWorkflowTask, RequestDedupeOp};
+    use tokeira_kernel::{
+        event::{HistoryEvent, HistoryEventKind},
+        PendingWorkflowTask, RequestDedupeOp,
+    };
     use tokeira_types::{
-        ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, QueueKey, RequestId, RunId,
-        RunKey, SearchAttributes, TaskKind, TaskQueueName, TransitionSeq, WorkflowId,
-        WorkflowType,
+        ExecutionRef, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, QueueKey,
+        RequestId, RunId, RunKey, SearchAttributes, TaskKind, TaskQueueName,
+        TransitionSeq, WorkerIdentity, WorkflowId, WorkflowType,
     };
 
-    use super::*;
-    use crate::api::BacklogTaskKind;
+    use crate::api::RunRepository;
 
+    use super::*;
     fn fixed_now() -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()
     }
@@ -635,6 +1009,8 @@ mod tests {
             run_id: RunId::new(),
             workflow_type: WorkflowType("wf".into()),
             task_queue: TaskQueueName("queue".into()),
+            deployment: None,
+            build_id: None,
             status: ExecutionStatus::Running,
             transition_seq: TransitionSeq(1),
             last_event_id: 0,
@@ -691,15 +1067,22 @@ mod tests {
     fn activity_state(activity_id: &str) -> tokeira_kernel::ActivityState {
         tokeira_kernel::ActivityState {
             activity_id: activity_id.into(),
+            activity_type: "activity-type".into(),
             schedule_event_id: 7,
             task_queue: TaskQueueName("activity-q".into()),
+            deployment: None,
+            build_id: None,
             input: tokeira_types::Payloads::default(),
+            header: None,
             attempt: 2,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::seconds(30)),
             schedule_to_start_timeout: Some(Duration::seconds(10)),
             start_to_close_timeout: Some(Duration::seconds(20)),
             heartbeat_timeout: Some(Duration::seconds(5)),
+            scheduled_at: fixed_now(),
+            started_at: None,
+            started_event_id: None,
             pause_info: None,
             stamp: 0,
         }
@@ -714,6 +1097,37 @@ mod tests {
             started_event_id: 11,
             fire_at,
         }
+    }
+
+    fn history_event(
+        event_id: i64,
+        happened_at: OffsetDateTime,
+        kind: HistoryEventKind,
+    ) -> HistoryEvent {
+        HistoryEvent {
+            event_id,
+            happened_at,
+            kind,
+        }
+    }
+
+    async fn seed_base_run(
+        store: &InMemoryStore,
+        run_key: RunKey,
+        state: WorkflowState,
+        history: Vec<HistoryEvent>,
+    ) {
+        let mut inner = store.inner.lock().await;
+        inner.runs.insert(run_key, state.clone());
+        inner.history.insert(run_key, history);
+        inner.execution_index.insert(
+            (
+                state.namespace_id,
+                state.workflow_id.0.clone(),
+                state.run_id,
+            ),
+            run_key,
+        );
     }
 
     fn arb_activity_id() -> impl Strategy<Value = String> {
@@ -747,7 +1161,7 @@ mod tests {
                     heartbeat_timeout: Some(Duration::seconds(5)),
                 });
 
-                let result = store.commit_transition(run_key, transition).await.unwrap();
+                let result = store.commit_transition(run_key, transition, ShardEpoch::ZERO).await.unwrap();
                 assert!(matches!(result, CommitResult::Applied { .. }));
                 let tasks = store.list_dispatchable_activity_tasks(&queue, 10).await.unwrap();
                 assert_eq!(tasks.len(), 1);
@@ -789,7 +1203,7 @@ mod tests {
                     heartbeat_timeout: None,
                 });
                 transition.activity_ops.push(ActivityOp::Upsert(activity_state(&activity_id)));
-                let _ = store.commit_transition(run_key, transition).await.unwrap();
+                let _ = store.commit_transition(run_key, transition, ShardEpoch::ZERO).await.unwrap();
 
                 let mut delete_transition = Transition {
                     expected_seq: TransitionSeq(1),
@@ -805,7 +1219,7 @@ mod tests {
                 delete_transition
                     .activity_ops
                     .push(ActivityOp::Delete { activity_id: activity_id.clone() });
-                let _ = store.commit_transition(run_key, delete_transition).await.unwrap();
+                let _ = store.commit_transition(run_key, delete_transition, ShardEpoch::ZERO).await.unwrap();
 
                 let tasks = store.list_dispatchable_activity_tasks(&queue, 10).await.unwrap();
                 assert!(tasks.is_empty());
@@ -840,7 +1254,7 @@ mod tests {
                     heartbeat_timeout: None,
                 });
                 first.activity_ops.push(ActivityOp::Upsert(activity_state(&activity_id)));
-                let _ = store.commit_transition(run_key, first).await.unwrap();
+                let _ = store.commit_transition(run_key, first, ShardEpoch::ZERO).await.unwrap();
                 let before = store.list_dispatchable_activity_tasks(&queue, 10).await.unwrap();
 
                 store.inject_conflict(run_key, 1).await;
@@ -867,7 +1281,7 @@ mod tests {
                     start_to_close_timeout: None,
                     heartbeat_timeout: None,
                 });
-                let result = store.commit_transition(run_key, conflict).await.unwrap();
+                let result = store.commit_transition(run_key, conflict, ShardEpoch::ZERO).await.unwrap();
                 assert!(matches!(result, CommitResult::Conflict { .. }));
 
                 let after = store.list_dispatchable_activity_tasks(&queue, 10).await.unwrap();
@@ -898,7 +1312,7 @@ mod tests {
                         start_to_close_timeout: None,
                         heartbeat_timeout: None,
                     });
-                    let _ = store.commit_transition(run_key, transition).await.unwrap();
+                    let _ = store.commit_transition(run_key, transition, ShardEpoch::ZERO).await.unwrap();
                 }
 
                 let tasks = store.list_dispatchable_activity_tasks(&activity_queue, limit).await.unwrap();
@@ -917,11 +1331,19 @@ mod tests {
                     .map(|idx| BacklogEntry {
                         run_key: RunKey::new(),
                         queue: queue.clone(),
-                        kind: if idx % 2 == 0 {
-                            BacklogTaskKind::Workflow
+                        payload: if idx % 2 == 0 {
+                            crate::api::BacklogPayload::Workflow {
+                                logical_seq: LogicalTaskSeq(idx as u64 + 1),
+                            }
                         } else {
-                            BacklogTaskKind::Activity { activity_id: format!("a{idx}") }
+                            crate::api::BacklogPayload::Activity {
+                                activity_id: format!("a{idx}"),
+                                input: tokeira_types::Payloads::default(),
+                                schedule_event_id: idx as i64,
+                                attempt: 1,
+                            }
                         },
+                        scheduled_at: fixed_now(),
                         insertion_seq: 999,
                     })
                     .collect();
@@ -942,10 +1364,10 @@ mod tests {
                 let run_key = RunKey::new();
                 store.inject_conflict(run_key, count).await;
                 for _ in 0..count {
-                    let result = store.commit_transition(run_key, start_transition(run_key)).await.unwrap();
+                    let result = store.commit_transition(run_key, start_transition(run_key), ShardEpoch::ZERO).await.unwrap();
                     assert!(matches!(result, CommitResult::Conflict { .. }));
                 }
-                let result = store.commit_transition(run_key, start_transition(run_key)).await.unwrap();
+                let result = store.commit_transition(run_key, start_transition(run_key), ShardEpoch::ZERO).await.unwrap();
                 assert!(matches!(result, CommitResult::Applied { .. }));
             });
         }
@@ -965,13 +1387,13 @@ mod tests {
                 let mut t1 = start_transition(run_key_1);
                 t1.next_state.namespace_id = namespace_id;
                 t1.next_state.workflow_id = workflow_id.clone();
-                let _ = store.commit_transition(run_key_1, t1).await.unwrap();
+                let _ = store.commit_transition(run_key_1, t1, ShardEpoch::ZERO).await.unwrap();
 
                 let run_key_2 = RunKey::new();
                 let mut t2 = start_transition(run_key_2);
                 t2.next_state.namespace_id = namespace_id;
                 t2.next_state.workflow_id = workflow_id;
-                let result = store.commit_transition(run_key_2, t2).await.unwrap();
+                let result = store.commit_transition(run_key_2, t2, ShardEpoch::ZERO).await.unwrap();
                 assert!(matches!(result, CommitResult::Conflict { .. }));
             });
         }
@@ -985,7 +1407,7 @@ mod tests {
                 let mut upsert = start_transition(run_key);
                 upsert.activity_ops.push(ActivityOp::Upsert(activity_state(&activity_id)));
                 upsert.timer_ops.push(TimerOp::Upsert(timer_state("timer-1", fixed_now())));
-                let _ = store.commit_transition(run_key, upsert).await.unwrap();
+                let _ = store.commit_transition(run_key, upsert, ShardEpoch::ZERO).await.unwrap();
                 assert_eq!(store.list_due_timers(fixed_now(), 10).await.unwrap().len(), 1);
 
                 let mut delete = Transition {
@@ -1001,7 +1423,7 @@ mod tests {
                 delete.next_state.transition_seq = TransitionSeq(2);
                 delete.activity_ops.push(ActivityOp::Delete { activity_id });
                 delete.timer_ops.push(TimerOp::Delete { timer_id: "timer-1".into() });
-                let _ = store.commit_transition(run_key, delete).await.unwrap();
+                let _ = store.commit_transition(run_key, delete, ShardEpoch::ZERO).await.unwrap();
                 assert!(store.list_due_timers(fixed_now(), 10).await.unwrap().is_empty());
             });
         }
@@ -1021,7 +1443,7 @@ mod tests {
                 let mut open = start_transition(run_key_1);
                 open.next_state.namespace_id = namespace_id;
                 open.next_state.workflow_id = workflow_id.clone();
-                let _ = store.commit_transition(run_key_1, open).await.unwrap();
+                let _ = store.commit_transition(run_key_1, open, ShardEpoch::ZERO).await.unwrap();
 
                 let mut close = Transition {
                     expected_seq: TransitionSeq(1),
@@ -1039,13 +1461,13 @@ mod tests {
                 close.next_state.closed_at = Some(fixed_now());
                 close.next_state.pending_workflow_task = None;
                 close.next_state.transition_seq = TransitionSeq(2);
-                let _ = store.commit_transition(run_key_1, close).await.unwrap();
+                let _ = store.commit_transition(run_key_1, close, ShardEpoch::ZERO).await.unwrap();
 
                 let run_key_2 = RunKey::new();
                 let mut reopen = start_transition(run_key_2);
                 reopen.next_state.namespace_id = namespace_id;
                 reopen.next_state.workflow_id = workflow_id;
-                let result = store.commit_transition(run_key_2, reopen).await.unwrap();
+                let result = store.commit_transition(run_key_2, reopen, ShardEpoch::ZERO).await.unwrap();
                 assert!(matches!(result, CommitResult::Applied { .. }));
             });
         }
@@ -1066,7 +1488,7 @@ mod tests {
                 t1.timer_ops.push(TimerOp::Upsert(tmr.clone()));
                 t1.next_state.activities.insert(activity_id.clone(), act);
                 t1.next_state.timers.insert(timer_id.clone(), tmr);
-                let _ = store.commit_transition(run_key, t1).await.unwrap();
+                let _ = store.commit_transition(run_key, t1, ShardEpoch::ZERO).await.unwrap();
 
                 let inner = store.inner.lock().await;
                 for (rk, state) in &inner.runs {
@@ -1100,7 +1522,10 @@ mod tests {
                         .map(|_| BacklogEntry {
                             run_key: RunKey::new(),
                             queue: queue.clone(),
-                            kind: BacklogTaskKind::Workflow,
+                            payload: crate::api::BacklogPayload::Workflow {
+                                logical_seq: LogicalTaskSeq::ONE,
+                            },
+                            scheduled_at: fixed_now(),
                             insertion_seq: 123,
                         })
                         .collect::<Vec<_>>()
@@ -1125,13 +1550,13 @@ mod tests {
         let mut t1 = start_transition(run_key_1);
         t1.next_state.namespace_id = namespace_id;
         t1.next_state.workflow_id = workflow_id.clone();
-        let _ = store.commit_transition(run_key_1, t1).await.unwrap();
+        let _ = store.commit_transition(run_key_1, t1, ShardEpoch::ZERO).await.unwrap();
 
         let run_key_2 = RunKey::new();
         let mut t2 = start_transition(run_key_2);
         t2.next_state.namespace_id = namespace_id;
         t2.next_state.workflow_id = workflow_id;
-        let result = store.commit_transition(run_key_2, t2).await.unwrap();
+        let result = store.commit_transition(run_key_2, t2, ShardEpoch::ZERO).await.unwrap();
         assert!(matches!(result, CommitResult::Conflict { .. }));
     }
 
@@ -1149,7 +1574,7 @@ mod tests {
         let mut open = start_transition(run_key_1);
         open.next_state.namespace_id = namespace_id;
         open.next_state.workflow_id = workflow_id.clone();
-        let _ = store.commit_transition(run_key_1, open).await.unwrap();
+        let _ = store.commit_transition(run_key_1, open, ShardEpoch::ZERO).await.unwrap();
 
         let mut close = Transition {
             expected_seq: TransitionSeq(1),
@@ -1167,13 +1592,13 @@ mod tests {
         close.next_state.closed_at = Some(fixed_now());
         close.next_state.pending_workflow_task = None;
         close.next_state.transition_seq = TransitionSeq(2);
-        let _ = store.commit_transition(run_key_1, close).await.unwrap();
+        let _ = store.commit_transition(run_key_1, close, ShardEpoch::ZERO).await.unwrap();
 
         let run_key_2 = RunKey::new();
         let mut reopen = start_transition(run_key_2);
         reopen.next_state.namespace_id = namespace_id;
         reopen.next_state.workflow_id = workflow_id;
-        let result = store.commit_transition(run_key_2, reopen).await.unwrap();
+        let result = store.commit_transition(run_key_2, reopen, ShardEpoch::ZERO).await.unwrap();
         assert!(matches!(result, CommitResult::Applied { .. }));
     }
 
@@ -1185,7 +1610,7 @@ mod tests {
         transition
             .timer_ops
             .push(TimerOp::Upsert(timer_state("timer-1", fixed_now())));
-        let _ = store.commit_transition(run_key, transition).await.unwrap();
+        let _ = store.commit_transition(run_key, transition, ShardEpoch::ZERO).await.unwrap();
         let due = store.list_due_timers(fixed_now(), 10).await.unwrap();
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].timer_id, "timer-1");
@@ -1196,7 +1621,10 @@ mod tests {
         let store = InMemoryStore::default();
         assert!(
             store
-                .list_dispatchable_activity_tasks(&sample_queue(TaskKind::Activity), 10)
+                .list_dispatchable_activity_tasks(
+                    &sample_queue(TaskKind::Activity),
+                    10,
+                )
                 .await
                 .unwrap()
                 .is_empty()
@@ -1217,11 +1645,11 @@ mod tests {
         store.inject_conflict(run_key, 3).await;
         store.inject_conflict(run_key, 1).await;
         let first = store
-            .commit_transition(run_key, start_transition(run_key))
+            .commit_transition(run_key, start_transition(run_key), ShardEpoch::ZERO)
             .await
             .unwrap();
         let second = store
-            .commit_transition(run_key, start_transition(run_key))
+            .commit_transition(run_key, start_transition(run_key), ShardEpoch::ZERO)
             .await
             .unwrap();
         assert!(matches!(first, CommitResult::Conflict { .. }));
@@ -1237,15 +1665,22 @@ mod tests {
                 BacklogEntry {
                     run_key: RunKey::new(),
                     queue: queue.clone(),
-                    kind: BacklogTaskKind::Workflow,
+                    payload: crate::api::BacklogPayload::Workflow {
+                        logical_seq: LogicalTaskSeq::ONE,
+                    },
+                    scheduled_at: fixed_now(),
                     insertion_seq: 999,
                 },
                 BacklogEntry {
                     run_key: RunKey::new(),
                     queue: queue.clone(),
-                    kind: BacklogTaskKind::Activity {
+                    payload: crate::api::BacklogPayload::Activity {
                         activity_id: "a1".into(),
+                        input: tokeira_types::Payloads::default(),
+                        schedule_event_id: 7,
+                        attempt: 1,
                     },
+                    scheduled_at: fixed_now(),
                     insertion_seq: 999,
                 },
             ])
@@ -1282,7 +1717,7 @@ mod tests {
                 start_to_close_timeout: None,
                 heartbeat_timeout: None,
             });
-        let _ = store.commit_transition(run_key, transition).await.unwrap();
+        let _ = store.commit_transition(run_key, transition, ShardEpoch::ZERO).await.unwrap();
         assert!(
             store
                 .drain_backlog(&sample_queue(TaskKind::Workflow), 10)
@@ -1324,10 +1759,13 @@ mod tests {
         first
             .activity_ops
             .push(ActivityOp::Upsert(activity_state("a1")));
-        let _ = store.commit_transition(run_key, first).await.unwrap();
+        let _ = store.commit_transition(run_key, first, ShardEpoch::ZERO).await.unwrap();
 
         let tasks_before = store
-            .list_dispatchable_activity_tasks(&sample_queue(TaskKind::Activity), 10)
+            .list_dispatchable_activity_tasks(
+                &sample_queue(TaskKind::Activity),
+                10,
+            )
             .await
             .unwrap();
 
@@ -1347,13 +1785,558 @@ mod tests {
         duplicate.request_dedupe_ops.push(RequestDedupeOp {
             request_id: RequestId("req-1".into()),
         });
-        let result = store.commit_transition(run_key, duplicate).await.unwrap();
+        let result = store.commit_transition(run_key, duplicate, ShardEpoch::ZERO).await.unwrap();
         assert!(matches!(result, CommitResult::Duplicate));
 
         let tasks_after = store
-            .list_dispatchable_activity_tasks(&sample_queue(TaskKind::Activity), 10)
+            .list_dispatchable_activity_tasks(
+                &sample_queue(TaskKind::Activity),
+                10,
+            )
             .await
             .unwrap();
         assert_eq!(tasks_before, tasks_after);
+    }
+
+    #[tokio::test]
+    async fn materialize_reset_successor_replays_prefix_state() {
+        let store = InMemoryStore::default();
+        let base_run_key = RunKey::new();
+        let successor_run_id = RunId::new();
+        let successor_run_key = RunKey(successor_run_id.0);
+        let mut base_state = sample_state(base_run_key);
+        base_state.status = ExecutionStatus::Terminated;
+        base_state.closed_at = Some(fixed_now());
+        base_state.pending_workflow_task = None;
+        base_state.transition_seq = TransitionSeq(7);
+
+        let history = vec![
+            history_event(
+                1,
+                fixed_now(),
+                HistoryEventKind::WorkflowExecutionStarted {
+                    workflow_type: base_state.workflow_type.clone(),
+                    task_queue: base_state.task_queue.clone(),
+                    input: tokeira_types::Payloads::default(),
+                    memo: base_state.memo.clone(),
+                    search_attributes: base_state.search_attributes.clone(),
+                    request_id: "start".into(),
+                    continued_execution_run_id: None,
+                    first_execution_run_id: base_state.first_execution_run_id,
+                    retry_policy: base_state.retry_policy.clone(),
+                    attempt: base_state.attempt,
+                    workflow_execution_timeout: base_state.workflow_execution_timeout,
+                    workflow_run_timeout: base_state.workflow_run_timeout,
+                    workflow_task_timeout: base_state.workflow_task_timeout,
+                },
+            ),
+            history_event(
+                2,
+                fixed_now(),
+                HistoryEventKind::WorkflowTaskScheduled {
+                    logical_seq: LogicalTaskSeq::ONE,
+                },
+            ),
+            history_event(
+                3,
+                fixed_now(),
+                HistoryEventKind::WorkflowTaskStarted {
+                    logical_seq: LogicalTaskSeq::ONE,
+                    scheduled_event_id: 2,
+                    attempt: 1,
+                    identity: WorkerIdentity("worker".into()),
+                },
+            ),
+            history_event(
+                4,
+                fixed_now(),
+                HistoryEventKind::WorkflowTaskCompleted {
+                    logical_seq: LogicalTaskSeq::ONE,
+                    scheduled_event_id: 2,
+                    started_event_id: 3,
+                    identity: WorkerIdentity("worker".into()),
+                },
+            ),
+            history_event(
+                5,
+                fixed_now(),
+                HistoryEventKind::ActivityTaskScheduled {
+                    activity_id: "a1".into(),
+                    activity_type: "activity".into(),
+                    task_queue: TaskQueueName("activity-q".into()),
+                    input: tokeira_types::Payloads::default(),
+                    header: None,
+                    retry_policy: None,
+                    schedule_to_close_timeout: Some(Duration::seconds(30)),
+                    schedule_to_start_timeout: Some(Duration::seconds(10)),
+                    start_to_close_timeout: Some(Duration::seconds(20)),
+                    heartbeat_timeout: Some(Duration::seconds(5)),
+                },
+            ),
+            history_event(
+                6,
+                fixed_now(),
+                HistoryEventKind::TimerStarted {
+                    timer_id: "t1".into(),
+                    fire_at: fixed_now() + Duration::seconds(30),
+                },
+            ),
+        ];
+        seed_base_run(&store, base_run_key, base_state.clone(), history).await;
+
+        RunRepository::materialize_reset_successor(
+            &store,
+            base_run_key,
+            6,
+            successor_run_key,
+            successor_run_id,
+        )
+        .await
+        .unwrap();
+
+        let LoadedRun::Existing(successor) =
+            RunRepository::load_run(&store, successor_run_key).await.unwrap()
+        else {
+            panic!("expected successor run to exist");
+        };
+
+        assert_eq!(successor.run_id, successor_run_id);
+        assert_eq!(successor.transition_seq, TransitionSeq::ZERO);
+        assert_eq!(successor.last_event_id, 6);
+        assert!(successor.pending_workflow_task.is_none());
+        assert!(successor.activities.contains_key("a1"));
+        assert!(successor.timers.contains_key("t1"));
+    }
+
+    #[tokio::test]
+    async fn materialize_reset_successor_rejects_invalid_fork_event_id() {
+        let store = InMemoryStore::default();
+        let base_run_key = RunKey::new();
+        let mut base_state = sample_state(base_run_key);
+        base_state.status = ExecutionStatus::Terminated;
+        base_state.closed_at = Some(fixed_now());
+        seed_base_run(
+            &store,
+            base_run_key,
+            base_state.clone(),
+            vec![history_event(
+                1,
+                fixed_now(),
+                HistoryEventKind::WorkflowExecutionStarted {
+                    workflow_type: base_state.workflow_type.clone(),
+                    task_queue: base_state.task_queue.clone(),
+                    input: tokeira_types::Payloads::default(),
+                    memo: base_state.memo.clone(),
+                    search_attributes: base_state.search_attributes.clone(),
+                    request_id: "start".into(),
+                    continued_execution_run_id: None,
+                    first_execution_run_id: base_state.first_execution_run_id,
+                    retry_policy: base_state.retry_policy.clone(),
+                    attempt: base_state.attempt,
+                    workflow_execution_timeout: base_state.workflow_execution_timeout,
+                    workflow_run_timeout: base_state.workflow_run_timeout,
+                    workflow_task_timeout: base_state.workflow_task_timeout,
+                },
+            )],
+        )
+        .await;
+
+        let err = RunRepository::materialize_reset_successor(
+            &store,
+            base_run_key,
+            99,
+            RunKey::new(),
+            RunId::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("outside committed history"));
+    }
+
+    #[tokio::test]
+    async fn materialize_reset_successor_is_durably_queryable() {
+        let store = InMemoryStore::default();
+        let base_run_key = RunKey::new();
+        let successor_run_id = RunId::new();
+        let successor_run_key = RunKey(successor_run_id.0);
+        let mut base_state = sample_state(base_run_key);
+        base_state.status = ExecutionStatus::Terminated;
+        base_state.closed_at = Some(fixed_now());
+        base_state.pending_workflow_task = None;
+        let base_namespace = base_state.namespace_id;
+        let base_workflow_id = base_state.workflow_id.clone();
+        seed_base_run(
+            &store,
+            base_run_key,
+            base_state.clone(),
+            vec![
+                history_event(
+                    1,
+                    fixed_now(),
+                    HistoryEventKind::WorkflowExecutionStarted {
+                        workflow_type: base_state.workflow_type.clone(),
+                        task_queue: base_state.task_queue.clone(),
+                        input: tokeira_types::Payloads::default(),
+                        memo: base_state.memo.clone(),
+                        search_attributes: base_state.search_attributes.clone(),
+                        request_id: "start".into(),
+                        continued_execution_run_id: None,
+                        first_execution_run_id: base_state.first_execution_run_id,
+                        retry_policy: base_state.retry_policy.clone(),
+                        attempt: base_state.attempt,
+                        workflow_execution_timeout: base_state.workflow_execution_timeout,
+                        workflow_run_timeout: base_state.workflow_run_timeout,
+                        workflow_task_timeout: base_state.workflow_task_timeout,
+                    },
+                ),
+                history_event(
+                    2,
+                    fixed_now(),
+                    HistoryEventKind::WorkflowTaskScheduled {
+                        logical_seq: LogicalTaskSeq::ONE,
+                    },
+                ),
+            ],
+        )
+        .await;
+
+        RunRepository::materialize_reset_successor(
+            &store,
+            base_run_key,
+            2,
+            successor_run_key,
+            successor_run_id,
+        )
+        .await
+        .unwrap();
+
+        let resolved = RunRepository::resolve_execution(
+            &store,
+            &ExecutionRef {
+                namespace_id: base_namespace,
+                workflow_id: base_workflow_id,
+                run_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved, Some(successor_run_key));
+
+        let history = RunRepository::read_history(&store, successor_run_key, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].event_id, 2);
+    }
+
+    // ── Property 17: Shard-filtered query correctness ──
+    // Feature: runtime-sweeper-recovery
+    // **Validates: Requirements 14.3, 14.4, 14.5, 14.6**
+
+    // ── Property 2: Epoch fencing rejects stale commits ─
+    // Feature: runtime-sweeper-recovery
+    // **Validates: Requirements 1.5**
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn epoch_fencing_rejects_stale_commits(
+            stale_epoch in 2u64..100,
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let store =
+                    InMemoryStore::with_shard_count(1);
+                let shard_id = ShardId(0);
+                let current_epoch = ShardEpoch(1);
+
+                // Acquire a lease so the store knows
+                // the current epoch.
+                let outcome = store
+                    .try_acquire_bundle(
+                        shard_id,
+                        "owner".into(),
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    outcome,
+                    LeaseOutcome::Acquired { .. }
+                ));
+
+                let run_key = RunKey::new();
+                // First commit with correct epoch
+                let t = start_transition(run_key);
+                let result = store
+                    .commit_transition(
+                        run_key,
+                        t,
+                        current_epoch,
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    result,
+                    CommitResult::Applied { .. }
+                ));
+
+                // Attempt commit with stale epoch
+                let stale = ShardEpoch(stale_epoch);
+                if stale != current_epoch {
+                    let mut t2 = Transition {
+                        expected_seq: TransitionSeq(1),
+                        next_state: sample_state(run_key),
+                        history_events: Default::default(),
+                        request_dedupe_ops:
+                            Default::default(),
+                        activity_ops: Default::default(),
+                        timer_ops: Default::default(),
+                        dispatch_ops: Default::default(),
+                        projection_ops: Default::default(),
+                    };
+                    t2.next_state.transition_seq =
+                        TransitionSeq(2);
+                    let result = store
+                        .commit_transition(
+                            run_key,
+                            t2,
+                            stale,
+                        )
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        result,
+                        CommitResult::Conflict { .. }
+                    ));
+                }
+            });
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn property_shard_filtered_query_correctness(
+            run_count in 2usize..6usize,
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let shard_count: u32 = 4;
+                let store =
+                    InMemoryStore::with_shard_count(shard_count);
+                let ns = NamespaceId::new();
+                let mut run_shards: Vec<(RunKey, ShardId)> =
+                    Vec::new();
+
+                for idx in 0..run_count {
+                    let run_key = RunKey::new();
+                    let shard_id = ShardId(
+                        (run_key.0.as_u128() as u32) % shard_count,
+                    );
+                    run_shards.push((run_key, shard_id));
+
+                    let mut t = start_transition(run_key);
+                    t.next_state.namespace_id = ns;
+                    t.next_state.workflow_id =
+                        WorkflowId(format!("wf-{idx}"));
+                    t.next_state.workflow_execution_timeout =
+                        Some(Duration::minutes(5));
+                    t.next_state.workflow_run_timeout =
+                        Some(Duration::minutes(10));
+
+                    let act_id = format!("act-{idx}");
+                    let act = tokeira_kernel::ActivityState {
+                        activity_id: act_id.clone(),
+                        activity_type: "activity-type".into(),
+                        schedule_event_id: idx as i64,
+                        task_queue: TaskQueueName(
+                            "q".into(),
+                        ),
+                        deployment: None,
+                        build_id: None,
+                        input:
+                            tokeira_types::Payloads::default(),
+                        header: None,
+                        attempt: 1,
+                        retry_policy: None,
+                        schedule_to_close_timeout: Some(
+                            Duration::seconds(30),
+                        ),
+                        schedule_to_start_timeout: None,
+                        start_to_close_timeout: None,
+                        heartbeat_timeout: None,
+                        scheduled_at: fixed_now(),
+                        started_at: None,
+                        started_event_id: None,
+                        pause_info: None,
+                        stamp: 0,
+                    };
+                    t.activity_ops.push(
+                        tokeira_kernel::ActivityOp::Upsert(
+                            act.clone(),
+                        ),
+                    );
+                    t.next_state
+                        .activities
+                        .insert(act_id.clone(), act);
+
+                    let timer_id = format!("tmr-{idx}");
+                    let tmr = timer_state(
+                        &timer_id,
+                        fixed_now(),
+                    );
+                    t.timer_ops.push(
+                        tokeira_kernel::TimerOp::Upsert(
+                            tmr.clone(),
+                        ),
+                    );
+                    t.next_state
+                        .timers
+                        .insert(timer_id, tmr);
+
+                    let queue = QueueKey {
+                        namespace_id: ns,
+                        task_queue: TaskQueueName(
+                            "q".into(),
+                        ),
+                        task_kind: TaskKind::Activity,
+                        deployment: None,
+                        build_id: None,
+                    };
+                    t.dispatch_ops.push(
+                        DispatchOp::EnqueueActivityTask {
+                            queue,
+                            activity_id: act_id,
+                            input:
+                                tokeira_types::Payloads::default(),
+                            schedule_event_id: idx as i64,
+                            attempt: 1,
+                            schedule_to_close_timeout: Some(
+                                Duration::seconds(30),
+                            ),
+                            schedule_to_start_timeout: None,
+                            start_to_close_timeout: None,
+                            heartbeat_timeout: None,
+                        },
+                    );
+
+                    let result = store
+                        .commit_transition(
+                            run_key,
+                            t,
+                            ShardEpoch::ZERO,
+                        )
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        result,
+                        CommitResult::Applied { .. }
+                    ));
+                }
+
+                for target_shard_id in 0..shard_count {
+                    let sid = ShardId(target_shard_id);
+                    let expected_runs: Vec<RunKey> =
+                        run_shards
+                            .iter()
+                            .filter(|(_, s)| *s == sid)
+                            .map(|(rk, _)| *rk)
+                            .collect();
+
+                    let wf_tasks = store
+                        .list_dispatchable_workflow_tasks_for_shard(
+                            sid,
+                            usize::MAX,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        wf_tasks.len(),
+                        expected_runs.len(),
+                    );
+                    for task in &wf_tasks {
+                        assert!(
+                            expected_runs
+                                .contains(&task.run_key),
+                        );
+                    }
+
+                    let act_tasks = store
+                        .list_dispatchable_activity_tasks_for_shard(
+                            sid,
+                            usize::MAX,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        act_tasks.len(),
+                        expected_runs.len(),
+                    );
+                    for task in &act_tasks {
+                        assert!(
+                            expected_runs
+                                .contains(&task.run_key),
+                        );
+                    }
+
+                    let timers = store
+                        .list_due_timers_for_shard(
+                            sid,
+                            fixed_now(),
+                            usize::MAX,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        timers.len(),
+                        expected_runs.len(),
+                    );
+                    for timer in &timers {
+                        assert!(
+                            expected_runs
+                                .contains(&timer.run_key),
+                        );
+                    }
+
+                    let wf_timeouts = store
+                        .list_runs_with_workflow_timeouts_for_shard(
+                            sid,
+                            usize::MAX,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        wf_timeouts.len(),
+                        expected_runs.len(),
+                    );
+                    for entry in &wf_timeouts {
+                        assert!(
+                            expected_runs
+                                .contains(&entry.run_key),
+                        );
+                    }
+
+                    let activities = store
+                        .list_open_activities_for_shard(
+                            sid,
+                            usize::MAX,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        activities.len(),
+                        expected_runs.len(),
+                    );
+                    for entry in &activities {
+                        assert!(
+                            expected_runs
+                                .contains(&entry.run_key),
+                        );
+                    }
+                }
+            });
+        }
     }
 }

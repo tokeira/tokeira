@@ -1,48 +1,79 @@
-use std::path::PathBuf;
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
+
+use walkdir::WalkDir;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("cargo:rerun-if-changed=proto");
+    let workspace_root = find_workspace_root()?;
+    let proto_root = workspace_root.join("proto");
+    let upstream_dir = proto_root.join("upstream");
+    let internal_dir = proto_root.join("tokeira");
 
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
+    println!("cargo:rerun-if-changed={}", upstream_dir.display());
+    println!("cargo:rerun-if-changed={}", internal_dir.display());
 
-    // Public, Temporal-compatible surface.
-    //
-    // In the mature repository, these files should come from a workspace-level vendored proto
-    // tree synced from upstream Temporal. We keep them inside this starter crate so the artifact
-    // is self-contained and easy to inspect.
-    tonic_build::configure()
-        .build_client(true)
-        .build_server(true)
-        .btree_map(["."])
-        .file_descriptor_set_path(out_dir.join("tokeira_public_descriptor.bin"))
-        .compile(
-            &[
-                "proto/upstream/temporal/api/common/v1/message.proto",
-                "proto/upstream/temporal/api/enums/v1/workflow.proto",
-                "proto/upstream/temporal/api/workflowservice/v1/service.proto",
-                "proto/upstream/temporal/api/operatorservice/v1/service.proto",
-            ],
-            &["proto/upstream"],
-        )?;
+    let out_dir = PathBuf::from(env::var("OUT_DIR")?);
 
-    // Internal Tokeira-only control surface.
-    //
-    // These APIs are intentionally narrow. They should model the runtime's durable-execution
-    // mechanics rather than mirror the external Temporal API.
-    tonic_build::configure()
-        .build_client(true)
-        .build_server(true)
-        .btree_map(["."])
-        .file_descriptor_set_path(out_dir.join("tokeira_internal_descriptor.bin"))
-        .compile(
-            &[
-                "proto/tokeira/internal/runtime/v1/command.proto",
-                "proto/tokeira/internal/runtime/v1/dispatch.proto",
-                "proto/tokeira/internal/runtime/v1/projection.proto",
-                "proto/tokeira/internal/admin/v1/service.proto",
-            ],
-            &["proto", "proto/upstream"],
-        )?;
+    let upstream_protos = discover_protos(&upstream_dir)?;
+    if !upstream_protos.is_empty() {
+        tonic_build::configure()
+            .build_client(true)
+            .build_server(true)
+            .btree_map(["."])
+            .file_descriptor_set_path(out_dir.join("tokeira_public_descriptor.bin"))
+            .compile(
+                &upstream_protos,
+                &[upstream_dir.as_path()],
+            )?;
+    }
+
+    let internal_protos = discover_protos(&internal_dir)?;
+    if !internal_protos.is_empty() {
+        tonic_build::configure()
+            .build_client(true)
+            .build_server(true)
+            .btree_map(["."])
+            .file_descriptor_set_path(out_dir.join("tokeira_internal_descriptor.bin"))
+            .compile(
+                &internal_protos,
+                &[proto_root.as_path(), upstream_dir.as_path()],
+            )?;
+    }
 
     Ok(())
+}
+
+fn find_workspace_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let mut dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
+    loop {
+        let cargo_toml = dir.join("Cargo.toml");
+        if cargo_toml.is_file() {
+            let contents = fs::read_to_string(&cargo_toml)?;
+            if contents.contains("[workspace]") {
+                return Ok(dir);
+            }
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    Err("workspace root not found".into())
+}
+
+fn discover_protos(root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut protos = WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "proto"))
+        .map(|entry| entry.into_path())
+        .collect::<Vec<_>>();
+    protos.sort();
+    Ok(protos)
 }

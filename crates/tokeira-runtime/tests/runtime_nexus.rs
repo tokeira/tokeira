@@ -12,9 +12,10 @@ use tokeira_kernel::{
     WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    LaneConfig, NexusEndpointConfig, NexusEndpointRegistry, NexusHttpClient,
-    NexusStartResult, NexusTimeoutScannerConfig, TimerScannerConfig, TokeiraRuntime,
-    WorkflowTimeoutScannerConfig,
+    ActivityTimeoutScannerConfig, BacklogConfig, LaneConfig,
+    NexusEndpointConfig, NexusEndpointRegistry, NexusHttpClient,
+    NexusStartResult, NexusTimeoutScannerConfig, TimerScannerConfig,
+    TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -339,6 +340,8 @@ fn runtime_with_nexus(
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
+        ActivityTimeoutScannerConfig::default(),
         NexusTimeoutScannerConfig {
             scan_interval: tokio::time::Duration::from_millis(10),
             max_timeouts_per_scan: 100,
@@ -421,6 +424,8 @@ fn start_request(
         workflow_run_timeout: None,
         workflow_task_timeout: time::Duration::seconds(10),
         retry_policy: None,
+        deployment: None,
+        build_id: None,
         attempt: 1,
         continued_execution_run_id: None,
         first_execution_run_id: None,

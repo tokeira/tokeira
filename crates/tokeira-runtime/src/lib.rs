@@ -7,20 +7,36 @@
 //! The runtime deliberately does not assume that all runs are hot, that all work
 //! is poll-driven, or that a lane owns a run forever.
 
+pub mod activity_timeout;
+pub mod backlog;
 pub mod broker;
+pub mod fairness;
 pub mod lane;
 pub mod nexus;
 pub mod publisher;
+pub mod query;
+pub mod recovery;
 pub mod retry;
 pub mod runtime;
 pub mod scanner;
+pub mod shard;
 pub mod timeout;
+pub mod update;
+pub mod worker_registry;
 
+pub use activity_timeout::*;
+pub use backlog::*;
 pub use broker::*;
+pub use fairness::*;
 pub use lane::*;
 pub use nexus::*;
 pub use publisher::*;
+pub use query::*;
+pub use recovery::*;
 pub use retry::*;
 pub use runtime::*;
 pub use scanner::*;
+pub use shard::*;
 pub use timeout::*;
+pub use update::*;
+pub use worker_registry::*;

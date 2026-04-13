@@ -45,8 +45,17 @@ This starter crate contains:
 
 ## Important note about upstream compatibility
 
-This crate is intentionally a **starter**. It does **not** yet vendor the full upstream
-Temporal API repo.
+This crate maintains a Tokeira-owned subset of Temporal-compatible proto definitions. It does
+**not** vendor the full upstream Temporal API repo — it defines only the RPCs and message types
+needed for the endpoints Tokeira implements.
+
+The current surface covers:
+
+- `WorkflowService`: start, signal, poll WFT, respond WFT completed, describe, list, count,
+  poll activity, respond activity completed/failed, record heartbeat, terminate, cancel, query,
+  update
+- `OperatorService`: cluster info, search attributes
+- Common types: payloads, memo, search attributes, task queue, workflow execution, enums
 
 In the mature repository layout, the recommended move is:
 

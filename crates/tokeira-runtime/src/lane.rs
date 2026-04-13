@@ -1,13 +1,21 @@
+use std::sync::{Arc, RwLock};
+
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use smallvec::SmallVec;
 use time::OffsetDateTime;
 use tokeira_kernel::{
-    Command, DispatchOp, HistoryEvent, HistoryEventKind, Kernel, StartRequest,
+    Command, DispatchOp, HistoryEvent, HistoryEventKind, Kernel, LoadedRun,
+    StartRequest,
 };
 use tokeira_storage::{CommitResult, RunRepository};
-use tokeira_types::{ExecutionStatus, RunKey};
+use tokeira_types::{ExecutionStatus, RunKey, ShardEpoch};
 use tokio::sync::{mpsc, oneshot};
+
+use crate::{
+    UpdateRegistry, UpdateResolution,
+    shard::{ShardOwner, shard_for},
+};
 
 /// Configuration knobs for a single lane executor.
 ///
@@ -108,8 +116,11 @@ pub fn spawn_lane<K, R, P>(
     kernel: K,
     repo: R,
     publisher: P,
+    shard_owner: Arc<RwLock<ShardOwner>>,
+    activity_tracking: crate::activity_timeout::ActivityTrackingState,
     workflow_timeout_tracking: crate::timeout::WorkflowTimeoutTrackingState,
     nexus_timeout_tracking: crate::nexus::NexusTimeoutTrackingState,
+    update_registry: UpdateRegistry,
     config: LaneConfig,
 ) -> LaneHandle
 where
@@ -125,8 +136,11 @@ where
                 &kernel,
                 &repo,
                 &publisher,
+                &shard_owner,
+                &activity_tracking,
                 &workflow_timeout_tracking,
                 &nexus_timeout_tracking,
+                &update_registry,
                 &mut rx,
                 message,
                 &config,
@@ -146,8 +160,11 @@ async fn run_activation<K, R, P>(
     kernel: &K,
     repo: &R,
     publisher: &P,
+    shard_owner: &Arc<RwLock<ShardOwner>>,
+    activity_tracking: &crate::activity_timeout::ActivityTrackingState,
     workflow_timeout_tracking: &crate::timeout::WorkflowTimeoutTrackingState,
     nexus_timeout_tracking: &crate::nexus::NexusTimeoutTrackingState,
+    update_registry: &UpdateRegistry,
     rx: &mut mpsc::Receiver<LaneMessage>,
     first_message: LaneMessage,
     config: &LaneConfig,
@@ -165,22 +182,152 @@ where
 
     while let Some(message) = current.take() {
         let committed_command = message.command.clone();
-        let result = handle_message(
-            kernel,
-            repo,
-            message.run_key,
-            message.command,
-            config.max_occ_retries,
+            let result = handle_message(
+                kernel,
+                repo,
+                shard_owner,
+                message.run_key,
+                message.command,
+                config.max_occ_retries,
         )
         .await;
 
         let stop_draining = result.is_err();
         let reply = match result {
             Ok((commit_result, dispatch_ops, history_events)) => {
+                let mut reset_materialization_error = None;
                 if let CommitResult::Applied { new_state } = &commit_result {
+                    for event in &history_events {
+                        match &event.kind {
+                            HistoryEventKind::ActivityTaskCancelRequested {
+                                activity_id,
+                            } => activity_tracking
+                                .mark_cancel_requested(message.run_key, activity_id),
+                            HistoryEventKind::ActivityTaskCompleted {
+                                activity_id, ..
+                            }
+                            | HistoryEventKind::ActivityTaskFailed {
+                                activity_id, ..
+                            }
+                            | HistoryEventKind::ActivityTaskTimedOut {
+                                activity_id, ..
+                            }
+                            | HistoryEventKind::ActivityTaskCanceled {
+                                activity_id, ..
+                            } => activity_tracking
+                                .remove(message.run_key, activity_id),
+                            HistoryEventKind::WorkflowExecutionUpdateCompleted {
+                                update_id,
+                                result,
+                            } => {
+                                update_registry.notify(
+                                    message.run_key,
+                                    update_id,
+                                    UpdateResolution::Completed {
+                                        result: result.clone(),
+                                    },
+                                );
+                            }
+                            HistoryEventKind::WorkflowExecutionUpdateRejected {
+                                update_id,
+                                failure,
+                            } => {
+                                update_registry.notify(
+                                    message.run_key,
+                                    update_id,
+                                    UpdateResolution::Rejected {
+                                        failure: failure.clone(),
+                                    },
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
                     if new_state.closed_at.is_some() {
                         workflow_timeout_tracking.remove(message.run_key);
                         nexus_timeout_tracking.remove_all_for_run(message.run_key);
+                        update_registry.drain_for_run(message.run_key);
+                    }
+                    if new_state.closed_at.is_some() {
+                        if let Some((successor_run_id, fork_event_id)) =
+                            extract_reset_metadata(&history_events)
+                        {
+                            let successor_run_key = RunKey(successor_run_id.0);
+                            if let Err(error) = repo
+                                .materialize_reset_successor(
+                                    message.run_key,
+                                    fork_event_id,
+                                    successor_run_key,
+                                    successor_run_id,
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    ?error,
+                                    predecessor_run_key = ?message.run_key,
+                                    successor_run_key = ?successor_run_key,
+                                    "failed to materialize reset successor"
+                                );
+                                reset_materialization_error = Some(error);
+                            } else if let Ok(LoadedRun::Existing(successor_state)) =
+                                repo.load_run(successor_run_key).await
+                            {
+                                let shard_id = {
+                                    let owner = shard_owner.read().unwrap();
+                                    shard_for(successor_run_key, owner.shard_count())
+                                };
+                                if successor_state.workflow_execution_timeout.is_some()
+                                    || successor_state.workflow_run_timeout.is_some()
+                                {
+                                    workflow_timeout_tracking.insert(
+                                        crate::timeout::WorkflowTimeoutEntry {
+                                            run_key: successor_state.run_key,
+                                            shard_id,
+                                            workflow_execution_timeout: successor_state
+                                                .workflow_execution_timeout,
+                                            workflow_run_timeout: successor_state
+                                                .workflow_run_timeout,
+                                            started_at: successor_state.started_at,
+                                            first_run_started_at: successor_state
+                                                .first_run_started_at,
+                                            has_retry_policy: successor_state
+                                                .retry_policy
+                                                .is_some(),
+                                        },
+                                    );
+                                }
+                                for activity in successor_state.activities.values() {
+                                    activity_tracking.insert(
+                                        crate::activity_timeout::ActivityTrackingEntry {
+                                            run_key: successor_state.run_key,
+                                            shard_id,
+                                            activity_id: activity.activity_id.clone(),
+                                            original_scheduled_at: activity.scheduled_at,
+                                            last_dispatched_at: activity.scheduled_at,
+                                            started_at: activity.started_at,
+                                            last_heartbeat_at: None,
+                                            cancel_requested: false,
+                                        },
+                                    );
+                                }
+                                for nexus in successor_state.pending_nexus_operations.values() {
+                                    if let Some(schedule_to_close_timeout) =
+                                        nexus.schedule_to_close_timeout
+                                    {
+                                        nexus_timeout_tracking.insert(
+                                            crate::nexus::NexusTimeoutEntry {
+                                                run_key: successor_state.run_key,
+                                                shard_id,
+                                                operation_id: nexus.operation_id.clone(),
+                                                scheduled_event_id: nexus.scheduled_event_id,
+                                                schedule_to_close_timeout,
+                                                scheduled_at: nexus.scheduled_at,
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 if !dispatch_ops.is_empty() {
@@ -190,6 +337,9 @@ where
                         tracing::warn!(?error, run_key = ?message.run_key, "failed to publish dispatch ops");
                     }
                 }
+                if let Some(error) = reset_materialization_error {
+                    Err(error)
+                } else {
                 if let CommitResult::Applied { new_state } = &commit_result {
                     if let Command::NexusOperationResolved(request) = &committed_command {
                         if matches!(
@@ -205,6 +355,7 @@ where
                     }
                     if new_state.closed_at.is_some() {
                         if let Some(parent_run_key) = new_state.parent_run_key {
+                            if extract_reset_metadata(&history_events).is_none() {
                             let maybe_resolution = match new_state.status {
                                 tokeira_types::ExecutionStatus::Completed => {
                                     Some(tokeira_kernel::ChildResolution::Completed {
@@ -260,6 +411,7 @@ where
                                         }
                                     }
                                 });
+                            }
                             }
                         }
                         if new_state.status == ExecutionStatus::ContinuedAsNew {
@@ -320,6 +472,8 @@ where
                                     run_id: successor_run_id,
                                     workflow_type,
                                     task_queue,
+                                    deployment: new_state.deployment.clone(),
+                                    build_id: new_state.build_id.clone(),
                                     input,
                                     memo,
                                     search_attributes,
@@ -366,6 +520,10 @@ where
                                                 workflow_timeout_tracking.insert(
                                                     crate::timeout::WorkflowTimeoutEntry {
                                                         run_key: new_state.run_key,
+                                                        shard_id: crate::shard::shard_for(
+                                                            new_state.run_key,
+                                                            1,
+                                                        ),
                                                         workflow_execution_timeout: new_state
                                                             .workflow_execution_timeout,
                                                         workflow_run_timeout: new_state
@@ -415,6 +573,7 @@ where
                     }
                 }
                 Ok(commit_result)
+                }
             }
             Err(error) => Err(error),
         };
@@ -444,6 +603,7 @@ where
 async fn handle_message<K, R>(
     kernel: &K,
     repo: &R,
+    shard_owner: &Arc<RwLock<ShardOwner>>,
     run_key: RunKey,
     command: Command,
     max_retries: u32,
@@ -459,13 +619,18 @@ where
     let mut attempts = 0u32;
     loop {
         let loaded = repo.load_run(run_key).await?;
+        let epoch = {
+            let owner = shard_owner.read().unwrap();
+            let shard_id = shard_for(run_key, owner.shard_count());
+            owner.epoch_of(shard_id).unwrap_or(ShardEpoch::ZERO)
+        };
         let transition = kernel
             .apply(loaded, command.clone())
             .map_err(|reject| anyhow!("kernel rejected command: {reject}"))?;
         let dispatch_ops = transition.dispatch_ops.clone();
         let history_events = transition.history_events.clone();
 
-        match repo.commit_transition(run_key, transition).await? {
+        match repo.commit_transition(run_key, transition, epoch).await? {
             CommitResult::Applied { new_state } => {
                 return Ok((
                     CommitResult::Applied { new_state },
@@ -489,6 +654,18 @@ where
             }
         }
     }
+}
+
+fn extract_reset_metadata(history_events: &[HistoryEvent]) -> Option<(tokeira_types::RunId, i64)> {
+    history_events.iter().find_map(|event| match &event.kind {
+        HistoryEventKind::WorkflowTaskFailed {
+            failure_cause: tokeira_kernel::WorkflowTaskFailedCause::ResetWorkflow,
+            new_run_id: Some(new_run_id),
+            fork_event_id: Some(fork_event_id),
+            ..
+        } => Some((*new_run_id, *fork_event_id)),
+        _ => None,
+    })
 }
 
 #[cfg(test)]
@@ -680,6 +857,7 @@ mod tests {
             &self,
             _run_key: RunKey,
             transition: Transition,
+            _epoch: ShardEpoch,
         ) -> Result<CommitResult> {
             let mut state = self.state.lock().await;
             state.commit_calls += 1;
@@ -700,6 +878,21 @@ mod tests {
                 CommitBehavior::Duplicate => Ok(CommitResult::Duplicate),
                 CommitBehavior::Error => Err(anyhow!("commit failed")),
             }
+        }
+
+        async fn materialize_reset_successor(
+            &self,
+            _base_run_key: RunKey,
+            _fork_event_id: i64,
+            successor_run_key: RunKey,
+            successor_run_id: RunId,
+        ) -> Result<()> {
+            let mut state = self.state.lock().await;
+            state.loaded = LoadedRun::Existing(sample_state(successor_run_key));
+            if let LoadedRun::Existing(run) = &mut state.loaded {
+                run.run_id = successor_run_id;
+            }
+            Ok(())
         }
 
         async fn list_dispatchable_workflow_tasks(
@@ -735,6 +928,55 @@ mod tests {
             _now: OffsetDateTime,
             _limit: usize,
         ) -> Result<Vec<DueTimer>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_dispatchable_workflow_tasks_for_shard(
+            &self,
+            _shard_id: ShardId,
+            _limit: usize,
+        ) -> Result<Vec<DispatchableWorkflowTask>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_dispatchable_activity_tasks_for_shard(
+            &self,
+            _shard_id: ShardId,
+            _limit: usize,
+        ) -> Result<Vec<DispatchableActivityTask>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_due_timers_for_shard(
+            &self,
+            _shard_id: ShardId,
+            _now: OffsetDateTime,
+            _limit: usize,
+        ) -> Result<Vec<DueTimer>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_runs_with_workflow_timeouts_for_shard(
+            &self,
+            _shard_id: ShardId,
+            _limit: usize,
+        ) -> Result<Vec<tokeira_storage::WorkflowTimeoutSweepEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_open_activities_for_shard(
+            &self,
+            _shard_id: ShardId,
+            _limit: usize,
+        ) -> Result<Vec<tokeira_storage::ActivitySweepEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_pending_nexus_operations_for_shard(
+            &self,
+            _shard_id: ShardId,
+            _limit: usize,
+        ) -> Result<Vec<tokeira_storage::NexusSweepEntry>> {
             Ok(Vec::new())
         }
     }
@@ -938,6 +1180,8 @@ mod tests {
             run_id: RunId::new(),
             workflow_type: WorkflowType("example".to_string()),
             task_queue: TaskQueueName("queue-a".to_string()),
+            deployment: None,
+            build_id: None,
             status: ExecutionStatus::Running,
             transition_seq: DurableTransitionSeq::ZERO,
             last_event_id: 0,
@@ -1020,6 +1264,16 @@ mod tests {
         )
     }
 
+    fn test_shard_owner() -> Arc<RwLock<ShardOwner>> {
+        let owner = Arc::new(RwLock::new(ShardOwner::new(1)));
+        {
+            let mut guard = owner.write().unwrap();
+            let _ = guard.record_acquired(ShardId(0), ShardEpoch::ZERO);
+            guard.mark_active(ShardId(0));
+        }
+        owner
+    }
+
     #[test]
     fn lane_config_defaults() {
         let config = LaneConfig::default();
@@ -1052,8 +1306,9 @@ mod tests {
                         .collect(),
                 );
                 let kernel = MockKernel::new(sample_dispatch_ops(state.namespace_id));
+                let shard_owner = test_shard_owner();
 
-                let (result, _, _) = handle_message(&kernel, &repo, run_key, sample_command("a"), 8).await.unwrap();
+                let (result, _, _) = handle_message(&kernel, &repo, &shard_owner, run_key, sample_command("a"), 8).await.unwrap();
                 let (load_calls, commit_calls, _) = repo.snapshot().await;
                 let (commands, loaded_runs) = kernel.snapshot();
                 (result, load_calls, commit_calls, commands.len(), loaded_runs.len())
@@ -1081,8 +1336,9 @@ mod tests {
                 );
                 let kernel = MockKernel::new(sample_dispatch_ops(state.namespace_id));
                 let command = sample_command("stable");
+                let shard_owner = test_shard_owner();
 
-                let _ = handle_message(&kernel, &repo, run_key, command.clone(), 8).await.unwrap();
+                let _ = handle_message(&kernel, &repo, &shard_owner, run_key, command.clone(), 8).await.unwrap();
                 kernel.snapshot().0
             });
             prop_assert!(!commands.is_empty());
@@ -1105,8 +1361,9 @@ mod tests {
                         .collect(),
                 );
                 let kernel = MockKernel::new(sample_dispatch_ops(state.namespace_id));
+                let shard_owner = test_shard_owner();
 
-                let error = handle_message(&kernel, &repo, run_key, sample_command("bound"), max_retries)
+                let error = handle_message(&kernel, &repo, &shard_owner, run_key, sample_command("bound"), max_retries)
                     .await
                     .expect_err("retry exhaustion should surface as an error");
                 let (load_calls, commit_calls, _) = repo.snapshot().await;
@@ -1128,10 +1385,12 @@ mod tests {
                     vec![CommitBehavior::Duplicate],
                 );
                 let kernel = MockKernel::new(sample_dispatch_ops(state.namespace_id));
+                let shard_owner = test_shard_owner();
 
                 let (result, ops, _) = handle_message(
                     &kernel,
                     &repo,
+                    &shard_owner,
                     run_key,
                     sample_command(&format!("dup-{seed}")),
                     5,
@@ -1164,8 +1423,12 @@ mod tests {
         let (_foreign, _foreign_reply) = lane_message(RunKey::new(), "foreign");
         let (second, second_reply) = lane_message(run_key, "second");
         let (tx, mut rx) = mpsc::channel(8);
+        let activity_tracking =
+            crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
+        let update_registry = crate::UpdateRegistry::new();
+        let shard_owner = test_shard_owner();
         tx.send(second).await.unwrap();
         tx.send(_foreign).await.unwrap();
 
@@ -1173,8 +1436,11 @@ mod tests {
             &kernel,
             &repo,
             &publisher,
+            &shard_owner,
+            &activity_tracking,
             &tracking,
             &nexus_tracking,
+            &update_registry,
             &mut rx,
             first,
             &LaneConfig {
@@ -1230,8 +1496,12 @@ mod tests {
         let (second, second_reply) = lane_message(run_key, "second");
         let (third, _third_reply) = lane_message(run_key, "third");
         let (tx, mut rx) = mpsc::channel(8);
+        let activity_tracking =
+            crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
+        let update_registry = crate::UpdateRegistry::new();
+        let shard_owner = test_shard_owner();
         tx.send(second).await.unwrap();
         tx.send(third).await.unwrap();
 
@@ -1239,8 +1509,11 @@ mod tests {
             &kernel,
             &repo,
             &publisher,
+            &shard_owner,
+            &activity_tracking,
             &tracking,
             &nexus_tracking,
+            &update_registry,
             &mut rx,
             first,
             &LaneConfig {
@@ -1280,8 +1553,12 @@ mod tests {
         let (second, second_reply) = lane_message(run_key, "second");
         let (third, _third_reply) = lane_message(run_key, "third");
         let (tx, mut rx) = mpsc::channel(8);
+        let activity_tracking =
+            crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
+        let update_registry = crate::UpdateRegistry::new();
+        let shard_owner = test_shard_owner();
         tx.send(second).await.unwrap();
         tx.send(third).await.unwrap();
 
@@ -1289,8 +1566,11 @@ mod tests {
             &kernel,
             &repo,
             &publisher,
+            &shard_owner,
+            &activity_tracking,
             &tracking,
             &nexus_tracking,
+            &update_registry,
             &mut rx,
             first,
             &LaneConfig::default(),
@@ -1319,15 +1599,22 @@ mod tests {
         let publisher = MockPublisher::new().with_failure().await;
         let (first, first_reply) = lane_message(run_key, "first");
         let (_tx, mut rx) = mpsc::channel(8);
+        let activity_tracking =
+            crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
+        let update_registry = crate::UpdateRegistry::new();
+        let shard_owner = test_shard_owner();
 
         let buffered = run_activation(
             &kernel,
             &repo,
             &publisher,
+            &shard_owner,
+            &activity_tracking,
             &tracking,
             &nexus_tracking,
+            &update_registry,
             &mut rx,
             first,
             &LaneConfig::default(),
@@ -1357,15 +1644,22 @@ mod tests {
         let publisher = MockPublisher::new();
         let (first, first_reply) = lane_message(run_key, "first");
         let (_tx, mut rx) = mpsc::channel(8);
+        let activity_tracking =
+            crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
+        let update_registry = crate::UpdateRegistry::new();
+        let shard_owner = test_shard_owner();
 
         let _ = run_activation(
             &kernel,
             &repo,
             &publisher,
+            &shard_owner,
+            &activity_tracking,
             &tracking,
             &nexus_tracking,
+            &update_registry,
             &mut rx,
             first,
             &LaneConfig {
@@ -1401,15 +1695,22 @@ mod tests {
         let publisher = MockPublisher::new();
         let (first, first_reply) = lane_message(child_run_key, "first");
         let (_tx, mut rx) = mpsc::channel(8);
+        let activity_tracking =
+            crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
+        let update_registry = crate::UpdateRegistry::new();
+        let shard_owner = test_shard_owner();
 
         let buffered = run_activation(
             &kernel,
             &repo,
             &publisher,
+            &shard_owner,
+            &activity_tracking,
             &tracking,
             &nexus_tracking,
+            &update_registry,
             &mut rx,
             first,
             &LaneConfig::default(),
@@ -1457,15 +1758,22 @@ mod tests {
         let publisher = MockPublisher::new();
         let (first, first_reply) = lane_message(run_key, "first");
         let (_tx, mut rx) = mpsc::channel(8);
+        let activity_tracking =
+            crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
+        let update_registry = crate::UpdateRegistry::new();
+        let shard_owner = test_shard_owner();
 
         let buffered = run_activation(
             &kernel,
             &repo,
             &publisher,
+            &shard_owner,
+            &activity_tracking,
             &tracking,
             &nexus_tracking,
+            &update_registry,
             &mut rx,
             first,
             &LaneConfig::default(),
@@ -1520,15 +1828,22 @@ mod tests {
             .await;
         let (first, first_reply) = lane_message(run_key, "continue");
         let (_tx, mut rx) = mpsc::channel(8);
+        let activity_tracking =
+            crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
+        let update_registry = crate::UpdateRegistry::new();
+        let shard_owner = test_shard_owner();
 
         let buffered = run_activation(
             &kernel,
             &repo,
             &publisher,
+            &shard_owner,
+            &activity_tracking,
             &tracking,
             &nexus_tracking,
+            &update_registry,
             &mut rx,
             first,
             &LaneConfig::default(),
@@ -1591,15 +1906,22 @@ mod tests {
                 let publisher = MockPublisher::new();
                 let (first, first_reply) = lane_message(run_key, "continue");
                 let (_tx, mut rx) = mpsc::channel(8);
+                let activity_tracking =
+                    crate::activity_timeout::ActivityTrackingState::default();
                 let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
                 let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
+                let update_registry = crate::UpdateRegistry::new();
+                let shard_owner = test_shard_owner();
 
                 let _ = run_activation(
                     &kernel,
                     &repo,
                     &publisher,
+                    &shard_owner,
+                    &activity_tracking,
                     &tracking,
                     &nexus_tracking,
+                    &update_registry,
                     &mut rx,
                     first,
                     &LaneConfig::default(),
@@ -1630,15 +1952,22 @@ mod tests {
         let publisher = MockPublisher::new().with_failure().await;
         let (first, first_reply) = lane_message(run_key, "continue");
         let (_tx, mut rx) = mpsc::channel(8);
+        let activity_tracking =
+            crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
+        let update_registry = crate::UpdateRegistry::new();
+        let shard_owner = test_shard_owner();
 
         let _ = run_activation(
             &kernel,
             &repo,
             &publisher,
+            &shard_owner,
+            &activity_tracking,
             &tracking,
             &nexus_tracking,
+            &update_registry,
             &mut rx,
             first,
             &LaneConfig::default(),
@@ -1663,8 +1992,9 @@ mod tests {
         );
         let kernel =
             MockKernel::new(sample_dispatch_ops(state.namespace_id)).with_reject();
+        let shard_owner = test_shard_owner();
 
-        let error = handle_message(&kernel, &repo, run_key, sample_command("reject"), 5)
+        let error = handle_message(&kernel, &repo, &shard_owner, run_key, sample_command("reject"), 5)
             .await
             .expect_err("reject should surface as error");
         assert!(error.to_string().contains("kernel rejected command"));

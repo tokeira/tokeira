@@ -25,13 +25,16 @@ use tokeira_types::{
 };
 
 use crate::{
+    activity_timeout::ActivityTrackingState,
     broker::{InMemoryActivityBroker, InMemoryBroker},
+    fairness::DeliveryMetrics,
     lane::{DispatchPublisher, LaneHandle},
     nexus::{
         NexusEndpointRegistry, NexusHttpClient, NexusStartResult, NexusTimeoutEntry,
         NexusTimeoutTrackingState,
     },
     scanner::pick_lane,
+    shard::shard_for,
 };
 
 /// [`DispatchPublisher`] that forwards dispatch ops to
@@ -42,9 +45,12 @@ pub struct RuntimeDispatchPublisher<R> {
     repo: Arc<R>,
     lanes: Arc<Mutex<Vec<LaneHandle>>>,
     lane_count: usize,
+    shard_count: u32,
     nexus_client: Arc<dyn NexusHttpClient>,
     nexus_registry: NexusEndpointRegistry,
     nexus_timeout_tracking: NexusTimeoutTrackingState,
+    activity_tracking: ActivityTrackingState,
+    delivery_metrics: DeliveryMetrics,
 }
 
 impl<R> Clone for RuntimeDispatchPublisher<R> {
@@ -55,9 +61,12 @@ impl<R> Clone for RuntimeDispatchPublisher<R> {
             repo: self.repo.clone(),
             lanes: self.lanes.clone(),
             lane_count: self.lane_count,
+            shard_count: self.shard_count,
             nexus_client: self.nexus_client.clone(),
             nexus_registry: self.nexus_registry.clone(),
             nexus_timeout_tracking: self.nexus_timeout_tracking.clone(),
+            activity_tracking: self.activity_tracking.clone(),
+            delivery_metrics: self.delivery_metrics.clone(),
         }
     }
 }
@@ -73,9 +82,12 @@ where
         repo: Arc<R>,
         lanes: Arc<Mutex<Vec<LaneHandle>>>,
         lane_count: usize,
+        shard_count: u32,
         nexus_client: Arc<dyn NexusHttpClient>,
         nexus_registry: NexusEndpointRegistry,
         nexus_timeout_tracking: NexusTimeoutTrackingState,
+        activity_tracking: ActivityTrackingState,
+        delivery_metrics: DeliveryMetrics,
     ) -> Self {
         Self {
             broker,
@@ -83,9 +95,12 @@ where
             repo,
             lanes,
             lane_count,
+            shard_count,
             nexus_client,
             nexus_registry,
             nexus_timeout_tracking,
+            activity_tracking,
+            delivery_metrics,
         }
     }
 
@@ -129,6 +144,8 @@ where
             run_id: child_run_id,
             workflow_type: workflow_type.clone(),
             task_queue,
+            deployment: None,
+            build_id: None,
             input,
             memo: Memo::default(),
             search_attributes: SearchAttributes::default(),
@@ -625,7 +642,7 @@ where
                             logical_seq: *logical_seq,
                             sticky_preferred: sticky_preferred.clone(),
                             sticky_expires_at: None,
-                        })
+                        }, Some(&self.delivery_metrics))
                         .await;
                 }
                 DispatchOp::EnqueueActivityTask { .. } => {
@@ -647,10 +664,17 @@ where
                                 input: input.clone(),
                                 schedule_event_id: *schedule_event_id,
                                 attempt: *attempt,
-                            })
+                            }, Some(&self.delivery_metrics))
                             .await
                         {
                             tracing::warn!(?error, run_key = ?run_key, activity_id, "failed to publish activity task");
+                        } else {
+                            self.activity_tracking.record_scheduled(
+                                run_key,
+                                shard_for(run_key, self.shard_count),
+                                activity_id.clone(),
+                                OffsetDateTime::now_utc(),
+                            );
                         }
                     }
                 }
@@ -814,6 +838,10 @@ where
                     if let Some(timeout) = schedule_to_close_timeout {
                         self.nexus_timeout_tracking.insert(NexusTimeoutEntry {
                             run_key: *originator_run_key,
+                            shard_id: shard_for(
+                                *originator_run_key,
+                                self.shard_count,
+                            ),
                             operation_id: operation_id.clone(),
                             scheduled_event_id: *scheduled_event_id,
                             schedule_to_close_timeout: *timeout,

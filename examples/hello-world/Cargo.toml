@@ -1,0 +1,24 @@
+[package]
+name = "tokeira-hello-world"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+temporalio-sdk = "0.2"
+temporalio-sdk-core = "0.2"
+temporalio-client = "0.2"
+temporalio-common = "0.2"
+temporalio-macros = "0.2"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+futures-util = "0.3"
+futures = "0.3"
+
+[[bin]]
+name = "worker"
+path = "worker.rs"
+
+[[bin]]
+name = "starter"
+path = "starter.rs"

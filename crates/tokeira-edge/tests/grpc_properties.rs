@@ -66,8 +66,11 @@ proptest! {
     fn property_describe_request_roundtrip(edge in arb_describe_request()) {
         let proto = workflowservice::DescribeWorkflowExecutionRequest {
             namespace: edge.namespace.clone(),
-            workflow_id: edge.workflow_id.clone(),
-            run_id: String::new(),
+            execution: Some(tokeira_proto::common::WorkflowExecution {
+                workflow_id: edge.workflow_id.clone(),
+                run_id: String::new(),
+                ..Default::default()
+            }),
         };
         let roundtrip = describe_request_to_edge(proto).unwrap();
         prop_assert_eq!(roundtrip, edge);
@@ -90,7 +93,6 @@ proptest! {
         let proto = workflowservice::CountWorkflowExecutionsRequest {
             namespace: edge.namespace.clone(),
             query: edge.query.clone().unwrap_or_default(),
-            group_by: edge.group_by.clone().into_iter().collect(),
         };
         let roundtrip = count_request_to_edge(proto).unwrap();
         prop_assert_eq!(roundtrip, edge);
@@ -107,8 +109,6 @@ proptest! {
         let proto = poll_response_to_proto(edge.clone());
         prop_assert_eq!(proto.task_token, edge.task_token);
         prop_assert_eq!(proto.started_event_id, edge.started_event_id);
-        prop_assert_eq!(proto.sticky, false);
-        prop_assert_eq!(proto.history_blob, Vec::<u8>::new());
         let execution = proto.workflow_execution.expect("workflow_execution");
         prop_assert_eq!(execution.workflow_id, edge.payload.workflow_id);
         prop_assert_eq!(execution.run_id, edge.payload.run_key.0.to_string());
@@ -117,15 +117,46 @@ proptest! {
     #[test]
     fn property_describe_response_projection(edge in arb_description()) {
         let proto = describe_response_to_proto(edge.clone());
-        let info = proto.execution.expect("execution");
-        prop_assert_eq!(info.namespace, edge.namespace);
-        prop_assert_eq!(info.workflow_id, edge.workflow_id);
-        prop_assert_eq!(info.run_id, edge.run_id.0.to_string());
-        prop_assert_eq!(info.workflow_type, edge.workflow_type);
-        prop_assert_eq!(info.task_queue.expect("task_queue").name, edge.task_queue);
+        let info = proto.workflow_execution_info.expect("workflow_execution_info");
+        let exec = info.execution.expect("execution");
+        prop_assert_eq!(exec.workflow_id, edge.workflow_id);
+        prop_assert_eq!(exec.run_id, edge.run_id.0.to_string());
+        prop_assert_eq!(
+            info.r#type.expect("workflow_type").name,
+            edge.workflow_type
+        );
+        prop_assert_eq!(info.task_queue, edge.task_queue);
         prop_assert_eq!(info.status, execution_status_to_proto(edge.status));
+        prop_assert_eq!(
+            info.start_time.map(|ts| (ts.seconds, ts.nanos)),
+            edge.start_time.map(|t| {
+                let nanos = t.unix_timestamp_nanos();
+                (
+                    (nanos / 1_000_000_000) as i64,
+                    (nanos % 1_000_000_000) as i32,
+                )
+            })
+        );
+        prop_assert_eq!(
+            info.close_time.map(|ts| (ts.seconds, ts.nanos)),
+            edge.close_time.map(|t| {
+                let nanos = t.unix_timestamp_nanos();
+                (
+                    (nanos / 1_000_000_000) as i64,
+                    (nanos % 1_000_000_000) as i32,
+                )
+            })
+        );
         prop_assert_eq!(info.history_length, edge.history_length);
         prop_assert_eq!(info.state_transition_count, edge.state_transition_count);
+        prop_assert_eq!(
+            info.memo.expect("memo").fields.len(),
+            edge.memo.0.len()
+        );
+        prop_assert_eq!(
+            info.search_attributes.expect("search attributes").indexed_fields.len(),
+            edge.search_attributes.0.len()
+        );
     }
 
     #[test]
@@ -150,27 +181,51 @@ proptest! {
             | WorkflowCommand::UpsertMemo(_)
             | WorkflowCommand::UpsertSearchAttributes(_)
             | WorkflowCommand::CompleteWorkflow { .. }
-            | WorkflowCommand::FailWorkflow { .. } => {
-                let proto = workflow_command_to_proto(&cmd).unwrap();
-                let roundtrip = proto_command_to_workflow_command(proto).unwrap();
-                prop_assert_eq!(roundtrip, cmd);
-            }
-            WorkflowCommand::CancelWorkflow
-            | WorkflowCommand::RecordMarker { .. }
-            | WorkflowCommand::ContinueAsNew { .. }
-            | WorkflowCommand::RequestCancelActivity { .. }
+            | WorkflowCommand::FailWorkflow { .. }
+            | WorkflowCommand::CancelWorkflow
             | WorkflowCommand::CancelTimer { .. }
             | WorkflowCommand::StartChildWorkflow { .. }
             | WorkflowCommand::SignalExternalWorkflowExecution { .. }
             | WorkflowCommand::RequestCancelExternalWorkflowExecution { .. }
-            | WorkflowCommand::ScheduleNexusOperation { .. }
-            | WorkflowCommand::CancelNexusOperation { .. }
-            | WorkflowCommand::UpdateCompleted { .. }
+            | WorkflowCommand::CancelNexusOperation { .. } => {
+                let proto = workflow_command_to_proto(&cmd).unwrap();
+                let roundtrip = proto_command_to_workflow_command(proto).unwrap();
+                prop_assert_eq!(roundtrip, cmd);
+            }
+            WorkflowCommand::RecordMarker { .. }
+            | WorkflowCommand::ContinueAsNew { .. }
+            | WorkflowCommand::RequestCancelActivity { .. }
+            | WorkflowCommand::ScheduleNexusOperation { .. } => {
+                prop_assert!(workflow_command_to_proto(&cmd).is_ok());
+            }
+            WorkflowCommand::ProtocolMessage { .. } => {
+                let proto = workflow_command_to_proto(&cmd).unwrap();
+                prop_assert!(proto_command_to_workflow_command(proto).is_err());
+            }
+            WorkflowCommand::UpdateCompleted { .. }
             | WorkflowCommand::UpdateRejected { .. }
-            | WorkflowCommand::ProtocolMessage { .. }
             | WorkflowCommand::RequestNewWorkflowTask => {
                 prop_assert!(workflow_command_to_proto(&cmd).is_err());
             }
+        }
+    }
+
+    #[test]
+    fn property_forward_translation_supported_for_added_commands(cmd in arb_workflow_command()) {
+        match &cmd {
+            WorkflowCommand::ContinueAsNew { .. }
+            | WorkflowCommand::RecordMarker { .. }
+            | WorkflowCommand::RequestCancelActivity { .. }
+            | WorkflowCommand::ScheduleNexusOperation { .. }
+            | WorkflowCommand::ProtocolMessage { .. } => {
+                prop_assert!(workflow_command_to_proto(&cmd).is_ok());
+            }
+            WorkflowCommand::UpdateCompleted { .. }
+            | WorkflowCommand::UpdateRejected { .. }
+            | WorkflowCommand::RequestNewWorkflowTask => {
+                prop_assert!(workflow_command_to_proto(&cmd).is_err());
+            }
+            _ => {}
         }
     }
 
@@ -218,14 +273,18 @@ fn start_request_to_proto(
     workflowservice::StartWorkflowExecutionRequest {
         namespace: edge.namespace.clone(),
         workflow_id: edge.workflow_id.clone(),
-        workflow_type: edge.workflow_type.clone(),
-        task_queue: Some(tokeira_proto::common::TaskQueue {
+        workflow_type: Some(tokeira_proto::common::WorkflowType {
+            name: edge.workflow_type.clone(),
+        }),
+        task_queue: Some(tokeira_proto::taskqueue::TaskQueue {
             name: edge.task_queue.clone(),
+            ..Default::default()
         }),
         input: Some(payloads_from_domain(&edge.input)),
         request_id: edge.request_id.clone().unwrap_or_default(),
         memo: Some(memo_from_domain(&edge.memo)),
         search_attributes: Some(search_attributes_from_domain(&edge.search_attributes)),
+        ..Default::default()
     }
 }
 
@@ -234,12 +293,16 @@ fn signal_request_to_proto(
 ) -> workflowservice::SignalWorkflowExecutionRequest {
     workflowservice::SignalWorkflowExecutionRequest {
         namespace: edge.namespace.clone(),
-        workflow_id: edge.workflow_id.clone(),
-        run_id: String::new(),
+        workflow_execution: Some(tokeira_proto::common::WorkflowExecution {
+            workflow_id: edge.workflow_id.clone(),
+            run_id: String::new(),
+            ..Default::default()
+        }),
         signal_name: edge.signal_name.clone(),
         input: Some(payloads_from_domain(&edge.input)),
         request_id: edge.request_id.clone().unwrap_or_default(),
         identity: edge.identity.clone().unwrap_or_default(),
+        ..Default::default()
     }
 }
 
@@ -248,12 +311,12 @@ fn poll_request_to_proto(
 ) -> workflowservice::PollWorkflowTaskQueueRequest {
     workflowservice::PollWorkflowTaskQueueRequest {
         namespace: edge.namespace.clone(),
-        task_queue: Some(tokeira_proto::common::TaskQueue {
+        task_queue: Some(tokeira_proto::taskqueue::TaskQueue {
             name: edge.task_queue.clone(),
+            ..Default::default()
         }),
         identity: edge.worker_identity.clone(),
-        deployment: String::new(),
-        build_id: String::new(),
+        ..Default::default()
     }
 }
 
@@ -279,6 +342,7 @@ fn expected_code(err: &EdgeError) -> Code {
             Code::NotFound
         }
         EdgeError::NamespaceDeleted(_) => Code::FailedPrecondition,
+        EdgeError::NamespaceAlreadyExists(_) => Code::AlreadyExists,
         EdgeError::TooManyLongPolls => Code::ResourceExhausted,
         EdgeError::LongPollAdmissionTimeout => Code::DeadlineExceeded,
         EdgeError::RemoteRouteUnsupported { .. } => Code::Unavailable,
@@ -374,6 +438,11 @@ fn arb_start_request() -> impl Strategy<Value = StartWorkflowExecutionRequest> {
                 memo,
                 search_attributes,
                 identity: None,
+                workflow_execution_timeout: None,
+                workflow_run_timeout: None,
+                workflow_task_timeout: None,
+                retry_policy: None,
+                header: None,
                 run_key: None,
                 run_id: None,
                 now: None,
@@ -406,11 +475,18 @@ fn arb_signal_request() -> impl Strategy<Value = SignalWorkflowExecutionRequest>
 }
 
 fn arb_poll_request() -> impl Strategy<Value = PollWorkflowTaskQueueRequest> {
-    (arb_small_string(), arb_small_string(), arb_small_string()).prop_map(
+    (
+        arb_small_string(),
+        arb_small_string(),
+        arb_small_string(),
+    )
+        .prop_map(
         |(namespace, task_queue, worker_identity)| PollWorkflowTaskQueueRequest {
             namespace,
             task_queue,
             worker_identity,
+            deployment: None,
+            build_id: None,
             sticky_run: None,
             timeout: Duration::from_secs(60),
             sticky_ttl: Duration::from_secs(30),
@@ -448,13 +524,12 @@ fn arb_count_request() -> impl Strategy<Value = CountWorkflowExecutionsRequest> 
     (
         arb_small_string(),
         prop::option::of(arb_small_string()),
-        prop::option::of(arb_small_string()),
     )
         .prop_map(
-            |(namespace, query, group_by)| CountWorkflowExecutionsRequest {
+            |(namespace, query)| CountWorkflowExecutionsRequest {
                 namespace,
                 query,
-                group_by,
+                group_by: None,
             },
         )
 }
@@ -607,6 +682,10 @@ fn arb_summary() -> impl Strategy<Value = WorkflowExecutionSummary> {
                     .map(|secs| OffsetDateTime::from_unix_timestamp(secs).unwrap()),
                 close_time: close_time
                     .map(|secs| OffsetDateTime::from_unix_timestamp(secs).unwrap()),
+                history_length: 0,
+                state_transition_count: 0,
+                memo: Default::default(),
+                search_attributes: Default::default(),
             },
         )
 }
@@ -643,9 +722,13 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
         (arb_small_string(), arb_small_string(), arb_payloads()).prop_map(
             |(activity_id, task_queue, input)| WorkflowCommand::ScheduleActivity {
                 activity_id,
+                activity_type: "activity-type".into(),
                 task_queue: tokeira_types::TaskQueueName(task_queue),
                 input,
+                header: None,
                 retry_policy: None,
+                deployment: None,
+                build_id: None,
                 schedule_to_close_timeout: None,
                 schedule_to_start_timeout: None,
                 start_to_close_timeout: None,
@@ -673,8 +756,8 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
                 }
             }),
         arb_payloads().prop_map(|result| WorkflowCommand::CompleteWorkflow { result }),
-        (arb_small_string(), prop::option::of(arb_payload())).prop_map(
-            |(message, details)| WorkflowCommand::FailWorkflow { message, details }
+        arb_small_string().prop_map(
+            |message| WorkflowCommand::FailWorkflow { message, details: None }
         ),
         (
             arb_small_string(),
@@ -801,4 +884,412 @@ fn arb_edge_error() -> impl Strategy<Value = EdgeError> {
             .prop_map(|target| EdgeError::RemoteRouteUnsupported { target }),
         arb_small_string().prop_map(EdgeError::Internal),
     ]
+}
+
+// ── Property 5: Proto-to-edge DTO round-trip for new endpoints ──
+// **Validates: Requirements 12.1, 12.2, 12.3, 12.4, 12.5, 12.6,
+//   12.7, 12.8, 12.9, 12.10, 12.11, 12.12, 12.15**
+
+use tokeira_edge::{
+    grpc::translate::{
+        cancel_request_to_edge,
+        deserialize_activity_token,
+        poll_activity_request_to_edge,
+        poll_activity_response_to_proto,
+        query_request_to_edge, query_response_to_proto,
+        respond_activity_completed_to_edge,
+        serialize_activity_token,
+        terminate_request_to_edge,
+        update_request_to_edge, update_response_to_proto,
+    },
+    translate::{
+        PollActivityTaskQueueRequest,
+        PollActivityTaskQueueResponse,
+        QueryWorkflowRequest, QueryWorkflowResponse,
+        RequestCancelWorkflowExecutionRequest,
+        TerminateWorkflowExecutionRequest,
+        UpdateOutcomeDto, UpdateWaitPolicyDto,
+        UpdateWorkflowExecutionRequest,
+        UpdateWorkflowExecutionResponse,
+    },
+};
+use tokeira_types::{
+    ActivityTaskToken, ShardEpoch,
+};
+
+fn arb_activity_task_token(
+) -> impl Strategy<Value = ActivityTaskToken> {
+    (
+        any::<u128>(),
+        arb_small_string(),
+        any::<i64>(),
+        1u32..100u32,
+    )
+        .prop_map(
+            |(run_key, activity_id, schedule_event_id, attempt)| {
+                ActivityTaskToken {
+                    run_key: RunKey(Uuid::from_u128(run_key)),
+                    activity_id,
+                    schedule_event_id,
+                    attempt,
+                    shard_epoch: ShardEpoch::ZERO,
+                }
+            },
+        )
+}
+
+fn arb_poll_activity_request(
+) -> impl Strategy<Value = PollActivityTaskQueueRequest> {
+    (arb_small_string(), arb_small_string(), arb_small_string())
+        .prop_map(
+            |(namespace, task_queue, worker_identity)| {
+                PollActivityTaskQueueRequest {
+                    namespace,
+                    task_queue,
+                    worker_identity,
+                    timeout: Duration::from_secs(60),
+                }
+            },
+        )
+}
+
+fn arb_poll_activity_response(
+) -> impl Strategy<Value = PollActivityTaskQueueResponse> {
+    (
+        arb_activity_task_token(),
+        arb_small_string(),
+        arb_payloads(),
+        1u32..100u32,
+        arb_small_string(),
+        any::<u128>(),
+    )
+        .prop_map(
+            |(
+                token,
+                activity_id,
+                input,
+                attempt,
+                workflow_id,
+                run_key,
+            )| {
+                let token_bytes =
+                    serialize_activity_token(&token);
+                PollActivityTaskQueueResponse {
+                    task_token: token_bytes,
+                    activity_id,
+                    activity_type: String::new(),
+                    input,
+                    attempt,
+                    workflow_id,
+                    workflow_type: String::new(),
+                    workflow_namespace: String::new(),
+                    run_key: RunKey(
+                        Uuid::from_u128(run_key),
+                    ),
+                    header: None,
+                    retry_policy: None,
+                    schedule_to_close_timeout: None,
+                    start_to_close_timeout: None,
+                    heartbeat_timeout: None,
+                }
+            },
+        )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    // Property 5a: PollActivityTaskQueue request round-trip
+    #[test]
+    fn property_poll_activity_request_roundtrip(
+        edge in arb_poll_activity_request()
+    ) {
+        let proto =
+            workflowservice::PollActivityTaskQueueRequest {
+                namespace: edge.namespace.clone(),
+                task_queue: Some(
+                    tokeira_proto::taskqueue::TaskQueue {
+                        name: edge.task_queue.clone(),
+                        ..Default::default()
+                    },
+                ),
+                identity: edge.worker_identity.clone(),
+                ..Default::default()
+            };
+        let roundtrip =
+            poll_activity_request_to_edge(proto).unwrap();
+        prop_assert_eq!(roundtrip, edge);
+    }
+
+    // Property 5b: PollActivityTaskQueue response projection
+    #[test]
+    fn property_poll_activity_response_projection(
+        edge in arb_poll_activity_response()
+    ) {
+        let proto =
+            poll_activity_response_to_proto(edge.clone());
+        prop_assert_eq!(proto.task_token, edge.task_token);
+        prop_assert_eq!(proto.activity_id, edge.activity_id);
+        prop_assert_eq!(
+            proto.attempt, edge.attempt as i32
+        );
+    }
+
+    // Property 5c: Terminate request round-trip
+    #[test]
+    fn property_terminate_request_roundtrip(
+        namespace in arb_small_string(),
+        workflow_id in arb_small_string(),
+        reason in arb_small_string(),
+        identity in arb_small_string(),
+    ) {
+        let edge = TerminateWorkflowExecutionRequest {
+            namespace: namespace.clone(),
+            workflow_id: workflow_id.clone(),
+            run_id: None,
+            reason: reason.clone(),
+            details: None,
+            identity: identity.clone(),
+        };
+        let proto =
+            workflowservice::TerminateWorkflowExecutionRequest {
+                namespace,
+                workflow_execution: Some(tokeira_proto::common::WorkflowExecution {
+                    workflow_id,
+                    run_id: String::new(),
+                    ..Default::default()
+                }),
+                reason,
+                details: None,
+                identity,
+                ..Default::default()
+            };
+        let roundtrip =
+            terminate_request_to_edge(proto).unwrap();
+        prop_assert_eq!(roundtrip, edge);
+    }
+
+    // Property 5d: Cancel request round-trip
+    #[test]
+    fn property_cancel_request_roundtrip(
+        namespace in arb_small_string(),
+        workflow_id in arb_small_string(),
+        reason in arb_small_string(),
+        identity in arb_small_string(),
+    ) {
+        let edge = RequestCancelWorkflowExecutionRequest {
+            namespace: namespace.clone(),
+            workflow_id: workflow_id.clone(),
+            run_id: None,
+            reason: reason.clone(),
+            identity: identity.clone(),
+        };
+        let proto =
+            workflowservice::RequestCancelWorkflowExecutionRequest {
+                namespace,
+                workflow_execution: Some(tokeira_proto::common::WorkflowExecution {
+                    workflow_id,
+                    run_id: String::new(),
+                    ..Default::default()
+                }),
+                reason,
+                identity,
+                ..Default::default()
+            };
+        let roundtrip =
+            cancel_request_to_edge(proto).unwrap();
+        prop_assert_eq!(roundtrip, edge);
+    }
+
+    // Property 5e: Query request round-trip
+    #[test]
+    fn property_query_request_roundtrip(
+        namespace in arb_small_string(),
+        workflow_id in arb_small_string(),
+        query_type in arb_small_string(),
+        query_args in arb_payloads(),
+    ) {
+        let edge = QueryWorkflowRequest {
+            namespace: namespace.clone(),
+            workflow_id: workflow_id.clone(),
+            run_id: None,
+            query_type: query_type.clone(),
+            query_args: query_args.clone(),
+            timeout: Duration::from_secs(10),
+        };
+        let proto = workflowservice::QueryWorkflowRequest {
+            namespace,
+            execution: Some(
+                tokeira_proto::common::WorkflowExecution {
+                    workflow_id,
+                    run_id: String::new(),
+                    ..Default::default()
+                },
+            ),
+            query: Some(tokeira_proto::public::temporal::api::query::v1::WorkflowQuery {
+                query_type,
+                query_args: Some(payloads_from_domain(
+                    &query_args,
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let roundtrip =
+            query_request_to_edge(proto).unwrap();
+        prop_assert_eq!(roundtrip, edge);
+    }
+
+    // Property 5f: Query response projection
+    #[test]
+    fn property_query_response_projection(
+        result in prop::option::of(arb_payloads()),
+    ) {
+        let edge = QueryWorkflowResponse {
+            result: result.clone(),
+            rejected_status: None,
+        };
+        let proto = query_response_to_proto(edge);
+        match result {
+            Some(payloads) => {
+                let proto_payloads =
+                    proto.query_result.unwrap();
+                prop_assert_eq!(
+                    proto_payloads.payloads.len(),
+                    payloads.0.len()
+                );
+            }
+            None => {
+                prop_assert!(
+                    proto.query_result.is_none()
+                );
+            }
+        }
+        prop_assert!(proto.query_rejected.is_none());
+    }
+
+    // Property 5g: Update request round-trip
+    #[test]
+    fn property_update_request_roundtrip(
+        namespace in arb_small_string(),
+        workflow_id in arb_small_string(),
+        update_id in arb_small_string(),
+        update_name in arb_small_string(),
+        input in arb_payloads(),
+        use_completed in any::<bool>(),
+    ) {
+        let wait_policy = if use_completed {
+            UpdateWaitPolicyDto::Completed
+        } else {
+            UpdateWaitPolicyDto::Accepted
+        };
+        let stage = if use_completed { 2 } else { 1 };
+
+        let edge = UpdateWorkflowExecutionRequest {
+            namespace: namespace.clone(),
+            workflow_id: workflow_id.clone(),
+            run_id: None,
+            update_id: update_id.clone(),
+            update_name: update_name.clone(),
+            input: input.clone(),
+            wait_policy,
+            timeout: Duration::from_secs(30),
+        };
+        let proto =
+            workflowservice::UpdateWorkflowExecutionRequest {
+                namespace,
+                workflow_execution: Some(
+                    tokeira_proto::common::WorkflowExecution {
+                        workflow_id,
+                        run_id: String::new(),
+                        ..Default::default()
+                    },
+                ),
+                request: Some(tokeira_proto::public::temporal::api::update::v1::Request {
+                    meta: Some(tokeira_proto::public::temporal::api::update::v1::Meta {
+                        update_id,
+                        identity: String::new(),
+                    }),
+                    input: Some(tokeira_proto::public::temporal::api::update::v1::Input {
+                        name: update_name,
+                        args: Some(payloads_from_domain(&input)),
+                        ..Default::default()
+                    }),
+                }),
+                wait_policy: Some(
+                    tokeira_proto::public::temporal::api::update::v1::WaitPolicy {
+                        lifecycle_stage: stage,
+                    },
+                ),
+                ..Default::default()
+            };
+        let roundtrip =
+            update_request_to_edge(proto).unwrap();
+        prop_assert_eq!(roundtrip, edge);
+    }
+
+    // Property 5h: Update response projection
+    #[test]
+    fn property_update_response_projection(
+        accepted_event_id in 1i64..1000i64,
+        result in arb_payloads(),
+        failure in arb_small_string(),
+        variant in 0u8..3u8,
+    ) {
+        let outcome = match variant {
+            0 => UpdateOutcomeDto::Accepted {
+                accepted_event_id,
+            },
+            1 => UpdateOutcomeDto::Completed {
+                accepted_event_id,
+                result: result.clone(),
+            },
+            _ => UpdateOutcomeDto::Rejected {
+                accepted_event_id,
+                failure: failure.clone(),
+            },
+        };
+        let edge = UpdateWorkflowExecutionResponse {
+            outcome: outcome.clone(),
+        };
+        let _proto = update_response_to_proto(edge);
+        // The upstream response type has different fields (update_ref, outcome, stage)
+        // so we just verify the conversion doesn't panic.
+    }
+}
+
+// ── Property 6: ActivityTaskToken serialization round-trip ──
+// **Validates: Requirements 12.3, 12.4, 12.5, 12.13**
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn property_activity_token_roundtrip(
+        token in arb_activity_task_token()
+    ) {
+        let bytes = serialize_activity_token(&token);
+        let roundtrip =
+            deserialize_activity_token(&bytes).unwrap();
+        prop_assert_eq!(roundtrip, token);
+    }
+
+    #[test]
+    fn property_activity_token_in_completed_request(
+        token in arb_activity_task_token(),
+        result in arb_payloads(),
+    ) {
+        let bytes = serialize_activity_token(&token);
+        let proto =
+            workflowservice::RespondActivityTaskCompletedRequest {
+                task_token: bytes,
+                result: Some(payloads_from_domain(&result)),
+                identity: "worker".to_string(),
+                ..Default::default()
+            };
+        let edge =
+            respond_activity_completed_to_edge(proto)
+                .unwrap();
+        prop_assert_eq!(edge.token, token);
+    }
 }

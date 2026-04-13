@@ -4,7 +4,9 @@ use smallvec::SmallVec;
 use thiserror::Error;
 use time::OffsetDateTime;
 use tokeira_types::{
-    ExecutionStatus, LogicalTaskSeq, QueueKey, StickyAffinity, TransitionSeq,
+    BuildId, DeploymentId, ExecutionStatus, LogicalTaskSeq, NamespaceId,
+    QueueKey, RunId, RunKey, StickyAffinity, TransitionSeq, WorkerIdentity,
+    WorkflowId,
 };
 
 use crate::{
@@ -19,8 +21,8 @@ use crate::{
         TimerDueRequest, UnpauseActivityRequest, UnpauseWorkflowRequest,
         UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody,
         UpdateRequest, WorkflowCommand, WorkflowExecutionTimedOutRequest,
-        WorkflowTaskCompletedRequest, WorkflowTaskFailedRequest,
-        WorkflowTaskTimedOutRequest,
+        WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
+        WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
     },
     event::{ActivityResolution, HistoryEvent, HistoryEventKind},
     state::{
@@ -56,6 +58,24 @@ pub trait Kernel {
 /// property-based tests.
 #[derive(Default)]
 pub struct BasicKernel;
+
+/// Additional durable identity/config needed to replay a history prefix.
+///
+/// History is authoritative for semantic state transitions, but some envelope
+/// fields live outside individual history events and must be supplied by the
+/// caller when reconstructing state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReplayContext {
+    pub run_key: RunKey,
+    pub namespace_id: NamespaceId,
+    pub workflow_id: WorkflowId,
+    pub run_id: RunId,
+    pub deployment: Option<DeploymentId>,
+    pub build_id: Option<BuildId>,
+    pub parent_run_key: Option<RunKey>,
+    pub parent_workflow_id: Option<WorkflowId>,
+    pub first_run_started_at: Option<OffsetDateTime>,
+}
 
 impl Kernel for BasicKernel {
     fn apply(&self, loaded: LoadedRun, command: Command) -> Result<Transition, Reject> {
@@ -112,6 +132,85 @@ impl Kernel for BasicKernel {
 }
 
 impl BasicKernel {
+    /// Reconstruct mutable workflow state from a committed history prefix.
+    ///
+    /// This is intentionally narrower than a full replay engine: it rebuilds
+    /// durable kernel state from already-recorded history events, plus the
+    /// non-historical envelope fields supplied by [`ReplayContext`].
+    pub fn replay_history_prefix(
+        &self,
+        ctx: ReplayContext,
+        events: &[HistoryEvent],
+    ) -> Result<WorkflowState, Reject> {
+        let first = events.first().ok_or(Reject::InvalidReplayHistory)?;
+        let HistoryEventKind::WorkflowExecutionStarted {
+            workflow_type,
+            task_queue,
+            memo,
+            search_attributes,
+            retry_policy,
+            attempt,
+            first_execution_run_id,
+            workflow_execution_timeout,
+            workflow_run_timeout,
+            workflow_task_timeout,
+            ..
+        } = &first.kind
+        else {
+            return Err(Reject::InvalidReplayHistory);
+        };
+
+        let mut state = WorkflowState {
+            run_key: ctx.run_key,
+            namespace_id: ctx.namespace_id,
+            workflow_id: ctx.workflow_id,
+            run_id: ctx.run_id,
+            workflow_type: workflow_type.clone(),
+            task_queue: task_queue.clone(),
+            deployment: ctx.deployment,
+            build_id: ctx.build_id,
+            status: ExecutionStatus::Running,
+            transition_seq: TransitionSeq::ZERO,
+            last_event_id: first.event_id,
+            next_workflow_task_seq: LogicalTaskSeq::ONE,
+            pending_workflow_task: None,
+            sticky: None,
+            pause_info: None,
+            wft_stamp: 0,
+            memo: memo.clone(),
+            search_attributes: search_attributes.clone(),
+            workflow_execution_timeout: *workflow_execution_timeout,
+            workflow_run_timeout: *workflow_run_timeout,
+            workflow_task_timeout: *workflow_task_timeout,
+            retry_policy: retry_policy.clone(),
+            attempt: *attempt,
+            first_execution_run_id: *first_execution_run_id,
+            parent_run_key: ctx.parent_run_key,
+            parent_workflow_id: ctx.parent_workflow_id,
+            activities: BTreeMap::new(),
+            timers: BTreeMap::new(),
+            children: BTreeMap::new(),
+            pending_external_signals: BTreeMap::new(),
+            pending_external_cancels: BTreeMap::new(),
+            pending_updates: BTreeMap::new(),
+            pending_nexus_operations: BTreeMap::new(),
+            versioning_override: None,
+            completion_callbacks: Vec::new(),
+            started_at: first.happened_at,
+            first_run_started_at: ctx.first_run_started_at,
+            closed_at: None,
+            close_result: None,
+            close_failure: None,
+        };
+
+        for event in events {
+            state.last_event_id = event.event_id;
+            self.apply_replayed_event(&mut state, event);
+        }
+
+        Ok(state)
+    }
+
     fn apply_start(
         &self,
         loaded: LoadedRun,
@@ -128,6 +227,8 @@ impl BasicKernel {
             run_id: req.run_id,
             workflow_type: req.workflow_type.clone(),
             task_queue: req.task_queue.clone(),
+            deployment: req.deployment.clone(),
+            build_id: req.build_id.clone(),
             status: ExecutionStatus::Running,
             transition_seq: TransitionSeq::ZERO,
             last_event_id: 0,
@@ -408,8 +509,14 @@ impl BasicKernel {
                     namespace_id: builder.state.namespace_id,
                     task_queue: snapshot.task_queue.clone(),
                     task_kind: tokeira_types::TaskKind::Activity,
-                    deployment: None,
-                    build_id: None,
+                    deployment: snapshot
+                        .deployment
+                        .clone()
+                        .or_else(|| builder.state.deployment.clone()),
+                    build_id: snapshot
+                        .build_id
+                        .clone()
+                        .or_else(|| builder.state.build_id.clone()),
                 },
                 activity_id: snapshot.activity_id.clone(),
                 input: snapshot.input.clone(),
@@ -548,8 +655,14 @@ impl BasicKernel {
                     namespace_id: builder.state.namespace_id,
                     task_queue: snapshot.task_queue.clone(),
                     task_kind: tokeira_types::TaskKind::Activity,
-                    deployment: None,
-                    build_id: None,
+                    deployment: snapshot
+                        .deployment
+                        .clone()
+                        .or_else(|| builder.state.deployment.clone()),
+                    build_id: snapshot
+                        .build_id
+                        .clone()
+                        .or_else(|| builder.state.build_id.clone()),
                 },
                 activity_id: snapshot.activity_id.clone(),
                 input: snapshot.input.clone(),
@@ -592,8 +705,14 @@ impl BasicKernel {
                     namespace_id: builder.state.namespace_id,
                     task_queue: snapshot.task_queue.clone(),
                     task_kind: tokeira_types::TaskKind::Activity,
-                    deployment: None,
-                    build_id: None,
+                    deployment: snapshot
+                        .deployment
+                        .clone()
+                        .or_else(|| builder.state.deployment.clone()),
+                    build_id: snapshot
+                        .build_id
+                        .clone()
+                        .or_else(|| builder.state.build_id.clone()),
                 },
                 activity_id: snapshot.activity_id.clone(),
                 input: snapshot.input.clone(),
@@ -854,6 +973,41 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Record that a worker picked up an activity task.
+    ///
+    /// Emits `ActivityTaskStarted` and records the started
+    /// event ID back into `ActivityState` so that subsequent
+    /// resolution events can reference it.
+    pub fn apply_activity_started(
+        &self,
+        loaded: LoadedRun,
+        activity_id: &str,
+        identity: WorkerIdentity,
+        now: OffsetDateTime,
+    ) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+        let activity = state
+            .activities
+            .get(activity_id)
+            .cloned()
+            .ok_or_else(|| Reject::UnknownActivity(activity_id.to_string()))?;
+
+        let mut builder = TransitionBuilder::new(state, now);
+        let started_event_id = builder.emit(HistoryEventKind::ActivityTaskStarted {
+            activity_id: activity_id.to_string(),
+            scheduled_event_id: activity.schedule_event_id,
+            attempt: activity.attempt,
+            identity,
+        });
+
+        if let Some(act) = builder.state.activities.get_mut(activity_id) {
+            act.started_event_id = Some(started_event_id);
+            act.started_at = Some(now);
+        }
+
+        Ok(builder.finish())
+    }
+
     fn apply_activity_resolved(
         &self,
         loaded: LoadedRun,
@@ -871,24 +1025,32 @@ impl BasicKernel {
             ActivityResolution::Completed { result } => {
                 builder.emit(HistoryEventKind::ActivityTaskCompleted {
                     activity_id: activity.activity_id.clone(),
+                    scheduled_event_id: activity.schedule_event_id,
+                    started_event_id: activity.started_event_id.unwrap_or(0),
                     result,
                 });
             }
             ActivityResolution::Failed { message } => {
                 builder.emit(HistoryEventKind::ActivityTaskFailed {
                     activity_id: activity.activity_id.clone(),
+                    scheduled_event_id: activity.schedule_event_id,
+                    started_event_id: activity.started_event_id.unwrap_or(0),
                     message,
                 });
             }
             ActivityResolution::TimedOut { timeout_type } => {
                 builder.emit(HistoryEventKind::ActivityTaskTimedOut {
                     activity_id: activity.activity_id.clone(),
+                    scheduled_event_id: activity.schedule_event_id,
+                    started_event_id: activity.started_event_id.unwrap_or(0),
                     timeout_type,
                 });
             }
             ActivityResolution::Canceled { details } => {
                 builder.emit(HistoryEventKind::ActivityTaskCanceled {
                     activity_id: activity.activity_id.clone(),
+                    scheduled_event_id: activity.schedule_event_id,
+                    started_event_id: activity.started_event_id.unwrap_or(0),
                     details,
                 });
             }
@@ -1258,8 +1420,8 @@ impl BasicKernel {
                     namespace_id: builder.state.namespace_id,
                     task_queue: builder.state.task_queue.clone(),
                     task_kind: tokeira_types::TaskKind::Workflow,
-                    deployment: None,
-                    build_id: None,
+                    deployment: builder.state.deployment.clone(),
+                    build_id: builder.state.build_id.clone(),
                 },
                 logical_seq: pending.logical_seq,
                 sticky_preferred,
@@ -1315,8 +1477,8 @@ impl BasicKernel {
                     namespace_id: builder.state.namespace_id,
                     task_queue: builder.state.task_queue.clone(),
                     task_kind: tokeira_types::TaskKind::Workflow,
-                    deployment: None,
-                    build_id: None,
+                    deployment: builder.state.deployment.clone(),
+                    build_id: builder.state.build_id.clone(),
                 },
                 logical_seq: pending.logical_seq,
                 sticky_preferred: None,
@@ -1352,6 +1514,399 @@ impl BasicKernel {
 
         Ok(builder.finish())
     }
+
+    fn apply_replayed_event(&self, state: &mut WorkflowState, event: &HistoryEvent) {
+        match &event.kind {
+            HistoryEventKind::WorkflowExecutionStarted { .. } => {}
+            HistoryEventKind::WorkflowExecutionSignaled { .. } => {}
+            HistoryEventKind::WorkflowExecutionCancelRequested { .. } => {}
+            HistoryEventKind::WorkflowExecutionPaused {
+                identity,
+                reason,
+                request_id,
+            } => {
+                state.status = ExecutionStatus::Paused;
+                state.pause_info = Some(PauseInfo {
+                    pause_time: event.happened_at,
+                    identity: identity.clone(),
+                    reason: reason.clone(),
+                    request_id: request_id.clone(),
+                });
+            }
+            HistoryEventKind::WorkflowExecutionUnpaused { .. } => {
+                state.status = ExecutionStatus::Running;
+                state.pause_info = None;
+            }
+            HistoryEventKind::WorkflowExecutionTerminated { .. } => {
+                close_replayed_run(state, ExecutionStatus::Terminated, event.happened_at);
+            }
+            HistoryEventKind::WorkflowExecutionTimedOut { .. } => {
+                close_replayed_run(state, ExecutionStatus::TimedOut, event.happened_at);
+            }
+            HistoryEventKind::WorkflowTaskScheduled { logical_seq } => {
+                state.pending_workflow_task = Some(PendingWorkflowTask {
+                    logical_seq: *logical_seq,
+                    scheduled_event_id: event.event_id,
+                    started_event_id: None,
+                    attempt: 0,
+                });
+                if logical_seq.0 >= state.next_workflow_task_seq.0 {
+                    state.next_workflow_task_seq = logical_seq.next();
+                }
+            }
+            HistoryEventKind::WorkflowTaskStarted {
+                logical_seq,
+                scheduled_event_id,
+                attempt,
+                ..
+            } => {
+                state.pending_workflow_task = Some(PendingWorkflowTask {
+                    logical_seq: *logical_seq,
+                    scheduled_event_id: *scheduled_event_id,
+                    started_event_id: Some(event.event_id),
+                    attempt: *attempt,
+                });
+                if logical_seq.0 >= state.next_workflow_task_seq.0 {
+                    state.next_workflow_task_seq = logical_seq.next();
+                }
+            }
+            HistoryEventKind::WorkflowTaskCompleted { .. } => {
+                state.pending_workflow_task = None;
+            }
+            HistoryEventKind::WorkflowTaskFailed {
+                logical_seq,
+                scheduled_event_id,
+                failure_cause,
+                ..
+            } => {
+                if *failure_cause == WorkflowTaskFailedCause::ResetWorkflow {
+                    close_replayed_run(
+                        state,
+                        ExecutionStatus::Terminated,
+                        event.happened_at,
+                    );
+                } else {
+                    let attempt = state
+                        .pending_workflow_task
+                        .as_ref()
+                        .map(|pending| pending.attempt)
+                        .unwrap_or(0);
+                    state.pending_workflow_task = Some(PendingWorkflowTask {
+                        logical_seq: *logical_seq,
+                        scheduled_event_id: *scheduled_event_id,
+                        started_event_id: None,
+                        attempt,
+                    });
+                    if logical_seq.0 >= state.next_workflow_task_seq.0 {
+                        state.next_workflow_task_seq = logical_seq.next();
+                    }
+                }
+            }
+            HistoryEventKind::WorkflowTaskTimedOut {
+                logical_seq,
+                scheduled_event_id,
+                ..
+            } => {
+                let attempt = state
+                    .pending_workflow_task
+                    .as_ref()
+                    .map(|pending| pending.attempt)
+                    .unwrap_or(0);
+                state.pending_workflow_task = Some(PendingWorkflowTask {
+                    logical_seq: *logical_seq,
+                    scheduled_event_id: *scheduled_event_id,
+                    started_event_id: None,
+                    attempt,
+                });
+                state.sticky = None;
+                if logical_seq.0 >= state.next_workflow_task_seq.0 {
+                    state.next_workflow_task_seq = logical_seq.next();
+                }
+            }
+            HistoryEventKind::ActivityTaskScheduled {
+                activity_id,
+                activity_type,
+                task_queue,
+                input,
+                header,
+                retry_policy,
+                schedule_to_close_timeout,
+                schedule_to_start_timeout,
+                start_to_close_timeout,
+                heartbeat_timeout,
+            } => {
+                state.activities.insert(
+                    activity_id.clone(),
+                    ActivityState {
+                        activity_id: activity_id.clone(),
+                        activity_type: activity_type.clone(),
+                        schedule_event_id: event.event_id,
+                        task_queue: task_queue.clone(),
+                        deployment: state.deployment.clone(),
+                        build_id: state.build_id.clone(),
+                        input: input.clone(),
+                        header: header.clone(),
+                        attempt: 1,
+                        retry_policy: retry_policy.clone(),
+                        schedule_to_close_timeout: *schedule_to_close_timeout,
+                        schedule_to_start_timeout: *schedule_to_start_timeout,
+                        start_to_close_timeout: *start_to_close_timeout,
+                        heartbeat_timeout: *heartbeat_timeout,
+                        scheduled_at: event.happened_at,
+                        started_at: None,
+                        started_event_id: None,
+                        pause_info: None,
+                        stamp: 0,
+                    },
+                );
+            }
+            HistoryEventKind::ActivityTaskStarted {
+                activity_id,
+                attempt,
+                ..
+            } => {
+                if let Some(activity) = state.activities.get_mut(activity_id) {
+                    activity.attempt = *attempt;
+                    activity.started_at = Some(event.happened_at);
+                    activity.started_event_id = Some(event.event_id);
+                }
+            }
+            HistoryEventKind::ActivityTaskCompleted { activity_id, .. }
+            | HistoryEventKind::ActivityTaskFailed { activity_id, .. }
+            | HistoryEventKind::ActivityTaskTimedOut { activity_id, .. }
+            | HistoryEventKind::ActivityTaskCanceled { activity_id, .. } => {
+                state.activities.remove(activity_id);
+            }
+            HistoryEventKind::ActivityTaskCancelRequested { .. } => {}
+            HistoryEventKind::TimerStarted { timer_id, fire_at } => {
+                state.timers.insert(
+                    timer_id.clone(),
+                    TimerState {
+                        timer_id: timer_id.clone(),
+                        started_event_id: event.event_id,
+                        fire_at: *fire_at,
+                    },
+                );
+            }
+            HistoryEventKind::MarkerRecorded { .. } => {}
+            HistoryEventKind::TimerCanceled { timer_id }
+            | HistoryEventKind::TimerFired { timer_id } => {
+                state.timers.remove(timer_id);
+            }
+            HistoryEventKind::StartChildWorkflowExecutionInitiated {
+                child_workflow_id,
+                namespace_id,
+                parent_close_policy,
+                ..
+            } => {
+                state.children.insert(
+                    child_workflow_id.clone(),
+                    ChildWorkflowState {
+                        child_workflow_id: child_workflow_id.clone(),
+                        namespace_id: *namespace_id,
+                        child_run_id: None,
+                        initiated_event_id: event.event_id,
+                        started_event_id: None,
+                        parent_close_policy: *parent_close_policy,
+                    },
+                );
+            }
+            HistoryEventKind::ChildWorkflowExecutionStarted {
+                child_workflow_id,
+                child_run_id,
+                ..
+            } => {
+                if let Some(child) = state.children.get_mut(child_workflow_id) {
+                    child.child_run_id = Some(*child_run_id);
+                    child.started_event_id = Some(event.event_id);
+                }
+            }
+            HistoryEventKind::StartChildWorkflowExecutionFailed {
+                child_workflow_id, ..
+            }
+            | HistoryEventKind::ChildWorkflowExecutionCompleted {
+                child_workflow_id, ..
+            }
+            | HistoryEventKind::ChildWorkflowExecutionFailed {
+                child_workflow_id, ..
+            }
+            | HistoryEventKind::ChildWorkflowExecutionCanceled {
+                child_workflow_id,
+            }
+            | HistoryEventKind::ChildWorkflowExecutionTerminated {
+                child_workflow_id,
+            }
+            | HistoryEventKind::ChildWorkflowExecutionTimedOut {
+                child_workflow_id,
+            } => {
+                state.children.remove(child_workflow_id);
+            }
+            HistoryEventKind::SignalExternalWorkflowExecutionInitiated {
+                target_workflow_id,
+                target_run_id,
+                signal_name,
+                ..
+            } => {
+                state.pending_external_signals.insert(
+                    event.event_id,
+                    PendingExternalSignal {
+                        initiated_event_id: event.event_id,
+                        target_workflow_id: target_workflow_id.clone(),
+                        target_run_id: *target_run_id,
+                        signal_name: signal_name.clone(),
+                    },
+                );
+            }
+            HistoryEventKind::ExternalWorkflowExecutionSignaled {
+                initiated_event_id,
+                ..
+            }
+            | HistoryEventKind::SignalExternalWorkflowExecutionFailed {
+                initiated_event_id,
+                ..
+            } => {
+                state.pending_external_signals.remove(initiated_event_id);
+            }
+            HistoryEventKind::RequestCancelExternalWorkflowExecutionInitiated {
+                target_workflow_id,
+                target_run_id,
+            } => {
+                state.pending_external_cancels.insert(
+                    event.event_id,
+                    PendingExternalCancel {
+                        initiated_event_id: event.event_id,
+                        target_workflow_id: target_workflow_id.clone(),
+                        target_run_id: *target_run_id,
+                    },
+                );
+            }
+            HistoryEventKind::ExternalWorkflowExecutionCancelRequested {
+                initiated_event_id,
+                ..
+            }
+            | HistoryEventKind::RequestCancelExternalWorkflowExecutionFailed {
+                initiated_event_id,
+                ..
+            } => {
+                state.pending_external_cancels.remove(initiated_event_id);
+            }
+            HistoryEventKind::NexusOperationScheduled {
+                operation_id,
+                endpoint,
+                service,
+                operation,
+                schedule_to_close_timeout,
+                ..
+            } => {
+                state.pending_nexus_operations.insert(
+                    operation_id.clone(),
+                    PendingNexusOperation {
+                        operation_id: operation_id.clone(),
+                        scheduled_event_id: event.event_id,
+                        endpoint: endpoint.clone(),
+                        service: service.clone(),
+                        operation: operation.clone(),
+                        schedule_to_close_timeout: *schedule_to_close_timeout,
+                        scheduled_at: event.happened_at,
+                        started: false,
+                    },
+                );
+            }
+            HistoryEventKind::NexusOperationStarted { operation_id, .. } => {
+                if let Some(operation) =
+                    state.pending_nexus_operations.get_mut(operation_id)
+                {
+                    operation.started = true;
+                }
+            }
+            HistoryEventKind::NexusOperationCompleted { operation_id, .. }
+            | HistoryEventKind::NexusOperationFailed { operation_id, .. }
+            | HistoryEventKind::NexusOperationCanceled { operation_id, .. }
+            | HistoryEventKind::NexusOperationTimedOut { operation_id, .. } => {
+                state.pending_nexus_operations.remove(operation_id);
+            }
+            HistoryEventKind::NexusOperationCancelRequested { .. } => {}
+            HistoryEventKind::WorkflowExecutionUpdateAccepted {
+                update_id,
+                update_name,
+                ..
+            } => {
+                state.pending_updates.insert(
+                    update_id.clone(),
+                    PendingUpdate {
+                        update_id: update_id.clone(),
+                        accepted_event_id: event.event_id,
+                        name: update_name.clone(),
+                    },
+                );
+            }
+            HistoryEventKind::WorkflowExecutionUpdateCompleted { update_id, .. }
+            | HistoryEventKind::WorkflowExecutionUpdateRejected { update_id, .. } => {
+                state.pending_updates.remove(update_id);
+            }
+            HistoryEventKind::WorkflowExecutionOptionsUpdated {
+                versioning_override,
+                completion_callbacks,
+                ..
+            } => {
+                match versioning_override {
+                    FieldChange::Set(value) => {
+                        state.versioning_override = Some(value.clone());
+                    }
+                    FieldChange::Clear => {
+                        state.versioning_override = None;
+                    }
+                    FieldChange::Unchanged => {}
+                }
+                match completion_callbacks {
+                    FieldChange::Set(value) => {
+                        state.completion_callbacks = value.clone();
+                    }
+                    FieldChange::Clear => {
+                        state.completion_callbacks.clear();
+                    }
+                    FieldChange::Unchanged => {}
+                }
+            }
+            HistoryEventKind::WorkflowExecutionCompleted { result } => {
+                close_replayed_run(state, ExecutionStatus::Completed, event.happened_at);
+                state.close_result = Some(result.clone());
+            }
+            HistoryEventKind::WorkflowExecutionFailed { message, .. } => {
+                close_replayed_run(state, ExecutionStatus::Failed, event.happened_at);
+                state.close_failure = Some(message.clone());
+            }
+            HistoryEventKind::WorkflowExecutionContinuedAsNew { .. } => {
+                close_replayed_run(
+                    state,
+                    ExecutionStatus::ContinuedAsNew,
+                    event.happened_at,
+                );
+            }
+            HistoryEventKind::WorkflowExecutionCanceled => {
+                close_replayed_run(state, ExecutionStatus::Cancelled, event.happened_at);
+            }
+        }
+    }
+}
+
+fn close_replayed_run(
+    state: &mut WorkflowState,
+    status: ExecutionStatus,
+    closed_at: OffsetDateTime,
+) {
+    state.status = status;
+    state.closed_at = Some(closed_at);
+    state.pending_workflow_task = None;
+    state.sticky = None;
+    state.pause_info = None;
+    state.activities.clear();
+    state.timers.clear();
+    state.children.clear();
+    state.pending_external_signals.clear();
+    state.pending_external_cancels.clear();
+    state.pending_updates.clear();
+    state.pending_nexus_operations.clear();
 }
 
 /// Extract an open `WorkflowState` from a `LoadedRun`,
@@ -1380,9 +1935,13 @@ fn apply_workflow_command(
     match command {
         WorkflowCommand::ScheduleActivity {
             activity_id,
+            activity_type,
             task_queue,
             input,
+            header,
             retry_policy,
+            deployment,
+            build_id,
             schedule_to_close_timeout,
             schedule_to_start_timeout,
             start_to_close_timeout,
@@ -1395,8 +1954,11 @@ fn apply_workflow_command(
             let schedule_event_id =
                 builder.emit(HistoryEventKind::ActivityTaskScheduled {
                     activity_id: activity_id.clone(),
+                    activity_type: activity_type.clone(),
                     task_queue: task_queue.clone(),
                     input: input.clone(),
+                    header: header.clone(),
+                    retry_policy: retry_policy.clone(),
                     schedule_to_close_timeout,
                     schedule_to_start_timeout,
                     start_to_close_timeout,
@@ -1405,15 +1967,22 @@ fn apply_workflow_command(
 
             let activity = ActivityState {
                 activity_id: activity_id.clone(),
+                activity_type,
                 schedule_event_id,
                 task_queue: task_queue.clone(),
+                deployment: deployment.clone().or_else(|| builder.state.deployment.clone()),
+                build_id: build_id.clone().or_else(|| builder.state.build_id.clone()),
                 input: input.clone(),
+                header,
                 attempt: 1,
                 retry_policy: retry_policy.clone(),
                 schedule_to_close_timeout,
                 schedule_to_start_timeout,
                 start_to_close_timeout,
                 heartbeat_timeout,
+                scheduled_at: builder.now,
+                started_at: None,
+                started_event_id: None,
                 pause_info: None,
                 stamp: 0,
             };
@@ -1421,14 +1990,16 @@ fn apply_workflow_command(
                 .state
                 .activities
                 .insert(activity_id.clone(), activity.clone());
-            builder.activity_ops.push(ActivityOp::Upsert(activity));
+            builder
+                .activity_ops
+                .push(ActivityOp::Upsert(activity.clone()));
             builder.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
                 queue: QueueKey {
                     namespace_id: builder.state.namespace_id,
                     task_queue,
                     task_kind: tokeira_types::TaskKind::Activity,
-                    deployment: None,
-                    build_id: None,
+                    deployment: activity.deployment.clone(),
+                    build_id: activity.build_id.clone(),
                 },
                 activity_id,
                 input,
@@ -1720,6 +2291,8 @@ fn apply_workflow_command(
                     endpoint: endpoint.clone(),
                     service: service.clone(),
                     operation: operation.clone(),
+                    schedule_to_close_timeout,
+                    scheduled_at: builder.now,
                     started: false,
                 },
             );
@@ -1916,8 +2489,8 @@ impl TransitionBuilder {
                 namespace_id: self.state.namespace_id,
                 task_queue: self.state.task_queue.clone(),
                 task_kind: tokeira_types::TaskKind::Workflow,
-                deployment: None,
-                build_id: None,
+                deployment: self.state.deployment.clone(),
+                build_id: self.state.build_id.clone(),
             },
             logical_seq,
             sticky_preferred: self
@@ -2011,6 +2584,9 @@ pub enum Reject {
     /// The run does not exist (expected `LoadedRun::Existing`).
     #[error("run not found")]
     MissingRun,
+    /// History replay requires a non-empty sequence beginning with a start event.
+    #[error("invalid replay history")]
+    InvalidReplayHistory,
     /// The run has already reached a terminal status.
     #[error("run closed: {0:?}")]
     RunClosed(ExecutionStatus),

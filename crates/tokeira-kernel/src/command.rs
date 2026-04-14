@@ -67,6 +67,9 @@ pub enum Command {
     NexusOperationResolved(NexusOperationResolvedRequest),
     /// A timer's deadline was reached.
     TimerDue(TimerDueRequest),
+    /// Schedule a WFT so that a pending query can be delivered
+    /// to a worker. Only schedules if no WFT is already pending.
+    ScheduleQueryTask(ScheduleQueryTaskRequest),
 }
 
 /// Three-valued patch for optional fields in update commands.
@@ -717,6 +720,13 @@ pub struct TimerDueRequest {
     pub timer_id: String,
     /// Wall-clock time the timer was observed as due.
     pub fired_at: OffsetDateTime,
+}
+
+/// Request from the runtime to schedule a WFT so a pending
+/// query can be piggybacked on the worker's next poll.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScheduleQueryTaskRequest {
+    pub now: OffsetDateTime,
 }
 
 /// Commands produced by workflow code when a workflow task completes.

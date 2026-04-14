@@ -17,7 +17,7 @@ use crate::{
         ExternalSignalResolvedRequest, ExternalSignalResult, FieldChange,
         NexusOperationResolvedRequest, NexusResolution, PauseActivityRequest,
         PauseWorkflowRequest, ResetActivityRequest, ResetRequest, RetryState,
-        SignalRequest, SignalWithStartRequest, StartRequest,
+        ScheduleQueryTaskRequest, SignalRequest, SignalWithStartRequest, StartRequest,
         StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest,
         UnpauseActivityRequest, UnpauseWorkflowRequest,
         UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody,
@@ -131,6 +131,7 @@ impl Kernel for BasicKernel {
                 self.apply_nexus_operation_resolved(loaded, req)
             }
             Command::TimerDue(req) => self.apply_timer_due(loaded, req),
+            Command::ScheduleQueryTask(req) => self.apply_schedule_query_task(loaded, req),
         }
     }
 }
@@ -1602,6 +1603,25 @@ impl BasicKernel {
             builder.schedule_workflow_task();
         }
 
+        Ok(builder.finish())
+    }
+
+    fn apply_schedule_query_task(
+        &self,
+        loaded: LoadedRun,
+        req: ScheduleQueryTaskRequest,
+    ) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+
+        // If a WFT is already pending, no-op — the query will be
+        // piggybacked on the existing WFT when the worker polls.
+        if state.pending_workflow_task.is_some() {
+            let builder = TransitionBuilder::new(state, req.now);
+            return Ok(builder.finish());
+        }
+
+        let mut builder = TransitionBuilder::new(state, req.now);
+        builder.schedule_workflow_task();
         Ok(builder.finish())
     }
 

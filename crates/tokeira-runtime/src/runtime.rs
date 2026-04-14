@@ -5,7 +5,8 @@ use smallvec::{SmallVec, smallvec};
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     ActivityOp, ActivityResolution, ActivityResolvedRequest, BasicKernel, Command,
-    DispatchOp, HistoryEvent, HistoryEventKind, LoadedRun, SignalRequest,
+    DispatchOp, HistoryEvent, HistoryEventKind, LoadedRun, ScheduleQueryTaskRequest,
+    SignalRequest,
     SignalWithStartRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest,
     Transition, UpdateRequest, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
     WorkflowTaskCompletedRequest,
@@ -503,9 +504,20 @@ where
         };
 
         let now = OffsetDateTime::now_utc();
-        let sticky_preferred = state.sticky.and_then(|affinity| {
-            (affinity.expires_at > now).then_some(affinity.worker_identity)
+        let sticky_preferred = state.sticky.as_ref().and_then(|affinity| {
+            (affinity.expires_at > now).then_some(affinity.worker_identity.clone())
         });
+
+        // If no WFT is pending, schedule one so the worker has
+        // something to poll and the query can be piggybacked.
+        if state.pending_workflow_task.is_none() && state.status.is_open() {
+            let _ = self
+                .submit(
+                    run_key,
+                    Command::ScheduleQueryTask(ScheduleQueryTaskRequest { now }),
+                )
+                .await;
+        }
 
         let (response_tx, response_rx) = oneshot::channel();
         self.broker

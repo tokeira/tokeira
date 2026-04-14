@@ -76,7 +76,9 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             .await?;
 
         let has_task = edge_resp.is_some();
-        debug!(has_task, "poll_workflow_task_queue response");
+        let num_queries = edge_resp.as_ref().map(|r| r.queries.len()).unwrap_or(0);
+        let num_messages = edge_resp.as_ref().map(|r| r.messages.len()).unwrap_or(0);
+        debug!(has_task, num_queries, num_messages, "poll_workflow_task_queue response");
         Ok(Response::new(match edge_resp {
             Some(resp) => translate::poll_response_to_proto(resp),
             None => workflowservice::PollWorkflowTaskQueueResponse::default(),
@@ -91,7 +93,12 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         let headers = metadata_to_header_map(request.metadata());
         let edge_req = translate::respond_completed_request_to_edge(request.into_inner())
             .map_err(proto_conversion_status)?;
-        debug!(num_commands = edge_req.commands.len(), "respond_workflow_task_completed");
+        debug!(
+            num_commands = edge_req.commands.len(),
+            num_query_results = edge_req.query_results.len(),
+            num_messages = edge_req.messages.len(),
+            "respond_workflow_task_completed"
+        );
         let edge_resp = self
             .inner
             .respond_workflow_task_completed(&headers, edge_req)

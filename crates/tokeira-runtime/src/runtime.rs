@@ -1288,7 +1288,7 @@ where
         })
     }
 
-    async fn submit(&self, run_key: RunKey, command: Command) -> Result<CommitResult> {
+    pub async fn submit(&self, run_key: RunKey, command: Command) -> Result<CommitResult> {
         let shard_id = self.shard_id_for(run_key).await;
         if !self.shard_owner.read().unwrap().is_active(shard_id) {
             return Err(anyhow!("shard not active for run {:?}", run_key));

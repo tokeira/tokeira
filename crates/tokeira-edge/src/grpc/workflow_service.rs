@@ -950,6 +950,9 @@ mod tests {
         ) -> Result<bool> {
             Ok(false)
         }
+        async fn submit_schedule_query_task(&self, _run_key: tokeira_types::RunKey) -> Result<()> {
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -1106,6 +1109,9 @@ mod tests {
             _resolution: tokeira_runtime::UpdateTransportResolution,
         ) -> Result<bool> {
             Ok(false)
+        }
+        async fn submit_schedule_query_task(&self, _run_key: tokeira_types::RunKey) -> Result<()> {
+            Ok(())
         }
     }
 

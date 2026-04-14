@@ -205,6 +205,10 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         update_id: String,
         resolution: UpdateTransportResolution,
     ) -> Result<bool>;
+
+    /// Schedule a WFT for query delivery if no WFT is pending.
+    /// No-op if a WFT is already pending.
+    async fn submit_schedule_query_task(&self, run_key: RunKey) -> Result<()>;
 }
 
 #[async_trait]
@@ -627,43 +631,17 @@ impl WorkflowService {
                     );
                 }
 
-        while let Some(query) = self
-                    .broker
-                    .poll_query_task(
-                        &broker_queue,
-                        &internal.worker_identity,
-                        Duration::from_millis(0),
-                    )
-                    .await
-                {
-                    let query_id = Uuid::new_v4().to_string();
-                    self.pending_queries
-                        .insert(&task_token, query_id.clone(), query.response_tx)
-                        .await;
-                    response.queries.insert(
-                        query_id,
-                        WorkflowQueryDto {
-                            query_type: query.query_type,
-                            query_args: query.query_args,
-                        },
-                    );
-                }
-
-                // Also drain queries from the workflow's normal task queue
-                // (queries are published to the normal queue, but the worker
-                // may be polling on a sticky queue).
-                let normal_queue = QueueKey {
-                    namespace_id: to_internal::namespace_id_for(&req_namespace),
-                    task_queue: TaskQueueName(response.payload.task_queue.clone()),
-                    task_kind: TaskKind::Workflow,
-                    deployment: None,
-                    build_id: None,
-                };
-                if normal_queue != broker_queue {
+                // Only drain queries from the broker for query-only WFTs.
+                // For real WFTs, queries must NOT be piggybacked because the
+                // query may have arrived before the WFT's events were committed.
+                // The worker would evaluate the query against stale state.
+                // Instead, queries are delivered on a subsequent query-triggered
+                // WFT (via ScheduleQueryTask) after the current WFT completes.
+                if started.query_only {
                     while let Some(query) = self
                         .broker
                         .poll_query_task(
-                            &normal_queue,
+                            &broker_queue,
                             &internal.worker_identity,
                             Duration::from_millis(0),
                         )
@@ -680,6 +658,38 @@ impl WorkflowService {
                                 query_args: query.query_args,
                             },
                         );
+                    }
+
+                    // Also drain from the normal queue for sticky workers
+                    let normal_queue = QueueKey {
+                        namespace_id: to_internal::namespace_id_for(&req_namespace),
+                        task_queue: TaskQueueName(response.payload.task_queue.clone()),
+                        task_kind: TaskKind::Workflow,
+                        deployment: None,
+                        build_id: None,
+                    };
+                    if normal_queue != broker_queue {
+                        while let Some(query) = self
+                            .broker
+                            .poll_query_task(
+                                &normal_queue,
+                                &internal.worker_identity,
+                                Duration::from_millis(0),
+                            )
+                            .await
+                        {
+                            let query_id = Uuid::new_v4().to_string();
+                            self.pending_queries
+                                .insert(&task_token, query_id.clone(), query.response_tx)
+                                .await;
+                            response.queries.insert(
+                                query_id,
+                                WorkflowQueryDto {
+                                    query_type: query.query_type,
+                                    query_args: query.query_args,
+                                },
+                            );
+                        }
                     }
                 }
 
@@ -848,6 +858,18 @@ impl WorkflowService {
             .map_err(EdgeError::from)?;
         self.notify_history_run_key(run_key, outcome.last_event_id)
             .await;
+
+        // After WFT completion, schedule a query-triggered WFT if the
+        // workflow is still open. This ensures pending queries in the
+        // broker get delivered on a fresh WFT with up-to-date history.
+        // ScheduleQueryTask is a no-op if a WFT is already pending
+        // (e.g. from commands in this completion).
+        if outcome.execution_status.is_open() {
+            let _ = self
+                .runtime
+                .submit_schedule_query_task(run_key)
+                .await;
+        }
 
         Ok(from_internal::completed_response(outcome))
     }

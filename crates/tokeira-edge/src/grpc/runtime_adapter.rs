@@ -232,6 +232,21 @@ where
             .runtime
             .resolve_update_transport(run_key, &update_id, resolution))
     }
+
+    async fn submit_schedule_query_task(&self, run_key: tokeira_types::RunKey) -> Result<()> {
+        let _ = self
+            .runtime
+            .submit(
+                run_key,
+                tokeira_kernel::Command::ScheduleQueryTask(
+                    tokeira_kernel::ScheduleQueryTaskRequest {
+                        now: time::OffsetDateTime::now_utc(),
+                    },
+                ),
+            )
+            .await;
+        Ok(())
+    }
 }
 
 pub fn commit_result_to_outcome(

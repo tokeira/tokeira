@@ -153,15 +153,17 @@ This feature wires the existing runtime query and update dispatch through the ed
 3. WHEN the update validator rejects the update, THE client SHALL receive the `UpdateOutcome::Rejected` with the failure message.
 4. WHEN the update handler accepts but the client's wait policy is `Accepted`, THE client SHALL receive `UpdateOutcome::Accepted` without waiting for completion.
 
-### Requirement 12: Query-Only WFT Must Include History
+### Requirement 12: Query Dispatch Must Integrate with WFT Scheduling
 
-**User Story:** As an SDK worker evaluating a query, I want the query-only poll response to include the workflow's full history, so that I can replay to the current state before evaluating the query handler.
+**User Story:** As an SDK worker evaluating a query, I want the query delivered on a real workflow task with full history, so that I can replay to the current state before evaluating the query handler.
 
 #### Acceptance Criteria
 
-1. WHEN a query-only WFT is constructed (no real WFT pending), THE Poll_Response SHALL include the workflow's committed history in the `history` field so the worker can replay to the current state.
-2. THE query-only WFT SHALL set `started_event_id` to 0 to indicate no history advancement, while still carrying the full history for replay.
-3. WITHOUT the history, the worker evaluates the query against the initial workflow state (e.g. counter=0 instead of counter=5 after a signal), producing incorrect results.
+1. WHEN a query arrives and no worker has the workflow cached on a sticky queue, THE runtime SHALL schedule a real WFT (via the kernel's `schedule_workflow_task`) and the edge layer SHALL piggyback the query on that WFT's poll response.
+2. WHEN a query arrives and a worker has the workflow cached on a sticky queue, THE edge layer MAY deliver a query-only task with `started_event_id = 0` to that sticky worker.
+3. THE query-only path (`started_event_id = 0`) SHALL only be used for sticky-queue delivery where the worker already has the workflow in memory. For non-sticky delivery, the query MUST be piggybacked on a real WFT.
+4. WHEN a real WFT carries piggybacked queries, THE `queries` map SHALL be populated alongside the normal history and `started_event_id`. The worker replays history, evaluates queries, and returns both WFT completion commands and `query_results` together.
+5. AS A WORKAROUND until sticky-queue detection is implemented, THE edge layer SHALL set `started_event_id` to the last event ID in the history for query-only tasks, forcing the SDK to replay. This is documented as a temporary measure with a `TODO(correctness)` comment.
 
 ### Requirement 13: PollWorkflowExecutionUpdate Long-Poll
 

@@ -596,7 +596,19 @@ impl WorkflowService {
                 .map_err(EdgeError::from)?;
 
                 if started.query_only {
-                    response.started_event_id = 0;
+                    // TODO(correctness): query-only tasks with started_event_id=0
+                    // only work when the worker has the workflow cached (sticky queue).
+                    // For non-sticky queries, the runtime should schedule a real WFT
+                    // and piggyback the query on it. For now, we set started_event_id
+                    // to the last event so the SDK replays history, but this is a
+                    // workaround — the correct fix is to integrate query dispatch
+                    // with WFT scheduling.
+                    response.started_event_id = response
+                        .payload
+                        .history
+                        .last()
+                        .map(|e| e.event_id)
+                        .unwrap_or(0);
                 }
 
                 let task_token = response.task_token.clone();

@@ -78,7 +78,10 @@ sequenceDiagram
 
 1. **PendingQueryStore is edge-local, not in the runtime.** The runtime's broker already manages query task queues. The edge layer drains them during poll response construction and holds the oneshot senders. This avoids changing the runtime's internal architecture.
 
-2. **Queries are delivered via two paths: piggybacked on real WFTs, or as synthetic query-only poll responses.** When a real WFT is available, queries are attached to it. When no real WFT exists (workflow is idle), the edge layer must create a synthetic query-only poll response. This requires a new poll path in the edge layer that checks the broker's query queue independently of the WFT poll. The synthetic response has `started_event_id = 0`, an empty history, and a synthetic task token that identifies the query batch. The worker evaluates queries without replaying history (the SDK handles this when `started_event_id == 0`). This is a **runtime change** — the broker needs a combined poll that returns either a real WFT or a query-only task.
+2. **Queries are delivered via two paths: piggybacked on real WFTs, or as query-only tasks to sticky workers.** The correct Temporal behavior is:
+   - **Non-sticky (no cached state)**: The runtime schedules a real WFT via the kernel, and the edge layer piggybacks the query on that WFT's poll response. The worker replays history, evaluates the query, and returns both commands and `query_results`.
+   - **Sticky (worker has cached state)**: The edge layer delivers a query-only task with `started_event_id = 0`. The worker evaluates the query against its cached state without replaying.
+   **Current workaround**: Tokeira does not yet implement sticky-queue detection. As a temporary measure, query-only tasks set `started_event_id` to the last event ID in the history, forcing the SDK to replay. This is marked with `TODO(correctness)` and should be replaced with proper WFT-piggybacked query delivery.
 
 3. **Update messages use `google.protobuf.Any` wrapping.** The `protocol.v1.Message.body` field is a `google.protobuf.Any`. The edge layer packs `update.v1.Request` into this envelope with the standard type URL `type.googleapis.com/temporal.api.update.v1.Request`, matching the SDK's expectations.
 

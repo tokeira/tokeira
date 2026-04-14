@@ -2,11 +2,30 @@
 
 ## Overview
 
-Wire the runtime's existing query dispatch (`QueryTask`, `QueryResult`) and update lifecycle (`UpdateRegistry`, `UpdateOutcome`) through the edge/gRPC layer so that queries and updates flow end-to-end between SDK clients and workers via the standard Temporal protocol. All work is confined to the `tokeira-edge` crate.
+Wire the runtime's existing query dispatch (`QueryTask`, `QueryResult`) and update lifecycle (`UpdateRegistry`, `UpdateOutcome`) through the edge/gRPC layer so that queries and updates flow end-to-end between SDK clients and workers via the standard Temporal protocol. Work spans `tokeira-edge` (primary) and `tokeira-runtime` (UpdateRegistry extension, broker combined poll).
 
-Tasks follow a four-phase approach: infrastructure first (new types and DTO extensions), then query transport, then update transport, then cleanup and validation. Each phase builds on the previous one with no orphaned code.
+Tasks follow a five-phase approach: runtime prerequisites first, then edge infrastructure, then query transport, then update transport, then cleanup and validation.
 
 ## Tasks
+
+- [ ] 0. Runtime prerequisites
+  - [ ] 0.1 Extend `UpdateRegistryEntry` to retain `input`, `identity`, and `update_name`
+    - The current `UpdateRegistryEntry` only stores `complete_tx: oneshot::Sender<UpdateResolution>`
+    - Add `update_name: String`, `input: Payloads`, `identity: String` fields so the edge can construct `update.v1.Request` messages
+    - Update `UpdateRegistry::register()` to accept and store these fields
+    - Update all call sites in the runtime that register updates
+    - _Requirements: 3.2_
+
+  - [ ] 0.2 Add combined query/WFT poll to the broker
+    - The current `poll_workflow_task` only returns real WFTs. When a workflow is idle and a client issues `QueryWorkflow`, the worker poll gets no task.
+    - Add a `poll_workflow_or_query_task` method (or extend the existing poll) that returns either a real WFT or a synthetic query-only task when queries are pending but no WFT exists
+    - The synthetic query-only task has no history, `started_event_id = 0`, and a synthetic task token
+    - _Requirements: 1.1, 1.5_
+
+  - [ ] 0.3 Add `drain_pending_updates` method to `UpdateRegistry`
+    - Add a method that returns all pending update entries for a given `run_key` without removing them (the entries stay until the worker responds)
+    - Return `Vec<(String, String, Payloads, String)>` — (update_id, update_name, input, identity)
+    - _Requirements: 3.1, 3.4_
 
 - [ ] 1. Create `PendingQueryStore` and new edge DTO types
   - [ ] 1.1 Create `pending_queries.rs` module with `PendingQueryStore`
@@ -168,6 +187,7 @@ Tasks follow a four-phase approach: infrastructure first (new types and DTO exte
 - Each task references specific requirements for traceability
 - Checkpoints ensure incremental validation
 - Property tests validate universal correctness properties from the design document (7 properties)
-- Unit tests validate specific examples and edge cases
-- The design uses Rust throughout — all implementations target the `tokeira-edge` crate
-- No kernel or runtime changes are needed
+- **Task 0 is a runtime prerequisite** — `UpdateRegistryEntry` must retain input/identity/name, and the broker needs a combined poll for query-only tasks
+- The `PendingQueryStore` is keyed by task token bytes, with at most one legacy query per token under key `"__legacy__"`
+- Legacy and modern query paths are mutually exclusive per poll response to avoid ambiguity
+- No kernel changes are needed

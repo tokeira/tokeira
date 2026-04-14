@@ -12,7 +12,10 @@ The fix introduces a coordination layer between the WFT poll path and the query/
 2. **Update message construction** — pending updates from the `UpdateRegistry` are wrapped in `protocol.v1.Message` envelopes containing `update.v1.Request` bodies and attached to the `messages` field.
 3. **Result routing** — on `RespondWorkflowTaskCompleted`, the edge layer extracts `query_results` and `messages`, matches them by ID to retained channels, and delivers results back to waiting callers.
 
-The work is confined to `tokeira-edge`. No kernel or runtime changes are needed.
+The work spans `tokeira-edge` and `tokeira-runtime`:
+
+- **Edge**: `PendingQueryStore`, proto translation for `queries`/`query_results`/`messages`, result routing, legacy `RespondQueryTaskCompleted`
+- **Runtime**: `UpdateRegistryEntry` must be extended to retain `input`, `identity`, and `update_name` so the edge can construct `update.v1.Request` messages. The broker needs a combined poll that returns either a real WFT or a query-only task when queries are pending but no WFT exists.
 
 ## Architecture
 
@@ -75,7 +78,7 @@ sequenceDiagram
 
 1. **PendingQueryStore is edge-local, not in the runtime.** The runtime's broker already manages query task queues. The edge layer drains them during poll response construction and holds the oneshot senders. This avoids changing the runtime's internal architecture.
 
-2. **Queries are drained non-blockingly.** During `poll_workflow_task_queue`, the edge layer calls `broker.poll_query_task` with a zero timeout to collect any pending queries for the same task queue. If none exist, the poll response has an empty `queries` map. This is a best-effort attachment — queries that arrive after the poll response is built will be picked up by the next WFT.
+2. **Queries are delivered via two paths: piggybacked on real WFTs, or as synthetic query-only poll responses.** When a real WFT is available, queries are attached to it. When no real WFT exists (workflow is idle), the edge layer must create a synthetic query-only poll response. This requires a new poll path in the edge layer that checks the broker's query queue independently of the WFT poll. The synthetic response has `started_event_id = 0`, an empty history, and a synthetic task token that identifies the query batch. The worker evaluates queries without replaying history (the SDK handles this when `started_event_id == 0`). This is a **runtime change** — the broker needs a combined poll that returns either a real WFT or a query-only task.
 
 3. **Update messages use `google.protobuf.Any` wrapping.** The `protocol.v1.Message.body` field is a `google.protobuf.Any`. The edge layer packs `update.v1.Request` into this envelope with the standard type URL `type.googleapis.com/temporal.api.update.v1.Request`, matching the SDK's expectations.
 
@@ -83,7 +86,7 @@ sequenceDiagram
 
 5. **Query-only WFTs set `started_event_id` to zero.** When a poll response carries only queries (no history advancement), `started_event_id` is set to 0 to signal a query-only task. The SDK uses this to skip history replay when only queries need evaluation.
 
-6. **Legacy query support via `RespondQueryTaskCompleted`.** The `query` field (field 10) on the poll response carries a single legacy query. The `RespondQueryTaskCompleted` RPC routes the result back through the same `PendingQueryStore`. Both legacy and modern paths coexist.
+6. **Legacy query support via `RespondQueryTaskCompleted`.** The `query` field (field 10) on the poll response carries a single legacy query. The `RespondQueryTaskCompleted` RPC does not carry a query ID — it uses the task token to identify the query. The `PendingQueryStore` stores at most one legacy query per task token under a well-known key (e.g. `"__legacy__"`). When a legacy query is delivered via field 10, the modern `queries` map (field 14) is left empty to avoid mixed legacy/modern ambiguity. Both legacy and modern paths coexist but are mutually exclusive per poll response.
 
 ## Components and Interfaces
 

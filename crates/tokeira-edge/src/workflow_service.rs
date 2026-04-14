@@ -20,7 +20,7 @@ use tokeira_runtime::{
 use tokeira_storage::RunRepository;
 use tokeira_types::{
     ActivityTaskToken, ExecutionRef, ExecutionStatus,
-    Payloads, RequestContext, RunId, RunKey, TaskKind, TaskQueueName,
+    Payloads, QueueKey, RequestContext, RunId, RunKey, TaskKind, TaskQueueName,
     WorkerIdentity,
 };
 
@@ -569,6 +569,7 @@ impl WorkflowService {
             req.deployment.clone(),
             req.build_id.clone(),
         );
+        let req_namespace = req.namespace.clone();
         let internal = to_internal::poll_request(req);
         let polled = self
             .runtime
@@ -646,6 +647,40 @@ impl WorkflowService {
                             query_args: query.query_args,
                         },
                     );
+                }
+
+                // Also drain queries from the workflow's normal task queue
+                // (queries are published to the normal queue, but the worker
+                // may be polling on a sticky queue).
+                let normal_queue = QueueKey {
+                    namespace_id: to_internal::namespace_id_for(&req_namespace),
+                    task_queue: TaskQueueName(response.payload.task_queue.clone()),
+                    task_kind: TaskKind::Workflow,
+                    deployment: None,
+                    build_id: None,
+                };
+                if normal_queue != broker_queue {
+                    while let Some(query) = self
+                        .broker
+                        .poll_query_task(
+                            &normal_queue,
+                            &internal.worker_identity,
+                            Duration::from_millis(0),
+                        )
+                        .await
+                    {
+                        let query_id = Uuid::new_v4().to_string();
+                        self.pending_queries
+                            .insert(&task_token, query_id.clone(), query.response_tx)
+                            .await;
+                        response.queries.insert(
+                            query_id,
+                            WorkflowQueryDto {
+                                query_type: query.query_type,
+                                query_args: query.query_args,
+                            },
+                        );
+                    }
                 }
 
                 for update in self

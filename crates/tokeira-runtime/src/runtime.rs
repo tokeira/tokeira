@@ -510,13 +510,30 @@ where
 
         // If no WFT is pending, schedule one so the worker has
         // something to poll and the query can be piggybacked.
-        if state.pending_workflow_task.is_none() && state.status.is_open() {
-            let _ = self
+        let has_pending_wft = state.pending_workflow_task.is_some();
+        if !has_pending_wft && state.status.is_open() {
+            tracing::debug!(
+                ?run_key,
+                status = ?state.status,
+                "query_workflow: no pending WFT, scheduling ScheduleQueryTask"
+            );
+            match self
                 .submit(
                     run_key,
                     Command::ScheduleQueryTask(ScheduleQueryTaskRequest { now }),
                 )
-                .await;
+                .await
+            {
+                Ok(result) => tracing::debug!(?result, "ScheduleQueryTask committed"),
+                Err(e) => tracing::warn!(%e, "ScheduleQueryTask failed"),
+            }
+        } else {
+            tracing::debug!(
+                ?run_key,
+                has_pending_wft,
+                status = ?state.status,
+                "query_workflow: WFT already pending or workflow not open"
+            );
         }
 
         let (response_tx, response_rx) = oneshot::channel();

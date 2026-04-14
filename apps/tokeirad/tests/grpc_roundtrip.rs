@@ -16,7 +16,8 @@ use tonic_reflection::pb::{
 use tokeira_edge::{
     EdgeInterceptors, InMemoryNamespaceCache, InMemoryOperatorApi,
     LocalOnlyRouter, LongPollConfig, LongPollGate, NamespaceCache, OperatorService,
-    PollerRegistry, ResolvedNamespace, WorkflowExecutionDescription, WorkflowService,
+    PendingQueryStore, PollerRegistry, ResolvedNamespace, WorkflowExecutionDescription,
+    WorkflowService,
     grpc::{
         operator_service::OperatorServiceGrpc, runtime_adapter::RuntimeAdapter,
         workflow_service::WorkflowServiceGrpc,
@@ -467,6 +468,7 @@ async fn spawn_test_server() -> Result<(
                 .await;
         });
     }
+    let workflow_broker = runtime.broker();
     let workflow_service = WorkflowService::new(
         Arc::new(RuntimeAdapter::new(runtime)),
         Arc::new(StoreExecutionResolver::new(Arc::new(store.clone()))),
@@ -476,6 +478,8 @@ async fn spawn_test_server() -> Result<(
         namespaces,
         interceptors.clone(),
         PollerRegistry::default(),
+        PendingQueryStore::default(),
+        workflow_broker,
         LongPollGate::new(LongPollConfig::default()),
         Arc::new(LocalOnlyRouter),
     );

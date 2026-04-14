@@ -152,3 +152,25 @@ This feature wires the existing runtime query and update dispatch through the ed
 2. WHEN the update handler accepts and completes the update, THE client SHALL receive the `UpdateOutcome::Completed` with the result payloads.
 3. WHEN the update validator rejects the update, THE client SHALL receive the `UpdateOutcome::Rejected` with the failure message.
 4. WHEN the update handler accepts but the client's wait policy is `Accepted`, THE client SHALL receive `UpdateOutcome::Accepted` without waiting for completion.
+
+### Requirement 12: Query-Only WFT Must Include History
+
+**User Story:** As an SDK worker evaluating a query, I want the query-only poll response to include the workflow's full history, so that I can replay to the current state before evaluating the query handler.
+
+#### Acceptance Criteria
+
+1. WHEN a query-only WFT is constructed (no real WFT pending), THE Poll_Response SHALL include the workflow's committed history in the `history` field so the worker can replay to the current state.
+2. THE query-only WFT SHALL set `started_event_id` to 0 to indicate no history advancement, while still carrying the full history for replay.
+3. WITHOUT the history, the worker evaluates the query against the initial workflow state (e.g. counter=0 instead of counter=5 after a signal), producing incorrect results.
+
+### Requirement 13: PollWorkflowExecutionUpdate Long-Poll
+
+**User Story:** As an SDK client, I want to long-poll for update results via `PollWorkflowExecutionUpdate`, so that `execute_update` can wait for the update to complete.
+
+#### Acceptance Criteria
+
+1. WHEN a `PollWorkflowExecutionUpdate` request is received, THE WorkflowServiceGrpc SHALL look up the update in the `UpdateRegistry` and wait for the resolution.
+2. WHEN the update completes (accepted, completed, or rejected), THE response SHALL contain the update outcome.
+3. WHEN the update is not found in the registry, THE response SHALL return a NOT_FOUND error.
+4. WHEN the long-poll times out, THE response SHALL return an empty response indicating no result yet.
+5. THE `PollWorkflowExecutionUpdate` RPC SHALL replace the current `Status::unimplemented` stub.

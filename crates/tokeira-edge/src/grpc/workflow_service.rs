@@ -519,7 +519,34 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         Err(Status::unimplemented("get_search_attributes"))
     }
     async fn respond_query_task_completed(&self, _request: Request<workflowservice::RespondQueryTaskCompletedRequest>) -> Result<Response<workflowservice::RespondQueryTaskCompletedResponse>, Status> {
-        Err(Status::unimplemented("respond_query_task_completed"))
+        let request = _request;
+        let headers = metadata_to_header_map(request.metadata());
+        let req = request.into_inner();
+        let result = match tokeira_proto::enums::QueryResultType::try_from(req.completed_type)
+            .unwrap_or(tokeira_proto::enums::QueryResultType::Failed)
+        {
+            tokeira_proto::enums::QueryResultType::Answered => {
+                tokeira_runtime::QueryResult::Completed {
+                    result: req
+                        .query_result
+                        .as_ref()
+                        .map(tokeira_proto::conversions::common::payloads_to_domain)
+                        .unwrap_or_default(),
+                }
+            }
+            tokeira_proto::enums::QueryResultType::Failed
+            | tokeira_proto::enums::QueryResultType::Unspecified => {
+                tokeira_runtime::QueryResult::Failed {
+                    message: req.error_message,
+                }
+            }
+        };
+        self.inner
+            .respond_query_task_completed(&headers, req.task_token, result)
+            .await?;
+        Ok(Response::new(
+            workflowservice::RespondQueryTaskCompletedResponse {},
+        ))
     }
     async fn reset_sticky_task_queue(&self, _request: Request<workflowservice::ResetStickyTaskQueueRequest>) -> Result<Response<workflowservice::ResetStickyTaskQueueResponse>, Status> {
         Err(Status::unimplemented("reset_sticky_task_queue"))
@@ -600,8 +627,90 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn set_current_deployment(&self, _request: Request<workflowservice::SetCurrentDeploymentRequest>) -> Result<Response<workflowservice::SetCurrentDeploymentResponse>, Status> {
         Err(Status::unimplemented("set_current_deployment"))
     }
-    async fn poll_workflow_execution_update(&self, _request: Request<workflowservice::PollWorkflowExecutionUpdateRequest>) -> Result<Response<workflowservice::PollWorkflowExecutionUpdateResponse>, Status> {
-        Err(Status::unimplemented("poll_workflow_execution_update"))
+    async fn poll_workflow_execution_update(&self, request: Request<workflowservice::PollWorkflowExecutionUpdateRequest>) -> Result<Response<workflowservice::PollWorkflowExecutionUpdateResponse>, Status> {
+        use tokeira_proto::public::temporal::api::update::v1 as update;
+        use tokeira_proto::public::temporal::api::failure::v1 as failure_proto;
+
+        let headers = metadata_to_header_map(request.metadata());
+        let req = request.into_inner();
+
+        let update_ref = req.update_ref.ok_or_else(|| {
+            Status::invalid_argument("update_ref is required")
+        })?;
+        let execution = update_ref.workflow_execution.ok_or_else(|| {
+            Status::invalid_argument("update_ref.workflow_execution is required")
+        })?;
+        let update_id = update_ref.update_id;
+        if update_id.is_empty() {
+            return Err(Status::invalid_argument("update_ref.update_id is required"));
+        }
+
+        let result = self
+            .inner
+            .poll_workflow_execution_update(
+                &headers,
+                req.namespace.clone(),
+                execution.workflow_id.clone(),
+                execution.run_id.clone(),
+                update_id.clone(),
+            )
+            .await?;
+
+        match result {
+            Some((outcome, _run_key)) => {
+                let (proto_outcome, stage) = match outcome {
+                    tokeira_runtime::UpdateOutcome::Completed { result, .. } => (
+                        Some(update::Outcome {
+                            value: Some(update::outcome::Value::Success(
+                                tokeira_proto::conversions::common::payloads_from_domain(&result),
+                            )),
+                        }),
+                        tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Completed as i32,
+                    ),
+                    tokeira_runtime::UpdateOutcome::Rejected { failure, .. } => (
+                        Some(update::Outcome {
+                            value: Some(update::outcome::Value::Failure(
+                                failure_proto::Failure {
+                                    message: failure,
+                                    ..Default::default()
+                                },
+                            )),
+                        }),
+                        tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Completed as i32,
+                    ),
+                    tokeira_runtime::UpdateOutcome::Accepted { .. } => (
+                        None,
+                        tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Accepted as i32,
+                    ),
+                };
+
+                Ok(Response::new(workflowservice::PollWorkflowExecutionUpdateResponse {
+                    outcome: proto_outcome,
+                    stage,
+                    update_ref: Some(update::UpdateRef {
+                        workflow_execution: Some(tokeira_proto::common::WorkflowExecution {
+                            workflow_id: execution.workflow_id,
+                            run_id: execution.run_id,
+                        }),
+                        update_id,
+                    }),
+                }))
+            }
+            None => {
+                // Timeout — return empty response so the SDK retries.
+                Ok(Response::new(workflowservice::PollWorkflowExecutionUpdateResponse {
+                    outcome: None,
+                    stage: tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Unspecified as i32,
+                    update_ref: Some(update::UpdateRef {
+                        workflow_execution: Some(tokeira_proto::common::WorkflowExecution {
+                            workflow_id: execution.workflow_id,
+                            run_id: execution.run_id,
+                        }),
+                        update_id,
+                    }),
+                }))
+            }
+        }
     }
     async fn start_batch_operation(&self, _request: Request<workflowservice::StartBatchOperationRequest>) -> Result<Response<workflowservice::StartBatchOperationResponse>, Status> {
         Err(Status::unimplemented("start_batch_operation"))
@@ -723,6 +832,15 @@ mod tests {
             Ok(None)
         }
 
+        async fn poll_workflow_or_query_task(
+            &self,
+            _queue: tokeira_types::QueueKey,
+            _worker_identity: tokeira_types::WorkerIdentity,
+            _timeout: std::time::Duration,
+        ) -> Result<Option<tokeira_runtime::PolledWorkflowTaskTransport>> {
+            Ok(None)
+        }
+
         async fn complete_workflow_task(
             &self,
             _req: tokeira_kernel::WorkflowTaskCompletedRequest,
@@ -809,6 +927,22 @@ mod tests {
         ) -> Result<tokeira_runtime::UpdateOutcome> {
             unreachable!()
         }
+
+        async fn pending_update_transports(
+            &self,
+            _run_key: tokeira_types::RunKey,
+        ) -> Result<Vec<tokeira_runtime::PendingUpdateTransport>> {
+            Ok(Vec::new())
+        }
+
+        async fn resolve_update_transport(
+            &self,
+            _run_key: tokeira_types::RunKey,
+            _update_id: String,
+            _resolution: tokeira_runtime::UpdateTransportResolution,
+        ) -> Result<bool> {
+            Ok(false)
+        }
     }
 
     #[async_trait]
@@ -848,6 +982,17 @@ mod tests {
             _worker_identity: tokeira_types::WorkerIdentity,
             _timeout: std::time::Duration,
         ) -> Result<Option<tokeira_runtime::StartedWorkflowTask>> {
+            self.ready.notify_waiters();
+            self.release.notified().await;
+            Ok(None)
+        }
+
+        async fn poll_workflow_or_query_task(
+            &self,
+            _queue: tokeira_types::QueueKey,
+            _worker_identity: tokeira_types::WorkerIdentity,
+            _timeout: std::time::Duration,
+        ) -> Result<Option<tokeira_runtime::PolledWorkflowTaskTransport>> {
             self.ready.notify_waiters();
             self.release.notified().await;
             Ok(None)
@@ -939,6 +1084,22 @@ mod tests {
         ) -> Result<tokeira_runtime::UpdateOutcome> {
             unreachable!()
         }
+
+        async fn pending_update_transports(
+            &self,
+            _run_key: tokeira_types::RunKey,
+        ) -> Result<Vec<tokeira_runtime::PendingUpdateTransport>> {
+            Ok(Vec::new())
+        }
+
+        async fn resolve_update_transport(
+            &self,
+            _run_key: tokeira_types::RunKey,
+            _update_id: String,
+            _resolution: tokeira_runtime::UpdateTransportResolution,
+        ) -> Result<bool> {
+            Ok(false)
+        }
     }
 
     #[derive(Default)]
@@ -983,6 +1144,8 @@ mod tests {
             cache.clone(),
             Arc::new(EdgeInterceptors::permissive(cache)),
             PollerRegistry::default(),
+            crate::PendingQueryStore::default(),
+            tokeira_runtime::InMemoryBroker::default(),
             LongPollGate::new(LongPollConfig::default()),
             Arc::new(LocalOnlyRouter),
         );
@@ -1030,6 +1193,8 @@ mod tests {
             cache.clone(),
             Arc::new(EdgeInterceptors::permissive(cache)),
             PollerRegistry::default(),
+            crate::PendingQueryStore::default(),
+            tokeira_runtime::InMemoryBroker::default(),
             LongPollGate::new(LongPollConfig::default()),
             Arc::new(LocalOnlyRouter),
         );
@@ -1092,6 +1257,8 @@ mod tests {
                 cache,
             )),
             PollerRegistry::default(),
+            crate::PendingQueryStore::default(),
+            tokeira_runtime::InMemoryBroker::default(),
             gate,
             Arc::new(LocalOnlyRouter),
         );
@@ -1146,6 +1313,8 @@ mod tests {
             cache.clone(),
             Arc::new(EdgeInterceptors::permissive(cache)),
             PollerRegistry::default(),
+            crate::PendingQueryStore::default(),
+            tokeira_runtime::InMemoryBroker::default(),
             LongPollGate::new(LongPollConfig::default()),
             Arc::new(LocalOnlyRouter),
         );
@@ -1230,6 +1399,8 @@ mod tests {
             cache.clone(),
             Arc::new(EdgeInterceptors::permissive(cache)),
             PollerRegistry::default(),
+            crate::PendingQueryStore::default(),
+            tokeira_runtime::InMemoryBroker::default(),
             LongPollGate::new(LongPollConfig::default()),
             Arc::new(LocalOnlyRouter),
         );
@@ -1296,6 +1467,8 @@ mod tests {
             cache.clone(),
             Arc::new(EdgeInterceptors::permissive(cache)),
             PollerRegistry::default(),
+            crate::PendingQueryStore::default(),
+            tokeira_runtime::InMemoryBroker::default(),
             LongPollGate::new(LongPollConfig::default()),
             Arc::new(LocalOnlyRouter),
         );
@@ -1321,6 +1494,102 @@ mod tests {
             .expect_err("missing workflow should fail");
 
         assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn respond_query_task_completed_without_waiter_returns_success() {
+        let cache = Arc::new(InMemoryNamespaceCache::new());
+        cache
+            .insert(ResolvedNamespace::active("default"))
+            .await
+            .unwrap();
+
+        let service = WorkflowService::new(
+            Arc::new(PollNoneRuntime),
+            Arc::new(NoopResolver),
+            Arc::new(EmptyVisibilityApi),
+            Arc::new(tokeira_storage::InMemoryStore::default()),
+            Arc::new(InMemoryOperatorApi::new("tokeira-local")),
+            cache.clone(),
+            Arc::new(EdgeInterceptors::permissive(cache)),
+            PollerRegistry::default(),
+            crate::PendingQueryStore::default(),
+            tokeira_runtime::InMemoryBroker::default(),
+            LongPollGate::new(LongPollConfig::default()),
+            Arc::new(LocalOnlyRouter),
+        );
+        let grpc = WorkflowServiceGrpc::new(service);
+
+        let response = grpc
+            .respond_query_task_completed(Request::new(
+                workflowservice::RespondQueryTaskCompletedRequest {
+                    task_token: b"missing".to_vec(),
+                    completed_type: tokeira_proto::enums::QueryResultType::Answered as i32,
+                    query_result: Some(tokeira_proto::common::Payloads::default()),
+                    error_message: String::new(),
+                    namespace: "default".to_string(),
+                },
+            ))
+            .await
+            .expect("legacy query completion should succeed")
+            .into_inner();
+
+        assert_eq!(
+            response,
+            workflowservice::RespondQueryTaskCompletedResponse {}
+        );
+    }
+
+    #[tokio::test]
+    async fn respond_query_task_completed_routes_legacy_result() {
+        let cache = Arc::new(InMemoryNamespaceCache::new());
+        cache
+            .insert(ResolvedNamespace::active("default"))
+            .await
+            .unwrap();
+
+        let service = WorkflowService::new(
+            Arc::new(PollNoneRuntime),
+            Arc::new(NoopResolver),
+            Arc::new(EmptyVisibilityApi),
+            Arc::new(tokeira_storage::InMemoryStore::default()),
+            Arc::new(InMemoryOperatorApi::new("tokeira-local")),
+            cache.clone(),
+            Arc::new(EdgeInterceptors::permissive(cache)),
+            PollerRegistry::default(),
+            crate::PendingQueryStore::default(),
+            tokeira_runtime::InMemoryBroker::default(),
+            LongPollGate::new(LongPollConfig::default()),
+            Arc::new(LocalOnlyRouter),
+        );
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let task_token = b"legacy-query".to_vec();
+        service
+            .insert_legacy_query_waiter(task_token.clone(), tx)
+            .await;
+        let grpc = WorkflowServiceGrpc::new(service);
+
+        grpc.respond_query_task_completed(Request::new(
+            workflowservice::RespondQueryTaskCompletedRequest {
+                task_token,
+                completed_type: tokeira_proto::enums::QueryResultType::Answered as i32,
+                query_result: Some(tokeira_proto::common::Payloads {
+                    payloads: vec![tokeira_proto::common::Payload::default()],
+                }),
+                error_message: String::new(),
+                namespace: "default".to_string(),
+            },
+        ))
+        .await
+        .expect("legacy query completion should route");
+
+        let result = rx.await.expect("legacy waiter should receive result");
+        match result {
+            tokeira_runtime::QueryResult::Completed { result } => {
+                assert_eq!(result.0.len(), 1);
+            }
+            other => panic!("unexpected query result: {other:?}"),
+        }
     }
 
     async fn history_test_service(
@@ -1356,6 +1625,8 @@ mod tests {
             cache.clone(),
             Arc::new(EdgeInterceptors::permissive(cache)),
             PollerRegistry::default(),
+            crate::PendingQueryStore::default(),
+            tokeira_runtime::InMemoryBroker::default(),
             LongPollGate::new(LongPollConfig::default()),
             Arc::new(LocalOnlyRouter),
             waits,

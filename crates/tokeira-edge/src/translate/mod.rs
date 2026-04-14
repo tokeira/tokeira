@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use time::OffsetDateTime;
 
@@ -95,6 +95,8 @@ pub struct PollWorkflowTaskQueueResponse {
     pub started_event_id: i64,
     pub attempt: u32,
     pub payload: WorkflowTaskPayloadDto,
+    pub queries: HashMap<String, WorkflowQueryDto>,
+    pub messages: Vec<ProtocolMessageDto>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -103,6 +105,28 @@ pub struct RespondWorkflowTaskCompletedRequest {
     pub identity: String,
     pub commands: Vec<WorkflowCommand>,
     pub force_new_workflow_task: bool,
+    pub query_results: HashMap<String, QueryResultDto>,
+    pub messages: Vec<ProtocolMessageDto>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkflowQueryDto {
+    pub query_type: String,
+    pub query_args: Payloads,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum QueryResultDto {
+    Answered { result: Payloads },
+    Failed { error_message: String },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProtocolMessageDto {
+    pub id: String,
+    pub protocol_instance_id: String,
+    pub body: Vec<u8>,
+    pub sequencing_event_id: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

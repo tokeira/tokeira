@@ -7,8 +7,9 @@ use tokeira_kernel::{
     TerminateRequest, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    QueryResult, ResetWorkflowResult, SignalWithStartResult, StartWorkflowResult,
-    StartedActivityTask, TokeiraRuntime, UpdateOutcome, UpdateWaitPolicy,
+    PendingUpdateTransport, QueryResult, ResetWorkflowResult, SignalWithStartResult,
+    StartWorkflowResult, StartedActivityTask, TokeiraRuntime, UpdateOutcome,
+    UpdateTransportResolution, UpdateWaitPolicy,
 };
 use tokeira_storage::{CommitResult, RunRepository};
 use tokeira_types::{
@@ -73,6 +74,17 @@ where
     ) -> Result<Option<tokeira_runtime::StartedWorkflowTask>> {
         self.runtime
             .poll_workflow_task(queue, worker_identity, timeout)
+            .await
+    }
+
+    async fn poll_workflow_or_query_task(
+        &self,
+        queue: tokeira_types::QueueKey,
+        worker_identity: tokeira_types::WorkerIdentity,
+        timeout: std::time::Duration,
+    ) -> Result<Option<tokeira_runtime::PolledWorkflowTaskTransport>> {
+        self.runtime
+            .poll_workflow_or_query_task(queue, worker_identity, timeout)
             .await
     }
 
@@ -201,6 +213,24 @@ where
                 wait_policy,
             )
             .await
+    }
+
+    async fn pending_update_transports(
+        &self,
+        run_key: tokeira_types::RunKey,
+    ) -> Result<Vec<PendingUpdateTransport>> {
+        Ok(self.runtime.pending_update_transports(run_key))
+    }
+
+    async fn resolve_update_transport(
+        &self,
+        run_key: tokeira_types::RunKey,
+        update_id: String,
+        resolution: UpdateTransportResolution,
+    ) -> Result<bool> {
+        Ok(self
+            .runtime
+            .resolve_update_transport(run_key, &update_id, resolution))
     }
 }
 

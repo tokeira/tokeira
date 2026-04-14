@@ -3,6 +3,8 @@ use std::{sync::Arc, time::Duration};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use http::HeaderMap;
+use prost::Message as _;
+use uuid::Uuid;
 use time::OffsetDateTime;
 use tokeira_kernel::{
     CancelRequest, HistoryEvent, HistoryEventKind, ResetRequest, SignalRequest,
@@ -10,8 +12,10 @@ use tokeira_kernel::{
     WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    QueryResult, ResetWorkflowResult, SignalWithStartResult, StartWorkflowResult,
-    StartedActivityTask, StartedWorkflowTask, UpdateOutcome, UpdateWaitPolicy,
+    InMemoryBroker, PolledWorkflowTaskTransport, QueryResult, ResetWorkflowResult,
+    SignalWithStartResult, StartWorkflowResult, StartedActivityTask,
+    StartedWorkflowTask, UpdateOutcome, UpdateTransportResolution,
+    UpdateWaitPolicy, PendingUpdateTransport,
 };
 use tokeira_storage::RunRepository;
 use tokeira_types::{
@@ -27,6 +31,8 @@ use crate::{
     long_poll::LongPollGate,
     namespace_cache::{NamespaceCache, ResolvedNamespace},
     operator_service::{ClusterInfo, OperatorApi},
+    pending_queries::PendingQueryStore,
+    pending_queries::LEGACY_QUERY_ID,
     poller_registry::{ActivePoller, PollerRegistry},
     routing::{EdgeRouter, ensure_local},
     translate::{
@@ -44,6 +50,8 @@ use crate::{
         PollActivityTaskQueueResponse,
         PollWorkflowTaskQueueRequest,
         PollWorkflowTaskQueueResponse,
+        ProtocolMessageDto,
+        QueryResultDto,
         QueryWorkflowRequest, QueryWorkflowResponse,
         RecordActivityTaskHeartbeatRequest,
         RecordActivityTaskHeartbeatResponse,
@@ -70,6 +78,7 @@ use crate::{
         TerminateWorkflowExecutionResponse,
         UpdateWorkflowExecutionRequest,
         UpdateWorkflowExecutionResponse,
+        WorkflowQueryDto,
         WorkflowExecutionDescription, from_internal,
         to_internal,
     },
@@ -110,6 +119,13 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         worker_identity: tokeira_types::WorkerIdentity,
         timeout: std::time::Duration,
     ) -> Result<Option<StartedWorkflowTask>>;
+
+    async fn poll_workflow_or_query_task(
+        &self,
+        queue: tokeira_types::QueueKey,
+        worker_identity: tokeira_types::WorkerIdentity,
+        timeout: std::time::Duration,
+    ) -> Result<Option<PolledWorkflowTaskTransport>>;
 
     async fn complete_workflow_task(
         &self,
@@ -177,6 +193,18 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         timeout: std::time::Duration,
         wait_policy: UpdateWaitPolicy,
     ) -> Result<UpdateOutcome>;
+
+    async fn pending_update_transports(
+        &self,
+        run_key: RunKey,
+    ) -> Result<Vec<PendingUpdateTransport>>;
+
+    async fn resolve_update_transport(
+        &self,
+        run_key: RunKey,
+        update_id: String,
+        resolution: UpdateTransportResolution,
+    ) -> Result<bool>;
 }
 
 #[async_trait]
@@ -314,6 +342,8 @@ pub struct WorkflowService {
     namespaces: Arc<dyn NamespaceCache>,
     interceptors: Arc<EdgeInterceptors>,
     poller_registry: PollerRegistry,
+    pending_queries: PendingQueryStore,
+    broker: InMemoryBroker,
     long_polls: LongPollGate,
     router: Arc<dyn EdgeRouter>,
     history_waiters: HistoryWaitRegistry,
@@ -335,6 +365,8 @@ impl WorkflowService {
         namespaces: Arc<dyn NamespaceCache>,
         interceptors: Arc<EdgeInterceptors>,
         poller_registry: PollerRegistry,
+        pending_queries: PendingQueryStore,
+        broker: InMemoryBroker,
         long_polls: LongPollGate,
         router: Arc<dyn EdgeRouter>,
     ) -> Self {
@@ -347,6 +379,8 @@ impl WorkflowService {
             namespaces,
             interceptors,
             poller_registry,
+            pending_queries,
+            broker,
             long_polls,
             router,
             HistoryWaitRegistry::default(),
@@ -362,6 +396,8 @@ impl WorkflowService {
         namespaces: Arc<dyn NamespaceCache>,
         interceptors: Arc<EdgeInterceptors>,
         poller_registry: PollerRegistry,
+        pending_queries: PendingQueryStore,
+        broker: InMemoryBroker,
         long_polls: LongPollGate,
         router: Arc<dyn EdgeRouter>,
         history_waiters: HistoryWaitRegistry,
@@ -375,6 +411,8 @@ impl WorkflowService {
             namespaces,
             interceptors,
             poller_registry,
+            pending_queries,
+            broker,
             long_polls,
             router,
             history_waiters,
@@ -524,26 +562,119 @@ impl WorkflowService {
             ),
             WorkerIdentity(req.worker_identity.clone()),
         );
+        let broker_queue = queue_key_for_poll(
+            &req.namespace,
+            &req.task_queue,
+            TaskKind::Workflow,
+            req.deployment.clone(),
+            req.build_id.clone(),
+        );
         let internal = to_internal::poll_request(req);
-        let started = self
+        let polled = self
             .runtime
-            .poll_workflow_task(
+            .poll_workflow_or_query_task(
                 internal.queue,
-                internal.worker_identity,
+                internal.worker_identity.clone(),
                 internal.timeout,
             )
             .await
             .map_err(EdgeError::from)?;
 
-        match started {
-            Some(started) => Ok(Some(
-                from_internal::poll_response(
-                    started,
+        match polled {
+            Some(polled) => {
+                let (started, first_query) = match polled {
+                    PolledWorkflowTaskTransport::Workflow(started) => (started, None),
+                    PolledWorkflowTaskTransport::QueryOnly { started, first_query } => {
+                        (started, Some(first_query))
+                    }
+                };
+                let mut response = from_internal::poll_response(
+                    started.clone(),
                     self.repo.as_ref(),
                 )
                 .await
-                .map_err(EdgeError::from)?,
-            )),
+                .map_err(EdgeError::from)?;
+
+                if started.query_only {
+                    response.started_event_id = 0;
+                }
+
+                let task_token = response.task_token.clone();
+                if let Some(query) = first_query {
+                    let query_id = Uuid::new_v4().to_string();
+                    self.pending_queries
+                        .insert(&task_token, query_id.clone(), query.response_tx)
+                        .await;
+                    response.queries.insert(
+                        query_id,
+                        WorkflowQueryDto {
+                            query_type: query.query_type,
+                            query_args: query.query_args,
+                        },
+                    );
+                }
+
+        while let Some(query) = self
+                    .broker
+                    .poll_query_task(
+                        &broker_queue,
+                        &internal.worker_identity,
+                        Duration::from_millis(0),
+                    )
+                    .await
+                {
+                    let query_id = Uuid::new_v4().to_string();
+                    self.pending_queries
+                        .insert(&task_token, query_id.clone(), query.response_tx)
+                        .await;
+                    response.queries.insert(
+                        query_id,
+                        WorkflowQueryDto {
+                            query_type: query.query_type,
+                            query_args: query.query_args,
+                        },
+                    );
+                }
+
+                for update in self
+                    .runtime
+                    .pending_update_transports(started.run_key)
+                    .await
+                    .map_err(EdgeError::from)?
+                {
+                    let request = tokeira_proto::public::temporal::api::update::v1::Request {
+                        meta: Some(
+                            tokeira_proto::public::temporal::api::update::v1::Meta {
+                                update_id: update.update_id.clone(),
+                                identity: update.identity,
+                            },
+                        ),
+                        input: Some(
+                            tokeira_proto::public::temporal::api::update::v1::Input {
+                                header: None,
+                                name: update.update_name,
+                                args: Some(
+                                    tokeira_proto::conversions::common::payloads_from_domain(
+                                        &update.input,
+                                    ),
+                                ),
+                            },
+                        ),
+                    };
+                    let body = prost_types::Any {
+                        type_url: "type.googleapis.com/temporal.api.update.v1.Request".to_string(),
+                        value: request.encode_to_vec(),
+                    };
+                    response.messages.push(ProtocolMessageDto {
+                        id: format!("{}/request", update.update_id),
+                        protocol_instance_id: update.update_id,
+                        body: body.encode_to_vec(),
+                        sequencing_event_id: None,
+                    });
+                }
+
+                Ok(Some(response))
+            }
             None => Ok(None),
         }
     }
@@ -558,6 +689,108 @@ impl WorkflowService {
             .begin(headers, None, Action::RespondWorkflowTaskCompleted, false)
             .await?;
 
+        let query_only = {
+            let token: tokeira_types::WorkflowTaskToken =
+                serde_json::from_slice(&req.task_token).map_err(EdgeError::from)?;
+            token.logical_seq.0 == 0
+        };
+
+        for (query_id, result) in &req.query_results {
+            if let Some(sender) = self.pending_queries.take(&req.task_token, query_id).await {
+                let _ = sender.send(match result {
+                    QueryResultDto::Answered { result } => QueryResult::Completed {
+                        result: result.clone(),
+                    },
+                    QueryResultDto::Failed { error_message } => QueryResult::Failed {
+                        message: error_message.clone(),
+                    },
+                });
+            }
+        }
+
+        let task_token: tokeira_types::WorkflowTaskToken =
+            serde_json::from_slice(&req.task_token).map_err(EdgeError::from)?;
+
+        for message in &req.messages {
+            let Ok(any) = prost_types::Any::decode(message.body.as_slice()) else {
+                continue;
+            };
+            match any.type_url.as_str() {
+                "type.googleapis.com/temporal.api.update.v1.Acceptance" => {
+                    let _ = self
+                        .runtime
+                        .resolve_update_transport(
+                            task_token.run_key,
+                            message.protocol_instance_id.clone(),
+                            UpdateTransportResolution::Accepted,
+                        )
+                        .await
+                        .map_err(EdgeError::from)?;
+                }
+                "type.googleapis.com/temporal.api.update.v1.Response" => {
+                    let Ok(response) = tokeira_proto::public::temporal::api::update::v1::Response::decode(any.value.as_slice()) else {
+                        continue;
+                    };
+                    let resolution = match response.outcome.and_then(|outcome| outcome.value) {
+                        Some(
+                            tokeira_proto::public::temporal::api::update::v1::outcome::Value::Success(
+                                payloads,
+                            ),
+                        ) => UpdateTransportResolution::Completed {
+                            result: tokeira_proto::conversions::common::payloads_to_domain(&payloads),
+                        },
+                        Some(
+                            tokeira_proto::public::temporal::api::update::v1::outcome::Value::Failure(
+                                failure,
+                            ),
+                        ) => UpdateTransportResolution::Rejected {
+                            failure: failure.message,
+                        },
+                        None => continue,
+                    };
+                    let _ = self
+                        .runtime
+                        .resolve_update_transport(
+                            task_token.run_key,
+                            message.protocol_instance_id.clone(),
+                            resolution,
+                        )
+                        .await
+                        .map_err(EdgeError::from)?;
+                }
+                "type.googleapis.com/temporal.api.update.v1.Rejection" => {
+                    let Ok(rejection) = tokeira_proto::public::temporal::api::update::v1::Rejection::decode(any.value.as_slice()) else {
+                        continue;
+                    };
+                    let _ = self
+                        .runtime
+                        .resolve_update_transport(
+                            task_token.run_key,
+                            message.protocol_instance_id.clone(),
+                            UpdateTransportResolution::Rejected {
+                                failure: rejection
+                                    .failure
+                                    .map(|failure| failure.message)
+                                    .unwrap_or_else(|| "update rejected".to_string()),
+                            },
+                        )
+                        .await
+                        .map_err(EdgeError::from)?;
+                }
+                _ => {}
+            }
+        }
+
+        if query_only && req.commands.is_empty() {
+            return Ok(RespondWorkflowTaskCompletedResponse {
+                transition_seq: 0,
+                last_event_id: 0,
+                execution_status: ExecutionStatus::Running,
+                new_run_id: None,
+                was_duplicate: false,
+            });
+        }
+
         let internal = to_internal::workflow_task_completed_request(req)
             .map_err(EdgeError::from)?;
         let run_key = internal.token.run_key;
@@ -570,6 +803,34 @@ impl WorkflowService {
             .await;
 
         Ok(from_internal::completed_response(outcome))
+    }
+
+    pub async fn respond_query_task_completed(
+        &self,
+        headers: &HeaderMap,
+        task_token: Vec<u8>,
+        result: QueryResult,
+    ) -> EdgeResult<()> {
+        let _ctx = self
+            .interceptors
+            .begin(headers, None, Action::RespondQueryTaskCompleted, false)
+            .await?;
+
+        if let Some(sender) = self.pending_queries.take(&task_token, LEGACY_QUERY_ID).await {
+            let _ = sender.send(result);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn insert_legacy_query_waiter(
+        &self,
+        task_token: Vec<u8>,
+        tx: tokio::sync::oneshot::Sender<QueryResult>,
+    ) {
+        self.pending_queries
+            .insert(&task_token, LEGACY_QUERY_ID.to_string(), tx)
+            .await;
     }
 
     pub async fn describe_workflow_execution(
@@ -1395,6 +1656,99 @@ impl WorkflowService {
             .await;
 
         Ok(from_internal::update_response(outcome))
+    }
+
+    pub async fn poll_workflow_execution_update(
+        &self,
+        headers: &HeaderMap,
+        namespace: String,
+        workflow_id: String,
+        _run_id_str: String,
+        update_id: String,
+    ) -> EdgeResult<Option<(tokeira_runtime::UpdateOutcome, RunKey)>> {
+        let _ctx = self
+            .interceptors
+            .begin(
+                headers,
+                Some(&namespace),
+                Action::UpdateWorkflowExecution,
+                false,
+            )
+            .await?;
+
+        ensure_local(
+            self.router
+                .route_workflow(&namespace, &workflow_id)
+                .await?,
+        )?;
+
+        let run_key = self
+            .resolve_run_key(&namespace, &workflow_id)
+            .await?;
+
+        let timeout = Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        // Check history for a completed/rejected update event matching update_id.
+        // If not found, wait for new history events and re-check until timeout.
+        loop {
+            let history = self
+                .repo
+                .read_history(run_key, 0, usize::MAX)
+                .await
+                .map_err(EdgeError::from)?;
+
+            let current_last_event_id = history
+                .last()
+                .map(|e| e.event_id)
+                .unwrap_or(0);
+
+            for event in &history {
+                match &event.kind {
+                    HistoryEventKind::WorkflowExecutionUpdateCompleted {
+                        update_id: uid,
+                        result,
+                    } if uid == &update_id => {
+                        return Ok(Some((
+                            UpdateOutcome::Completed {
+                                accepted_event_id: 0,
+                                result: result.clone(),
+                            },
+                            run_key,
+                        )));
+                    }
+                    HistoryEventKind::WorkflowExecutionUpdateRejected {
+                        update_id: uid,
+                        failure,
+                    } if uid == &update_id => {
+                        return Ok(Some((
+                            UpdateOutcome::Rejected {
+                                accepted_event_id: 0,
+                                failure: failure.clone(),
+                            },
+                            run_key,
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+
+            let mut rx = self
+                .history_waiters
+                .receiver(run_key, current_last_event_id)
+                .await;
+
+            // Wait for a history change or timeout.
+            let wait_result = tokio::time::timeout(remaining, rx.changed()).await;
+            if wait_result.is_err() {
+                return Ok(None);
+            }
+        }
     }
 
     // ── History ──

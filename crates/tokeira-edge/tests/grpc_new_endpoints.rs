@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tokeira_edge::{
     EdgeInterceptors, EmptyVisibilityApi,
     InMemoryNamespaceCache, InMemoryOperatorApi, LocalOnlyRouter,
-    LongPollConfig, LongPollGate, PollerRegistry,
+    LongPollConfig, LongPollGate, PendingQueryStore, PollerRegistry,
     NamespaceCache, ResolvedNamespace, WorkflowExecutionDescription,
     WorkflowService,
     grpc::workflow_service::WorkflowServiceGrpc,
@@ -143,6 +143,7 @@ async fn build_grpc_with_namespaces(
         Arc::new(EdgeInterceptors::permissive(namespaces.clone()));
     let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
     let router = Arc::new(LocalOnlyRouter);
+    let workflow_broker = runtime.broker();
     let runtime_adapter =
         Arc::new(RuntimeAdapter::new(runtime));
     let resolver = Arc::new(StoreExecutionResolver::new(
@@ -162,6 +163,8 @@ async fn build_grpc_with_namespaces(
         namespaces,
         interceptors,
         PollerRegistry::default(),
+        PendingQueryStore::default(),
+        workflow_broker,
         long_polls,
         router,
     );

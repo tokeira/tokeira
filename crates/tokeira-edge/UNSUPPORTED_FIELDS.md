@@ -26,9 +26,7 @@ does not support or cannot yet populate, along with rationale.
 | `sticky_attributes` | Not supported | Sticky task queues partially implemented |
 | `return_new_workflow_task` | Not supported | Inline WFT return not implemented |
 | `binary_checksum` | Deprecated | Superseded by worker versioning |
-| `query_results` | Not supported | Legacy query protocol not implemented |
 | `worker_version_stamp` | Deprecated | Superseded by deployment-based versioning |
-| `messages` | Not supported | Update protocol messages carried via ProtocolMessage command |
 | `sdk_metadata` | Not supported | SDK metadata not threaded |
 | `metering_metadata` | Not supported | Metering not implemented |
 | `deployment` | Not supported | Deployment-based versioning not implemented |
@@ -52,8 +50,6 @@ does not support or cannot yet populate, along with rationale.
 | `previous_started_event_id` | Not populated | Requires tracking across WFT cycles |
 | `scheduled_time` | Not populated | Requires WFT scheduled event timestamp |
 | `started_time` | Not populated | Requires WFT started event timestamp |
-| `messages` | Not populated | Update protocol messages not threaded |
-| `queries` | Not populated | Legacy query protocol not implemented |
 
 ## PollActivityTaskQueueResponse
 

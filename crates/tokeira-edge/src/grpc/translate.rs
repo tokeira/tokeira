@@ -39,7 +39,8 @@ use crate::translate::{
     DescribeWorkflowExecutionRequest, ListNamespacesResponse as EdgeListNamespacesResponse,
     ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse,
     NamespaceDescription, PollWorkflowTaskQueueRequest,
-    PollWorkflowTaskQueueResponse, RespondWorkflowTaskCompletedRequest,
+    PollWorkflowTaskQueueResponse, ProtocolMessageDto, QueryResultDto,
+    RespondWorkflowTaskCompletedRequest,
     ResetWorkflowExecutionRequest as EdgeResetWorkflowExecutionRequest,
     ResetWorkflowExecutionResponse as EdgeResetWorkflowExecutionResponse,
     RegisterNamespaceRequest as EdgeRegisterNamespaceRequest,
@@ -292,6 +293,48 @@ pub fn respond_completed_request_to_edge(
             .map(proto_command_to_workflow_command)
             .collect::<Result<Vec<_>, _>>()?,
         force_new_workflow_task: false,
+        query_results: req
+            .query_results
+            .into_iter()
+            .map(|(id, result)| {
+                let dto = match enums::QueryResultType::try_from(result.result_type).unwrap_or(
+                    enums::QueryResultType::Failed,
+                ) {
+                    enums::QueryResultType::Answered => QueryResultDto::Answered {
+                        result: result.answer.as_ref().map(payloads_to_domain).unwrap_or_default(),
+                    },
+                    enums::QueryResultType::Failed
+                    | enums::QueryResultType::Unspecified => QueryResultDto::Failed {
+                        error_message: result.error_message,
+                    },
+                };
+                Ok((id, dto))
+            })
+            .collect::<Result<_, ProtoConversionError>>()?,
+        messages: req
+            .messages
+            .into_iter()
+            .map(|message| {
+                let body = message
+                    .body
+                    .map(|body| body.encode_to_vec())
+                    .unwrap_or_default();
+                Ok(ProtocolMessageDto {
+                    id: message.id,
+                    protocol_instance_id: message.protocol_instance_id,
+                    body,
+                    sequencing_event_id: match message.sequencing_id {
+                        Some(
+                            tokeira_proto::public::temporal::api::protocol::v1::message::SequencingId::EventId(event_id),
+                        ) => Some(event_id),
+                        Some(
+                            tokeira_proto::public::temporal::api::protocol::v1::message::SequencingId::CommandIndex(command_index),
+                        ) => Some(command_index),
+                        None => None,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, ProtoConversionError>>()?,
     })
 }
 
@@ -399,6 +442,35 @@ pub fn poll_response_to_proto(
                 &tokeira_types::TaskQueueName(resp.payload.task_queue),
             ),
         ),
+        queries: resp
+            .queries
+            .into_iter()
+            .map(|(id, query)| {
+                (
+                    id,
+                    tokeira_proto::public::temporal::api::query::v1::WorkflowQuery {
+                        query_type: query.query_type,
+                        query_args: Some(payloads_from_domain(&query.query_args)),
+                        header: None,
+                    },
+                )
+            })
+            .collect(),
+        messages: resp
+            .messages
+            .into_iter()
+            .map(|message| {
+                Ok(tokeira_proto::public::temporal::api::protocol::v1::Message {
+                    id: message.id,
+                    protocol_instance_id: message.protocol_instance_id,
+                    body: prost_types::Any::decode(message.body.as_slice()).ok(),
+                    sequencing_id: message.sequencing_event_id.map(
+                        tokeira_proto::public::temporal::api::protocol::v1::message::SequencingId::EventId,
+                    ),
+                })
+            })
+            .collect::<Result<Vec<_>, ProtoConversionError>>()
+            .unwrap_or_default(),
         ..Default::default()
     }
 }

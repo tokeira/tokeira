@@ -29,7 +29,7 @@ use crate::{
         run_activity_timeout_scanner,
     },
     backlog::{BacklogConfig, run_drain_loop, run_grace_scanner},
-    broker::{InMemoryActivityBroker, InMemoryBroker},
+    broker::{InMemoryActivityBroker, InMemoryBroker, PolledWorkflowOrQueryTask},
     fairness::{DeliveryMetrics, FairnessState, run_control_loop},
     lane::{LaneConfig, LaneHandle, spawn_lane},
     nexus::{
@@ -46,7 +46,10 @@ use crate::{
         WorkflowTimeoutEntry, WorkflowTimeoutScannerConfig, WorkflowTimeoutTrackingState,
         run_workflow_timeout_scanner,
     },
-    update::{UpdateOutcome, UpdateRegistry, UpdateResolution, UpdateWaitPolicy},
+    update::{
+        PendingUpdateTransport, UpdateOutcome, UpdateRegistry, UpdateResolution,
+        UpdateTransportResolution, UpdateWaitPolicy,
+    },
     worker_registry::{
         WorkerRegistrationKey, WorkerRegistry, WorkerVersionMetadata,
     },
@@ -427,6 +430,43 @@ where
         self.update_registry.clone()
     }
 
+    pub fn pending_update_transports(
+        &self,
+        run_key: RunKey,
+    ) -> Vec<PendingUpdateTransport> {
+        self.update_registry
+            .drain_pending_updates(run_key)
+            .into_iter()
+            .map(|(update_id, update_name, input, identity)| PendingUpdateTransport {
+                update_id,
+                update_name,
+                input,
+                identity,
+            })
+            .collect()
+    }
+
+    pub fn resolve_update_transport(
+        &self,
+        run_key: RunKey,
+        update_id: &str,
+        resolution: UpdateTransportResolution,
+    ) -> bool {
+        match resolution {
+            UpdateTransportResolution::Accepted => true,
+            UpdateTransportResolution::Completed { result } => self.update_registry.notify(
+                run_key,
+                update_id,
+                UpdateResolution::Completed { result },
+            ),
+            UpdateTransportResolution::Rejected { failure } => self.update_registry.notify(
+                run_key,
+                update_id,
+                UpdateResolution::Rejected { failure },
+            ),
+        }
+    }
+
     pub fn owner_identity(&self) -> &str {
         &self.owner_identity
     }
@@ -511,7 +551,14 @@ where
         if wait_policy == UpdateWaitPolicy::Completed {
             let (complete_tx, rx) = oneshot::channel::<UpdateResolution>();
             self.update_registry
-                .register(run_key, update_id.clone(), complete_tx);
+                .register(
+                    run_key,
+                    update_id.clone(),
+                    update_name.clone(),
+                    input.clone(),
+                    request.caller_identity.clone().unwrap_or_default(),
+                    complete_tx,
+                );
             complete_rx = Some(rx);
         }
 
@@ -964,6 +1011,48 @@ where
         Ok(Some(started))
     }
 
+    /// Long-poll for either a real workflow task or a synthetic query-only task.
+    pub async fn poll_workflow_or_query_task(
+        &self,
+        queue: QueueKey,
+        worker_identity: WorkerIdentity,
+        timeout_after: tokio::time::Duration,
+    ) -> Result<Option<PolledWorkflowTaskTransport>> {
+        let offered = match self
+            .broker
+            .poll_workflow_or_query_task(&queue, &worker_identity, timeout_after)
+            .await?
+        {
+            Some(offered) => {
+                self.delivery_metrics.record_poll_success(&queue);
+                offered
+            }
+            None => {
+                self.delivery_metrics.record_poll_timeout(&queue);
+                return Ok(None);
+            }
+        };
+
+        match offered {
+            PolledWorkflowOrQueryTask::Workflow(offered) => {
+                let started = self
+                    .start_polled_workflow_task(offered.0, offered.1, worker_identity)
+                    .await?;
+                Ok(Some(PolledWorkflowTaskTransport::Workflow(started)))
+            }
+            PolledWorkflowOrQueryTask::Query(query) => {
+                let task_queue = query.queue.task_queue.clone();
+                let started = self
+                    .start_query_only_workflow_task(query.run_key, task_queue)
+                    .await?;
+                Ok(Some(PolledWorkflowTaskTransport::QueryOnly {
+                    started,
+                    first_query: query,
+                }))
+            }
+        }
+    }
+
     /// Record the completion of a workflow task and
     /// apply any resulting commands.
     pub async fn complete_workflow_task(
@@ -1139,6 +1228,34 @@ where
             workflow_id: new_state.workflow_id,
             task_queue: new_state.task_queue,
             token,
+            query_only: false,
+        })
+    }
+
+    async fn start_query_only_workflow_task(
+        &self,
+        run_key: RunKey,
+        task_queue: TaskQueueName,
+    ) -> Result<StartedWorkflowTask> {
+        let state = match self.repo.load_run(run_key).await? {
+            LoadedRun::Existing(state) => state,
+            LoadedRun::Absent => {
+                return Err(anyhow!("query target run missing"));
+            }
+        };
+        let token = WorkflowTaskToken {
+            run_key,
+            logical_seq: tokeira_types::LogicalTaskSeq(0),
+            started_event_id: 0,
+            attempt: 1,
+            shard_epoch: self.current_shard_epoch(run_key).await?,
+        };
+        Ok(StartedWorkflowTask {
+            run_key,
+            workflow_id: state.workflow_id,
+            task_queue,
+            token,
+            query_only: true,
         })
     }
 
@@ -1676,6 +1793,17 @@ pub struct StartedWorkflowTask {
     pub task_queue: TaskQueueName,
     /// Opaque token used to complete the task.
     pub token: WorkflowTaskToken,
+    /// True when this poll exists only to carry queries, not a real WFT.
+    pub query_only: bool,
+}
+
+#[derive(Debug)]
+pub enum PolledWorkflowTaskTransport {
+    Workflow(StartedWorkflowTask),
+    QueryOnly {
+        started: StartedWorkflowTask,
+        first_query: QueryTask,
+    },
 }
 
 /// An activity task that has been polled and started.

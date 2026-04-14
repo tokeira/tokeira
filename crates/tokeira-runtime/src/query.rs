@@ -2,6 +2,7 @@ use tokio::sync::oneshot;
 use tokeira_types::{Payloads, QueueKey, RunKey, WorkerIdentity};
 
 /// A transient read-only query task delivered to a worker.
+#[derive(Debug)]
 pub struct QueryTask {
     /// Durable storage key for the target run.
     pub run_key: RunKey,

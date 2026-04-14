@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::HashMap;
 use tokeira_kernel::StartRequest;
 use tokeira_runtime::StartedWorkflowTask;
 use tokeira_storage::RunRepository;
@@ -53,6 +54,8 @@ pub async fn poll_response(
             task_queue: started.task_queue.0,
             history,
         },
+        queries: HashMap::new(),
+        messages: Vec::new(),
     })
 }
 

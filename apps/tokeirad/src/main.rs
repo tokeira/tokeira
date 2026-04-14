@@ -12,8 +12,8 @@ use tokeira_edge::{
     EdgeInterceptors, InMemoryNamespaceCache,
     HistoryNotifyingRepository, HistoryWaitRegistry,
     InMemoryOperatorApi, LocalOnlyRouter, LongPollConfig,
-    LongPollGate, OperatorService, PollerRegistry, ResolvedNamespace,
-    WorkflowExecutionDescription, WorkflowService, NamespaceCache,
+    LongPollGate, OperatorService, PendingQueryStore, PollerRegistry,
+    ResolvedNamespace, WorkflowExecutionDescription, WorkflowService, NamespaceCache,
     grpc::{
         operator_service::OperatorServiceGrpc,
         runtime_adapter::RuntimeAdapter,
@@ -64,6 +64,7 @@ async fn main() -> Result<()> {
 
     let interceptors = Arc::new(EdgeInterceptors::permissive(namespaces.clone()));
     let router = Arc::new(LocalOnlyRouter);
+    let workflow_broker = runtime.broker();
     let runtime_adapter = Arc::new(RuntimeAdapter::new(runtime));
     let resolver = Arc::new(StoreExecutionResolver::new(
         repo.clone(),
@@ -108,6 +109,8 @@ async fn main() -> Result<()> {
         namespaces,
         interceptors.clone(),
         PollerRegistry::default(),
+        PendingQueryStore::default(),
+        workflow_broker,
         long_polls,
         router,
         history_waits,

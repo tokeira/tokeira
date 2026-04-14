@@ -74,6 +74,12 @@ pub(crate) struct TimestampedActivityTask {
     pub(crate) scheduled_at: OffsetDateTime,
 }
 
+#[derive(Debug)]
+pub enum PolledWorkflowOrQueryTask {
+    Workflow((DispatchableWorkflowTask, Instant)),
+    Query(QueryTask),
+}
+
 impl InMemoryBroker {
     /// Publish a query task without deduplication or backlog participation.
     pub async fn publish_query_task(&self, task: QueryTask) {
@@ -187,6 +193,50 @@ impl InMemoryBroker {
         }
 
         self.try_take(queue, worker).await
+    }
+
+    /// Long-poll for either a real workflow task or a query-only task.
+    ///
+    /// Workflow tasks are preferred when both are available so query transport
+    /// does not starve real workflow progress.
+    pub async fn poll_workflow_or_query_task(
+        &self,
+        queue: &QueueKey,
+        worker: &WorkerIdentity,
+        wait_for: Duration,
+    ) -> Result<Option<PolledWorkflowOrQueryTask>> {
+        if let Some(task) = self.try_take(queue, worker).await? {
+            return Ok(Some(PolledWorkflowOrQueryTask::Workflow(task)));
+        }
+        if let Some(task) = self.try_take_query(queue, worker).await {
+            return Ok(Some(PolledWorkflowOrQueryTask::Query(task)));
+        }
+
+        self.increment_waiter(queue).await;
+        self.increment_query_waiter(queue).await;
+
+        let notified = timeout(wait_for, async {
+            tokio::select! {
+                _ = self.wake.notified() => {}
+                _ = self.query_wake.notified() => {}
+            }
+        })
+        .await;
+
+        self.decrement_waiter(queue).await;
+        self.decrement_query_waiter(queue).await;
+
+        if notified.is_err() {
+            return Ok(None);
+        }
+
+        if let Some(task) = self.try_take(queue, worker).await? {
+            return Ok(Some(PolledWorkflowOrQueryTask::Workflow(task)));
+        }
+        Ok(self
+            .try_take_query(queue, worker)
+            .await
+            .map(PolledWorkflowOrQueryTask::Query))
     }
 
     pub async fn queues_with_waiters(&self) -> HashSet<QueueKey> {

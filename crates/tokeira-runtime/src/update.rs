@@ -30,6 +30,21 @@ pub enum UpdateWaitPolicy {
     Completed,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingUpdateTransport {
+    pub update_id: String,
+    pub update_name: String,
+    pub input: Payloads,
+    pub identity: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum UpdateTransportResolution {
+    Accepted,
+    Completed { result: Payloads },
+    Rejected { failure: String },
+}
+
 #[derive(Debug)]
 pub(crate) enum UpdateResolution {
     Completed { result: Payloads },
@@ -39,6 +54,9 @@ pub(crate) enum UpdateResolution {
 
 #[derive(Debug)]
 pub(crate) struct UpdateRegistryEntry {
+    pub update_name: String,
+    pub input: Payloads,
+    pub identity: String,
     pub complete_tx: oneshot::Sender<UpdateResolution>,
 }
 
@@ -57,12 +75,40 @@ impl UpdateRegistry {
         &self,
         run_key: RunKey,
         update_id: String,
+        update_name: String,
+        input: Payloads,
+        identity: String,
         complete_tx: oneshot::Sender<UpdateResolution>,
     ) {
         self.inner.lock().unwrap().insert(
             (run_key, update_id),
-            UpdateRegistryEntry { complete_tx },
+            UpdateRegistryEntry {
+                update_name,
+                input,
+                identity,
+                complete_tx,
+            },
         );
+    }
+
+    pub(crate) fn drain_pending_updates(
+        &self,
+        run_key: RunKey,
+    ) -> Vec<(String, String, Payloads, String)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((entry_run_key, _), _)| *entry_run_key == run_key)
+            .map(|((_entry_run_key, update_id), entry)| {
+                (
+                    update_id.clone(),
+                    entry.update_name.clone(),
+                    entry.input.clone(),
+                    entry.identity.clone(),
+                )
+            })
+            .collect()
     }
 
     pub(crate) fn notify(
@@ -163,7 +209,14 @@ mod tests {
         let run_key = RunKey::new();
         let (tx, rx) = oneshot::channel();
 
-        registry.register(run_key, "update-1".into(), tx);
+        registry.register(
+            run_key,
+            "update-1".into(),
+            "name".into(),
+            Payloads::default(),
+            "worker".into(),
+            tx,
+        );
         assert!(registry.contains(run_key, "update-1"));
 
         assert!(registry.notify(
@@ -187,8 +240,22 @@ mod tests {
         let (tx1, rx1) = oneshot::channel();
         let (tx2, rx2) = oneshot::channel();
 
-        registry.register(run_key, "update-1".into(), tx1);
-        registry.register(run_key, "update-2".into(), tx2);
+        registry.register(
+            run_key,
+            "update-1".into(),
+            "name-1".into(),
+            Payloads::default(),
+            "worker".into(),
+            tx1,
+        );
+        registry.register(
+            run_key,
+            "update-2".into(),
+            "name-2".into(),
+            Payloads::default(),
+            "worker".into(),
+            tx2,
+        );
 
         assert_eq!(registry.drain_for_run(run_key), 2);
         assert!(!registry.contains(run_key, "update-1"));
@@ -499,6 +566,9 @@ mod tests {
                     registry.register(
                         run_key,
                         uid.clone(),
+                        format!("name-{i}"),
+                        Payloads::default(),
+                        format!("worker-{i}"),
                         tx,
                     );
                     receivers.push((uid, rx));
@@ -705,6 +775,9 @@ mod tests {
                     registry.register(
                         run_key,
                         uid.clone(),
+                        format!("name-{i}"),
+                        Payloads::default(),
+                        format!("worker-{i}"),
                         tx,
                     );
                     receivers.push((uid, rx));
@@ -771,6 +844,9 @@ mod tests {
                     registry.register(
                         run_key,
                         uid.clone(),
+                        format!("name-{i}"),
+                        Payloads::default(),
+                        format!("worker-{i}"),
                         tx,
                     );
                     receivers.push((uid, rx));
@@ -823,6 +899,9 @@ mod tests {
             registry.register(
                 run_key,
                 uid.into(),
+                "name".into(),
+                Payloads::default(),
+                "worker".into(),
                 tx,
             );
 

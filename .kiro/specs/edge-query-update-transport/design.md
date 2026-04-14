@@ -95,26 +95,26 @@ sequenceDiagram
 A per-poll-response store that retains query oneshot senders keyed by query ID.
 
 ```rust
-/// Retained query channels for a single WFT poll response.
+/// Retained query channels keyed by task token, then by query ID.
 pub struct PendingQueryStore {
-    inner: Arc<Mutex<HashMap<String, oneshot::Sender<QueryResult>>>>,
+    inner: Arc<Mutex<HashMap<Vec<u8>, HashMap<String, oneshot::Sender<QueryResult>>>>>,
 }
 
 impl PendingQueryStore {
     pub fn new() -> Self { ... }
 
-    /// Store a query's response channel, returning the query ID.
-    pub fn insert(&self, query_id: String, tx: oneshot::Sender<QueryResult>) { ... }
+    /// Store a query's response channel under a task token and query ID.
+    pub fn insert(&self, token: &[u8], query_id: String, tx: oneshot::Sender<QueryResult>) { ... }
 
-    /// Remove and return the sender for a query ID.
-    pub fn take(&self, query_id: &str) -> Option<oneshot::Sender<QueryResult>> { ... }
+    /// Remove and return the sender for a query ID under a task token.
+    pub fn take(&self, token: &[u8], query_id: &str) -> Option<oneshot::Sender<QueryResult>> { ... }
 
-    /// Drain all remaining senders (for cleanup on timeout).
-    pub fn drain(&self) -> Vec<(String, oneshot::Sender<QueryResult>)> { ... }
+    /// Drain all remaining senders for a task token (for cleanup on timeout).
+    pub fn drain(&self, token: &[u8]) -> Vec<(String, oneshot::Sender<QueryResult>)> { ... }
 }
 ```
 
-The store is held by the `WorkflowService` and keyed by task token so that `RespondWorkflowTaskCompleted` can look up the correct store.
+The store is held by the `WorkflowService`. The outer key is the serialized task token bytes so that both `RespondWorkflowTaskCompleted` (which carries the task token) and `RespondQueryTaskCompleted` (which also carries the task token) can look up the correct query channels. For legacy queries, the inner key is the well-known string `"__legacy__"`.
 
 ### 2. Edge DTO Extensions
 
@@ -301,9 +301,13 @@ fn extract_update_resolution(msg: &ProtocolMessageDto) -> Option<(String, Update
 
     match any.type_url.as_str() {
         url if url.ends_with("update.v1.Acceptance") => {
-            // Acceptance — notify registry (acceptance is informational,
-            // the runtime handles wait_policy logic)
-            None // or Some depending on wait_policy handling
+            // Acceptance is informational only — the runtime produces
+            // UpdateOutcome::Accepted directly from the kernel commit
+            // (runtime.rs line ~494), not from a worker message.
+            // The UpdateRegistry only stores completion waiters with
+            // Completed/Rejected/RunClosed resolutions.
+            // Do NOT route acceptance to the registry.
+            None
         }
         url if url.ends_with("update.v1.Rejection") => {
             let rejection = update::v1::Rejection::decode(&any.value[..])?;

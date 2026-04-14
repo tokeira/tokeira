@@ -70,7 +70,7 @@ This feature wires the existing runtime query and update dispatch through the ed
 
 #### Acceptance Criteria
 
-1. WHEN a Completion_Request contains `messages` with `update.v1.Acceptance` bodies, THE Edge_Layer SHALL notify the corresponding `UpdateRegistry` entry that the update was accepted.
+1. WHEN a Completion_Request contains `messages` with `update.v1.Acceptance` bodies, THE Edge_Layer SHALL silently acknowledge the acceptance without routing it to the `UpdateRegistry`. Acceptance is produced by the runtime directly from the kernel commit path (`UpdateOutcome::Accepted`), not from worker messages. The `UpdateRegistry` only stores completion waiters with `Completed`/`Rejected`/`RunClosed` resolutions.
 2. WHEN a Completion_Request contains `messages` with `update.v1.Rejection` bodies, THE Edge_Layer SHALL notify the corresponding `UpdateRegistry` entry with a `Rejected` resolution containing the failure message.
 3. WHEN a Completion_Request contains `messages` with `update.v1.Response` bodies, THE Edge_Layer SHALL notify the corresponding `UpdateRegistry` entry with a `Completed` resolution containing the result payloads, or a `Rejected` resolution if the outcome is a failure.
 4. WHEN a `messages` entry references an update ID that has no waiting caller in the `UpdateRegistry` (caller timed out), THE Edge_Layer SHALL silently discard the message without returning an error.

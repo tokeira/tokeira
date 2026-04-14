@@ -86,6 +86,21 @@ sequenceDiagram
 
 5. **Query-only WFTs set `started_event_id` to zero.** When a poll response carries only queries (no history advancement), `started_event_id` is set to 0 to signal a query-only task. The SDK uses this to skip history replay when only queries need evaluation.
 
+   **Synthetic query-only task token contract:** The synthetic task token reuses `WorkflowTaskToken` with these field values:
+   - `run_key`: the target workflow's `RunKey` (needed for `PendingQueryStore` lookup)
+   - `logical_seq`: `LogicalTaskSeq(0)` — sentinel value indicating a query-only task
+   - `started_event_id`: `0` — no history event was created
+   - `attempt`: `1`
+   - `shard_epoch`: `ShardEpoch::ZERO`
+
+   On the completion side, `respond_workflow_task_completed` must detect `logical_seq == 0` as a query-only completion. When detected:
+   - Skip command processing entirely (no kernel call, no state transition)
+   - Route `query_results` to the `PendingQueryStore` using the task token
+   - Route `messages` (update responses) normally
+   - Return an empty `RespondWorkflowTaskCompletedResponse`
+
+   This avoids introducing a separate token type while keeping the query-only path distinguishable from real WFT completions.
+
 6. **Legacy query support via `RespondQueryTaskCompleted`.** The `query` field (field 10) on the poll response carries a single legacy query. The `RespondQueryTaskCompleted` RPC does not carry a query ID — it uses the task token to identify the query. The `PendingQueryStore` stores at most one legacy query per task token under a well-known key (e.g. `"__legacy__"`). When a legacy query is delivered via field 10, the modern `queries` map (field 14) is left empty to avoid mixed legacy/modern ambiguity. Both legacy and modern paths coexist but are mutually exclusive per poll response.
 
 ## Components and Interfaces

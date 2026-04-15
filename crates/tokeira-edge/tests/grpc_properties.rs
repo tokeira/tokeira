@@ -3,9 +3,6 @@ use std::{collections::BTreeMap, time::Duration};
 use http::header::HeaderValue;
 use proptest::prelude::*;
 use time::OffsetDateTime;
-use tokeira_kernel::{
-    WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
-};
 use tokeira_edge::{
     errors::EdgeError,
     grpc::{
@@ -29,6 +26,7 @@ use tokeira_edge::{
     },
 };
 use tokeira_kernel::WorkflowCommand;
+use tokeira_kernel::{WorkflowIdConflictPolicy, WorkflowIdReusePolicy};
 use tokeira_proto::{
     conversions::common::{
         memo_from_domain, payloads_from_domain, search_attributes_from_domain,
@@ -203,7 +201,10 @@ proptest! {
             }
             WorkflowCommand::ProtocolMessage { .. } => {
                 let proto = workflow_command_to_proto(&cmd).unwrap();
-                prop_assert!(proto_command_to_workflow_command(proto).is_err());
+                // ProtocolMessage commands produce a placeholder that
+                // the edge layer resolves from the messages field.
+                let result = proto_command_to_workflow_command(proto);
+                prop_assert!(result.is_ok());
             }
             WorkflowCommand::UpdateCompleted { .. }
             | WorkflowCommand::UpdateRejected { .. }
@@ -481,12 +482,7 @@ fn arb_signal_request() -> impl Strategy<Value = SignalWorkflowExecutionRequest>
 }
 
 fn arb_poll_request() -> impl Strategy<Value = PollWorkflowTaskQueueRequest> {
-    (
-        arb_small_string(),
-        arb_small_string(),
-        arb_small_string(),
-    )
-        .prop_map(
+    (arb_small_string(), arb_small_string(), arb_small_string()).prop_map(
         |(namespace, task_queue, worker_identity)| PollWorkflowTaskQueueRequest {
             namespace,
             task_queue,
@@ -527,17 +523,13 @@ fn arb_list_request() -> impl Strategy<Value = ListWorkflowExecutionsRequest> {
 }
 
 fn arb_count_request() -> impl Strategy<Value = CountWorkflowExecutionsRequest> {
-    (
-        arb_small_string(),
-        prop::option::of(arb_small_string()),
+    (arb_small_string(), prop::option::of(arb_small_string())).prop_map(
+        |(namespace, query)| CountWorkflowExecutionsRequest {
+            namespace,
+            query,
+            group_by: None,
+        },
     )
-        .prop_map(
-            |(namespace, query)| CountWorkflowExecutionsRequest {
-                namespace,
-                query,
-                group_by: None,
-            },
-        )
 }
 
 fn arb_start_response() -> impl Strategy<Value = StartWorkflowExecutionResponse> {
@@ -764,9 +756,10 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
                 }
             }),
         arb_payloads().prop_map(|result| WorkflowCommand::CompleteWorkflow { result }),
-        arb_small_string().prop_map(
-            |message| WorkflowCommand::FailWorkflow { message, details: None }
-        ),
+        arb_small_string().prop_map(|message| WorkflowCommand::FailWorkflow {
+            message,
+            details: None
+        }),
         (
             arb_small_string(),
             arb_small_string(),
@@ -900,69 +893,52 @@ fn arb_edge_error() -> impl Strategy<Value = EdgeError> {
 
 use tokeira_edge::{
     grpc::translate::{
-        cancel_request_to_edge,
-        deserialize_activity_token,
-        poll_activity_request_to_edge,
-        poll_activity_response_to_proto,
+        cancel_request_to_edge, deserialize_activity_token,
+        poll_activity_request_to_edge, poll_activity_response_to_proto,
         query_request_to_edge, query_response_to_proto,
-        respond_activity_completed_to_edge,
-        serialize_activity_token,
-        terminate_request_to_edge,
-        update_request_to_edge, update_response_to_proto,
+        respond_activity_completed_to_edge, serialize_activity_token,
+        terminate_request_to_edge, update_request_to_edge, update_response_to_proto,
     },
     translate::{
-        PollActivityTaskQueueRequest,
-        PollActivityTaskQueueResponse,
+        PollActivityTaskQueueRequest, PollActivityTaskQueueResponse,
         QueryWorkflowRequest, QueryWorkflowResponse,
-        RequestCancelWorkflowExecutionRequest,
-        TerminateWorkflowExecutionRequest,
-        UpdateOutcomeDto, UpdateWaitPolicyDto,
-        UpdateWorkflowExecutionRequest,
+        RequestCancelWorkflowExecutionRequest, TerminateWorkflowExecutionRequest,
+        UpdateOutcomeDto, UpdateWaitPolicyDto, UpdateWorkflowExecutionRequest,
         UpdateWorkflowExecutionResponse,
     },
 };
-use tokeira_types::{
-    ActivityTaskToken, ShardEpoch,
-};
+use tokeira_types::{ActivityTaskToken, ShardEpoch};
 
-fn arb_activity_task_token(
-) -> impl Strategy<Value = ActivityTaskToken> {
+fn arb_activity_task_token() -> impl Strategy<Value = ActivityTaskToken> {
     (
         any::<u128>(),
         arb_small_string(),
         any::<i64>(),
         1u32..100u32,
     )
-        .prop_map(
-            |(run_key, activity_id, schedule_event_id, attempt)| {
-                ActivityTaskToken {
-                    run_key: RunKey(Uuid::from_u128(run_key)),
-                    activity_id,
-                    schedule_event_id,
-                    attempt,
-                    shard_epoch: ShardEpoch::ZERO,
-                }
-            },
-        )
+        .prop_map(|(run_key, activity_id, schedule_event_id, attempt)| {
+            ActivityTaskToken {
+                run_key: RunKey(Uuid::from_u128(run_key)),
+                activity_id,
+                schedule_event_id,
+                attempt,
+                shard_epoch: ShardEpoch::ZERO,
+            }
+        })
 }
 
-fn arb_poll_activity_request(
-) -> impl Strategy<Value = PollActivityTaskQueueRequest> {
-    (arb_small_string(), arb_small_string(), arb_small_string())
-        .prop_map(
-            |(namespace, task_queue, worker_identity)| {
-                PollActivityTaskQueueRequest {
-                    namespace,
-                    task_queue,
-                    worker_identity,
-                    timeout: Duration::from_secs(60),
-                }
-            },
-        )
+fn arb_poll_activity_request() -> impl Strategy<Value = PollActivityTaskQueueRequest> {
+    (arb_small_string(), arb_small_string(), arb_small_string()).prop_map(
+        |(namespace, task_queue, worker_identity)| PollActivityTaskQueueRequest {
+            namespace,
+            task_queue,
+            worker_identity,
+            timeout: Duration::from_secs(60),
+        },
+    )
 }
 
-fn arb_poll_activity_response(
-) -> impl Strategy<Value = PollActivityTaskQueueResponse> {
+fn arb_poll_activity_response() -> impl Strategy<Value = PollActivityTaskQueueResponse> {
     (
         arb_activity_task_token(),
         arb_small_string(),
@@ -972,16 +948,8 @@ fn arb_poll_activity_response(
         any::<u128>(),
     )
         .prop_map(
-            |(
-                token,
-                activity_id,
-                input,
-                attempt,
-                workflow_id,
-                run_key,
-            )| {
-                let token_bytes =
-                    serialize_activity_token(&token);
+            |(token, activity_id, input, attempt, workflow_id, run_key)| {
+                let token_bytes = serialize_activity_token(&token);
                 PollActivityTaskQueueResponse {
                     task_token: token_bytes,
                     activity_id,
@@ -991,9 +959,7 @@ fn arb_poll_activity_response(
                     workflow_id,
                     workflow_type: String::new(),
                     workflow_namespace: String::new(),
-                    run_key: RunKey(
-                        Uuid::from_u128(run_key),
-                    ),
+                    run_key: RunKey(Uuid::from_u128(run_key)),
                     header: None,
                     retry_policy: None,
                     schedule_to_close_timeout: None,
@@ -1191,7 +1157,7 @@ proptest! {
         } else {
             UpdateWaitPolicyDto::Accepted
         };
-        let stage = if use_completed { 2 } else { 1 };
+        let stage = if use_completed { 3 } else { 1 };
 
         let edge = UpdateWorkflowExecutionRequest {
             namespace: namespace.clone(),

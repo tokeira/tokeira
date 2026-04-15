@@ -10,8 +10,8 @@ use crate::{
     store::VisibilityStore,
     types::{
         AttrDescriptor, AttrId, CompiledFilter, CountResult, ExecutionRow, GroupByField,
-        ListResult, PageBounds, RollupDelta, RollupDimension, SearchAttrType,
-        SortOrder, search_attr_type_of,
+        ListResult, PageBounds, RollupDelta, RollupDimension, SearchAttrType, SortOrder,
+        search_attr_type_of,
     },
 };
 
@@ -77,7 +77,9 @@ where
         sort: SortOrder,
         page: &PageBounds,
     ) -> Result<ListResult> {
-        self.store.list_executions(namespace_id, filter, sort, page).await
+        self.store
+            .list_executions(namespace_id, filter, sort, page)
+            .await
     }
     async fn count_executions(
         &self,
@@ -85,7 +87,9 @@ where
         filter: &CompiledFilter,
         group_by: Option<GroupByField>,
     ) -> Result<CountResult> {
-        self.store.count_executions(namespace_id, filter, group_by).await
+        self.store
+            .count_executions(namespace_id, filter, group_by)
+            .await
     }
     async fn count_from_rollup(
         &self,
@@ -120,7 +124,9 @@ where
         name: String,
         attr_type: SearchAttrType,
     ) -> Result<AttrId> {
-        self.store.register_attr(namespace_id, name, attr_type).await
+        self.store
+            .register_attr(namespace_id, name, attr_type)
+            .await
     }
     async fn get_row(&self, run_key: tokeira_types::RunKey) -> Option<ExecutionRow> {
         self.store.get_row(run_key).await
@@ -133,22 +139,26 @@ where
     S: VisibilityStore,
 {
     async fn apply(&self, record: &ProjectionRecord) -> Result<()> {
-        let mut row = self.store.get_row(record.run_key).await.unwrap_or(ExecutionRow {
-            run_key: record.run_key,
-            namespace_id: record.context.namespace_id,
-            workflow_id: record.context.workflow_id.clone(),
-            run_id: record.context.run_id,
-            workflow_type: record.context.workflow_type.clone(),
-            task_queue: record.context.task_queue.clone(),
-            status: record.context.execution_status,
-            start_time: record.context.start_time,
-            execution_time: record.context.execution_time,
-            close_time: record.context.close_time,
-            history_length: record.context.history_length,
-            state_transition_count: record.context.state_transition_count,
-            memo: Memo::default(),
-            search_attr_version: 0,
-        });
+        let mut row = self
+            .store
+            .get_row(record.run_key)
+            .await
+            .unwrap_or(ExecutionRow {
+                run_key: record.run_key,
+                namespace_id: record.context.namespace_id,
+                workflow_id: record.context.workflow_id.clone(),
+                run_id: record.context.run_id,
+                workflow_type: record.context.workflow_type.clone(),
+                task_queue: record.context.task_queue.clone(),
+                status: record.context.execution_status,
+                start_time: record.context.start_time,
+                execution_time: record.context.execution_time,
+                close_time: record.context.close_time,
+                history_length: record.context.history_length,
+                state_transition_count: record.context.state_transition_count,
+                memo: Memo::default(),
+                search_attr_version: 0,
+            });
         let previous = Some(row.clone());
         let mut search_patch = SearchAttributes::default();
 
@@ -296,9 +306,7 @@ mod tests {
         ]
     }
 
-    fn arb_context(
-        ns: NamespaceId,
-    ) -> impl Strategy<Value = ProjectionContext> {
+    fn arb_context(ns: NamespaceId) -> impl Strategy<Value = ProjectionContext> {
         (
             arb_status(),
             "[a-z]{1,8}",
@@ -310,16 +318,7 @@ mod tests {
             1i64..100,
         )
             .prop_map(
-                move |(
-                    status,
-                    wf_id,
-                    run_id,
-                    wf_type,
-                    tq,
-                    start,
-                    hl,
-                    stc,
-                )| {
+                move |(status, wf_id, run_id, wf_type, tq, start, hl, stc)| {
                     ProjectionContext {
                         namespace_id: ns,
                         workflow_id: WorkflowId(wf_id),
@@ -337,31 +336,21 @@ mod tests {
             )
     }
 
-    fn arb_record(
-        ns: NamespaceId,
-    ) -> impl Strategy<Value = ProjectionRecord> {
-        (
-            any::<u128>(),
-            arb_context(ns),
-            arb_status(),
-        )
-            .prop_map(|(rk, ctx, status)| {
-                ProjectionRecord {
-                    partition_id: 0,
-                    fanout: 1,
-                    run_key: RunKey(Uuid::from_u128(rk)),
-                    transition_seq: TransitionSeq(1),
-                    context: ctx,
-                    ops: vec![
-                        ProjectionOp::UpsertExecution {
-                            status,
-                            memo_patch: Memo::default(),
-                            search_attr_patch:
-                                SearchAttributes::default(),
-                        },
-                    ],
-                }
-            })
+    fn arb_record(ns: NamespaceId) -> impl Strategy<Value = ProjectionRecord> {
+        (any::<u128>(), arb_context(ns), arb_status()).prop_map(|(rk, ctx, status)| {
+            ProjectionRecord {
+                partition_id: 0,
+                fanout: 1,
+                run_key: RunKey(Uuid::from_u128(rk)),
+                transition_seq: TransitionSeq(1),
+                context: ctx,
+                ops: vec![ProjectionOp::UpsertExecution {
+                    status,
+                    memo_patch: Memo::default(),
+                    search_attr_patch: SearchAttributes::default(),
+                }],
+            }
+        })
     }
 
     // Feature: projection-visibility, Property 1:
@@ -520,7 +509,11 @@ mod tests {
         let namespace_id = NamespaceId(Uuid::from_u128(1));
         let store = InMemoryVisibilityStore::default();
         store
-            .register_attr(namespace_id, "CustomKeyword".to_string(), SearchAttrType::Int)
+            .register_attr(
+                namespace_id,
+                "CustomKeyword".to_string(),
+                SearchAttrType::Int,
+            )
             .await
             .unwrap();
         let sink = VisibilitySink::new(store, "sink");

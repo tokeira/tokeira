@@ -23,10 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .build_server(true)
             .btree_map(["."])
             .file_descriptor_set_path(out_dir.join("tokeira_public_descriptor.bin"))
-            .compile(
-                &upstream_protos,
-                &[upstream_dir.as_path()],
-            )?;
+            .compile(&upstream_protos, &[upstream_dir.as_path()])?;
     }
 
     let internal_protos = discover_protos(&internal_dir)?;

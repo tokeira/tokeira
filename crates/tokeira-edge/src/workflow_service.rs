@@ -4,25 +4,22 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use http::HeaderMap;
 use prost::Message as _;
-use uuid::Uuid;
 use time::OffsetDateTime;
 use tokeira_kernel::{
     CancelRequest, HistoryEvent, HistoryEventKind, ResetRequest, SignalRequest,
-    SignalWithStartRequest, StartRequest, TerminateRequest,
-    WorkflowTaskCompletedRequest,
+    SignalWithStartRequest, StartRequest, TerminateRequest, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    InMemoryBroker, PolledWorkflowTaskTransport, QueryResult, ResetWorkflowResult,
-    SignalWithStartResult, StartWorkflowResult, StartedActivityTask,
-    StartedWorkflowTask, UpdateOutcome, UpdateTransportResolution,
-    UpdateWaitPolicy, PendingUpdateTransport,
+    BufferedQueryRegistry, InMemoryBroker, PendingUpdateTransport, QueryResult,
+    ResetWorkflowResult, SignalWithStartResult, StartWorkflowResult, StartedActivityTask,
+    StartedWorkflowTask, UpdateOutcome, UpdateTransportResolution, UpdateWaitPolicy,
 };
 use tokeira_storage::RunRepository;
 use tokeira_types::{
-    ActivityTaskToken, ExecutionRef, ExecutionStatus,
-    Payloads, QueueKey, RequestContext, RunId, RunKey, TaskKind, TaskQueueName,
-    WorkerIdentity,
+    ActivityTaskToken, ExecutionRef, ExecutionStatus, Payloads, QueueKey, RequestContext,
+    RunId, RunKey, TaskKind, TaskQueueName, WorkerIdentity,
 };
+use uuid::Uuid;
 
 use crate::{
     errors::{EdgeError, EdgeResult},
@@ -31,56 +28,33 @@ use crate::{
     long_poll::LongPollGate,
     namespace_cache::{NamespaceCache, ResolvedNamespace},
     operator_service::{ClusterInfo, OperatorApi},
-    pending_queries::PendingQueryStore,
     pending_queries::LEGACY_QUERY_ID,
+    pending_queries::PendingQueryStore,
     poller_registry::{ActivePoller, PollerRegistry},
     routing::{EdgeRouter, ensure_local},
     translate::{
-        CountWorkflowExecutionsRequest,
-        CountWorkflowExecutionsResponse,
-        DeleteWorkflowExecutionRequest,
-        DescribeTaskQueueRequest,
-        DescribeTaskQueueResponse,
-        DescribeWorkflowExecutionRequest,
+        CountWorkflowExecutionsRequest, CountWorkflowExecutionsResponse,
+        DeleteWorkflowExecutionRequest, DescribeTaskQueueRequest,
+        DescribeTaskQueueResponse, DescribeWorkflowExecutionRequest,
         ListNamespacesResponse as EdgeListNamespacesResponse,
-        ListWorkflowExecutionsRequest,
-        ListWorkflowExecutionsResponse,
-        NamespaceDescription,
-        PollActivityTaskQueueRequest,
-        PollActivityTaskQueueResponse,
-        PollWorkflowTaskQueueRequest,
-        PollWorkflowTaskQueueResponse,
-        ProtocolMessageDto,
-        QueryResultDto,
-        QueryWorkflowRequest, QueryWorkflowResponse,
-        RecordActivityTaskHeartbeatRequest,
-        RecordActivityTaskHeartbeatResponse,
-        ResetWorkflowExecutionRequest,
-        ResetWorkflowExecutionResponse,
-        RegisterNamespaceRequest,
-        RequestCancelWorkflowExecutionRequest,
-        RequestCancelWorkflowExecutionResponse,
-        RespondActivityTaskCompletedRequest,
-        RespondActivityTaskCompletedResponse,
-        RespondActivityTaskFailedRequest,
-        RespondActivityTaskFailedResponse,
-        RespondWorkflowTaskCompletedRequest,
-        RespondWorkflowTaskCompletedResponse,
-        SignalWorkflowExecutionRequest,
-        SignalWorkflowExecutionResponse,
+        ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse,
+        NamespaceDescription, PollActivityTaskQueueRequest,
+        PollActivityTaskQueueResponse, PollWorkflowTaskQueueRequest,
+        PollWorkflowTaskQueueResponse, ProtocolMessageDto, QueryResultDto,
+        QueryWorkflowRequest, QueryWorkflowResponse, RecordActivityTaskHeartbeatRequest,
+        RecordActivityTaskHeartbeatResponse, RegisterNamespaceRequest,
+        RequestCancelWorkflowExecutionRequest, RequestCancelWorkflowExecutionResponse,
+        ResetWorkflowExecutionRequest, ResetWorkflowExecutionResponse,
+        RespondActivityTaskCompletedRequest, RespondActivityTaskCompletedResponse,
+        RespondActivityTaskFailedRequest, RespondActivityTaskFailedResponse,
+        RespondWorkflowTaskCompletedRequest, RespondWorkflowTaskCompletedResponse,
         SignalWithStartWorkflowExecutionRequest,
-        SignalWithStartWorkflowExecutionResponse,
-        StartWorkflowExecutionRequest,
-        StartWorkflowExecutionResponse,
-        SystemCapabilities,
-        SystemInfo,
-        TerminateWorkflowExecutionRequest,
-        TerminateWorkflowExecutionResponse,
-        UpdateWorkflowExecutionRequest,
-        UpdateWorkflowExecutionResponse,
-        WorkflowQueryDto,
-        WorkflowExecutionDescription, from_internal,
-        to_internal,
+        SignalWithStartWorkflowExecutionResponse, SignalWorkflowExecutionRequest,
+        SignalWorkflowExecutionResponse, StartWorkflowExecutionRequest,
+        StartWorkflowExecutionResponse, SystemCapabilities, SystemInfo,
+        TerminateWorkflowExecutionRequest, TerminateWorkflowExecutionResponse,
+        UpdateWorkflowExecutionRequest, UpdateWorkflowExecutionResponse,
+        WorkflowExecutionDescription, WorkflowQueryDto, from_internal, to_internal,
     },
 };
 
@@ -120,13 +94,6 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         timeout: std::time::Duration,
     ) -> Result<Option<StartedWorkflowTask>>;
 
-    async fn poll_workflow_or_query_task(
-        &self,
-        queue: tokeira_types::QueueKey,
-        worker_identity: tokeira_types::WorkerIdentity,
-        timeout: std::time::Duration,
-    ) -> Result<Option<PolledWorkflowTaskTransport>>;
-
     async fn complete_workflow_task(
         &self,
         req: WorkflowTaskCompletedRequest,
@@ -152,10 +119,7 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         failure_error_type: Option<String>,
     ) -> Result<()>;
 
-    async fn record_activity_heartbeat(
-        &self,
-        token: ActivityTaskToken,
-    ) -> Result<bool>;
+    async fn record_activity_heartbeat(&self, token: ActivityTaskToken) -> Result<bool>;
 
     async fn terminate_workflow(
         &self,
@@ -206,9 +170,12 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         resolution: UpdateTransportResolution,
     ) -> Result<bool>;
 
-    /// Schedule a WFT for query delivery if no WFT is pending.
-    /// No-op if a WFT is already pending.
-    async fn submit_schedule_query_task(&self, run_key: RunKey) -> Result<()>;
+    /// Read the update_name and input for a registered update.
+    async fn peek_update_info(
+        &self,
+        run_key: RunKey,
+        update_id: String,
+    ) -> Result<Option<(String, Payloads)>>;
 }
 
 #[async_trait]
@@ -347,6 +314,7 @@ pub struct WorkflowService {
     interceptors: Arc<EdgeInterceptors>,
     poller_registry: PollerRegistry,
     pending_queries: PendingQueryStore,
+    buffered_queries: BufferedQueryRegistry,
     broker: InMemoryBroker,
     long_polls: LongPollGate,
     router: Arc<dyn EdgeRouter>,
@@ -374,7 +342,7 @@ impl WorkflowService {
         long_polls: LongPollGate,
         router: Arc<dyn EdgeRouter>,
     ) -> Self {
-        Self::new_with_history_wait_registry(
+        Self::new_with_buffered_queries_and_history_wait_registry(
             runtime,
             resolver,
             visibility,
@@ -384,6 +352,40 @@ impl WorkflowService {
             interceptors,
             poller_registry,
             pending_queries,
+            BufferedQueryRegistry::default(),
+            broker,
+            long_polls,
+            router,
+            HistoryWaitRegistry::default(),
+        )
+    }
+
+    pub fn new_with_buffered_queries(
+        runtime: Arc<dyn WorkflowRuntimeApi>,
+        resolver: Arc<dyn ExecutionResolver>,
+        visibility: Arc<dyn VisibilityApi>,
+        repo: Arc<dyn RunRepository>,
+        operator_api: Arc<dyn OperatorApi>,
+        namespaces: Arc<dyn NamespaceCache>,
+        interceptors: Arc<EdgeInterceptors>,
+        poller_registry: PollerRegistry,
+        pending_queries: PendingQueryStore,
+        buffered_queries: BufferedQueryRegistry,
+        broker: InMemoryBroker,
+        long_polls: LongPollGate,
+        router: Arc<dyn EdgeRouter>,
+    ) -> Self {
+        Self::new_with_buffered_queries_and_history_wait_registry(
+            runtime,
+            resolver,
+            visibility,
+            repo,
+            operator_api,
+            namespaces,
+            interceptors,
+            poller_registry,
+            pending_queries,
+            buffered_queries,
             broker,
             long_polls,
             router,
@@ -406,6 +408,40 @@ impl WorkflowService {
         router: Arc<dyn EdgeRouter>,
         history_waiters: HistoryWaitRegistry,
     ) -> Self {
+        Self::new_with_buffered_queries_and_history_wait_registry(
+            runtime,
+            resolver,
+            visibility,
+            repo,
+            operator_api,
+            namespaces,
+            interceptors,
+            poller_registry,
+            pending_queries,
+            BufferedQueryRegistry::default(),
+            broker,
+            long_polls,
+            router,
+            history_waiters,
+        )
+    }
+
+    pub fn new_with_buffered_queries_and_history_wait_registry(
+        runtime: Arc<dyn WorkflowRuntimeApi>,
+        resolver: Arc<dyn ExecutionResolver>,
+        visibility: Arc<dyn VisibilityApi>,
+        repo: Arc<dyn RunRepository>,
+        operator_api: Arc<dyn OperatorApi>,
+        namespaces: Arc<dyn NamespaceCache>,
+        interceptors: Arc<EdgeInterceptors>,
+        poller_registry: PollerRegistry,
+        pending_queries: PendingQueryStore,
+        buffered_queries: BufferedQueryRegistry,
+        broker: InMemoryBroker,
+        long_polls: LongPollGate,
+        router: Arc<dyn EdgeRouter>,
+        history_waiters: HistoryWaitRegistry,
+    ) -> Self {
         Self {
             runtime,
             resolver,
@@ -416,11 +452,122 @@ impl WorkflowService {
             interceptors,
             poller_registry,
             pending_queries,
+            buffered_queries,
             broker,
             long_polls,
             router,
             history_waiters,
         }
+    }
+
+    async fn attach_buffered_queries(
+        &self,
+        run_key: RunKey,
+        observable_barrier: i64,
+        task_token: &[u8],
+        target: &mut std::collections::HashMap<String, WorkflowQueryDto>,
+    ) {
+        for query in self
+            .buffered_queries
+            .drain_satisfied(run_key, observable_barrier)
+        {
+            let query_id = Uuid::new_v4().to_string();
+            self.pending_queries
+                .insert(task_token, query_id.clone(), query.response_tx)
+                .await;
+            target.insert(
+                query_id,
+                WorkflowQueryDto {
+                    query_type: query.query_type,
+                    query_args: query.query_args,
+                },
+            );
+        }
+    }
+
+    async fn dispatch_queries_direct(
+        &self,
+        run_key: RunKey,
+        state: &tokeira_kernel::WorkflowState,
+        barrier: i64,
+    ) {
+        let now = OffsetDateTime::now_utc();
+        let sticky_preferred = state.sticky.as_ref().and_then(|affinity| {
+            (affinity.expires_at > now).then_some(affinity.worker_identity.clone())
+        });
+        let queue = QueueKey {
+            namespace_id: state.namespace_id,
+            task_queue: state.task_queue.clone(),
+            task_kind: TaskKind::Workflow,
+            deployment: state.deployment.clone(),
+            build_id: state.build_id.clone(),
+        };
+
+        for query in self.buffered_queries.drain_satisfied(run_key, barrier) {
+            self.broker
+                .publish_query_task(tokeira_runtime::QueryTask {
+                    run_key,
+                    query_type: query.query_type,
+                    query_args: query.query_args,
+                    queue: queue.clone(),
+                    sticky_preferred: sticky_preferred.clone(),
+                    response_tx: query.response_tx,
+                })
+                .await;
+        }
+    }
+
+    async fn build_eager_query_workflow_task(
+        &self,
+        state: &tokeira_kernel::WorkflowState,
+        shard_epoch: tokeira_types::ShardEpoch,
+        barrier: i64,
+    ) -> Option<PollWorkflowTaskQueueResponse> {
+        let queries = self
+            .buffered_queries
+            .drain_satisfied(state.run_key, barrier);
+        if queries.is_empty() {
+            return None;
+        }
+
+        let query_token = tokeira_types::WorkflowTaskToken {
+            run_key: state.run_key,
+            logical_seq: tokeira_types::LogicalTaskSeq(0),
+            started_event_id: 0,
+            attempt: 1,
+            shard_epoch,
+        };
+
+        let task_token = serde_json::to_vec(&query_token).ok()?;
+        let mut response = PollWorkflowTaskQueueResponse {
+            task_token: task_token.clone(),
+            started_event_id: 0,
+            attempt: 1,
+            payload: crate::translate::WorkflowTaskPayloadDto {
+                workflow_id: state.workflow_id.0.clone(),
+                run_key: state.run_key,
+                task_queue: state.task_queue.0.clone(),
+                history: Vec::new(),
+            },
+            queries: std::collections::HashMap::new(),
+            messages: Vec::new(),
+        };
+
+        for query in queries {
+            let query_id = Uuid::new_v4().to_string();
+            self.pending_queries
+                .insert(&task_token, query_id.clone(), query.response_tx)
+                .await;
+            response.queries.insert(
+                query_id,
+                WorkflowQueryDto {
+                    query_type: query.query_type,
+                    query_args: query.query_args,
+                },
+            );
+        }
+
+        Some(response)
     }
 
     pub async fn start_workflow_execution(
@@ -440,11 +587,7 @@ impl WorkflowService {
             )
             .await?;
 
-        ensure_local(
-            self.router
-                .route_workflow(&namespace, &workflow_id)
-                .await?,
-        )?;
+        ensure_local(self.router.route_workflow(&namespace, &workflow_id).await?)?;
 
         let internal = to_internal::start_request(req, &ctx.request_id);
         let outcome = self
@@ -566,18 +709,10 @@ impl WorkflowService {
             ),
             WorkerIdentity(req.worker_identity.clone()),
         );
-        let broker_queue = queue_key_for_poll(
-            &req.namespace,
-            &req.task_queue,
-            TaskKind::Workflow,
-            req.deployment.clone(),
-            req.build_id.clone(),
-        );
-        let req_namespace = req.namespace.clone();
         let internal = to_internal::poll_request(req);
-        let polled = self
+        let started = self
             .runtime
-            .poll_workflow_or_query_task(
+            .poll_workflow_task(
                 internal.queue,
                 internal.worker_identity.clone(),
                 internal.timeout,
@@ -585,113 +720,27 @@ impl WorkflowService {
             .await
             .map_err(EdgeError::from)?;
 
-        match polled {
-            Some(polled) => {
-                let (started, first_query) = match polled {
-                    PolledWorkflowTaskTransport::Workflow(started) => (started, None),
-                    PolledWorkflowTaskTransport::QueryOnly { started, first_query } => {
-                        (started, Some(first_query))
-                    }
-                };
-                let mut response = from_internal::poll_response(
-                    started.clone(),
-                    self.repo.as_ref(),
-                )
-                .await
-                .map_err(EdgeError::from)?;
-
-                if started.query_only {
-                    // TODO(correctness): query-only tasks with started_event_id=0
-                    // only work when the worker has the workflow cached (sticky queue).
-                    // For non-sticky queries, the runtime should schedule a real WFT
-                    // and piggyback the query on it. For now, we set started_event_id
-                    // to the last event so the SDK replays history, but this is a
-                    // workaround — the correct fix is to integrate query dispatch
-                    // with WFT scheduling.
-                    response.started_event_id = response
-                        .payload
-                        .history
-                        .last()
-                        .map(|e| e.event_id)
-                        .unwrap_or(0);
-                }
+        match started {
+            Some(started) => {
+                let mut response =
+                    from_internal::poll_response(started.clone(), self.repo.as_ref())
+                        .await
+                        .map_err(EdgeError::from)?;
 
                 let task_token = response.task_token.clone();
-                if let Some(query) = first_query {
-                    let query_id = Uuid::new_v4().to_string();
-                    self.pending_queries
-                        .insert(&task_token, query_id.clone(), query.response_tx)
-                        .await;
-                    response.queries.insert(
-                        query_id,
-                        WorkflowQueryDto {
-                            query_type: query.query_type,
-                            query_args: query.query_args,
-                        },
-                    );
-                }
-
-                // Only drain queries from the broker for query-only WFTs.
-                // For real WFTs, queries must NOT be piggybacked because the
-                // query may have arrived before the WFT's events were committed.
-                // The worker would evaluate the query against stale state.
-                // Instead, queries are delivered on a subsequent query-triggered
-                // WFT (via ScheduleQueryTask) after the current WFT completes.
-                if started.query_only {
-                    while let Some(query) = self
-                        .broker
-                        .poll_query_task(
-                            &broker_queue,
-                            &internal.worker_identity,
-                            Duration::from_millis(0),
-                        )
-                        .await
-                    {
-                        let query_id = Uuid::new_v4().to_string();
-                        self.pending_queries
-                            .insert(&task_token, query_id.clone(), query.response_tx)
-                            .await;
-                        response.queries.insert(
-                            query_id,
-                            WorkflowQueryDto {
-                                query_type: query.query_type,
-                                query_args: query.query_args,
-                            },
-                        );
-                    }
-
-                    // Also drain from the normal queue for sticky workers
-                    let normal_queue = QueueKey {
-                        namespace_id: to_internal::namespace_id_for(&req_namespace),
-                        task_queue: TaskQueueName(response.payload.task_queue.clone()),
-                        task_kind: TaskKind::Workflow,
-                        deployment: None,
-                        build_id: None,
-                    };
-                    if normal_queue != broker_queue {
-                        while let Some(query) = self
-                            .broker
-                            .poll_query_task(
-                                &normal_queue,
-                                &internal.worker_identity,
-                                Duration::from_millis(0),
-                            )
-                            .await
-                        {
-                            let query_id = Uuid::new_v4().to_string();
-                            self.pending_queries
-                                .insert(&task_token, query_id.clone(), query.response_tx)
-                                .await;
-                            response.queries.insert(
-                                query_id,
-                                WorkflowQueryDto {
-                                    query_type: query.query_type,
-                                    query_args: query.query_args,
-                                },
-                            );
-                        }
-                    }
-                }
+                let observable_barrier = response
+                    .payload
+                    .history
+                    .last()
+                    .map(|event| event.event_id)
+                    .unwrap_or(response.started_event_id);
+                self.attach_buffered_queries(
+                    started.run_key,
+                    observable_barrier,
+                    &task_token,
+                    &mut response.queries,
+                )
+                .await;
 
                 for update in self
                     .runtime
@@ -719,14 +768,19 @@ impl WorkflowService {
                         ),
                     };
                     let body = prost_types::Any {
-                        type_url: "type.googleapis.com/temporal.api.update.v1.Request".to_string(),
+                        type_url: "type.googleapis.com/temporal.api.update.v1.Request"
+                            .to_string(),
                         value: request.encode_to_vec(),
                     };
+                    // The SDK requires sequencing_event_id to determine where
+                    // in the history replay the update should be processed.
+                    // Temporal sets this to workflowTaskStartedEventID - 1.
+                    let sequencing_event_id = started.token.started_event_id - 1;
                     response.messages.push(ProtocolMessageDto {
                         id: format!("{}/request", update.update_id),
                         protocol_instance_id: update.update_id,
                         body: body.encode_to_vec(),
-                        sequencing_event_id: None,
+                        sequencing_event_id: Some(sequencing_event_id),
                     });
                 }
 
@@ -739,7 +793,7 @@ impl WorkflowService {
     pub async fn respond_workflow_task_completed(
         &self,
         headers: &HeaderMap,
-        req: RespondWorkflowTaskCompletedRequest,
+        mut req: RespondWorkflowTaskCompletedRequest,
     ) -> EdgeResult<RespondWorkflowTaskCompletedResponse> {
         let _ctx = self
             .interceptors
@@ -753,7 +807,9 @@ impl WorkflowService {
         };
 
         for (query_id, result) in &req.query_results {
-            if let Some(sender) = self.pending_queries.take(&req.task_token, query_id).await {
+            if let Some(sender) =
+                self.pending_queries.take(&req.task_token, query_id).await
+            {
                 let _ = sender.send(match result {
                     QueryResultDto::Answered { result } => QueryResult::Completed {
                         result: result.clone(),
@@ -768,73 +824,59 @@ impl WorkflowService {
         let task_token: tokeira_types::WorkflowTaskToken =
             serde_json::from_slice(&req.task_token).map_err(EdgeError::from)?;
 
-        for message in &req.messages {
-            let Ok(any) = prost_types::Any::decode(message.body.as_slice()) else {
-                continue;
-            };
-            match any.type_url.as_str() {
-                "type.googleapis.com/temporal.api.update.v1.Acceptance" => {
-                    let _ = self
-                        .runtime
-                        .resolve_update_transport(
-                            task_token.run_key,
-                            message.protocol_instance_id.clone(),
-                            UpdateTransportResolution::Accepted,
-                        )
-                        .await
-                        .map_err(EdgeError::from)?;
+        // ProtocolMessage commands have been resolved from the
+        // messages field by the translate layer. Walk the commands
+        // to fill in update_name/input for Accepted bodies (from
+        // the UpdateRegistry) and notify the registry for
+        // Completed/Rejected bodies.
+        for cmd in &mut req.commands {
+            if let tokeira_kernel::WorkflowCommand::ProtocolMessage { body, .. } = cmd {
+                match body {
+                    tokeira_kernel::UpdateProtocolBody::Accepted {
+                        update_id,
+                        update_name,
+                        input,
+                    } => {
+                        if let Ok(Some((name, inp))) = self
+                            .runtime
+                            .peek_update_info(task_token.run_key, update_id.clone())
+                            .await
+                        {
+                            *update_name = name;
+                            *input = inp;
+                        }
+                    }
+                    tokeira_kernel::UpdateProtocolBody::Completed {
+                        update_id,
+                        result,
+                    } => {
+                        let _ = self
+                            .runtime
+                            .resolve_update_transport(
+                                task_token.run_key,
+                                update_id.clone(),
+                                UpdateTransportResolution::Completed {
+                                    result: result.clone(),
+                                },
+                            )
+                            .await;
+                    }
+                    tokeira_kernel::UpdateProtocolBody::Rejected {
+                        update_id,
+                        failure,
+                    } => {
+                        let _ = self
+                            .runtime
+                            .resolve_update_transport(
+                                task_token.run_key,
+                                update_id.clone(),
+                                UpdateTransportResolution::Rejected {
+                                    failure: failure.clone(),
+                                },
+                            )
+                            .await;
+                    }
                 }
-                "type.googleapis.com/temporal.api.update.v1.Response" => {
-                    let Ok(response) = tokeira_proto::public::temporal::api::update::v1::Response::decode(any.value.as_slice()) else {
-                        continue;
-                    };
-                    let resolution = match response.outcome.and_then(|outcome| outcome.value) {
-                        Some(
-                            tokeira_proto::public::temporal::api::update::v1::outcome::Value::Success(
-                                payloads,
-                            ),
-                        ) => UpdateTransportResolution::Completed {
-                            result: tokeira_proto::conversions::common::payloads_to_domain(&payloads),
-                        },
-                        Some(
-                            tokeira_proto::public::temporal::api::update::v1::outcome::Value::Failure(
-                                failure,
-                            ),
-                        ) => UpdateTransportResolution::Rejected {
-                            failure: failure.message,
-                        },
-                        None => continue,
-                    };
-                    let _ = self
-                        .runtime
-                        .resolve_update_transport(
-                            task_token.run_key,
-                            message.protocol_instance_id.clone(),
-                            resolution,
-                        )
-                        .await
-                        .map_err(EdgeError::from)?;
-                }
-                "type.googleapis.com/temporal.api.update.v1.Rejection" => {
-                    let Ok(rejection) = tokeira_proto::public::temporal::api::update::v1::Rejection::decode(any.value.as_slice()) else {
-                        continue;
-                    };
-                    let _ = self
-                        .runtime
-                        .resolve_update_transport(
-                            task_token.run_key,
-                            message.protocol_instance_id.clone(),
-                            UpdateTransportResolution::Rejected {
-                                failure: rejection
-                                    .failure
-                                    .map(|failure| failure.message)
-                                    .unwrap_or_else(|| "update rejected".to_string()),
-                            },
-                        )
-                        .await
-                        .map_err(EdgeError::from)?;
-                }
-                _ => {}
             }
         }
 
@@ -845,11 +887,15 @@ impl WorkflowService {
                 execution_status: ExecutionStatus::Running,
                 new_run_id: None,
                 was_duplicate: false,
+                workflow_task: None,
             });
         }
 
-        let internal = to_internal::workflow_task_completed_request(req)
-            .map_err(EdgeError::from)?;
+        let saved_task_token = req.task_token.clone();
+        let wants_eager_return = req.return_new_workflow_task;
+
+        let internal =
+            to_internal::workflow_task_completed_request(req).map_err(EdgeError::from)?;
         let run_key = internal.token.run_key;
         let outcome = self
             .runtime
@@ -859,19 +905,45 @@ impl WorkflowService {
         self.notify_history_run_key(run_key, outcome.last_event_id)
             .await;
 
-        // After WFT completion, schedule a query-triggered WFT if the
-        // workflow is still open. This ensures pending queries in the
-        // broker get delivered on a fresh WFT with up-to-date history.
-        // ScheduleQueryTask is a no-op if a WFT is already pending
-        // (e.g. from commands in this completion).
-        if outcome.execution_status.is_open() {
-            let _ = self
-                .runtime
-                .submit_schedule_query_task(run_key)
-                .await;
+        // After WFT completion, if the SDK requested an eager return and
+        // there are buffered queries and the run is quiescent, build an
+        // inline query-only WFT so the worker evaluates against the
+        // just-committed state without an extra poll round-trip.
+        let mut resp = from_internal::completed_response(outcome);
+
+        if resp.execution_status.is_open() && self.buffered_queries.has_buffered(run_key)
+        {
+            let token: tokeira_types::WorkflowTaskToken =
+                serde_json::from_slice(&saved_task_token).map_err(EdgeError::from)?;
+            let loaded = self
+                .repo
+                .load_run(token.run_key)
+                .await
+                .map_err(EdgeError::from)?;
+            if let tokeira_kernel::LoadedRun::Existing(state) = loaded {
+                let quiescent = state.pending_workflow_task.is_none();
+                if quiescent {
+                    if wants_eager_return {
+                        resp.workflow_task = self
+                            .build_eager_query_workflow_task(
+                                &state,
+                                token.shard_epoch,
+                                state.last_event_id,
+                            )
+                            .await;
+                    } else {
+                        self.dispatch_queries_direct(
+                            state.run_key,
+                            &state,
+                            state.last_event_id,
+                        )
+                        .await;
+                    }
+                }
+            }
         }
 
-        Ok(from_internal::completed_response(outcome))
+        Ok(resp)
     }
 
     pub async fn respond_query_task_completed(
@@ -885,7 +957,11 @@ impl WorkflowService {
             .begin(headers, None, Action::RespondQueryTaskCompleted, false)
             .await?;
 
-        if let Some(sender) = self.pending_queries.take(&task_token, LEGACY_QUERY_ID).await {
+        if let Some(sender) = self
+            .pending_queries
+            .take(&task_token, LEGACY_QUERY_ID)
+            .await
+        {
             let _ = sender.send(result);
         }
         Ok(())
@@ -975,10 +1051,7 @@ impl WorkflowService {
             .map_err(EdgeError::from)
     }
 
-    pub async fn get_cluster_info(
-        &self,
-        headers: &HeaderMap,
-    ) -> EdgeResult<ClusterInfo> {
+    pub async fn get_cluster_info(&self, headers: &HeaderMap) -> EdgeResult<ClusterInfo> {
         let _ctx = self
             .interceptors
             .begin(headers, None, Action::GetClusterInfo, false)
@@ -990,10 +1063,7 @@ impl WorkflowService {
             .map_err(EdgeError::from)
     }
 
-    pub async fn get_system_info(
-        &self,
-        headers: &HeaderMap,
-    ) -> EdgeResult<SystemInfo> {
+    pub async fn get_system_info(&self, headers: &HeaderMap) -> EdgeResult<SystemInfo> {
         let _ctx = self
             .interceptors
             .begin(headers, None, Action::GetSystemInfo, false)
@@ -1032,11 +1102,7 @@ impl WorkflowService {
             .begin(headers, None, Action::ListNamespaces, false)
             .await?;
 
-        let mut namespaces = self
-            .namespaces
-            .list_all()
-            .await
-            .map_err(EdgeError::from)?;
+        let mut namespaces = self.namespaces.list_all().await.map_err(EdgeError::from)?;
         namespaces.sort_by(|left, right| left.name.cmp(&right.name));
 
         Ok(EdgeListNamespacesResponse {
@@ -1068,9 +1134,7 @@ impl WorkflowService {
             .get(namespace_name)
             .await
             .map_err(EdgeError::from)?
-            .ok_or_else(|| {
-                EdgeError::NamespaceNotFound(namespace_name.to_string())
-            })?;
+            .ok_or_else(|| EdgeError::NamespaceNotFound(namespace_name.to_string()))?;
 
         Ok(namespace_to_description(namespace))
     }
@@ -1177,11 +1241,7 @@ impl WorkflowService {
             )
             .await?;
 
-        let loaded = self
-            .repo
-            .load_run(run_key)
-            .await
-            .map_err(EdgeError::from)?;
+        let loaded = self.repo.load_run(run_key).await.map_err(EdgeError::from)?;
         let tokeira_kernel::LoadedRun::Existing(state) = loaded else {
             return Err(EdgeError::WorkflowNotFound {
                 namespace: req.namespace,
@@ -1253,10 +1313,7 @@ impl WorkflowService {
             .read_history(run_key, 0, usize::MAX)
             .await
             .map_err(EdgeError::from)?;
-        validate_reset_target(
-            &history,
-            req.workflow_task_finish_event_id,
-        )?;
+        validate_reset_target(&history, req.workflow_task_finish_event_id)?;
 
         let execution = ExecutionRef {
             namespace_id: to_internal::namespace_id_for(&req.namespace),
@@ -1267,24 +1324,17 @@ impl WorkflowService {
                 .and_then(|value| uuid::Uuid::parse_str(value).ok())
                 .map(RunId),
         };
-        let internal =
-            to_internal::reset_request(req, &ctx.request_id);
+        let internal = to_internal::reset_request(req, &ctx.request_id);
         let outcome = self
             .runtime
             .reset_workflow(execution, internal)
             .await
             .map_err(EdgeError::from)?;
 
-        let last_event_id = read_last_event_id(
-            self.repo.as_ref(),
-            outcome.successor_run_key,
-        )
-        .await?;
-        self.notify_history_run_key(
-            outcome.successor_run_key,
-            last_event_id,
-        )
-        .await;
+        let last_event_id =
+            read_last_event_id(self.repo.as_ref(), outcome.successor_run_key).await?;
+        self.notify_history_run_key(outcome.successor_run_key, last_event_id)
+            .await;
 
         Ok(from_internal::reset_response(outcome))
     }
@@ -1320,8 +1370,7 @@ impl WorkflowService {
             SignalWithStartResult::Started { run_key, run_id } => {
                 let last_event_id =
                     read_last_event_id(self.repo.as_ref(), run_key).await?;
-                self.notify_history_run_key(run_key, last_event_id)
-                    .await;
+                self.notify_history_run_key(run_key, last_event_id).await;
                 Ok(SignalWithStartWorkflowExecutionResponse {
                     run_id,
                     started: true,
@@ -1330,8 +1379,7 @@ impl WorkflowService {
             SignalWithStartResult::Signaled { run_key, run_id } => {
                 let last_event_id =
                     read_last_event_id(self.repo.as_ref(), run_key).await?;
-                self.notify_history_run_key(run_key, last_event_id)
-                    .await;
+                self.notify_history_run_key(run_key, last_event_id).await;
                 Ok(SignalWithStartWorkflowExecutionResponse {
                     run_id,
                     started: false,
@@ -1366,10 +1414,7 @@ impl WorkflowService {
 
         ensure_local(
             self.router
-                .route_task_queue(
-                    &req.namespace,
-                    &req.task_queue,
-                )
+                .route_task_queue(&req.namespace, &req.task_queue)
                 .await?,
         )?;
 
@@ -1411,12 +1456,7 @@ impl WorkflowService {
     ) -> EdgeResult<RespondActivityTaskCompletedResponse> {
         let _ctx = self
             .interceptors
-            .begin(
-                headers,
-                None,
-                Action::RespondActivityTaskCompleted,
-                false,
-            )
+            .begin(headers, None, Action::RespondActivityTaskCompleted, false)
             .await?;
 
         let token = req.token;
@@ -1441,12 +1481,7 @@ impl WorkflowService {
     ) -> EdgeResult<RespondActivityTaskFailedResponse> {
         let _ctx = self
             .interceptors
-            .begin(
-                headers,
-                None,
-                Action::RespondActivityTaskFailed,
-                false,
-            )
+            .begin(headers, None, Action::RespondActivityTaskFailed, false)
             .await?;
 
         let token = req.token;
@@ -1474,12 +1509,7 @@ impl WorkflowService {
     ) -> EdgeResult<RecordActivityTaskHeartbeatResponse> {
         let _ctx = self
             .interceptors
-            .begin(
-                headers,
-                None,
-                Action::RecordActivityTaskHeartbeat,
-                false,
-            )
+            .begin(headers, None, Action::RecordActivityTaskHeartbeat, false)
             .await?;
 
         let cancel_requested = self
@@ -1488,9 +1518,7 @@ impl WorkflowService {
             .await
             .map_err(EdgeError::from)?;
 
-        Ok(RecordActivityTaskHeartbeatResponse {
-            cancel_requested,
-        })
+        Ok(RecordActivityTaskHeartbeatResponse { cancel_requested })
     }
 
     // ── Advanced workflow endpoints ──
@@ -1512,22 +1540,15 @@ impl WorkflowService {
 
         ensure_local(
             self.router
-                .route_workflow(
-                    &req.namespace,
-                    &req.workflow_id,
-                )
+                .route_workflow(&req.namespace, &req.workflow_id)
                 .await?,
         )?;
 
         let run_key = self
-            .resolve_run_key(
-                &req.namespace,
-                &req.workflow_id,
-            )
+            .resolve_run_key(&req.namespace, &req.workflow_id)
             .await?;
 
-        let internal =
-            to_internal::terminate_request(req, &ctx.request_id);
+        let internal = to_internal::terminate_request(req, &ctx.request_id);
         let outcome = self
             .runtime
             .terminate_workflow(run_key, internal)
@@ -1543,8 +1564,7 @@ impl WorkflowService {
         &self,
         headers: &HeaderMap,
         req: RequestCancelWorkflowExecutionRequest,
-    ) -> EdgeResult<RequestCancelWorkflowExecutionResponse>
-    {
+    ) -> EdgeResult<RequestCancelWorkflowExecutionResponse> {
         let ctx = self
             .interceptors
             .begin(
@@ -1557,22 +1577,15 @@ impl WorkflowService {
 
         ensure_local(
             self.router
-                .route_workflow(
-                    &req.namespace,
-                    &req.workflow_id,
-                )
+                .route_workflow(&req.namespace, &req.workflow_id)
                 .await?,
         )?;
 
         let run_key = self
-            .resolve_run_key(
-                &req.namespace,
-                &req.workflow_id,
-            )
+            .resolve_run_key(&req.namespace, &req.workflow_id)
             .await?;
 
-        let internal =
-            to_internal::cancel_request(req, &ctx.request_id);
+        let internal = to_internal::cancel_request(req, &ctx.request_id);
         let outcome = self
             .runtime
             .cancel_workflow(run_key, internal)
@@ -1591,49 +1604,29 @@ impl WorkflowService {
     ) -> EdgeResult<QueryWorkflowResponse> {
         let _ctx = self
             .interceptors
-            .begin(
-                headers,
-                Some(&req.namespace),
-                Action::QueryWorkflow,
-                false,
-            )
+            .begin(headers, Some(&req.namespace), Action::QueryWorkflow, false)
             .await?;
 
         ensure_local(
             self.router
-                .route_workflow(
-                    &req.namespace,
-                    &req.workflow_id,
-                )
+                .route_workflow(&req.namespace, &req.workflow_id)
                 .await?,
         )?;
 
         let _run_key = self
-            .resolve_run_key(
-                &req.namespace,
-                &req.workflow_id,
-            )
+            .resolve_run_key(&req.namespace, &req.workflow_id)
             .await?;
 
         let workflow_id = req.workflow_id.clone();
         let execution = ExecutionRef {
-            namespace_id: to_internal::namespace_id_for(
-                &req.namespace,
-            ),
-            workflow_id: tokeira_types::WorkflowId(
-                workflow_id,
-            ),
+            namespace_id: to_internal::namespace_id_for(&req.namespace),
+            workflow_id: tokeira_types::WorkflowId(workflow_id),
             run_id: None,
         };
 
         let result = self
             .runtime
-            .query_workflow(
-                execution,
-                req.query_type,
-                req.query_args,
-                req.timeout,
-            )
+            .query_workflow(execution, req.query_type, req.query_args, req.timeout)
             .await
             .map_err(EdgeError::from)?;
 
@@ -1657,44 +1650,30 @@ impl WorkflowService {
 
         ensure_local(
             self.router
-                .route_workflow(
-                    &req.namespace,
-                    &req.workflow_id,
-                )
+                .route_workflow(&req.namespace, &req.workflow_id)
                 .await?,
         )?;
 
         let _run_key = self
-            .resolve_run_key(
-                &req.namespace,
-                &req.workflow_id,
-            )
+            .resolve_run_key(&req.namespace, &req.workflow_id)
             .await?;
 
         let workflow_id = req.workflow_id.clone();
         let execution = ExecutionRef {
-            namespace_id: to_internal::namespace_id_for(
-                &req.namespace,
-            ),
-            workflow_id: tokeira_types::WorkflowId(
-                workflow_id,
-            ),
+            namespace_id: to_internal::namespace_id_for(&req.namespace),
+            workflow_id: tokeira_types::WorkflowId(workflow_id),
             run_id: None,
         };
 
         let wait_policy = match req.wait_policy {
-            crate::translate::UpdateWaitPolicyDto::Accepted => {
-                UpdateWaitPolicy::Accepted
-            }
+            crate::translate::UpdateWaitPolicyDto::Accepted => UpdateWaitPolicy::Accepted,
             crate::translate::UpdateWaitPolicyDto::Completed => {
                 UpdateWaitPolicy::Completed
             }
         };
 
         let request = RequestContext {
-            request_id: tokeira_types::RequestId(
-                uuid::Uuid::new_v4().to_string(),
-            ),
+            request_id: tokeira_types::RequestId(uuid::Uuid::new_v4().to_string()),
             caller_identity: None,
             received_at: time::OffsetDateTime::now_utc(),
         };
@@ -1713,16 +1692,10 @@ impl WorkflowService {
             .await
             .map_err(EdgeError::from)?;
         let run_key = self
-            .resolve_execution_run_key(
-                &req.namespace,
-                &req.workflow_id,
-                None,
-            )
+            .resolve_execution_run_key(&req.namespace, &req.workflow_id, None)
             .await?;
-        let last_event_id =
-            read_last_event_id(self.repo.as_ref(), run_key).await?;
-        self.notify_history_run_key(run_key, last_event_id)
-            .await;
+        let last_event_id = read_last_event_id(self.repo.as_ref(), run_key).await?;
+        self.notify_history_run_key(run_key, last_event_id).await;
 
         Ok(from_internal::update_response(outcome))
     }
@@ -1745,15 +1718,9 @@ impl WorkflowService {
             )
             .await?;
 
-        ensure_local(
-            self.router
-                .route_workflow(&namespace, &workflow_id)
-                .await?,
-        )?;
+        ensure_local(self.router.route_workflow(&namespace, &workflow_id).await?)?;
 
-        let run_key = self
-            .resolve_run_key(&namespace, &workflow_id)
-            .await?;
+        let run_key = self.resolve_run_key(&namespace, &workflow_id).await?;
 
         let timeout = Duration::from_secs(60);
         let deadline = tokio::time::Instant::now() + timeout;
@@ -1767,10 +1734,7 @@ impl WorkflowService {
                 .await
                 .map_err(EdgeError::from)?;
 
-            let current_last_event_id = history
-                .last()
-                .map(|e| e.event_id)
-                .unwrap_or(0);
+            let current_last_event_id = history.last().map(|e| e.event_id).unwrap_or(0);
 
             for event in &history {
                 match &event.kind {
@@ -1802,7 +1766,8 @@ impl WorkflowService {
                 }
             }
 
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remaining =
+                deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 return Ok(None);
             }
@@ -1826,9 +1791,7 @@ impl WorkflowService {
         &self,
         headers: &HeaderMap,
         req: crate::translate::GetWorkflowExecutionHistoryRequest,
-    ) -> EdgeResult<
-        crate::translate::GetWorkflowExecutionHistoryResponse,
-    > {
+    ) -> EdgeResult<crate::translate::GetWorkflowExecutionHistoryResponse> {
         let _ctx = self
             .interceptors
             .begin(
@@ -1841,10 +1804,7 @@ impl WorkflowService {
 
         ensure_local(
             self.router
-                .route_workflow(
-                    &req.namespace,
-                    &req.workflow_id,
-                )
+                .route_workflow(&req.namespace, &req.workflow_id)
                 .await?,
         )?;
 
@@ -1855,9 +1815,8 @@ impl WorkflowService {
                 req.run_id.as_deref(),
             )
             .await?;
-        let caller_last_event_id =
-            decode_history_page_token(&req.next_page_token)
-                .map_err(EdgeError::BadRequest)?;
+        let caller_last_event_id = decode_history_page_token(&req.next_page_token)
+            .map_err(EdgeError::BadRequest)?;
         let limit = if req.maximum_page_size > 0 {
             req.maximum_page_size
         } else {
@@ -1874,52 +1833,52 @@ impl WorkflowService {
                 .last()
                 .map(|event| event.event_id)
                 .unwrap_or(caller_last_event_id);
-            let filtered = filter_history_events(
-                &history,
-                req.history_event_filter_type,
+            let filtered = filter_history_events(&history, req.history_event_filter_type);
+
+            tracing::debug!(
+                run_key = ?run_key,
+                caller_last_event_id,
+                current_last_event_id,
+                total_events = history.len(),
+                filtered_count = filtered.len(),
+                filter_type = req.history_event_filter_type,
+                wait_new_event = req.wait_new_event,
+                "get_workflow_execution_history loop iteration"
             );
 
             if !filtered.is_empty() || !req.wait_new_event {
-                return Ok(
-                    crate::translate::GetWorkflowExecutionHistoryResponse {
-                        history: filtered
-                            .into_iter()
-                            .take(limit)
-                            .collect(),
-                        next_page_token:
-                            encode_history_page_token(current_last_event_id),
-                    },
-                );
+                return Ok(crate::translate::GetWorkflowExecutionHistoryResponse {
+                    history: filtered.into_iter().take(limit).collect(),
+                    next_page_token: encode_history_page_token(current_last_event_id),
+                });
             }
 
-            if current_last_event_id > caller_last_event_id {
-                return Ok(
-                    crate::translate::GetWorkflowExecutionHistoryResponse {
-                        history: Vec::new(),
-                        next_page_token:
-                            encode_history_page_token(current_last_event_id),
-                    },
-                );
+            // When waiting for new events with a close-event filter,
+            // don't return early just because new non-close events
+            // arrived. Keep blocking until a close event appears.
+            // For non-filtered requests, advance the token so the
+            // caller can paginate.
+            if req.history_event_filter_type != 2
+                && current_last_event_id > caller_last_event_id
+            {
+                return Ok(crate::translate::GetWorkflowExecutionHistoryResponse {
+                    history: Vec::new(),
+                    next_page_token: encode_history_page_token(current_last_event_id),
+                });
             }
 
             let mut wait = self
                 .history_waiters
                 .receiver(run_key, current_last_event_id)
                 .await;
-            if tokio::time::timeout(
-                Duration::from_secs(60),
-                wait.changed(),
-            )
-            .await
-            .is_err()
+            if tokio::time::timeout(Duration::from_secs(60), wait.changed())
+                .await
+                .is_err()
             {
-                return Ok(
-                    crate::translate::GetWorkflowExecutionHistoryResponse {
-                        history: Vec::new(),
-                        next_page_token:
-                            encode_history_page_token(current_last_event_id),
-                    },
-                );
+                return Ok(crate::translate::GetWorkflowExecutionHistoryResponse {
+                    history: Vec::new(),
+                    next_page_token: encode_history_page_token(current_last_event_id),
+                });
             }
         }
     }
@@ -1928,9 +1887,7 @@ impl WorkflowService {
         &self,
         headers: &HeaderMap,
         req: crate::translate::GetWorkflowExecutionHistoryReverseRequest,
-    ) -> EdgeResult<
-        crate::translate::GetWorkflowExecutionHistoryReverseResponse,
-    > {
+    ) -> EdgeResult<crate::translate::GetWorkflowExecutionHistoryReverseResponse> {
         let _ctx = self
             .interceptors
             .begin(
@@ -1970,7 +1927,11 @@ impl WorkflowService {
 
         let mut reversed: Vec<_> = history
             .into_iter()
-            .filter(|event| before_event_id.map(|value| event.event_id < value).unwrap_or(true))
+            .filter(|event| {
+                before_event_id
+                    .map(|value| event.event_id < value)
+                    .unwrap_or(true)
+            })
             .collect();
         reversed.sort_by(|left, right| right.event_id.cmp(&left.event_id));
 
@@ -1980,10 +1941,12 @@ impl WorkflowService {
             .map(|event| encode_reverse_history_page_token(event.event_id))
             .unwrap_or_default();
 
-        Ok(crate::translate::GetWorkflowExecutionHistoryReverseResponse {
-            history: page,
-            next_page_token,
-        })
+        Ok(
+            crate::translate::GetWorkflowExecutionHistoryReverseResponse {
+                history: page,
+                next_page_token,
+            },
+        )
     }
 
     // ── Helpers ──
@@ -2011,9 +1974,7 @@ impl WorkflowService {
     ) -> EdgeResult<RunKey> {
         let execution = ExecutionRef {
             namespace_id: to_internal::namespace_id_for(namespace),
-            workflow_id: tokeira_types::WorkflowId(
-                workflow_id.to_string(),
-            ),
+            workflow_id: tokeira_types::WorkflowId(workflow_id.to_string()),
             run_id: run_id
                 .and_then(|value| uuid::Uuid::parse_str(value).ok())
                 .map(RunId),
@@ -2028,11 +1989,7 @@ impl WorkflowService {
             })
     }
 
-    async fn notify_history_run_key(
-        &self,
-        run_key: RunKey,
-        last_event_id: i64,
-    ) {
+    async fn notify_history_run_key(&self, run_key: RunKey, last_event_id: i64) {
         self.history_waiters.notify(run_key, last_event_id).await;
     }
 }
@@ -2097,13 +2054,8 @@ fn is_close_history_event(kind: &HistoryEventKind) -> bool {
     )
 }
 
-fn validate_reset_target(
-    history: &[HistoryEvent],
-    fork_event_id: i64,
-) -> EdgeResult<()> {
-    let Some(event) =
-        history.iter().find(|event| event.event_id == fork_event_id)
-    else {
+fn validate_reset_target(history: &[HistoryEvent], fork_event_id: i64) -> EdgeResult<()> {
+    let Some(event) = history.iter().find(|event| event.event_id == fork_event_id) else {
         return Err(EdgeError::BadRequest(format!(
             "reset target event_id {} not found",
             fork_event_id
@@ -2126,10 +2078,7 @@ fn validate_reset_target(
     Ok(())
 }
 
-async fn read_last_event_id(
-    repo: &dyn RunRepository,
-    run_key: RunKey,
-) -> Result<i64> {
+async fn read_last_event_id(repo: &dyn RunRepository, run_key: RunKey) -> Result<i64> {
     Ok(repo
         .read_history(run_key, 0, usize::MAX)
         .await?
@@ -2164,9 +2113,7 @@ fn queue_key_for_poll(
     }
 }
 
-fn active_poller_to_edge(
-    poller: ActivePoller,
-) -> crate::translate::PollerInfo {
+fn active_poller_to_edge(poller: ActivePoller) -> crate::translate::PollerInfo {
     crate::translate::PollerInfo {
         identity: poller.identity.0,
         last_access_time: Some(poller.registered_at),
@@ -2180,7 +2127,6 @@ fn is_valid_namespace_name(name: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
-
 
 impl From<serde_json::Error> for EdgeError {
     fn from(value: serde_json::Error) -> Self {

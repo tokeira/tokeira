@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use tokio::sync::oneshot;
 use tokio_stream::{StreamExt, wrappers::TcpListenerStream};
 use tokio_util::sync::CancellationToken;
-use tonic::{Request, transport::Server};
 use tonic::Code;
+use tonic::{Request, transport::Server};
 use tonic_reflection::pb::{
     ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
     server_reflection_request::MessageRequest,
@@ -14,10 +14,9 @@ use tonic_reflection::pb::{
 };
 
 use tokeira_edge::{
-    EdgeInterceptors, InMemoryNamespaceCache, InMemoryOperatorApi,
-    LocalOnlyRouter, LongPollConfig, LongPollGate, NamespaceCache, OperatorService,
-    PendingQueryStore, PollerRegistry, ResolvedNamespace, WorkflowExecutionDescription,
-    WorkflowService,
+    EdgeInterceptors, InMemoryNamespaceCache, InMemoryOperatorApi, LocalOnlyRouter,
+    LongPollConfig, LongPollGate, NamespaceCache, OperatorService, PendingQueryStore,
+    PollerRegistry, ResolvedNamespace, WorkflowExecutionDescription, WorkflowService,
     grpc::{
         operator_service::OperatorServiceGrpc, runtime_adapter::RuntimeAdapter,
         workflow_service::WorkflowServiceGrpc,
@@ -34,11 +33,11 @@ use tokeira_proto::{
     taskqueue::TaskQueue,
     workflowservice::{
         DescribeWorkflowExecutionRequest, ListWorkflowExecutionsRequest,
-        PollWorkflowTaskQueueRequest, ResetWorkflowExecutionRequest,
-        RespondWorkflowTaskCompletedRequest, StartWorkflowExecutionRequest,
-        SignalWithStartWorkflowExecutionRequest,
-        TerminateWorkflowExecutionRequest,
-        workflow_service_client::WorkflowServiceClient,
+        PollWorkflowTaskQueueRequest, QueryWorkflowRequest,
+        ResetWorkflowExecutionRequest, RespondWorkflowTaskCompletedRequest,
+        SignalWithStartWorkflowExecutionRequest, SignalWorkflowExecutionRequest,
+        StartWorkflowExecutionRequest, TerminateWorkflowExecutionRequest,
+        UpdateWorkflowExecutionRequest, workflow_service_client::WorkflowServiceClient,
     },
 };
 use tokeira_runtime::{
@@ -89,14 +88,13 @@ async fn grpc_roundtrip_start_describe_and_reflection() -> Result<()> {
         .await?
         .into_inner();
 
-    let info = describe.workflow_execution_info.expect("execution info should exist");
+    let info = describe
+        .workflow_execution_info
+        .expect("execution info should exist");
     let execution = info.execution.expect("execution should exist");
     assert_eq!(execution.workflow_id, "workflow-1");
     assert_eq!(execution.run_id, start.run_id);
-    assert_eq!(
-        info.r#type.expect("workflow type").name,
-        "example"
-    );
+    assert_eq!(info.r#type.expect("workflow type").name, "example");
     assert_eq!(info.task_queue, "queue-a");
     assert!(info.start_time.is_some());
     assert_eq!(
@@ -251,7 +249,9 @@ async fn grpc_roundtrip_reset_returns_successor_and_updates_current_run() -> Res
         .await?
         .into_inner();
 
-    let info = describe.workflow_execution_info.expect("execution info should exist");
+    let info = describe
+        .workflow_execution_info
+        .expect("execution info should exist");
     let execution = info.execution.expect("execution should exist");
     assert_eq!(execution.workflow_id, "workflow-reset");
     assert_eq!(execution.run_id, reset.run_id);
@@ -304,10 +304,7 @@ async fn grpc_roundtrip_signal_with_start_starts_new_run() -> Result<()> {
         .await?
         .into_inner();
     let info = describe.workflow_execution_info.expect("execution info");
-    assert_eq!(
-        info.execution.expect("execution").run_id,
-        response.run_id
-    );
+    assert_eq!(info.execution.expect("execution").run_id, response.run_id);
 
     let _ = shutdown_tx.send(());
     server.await??;
@@ -359,6 +356,301 @@ async fn grpc_roundtrip_signal_with_start_uses_existing_run() -> Result<()> {
 
     assert!(!response.started);
     assert_eq!(response.run_id, start.run_id);
+
+    let _ = shutdown_tx.send(());
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn grpc_roundtrip_signal_then_query_returns_latest_buffered_result() -> Result<()> {
+    let (addr, shutdown_tx, server) = spawn_test_server().await?;
+
+    let endpoint = format!("http://{addr}");
+    let mut workflow = WorkflowServiceClient::connect(endpoint.clone()).await?;
+
+    let start = workflow
+        .start_workflow_execution(StartWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_id: "workflow-query-order".to_string(),
+            workflow_type: Some(tokeira_proto::common::WorkflowType {
+                name: "example".to_string(),
+            }),
+            task_queue: Some(TaskQueue {
+                name: "queue-a".to_string(),
+                ..Default::default()
+            }),
+            input: Some(Payloads::default()),
+            request_id: "query-order-start".to_string(),
+            memo: Some(Memo::default()),
+            search_attributes: Some(SearchAttributes::default()),
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+
+    let initial = workflow
+        .poll_workflow_task_queue(PollWorkflowTaskQueueRequest {
+            namespace: "default".to_string(),
+            task_queue: Some(TaskQueue {
+                name: "queue-a".to_string(),
+                ..Default::default()
+            }),
+            identity: "worker-1".to_string(),
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    workflow
+        .respond_workflow_task_completed(RespondWorkflowTaskCompletedRequest {
+            task_token: initial.task_token,
+            identity: "worker-1".to_string(),
+            commands: Vec::new(),
+            ..Default::default()
+        })
+        .await?;
+
+    workflow
+        .signal_workflow_execution(SignalWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_execution: Some(tokeira_proto::common::WorkflowExecution {
+                workflow_id: "workflow-query-order".to_string(),
+                run_id: start.run_id.clone(),
+            }),
+            signal_name: "set_counter".to_string(),
+            input: Some(payloads("5")),
+            request_id: "query-order-signal".to_string(),
+            ..Default::default()
+        })
+        .await?;
+
+    let endpoint_for_query = endpoint.clone();
+    let run_id_for_query = start.run_id.clone();
+    let query_handle = tokio::spawn(async move {
+        let mut client = WorkflowServiceClient::connect(endpoint_for_query).await?;
+        client
+            .query_workflow(QueryWorkflowRequest {
+                namespace: "default".to_string(),
+                execution: Some(tokeira_proto::common::WorkflowExecution {
+                    workflow_id: "workflow-query-order".to_string(),
+                    run_id: run_id_for_query,
+                }),
+                query: Some(
+                    tokeira_proto::public::temporal::api::query::v1::WorkflowQuery {
+                        query_type: "get_counter".to_string(),
+                        query_args: Some(Payloads::default()),
+                        header: None,
+                    },
+                ),
+                ..Default::default()
+            })
+            .await
+            .map(|resp| resp.into_inner())
+            .map_err(anyhow::Error::from)
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+    let poll = workflow
+        .poll_workflow_task_queue(PollWorkflowTaskQueueRequest {
+            namespace: "default".to_string(),
+            task_queue: Some(TaskQueue {
+                name: "queue-a".to_string(),
+                ..Default::default()
+            }),
+            identity: "worker-1".to_string(),
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    assert_eq!(poll.queries.len(), 1);
+    let query_id = poll
+        .queries
+        .keys()
+        .next()
+        .cloned()
+        .expect("buffered query should be attached");
+
+    let mut query_results = std::collections::BTreeMap::new();
+    query_results.insert(
+        query_id,
+        tokeira_proto::public::temporal::api::query::v1::WorkflowQueryResult {
+            result_type: tokeira_proto::enums::QueryResultType::Answered as i32,
+            answer: Some(payloads("5")),
+            error_message: String::new(),
+        },
+    );
+
+    workflow
+        .respond_workflow_task_completed(RespondWorkflowTaskCompletedRequest {
+            task_token: poll.task_token,
+            identity: "worker-1".to_string(),
+            commands: Vec::new(),
+            query_results,
+            ..Default::default()
+        })
+        .await?;
+
+    let query = query_handle.await??;
+    assert_eq!(
+        query.query_result.expect("query result should be present"),
+        payloads("5")
+    );
+
+    let _ = shutdown_tx.send(());
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn grpc_roundtrip_update_completed_through_protocol_messages() -> Result<()> {
+    use prost::Message as _;
+    use tokeira_proto::public::temporal::api::{
+        protocol::v1::Message as ProtocolMessage,
+        update::v1::{Outcome as UpdateOutcome, Response as UpdateResponse, outcome},
+    };
+
+    let (addr, shutdown_tx, server) = spawn_test_server().await?;
+
+    let endpoint = format!("http://{addr}");
+    let mut workflow = WorkflowServiceClient::connect(endpoint.clone()).await?;
+
+    let start = workflow
+        .start_workflow_execution(StartWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_id: "workflow-update-transport".to_string(),
+            workflow_type: Some(tokeira_proto::common::WorkflowType {
+                name: "example".to_string(),
+            }),
+            task_queue: Some(TaskQueue {
+                name: "queue-a".to_string(),
+                ..Default::default()
+            }),
+            input: Some(Payloads::default()),
+            request_id: "update-start".to_string(),
+            memo: Some(Memo::default()),
+            search_attributes: Some(SearchAttributes::default()),
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+
+    let initial = workflow
+        .poll_workflow_task_queue(PollWorkflowTaskQueueRequest {
+            namespace: "default".to_string(),
+            task_queue: Some(TaskQueue {
+                name: "queue-a".to_string(),
+                ..Default::default()
+            }),
+            identity: "worker-1".to_string(),
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    workflow
+        .respond_workflow_task_completed(RespondWorkflowTaskCompletedRequest {
+            task_token: initial.task_token,
+            identity: "worker-1".to_string(),
+            commands: Vec::new(),
+            ..Default::default()
+        })
+        .await?;
+
+    let endpoint_for_update = endpoint.clone();
+    let run_id_for_update = start.run_id.clone();
+    let update_handle = tokio::spawn(async move {
+        let mut client = WorkflowServiceClient::connect(endpoint_for_update).await?;
+        client
+            .update_workflow_execution(UpdateWorkflowExecutionRequest {
+                namespace: "default".to_string(),
+                workflow_execution: Some(tokeira_proto::common::WorkflowExecution {
+                    workflow_id: "workflow-update-transport".to_string(),
+                    run_id: run_id_for_update,
+                }),
+                request: Some(
+                    tokeira_proto::public::temporal::api::update::v1::Request {
+                        meta: Some(
+                            tokeira_proto::public::temporal::api::update::v1::Meta {
+                                update_id: "update-1".to_string(),
+                                identity: "starter".to_string(),
+                            },
+                        ),
+                        input: Some(
+                            tokeira_proto::public::temporal::api::update::v1::Input {
+                                header: None,
+                                name: "set_counter".to_string(),
+                                args: Some(payloads("10")),
+                            },
+                        ),
+                    },
+                ),
+                wait_policy: Some(
+                    tokeira_proto::public::temporal::api::update::v1::WaitPolicy {
+                        lifecycle_stage: 2,
+                    },
+                ),
+                ..Default::default()
+            })
+            .await
+            .map(|resp| resp.into_inner())
+            .map_err(anyhow::Error::from)
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+    let poll = workflow
+        .poll_workflow_task_queue(PollWorkflowTaskQueueRequest {
+            namespace: "default".to_string(),
+            task_queue: Some(TaskQueue {
+                name: "queue-a".to_string(),
+                ..Default::default()
+            }),
+            identity: "worker-1".to_string(),
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+
+    assert_eq!(poll.messages.len(), 1);
+    let update_id = poll.messages[0].protocol_instance_id.clone();
+    assert_eq!(update_id, "update-1");
+
+    let response = UpdateResponse {
+        meta: None,
+        outcome: Some(UpdateOutcome {
+            value: Some(outcome::Value::Success(payloads("5"))),
+        }),
+    };
+    let body = prost_types::Any {
+        type_url: "type.googleapis.com/temporal.api.update.v1.Response".to_string(),
+        value: response.encode_to_vec(),
+    };
+
+    workflow
+        .respond_workflow_task_completed(RespondWorkflowTaskCompletedRequest {
+            task_token: poll.task_token,
+            identity: "worker-1".to_string(),
+            commands: Vec::new(),
+            messages: vec![ProtocolMessage {
+                id: format!("{update_id}/response"),
+                protocol_instance_id: update_id,
+                body: Some(body),
+                sequencing_id: None,
+            }],
+            ..Default::default()
+        })
+        .await?;
+
+    let update = update_handle.await??;
+    let outcome = update.outcome.expect("update outcome should be present");
+    match outcome.value {
+        Some(
+            tokeira_proto::public::temporal::api::update::v1::outcome::Value::Success(
+                result,
+            ),
+        ) => assert_eq!(result, payloads("5")),
+        other => panic!("unexpected update outcome: {other:?}"),
+    }
 
     let _ = shutdown_tx.send(());
     server.await??;
@@ -439,6 +731,7 @@ async fn spawn_test_server() -> Result<(
         WorkflowTimeoutScannerConfig::default(),
         BacklogConfig::default(),
     ));
+    let buffered_queries = runtime.buffered_queries();
 
     let namespaces = Arc::new(InMemoryNamespaceCache::new());
     namespaces
@@ -469,7 +762,7 @@ async fn spawn_test_server() -> Result<(
         });
     }
     let workflow_broker = runtime.broker();
-    let workflow_service = WorkflowService::new(
+    let workflow_service = WorkflowService::new_with_buffered_queries(
         Arc::new(RuntimeAdapter::new(runtime)),
         Arc::new(StoreExecutionResolver::new(Arc::new(store.clone()))),
         Arc::new(VisibilityQueryService::new(visibility_store)),
@@ -479,6 +772,7 @@ async fn spawn_test_server() -> Result<(
         interceptors.clone(),
         PollerRegistry::default(),
         PendingQueryStore::default(),
+        buffered_queries,
         workflow_broker,
         LongPollGate::new(LongPollConfig::default()),
         Arc::new(LocalOnlyRouter),
@@ -576,5 +870,14 @@ where
                 Err(anyhow!("resolved run missing from storage: {:?}", run_key))
             }
         }
+    }
+}
+
+fn payloads(value: &str) -> Payloads {
+    Payloads {
+        payloads: vec![tokeira_proto::common::Payload {
+            data: value.as_bytes().to_vec(),
+            metadata: Default::default(),
+        }],
     }
 }

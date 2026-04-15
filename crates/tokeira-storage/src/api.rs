@@ -688,9 +688,7 @@ where
         limit: usize,
     ) -> Result<Vec<DispatchableWorkflowTask>> {
         (**self)
-            .list_dispatchable_workflow_tasks_for_shard(
-                shard_id, limit,
-            )
+            .list_dispatchable_workflow_tasks_for_shard(shard_id, limit)
             .await
     }
 
@@ -700,9 +698,7 @@ where
         limit: usize,
     ) -> Result<Vec<DispatchableActivityTask>> {
         (**self)
-            .list_dispatchable_activity_tasks_for_shard(
-                shard_id, limit,
-            )
+            .list_dispatchable_activity_tasks_for_shard(shard_id, limit)
             .await
     }
 
@@ -723,9 +719,7 @@ where
         limit: usize,
     ) -> Result<Vec<WorkflowTimeoutSweepEntry>> {
         (**self)
-            .list_runs_with_workflow_timeouts_for_shard(
-                shard_id, limit,
-            )
+            .list_runs_with_workflow_timeouts_for_shard(shard_id, limit)
             .await
     }
 
@@ -745,9 +739,7 @@ where
         limit: usize,
     ) -> Result<Vec<NexusSweepEntry>> {
         (**self)
-            .list_pending_nexus_operations_for_shard(
-                shard_id, limit,
-            )
+            .list_pending_nexus_operations_for_shard(shard_id, limit)
             .await
     }
 }

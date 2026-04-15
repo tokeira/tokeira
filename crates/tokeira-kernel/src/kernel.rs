@@ -4,9 +4,8 @@ use smallvec::SmallVec;
 use thiserror::Error;
 use time::OffsetDateTime;
 use tokeira_types::{
-    BuildId, DeploymentId, ExecutionStatus, LogicalTaskSeq, NamespaceId,
-    QueueKey, RunId, RunKey, StickyAffinity, TransitionSeq, WorkerIdentity,
-    WorkflowId,
+    BuildId, DeploymentId, ExecutionStatus, LogicalTaskSeq, NamespaceId, QueueKey, RunId,
+    RunKey, StickyAffinity, TransitionSeq, WorkerIdentity, WorkflowId,
 };
 
 use crate::{
@@ -19,11 +18,10 @@ use crate::{
         PauseWorkflowRequest, ResetActivityRequest, ResetRequest, RetryState,
         ScheduleQueryTaskRequest, SignalRequest, SignalWithStartRequest, StartRequest,
         StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest,
-        UnpauseActivityRequest, UnpauseWorkflowRequest,
-        UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody,
-        UpdateRequest, WorkflowCommand, WorkflowExecutionTimedOutRequest,
-        WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
-        WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
+        UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
+        UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest,
+        WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowTaskCompletedRequest,
+        WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
     },
     event::{ActivityResolution, HistoryEvent, HistoryEventKind},
     state::{
@@ -82,9 +80,7 @@ impl Kernel for BasicKernel {
     fn apply(&self, loaded: LoadedRun, command: Command) -> Result<Transition, Reject> {
         match command {
             Command::Start(req) => self.apply_start(loaded, req),
-            Command::SignalWithStart(req) => {
-                self.apply_signal_with_start(loaded, req)
-            }
+            Command::SignalWithStart(req) => self.apply_signal_with_start(loaded, req),
             Command::Update(req) => self.apply_update(loaded, req),
             Command::Signal(req) => self.apply_signal(loaded, req),
             Command::Cancel(req) => self.apply_cancel(loaded, req),
@@ -131,7 +127,9 @@ impl Kernel for BasicKernel {
                 self.apply_nexus_operation_resolved(loaded, req)
             }
             Command::TimerDue(req) => self.apply_timer_due(loaded, req),
-            Command::ScheduleQueryTask(req) => self.apply_schedule_query_task(loaded, req),
+            Command::ScheduleQueryTask(req) => {
+                self.apply_schedule_query_task(loaded, req)
+            }
         }
     }
 }
@@ -198,6 +196,7 @@ impl BasicKernel {
             pending_external_signals: BTreeMap::new(),
             pending_external_cancels: BTreeMap::new(),
             pending_updates: BTreeMap::new(),
+            admitted_updates: std::collections::HashSet::new(),
             pending_nexus_operations: BTreeMap::new(),
             versioning_override: None,
             completion_callbacks: Vec::new(),
@@ -258,6 +257,7 @@ impl BasicKernel {
             pending_external_signals: BTreeMap::new(),
             pending_external_cancels: BTreeMap::new(),
             pending_updates: BTreeMap::new(),
+            admitted_updates: std::collections::HashSet::new(),
             pending_nexus_operations: BTreeMap::new(),
             versioning_override: None,
             completion_callbacks: Vec::new(),
@@ -338,6 +338,7 @@ impl BasicKernel {
             pending_external_signals: BTreeMap::new(),
             pending_external_cancels: BTreeMap::new(),
             pending_updates: BTreeMap::new(),
+            admitted_updates: std::collections::HashSet::new(),
             pending_nexus_operations: BTreeMap::new(),
             versioning_override: None,
             completion_callbacks: Vec::new(),
@@ -419,7 +420,12 @@ impl BasicKernel {
         if state.status == ExecutionStatus::Paused {
             return Err(Reject::WorkflowPaused);
         }
+        // Reject duplicate update IDs — check both pending_updates
+        // (already accepted) and admitted_updates (awaiting worker acceptance).
         if state.pending_updates.contains_key(&req.update_id) {
+            return Err(Reject::DuplicateUpdateId(req.update_id));
+        }
+        if state.admitted_updates.contains(&req.update_id) {
             return Err(Reject::DuplicateUpdateId(req.update_id));
         }
 
@@ -427,20 +433,11 @@ impl BasicKernel {
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
-        let accepted_event_id =
-            builder.emit(HistoryEventKind::WorkflowExecutionUpdateAccepted {
-                update_id: req.update_id.clone(),
-                update_name: req.update_name.clone(),
-                input: req.input,
-            });
-        builder.state.pending_updates.insert(
-            req.update_id.clone(),
-            PendingUpdate {
-                update_id: req.update_id,
-                accepted_event_id,
-                name: req.update_name,
-            },
-        );
+
+        // Track that this update has been admitted but not yet accepted
+        // by the worker. The UpdateAccepted event is written later when
+        // the worker sends an Acceptance protocol message.
+        builder.state.admitted_updates.insert(req.update_id.clone());
 
         if builder.state.pending_workflow_task.is_none() {
             builder.schedule_workflow_task();
@@ -1038,6 +1035,12 @@ impl BasicKernel {
         }
 
         let mut builder = TransitionBuilder::new(state, req.now);
+
+        // Capture last_event_id before emitting the completion event.
+        // Events between started_event_id and this value arrived while
+        // the WFT was in progress (e.g., signals) and need a fresh WFT.
+        let pre_completion_last_event_id = builder.state.last_event_id;
+
         builder.emit(HistoryEventKind::WorkflowTaskCompleted {
             logical_seq: req.token.logical_seq,
             scheduled_event_id: pending.scheduled_event_id,
@@ -1054,9 +1057,22 @@ impl BasicKernel {
             closed = apply_workflow_command(&mut builder, command)?;
         }
 
+        // Schedule a new WFT when the worker explicitly requests one
+        // (heartbeat / local-activity keep-alive).
         if req.force_new_workflow_task
             && builder.state.is_open()
             && builder.state.pending_workflow_task.is_none()
+        {
+            builder.schedule_workflow_task();
+        }
+
+        // Schedule a new WFT if events arrived while this WFT was in
+        // progress (e.g., signals). The worker only saw history up to
+        // started_event_id; any events beyond that are "buffered" and
+        // need a fresh WFT so the worker can process them.
+        if builder.state.is_open()
+            && builder.state.pending_workflow_task.is_none()
+            && pre_completion_last_event_id > started_event_id
         {
             builder.schedule_workflow_task();
         }
@@ -1593,6 +1609,7 @@ impl BasicKernel {
         let mut builder = TransitionBuilder::new(state, req.fired_at);
         builder.emit(HistoryEventKind::TimerFired {
             timer_id: timer.timer_id.clone(),
+            started_event_id: timer.started_event_id,
         });
         builder.state.timers.remove(&timer.timer_id);
         builder.timer_ops.push(TimerOp::Delete {
@@ -1800,7 +1817,7 @@ impl BasicKernel {
             }
             HistoryEventKind::MarkerRecorded { .. } => {}
             HistoryEventKind::TimerCanceled { timer_id }
-            | HistoryEventKind::TimerFired { timer_id } => {
+            | HistoryEventKind::TimerFired { timer_id, .. } => {
                 state.timers.remove(timer_id);
             }
             HistoryEventKind::StartChildWorkflowExecutionInitiated {
@@ -1832,23 +1849,19 @@ impl BasicKernel {
                 }
             }
             HistoryEventKind::StartChildWorkflowExecutionFailed {
-                child_workflow_id, ..
+                child_workflow_id,
+                ..
             }
             | HistoryEventKind::ChildWorkflowExecutionCompleted {
-                child_workflow_id, ..
+                child_workflow_id,
+                ..
             }
             | HistoryEventKind::ChildWorkflowExecutionFailed {
                 child_workflow_id, ..
             }
-            | HistoryEventKind::ChildWorkflowExecutionCanceled {
-                child_workflow_id,
-            }
-            | HistoryEventKind::ChildWorkflowExecutionTerminated {
-                child_workflow_id,
-            }
-            | HistoryEventKind::ChildWorkflowExecutionTimedOut {
-                child_workflow_id,
-            } => {
+            | HistoryEventKind::ChildWorkflowExecutionCanceled { child_workflow_id }
+            | HistoryEventKind::ChildWorkflowExecutionTerminated { child_workflow_id }
+            | HistoryEventKind::ChildWorkflowExecutionTimedOut { child_workflow_id } => {
                 state.children.remove(child_workflow_id);
             }
             HistoryEventKind::SignalExternalWorkflowExecutionInitiated {
@@ -2080,7 +2093,9 @@ fn apply_workflow_command(
                 activity_type,
                 schedule_event_id,
                 task_queue: task_queue.clone(),
-                deployment: deployment.clone().or_else(|| builder.state.deployment.clone()),
+                deployment: deployment
+                    .clone()
+                    .or_else(|| builder.state.deployment.clone()),
                 build_id: build_id.clone().or_else(|| builder.state.build_id.clone()),
                 input: input.clone(),
                 header,
@@ -2480,6 +2495,8 @@ fn apply_workflow_command(
                     if builder.state.pending_updates.contains_key(&update_id) {
                         return Err(Reject::DuplicateUpdateId(update_id));
                     }
+                    // Move from admitted to pending on worker acceptance.
+                    builder.state.admitted_updates.remove(&update_id);
                     let accepted_event_id =
                         builder.emit(HistoryEventKind::WorkflowExecutionUpdateAccepted {
                             update_id: update_id.clone(),
@@ -2506,7 +2523,12 @@ fn apply_workflow_command(
                     builder.state.pending_updates.remove(&update_id);
                 }
                 UpdateProtocolBody::Rejected { update_id, failure } => {
-                    if !builder.state.pending_updates.contains_key(&update_id) {
+                    // A rejection can come for an admitted update (worker
+                    // rejects during validation) or a pending update.
+                    let was_admitted = builder.state.admitted_updates.remove(&update_id);
+                    let was_pending =
+                        builder.state.pending_updates.contains_key(&update_id);
+                    if !was_admitted && !was_pending {
                         return Err(Reject::UnknownUpdate(update_id));
                     }
                     builder.emit(HistoryEventKind::WorkflowExecutionUpdateRejected {
@@ -2623,6 +2645,7 @@ impl TransitionBuilder {
         self.state.pending_external_signals.clear();
         self.state.pending_external_cancels.clear();
         self.state.pending_updates.clear();
+        self.state.admitted_updates.clear();
         self.state.pending_nexus_operations.clear();
         self.projection_ops.push(ProjectionOp::CloseExecution {
             status,

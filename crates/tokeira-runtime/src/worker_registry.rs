@@ -3,9 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use tokeira_types::{
-    BuildId, DeploymentId, NamespaceId, TaskQueueName, WorkerIdentity,
-};
+use tokeira_types::{BuildId, DeploymentId, NamespaceId, TaskQueueName, WorkerIdentity};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct WorkerRegistrationKey {
@@ -26,11 +24,7 @@ pub struct WorkerRegistry {
 }
 
 impl WorkerRegistry {
-    pub fn register(
-        &self,
-        key: WorkerRegistrationKey,
-        metadata: WorkerVersionMetadata,
-    ) {
+    pub fn register(&self, key: WorkerRegistrationKey, metadata: WorkerVersionMetadata) {
         self.inner.lock().unwrap().insert(key, metadata);
     }
 
@@ -47,7 +41,9 @@ impl WorkerRegistry {
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
-    use tokeira_types::{BuildId, DeploymentId, NamespaceId, TaskQueueName, WorkerIdentity};
+    use tokeira_types::{
+        BuildId, DeploymentId, NamespaceId, TaskQueueName, WorkerIdentity,
+    };
 
     use super::{WorkerRegistrationKey, WorkerRegistry, WorkerVersionMetadata};
 

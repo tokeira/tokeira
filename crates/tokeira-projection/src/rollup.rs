@@ -7,7 +7,10 @@ pub fn compute_rollup_deltas(
     let mut out = Vec::new();
 
     for (dimension, next_value) in [
-        (RollupDimension::ExecutionStatus, format!("{:?}", next.status)),
+        (
+            RollupDimension::ExecutionStatus,
+            format!("{:?}", next.status),
+        ),
         (RollupDimension::WorkflowType, next.workflow_type.0.clone()),
         (RollupDimension::TaskQueue, next.task_queue.0.clone()),
     ] {
@@ -47,13 +50,12 @@ mod tests {
     use proptest::prelude::*;
     use time::OffsetDateTime;
     use tokeira_types::{
-        ExecutionStatus, Memo, NamespaceId, RunId, RunKey,
-        TaskQueueName, WorkflowId, WorkflowType,
+        ExecutionStatus, Memo, NamespaceId, RunId, RunKey, TaskQueueName, WorkflowId,
+        WorkflowType,
     };
     use uuid::Uuid;
 
-    fn arb_status(
-    ) -> impl Strategy<Value = ExecutionStatus> {
+    fn arb_status() -> impl Strategy<Value = ExecutionStatus> {
         prop_oneof![
             Just(ExecutionStatus::Running),
             Just(ExecutionStatus::Completed),
@@ -65,9 +67,7 @@ mod tests {
         ]
     }
 
-    fn arb_row(
-        ns: NamespaceId,
-    ) -> impl Strategy<Value = ExecutionRow> {
+    fn arb_row(ns: NamespaceId) -> impl Strategy<Value = ExecutionRow> {
         (
             any::<u128>(),
             "[a-z]{1,6}",
@@ -77,44 +77,24 @@ mod tests {
             arb_status(),
             1i64..1_000_000,
         )
-            .prop_map(
-                move |(
-                    rk,
-                    wf_id,
-                    run_id,
-                    wf_type,
-                    tq,
+            .prop_map(move |(rk, wf_id, run_id, wf_type, tq, status, start)| {
+                ExecutionRow {
+                    run_key: RunKey(Uuid::from_u128(rk)),
+                    namespace_id: ns,
+                    workflow_id: WorkflowId(wf_id),
+                    run_id: RunId(Uuid::from_u128(run_id)),
+                    workflow_type: WorkflowType(wf_type),
+                    task_queue: TaskQueueName(tq),
                     status,
-                    start,
-                )| {
-                    ExecutionRow {
-                        run_key: RunKey(
-                            Uuid::from_u128(rk),
-                        ),
-                        namespace_id: ns,
-                        workflow_id: WorkflowId(wf_id),
-                        run_id: RunId(
-                            Uuid::from_u128(run_id),
-                        ),
-                        workflow_type: WorkflowType(
-                            wf_type,
-                        ),
-                        task_queue: TaskQueueName(tq),
-                        status,
-                        start_time:
-                            OffsetDateTime::from_unix_timestamp(
-                                start,
-                            )
-                            .unwrap(),
-                        execution_time: None,
-                        close_time: None,
-                        history_length: 1,
-                        state_transition_count: 1,
-                        memo: Memo::default(),
-                        search_attr_version: 0,
-                    }
-                },
-            )
+                    start_time: OffsetDateTime::from_unix_timestamp(start).unwrap(),
+                    execution_time: None,
+                    close_time: None,
+                    history_length: 1,
+                    state_transition_count: 1,
+                    memo: Memo::default(),
+                    search_attr_version: 0,
+                }
+            })
     }
 
     // Feature: projection-visibility, Property 11:

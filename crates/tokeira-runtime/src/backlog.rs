@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use time::OffsetDateTime;
-use tokio_util::sync::CancellationToken;
 use tokeira_storage::{
     BacklogEntry, BacklogPayload, DispatchableActivityTask, DispatchableWorkflowTask,
     RunRepository,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{DeliveryMetrics, FairnessState, InMemoryActivityBroker, InMemoryBroker};
 
@@ -52,7 +52,10 @@ pub(crate) async fn scan_grace_once<R>(
     entries.extend(expired_activity.iter().map(activity_to_backlog_entry));
 
     if let Err(error) = repo.persist_to_backlog(entries).await {
-        tracing::warn!(?error, "failed to persist expired live-ready tasks to backlog");
+        tracing::warn!(
+            ?error,
+            "failed to persist expired live-ready tasks to backlog"
+        );
         for task in expired_workflow {
             broker.publish_workflow_task(task.task, None).await;
         }
@@ -60,7 +63,10 @@ pub(crate) async fn scan_grace_once<R>(
             if let Err(republish_error) =
                 activity_broker.publish_activity_task(task.task, None).await
             {
-                tracing::warn!(?republish_error, "failed to re-publish expired activity task after backlog persist failure");
+                tracing::warn!(
+                    ?republish_error,
+                    "failed to re-publish expired activity task after backlog persist failure"
+                );
             }
         }
     }
@@ -113,13 +119,16 @@ pub(crate) async fn drain_once<R>(
                     match entry.payload {
                         BacklogPayload::Workflow { logical_seq } => {
                             broker
-                                .publish_workflow_task(DispatchableWorkflowTask {
-                                    run_key: entry.run_key,
-                                    queue: entry.queue,
-                                    logical_seq,
-                                    sticky_preferred: None,
-                                    sticky_expires_at: None,
-                                }, Some(metrics))
+                                .publish_workflow_task(
+                                    DispatchableWorkflowTask {
+                                        run_key: entry.run_key,
+                                        queue: entry.queue,
+                                        logical_seq,
+                                        sticky_preferred: None,
+                                        sticky_expires_at: None,
+                                    },
+                                    Some(metrics),
+                                )
                                 .await;
                         }
                         BacklogPayload::Activity { .. } => {
@@ -157,17 +166,23 @@ pub(crate) async fn drain_once<R>(
                             attempt,
                         } => {
                             if let Err(error) = activity_broker
-                                .publish_activity_task(DispatchableActivityTask {
-                                    run_key: entry.run_key,
-                                    queue: entry.queue,
-                                    activity_id,
-                                    input,
-                                    schedule_event_id,
-                                    attempt,
-                                }, Some(metrics))
+                                .publish_activity_task(
+                                    DispatchableActivityTask {
+                                        run_key: entry.run_key,
+                                        queue: entry.queue,
+                                        activity_id,
+                                        input,
+                                        schedule_event_id,
+                                        attempt,
+                                    },
+                                    Some(metrics),
+                                )
                                 .await
                             {
-                                tracing::warn!(?error, "failed to re-publish drained activity backlog task");
+                                tracing::warn!(
+                                    ?error,
+                                    "failed to re-publish drained activity backlog task"
+                                );
                             }
                         }
                         BacklogPayload::Workflow { .. } => {
@@ -216,7 +231,9 @@ pub(crate) async fn run_drain_loop<R>(
     }
 }
 
-fn workflow_to_backlog_entry(task: &crate::broker::TimestampedWorkflowTask) -> BacklogEntry {
+fn workflow_to_backlog_entry(
+    task: &crate::broker::TimestampedWorkflowTask,
+) -> BacklogEntry {
     BacklogEntry {
         run_key: task.task.run_key,
         queue: task.task.queue.clone(),
@@ -228,7 +245,9 @@ fn workflow_to_backlog_entry(task: &crate::broker::TimestampedWorkflowTask) -> B
     }
 }
 
-fn activity_to_backlog_entry(task: &crate::broker::TimestampedActivityTask) -> BacklogEntry {
+fn activity_to_backlog_entry(
+    task: &crate::broker::TimestampedActivityTask,
+) -> BacklogEntry {
     BacklogEntry {
         run_key: task.task.run_key,
         queue: task.task.queue.clone(),
@@ -276,7 +295,10 @@ mod tests {
 
     #[async_trait]
     impl RunRepository for MockBacklogRepo {
-        async fn resolve_execution(&self, _execution: &ExecutionRef) -> Result<Option<RunKey>> {
+        async fn resolve_execution(
+            &self,
+            _execution: &ExecutionRef,
+        ) -> Result<Option<RunKey>> {
             Ok(None)
         }
         async fn find_latest_run(
@@ -443,13 +465,16 @@ mod tests {
         let broker = InMemoryBroker::default();
         let activity_broker = InMemoryActivityBroker::default();
         broker
-            .publish_workflow_task(DispatchableWorkflowTask {
-                run_key: RunKey::new(),
-                queue: workflow_queue(),
-                logical_seq: LogicalTaskSeq::ONE,
-                sticky_preferred: None,
-                sticky_expires_at: None,
-            }, None)
+            .publish_workflow_task(
+                DispatchableWorkflowTask {
+                    run_key: RunKey::new(),
+                    queue: workflow_queue(),
+                    logical_seq: LogicalTaskSeq::ONE,
+                    sticky_preferred: None,
+                    sticky_expires_at: None,
+                },
+                None,
+            )
             .await;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
@@ -780,8 +805,7 @@ mod tests {
     async fn property_grace_scanner_moves_exactly_expired() {
         let repo = MockBacklogRepo::default();
         let broker = InMemoryBroker::default();
-        let activity_broker =
-            InMemoryActivityBroker::default();
+        let activity_broker = InMemoryActivityBroker::default();
         let queue = workflow_queue();
 
         // Publish 3 tasks. task_a is published first and
@@ -796,10 +820,7 @@ mod tests {
         broker.publish_workflow_task(task_a.clone(), None).await;
 
         // Wait so task_a ages past the grace window.
-        tokio::time::sleep(
-            std::time::Duration::from_millis(15),
-        )
-        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
 
         // Publish task_b and task_c — they are fresh.
         let task_b = DispatchableWorkflowTask {
@@ -823,20 +844,12 @@ mod tests {
         // Grace window = 10ms. task_a (age ~15ms) exceeds
         // it. task_b and task_c (age ~0ms) do not.
         let config = BacklogConfig {
-            workflow_grace_window:
-                std::time::Duration::from_millis(10),
+            workflow_grace_window: std::time::Duration::from_millis(10),
             ..BacklogConfig::default()
         };
-        scan_grace_once(
-            &broker,
-            &activity_broker,
-            &repo,
-            &config,
-        )
-        .await;
+        scan_grace_once(&broker, &activity_broker, &repo, &config).await;
 
-        let persisted =
-            repo.persisted.lock().unwrap().clone();
+        let persisted = repo.persisted.lock().unwrap().clone();
         assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0].run_key, task_a.run_key);
 

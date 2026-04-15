@@ -167,9 +167,7 @@ impl ShardOwner {
     }
 
     /// Iterator over active shard IDs only.
-    pub fn active_shards(
-        &self,
-    ) -> impl Iterator<Item = ShardId> + '_ {
+    pub fn active_shards(&self) -> impl Iterator<Item = ShardId> + '_ {
         self.shards.iter().filter_map(|(id, o)| {
             if o.state == ShardState::Active {
                 Some(*id)
@@ -271,16 +269,14 @@ mod tests {
 
     #[test]
     fn shard_for_panics_on_zero_count() {
-        let result =
-            std::panic::catch_unwind(|| shard_for(RunKey::new(), 0));
+        let result = std::panic::catch_unwind(|| shard_for(RunKey::new(), 0));
         assert!(result.is_err());
     }
 
     #[test]
     fn shard_owner_remove_cleans_up() {
         let mut owner = ShardOwner::new(16);
-        let cancel =
-            owner.record_acquired(ShardId(3), ShardEpoch(1));
+        let cancel = owner.record_acquired(ShardId(3), ShardEpoch(1));
         owner.mark_active(ShardId(3));
         assert!(owner.is_active(ShardId(3)));
 
@@ -293,8 +289,7 @@ mod tests {
     #[test]
     fn mark_draining_cancels_token() {
         let mut owner = ShardOwner::new(16);
-        let cancel =
-            owner.record_acquired(ShardId(5), ShardEpoch(10));
+        let cancel = owner.record_acquired(ShardId(5), ShardEpoch(10));
         assert!(!cancel.is_cancelled());
 
         owner.mark_draining(ShardId(5));
@@ -304,28 +299,18 @@ mod tests {
     #[test]
     fn epoch_of_returns_epoch_in_any_state() {
         let mut owner = ShardOwner::new(16);
-        let _cancel =
-            owner.record_acquired(ShardId(1), ShardEpoch(42));
+        let _cancel = owner.record_acquired(ShardId(1), ShardEpoch(42));
 
         // Sweeping
-        assert_eq!(
-            owner.epoch_of(ShardId(1)),
-            Some(ShardEpoch(42))
-        );
+        assert_eq!(owner.epoch_of(ShardId(1)), Some(ShardEpoch(42)));
 
         // Active
         owner.mark_active(ShardId(1));
-        assert_eq!(
-            owner.epoch_of(ShardId(1)),
-            Some(ShardEpoch(42))
-        );
+        assert_eq!(owner.epoch_of(ShardId(1)), Some(ShardEpoch(42)));
 
         // Draining
         owner.mark_draining(ShardId(1));
-        assert_eq!(
-            owner.epoch_of(ShardId(1)),
-            Some(ShardEpoch(42))
-        );
+        assert_eq!(owner.epoch_of(ShardId(1)), Some(ShardEpoch(42)));
     }
 
     // ── Property 14: Shard-scoped timeout scanning ──────

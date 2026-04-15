@@ -5,8 +5,7 @@ use smallvec::{SmallVec, smallvec};
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     ActivityOp, ActivityResolution, ActivityResolvedRequest, BasicKernel, Command,
-    DispatchOp, HistoryEvent, HistoryEventKind, LoadedRun, ScheduleQueryTaskRequest,
-    SignalRequest,
+    DispatchOp, HistoryEvent, HistoryEventKind, LoadedRun, SignalRequest,
     SignalWithStartRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest,
     Transition, UpdateRequest, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
     WorkflowTaskCompletedRequest,
@@ -17,20 +16,21 @@ use tokeira_storage::{
 };
 use tokeira_types::{
     ActivityTaskToken, BuildId, DeploymentId, ExecutionRef, Headers, NamespaceId,
-    Payloads, QueueKey, RetryPolicy, RunId, RunKey, ShardEpoch, ShardId,
-    TaskKind, TaskQueueName, WorkerIdentity, RequestContext, WorkflowTaskToken,
+    Payloads, QueueKey, RequestContext, RetryPolicy, RunId, RunKey, ShardEpoch, ShardId,
+    TaskKind, TaskQueueName, WorkerIdentity, WorkflowTaskToken,
 };
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::nexus::run_nexus_timeout_scanner;
 use crate::{
     activity_timeout::{
-        ActivityTimeoutScannerConfig, ActivityTrackingState,
-        run_activity_timeout_scanner,
+        ActivityTimeoutScannerConfig, ActivityTrackingState, run_activity_timeout_scanner,
     },
     backlog::{BacklogConfig, run_drain_loop, run_grace_scanner},
-    broker::{InMemoryActivityBroker, InMemoryBroker, PolledWorkflowOrQueryTask},
+    broker::{InMemoryActivityBroker, InMemoryBroker},
+    buffered_queries::{BufferedQuery, BufferedQueryRegistry},
     fairness::{DeliveryMetrics, FairnessState, run_control_loop},
     lane::{LaneConfig, LaneHandle, spawn_lane},
     nexus::{
@@ -51,9 +51,7 @@ use crate::{
         PendingUpdateTransport, UpdateOutcome, UpdateRegistry, UpdateResolution,
         UpdateTransportResolution, UpdateWaitPolicy,
     },
-    worker_registry::{
-        WorkerRegistrationKey, WorkerRegistry, WorkerVersionMetadata,
-    },
+    worker_registry::{WorkerRegistrationKey, WorkerRegistry, WorkerVersionMetadata},
 };
 
 /// Public runtime facade.
@@ -91,6 +89,8 @@ pub struct TokeiraRuntime<R> {
     nexus_timeout_tracking: NexusTimeoutTrackingState,
     /// In-memory update caller registry.
     update_registry: UpdateRegistry,
+    /// Run-local buffered consistent queries.
+    buffered_queries: BufferedQueryRegistry,
     /// Observational registry of worker version metadata.
     worker_registry: WorkerRegistry,
     /// Runtime-local delivery metrics for fairness/observability.
@@ -150,6 +150,27 @@ enum ConflictResolution {
     TerminateAndStart { run_key: RunKey },
     ClosedAllowReuse,
     Rejected { run_key: RunKey, run_id: RunId },
+}
+
+struct BufferedQueryCleanup {
+    registry: BufferedQueryRegistry,
+    run_key: RunKey,
+    query_id: String,
+    enabled: bool,
+}
+
+impl BufferedQueryCleanup {
+    fn disarm(mut self) {
+        self.enabled = false;
+    }
+}
+
+impl Drop for BufferedQueryCleanup {
+    fn drop(&mut self) {
+        if self.enabled {
+            let _ = self.registry.remove(self.run_key, &self.query_id);
+        }
+    }
 }
 
 impl<R> TokeiraRuntime<R>
@@ -230,6 +251,7 @@ where
         let activity_tracking = ActivityTrackingState::default();
         let nexus_timeout_tracking = NexusTimeoutTrackingState::default();
         let update_registry = UpdateRegistry::new();
+        let buffered_queries = BufferedQueryRegistry::default();
         let worker_registry = WorkerRegistry::default();
         let delivery_metrics = DeliveryMetrics::new();
         let fairness_state = FairnessState::new();
@@ -349,6 +371,7 @@ where
             workflow_timeout_scanner_cancel,
             nexus_timeout_tracking,
             update_registry,
+            buffered_queries,
             worker_registry,
             delivery_metrics,
             fairness_state,
@@ -375,6 +398,10 @@ where
     /// Return a clone of the activity-task broker.
     pub fn activity_broker(&self) -> InMemoryActivityBroker {
         self.activity_broker.clone()
+    }
+
+    pub fn buffered_queries(&self) -> BufferedQueryRegistry {
+        self.buffered_queries.clone()
     }
 
     /// Return a shared reference to the run repository.
@@ -438,12 +465,14 @@ where
         self.update_registry
             .drain_pending_updates(run_key)
             .into_iter()
-            .map(|(update_id, update_name, input, identity)| PendingUpdateTransport {
-                update_id,
-                update_name,
-                input,
-                identity,
-            })
+            .map(
+                |(update_id, update_name, input, identity)| PendingUpdateTransport {
+                    update_id,
+                    update_name,
+                    input,
+                    identity,
+                },
+            )
             .collect()
     }
 
@@ -455,16 +484,12 @@ where
     ) -> bool {
         match resolution {
             UpdateTransportResolution::Accepted => true,
-            UpdateTransportResolution::Completed { result } => self.update_registry.notify(
-                run_key,
-                update_id,
-                UpdateResolution::Completed { result },
-            ),
-            UpdateTransportResolution::Rejected { failure } => self.update_registry.notify(
-                run_key,
-                update_id,
-                UpdateResolution::Rejected { failure },
-            ),
+            UpdateTransportResolution::Completed { result } => self
+                .update_registry
+                .notify(run_key, update_id, UpdateResolution::Completed { result }),
+            UpdateTransportResolution::Rejected { failure } => self
+                .update_registry
+                .notify(run_key, update_id, UpdateResolution::Rejected { failure }),
         }
     }
 
@@ -489,9 +514,7 @@ where
         let state = match self.repo.load_run(run_key).await? {
             LoadedRun::Existing(state) => state,
             LoadedRun::Absent => {
-                return Err(anyhow!(
-                    "execution disappeared before query dispatch"
-                ));
+                return Err(anyhow!("execution disappeared before query dispatch"));
             }
         };
 
@@ -507,53 +530,56 @@ where
         let sticky_preferred = state.sticky.as_ref().and_then(|affinity| {
             (affinity.expires_at > now).then_some(affinity.worker_identity.clone())
         });
-
-        // If no WFT is pending, schedule one so the worker has
-        // something to poll and the query can be piggybacked.
-        let has_pending_wft = state.pending_workflow_task.is_some();
-        if !has_pending_wft && state.status.is_open() {
-            tracing::debug!(
-                ?run_key,
-                status = ?state.status,
-                "query_workflow: no pending WFT, scheduling ScheduleQueryTask"
-            );
-            match self
-                .submit(
-                    run_key,
-                    Command::ScheduleQueryTask(ScheduleQueryTaskRequest { now }),
-                )
-                .await
-            {
-                Ok(result) => tracing::debug!(?result, "ScheduleQueryTask committed"),
-                Err(e) => tracing::warn!(%e, "ScheduleQueryTask failed"),
-            }
-        } else {
-            tracing::debug!(
-                ?run_key,
-                has_pending_wft,
-                status = ?state.status,
-                "query_workflow: WFT already pending or workflow not open"
-            );
-        }
+        let required_barrier = state.last_event_id;
 
         let (response_tx, response_rx) = oneshot::channel();
-        self.broker
-            .publish_query_task(QueryTask {
-                run_key,
-                query_type,
-                query_args,
-                queue,
-                sticky_preferred,
-                response_tx,
-            })
-            .await;
+        let query_id = Uuid::new_v4().to_string();
+        let has_pending_wft = state.pending_workflow_task.is_some();
+
+        if has_pending_wft {
+            self.buffered_queries
+                .buffer(
+                    run_key,
+                    BufferedQuery {
+                        query_id: query_id.clone(),
+                        query_type,
+                        query_args,
+                        required_barrier,
+                        response_tx,
+                    },
+                )
+                .map_err(|_| {
+                    anyhow!("too many buffered queries for run {:?}", run_key)
+                })?;
+        } else {
+            self.broker
+                .publish_query_task(QueryTask {
+                    run_key,
+                    query_type,
+                    query_args,
+                    queue,
+                    sticky_preferred,
+                    response_tx,
+                })
+                .await;
+        }
 
         let timeout_after: std::time::Duration = timeout_after
             .try_into()
             .map_err(|_| anyhow!("query timeout must be non-negative"))?;
 
+        let cleanup = BufferedQueryCleanup {
+            registry: self.buffered_queries.clone(),
+            run_key,
+            query_id,
+            enabled: has_pending_wft,
+        };
+
         match tokio::time::timeout(timeout_after, response_rx).await {
-            Ok(Ok(result)) => Ok(result),
+            Ok(Ok(result)) => {
+                cleanup.disarm();
+                Ok(result)
+            }
             Ok(Err(_)) => Err(anyhow!("query response channel closed")),
             Err(_) => Err(anyhow!("query timed out")),
         }
@@ -579,15 +605,14 @@ where
         let mut complete_rx = None;
         if wait_policy == UpdateWaitPolicy::Completed {
             let (complete_tx, rx) = oneshot::channel::<UpdateResolution>();
-            self.update_registry
-                .register(
-                    run_key,
-                    update_id.clone(),
-                    update_name.clone(),
-                    input.clone(),
-                    request.caller_identity.clone().unwrap_or_default(),
-                    complete_tx,
-                );
+            self.update_registry.register(
+                run_key,
+                update_id.clone(),
+                update_name.clone(),
+                input.clone(),
+                request.caller_identity.clone().unwrap_or_default(),
+                complete_tx,
+            );
             complete_rx = Some(rx);
         }
 
@@ -610,12 +635,12 @@ where
             }
         };
 
-        let accepted_event_id = match commit_result {
-            CommitResult::Applied { new_state } => new_state
-                .pending_updates
-                .get(&update_id)
-                .map(|pending| pending.accepted_event_id)
-                .ok_or_else(|| anyhow!("accepted update missing from pending_updates"))?,
+        // The update has been admitted (tracked in admitted_updates).
+        // The accepted_event_id is not yet known — it will be assigned
+        // when the worker sends an Acceptance message. For now, use 0
+        // as a placeholder for the Accepted wait policy.
+        match commit_result {
+            CommitResult::Applied { .. } => {}
             CommitResult::Duplicate => {
                 if wait_policy == UpdateWaitPolicy::Completed {
                     self.update_registry.remove(run_key, &update_id);
@@ -633,7 +658,9 @@ where
         };
 
         if wait_policy == UpdateWaitPolicy::Accepted {
-            return Ok(UpdateOutcome::Accepted { accepted_event_id });
+            return Ok(UpdateOutcome::Accepted {
+                accepted_event_id: 0,
+            });
         }
 
         let timeout_after: std::time::Duration = timeout_after
@@ -642,18 +669,18 @@ where
         let complete_rx = complete_rx.expect("completion receiver should exist");
 
         match tokio::time::timeout(timeout_after, complete_rx).await {
-            Ok(Ok(UpdateResolution::Completed { result })) => Ok(
-                UpdateOutcome::Completed {
-                    accepted_event_id,
+            Ok(Ok(UpdateResolution::Completed { result })) => {
+                Ok(UpdateOutcome::Completed {
+                    accepted_event_id: 0,
                     result,
-                },
-            ),
-            Ok(Ok(UpdateResolution::Rejected { failure })) => Ok(
-                UpdateOutcome::Rejected {
-                    accepted_event_id,
+                })
+            }
+            Ok(Ok(UpdateResolution::Rejected { failure })) => {
+                Ok(UpdateOutcome::Rejected {
+                    accepted_event_id: 0,
                     failure,
-                },
-            ),
+                })
+            }
             Ok(Ok(UpdateResolution::RunClosed)) => {
                 Err(anyhow!("run closed before update completed"))
             }
@@ -711,7 +738,9 @@ where
                         "unexpected duplicate start commit for {:?}",
                         request.run_key
                     )),
-                    CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
+                    CommitResult::Conflict { reason } => {
+                        Err(anyhow!("conflict: {reason}"))
+                    }
                 }
             }
             ConflictResolution::UseExisting { run_key, run_id } => {
@@ -734,7 +763,9 @@ where
                         "unexpected duplicate start commit for {:?}",
                         request.run_key
                     )),
-                    CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
+                    CommitResult::Conflict { reason } => {
+                        Err(anyhow!("conflict: {reason}"))
+                    }
                 }
             }
             ConflictResolution::Rejected { run_key, run_id } => {
@@ -769,7 +800,9 @@ where
                         "unexpected duplicate signal-with-start commit for {:?}",
                         request.run_key
                     )),
-                    CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
+                    CommitResult::Conflict { reason } => {
+                        Err(anyhow!("conflict: {reason}"))
+                    }
                 }
             }
             ConflictResolution::UseExisting { run_key, run_id } => {
@@ -793,7 +826,9 @@ where
                     CommitResult::Applied { .. } | CommitResult::Duplicate => {
                         Ok(SignalWithStartResult::Signaled { run_key, run_id })
                     }
-                    CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
+                    CommitResult::Conflict { reason } => {
+                        Err(anyhow!("conflict: {reason}"))
+                    }
                 }
             }
             ConflictResolution::TerminateAndStart { run_key } => {
@@ -816,7 +851,9 @@ where
                         "unexpected duplicate signal-with-start commit for {:?}",
                         request.run_key
                     )),
-                    CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
+                    CommitResult::Conflict { reason } => {
+                        Err(anyhow!("conflict: {reason}"))
+                    }
                 }
             }
             ConflictResolution::Rejected { run_key, run_id } => {
@@ -879,14 +916,18 @@ where
             .await?
             .ok_or_else(|| anyhow!("execution not found"))?;
         let successor_run_key = RunKey(request.new_run_id.0);
-        match self.submit(run_key, Command::Reset(request.clone())).await? {
+        match self
+            .submit(run_key, Command::Reset(request.clone()))
+            .await?
+        {
             CommitResult::Applied { .. } => Ok(ResetWorkflowResult {
                 successor_run_key,
                 successor_run_id: request.new_run_id,
             }),
-            CommitResult::Duplicate => {
-                Err(anyhow!("unexpected duplicate reset commit for {:?}", run_key))
-            }
+            CommitResult::Duplicate => Err(anyhow!(
+                "unexpected duplicate reset commit for {:?}",
+                run_key
+            )),
             CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
         }
     }
@@ -913,10 +954,12 @@ where
                         run_key,
                         run_id: state.run_id,
                     },
-                    WorkflowIdConflictPolicy::UseExisting => ConflictResolution::UseExisting {
-                        run_key,
-                        run_id: state.run_id,
-                    },
+                    WorkflowIdConflictPolicy::UseExisting => {
+                        ConflictResolution::UseExisting {
+                            run_key,
+                            run_id: state.run_id,
+                        }
+                    }
                     WorkflowIdConflictPolicy::TerminateExisting => {
                         ConflictResolution::TerminateAndStart { run_key }
                     }
@@ -924,7 +967,8 @@ where
             }
         }
 
-        let Some(run_key) = self.repo.find_latest_run(namespace_id, workflow_id).await? else {
+        let Some(run_key) = self.repo.find_latest_run(namespace_id, workflow_id).await?
+        else {
             return Ok(ConflictResolution::Absent);
         };
         let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
@@ -936,10 +980,12 @@ where
                     run_key,
                     run_id: state.run_id,
                 },
-                WorkflowIdConflictPolicy::UseExisting => ConflictResolution::UseExisting {
-                    run_key,
-                    run_id: state.run_id,
-                },
+                WorkflowIdConflictPolicy::UseExisting => {
+                    ConflictResolution::UseExisting {
+                        run_key,
+                        run_id: state.run_id,
+                    }
+                }
                 WorkflowIdConflictPolicy::TerminateExisting => {
                     ConflictResolution::TerminateAndStart { run_key }
                 }
@@ -1040,48 +1086,6 @@ where
         Ok(Some(started))
     }
 
-    /// Long-poll for either a real workflow task or a synthetic query-only task.
-    pub async fn poll_workflow_or_query_task(
-        &self,
-        queue: QueueKey,
-        worker_identity: WorkerIdentity,
-        timeout_after: tokio::time::Duration,
-    ) -> Result<Option<PolledWorkflowTaskTransport>> {
-        let offered = match self
-            .broker
-            .poll_workflow_or_query_task(&queue, &worker_identity, timeout_after)
-            .await?
-        {
-            Some(offered) => {
-                self.delivery_metrics.record_poll_success(&queue);
-                offered
-            }
-            None => {
-                self.delivery_metrics.record_poll_timeout(&queue);
-                return Ok(None);
-            }
-        };
-
-        match offered {
-            PolledWorkflowOrQueryTask::Workflow(offered) => {
-                let started = self
-                    .start_polled_workflow_task(offered.0, offered.1, worker_identity)
-                    .await?;
-                Ok(Some(PolledWorkflowTaskTransport::Workflow(started)))
-            }
-            PolledWorkflowOrQueryTask::Query(query) => {
-                let task_queue = query.queue.task_queue.clone();
-                let started = self
-                    .start_query_only_workflow_task(query.run_key, task_queue)
-                    .await?;
-                Ok(Some(PolledWorkflowTaskTransport::QueryOnly {
-                    started,
-                    first_query: query,
-                }))
-            }
-        }
-    }
-
     /// Record the completion of a workflow task and
     /// apply any resulting commands.
     pub async fn complete_workflow_task(
@@ -1130,18 +1134,23 @@ where
     ) -> Result<CommitResult> {
         let activity_id = token.activity_id.clone();
         self.validate_activity_token(&token).await?;
-        let result = self.submit_for_owned_shard(
-            token.run_key,
-            Command::ActivityResolved(ActivityResolvedRequest {
-                activity_id,
-                resolution: ActivityResolution::Completed { result },
-                worker_identity: None,
-                now: OffsetDateTime::now_utc(),
-            }),
-        )
-        .await?;
-        if matches!(result, CommitResult::Applied { .. } | CommitResult::Duplicate) {
-            self.activity_tracking.remove(token.run_key, &token.activity_id);
+        let result = self
+            .submit_for_owned_shard(
+                token.run_key,
+                Command::ActivityResolved(ActivityResolvedRequest {
+                    activity_id,
+                    resolution: ActivityResolution::Completed { result },
+                    worker_identity: None,
+                    now: OffsetDateTime::now_utc(),
+                }),
+            )
+            .await?;
+        if matches!(
+            result,
+            CommitResult::Applied { .. } | CommitResult::Duplicate
+        ) {
+            self.activity_tracking
+                .remove(token.run_key, &token.activity_id);
         }
         Ok(result)
     }
@@ -1186,7 +1195,8 @@ where
                 }),
             )
             .await?;
-        self.activity_tracking.remove(token.run_key, &token.activity_id);
+        self.activity_tracking
+            .remove(token.run_key, &token.activity_id);
         Ok(())
     }
 
@@ -1257,44 +1267,22 @@ where
             workflow_id: new_state.workflow_id,
             task_queue: new_state.task_queue,
             token,
-            query_only: false,
         })
     }
 
-    async fn start_query_only_workflow_task(
+    pub async fn submit(
         &self,
         run_key: RunKey,
-        task_queue: TaskQueueName,
-    ) -> Result<StartedWorkflowTask> {
-        let state = match self.repo.load_run(run_key).await? {
-            LoadedRun::Existing(state) => state,
-            LoadedRun::Absent => {
-                return Err(anyhow!("query target run missing"));
-            }
-        };
-        let token = WorkflowTaskToken {
-            run_key,
-            logical_seq: tokeira_types::LogicalTaskSeq(0),
-            started_event_id: 0,
-            attempt: 1,
-            shard_epoch: self.current_shard_epoch(run_key).await?,
-        };
-        Ok(StartedWorkflowTask {
-            run_key,
-            workflow_id: state.workflow_id,
-            task_queue,
-            token,
-            query_only: true,
-        })
-    }
-
-    pub async fn submit(&self, run_key: RunKey, command: Command) -> Result<CommitResult> {
+        command: Command,
+    ) -> Result<CommitResult> {
         let shard_id = self.shard_id_for(run_key).await;
         if !self.shard_owner.read().unwrap().is_active(shard_id) {
             return Err(anyhow!("shard not active for run {:?}", run_key));
         }
         let lane = self.pick_lane(run_key);
-        lane.submit(run_key, command).await
+        let result = lane.submit(run_key, command).await?;
+        self.handle_post_commit(run_key, &result);
+        Ok(result)
     }
 
     async fn submit_for_owned_shard(
@@ -1303,11 +1291,28 @@ where
         command: Command,
     ) -> Result<CommitResult> {
         let shard_id = self.shard_id_for(run_key).await;
-        if self.shard_owner.read().unwrap().epoch_of(shard_id).is_none() {
+        if self
+            .shard_owner
+            .read()
+            .unwrap()
+            .epoch_of(shard_id)
+            .is_none()
+        {
             return Err(anyhow!("shard not owned for run {:?}", run_key));
         }
         let lane = self.pick_lane(run_key);
-        lane.submit(run_key, command).await
+        let result = lane.submit(run_key, command).await?;
+        self.handle_post_commit(run_key, &result);
+        Ok(result)
+    }
+
+    fn handle_post_commit(&self, run_key: RunKey, result: &CommitResult) {
+        if let CommitResult::Applied { new_state } = result {
+            if new_state.closed_at.is_some() {
+                self.buffered_queries
+                    .fail_run_queries(run_key, "workflow execution completed");
+            }
+        }
     }
 
     async fn current_shard_epoch(&self, run_key: RunKey) -> Result<ShardEpoch> {
@@ -1319,10 +1324,7 @@ where
             .ok_or_else(|| anyhow!("shard not owned for run {:?}", run_key))
     }
 
-    async fn shard_epoch_for_completion(
-        &self,
-        run_key: RunKey,
-    ) -> Result<ShardEpoch> {
+    async fn shard_epoch_for_completion(&self, run_key: RunKey) -> Result<ShardEpoch> {
         let shard_id = self.shard_id_for(run_key).await;
         self.shard_owner
             .read()
@@ -1415,7 +1417,8 @@ where
 
     pub async fn relinquish_shard(&self, shard_id: ShardId) {
         self.shard_owner.write().unwrap().mark_draining(shard_id);
-        self.workflow_timeout_tracking.remove_all_for_shard(shard_id);
+        self.workflow_timeout_tracking
+            .remove_all_for_shard(shard_id);
         self.activity_tracking.remove_all_for_shard(shard_id);
         self.nexus_timeout_tracking.remove_all_for_shard(shard_id);
         self.shard_owner.write().unwrap().remove(shard_id);
@@ -1617,11 +1620,7 @@ where
 
             match self
                 .repo
-                .commit_transition(
-                    task.run_key,
-                    transition,
-                    ShardEpoch::ZERO,
-                )
+                .commit_transition(task.run_key, transition, ShardEpoch::ZERO)
                 .await?
             {
                 CommitResult::Applied { .. } => {
@@ -1774,11 +1773,7 @@ where
 
             match self
                 .repo
-                .commit_transition(
-                    token.run_key,
-                    transition,
-                    ShardEpoch::ZERO,
-                )
+                .commit_transition(token.run_key, transition, ShardEpoch::ZERO)
                 .await?
             {
                 CommitResult::Applied { .. } => {
@@ -1822,17 +1817,6 @@ pub struct StartedWorkflowTask {
     pub task_queue: TaskQueueName,
     /// Opaque token used to complete the task.
     pub token: WorkflowTaskToken,
-    /// True when this poll exists only to carry queries, not a real WFT.
-    pub query_only: bool,
-}
-
-#[derive(Debug)]
-pub enum PolledWorkflowTaskTransport {
-    Workflow(StartedWorkflowTask),
-    QueryOnly {
-        started: StartedWorkflowTask,
-        first_query: QueryTask,
-    },
 }
 
 /// An activity task that has been polled and started.

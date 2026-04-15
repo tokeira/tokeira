@@ -7,7 +7,7 @@ use std::{
 
 use time::OffsetDateTime;
 use tokeira_kernel::{
-    ActivityResolvedRequest, ActivityResolution, ActivityState, Command, LoadedRun,
+    ActivityResolution, ActivityResolvedRequest, ActivityState, Command, LoadedRun,
 };
 use tokeira_storage::RunRepository;
 use tokeira_types::{RunKey, ShardId};
@@ -63,12 +63,7 @@ impl ActivityTrackingState {
         );
     }
 
-    pub fn record_retry(
-        &self,
-        run_key: RunKey,
-        activity_id: &str,
-        now: OffsetDateTime,
-    ) {
+    pub fn record_retry(&self, run_key: RunKey, activity_id: &str, now: OffsetDateTime) {
         if let Some(entry) = self
             .inner
             .lock()
@@ -151,10 +146,7 @@ impl ActivityTrackingState {
         self.inner.lock().unwrap().values().cloned().collect()
     }
 
-    pub fn snapshot_for_shard(
-        &self,
-        shard_id: ShardId,
-    ) -> Vec<ActivityTrackingEntry> {
+    pub fn snapshot_for_shard(&self, shard_id: ShardId) -> Vec<ActivityTrackingEntry> {
         self.inner
             .lock()
             .unwrap()

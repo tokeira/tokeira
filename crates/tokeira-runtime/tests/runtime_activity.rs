@@ -200,11 +200,7 @@ async fn retryable_activity_failure_preserves_versioned_queue() -> Result<()> {
 
     let second = runtime
         .poll_activity_task(
-            activity_queue_with_version(
-                namespace_id,
-                Some(deployment),
-                Some(build_id),
-            ),
+            activity_queue_with_version(namespace_id, Some(deployment), Some(build_id)),
             WorkerIdentity("worker-a".to_string()),
             tokio::time::Duration::from_millis(5),
         )

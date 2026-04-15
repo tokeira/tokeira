@@ -1,9 +1,12 @@
-use std::{collections::{BTreeMap, HashMap, HashSet}, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::Arc,
+};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use tokio::sync::Mutex;
 use tokeira_types::{NamespaceId, ProjectionCursor, RunKey, SearchAttrValue};
+use tokio::sync::Mutex;
 
 use crate::{
     store::VisibilityStore,
@@ -58,7 +61,11 @@ impl InMemoryVisibilityStore {
 #[async_trait]
 impl VisibilityStore for InMemoryVisibilityStore {
     async fn upsert_execution(&self, row: &ExecutionRow) -> Result<()> {
-        self.inner.lock().await.rows.insert(row.run_key, row.clone());
+        self.inner
+            .lock()
+            .await
+            .rows
+            .insert(row.run_key, row.clone());
         Ok(())
     }
 
@@ -86,40 +93,45 @@ impl VisibilityStore for InMemoryVisibilityStore {
             };
             match previous {
                 SearchAttrValue::Keyword(v) => {
-                    if let Some(set) = inner
-                        .sa_keyword_idx
-                        .get_mut(&(row.namespace_id, attr_id, v))
+                    if let Some(set) =
+                        inner
+                            .sa_keyword_idx
+                            .get_mut(&(row.namespace_id, attr_id, v))
                     {
                         set.remove(&run_key);
                     }
                 }
                 SearchAttrValue::KeywordList(values) => {
                     for v in values {
-                        if let Some(set) = inner
-                            .sa_keyword_list_idx
-                            .get_mut(&(row.namespace_id, attr_id, v))
-                        {
+                        if let Some(set) = inner.sa_keyword_list_idx.get_mut(&(
+                            row.namespace_id,
+                            attr_id,
+                            v,
+                        )) {
                             set.remove(&run_key);
                         }
                     }
                 }
                 SearchAttrValue::Int(v) => {
-                    if let Some(set) = inner.sa_int_idx.get_mut(&(row.namespace_id, attr_id, v))
+                    if let Some(set) =
+                        inner.sa_int_idx.get_mut(&(row.namespace_id, attr_id, v))
                     {
                         set.remove(&run_key);
                     }
                 }
                 SearchAttrValue::Bool(v) => {
-                    if let Some(set) = inner.sa_bool_idx.get_mut(&(row.namespace_id, attr_id, v))
+                    if let Some(set) =
+                        inner.sa_bool_idx.get_mut(&(row.namespace_id, attr_id, v))
                     {
                         set.remove(&run_key);
                     }
                 }
                 SearchAttrValue::Double(v) => {
-                    if let Some(set) = inner
-                        .sa_double_idx
-                        .get_mut(&(row.namespace_id, attr_id, format!("{v:.17}")))
-                    {
+                    if let Some(set) = inner.sa_double_idx.get_mut(&(
+                        row.namespace_id,
+                        attr_id,
+                        format!("{v:.17}"),
+                    )) {
                         set.remove(&run_key);
                     }
                 }
@@ -134,9 +146,10 @@ impl VisibilityStore for InMemoryVisibilityStore {
                 }
                 SearchAttrValue::Text(v) => {
                     for token in Self::index_text(&v) {
-                        if let Some(set) = inner
-                            .sa_text_idx
-                            .get_mut(&(row.namespace_id, attr_id, token))
+                        if let Some(set) =
+                            inner
+                                .sa_text_idx
+                                .get_mut(&(row.namespace_id, attr_id, token))
                         {
                             set.remove(&run_key);
                         }
@@ -146,7 +159,10 @@ impl VisibilityStore for InMemoryVisibilityStore {
         }
 
         for (dimension, value) in [
-            (RollupDimension::ExecutionStatus, format!("{:?}", row.status)),
+            (
+                RollupDimension::ExecutionStatus,
+                format!("{:?}", row.status),
+            ),
             (RollupDimension::WorkflowType, row.workflow_type.0),
             (RollupDimension::TaskQueue, row.task_queue.0),
         ] {
@@ -174,28 +190,56 @@ impl VisibilityStore for InMemoryVisibilityStore {
         inner.sa_current.insert((run_key, attr_id), value.clone());
         match (attr_type, value) {
             (SearchAttrType::Keyword, SearchAttrValue::Keyword(v)) => {
-                inner.sa_keyword_idx.entry((namespace_id, attr_id, v.clone())).or_default().insert(run_key);
+                inner
+                    .sa_keyword_idx
+                    .entry((namespace_id, attr_id, v.clone()))
+                    .or_default()
+                    .insert(run_key);
             }
             (SearchAttrType::KeywordList, SearchAttrValue::KeywordList(values)) => {
                 for v in values {
-                    inner.sa_keyword_list_idx.entry((namespace_id, attr_id, v.clone())).or_default().insert(run_key);
+                    inner
+                        .sa_keyword_list_idx
+                        .entry((namespace_id, attr_id, v.clone()))
+                        .or_default()
+                        .insert(run_key);
                 }
             }
             (SearchAttrType::Int, SearchAttrValue::Int(v)) => {
-                inner.sa_int_idx.entry((namespace_id, attr_id, *v)).or_default().insert(run_key);
+                inner
+                    .sa_int_idx
+                    .entry((namespace_id, attr_id, *v))
+                    .or_default()
+                    .insert(run_key);
             }
             (SearchAttrType::Bool, SearchAttrValue::Bool(v)) => {
-                inner.sa_bool_idx.entry((namespace_id, attr_id, *v)).or_default().insert(run_key);
+                inner
+                    .sa_bool_idx
+                    .entry((namespace_id, attr_id, *v))
+                    .or_default()
+                    .insert(run_key);
             }
             (SearchAttrType::Double, SearchAttrValue::Double(v)) => {
-                inner.sa_double_idx.entry((namespace_id, attr_id, format!("{v:.17}"))).or_default().insert(run_key);
+                inner
+                    .sa_double_idx
+                    .entry((namespace_id, attr_id, format!("{v:.17}")))
+                    .or_default()
+                    .insert(run_key);
             }
             (SearchAttrType::Datetime, SearchAttrValue::Datetime(v)) => {
-                inner.sa_datetime_idx.entry((namespace_id, attr_id, v.unix_timestamp_nanos())).or_default().insert(run_key);
+                inner
+                    .sa_datetime_idx
+                    .entry((namespace_id, attr_id, v.unix_timestamp_nanos()))
+                    .or_default()
+                    .insert(run_key);
             }
             (SearchAttrType::Text, SearchAttrValue::Text(v)) => {
                 for token in Self::index_text(v) {
-                    inner.sa_text_idx.entry((namespace_id, attr_id, token)).or_default().insert(run_key);
+                    inner
+                        .sa_text_idx
+                        .entry((namespace_id, attr_id, token))
+                        .or_default()
+                        .insert(run_key);
                 }
             }
             _ => {}
@@ -216,13 +260,21 @@ impl VisibilityStore for InMemoryVisibilityStore {
         };
         match (attr_type, previous) {
             (SearchAttrType::Keyword, SearchAttrValue::Keyword(v)) => {
-                if let Some(set) = inner.sa_keyword_idx.get_mut(&(namespace_id, attr_id, v.clone())) {
+                if let Some(set) =
+                    inner
+                        .sa_keyword_idx
+                        .get_mut(&(namespace_id, attr_id, v.clone()))
+                {
                     set.remove(&run_key);
                 }
             }
             (SearchAttrType::KeywordList, SearchAttrValue::KeywordList(values)) => {
                 for v in values {
-                    if let Some(set) = inner.sa_keyword_list_idx.get_mut(&(namespace_id, attr_id, v.clone())) {
+                    if let Some(set) = inner.sa_keyword_list_idx.get_mut(&(
+                        namespace_id,
+                        attr_id,
+                        v.clone(),
+                    )) {
                         set.remove(&run_key);
                     }
                 }
@@ -233,23 +285,34 @@ impl VisibilityStore for InMemoryVisibilityStore {
                 }
             }
             (SearchAttrType::Bool, SearchAttrValue::Bool(v)) => {
-                if let Some(set) = inner.sa_bool_idx.get_mut(&(namespace_id, attr_id, v)) {
+                if let Some(set) = inner.sa_bool_idx.get_mut(&(namespace_id, attr_id, v))
+                {
                     set.remove(&run_key);
                 }
             }
             (SearchAttrType::Double, SearchAttrValue::Double(v)) => {
-                if let Some(set) = inner.sa_double_idx.get_mut(&(namespace_id, attr_id, format!("{v:.17}"))) {
+                if let Some(set) = inner.sa_double_idx.get_mut(&(
+                    namespace_id,
+                    attr_id,
+                    format!("{v:.17}"),
+                )) {
                     set.remove(&run_key);
                 }
             }
             (SearchAttrType::Datetime, SearchAttrValue::Datetime(v)) => {
-                if let Some(set) = inner.sa_datetime_idx.get_mut(&(namespace_id, attr_id, v.unix_timestamp_nanos())) {
+                if let Some(set) = inner.sa_datetime_idx.get_mut(&(
+                    namespace_id,
+                    attr_id,
+                    v.unix_timestamp_nanos(),
+                )) {
                     set.remove(&run_key);
                 }
             }
             (SearchAttrType::Text, SearchAttrValue::Text(v)) => {
                 for token in Self::index_text(&v) {
-                    if let Some(set) = inner.sa_text_idx.get_mut(&(namespace_id, attr_id, token)) {
+                    if let Some(set) =
+                        inner.sa_text_idx.get_mut(&(namespace_id, attr_id, token))
+                    {
                         set.remove(&run_key);
                     }
                 }
@@ -262,7 +325,10 @@ impl VisibilityStore for InMemoryVisibilityStore {
     async fn accumulate_rollup(&self, entries: &[RollupDelta]) -> Result<()> {
         let mut inner = self.inner.lock().await;
         for entry in entries {
-            *inner.rollups.entry((entry.namespace_id, entry.dimension, entry.value.clone())).or_insert(0) += entry.delta;
+            *inner
+                .rollups
+                .entry((entry.namespace_id, entry.dimension, entry.value.clone()))
+                .or_insert(0) += entry.delta;
         }
         Ok(())
     }
@@ -299,7 +365,10 @@ impl VisibilityStore for InMemoryVisibilityStore {
             None
         };
         rows.truncate(limit);
-        Ok(ListResult { rows, next_page_token })
+        Ok(ListResult {
+            rows,
+            next_page_token,
+        })
     }
 
     async fn count_executions(
@@ -328,7 +397,10 @@ impl VisibilityStore for InMemoryVisibilityStore {
                 .map(|(value, count)| RollupCounter { value, count })
                 .collect();
         }
-        Ok(CountResult { total_count, groups })
+        Ok(CountResult {
+            total_count,
+            groups,
+        })
     }
 
     async fn count_from_rollup(
@@ -342,18 +414,32 @@ impl VisibilityStore for InMemoryVisibilityStore {
         for ((ns, dim, value), count) in &inner.rollups {
             if *ns == namespace_id && *dim == dimension {
                 total_count += *count;
-                groups.push(RollupCounter { value: value.clone(), count: *count });
+                groups.push(RollupCounter {
+                    value: value.clone(),
+                    count: *count,
+                });
             }
         }
-        Ok(CountResult { total_count, groups })
+        Ok(CountResult {
+            total_count,
+            groups,
+        })
     }
 
     async fn load_checkpoint(&self, sink_id: &str) -> Result<Option<ProjectionCursor>> {
         Ok(self.inner.lock().await.checkpoints.get(sink_id).cloned())
     }
 
-    async fn save_checkpoint(&self, sink_id: &str, cursor: &ProjectionCursor) -> Result<()> {
-        self.inner.lock().await.checkpoints.insert(sink_id.to_string(), cursor.clone());
+    async fn save_checkpoint(
+        &self,
+        sink_id: &str,
+        cursor: &ProjectionCursor,
+    ) -> Result<()> {
+        self.inner
+            .lock()
+            .await
+            .checkpoints
+            .insert(sink_id.to_string(), cursor.clone());
         Ok(())
     }
 
@@ -362,7 +448,13 @@ impl VisibilityStore for InMemoryVisibilityStore {
         namespace_id: NamespaceId,
         name: &str,
     ) -> Result<Option<AttrDescriptor>> {
-        Ok(self.inner.lock().await.registry.get(&(namespace_id, name.to_string())).cloned())
+        Ok(self
+            .inner
+            .lock()
+            .await
+            .registry
+            .get(&(namespace_id, name.to_string()))
+            .cloned())
     }
 
     async fn register_attr(
@@ -377,7 +469,9 @@ impl VisibilityStore for InMemoryVisibilityStore {
         }
         inner.next_attr_id += 1;
         let attr_id = AttrId(inner.next_attr_id);
-        inner.registry.insert((namespace_id, name), AttrDescriptor { attr_id, attr_type });
+        inner
+            .registry
+            .insert((namespace_id, name), AttrDescriptor { attr_id, attr_type });
         Ok(attr_id)
     }
 
@@ -388,15 +482,27 @@ impl VisibilityStore for InMemoryVisibilityStore {
 
 fn sort_rows(rows: &mut [ExecutionRow], sort: SortOrder) {
     rows.sort_by(|a, b| match sort {
-        SortOrder::Default => {
-            b.close_time.cmp(&a.close_time)
-                .then_with(|| b.start_time.cmp(&a.start_time))
-                .then_with(|| b.run_key.0.cmp(&a.run_key.0))
-        }
-        SortOrder::StartTimeAsc => a.start_time.cmp(&b.start_time).then_with(|| a.run_key.0.cmp(&b.run_key.0)),
-        SortOrder::StartTimeDesc => b.start_time.cmp(&a.start_time).then_with(|| b.run_key.0.cmp(&a.run_key.0)),
-        SortOrder::CloseTimeAsc => a.close_time.cmp(&b.close_time).then_with(|| a.run_key.0.cmp(&b.run_key.0)),
-        SortOrder::CloseTimeDesc => b.close_time.cmp(&a.close_time).then_with(|| b.run_key.0.cmp(&a.run_key.0)),
+        SortOrder::Default => b
+            .close_time
+            .cmp(&a.close_time)
+            .then_with(|| b.start_time.cmp(&a.start_time))
+            .then_with(|| b.run_key.0.cmp(&a.run_key.0)),
+        SortOrder::StartTimeAsc => a
+            .start_time
+            .cmp(&b.start_time)
+            .then_with(|| a.run_key.0.cmp(&b.run_key.0)),
+        SortOrder::StartTimeDesc => b
+            .start_time
+            .cmp(&a.start_time)
+            .then_with(|| b.run_key.0.cmp(&a.run_key.0)),
+        SortOrder::CloseTimeAsc => a
+            .close_time
+            .cmp(&b.close_time)
+            .then_with(|| a.run_key.0.cmp(&b.run_key.0)),
+        SortOrder::CloseTimeDesc => b
+            .close_time
+            .cmp(&a.close_time)
+            .then_with(|| b.run_key.0.cmp(&a.run_key.0)),
     });
 }
 
@@ -405,33 +511,78 @@ fn row_after(row: &ExecutionRow, token: &PageToken) -> bool {
         < (token.close_time, token.start_time, token.run_key.0)
 }
 
-fn matches_filter(inner: &VisibilityState, row: &ExecutionRow, filter: &CompiledFilter) -> bool {
-    filter.expr.as_ref().is_none_or(|expr| eval_expr(inner, row, expr))
+fn matches_filter(
+    inner: &VisibilityState,
+    row: &ExecutionRow,
+    filter: &CompiledFilter,
+) -> bool {
+    filter
+        .expr
+        .as_ref()
+        .is_none_or(|expr| eval_expr(inner, row, expr))
 }
 
 fn eval_expr(inner: &VisibilityState, row: &ExecutionRow, expr: &FilterExpr) -> bool {
     match expr {
-        FilterExpr::And(lhs, rhs) => eval_expr(inner, row, lhs) && eval_expr(inner, row, rhs),
-        FilterExpr::Or(lhs, rhs) => eval_expr(inner, row, lhs) || eval_expr(inner, row, rhs),
-        FilterExpr::Compare { field, op, value } => compare(field_value(inner, row, field), *op, value),
-        FilterExpr::In { field, values } => values.iter().any(|v| compare(field_value(inner, row, field), CompareOp::Eq, v)),
-        FilterExpr::Between { field, low, high } => compare(field_value(inner, row, field), CompareOp::Ge, low) && compare(field_value(inner, row, field), CompareOp::Le, high),
-        FilterExpr::StartsWith { field, prefix } => matches!(field_value(inner, row, field), Some(FilterValue::String(v)) if v.starts_with(prefix)),
+        FilterExpr::And(lhs, rhs) => {
+            eval_expr(inner, row, lhs) && eval_expr(inner, row, rhs)
+        }
+        FilterExpr::Or(lhs, rhs) => {
+            eval_expr(inner, row, lhs) || eval_expr(inner, row, rhs)
+        }
+        FilterExpr::Compare { field, op, value } => {
+            compare(field_value(inner, row, field), *op, value)
+        }
+        FilterExpr::In { field, values } => values
+            .iter()
+            .any(|v| compare(field_value(inner, row, field), CompareOp::Eq, v)),
+        FilterExpr::Between { field, low, high } => {
+            compare(field_value(inner, row, field), CompareOp::Ge, low)
+                && compare(field_value(inner, row, field), CompareOp::Le, high)
+        }
+        FilterExpr::StartsWith { field, prefix } => {
+            matches!(field_value(inner, row, field), Some(FilterValue::String(v)) if v.starts_with(prefix))
+        }
     }
 }
 
-fn field_value(inner: &VisibilityState, row: &ExecutionRow, field: &FieldRef) -> Option<FilterValue> {
+fn field_value(
+    inner: &VisibilityState,
+    row: &ExecutionRow,
+    field: &FieldRef,
+) -> Option<FilterValue> {
     match field {
-        FieldRef::System(SystemField::WorkflowId) => Some(FilterValue::String(row.workflow_id.0.clone())),
-        FieldRef::System(SystemField::RunId) => Some(FilterValue::String(row.run_id.0.to_string())),
-        FieldRef::System(SystemField::WorkflowType) => Some(FilterValue::String(row.workflow_type.0.clone())),
-        FieldRef::System(SystemField::TaskQueue) => Some(FilterValue::String(row.task_queue.0.clone())),
-        FieldRef::System(SystemField::ExecutionStatus) => Some(FilterValue::Status(row.status)),
-        FieldRef::System(SystemField::StartTime) => Some(FilterValue::Datetime(row.start_time)),
-        FieldRef::System(SystemField::CloseTime) => row.close_time.map(FilterValue::Datetime),
-        FieldRef::System(SystemField::HistoryLength) => Some(FilterValue::Int(row.history_length)),
-        FieldRef::System(SystemField::StateTransitionCount) => Some(FilterValue::Int(row.state_transition_count)),
-        FieldRef::Custom { attr_id, .. } => inner.sa_current.get(&(row.run_key, *attr_id)).map(search_attr_to_filter),
+        FieldRef::System(SystemField::WorkflowId) => {
+            Some(FilterValue::String(row.workflow_id.0.clone()))
+        }
+        FieldRef::System(SystemField::RunId) => {
+            Some(FilterValue::String(row.run_id.0.to_string()))
+        }
+        FieldRef::System(SystemField::WorkflowType) => {
+            Some(FilterValue::String(row.workflow_type.0.clone()))
+        }
+        FieldRef::System(SystemField::TaskQueue) => {
+            Some(FilterValue::String(row.task_queue.0.clone()))
+        }
+        FieldRef::System(SystemField::ExecutionStatus) => {
+            Some(FilterValue::Status(row.status))
+        }
+        FieldRef::System(SystemField::StartTime) => {
+            Some(FilterValue::Datetime(row.start_time))
+        }
+        FieldRef::System(SystemField::CloseTime) => {
+            row.close_time.map(FilterValue::Datetime)
+        }
+        FieldRef::System(SystemField::HistoryLength) => {
+            Some(FilterValue::Int(row.history_length))
+        }
+        FieldRef::System(SystemField::StateTransitionCount) => {
+            Some(FilterValue::Int(row.state_transition_count))
+        }
+        FieldRef::Custom { attr_id, .. } => inner
+            .sa_current
+            .get(&(row.run_key, *attr_id))
+            .map(search_attr_to_filter),
     }
 }
 
@@ -448,14 +599,18 @@ fn search_attr_to_filter(value: &SearchAttrValue) -> FilterValue {
 }
 
 fn compare(left: Option<FilterValue>, op: CompareOp, right: &FilterValue) -> bool {
-    let Some(left) = left else { return false; };
+    let Some(left) = left else {
+        return false;
+    };
     match (left, right) {
         (FilterValue::String(a), FilterValue::String(b)) => cmp_ord(&a, b, op),
         (FilterValue::Int(a), FilterValue::Int(b)) => cmp_ord(&a, b, op),
         (FilterValue::Float(a), FilterValue::Float(b)) => cmp_partial(a, *b, op),
         (FilterValue::Bool(a), FilterValue::Bool(b)) => cmp_ord(&a, b, op),
         (FilterValue::Datetime(a), FilterValue::Datetime(b)) => cmp_ord(&a, b, op),
-        (FilterValue::Status(a), FilterValue::Status(b)) => cmp_ord(&format!("{a:?}"), &format!("{b:?}"), op),
+        (FilterValue::Status(a), FilterValue::Status(b)) => {
+            cmp_ord(&format!("{a:?}"), &format!("{b:?}"), op)
+        }
         _ => false,
     }
 }
@@ -488,24 +643,37 @@ fn group_value(
     field: &GroupByField,
 ) -> Option<String> {
     match field {
-        GroupByField::System(SystemField::ExecutionStatus) => Some(format!("{:?}", row.status)),
-        GroupByField::System(SystemField::WorkflowType) => Some(row.workflow_type.0.clone()),
+        GroupByField::System(SystemField::ExecutionStatus) => {
+            Some(format!("{:?}", row.status))
+        }
+        GroupByField::System(SystemField::WorkflowType) => {
+            Some(row.workflow_type.0.clone())
+        }
         GroupByField::System(SystemField::TaskQueue) => Some(row.task_queue.0.clone()),
         GroupByField::System(SystemField::WorkflowId) => Some(row.workflow_id.0.clone()),
         GroupByField::System(SystemField::RunId) => Some(row.run_id.0.to_string()),
         GroupByField::System(SystemField::StartTime) => Some(row.start_time.to_string()),
-        GroupByField::System(SystemField::CloseTime) => row.close_time.map(|v| v.to_string()),
-        GroupByField::System(SystemField::HistoryLength) => Some(row.history_length.to_string()),
-        GroupByField::System(SystemField::StateTransitionCount) => Some(row.state_transition_count.to_string()),
-        GroupByField::Custom { attr_id, .. } => inner.sa_current.get(&(row.run_key, *attr_id)).map(|v| match v {
-            SearchAttrValue::Keyword(v) => v.clone(),
-            SearchAttrValue::KeywordList(v) => v.join(","),
-            SearchAttrValue::Int(v) => v.to_string(),
-            SearchAttrValue::Double(v) => v.to_string(),
-            SearchAttrValue::Bool(v) => v.to_string(),
-            SearchAttrValue::Datetime(v) => v.to_string(),
-            SearchAttrValue::Text(v) => v.clone(),
-        }),
+        GroupByField::System(SystemField::CloseTime) => {
+            row.close_time.map(|v| v.to_string())
+        }
+        GroupByField::System(SystemField::HistoryLength) => {
+            Some(row.history_length.to_string())
+        }
+        GroupByField::System(SystemField::StateTransitionCount) => {
+            Some(row.state_transition_count.to_string())
+        }
+        GroupByField::Custom { attr_id, .. } => inner
+            .sa_current
+            .get(&(row.run_key, *attr_id))
+            .map(|v| match v {
+                SearchAttrValue::Keyword(v) => v.clone(),
+                SearchAttrValue::KeywordList(v) => v.join(","),
+                SearchAttrValue::Int(v) => v.to_string(),
+                SearchAttrValue::Double(v) => v.to_string(),
+                SearchAttrValue::Bool(v) => v.to_string(),
+                SearchAttrValue::Datetime(v) => v.to_string(),
+                SearchAttrValue::Text(v) => v.clone(),
+            }),
     }
 }
 
@@ -515,36 +683,27 @@ mod tests {
     use proptest::prelude::*;
     use time::OffsetDateTime;
     use tokeira_types::{
-        ExecutionStatus, Memo, RunId, RunKey, TaskQueueName,
-        TransitionSeq, WorkflowId, WorkflowType,
+        ExecutionStatus, Memo, RunId, RunKey, TaskQueueName, TransitionSeq, WorkflowId,
+        WorkflowType,
     };
     use uuid::Uuid;
 
-    fn arb_projection_cursor(
-    ) -> impl Strategy<Value = ProjectionCursor> {
+    fn arb_projection_cursor() -> impl Strategy<Value = ProjectionCursor> {
         (
             0u32..100,
             1u16..64,
-            proptest::option::of(
-                any::<u128>()
-                    .prop_map(|v| RunKey(Uuid::from_u128(v))),
-            ),
-            proptest::option::of(
-                any::<u64>().prop_map(TransitionSeq),
-            ),
+            proptest::option::of(any::<u128>().prop_map(|v| RunKey(Uuid::from_u128(v)))),
+            proptest::option::of(any::<u64>().prop_map(TransitionSeq)),
         )
-            .prop_map(|(pid, fanout, rk, ts)| {
-                ProjectionCursor {
-                    partition_id: pid,
-                    fanout,
-                    last_run_key: rk,
-                    last_transition_seq: ts,
-                }
+            .prop_map(|(pid, fanout, rk, ts)| ProjectionCursor {
+                partition_id: pid,
+                fanout,
+                last_run_key: rk,
+                last_transition_seq: ts,
             })
     }
 
-    fn arb_status(
-    ) -> impl Strategy<Value = ExecutionStatus> {
+    fn arb_status() -> impl Strategy<Value = ExecutionStatus> {
         prop_oneof![
             Just(ExecutionStatus::Running),
             Just(ExecutionStatus::Completed),
@@ -556,9 +715,7 @@ mod tests {
         ]
     }
 
-    fn arb_execution_row(
-        ns: NamespaceId,
-    ) -> impl Strategy<Value = ExecutionRow> {
+    fn arb_execution_row(ns: NamespaceId) -> impl Strategy<Value = ExecutionRow> {
         (
             any::<u128>(),
             "[a-z]{1,8}",
@@ -572,41 +729,19 @@ mod tests {
             1i64..100,
         )
             .prop_map(
-                move |(
-                    rk,
-                    wf_id,
-                    run_id,
-                    wf_type,
-                    tq,
-                    status,
-                    start,
-                    close,
-                    hl,
-                    stc,
-                )| {
+                move |(rk, wf_id, run_id, wf_type, tq, status, start, close, hl, stc)| {
                     ExecutionRow {
-                        run_key: RunKey(
-                            Uuid::from_u128(rk),
-                        ),
+                        run_key: RunKey(Uuid::from_u128(rk)),
                         namespace_id: ns,
                         workflow_id: WorkflowId(wf_id),
-                        run_id: RunId(
-                            Uuid::from_u128(run_id),
-                        ),
-                        workflow_type: WorkflowType(
-                            wf_type,
-                        ),
+                        run_id: RunId(Uuid::from_u128(run_id)),
+                        workflow_type: WorkflowType(wf_type),
                         task_queue: TaskQueueName(tq),
                         status,
-                        start_time:
-                            OffsetDateTime::from_unix_timestamp(
-                                start,
-                            )
-                            .unwrap(),
+                        start_time: OffsetDateTime::from_unix_timestamp(start).unwrap(),
                         execution_time: None,
-                        close_time: close.map(|c| {
-                            OffsetDateTime::from_unix_timestamp(c).unwrap()
-                        }),
+                        close_time: close
+                            .map(|c| OffsetDateTime::from_unix_timestamp(c).unwrap()),
                         history_length: hl,
                         state_transition_count: stc,
                         memo: Memo::default(),

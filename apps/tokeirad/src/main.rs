@@ -2,21 +2,19 @@ use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 use tonic_web::GrpcWebLayer;
+use tower_http::cors::CorsLayer;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-use tokio_util::sync::CancellationToken;
-use tower_http::cors::CorsLayer;
 
 use tokeira_edge::{
-    EdgeInterceptors, InMemoryNamespaceCache,
-    HistoryNotifyingRepository, HistoryWaitRegistry,
-    InMemoryOperatorApi, LocalOnlyRouter, LongPollConfig,
-    LongPollGate, OperatorService, PendingQueryStore, PollerRegistry,
-    ResolvedNamespace, WorkflowExecutionDescription, WorkflowService, NamespaceCache,
+    EdgeInterceptors, HistoryNotifyingRepository, HistoryWaitRegistry,
+    InMemoryNamespaceCache, InMemoryOperatorApi, LocalOnlyRouter, LongPollConfig,
+    LongPollGate, NamespaceCache, OperatorService, PendingQueryStore, PollerRegistry,
+    ResolvedNamespace, WorkflowExecutionDescription, WorkflowService,
     grpc::{
-        operator_service::OperatorServiceGrpc,
-        runtime_adapter::RuntimeAdapter,
+        operator_service::OperatorServiceGrpc, runtime_adapter::RuntimeAdapter,
         workflow_service::WorkflowServiceGrpc,
     },
     translate::to_internal::namespace_id_for,
@@ -65,15 +63,14 @@ async fn main() -> Result<()> {
     let interceptors = Arc::new(EdgeInterceptors::permissive(namespaces.clone()));
     let router = Arc::new(LocalOnlyRouter);
     let workflow_broker = runtime.broker();
+    let buffered_queries = runtime.buffered_queries();
     let runtime_adapter = Arc::new(RuntimeAdapter::new(runtime));
     let resolver = Arc::new(StoreExecutionResolver::new(
         repo.clone(),
         default_namespace_id,
     ));
     let visibility_store = InMemoryVisibilityStore::default();
-    let visibility = Arc::new(VisibilityQueryService::new(
-        visibility_store.clone(),
-    ));
+    let visibility = Arc::new(VisibilityQueryService::new(visibility_store.clone()));
     let long_polls = LongPollGate::new(LongPollConfig::default());
     let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
     for partition_id in 0..16 {
@@ -100,21 +97,23 @@ async fn main() -> Result<()> {
         });
     }
 
-    let workflow_service = WorkflowService::new_with_history_wait_registry(
-        runtime_adapter,
-        resolver,
-        visibility,
-        repo.clone(),
-        operator_api.clone(),
-        namespaces,
-        interceptors.clone(),
-        PollerRegistry::default(),
-        PendingQueryStore::default(),
-        workflow_broker,
-        long_polls,
-        router,
-        history_waits,
-    );
+    let workflow_service =
+        WorkflowService::new_with_buffered_queries_and_history_wait_registry(
+            runtime_adapter,
+            resolver,
+            visibility,
+            repo.clone(),
+            operator_api.clone(),
+            namespaces,
+            interceptors.clone(),
+            PollerRegistry::default(),
+            PendingQueryStore::default(),
+            buffered_queries,
+            workflow_broker,
+            long_polls,
+            router,
+            history_waits,
+        );
     let operator_service = OperatorService::new(operator_api, interceptors);
 
     let workflow_grpc = WorkflowServiceGrpc::new(workflow_service);
@@ -206,7 +205,10 @@ where
                 // Workflow may be closed — find the latest run by scanning all runs
                 match self
                     .repo
-                    .find_latest_run(self.namespace_id, &WorkflowId(workflow_id.to_string()))
+                    .find_latest_run(
+                        self.namespace_id,
+                        &WorkflowId(workflow_id.to_string()),
+                    )
                     .await?
                 {
                     Some(rk) => rk,

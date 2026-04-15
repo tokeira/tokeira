@@ -5,8 +5,7 @@ use async_trait::async_trait;
 use smallvec::SmallVec;
 use time::OffsetDateTime;
 use tokeira_kernel::{
-    Command, DispatchOp, HistoryEvent, HistoryEventKind, Kernel, LoadedRun,
-    StartRequest,
+    Command, DispatchOp, HistoryEvent, HistoryEventKind, Kernel, LoadedRun, StartRequest,
 };
 use tokeira_storage::{CommitResult, RunRepository};
 use tokeira_types::{ExecutionStatus, RunKey, ShardEpoch};
@@ -182,13 +181,13 @@ where
 
     while let Some(message) = current.take() {
         let committed_command = message.command.clone();
-            let result = handle_message(
-                kernel,
-                repo,
-                shard_owner,
-                message.run_key,
-                message.command,
-                config.max_occ_retries,
+        let result = handle_message(
+            kernel,
+            repo,
+            shard_owner,
+            message.run_key,
+            message.command,
+            config.max_occ_retries,
         )
         .await;
 
@@ -204,18 +203,20 @@ where
                             } => activity_tracking
                                 .mark_cancel_requested(message.run_key, activity_id),
                             HistoryEventKind::ActivityTaskCompleted {
-                                activity_id, ..
+                                activity_id,
+                                ..
                             }
                             | HistoryEventKind::ActivityTaskFailed {
                                 activity_id, ..
                             }
                             | HistoryEventKind::ActivityTaskTimedOut {
-                                activity_id, ..
+                                activity_id,
+                                ..
                             }
                             | HistoryEventKind::ActivityTaskCanceled {
-                                activity_id, ..
-                            } => activity_tracking
-                                .remove(message.run_key, activity_id),
+                                activity_id,
+                                ..
+                            } => activity_tracking.remove(message.run_key, activity_id),
                             HistoryEventKind::WorkflowExecutionUpdateCompleted {
                                 update_id,
                                 result,
@@ -310,7 +311,9 @@ where
                                         },
                                     );
                                 }
-                                for nexus in successor_state.pending_nexus_operations.values() {
+                                for nexus in
+                                    successor_state.pending_nexus_operations.values()
+                                {
                                     if let Some(schedule_to_close_timeout) =
                                         nexus.schedule_to_close_timeout
                                     {
@@ -319,7 +322,8 @@ where
                                                 run_key: successor_state.run_key,
                                                 shard_id,
                                                 operation_id: nexus.operation_id.clone(),
-                                                scheduled_event_id: nexus.scheduled_event_id,
+                                                scheduled_event_id: nexus
+                                                    .scheduled_event_id,
                                                 schedule_to_close_timeout,
                                                 scheduled_at: nexus.scheduled_at,
                                             },
@@ -340,23 +344,25 @@ where
                 if let Some(error) = reset_materialization_error {
                     Err(error)
                 } else {
-                if let CommitResult::Applied { new_state } = &commit_result {
-                    if let Command::NexusOperationResolved(request) = &committed_command {
-                        if matches!(
-                            request.resolution,
-                            tokeira_kernel::NexusResolution::Completed { .. }
-                                | tokeira_kernel::NexusResolution::Failed { .. }
-                                | tokeira_kernel::NexusResolution::Canceled
-                                | tokeira_kernel::NexusResolution::TimedOut
-                        ) {
-                            nexus_timeout_tracking
-                                .remove(message.run_key, &request.operation_id);
+                    if let CommitResult::Applied { new_state } = &commit_result {
+                        if let Command::NexusOperationResolved(request) =
+                            &committed_command
+                        {
+                            if matches!(
+                                request.resolution,
+                                tokeira_kernel::NexusResolution::Completed { .. }
+                                    | tokeira_kernel::NexusResolution::Failed { .. }
+                                    | tokeira_kernel::NexusResolution::Canceled
+                                    | tokeira_kernel::NexusResolution::TimedOut
+                            ) {
+                                nexus_timeout_tracking
+                                    .remove(message.run_key, &request.operation_id);
+                            }
                         }
-                    }
-                    if new_state.closed_at.is_some() {
-                        if let Some(parent_run_key) = new_state.parent_run_key {
-                            if extract_reset_metadata(&history_events).is_none() {
-                            let maybe_resolution = match new_state.status {
+                        if new_state.closed_at.is_some() {
+                            if let Some(parent_run_key) = new_state.parent_run_key {
+                                if extract_reset_metadata(&history_events).is_none() {
+                                    let maybe_resolution = match new_state.status {
                                 tokeira_types::ExecutionStatus::Completed => {
                                     Some(tokeira_kernel::ChildResolution::Completed {
                                         result: new_state
@@ -386,38 +392,42 @@ where
                                 }
                                 _ => None,
                             };
-                            if let Some(resolution) = maybe_resolution {
-                                let command = tokeira_kernel::Command::ChildResolved(
-                                    tokeira_kernel::ChildResolvedRequest {
-                                        child_workflow_id: new_state.workflow_id.clone(),
-                                        resolution,
-                                        now: time::OffsetDateTime::now_utc(),
-                                    },
-                                );
-                                let publisher = publisher.clone();
-                                let child_run_key = message.run_key;
-                                tokio::spawn(async move {
-                                    if let Err(error) = publisher
-                                        .submit_to_run(parent_run_key, command)
-                                        .await
-                                    {
-                                        let error_message = error.to_string();
-                                        if error_message.contains("kernel rejected")
-                                            || error_message.contains("not found")
-                                        {
-                                            tracing::debug!(?error, parent_run_key = ?parent_run_key, child_run_key = ?child_run_key, "failed to deliver child resolution to parent");
-                                        } else {
-                                            tracing::warn!(?error, parent_run_key = ?parent_run_key, child_run_key = ?child_run_key, "failed to deliver child resolution to parent");
-                                        }
+                                    if let Some(resolution) = maybe_resolution {
+                                        let command =
+                                            tokeira_kernel::Command::ChildResolved(
+                                                tokeira_kernel::ChildResolvedRequest {
+                                                    child_workflow_id: new_state
+                                                        .workflow_id
+                                                        .clone(),
+                                                    resolution,
+                                                    now: time::OffsetDateTime::now_utc(),
+                                                },
+                                            );
+                                        let publisher = publisher.clone();
+                                        let child_run_key = message.run_key;
+                                        tokio::spawn(async move {
+                                            if let Err(error) = publisher
+                                                .submit_to_run(parent_run_key, command)
+                                                .await
+                                            {
+                                                let error_message = error.to_string();
+                                                if error_message
+                                                    .contains("kernel rejected")
+                                                    || error_message.contains("not found")
+                                                {
+                                                    tracing::debug!(?error, parent_run_key = ?parent_run_key, child_run_key = ?child_run_key, "failed to deliver child resolution to parent");
+                                                } else {
+                                                    tracing::warn!(?error, parent_run_key = ?parent_run_key, child_run_key = ?child_run_key, "failed to deliver child resolution to parent");
+                                                }
+                                            }
+                                        });
                                     }
-                                });
+                                }
                             }
-                            }
-                        }
-                        if new_state.status == ExecutionStatus::ContinuedAsNew {
-                            let successor_event =
-                                history_events.iter().find_map(|event| {
-                                    match &event.kind {
+                            if new_state.status == ExecutionStatus::ContinuedAsNew {
+                                let successor_event =
+                                    history_events.iter().find_map(|event| {
+                                        match &event.kind {
                                     HistoryEventKind::WorkflowExecutionContinuedAsNew {
                                         new_run_id,
                                         workflow_type,
@@ -441,37 +451,42 @@ where
                                     )),
                                     _ => None,
                                 }
-                                });
-                            if let Some((
-                                successor_run_id,
-                                workflow_type,
-                                task_queue,
-                                input,
-                                memo,
-                                search_attributes,
-                                workflow_execution_timeout,
-                                workflow_run_timeout,
-                                workflow_task_timeout,
-                            )) = successor_event
-                            {
-                                let first_execution_run_id = Some(
-                                    new_state
-                                        .first_execution_run_id
-                                        .unwrap_or(new_state.run_id),
-                                );
-                                let first_run_started_at = Some(
-                                    new_state
-                                        .first_run_started_at
-                                        .unwrap_or(new_state.started_at),
-                                );
-                                let successor_run_key = RunKey::new();
-                                let start_request = StartRequest {
+                                    });
+                                if let Some((
+                                    successor_run_id,
+                                    workflow_type,
+                                    task_queue,
+                                    input,
+                                    memo,
+                                    search_attributes,
+                                    workflow_execution_timeout,
+                                    workflow_run_timeout,
+                                    workflow_task_timeout,
+                                )) = successor_event
+                                {
+                                    let first_execution_run_id = Some(
+                                        new_state
+                                            .first_execution_run_id
+                                            .unwrap_or(new_state.run_id),
+                                    );
+                                    let first_run_started_at = Some(
+                                        new_state
+                                            .first_run_started_at
+                                            .unwrap_or(new_state.started_at),
+                                    );
+                                    let successor_run_key = RunKey::new();
+                                    let start_request = StartRequest {
                                     run_key: successor_run_key,
                                     namespace_id: new_state.namespace_id,
                                     workflow_id: new_state.workflow_id.clone(),
                                     run_id: successor_run_id,
                                     workflow_type,
-                                    task_queue,
+                                    // Empty task_queue means "reuse the predecessor's queue"
+                                    task_queue: if task_queue.0.is_empty() {
+                                        new_state.task_queue.clone()
+                                    } else {
+                                        task_queue
+                                    },
                                     deployment: new_state.deployment.clone(),
                                     build_id: new_state.build_id.clone(),
                                     input,
@@ -499,27 +514,27 @@ where
                                     },
                                     now: OffsetDateTime::now_utc(),
                                 };
-                                let publisher = publisher.clone();
-                                let workflow_timeout_tracking =
-                                    workflow_timeout_tracking.clone();
-                                let predecessor_run_key = message.run_key;
-                                tokio::spawn(async move {
-                                    match publisher
-                                        .submit_to_run(
-                                            successor_run_key,
-                                            Command::Start(start_request),
-                                        )
-                                        .await
-                                    {
-                                        Ok(CommitResult::Applied { new_state }) => {
-                                            if new_state
-                                                .workflow_execution_timeout
-                                                .is_some()
-                                                || new_state
-                                                    .workflow_run_timeout
+                                    let publisher = publisher.clone();
+                                    let workflow_timeout_tracking =
+                                        workflow_timeout_tracking.clone();
+                                    let predecessor_run_key = message.run_key;
+                                    tokio::spawn(async move {
+                                        match publisher
+                                            .submit_to_run(
+                                                successor_run_key,
+                                                Command::Start(start_request),
+                                            )
+                                            .await
+                                        {
+                                            Ok(CommitResult::Applied { new_state }) => {
+                                                if new_state
+                                                    .workflow_execution_timeout
                                                     .is_some()
-                                            {
-                                                workflow_timeout_tracking.insert(
+                                                    || new_state
+                                                        .workflow_run_timeout
+                                                        .is_some()
+                                                {
+                                                    workflow_timeout_tracking.insert(
                                                     crate::timeout::WorkflowTimeoutEntry {
                                                         run_key: new_state.run_key,
                                                         shard_id: crate::shard::shard_for(
@@ -538,43 +553,43 @@ where
                                                             .is_some(),
                                                     },
                                                 );
+                                                }
+                                            }
+                                            Ok(CommitResult::Duplicate) => {
+                                                tracing::error!(
+                                                    predecessor_run_key = ?predecessor_run_key,
+                                                    successor_run_key = ?successor_run_key,
+                                                    "unexpected duplicate when starting continue-as-new successor"
+                                                );
+                                            }
+                                            Ok(CommitResult::Conflict { reason }) => {
+                                                tracing::error!(
+                                                    predecessor_run_key = ?predecessor_run_key,
+                                                    successor_run_key = ?successor_run_key,
+                                                    %reason,
+                                                    "unexpected conflict when starting continue-as-new successor"
+                                                );
+                                            }
+                                            Err(error) => {
+                                                tracing::error!(
+                                                    ?error,
+                                                    predecessor_run_key = ?predecessor_run_key,
+                                                    successor_run_key = ?successor_run_key,
+                                                    "failed to start continue-as-new successor"
+                                                );
                                             }
                                         }
-                                        Ok(CommitResult::Duplicate) => {
-                                            tracing::error!(
-                                                predecessor_run_key = ?predecessor_run_key,
-                                                successor_run_key = ?successor_run_key,
-                                                "unexpected duplicate when starting continue-as-new successor"
-                                            );
-                                        }
-                                        Ok(CommitResult::Conflict { reason }) => {
-                                            tracing::error!(
-                                                predecessor_run_key = ?predecessor_run_key,
-                                                successor_run_key = ?successor_run_key,
-                                                %reason,
-                                                "unexpected conflict when starting continue-as-new successor"
-                                            );
-                                        }
-                                        Err(error) => {
-                                            tracing::error!(
-                                                ?error,
-                                                predecessor_run_key = ?predecessor_run_key,
-                                                successor_run_key = ?successor_run_key,
-                                                "failed to start continue-as-new successor"
-                                            );
-                                        }
-                                    }
-                                });
-                            } else {
-                                tracing::error!(
-                                    predecessor_run_key = ?message.run_key,
-                                    "continued-as-new close missing WorkflowExecutionContinuedAsNew history event"
-                                );
+                                    });
+                                } else {
+                                    tracing::error!(
+                                        predecessor_run_key = ?message.run_key,
+                                        "continued-as-new close missing WorkflowExecutionContinuedAsNew history event"
+                                    );
+                                }
                             }
                         }
                     }
-                }
-                Ok(commit_result)
+                    Ok(commit_result)
                 }
             }
             Err(error) => Err(error),
@@ -658,7 +673,9 @@ where
     }
 }
 
-fn extract_reset_metadata(history_events: &[HistoryEvent]) -> Option<(tokeira_types::RunId, i64)> {
+fn extract_reset_metadata(
+    history_events: &[HistoryEvent],
+) -> Option<(tokeira_types::RunId, i64)> {
     history_events.iter().find_map(|event| match &event.kind {
         HistoryEventKind::WorkflowTaskFailed {
             failure_cause: tokeira_kernel::WorkflowTaskFailedCause::ResetWorkflow,
@@ -1221,6 +1238,7 @@ mod tests {
             pending_external_signals: BTreeMap::new(),
             pending_external_cancels: BTreeMap::new(),
             pending_updates: BTreeMap::new(),
+            admitted_updates: std::collections::HashSet::new(),
             pending_nexus_operations: BTreeMap::new(),
             versioning_override: None,
             completion_callbacks: Vec::new(),
@@ -1433,8 +1451,7 @@ mod tests {
         let (_foreign, _foreign_reply) = lane_message(RunKey::new(), "foreign");
         let (second, second_reply) = lane_message(run_key, "second");
         let (tx, mut rx) = mpsc::channel(8);
-        let activity_tracking =
-            crate::activity_timeout::ActivityTrackingState::default();
+        let activity_tracking = crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
         let update_registry = crate::UpdateRegistry::new();
@@ -1506,8 +1523,7 @@ mod tests {
         let (second, second_reply) = lane_message(run_key, "second");
         let (third, _third_reply) = lane_message(run_key, "third");
         let (tx, mut rx) = mpsc::channel(8);
-        let activity_tracking =
-            crate::activity_timeout::ActivityTrackingState::default();
+        let activity_tracking = crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
         let update_registry = crate::UpdateRegistry::new();
@@ -1563,8 +1579,7 @@ mod tests {
         let (second, second_reply) = lane_message(run_key, "second");
         let (third, _third_reply) = lane_message(run_key, "third");
         let (tx, mut rx) = mpsc::channel(8);
-        let activity_tracking =
-            crate::activity_timeout::ActivityTrackingState::default();
+        let activity_tracking = crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
         let update_registry = crate::UpdateRegistry::new();
@@ -1609,8 +1624,7 @@ mod tests {
         let publisher = MockPublisher::new().with_failure().await;
         let (first, first_reply) = lane_message(run_key, "first");
         let (_tx, mut rx) = mpsc::channel(8);
-        let activity_tracking =
-            crate::activity_timeout::ActivityTrackingState::default();
+        let activity_tracking = crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
         let update_registry = crate::UpdateRegistry::new();
@@ -1654,8 +1668,7 @@ mod tests {
         let publisher = MockPublisher::new();
         let (first, first_reply) = lane_message(run_key, "first");
         let (_tx, mut rx) = mpsc::channel(8);
-        let activity_tracking =
-            crate::activity_timeout::ActivityTrackingState::default();
+        let activity_tracking = crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
         let update_registry = crate::UpdateRegistry::new();
@@ -1705,8 +1718,7 @@ mod tests {
         let publisher = MockPublisher::new();
         let (first, first_reply) = lane_message(child_run_key, "first");
         let (_tx, mut rx) = mpsc::channel(8);
-        let activity_tracking =
-            crate::activity_timeout::ActivityTrackingState::default();
+        let activity_tracking = crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
         let update_registry = crate::UpdateRegistry::new();
@@ -1768,8 +1780,7 @@ mod tests {
         let publisher = MockPublisher::new();
         let (first, first_reply) = lane_message(run_key, "first");
         let (_tx, mut rx) = mpsc::channel(8);
-        let activity_tracking =
-            crate::activity_timeout::ActivityTrackingState::default();
+        let activity_tracking = crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
         let update_registry = crate::UpdateRegistry::new();
@@ -1838,8 +1849,7 @@ mod tests {
             .await;
         let (first, first_reply) = lane_message(run_key, "continue");
         let (_tx, mut rx) = mpsc::channel(8);
-        let activity_tracking =
-            crate::activity_timeout::ActivityTrackingState::default();
+        let activity_tracking = crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
         let update_registry = crate::UpdateRegistry::new();
@@ -1962,8 +1972,7 @@ mod tests {
         let publisher = MockPublisher::new().with_failure().await;
         let (first, first_reply) = lane_message(run_key, "continue");
         let (_tx, mut rx) = mpsc::channel(8);
-        let activity_tracking =
-            crate::activity_timeout::ActivityTrackingState::default();
+        let activity_tracking = crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
         let update_registry = crate::UpdateRegistry::new();
@@ -2004,9 +2013,16 @@ mod tests {
             MockKernel::new(sample_dispatch_ops(state.namespace_id)).with_reject();
         let shard_owner = test_shard_owner();
 
-        let error = handle_message(&kernel, &repo, &shard_owner, run_key, sample_command("reject"), 5)
-            .await
-            .expect_err("reject should surface as error");
+        let error = handle_message(
+            &kernel,
+            &repo,
+            &shard_owner,
+            run_key,
+            sample_command("reject"),
+            5,
+        )
+        .await
+        .expect_err("reject should surface as error");
         assert!(error.to_string().contains("kernel rejected command"));
 
         let (load_calls, commit_calls, _) = repo.snapshot().await;

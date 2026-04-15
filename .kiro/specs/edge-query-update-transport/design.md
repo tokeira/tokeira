@@ -2,52 +2,74 @@
 
 ## Overview
 
-This design wires the runtime's existing query dispatch (`QueryTask`, `QueryResult`) and update lifecycle (`UpdateRegistry`, `UpdateOutcome`) through the edge/gRPC layer so that queries and updates flow end-to-end between SDK clients and workers via the standard Temporal protocol.
+This design wires the runtime's existing query dispatch and update lifecycle through the edge/gRPC layer so that queries and updates flow end-to-end between SDK clients and workers via the standard Temporal protocol.
 
-Today, `QueryWorkflow` and `UpdateWorkflowExecution` calls reach the runtime, which creates `QueryTask`/`UpdateRegistry` entries and waits on oneshot channels. But the poll/completion path doesn't carry these to workers — the `PollWorkflowTaskQueueResponse` omits the `queries` map (field 14) and `messages` field (field 15), and `RespondWorkflowTaskCompletedRequest` ignores `query_results` (field 8) and `messages` (field 11).
+The core correctness invariant: **once a state-mutating operation (signal, update, etc.) has been acknowledged to the client, a subsequent consistent query must not be evaluated against pre-mutation workflow state.** This is enforced by a run-local consistent-query registry with a read barrier, matching Temporal's `QueryRegistry` on mutable state.
 
-The fix introduces a coordination layer between the WFT poll path and the query/update dispatch paths:
+### What Exists Today (Implemented)
 
-1. **`PendingQueryStore`** — when a `QueryTask` is published to the broker, the edge layer drains pending queries during poll response construction, attaches them to the `queries` map, and retains the oneshot senders for result routing.
-2. **Update message construction** — pending updates from the `UpdateRegistry` are wrapped in `protocol.v1.Message` envelopes containing `update.v1.Request` bodies and attached to the `messages` field.
-3. **Result routing** — on `RespondWorkflowTaskCompleted`, the edge layer extracts `query_results` and `messages`, matches them by ID to retained channels, and delivers results back to waiting callers.
+The following transport plumbing is already implemented and working:
 
-The work spans `tokeira-edge` and `tokeira-runtime`:
+- `PendingQueryStore` — retains query oneshot senders between poll and completion, keyed by task token then query ID
+- Edge DTO extensions — `queries`, `messages`, `query_results` fields on poll/completion DTOs
+- Proto translation — `queries` map (field 14), `query_results` (field 8), `messages` (field 15/11) serialization and deserialization
+- Query draining from broker during poll response construction
+- Query result routing from `RespondWorkflowTaskCompleted`
+- Legacy `RespondQueryTaskCompleted` support
+- Update message construction and response routing
+- `PollWorkflowExecutionUpdate` long-poll
+- `RespondWorkflowTaskCompletedResponse.workflow_task` field for eager WFT return
 
-- **Edge**: `PendingQueryStore`, proto translation for `queries`/`query_results`/`messages`, result routing, legacy `RespondQueryTaskCompleted`
-- **Runtime**: `UpdateRegistryEntry` must be extended to retain `input`, `identity`, and `update_name` so the edge can construct `update.v1.Request` messages. The broker needs a combined poll that returns either a real WFT or a query-only task when queries are pending but no WFT exists.
+### What Needs to Change
+
+The current implementation buffers queries in the broker's query queue, where any poller can drain them independently. This is architecturally wrong — it allows queries to be evaluated against stale state when a WFT is in progress. The fix is to replace broker-based query buffering with a **run-local `BufferedQueryRegistry`** that enforces a read barrier on each query.
 
 ## Architecture
 
-### Query Flow
+### Query Flow (Target)
 
 ```mermaid
 sequenceDiagram
     participant Client
     participant Edge as Edge Layer
     participant Runtime
-    participant Broker
+    participant Registry as BufferedQueryRegistry
     participant Worker
 
     Client->>Edge: QueryWorkflow(query_type, args)
     Edge->>Runtime: query_workflow(execution, query_type, args)
-    Runtime->>Broker: publish_query_task(QueryTask{response_tx})
-    Runtime-->>Edge: awaits oneshot rx
+    Runtime->>Runtime: Read run state, capture required_barrier = last_event_id
+
+    alt No pending/started WFT (run is quiescent)
+        Runtime->>Runtime: Dispatch through direct query-only path
+        Runtime-->>Edge: awaits query result
+    else WFT pending or started
+        Runtime->>Registry: buffer(run_key, query_id, payload, required_barrier, response_tx)
+        Runtime-->>Edge: awaits oneshot rx
+    end
 
     Worker->>Edge: PollWorkflowTaskQueue
-    Edge->>Broker: poll_query_task(queue)
-    Broker-->>Edge: QueryTask
-    Edge->>Edge: retain response_tx in PendingQueryStore
-    Edge-->>Worker: PollResponse{queries: {qid: WorkflowQuery}}
+    Edge->>Runtime: poll_workflow_task → real WFT
+    Edge->>Registry: drain queries where required_barrier ≤ task history barrier
+    Edge->>Edge: retain response channels in PendingQueryStore
+    Edge-->>Worker: PollResponse{queries: {qid: WorkflowQuery}, history, messages}
 
     Worker->>Edge: RespondWorkflowTaskCompleted{query_results: {qid: result}}
-    Edge->>Edge: match qid → PendingQueryStore
-    Edge->>Edge: send QueryResult on retained response_tx
+    Edge->>Edge: route query_results to PendingQueryStore channels
+    Edge->>Edge: check: is run quiescent after completion?
+
+    alt Run quiescent, no new WFT
+        Edge->>Registry: drain remaining queries with satisfied barriers
+        Edge->>Edge: dispatch through direct query-only path or eager return
+    else New WFT created
+        Note over Registry: Queries stay buffered for next WFT
+    end
+
     Edge-->>Runtime: oneshot delivers result
     Runtime-->>Client: QueryResult
 ```
 
-### Update Flow
+### Update Flow (Unchanged)
 
 ```mermaid
 sequenceDiagram
@@ -76,400 +98,293 @@ sequenceDiagram
 
 ### Design Decisions
 
-1. **PendingQueryStore is edge-local, not in the runtime.** The runtime's broker already manages query task queues. The edge layer drains them during poll response construction and holds the oneshot senders. This avoids changing the runtime's internal architecture.
+1. **Consistent queries live with the run, not in the broker.** A broker is a good abstraction for workflow tasks, activity tasks, and delivery. It is a bad abstraction for consistent query waiters. Consistent queries need a run-local registry with a waiter/future, the query payload, a required state barrier, delivery status, and cancellation cleanup. This matches Temporal's `QueryRegistry` on mutable state.
 
-2. **Queries are delivered via two paths: piggybacked on real WFTs, or as query-only tasks to sticky workers.** The correct Temporal behavior is:
-   - **Non-sticky (no cached state)**: The runtime schedules a real WFT via the kernel, and the edge layer piggybacks the query on that WFT's poll response. The worker replays history, evaluates the query, and returns both commands and `query_results`.
-   - **Sticky (worker has cached state)**: The edge layer delivers a query-only task with `started_event_id = 0`. The worker evaluates the query against its cached state without replaying.
-   **Current workaround**: Tokeira does not yet implement sticky-queue detection. As a temporary measure, query-only tasks set `started_event_id` to the last event ID in the history, forcing the SDK to replay. This is marked with `TODO(correctness)` and should be replaced with proper WFT-piggybacked query delivery.
+2. **Each buffered query carries a `required_barrier`.** When a query is accepted, the runtime captures `required_barrier = current last_event_id`. A query may only be delivered on a task whose worker-visible state is guaranteed to include at least that barrier. This makes the consistency rule crisp: if the delivery task's history snapshot is too old, do not deliver the query; if it is new enough, piggybacking is safe; if no task is new enough yet, keep buffering.
 
-3. **Update messages use `google.protobuf.Any` wrapping.** The `protocol.v1.Message.body` field is a `google.protobuf.Any`. The edge layer packs `update.v1.Request` into this envelope with the standard type URL `type.googleapis.com/temporal.api.update.v1.Request`, matching the SDK's expectations.
+3. **Piggybacking is only safe when the WFT hasn't been started.** Piggybacking a query onto a real WFT is safe only if that WFT has not already been handed to a worker. If a WFT has already been started and is executing on a worker, the server cannot retroactively add the query to that in-flight task payload. In that case, the query must remain buffered until the WFT completes.
 
-4. **Result routing is by ID, tolerant of missing channels.** When a `query_results` entry or update response message references an ID with no retained channel (caller timed out), the edge layer silently discards it. This matches Temporal server behavior.
+4. **Eager return is gated by authoritative run state.** After WFT completion, if the run is quiescent (no pending/started WFT) and `return_new_workflow_task` is true, the edge may return an inline query-only WFT with empty history and `started_event_id=0`. If a new WFT was created by the completion (e.g., from a signal), queries stay buffered — they ride on the next real WFT. The decision is based on authoritative run state, not broker visibility.
 
-5. **Query-only WFTs set `started_event_id` to zero.** When a poll response carries only queries (no history advancement), `started_event_id` is set to 0 to signal a query-only task. The SDK uses this to skip history replay when only queries need evaluation.
+5. **Direct query dispatch when quiescent.** When no WFT is pending/started and the run has completed at least one WFT, queries can be dispatched directly through the query-only path. The worker evaluates against cached state (sticky) or replays full history (non-sticky). This matches Temporal's "unblocked" query path.
 
-   **Synthetic query-only task token contract:** The synthetic task token reuses `WorkflowTaskToken` with these field values:
-   - `run_key`: the target workflow's `RunKey` (needed for `PendingQueryStore` lookup)
-   - `logical_seq`: `LogicalTaskSeq(0)` — sentinel value indicating a query-only task
-   - `started_event_id`: `0` — no history event was created
-   - `attempt`: `1`
-   - `shard_epoch`: `ShardEpoch::ZERO`
+6. **`ScheduleQueryTask` is a design smell.** Temporal's API surface suggests two query delivery modes: piggyback on an existing WFT (`queries`), or deliver a separate query-only task (`query` via `RespondQueryTaskCompleted`). Neither requires minting new WFT history events. The current `ScheduleQueryTask` kernel command creates unnecessary history churn and should be replaced incrementally. For now, the `BufferedQueryRegistry` + direct dispatch path avoids this for the common case.
 
-   On the completion side, `respond_workflow_task_completed` must detect `logical_seq == 0` as a query-only completion. When detected:
-   - Skip command processing entirely (no kernel call, no state transition)
-   - Route `query_results` to the `PendingQueryStore` using the task token
-   - Route `messages` (update responses) normally
-   - Return an empty `RespondWorkflowTaskCompletedResponse`
+7. **Update messages use `google.protobuf.Any` wrapping.** (Unchanged from current implementation.)
 
-   This avoids introducing a separate token type while keeping the query-only path distinguishable from real WFT completions.
+8. **Result routing is by ID, tolerant of missing channels.** (Unchanged from current implementation.)
 
-6. **Legacy query support via `RespondQueryTaskCompleted`.** The `query` field (field 10) on the poll response carries a single legacy query. The `RespondQueryTaskCompleted` RPC does not carry a query ID — it uses the task token to identify the query. The `PendingQueryStore` stores at most one legacy query per task token under a well-known key (e.g. `"__legacy__"`). When a legacy query is delivered via field 10, the modern `queries` map (field 14) is left empty to avoid mixed legacy/modern ambiguity. Both legacy and modern paths coexist but are mutually exclusive per poll response.
+9. **Legacy query support via `RespondQueryTaskCompleted`.** (Unchanged from current implementation.)
+
+10. **Synthetic query-only task token contract.** (Unchanged from current implementation.) The synthetic task token reuses `WorkflowTaskToken` with `logical_seq = LogicalTaskSeq(0)` as a sentinel for query-only completions.
+
+## Key Invariants
+
+### Barrier-Release Condition (Single Sentence)
+
+A buffered query with `required_barrier = B` may be delivered to a worker if and only if the delivery task's worker-visible history includes event `B`, AND no started-but-not-yet-completed workflow task exists whose completion could produce events that the query's caller would expect to observe.
+
+In other words: the query is released when `observable_last_event_id ≥ required_barrier` AND `started_wft_count == 0` for the run at the moment of attachment. A pending-but-not-started WFT is fine — the query will be attached when that WFT is started (poll response built). A started WFT blocks release because its completion may produce new events the query should see.
+
+### Lifecycle and Cleanup Rules for BufferedQueryRegistry Entries
+
+| Event | Behavior |
+|---|---|
+| **Query caller timeout / cancellation** | The `query_workflow` future is cancelled or the deadline expires. The runtime removes the entry from the `BufferedQueryRegistry` via `remove(run_key, query_id)`. The oneshot `response_tx` is dropped, which causes the caller's `response_rx` to resolve with a channel-closed error (translated to a timeout error by the runtime). |
+| **Run close (completed / failed / terminated / cancelled / continued-as-new / timed out)** | When the run transitions to a closed status, the runtime calls `drain_all(run_key)` on the `BufferedQueryRegistry`. Each drained query's `response_tx` is sent a `QueryResult::Failed { message: "workflow execution completed" }` (matching Temporal's behavior for queries on closed workflows). The entry is then dropped. |
+| **Worker crash / WFT timeout** | The started WFT times out and the runtime schedules a new WFT (or the run becomes quiescent if no retry). Buffered queries are NOT affected — they remain in the registry. On the next successful poll or post-completion check, the normal barrier-release logic applies. No special cleanup is needed because queries are not tied to a specific WFT; they are tied to the run. |
+| **Abandoned poll (poller disconnects before completion)** | If a poll response was built and queries were moved from the `BufferedQueryRegistry` to the `PendingQueryStore`, but the worker never completes the WFT (abandoned poll / network failure), the WFT will eventually time out. The `PendingQueryStore` entries for that task token become orphaned. They are cleaned up when the task token's WFT times out and the runtime schedules a replacement WFT. The query callers' oneshot channels will be dropped, causing timeout errors. This is acceptable — the callers retry. |
+| **Server restart** | The `BufferedQueryRegistry` is in-memory and non-durable. On restart, all buffered queries are lost. Query callers experience timeouts and retry. This matches Temporal's behavior — the `QueryRegistry` is also in-memory on mutable state and lost on shard movement. |
+
+### Fast-Path Preservation for Idle Runs
+
+Phase 2 **preserves** the query-only fast path for fully idle runs. The decision tree at query acceptance time is:
+
+1. Read authoritative run state.
+2. If `pending_workflow_task.is_none()` AND `started_workflow_task.is_none()` AND the run has completed at least one WFT:
+   → **Fast path**: dispatch the query directly through the broker's query-only delivery (legacy `query` field or direct matching). The query does NOT enter the `BufferedQueryRegistry`. This is the common case for queries on idle workflows.
+3. Otherwise:
+   → **Buffered path**: place the query in the `BufferedQueryRegistry` with `required_barrier = last_event_id`. The query waits for a WFT whose history satisfies the barrier.
+
+The fast path is safe because: if no WFT is pending or started, no in-flight mutation can produce events the query should observe. The run's `last_event_id` at query acceptance time IS the latest committed state, and the worker (if sticky-cached) or the full history (if non-sticky) will reflect exactly that state.
+
+The `BufferedQueryRegistry` is only used when there is an in-flight or pending WFT that could produce events between the query's acceptance and its evaluation. Once all queries go through the registry, they are subject to the barrier-release condition above.
 
 ## Components and Interfaces
 
-### 1. PendingQueryStore
+### 1. BufferedQueryRegistry (New)
 
-A per-poll-response store that retains query oneshot senders keyed by query ID.
+A run-local in-memory registry of consistent query waiters.
 
 ```rust
-/// Retained query channels keyed by task token, then by query ID.
+/// A buffered consistent query waiting for delivery.
+pub struct BufferedQuery {
+    pub query_id: String,
+    pub query_type: String,
+    pub query_args: Payloads,
+    /// The minimum last_event_id the delivery task must observe.
+    pub required_barrier: i64,
+    /// One-shot response channel back to the QueryWorkflow caller.
+    pub response_tx: oneshot::Sender<QueryResult>,
+}
+
+/// Run-local registry of buffered consistent queries.
+pub struct BufferedQueryRegistry {
+    inner: Arc<Mutex<HashMap<RunKey, VecDeque<BufferedQuery>>>>,
+}
+
+impl BufferedQueryRegistry {
+    pub fn new() -> Self { ... }
+
+    /// Buffer a query for a run. Returns Err if the per-run limit is exceeded.
+    pub fn buffer(
+        &self,
+        run_key: RunKey,
+        query: BufferedQuery,
+    ) -> Result<(), BufferedQuery> { ... }
+
+    /// Drain queries whose required_barrier is satisfied by the given barrier.
+    /// Returns the drained queries; leaves unsatisfied queries in the registry.
+    pub fn drain_satisfied(
+        &self,
+        run_key: RunKey,
+        observable_barrier: i64,
+    ) -> Vec<BufferedQuery> { ... }
+
+    /// Drain ALL remaining queries for a run (e.g., for direct dispatch
+    /// when the run is quiescent and the barrier is satisfied).
+    pub fn drain_all(&self, run_key: RunKey) -> Vec<BufferedQuery> { ... }
+
+    /// Remove a specific query (e.g., on timeout/cancellation).
+    pub fn remove(&self, run_key: RunKey, query_id: &str) -> Option<BufferedQuery> { ... }
+
+    /// Check if any queries are buffered for a run.
+    pub fn has_buffered(&self, run_key: RunKey) -> bool { ... }
+}
+```
+
+The registry is held by the runtime (or the `WorkflowService`). It replaces the broker's query queue for consistent query buffering.
+
+### 2. PendingQueryStore (Existing, Unchanged)
+
+Retains query oneshot senders between poll response construction and completion response routing. Keyed by task token bytes, then by query ID. This store is populated when queries are attached to a poll response (from the `BufferedQueryRegistry`) and consumed when `query_results` arrive in the completion.
+
+```rust
 pub struct PendingQueryStore {
     inner: Arc<Mutex<HashMap<Vec<u8>, HashMap<String, oneshot::Sender<QueryResult>>>>>,
 }
-
-impl PendingQueryStore {
-    pub fn new() -> Self { ... }
-
-    /// Store a query's response channel under a task token and query ID.
-    pub fn insert(&self, token: &[u8], query_id: String, tx: oneshot::Sender<QueryResult>) { ... }
-
-    /// Remove and return the sender for a query ID under a task token.
-    pub fn take(&self, token: &[u8], query_id: &str) -> Option<oneshot::Sender<QueryResult>> { ... }
-
-    /// Drain all remaining senders for a task token (for cleanup on timeout).
-    pub fn drain(&self, token: &[u8]) -> Vec<(String, oneshot::Sender<QueryResult>)> { ... }
-}
 ```
 
-The store is held by the `WorkflowService`. The outer key is the serialized task token bytes so that both `RespondWorkflowTaskCompleted` (which carries the task token) and `RespondQueryTaskCompleted` (which also carries the task token) can look up the correct query channels. For legacy queries, the inner key is the well-known string `"__legacy__"`.
+### 3. Edge DTO Extensions (Existing, Extended)
 
-### 2. Edge DTO Extensions
-
-#### PollWorkflowTaskQueueResponse
+#### RespondWorkflowTaskCompletedResponse
 
 ```rust
-pub struct PollWorkflowTaskQueueResponse {
-    pub task_token: Vec<u8>,
-    pub started_event_id: i64,
-    pub attempt: u32,
-    pub payload: WorkflowTaskPayloadDto,
-    // New fields:
-    pub queries: HashMap<String, WorkflowQueryDto>,
-    pub messages: Vec<ProtocolMessageDto>,
-}
-
-pub struct WorkflowQueryDto {
-    pub query_type: String,
-    pub query_args: Payloads,
-}
-
-/// Opaque wrapper around a serialized protocol.v1.Message.
-/// The edge layer constructs these from update requests;
-/// the gRPC translate layer converts them to proto.
-pub struct ProtocolMessageDto {
-    pub id: String,
-    pub protocol_instance_id: String,
-    pub body: Vec<u8>,  // serialized google.protobuf.Any
-    pub sequencing_event_id: Option<i64>,
+pub struct RespondWorkflowTaskCompletedResponse {
+    pub transition_seq: u64,
+    pub last_event_id: i64,
+    pub execution_status: ExecutionStatus,
+    pub new_run_id: Option<RunId>,
+    pub was_duplicate: bool,
+    /// Inline query-only WFT for eager return (empty history + queries).
+    pub workflow_task: Option<PollWorkflowTaskQueueResponse>,
 }
 ```
 
-#### RespondWorkflowTaskCompletedRequest
-
-```rust
-pub struct RespondWorkflowTaskCompletedRequest {
-    pub task_token: Vec<u8>,
-    pub identity: String,
-    pub commands: Vec<WorkflowCommand>,
-    pub force_new_workflow_task: bool,
-    // New fields:
-    pub query_results: HashMap<String, QueryResultDto>,
-    pub messages: Vec<ProtocolMessageDto>,
-}
-
-pub enum QueryResultDto {
-    Answered { result: Payloads },
-    Failed { error_message: String },
-}
-```
-
-### 3. Proto Translation Extensions
-
-#### poll_response_to_proto
-
-Populates the `queries` map (field 14) and `messages` repeated field (field 15) from the edge DTO:
-
-```rust
-pub fn poll_response_to_proto(resp: PollWorkflowTaskQueueResponse) -> proto::PollWorkflowTaskQueueResponse {
-    // ... existing fields ...
-    queries: resp.queries.iter().map(|(id, q)| {
-        (id.clone(), query::v1::WorkflowQuery {
-            query_type: q.query_type.clone(),
-            query_args: Some(payloads_from_domain(&q.query_args)),
-            header: None,
-        })
-    }).collect(),
-    messages: resp.messages.iter().map(|m| {
-        protocol::v1::Message {
-            id: m.id.clone(),
-            protocol_instance_id: m.protocol_instance_id.clone(),
-            body: Some(prost_types::Any::decode(&m.body[..]).unwrap_or_default()),
-            sequencing_id: m.sequencing_event_id.map(|eid|
-                protocol::v1::message::SequencingId::EventId(eid)
-            ),
-        }
-    }).collect(),
-}
-```
-
-#### respond_completed_request_to_edge
-
-Extracts `query_results` (field 8) and `messages` (field 11) from the proto into the edge DTO:
-
-```rust
-pub fn respond_completed_request_to_edge(req: proto::RespondWorkflowTaskCompletedRequest) -> Result<RespondWorkflowTaskCompletedRequest> {
-    // ... existing fields ...
-    query_results: req.query_results.into_iter().map(|(id, qr)| {
-        let result = match qr.result_type {
-            QUERY_RESULT_TYPE_ANSWERED => QueryResultDto::Answered {
-                result: payloads_to_domain(&qr.answer.unwrap_or_default()),
-            },
-            _ => QueryResultDto::Failed {
-                error_message: qr.error_message,
-            },
-        };
-        (id, result)
-    }).collect(),
-    messages: req.messages.into_iter().map(|m| {
-        ProtocolMessageDto {
-            id: m.id,
-            protocol_instance_id: m.protocol_instance_id,
-            body: m.body.map(|a| a.encode_to_vec()).unwrap_or_default(),
-            sequencing_event_id: match m.sequencing_id {
-                Some(protocol::v1::message::SequencingId::EventId(eid)) => Some(eid),
-                _ => None,
-            },
-        }
-    }).collect(),
-}
-```
+All other DTOs remain as currently implemented.
 
 ### 4. WorkflowService Changes
 
-#### poll_workflow_task_queue
+#### query_workflow (Runtime)
 
-After obtaining a `StartedWorkflowTask` from the runtime, the edge layer:
-
-1. Drains pending query tasks from the broker for the same task queue (non-blocking, zero-timeout poll)
-2. For each `QueryTask`, generates a UUID query ID, stores the `response_tx` in the `PendingQueryStore`, and adds the query to the DTO's `queries` map
-3. Checks the `UpdateRegistry` for pending updates on the same `run_key` and constructs `protocol.v1.Message` entries
-4. If the response carries only queries (no history events beyond what the worker already has), sets `started_event_id` to 0
-
-#### respond_workflow_task_completed
-
-After receiving the completion:
-
-1. Extracts `query_results` from the DTO, looks up each query ID in the `PendingQueryStore`, and sends the `QueryResult` on the retained oneshot channel
-2. Extracts `messages` from the DTO, unpacks each `protocol.v1.Message` body to determine the update response type (`Acceptance`, `Rejection`, `Response`), and notifies the `UpdateRegistry`
-3. If the completion contains only `query_results` and no commands, skips command processing (query-only completion)
-
-#### respond_query_task_completed (new)
-
-Implements the legacy `RespondQueryTaskCompleted` RPC:
-
-1. Extracts the query result from the request
-2. Looks up the query ID in the `PendingQueryStore`
-3. Sends the result on the retained oneshot channel
-
-### 5. Update Message Construction
-
-When constructing update request messages for the poll response:
-
-```rust
-fn build_update_request_message(
-    update_id: &str,
-    update_name: &str,
-    input: &Payloads,
-    identity: &str,
-    sequencing_event_id: i64,
-) -> ProtocolMessageDto {
-    let request = update::v1::Request {
-        meta: Some(update::v1::Meta {
-            update_id: update_id.to_string(),
-            identity: identity.to_string(),
-        }),
-        input: Some(update::v1::Input {
-            name: update_name.to_string(),
-            args: Some(payloads_from_domain(input)),
-            header: None,
-        }),
-    };
-    let any = pack_any(
-        "type.googleapis.com/temporal.api.update.v1.Request",
-        &request,
-    );
-    ProtocolMessageDto {
-        id: format!("{update_id}/request"),
-        protocol_instance_id: update_id.to_string(),
-        body: any.encode_to_vec(),
-        sequencing_event_id: Some(sequencing_event_id),
-    }
-}
+```
+1. Resolve the run
+2. Read authoritative run state
+3. Capture required_barrier = current last_event_id
+4. If no pending/started WFT and run has completed ≥1 WFT:
+     → dispatch through direct query-only path
+5. Else:
+     → buffer in BufferedQueryRegistry
+     → await oneshot response
 ```
 
-### 6. Update Response Extraction
+#### poll_workflow_task_queue (Edge)
 
-When processing update response messages from the completion:
-
-```rust
-fn extract_update_resolution(msg: &ProtocolMessageDto) -> Option<(String, UpdateResolution)> {
-    let any = prost_types::Any::decode(&msg.body[..])?;
-    let update_id = msg.protocol_instance_id.clone();
-
-    match any.type_url.as_str() {
-        url if url.ends_with("update.v1.Acceptance") => {
-            // Acceptance is informational only — the runtime produces
-            // UpdateOutcome::Accepted directly from the kernel commit
-            // (runtime.rs line ~494), not from a worker message.
-            // The UpdateRegistry only stores completion waiters with
-            // Completed/Rejected/RunClosed resolutions.
-            // Do NOT route acceptance to the registry.
-            None
-        }
-        url if url.ends_with("update.v1.Rejection") => {
-            let rejection = update::v1::Rejection::decode(&any.value[..])?;
-            let failure = rejection.failure.map(|f| f.message).unwrap_or_default();
-            Some((update_id, UpdateResolution::Rejected { failure }))
-        }
-        url if url.ends_with("update.v1.Response") => {
-            let response = update::v1::Response::decode(&any.value[..])?;
-            match response.outcome?.value? {
-                outcome::Value::Success(payloads) => {
-                    Some((update_id, UpdateResolution::Completed {
-                        result: payloads_to_domain(&payloads),
-                    }))
-                }
-                outcome::Value::Failure(failure) => {
-                    Some((update_id, UpdateResolution::Rejected {
-                        failure: failure.message,
-                    }))
-                }
-            }
-        }
-        _ => None,
-    }
-}
 ```
+1. Poll runtime for a real WFT (no query-only tasks from broker)
+2. Build poll response with history
+3. Determine observable_barrier = last event ID in the response history
+4. Drain BufferedQueryRegistry: queries where required_barrier ≤ observable_barrier
+5. For each drained query:
+   - Generate UUID query ID
+   - Store response_tx in PendingQueryStore keyed by task token
+   - Add to response queries map
+6. Drain UpdateRegistry for pending updates → messages
+7. Return response
+```
+
+#### respond_workflow_task_completed (Edge)
+
+```
+1. Route query_results to PendingQueryStore channels
+2. Route update messages to UpdateRegistry
+3. If query-only completion (logical_seq=0): skip command processing, return
+4. Commit WFT completion via runtime
+5. Read post-completion run state (authoritative)
+6. If run is quiescent (no pending/started WFT):
+   a. If return_new_workflow_task and BufferedQueryRegistry has queries:
+      → build eager return (empty history, started_event_id=0, attach queries)
+   b. Else if BufferedQueryRegistry has queries:
+      → dispatch through direct query-only path
+7. If new WFT was created: queries stay buffered
+```
+
+### 5. Update Message Construction (Existing, Unchanged)
+
+(Same as current implementation — `build_update_request_message` and `extract_update_resolution`.)
 
 ## Data Models
 
-No new persistent data models. All new structures are transient, in-memory coordination types:
-
 | Type | Location | Purpose |
 |---|---|---|
+| `BufferedQueryRegistry` | `tokeira-runtime` | Run-local registry of consistent query waiters with barriers |
+| `BufferedQuery` | `tokeira-runtime` | A single buffered query entry with payload and barrier |
 | `PendingQueryStore` | `tokeira-edge` | Retains query oneshot senders between poll and completion |
 | `WorkflowQueryDto` | `tokeira-edge/translate` | Edge DTO for a query in the poll response |
 | `QueryResultDto` | `tokeira-edge/translate` | Edge DTO for a query result in the completion |
 | `ProtocolMessageDto` | `tokeira-edge/translate` | Edge DTO for a protocol message (update request/response) |
 
-### Task Token Extension
-
-The task token (serialized as JSON in `task_token`) already contains `run_key`. The `PendingQueryStore` is keyed by the serialized task token bytes so that `RespondWorkflowTaskCompleted` can locate the correct store entry.
-
 ## Correctness Properties
 
-*A property is a characteristic or behavior that should hold true across all valid executions of a system — essentially, a formal statement about what the system should do. Properties serve as the bridge between human-readable specifications and machine-verifiable correctness guarantees.*
+### Property 1: Query barrier consistency
 
-### Property 1: Query attachment preserves fields
+*For any* query accepted with `required_barrier = B`, the query SHALL NOT be delivered on any task whose observable history barrier is less than `B`. *For any* task with observable barrier `≥ B`, the query MAY be delivered.
 
-*For any* set of `QueryTask` entries with arbitrary `query_type` strings and `query_args` payloads, when the edge layer drains them during poll response construction, the resulting `queries` map SHALL contain an entry for each query whose `WorkflowQuery` has the exact same `query_type` and `query_args`.
+**Validates: Requirements 1.1, 2.1, 2.2, 2.3**
 
-**Validates: Requirements 1.1, 1.3**
+### Property 2: Query attachment preserves fields
 
-### Property 2: PendingQueryStore insert/take round-trip
+*For any* set of `BufferedQuery` entries with arbitrary `query_type` strings and `query_args` payloads, when attached to a poll response, the resulting `queries` map SHALL contain an entry for each query whose `WorkflowQuery` has the exact same `query_type` and `query_args`.
+
+**Validates: Requirements 2.5, 8.1**
+
+### Property 3: PendingQueryStore insert/take round-trip
 
 *For any* set of query IDs and oneshot senders inserted into the `PendingQueryStore`, taking each query ID back SHALL return the original sender, and the sender SHALL still be usable to deliver a `QueryResult`.
 
-**Validates: Requirements 1.4, 2.1**
+**Validates: Requirements 2.6, 3.1**
 
-### Property 3: Query result routing delivers correct results
+### Property 4: Query result routing delivers correct results
 
 *For any* set of `QueryResultDto` entries (mix of `Answered` with arbitrary payloads and `Failed` with arbitrary error messages), when routed through the `PendingQueryStore` by query ID, each retained oneshot channel SHALL receive the corresponding `QueryResult` with matching variant and content. Entries with no matching channel SHALL be silently discarded.
 
-**Validates: Requirements 2.1, 2.2, 2.3, 2.5**
+**Validates: Requirements 3.1, 3.2, 3.3, 3.5**
 
-### Property 4: Update message construction preserves fields
+### Property 5: Post-completion quiescence check
+
+*For any* WFT completion that creates a new pending WFT, buffered queries SHALL NOT be dispatched eagerly or directly. *For any* WFT completion that leaves the run quiescent, buffered queries with satisfied barriers SHALL be dispatchable.
+
+**Validates: Requirements 4.1, 4.2, 4.3, 5.4**
+
+### Property 6: Update message construction preserves fields
 
 *For any* update with arbitrary `update_id`, `update_name`, and `input` payloads, the constructed `protocol.v1.Message` SHALL have `protocol_instance_id` equal to the `update_id`, and the `body` SHALL unpack to an `update.v1.Request` whose `Meta.update_id` and `Input.name` and `Input.args` match the original values.
 
-**Validates: Requirements 3.1, 3.2**
+**Validates: Requirements 6.1, 6.2**
 
-### Property 5: Update response routing delivers correct resolution
+### Property 7: Update response routing delivers correct resolution
 
 *For any* update response `protocol.v1.Message` (Acceptance, Rejection with arbitrary failure message, or Response with arbitrary success payloads or failure), when routed through the `UpdateRegistry` by `protocol_instance_id`, the waiting caller SHALL receive the correct `UpdateResolution` variant with matching content. Messages with no matching registry entry SHALL be silently discarded.
 
-**Validates: Requirements 4.1, 4.2, 4.3, 4.4, 4.5**
+**Validates: Requirements 7.1, 7.2, 7.3, 7.4, 7.5**
 
-### Property 6: Query proto round-trip
+### Property 8: Query proto round-trip
 
-*For any* valid query ID, query type, and payloads, serializing a `WorkflowQueryDto` into the proto `queries` map and then deserializing a matching `WorkflowQueryResult` (with `QUERY_RESULT_TYPE_ANSWERED` and the same payloads) back into a `QueryResultDto` SHALL preserve the query ID, result type, and answer payloads.
+*For any* valid query ID, query type, and payloads, serializing a `WorkflowQueryDto` into the proto `queries` map and then deserializing a matching `WorkflowQueryResult` back into a `QueryResultDto` SHALL preserve the query ID, result type, and answer payloads.
 
-**Validates: Requirements 7.1, 7.2, 7.3, 7.4**
+**Validates: Requirements 10.1, 10.2, 10.3, 10.4**
 
-### Property 7: Update message proto round-trip
+### Property 9: Update message proto round-trip
 
 *For any* valid update ID and protocol instance ID, serializing a `ProtocolMessageDto` into a proto `protocol.v1.Message` and deserializing it back SHALL preserve the `id`, `protocol_instance_id`, `body` bytes, and `sequencing_event_id`.
 
-**Validates: Requirements 8.1, 8.2, 8.3, 8.4**
-
-
+**Validates: Requirements 11.1, 11.2, 11.3, 11.4**
 
 ## Error Handling
 
 | Scenario | Behavior |
 |---|---|
-| Query caller times out before worker responds | `PendingQueryStore` entry is dropped; worker's `query_results` entry is silently discarded |
-| Update caller times out before worker responds | `UpdateRegistry` entry is removed by runtime timeout logic; worker's response message is silently discarded |
-| Worker returns `query_results` for unknown query ID | Silently discarded, no error returned to worker |
-| Worker returns update response for unknown update ID | Silently discarded, no error returned to worker |
-| `query_results` entry has `QUERY_RESULT_TYPE_FAILED` | Translated to `QueryResult::Failed { message }` and sent to caller |
-| Update response message has `outcome::Value::Failure` | Translated to `UpdateResolution::Rejected { failure }` and sent to caller |
-| Proto deserialization failure on `protocol.v1.Message` body | Log warning, skip the message, continue processing remaining messages |
-| `RespondQueryTaskCompleted` for timed-out query | Return success (empty response), no error |
-| Completion with `query_results` but no commands | Treated as query-only completion; skip command processing, no state transitions |
-
-No new `EdgeError` variants are needed. The query and update result routing is fire-and-forget on the oneshot channels — if the receiver is dropped (caller timed out), the send simply fails silently.
+| Query caller times out before worker responds | `BufferedQueryRegistry` entry removed; `PendingQueryStore` entry dropped; worker's `query_results` entry silently discarded |
+| Buffered query count exceeds per-run limit | Query rejected with error |
+| Update caller times out before worker responds | `UpdateRegistry` entry removed; worker's response message silently discarded |
+| Worker returns `query_results` for unknown query ID | Silently discarded |
+| Worker returns update response for unknown update ID | Silently discarded |
+| `query_results` entry has `QUERY_RESULT_TYPE_FAILED` | Translated to `QueryResult::Failed { message }` |
+| Update response message has `outcome::Value::Failure` | Translated to `UpdateResolution::Rejected { failure }` |
+| Proto deserialization failure on `protocol.v1.Message` body | Log warning, skip the message |
+| `RespondQueryTaskCompleted` for timed-out query | Return success (empty response) |
+| Completion with `query_results` but no commands | Query-only completion; skip command processing |
 
 ## Testing Strategy
 
 ### Property-based tests (proptest, 100 iterations each)
 
-Each property test references its design document property and uses the tag format:
-**Feature: edge-query-update-transport, Property {N}: {title}**
+1. **Property 1** — Generate random `(required_barrier, observable_barrier)` pairs. Verify `drain_satisfied` only returns queries where `required_barrier ≤ observable_barrier`.
 
-1. **Property 1** — Generate random `Vec<(String, String, Payloads)>` (query_id, query_type, query_args). Build `WorkflowQueryDto` entries, verify the queries map contains all entries with matching fields.
+2. **Property 2** — Generate random query payloads. Attach to poll response. Verify all fields preserved.
 
-2. **Property 2** — Generate random query IDs (1..8). Insert oneshot senders into `PendingQueryStore`. Take each back, send a `QueryResult` on the returned sender, verify the receiver gets the correct result.
+3. **Property 3** — Generate random query IDs. Insert/take round-trip through `PendingQueryStore`. Verify senders are usable.
 
-3. **Property 3** — Generate N random `QueryResultDto` entries (mix of Answered/Failed). Insert corresponding oneshot channels. Route results by ID. Verify each channel receives the correct variant and content. Include orphaned IDs (no channel) to verify silent discard.
+4. **Property 4** — Generate random `QueryResultDto` entries. Route through `PendingQueryStore`. Verify correct delivery and silent discard of orphans.
 
-4. **Property 4** — Generate random `(update_id, update_name, Payloads)`. Call `build_update_request_message`. Decode the body as `update.v1.Request`. Verify `protocol_instance_id == update_id`, `Meta.update_id == update_id`, `Input.name == update_name`, `Input.args == payloads`.
+5. **Property 5** — Generate random completion outcomes (with/without new WFT). Verify buffered queries are dispatched only when quiescent.
 
-5. **Property 5** — Generate random update response messages (Acceptance, Rejection with random failure, Response with random success/failure). Register corresponding entries in `UpdateRegistry`. Route messages. Verify each caller receives the correct `UpdateResolution` variant. Include orphaned IDs to verify silent discard.
-
-6. **Property 6** — Generate random `(query_id, query_type, Payloads)`. Serialize to proto `WorkflowQuery` in the queries map. Create a matching `WorkflowQueryResult` with `ANSWERED` and the same payloads. Deserialize to `QueryResultDto`. Verify all fields preserved.
-
-7. **Property 7** — Generate random `ProtocolMessageDto` with arbitrary `id`, `protocol_instance_id`, `body` bytes, and optional `sequencing_event_id`. Serialize to proto `protocol.v1.Message`. Deserialize back. Verify all fields match.
-
-### Unit tests (example-based)
-
-- Query-only WFT sets `started_event_id` to 0 (Requirement 1.5)
-- Query-only completion skips command processing (Requirement 2.4)
-- Legacy query populates `query` field 10 (Requirement 6.1)
-- `RespondQueryTaskCompleted` routes result to caller (Requirement 6.2)
-- `RespondQueryTaskCompleted` for timed-out query returns success (Requirement 6.3)
-- Empty `query_results` produces empty DTO (Requirement 7.4)
-- Empty `messages` produces empty DTO (Requirement 8.4)
+6-9. — (Same as current property tests for update message construction, update response routing, query proto round-trip, update message proto round-trip.)
 
 ### Integration tests
 
-- End-to-end query: `QueryWorkflow` → poll → worker answers → client receives result (Requirement 10.1-10.4)
-- End-to-end update (completed): `UpdateWorkflowExecution` → poll → worker accepts+completes → client receives `Completed` (Requirement 11.1-11.2)
-- End-to-end update (rejected): `UpdateWorkflowExecution` → poll → worker rejects → client receives `Rejected` (Requirement 11.3)
-- End-to-end update (accepted wait policy): `UpdateWorkflowExecution` with `Accepted` wait → poll → worker accepts → client receives `Accepted` (Requirement 11.4)
-- Query produces no state transitions (Requirement 10.4)
-
-### Test library
-
-Property-based tests use `proptest` with `ProptestConfig::with_cases(100)`, consistent with the existing test patterns in `query.rs` and `update.rs`.
+- Signal → Query ordering: signal(5) then query(get_counter) returns 5 (the core invariant)
+- End-to-end query on idle workflow
+- End-to-end update (completed, rejected, accepted wait policy)
+- Query produces no state transitions
+- Buffered query count limit enforcement

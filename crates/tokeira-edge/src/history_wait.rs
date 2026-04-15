@@ -3,18 +3,17 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::Result;
 use async_trait::async_trait;
 use time::OffsetDateTime;
-use tokio::sync::{RwLock, watch};
 use tokeira_kernel::{HistoryEvent, LoadedRun, Transition};
 use tokeira_storage::{
     ActivitySweepEntry, BacklogEntry, CommitResult, DispatchableActivityTask,
-    DispatchableWorkflowTask, DueTimer, LeaseOutcome, LeaseRepository,
-    NexusSweepEntry, RequestRecord, RunRepository, TransitionAuditRecord,
-    WorkflowTimeoutSweepEntry,
+    DispatchableWorkflowTask, DueTimer, LeaseOutcome, LeaseRepository, NexusSweepEntry,
+    RequestRecord, RunRepository, TransitionAuditRecord, WorkflowTimeoutSweepEntry,
 };
 use tokeira_types::{
-    ExecutionRef, NamespaceId, QueueKey, RequestId, RunId, RunKey, ShardEpoch,
-    ShardId, WorkflowId,
+    ExecutionRef, NamespaceId, QueueKey, RequestId, RunId, RunKey, ShardEpoch, ShardId,
+    WorkflowId,
 };
+use tokio::sync::{RwLock, watch};
 
 #[derive(Clone, Default)]
 pub struct HistoryWaitRegistry {
@@ -82,9 +81,7 @@ where
         namespace_id: NamespaceId,
         workflow_id: &WorkflowId,
     ) -> Result<Option<RunKey>> {
-        self.inner
-            .find_latest_run(namespace_id, workflow_id)
-            .await
+        self.inner.find_latest_run(namespace_id, workflow_id).await
     }
 
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun> {
@@ -97,7 +94,9 @@ where
         after_event_id: i64,
         limit: usize,
     ) -> Result<Vec<HistoryEvent>> {
-        self.inner.read_history(run_key, after_event_id, limit).await
+        self.inner
+            .read_history(run_key, after_event_id, limit)
+            .await
     }
 
     async fn lookup_request_dedupe(
@@ -105,7 +104,9 @@ where
         execution: &ExecutionRef,
         request_id: &RequestId,
     ) -> Result<Option<RequestRecord>> {
-        self.inner.lookup_request_dedupe(execution, request_id).await
+        self.inner
+            .lookup_request_dedupe(execution, request_id)
+            .await
     }
 
     async fn read_transition_audit(
@@ -121,10 +122,7 @@ where
         transition: Transition,
         epoch: ShardEpoch,
     ) -> Result<CommitResult> {
-        let last_event_id = transition
-            .history_events
-            .last()
-            .map(|event| event.event_id);
+        let last_event_id = transition.history_events.last().map(|event| event.event_id);
         let result = self
             .inner
             .commit_transition(run_key, transition, epoch)
@@ -242,7 +240,9 @@ where
         shard_id: ShardId,
         limit: usize,
     ) -> Result<Vec<ActivitySweepEntry>> {
-        self.inner.list_open_activities_for_shard(shard_id, limit).await
+        self.inner
+            .list_open_activities_for_shard(shard_id, limit)
+            .await
     }
 
     async fn list_pending_nexus_operations_for_shard(

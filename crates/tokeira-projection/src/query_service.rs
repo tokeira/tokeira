@@ -11,7 +11,9 @@ use uuid::Uuid;
 use crate::{
     filter::compile_filter,
     store::VisibilityStore,
-    types::{GroupByField, PageBounds, PageToken, RollupDimension, SortOrder, SystemField},
+    types::{
+        GroupByField, PageBounds, PageToken, RollupDimension, SortOrder, SystemField,
+    },
 };
 
 pub struct VisibilityQueryService<S> {
@@ -34,7 +36,8 @@ where
         req: ListWorkflowExecutionsRequest,
     ) -> Result<ListWorkflowExecutionsResponse> {
         let namespace_id = parse_namespace(&req.namespace)?;
-        let filter = compile_filter(req.query.as_deref(), namespace_id, &self.store).await?;
+        let filter =
+            compile_filter(req.query.as_deref(), namespace_id, &self.store).await?;
         let page = PageBounds {
             limit: req.page_size.clamp(1, crate::types::MAX_PAGE_SIZE),
             after: req
@@ -49,10 +52,7 @@ where
             .await?;
         Ok(ListWorkflowExecutionsResponse {
             executions: result.rows.into_iter().map(map_summary).collect(),
-            next_page_token: result
-                .next_page_token
-                .map(|t| t.encode())
-                .transpose()?,
+            next_page_token: result.next_page_token.map(|t| t.encode()).transpose()?,
         })
     }
 
@@ -61,8 +61,10 @@ where
         req: CountWorkflowExecutionsRequest,
     ) -> Result<CountWorkflowExecutionsResponse> {
         let namespace_id = parse_namespace(&req.namespace)?;
-        let filter = compile_filter(req.query.as_deref(), namespace_id, &self.store).await?;
-        let group_by = parse_group_by(req.group_by.as_deref(), namespace_id, &self.store).await?;
+        let filter =
+            compile_filter(req.query.as_deref(), namespace_id, &self.store).await?;
+        let group_by =
+            parse_group_by(req.group_by.as_deref(), namespace_id, &self.store).await?;
         let result = match (&filter.expr, &group_by) {
             (None, Some(GroupByField::System(SystemField::ExecutionStatus))) => {
                 self.store
@@ -182,8 +184,8 @@ mod tests {
     use tokeira_kernel::ProjectionOp;
     use tokeira_storage::{ProjectionContext, ProjectionRecord};
     use tokeira_types::{
-        ExecutionStatus, Memo, NamespaceId, RunId, RunKey, SearchAttributes,
-        SearchAttrValue, TaskQueueName, TransitionSeq, WorkflowId, WorkflowType,
+        ExecutionStatus, Memo, NamespaceId, RunId, RunKey, SearchAttrValue,
+        SearchAttributes, TaskQueueName, TransitionSeq, WorkflowId, WorkflowType,
     };
     use uuid::Uuid;
 
@@ -195,9 +197,10 @@ mod tests {
         close_time: Option<OffsetDateTime>,
     ) -> ProjectionRecord {
         let mut search_attr_patch = SearchAttributes::default();
-        search_attr_patch
-            .0
-            .insert("CustomKeyword".to_string(), SearchAttrValue::Keyword("blue".to_string()));
+        search_attr_patch.0.insert(
+            "CustomKeyword".to_string(),
+            SearchAttrValue::Keyword("blue".to_string()),
+        );
 
         ProjectionRecord {
             partition_id: 0,
@@ -215,7 +218,10 @@ mod tests {
                 } else {
                     ExecutionStatus::Running
                 },
-                start_time: OffsetDateTime::from_unix_timestamp(run_key.0.as_u128() as i64).unwrap(),
+                start_time: OffsetDateTime::from_unix_timestamp(
+                    run_key.0.as_u128() as i64
+                )
+                .unwrap(),
                 execution_time: None,
                 close_time,
                 history_length: 10,
@@ -233,7 +239,8 @@ mod tests {
         }
     }
 
-    async fn build_service() -> (NamespaceId, VisibilityQueryService<InMemoryVisibilityStore>) {
+    async fn build_service()
+    -> (NamespaceId, VisibilityQueryService<InMemoryVisibilityStore>) {
         let namespace_id = NamespaceId(Uuid::from_u128(1));
         let store = InMemoryVisibilityStore::default();
         store
@@ -268,8 +275,7 @@ mod tests {
 
     use proptest::prelude::*;
 
-    fn arb_status(
-    ) -> impl Strategy<Value = ExecutionStatus> {
+    fn arb_status() -> impl Strategy<Value = ExecutionStatus> {
         prop_oneof![
             Just(ExecutionStatus::Running),
             Just(ExecutionStatus::Completed),
@@ -281,8 +287,7 @@ mod tests {
         ]
     }
 
-    fn arb_execution_row(
-    ) -> impl Strategy<Value = crate::types::ExecutionRow> {
+    fn arb_execution_row() -> impl Strategy<Value = crate::types::ExecutionRow> {
         (
             any::<u128>(),
             any::<u128>(),
@@ -297,39 +302,16 @@ mod tests {
             1i64..100,
         )
             .prop_map(
-                |(
-                    ns,
-                    rk,
-                    wf_id,
-                    run_id,
-                    wf_type,
-                    tq,
-                    status,
-                    start,
-                    close,
-                    hl,
-                    stc,
-                )| {
+                |(ns, rk, wf_id, run_id, wf_type, tq, status, start, close, hl, stc)| {
                     crate::types::ExecutionRow {
-                        run_key: RunKey(
-                            Uuid::from_u128(rk),
-                        ),
-                        namespace_id: NamespaceId(
-                            Uuid::from_u128(ns),
-                        ),
+                        run_key: RunKey(Uuid::from_u128(rk)),
+                        namespace_id: NamespaceId(Uuid::from_u128(ns)),
                         workflow_id: WorkflowId(wf_id),
-                        run_id: RunId(
-                            Uuid::from_u128(run_id),
-                        ),
-                        workflow_type: WorkflowType(
-                            wf_type,
-                        ),
+                        run_id: RunId(Uuid::from_u128(run_id)),
+                        workflow_type: WorkflowType(wf_type),
                         task_queue: TaskQueueName(tq),
                         status,
-                        start_time:
-                            time::OffsetDateTime::from_unix_timestamp(
-                                start,
-                            )
+                        start_time: time::OffsetDateTime::from_unix_timestamp(start)
                             .unwrap(),
                         execution_time: None,
                         close_time: close.map(|c| {
@@ -405,7 +387,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.executions.len(), 1);
-        assert_ne!(first.executions[0].workflow_id, second.executions[0].workflow_id);
+        assert_ne!(
+            first.executions[0].workflow_id,
+            second.executions[0].workflow_id
+        );
     }
 
     #[tokio::test]

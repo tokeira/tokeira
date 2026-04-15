@@ -25,4 +25,6 @@ tokeira-storage = { path = "../../crates/tokeira-storage" }
 tokeira-types = { path = "../../crates/tokeira-types" }
 
 [dev-dependencies]
+prost = "0.12"
+prost-types = "0.12"
 tokio-stream = { version = "0.1", features = ["net"] }

@@ -1,8 +1,8 @@
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
-    ExecutionStatus, Headers, LogicalTaskSeq, Memo, NamespaceId, Payload,
-    Payloads, RetryPolicy, RunId, SearchAttributes, TaskQueueName, WorkerIdentity,
-    WorkflowId, WorkflowType,
+    ExecutionStatus, Headers, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads,
+    RetryPolicy, RunId, SearchAttributes, TaskQueueName, WorkerIdentity, WorkflowId,
+    WorkflowType,
 };
 
 use crate::command::{
@@ -201,7 +201,10 @@ pub enum HistoryEventKind {
     /// A timer was canceled before it fired.
     TimerCanceled { timer_id: String },
     /// A timer's deadline was reached and it fired.
-    TimerFired { timer_id: String },
+    TimerFired {
+        timer_id: String,
+        started_event_id: i64,
+    },
     /// A cancel was requested for a pending activity.
     ActivityTaskCancelRequested { activity_id: String },
     /// A child workflow start was requested by the parent.

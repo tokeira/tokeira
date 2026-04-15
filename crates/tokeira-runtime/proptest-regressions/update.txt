@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c8a618f549d8227b60391d1d5c7993c7079ec953b7abf3bf5a4bbd70fc1ba17a # shrinks to update_id = "upd-0", update_name = "a", input = Payloads([])

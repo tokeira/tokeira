@@ -6,7 +6,7 @@ use tokeira_types::{ExecutionStatus, NamespaceId};
 use crate::{
     store::VisibilityStore,
     types::{
-        CompiledFilter, CompareOp, FieldRef, FilterExpr, FilterValue, SearchAttrType,
+        CompareOp, CompiledFilter, FieldRef, FilterExpr, FilterValue, SearchAttrType,
         SystemField,
     },
 };
@@ -47,11 +47,7 @@ async fn compile_expr<S: VisibilityStore + ?Sized>(
         let high = parse_value(&high);
         ensure_value_type(&field, &low)?;
         ensure_value_type(&field, &high)?;
-        return Ok(FilterExpr::Between {
-            field,
-            low,
-            high,
-        });
+        return Ok(FilterExpr::Between { field, low, high });
     }
     if let Some((field, values)) = parse_in(input) {
         let field = resolve_field(field, namespace_id, store).await?;
@@ -59,10 +55,7 @@ async fn compile_expr<S: VisibilityStore + ?Sized>(
         for value in &values {
             ensure_value_type(&field, value)?;
         }
-        return Ok(FilterExpr::In {
-            field,
-            values,
-        });
+        return Ok(FilterExpr::In { field, values });
     }
     if let Some((field, prefix)) = parse_starts_with(input) {
         let field = resolve_field(field, namespace_id, store).await?;
@@ -81,11 +74,7 @@ async fn compile_expr<S: VisibilityStore + ?Sized>(
             let field = resolve_field(field.trim(), namespace_id, store).await?;
             let value = parse_value(value.trim());
             ensure_value_type(&field, &value)?;
-            return Ok(FilterExpr::Compare {
-                field,
-                op,
-                value,
-            });
+            return Ok(FilterExpr::Compare { field, op, value });
         }
     }
     Err(anyhow!("unsupported filter expression: {input}"))
@@ -139,7 +128,9 @@ fn parse_value(input: &str) -> FilterValue {
     if let Ok(value) = trimmed.parse::<f64>() {
         return FilterValue::Float(value);
     }
-    if let Ok(value) = OffsetDateTime::parse(trimmed, &time::format_description::well_known::Rfc3339) {
+    if let Ok(value) =
+        OffsetDateTime::parse(trimmed, &time::format_description::well_known::Rfc3339)
+    {
         return FilterValue::Datetime(value);
     }
     FilterValue::String(trimmed.to_string())
@@ -165,7 +156,11 @@ fn split_top_level<'a>(input: &'a str, needle: &str) -> Option<(&'a str, &'a str
 fn parse_between(input: &str) -> Option<(&str, String, String)> {
     let (field, rest) = input.split_once(" BETWEEN ")?;
     let (low, high) = rest.split_once(" AND ")?;
-    Some((field.trim(), low.trim().to_string(), high.trim().to_string()))
+    Some((
+        field.trim(),
+        low.trim().to_string(),
+        high.trim().to_string(),
+    ))
 }
 
 fn parse_in(input: &str) -> Option<(&str, Vec<String>)> {
@@ -178,7 +173,10 @@ fn parse_in(input: &str) -> Option<(&str, Vec<String>)> {
 
 fn parse_starts_with(input: &str) -> Option<(&str, String)> {
     let (field, rest) = input.split_once(" STARTS_WITH ")?;
-    Some((field.trim(), rest.trim().trim_matches('"').trim_matches('\'').to_string()))
+    Some((
+        field.trim(),
+        rest.trim().trim_matches('"').trim_matches('\'').to_string(),
+    ))
 }
 
 pub fn expected_type_for_field(field: &FieldRef) -> Option<SearchAttrType> {
@@ -193,14 +191,24 @@ fn ensure_value_type(field: &FieldRef, value: &FilterValue) -> Result<()> {
         FieldRef::System(SystemField::WorkflowId)
         | FieldRef::System(SystemField::RunId)
         | FieldRef::System(SystemField::WorkflowType)
-        | FieldRef::System(SystemField::TaskQueue) => matches!(value, FilterValue::String(_)),
-        FieldRef::System(SystemField::ExecutionStatus) => matches!(value, FilterValue::Status(_)),
+        | FieldRef::System(SystemField::TaskQueue) => {
+            matches!(value, FilterValue::String(_))
+        }
+        FieldRef::System(SystemField::ExecutionStatus) => {
+            matches!(value, FilterValue::Status(_))
+        }
         FieldRef::System(SystemField::StartTime)
-        | FieldRef::System(SystemField::CloseTime) => matches!(value, FilterValue::Datetime(_)),
+        | FieldRef::System(SystemField::CloseTime) => {
+            matches!(value, FilterValue::Datetime(_))
+        }
         FieldRef::System(SystemField::HistoryLength)
-        | FieldRef::System(SystemField::StateTransitionCount) => matches!(value, FilterValue::Int(_)),
+        | FieldRef::System(SystemField::StateTransitionCount) => {
+            matches!(value, FilterValue::Int(_))
+        }
         FieldRef::Custom { attr_type, .. } => match attr_type {
-            SearchAttrType::Keyword | SearchAttrType::KeywordList | SearchAttrType::Text => {
+            SearchAttrType::Keyword
+            | SearchAttrType::KeywordList
+            | SearchAttrType::Text => {
                 matches!(value, FilterValue::String(_))
             }
             SearchAttrType::Int => matches!(value, FilterValue::Int(_)),
@@ -224,7 +232,8 @@ fn ensure_starts_with_field(field: &FieldRef) -> Result<()> {
         | FieldRef::System(SystemField::WorkflowType)
         | FieldRef::System(SystemField::TaskQueue)
         | FieldRef::Custom {
-            attr_type: SearchAttrType::Keyword | SearchAttrType::KeywordList | SearchAttrType::Text,
+            attr_type:
+                SearchAttrType::Keyword | SearchAttrType::KeywordList | SearchAttrType::Text,
             ..
         } => Ok(()),
         _ => Err(anyhow!("type mismatch for filter field")),
@@ -237,25 +246,15 @@ mod tests {
     use crate::memory::InMemoryVisibilityStore;
     use proptest::prelude::*;
 
-    fn arb_system_string_field(
-    ) -> impl Strategy<Value = &'static str> {
-        prop_oneof![
-            Just("WorkflowId"),
-            Just("WorkflowType"),
-            Just("TaskQueue"),
-        ]
+    fn arb_system_string_field() -> impl Strategy<Value = &'static str> {
+        prop_oneof![Just("WorkflowId"), Just("WorkflowType"), Just("TaskQueue"),]
     }
 
-    fn arb_compare_op(
-    ) -> impl Strategy<Value = &'static str> {
+    fn arb_compare_op() -> impl Strategy<Value = &'static str> {
         prop_oneof![Just("="), Just("!="),]
     }
 
-    fn format_compare(
-        field: &str,
-        op: &str,
-        value: &str,
-    ) -> String {
+    fn format_compare(field: &str, op: &str, value: &str) -> String {
         format!("{field} {op} \"{value}\"")
     }
 

@@ -23,7 +23,10 @@ fn run() -> Result<()> {
     buf_export(&version, &upstream_dir)?;
     write_version_file(&version_file, &version)?;
 
-    println!("synced Temporal API protos {version} into {}", upstream_dir.display());
+    println!(
+        "synced Temporal API protos {version} into {}",
+        upstream_dir.display()
+    );
     Ok(())
 }
 
@@ -52,16 +55,17 @@ fn find_workspace_root() -> Result<PathBuf> {
         }
         dir = parent.to_path_buf();
     }
-    Err(anyhow!("workspace root not found from {}", env!("CARGO_MANIFEST_DIR")))
+    Err(anyhow!(
+        "workspace root not found from {}",
+        env!("CARGO_MANIFEST_DIR")
+    ))
 }
 
 fn clean_upstream_dir(path: &Path) -> Result<()> {
     if path.exists() {
-        fs::remove_dir_all(path)
-            .with_context(|| format!("remove {}", path.display()))?;
+        fs::remove_dir_all(path).with_context(|| format!("remove {}", path.display()))?;
     }
-    fs::create_dir_all(path)
-        .with_context(|| format!("create {}", path.display()))?;
+    fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
     Ok(())
 }
 
@@ -85,7 +89,6 @@ fn write_version_file(path: &Path, version: &str) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("create {}", parent.display()))?;
     }
-    fs::write(path, version)
-        .with_context(|| format!("write {}", path.display()))?;
+    fs::write(path, version).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }

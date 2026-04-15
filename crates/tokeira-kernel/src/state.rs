@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
-    BuildId, DeploymentId, ExecutionStatus, Headers, LogicalTaskSeq, Memo,
-    NamespaceId, Payloads, RetryPolicy, RunId, RunKey, SearchAttributes,
-    StickyAffinity, TaskQueueName, TransitionSeq, WorkflowId, WorkflowType,
+    BuildId, DeploymentId, ExecutionStatus, Headers, LogicalTaskSeq, Memo, NamespaceId,
+    Payloads, RetryPolicy, RunId, RunKey, SearchAttributes, StickyAffinity,
+    TaskQueueName, TransitionSeq, WorkflowId, WorkflowType,
 };
 
 /// Durable state for an open or closed workflow run.
@@ -87,7 +87,13 @@ pub struct WorkflowState {
     /// event ID.
     pub pending_external_cancels: BTreeMap<i64, PendingExternalCancel>,
     /// Pending workflow updates keyed by update ID.
+    /// These are updates that have been accepted by the worker
+    /// (WorkflowExecutionUpdateAccepted event written).
     pub pending_updates: BTreeMap<String, PendingUpdate>,
+    /// Updates that have been admitted (submitted by the client)
+    /// but not yet accepted by the worker. Tracked to reject
+    /// duplicate update IDs.
+    pub admitted_updates: std::collections::HashSet<String>,
     /// Pending Nexus operations keyed by operation ID.
     pub pending_nexus_operations: BTreeMap<String, PendingNexusOperation>,
     /// Versioning override for this execution, if set.

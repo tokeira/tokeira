@@ -115,10 +115,7 @@ pub fn search_attributes_to_domain(
 fn search_attr_value_to_payload(value: &SearchAttrValue) -> common::Payload {
     let data = serde_json::to_vec(value).unwrap_or_default();
     let mut metadata = std::collections::BTreeMap::new();
-    metadata.insert(
-        "encoding".to_string(),
-        b"json/plain".to_vec(),
-    );
+    metadata.insert("encoding".to_string(), b"json/plain".to_vec());
     common::Payload {
         metadata,
         data,

@@ -74,12 +74,6 @@ pub(crate) struct TimestampedActivityTask {
     pub(crate) scheduled_at: OffsetDateTime,
 }
 
-#[derive(Debug)]
-pub enum PolledWorkflowOrQueryTask {
-    Workflow((DispatchableWorkflowTask, Instant)),
-    Query(QueryTask),
-}
-
 impl InMemoryBroker {
     /// Publish a query task without deduplication or backlog participation.
     pub async fn publish_query_task(&self, task: QueryTask) {
@@ -177,66 +171,26 @@ impl InMemoryBroker {
         worker: &WorkerIdentity,
         wait_for: Duration,
     ) -> Result<Option<(DispatchableWorkflowTask, Instant)>> {
-        // TODO(perf): add fairness budgets between sticky/live/backlog sources.
-        // TODO(perf): add per-namespace admission and caps.
         if let Some(task) = self.try_take(queue, worker).await? {
             return Ok(Some(task));
         }
 
         self.increment_waiter(queue).await;
 
-        let notified = timeout(wait_for, self.wake.notified()).await;
-        self.decrement_waiter(queue).await;
-
-        if notified.is_err() {
-            return Ok(None);
+        // Create the notified future first, then re-check. This
+        // closes the race between try_take and notify_waiters:
+        // if a task was published between our first try_take and
+        // registering the waiter, we catch it here.
+        let notified = self.wake.notified();
+        if let Some(task) = self.try_take(queue, worker).await? {
+            self.decrement_waiter(queue).await;
+            return Ok(Some(task));
         }
+
+        let _ = timeout(wait_for, notified).await;
+        self.decrement_waiter(queue).await;
 
         self.try_take(queue, worker).await
-    }
-
-    /// Long-poll for either a real workflow task or a query-only task.
-    ///
-    /// Workflow tasks are preferred when both are available so query transport
-    /// does not starve real workflow progress.
-    pub async fn poll_workflow_or_query_task(
-        &self,
-        queue: &QueueKey,
-        worker: &WorkerIdentity,
-        wait_for: Duration,
-    ) -> Result<Option<PolledWorkflowOrQueryTask>> {
-        if let Some(task) = self.try_take(queue, worker).await? {
-            return Ok(Some(PolledWorkflowOrQueryTask::Workflow(task)));
-        }
-        if let Some(task) = self.try_take_query(queue, worker).await {
-            return Ok(Some(PolledWorkflowOrQueryTask::Query(task)));
-        }
-
-        self.increment_waiter(queue).await;
-        self.increment_query_waiter(queue).await;
-
-        let notified = timeout(wait_for, async {
-            tokio::select! {
-                _ = self.wake.notified() => {}
-                _ = self.query_wake.notified() => {}
-            }
-        })
-        .await;
-
-        self.decrement_waiter(queue).await;
-        self.decrement_query_waiter(queue).await;
-
-        if notified.is_err() {
-            return Ok(None);
-        }
-
-        if let Some(task) = self.try_take(queue, worker).await? {
-            return Ok(Some(PolledWorkflowOrQueryTask::Workflow(task)));
-        }
-        Ok(self
-            .try_take_query(queue, worker)
-            .await
-            .map(PolledWorkflowOrQueryTask::Query))
     }
 
     pub async fn queues_with_waiters(&self) -> HashSet<QueueKey> {
@@ -313,9 +267,7 @@ impl InMemoryBroker {
             let mut idx = 0;
             while idx < sticky.len() {
                 let action = match sticky.get(idx) {
-                    Some(task)
-                        if task.task.sticky_preferred.as_ref() == Some(worker) =>
-                    {
+                    Some(task) if task.task.sticky_preferred.as_ref() == Some(worker) => {
                         StickyAction::Take
                     }
                     Some(task)
@@ -641,8 +593,14 @@ mod tests {
         let queue = activity_queue("queue-a");
         let task = activity_task(queue.clone());
 
-        broker.publish_activity_task(task.clone(), None).await.unwrap();
-        broker.publish_activity_task(task.clone(), None).await.unwrap();
+        broker
+            .publish_activity_task(task.clone(), None)
+            .await
+            .unwrap();
+        broker
+            .publish_activity_task(task.clone(), None)
+            .await
+            .unwrap();
 
         let first = broker
             .poll_activity_task(&queue, std::time::Duration::from_millis(5))
@@ -664,7 +622,10 @@ mod tests {
         let queue_b = activity_queue("queue-b");
         let task = activity_task(queue_a.clone());
 
-        broker.publish_activity_task(task.clone(), None).await.unwrap();
+        broker
+            .publish_activity_task(task.clone(), None)
+            .await
+            .unwrap();
 
         let wrong = broker
             .poll_activity_task(&queue_b, std::time::Duration::from_millis(5))
@@ -697,7 +658,10 @@ mod tests {
         };
         let task = activity_task(versioned.clone());
 
-        broker.publish_activity_task(task.clone(), None).await.unwrap();
+        broker
+            .publish_activity_task(task.clone(), None)
+            .await
+            .unwrap();
 
         let wrong = broker
             .poll_activity_task(&unversioned, std::time::Duration::from_millis(5))
@@ -751,7 +715,9 @@ mod tests {
         broker.publish_workflow_task(task.clone(), None).await;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
-        let expired = broker.take_expired(std::time::Duration::from_millis(1)).await;
+        let expired = broker
+            .take_expired(std::time::Duration::from_millis(1))
+            .await;
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].task, task);
     }
@@ -782,7 +748,9 @@ mod tests {
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(3)).await;
-        let expired = broker.take_expired(std::time::Duration::from_millis(5)).await;
+        let expired = broker
+            .take_expired(std::time::Duration::from_millis(5))
+            .await;
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].task.run_key, task.run_key);
         assert_eq!(expired[0].task.logical_seq, task.logical_seq);

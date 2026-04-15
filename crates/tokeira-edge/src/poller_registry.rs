@@ -27,11 +27,7 @@ pub struct PollerRegistry {
 }
 
 impl PollerRegistry {
-    pub fn register(
-        &self,
-        queue: QueueKey,
-        identity: WorkerIdentity,
-    ) -> PollerGuard {
+    pub fn register(&self, queue: QueueKey, identity: WorkerIdentity) -> PollerGuard {
         let id = self.state.next_id.fetch_add(1, Ordering::Relaxed);
         let poller = ActivePoller {
             identity,

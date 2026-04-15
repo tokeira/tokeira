@@ -7,8 +7,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use time::OffsetDateTime;
 use tokeira_kernel::{
-    ActivityOp, BasicKernel, DispatchOp, LoadedRun, ReplayContext, TimerOp,
-    Transition, WorkflowState,
+    ActivityOp, BasicKernel, DispatchOp, LoadedRun, ReplayContext, TimerOp, Transition,
+    WorkflowState,
 };
 use tokeira_types::{
     ExecutionRef, NamespaceId, ProjectionCursor, QueueKey, RequestId, RunId, RunKey,
@@ -19,10 +19,9 @@ use tokio::sync::Mutex;
 use crate::api::{
     ActivitySweepEntry, BacklogEntry, CommitResult, ConnectionDirector,
     CurrentExecutionConflictPolicy, DbClass, DbPermit, DispatchableActivityTask,
-    DispatchableWorkflowTask, DueTimer, LeaseOutcome, LeaseRepository,
-    NexusSweepEntry, ProjectionBatch, ProjectionContext, ProjectionLog,
-    ProjectionRecord, RequestRecord, RunRepository, TransitionAuditRecord,
-    WorkflowTimeoutSweepEntry,
+    DispatchableWorkflowTask, DueTimer, LeaseOutcome, LeaseRepository, NexusSweepEntry,
+    ProjectionBatch, ProjectionContext, ProjectionLog, ProjectionRecord, RequestRecord,
+    RunRepository, TransitionAuditRecord, WorkflowTimeoutSweepEntry,
 };
 
 /// In-memory store intended for local development and semantic tests.
@@ -140,8 +139,7 @@ impl RunRepository for InMemoryStore {
             .runs
             .values()
             .filter(|state| {
-                state.namespace_id == namespace_id
-                    && state.workflow_id == *workflow_id
+                state.namespace_id == namespace_id && state.workflow_id == *workflow_id
             })
             .max_by(|left, right| {
                 left.started_at
@@ -220,13 +218,14 @@ impl RunRepository for InMemoryStore {
     ) -> Result<CommitResult> {
         let mut store = self.inner.lock().await;
         if epoch != ShardEpoch::ZERO {
-            let shard_id = store
-                .run_shard_map
-                .get(&run_key)
-                .copied()
-                .unwrap_or_else(|| {
-                    shard_for_run_key(run_key, Self::effective_shard_count(&store))
-                });
+            let shard_id =
+                store
+                    .run_shard_map
+                    .get(&run_key)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        shard_for_run_key(run_key, Self::effective_shard_count(&store))
+                    });
             match store.bundle_leases.get(&shard_id) {
                 Some((_owner, current_epoch)) if *current_epoch == epoch => {}
                 Some((_owner, current_epoch)) => {
@@ -452,7 +451,8 @@ impl RunRepository for InMemoryStore {
         }
 
         if transition.expected_seq == tokeira_types::TransitionSeq::ZERO {
-            let shard_id = shard_for_run_key(run_key, Self::effective_shard_count(&store));
+            let shard_id =
+                shard_for_run_key(run_key, Self::effective_shard_count(&store));
             store.run_shard_map.insert(run_key, shard_id);
         }
 
@@ -476,16 +476,14 @@ impl RunRepository for InMemoryStore {
             );
         }
 
-        let base_state = store
-            .runs
-            .get(&base_run_key)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("base run not found: {:?}", base_run_key))?;
+        let base_state =
+            store.runs.get(&base_run_key).cloned().ok_or_else(|| {
+                anyhow::anyhow!("base run not found: {:?}", base_run_key)
+            })?;
 
-        let base_history = store
-            .history
-            .get(&base_run_key)
-            .ok_or_else(|| anyhow::anyhow!("base history not found: {:?}", base_run_key))?;
+        let base_history = store.history.get(&base_run_key).ok_or_else(|| {
+            anyhow::anyhow!("base history not found: {:?}", base_run_key)
+        })?;
 
         let prefix_len = base_history
             .iter()
@@ -512,11 +510,10 @@ impl RunRepository for InMemoryStore {
             parent_workflow_id: base_state.parent_workflow_id.clone(),
             first_run_started_at: base_state.first_run_started_at,
         };
-        let successor_state = kernel.replay_history_prefix(replay_ctx, &copied_history)?;
+        let successor_state =
+            kernel.replay_history_prefix(replay_ctx, &copied_history)?;
 
-        store
-            .history
-            .insert(successor_run_key, copied_history);
+        store.history.insert(successor_run_key, copied_history);
         store
             .runs
             .insert(successor_run_key, successor_state.clone());
@@ -684,9 +681,7 @@ impl RunRepository for InMemoryStore {
         let candidates: Vec<RunKey> = store
             .runs
             .keys()
-            .filter(|rk| {
-                store.run_shard_map.get(rk) == Some(&shard_id)
-            })
+            .filter(|rk| store.run_shard_map.get(rk) == Some(&shard_id))
             .copied()
             .collect();
 
@@ -696,8 +691,7 @@ impl RunRepository for InMemoryStore {
                 continue;
             };
             clear_expired_sticky_if_needed(state, now);
-            let Some(pending) = &state.pending_workflow_task
-            else {
+            let Some(pending) = &state.pending_workflow_task else {
                 continue;
             };
             if pending.started_event_id.is_some() {
@@ -717,10 +711,7 @@ impl RunRepository for InMemoryStore {
                     .sticky
                     .as_ref()
                     .map(|s| s.worker_identity.clone()),
-                sticky_expires_at: state
-                    .sticky
-                    .as_ref()
-                    .map(|s| s.expires_at),
+                sticky_expires_at: state.sticky.as_ref().map(|s| s.expires_at),
             });
             if out.len() >= limit {
                 break;
@@ -738,7 +729,9 @@ impl RunRepository for InMemoryStore {
         Ok(store
             .activity_dispatch
             .values()
-            .filter(|entry| store.run_shard_map.get(&entry.task.run_key) == Some(&shard_id))
+            .filter(|entry| {
+                store.run_shard_map.get(&entry.task.run_key) == Some(&shard_id)
+            })
             .take(limit)
             .map(|entry| entry.task.clone())
             .collect())
@@ -841,9 +834,7 @@ impl RunRepository for InMemoryStore {
         let store = self.inner.lock().await;
         let mut out = Vec::new();
         for state in store.runs.values() {
-            if store.run_shard_map.get(&state.run_key)
-                != Some(&shard_id)
-            {
+            if store.run_shard_map.get(&state.run_key) != Some(&shard_id) {
                 continue;
             }
             if !state.is_open() {
@@ -853,8 +844,7 @@ impl RunRepository for InMemoryStore {
                 // Only include operations that have a timeout
                 // configured — operations without a timeout
                 // don't need timeout tracking reconstruction.
-                let Some(timeout) = op.schedule_to_close_timeout
-                else {
+                let Some(timeout) = op.schedule_to_close_timeout else {
                     continue;
                 };
                 out.push(NexusSweepEntry {
@@ -997,8 +987,8 @@ mod tests {
     use proptest::prelude::*;
     use time::Duration;
     use tokeira_kernel::{
-        event::{HistoryEvent, HistoryEventKind},
         PendingWorkflowTask, RequestDedupeOp,
+        event::{HistoryEvent, HistoryEventKind},
     };
     use tokeira_types::{
         ExecutionRef, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, QueueKey,
@@ -1572,13 +1562,19 @@ mod tests {
         let mut t1 = start_transition(run_key_1);
         t1.next_state.namespace_id = namespace_id;
         t1.next_state.workflow_id = workflow_id.clone();
-        let _ = store.commit_transition(run_key_1, t1, ShardEpoch::ZERO).await.unwrap();
+        let _ = store
+            .commit_transition(run_key_1, t1, ShardEpoch::ZERO)
+            .await
+            .unwrap();
 
         let run_key_2 = RunKey::new();
         let mut t2 = start_transition(run_key_2);
         t2.next_state.namespace_id = namespace_id;
         t2.next_state.workflow_id = workflow_id;
-        let result = store.commit_transition(run_key_2, t2, ShardEpoch::ZERO).await.unwrap();
+        let result = store
+            .commit_transition(run_key_2, t2, ShardEpoch::ZERO)
+            .await
+            .unwrap();
         assert!(matches!(result, CommitResult::Conflict { .. }));
     }
 
@@ -1596,7 +1592,10 @@ mod tests {
         let mut open = start_transition(run_key_1);
         open.next_state.namespace_id = namespace_id;
         open.next_state.workflow_id = workflow_id.clone();
-        let _ = store.commit_transition(run_key_1, open, ShardEpoch::ZERO).await.unwrap();
+        let _ = store
+            .commit_transition(run_key_1, open, ShardEpoch::ZERO)
+            .await
+            .unwrap();
 
         let mut close = Transition {
             expected_seq: TransitionSeq(1),
@@ -1614,13 +1613,19 @@ mod tests {
         close.next_state.closed_at = Some(fixed_now());
         close.next_state.pending_workflow_task = None;
         close.next_state.transition_seq = TransitionSeq(2);
-        let _ = store.commit_transition(run_key_1, close, ShardEpoch::ZERO).await.unwrap();
+        let _ = store
+            .commit_transition(run_key_1, close, ShardEpoch::ZERO)
+            .await
+            .unwrap();
 
         let run_key_2 = RunKey::new();
         let mut reopen = start_transition(run_key_2);
         reopen.next_state.namespace_id = namespace_id;
         reopen.next_state.workflow_id = workflow_id;
-        let result = store.commit_transition(run_key_2, reopen, ShardEpoch::ZERO).await.unwrap();
+        let result = store
+            .commit_transition(run_key_2, reopen, ShardEpoch::ZERO)
+            .await
+            .unwrap();
         assert!(matches!(result, CommitResult::Applied { .. }));
     }
 
@@ -1632,7 +1637,10 @@ mod tests {
         transition
             .timer_ops
             .push(TimerOp::Upsert(timer_state("timer-1", fixed_now())));
-        let _ = store.commit_transition(run_key, transition, ShardEpoch::ZERO).await.unwrap();
+        let _ = store
+            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .await
+            .unwrap();
         let due = store.list_due_timers(fixed_now(), 10).await.unwrap();
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].timer_id, "timer-1");
@@ -1643,10 +1651,7 @@ mod tests {
         let store = InMemoryStore::default();
         assert!(
             store
-                .list_dispatchable_activity_tasks(
-                    &sample_queue(TaskKind::Activity),
-                    10,
-                )
+                .list_dispatchable_activity_tasks(&sample_queue(TaskKind::Activity), 10,)
                 .await
                 .unwrap()
                 .is_empty()
@@ -1739,7 +1744,10 @@ mod tests {
                 start_to_close_timeout: None,
                 heartbeat_timeout: None,
             });
-        let _ = store.commit_transition(run_key, transition, ShardEpoch::ZERO).await.unwrap();
+        let _ = store
+            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .await
+            .unwrap();
         assert!(
             store
                 .drain_backlog(&sample_queue(TaskKind::Workflow), 10)
@@ -1781,13 +1789,13 @@ mod tests {
         first
             .activity_ops
             .push(ActivityOp::Upsert(activity_state("a1")));
-        let _ = store.commit_transition(run_key, first, ShardEpoch::ZERO).await.unwrap();
+        let _ = store
+            .commit_transition(run_key, first, ShardEpoch::ZERO)
+            .await
+            .unwrap();
 
         let tasks_before = store
-            .list_dispatchable_activity_tasks(
-                &sample_queue(TaskKind::Activity),
-                10,
-            )
+            .list_dispatchable_activity_tasks(&sample_queue(TaskKind::Activity), 10)
             .await
             .unwrap();
 
@@ -1807,14 +1815,14 @@ mod tests {
         duplicate.request_dedupe_ops.push(RequestDedupeOp {
             request_id: RequestId("req-1".into()),
         });
-        let result = store.commit_transition(run_key, duplicate, ShardEpoch::ZERO).await.unwrap();
+        let result = store
+            .commit_transition(run_key, duplicate, ShardEpoch::ZERO)
+            .await
+            .unwrap();
         assert!(matches!(result, CommitResult::Duplicate));
 
         let tasks_after = store
-            .list_dispatchable_activity_tasks(
-                &sample_queue(TaskKind::Activity),
-                10,
-            )
+            .list_dispatchable_activity_tasks(&sample_queue(TaskKind::Activity), 10)
             .await
             .unwrap();
         assert_eq!(tasks_before, tasks_after);
@@ -1917,7 +1925,9 @@ mod tests {
         .unwrap();
 
         let LoadedRun::Existing(successor) =
-            RunRepository::load_run(&store, successor_run_key).await.unwrap()
+            RunRepository::load_run(&store, successor_run_key)
+                .await
+                .unwrap()
         else {
             panic!("expected successor run to exist");
         };

@@ -14,8 +14,8 @@ use uuid::Uuid;
 use crate::{
     request_id::RequestId,
     translate::{
-        PollWorkflowTaskQueueRequest, RespondWorkflowTaskCompletedRequest,
-        ResetWorkflowExecutionRequest, SignalWorkflowExecutionRequest,
+        PollWorkflowTaskQueueRequest, ResetWorkflowExecutionRequest,
+        RespondWorkflowTaskCompletedRequest, SignalWorkflowExecutionRequest,
         StartWorkflowExecutionRequest,
     },
 };
@@ -173,7 +173,7 @@ pub fn workflow_task_completed_request(
         },
         identity: WorkerIdentity(req.identity),
         commands: req.commands,
-        force_new_workflow_task: req.force_new_workflow_task,
+        force_new_workflow_task: req.force_create_new_workflow_task,
         now: OffsetDateTime::now_utc(),
     })
 }
@@ -204,9 +204,7 @@ pub fn terminate_request(
         details: req.details,
         identity: req.identity,
         request: RequestContext {
-            request_id: CoreRequestId(
-                request_id.as_str().to_string(),
-            ),
+            request_id: CoreRequestId(request_id.as_str().to_string()),
             caller_identity: None,
             received_at: now,
         },
@@ -223,9 +221,7 @@ pub fn cancel_request(
         reason: req.reason,
         external_initiator: None,
         request: RequestContext {
-            request_id: CoreRequestId(
-                request_id.as_str().to_string(),
-            ),
+            request_id: CoreRequestId(request_id.as_str().to_string()),
             caller_identity: None,
             received_at: now,
         },

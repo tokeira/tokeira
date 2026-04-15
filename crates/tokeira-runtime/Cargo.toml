@@ -12,6 +12,7 @@ time.workspace = true
 tokio.workspace = true
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing.workspace = true
+uuid.workspace = true
 tokeira-kernel = { path = "../tokeira-kernel" }
 tokeira-storage = { path = "../tokeira-storage" }
 tokeira-types = { path = "../tokeira-types" }

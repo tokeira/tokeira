@@ -5,9 +5,7 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use time::OffsetDateTime;
 use tokeira_kernel::Command;
-use tokeira_storage::{
-    LeaseOutcome, LeaseRepository, RunRepository,
-};
+use tokeira_storage::{LeaseOutcome, LeaseRepository, RunRepository};
 use tokeira_types::{ShardEpoch, ShardId};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -196,40 +194,28 @@ pub async fn run_lease_renewer<R>(
     }
 }
 
-pub(crate) fn lease_rejected_error(
-    shard_id: ShardId,
-) -> anyhow::Error {
+pub(crate) fn lease_rejected_error(shard_id: ShardId) -> anyhow::Error {
     anyhow!("shard lease rejected for {:?}", shard_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::broker::{
-        InMemoryActivityBroker, InMemoryBroker,
-    };
-    use crate::lane::{
-        DispatchPublisher, LaneConfig, LaneHandle,
-        spawn_lane,
-    };
+    use crate::broker::{InMemoryActivityBroker, InMemoryBroker};
+    use crate::lane::{DispatchPublisher, LaneConfig, LaneHandle, spawn_lane};
     use crate::shard::ShardOwner;
     use proptest::prelude::*;
     use std::sync::RwLock;
     use time::Duration;
     use tokeira_kernel::{
-        ActivityOp, ActivityState, BasicKernel, DispatchOp,
-        PendingNexusOperation, PendingWorkflowTask, TimerOp,
-        TimerState, Transition, WorkflowState,
+        ActivityOp, ActivityState, BasicKernel, DispatchOp, PendingNexusOperation,
+        PendingWorkflowTask, TimerOp, TimerState, Transition, WorkflowState,
     };
-    use tokeira_storage::{
-        CommitResult, InMemoryStore,
-    };
+    use tokeira_storage::{CommitResult, InMemoryStore};
     use tokeira_types::{
-        ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId,
-        Payloads, QueueKey, RunId, RunKey, SearchAttributes,
-        ShardEpoch, ShardId, TaskKind, TaskQueueName,
-        TransitionSeq, WorkerIdentity, WorkflowId,
-        WorkflowType,
+        ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payloads, QueueKey, RunId,
+        RunKey, SearchAttributes, ShardEpoch, ShardId, TaskKind, TaskQueueName,
+        TransitionSeq, WorkerIdentity, WorkflowId, WorkflowType,
     };
 
     #[derive(Clone)]
@@ -256,8 +242,7 @@ mod tests {
     }
 
     fn fixed_now() -> OffsetDateTime {
-        OffsetDateTime::from_unix_timestamp(1_700_000_000)
-            .unwrap()
+        OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()
     }
 
     fn sample_state(run_key: RunKey) -> WorkflowState {
@@ -274,14 +259,12 @@ mod tests {
             transition_seq: TransitionSeq(1),
             last_event_id: 0,
             next_workflow_task_seq: LogicalTaskSeq(1),
-            pending_workflow_task: Some(
-                PendingWorkflowTask {
-                    logical_seq: LogicalTaskSeq(1),
-                    scheduled_event_id: 1,
-                    started_event_id: None,
-                    attempt: 0,
-                },
-            ),
+            pending_workflow_task: Some(PendingWorkflowTask {
+                logical_seq: LogicalTaskSeq(1),
+                scheduled_event_id: 1,
+                started_event_id: None,
+                attempt: 0,
+            }),
             sticky: None,
             pause_info: None,
             wft_stamp: 0,
@@ -301,6 +284,7 @@ mod tests {
             pending_external_signals: Default::default(),
             pending_external_cancels: Default::default(),
             pending_updates: Default::default(),
+            admitted_updates: Default::default(),
             pending_nexus_operations: Default::default(),
             versioning_override: None,
             completion_callbacks: Vec::new(),
@@ -325,15 +309,11 @@ mod tests {
         }
     }
 
-    fn make_lanes(
-        store: &InMemoryStore,
-    ) -> (Vec<LaneHandle>, usize) {
-        let shard_owner =
-            Arc::new(RwLock::new(ShardOwner::new(1)));
+    fn make_lanes(store: &InMemoryStore) -> (Vec<LaneHandle>, usize) {
+        let shard_owner = Arc::new(RwLock::new(ShardOwner::new(1)));
         {
             let mut owner = shard_owner.write().unwrap();
-            let _ = owner
-                .record_acquired(ShardId(0), ShardEpoch::ZERO);
+            let _ = owner.record_acquired(ShardId(0), ShardEpoch::ZERO);
             owner.mark_active(ShardId(0));
         }
         let lane = spawn_lane(

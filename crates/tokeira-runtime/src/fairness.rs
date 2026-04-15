@@ -5,8 +5,8 @@ use std::{
 };
 
 use time::OffsetDateTime;
-use tokio_util::sync::CancellationToken;
 use tokeira_types::QueueKey;
+use tokio_util::sync::CancellationToken;
 
 pub(crate) const DEFAULT_DRAIN_SHARE: f64 = 0.1;
 pub(crate) const MIN_DRAIN_SHARE: f64 = 0.0;
@@ -257,7 +257,11 @@ impl DeliveryMetrics {
                     .or_insert_with(SlidingWindowCounter::new);
                 (poll.rate(), poll.total())
             };
-            let backlog_age = inner.backlog_age.get(&queue).copied().unwrap_or(Duration::ZERO);
+            let backlog_age = inner
+                .backlog_age
+                .get(&queue)
+                .copied()
+                .unwrap_or(Duration::ZERO);
 
             snapshot_queues.insert(
                 queue.clone(),
@@ -309,11 +313,14 @@ impl FairnessState {
 
     pub fn consume_budget(&self, queue: &QueueKey, count: u32) -> u32 {
         let mut inner = self.inner.lock().unwrap();
-        let entry = inner.queues.entry(queue.clone()).or_insert(QueueFairnessState {
-            drain_share: DEFAULT_DRAIN_SHARE,
-            remaining_budget: DEFAULT_BUDGET,
-            last_adjusted_at: OffsetDateTime::now_utc(),
-        });
+        let entry = inner
+            .queues
+            .entry(queue.clone())
+            .or_insert(QueueFairnessState {
+                drain_share: DEFAULT_DRAIN_SHARE,
+                remaining_budget: DEFAULT_BUDGET,
+                last_adjusted_at: OffsetDateTime::now_utc(),
+            });
         let consumed = entry.remaining_budget.min(count);
         entry.remaining_budget -= consumed;
         consumed
@@ -345,17 +352,13 @@ impl FairnessState {
     }
 }
 
-pub(crate) fn evaluate_drain_share(
-    current: f64,
-    metrics: &QueueMetricsSnapshot,
-) -> f64 {
+pub(crate) fn evaluate_drain_share(current: f64, metrics: &QueueMetricsSnapshot) -> f64 {
     let mut delta = 0.0f64;
 
     let age_threshold = metrics.latency_p99.saturating_mul(2);
     if metrics.backlog_age > age_threshold && age_threshold > Duration::ZERO {
-        let pressure = (metrics.backlog_age.as_secs_f64()
-            / age_threshold.as_secs_f64())
-        .min(3.0);
+        let pressure =
+            (metrics.backlog_age.as_secs_f64() / age_threshold.as_secs_f64()).min(3.0);
         delta += 0.03 * pressure;
     }
 
@@ -426,8 +429,7 @@ pub(crate) async fn run_control_loop(
 mod tests {
     use super::*;
     use tokeira_types::{
-        LogicalTaskSeq, NamespaceId, RunKey, TaskKind,
-        TaskQueueName, WorkerIdentity,
+        LogicalTaskSeq, NamespaceId, RunKey, TaskKind, TaskQueueName, WorkerIdentity,
     };
 
     fn queue() -> QueueKey {
@@ -459,10 +461,7 @@ mod tests {
     #[test]
     fn latency_histogram_empty_percentile_is_zero() {
         let histogram = LatencyHistogram::new();
-        assert_eq!(
-            histogram.percentile(0.99),
-            Duration::ZERO
-        );
+        assert_eq!(histogram.percentile(0.99), Duration::ZERO);
         assert_eq!(histogram.count, 0);
     }
 
@@ -478,9 +477,7 @@ mod tests {
                 backlog_age: Duration::from_secs(120),
             },
         );
-        assert!(
-            (MIN_DRAIN_SHARE..=MAX_DRAIN_SHARE).contains(&next)
-        );
+        assert!((MIN_DRAIN_SHARE..=MAX_DRAIN_SHARE).contains(&next));
     }
 
     #[test]
@@ -488,8 +485,7 @@ mod tests {
         let metrics = DeliveryMetrics::new();
         let fairness = FairnessState::new();
         metrics.record_sync_match(&queue());
-        let interval =
-            control_loop_tick(&metrics, &fairness);
+        let interval = control_loop_tick(&metrics, &fairness);
         assert!(interval >= MIN_CONTROL_INTERVAL);
         assert!(interval <= MAX_CONTROL_INTERVAL);
     }
@@ -507,9 +503,7 @@ mod tests {
         /// proptest which would defeat shrinking).
         fn fixed_queue() -> QueueKey {
             QueueKey {
-                namespace_id: NamespaceId(
-                    uuid::Uuid::nil(),
-                ),
+                namespace_id: NamespaceId(uuid::Uuid::nil()),
                 task_queue: TaskQueueName("pq".into()),
                 task_kind: TaskKind::Workflow,
                 deployment: None,
@@ -523,33 +517,24 @@ mod tests {
 
         /// Strategy for QueueMetricsSnapshot with
         /// controllable ranges.
-        fn arb_metrics() -> impl Strategy<Value = QueueMetricsSnapshot>
-        {
+        fn arb_metrics() -> impl Strategy<Value = QueueMetricsSnapshot> {
             (
-                0u64..60_000,  // latency_p50 ms
-                0u64..60_000,  // latency_p99 ms
-                0.0f64..=1.0,  // sync_match_rate
-                0.0f64..=1.0,  // poll_success_rate
-                0u64..600,     // backlog_age secs
+                0u64..60_000, // latency_p50 ms
+                0u64..60_000, // latency_p99 ms
+                0.0f64..=1.0, // sync_match_rate
+                0.0f64..=1.0, // poll_success_rate
+                0u64..600,    // backlog_age secs
             )
-                .prop_map(
-                    |(p50, p99, smr, psr, age)| {
-                        QueueMetricsSnapshot {
-                            latency_p50:
-                                Duration::from_millis(p50),
-                            latency_p99:
-                                Duration::from_millis(p99),
-                            sync_match_rate: smr,
-                            poll_success_rate: psr,
-                            backlog_age:
-                                Duration::from_secs(age),
-                        }
-                    },
-                )
+                .prop_map(|(p50, p99, smr, psr, age)| QueueMetricsSnapshot {
+                    latency_p50: Duration::from_millis(p50),
+                    latency_p99: Duration::from_millis(p99),
+                    sync_match_rate: smr,
+                    poll_success_rate: psr,
+                    backlog_age: Duration::from_secs(age),
+                })
         }
 
-        fn arb_drain_share(
-        ) -> impl Strategy<Value = f64> {
+        fn arb_drain_share() -> impl Strategy<Value = f64> {
             (MIN_DRAIN_SHARE)..=(MAX_DRAIN_SHARE)
         }
 

@@ -8,3 +8,4 @@ cc d098a4967de53ab82a0cccd619da6cd31461c027017454ffe8cd0df5d7abf5a5 # shrinks to
 cc 66a81bc77ebc0031ffec49a65d65e55febbc766013a3b6cedb0fba4050776b80 # shrinks to edge = PollWorkflowTaskQueueRequest { namespace: "a", task_queue: "a", worker_identity: "a", deployment: Some(DeploymentId("a")), build_id: None, sticky_run: None, timeout: 60s, sticky_ttl: 30s }
 cc 6f537e5889f80be9f5dac493197052dd25014f9a71454e3e868cfbc0a708af53 # shrinks to cmd = FailWorkflow { message: "a", details: Some(Payload { data: [], metadata: {} }) }
 cc 318bdad32991ba54172008dd913ae35d995a8da448db9df62f4cdd9f3eb43003 # shrinks to cmd = RecordMarker { marker_name: "a", details: {}, failure: Some(Payload { data: [], metadata: {} }), header: None }
+cc a8bba239354780e18903a189e163f3cb610614adffdfb29b632b91fcb2942956 # shrinks to cmd = ProtocolMessage { message_id: "msg-1", body: Accepted { update_id: "update-1", update_name: "handler", input: Payloads([]) } }

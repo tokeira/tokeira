@@ -6,10 +6,8 @@ use tokeira_storage::RunRepository;
 
 use crate::{
     translate::{
-        PollWorkflowTaskQueueResponse,
-        RespondWorkflowTaskCompletedResponse,
-        SignalWorkflowExecutionResponse,
-        StartWorkflowExecutionResponse,
+        PollWorkflowTaskQueueResponse, RespondWorkflowTaskCompletedResponse,
+        SignalWorkflowExecutionResponse, StartWorkflowExecutionResponse,
         WorkflowTaskPayloadDto,
     },
     workflow_service::WorkflowMutationOutcome,
@@ -41,9 +39,7 @@ pub async fn poll_response(
     started: StartedWorkflowTask,
     repo: &dyn RunRepository,
 ) -> Result<PollWorkflowTaskQueueResponse> {
-    let history = repo
-        .read_history(started.run_key, 0, usize::MAX)
-        .await?;
+    let history = repo.read_history(started.run_key, 0, usize::MAX).await?;
     Ok(PollWorkflowTaskQueueResponse {
         task_token: serde_json::to_vec(&started.token)?,
         started_event_id: started.token.started_event_id,
@@ -68,6 +64,7 @@ pub fn completed_response(
         execution_status: outcome.execution_status,
         new_run_id: outcome.new_run_id,
         was_duplicate: outcome.was_duplicate,
+        workflow_task: None,
     }
 }
 
@@ -92,9 +89,7 @@ pub fn poll_activity_response(
         start_to_close_timeout: started
             .start_to_close_timeout
             .and_then(|d| d.try_into().ok()),
-        heartbeat_timeout: started
-            .heartbeat_timeout
-            .and_then(|d| d.try_into().ok()),
+        heartbeat_timeout: started.heartbeat_timeout.and_then(|d| d.try_into().ok()),
     })
 }
 
@@ -106,8 +101,7 @@ pub fn terminate_response(
 
 pub fn cancel_response(
     _outcome: WorkflowMutationOutcome,
-) -> crate::translate::RequestCancelWorkflowExecutionResponse
-{
+) -> crate::translate::RequestCancelWorkflowExecutionResponse {
     crate::translate::RequestCancelWorkflowExecutionResponse
 }
 
@@ -123,12 +117,12 @@ pub fn query_response(
     result: tokeira_runtime::QueryResult,
 ) -> crate::translate::QueryWorkflowResponse {
     match result {
-        tokeira_runtime::QueryResult::Completed {
-            result,
-        } => crate::translate::QueryWorkflowResponse {
-            result: Some(result),
-            rejected_status: None,
-        },
+        tokeira_runtime::QueryResult::Completed { result } => {
+            crate::translate::QueryWorkflowResponse {
+                result: Some(result),
+                rejected_status: None,
+            }
+        }
         tokeira_runtime::QueryResult::Failed { message: _ } => {
             crate::translate::QueryWorkflowResponse {
                 result: None,
@@ -142,11 +136,9 @@ pub fn update_response(
     outcome: tokeira_runtime::UpdateOutcome,
 ) -> crate::translate::UpdateWorkflowExecutionResponse {
     let dto = match outcome {
-        tokeira_runtime::UpdateOutcome::Accepted {
-            accepted_event_id,
-        } => crate::translate::UpdateOutcomeDto::Accepted {
-            accepted_event_id,
-        },
+        tokeira_runtime::UpdateOutcome::Accepted { accepted_event_id } => {
+            crate::translate::UpdateOutcomeDto::Accepted { accepted_event_id }
+        }
         tokeira_runtime::UpdateOutcome::Completed {
             accepted_event_id,
             result,
@@ -162,7 +154,5 @@ pub fn update_response(
             failure,
         },
     };
-    crate::translate::UpdateWorkflowExecutionResponse {
-        outcome: dto,
-    }
+    crate::translate::UpdateWorkflowExecutionResponse { outcome: dto }
 }

@@ -1,8 +1,8 @@
 use anyhow::Result;
 use tokeira_storage::ProjectionLog;
 use tokeira_types::ProjectionCursor;
-use tracing::{debug, info};
 use tokio_util::sync::CancellationToken;
+use tracing::{debug, info};
 
 use crate::{sink::ProjectionSink, store::VisibilityStore, types::beginning_cursor};
 
@@ -118,12 +118,9 @@ where
         }
     }
 
-    pub async fn run(
-        &self,
-        sink_id: &str,
-        cancel: CancellationToken,
-    ) -> Result<()> {
-        self.run_from_cursor(sink_id, cancel, beginning_cursor()).await
+    pub async fn run(&self, sink_id: &str, cancel: CancellationToken) -> Result<()> {
+        self.run_from_cursor(sink_id, cancel, beginning_cursor())
+            .await
     }
 }
 
@@ -134,13 +131,13 @@ mod tests {
     use super::*;
     use anyhow::anyhow;
     use async_trait::async_trait;
-    use tokio::sync::Mutex;
     use tokeira_kernel::ProjectionOp;
     use tokeira_storage::{ProjectionBatch, ProjectionContext, ProjectionRecord};
     use tokeira_types::{
         ExecutionStatus, Memo, NamespaceId, RunId, RunKey, SearchAttributes,
         TaskQueueName, TransitionSeq, WorkflowId, WorkflowType,
     };
+    use tokio::sync::Mutex;
     use uuid::Uuid;
 
     use crate::{memory::InMemoryVisibilityStore, visibility_sink::VisibilitySink};
@@ -313,7 +310,13 @@ mod tests {
             value: &tokeira_types::SearchAttrValue,
         ) -> Result<()> {
             self.store
-                .upsert_search_attr_index(run_key, namespace_id, attr_id, attr_type, value)
+                .upsert_search_attr_index(
+                    run_key,
+                    namespace_id,
+                    attr_id,
+                    attr_type,
+                    value,
+                )
                 .await
         }
         async fn remove_search_attr_index(
@@ -327,7 +330,10 @@ mod tests {
                 .remove_search_attr_index(run_key, namespace_id, attr_id, attr_type)
                 .await
         }
-        async fn accumulate_rollup(&self, entries: &[crate::types::RollupDelta]) -> Result<()> {
+        async fn accumulate_rollup(
+            &self,
+            entries: &[crate::types::RollupDelta],
+        ) -> Result<()> {
             self.store.accumulate_rollup(entries).await
         }
         async fn list_executions(
@@ -337,7 +343,9 @@ mod tests {
             sort: crate::types::SortOrder,
             page: &crate::types::PageBounds,
         ) -> Result<crate::types::ListResult> {
-            self.store.list_executions(namespace_id, filter, sort, page).await
+            self.store
+                .list_executions(namespace_id, filter, sort, page)
+                .await
         }
         async fn count_executions(
             &self,
@@ -345,7 +353,9 @@ mod tests {
             filter: &crate::types::CompiledFilter,
             group_by: Option<crate::types::GroupByField>,
         ) -> Result<crate::types::CountResult> {
-            self.store.count_executions(namespace_id, filter, group_by).await
+            self.store
+                .count_executions(namespace_id, filter, group_by)
+                .await
         }
         async fn count_from_rollup(
             &self,
@@ -354,10 +364,17 @@ mod tests {
         ) -> Result<crate::types::CountResult> {
             self.store.count_from_rollup(namespace_id, dimension).await
         }
-        async fn load_checkpoint(&self, sink_id: &str) -> Result<Option<ProjectionCursor>> {
+        async fn load_checkpoint(
+            &self,
+            sink_id: &str,
+        ) -> Result<Option<ProjectionCursor>> {
             self.store.load_checkpoint(sink_id).await
         }
-        async fn save_checkpoint(&self, sink_id: &str, cursor: &ProjectionCursor) -> Result<()> {
+        async fn save_checkpoint(
+            &self,
+            sink_id: &str,
+            cursor: &ProjectionCursor,
+        ) -> Result<()> {
             self.store.save_checkpoint(sink_id, cursor).await
         }
         async fn resolve_attr(
@@ -373,7 +390,9 @@ mod tests {
             name: String,
             attr_type: crate::types::SearchAttrType,
         ) -> Result<crate::types::AttrId> {
-            self.store.register_attr(namespace_id, name, attr_type).await
+            self.store
+                .register_attr(namespace_id, name, attr_type)
+                .await
         }
         async fn get_row(&self, run_key: RunKey) -> Option<crate::types::ExecutionRow> {
             self.store.get_row(run_key).await

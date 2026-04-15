@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use time::{Duration, OffsetDateTime};
 
-use tokeira_kernel::{StartRequest, TerminateRequest};
+use tokeira_kernel::{StartRequest, TerminateRequest, WorkflowTaskCompletedRequest};
 use tokeira_runtime::{
     BacklogConfig, LaneConfig, QueryResult, TimerScannerConfig, TokeiraRuntime,
     WorkflowTimeoutScannerConfig,
@@ -21,6 +21,7 @@ async fn query_roundtrip_returns_worker_result() -> Result<()> {
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("query-success".into());
     let run_key = start_workflow(&runtime, namespace_id, workflow_id.clone()).await?;
+    quiesce_workflow(&runtime, namespace_id).await?;
 
     let broker = runtime.broker();
     let worker = tokio::spawn(async move {
@@ -53,7 +54,12 @@ async fn query_roundtrip_returns_worker_result() -> Result<()> {
         .await?;
 
     worker.await.unwrap();
-    assert_eq!(result, QueryResult::Completed { result: payloads("ok") });
+    assert_eq!(
+        result,
+        QueryResult::Completed {
+            result: payloads("ok")
+        }
+    );
     Ok(())
 }
 
@@ -64,6 +70,7 @@ async fn query_times_out_when_no_worker_responds() -> Result<()> {
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("query-timeout".into());
     let _ = start_workflow(&runtime, namespace_id, workflow_id.clone()).await?;
+    quiesce_workflow(&runtime, namespace_id).await?;
 
     let error = runtime
         .query_workflow(
@@ -89,6 +96,7 @@ async fn closed_run_query_with_explicit_run_id_still_dispatches() -> Result<()> 
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("query-closed".into());
     let run_key = start_workflow(&runtime, namespace_id, workflow_id.clone()).await?;
+    quiesce_workflow(&runtime, namespace_id).await?;
     let run_id = match store.load_run(run_key).await? {
         tokeira_kernel::LoadedRun::Existing(state) => state.run_id,
         tokeira_kernel::LoadedRun::Absent => panic!("run missing"),
@@ -206,6 +214,30 @@ async fn start_workflow(
         CommitResult::Applied { new_state } => new_state.run_key,
         other => panic!("unexpected start result: {other:?}"),
     })
+}
+
+async fn quiesce_workflow(
+    runtime: &TokeiraRuntime<InMemoryStore>,
+    namespace_id: NamespaceId,
+) -> Result<()> {
+    let started = runtime
+        .poll_workflow_task(
+            workflow_queue(namespace_id),
+            WorkerIdentity("worker-a".into()),
+            std::time::Duration::from_millis(50),
+        )
+        .await?
+        .expect("initial workflow task should be available");
+    let _ = runtime
+        .complete_workflow_task(WorkflowTaskCompletedRequest {
+            token: started.token,
+            identity: WorkerIdentity("worker-a".into()),
+            commands: Vec::new(),
+            force_new_workflow_task: false,
+            now: OffsetDateTime::now_utc(),
+        })
+        .await?;
+    Ok(())
 }
 
 fn workflow_queue(namespace_id: NamespaceId) -> tokeira_types::QueueKey {

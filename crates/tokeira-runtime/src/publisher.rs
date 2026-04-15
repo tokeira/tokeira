@@ -638,13 +638,16 @@ where
                     sticky_preferred,
                 } => {
                     self.broker
-                        .publish_workflow_task(DispatchableWorkflowTask {
-                            run_key,
-                            queue: queue.clone(),
-                            logical_seq: *logical_seq,
-                            sticky_preferred: sticky_preferred.clone(),
-                            sticky_expires_at: None,
-                        }, Some(&self.delivery_metrics))
+                        .publish_workflow_task(
+                            DispatchableWorkflowTask {
+                                run_key,
+                                queue: queue.clone(),
+                                logical_seq: *logical_seq,
+                                sticky_preferred: sticky_preferred.clone(),
+                                sticky_expires_at: None,
+                            },
+                            Some(&self.delivery_metrics),
+                        )
                         .await;
                 }
                 DispatchOp::EnqueueActivityTask { .. } => {
@@ -659,14 +662,17 @@ where
                     {
                         if let Err(error) = self
                             .activity_broker
-                            .publish_activity_task(DispatchableActivityTask {
-                                run_key,
-                                queue: queue.clone(),
-                                activity_id: activity_id.clone(),
-                                input: input.clone(),
-                                schedule_event_id: *schedule_event_id,
-                                attempt: *attempt,
-                            }, Some(&self.delivery_metrics))
+                            .publish_activity_task(
+                                DispatchableActivityTask {
+                                    run_key,
+                                    queue: queue.clone(),
+                                    activity_id: activity_id.clone(),
+                                    input: input.clone(),
+                                    schedule_event_id: *schedule_event_id,
+                                    attempt: *attempt,
+                                },
+                                Some(&self.delivery_metrics),
+                            )
                             .await
                         {
                             tracing::warn!(?error, run_key = ?run_key, activity_id, "failed to publish activity task");
@@ -840,10 +846,7 @@ where
                     if let Some(timeout) = schedule_to_close_timeout {
                         self.nexus_timeout_tracking.insert(NexusTimeoutEntry {
                             run_key: *originator_run_key,
-                            shard_id: shard_for(
-                                *originator_run_key,
-                                self.shard_count,
-                            ),
+                            shard_id: shard_for(*originator_run_key, self.shard_count),
                             operation_id: operation_id.clone(),
                             scheduled_event_id: *scheduled_event_id,
                             schedule_to_close_timeout: *timeout,

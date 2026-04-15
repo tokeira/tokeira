@@ -143,10 +143,7 @@ impl NexusTimeoutTrackingState {
         self.inner.lock().unwrap().values().cloned().collect()
     }
 
-    pub fn snapshot_for_shard(
-        &self,
-        shard_id: ShardId,
-    ) -> Vec<NexusTimeoutEntry> {
+    pub fn snapshot_for_shard(&self, shard_id: ShardId) -> Vec<NexusTimeoutEntry> {
         self.inner
             .lock()
             .unwrap()

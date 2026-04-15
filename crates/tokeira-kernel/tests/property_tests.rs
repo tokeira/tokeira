@@ -106,6 +106,7 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         pending_external_signals: BTreeMap::new(),
         pending_external_cancels: BTreeMap::new(),
         pending_updates: BTreeMap::new(),
+        admitted_updates: std::collections::HashSet::new(),
         pending_nexus_operations: BTreeMap::new(),
         versioning_override: None,
         completion_callbacks: Vec::new(),
@@ -2996,17 +2997,16 @@ proptest! {
         ).unwrap();
 
         prop_assert_eq!(transition.request_dedupe_ops.len(), 1);
-        match &transition.history_events[0].kind {
-            HistoryEventKind::WorkflowExecutionUpdateAccepted { update_id, update_name, input } => {
-                prop_assert_eq!(update_id, &req.update_id);
-                prop_assert_eq!(update_name, &req.update_name);
-                prop_assert_eq!(input, &req.input);
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
-        let pending = transition.next_state.pending_updates.get(&req.update_id).unwrap();
-        prop_assert_eq!(&pending.name, &req.update_name);
-        prop_assert_eq!(pending.accepted_event_id, transition.history_events[0].event_id);
+        // apply_update no longer emits UpdateAccepted — it only
+        // tracks the update as admitted and schedules a WFT.
+        prop_assert!(transition.next_state.admitted_updates.contains(&req.update_id));
+        prop_assert!(!transition.next_state.pending_updates.contains_key(&req.update_id));
+        // First event should be WFT-Scheduled (no UpdateAccepted).
+        let is_scheduled = matches!(
+            transition.history_events[0].kind,
+            HistoryEventKind::WorkflowTaskScheduled { .. }
+        );
+        prop_assert!(is_scheduled);
     }
 
     #[test]

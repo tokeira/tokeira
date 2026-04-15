@@ -3,12 +3,11 @@ use std::{collections::HashMap, time::Duration};
 use time::OffsetDateTime;
 
 use tokeira_kernel::{
-    WorkflowCommand, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
-    event::HistoryEvent,
+    WorkflowCommand, WorkflowIdConflictPolicy, WorkflowIdReusePolicy, event::HistoryEvent,
 };
 use tokeira_types::{
-    ActivityTaskToken, BuildId, DeploymentId, ExecutionStatus, Headers, Memo,
-    Payloads, RetryPolicy, RunId, RunKey, SearchAttributes, TaskKind,
+    ActivityTaskToken, BuildId, DeploymentId, ExecutionStatus, Headers, Memo, Payloads,
+    RetryPolicy, RunId, RunKey, SearchAttributes, TaskKind,
 };
 
 pub mod from_internal;
@@ -104,7 +103,8 @@ pub struct RespondWorkflowTaskCompletedRequest {
     pub task_token: Vec<u8>,
     pub identity: String,
     pub commands: Vec<WorkflowCommand>,
-    pub force_new_workflow_task: bool,
+    pub return_new_workflow_task: bool,
+    pub force_create_new_workflow_task: bool,
     pub query_results: HashMap<String, QueryResultDto>,
     pub messages: Vec<ProtocolMessageDto>,
 }
@@ -136,6 +136,7 @@ pub struct RespondWorkflowTaskCompletedResponse {
     pub execution_status: ExecutionStatus,
     pub new_run_id: Option<RunId>,
     pub was_duplicate: bool,
+    pub workflow_task: Option<PollWorkflowTaskQueueResponse>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -374,9 +375,17 @@ pub enum UpdateWaitPolicyDto {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum UpdateOutcomeDto {
-    Accepted { accepted_event_id: i64 },
-    Completed { accepted_event_id: i64, result: Payloads },
-    Rejected { accepted_event_id: i64, failure: String },
+    Accepted {
+        accepted_event_id: i64,
+    },
+    Completed {
+        accepted_event_id: i64,
+        result: Payloads,
+    },
+    Rejected {
+        accepted_event_id: i64,
+        failure: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

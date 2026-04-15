@@ -4,14 +4,13 @@ use time::{Duration, OffsetDateTime};
 
 use tokeira_kernel::StartRequest;
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, TimerScannerConfig,
-    TokeiraRuntime, WorkflowTimeoutScannerConfig,
+    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime,
+    WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::InMemoryStore;
 use tokeira_types::{
-    Memo, NamespaceId, Payloads, QueueKey, RequestContext,
-    RequestId, RunId, RunKey, SearchAttributes, TaskKind,
-    TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
+    Memo, NamespaceId, Payloads, QueueKey, RequestContext, RequestId, RunId, RunKey,
+    SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
 };
 
 fn sample_start_request(
@@ -44,9 +43,7 @@ fn sample_start_request(
         parent_workflow_id: None,
         first_run_started_at: None,
         request: RequestContext {
-            request_id: RequestId(
-                format!("req-{workflow_id}"),
-            ),
+            request_id: RequestId(format!("req-{workflow_id}")),
             caller_identity: None,
             received_at: OffsetDateTime::now_utc(),
         },
@@ -59,18 +56,13 @@ fn sample_start_request(
 /// backlog → drain loop retrieves → re-publishes to
 /// broker → poller arrives and receives the task.
 #[tokio::test]
-async fn backlog_full_lifecycle_publish_grace_drain_poll()
-{
+async fn backlog_full_lifecycle_publish_grace_drain_poll() {
     let store = Arc::new(InMemoryStore::default());
     let backlog_config = BacklogConfig {
-        workflow_grace_window:
-            std::time::Duration::from_millis(10),
-        activity_grace_window:
-            std::time::Duration::from_millis(10),
-        grace_scan_interval:
-            std::time::Duration::from_millis(5),
-        drain_interval:
-            std::time::Duration::from_millis(5),
+        workflow_grace_window: std::time::Duration::from_millis(10),
+        activity_grace_window: std::time::Duration::from_millis(10),
+        grace_scan_interval: std::time::Duration::from_millis(5),
+        drain_interval: std::time::Duration::from_millis(5),
         drain_batch_limit: 100,
     };
     let mut runtime = TokeiraRuntime::new(
@@ -83,19 +75,14 @@ async fn backlog_full_lifecycle_publish_grace_drain_poll()
     );
 
     let ns = NamespaceId::new();
-    let request =
-        sample_start_request(ns, "wf-backlog", "q");
-    let result =
-        runtime.start_workflow(request.clone()).await;
+    let request = sample_start_request(ns, "wf-backlog", "q");
+    let result = runtime.start_workflow(request.clone()).await;
     assert!(result.is_ok());
 
     // No poller yet — the workflow task sits in
     // live-ready. Wait for grace window + scanner cycle
     // to persist it to backlog.
-    tokio::time::sleep(
-        std::time::Duration::from_millis(30),
-    )
-    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
     // Now poll — the drain loop should have retrieved
     // the task from backlog and re-published it.
@@ -108,26 +95,16 @@ async fn backlog_full_lifecycle_publish_grace_drain_poll()
     };
     let worker = WorkerIdentity("worker-1".into());
     let task = runtime
-        .poll_workflow_task(
-            queue,
-            worker,
-            std::time::Duration::from_millis(200),
-        )
+        .poll_workflow_task(queue, worker, std::time::Duration::from_millis(200))
         .await
         .unwrap();
 
-    assert!(
-        task.is_some(),
-        "expected task after backlog lifecycle"
-    );
+    assert!(task.is_some(), "expected task after backlog lifecycle");
 
     runtime.shutdown_grace_scanner().await.unwrap();
     runtime.shutdown_drain_loop().await.unwrap();
     runtime.shutdown_timer_scanner().await.unwrap();
-    runtime
-        .shutdown_workflow_timeout_scanner()
-        .await
-        .unwrap();
+    runtime.shutdown_workflow_timeout_scanner().await.unwrap();
 }
 
 /// Graceful shutdown: cancel the grace scanner and drain
@@ -149,8 +126,5 @@ async fn backlog_graceful_shutdown() {
     runtime.shutdown_grace_scanner().await.unwrap();
     runtime.shutdown_drain_loop().await.unwrap();
     runtime.shutdown_timer_scanner().await.unwrap();
-    runtime
-        .shutdown_workflow_timeout_scanner()
-        .await
-        .unwrap();
+    runtime.shutdown_workflow_timeout_scanner().await.unwrap();
 }

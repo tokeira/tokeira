@@ -3,11 +3,11 @@
 //! Projection is intentionally separated from the correctness path. That means a
 //! lagging projector is a quality problem, not a correctness failure.
 
-pub mod sink;
 pub mod filter;
 pub mod memory;
 pub mod query_service;
 pub mod rollup;
+pub mod sink;
 pub mod store;
 pub mod types;
 pub mod visibility_sink;

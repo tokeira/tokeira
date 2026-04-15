@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
-use tokio::sync::{Mutex, oneshot};
 use tokeira_runtime::QueryResult;
+use tokio::sync::{Mutex, oneshot};
 
 pub const LEGACY_QUERY_ID: &str = "__legacy__";
 

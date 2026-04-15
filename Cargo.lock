@@ -1253,6 +1253,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "prost",
+ "prost-types",
  "time",
  "tokeira-edge",
  "tokeira-kernel",

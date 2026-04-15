@@ -3,8 +3,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use tokio::sync::oneshot;
 use tokeira_types::{Payloads, RunKey};
+use tokio::sync::oneshot;
 
 /// Caller-visible outcome of an update request.
 #[derive(Clone, Debug, PartialEq)]
@@ -160,6 +160,19 @@ impl UpdateRegistry {
         count
     }
 
+    /// Read the update_name and input for a registered update without removing it.
+    pub fn peek_update_info(
+        &self,
+        run_key: RunKey,
+        update_id: &str,
+    ) -> Option<(String, Payloads)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(&(run_key, update_id.to_string()))
+            .map(|entry| (entry.update_name.clone(), entry.input.clone()))
+    }
+
     #[cfg(test)]
     pub(crate) fn contains(&self, run_key: RunKey, update_id: &str) -> bool {
         self.inner
@@ -179,22 +192,18 @@ mod tests {
     // ── Generators ──────────────────────────────────
 
     fn arb_payload() -> impl Strategy<Value = Payload> {
-        prop::collection::vec(any::<u8>(), 0..32)
-            .prop_map(|data| Payload {
-                data,
-                metadata: BTreeMap::new(),
-            })
+        prop::collection::vec(any::<u8>(), 0..32).prop_map(|data| Payload {
+            data,
+            metadata: BTreeMap::new(),
+        })
     }
 
     fn arb_payloads() -> impl Strategy<Value = Payloads> {
-        prop::collection::vec(arb_payload(), 0..4)
-            .prop_map(Payloads)
+        prop::collection::vec(arb_payload(), 0..4).prop_map(Payloads)
     }
 
     fn arb_update_id() -> impl Strategy<Value = String> {
-        "[a-z0-9]{1,12}".prop_map(|s| {
-            format!("upd-{s}")
-        })
+        "[a-z0-9]{1,12}".prop_map(|s| format!("upd-{s}"))
     }
 
     fn arb_failure() -> impl Strategy<Value = String> {
@@ -227,10 +236,7 @@ mod tests {
             },
         ));
         assert!(!registry.contains(run_key, "update-1"));
-        assert!(matches!(
-            rx.await,
-            Ok(UpdateResolution::Completed { .. })
-        ));
+        assert!(matches!(rx.await, Ok(UpdateResolution::Completed { .. })));
     }
 
     #[tokio::test]
@@ -312,20 +318,22 @@ mod tests {
                     .await
                     .unwrap();
 
-                // Acceptance means the kernel saw our
-                // params and committed.
-                let eid = match outcome {
+                // Accepted returns immediately with
+                // accepted_event_id=0 (the actual event
+                // is written when the worker accepts).
+                match outcome {
                     UpdateOutcome::Accepted {
                         accepted_event_id,
-                    } => accepted_event_id,
+                    } => {
+                        prop_assert_eq!(accepted_event_id, 0);
+                    }
                     other => panic!(
                         "expected Accepted, got {other:?}"
                     ),
                 };
-                prop_assert!(eid > 0);
 
-                // Verify kernel state preserved the
-                // caller's update_name and input.
+                // The update should be in admitted_updates,
+                // not pending_updates (no worker acceptance yet).
                 let state = match store
                     .load_run(run_key)
                     .await
@@ -334,43 +342,22 @@ mod tests {
                     LoadedRun::Existing(s) => s,
                     _ => panic!("run missing"),
                 };
-                let pending = state
-                    .pending_updates
-                    .get(&update_id)
-                    .expect("update should be pending");
-                prop_assert_eq!(
-                    &pending.name, &update_name
+                prop_assert!(
+                    state.admitted_updates.contains(&update_id)
                 );
-                prop_assert_eq!(
-                    pending.accepted_event_id, eid
+                prop_assert!(
+                    !state.pending_updates.contains_key(&update_id)
                 );
 
-                // Verify the history event carries the
-                // correct input.
-                let history = store
-                    .read_history(run_key, 0, 256)
-                    .await
-                    .unwrap();
-                let accepted_evt = history
-                    .iter()
-                    .find(|e| matches!(
-                        &e.kind,
-                        HistoryEventKind::WorkflowExecutionUpdateAccepted {
-                            update_id: uid, ..
-                        } if uid == &update_id
-                    ))
-                    .expect("accepted event");
-                if let HistoryEventKind::WorkflowExecutionUpdateAccepted {
-                    update_name: name,
-                    input: inp,
-                    ..
-                } = &accepted_evt.kind
-                {
-                    prop_assert_eq!(
-                        name, &update_name
-                    );
-                    prop_assert_eq!(inp, &input);
-                }
+                // For Accepted wait policy, the UpdateRegistry
+                // does not hold the entry (it's only registered
+                // for Completed policy). The update_name and input
+                // are preserved in the kernel's admitted_updates set
+                // (just the ID) and in the UpdateRegistry for
+                // Completed callers.
+                let is_admitted = state.admitted_updates.contains(&update_id);
+                prop_assert!(is_admitted);
+
                 Ok(())
             })?;
         }
@@ -505,6 +492,11 @@ mod tests {
                     ),
                 };
 
+                // With the new lifecycle, accepted_event_id is 0
+                // at admission time (the actual event is written
+                // when the worker sends Acceptance).
+                prop_assert_eq!(eid, 0);
+
                 let state = match store
                     .load_run(run_key)
                     .await
@@ -513,13 +505,8 @@ mod tests {
                     LoadedRun::Existing(s) => s,
                     _ => panic!("missing"),
                 };
-                let pending = state
-                    .pending_updates
-                    .get(&update_id)
-                    .unwrap();
-                prop_assert_eq!(
-                    eid,
-                    pending.accepted_event_id
+                prop_assert!(
+                    state.admitted_updates.contains(&update_id)
                 );
                 Ok(())
             })?;
@@ -739,8 +726,8 @@ mod tests {
                     _ => panic!("missing"),
                 };
                 prop_assert!(state
-                    .pending_updates
-                    .contains_key(&update_id));
+                    .admitted_updates
+                    .contains(&update_id));
                 Ok(())
             })?;
         }
@@ -978,29 +965,19 @@ mod tests {
 
     use std::sync::Arc;
     use time::{Duration, OffsetDateTime};
-    use tokeira_kernel::{
-        HistoryEventKind, LoadedRun, StartRequest,
-        TerminateRequest,
-    };
-    use tokeira_storage::{
-        CommitResult, InMemoryStore, RunRepository,
-    };
+    use tokeira_kernel::{HistoryEventKind, LoadedRun, StartRequest, TerminateRequest};
+    use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
     use tokeira_types::{
-        ExecutionRef, Memo, NamespaceId,
-        RequestContext, RequestId, RunId,
-        SearchAttributes, TaskQueueName, WorkflowId,
-        WorkflowType,
+        ExecutionRef, Memo, NamespaceId, RequestContext, RequestId, RunId,
+        SearchAttributes, TaskQueueName, WorkflowId, WorkflowType,
     };
 
     use crate::{
-        BacklogConfig, LaneConfig,
-        TimerScannerConfig, TokeiraRuntime,
+        BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime,
         WorkflowTimeoutScannerConfig,
     };
 
-    fn make_runtime(
-        store: Arc<InMemoryStore>,
-    ) -> TokeiraRuntime<InMemoryStore> {
+    fn make_runtime(store: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {
         TokeiraRuntime::new(
             store,
             1,
@@ -1019,10 +996,7 @@ mod tests {
         }
     }
 
-    fn exec_ref(
-        ns: NamespaceId,
-        wf_id: &str,
-    ) -> ExecutionRef {
+    fn exec_ref(ns: NamespaceId, wf_id: &str) -> ExecutionRef {
         ExecutionRef {
             namespace_id: ns,
             workflow_id: WorkflowId(wf_id.into()),
@@ -1042,20 +1016,16 @@ mod tests {
                 namespace_id: ns,
                 workflow_id: WorkflowId(wf_id.into()),
                 run_id: RunId::new(),
-                workflow_type: WorkflowType(
-                    "update-wf".into(),
-                ),
+                workflow_type: WorkflowType("update-wf".into()),
                 task_queue: TaskQueueName("q".into()),
                 deployment: None,
                 build_id: None,
                 input: Payloads::default(),
                 memo: Memo::default(),
-                search_attributes:
-                    SearchAttributes::default(),
+                search_attributes: SearchAttributes::default(),
                 workflow_execution_timeout: None,
                 workflow_run_timeout: None,
-                workflow_task_timeout:
-                    Duration::seconds(10),
+                workflow_task_timeout: Duration::seconds(10),
                 retry_policy: None,
                 conflict_policy: tokeira_kernel::WorkflowIdConflictPolicy::Fail,
                 reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
@@ -1065,17 +1035,13 @@ mod tests {
                 parent_run_key: None,
                 parent_workflow_id: None,
                 first_run_started_at: None,
-                request: req_ctx(
-                    &format!("start-{wf_id}"),
-                ),
+                request: req_ctx(&format!("start-{wf_id}")),
                 now: OffsetDateTime::now_utc(),
             })
             .await
             .unwrap();
         match result {
-            CommitResult::Applied { new_state } => {
-                new_state.run_key
-            }
+            CommitResult::Applied { new_state } => new_state.run_key,
             other => {
                 panic!("unexpected: {other:?}")
             }

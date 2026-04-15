@@ -1,5 +1,5 @@
-use tokio::sync::oneshot;
 use tokeira_types::{Payloads, QueueKey, RunKey, WorkerIdentity};
+use tokio::sync::oneshot;
 
 /// A transient read-only query task delivered to a worker.
 #[derive(Debug)]
@@ -33,26 +33,21 @@ mod tests {
     use proptest::prelude::*;
     use std::sync::Arc;
     use time::{Duration, OffsetDateTime};
-    use tokio::sync::oneshot;
-    use tokeira_kernel::{LoadedRun, StartRequest};
+    use tokeira_kernel::{LoadedRun, StartRequest, WorkflowTaskCompletedRequest};
     use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
     use tokeira_types::{
-        ExecutionRef, Memo, NamespaceId,
-        QueueKey, RequestContext, RequestId, RunId, RunKey,
-        SearchAttributes, TaskKind,
-        TaskQueueName, WorkerIdentity,
-        WorkflowId, WorkflowType,
+        ExecutionRef, Memo, NamespaceId, QueueKey, RequestContext, RequestId, RunId,
+        RunKey, SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId,
+        WorkflowType,
     };
+    use tokio::sync::oneshot;
 
     use crate::{
-        BacklogConfig, InMemoryBroker, LaneConfig,
-        TimerScannerConfig, TokeiraRuntime,
+        BacklogConfig, InMemoryBroker, LaneConfig, TimerScannerConfig, TokeiraRuntime,
         WorkflowTimeoutScannerConfig,
     };
 
-    fn make_runtime(
-        store: Arc<InMemoryStore>,
-    ) -> TokeiraRuntime<InMemoryStore> {
+    fn make_runtime(store: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {
         TokeiraRuntime::new(
             store,
             1,
@@ -63,10 +58,7 @@ mod tests {
         )
     }
 
-    fn start_request(
-        ns: NamespaceId,
-        wf_id: &str,
-    ) -> StartRequest {
+    fn start_request(ns: NamespaceId, wf_id: &str) -> StartRequest {
         StartRequest {
             run_key: RunKey::new(),
             namespace_id: ns,
@@ -92,9 +84,7 @@ mod tests {
             parent_workflow_id: None,
             first_run_started_at: None,
             request: RequestContext {
-                request_id: RequestId(
-                    format!("req-{wf_id}"),
-                ),
+                request_id: RequestId(format!("req-{wf_id}")),
                 caller_identity: None,
                 received_at: OffsetDateTime::now_utc(),
             },
@@ -102,10 +92,7 @@ mod tests {
         }
     }
 
-    fn exec_ref(
-        ns: NamespaceId,
-        wf_id: &str,
-    ) -> ExecutionRef {
+    fn exec_ref(ns: NamespaceId, wf_id: &str) -> ExecutionRef {
         ExecutionRef {
             namespace_id: ns,
             workflow_id: WorkflowId(wf_id.into()),
@@ -132,19 +119,14 @@ mod tests {
         let runtime = make_runtime(store.clone());
         let ns = NamespaceId::new();
         let req = start_request(ns, "p1");
-        let run_key = match runtime
-            .start_workflow(req)
-            .await
-            .unwrap()
-        {
-            CommitResult::Applied { new_state } => {
-                new_state.run_key
-            }
+        let run_key = match runtime.start_workflow(req).await.unwrap() {
+            CommitResult::Applied { new_state } => new_state.run_key,
             other => panic!("unexpected: {other:?}"),
         };
 
-        let before = match store.load_run(run_key).await.unwrap()
-        {
+        quiesce_workflow(&runtime, ns).await;
+
+        let before = match store.load_run(run_key).await.unwrap() {
             LoadedRun::Existing(s) => s,
             _ => panic!("missing"),
         };
@@ -162,11 +144,9 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let _ = task.response_tx.send(
-                QueryResult::Completed {
-                    result: Payloads::default(),
-                },
-            );
+            let _ = task.response_tx.send(QueryResult::Completed {
+                result: Payloads::default(),
+            });
         });
 
         let _ = runtime
@@ -180,19 +160,13 @@ mod tests {
             .unwrap();
         worker.await.unwrap();
 
-        let after = match store.load_run(run_key).await.unwrap()
-        {
+        let after = match store.load_run(run_key).await.unwrap() {
             LoadedRun::Existing(s) => s,
             _ => panic!("missing"),
         };
 
-        assert_eq!(
-            before.transition_seq,
-            after.transition_seq
-        );
-        assert_eq!(
-            before.last_event_id, after.last_event_id
-        );
+        assert_eq!(before.transition_seq, after.transition_seq);
+        assert_eq!(before.last_event_id, after.last_event_id);
     }
 
     // ── Property 4: Query result round-trip
@@ -235,22 +209,16 @@ mod tests {
     // Feature: runtime-query-dispatch
     // Validates: Requirements 2.1, 2.2
     #[tokio::test]
-    async fn property_query_task_carries_correct_metadata()
-    {
+    async fn property_query_task_carries_correct_metadata() {
         let store = Arc::new(InMemoryStore::default());
         let runtime = make_runtime(store.clone());
         let ns = NamespaceId::new();
         let req = start_request(ns, "p2");
-        let run_key = match runtime
-            .start_workflow(req)
-            .await
-            .unwrap()
-        {
-            CommitResult::Applied { new_state } => {
-                new_state.run_key
-            }
+        let run_key = match runtime.start_workflow(req).await.unwrap() {
+            CommitResult::Applied { new_state } => new_state.run_key,
             other => panic!("unexpected: {other:?}"),
         };
+        quiesce_workflow(&runtime, ns).await;
 
         let broker = runtime.broker();
         let q = queue_for(ns);
@@ -266,15 +234,10 @@ mod tests {
             assert_eq!(task.run_key, run_key);
             assert_eq!(task.query_type, "my-query");
             assert_eq!(task.queue.namespace_id, ns);
-            assert_eq!(
-                task.queue.task_kind,
-                TaskKind::Workflow
-            );
-            let _ = task.response_tx.send(
-                QueryResult::Completed {
-                    result: Payloads::default(),
-                },
-            );
+            assert_eq!(task.queue.task_kind, TaskKind::Workflow);
+            let _ = task.response_tx.send(QueryResult::Completed {
+                result: Payloads::default(),
+            });
         });
 
         let _ = runtime
@@ -293,15 +256,16 @@ mod tests {
     // Feature: runtime-query-dispatch
     // Validates: Requirements 3.1, 3.2, 3.3
     #[tokio::test]
-    async fn property_sticky_affinity_reflected_on_query()
-    {
+    async fn property_sticky_affinity_reflected_on_query() {
         let store = Arc::new(InMemoryStore::default());
         let runtime = make_runtime(store.clone());
         let ns = NamespaceId::new();
         let req = start_request(ns, "p3");
         let _ = runtime.start_workflow(req).await.unwrap();
+        quiesce_workflow(&runtime, ns).await;
 
-        // No sticky set → sticky_preferred should be None.
+        // After quiesce, the worker "w" has sticky affinity.
+        // The query should carry that sticky hint.
         let broker = runtime.broker();
         let q = queue_for(ns);
         let b1 = broker.clone();
@@ -315,12 +279,10 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(task.sticky_preferred, None);
-            let _ = task.response_tx.send(
-                QueryResult::Completed {
-                    result: Payloads::default(),
-                },
-            );
+            assert_eq!(task.sticky_preferred, Some(WorkerIdentity("w".into())));
+            let _ = task.response_tx.send(QueryResult::Completed {
+                result: Payloads::default(),
+            });
         });
 
         let _ = runtime
@@ -345,6 +307,7 @@ mod tests {
         let ns = NamespaceId::new();
         let req = start_request(ns, "p5");
         let _ = runtime.start_workflow(req).await.unwrap();
+        quiesce_workflow(&runtime, ns).await;
 
         let err = runtime
             .query_workflow(
@@ -368,6 +331,7 @@ mod tests {
         let ns = NamespaceId::new();
         let req = start_request(ns, "p6");
         let _ = runtime.start_workflow(req).await.unwrap();
+        quiesce_workflow(runtime.as_ref(), ns).await;
 
         let broker = runtime.broker();
         let q = queue_for(ns);
@@ -383,11 +347,9 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                let _ = task.response_tx.send(
-                    QueryResult::Completed {
-                        result: Payloads::default(),
-                    },
-                );
+                let _ = task.response_tx.send(QueryResult::Completed {
+                    result: Payloads::default(),
+                });
             }
         });
 
@@ -417,14 +379,8 @@ mod tests {
         let res2 = h2.await.unwrap().unwrap();
         worker.await.unwrap();
 
-        assert!(matches!(
-            res1,
-            QueryResult::Completed { .. }
-        ));
-        assert!(matches!(
-            res2,
-            QueryResult::Completed { .. }
-        ));
+        assert!(matches!(res1, QueryResult::Completed { .. }));
+        assert!(matches!(res2, QueryResult::Completed { .. }));
     }
 
     // ── Property 7: Query tasks bypass dedup
@@ -482,28 +438,18 @@ mod tests {
     // Feature: runtime-query-dispatch
     // Validates: Requirements 8.1, 8.3, 8.4
     #[tokio::test]
-    async fn property_closed_execution_query_dispatches()
-    {
+    async fn property_closed_execution_query_dispatches() {
         let store = Arc::new(InMemoryStore::default());
         let runtime = Arc::new(make_runtime(store.clone()));
         let ns = NamespaceId::new();
         let req = start_request(ns, "p8");
-        let run_key = match runtime
-            .start_workflow(req)
-            .await
-            .unwrap()
-        {
-            CommitResult::Applied { new_state } => {
-                new_state.run_key
-            }
+        let run_key = match runtime.start_workflow(req).await.unwrap() {
+            CommitResult::Applied { new_state } => new_state.run_key,
             other => panic!("unexpected: {other:?}"),
         };
+        quiesce_workflow(runtime.as_ref(), ns).await;
 
-        let run_id = match store
-            .load_run(run_key)
-            .await
-            .unwrap()
-        {
+        let run_id = match store.load_run(run_key).await.unwrap() {
             LoadedRun::Existing(s) => s.run_id,
             _ => panic!("missing"),
         };
@@ -521,9 +467,7 @@ mod tests {
                     details: None,
                     identity: "test".into(),
                     request: RequestContext {
-                        request_id: RequestId(
-                            "term".into(),
-                        ),
+                        request_id: RequestId("term".into()),
                         caller_identity: None,
                         received_at: OffsetDateTime::now_utc(),
                     },
@@ -545,11 +489,9 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let _ = task.response_tx.send(
-                QueryResult::Failed {
-                    message: "closed".into(),
-                },
-            );
+            let _ = task.response_tx.send(QueryResult::Failed {
+                message: "closed".into(),
+            });
         });
 
         let result = runtime
@@ -573,5 +515,27 @@ mod tests {
                 message: "closed".into()
             }
         );
+    }
+
+    async fn quiesce_workflow(runtime: &TokeiraRuntime<InMemoryStore>, ns: NamespaceId) {
+        let started = runtime
+            .poll_workflow_task(
+                queue_for(ns),
+                WorkerIdentity("w".into()),
+                std::time::Duration::from_millis(50),
+            )
+            .await
+            .unwrap()
+            .expect("initial workflow task should be available");
+        let _ = runtime
+            .complete_workflow_task(WorkflowTaskCompletedRequest {
+                token: started.token,
+                identity: WorkerIdentity("w".into()),
+                commands: Vec::new(),
+                force_new_workflow_task: false,
+                now: OffsetDateTime::now_utc(),
+            })
+            .await
+            .unwrap();
     }
 }

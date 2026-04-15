@@ -10,8 +10,8 @@ use tokeira_runtime::{
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
     ExecutionRef, Memo, NamespaceId, Payload, Payloads, QueueKey, RequestContext,
-    RequestId, SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity,
-    WorkflowId, WorkflowType,
+    RequestId, SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId,
+    WorkflowType,
 };
 
 #[tokio::test]
@@ -224,27 +224,22 @@ async fn run_close_notifies_waiting_update_callers() -> Result<()> {
         })
         .await?;
 
-    let error = caller.await.unwrap().expect_err("run close should fail caller");
+    let error = caller
+        .await
+        .unwrap()
+        .expect_err("run close should fail caller");
     assert!(error.to_string().contains("run closed"));
     Ok(())
 }
 
 #[tokio::test]
-async fn multiple_updates_resolved_in_single_wft()
--> Result<()> {
+async fn multiple_updates_resolved_in_single_wft() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
-    let runtime =
-        Arc::new(make_runtime(store.clone()));
+    let runtime = Arc::new(make_runtime(store.clone()));
     let namespace_id = NamespaceId::new();
-    let workflow_id =
-        WorkflowId("update-multi".into());
-    let run_key = start_workflow(
-        &runtime,
-        namespace_id,
-        workflow_id.clone(),
-        "queue-a",
-    )
-    .await?;
+    let workflow_id = WorkflowId("update-multi".into());
+    let run_key =
+        start_workflow(&runtime, namespace_id, workflow_id.clone(), "queue-a").await?;
 
     // Submit two updates concurrently.
     let r1 = runtime.clone();
@@ -286,44 +281,30 @@ async fn multiple_updates_resolved_in_single_wft()
     });
 
     // Wait for both updates to be pending.
-    wait_for_pending_update(
-        &*store, run_key, "update-1",
-    )
-    .await?;
-    wait_for_pending_update(
-        &*store, run_key, "update-2",
-    )
-    .await?;
+    wait_for_pending_update(&*store, run_key, "update-1").await?;
+    wait_for_pending_update(&*store, run_key, "update-2").await?;
 
     // Poll the WFT (may need to poll twice if the
     // kernel scheduled separate WFTs for each update).
     // Complete both updates in a single WFT completion.
-    let task = poll_wft(
-        &runtime,
-        workflow_queue(namespace_id, "queue-a"),
-    )
-    .await?;
+    let task = poll_wft(&runtime, workflow_queue(namespace_id, "queue-a")).await?;
     runtime
-        .complete_workflow_task(
-            WorkflowTaskCompletedRequest {
-                token: task.token,
-                identity: WorkerIdentity(
-                    "worker-a".into(),
-                ),
-                commands: vec![
-                    WorkflowCommand::UpdateCompleted {
-                        update_id: "update-1".into(),
-                        result: payloads("result-1"),
-                    },
-                    WorkflowCommand::UpdateCompleted {
-                        update_id: "update-2".into(),
-                        result: payloads("result-2"),
-                    },
-                ],
-                force_new_workflow_task: false,
-                now: OffsetDateTime::now_utc(),
-            },
-        )
+        .complete_workflow_task(WorkflowTaskCompletedRequest {
+            token: task.token,
+            identity: WorkerIdentity("worker-a".into()),
+            commands: vec![
+                WorkflowCommand::UpdateCompleted {
+                    update_id: "update-1".into(),
+                    result: payloads("result-1"),
+                },
+                WorkflowCommand::UpdateCompleted {
+                    update_id: "update-2".into(),
+                    result: payloads("result-2"),
+                },
+            ],
+            force_new_workflow_task: false,
+            now: OffsetDateTime::now_utc(),
+        })
         .await?;
 
     let outcome1 = caller1.await.unwrap()?;
@@ -332,9 +313,7 @@ async fn multiple_updates_resolved_in_single_wft()
     // Both callers should receive their respective
     // results independently.
     match outcome1 {
-        UpdateOutcome::Completed {
-            result, ..
-        } => {
+        UpdateOutcome::Completed { result, .. } => {
             assert_eq!(result, payloads("result-1"));
         }
         other => panic!(
@@ -343,9 +322,7 @@ async fn multiple_updates_resolved_in_single_wft()
         ),
     }
     match outcome2 {
-        UpdateOutcome::Completed {
-            result, ..
-        } => {
+        UpdateOutcome::Completed { result, .. } => {
             assert_eq!(result, payloads("result-2"));
         }
         other => panic!(

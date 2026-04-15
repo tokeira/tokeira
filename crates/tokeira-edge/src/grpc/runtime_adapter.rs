@@ -12,14 +12,9 @@ use tokeira_runtime::{
     UpdateTransportResolution, UpdateWaitPolicy,
 };
 use tokeira_storage::{CommitResult, RunRepository};
-use tokeira_types::{
-    ActivityTaskToken, ExecutionRef, Payloads,
-    RequestContext,
-};
+use tokeira_types::{ActivityTaskToken, ExecutionRef, Payloads, RequestContext};
 
-use crate::workflow_service::{
-    WorkflowMutationOutcome, WorkflowRuntimeApi,
-};
+use crate::workflow_service::{WorkflowMutationOutcome, WorkflowRuntimeApi};
 
 #[derive(Clone)]
 pub struct RuntimeAdapter<R> {
@@ -77,23 +72,11 @@ where
             .await
     }
 
-    async fn poll_workflow_or_query_task(
-        &self,
-        queue: tokeira_types::QueueKey,
-        worker_identity: tokeira_types::WorkerIdentity,
-        timeout: std::time::Duration,
-    ) -> Result<Option<tokeira_runtime::PolledWorkflowTaskTransport>> {
-        self.runtime
-            .poll_workflow_or_query_task(queue, worker_identity, timeout)
-            .await
-    }
-
     async fn complete_workflow_task(
         &self,
         req: WorkflowTaskCompletedRequest,
     ) -> Result<WorkflowMutationOutcome> {
-        let result =
-            self.runtime.complete_workflow_task(req).await?;
+        let result = self.runtime.complete_workflow_task(req).await?;
         commit_result_to_outcome(result)
     }
 
@@ -113,8 +96,7 @@ where
         token: ActivityTaskToken,
         result: Payloads,
     ) -> Result<WorkflowMutationOutcome> {
-        let commit =
-            self.runtime.complete_activity_task(token, result).await?;
+        let commit = self.runtime.complete_activity_task(token, result).await?;
         commit_result_to_outcome(commit)
     }
 
@@ -125,18 +107,11 @@ where
         failure_error_type: Option<String>,
     ) -> Result<()> {
         self.runtime
-            .fail_activity_task(
-                token,
-                failure_message,
-                failure_error_type,
-            )
+            .fail_activity_task(token, failure_message, failure_error_type)
             .await
     }
 
-    async fn record_activity_heartbeat(
-        &self,
-        token: ActivityTaskToken,
-    ) -> Result<bool> {
+    async fn record_activity_heartbeat(&self, token: ActivityTaskToken) -> Result<bool> {
         self.runtime.record_activity_heartbeat(token).await
     }
 
@@ -145,11 +120,8 @@ where
         run_key: tokeira_types::RunKey,
         req: TerminateRequest,
     ) -> Result<WorkflowMutationOutcome> {
-        let execution =
-            execution_for_run(self.runtime.as_ref(), run_key)
-                .await?;
-        let result =
-            self.runtime.terminate_workflow(execution, req).await?;
+        let execution = execution_for_run(self.runtime.as_ref(), run_key).await?;
+        let result = self.runtime.terminate_workflow(execution, req).await?;
         commit_result_to_outcome(result)
     }
 
@@ -158,11 +130,8 @@ where
         run_key: tokeira_types::RunKey,
         req: CancelRequest,
     ) -> Result<WorkflowMutationOutcome> {
-        let execution =
-            execution_for_run(self.runtime.as_ref(), run_key)
-                .await?;
-        let result =
-            self.runtime.cancel_workflow(execution, req).await?;
+        let execution = execution_for_run(self.runtime.as_ref(), run_key).await?;
+        let result = self.runtime.cancel_workflow(execution, req).await?;
         commit_result_to_outcome(result)
     }
 
@@ -181,12 +150,10 @@ where
         query_args: Payloads,
         timeout: std::time::Duration,
     ) -> Result<QueryResult> {
-        let timeout: time::Duration = time::Duration::try_from(timeout)
-            .map_err(|_| anyhow!("invalid timeout"))?;
+        let timeout: time::Duration =
+            time::Duration::try_from(timeout).map_err(|_| anyhow!("invalid timeout"))?;
         self.runtime
-            .query_workflow(
-                execution, query_type, query_args, timeout,
-            )
+            .query_workflow(execution, query_type, query_args, timeout)
             .await
     }
 
@@ -200,8 +167,8 @@ where
         timeout: std::time::Duration,
         wait_policy: UpdateWaitPolicy,
     ) -> Result<UpdateOutcome> {
-        let timeout: time::Duration = time::Duration::try_from(timeout)
-            .map_err(|_| anyhow!("invalid timeout"))?;
+        let timeout: time::Duration =
+            time::Duration::try_from(timeout).map_err(|_| anyhow!("invalid timeout"))?;
         self.runtime
             .update_workflow(
                 execution,
@@ -233,31 +200,23 @@ where
             .resolve_update_transport(run_key, &update_id, resolution))
     }
 
-    async fn submit_schedule_query_task(&self, run_key: tokeira_types::RunKey) -> Result<()> {
-        let _ = self
+    async fn peek_update_info(
+        &self,
+        run_key: tokeira_types::RunKey,
+        update_id: String,
+    ) -> Result<Option<(String, Payloads)>> {
+        Ok(self
             .runtime
-            .submit(
-                run_key,
-                tokeira_kernel::Command::ScheduleQueryTask(
-                    tokeira_kernel::ScheduleQueryTaskRequest {
-                        now: time::OffsetDateTime::now_utc(),
-                    },
-                ),
-            )
-            .await;
-        Ok(())
+            .update_registry()
+            .peek_update_info(run_key, &update_id))
     }
 }
 
-pub fn commit_result_to_outcome(
-    result: CommitResult,
-) -> Result<WorkflowMutationOutcome> {
+pub fn commit_result_to_outcome(result: CommitResult) -> Result<WorkflowMutationOutcome> {
     match result {
         CommitResult::Applied { new_state } => {
             let new_run_id =
-                if new_state.status
-                    == tokeira_types::ExecutionStatus::ContinuedAsNew
-                {
+                if new_state.status == tokeira_types::ExecutionStatus::ContinuedAsNew {
                     // The new run ID is not directly
                     // available on WorkflowState; the
                     // caller should extract it from the
@@ -268,29 +227,21 @@ pub fn commit_result_to_outcome(
                     None
                 };
             Ok(WorkflowMutationOutcome {
-                transition_seq: new_state
-                    .transition_seq
-                    .0,
-                last_event_id: new_state
-                    .last_event_id,
+                transition_seq: new_state.transition_seq.0,
+                last_event_id: new_state.last_event_id,
                 was_duplicate: false,
                 execution_status: new_state.status,
                 new_run_id,
             })
         }
-        CommitResult::Duplicate => {
-            Ok(WorkflowMutationOutcome {
-                transition_seq: 0,
-                last_event_id: 0,
-                was_duplicate: true,
-                execution_status:
-                    tokeira_types::ExecutionStatus::Running,
-                new_run_id: None,
-            })
-        }
-        CommitResult::Conflict { reason } => {
-            Err(anyhow!("conflict: {reason}"))
-        }
+        CommitResult::Duplicate => Ok(WorkflowMutationOutcome {
+            transition_seq: 0,
+            last_event_id: 0,
+            was_duplicate: true,
+            execution_status: tokeira_types::ExecutionStatus::Running,
+            new_run_id: None,
+        }),
+        CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
     }
 }
 

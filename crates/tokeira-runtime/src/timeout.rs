@@ -59,10 +59,7 @@ impl WorkflowTimeoutTrackingState {
         self.inner.lock().unwrap().values().cloned().collect()
     }
 
-    pub fn snapshot_for_shard(
-        &self,
-        shard_id: ShardId,
-    ) -> Vec<WorkflowTimeoutEntry> {
+    pub fn snapshot_for_shard(&self, shard_id: ShardId) -> Vec<WorkflowTimeoutEntry> {
         self.inner
             .lock()
             .unwrap()

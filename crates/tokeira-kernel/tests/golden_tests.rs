@@ -10,16 +10,16 @@ use tokeira_kernel::{
     NexusOperationResolvedRequest, NexusResolution, ParentClosePolicy,
     PauseActivityRequest, PauseInfo, PauseWorkflowRequest, PendingExternalCancel,
     PendingExternalSignal, PendingNexusOperation, PendingUpdate, PendingWorkflowTask,
-    ProjectionOp, Reject, ReplayContext, ResetActivityRequest, ResetRequest,
-    RetryState, SignalRequest, SignalWithStartRequest, StartRequest,
-    StartWorkflowTaskRequest,
+    ProjectionOp, Reject, ReplayContext, ResetActivityRequest, ResetRequest, RetryState,
+    SignalRequest, SignalWithStartRequest, StartRequest, StartWorkflowTaskRequest,
     TerminateRequest, TimerDueRequest, TimerState, UnpauseActivityRequest,
-    UnpauseWorkflowRequest,
-    UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody,
-    UpdateRequest, VersioningOverride, WorkflowCommand, WorkflowExecutionTimedOutRequest,
-    WorkflowState, WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
-    WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType,
-    WorkflowTimeoutType, event::{HistoryEvent, HistoryEventKind}, kernel::Kernel,
+    UnpauseWorkflowRequest, UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest,
+    UpdateProtocolBody, UpdateRequest, VersioningOverride, WorkflowCommand,
+    WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
+    WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
+    WorkflowTaskTimeoutType, WorkflowTimeoutType,
+    event::{HistoryEvent, HistoryEventKind},
+    kernel::Kernel,
 };
 use tokeira_types::{
     ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads,
@@ -193,6 +193,7 @@ fn make_open_state() -> WorkflowState {
         pending_external_signals: BTreeMap::new(),
         pending_external_cancels: BTreeMap::new(),
         pending_updates: BTreeMap::new(),
+        admitted_updates: std::collections::HashSet::new(),
         pending_nexus_operations: BTreeMap::new(),
         versioning_override: None,
         completion_callbacks: Vec::new(),
@@ -3938,19 +3939,13 @@ fn update_with_no_pending_wft() {
         )
         .unwrap();
 
+    // apply_update no longer emits UpdateAccepted — that happens
+    // when the worker sends an Acceptance protocol message.
+    // It only schedules a WFT and tracks the update as admitted.
+    assert_eq!(transition.request_dedupe_ops.len(), 1);
+    assert!(transition.next_state.admitted_updates.contains("update-1"));
     assert!(matches!(
         transition.history_events[0].kind,
-        HistoryEventKind::WorkflowExecutionUpdateAccepted { .. }
-    ));
-    assert_eq!(transition.request_dedupe_ops.len(), 1);
-    assert!(
-        transition
-            .next_state
-            .pending_updates
-            .contains_key("update-1")
-    );
-    assert!(matches!(
-        transition.history_events[1].kind,
         HistoryEventKind::WorkflowTaskScheduled { .. }
     ));
 }
@@ -3972,12 +3967,11 @@ fn update_with_pending_wft() {
         )
         .unwrap();
 
-    assert!(matches!(
-        transition.history_events[0].kind,
-        HistoryEventKind::WorkflowExecutionUpdateAccepted { .. }
-    ));
+    // No events emitted, no new WFT (one already pending).
+    assert!(transition.history_events.is_empty());
     assert_eq!(transition.dispatch_ops.len(), 0);
     assert_eq!(transition.next_state.pending_workflow_task, pending);
+    assert!(transition.next_state.admitted_updates.contains("update-1"));
 }
 
 #[test]

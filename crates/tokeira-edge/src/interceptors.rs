@@ -71,11 +71,15 @@ impl Action {
             Action::DescribeNamespace => "describe_namespace",
             Action::ListNamespaces => "list_namespaces",
             Action::RegisterNamespace => "register_namespace",
-            Action::GetWorkflowExecutionHistoryReverse => "get_workflow_execution_history_reverse",
+            Action::GetWorkflowExecutionHistoryReverse => {
+                "get_workflow_execution_history_reverse"
+            }
             Action::DescribeTaskQueue => "describe_task_queue",
             Action::DeleteWorkflowExecution => "delete_workflow_execution",
             Action::ResetWorkflowExecution => "reset_workflow_execution",
-            Action::SignalWithStartWorkflowExecution => "signal_with_start_workflow_execution",
+            Action::SignalWithStartWorkflowExecution => {
+                "signal_with_start_workflow_execution"
+            }
             Action::GetClusterInfo => "get_cluster_info",
             Action::GetSystemInfo => "get_system_info",
             Action::OperatorRead => "operator_read",

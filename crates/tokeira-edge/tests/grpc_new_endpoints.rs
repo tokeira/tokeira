@@ -3,30 +3,24 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use tokeira_edge::{
-    EdgeInterceptors, EmptyVisibilityApi,
-    InMemoryNamespaceCache, InMemoryOperatorApi, LocalOnlyRouter,
-    LongPollConfig, LongPollGate, PendingQueryStore, PollerRegistry,
-    NamespaceCache, ResolvedNamespace, WorkflowExecutionDescription,
-    WorkflowService,
+    EdgeInterceptors, EmptyVisibilityApi, InMemoryNamespaceCache, InMemoryOperatorApi,
+    LocalOnlyRouter, LongPollConfig, LongPollGate, NamespaceCache, PendingQueryStore,
+    PollerRegistry, ResolvedNamespace, WorkflowExecutionDescription, WorkflowService,
     grpc::workflow_service::WorkflowServiceGrpc,
-    translate::to_internal::namespace_id_for,
-    workflow_service::ExecutionResolver,
+    translate::to_internal::namespace_id_for, workflow_service::ExecutionResolver,
 };
 use tokeira_kernel::LoadedRun;
 use tokeira_proto::workflowservice::{
-    self,
-    workflow_service_server::WorkflowService as WfApi,
+    self, workflow_service_server::WorkflowService as WfApi,
 };
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, TimerScannerConfig,
-    TokeiraRuntime, WorkflowTimeoutScannerConfig,
+    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime,
+    WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{InMemoryStore, RunRepository};
-use tokeira_types::{
-    ExecutionRef, NamespaceId, WorkflowId,
-};
-use tonic::Request;
+use tokeira_types::{ExecutionRef, NamespaceId, WorkflowId};
 use tonic::Code;
+use tonic::Request;
 
 use tokeira_edge::grpc::runtime_adapter::RuntimeAdapter;
 
@@ -36,10 +30,7 @@ struct StoreExecutionResolver {
 }
 
 impl StoreExecutionResolver {
-    fn new(
-        repo: Arc<InMemoryStore>,
-        namespace_id: NamespaceId,
-    ) -> Self {
+    fn new(repo: Arc<InMemoryStore>, namespace_id: NamespaceId) -> Self {
         Self { repo, namespace_id }
     }
 }
@@ -54,9 +45,7 @@ impl ExecutionResolver for StoreExecutionResolver {
         self.repo
             .resolve_execution(&ExecutionRef {
                 namespace_id: self.namespace_id,
-                workflow_id: WorkflowId(
-                    workflow_id.to_string(),
-                ),
+                workflow_id: WorkflowId(workflow_id.to_string()),
                 run_id: None,
             })
             .await
@@ -71,9 +60,7 @@ impl ExecutionResolver for StoreExecutionResolver {
             .repo
             .resolve_execution(&ExecutionRef {
                 namespace_id: self.namespace_id,
-                workflow_id: WorkflowId(
-                    workflow_id.to_string(),
-                ),
+                workflow_id: WorkflowId(workflow_id.to_string()),
                 run_id: None,
             })
             .await?
@@ -82,42 +69,28 @@ impl ExecutionResolver for StoreExecutionResolver {
         };
 
         match self.repo.load_run(run_key).await? {
-            LoadedRun::Existing(state) => {
-                Ok(Some(WorkflowExecutionDescription {
-                    namespace: "default".to_string(),
-                    workflow_id: state.workflow_id.0,
-                    run_key: state.run_key,
-                    run_id: state.run_id,
-                    workflow_type: state.workflow_type.0,
-                    task_queue: state.task_queue.0,
-                    status: state.status,
-                    start_time: Some(state.started_at),
-                    close_time: state.closed_at,
-                    history_length: state.last_event_id,
-                    state_transition_count: state
-                        .transition_seq
-                        .0
-                        as i64,
-                    memo: state.memo,
-                    search_attributes: state
-                        .search_attributes,
-                }))
-            }
-            LoadedRun::Absent => Err(anyhow::anyhow!(
-                "resolved run missing"
-            )),
+            LoadedRun::Existing(state) => Ok(Some(WorkflowExecutionDescription {
+                namespace: "default".to_string(),
+                workflow_id: state.workflow_id.0,
+                run_key: state.run_key,
+                run_id: state.run_id,
+                workflow_type: state.workflow_type.0,
+                task_queue: state.task_queue.0,
+                status: state.status,
+                start_time: Some(state.started_at),
+                close_time: state.closed_at,
+                history_length: state.last_event_id,
+                state_transition_count: state.transition_seq.0 as i64,
+                memo: state.memo,
+                search_attributes: state.search_attributes,
+            })),
+            LoadedRun::Absent => Err(anyhow::anyhow!("resolved run missing")),
         }
     }
 }
 
-async fn build_grpc(
-    store: Arc<InMemoryStore>,
-) -> WorkflowServiceGrpc {
-    build_grpc_with_namespaces(
-        store,
-        vec![ResolvedNamespace::active("default")],
-    )
-    .await
+async fn build_grpc(store: Arc<InMemoryStore>) -> WorkflowServiceGrpc {
+    build_grpc_with_namespaces(store, vec![ResolvedNamespace::active("default")]).await
 }
 
 async fn build_grpc_with_namespaces(
@@ -139,20 +112,14 @@ async fn build_grpc_with_namespaces(
         namespaces.insert(namespace).await.unwrap();
     }
 
-    let interceptors =
-        Arc::new(EdgeInterceptors::permissive(namespaces.clone()));
+    let interceptors = Arc::new(EdgeInterceptors::permissive(namespaces.clone()));
     let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
     let router = Arc::new(LocalOnlyRouter);
     let workflow_broker = runtime.broker();
-    let runtime_adapter =
-        Arc::new(RuntimeAdapter::new(runtime));
-    let resolver = Arc::new(StoreExecutionResolver::new(
-        store.clone(),
-        ns_id,
-    ));
+    let runtime_adapter = Arc::new(RuntimeAdapter::new(runtime));
+    let resolver = Arc::new(StoreExecutionResolver::new(store.clone(), ns_id));
     let visibility = Arc::new(EmptyVisibilityApi);
-    let long_polls =
-        LongPollGate::new(LongPollConfig::default());
+    let long_polls = LongPollGate::new(LongPollConfig::default());
 
     let service = WorkflowService::new(
         runtime_adapter,
@@ -188,12 +155,10 @@ async fn terminate_workflow_via_grpc() {
                 workflow_type: Some(tokeira_proto::common::WorkflowType {
                     name: "test".to_string(),
                 }),
-                task_queue: Some(
-                    tokeira_proto::taskqueue::TaskQueue {
-                        name: "q".to_string(),
-                        ..Default::default()
-                    },
-                ),
+                task_queue: Some(tokeira_proto::taskqueue::TaskQueue {
+                    name: "q".to_string(),
+                    ..Default::default()
+                }),
                 request_id: "req-1".to_string(),
                 ..Default::default()
             },
@@ -226,9 +191,7 @@ async fn terminate_workflow_via_grpc() {
     let run_key = store
         .resolve_execution(&ExecutionRef {
             namespace_id: ns_id,
-            workflow_id: WorkflowId(
-                "term-wf".to_string(),
-            ),
+            workflow_id: WorkflowId("term-wf".to_string()),
             run_id: None,
         })
         .await
@@ -240,15 +203,11 @@ async fn terminate_workflow_via_grpc() {
     // terminate call itself succeeded without error.
     // If the run is still resolvable, verify status.
     if let Some(rk) = run_key {
-        let state =
-            match store.load_run(rk).await.unwrap() {
-                LoadedRun::Existing(s) => s,
-                _ => panic!("run should exist"),
-            };
-        assert_eq!(
-            state.status,
-            tokeira_types::ExecutionStatus::Terminated
-        );
+        let state = match store.load_run(rk).await.unwrap() {
+            LoadedRun::Existing(s) => s,
+            _ => panic!("run should exist"),
+        };
+        assert_eq!(state.status, tokeira_types::ExecutionStatus::Terminated);
     }
 }
 
@@ -268,12 +227,10 @@ async fn cancel_workflow_via_grpc() {
                 workflow_type: Some(tokeira_proto::common::WorkflowType {
                     name: "test".to_string(),
                 }),
-                task_queue: Some(
-                    tokeira_proto::taskqueue::TaskQueue {
-                        name: "q".to_string(),
-                        ..Default::default()
-                    },
-                ),
+                task_queue: Some(tokeira_proto::taskqueue::TaskQueue {
+                    name: "q".to_string(),
+                    ..Default::default()
+                }),
                 request_id: "req-2".to_string(),
                 ..Default::default()
             },
@@ -331,9 +288,7 @@ async fn discovery_and_namespace_reads_via_grpc() {
     let grpc = build_grpc(store).await;
 
     let system = grpc
-        .get_system_info(Request::new(
-            workflowservice::GetSystemInfoRequest {},
-        ))
+        .get_system_info(Request::new(workflowservice::GetSystemInfoRequest {}))
         .await
         .expect("get system info should succeed")
         .into_inner();
@@ -341,9 +296,7 @@ async fn discovery_and_namespace_reads_via_grpc() {
     assert!(system.capabilities.is_some());
 
     let cluster = grpc
-        .get_cluster_info(Request::new(
-            workflowservice::GetClusterInfoRequest {},
-        ))
+        .get_cluster_info(Request::new(workflowservice::GetClusterInfoRequest {}))
         .await
         .expect("get cluster info should succeed")
         .into_inner();
@@ -368,12 +321,10 @@ async fn discovery_and_namespace_reads_via_grpc() {
     );
 
     let describe = grpc
-        .describe_namespace(Request::new(
-            workflowservice::DescribeNamespaceRequest {
-                namespace: "default".to_string(),
-                id: String::new(),
-            },
-        ))
+        .describe_namespace(Request::new(workflowservice::DescribeNamespaceRequest {
+            namespace: "default".to_string(),
+            id: String::new(),
+        }))
         .await
         .expect("describe namespace should succeed")
         .into_inner();
@@ -392,22 +343,18 @@ async fn register_namespace_roundtrip_and_duplicate_rejection() {
     let store = Arc::new(InMemoryStore::default());
     let grpc = build_grpc(store).await;
 
-    grpc.register_namespace(Request::new(
-        workflowservice::RegisterNamespaceRequest {
-            namespace: "payments".to_string(),
-            ..Default::default()
-        },
-    ))
+    grpc.register_namespace(Request::new(workflowservice::RegisterNamespaceRequest {
+        namespace: "payments".to_string(),
+        ..Default::default()
+    }))
     .await
     .expect("register namespace should succeed");
 
     let describe = grpc
-        .describe_namespace(Request::new(
-            workflowservice::DescribeNamespaceRequest {
-                namespace: "payments".to_string(),
-                id: String::new(),
-            },
-        ))
+        .describe_namespace(Request::new(workflowservice::DescribeNamespaceRequest {
+            namespace: "payments".to_string(),
+            id: String::new(),
+        }))
         .await
         .expect("describe registered namespace should succeed")
         .into_inner();
@@ -421,12 +368,10 @@ async fn register_namespace_roundtrip_and_duplicate_rejection() {
     );
 
     let err = grpc
-        .register_namespace(Request::new(
-            workflowservice::RegisterNamespaceRequest {
-                namespace: "payments".to_string(),
-                ..Default::default()
-            },
-        ))
+        .register_namespace(Request::new(workflowservice::RegisterNamespaceRequest {
+            namespace: "payments".to_string(),
+            ..Default::default()
+        }))
         .await
         .expect_err("duplicate registration should fail");
     assert_eq!(err.code(), Code::AlreadyExists);
@@ -454,12 +399,10 @@ async fn describe_namespace_missing_returns_not_found() {
     let grpc = build_grpc_with_namespaces(store, Vec::new()).await;
 
     let err = grpc
-        .describe_namespace(Request::new(
-            workflowservice::DescribeNamespaceRequest {
-                namespace: "missing".to_string(),
-                id: String::new(),
-            },
-        ))
+        .describe_namespace(Request::new(workflowservice::DescribeNamespaceRequest {
+            namespace: "missing".to_string(),
+            id: String::new(),
+        }))
         .await
         .expect_err("missing namespace should fail");
 
@@ -473,12 +416,10 @@ async fn register_namespace_invalid_names_return_invalid_argument() {
 
     for namespace in ["", "bad namespace", "bad!"] {
         let err = grpc
-            .register_namespace(Request::new(
-                workflowservice::RegisterNamespaceRequest {
-                    namespace: namespace.to_string(),
-                    ..Default::default()
-                },
-            ))
+            .register_namespace(Request::new(workflowservice::RegisterNamespaceRequest {
+                namespace: namespace.to_string(),
+                ..Default::default()
+            }))
             .await
             .expect_err("invalid namespace should fail");
         assert_eq!(err.code(), Code::InvalidArgument);

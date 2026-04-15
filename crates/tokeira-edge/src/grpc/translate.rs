@@ -1,3 +1,23 @@
+//! gRPC <-> edge DTO translation.
+//!
+//! This module is where we normalize the upstream Temporal proto surface into
+//! the smaller edge-facing DTOs used by the rest of the crate. It is allowed to
+//! carry compatibility policy: proto enums are migrated into kernel/runtime
+//! policies here, missing transport fields receive edge defaults here, and
+//! version-specific transport quirks are collapsed before they leak deeper into
+//! the system.
+//!
+//! That also means defaults here must be treated carefully. A default is only
+//! acceptable when the upstream API truly omits the concept and the edge needs
+//! an internal policy value. If upstream already carries a field, translation
+//! should preserve it rather than silently inventing a replacement.
+//!
+//! The update protocol is the most complex translation path: SDK completions
+//! carry `ProtocolMessage` commands that reference entries in the `messages`
+//! list by `message_id`. This module resolves those references and decodes
+//! the `Any`-typed bodies into kernel `UpdateProtocolBody` variants before
+//! the workflow service layer ever sees them.
+
 use std::time::Duration;
 
 use prost::Message as _;
@@ -23,8 +43,8 @@ use tokeira_proto::{
     workflowservice,
 };
 use tokeira_types::{
-    ActivityTaskToken, ExecutionStatus, NamespaceId, Payload, Payloads, RetryPolicy,
-    RunId, RunKey, TaskKind, WorkflowId, WorkflowType,
+    ActivityTaskToken, BuildId, DeploymentId, ExecutionStatus, NamespaceId, Payload,
+    Payloads, RetryPolicy, RunId, RunKey, TaskKind, WorkflowId, WorkflowType,
 };
 use uuid::Uuid;
 
@@ -262,18 +282,40 @@ pub fn poll_request_to_edge(
                 "PollWorkflowTaskQueueRequest.task_queue",
             ))?;
 
+    let (deployment, build_id) = req
+        .worker_version_capabilities
+        .as_ref()
+        .filter(|caps| caps.use_versioning)
+        .map(|caps| {
+            let deployment =
+                non_empty(caps.deployment_series_name.clone()).map(DeploymentId);
+            let build_id = non_empty(caps.build_id.clone()).map(BuildId);
+            (deployment, build_id)
+        })
+        .unwrap_or((None, None));
+
     Ok(PollWorkflowTaskQueueRequest {
         namespace: req.namespace,
         task_queue: task_queue.name.clone(),
         worker_identity: req.identity,
-        deployment: None,
-        build_id: None,
+        deployment,
+        build_id,
         sticky_run: None,
         timeout: DEFAULT_POLL_TIMEOUT,
         sticky_ttl: DEFAULT_STICKY_TTL,
     })
 }
 
+/// Translate a WFT completion from the proto wire format into the edge DTO.
+///
+/// The critical step here is resolving `ProtocolMessage` commands. The SDK
+/// sends update protocol responses as two correlated pieces: a
+/// `ProtocolMessageCommandAttributes` (carrying only a `message_id`) and a
+/// corresponding entry in the top-level `messages` list (carrying the actual
+/// `Any`-typed body). We index the messages by ID, then for each
+/// `ProtocolMessage` command we pop the matching message and decode its body
+/// via `resolve_protocol_message_body`. Any messages not claimed by a command
+/// are passed through as-is for edge-layer processing.
 pub fn respond_completed_request_to_edge(
     req: workflowservice::RespondWorkflowTaskCompletedRequest,
 ) -> Result<RespondWorkflowTaskCompletedRequest, ProtoConversionError> {
@@ -367,6 +409,15 @@ pub fn respond_completed_request_to_edge(
     })
 }
 
+/// Decode the `Any`-typed body of a protocol message into a kernel
+/// `UpdateProtocolBody` variant.
+///
+/// The Temporal update protocol uses three message types — `Acceptance`,
+/// `Response`, and `Rejection` — each wrapped in a `prost_types::Any`.
+/// We match on the `type_url` suffix to determine which variant to decode.
+/// `Response` bodies carry an `Outcome` that can be either `Success` or
+/// `Failure`; a `Failure` outcome is mapped to `Rejected` because from the
+/// kernel's perspective both represent terminal negative outcomes.
 fn resolve_protocol_message_body(
     body_bytes: &[u8],
     protocol_instance_id: String,
@@ -500,6 +551,14 @@ pub fn signal_response_to_proto(
     workflowservice::SignalWorkflowExecutionResponse {}
 }
 
+/// Build the proto poll response from the edge DTO.
+///
+/// Populates `task_token`, `workflow_execution`, `workflow_type`, history,
+/// `started_event_id`, `attempt`, `queries`, and `messages`. Several proto
+/// fields are intentionally left at their defaults because the kernel does
+/// not yet track them — notably `previous_started_event_id` (needed for
+/// sticky replay boundaries) and `scheduled_time`/`started_time`. See
+/// `docs/proto-field-audit.md` §2 for the full list.
 pub fn poll_response_to_proto(
     resp: PollWorkflowTaskQueueResponse,
 ) -> workflowservice::PollWorkflowTaskQueueResponse {
@@ -585,6 +644,12 @@ pub fn poll_response_to_proto(
     }
 }
 
+/// Build the proto WFT completion response.
+///
+/// The `workflow_task` field carries an optional inline poll response for
+/// "eager return": when the SDK sets `return_new_workflow_task = true` and
+/// the edge has a query-only WFT ready, it piggybacks the next task on the
+/// completion response to avoid an extra poll round-trip.
 pub fn completed_response_to_proto(
     resp: RespondWorkflowTaskCompletedResponse,
 ) -> workflowservice::RespondWorkflowTaskCompletedResponse {
@@ -1955,6 +2020,30 @@ mod tests {
 
         assert_eq!(edge.deployment, None);
         assert_eq!(edge.build_id, None);
+    }
+
+    #[test]
+    fn poll_request_preserves_worker_version_capabilities() {
+        let edge = poll_request_to_edge(workflowservice::PollWorkflowTaskQueueRequest {
+            namespace: "default".to_string(),
+            task_queue: Some(taskqueue::TaskQueue {
+                name: "queue".to_string(),
+                ..Default::default()
+            }),
+            identity: "worker-1".to_string(),
+            worker_version_capabilities: Some(
+                tokeira_proto::public::temporal::api::common::v1::WorkerVersionCapabilities {
+                    build_id: "build-a".to_string(),
+                    use_versioning: true,
+                    deployment_series_name: "deploy-a".to_string(),
+                },
+            ),
+            ..Default::default()
+        })
+        .expect("poll request should convert");
+
+        assert_eq!(edge.deployment, Some(DeploymentId("deploy-a".to_string())));
+        assert_eq!(edge.build_id, Some(BuildId("build-a".to_string())));
     }
 
     #[test]

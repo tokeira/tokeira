@@ -1,3 +1,9 @@
+//! Request context carrying caller identity and idempotency keys.
+//!
+//! Every inbound gRPC call is assigned a `RequestId` at the edge. Storage uses
+//! this identity for request deduplication so that retried or replayed calls
+//! produce the same outcome without re-executing side effects.
+
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 

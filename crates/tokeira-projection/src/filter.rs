@@ -1,3 +1,11 @@
+//! Filter compilation for visibility queries.
+//!
+//! Translates a user-supplied filter string (e.g. `WorkflowType = "Foo" AND
+//! StartTime > ...`) into a typed `FilterExpr` tree. Field references are
+//! resolved against the visibility store's attribute registry so that unknown
+//! or type-mismatched filters are rejected at compile time rather than at
+//! evaluation time.
+
 use anyhow::{Result, anyhow};
 use async_recursion::async_recursion;
 use time::OffsetDateTime;

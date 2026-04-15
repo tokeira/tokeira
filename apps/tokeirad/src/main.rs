@@ -1,3 +1,10 @@
+//! Local `tokeirad` bootstrap.
+//!
+//! This binary wires the dev in-memory store, runtime, projection workers, and
+//! edge services into one process. It is intentionally explicit so developers
+//! can see which pieces are authoritative, which are transport-only, and where
+//! background tasks such as projection and history notification are attached.
+
 use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{Context, Result, anyhow};
@@ -39,12 +46,16 @@ async fn main() -> Result<()> {
 
     let addr = grpc_addr_from_env()?;
 
+    // Build the authoritative dev store first, then wrap it with the
+    // history-notifying repository used by edge long-poll.
     let store = InMemoryStore::default();
     let history_waits = HistoryWaitRegistry::default();
     let repo = Arc::new(HistoryNotifyingRepository::new(
         Arc::new(store.clone()),
         history_waits.clone(),
     ));
+    // The runtime owns execution orchestration, scanners, brokers, and all
+    // run-local in-memory coordination such as buffered consistent queries.
     let runtime = Arc::new(TokeiraRuntime::new(
         repo.clone(),
         4,
@@ -57,6 +68,7 @@ async fn main() -> Result<()> {
     let default_namespace = ResolvedNamespace::active("default");
     let default_namespace_id = namespace_id_for("default");
 
+    // Bootstrap edge-facing namespace/operator state.
     let namespaces = Arc::new(InMemoryNamespaceCache::new());
     namespaces.insert(default_namespace).await?;
 
@@ -73,6 +85,9 @@ async fn main() -> Result<()> {
     let visibility = Arc::new(VisibilityQueryService::new(visibility_store.clone()));
     let long_polls = LongPollGate::new(LongPollConfig::default());
     let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
+    // Visibility is populated from the projection log, not from ad hoc edge
+    // mutation hooks. One worker per partition keeps checkpoint ownership and
+    // replay boundaries explicit.
     for partition_id in 0..16 {
         let projection_worker = ProjectionWorker {
             log: store.clone(),
@@ -97,6 +112,9 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Assemble the transport services once shared runtime/read-side components
+    // exist. The edge stays thin: it delegates workflow semantics back into the
+    // runtime and uses visibility/operator helpers only for read APIs.
     let workflow_service =
         WorkflowService::new_with_buffered_queries_and_history_wait_registry(
             runtime_adapter,

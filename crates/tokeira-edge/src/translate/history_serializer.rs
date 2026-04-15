@@ -1,5 +1,13 @@
-//! Converts kernel `HistoryEvent` values into
-//! proto-encoded bytes for the Temporal wire format.
+//! Converts kernel `HistoryEvent` values into proto-encoded bytes for the
+//! Temporal wire format.
+//!
+//! The kernel stores events in its own domain types; this serializer is the
+//! single place where those types are mapped to the upstream proto `History`
+//! message that SDKs expect. Many proto attribute structs use
+//! `..Default::default()` because the kernel does not yet carry the full set
+//! of upstream fields (e.g. chained `Failure.cause`, `stack_trace`,
+//! `failure_info` variants). See `docs/proto-field-audit.md` §3 for the
+//! complete gap inventory.
 
 use prost::Message;
 use tokeira_kernel::event::{HistoryEvent, HistoryEventKind};

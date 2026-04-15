@@ -1,3 +1,15 @@
+//! Edge-layer Data Transfer Objects and proto ↔ edge translation.
+//!
+//! The DTOs in this module sit between the gRPC proto types and the
+//! kernel/runtime domain types. They exist so that the edge layer can
+//! reason about requests and responses without depending on generated
+//! proto code, and so that the kernel never sees transport concerns.
+//!
+//! Sub-modules handle the two translation directions:
+//! - [`to_internal`] — edge DTO → kernel command / runtime call
+//! - [`from_internal`] — kernel result / runtime response → proto
+//! - [`history_serializer`] — kernel `HistoryEvent` → proto history event
+
 use std::{collections::HashMap, time::Duration};
 
 use time::OffsetDateTime;

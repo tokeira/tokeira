@@ -1,3 +1,12 @@
+//! Pure state-machine kernel for workflow execution.
+//!
+//! This module is the single source of truth for all workflow state
+//! transitions. It enforces a strict contract: one writer at a time,
+//! zero I/O, and deterministic outputs for any given (state, command)
+//! pair. That contract is what makes the kernel safe to test with
+//! golden-file snapshots and property-based fuzzing, and what lets
+//! the runtime layer treat it as an opaque, infallible oracle.
+
 use std::collections::BTreeMap;
 
 use smallvec::SmallVec;
@@ -215,6 +224,8 @@ impl BasicKernel {
         Ok(state)
     }
 
+    /// Bootstrap a brand-new workflow run from a `StartWorkflowExecution` request.
+    /// Requires `LoadedRun::Absent` — the run must not already exist in storage.
     fn apply_start(
         &self,
         loaded: LoadedRun,
@@ -296,6 +307,8 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Atomically create a run and deliver a signal in one transition,
+    /// so the signal is never lost to a race with a separate start.
     fn apply_signal_with_start(
         &self,
         loaded: LoadedRun,
@@ -383,6 +396,9 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Deliver an external signal to a running workflow.
+    /// Only schedules a new WFT if none is already pending — see the
+    /// "at most one outstanding WFT" invariant comment below.
     fn apply_signal(
         &self,
         loaded: LoadedRun,
@@ -411,6 +427,9 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Admit a workflow update request. Updates go through a two-phase
+    /// lifecycle (admitted → accepted/rejected) because the worker must
+    /// validate the update before it becomes durable.
     fn apply_update(
         &self,
         loaded: LoadedRun,
@@ -446,6 +465,8 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Record a cancellation request. This does not close the workflow —
+    /// the worker decides how to honour the request during its next WFT.
     fn apply_cancel(
         &self,
         loaded: LoadedRun,
@@ -469,6 +490,9 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Forcefully close the workflow. Unlike cancel, terminate is
+    /// immediate — the worker gets no say. All pending activities and
+    /// timers are deleted because they can never resolve.
     fn apply_terminate(
         &self,
         loaded: LoadedRun,
@@ -503,6 +527,9 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Freeze the workflow so no new WFTs are dispatched. Bumps the
+    /// `wft_stamp` and activity stamps to invalidate any in-flight
+    /// task tokens, preventing stale completions from landing.
     fn apply_pause_workflow(
         &self,
         loaded: LoadedRun,
@@ -555,6 +582,8 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Resume a paused workflow. Re-enqueues every pending activity
+    /// because their dispatch ops were suppressed while paused.
     fn apply_unpause_workflow(
         &self,
         loaded: LoadedRun,
@@ -628,6 +657,8 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Hot-patch activity options (timeouts, task queue) without
+    /// cancelling and re-scheduling the activity.
     fn apply_update_activity_options(
         &self,
         loaded: LoadedRun,
@@ -681,6 +712,8 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Pause a single activity. The activity stays in the pending set
+    /// but will not be dispatched until unpaused.
     fn apply_pause_activity(
         &self,
         loaded: LoadedRun,
@@ -714,6 +747,8 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Resume a paused activity and re-enqueue it for dispatch
+    /// (unless the whole workflow is paused).
     fn apply_unpause_activity(
         &self,
         loaded: LoadedRun,
@@ -766,6 +801,8 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Reset an activity's attempt counter and re-dispatch it,
+    /// giving the worker a fresh start without losing the schedule event.
     fn apply_reset_activity(
         &self,
         loaded: LoadedRun,
@@ -816,6 +853,8 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Fork the workflow history at a prior event, closing this run
+    /// and pointing to a new run that will replay from the fork point.
     fn apply_reset(
         &self,
         loaded: LoadedRun,
@@ -886,6 +925,7 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Mutate versioning override and completion callbacks on a live run.
     fn apply_update_execution_options(
         &self,
         loaded: LoadedRun,
@@ -925,6 +965,8 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Close the workflow because a server-enforced timeout fired.
+    /// This is not a worker decision — the runtime drives it.
     fn apply_workflow_execution_timed_out(
         &self,
         loaded: LoadedRun,
@@ -955,6 +997,8 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Mark a pending WFT as started. Validates the logical sequence
+    /// to prevent stale dispatches from mutating state.
     fn apply_workflow_task_started(
         &self,
         loaded: LoadedRun,
@@ -1005,6 +1049,29 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Complete a workflow task and apply the worker's command batch.
+    ///
+    /// This is the most complex transition because it bridges the
+    /// worker's view of history (frozen at `started_event_id`) with
+    /// events that may have arrived concurrently (signals, updates).
+    /// Two independent conditions can trigger a follow-up WFT:
+    ///
+    /// 1. `force_new_workflow_task` — the worker explicitly asks for
+    ///    another turn (e.g., local-activity heartbeat keep-alive).
+    ///    This is checked first because the worker knows it needs
+    ///    more work regardless of buffered events.
+    ///
+    /// 2. Buffered events — `pre_completion_last_event_id > started_event_id`
+    ///    means events landed while the WFT was in flight. The worker
+    ///    never saw them, so a fresh WFT is needed for correctness.
+    ///    This is the mechanism that preserves the query consistency
+    ///    model: queries piggyback on WFTs, so any state a query
+    ///    might observe must have been processed by a WFT first.
+    ///
+    /// These are separate checks because `force_new_workflow_task`
+    /// can be true even when no events were buffered (heartbeat
+    /// keep-alive), and buffered events can exist even when the
+    /// worker didn't request a new task.
     fn apply_workflow_task_completed(
         &self,
         loaded: LoadedRun,
@@ -1115,6 +1182,8 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Remove a resolved activity from the pending set and wake the
+    /// workflow so it can observe the result.
     fn apply_activity_resolved(
         &self,
         loaded: LoadedRun,
@@ -1175,6 +1244,9 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Record whether a child workflow started or failed to start.
+    /// Validates `initiated_event_id` to guard against stale callbacks
+    /// from a previous reset cycle.
     fn apply_child_start_confirmed(
         &self,
         loaded: LoadedRun,
@@ -1231,6 +1303,8 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Record the terminal outcome of a child workflow and remove it
+    /// from the pending set.
     fn apply_child_resolved(
         &self,
         loaded: LoadedRun,
@@ -1284,6 +1358,7 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Record the outcome of a cross-workflow signal request.
     fn apply_external_signal_resolved(
         &self,
         loaded: LoadedRun,
@@ -1326,6 +1401,7 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Record the outcome of a cross-workflow cancel request.
     fn apply_external_cancel_resolved(
         &self,
         loaded: LoadedRun,
@@ -1372,6 +1448,9 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Record a Nexus operation lifecycle event (started, completed,
+    /// failed, canceled, timed out). Only terminal resolutions remove
+    /// the operation from the pending set and wake the workflow.
     fn apply_nexus_operation_resolved(
         &self,
         loaded: LoadedRun,
@@ -1470,6 +1549,9 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Record a WFT failure. The pending WFT stays alive (with
+    /// `started_event_id` cleared) so it can be retried — unlike
+    /// completion, failure does not consume the logical task slot.
     fn apply_workflow_task_failed(
         &self,
         loaded: LoadedRun,
@@ -1537,6 +1619,8 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Record a WFT timeout. Clears sticky affinity so the retry
+    /// goes to the normal queue — the sticky worker is presumed dead.
     fn apply_workflow_task_timed_out(
         &self,
         loaded: LoadedRun,
@@ -1594,6 +1678,8 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Fire a timer and wake the workflow. The timer is removed from
+    /// the pending set because it is a one-shot construct.
     fn apply_timer_due(
         &self,
         loaded: LoadedRun,
@@ -1623,6 +1709,9 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Ensure a WFT is pending so that an incoming query has a task
+    /// to piggyback on. If a WFT is already in flight, the query will
+    /// be delivered alongside it — no extra scheduling needed.
     fn apply_schedule_query_task(
         &self,
         loaded: LoadedRun,
@@ -2047,10 +2136,11 @@ fn expect_open(loaded: LoadedRun) -> Result<WorkflowState, Reject> {
     Ok(state)
 }
 
-/// Process a single workflow command from a
-/// `WorkflowTaskCompleted` batch. Returns `true` if the
-/// command closed the run (no further commands should be
-/// processed).
+/// Process a single workflow command produced by the worker during
+/// WFT completion. Each command maps to one or more history events
+/// and side-effect ops. Returns `true` if the command closed the
+/// run, which tells the caller to reject any subsequent commands
+/// in the batch.
 fn apply_workflow_command(
     builder: &mut TransitionBuilder,
     command: WorkflowCommand,
@@ -2551,6 +2641,13 @@ fn apply_workflow_command(
 /// and closing the run, then produces the final `Transition`
 /// on `finish()`.
 ///
+/// Every `apply_*` method creates exactly one builder, so
+/// each transition is an atomic unit: either all mutations
+/// commit together or none do. The builder also captures
+/// `expected_seq` at construction time to serve as the
+/// optimistic concurrency fence when the runtime persists
+/// the transition.
+///
 /// See `docs/architecture/020-kernel.md` §Transition builder.
 struct TransitionBuilder {
     /// Mutable working copy of the run state.
@@ -2633,9 +2730,13 @@ impl TransitionBuilder {
         });
     }
 
-    /// Transition the run to a terminal status: set the
-    /// status, clear pending WFT and sticky affinity, and
-    /// emit a `ProjectionOp::CloseExecution`.
+    /// Transition the run to a terminal status.
+    ///
+    /// Beyond setting the status, this clears all pending subsystem
+    /// state (WFT, sticky, pause, external signals/cancels, updates,
+    /// nexus ops) because none of those can ever resolve once the run
+    /// is closed. Cleaning them here keeps the persisted state minimal
+    /// and prevents stale callbacks from matching.
     fn close(&mut self, status: ExecutionStatus) {
         self.state.status = status;
         self.state.closed_at = Some(self.now);

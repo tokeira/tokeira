@@ -1,3 +1,16 @@
+//! Serial command execution lanes.
+//!
+//! A lane is the serialization boundary for all state mutations on a run.
+//! Every command — signal, timer fire, activity resolution, WFT completion —
+//! enters through a lane's bounded channel and is processed one at a time.
+//! This eliminates the need for per-run locking: the lane *is* the lock.
+//!
+//! When a run closes via continue-as-new, the lane is responsible for
+//! constructing and submitting the successor `StartRequest`. The successor
+//! inherits the predecessor's execution chain metadata (`first_execution_run_id`,
+//! `first_run_started_at`) so the server can enforce execution-level timeouts
+//! across the entire chain, not just the current run.
+
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Result, anyhow};

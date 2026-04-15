@@ -1,3 +1,11 @@
+//! Identity types separating user-visible identifiers from internal storage keys.
+//!
+//! `RunId` and `WorkflowId` are what clients and operators see in APIs and logs.
+//! `RunKey` and `ShardId` are internal storage and routing keys that can be
+//! optimised for clustering and placement without leaking layout details into
+//! the public API. `TransitionSeq` and `ShardEpoch` are monotonic fencing
+//! values used for optimistic concurrency control.
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

@@ -1,5 +1,18 @@
+//! Rollup delta computation for aggregate visibility counts.
+//!
+//! When an execution row is upserted, the sink needs to adjust per-dimension
+//! counters (status, workflow type, task queue) without scanning the whole
+//! table. This module computes the minimal set of +1/−1 deltas by diffing
+//! the previous and next row states. The conservation invariant (net delta
+//! is zero for transitions, +1 for inserts) is validated by property tests.
+
 use crate::types::{ExecutionRow, RollupDelta, RollupDimension};
 
+/// Compute the rollup counter deltas between a previous and next row state.
+///
+/// For each tracked dimension, if the value changed, emits a −1 for the old
+/// value and a +1 for the new value. If `previous` is `None` (new row),
+/// only +1 deltas are emitted.
 pub fn compute_rollup_deltas(
     previous: Option<&ExecutionRow>,
     next: &ExecutionRow,

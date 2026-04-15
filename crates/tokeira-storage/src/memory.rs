@@ -1,3 +1,12 @@
+//! In-memory storage backend for development and tests.
+//!
+//! This store exercises the full `RunRepository` contract in a single process
+//! without external dependencies. It is a reference model for behaviour, not a
+//! template for a production engine. Key indexing structures: `execution_index`
+//! maps `(namespace, workflow_id, run_id)` → `RunKey`, `current_open` tracks
+//! the single open run per workflow, and `latest_run` ordering is derived from
+//! `started_at` + `transition_seq`.
+
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,

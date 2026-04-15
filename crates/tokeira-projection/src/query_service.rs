@@ -1,3 +1,11 @@
+//! Read-side query service for the visibility projection.
+//!
+//! Implements the [`VisibilityApi`] trait that the edge layer depends on,
+//! translating `ListWorkflowExecutions` and `CountWorkflowExecutions`
+//! requests into store queries. Filter compilation, pagination token
+//! encoding, and namespace resolution happen here so that the store
+//! implementations stay purely mechanical.
+
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use tokeira_edge::{

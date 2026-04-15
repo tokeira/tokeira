@@ -1,3 +1,10 @@
+//! In-memory visibility store for development and tests.
+//!
+//! Maintains a multi-index structure over execution rows and search attributes:
+//! per-type inverted indexes (`sa_keyword_idx`, `sa_int_idx`, etc.) enable
+//! efficient filter evaluation, while `rollups` tracks pre-aggregated counters
+//! by status, workflow type, and task queue for fast count queries.
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,

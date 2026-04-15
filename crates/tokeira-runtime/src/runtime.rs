@@ -1,3 +1,14 @@
+//! Public runtime orchestration surface.
+//!
+//! This module is the narrow waist between transports and the kernel/storage
+//! internals. Callers ask the runtime to start workflows, complete tasks,
+//! buffer consistent queries, and manage background scanners; they do not
+//! reach into lane execution or storage tables directly.
+//!
+//! The durable source of truth still lives below this layer. The runtime's job
+//! is to route work, retry OCC conflicts, and keep the in-memory delivery and
+//! timeout machinery aligned with authoritative history.
+
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Result, anyhow};
@@ -498,6 +509,15 @@ where
     }
 
     /// Dispatch a read-only query to a workflow worker and await the response.
+    ///
+    /// Two delivery paths exist depending on whether the run has a pending
+    /// workflow task (WFT). When a WFT is in flight, the query is buffered
+    /// behind a *barrier* — the run's `last_event_id` at query time — so the
+    /// worker cannot evaluate it against stale state. Once the WFT completes
+    /// and the run advances past the barrier, the transport layer releases the
+    /// query for delivery. When no WFT is pending the query goes directly to
+    /// the broker for immediate dispatch, because the run is quiescent and the
+    /// worker already has up-to-date state.
     pub async fn query_workflow(
         &self,
         execution: ExecutionRef,
@@ -586,6 +606,14 @@ where
     }
 
     /// Dispatch a synchronous update and optionally wait for completion.
+    ///
+    /// Updates follow a two-phase lifecycle: the kernel first *admits* the
+    /// update (recording it in `admitted_updates`), then the worker *accepts*
+    /// it during a subsequent WFT, which promotes it to `pending_updates` and
+    /// writes the acceptance event. This split lets the API return quickly for
+    /// `Accepted` wait policy (phase 1) while `Completed` callers block on a
+    /// oneshot until the lane notifies the `UpdateRegistry` with the final
+    /// resolution.
     pub async fn update_workflow(
         &self,
         execution: ExecutionRef,
@@ -1059,6 +1087,10 @@ where
 
     /// Long-poll for a workflow task, then atomically
     /// mark it as started.
+    ///
+    /// Queries are deliberately excluded from this path — they travel through
+    /// the broker's separate `poll_query_task` channel so that read-only
+    /// queries never masquerade as history-advancing workflow tasks.
     pub async fn poll_workflow_task(
         &self,
         queue: QueueKey,
@@ -1088,6 +1120,12 @@ where
 
     /// Record the completion of a workflow task and
     /// apply any resulting commands.
+    ///
+    /// After the kernel commits the completion, it checks whether events
+    /// arrived between WFT-Started and now (buffered events, e.g. signals).
+    /// If so, a new WFT is scheduled immediately so the worker replays those
+    /// events. The transport layer also uses this commit point to release any
+    /// buffered queries whose barrier has been satisfied.
     pub async fn complete_workflow_task(
         &self,
         req: WorkflowTaskCompletedRequest,
@@ -1215,6 +1253,11 @@ where
             .unwrap_or(false))
     }
 
+    /// Atomically transition a polled workflow task into the Started state.
+    ///
+    /// Sets a sticky TTL so subsequent tasks for this run are preferentially
+    /// routed back to the same worker, avoiding full-history replay when the
+    /// worker's cache is still warm.
     async fn start_polled_workflow_task(
         &self,
         offered: DispatchableWorkflowTask,

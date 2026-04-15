@@ -1,3 +1,14 @@
+//! Durable persistence contract (`RunRepository`) for the runtime and kernel.
+//!
+//! The interfaces here are intentionally semantic — callers talk in terms of
+//! runs, history, timers, backlog, and leases rather than tables or SQL. This
+//! keeps the rest of the workspace honest while allowing different backends to
+//! materialise the same guarantees in very different physical layouts.
+//!
+//! Writes use an optimistic concurrency model: `commit_transition` checks the
+//! caller's `TransitionSeq` against the durable value and returns `Conflict` on
+//! mismatch, so the runtime can reload and retry without distributed locks.
+
 use anyhow::Result;
 use async_trait::async_trait;
 use time::OffsetDateTime;
@@ -140,6 +151,10 @@ pub trait RunRepository: Send + Sync {
     /// [`CommitResult::Conflict`] on mismatch (OCC fence).
     /// See the [storage architecture docs](../../docs/crates/storage.md)
     /// for the full fenced-commit model.
+    ///
+    /// A successful implementation must persist the post-transition state
+    /// together with history and derived side effects as one semantic unit, or
+    /// fail without partially exposing the result.
     async fn commit_transition(
         &self,
         run_key: RunKey,

@@ -1,3 +1,10 @@
+//! Execution lifecycle model: identifiers, status, and resolution.
+//!
+//! A workflow execution progresses through a lifecycle from `Running` to a
+//! terminal status (`Completed`, `Failed`, `Cancelled`, etc.). `ExecutionRef`
+//! is the stable locator callers use before a concrete `RunKey` is known, and
+//! `ExecutionSummary` is the read-model projection for visibility queries.
+
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 

@@ -1,3 +1,11 @@
+//! Retry policy model for workflow and activity executions.
+//!
+//! Retry decisions are evaluated by the kernel during history replay, not at the
+//! edge or in the SDK. This keeps retry semantics deterministic and replayable:
+//! the kernel inspects the policy, the current attempt count, and the failure
+//! type to decide whether to schedule another attempt or transition to a
+//! terminal failure state.
+
 use serde::{Deserialize, Serialize};
 use time::Duration;
 

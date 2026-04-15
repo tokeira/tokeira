@@ -1,3 +1,38 @@
+//! In-memory delivery brokers for workflow, activity, and query work.
+//!
+//! These brokers are intentionally transport-local. Pollers should not become
+//! durable storage objects, and queue fairness/sticky behavior should be
+//! understandable without reading storage code. When work must survive process
+//! loss or prolonged absence of pollers, that responsibility moves to the
+//! durable backlog and scanner paths elsewhere in the runtime.
+//!
+//! Query delivery is kept separate from workflow-task delivery: queries may
+//! need sticky affinity and long-poll wakeups, but they should not advance
+//! history or masquerade as durable workflow tasks.
+//!
+//! ## Sticky / general tier model
+//!
+//! Workflow tasks enter the *sticky* tier when the run has a preferred worker
+//! (set by the sticky TTL during `start_polled_workflow_task`). Only the
+//! matching worker may take a sticky task; if the TTL expires before that
+//! worker polls, the task is promoted to the *general* tier where any poller
+//! can claim it. This avoids full-history replays when the worker's cache is
+//! warm, while still guaranteeing progress when a worker disappears.
+//!
+//! ## Deduplication
+//!
+//! Each workflow task is keyed by `(RunKey, LogicalTaskSeq)` and each activity
+//! task by `(RunKey, activity_id, attempt)`. Duplicate publications are
+//! silently suppressed so that scanner sweeps and retry paths can safely
+//! re-publish without creating phantom work items.
+//!
+//! ## Notify-based wake pattern
+//!
+//! Pollers register a `Notify` future *before* re-checking the queue. This
+//! closes the TOCTOU race between `try_take` returning `None` and a concurrent
+//! `publish` calling `notify_waiters`: if the publish fires in that gap, the
+//! already-registered future still fires and the poller retries.
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,

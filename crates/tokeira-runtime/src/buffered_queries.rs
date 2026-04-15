@@ -1,3 +1,18 @@
+//! Run-local buffering for consistent queries.
+//!
+//! Query correctness is enforced here, not in the broker. A query is attached
+//! to a run-local barrier representing the last write the caller must observe;
+//! it only becomes eligible for delivery once the runtime can prove that the
+//! run has advanced far enough. This avoids the older transport-level failure
+//! mode where queries could sit beside workflow tasks and observe stale state.
+//!
+//! The barrier-release condition: a buffered query with `required_barrier = B`
+//! is released when the transport calls `drain_satisfied(run_key, observable)`
+//! with `observable >= B`. In practice this happens after a WFT completion
+//! commits and the run's `last_event_id` advances past the barrier. Queries
+//! whose barrier is still ahead of the observable watermark stay buffered
+//! until the next completion cycle.
+
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
@@ -10,6 +25,8 @@ use crate::QueryResult;
 
 const MAX_BUFFERED_QUERIES_PER_RUN: usize = 256;
 
+/// Buffered query plus the consistency barrier it must observe before a worker
+/// is allowed to evaluate it.
 #[derive(Debug)]
 pub struct BufferedQuery {
     pub query_id: String,
@@ -25,6 +42,10 @@ pub struct BufferedQueryRegistry {
 }
 
 impl BufferedQueryRegistry {
+    /// Buffer a query behind its required barrier.
+    ///
+    /// Capacity is per run so one hot execution cannot consume unbounded memory
+    /// and starve unrelated workflows.
     pub fn buffer(
         &self,
         run_key: RunKey,

@@ -1,3 +1,18 @@
+//! Business-logic layer between gRPC handlers and the workflow runtime.
+//!
+//! This module translates transport concerns into runtime calls, long-poll
+//! coordination, and visibility lookups. The important boundary is what does
+//! *not* belong here: authoritative workflow mutation rules still live in the
+//! runtime/kernel, and durable execution state still lives in storage. The
+//! edge is responsible for request shaping, polling semantics, and combining
+//! read-side helpers into the APIs the Temporal surface expects.
+//!
+//! Query and update delivery are the most nuanced paths here. Queries use a
+//! two-path dispatch (direct broker dispatch for idle runs, barrier-buffered
+//! attachment for active runs) to guarantee consistency without unnecessary
+//! WFT round-trips. Updates flow through the `UpdateRegistry` and are
+//! surfaced to workers as `ProtocolMessage` entries on the poll response.
+
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow};
@@ -69,13 +84,19 @@ pub struct WorkflowMutationOutcome {
 
 #[async_trait]
 pub trait WorkflowRuntimeApi: Send + Sync + 'static {
+    /// Start a workflow and return mutation metadata for callers that only
+    /// care about the committed transition, not conflict-policy nuance.
     async fn start_workflow(&self, req: StartRequest) -> Result<WorkflowMutationOutcome>;
 
+    /// Start a workflow while preserving richer conflict/reuse results needed
+    /// by edge APIs such as `SignalWithStartWorkflowExecution`.
     async fn start_workflow_with_policy(
         &self,
         req: StartRequest,
     ) -> Result<StartWorkflowResult>;
 
+    /// Start a new execution or signal an existing one according to the
+    /// workflow-id conflict policy carried in the request.
     async fn signal_with_start_workflow(
         &self,
         req: SignalWithStartRequest,
@@ -460,6 +481,14 @@ impl WorkflowService {
         }
     }
 
+    /// Attach buffered queries whose consistency barrier has been met.
+    ///
+    /// Queries in the `BufferedQueryRegistry` each carry a `required_barrier`
+    /// (the `last_event_id` the caller must observe). We only drain queries
+    /// whose barrier is at or below `observable_barrier` — this guarantees
+    /// the worker will evaluate the query against state that includes the
+    /// write the caller was waiting on. Queries whose barrier is still ahead
+    /// stay buffered until the next WFT completion advances the watermark.
     async fn attach_buffered_queries(
         &self,
         run_key: RunKey,
@@ -485,6 +514,15 @@ impl WorkflowService {
         }
     }
 
+    /// Dispatch barrier-satisfied queries directly through the broker for
+    /// runs that are currently quiescent (no pending WFT).
+    ///
+    /// When a run has no in-flight workflow task, there is no poll response
+    /// to piggyback queries onto. Instead we publish each query as a
+    /// standalone `QueryTask` through the broker, which will route it to a
+    /// poller (preferring the sticky worker if the affinity hasn't expired).
+    /// This avoids the query sitting in the buffer indefinitely when no
+    /// further mutations are expected.
     async fn dispatch_queries_direct(
         &self,
         run_key: RunKey,
@@ -517,6 +555,15 @@ impl WorkflowService {
         }
     }
 
+    /// Build a synthetic query-only WFT for eager return.
+    ///
+    /// When the SDK requests `return_new_workflow_task` and there are
+    /// buffered queries ready, we construct a WFT with an empty history
+    /// and `started_event_id = 0`. The zero started-event-id signals to
+    /// the SDK that this is a query-only evaluation against the current
+    /// cached state (sticky evaluation) — no replay is needed. This
+    /// eliminates an extra poll round-trip for the common case where a
+    /// query arrives just after a WFT completion.
     async fn build_eager_query_workflow_task(
         &self,
         state: &tokeira_kernel::WorkflowState,
@@ -677,6 +724,24 @@ impl WorkflowService {
         Ok(from_internal::signal_response(outcome))
     }
 
+    /// Poll for a workflow task, attaching buffered queries and pending
+    /// update messages to the response.
+    ///
+    /// After the runtime returns a started WFT, we do two things before
+    /// handing the response to the caller:
+    ///
+    /// 1. **Barrier-gated query attachment** — drain queries from the
+    ///    `BufferedQueryRegistry` whose `required_barrier` is satisfied by
+    ///    the history included in this response. These come from the
+    ///    buffered registry (not the broker) because they need consistency
+    ///    guarantees that the broker's fire-and-forget dispatch cannot
+    ///    provide.
+    ///
+    /// 2. **Update message construction** — for each pending update
+    ///    transport, we build a `ProtocolMessage` with the update request
+    ///    body and a `sequencing_event_id` set to `started_event_id - 1`.
+    ///    The SDK uses this to determine where in the history replay the
+    ///    update should be processed.
     pub async fn poll_workflow_task_queue(
         &self,
         headers: &HeaderMap,
@@ -790,6 +855,27 @@ impl WorkflowService {
         }
     }
 
+    /// Process a WFT completion from the SDK.
+    ///
+    /// Three non-obvious things happen here:
+    ///
+    /// 1. **ProtocolMessage command resolution** — the translate layer has
+    ///    already decoded `ProtocolMessage` commands from the `messages`
+    ///    field. For `Accepted` bodies we fill in `update_name`/`input`
+    ///    from the `UpdateRegistry` (the SDK doesn't echo these back). For
+    ///    `Completed`/`Rejected` bodies we notify the registry so the
+    ///    original `UpdateWorkflowExecution` caller gets unblocked.
+    ///
+    /// 2. **Query-only short-circuit** — if the task token has
+    ///    `logical_seq = 0` (a synthetic query-only WFT) and there are no
+    ///    commands, we return immediately without touching the runtime.
+    ///
+    /// 3. **Post-completion quiescence check** — after committing the
+    ///    completion, if the run is still open, has buffered queries, and
+    ///    is now quiescent (no pending WFT), we either build an eager
+    ///    inline WFT (if the SDK requested `return_new_workflow_task`) or
+    ///    dispatch queries directly through the broker. This avoids
+    ///    queries sitting in the buffer until the next unrelated mutation.
     pub async fn respond_workflow_task_completed(
         &self,
         headers: &HeaderMap,
@@ -1597,6 +1683,15 @@ impl WorkflowService {
         Ok(from_internal::cancel_response(outcome))
     }
 
+    /// Execute a synchronous query against a workflow.
+    ///
+    /// This delegates to the runtime's `query_workflow`, which internally
+    /// uses a two-path dispatch: if the run is idle (quiescent), the query
+    /// is sent directly through the broker to a poller; if the run has an
+    /// active WFT, the query is buffered behind a consistency barrier and
+    /// attached to the next poll response. The edge layer doesn't need to
+    /// know which path was taken — the runtime handles the routing and
+    /// returns the result through the same `QueryResult` channel.
     pub async fn query_workflow(
         &self,
         headers: &HeaderMap,
@@ -1633,6 +1728,15 @@ impl WorkflowService {
         Ok(from_internal::query_response(result))
     }
 
+    /// Submit a workflow update and optionally wait for its outcome.
+    ///
+    /// The `wait_policy` controls how long the caller blocks: `Accepted`
+    /// returns as soon as the update is accepted by the workflow (the
+    /// validator ran), while `Completed` waits for the update handler to
+    /// finish. These map from the proto `lifecycle_stage` enum (stage 3 =
+    /// Completed, anything else = Accepted). The runtime manages the
+    /// wait-for-completion channel internally; the edge just translates
+    /// the policy and forwards the outcome.
     pub async fn update_workflow_execution(
         &self,
         headers: &HeaderMap,

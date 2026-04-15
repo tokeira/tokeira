@@ -1,3 +1,11 @@
+//! Edge-local history wait primitives used by history long-poll APIs.
+//!
+//! History long-poll is a transport concern: callers want to block until a run
+//! advances beyond the last event they have observed. The runtime should not
+//! know about individual gRPC waiters, so the edge keeps a lightweight
+//! notification registry keyed by `RunKey` and updates it from committed
+//! history-appending transitions.
+
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;

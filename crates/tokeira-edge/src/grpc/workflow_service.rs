@@ -1,3 +1,11 @@
+//! gRPC transport adapter for the Temporal `WorkflowService` API.
+//!
+//! This module is a thin tonic shim: it deserialises proto requests into
+//! edge-layer DTOs, delegates to [`WorkflowService`], and serialises the
+//! response back to proto. No business logic lives here — the translate
+//! layer owns field mapping and the edge `WorkflowService` owns
+//! orchestration.
+
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
@@ -13,6 +21,11 @@ use crate::{
     workflow_service::WorkflowService,
 };
 
+/// Tonic service implementation that bridges proto ↔ edge DTOs.
+///
+/// Each handler follows the same pattern: extract headers, translate the
+/// request, delegate to `WorkflowService`, translate the response. Keeping
+/// this layer mechanical makes it easy to audit proto field coverage.
 #[derive(Clone)]
 pub struct WorkflowServiceGrpc {
     inner: WorkflowService,

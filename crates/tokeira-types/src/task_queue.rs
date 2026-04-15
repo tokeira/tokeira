@@ -1,3 +1,11 @@
+//! Task queues as the routing dimension for work dispatch.
+//!
+//! `TaskQueueName` is the logical name workers poll; `WorkerIdentity` is the
+//! self-reported identity of a poller; `BuildId` and `DeploymentId` carry
+//! versioning information for deterministic task routing. Together with
+//! `NamespaceId` and `TaskKind`, these form the composite `QueueKey` that the
+//! broker uses to index its internal dispatch state.
+
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 

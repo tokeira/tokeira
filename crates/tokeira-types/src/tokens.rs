@@ -1,3 +1,10 @@
+//! Opaque fencing tokens that tie a poll response to its completion.
+//!
+//! When the broker dispatches a task it embeds a token containing the run key,
+//! sequence, attempt, and shard epoch. The worker echoes this token back on
+//! completion. The server validates every field to prevent stale completions
+//! caused by retries, failover, or delayed network delivery.
+
 use serde::{Deserialize, Serialize};
 
 use crate::{LogicalTaskSeq, RunKey, ShardEpoch};

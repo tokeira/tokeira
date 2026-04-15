@@ -1,3 +1,14 @@
+//! Projection sink that applies kernel `ProjectionOp`s to the visibility store.
+//!
+//! The sink is the write-side of the CQRS projection plane. It receives
+//! `ProjectionRecord`s (each wrapping one or more `ProjectionOp`s) from the
+//! projection worker, resolves search-attribute schemas, computes rollup
+//! deltas, and persists the results through the [`VisibilityStore`] trait.
+//!
+//! Rollup deltas are computed by [`compute_rollup_deltas`] so that aggregate
+//! counts (by status, workflow type, task queue) stay consistent without
+//! full-table scans.
+
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use tokeira_kernel::ProjectionOp;

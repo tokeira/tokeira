@@ -1,3 +1,10 @@
+//! Opaque data envelope for all user-facing values (inputs, results, memo entries).
+//!
+//! The server never inspects payload contents — encoding and decoding are the
+//! SDK's responsibility. This keeps the platform codec-neutral: JSON, Protobuf,
+//! encrypted blobs, or any future format can flow through the system without
+//! changes to the core types.
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};

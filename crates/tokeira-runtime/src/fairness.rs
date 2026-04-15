@@ -1,3 +1,11 @@
+//! Queue fairness algorithm and delivery metrics.
+//!
+//! The fairness controller adjusts per-queue drain shares based on delivery
+//! metrics (latency percentiles, sync-match rate, poll success rate, backlog
+//! age). A periodic control loop evaluates these signals and recomputes budgets
+//! so that no single queue can monopolise the dispatch path while still allowing
+//! hot queues to drain their backlogs.
+
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},

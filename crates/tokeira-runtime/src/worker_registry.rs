@@ -1,3 +1,10 @@
+//! Worker registry tracking active worker versions per task queue.
+//!
+//! When a worker polls, the edge registers its deployment and build identifiers
+//! here. The runtime consults the registry to resolve versioning metadata for
+//! task routing, ensuring that workflow tasks are dispatched to workers running
+//! compatible code.
+
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},

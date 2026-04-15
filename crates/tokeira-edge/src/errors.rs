@@ -1,3 +1,11 @@
+//! Typed error surface for the edge crate.
+//!
+//! Every variant of [`EdgeError`] maps to a specific HTTP/gRPC status code so
+//! that the gRPC translation layer can produce correct status responses without
+//! inspecting error messages. Keeping the classification here (rather than in
+//! the gRPC handlers) means the business-logic layer in `workflow_service`
+//! can return rich, testable errors while the transport layer stays thin.
+
 use http::StatusCode;
 use thiserror::Error;
 

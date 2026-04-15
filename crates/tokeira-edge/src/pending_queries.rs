@@ -1,3 +1,17 @@
+//! Poll-to-completion bridge for in-flight query channels.
+//!
+//! When a query is attached to a WFT (either via the `queries` map on a poll
+//! response or via the legacy `RespondQueryTaskCompleted` path), the edge
+//! needs a place to park the `oneshot::Sender` until the worker responds.
+//! That is this store: keyed by `(task_token, query_id)`, it holds the
+//! sender half so `respond_workflow_task_completed` can route each query
+//! result back to the original caller.
+//!
+//! This is distinct from [`BufferedQueryRegistry`](tokeira_runtime::BufferedQueryRegistry),
+//! which is the run-local barrier store that decides *when* a query is
+//! eligible for delivery. `PendingQueryStore` only tracks queries that have
+//! already been dispatched to a worker and are awaiting a response.
+
 use std::{collections::HashMap, sync::Arc};
 
 use tokeira_runtime::QueryResult;

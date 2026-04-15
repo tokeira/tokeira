@@ -1,3 +1,15 @@
+//! In-memory registry for waiting update callers.
+//!
+//! Updates follow a two-phase lifecycle: *admitted* (the kernel records the
+//! update ID) → *accepted* (the worker processes the update and writes an
+//! acceptance event). Callers using `UpdateWaitPolicy::Completed` need to
+//! block until the lane commits the final resolution event. This registry
+//! holds the oneshot senders that bridge the gap between the API call and
+//! the lane's eventual `notify` — it is purely in-memory because the
+//! caller's connection lifetime, not durable state, determines how long
+//! the entry lives. When a run closes, `drain_for_run` sends `RunClosed`
+//! to all waiting callers so they don't hang indefinitely.
+
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},

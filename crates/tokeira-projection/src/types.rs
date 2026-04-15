@@ -1,3 +1,11 @@
+//! Visibility data model for the projection plane.
+//!
+//! `ExecutionRow` is the materialised view of one workflow run, indexed for
+//! list and count queries. `FilterExpr` is the compiled representation of a
+//! user-supplied visibility query, and `SearchAttrType` defines the typed
+//! dimensions that custom search attributes can occupy. Together these types
+//! form the contract between the projection sink and the query path.
+
 use anyhow::{Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};

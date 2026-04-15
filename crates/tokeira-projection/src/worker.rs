@@ -1,3 +1,10 @@
+//! Projection-log worker driving one `(partition_id, fanout)` substream.
+//!
+//! The worker owns checkpointing and replay: sinks apply records, but they do
+//! not decide where to resume after failure. Keeping recovery responsibility
+//! here ensures consistent at-least-once delivery semantics across all sink
+//! implementations, whether in-memory or backed by a durable store.
+
 use anyhow::Result;
 use tokeira_storage::ProjectionLog;
 use tokeira_types::ProjectionCursor;
@@ -22,6 +29,8 @@ where
     L: ProjectionLog,
     S: ProjectionSink,
 {
+    /// Apply at most one batch from `cursor` and return the next cursor to
+    /// resume from.
     pub async fn run_once(&self, cursor: ProjectionCursor) -> Result<ProjectionCursor> {
         let batch = self.log.read_from(&cursor, self.batch_size).await?;
         if batch.records.is_empty() {
@@ -54,6 +63,8 @@ where
     L: ProjectionLog,
     S: ProjectionSink + VisibilityStore,
 {
+    /// Run continuously from the stored checkpoint (if any), persisting
+    /// progress after each successfully applied batch.
     pub async fn run_from_cursor(
         &self,
         sink_id: &str,

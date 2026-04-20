@@ -154,7 +154,7 @@ The kernel stays pure. Schedule evaluation and execution are edge/runtime-layer 
 2. WHEN the engine triggers a workflow start and `SchedulePolicies.keep_original_workflow_id` is true, THE engine SHALL use the workflow ID from the action definition without modification.
 3. THE timestamp suffix format SHALL be deterministic and based on the nominal schedule time (not wall clock), ensuring idempotent retries produce the same workflow ID.
 
-### Requirement 9: Pause-on-Failure Behavior
+### Requirement 9: Pause-on-Failure and Workflow Completion Observation
 
 **User Story:** As a Temporal operator, I want schedules to automatically pause when a triggered workflow fails, so that I can investigate failures before more actions are triggered.
 
@@ -162,6 +162,9 @@ The kernel stays pure. Schedule evaluation and execution are edge/runtime-layer 
 
 1. WHEN `SchedulePolicies.pause_on_failure` is true and a schedule-triggered workflow reaches a terminal failed state (after all retries are exhausted), THE engine SHALL set `ScheduleState.paused` to true and update `ScheduleState.notes` with a message indicating the failure.
 2. WHEN `SchedulePolicies.pause_on_failure` is false, THE engine SHALL NOT pause the schedule regardless of workflow outcomes.
+3. THE ScheduleExecutionEngine SHALL periodically reconcile `ScheduleInfo.running_workflows` by querying the runtime for workflow execution status, removing entries that have reached a terminal state (completed, failed, terminated, cancelled, timed out).
+4. WHEN a running workflow reaches a terminal state, THE engine SHALL update `ScheduleInfo.running_workflows` to remove it, and drain any buffered actions that were waiting for the workflow to complete.
+5. THE reconciliation interval SHALL be configurable (default: same as tick interval) and SHALL NOT block the main evaluation loop.
 
 ---
 
@@ -178,7 +181,7 @@ The kernel stays pure. Schedule evaluation and execution are edge/runtime-layer 
 3. WHEN the `patch_schedule` endpoint is called with `pause` set to a non-empty string, THE handler SHALL set `ScheduleState.paused` to true and `ScheduleState.notes` to the provided string.
 4. WHEN the `patch_schedule` endpoint is called with `unpause` set to a non-empty string, THE handler SHALL set `ScheduleState.paused` to false and `ScheduleState.notes` to the provided string.
 5. WHEN the schedule does not exist, THE handler SHALL return `NOT_FOUND`.
-6. WHEN `trigger_immediately` or `backfill_request` actions are triggered, THE handler SHALL record them in `ScheduleInfo.recent_actions` and increment `ScheduleInfo.action_count`.
+6. WHEN `trigger_immediately` or `backfill_request` actions result in a workflow start being attempted (not buffered), THE handler SHALL record the result in `ScheduleInfo.recent_actions` and increment `ScheduleInfo.action_count`. Actions that are buffered due to overlap policy SHALL NOT be recorded until they are actually executed.
 7. WHEN `limited_actions` is true, triggered-immediately and backfill actions SHALL NOT decrement `remaining_actions` (only scheduled actions count against the limit).
 
 ### Requirement 11: list_schedules Handler
@@ -225,10 +228,12 @@ The kernel stays pure. Schedule evaluation and execution are edge/runtime-layer 
 
 #### Acceptance Criteria
 
-1. WHEN the ScheduleExecutionEngine triggers a workflow start, THE engine SHALL construct a `StartWorkflowExecutionRequest` from the `ScheduleAction.start_workflow` configuration and submit it through the same internal path used by the gRPC `start_workflow_execution` handler.
-2. THE engine SHALL record the result (workflow execution info) in `ScheduleInfo.recent_actions` as a `ScheduleActionResult`.
+1. WHEN the ScheduleExecutionEngine triggers a workflow start, THE engine SHALL construct a `StartRequest` from the `ScheduleAction.start_workflow` configuration and submit it through `TokeiraRuntime::start_workflow_with_policy()`, which is the same runtime entry point used by the edge gRPC handler after translation. This ensures ID-conflict/reuse policy handling matches SDK-initiated starts.
+2. THE engine SHALL record the result (workflow execution info) in `ScheduleInfo.recent_actions` as a `ScheduleActionResult`, including the `start_workflow_status` field reflecting the outcome.
 3. THE engine SHALL add the started workflow to `ScheduleInfo.running_workflows`.
-4. WHEN a schedule-triggered start fails (e.g., due to workflow ID conflict with `REJECT_DUPLICATE` policy), THE engine SHALL record the failure and continue evaluating the schedule for future actions.
+4. WHEN a schedule-triggered start fails (e.g., due to workflow ID conflict with `REJECT_DUPLICATE` policy), THE engine SHALL record the failure in `ScheduleInfo.recent_actions` with the appropriate status and continue evaluating the schedule for future actions.
+
+> **NOTE:** The execution engine lives in `tokeira-runtime` and calls `TokeiraRuntime::start_workflow_with_policy()` directly. It does NOT call through the edge gRPC handler (which would create a crate cycle). Versioning rule evaluation (assignment rules) is performed by the engine before calling `start_workflow_with_policy()` using the same `VersioningRuleStore::evaluate_assignment()` function that the edge layer uses. This ensures schedule-triggered starts get the same versioning behavior without requiring the edge crate. Schedules do not support pinned versioning overrides — schedule actions always use assignment rule evaluation (equivalent to `AutoUpgrade` behavior).
 
 ### Requirement 15: Proto Translation for Schedule Types
 
@@ -237,7 +242,7 @@ The kernel stays pure. Schedule evaluation and execution are edge/runtime-layer 
 #### Acceptance Criteria
 
 1. THE Edge_Layer SHALL provide translation functions between proto `Schedule`, `ScheduleSpec`, `ScheduleAction`, `SchedulePolicies`, `ScheduleState`, `ScheduleInfo`, `SchedulePatch`, `ScheduleListEntry`, and their internal domain representations.
-2. THE translation functions SHALL preserve all proto fields without silent data loss.
+2. THE translation functions SHALL preserve all proto fields that have corresponding internal domain fields. The following fields are intentionally not round-tripped and are documented as lossy: `ScheduleSpec.timezone_data` (dropped on describe/list per proto documentation), original `CalendarSpec`/`cron_string` (compiled to `StructuredCalendarSpec` on ingest), and `NewWorkflowExecutionInfo` fields not modeled internally (headers, user_metadata — documented as unsupported in UNSUPPORTED_FIELDS.md). `NewWorkflowExecutionInfo.versioning_override` is intentionally not supported: schedules always use assignment rule evaluation (equivalent to `AutoUpgrade`); pinned versioning overrides on schedule actions are rejected with `INVALID_ARGUMENT`.
 3. WHEN a proto field contains an invalid value (e.g., negative interval duration), THE translation function SHALL return a descriptive error rather than silently defaulting.
 4. THE translation functions SHALL handle `CalendarSpec` and `cron_string` compilation into `StructuredCalendarSpec` on the create/update path.
 5. THE translation functions SHALL handle `ScheduleListInfo` construction from full schedule data for the list endpoint (dropping `timezone_data` from the spec copy per proto documentation).

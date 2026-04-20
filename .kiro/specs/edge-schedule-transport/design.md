@@ -29,7 +29,7 @@ graph TD
         SEE["ScheduleExecutionEngine<br/>(background task)"]
         SEE -->|read schedules| SS
         SEE -->|compute due times| MTC
-        SEE -->|start workflows| RT["TokeiraRuntime::start_workflow()"]
+        SEE -->|start workflows| RT["TokeiraRuntime::start_workflow_with_policy()"]
         SEE -->|cancel/terminate| RT
     end
 
@@ -57,6 +57,10 @@ graph TD
 7. **`cron_schedule` field threading** — The kernel's `StartRequest` does not currently have a `cron_schedule` field. We add an optional `cron_schedule: Option<String>` field to `StartRequest`. The execution engine sets it to the schedule ID. The history serializer emits it on `WorkflowExecutionStartedEventAttributes`.
 
 8. **Shared ownership** — `Arc<ScheduleStore>` shared between `WorkflowService` (CRUD handlers) and `ScheduleExecutionEngine` (background evaluation). The engine holds a reference to `TokeiraRuntime` for starting/cancelling/terminating workflows.
+
+9. **Engine calls `TokeiraRuntime::start_workflow_with_policy()` directly (not edge handler)** — The execution engine lives in `tokeira-runtime` and cannot call through the edge gRPC handler (that would create a crate cycle). Instead, it calls `TokeiraRuntime::start_workflow_with_policy()` directly — the same runtime entry point the edge handler calls after translation. This ensures ID-conflict/reuse policy handling matches SDK-initiated starts. For versioning, the engine calls `VersioningRuleStore::evaluate_assignment()` before constructing the `StartRequest`, replicating the same logic the edge layer performs. This avoids the crate cycle while preserving versioning and conflict-policy behavior.
+
+10. **Workflow completion observation via reconciliation** — The engine periodically reconciles `running_workflows` by querying `TokeiraRuntime` for workflow execution status. Completed/failed/terminated/cancelled/timed-out workflows are removed from `running_workflows`, buffered actions are drained, and `pause_on_failure` is evaluated. This is a polling approach (same tick interval) — event-driven completion callbacks are deferred to a future optimization.
 
 ## Components and Interfaces
 
@@ -197,6 +201,7 @@ pub struct ScheduleInfo {
     pub overlap_skipped: i64,
     pub buffer_dropped: i64,
     pub buffer_size: i64,
+    pub buffered_actions: Vec<BufferedAction>,
     pub running_workflows: Vec<WorkflowExecution>,
     pub recent_actions: Vec<ScheduleActionResult>,
     pub future_action_times: Vec<OffsetDateTime>,
@@ -204,10 +209,18 @@ pub struct ScheduleInfo {
     pub update_time: Option<OffsetDateTime>,
 }
 
+/// A buffered action waiting to be executed after running workflows complete.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BufferedAction {
+    pub nominal_time: OffsetDateTime,
+    pub overlap_policy_override: Option<OverlapPolicy>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkflowExecution {
     pub workflow_id: String,
     pub run_id: String,
+    pub run_key: RunKey,  // needed for reconciliation queries and cancel/terminate
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -215,6 +228,20 @@ pub struct ScheduleActionResult {
     pub schedule_time: OffsetDateTime,
     pub actual_time: OffsetDateTime,
     pub start_workflow_result: Option<WorkflowExecution>,
+    pub start_workflow_status: WorkflowExecutionStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Copy)]
+pub enum WorkflowExecutionStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    Terminated,
+    ContinuedAsNew,
+    TimedOut,
+    /// The start request itself failed (e.g., workflow ID conflict).
+    StartFailed,
 }
 ```
 
@@ -300,6 +327,8 @@ impl Default for ScheduleEngineConfig {
 }
 
 /// Background loop that evaluates schedules and triggers actions.
+/// Calls `TokeiraRuntime::start_workflow_with_policy()` directly (not the edge handler)
+/// to avoid a crate cycle. Performs versioning rule evaluation inline.
 pub async fn run_schedule_engine<R>(
     store: Arc<ScheduleStore>,
     runtime: Arc<TokeiraRuntime<R>>,
@@ -315,10 +344,21 @@ pub async fn run_schedule_engine<R>(
             _ = tokio::time::sleep(config.tick_interval) => {}
         }
         let now = OffsetDateTime::now_utc();
+        // 1. Reconcile running workflows — remove completed, drain buffers
+        reconcile_running_workflows(&store, &runtime).await;
+        // 2. Evaluate due actions for all active schedules
         evaluate_all_schedules(&store, &runtime, last_tick, now).await;
         last_tick = now;
     }
 }
+
+/// Reconcile running_workflows by querying runtime for terminal status.
+/// Drains buffered_actions when running workflows complete.
+/// Evaluates pause_on_failure when a workflow fails.
+async fn reconcile_running_workflows<R>(
+    store: &ScheduleStore,
+    runtime: &TokeiraRuntime<R>,
+) where R: RunRepository + 'static { ... }
 ```
 
 ### Proto Translation
@@ -336,6 +376,13 @@ New functions in `crates/tokeira-edge/src/translate/schedule.rs`:
 | `schedule_spec_to_domain()` | proto → domain | Convert `ScheduleSpec` proto to internal |
 | `schedule_spec_to_proto()` | domain → proto | Convert internal spec to proto |
 | `compile_calendar_spec()` | proto → domain | Compile `CalendarSpec`/`cron_string` to `StructuredCalendarSpec` |
+
+**Intentionally lossy fields (documented in UNSUPPORTED_FIELDS.md):**
+- `ScheduleSpec.timezone_data` — dropped on describe/list per proto documentation
+- `CalendarSpec` / `cron_string` — compiled to `StructuredCalendarSpec` on ingest; originals not stored
+- `NewWorkflowExecutionInfo.header` — not modeled internally
+- `NewWorkflowExecutionInfo.user_metadata` — not modeled internally
+- `NewWorkflowExecutionInfo.versioning_override` — not supported; schedules always use assignment rule evaluation (equivalent to `AutoUpgrade`). If a schedule action carries a pinned override, `create_schedule` / `update_schedule` SHALL reject with `INVALID_ARGUMENT`.
 
 ### Integration: cron_schedule Field
 
@@ -452,7 +499,7 @@ Initial value on creation: `1_u64.to_be_bytes()`. Incremented by 1 on each mutat
 
 ### Property 9: Proto translation round-trip
 
-*For any* valid internal `ScheduleSpec`, converting to proto and back SHALL produce an equivalent value. *For any* valid internal `ScheduleAction`, `SchedulePolicies`, `ScheduleState`, and `ScheduleInfo`, the round-trip SHALL preserve all fields.
+*For any* valid internal `ScheduleSpec`, converting to proto and back SHALL produce an equivalent value (excluding intentionally lossy fields: `timezone_data`, original `cron_string`/`CalendarSpec` text). *For any* valid internal `ScheduleAction`, `SchedulePolicies`, `ScheduleState`, and `ScheduleInfo`, the round-trip SHALL preserve all modeled fields.
 
 **Validates: Requirements 15.1, 15.2**
 

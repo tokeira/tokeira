@@ -140,6 +140,7 @@
   - Set `original_execution_run_id` from predecessor state
   - Set `continued_failure` from `new_state.close_failure`
   - Set `last_completion_result` from `new_state.close_result`
+  - Set `retry_policy` from the CAN event's `retry_policy` field (command override with state fallback — the kernel already resolved this when emitting the event)
   - Set parent fields to `None`/0
   - File: `crates/tokeira-runtime/src/lane.rs`
 

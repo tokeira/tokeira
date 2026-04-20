@@ -37,8 +37,9 @@ The work is organized into seven components:
 │  ─ Populates parent_workflow_execution, parent_namespace,        │
 │    parent_initiated_event_id, original_execution_run_id,         │
 │    continued_failure, last_completion_result on Started proto     │
-│  ─ Populates retry_policy, initiator,                            │
+│  ─ Populates initiator,                                          │
 │    failure, last_completion_result on ContinuedAsNew proto       │
+│    (retry_policy is NOT serialized — proto has no such field)    │
 │  ─ Populates control on signal/cancel-external initiated protos  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -268,7 +269,7 @@ let start_request = StartRequest {
 
 **Continue-as-new successor (`lane.rs`):**
 
-The lane already reads the `WorkflowExecutionContinuedAsNew` event to extract successor parameters. Extend this to also read from `new_state` (the predecessor's final `WorkflowState`):
+The lane already reads the `WorkflowExecutionContinuedAsNew` event to extract successor parameters. Extend this to also read from `new_state` (the predecessor's final `WorkflowState`) and the event's `retry_policy`:
 
 ```rust
 let start_request = StartRequest {
@@ -278,6 +279,7 @@ let start_request = StartRequest {
     ),
     continued_failure: new_state.close_failure.clone(),
     last_completion_result: new_state.close_result.clone().map(|r| r),
+    retry_policy: can_event.retry_policy.clone(),  // from CAN event (command override resolved by kernel)
     parent_run_key: None,
     parent_workflow_id: None,
     parent_run_id: None,
@@ -289,7 +291,7 @@ let start_request = StartRequest {
 
 Note: `close_failure` is `Option<Payload>` and `close_result` is `Option<Payloads>` on `WorkflowState`. For continue-as-new, the predecessor's `close_failure` is set if the run failed (retry-initiated CAN). For workflow-initiated CAN, `close_failure` is `None` and `close_result` is `None` (the run didn't complete — it continued).
 
-For `last_completion_result` to work correctly across chains, the `WorkflowState` needs to track the last completion result from the chain. This is populated from the `StartRequest.last_completion_result` (propagated from the predecessor) and updated when the current run completes successfully. However, for the initial implementation, we only need to propagate `close_result` from the immediate predecessor — the SDK handles chain tracking.
+The `retry_policy` on the CAN event is the resolved policy: if the CAN command carried an explicit override, the kernel uses that; otherwise it falls back to `builder.state.retry_policy`. The lane reads it from the event and passes it to the successor's `StartRequest`, ensuring the successor inherits the correct policy regardless of whether it was explicitly overridden.
 
 **Edge inbound translation (`grpc/translate.rs`):**
 
@@ -358,7 +360,7 @@ HistoryEventKind::WorkflowExecutionContinuedAsNew {
     workflow_execution_timeout: _,  // proto doesn't have this field; kernel carries it for runtime use only
     workflow_run_timeout,
     workflow_task_timeout,
-    retry_policy,
+    retry_policy: _,  // proto doesn't have this field; kernel carries it for runtime successor creation only
     initiator,
     failure,
     last_completion_result,
@@ -374,10 +376,7 @@ HistoryEventKind::WorkflowExecutionContinuedAsNew {
         search_attributes: Some(search_attributes_from_domain(search_attributes)),
         workflow_run_timeout: to_opt_proto_duration(*workflow_run_timeout),
         workflow_task_timeout: Some(to_proto_duration(*workflow_task_timeout)),
-        // Previously ignored fields now populated:
-        // Note: proto comment says workflow_execution_timeout is omitted,
-        // but we populate it for completeness since the kernel carries it.
-        retry_policy: retry_policy.as_ref().map(retry_policy_to_proto),
+        // retry_policy: NOT serialized — upstream proto has no retry_policy field on CAN attributes
         initiator: continue_as_new_initiator_i32(initiator),
         failure: failure.as_ref().map(payload_to_failure),
         last_completion_result: last_completion_result.as_ref()
@@ -387,7 +386,7 @@ HistoryEventKind::WorkflowExecutionContinuedAsNew {
 ),
 ```
 
-Note: The upstream proto comment says `workflow_execution_timeout` is "omitted as it shouldn't be overridden from within a workflow." The proto struct doesn't have a `workflow_execution_timeout` field. So we don't serialize it — the kernel carries it for internal use only. The `_` wildcard is correct for this field.
+Note: The upstream proto `WorkflowExecutionContinuedAsNewEventAttributes` does NOT have `workflow_execution_timeout` or `retry_policy` fields. The kernel carries both internally for the runtime to use when creating the successor run's `StartRequest`. The history serializer correctly ignores them with wildcard `_` patterns.
 
 **Signal-external initiated arm:**
 

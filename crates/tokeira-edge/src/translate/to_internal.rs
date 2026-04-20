@@ -97,6 +97,7 @@ pub fn start_request(
             received_at: now,
         },
         now,
+        cron_schedule: None,
     }
 }
 

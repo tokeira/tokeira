@@ -195,6 +195,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             original_execution_run_id,
             continued_failure,
             last_completion_result,
+            cron_schedule,
         } => Attributes::WorkflowExecutionStartedEventAttributes(
             history::WorkflowExecutionStartedEventAttributes {
                 workflow_type: Some(proto_common::WorkflowType {
@@ -221,6 +222,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                     .map(payloads_from_domain),
                 original_execution_run_id: opt_run_id(original_execution_run_id),
                 first_execution_run_id: opt_run_id(first_execution_run_id),
+                cron_schedule: cron_schedule.clone().unwrap_or_default(),
                 retry_policy: retry_policy.as_ref().map(retry_policy_to_proto),
                 attempt: *attempt as i32,
                 workflow_execution_timeout: to_opt_proto_duration(
@@ -1210,6 +1212,7 @@ mod tests {
                             original_execution_run_id: None,
                             continued_failure: None,
                             last_completion_result: None,
+                            cron_schedule: None,
                         }
                     }
                 ),
@@ -1487,6 +1490,7 @@ mod tests {
                 original_execution_run_id: None,
                 continued_failure: None,
                 last_completion_result: None,
+                cron_schedule: None,
             },
         };
         let proto = history_event_to_proto(&event);
@@ -1500,6 +1504,82 @@ mod tests {
                 assert_eq!(attrs.workflow_type.unwrap().name, "MyWorkflow");
                 let timeout = attrs.workflow_task_timeout.unwrap();
                 assert_eq!(timeout.seconds, 10);
+            }
+            other => panic!("unexpected attributes: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cron_schedule_field_set() {
+        let event = HistoryEvent {
+            event_id: 1,
+            happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
+            kind: HistoryEventKind::WorkflowExecutionStarted {
+                workflow_type: WorkflowType("ScheduledWorkflow".to_string()),
+                task_queue: TaskQueueName("default".to_string()),
+                input: Payloads::default(),
+                memo: Memo::default(),
+                search_attributes: SearchAttributes::default(),
+                request_id: "req-1".to_string(),
+                continued_execution_run_id: None,
+                first_execution_run_id: None,
+                retry_policy: None,
+                attempt: 1,
+                workflow_execution_timeout: None,
+                workflow_run_timeout: None,
+                workflow_task_timeout: time::Duration::seconds(10),
+                parent_workflow_id: None,
+                parent_run_id: None,
+                parent_namespace_id: None,
+                parent_initiated_event_id: 0,
+                original_execution_run_id: None,
+                continued_failure: None,
+                last_completion_result: None,
+                cron_schedule: Some("schedule-a".to_string()),
+            },
+        };
+
+        match history_event_to_proto(&event).attributes.unwrap() {
+            Attributes::WorkflowExecutionStartedEventAttributes(attrs) => {
+                assert_eq!(attrs.cron_schedule, "schedule-a");
+            }
+            other => panic!("unexpected attributes: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_schedule_start_empty_cron() {
+        let event = HistoryEvent {
+            event_id: 1,
+            happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
+            kind: HistoryEventKind::WorkflowExecutionStarted {
+                workflow_type: WorkflowType("NormalWorkflow".to_string()),
+                task_queue: TaskQueueName("default".to_string()),
+                input: Payloads::default(),
+                memo: Memo::default(),
+                search_attributes: SearchAttributes::default(),
+                request_id: "req-1".to_string(),
+                continued_execution_run_id: None,
+                first_execution_run_id: None,
+                retry_policy: None,
+                attempt: 1,
+                workflow_execution_timeout: None,
+                workflow_run_timeout: None,
+                workflow_task_timeout: time::Duration::seconds(10),
+                parent_workflow_id: None,
+                parent_run_id: None,
+                parent_namespace_id: None,
+                parent_initiated_event_id: 0,
+                original_execution_run_id: None,
+                continued_failure: None,
+                last_completion_result: None,
+                cron_schedule: None,
+            },
+        };
+
+        match history_event_to_proto(&event).attributes.unwrap() {
+            Attributes::WorkflowExecutionStartedEventAttributes(attrs) => {
+                assert!(attrs.cron_schedule.is_empty());
             }
             other => panic!("unexpected attributes: {other:?}"),
         }
@@ -2050,6 +2130,7 @@ mod tests {
                 original_execution_run_id,
                 continued_failure,
                 last_completion_result,
+                cron_schedule: None,
             },
         }
     }

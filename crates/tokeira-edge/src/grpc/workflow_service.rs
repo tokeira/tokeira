@@ -15,8 +15,8 @@ use tokeira_proto::workflowservice::{
     workflow_service_server::WorkflowServiceServer,
 };
 use tokeira_runtime::{
-    BuildIdReachabilityResult, TaskQueueReachability, VersioningError,
-    compute_reachability,
+    BuildIdReachabilityResult, ScheduleError, TaskQueueReachability, VersioningError,
+    compute_matching_times, compute_next_times, compute_reachability,
 };
 use tokeira_types::{BuildId, TaskQueueName, WorkerIdentity};
 
@@ -24,6 +24,7 @@ use crate::{
     grpc::{
         errors::proto_conversion_status, metadata::metadata_to_header_map, translate,
     },
+    translate::{schedule, to_internal},
     workflow_service::WorkflowService,
 };
 
@@ -64,6 +65,23 @@ fn versioning_error_status(error: VersioningError) -> Status {
             Status::failed_precondition(error.to_string())
         }
     }
+}
+
+fn schedule_error_status(error: ScheduleError) -> Status {
+    match error {
+        ScheduleError::AlreadyExists => Status::already_exists(error.to_string()),
+        ScheduleError::NotFound => Status::not_found(error.to_string()),
+        ScheduleError::StaleConflictToken => {
+            Status::failed_precondition(error.to_string())
+        }
+        ScheduleError::InvalidArgument(message) => Status::invalid_argument(message),
+    }
+}
+
+fn proto_timestamp_to_time(value: &prost_types::Timestamp) -> Option<OffsetDateTime> {
+    OffsetDateTime::from_unix_timestamp(value.seconds)
+        .ok()
+        .map(|time| time + time::Duration::nanoseconds(i64::from(value.nanos)))
 }
 
 #[tonic::async_trait]
@@ -633,7 +651,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         self.inner
             .broker()
             .deny_worker(
-                crate::translate::to_internal::namespace_id_for(&req.namespace),
+                crate::to_internal::namespace_id_for(&req.namespace),
                 TaskQueueName(req.sticky_task_queue),
                 WorkerIdentity(req.identity),
             )
@@ -677,46 +695,139 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     }
     async fn create_schedule(
         &self,
-        _request: Request<workflowservice::CreateScheduleRequest>,
+        request: Request<workflowservice::CreateScheduleRequest>,
     ) -> Result<Response<workflowservice::CreateScheduleResponse>, Status> {
-        Err(Status::unimplemented("create_schedule"))
+        let store = self.inner.schedule_store();
+        let (namespace_id, schedule_id, entry, initial_patch) =
+            schedule::create_schedule_request_to_edge(request.into_inner())?;
+        let conflict_token = store.create(entry).map_err(schedule_error_status)?;
+        if let Some(patch) = initial_patch {
+            self.inner
+                .apply_schedule_patch(namespace_id, &schedule_id, patch)
+                .await?;
+        }
+        Ok(Response::new(workflowservice::CreateScheduleResponse {
+            conflict_token,
+        }))
     }
+
     async fn describe_schedule(
         &self,
-        _request: Request<workflowservice::DescribeScheduleRequest>,
+        request: Request<workflowservice::DescribeScheduleRequest>,
     ) -> Result<Response<workflowservice::DescribeScheduleResponse>, Status> {
-        Err(Status::unimplemented("describe_schedule"))
+        let req = request.into_inner();
+        let namespace_id = to_internal::namespace_id_for(&req.namespace);
+        let schedule_id = tokeira_runtime::ScheduleId(req.schedule_id);
+        let store = self.inner.schedule_store();
+        let mut entry = store
+            .describe(namespace_id, &schedule_id)
+            .map_err(schedule_error_status)?;
+        entry.info.future_action_times =
+            compute_next_times(&entry.spec, OffsetDateTime::now_utc(), 10, &schedule_id);
+        Ok(Response::new(
+            schedule::describe_schedule_response_to_proto(&entry),
+        ))
     }
+
     async fn update_schedule(
         &self,
-        _request: Request<workflowservice::UpdateScheduleRequest>,
+        request: Request<workflowservice::UpdateScheduleRequest>,
     ) -> Result<Response<workflowservice::UpdateScheduleResponse>, Status> {
-        Err(Status::unimplemented("update_schedule"))
+        let (namespace_id, schedule_id, token, replacement) =
+            schedule::update_schedule_request_to_edge(request.into_inner())?;
+        let store = self.inner.schedule_store();
+        store
+            .update(namespace_id, &schedule_id, &token, |entry| {
+                entry.spec = replacement.spec;
+                entry.action = replacement.action;
+                entry.policies = replacement.policies;
+                entry.state = replacement.state;
+                entry.search_attributes = replacement.search_attributes;
+                entry.info.update_time = OffsetDateTime::now_utc();
+            })
+            .map_err(schedule_error_status)?;
+        Ok(Response::new(workflowservice::UpdateScheduleResponse {}))
     }
+
     async fn patch_schedule(
         &self,
-        _request: Request<workflowservice::PatchScheduleRequest>,
+        request: Request<workflowservice::PatchScheduleRequest>,
     ) -> Result<Response<workflowservice::PatchScheduleResponse>, Status> {
-        Err(Status::unimplemented("patch_schedule"))
+        let (namespace_id, schedule_id, patch) =
+            schedule::patch_schedule_request_to_edge(request.into_inner())?;
+        self.inner
+            .apply_schedule_patch(namespace_id, &schedule_id, patch)
+            .await?;
+        Ok(Response::new(workflowservice::PatchScheduleResponse {}))
     }
+
     async fn list_schedule_matching_times(
         &self,
-        _request: Request<workflowservice::ListScheduleMatchingTimesRequest>,
+        request: Request<workflowservice::ListScheduleMatchingTimesRequest>,
     ) -> Result<Response<workflowservice::ListScheduleMatchingTimesResponse>, Status>
     {
-        Err(Status::unimplemented("list_schedule_matching_times"))
+        let req = request.into_inner();
+        let namespace_id = to_internal::namespace_id_for(&req.namespace);
+        let schedule_id = tokeira_runtime::ScheduleId(req.schedule_id);
+        let store = self.inner.schedule_store();
+        let entry = store
+            .describe(namespace_id, &schedule_id)
+            .map_err(schedule_error_status)?;
+        let start = req
+            .start_time
+            .as_ref()
+            .and_then(proto_timestamp_to_time)
+            .unwrap_or_else(OffsetDateTime::now_utc);
+        let end = req
+            .end_time
+            .as_ref()
+            .and_then(proto_timestamp_to_time)
+            .unwrap_or(start);
+        let times = compute_matching_times(&entry.spec, start, end, &schedule_id);
+        Ok(Response::new(schedule::matching_times_response_to_proto(
+            times,
+        )))
     }
+
     async fn delete_schedule(
         &self,
-        _request: Request<workflowservice::DeleteScheduleRequest>,
+        request: Request<workflowservice::DeleteScheduleRequest>,
     ) -> Result<Response<workflowservice::DeleteScheduleResponse>, Status> {
-        Err(Status::unimplemented("delete_schedule"))
+        let req = request.into_inner();
+        let namespace_id = to_internal::namespace_id_for(&req.namespace);
+        let schedule_id = tokeira_runtime::ScheduleId(req.schedule_id);
+        self.inner
+            .schedule_store()
+            .delete(namespace_id, &schedule_id)
+            .map_err(schedule_error_status)?;
+        Ok(Response::new(workflowservice::DeleteScheduleResponse {}))
     }
+
     async fn list_schedules(
         &self,
-        _request: Request<workflowservice::ListSchedulesRequest>,
+        request: Request<workflowservice::ListSchedulesRequest>,
     ) -> Result<Response<workflowservice::ListSchedulesResponse>, Status> {
-        Err(Status::unimplemented("list_schedules"))
+        let req = request.into_inner();
+        let namespace_id = to_internal::namespace_id_for(&req.namespace);
+        let page_size = if req.maximum_page_size <= 0 {
+            100
+        } else {
+            req.maximum_page_size as usize
+        };
+        let (mut entries, next_page_token) = self.inner.schedule_store().list(
+            namespace_id,
+            page_size,
+            &req.next_page_token,
+        );
+        let now = OffsetDateTime::now_utc();
+        for entry in &mut entries {
+            entry.info.future_action_times =
+                compute_next_times(&entry.spec, now, 10, &entry.schedule_id);
+        }
+        Ok(Response::new(schedule::list_schedules_response_to_proto(
+            entries,
+            next_page_token,
+        )))
     }
     async fn update_worker_build_id_compatibility(
         &self,
@@ -747,8 +858,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 "namespace and task_queue are required",
             ));
         }
-        let namespace_id =
-            crate::translate::to_internal::namespace_id_for(&req.namespace);
+        let namespace_id = crate::to_internal::namespace_id_for(&req.namespace);
         let task_queue = TaskQueueName(req.task_queue);
         let now = OffsetDateTime::now_utc();
         let parsed = translate::versioning_mutation_from_proto(req.operation, now)
@@ -794,7 +904,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             ));
         }
         let rules = self.inner.versioning_rule_store().get_rules(
-            crate::translate::to_internal::namespace_id_for(&req.namespace),
+            crate::to_internal::namespace_id_for(&req.namespace),
             &TaskQueueName(req.task_queue),
         );
         Ok(Response::new(translate::versioning_rules_to_get_proto(
@@ -810,8 +920,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         if req.namespace.is_empty() {
             return Err(Status::invalid_argument("namespace is required"));
         }
-        let namespace_id =
-            crate::translate::to_internal::namespace_id_for(&req.namespace);
+        let namespace_id = crate::to_internal::namespace_id_for(&req.namespace);
         let store = self.inner.versioning_rule_store();
         let task_queues: Vec<TaskQueueName> = if req.task_queues.is_empty() {
             store
@@ -1075,7 +1184,7 @@ mod tests {
         operator_service::InMemoryOperatorApi,
         poller_registry::PollerRegistry,
         routing::LocalOnlyRouter,
-        translate::to_internal::namespace_id_for,
+        to_internal::namespace_id_for,
         workflow_service::{
             EmptyVisibilityApi, ExecutionResolver, WorkflowMutationOutcome,
             WorkflowRuntimeApi,
@@ -1458,6 +1567,7 @@ mod tests {
                 HistoryWaitRegistry::default(),
                 store.clone(),
                 worker_registry.clone(),
+                Arc::new(tokeira_runtime::ScheduleStore::default()),
             );
         (
             WorkflowServiceGrpc::new(service),
@@ -2237,6 +2347,7 @@ mod tests {
                 received_at: OffsetDateTime::now_utc(),
             },
             now: OffsetDateTime::now_utc(),
+            cron_schedule: None,
         };
 
         let transition = BasicKernel::default()

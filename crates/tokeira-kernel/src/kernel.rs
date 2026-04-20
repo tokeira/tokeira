@@ -323,6 +323,7 @@ impl BasicKernel {
             original_execution_run_id: req.original_execution_run_id.or(Some(req.run_id)),
             continued_failure: req.continued_failure,
             last_completion_result: req.last_completion_result,
+            cron_schedule: req.cron_schedule,
         });
         builder.projection_ops.push(ProjectionOp::UpsertExecution {
             status: ExecutionStatus::Running,
@@ -420,6 +421,7 @@ impl BasicKernel {
             original_execution_run_id: req.original_execution_run_id.or(Some(req.run_id)),
             continued_failure: req.continued_failure,
             last_completion_result: req.last_completion_result,
+            cron_schedule: None,
         });
         builder.emit(HistoryEventKind::WorkflowExecutionSignaled {
             signal_name: req.signal_name,

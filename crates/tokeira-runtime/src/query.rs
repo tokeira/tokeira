@@ -96,6 +96,7 @@ mod tests {
                 received_at: OffsetDateTime::now_utc(),
             },
             now: OffsetDateTime::now_utc(),
+            cron_schedule: None,
         }
     }
 

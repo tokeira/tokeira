@@ -32,8 +32,9 @@ use tokeira_projection::{
     InMemoryVisibilityStore, ProjectionWorker, VisibilityQueryService, VisibilitySink,
 };
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, VersioningRuleStore,
-    WorkflowTimeoutScannerConfig,
+    BacklogConfig, LaneConfig, ScheduleEngineConfig, ScheduleStore, TimerScannerConfig,
+    TokeiraRuntime, VersioningRuleStore, WorkflowTimeoutScannerConfig,
+    run_schedule_engine,
 };
 use tokeira_storage::{InMemoryStore, RunRepository};
 use tokeira_types::{ExecutionRef, NamespaceId, ProjectionCursor, WorkflowId};
@@ -57,6 +58,7 @@ async fn main() -> Result<()> {
     // The runtime owns execution orchestration, scanners, brokers, and all
     // run-local in-memory coordination such as buffered consistent queries.
     let versioning_rule_store = Arc::new(VersioningRuleStore::default());
+    let schedule_store = Arc::new(ScheduleStore::default());
     let runtime = Arc::new(TokeiraRuntime::new_with_versioning(
         repo.clone(),
         4,
@@ -66,6 +68,14 @@ async fn main() -> Result<()> {
         BacklogConfig::default(),
         versioning_rule_store.clone(),
     ));
+    let schedule_engine_cancel = CancellationToken::new();
+    let _schedule_engine = run_schedule_engine(
+        schedule_store.clone(),
+        runtime.clone(),
+        versioning_rule_store.clone(),
+        ScheduleEngineConfig::default(),
+        schedule_engine_cancel,
+    );
 
     let default_namespace = ResolvedNamespace::active("default");
     let default_namespace_id = namespace_id_for("default");
@@ -79,7 +89,7 @@ async fn main() -> Result<()> {
     let workflow_broker = runtime.broker();
     let buffered_queries = runtime.buffered_queries();
     let worker_registry = runtime.worker_registry();
-    let runtime_adapter = Arc::new(RuntimeAdapter::new(runtime));
+    let runtime_adapter = Arc::new(RuntimeAdapter::new(runtime.clone()));
     let resolver = Arc::new(StoreExecutionResolver::new(
         repo.clone(),
         default_namespace_id,
@@ -136,6 +146,7 @@ async fn main() -> Result<()> {
             history_waits,
             versioning_rule_store,
             worker_registry,
+            schedule_store,
         );
     let operator_service = OperatorService::new(operator_api, interceptors);
 

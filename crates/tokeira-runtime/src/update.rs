@@ -1056,6 +1056,7 @@ mod tests {
                 first_run_started_at: None,
                 request: req_ctx(&format!("start-{wf_id}")),
                 now: OffsetDateTime::now_utc(),
+                cron_schedule: None,
             })
             .await
             .unwrap();

@@ -103,6 +103,7 @@ fn make_start_request() -> StartRequest {
         first_run_started_at: Some(now()),
         request: request_context("start-req"),
         now: now(),
+        cron_schedule: None,
     }
 }
 
@@ -256,6 +257,7 @@ fn replay_history_reconstructs_workflow_task_lifecycle() {
                 original_execution_run_id: start.original_execution_run_id,
                 continued_failure: start.continued_failure.clone(),
                 last_completion_result: start.last_completion_result.clone(),
+                cron_schedule: start.cron_schedule.clone(),
             },
         ),
         history_event(
@@ -330,6 +332,7 @@ fn replay_history_reconstructs_activity_and_timer_state() {
                 original_execution_run_id: start.original_execution_run_id,
                 continued_failure: start.continued_failure.clone(),
                 last_completion_result: start.last_completion_result.clone(),
+                cron_schedule: start.cron_schedule.clone(),
             },
         ),
         history_event(
@@ -408,6 +411,7 @@ fn replay_history_reconstructs_historical_execution_options_and_pause() {
                 original_execution_run_id: start.original_execution_run_id,
                 continued_failure: start.continued_failure.clone(),
                 last_completion_result: start.last_completion_result.clone(),
+                cron_schedule: start.cron_schedule.clone(),
             },
         ),
         history_event(

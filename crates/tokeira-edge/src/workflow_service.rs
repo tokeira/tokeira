@@ -25,15 +25,18 @@ use tokeira_kernel::{
     SignalWithStartRequest, StartRequest, TerminateRequest, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    BufferedQueryRegistry, InMemoryBroker, PendingUpdateTransport, QueryResult,
-    ResetWorkflowResult, SignalWithStartResult, StartWorkflowResult, StartedActivityTask,
-    StartedWorkflowTask, UpdateOutcome, UpdateTransportResolution, UpdateWaitPolicy,
-    VersioningRuleStore, WorkerRegistry,
+    BufferedQueryRegistry, InMemoryBroker, OverlapDecision, OverlapPolicy,
+    PendingUpdateTransport, QueryResult, ResetWorkflowResult, ScheduleActionResult,
+    SchedulePatch, ScheduleStore, SignalWithStartResult, StartWorkflowResult,
+    StartedActivityTask, StartedWorkflowTask, UpdateOutcome, UpdateTransportResolution,
+    UpdateWaitPolicy, VersioningRuleStore, WorkerRegistry, WorkflowExecution,
+    WorkflowExecutionStatus, compute_matching_times, decide_overlap,
+    schedule_workflow_id,
 };
 use tokeira_storage::RunRepository;
 use tokeira_types::{
     ActivityTaskToken, ExecutionRef, ExecutionStatus, Payload, Payloads, QueueKey,
-    RequestContext, RunId, RunKey, TaskKind, TaskQueueName, WorkerIdentity,
+    RequestContext, RequestId, RunId, RunKey, TaskKind, TaskQueueName, WorkerIdentity,
 };
 use uuid::Uuid;
 
@@ -81,6 +84,14 @@ pub struct WorkflowMutationOutcome {
     pub was_duplicate: bool,
     pub execution_status: ExecutionStatus,
     pub new_run_id: Option<RunId>,
+}
+
+fn schedule_request_context(now: OffsetDateTime) -> RequestContext {
+    RequestContext {
+        request_id: RequestId(Uuid::new_v4().to_string()),
+        caller_identity: Some("schedule-engine".to_string()),
+        received_at: now,
+    }
 }
 
 #[async_trait]
@@ -344,6 +355,7 @@ pub struct WorkflowService {
     history_waiters: HistoryWaitRegistry,
     versioning_rule_store: Arc<VersioningRuleStore>,
     worker_registry: WorkerRegistry,
+    schedule_store: Arc<ScheduleStore>,
 }
 
 impl std::fmt::Debug for WorkflowService {
@@ -384,6 +396,7 @@ impl WorkflowService {
             HistoryWaitRegistry::default(),
             Arc::new(VersioningRuleStore::default()),
             WorkerRegistry::default(),
+            Arc::new(ScheduleStore::default()),
         )
     }
 
@@ -419,6 +432,7 @@ impl WorkflowService {
             HistoryWaitRegistry::default(),
             Arc::new(VersioningRuleStore::default()),
             WorkerRegistry::default(),
+            Arc::new(ScheduleStore::default()),
         )
     }
 
@@ -454,6 +468,7 @@ impl WorkflowService {
             history_waiters,
             Arc::new(VersioningRuleStore::default()),
             WorkerRegistry::default(),
+            Arc::new(ScheduleStore::default()),
         )
     }
 
@@ -474,6 +489,7 @@ impl WorkflowService {
         history_waiters: HistoryWaitRegistry,
         versioning_rule_store: Arc<VersioningRuleStore>,
         worker_registry: WorkerRegistry,
+        schedule_store: Arc<ScheduleStore>,
     ) -> Self {
         Self {
             runtime,
@@ -492,6 +508,7 @@ impl WorkflowService {
             history_waiters,
             versioning_rule_store,
             worker_registry,
+            schedule_store,
         }
     }
 
@@ -501,6 +518,284 @@ impl WorkflowService {
 
     pub fn worker_registry(&self) -> WorkerRegistry {
         self.worker_registry.clone()
+    }
+
+    pub fn schedule_store(&self) -> Arc<ScheduleStore> {
+        self.schedule_store.clone()
+    }
+
+    pub async fn apply_schedule_patch(
+        &self,
+        namespace_id: tokeira_types::NamespaceId,
+        schedule_id: &tokeira_runtime::ScheduleId,
+        patch: SchedulePatch,
+    ) -> EdgeResult<()> {
+        let now = OffsetDateTime::now_utc();
+        self.schedule_store
+            .describe(namespace_id, schedule_id)
+            .map_err(|err| EdgeError::BadRequest(err.to_string()))?;
+
+        self.schedule_store
+            .update(namespace_id, schedule_id, &[], |entry| {
+                if let Some(note) = patch.pause.clone() {
+                    entry.state.paused = true;
+                    entry.state.notes = note;
+                }
+                if let Some(note) = patch.unpause.clone() {
+                    entry.state.paused = false;
+                    entry.state.notes = note;
+                }
+            })
+            .map_err(|err| EdgeError::BadRequest(err.to_string()))?;
+
+        if let Some(trigger) = patch.trigger_immediately {
+            self.handle_schedule_due_action(
+                namespace_id,
+                schedule_id,
+                now,
+                Some(trigger.overlap_policy),
+                now,
+            )
+            .await?;
+        }
+        for backfill in patch.backfill_request {
+            let entry = self
+                .schedule_store
+                .describe(namespace_id, schedule_id)
+                .map_err(|err| EdgeError::BadRequest(err.to_string()))?;
+            let times = compute_matching_times(
+                &entry.spec,
+                backfill.start_time,
+                backfill.end_time,
+                schedule_id,
+            );
+            for nominal_time in times {
+                self.handle_schedule_due_action(
+                    namespace_id,
+                    schedule_id,
+                    nominal_time,
+                    Some(backfill.overlap_policy),
+                    now,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_schedule_due_action(
+        &self,
+        namespace_id: tokeira_types::NamespaceId,
+        schedule_id: &tokeira_runtime::ScheduleId,
+        nominal_time: OffsetDateTime,
+        overlap_override: Option<OverlapPolicy>,
+        actual_time: OffsetDateTime,
+    ) -> EdgeResult<()> {
+        let entry = self
+            .schedule_store
+            .describe(namespace_id, schedule_id)
+            .map_err(|err| EdgeError::BadRequest(err.to_string()))?;
+        let policy = overlap_override.unwrap_or(entry.policies.overlap_policy);
+        match decide_overlap(
+            policy,
+            &entry.info.running_workflows,
+            entry.info.buffered_actions.len(),
+        ) {
+            OverlapDecision::Allow => {
+                self.trigger_scheduled_workflow(
+                    namespace_id,
+                    schedule_id,
+                    nominal_time,
+                    actual_time,
+                )
+                .await
+            }
+            OverlapDecision::Skip => {
+                self.schedule_store
+                    .update(namespace_id, schedule_id, &[], |entry| {
+                        entry.info.overlap_skipped += 1;
+                    })
+                    .map_err(|err| EdgeError::BadRequest(err.to_string()))?;
+                Ok(())
+            }
+            OverlapDecision::Buffer => {
+                self.schedule_store
+                    .update(namespace_id, schedule_id, &[], |entry| {
+                        if policy == OverlapPolicy::BufferOne
+                            && entry.info.buffered_actions.len() >= 1
+                        {
+                            entry.info.buffered_actions.pop_front();
+                            entry.info.buffer_dropped += 1;
+                        }
+                        entry.info.buffered_actions.push_back(
+                            tokeira_runtime::BufferedAction {
+                                nominal_time,
+                                overlap_policy_override: overlap_override,
+                            },
+                        );
+                    })
+                    .map_err(|err| EdgeError::BadRequest(err.to_string()))?;
+                Ok(())
+            }
+            OverlapDecision::CancelOther(workflows) => {
+                for workflow in workflows {
+                    self.runtime
+                        .cancel_workflow(
+                            workflow.run_key,
+                            CancelRequest {
+                                reason: "schedule overlap policy".to_string(),
+                                external_initiator: None,
+                                request: schedule_request_context(actual_time),
+                                now: actual_time,
+                            },
+                        )
+                        .await
+                        .map_err(EdgeError::from)?;
+                }
+                Ok(())
+            }
+            OverlapDecision::TerminateOther(workflows) => {
+                for workflow in workflows {
+                    self.runtime
+                        .terminate_workflow(
+                            workflow.run_key,
+                            TerminateRequest {
+                                reason: "schedule overlap policy".to_string(),
+                                details: Some(Payloads::default()),
+                                identity: "schedule-engine".to_string(),
+                                request: schedule_request_context(actual_time),
+                                now: actual_time,
+                            },
+                        )
+                        .await
+                        .map_err(EdgeError::from)?;
+                }
+                self.schedule_store
+                    .update(namespace_id, schedule_id, &[], |entry| {
+                        entry.info.running_workflows.clear();
+                    })
+                    .map_err(|err| EdgeError::BadRequest(err.to_string()))?;
+                self.trigger_scheduled_workflow(
+                    namespace_id,
+                    schedule_id,
+                    nominal_time,
+                    actual_time,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn trigger_scheduled_workflow(
+        &self,
+        namespace_id: tokeira_types::NamespaceId,
+        schedule_id: &tokeira_runtime::ScheduleId,
+        nominal_time: OffsetDateTime,
+        actual_time: OffsetDateTime,
+    ) -> EdgeResult<()> {
+        let entry = self
+            .schedule_store
+            .describe(namespace_id, schedule_id)
+            .map_err(|err| EdgeError::BadRequest(err.to_string()))?;
+        let workflow_id = schedule_workflow_id(
+            &entry.action.start_workflow.workflow_id,
+            nominal_time,
+            entry.policies.keep_original_workflow_id,
+        );
+        let run_id = RunId::new();
+        let run_key = RunKey::new();
+        let build_id = self.versioning_rule_store.evaluate_assignment(
+            namespace_id,
+            &entry.action.start_workflow.task_queue,
+            &workflow_id,
+        );
+        let request = StartRequest {
+            run_key,
+            namespace_id,
+            workflow_id: workflow_id.clone(),
+            run_id,
+            workflow_type: entry.action.start_workflow.workflow_type.clone(),
+            task_queue: entry.action.start_workflow.task_queue.clone(),
+            input: entry.action.start_workflow.input.clone(),
+            memo: entry.action.start_workflow.memo.clone(),
+            search_attributes: entry.action.start_workflow.search_attributes.clone(),
+            workflow_execution_timeout: entry
+                .action
+                .start_workflow
+                .workflow_execution_timeout,
+            workflow_run_timeout: entry.action.start_workflow.workflow_run_timeout,
+            workflow_task_timeout: entry
+                .action
+                .start_workflow
+                .workflow_task_timeout
+                .unwrap_or(time::Duration::seconds(10)),
+            retry_policy: entry.action.start_workflow.retry_policy.clone(),
+            conflict_policy: tokeira_kernel::WorkflowIdConflictPolicy::Fail,
+            reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
+            deployment: None,
+            build_id,
+            attempt: 1,
+            continued_execution_run_id: None,
+            first_execution_run_id: Some(run_id),
+            parent_run_key: None,
+            parent_workflow_id: None,
+            parent_run_id: None,
+            parent_namespace_id: None,
+            parent_initiated_event_id: 0,
+            original_execution_run_id: Some(run_id),
+            continued_failure: None,
+            last_completion_result: None,
+            first_run_started_at: None,
+            request: schedule_request_context(actual_time),
+            now: actual_time,
+            cron_schedule: Some(schedule_id.0.clone()),
+        };
+        let outcome = self
+            .runtime
+            .start_workflow_with_policy(request)
+            .await
+            .map_err(EdgeError::from)?;
+        let result = match outcome {
+            StartWorkflowResult::Started { run_key, run_id } => ScheduleActionResult {
+                schedule_time: nominal_time,
+                actual_time,
+                start_workflow_result: Some(WorkflowExecution {
+                    namespace_id,
+                    workflow_id,
+                    run_id,
+                    run_key,
+                }),
+                start_workflow_status: WorkflowExecutionStatus::Running,
+            },
+            StartWorkflowResult::UsedExisting { run_key, run_id }
+            | StartWorkflowResult::Rejected { run_key, run_id } => ScheduleActionResult {
+                schedule_time: nominal_time,
+                actual_time,
+                start_workflow_result: Some(WorkflowExecution {
+                    namespace_id,
+                    workflow_id,
+                    run_id,
+                    run_key,
+                }),
+                start_workflow_status: WorkflowExecutionStatus::StartFailed,
+            },
+        };
+        self.schedule_store
+            .update(namespace_id, schedule_id, &[], |entry| {
+                if let Some(workflow) = result.start_workflow_result.clone()
+                    && result.start_workflow_status == WorkflowExecutionStatus::Running
+                {
+                    entry.info.running_workflows.push(workflow);
+                }
+                entry.info.action_count += 1;
+                entry.info.recent_actions.push(result);
+                if entry.info.recent_actions.len() > 10 {
+                    entry.info.recent_actions.remove(0);
+                }
+                entry.info.update_time = actual_time;
+            })
+            .map_err(|err| EdgeError::BadRequest(err.to_string()))?;
+        Ok(())
     }
 
     pub fn broker(&self) -> InMemoryBroker {
@@ -540,6 +835,7 @@ impl WorkflowService {
             history_waiters,
             Arc::new(VersioningRuleStore::default()),
             WorkerRegistry::default(),
+            Arc::new(ScheduleStore::default()),
         )
     }
 

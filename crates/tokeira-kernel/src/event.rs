@@ -61,6 +61,7 @@ pub enum HistoryEventKind {
         original_execution_run_id: Option<RunId>,
         continued_failure: Option<Payload>,
         last_completion_result: Option<Payloads>,
+        cron_schedule: Option<String>,
     },
     /// An external signal was delivered to the workflow.
     WorkflowExecutionSignaled {

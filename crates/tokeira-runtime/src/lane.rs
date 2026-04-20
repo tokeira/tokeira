@@ -457,6 +457,7 @@ where
                                         workflow_execution_timeout,
                                         workflow_run_timeout,
                                         workflow_task_timeout,
+                                        retry_policy,
                                         ..
                                     } => Some((
                                         *new_run_id,
@@ -468,6 +469,7 @@ where
                                         *workflow_execution_timeout,
                                         *workflow_run_timeout,
                                         *workflow_task_timeout,
+                                        retry_policy.clone(),
                                     )),
                                     _ => None,
                                 }
@@ -482,6 +484,7 @@ where
                                     workflow_execution_timeout,
                                     workflow_run_timeout,
                                     workflow_task_timeout,
+                                    retry_policy,
                                 )) = successor_event
                                 {
                                     let first_execution_run_id = Some(
@@ -515,7 +518,7 @@ where
                                     workflow_execution_timeout,
                                     workflow_run_timeout,
                                     workflow_task_timeout,
-                                    retry_policy: new_state.retry_policy.clone(),
+                                    retry_policy,
                                     conflict_policy: tokeira_kernel::WorkflowIdConflictPolicy::Fail,
                                     reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
                                     attempt: 1,
@@ -545,6 +548,7 @@ where
                                         received_at: OffsetDateTime::now_utc(),
                                     },
                                     now: OffsetDateTime::now_utc(),
+                                    cron_schedule: None,
                                 };
                                     let publisher = publisher.clone();
                                     let workflow_timeout_tracking =
@@ -1165,6 +1169,7 @@ mod tests {
         include_continue_event: bool,
         workflow_execution_timeout: Option<Duration>,
         workflow_run_timeout: Option<Duration>,
+        retry_policy: Option<tokeira_types::RetryPolicy>,
         first_run_started_at: Option<OffsetDateTime>,
     }
 
@@ -1175,6 +1180,7 @@ mod tests {
                 include_continue_event: true,
                 workflow_execution_timeout: Some(Duration::minutes(30)),
                 workflow_run_timeout: Some(Duration::minutes(5)),
+                retry_policy: None,
                 first_run_started_at: None,
             }
         }
@@ -1213,7 +1219,7 @@ mod tests {
                         workflow_execution_timeout: self.workflow_execution_timeout,
                         workflow_run_timeout: self.workflow_run_timeout,
                         workflow_task_timeout: Duration::seconds(15),
-                        retry_policy: None,
+                        retry_policy: self.retry_policy.clone(),
                         initiator: tokeira_kernel::ContinueAsNewInitiator::Workflow,
                         failure: None,
                         last_completion_result: None,
@@ -1894,6 +1900,13 @@ mod tests {
             maximum_attempts: 3,
             non_retryable_error_types: vec![],
         });
+        let successor_retry_policy = Some(tokeira_types::RetryPolicy {
+            initial_interval: Duration::seconds(5),
+            backoff_coefficient: 1.5,
+            maximum_interval: Some(Duration::seconds(60)),
+            maximum_attempts: 9,
+            non_retryable_error_types: vec!["fatal".to_string()],
+        });
 
         let successor_run_key = RunKey::new();
         let mut successor_state = sample_state(successor_run_key);
@@ -1908,7 +1921,8 @@ mod tests {
             LoadedRun::Existing(state.clone()),
             vec![CommitBehavior::Applied],
         );
-        let kernel = ContinueAsNewKernel::continued_as_new();
+        let mut kernel = ContinueAsNewKernel::continued_as_new();
+        kernel.retry_policy = successor_retry_policy.clone();
         let publisher = MockPublisher::new()
             .with_submit_result(CommitResult::Applied {
                 new_state: successor_state.clone(),
@@ -1955,7 +1969,7 @@ mod tests {
                 assert_eq!(request.continued_execution_run_id, Some(state.run_id));
                 assert_eq!(request.first_execution_run_id, Some(first_run_id));
                 assert_eq!(request.first_run_started_at, Some(chain_start));
-                assert_eq!(request.retry_policy, state.retry_policy);
+                assert_eq!(request.retry_policy, successor_retry_policy);
                 assert_eq!(request.attempt, 1);
                 assert_eq!(
                     request.workflow_execution_timeout,

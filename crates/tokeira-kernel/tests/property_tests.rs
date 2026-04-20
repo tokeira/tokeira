@@ -701,6 +701,7 @@ fn arb_start_request() -> impl Strategy<Value = StartRequest> {
                     first_run_started_at,
                     request: request_context("prop-start", now),
                     now,
+                    cron_schedule: None,
                 }
             },
         )

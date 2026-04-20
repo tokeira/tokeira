@@ -258,6 +258,9 @@ pub struct StartRequest {
     pub request: RequestContext,
     /// Wall-clock time the command was accepted.
     pub now: OffsetDateTime,
+    /// Schedule ID that triggered this start, if any. This is serialized as
+    /// Temporal's legacy `cron_schedule` marker for schedule-originated runs.
+    pub cron_schedule: Option<String>,
 }
 
 /// Request to create a brand-new workflow and immediately deliver a signal.

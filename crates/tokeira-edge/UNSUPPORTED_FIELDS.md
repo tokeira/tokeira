@@ -9,7 +9,7 @@ does not support or cannot yet populate, along with rationale.
 |---|---|---|
 | `workflow_id_reuse_policy` | Not supported | Tokeira uses simple ID-based dedup |
 | `workflow_id_conflict_policy` | Not supported | Tokeira uses simple ID-based dedup |
-| `cron_schedule` | Not supported | Cron scheduling not implemented |
+| `cron_schedule` | Server-managed | Populated for schedule-triggered runs; client-supplied cron starts are still not accepted |
 | `request_eager_execution` | Not supported | Eager dispatch not implemented |
 | `continued_failure` | Not supported | Server-internal field for schedules |
 | `last_completion_result` | Not supported | Server-internal field for schedules |
@@ -18,6 +18,16 @@ does not support or cannot yet populate, along with rationale.
 | `user_metadata` | Not supported | SDK user metadata not threaded |
 | `links` | Not supported | Link tracking not implemented |
 | `versioning_override` | Not supported | Versioning override not implemented |
+
+## Schedule Transport
+
+| Field | Status | Rationale |
+|---|---|---|
+| `ScheduleSpec.timezone_data` | Not round-tripped | Runtime uses `timezone_name`; embedded TZif definitions are dropped on describe/list |
+| Original `ScheduleSpec.calendar` / `cron_string` | Not round-tripped | Inputs are compiled to `structured_calendar` before storage |
+| `NewWorkflowExecutionInfo.header` | Not supported | Schedule action headers are not modeled internally |
+| `NewWorkflowExecutionInfo.user_metadata` | Not supported | SDK user metadata is not threaded to scheduled starts |
+| `NewWorkflowExecutionInfo.versioning_override` | Not supported | Scheduled starts use assignment rule evaluation; pinned overrides are rejected |
 
 ## RespondWorkflowTaskCompletedRequest
 

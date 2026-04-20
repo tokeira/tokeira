@@ -28,6 +28,7 @@ use tokeira_types::{
 
 pub mod from_internal;
 pub mod history_serializer;
+pub mod schedule;
 pub mod to_internal;
 
 /// Client-supplied worker-versioning override for starts.

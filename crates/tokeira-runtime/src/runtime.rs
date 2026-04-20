@@ -27,8 +27,8 @@ use tokeira_storage::{
 };
 use tokeira_types::{
     ActivityTaskToken, BuildId, DeploymentId, ExecutionRef, Headers, NamespaceId,
-    Payloads, QueueKey, RequestContext, RetryPolicy, RunId, RunKey, ShardEpoch, ShardId,
-    TaskKind, TaskQueueName, WorkerIdentity, WorkflowTaskToken,
+    Payload, Payloads, QueueKey, RequestContext, RetryPolicy, RunId, RunKey, ShardEpoch,
+    ShardId, TaskKind, TaskQueueName, WorkerIdentity, WorkflowTaskToken,
 };
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -62,6 +62,11 @@ use crate::{
         PendingUpdateTransport, UpdateOutcome, UpdateRegistry, UpdateResolution,
         UpdateTransportResolution, UpdateWaitPolicy,
     },
+    versioning::VersioningRuleStore,
+    wft_timeout::{
+        WftTimeoutEntry, WftTimeoutScannerConfig, WftTimeoutTrackingState,
+        run_wft_timeout_scanner,
+    },
     worker_registry::{WorkerRegistrationKey, WorkerRegistry, WorkerVersionMetadata},
 };
 
@@ -90,12 +95,18 @@ pub struct TokeiraRuntime<R> {
     timer_scanner_cancel: CancellationToken,
     /// Runtime-local workflow timeout tracking.
     workflow_timeout_tracking: WorkflowTimeoutTrackingState,
+    /// Runtime-local workflow-task timeout tracking.
+    wft_timeout_tracking: WftTimeoutTrackingState,
     /// Runtime-local activity timeout tracking.
     activity_tracking: ActivityTrackingState,
     /// Background workflow-timeout scanner task.
     workflow_timeout_scanner_handle: Option<tokio::task::JoinHandle<()>>,
     /// Cancellation token for the workflow-timeout scanner.
     workflow_timeout_scanner_cancel: CancellationToken,
+    /// Background workflow-task-timeout scanner task.
+    wft_timeout_scanner_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Cancellation token for the workflow-task-timeout scanner.
+    wft_timeout_scanner_cancel: CancellationToken,
     /// Runtime-local Nexus timeout tracking.
     nexus_timeout_tracking: NexusTimeoutTrackingState,
     /// In-memory update caller registry.
@@ -108,6 +119,8 @@ pub struct TokeiraRuntime<R> {
     delivery_metrics: DeliveryMetrics,
     /// Runtime-local backlog fairness state.
     fairness_state: FairnessState,
+    /// Shared worker-versioning rules used by edge handlers and dispatch.
+    versioning_rule_store: Arc<VersioningRuleStore>,
     /// Background Nexus-timeout scanner task.
     nexus_timeout_scanner_handle: Option<tokio::task::JoinHandle<()>>,
     /// Cancellation token for the Nexus-timeout scanner.
@@ -198,7 +211,28 @@ where
         workflow_timeout_config: WorkflowTimeoutScannerConfig,
         backlog_config: BacklogConfig,
     ) -> Self {
-        Self::new_with_nexus(
+        let versioning_rule_store = Arc::new(VersioningRuleStore::default());
+        Self::new_with_versioning(
+            repo,
+            lane_count,
+            config,
+            timer_config,
+            workflow_timeout_config,
+            backlog_config,
+            versioning_rule_store,
+        )
+    }
+
+    pub fn new_with_versioning(
+        repo: Arc<R>,
+        lane_count: usize,
+        config: LaneConfig,
+        timer_config: TimerScannerConfig,
+        workflow_timeout_config: WorkflowTimeoutScannerConfig,
+        backlog_config: BacklogConfig,
+        versioning_rule_store: Arc<VersioningRuleStore>,
+    ) -> Self {
+        Self::new_with_nexus_and_versioning(
             repo,
             lane_count,
             config,
@@ -209,6 +243,7 @@ where
             NexusTimeoutScannerConfig::default(),
             NexusEndpointRegistry::default(),
             Arc::new(NoopNexusHttpClient),
+            versioning_rule_store,
         )
     }
 
@@ -224,6 +259,34 @@ where
         nexus_registry: NexusEndpointRegistry,
         nexus_client: Arc<dyn NexusHttpClient>,
     ) -> Self {
+        Self::new_with_nexus_and_versioning(
+            repo,
+            lane_count,
+            config,
+            timer_config,
+            workflow_timeout_config,
+            backlog_config,
+            activity_timeout_config,
+            nexus_timeout_config,
+            nexus_registry,
+            nexus_client,
+            Arc::new(VersioningRuleStore::default()),
+        )
+    }
+
+    pub fn new_with_nexus_and_versioning(
+        repo: Arc<R>,
+        lane_count: usize,
+        config: LaneConfig,
+        timer_config: TimerScannerConfig,
+        workflow_timeout_config: WorkflowTimeoutScannerConfig,
+        backlog_config: BacklogConfig,
+        activity_timeout_config: ActivityTimeoutScannerConfig,
+        nexus_timeout_config: NexusTimeoutScannerConfig,
+        nexus_registry: NexusEndpointRegistry,
+        nexus_client: Arc<dyn NexusHttpClient>,
+        versioning_rule_store: Arc<VersioningRuleStore>,
+    ) -> Self {
         Self::new_with_nexus_and_shards(
             repo,
             lane_count,
@@ -238,6 +301,7 @@ where
             1,
             "local-runtime".to_string(),
             true,
+            versioning_rule_store,
         )
     }
 
@@ -255,10 +319,12 @@ where
         shard_count: u32,
         owner_identity: String,
         seed_default_shard: bool,
+        versioning_rule_store: Arc<VersioningRuleStore>,
     ) -> Self {
         let broker = InMemoryBroker::default();
         let activity_broker = InMemoryActivityBroker::default();
         let workflow_timeout_tracking = WorkflowTimeoutTrackingState::default();
+        let wft_timeout_tracking = WftTimeoutTrackingState::default();
         let activity_tracking = ActivityTrackingState::default();
         let nexus_timeout_tracking = NexusTimeoutTrackingState::default();
         let update_registry = UpdateRegistry::new();
@@ -284,14 +350,16 @@ where
                     nexus_timeout_tracking.clone(),
                     activity_tracking.clone(),
                     delivery_metrics.clone(),
+                    Some(versioning_rule_store.clone()),
                 );
                 spawn_lane(
-                    BasicKernel::default(),
+                    BasicKernel,
                     repo.clone(),
                     publisher,
                     shard_owner.clone(),
                     activity_tracking.clone(),
                     workflow_timeout_tracking.clone(),
+                    wft_timeout_tracking.clone(),
                     nexus_timeout_tracking.clone(),
                     update_registry.clone(),
                     config.clone(),
@@ -324,6 +392,15 @@ where
                 workflow_timeout_config,
                 workflow_timeout_scanner_cancel.clone(),
             )));
+        let wft_timeout_scanner_cancel = CancellationToken::new();
+        let wft_timeout_scanner_handle = Some(tokio::spawn(run_wft_timeout_scanner(
+            wft_timeout_tracking.clone(),
+            lanes.clone(),
+            lane_count,
+            shard_owner.clone(),
+            WftTimeoutScannerConfig::default(),
+            wft_timeout_scanner_cancel.clone(),
+        )));
         let activity_timeout_scanner_cancel = CancellationToken::new();
         let activity_timeout_scanner_handle =
             Some(tokio::spawn(run_activity_timeout_scanner(
@@ -377,9 +454,12 @@ where
             timer_scanner_handle,
             timer_scanner_cancel,
             workflow_timeout_tracking,
+            wft_timeout_tracking,
             activity_tracking,
             workflow_timeout_scanner_handle,
             workflow_timeout_scanner_cancel,
+            wft_timeout_scanner_handle,
+            wft_timeout_scanner_cancel,
             nexus_timeout_tracking,
             update_registry,
             buffered_queries,
@@ -398,6 +478,7 @@ where
             control_loop_cancel,
             shard_owner,
             owner_identity,
+            versioning_rule_store,
         }
     }
 
@@ -432,6 +513,10 @@ where
         self.workflow_timeout_tracking.clone()
     }
 
+    pub fn wft_timeout_tracking(&self) -> WftTimeoutTrackingState {
+        self.wft_timeout_tracking.clone()
+    }
+
     pub fn activity_tracking(&self) -> ActivityTrackingState {
         self.activity_tracking.clone()
     }
@@ -457,12 +542,17 @@ where
             WorkerVersionMetadata {
                 deployment,
                 build_id,
+                last_seen_at: Some(OffsetDateTime::now_utc()),
             },
         );
     }
 
     pub fn worker_registry(&self) -> WorkerRegistry {
         self.worker_registry.clone()
+    }
+
+    pub fn versioning_rule_store(&self) -> Arc<VersioningRuleStore> {
+        self.versioning_rule_store.clone()
     }
 
     pub fn update_registry(&self) -> UpdateRegistry {
@@ -1199,8 +1289,9 @@ where
     pub async fn fail_activity_task(
         &self,
         token: ActivityTaskToken,
-        failure_message: String,
+        failure: Payload,
         failure_error_type: Option<String>,
+        is_non_retryable: bool,
     ) -> Result<()> {
         let (activity, workflow_retry_policy) =
             self.validate_activity_token(&token).await?;
@@ -1211,7 +1302,11 @@ where
             evaluate_activity_retry(
                 policy,
                 activity.attempt,
-                failure_error_type.as_deref(),
+                if is_non_retryable {
+                    Some("__tokeira_non_retryable__")
+                } else {
+                    failure_error_type.as_deref()
+                },
             )
         });
 
@@ -1225,9 +1320,7 @@ where
                 token.run_key,
                 Command::ActivityResolved(ActivityResolvedRequest {
                     activity_id,
-                    resolution: ActivityResolution::Failed {
-                        message: failure_message,
-                    },
+                    resolution: ActivityResolution::Failed { failure },
                     worker_identity: None,
                     now: OffsetDateTime::now_utc(),
                 }),
@@ -1302,6 +1395,15 @@ where
             attempt: pending.attempt,
             shard_epoch: self.current_shard_epoch(new_state.run_key).await?,
         };
+        let shard_id = self.shard_id_for(new_state.run_key).await;
+        self.wft_timeout_tracking.insert(WftTimeoutEntry {
+            run_key: new_state.run_key,
+            shard_id,
+            logical_seq: pending.logical_seq,
+            started_event_id,
+            started_at: pending.started_at.unwrap_or(now),
+            workflow_task_timeout: new_state.workflow_task_timeout,
+        });
         self.delivery_metrics
             .record_latency(&offered.queue, entered_at.elapsed());
 
@@ -1309,6 +1411,9 @@ where
             run_key: new_state.run_key,
             workflow_id: new_state.workflow_id,
             task_queue: new_state.task_queue,
+            previous_started_event_id: new_state.previous_started_event_id,
+            scheduled_time: pending.scheduled_at,
+            started_time: pending.started_at.unwrap_or(now),
             token,
         })
     }
@@ -1351,9 +1456,18 @@ where
 
     fn handle_post_commit(&self, run_key: RunKey, result: &CommitResult) {
         if let CommitResult::Applied { new_state } = result {
+            if new_state
+                .pending_workflow_task
+                .as_ref()
+                .and_then(|pending| pending.started_at)
+                .is_none()
+            {
+                self.wft_timeout_tracking.remove(run_key);
+            }
             if new_state.closed_at.is_some() {
                 self.buffered_queries
                     .fail_run_queries(run_key, "workflow execution completed");
+                self.wft_timeout_tracking.remove(run_key);
             }
         }
     }
@@ -1433,6 +1547,7 @@ where
             &self.lanes,
             self.lanes.len(),
             &self.workflow_timeout_tracking,
+            &self.wft_timeout_tracking,
             &self.activity_tracking,
             &self.nexus_timeout_tracking,
         )
@@ -1442,6 +1557,7 @@ where
 
         let shard_owner = self.shard_owner.clone();
         let workflow_timeout_tracking = self.workflow_timeout_tracking.clone();
+        let wft_timeout_tracking = self.wft_timeout_tracking.clone();
         let activity_tracking = self.activity_tracking.clone();
         let nexus_timeout_tracking = self.nexus_timeout_tracking.clone();
         tokio::spawn(async move {
@@ -1450,6 +1566,7 @@ where
                 owner.mark_draining(shard_id);
                 drop(owner);
                 workflow_timeout_tracking.remove_all_for_shard(shard_id);
+                wft_timeout_tracking.remove_all_for_shard(shard_id);
                 activity_tracking.remove_all_for_shard(shard_id);
                 nexus_timeout_tracking.remove_all_for_shard(shard_id);
             }
@@ -1462,6 +1579,7 @@ where
         self.shard_owner.write().unwrap().mark_draining(shard_id);
         self.workflow_timeout_tracking
             .remove_all_for_shard(shard_id);
+        self.wft_timeout_tracking.remove_all_for_shard(shard_id);
         self.activity_tracking.remove_all_for_shard(shard_id);
         self.nexus_timeout_tracking.remove_all_for_shard(shard_id);
         self.shard_owner.write().unwrap().remove(shard_id);
@@ -1498,6 +1616,17 @@ where
                 .map_err(|error| {
                     anyhow!("workflow timeout scanner join failed: {error}")
                 })?;
+        }
+        Ok(())
+    }
+
+    pub async fn shutdown_wft_timeout_scanner(&mut self) -> Result<()> {
+        self.wft_timeout_scanner_cancel.cancel();
+        if let Some(handle) = self.wft_timeout_scanner_handle.take() {
+            tokio::time::timeout(tokio::time::Duration::from_secs(5), handle)
+                .await
+                .map_err(|_| anyhow!("wft timeout scanner shutdown timed out"))?
+                .map_err(|error| anyhow!("wft timeout scanner join failed: {error}"))?;
         }
         Ok(())
     }
@@ -1858,6 +1987,13 @@ pub struct StartedWorkflowTask {
     pub workflow_id: tokeira_types::WorkflowId,
     /// Task queue the task was dispatched on.
     pub task_queue: TaskQueueName,
+    /// started_event_id of the most recently completed
+    /// workflow task.
+    pub previous_started_event_id: i64,
+    /// Timestamp of the scheduling event for this task.
+    pub scheduled_time: OffsetDateTime,
+    /// Timestamp of the start event for this task.
+    pub started_time: OffsetDateTime,
     /// Opaque token used to complete the task.
     pub token: WorkflowTaskToken,
 }
@@ -1927,6 +2063,7 @@ mod tests {
         WorkflowTimeoutViolation, evaluate_workflow_timeout, scan_workflow_timeouts_once,
         workflow_timeout_retry_state,
     };
+    use crate::versioning::{RedirectRule, VersioningMutation};
     use std::collections::HashMap;
     use tokeira_kernel::RetryState;
     use tokeira_storage::{
@@ -2058,6 +2195,7 @@ mod tests {
             NexusTimeoutTrackingState::default(),
             ActivityTrackingState::default(),
             DeliveryMetrics::new(),
+            None,
         );
         let queue = QueueKey {
             namespace_id: NamespaceId::new(),
@@ -2094,6 +2232,241 @@ mod tests {
         assert_eq!(task.0.run_key, run_key);
         assert_eq!(task.0.activity_id, "activity-1");
         assert_eq!(task.0.attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn runtime_dispatch_publisher_applies_build_id_redirects() {
+        let workflow_broker = InMemoryBroker::default();
+        let activity_broker = InMemoryActivityBroker::default();
+        let repo = Arc::new(MockTimerRepo::from_responses(Vec::new()));
+        let versioning = Arc::new(VersioningRuleStore::default());
+        let namespace_id = NamespaceId::new();
+        let task_queue = TaskQueueName("workflow-q".to_string());
+        let token = versioning
+            .get_rules(namespace_id, &task_queue)
+            .conflict_token;
+        versioning
+            .apply_mutation(
+                namespace_id,
+                &task_queue,
+                token,
+                VersioningMutation::AddRedirectRule {
+                    rule: RedirectRule {
+                        source_build_id: "old".to_string(),
+                        target_build_id: "new".to_string(),
+                        create_time: OffsetDateTime::UNIX_EPOCH,
+                    },
+                },
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .unwrap();
+        let publisher = RuntimeDispatchPublisher::new(
+            workflow_broker.clone(),
+            activity_broker,
+            repo,
+            Arc::new(Mutex::new(Vec::new())),
+            1,
+            1,
+            Arc::new(NoopNexusHttpClient),
+            NexusEndpointRegistry::default(),
+            NexusTimeoutTrackingState::default(),
+            ActivityTrackingState::default(),
+            DeliveryMetrics::new(),
+            Some(versioning),
+        );
+        let original_queue = QueueKey {
+            namespace_id,
+            task_queue: task_queue.clone(),
+            task_kind: TaskKind::Workflow,
+            deployment: None,
+            build_id: Some(BuildId("old".to_string())),
+        };
+        let redirected_queue = QueueKey {
+            build_id: Some(BuildId("new".to_string())),
+            ..original_queue.clone()
+        };
+        let run_key = RunKey::new();
+
+        publisher
+            .publish(
+                run_key,
+                &[DispatchOp::EnqueueWorkflowTask {
+                    queue: original_queue,
+                    logical_seq: LogicalTaskSeq(1),
+                    sticky_preferred: None,
+                }],
+            )
+            .await
+            .unwrap();
+
+        let task = workflow_broker
+            .poll_workflow_task(
+                &redirected_queue,
+                &WorkerIdentity("worker-a".to_string()),
+                std::time::Duration::from_millis(5),
+            )
+            .await
+            .unwrap()
+            .expect("redirected workflow task should deliver");
+        assert_eq!(task.0.run_key, run_key);
+        assert_eq!(task.0.queue.build_id, Some(BuildId("new".to_string())));
+    }
+
+    #[tokio::test]
+    async fn runtime_dispatch_publisher_skips_redirect_for_deployment_pinned_queue() {
+        let workflow_broker = InMemoryBroker::default();
+        let activity_broker = InMemoryActivityBroker::default();
+        let repo = Arc::new(MockTimerRepo::from_responses(Vec::new()));
+        let versioning = Arc::new(VersioningRuleStore::default());
+        let namespace_id = NamespaceId::new();
+        let task_queue = TaskQueueName("workflow-q".to_string());
+        let token = versioning
+            .get_rules(namespace_id, &task_queue)
+            .conflict_token;
+        versioning
+            .apply_mutation(
+                namespace_id,
+                &task_queue,
+                token,
+                VersioningMutation::AddRedirectRule {
+                    rule: RedirectRule {
+                        source_build_id: "old".to_string(),
+                        target_build_id: "new".to_string(),
+                        create_time: OffsetDateTime::UNIX_EPOCH,
+                    },
+                },
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .unwrap();
+        let publisher = RuntimeDispatchPublisher::new(
+            workflow_broker.clone(),
+            activity_broker,
+            repo,
+            Arc::new(Mutex::new(Vec::new())),
+            1,
+            1,
+            Arc::new(NoopNexusHttpClient),
+            NexusEndpointRegistry::default(),
+            NexusTimeoutTrackingState::default(),
+            ActivityTrackingState::default(),
+            DeliveryMetrics::new(),
+            Some(versioning),
+        );
+        let pinned_queue = QueueKey {
+            namespace_id,
+            task_queue,
+            task_kind: TaskKind::Workflow,
+            deployment: Some(DeploymentId("series-a".to_string())),
+            build_id: Some(BuildId("old".to_string())),
+        };
+        let redirected_queue = QueueKey {
+            build_id: Some(BuildId("new".to_string())),
+            ..pinned_queue.clone()
+        };
+
+        publisher
+            .publish(
+                RunKey::new(),
+                &[DispatchOp::EnqueueWorkflowTask {
+                    queue: pinned_queue.clone(),
+                    logical_seq: LogicalTaskSeq(1),
+                    sticky_preferred: None,
+                }],
+            )
+            .await
+            .unwrap();
+
+        let wrong = workflow_broker
+            .poll_workflow_task(
+                &redirected_queue,
+                &WorkerIdentity("worker-a".to_string()),
+                std::time::Duration::from_millis(5),
+            )
+            .await
+            .unwrap();
+        let right = workflow_broker
+            .poll_workflow_task(
+                &pinned_queue,
+                &WorkerIdentity("worker-a".to_string()),
+                std::time::Duration::from_millis(5),
+            )
+            .await
+            .unwrap();
+
+        assert!(wrong.is_none());
+        assert!(right.is_some());
+    }
+
+    #[tokio::test]
+    async fn runtime_dispatch_publisher_skips_redirect_for_unassigned_queue() {
+        let workflow_broker = InMemoryBroker::default();
+        let activity_broker = InMemoryActivityBroker::default();
+        let repo = Arc::new(MockTimerRepo::from_responses(Vec::new()));
+        let versioning = Arc::new(VersioningRuleStore::default());
+        let namespace_id = NamespaceId::new();
+        let task_queue = TaskQueueName("workflow-q".to_string());
+        let token = versioning
+            .get_rules(namespace_id, &task_queue)
+            .conflict_token;
+        versioning
+            .apply_mutation(
+                namespace_id,
+                &task_queue,
+                token,
+                VersioningMutation::AddRedirectRule {
+                    rule: RedirectRule {
+                        source_build_id: "old".to_string(),
+                        target_build_id: "new".to_string(),
+                        create_time: OffsetDateTime::UNIX_EPOCH,
+                    },
+                },
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .unwrap();
+        let publisher = RuntimeDispatchPublisher::new(
+            workflow_broker.clone(),
+            activity_broker,
+            repo,
+            Arc::new(Mutex::new(Vec::new())),
+            1,
+            1,
+            Arc::new(NoopNexusHttpClient),
+            NexusEndpointRegistry::default(),
+            NexusTimeoutTrackingState::default(),
+            ActivityTrackingState::default(),
+            DeliveryMetrics::new(),
+            Some(versioning),
+        );
+        let queue = QueueKey {
+            namespace_id,
+            task_queue,
+            task_kind: TaskKind::Workflow,
+            deployment: None,
+            build_id: None,
+        };
+
+        publisher
+            .publish(
+                RunKey::new(),
+                &[DispatchOp::EnqueueWorkflowTask {
+                    queue: queue.clone(),
+                    logical_seq: LogicalTaskSeq(1),
+                    sticky_preferred: None,
+                }],
+            )
+            .await
+            .unwrap();
+
+        let delivered = workflow_broker
+            .poll_workflow_task(
+                &queue,
+                &WorkerIdentity("worker-a".to_string()),
+                std::time::Duration::from_millis(5),
+            )
+            .await
+            .unwrap();
+
+        assert!(delivered.is_some());
     }
 
     #[test]
@@ -2826,11 +3199,12 @@ mod tests {
         workflow_execution_timeout: Option<Duration>,
         workflow_run_timeout: Option<Duration>,
     ) -> StartRequest {
+        let run_id = tokeira_types::RunId::new();
         StartRequest {
             run_key: RunKey::new(),
             namespace_id: NamespaceId::new(),
             workflow_id: WorkflowId("workflow-timeout".to_string()),
-            run_id: tokeira_types::RunId::new(),
+            run_id,
             workflow_type: tokeira_types::WorkflowType("example".to_string()),
             task_queue: TaskQueueName("workflow-q".to_string()),
             deployment: None,
@@ -2849,6 +3223,12 @@ mod tests {
             first_execution_run_id: None,
             parent_run_key: None,
             parent_workflow_id: None,
+            parent_run_id: None,
+            parent_namespace_id: None,
+            parent_initiated_event_id: 0,
+            original_execution_run_id: Some(run_id),
+            continued_failure: None,
+            last_completion_result: None,
             first_run_started_at: None,
             request: RequestContext {
                 request_id: RequestId("req-timeout".to_string()),
@@ -3021,6 +3401,14 @@ mod tests {
             _shard_id: tokeira_types::ShardId,
             _limit: usize,
         ) -> Result<Vec<tokeira_storage::WorkflowTimeoutSweepEntry>> {
+            panic!("unused in timer scanner tests")
+        }
+
+        async fn list_started_workflow_tasks_for_shard(
+            &self,
+            _shard_id: tokeira_types::ShardId,
+            _limit: usize,
+        ) -> Result<Vec<tokeira_storage::WftTimeoutSweepEntry>> {
             panic!("unused in timer scanner tests")
         }
 

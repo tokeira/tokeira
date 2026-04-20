@@ -43,14 +43,6 @@ does not support or cannot yet populate, along with rationale.
 | `callbacks` | Not populated | Completion callbacks not implemented |
 | `pending_nexus_operations` | Not populated | Requires new storage query for pending Nexus state |
 
-## PollWorkflowTaskQueueResponse
-
-| Field | Status | Rationale |
-|---|---|---|
-| `previous_started_event_id` | Not populated | Requires tracking across WFT cycles |
-| `scheduled_time` | Not populated | Requires WFT scheduled event timestamp |
-| `started_time` | Not populated | Requires WFT started event timestamp |
-
 ## PollActivityTaskQueueResponse
 
 | Field | Status | Rationale |

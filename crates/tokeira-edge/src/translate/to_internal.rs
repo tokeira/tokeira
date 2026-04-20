@@ -4,10 +4,11 @@ use tokeira_kernel::{
     ResetRequest, SignalRequest, SignalWithStartRequest, StartRequest,
     WorkflowTaskCompletedRequest,
 };
+use tokeira_runtime::VersioningRuleStore;
 use tokeira_types::{
-    NamespaceId, QueueKey, RequestContext, RequestId as CoreRequestId, RunId, RunKey,
-    ShardEpoch, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowTaskToken,
-    WorkflowType,
+    BuildId, DeploymentId, NamespaceId, QueueKey, RequestContext,
+    RequestId as CoreRequestId, RunId, RunKey, ShardEpoch, TaskKind, TaskQueueName,
+    WorkerIdentity, WorkflowId, WorkflowTaskToken, WorkflowType,
 };
 use uuid::Uuid;
 
@@ -16,7 +17,7 @@ use crate::{
     translate::{
         PollWorkflowTaskQueueRequest, ResetWorkflowExecutionRequest,
         RespondWorkflowTaskCompletedRequest, SignalWorkflowExecutionRequest,
-        StartWorkflowExecutionRequest,
+        StartWorkflowExecutionRequest, VersioningOverride,
     },
 };
 
@@ -41,16 +42,27 @@ pub fn namespace_id_for(name: &str) -> NamespaceId {
 pub fn start_request(
     req: StartWorkflowExecutionRequest,
     request_id: &RequestId,
+    versioning_rules: Option<&VersioningRuleStore>,
 ) -> StartRequest {
     let now = req.now.unwrap_or_else(OffsetDateTime::now_utc);
-    let run_id = req.run_id.unwrap_or_else(RunId::new);
+    let run_id = req.run_id.unwrap_or_default();
+    let namespace_id = namespace_id_for(&req.namespace);
+    let workflow_id = WorkflowId(req.workflow_id);
+    let task_queue = TaskQueueName(req.task_queue);
+    let (deployment, build_id) = start_versioning(
+        namespace_id,
+        &workflow_id,
+        &task_queue,
+        req.versioning_override.as_ref(),
+        versioning_rules,
+    );
     StartRequest {
-        run_key: req.run_key.unwrap_or_else(RunKey::new),
-        namespace_id: namespace_id_for(&req.namespace),
-        workflow_id: WorkflowId(req.workflow_id),
+        run_key: req.run_key.unwrap_or_default(),
+        namespace_id,
+        workflow_id,
         run_id,
         workflow_type: WorkflowType(req.workflow_type),
-        task_queue: TaskQueueName(req.task_queue),
+        task_queue,
         input: req.input,
         memo: req.memo,
         search_attributes: req.search_attributes,
@@ -62,13 +74,19 @@ pub fn start_request(
         retry_policy: req.retry_policy,
         conflict_policy: req.conflict_policy,
         reuse_policy: req.reuse_policy,
-        deployment: None,
-        build_id: None,
+        deployment,
+        build_id,
         attempt: 1,
         continued_execution_run_id: None,
         first_execution_run_id: Some(run_id),
         parent_run_key: None,
         parent_workflow_id: None,
+        parent_run_id: None,
+        parent_namespace_id: None,
+        parent_initiated_event_id: 0,
+        original_execution_run_id: Some(run_id),
+        continued_failure: None,
+        last_completion_result: None,
         first_run_started_at: None,
         request: RequestContext {
             request_id: CoreRequestId(
@@ -85,18 +103,29 @@ pub fn start_request(
 pub fn signal_with_start_request(
     req: crate::translate::SignalWithStartWorkflowExecutionRequest,
     request_id: &RequestId,
+    versioning_rules: Option<&VersioningRuleStore>,
 ) -> SignalWithStartRequest {
     let now = OffsetDateTime::now_utc();
     let run_id = RunId::new();
+    let namespace_id = namespace_id_for(&req.namespace);
+    let workflow_id = WorkflowId(req.workflow_id);
+    let task_queue = TaskQueueName(req.task_queue);
+    let (deployment, build_id) = start_versioning(
+        namespace_id,
+        &workflow_id,
+        &task_queue,
+        req.versioning_override.as_ref(),
+        versioning_rules,
+    );
     SignalWithStartRequest {
         run_key: RunKey::new(),
-        namespace_id: namespace_id_for(&req.namespace),
-        workflow_id: WorkflowId(req.workflow_id),
+        namespace_id,
+        workflow_id,
         run_id,
         workflow_type: WorkflowType(req.workflow_type),
-        task_queue: TaskQueueName(req.task_queue),
-        deployment: None,
-        build_id: None,
+        task_queue,
+        deployment,
+        build_id,
         input: req.input,
         memo: req.memo,
         search_attributes: req.search_attributes,
@@ -113,6 +142,12 @@ pub fn signal_with_start_request(
         first_execution_run_id: Some(run_id),
         parent_run_key: None,
         parent_workflow_id: None,
+        parent_run_id: None,
+        parent_namespace_id: None,
+        parent_initiated_event_id: 0,
+        original_execution_run_id: Some(run_id),
+        continued_failure: None,
+        last_completion_result: None,
         first_run_started_at: None,
         request: RequestContext {
             request_id: CoreRequestId(
@@ -125,6 +160,30 @@ pub fn signal_with_start_request(
         now,
         signal_name: req.signal_name,
         signal_input: req.signal_input,
+    }
+}
+
+fn start_versioning(
+    namespace_id: NamespaceId,
+    workflow_id: &WorkflowId,
+    task_queue: &TaskQueueName,
+    override_: Option<&VersioningOverride>,
+    versioning_rules: Option<&VersioningRuleStore>,
+) -> (Option<DeploymentId>, Option<BuildId>) {
+    match override_ {
+        Some(VersioningOverride::Pinned {
+            deployment_series,
+            build_id,
+        }) => (
+            Some(DeploymentId(deployment_series.clone())),
+            Some(BuildId(build_id.clone())),
+        ),
+        Some(VersioningOverride::AutoUpgrade) | None => {
+            let build_id = versioning_rules.and_then(|rules| {
+                rules.evaluate_assignment(namespace_id, task_queue, workflow_id)
+            });
+            (None, build_id)
+        }
     }
 }
 
@@ -226,6 +285,132 @@ pub fn cancel_request(
             received_at: now,
         },
         now,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use time::OffsetDateTime;
+    use tokeira_kernel::{WorkflowIdConflictPolicy, WorkflowIdReusePolicy};
+    use tokeira_runtime::{AssignmentRule, VersioningMutation, VersioningRuleStore};
+    use tokeira_types::{BuildId, DeploymentId, Memo, Payloads, SearchAttributes};
+
+    use super::*;
+
+    fn start_dto() -> StartWorkflowExecutionRequest {
+        StartWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_id: "workflow-a".to_string(),
+            workflow_type: "workflow-type".to_string(),
+            task_queue: "queue".to_string(),
+            input: Payloads::default(),
+            request_id: None,
+            memo: Memo::default(),
+            search_attributes: SearchAttributes::default(),
+            identity: None,
+            workflow_execution_timeout: None,
+            workflow_run_timeout: None,
+            workflow_task_timeout: None,
+            retry_policy: None,
+            conflict_policy: WorkflowIdConflictPolicy::Fail,
+            reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+            header: None,
+            versioning_override: None,
+            run_key: None,
+            run_id: None,
+            now: Some(OffsetDateTime::UNIX_EPOCH),
+        }
+    }
+
+    fn signal_with_start_dto() -> crate::translate::SignalWithStartWorkflowExecutionRequest
+    {
+        crate::translate::SignalWithStartWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_id: "workflow-a".to_string(),
+            workflow_type: "workflow-type".to_string(),
+            task_queue: "queue".to_string(),
+            input: Payloads::default(),
+            request_id: None,
+            memo: Memo::default(),
+            search_attributes: SearchAttributes::default(),
+            identity: None,
+            workflow_execution_timeout: None,
+            workflow_run_timeout: None,
+            workflow_task_timeout: None,
+            retry_policy: None,
+            conflict_policy: WorkflowIdConflictPolicy::Fail,
+            reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+            header: None,
+            versioning_override: None,
+            signal_name: "signal".to_string(),
+            signal_input: Payloads::default(),
+        }
+    }
+
+    fn store_with_assignment() -> VersioningRuleStore {
+        let store = VersioningRuleStore::default();
+        let namespace_id = namespace_id_for("default");
+        let task_queue = TaskQueueName("queue".to_string());
+        let token = store.get_rules(namespace_id, &task_queue).conflict_token;
+        store
+            .apply_mutation(
+                namespace_id,
+                &task_queue,
+                token,
+                VersioningMutation::InsertAssignmentRule {
+                    rule: AssignmentRule {
+                        target_build_id: "rule-build".to_string(),
+                        percentage_ramp: None,
+                        create_time: OffsetDateTime::UNIX_EPOCH,
+                    },
+                    index: 0,
+                },
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn start_request_pinned_override_skips_assignment_rules() {
+        let store = store_with_assignment();
+        let mut dto = start_dto();
+        dto.versioning_override = Some(VersioningOverride::Pinned {
+            deployment_series: "series-a".to_string(),
+            build_id: "pinned-build".to_string(),
+        });
+
+        let internal = start_request(dto, &RequestId::new("req"), Some(&store));
+
+        assert_eq!(
+            internal.deployment,
+            Some(DeploymentId("series-a".to_string()))
+        );
+        assert_eq!(internal.build_id, Some(BuildId("pinned-build".to_string())));
+    }
+
+    #[test]
+    fn start_request_evaluates_assignment_rules_without_pinned_override() {
+        let store = store_with_assignment();
+
+        let internal = start_request(start_dto(), &RequestId::new("req"), Some(&store));
+
+        assert_eq!(internal.deployment, None);
+        assert_eq!(internal.build_id, Some(BuildId("rule-build".to_string())));
+    }
+
+    #[test]
+    fn signal_with_start_evaluates_assignment_rules() {
+        let store = store_with_assignment();
+
+        let internal = signal_with_start_request(
+            signal_with_start_dto(),
+            &RequestId::new("req"),
+            Some(&store),
+        );
+
+        assert_eq!(internal.deployment, None);
+        assert_eq!(internal.build_id, Some(BuildId("rule-build".to_string())));
     }
 }
 

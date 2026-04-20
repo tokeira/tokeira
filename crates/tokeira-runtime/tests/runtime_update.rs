@@ -2,7 +2,9 @@ use std::{sync::Arc, time::Instant};
 
 use anyhow::Result;
 use time::{Duration, OffsetDateTime};
-use tokeira_kernel::{StartRequest, WorkflowCommand, WorkflowTaskCompletedRequest};
+use tokeira_kernel::{
+    StartRequest, UpdateProtocolBody, WorkflowCommand, WorkflowTaskCompletedRequest,
+};
 use tokeira_runtime::{
     BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, UpdateOutcome,
     UpdateWaitPolicy, WorkflowTimeoutScannerConfig,
@@ -49,10 +51,20 @@ async fn update_completed_notifies_waiting_caller() -> Result<()> {
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: task.token,
             identity: WorkerIdentity("worker-a".into()),
-            commands: vec![WorkflowCommand::UpdateCompleted {
-                update_id: "update-1".into(),
-                result: payloads("done"),
-            }],
+            commands: vec![
+                WorkflowCommand::ProtocolMessage {
+                    message_id: "msg-accept-update-1".into(),
+                    body: UpdateProtocolBody::Accepted {
+                        update_id: "update-1".into(),
+                        update_name: "set-value".into(),
+                        input: payloads("input"),
+                    },
+                },
+                WorkflowCommand::UpdateCompleted {
+                    update_id: "update-1".into(),
+                    result: payloads("done"),
+                },
+            ],
             force_new_workflow_task: false,
             now: OffsetDateTime::now_utc(),
         })
@@ -62,7 +74,7 @@ async fn update_completed_notifies_waiting_caller() -> Result<()> {
     assert_eq!(
         outcome,
         UpdateOutcome::Completed {
-            accepted_event_id: 3,
+            accepted_event_id: 0,
             result: payloads("done"),
         }
     );
@@ -104,10 +116,20 @@ async fn update_rejected_notifies_waiting_caller() -> Result<()> {
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: task.token,
             identity: WorkerIdentity("worker-a".into()),
-            commands: vec![WorkflowCommand::UpdateRejected {
-                update_id: "update-1".into(),
-                failure: "nope".into(),
-            }],
+            commands: vec![
+                WorkflowCommand::ProtocolMessage {
+                    message_id: "msg-accept-update-1".into(),
+                    body: UpdateProtocolBody::Accepted {
+                        update_id: "update-1".into(),
+                        update_name: "reject-me".into(),
+                        input: payloads("input"),
+                    },
+                },
+                WorkflowCommand::UpdateRejected {
+                    update_id: "update-1".into(),
+                    failure: payload("nope"),
+                },
+            ],
             force_new_workflow_task: false,
             now: OffsetDateTime::now_utc(),
         })
@@ -117,8 +139,8 @@ async fn update_rejected_notifies_waiting_caller() -> Result<()> {
     assert_eq!(
         outcome,
         UpdateOutcome::Rejected {
-            accepted_event_id: 3,
-            failure: "nope".into(),
+            accepted_event_id: 0,
+            failure: payload("nope"),
         }
     );
     Ok(())
@@ -157,10 +179,20 @@ async fn update_timeout_does_not_block_late_completion_commit() -> Result<()> {
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: task.token,
             identity: WorkerIdentity("worker-a".into()),
-            commands: vec![WorkflowCommand::UpdateCompleted {
-                update_id: "update-1".into(),
-                result: payloads("late"),
-            }],
+            commands: vec![
+                WorkflowCommand::ProtocolMessage {
+                    message_id: "msg-accept-update-1".into(),
+                    body: UpdateProtocolBody::Accepted {
+                        update_id: "update-1".into(),
+                        update_name: "slow".into(),
+                        input: payloads("input"),
+                    },
+                },
+                WorkflowCommand::UpdateCompleted {
+                    update_id: "update-1".into(),
+                    result: payloads("late"),
+                },
+            ],
             force_new_workflow_task: false,
             now: OffsetDateTime::now_utc(),
         })
@@ -293,9 +325,25 @@ async fn multiple_updates_resolved_in_single_wft() -> Result<()> {
             token: task.token,
             identity: WorkerIdentity("worker-a".into()),
             commands: vec![
+                WorkflowCommand::ProtocolMessage {
+                    message_id: "msg-accept-update-1".into(),
+                    body: UpdateProtocolBody::Accepted {
+                        update_id: "update-1".into(),
+                        update_name: "handler-a".into(),
+                        input: payloads("input-1"),
+                    },
+                },
                 WorkflowCommand::UpdateCompleted {
                     update_id: "update-1".into(),
                     result: payloads("result-1"),
+                },
+                WorkflowCommand::ProtocolMessage {
+                    message_id: "msg-accept-update-2".into(),
+                    body: UpdateProtocolBody::Accepted {
+                        update_id: "update-2".into(),
+                        update_name: "handler-b".into(),
+                        input: payloads("input-2"),
+                    },
                 },
                 WorkflowCommand::UpdateCompleted {
                     update_id: "update-2".into(),
@@ -350,12 +398,13 @@ async fn start_workflow(
     workflow_id: WorkflowId,
     task_queue: &str,
 ) -> Result<tokeira_types::RunKey> {
+    let run_id = tokeira_types::RunId::new();
     let result = runtime
         .start_workflow(StartRequest {
             run_key: tokeira_types::RunKey::new(),
             namespace_id,
             workflow_id,
-            run_id: tokeira_types::RunId::new(),
+            run_id,
             workflow_type: WorkflowType("update-workflow".into()),
             task_queue: TaskQueueName(task_queue.into()),
             deployment: None,
@@ -375,6 +424,12 @@ async fn start_workflow(
             first_run_started_at: None,
             parent_run_key: None,
             parent_workflow_id: None,
+            parent_run_id: None,
+            parent_namespace_id: None,
+            parent_initiated_event_id: 0,
+            original_execution_run_id: Some(run_id),
+            continued_failure: None,
+            last_completion_result: None,
             request: request_context("start-1"),
             now: OffsetDateTime::now_utc(),
         })
@@ -408,7 +463,8 @@ async fn wait_for_pending_update(
     loop {
         match store.load_run(run_key).await? {
             tokeira_kernel::LoadedRun::Existing(state)
-                if state.pending_updates.contains_key(update_id) =>
+                if state.pending_updates.contains_key(update_id)
+                    || state.admitted_updates.contains(update_id) =>
             {
                 return Ok(());
             }
@@ -465,4 +521,11 @@ fn payloads(value: &str) -> Payloads {
         data: value.as_bytes().to_vec(),
         metadata: Default::default(),
     }])
+}
+
+fn payload(value: &str) -> Payload {
+    Payload {
+        data: value.as_bytes().to_vec(),
+        metadata: Default::default(),
+    }
 }

@@ -12,9 +12,9 @@ use tokeira_runtime::{
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
-    BuildId, DeploymentId, Memo, NamespaceId, Payloads, QueueKey, RequestContext,
-    RequestId, RetryPolicy, SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity,
-    WorkflowId, WorkflowType,
+    BuildId, DeploymentId, Memo, NamespaceId, Payload, Payloads, QueueKey,
+    RequestContext, RequestId, RetryPolicy, SearchAttributes, TaskKind, TaskQueueName,
+    WorkerIdentity, WorkflowId, WorkflowType,
 };
 
 #[tokio::test]
@@ -103,8 +103,9 @@ async fn retryable_activity_failure_redispatches_next_attempt() -> Result<()> {
     runtime
         .fail_activity_task(
             first.token,
-            "boom".to_string(),
+            Payload::new(b"boom".to_vec()),
             Some("retryable".to_string()),
+            false,
         )
         .await?;
 
@@ -182,8 +183,9 @@ async fn retryable_activity_failure_preserves_versioned_queue() -> Result<()> {
     runtime
         .fail_activity_task(
             first.token,
-            "boom".to_string(),
+            Payload::new(b"boom".to_vec()),
             Some("retryable".to_string()),
+            false,
         )
         .await?;
 
@@ -247,13 +249,19 @@ async fn non_retryable_activity_failure_submits_failed_resolution() -> Result<()
         .expect("activity should be pollable");
 
     runtime
-        .fail_activity_task(started.token, "boom".to_string(), Some("fatal".to_string()))
+        .fail_activity_task(
+            started.token,
+            Payload::new(b"boom".to_vec()),
+            Some("fatal".to_string()),
+            false,
+        )
         .await?;
 
     let history = store.read_history(run_key, 0, 64).await?;
     assert!(history.iter().any(|event| matches!(
         &event.kind,
-        HistoryEventKind::ActivityTaskFailed { activity_id, message, .. } if activity_id == "activity-1" && message == "boom"
+        HistoryEventKind::ActivityTaskFailed { activity_id, failure, .. }
+            if activity_id == "activity-1" && failure.data == b"boom"
     )));
     Ok(())
 }
@@ -384,11 +392,12 @@ fn start_request(
     workflow_id: WorkflowId,
     request_id: &str,
 ) -> StartRequest {
+    let run_id = tokeira_types::RunId::new();
     StartRequest {
         run_key: tokeira_types::RunKey::new(),
         namespace_id,
         workflow_id,
-        run_id: tokeira_types::RunId::new(),
+        run_id,
         workflow_type: WorkflowType("example".to_string()),
         task_queue: TaskQueueName("workflow-q".to_string()),
         input: Payloads::default(),
@@ -407,6 +416,12 @@ fn start_request(
         first_execution_run_id: None,
         parent_run_key: None,
         parent_workflow_id: None,
+        parent_run_id: None,
+        parent_namespace_id: None,
+        parent_initiated_event_id: 0,
+        original_execution_run_id: Some(run_id),
+        continued_failure: None,
+        last_completion_result: None,
         first_run_started_at: None,
         request: RequestContext {
             request_id: RequestId(request_id.to_string()),

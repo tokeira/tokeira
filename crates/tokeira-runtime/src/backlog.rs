@@ -423,6 +423,13 @@ mod tests {
         ) -> Result<Vec<WorkflowTimeoutSweepEntry>> {
             Ok(Vec::new())
         }
+        async fn list_started_workflow_tasks_for_shard(
+            &self,
+            _shard_id: ShardId,
+            _limit: usize,
+        ) -> Result<Vec<tokeira_storage::WftTimeoutSweepEntry>> {
+            Ok(Vec::new())
+        }
         async fn list_open_activities_for_shard(
             &self,
             _shard_id: ShardId,

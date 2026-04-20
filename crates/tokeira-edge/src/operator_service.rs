@@ -22,6 +22,8 @@ pub struct ClusterInfo {
     pub cluster_name: String,
     pub version: String,
     pub notes: Vec<String>,
+    pub shard_count: i32,
+    pub supported_clients: BTreeMap<String, String>,
 }
 
 #[async_trait]
@@ -60,6 +62,13 @@ impl InMemoryOperatorApi {
                 cluster_name: cluster_name.into(),
                 version: "0.1.0-dev".to_string(),
                 notes: vec!["in-memory operator api".to_string()],
+                shard_count: 1,
+                supported_clients: BTreeMap::from([
+                    ("temporal-go".to_string(), ">=1.26.0".to_string()),
+                    ("temporal-java".to_string(), ">=1.22.0".to_string()),
+                    ("temporal-python".to_string(), ">=1.6.0".to_string()),
+                    ("temporal-typescript".to_string(), ">=1.10.0".to_string()),
+                ]),
             }),
             attrs: RwLock::new(BTreeMap::new()),
         }

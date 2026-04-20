@@ -6,8 +6,8 @@ use tokeira_types::{
 };
 
 use crate::command::{
-    ExternalWorkflowExecution, FieldChange, RetryState, WorkflowTaskFailedCause,
-    WorkflowTaskTimeoutType, WorkflowTimeoutType,
+    ContinueAsNewInitiator, ExternalWorkflowExecution, FieldChange, RetryState,
+    WorkflowTaskFailedCause, WorkflowTaskTimeoutType, WorkflowTimeoutType,
 };
 use crate::state::{CompletionCallback, ParentClosePolicy, VersioningOverride};
 
@@ -54,6 +54,13 @@ pub enum HistoryEventKind {
         workflow_execution_timeout: Option<Duration>,
         workflow_run_timeout: Option<Duration>,
         workflow_task_timeout: Duration,
+        parent_workflow_id: Option<WorkflowId>,
+        parent_run_id: Option<RunId>,
+        parent_namespace_id: Option<NamespaceId>,
+        parent_initiated_event_id: i64,
+        original_execution_run_id: Option<RunId>,
+        continued_failure: Option<Payload>,
+        last_completion_result: Option<Payloads>,
     },
     /// An external signal was delivered to the workflow.
     WorkflowExecutionSignaled {
@@ -95,7 +102,12 @@ pub enum HistoryEventKind {
     },
     /// A workflow task was placed on the task queue. The
     /// kernel maintains at most one pending WFT per run.
-    WorkflowTaskScheduled { logical_seq: LogicalTaskSeq },
+    WorkflowTaskScheduled {
+        logical_seq: LogicalTaskSeq,
+        task_queue: TaskQueueName,
+        workflow_task_timeout: Duration,
+        attempt: u32,
+    },
     /// A worker picked up the workflow task and began
     /// processing it.
     WorkflowTaskStarted {
@@ -167,7 +179,7 @@ pub enum HistoryEventKind {
         activity_id: String,
         scheduled_event_id: i64,
         started_event_id: i64,
-        message: String,
+        failure: Payload,
     },
     /// The activity exceeded one of its configured timeouts.
     ActivityTaskTimedOut {
@@ -222,6 +234,7 @@ pub enum HistoryEventKind {
         child_workflow_id: WorkflowId,
         child_run_id: RunId,
         workflow_type: WorkflowType,
+        initiated_event_id: i64,
     },
     /// The child workflow could not be started (e.g. already
     /// exists).
@@ -233,24 +246,41 @@ pub enum HistoryEventKind {
     ChildWorkflowExecutionCompleted {
         child_workflow_id: WorkflowId,
         result: Payloads,
+        initiated_event_id: i64,
+        started_event_id: i64,
     },
     /// The child workflow failed with an application error.
     ChildWorkflowExecutionFailed {
         child_workflow_id: WorkflowId,
-        failure: String,
+        failure: Payload,
+        initiated_event_id: i64,
+        started_event_id: i64,
     },
     /// The child workflow was canceled.
-    ChildWorkflowExecutionCanceled { child_workflow_id: WorkflowId },
+    ChildWorkflowExecutionCanceled {
+        child_workflow_id: WorkflowId,
+        initiated_event_id: i64,
+        started_event_id: i64,
+    },
     /// The child workflow was forcibly terminated.
-    ChildWorkflowExecutionTerminated { child_workflow_id: WorkflowId },
+    ChildWorkflowExecutionTerminated {
+        child_workflow_id: WorkflowId,
+        initiated_event_id: i64,
+        started_event_id: i64,
+    },
     /// The child workflow exceeded its timeout.
-    ChildWorkflowExecutionTimedOut { child_workflow_id: WorkflowId },
+    ChildWorkflowExecutionTimedOut {
+        child_workflow_id: WorkflowId,
+        initiated_event_id: i64,
+        started_event_id: i64,
+    },
     /// A signal to an external workflow was initiated.
     SignalExternalWorkflowExecutionInitiated {
         target_workflow_id: WorkflowId,
         target_run_id: Option<RunId>,
         signal_name: String,
         input: Payloads,
+        control: String,
     },
     /// The external signal was successfully delivered.
     ExternalWorkflowExecutionSignaled {
@@ -267,6 +297,7 @@ pub enum HistoryEventKind {
     RequestCancelExternalWorkflowExecutionInitiated {
         target_workflow_id: WorkflowId,
         target_run_id: Option<RunId>,
+        control: String,
     },
     /// The external cancel request was successfully delivered.
     ExternalWorkflowExecutionCancelRequested {
@@ -303,7 +334,7 @@ pub enum HistoryEventKind {
     NexusOperationFailed {
         operation_id: String,
         scheduled_event_id: i64,
-        failure: String,
+        failure: Payload,
     },
     /// The Nexus operation was canceled.
     NexusOperationCanceled {
@@ -327,7 +358,7 @@ pub enum HistoryEventKind {
     /// A workflow update completed with a result.
     WorkflowExecutionUpdateCompleted { update_id: String, result: Payloads },
     /// A workflow update was rejected by the worker.
-    WorkflowExecutionUpdateRejected { update_id: String, failure: String },
+    WorkflowExecutionUpdateRejected { update_id: String, failure: Payload },
     /// Execution-level options (versioning, callbacks) were
     /// updated by an operator or API call.
     WorkflowExecutionOptionsUpdated {
@@ -339,8 +370,7 @@ pub enum HistoryEventKind {
     WorkflowExecutionCompleted { result: Payloads },
     /// The workflow failed with an application-level error.
     WorkflowExecutionFailed {
-        message: String,
-        details: Option<Payload>,
+        failure: Payload,
         retry_state: RetryState,
         attempt: u32,
     },
@@ -356,6 +386,10 @@ pub enum HistoryEventKind {
         workflow_execution_timeout: Option<Duration>,
         workflow_run_timeout: Option<Duration>,
         workflow_task_timeout: Duration,
+        retry_policy: Option<RetryPolicy>,
+        initiator: ContinueAsNewInitiator,
+        failure: Option<Payload>,
+        last_completion_result: Option<Payloads>,
     },
     /// The workflow was canceled via a `CancelWorkflow`
     /// workflow command (cooperative cancellation completed).
@@ -371,7 +405,7 @@ pub enum ActivityResolution {
     /// The activity returned a successful result.
     Completed { result: Payloads },
     /// The activity failed with an application-level error.
-    Failed { message: String },
+    Failed { failure: Payload },
     /// The activity exceeded one of its configured timeouts.
     TimedOut { timeout_type: String },
     /// The activity was canceled (cooperative cancellation).

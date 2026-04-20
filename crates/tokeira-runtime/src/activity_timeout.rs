@@ -185,12 +185,11 @@ pub fn evaluate_activity_timeout(
     activity: &ActivityState,
     now: OffsetDateTime,
 ) -> Option<TimeoutViolation> {
-    if let Some(timeout) = activity.schedule_to_close_timeout {
-        if now - entry.original_scheduled_at > timeout
-            || (timeout.is_zero() && now >= entry.original_scheduled_at)
-        {
-            return Some(TimeoutViolation::ScheduleToClose);
-        }
+    if let Some(timeout) = activity.schedule_to_close_timeout
+        && (now - entry.original_scheduled_at > timeout
+            || (timeout.is_zero() && now >= entry.original_scheduled_at))
+    {
+        return Some(TimeoutViolation::ScheduleToClose);
     }
 
     if let Some(started_at) = entry.started_at {
@@ -202,17 +201,16 @@ pub fn evaluate_activity_timeout(
             }
         }
 
-        if let Some(timeout) = activity.start_to_close_timeout {
-            if now - started_at > timeout || (timeout.is_zero() && now >= started_at) {
-                return Some(TimeoutViolation::StartToClose);
-            }
-        }
-    } else if let Some(timeout) = activity.schedule_to_start_timeout {
-        if now - entry.last_dispatched_at > timeout
-            || (timeout.is_zero() && now >= entry.last_dispatched_at)
+        if let Some(timeout) = activity.start_to_close_timeout
+            && (now - started_at > timeout || (timeout.is_zero() && now >= started_at))
         {
-            return Some(TimeoutViolation::ScheduleToStart);
+            return Some(TimeoutViolation::StartToClose);
         }
+    } else if let Some(timeout) = activity.schedule_to_start_timeout
+        && (now - entry.last_dispatched_at > timeout
+            || (timeout.is_zero() && now >= entry.last_dispatched_at))
+    {
+        return Some(TimeoutViolation::ScheduleToStart);
     }
 
     None

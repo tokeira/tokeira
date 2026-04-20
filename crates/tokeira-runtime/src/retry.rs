@@ -26,14 +26,13 @@ pub fn evaluate_activity_retry(
     current_attempt: u32,
     failure_error_type: Option<&str>,
 ) -> RetryDecision {
-    if let Some(error_type) = failure_error_type {
-        if policy
+    if let Some(error_type) = failure_error_type
+        && policy
             .non_retryable_error_types
             .iter()
             .any(|candidate| candidate == error_type)
-        {
-            return RetryDecision::Exhausted;
-        }
+    {
+        return RetryDecision::Exhausted;
     }
 
     if policy.maximum_attempts > 0 && current_attempt >= policy.maximum_attempts {
@@ -57,10 +56,10 @@ pub fn compute_retry_backoff(policy: &RetryPolicy, attempt: u32) -> Duration {
     let millis = (policy.initial_interval.whole_milliseconds() as f64)
         * coefficient.powi(exponent);
     let mut computed = Duration::milliseconds(millis.round() as i64);
-    if let Some(maximum) = policy.maximum_interval {
-        if computed > maximum {
-            computed = maximum;
-        }
+    if let Some(maximum) = policy.maximum_interval
+        && computed > maximum
+    {
+        computed = maximum;
     }
     computed
 }

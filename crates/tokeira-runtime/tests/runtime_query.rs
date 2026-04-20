@@ -177,12 +177,13 @@ async fn start_workflow(
     namespace_id: NamespaceId,
     workflow_id: WorkflowId,
 ) -> Result<tokeira_types::RunKey> {
+    let run_id = tokeira_types::RunId::new();
     let result = runtime
         .start_workflow(StartRequest {
             run_key: tokeira_types::RunKey::new(),
             namespace_id,
             workflow_id,
-            run_id: tokeira_types::RunId::new(),
+            run_id,
             workflow_type: WorkflowType("query-workflow".into()),
             task_queue: tokeira_types::TaskQueueName("queue-a".into()),
             deployment: None,
@@ -202,6 +203,12 @@ async fn start_workflow(
             first_run_started_at: None,
             parent_run_key: None,
             parent_workflow_id: None,
+            parent_run_id: None,
+            parent_namespace_id: None,
+            parent_initiated_event_id: 0,
+            original_execution_run_id: Some(run_id),
+            continued_failure: None,
+            last_completion_result: None,
             request: RequestContext {
                 request_id: RequestId("start-1".into()),
                 caller_identity: Some("tester".into()),

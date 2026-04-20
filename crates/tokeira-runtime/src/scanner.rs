@@ -52,6 +52,7 @@ pub(crate) fn pick_lane(
     &lanes[lane_index_for(run_key, lane_count.max(1)) % lanes.len()]
 }
 
+#[allow(dead_code)]
 pub(crate) async fn scan_due_timers_once<R, F, Fut>(
     repo: &R,
     config: &TimerScannerConfig,

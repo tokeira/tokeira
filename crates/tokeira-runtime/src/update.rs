@@ -15,7 +15,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use tokeira_types::{Payloads, RunKey};
+use tokeira_types::{Payload, Payloads, RunKey};
 use tokio::sync::oneshot;
 
 /// Caller-visible outcome of an update request.
@@ -31,7 +31,7 @@ pub enum UpdateOutcome {
     /// The update was rejected by workflow code.
     Rejected {
         accepted_event_id: i64,
-        failure: String,
+        failure: Payload,
     },
 }
 
@@ -54,13 +54,13 @@ pub struct PendingUpdateTransport {
 pub enum UpdateTransportResolution {
     Accepted,
     Completed { result: Payloads },
-    Rejected { failure: String },
+    Rejected { failure: Payload },
 }
 
 #[derive(Debug)]
 pub(crate) enum UpdateResolution {
     Completed { result: Payloads },
-    Rejected { failure: String },
+    Rejected { failure: Payload },
     RunClosed,
 }
 
@@ -218,8 +218,8 @@ mod tests {
         "[a-z0-9]{1,12}".prop_map(|s| format!("upd-{s}"))
     }
 
-    fn arb_failure() -> impl Strategy<Value = String> {
-        "[a-z ]{1,20}"
+    fn arb_failure() -> impl Strategy<Value = Payload> {
+        "[a-z ]{1,20}".prop_map(|s| Payload::new(s.into_bytes()))
     }
 
     // ── Existing unit tests ─────────────────────────
@@ -977,7 +977,7 @@ mod tests {
 
     use std::sync::Arc;
     use time::{Duration, OffsetDateTime};
-    use tokeira_kernel::{HistoryEventKind, LoadedRun, StartRequest, TerminateRequest};
+    use tokeira_kernel::{LoadedRun, StartRequest, TerminateRequest};
     use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
     use tokeira_types::{
         ExecutionRef, Memo, NamespaceId, RequestContext, RequestId, RunId,
@@ -1022,12 +1022,13 @@ mod tests {
         wf_id: &str,
     ) -> RunKey {
         let run_key = RunKey::new();
+        let run_id = RunId::new();
         let result = runtime
             .start_workflow(StartRequest {
                 run_key,
                 namespace_id: ns,
                 workflow_id: WorkflowId(wf_id.into()),
-                run_id: RunId::new(),
+                run_id,
                 workflow_type: WorkflowType("update-wf".into()),
                 task_queue: TaskQueueName("q".into()),
                 deployment: None,
@@ -1046,6 +1047,12 @@ mod tests {
                 first_execution_run_id: None,
                 parent_run_key: None,
                 parent_workflow_id: None,
+                parent_run_id: None,
+                parent_namespace_id: None,
+                parent_initiated_event_id: 0,
+                original_execution_run_id: Some(run_id),
+                continued_failure: None,
+                last_completion_result: None,
                 first_run_started_at: None,
                 request: req_ctx(&format!("start-{wf_id}")),
                 now: OffsetDateTime::now_utc(),

@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, time::Duration};
 
 use http::header::HeaderValue;
 use proptest::prelude::*;
+use prost::Message;
 use time::OffsetDateTime;
 use tokeira_edge::{
     errors::EdgeError,
@@ -19,19 +20,24 @@ use tokeira_edge::{
     translate::{
         CountWorkflowExecutionsRequest, CountWorkflowExecutionsResponse,
         DescribeWorkflowExecutionRequest, GroupCount, ListWorkflowExecutionsRequest,
-        ListWorkflowExecutionsResponse, PollWorkflowTaskQueueRequest,
-        PollWorkflowTaskQueueResponse, SignalWorkflowExecutionRequest,
-        StartWorkflowExecutionRequest, StartWorkflowExecutionResponse,
-        WorkflowExecutionDescription, WorkflowExecutionSummary, WorkflowTaskPayloadDto,
+        ListWorkflowExecutionsResponse, PendingActivityDescription,
+        PendingChildDescription, PendingWorkflowTaskDescription,
+        PollWorkflowTaskQueueRequest, PollWorkflowTaskQueueResponse,
+        SignalWorkflowExecutionRequest, StartWorkflowExecutionRequest,
+        StartWorkflowExecutionResponse, WorkflowExecutionDescription,
+        WorkflowExecutionSummary, WorkflowTaskPayloadDto,
     },
 };
 use tokeira_kernel::WorkflowCommand;
+use tokeira_kernel::state::ParentClosePolicy;
 use tokeira_kernel::{WorkflowIdConflictPolicy, WorkflowIdReusePolicy};
 use tokeira_proto::{
     conversions::common::{
-        memo_from_domain, payloads_from_domain, search_attributes_from_domain,
+        failure_to_payload, memo_from_domain, payload_to_failure, payloads_from_domain,
+        search_attributes_from_domain,
     },
     enums::WorkflowExecutionStatus,
+    public::temporal::api::failure::v1 as failure_proto,
     workflowservice,
 };
 use tokeira_types::{
@@ -103,6 +109,7 @@ proptest! {
     fn property_start_response_projection(edge in arb_start_response()) {
         let proto = start_response_to_proto(edge.clone());
         prop_assert_eq!(proto.run_id, edge.run_id.0.to_string());
+        prop_assert_eq!(proto.started, edge.started);
     }
 
     #[test]
@@ -110,6 +117,18 @@ proptest! {
         let proto = poll_response_to_proto(edge.clone());
         prop_assert_eq!(proto.task_token, edge.task_token);
         prop_assert_eq!(proto.started_event_id, edge.started_event_id);
+        prop_assert_eq!(
+            proto.previous_started_event_id,
+            edge.previous_started_event_id
+        );
+        prop_assert_eq!(
+            proto.scheduled_time.map(|ts| (ts.seconds, ts.nanos)),
+            edge.scheduled_time.map(|t| (t.unix_timestamp(), t.nanosecond() as i32))
+        );
+        prop_assert_eq!(
+            proto.started_time.map(|ts| (ts.seconds, ts.nanos)),
+            edge.started_time.map(|t| (t.unix_timestamp(), t.nanosecond() as i32))
+        );
         let execution = proto.workflow_execution.expect("workflow_execution");
         prop_assert_eq!(execution.workflow_id, edge.payload.workflow_id);
         prop_assert_eq!(execution.run_id, edge.payload.run_key.0.to_string());
@@ -161,6 +180,70 @@ proptest! {
     }
 
     #[test]
+    fn property_pending_activities_count_and_fields(edge in arb_description()) {
+        let proto = describe_response_to_proto(edge.clone());
+        prop_assert_eq!(proto.pending_activities.len(), edge.pending_activities.len());
+        for (actual, expected) in proto.pending_activities.iter().zip(edge.pending_activities.iter()) {
+            prop_assert_eq!(&actual.activity_id, &expected.activity_id);
+            prop_assert_eq!(
+                actual.activity_type.as_ref().map(|t| t.name.as_str()).unwrap_or_default(),
+                expected.activity_type.as_str()
+            );
+            prop_assert_eq!(actual.attempt, expected.attempt as i32);
+            prop_assert_eq!(
+                actual.state,
+                if expected.is_started {
+                    tokeira_proto::enums::PendingActivityState::Started as i32
+                } else {
+                    tokeira_proto::enums::PendingActivityState::Scheduled as i32
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn property_pending_children_count_and_fields(edge in arb_description()) {
+        let proto = describe_response_to_proto(edge.clone());
+        prop_assert_eq!(proto.pending_children.len(), edge.pending_children.len());
+        for (actual, expected) in proto.pending_children.iter().zip(edge.pending_children.iter()) {
+            prop_assert_eq!(&actual.workflow_id, &expected.workflow_id);
+            prop_assert_eq!(actual.initiated_id, expected.initiated_event_id);
+            prop_assert_eq!(
+                actual.parent_close_policy,
+                match expected.parent_close_policy {
+                    ParentClosePolicy::Terminate => 1,
+                    ParentClosePolicy::Abandon => 2,
+                    ParentClosePolicy::RequestCancel => 3,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn property_pending_wft_presence_and_fields(edge in arb_description()) {
+        let proto = describe_response_to_proto(edge.clone());
+        prop_assert_eq!(
+            proto.pending_workflow_task.is_some(),
+            edge.pending_workflow_task.is_some()
+        );
+        if let (Some(actual), Some(expected)) =
+            (proto.pending_workflow_task.as_ref(), edge.pending_workflow_task.as_ref())
+        {
+            prop_assert_eq!(actual.attempt, expected.attempt as i32);
+            prop_assert_eq!(
+                actual.state,
+                if expected.is_started {
+                    tokeira_proto::enums::PendingWorkflowTaskState::Started as i32
+                } else {
+                    tokeira_proto::enums::PendingWorkflowTaskState::Scheduled as i32
+                }
+            );
+            prop_assert_eq!(actual.started_time.is_some(), expected.started_at.is_some());
+            prop_assert_eq!(actual.scheduled_time.is_some(), true);
+        }
+    }
+
+    #[test]
     fn property_list_response_projection(edge in arb_list_response()) {
         let proto = list_response_to_proto(edge.clone());
         prop_assert_eq!(proto.executions.len(), edge.executions.len());
@@ -191,7 +274,18 @@ proptest! {
             | WorkflowCommand::CancelNexusOperation { .. } => {
                 let proto = workflow_command_to_proto(&cmd).unwrap();
                 let roundtrip = proto_command_to_workflow_command(proto).unwrap();
-                prop_assert_eq!(roundtrip, cmd);
+                match (&roundtrip, &cmd) {
+                    (
+                        WorkflowCommand::FailWorkflow { failure: actual },
+                        WorkflowCommand::FailWorkflow { failure: expected },
+                    ) => {
+                        prop_assert_eq!(
+                            payload_to_failure(actual).message,
+                            payload_to_failure(expected).message
+                        );
+                    }
+                    _ => prop_assert_eq!(roundtrip, cmd),
+                }
             }
             WorkflowCommand::RecordMarker { .. }
             | WorkflowCommand::ContinueAsNew { .. }
@@ -450,6 +544,7 @@ fn arb_start_request() -> impl Strategy<Value = StartWorkflowExecutionRequest> {
                 conflict_policy: WorkflowIdConflictPolicy::Fail,
                 reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
                 header: None,
+                versioning_override: None,
                 run_key: None,
                 run_id: None,
                 now: None,
@@ -533,23 +628,34 @@ fn arb_count_request() -> impl Strategy<Value = CountWorkflowExecutionsRequest> 
 }
 
 fn arb_start_response() -> impl Strategy<Value = StartWorkflowExecutionResponse> {
-    (any::<u128>(), any::<u128>(), any::<u64>(), any::<i64>()).prop_map(
-        |(run_key, run_id, transition_seq, last_event_id)| {
-            StartWorkflowExecutionResponse {
-                run_key: RunKey(Uuid::from_u128(run_key)),
-                run_id: RunId(Uuid::from_u128(run_id)),
-                transition_seq,
-                last_event_id,
-            }
-        },
+    (
+        any::<u128>(),
+        any::<u128>(),
+        any::<u64>(),
+        any::<i64>(),
+        any::<bool>(),
     )
+        .prop_map(
+            |(run_key, run_id, transition_seq, last_event_id, started)| {
+                StartWorkflowExecutionResponse {
+                    run_key: RunKey(Uuid::from_u128(run_key)),
+                    run_id: RunId(Uuid::from_u128(run_id)),
+                    transition_seq,
+                    last_event_id,
+                    started,
+                }
+            },
+        )
 }
 
 fn arb_poll_response() -> impl Strategy<Value = PollWorkflowTaskQueueResponse> {
     (
         prop::collection::vec(any::<u8>(), 0..16),
         any::<i64>(),
+        any::<i64>(),
         any::<u32>(),
+        prop::option::of(0i64..4_000_000_000i64),
+        prop::option::of(0i64..4_000_000_000i64),
         arb_small_string(),
         any::<u128>(),
         arb_small_string(),
@@ -558,14 +664,26 @@ fn arb_poll_response() -> impl Strategy<Value = PollWorkflowTaskQueueResponse> {
             |(
                 task_token,
                 started_event_id,
+                previous_started_event_id,
                 attempt,
+                scheduled_time,
+                started_time,
                 workflow_id,
                 run_key,
                 task_queue,
             )| PollWorkflowTaskQueueResponse {
                 task_token,
                 started_event_id,
+                previous_started_event_id,
                 attempt,
+                scheduled_time: scheduled_time
+                    .map(OffsetDateTime::from_unix_timestamp)
+                    .transpose()
+                    .expect("valid timestamp"),
+                started_time: started_time
+                    .map(OffsetDateTime::from_unix_timestamp)
+                    .transpose()
+                    .expect("valid timestamp"),
                 payload: WorkflowTaskPayloadDto {
                     workflow_id,
                     run_key: RunKey(Uuid::from_u128(run_key)),
@@ -596,6 +714,9 @@ fn arb_description() -> impl Strategy<Value = WorkflowExecutionDescription> {
             0i64..1000i64,
             arb_memo(),
             arb_search_attributes(),
+            prop::collection::vec(arb_pending_activity(), 0..10),
+            prop::collection::vec(arb_pending_child(), 0..5),
+            prop::option::of(arb_pending_wft()),
         ),
     )
         .prop_map(
@@ -616,6 +737,9 @@ fn arb_description() -> impl Strategy<Value = WorkflowExecutionDescription> {
                     state_transition_count,
                     memo,
                     search_attributes,
+                    pending_activities,
+                    pending_children,
+                    pending_workflow_task,
                 ),
             )| WorkflowExecutionDescription {
                 namespace,
@@ -633,8 +757,92 @@ fn arb_description() -> impl Strategy<Value = WorkflowExecutionDescription> {
                 state_transition_count,
                 memo,
                 search_attributes,
+                pending_activities,
+                pending_children,
+                pending_workflow_task,
             },
         )
+}
+
+fn arb_pending_activity() -> impl Strategy<Value = PendingActivityDescription> {
+    (
+        arb_small_string(),
+        arb_small_string(),
+        any::<bool>(),
+        1u32..5,
+        0u32..10,
+        0i64..4_000_000_000i64,
+        prop::option::of(0i64..4_000_000_000i64),
+    )
+        .prop_map(
+            |(
+                activity_id,
+                activity_type,
+                is_started,
+                attempt,
+                maximum_attempts,
+                scheduled_at,
+                started_at,
+            )| PendingActivityDescription {
+                activity_id,
+                activity_type,
+                is_started,
+                attempt,
+                maximum_attempts,
+                scheduled_at: OffsetDateTime::from_unix_timestamp(scheduled_at).unwrap(),
+                started_at: started_at
+                    .map(|secs| OffsetDateTime::from_unix_timestamp(secs).unwrap()),
+            },
+        )
+}
+
+fn arb_pending_child() -> impl Strategy<Value = PendingChildDescription> {
+    (
+        arb_small_string(),
+        prop::option::of(arb_small_string()),
+        arb_small_string(),
+        1i64..1000,
+        prop_oneof![
+            Just(ParentClosePolicy::Terminate),
+            Just(ParentClosePolicy::Abandon),
+            Just(ParentClosePolicy::RequestCancel),
+        ],
+    )
+        .prop_map(
+            |(
+                workflow_id,
+                run_id,
+                workflow_type,
+                initiated_event_id,
+                parent_close_policy,
+            )| {
+                PendingChildDescription {
+                    workflow_id,
+                    run_id,
+                    workflow_type,
+                    initiated_event_id,
+                    parent_close_policy,
+                }
+            },
+        )
+}
+
+fn arb_pending_wft() -> impl Strategy<Value = PendingWorkflowTaskDescription> {
+    (
+        any::<bool>(),
+        0i64..4_000_000_000i64,
+        prop::option::of(0i64..4_000_000_000i64),
+        1u32..5,
+    )
+        .prop_map(|(is_started, scheduled_at, started_at, attempt)| {
+            PendingWorkflowTaskDescription {
+                is_started,
+                scheduled_at: OffsetDateTime::from_unix_timestamp(scheduled_at).unwrap(),
+                started_at: started_at
+                    .map(|secs| OffsetDateTime::from_unix_timestamp(secs).unwrap()),
+                attempt,
+            }
+        })
 }
 
 fn arb_list_response() -> impl Strategy<Value = ListWorkflowExecutionsResponse> {
@@ -757,8 +965,7 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
             }),
         arb_payloads().prop_map(|result| WorkflowCommand::CompleteWorkflow { result }),
         arb_small_string().prop_map(|message| WorkflowCommand::FailWorkflow {
-            message,
-            details: None
+            failure: Payload::new(message.into_bytes()),
         }),
         (
             arb_small_string(),
@@ -779,6 +986,7 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
                         workflow_execution_timeout: None,
                         workflow_run_timeout: None,
                         workflow_task_timeout: time::Duration::seconds(10),
+                        retry_policy: None,
                     }
                 }
             ),
@@ -810,6 +1018,7 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
                 target_run_id: Some(tokeira_types::RunId::new()),
                 signal_name: "sig".into(),
                 input,
+                control: "ctl".into(),
             }
         }),
         arb_small_string().prop_map(|target_workflow_id| {
@@ -817,6 +1026,7 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
                 target_namespace_id: tokeira_types::NamespaceId::new(),
                 target_workflow_id: tokeira_types::WorkflowId(target_workflow_id),
                 target_run_id: Some(tokeira_types::RunId::new()),
+                control: "ctl".into(),
             }
         }),
         (
@@ -845,7 +1055,7 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
         }),
         arb_small_string().prop_map(|failure| WorkflowCommand::UpdateRejected {
             update_id: "update-1".into(),
-            failure,
+            failure: Payload::new(failure.into_bytes()),
         }),
         arb_payloads().prop_map(|input| WorkflowCommand::ProtocolMessage {
             message_id: "msg-1".into(),
@@ -1220,7 +1430,7 @@ proptest! {
             },
             _ => UpdateOutcomeDto::Rejected {
                 accepted_event_id,
-                failure: failure.clone(),
+                failure: Payload::new(failure.clone().into_bytes()),
             },
         };
         let edge = UpdateWorkflowExecutionResponse {
@@ -1265,5 +1475,70 @@ proptest! {
             respond_activity_completed_to_edge(proto)
                 .unwrap();
         prop_assert_eq!(edge.token, token);
+    }
+}
+
+// ── Property 8: failure_to_payload / payload_to_failure round-trip ──
+// **Validates: Requirement 8 (AC 8.1)**
+
+fn arb_proto_failure() -> impl Strategy<Value = failure_proto::Failure> {
+    (
+        "[a-z ]{0,20}",
+        "[a-z]{0,10}",
+        "[a-z\n]{0,30}",
+        arb_failure_info(),
+    )
+        .prop_map(
+            |(msg, source, stack, failure_info)| failure_proto::Failure {
+                message: msg,
+                source,
+                stack_trace: stack,
+                failure_info,
+                ..Default::default()
+            },
+        )
+}
+
+fn arb_failure_info() -> impl Strategy<Value = Option<failure_proto::failure::FailureInfo>>
+{
+    prop_oneof![
+        Just(None),
+        "[a-z]{0,10}".prop_map(|t| Some(
+            failure_proto::failure::FailureInfo::ApplicationFailureInfo(
+                failure_proto::ApplicationFailureInfo {
+                    r#type: t,
+                    non_retryable: false,
+                    ..Default::default()
+                },
+            )
+        )),
+        Just(Some(
+            failure_proto::failure::FailureInfo::TimeoutFailureInfo(
+                failure_proto::TimeoutFailureInfo {
+                    timeout_type: 3,
+                    ..Default::default()
+                },
+            )
+        )),
+        Just(Some(
+            failure_proto::failure::FailureInfo::CanceledFailureInfo(
+                failure_proto::CanceledFailureInfo {
+                    ..Default::default()
+                },
+            )
+        )),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn prop_failure_payload_round_trip(failure in arb_proto_failure()) {
+        let original_bytes = failure.encode_to_vec();
+        let payload = failure_to_payload(&failure);
+        let decoded = payload_to_failure(&payload);
+        let re_encoded = decoded.encode_to_vec();
+        prop_assert_eq!(original_bytes, re_encoded);
     }
 }

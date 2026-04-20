@@ -32,7 +32,7 @@ use tokeira_projection::{
     InMemoryVisibilityStore, ProjectionWorker, VisibilityQueryService, VisibilitySink,
 };
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime,
+    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, VersioningRuleStore,
     WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{InMemoryStore, RunRepository};
@@ -56,13 +56,15 @@ async fn main() -> Result<()> {
     ));
     // The runtime owns execution orchestration, scanners, brokers, and all
     // run-local in-memory coordination such as buffered consistent queries.
-    let runtime = Arc::new(TokeiraRuntime::new(
+    let versioning_rule_store = Arc::new(VersioningRuleStore::default());
+    let runtime = Arc::new(TokeiraRuntime::new_with_versioning(
         repo.clone(),
         4,
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
         BacklogConfig::default(),
+        versioning_rule_store.clone(),
     ));
 
     let default_namespace = ResolvedNamespace::active("default");
@@ -76,6 +78,7 @@ async fn main() -> Result<()> {
     let router = Arc::new(LocalOnlyRouter);
     let workflow_broker = runtime.broker();
     let buffered_queries = runtime.buffered_queries();
+    let worker_registry = runtime.worker_registry();
     let runtime_adapter = Arc::new(RuntimeAdapter::new(runtime));
     let resolver = Arc::new(StoreExecutionResolver::new(
         repo.clone(),
@@ -116,7 +119,7 @@ async fn main() -> Result<()> {
     // exist. The edge stays thin: it delegates workflow semantics back into the
     // runtime and uses visibility/operator helpers only for read APIs.
     let workflow_service =
-        WorkflowService::new_with_buffered_queries_and_history_wait_registry(
+        WorkflowService::new_with_versioning_and_buffered_queries_and_history_wait_registry(
             runtime_adapter,
             resolver,
             visibility,
@@ -131,6 +134,8 @@ async fn main() -> Result<()> {
             long_polls,
             router,
             history_waits,
+            versioning_rule_store,
+            worker_registry,
         );
     let operator_service = OperatorService::new(operator_api, interceptors);
 
@@ -250,6 +255,47 @@ where
                 state_transition_count: state.transition_seq.0 as i64,
                 memo: state.memo,
                 search_attributes: state.search_attributes,
+                pending_activities: state
+                    .activities
+                    .values()
+                    .map(
+                        |activity| tokeira_edge::translate::PendingActivityDescription {
+                            activity_id: activity.activity_id.clone(),
+                            activity_type: activity.activity_type.clone(),
+                            is_started: activity.started_at.is_some(),
+                            attempt: activity.attempt,
+                            maximum_attempts: activity
+                                .retry_policy
+                                .as_ref()
+                                .map(|policy| policy.maximum_attempts)
+                                .unwrap_or_default(),
+                            scheduled_at: activity.scheduled_at,
+                            started_at: activity.started_at,
+                        },
+                    )
+                    .collect(),
+                pending_children: state
+                    .children
+                    .values()
+                    .map(|child| tokeira_edge::translate::PendingChildDescription {
+                        workflow_id: child.child_workflow_id.0.clone(),
+                        run_id: child
+                            .child_run_id
+                            .as_ref()
+                            .map(|run_id| run_id.0.to_string()),
+                        workflow_type: String::new(),
+                        initiated_event_id: child.initiated_event_id,
+                        parent_close_policy: child.parent_close_policy,
+                    })
+                    .collect(),
+                pending_workflow_task: state.pending_workflow_task.as_ref().map(|task| {
+                    tokeira_edge::translate::PendingWorkflowTaskDescription {
+                        is_started: task.started_event_id.is_some(),
+                        scheduled_at: task.scheduled_at,
+                        started_at: task.started_at,
+                        attempt: task.attempt,
+                    }
+                }),
             })),
             LoadedRun::Absent => {
                 Err(anyhow!("resolved run missing from storage: {:?}", run_key))

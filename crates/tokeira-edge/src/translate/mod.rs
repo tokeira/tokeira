@@ -10,21 +10,39 @@
 //! - [`from_internal`] — kernel result / runtime response → proto
 //! - [`history_serializer`] — kernel `HistoryEvent` → proto history event
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    time::Duration,
+};
 
 use time::OffsetDateTime;
 
 use tokeira_kernel::{
-    WorkflowCommand, WorkflowIdConflictPolicy, WorkflowIdReusePolicy, event::HistoryEvent,
+    WorkflowCommand, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+    event::HistoryEvent, state::ParentClosePolicy,
 };
 use tokeira_types::{
-    ActivityTaskToken, BuildId, DeploymentId, ExecutionStatus, Headers, Memo, Payloads,
-    RetryPolicy, RunId, RunKey, SearchAttributes, TaskKind,
+    ActivityTaskToken, BuildId, DeploymentId, ExecutionStatus, Headers, Memo, Payload,
+    Payloads, RetryPolicy, RunId, RunKey, SearchAttributes, TaskKind,
 };
 
 pub mod from_internal;
 pub mod history_serializer;
 pub mod to_internal;
+
+/// Client-supplied worker-versioning override for starts.
+///
+/// Pinned starts bypass assignment rules and address one deployment/build
+/// tuple directly. Auto-upgrade remains rule-managed, so it is represented
+/// distinctly from a concrete build ID.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VersioningOverride {
+    Pinned {
+        deployment_series: String,
+        build_id: String,
+    },
+    AutoUpgrade,
+}
 
 /// Edge-facing request for `StartWorkflowExecution`.
 ///
@@ -49,6 +67,7 @@ pub struct StartWorkflowExecutionRequest {
     pub conflict_policy: WorkflowIdConflictPolicy,
     pub reuse_policy: WorkflowIdReusePolicy,
     pub header: Option<Headers>,
+    pub versioning_override: Option<VersioningOverride>,
     pub run_key: Option<RunKey>,
     pub run_id: Option<RunId>,
     pub now: Option<OffsetDateTime>,
@@ -60,6 +79,7 @@ pub struct StartWorkflowExecutionResponse {
     pub run_id: RunId,
     pub transition_seq: u64,
     pub last_event_id: i64,
+    pub started: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -104,7 +124,10 @@ pub struct WorkflowTaskPayloadDto {
 pub struct PollWorkflowTaskQueueResponse {
     pub task_token: Vec<u8>,
     pub started_event_id: i64,
+    pub previous_started_event_id: i64,
     pub attempt: u32,
+    pub scheduled_time: Option<OffsetDateTime>,
+    pub started_time: Option<OffsetDateTime>,
     pub payload: WorkflowTaskPayloadDto,
     pub queries: HashMap<String, WorkflowQueryDto>,
     pub messages: Vec<ProtocolMessageDto>,
@@ -172,6 +195,37 @@ pub struct WorkflowExecutionDescription {
     pub state_transition_count: i64,
     pub memo: Memo,
     pub search_attributes: SearchAttributes,
+    pub pending_activities: Vec<PendingActivityDescription>,
+    pub pending_children: Vec<PendingChildDescription>,
+    pub pending_workflow_task: Option<PendingWorkflowTaskDescription>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingActivityDescription {
+    pub activity_id: String,
+    pub activity_type: String,
+    pub is_started: bool,
+    pub attempt: u32,
+    pub maximum_attempts: u32,
+    pub scheduled_at: OffsetDateTime,
+    pub started_at: Option<OffsetDateTime>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingChildDescription {
+    pub workflow_id: String,
+    pub run_id: Option<String>,
+    pub workflow_type: String,
+    pub initiated_event_id: i64,
+    pub parent_close_policy: ParentClosePolicy,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingWorkflowTaskDescription {
+    pub is_started: bool,
+    pub scheduled_at: OffsetDateTime,
+    pub started_at: Option<OffsetDateTime>,
+    pub attempt: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -251,6 +305,10 @@ pub struct NamespaceDescription {
     pub is_global: bool,
     pub visibility_enabled: bool,
     pub deleted: bool,
+    pub description: String,
+    pub owner_email: String,
+    pub cluster_name: String,
+    pub custom_search_attribute_aliases: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -305,8 +363,9 @@ pub struct RespondActivityTaskCompletedResponse;
 #[derive(Clone, Debug, PartialEq)]
 pub struct RespondActivityTaskFailedRequest {
     pub token: ActivityTaskToken,
-    pub failure_message: String,
+    pub failure: Payload,
     pub failure_error_type: Option<String>,
+    pub is_non_retryable: bool,
     pub identity: String,
 }
 
@@ -396,7 +455,7 @@ pub enum UpdateOutcomeDto {
     },
     Rejected {
         accepted_event_id: i64,
-        failure: String,
+        failure: Payload,
     },
 }
 
@@ -479,6 +538,7 @@ pub struct SignalWithStartWorkflowExecutionRequest {
     pub conflict_policy: WorkflowIdConflictPolicy,
     pub reuse_policy: WorkflowIdReusePolicy,
     pub header: Option<Headers>,
+    pub versioning_override: Option<VersioningOverride>,
     pub signal_name: String,
     pub signal_input: Payloads,
 }

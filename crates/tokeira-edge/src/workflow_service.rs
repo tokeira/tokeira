@@ -28,11 +28,12 @@ use tokeira_runtime::{
     BufferedQueryRegistry, InMemoryBroker, PendingUpdateTransport, QueryResult,
     ResetWorkflowResult, SignalWithStartResult, StartWorkflowResult, StartedActivityTask,
     StartedWorkflowTask, UpdateOutcome, UpdateTransportResolution, UpdateWaitPolicy,
+    VersioningRuleStore, WorkerRegistry,
 };
 use tokeira_storage::RunRepository;
 use tokeira_types::{
-    ActivityTaskToken, ExecutionRef, ExecutionStatus, Payloads, QueueKey, RequestContext,
-    RunId, RunKey, TaskKind, TaskQueueName, WorkerIdentity,
+    ActivityTaskToken, ExecutionRef, ExecutionStatus, Payload, Payloads, QueueKey,
+    RequestContext, RunId, RunKey, TaskKind, TaskQueueName, WorkerIdentity,
 };
 use uuid::Uuid;
 
@@ -136,8 +137,9 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
     async fn fail_activity_task(
         &self,
         token: ActivityTaskToken,
-        failure_message: String,
+        failure: Payload,
         failure_error_type: Option<String>,
+        is_non_retryable: bool,
     ) -> Result<()>;
 
     async fn record_activity_heartbeat(&self, token: ActivityTaskToken) -> Result<bool>;
@@ -340,6 +342,8 @@ pub struct WorkflowService {
     long_polls: LongPollGate,
     router: Arc<dyn EdgeRouter>,
     history_waiters: HistoryWaitRegistry,
+    versioning_rule_store: Arc<VersioningRuleStore>,
+    worker_registry: WorkerRegistry,
 }
 
 impl std::fmt::Debug for WorkflowService {
@@ -363,7 +367,7 @@ impl WorkflowService {
         long_polls: LongPollGate,
         router: Arc<dyn EdgeRouter>,
     ) -> Self {
-        Self::new_with_buffered_queries_and_history_wait_registry(
+        Self::new_with_versioning_and_buffered_queries_and_history_wait_registry(
             runtime,
             resolver,
             visibility,
@@ -378,6 +382,8 @@ impl WorkflowService {
             long_polls,
             router,
             HistoryWaitRegistry::default(),
+            Arc::new(VersioningRuleStore::default()),
+            WorkerRegistry::default(),
         )
     }
 
@@ -396,7 +402,7 @@ impl WorkflowService {
         long_polls: LongPollGate,
         router: Arc<dyn EdgeRouter>,
     ) -> Self {
-        Self::new_with_buffered_queries_and_history_wait_registry(
+        Self::new_with_versioning_and_buffered_queries_and_history_wait_registry(
             runtime,
             resolver,
             visibility,
@@ -411,6 +417,8 @@ impl WorkflowService {
             long_polls,
             router,
             HistoryWaitRegistry::default(),
+            Arc::new(VersioningRuleStore::default()),
+            WorkerRegistry::default(),
         )
     }
 
@@ -429,7 +437,7 @@ impl WorkflowService {
         router: Arc<dyn EdgeRouter>,
         history_waiters: HistoryWaitRegistry,
     ) -> Self {
-        Self::new_with_buffered_queries_and_history_wait_registry(
+        Self::new_with_versioning_and_buffered_queries_and_history_wait_registry(
             runtime,
             resolver,
             visibility,
@@ -444,7 +452,59 @@ impl WorkflowService {
             long_polls,
             router,
             history_waiters,
+            Arc::new(VersioningRuleStore::default()),
+            WorkerRegistry::default(),
         )
+    }
+
+    pub fn new_with_versioning_and_buffered_queries_and_history_wait_registry(
+        runtime: Arc<dyn WorkflowRuntimeApi>,
+        resolver: Arc<dyn ExecutionResolver>,
+        visibility: Arc<dyn VisibilityApi>,
+        repo: Arc<dyn RunRepository>,
+        operator_api: Arc<dyn OperatorApi>,
+        namespaces: Arc<dyn NamespaceCache>,
+        interceptors: Arc<EdgeInterceptors>,
+        poller_registry: PollerRegistry,
+        pending_queries: PendingQueryStore,
+        buffered_queries: BufferedQueryRegistry,
+        broker: InMemoryBroker,
+        long_polls: LongPollGate,
+        router: Arc<dyn EdgeRouter>,
+        history_waiters: HistoryWaitRegistry,
+        versioning_rule_store: Arc<VersioningRuleStore>,
+        worker_registry: WorkerRegistry,
+    ) -> Self {
+        Self {
+            runtime,
+            resolver,
+            visibility,
+            repo,
+            operator_api,
+            namespaces,
+            interceptors,
+            poller_registry,
+            pending_queries,
+            buffered_queries,
+            broker,
+            long_polls,
+            router,
+            history_waiters,
+            versioning_rule_store,
+            worker_registry,
+        }
+    }
+
+    pub fn versioning_rule_store(&self) -> Arc<VersioningRuleStore> {
+        self.versioning_rule_store.clone()
+    }
+
+    pub fn worker_registry(&self) -> WorkerRegistry {
+        self.worker_registry.clone()
+    }
+
+    pub fn broker(&self) -> InMemoryBroker {
+        self.broker.clone()
     }
 
     pub fn new_with_buffered_queries_and_history_wait_registry(
@@ -463,7 +523,7 @@ impl WorkflowService {
         router: Arc<dyn EdgeRouter>,
         history_waiters: HistoryWaitRegistry,
     ) -> Self {
-        Self {
+        Self::new_with_versioning_and_buffered_queries_and_history_wait_registry(
             runtime,
             resolver,
             visibility,
@@ -478,7 +538,9 @@ impl WorkflowService {
             long_polls,
             router,
             history_waiters,
-        }
+            Arc::new(VersioningRuleStore::default()),
+            WorkerRegistry::default(),
+        )
     }
 
     /// Attach buffered queries whose consistency barrier has been met.
@@ -589,7 +651,10 @@ impl WorkflowService {
         let mut response = PollWorkflowTaskQueueResponse {
             task_token: task_token.clone(),
             started_event_id: 0,
+            previous_started_event_id: state.previous_started_event_id,
             attempt: 1,
+            scheduled_time: None,
+            started_time: None,
             payload: crate::translate::WorkflowTaskPayloadDto {
                 workflow_id: state.workflow_id.0.clone(),
                 run_key: state.run_key,
@@ -636,7 +701,11 @@ impl WorkflowService {
 
         ensure_local(self.router.route_workflow(&namespace, &workflow_id).await?)?;
 
-        let internal = to_internal::start_request(req, &ctx.request_id);
+        let internal = to_internal::start_request(
+            req,
+            &ctx.request_id,
+            Some(self.versioning_rule_store.as_ref()),
+        );
         let outcome = self
             .runtime
             .start_workflow_with_policy(internal.clone())
@@ -1445,8 +1514,11 @@ impl WorkflowService {
                 .route_workflow(&req.namespace, &req.workflow_id)
                 .await?,
         )?;
-        let internal =
-            to_internal::signal_with_start_request(req.clone(), &ctx.request_id);
+        let internal = to_internal::signal_with_start_request(
+            req.clone(),
+            &ctx.request_id,
+            Some(self.versioning_rule_store.as_ref()),
+        );
         match self
             .runtime
             .signal_with_start_workflow(internal)
@@ -1574,8 +1646,9 @@ impl WorkflowService {
         self.runtime
             .fail_activity_task(
                 token.clone(),
-                req.failure_message,
+                req.failure,
                 req.failure_error_type,
+                req.is_non_retryable,
             )
             .await
             .map_err(EdgeError::from)?;
@@ -2152,7 +2225,7 @@ fn is_close_history_event(kind: &HistoryEventKind) -> bool {
         HistoryEventKind::WorkflowExecutionCompleted { .. }
             | HistoryEventKind::WorkflowExecutionFailed { .. }
             | HistoryEventKind::WorkflowExecutionTimedOut { .. }
-            | HistoryEventKind::WorkflowExecutionCanceled { .. }
+            | HistoryEventKind::WorkflowExecutionCanceled
             | HistoryEventKind::WorkflowExecutionTerminated { .. }
             | HistoryEventKind::WorkflowExecutionContinuedAsNew { .. }
     )
@@ -2198,6 +2271,10 @@ fn namespace_to_description(namespace: ResolvedNamespace) -> NamespaceDescriptio
         is_global: namespace.is_global,
         visibility_enabled: namespace.visibility_enabled,
         deleted: namespace.deleted,
+        description: String::new(),
+        owner_email: String::new(),
+        cluster_name: "local".to_string(),
+        custom_search_attribute_aliases: std::collections::BTreeMap::new(),
     }
 }
 

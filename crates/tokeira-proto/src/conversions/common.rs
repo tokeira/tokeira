@@ -2,7 +2,9 @@
 
 use crate::conversions::ProtoConversionError;
 use crate::public::common;
+use crate::public::temporal::api::failure::v1 as failure_proto;
 use crate::public::temporal::api::taskqueue::v1 as taskqueue;
+use prost::Message as _;
 use prost_types::{Duration as ProtoDuration, Timestamp};
 use time::OffsetDateTime;
 use tokeira_types::{
@@ -19,7 +21,6 @@ pub fn payload_from_domain(value: &DomainPayload) -> common::Payload {
             .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
             .collect(),
         data: value.data.clone(),
-        ..Default::default()
     }
 }
 
@@ -34,10 +35,27 @@ pub fn payload_to_domain(value: &common::Payload) -> DomainPayload {
     }
 }
 
+pub fn failure_to_payload(value: &failure_proto::Failure) -> DomainPayload {
+    let mut metadata = std::collections::BTreeMap::new();
+    metadata.insert("encoding".to_string(), "temporal/failure+proto".to_string());
+    DomainPayload {
+        data: value.encode_to_vec(),
+        metadata,
+    }
+}
+
+pub fn payload_to_failure(value: &DomainPayload) -> failure_proto::Failure {
+    failure_proto::Failure::decode(value.data.as_slice()).unwrap_or_else(|_| {
+        failure_proto::Failure {
+            message: String::from_utf8_lossy(&value.data).into_owned(),
+            ..Default::default()
+        }
+    })
+}
+
 pub fn payloads_from_domain(values: &DomainPayloads) -> common::Payloads {
     common::Payloads {
         payloads: values.0.iter().map(payload_from_domain).collect(),
-        ..Default::default()
     }
 }
 
@@ -52,7 +70,6 @@ pub fn headers_from_domain(value: &Headers) -> common::Header {
             .iter()
             .map(|(k, v)| (k.clone(), payload_from_domain(v)))
             .collect(),
-        ..Default::default()
     }
 }
 
@@ -73,7 +90,6 @@ pub fn memo_from_domain(value: &Memo) -> common::Memo {
             .iter()
             .map(|(k, v)| (k.clone(), payload_from_domain(v)))
             .collect(),
-        ..Default::default()
     }
 }
 
@@ -96,7 +112,6 @@ pub fn search_attributes_from_domain(
             .iter()
             .map(|(name, val)| (name.clone(), search_attr_value_to_payload(val)))
             .collect(),
-        ..Default::default()
     }
 }
 
@@ -116,11 +131,7 @@ fn search_attr_value_to_payload(value: &SearchAttrValue) -> common::Payload {
     let data = serde_json::to_vec(value).unwrap_or_default();
     let mut metadata = std::collections::BTreeMap::new();
     metadata.insert("encoding".to_string(), b"json/plain".to_vec());
-    common::Payload {
-        metadata,
-        data,
-        ..Default::default()
-    }
+    common::Payload { metadata, data }
 }
 
 fn search_attr_payload_to_domain(
@@ -138,7 +149,6 @@ pub fn workflow_execution_from_ids(
     common::WorkflowExecution {
         workflow_id: workflow_id.0.clone(),
         run_id: run_id.0.to_string(),
-        ..Default::default()
     }
 }
 

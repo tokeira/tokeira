@@ -24,6 +24,8 @@ pub mod scanner;
 pub mod shard;
 pub mod timeout;
 pub mod update;
+pub mod versioning;
+pub mod wft_timeout;
 pub mod worker_registry;
 
 pub use activity_timeout::*;
@@ -42,4 +44,6 @@ pub use scanner::*;
 pub use shard::*;
 pub use timeout::*;
 pub use update::*;
+pub use versioning::*;
+pub use wft_timeout::*;
 pub use worker_registry::*;

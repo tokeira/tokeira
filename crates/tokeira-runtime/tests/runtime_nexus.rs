@@ -409,11 +409,12 @@ fn start_request(
     workflow_id: WorkflowId,
     request_id: &str,
 ) -> StartRequest {
+    let run_id = RunId::new();
     StartRequest {
         run_key: RunKey::new(),
         namespace_id,
         workflow_id,
-        run_id: RunId::new(),
+        run_id,
         workflow_type: WorkflowType("example".to_string()),
         task_queue: TaskQueueName("workflow-q".to_string()),
         input: Payloads::default(),
@@ -432,6 +433,12 @@ fn start_request(
         first_execution_run_id: None,
         parent_run_key: None,
         parent_workflow_id: None,
+        parent_run_id: None,
+        parent_namespace_id: None,
+        parent_initiated_event_id: 0,
+        original_execution_run_id: Some(run_id),
+        continued_failure: None,
+        last_completion_result: None,
         first_run_started_at: None,
         request: RequestContext {
             request_id: RequestId(request_id.to_string()),

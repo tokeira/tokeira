@@ -865,6 +865,47 @@ where
                 state_transition_count: state.transition_seq.0 as i64,
                 memo: state.memo,
                 search_attributes: state.search_attributes,
+                pending_activities: state
+                    .activities
+                    .values()
+                    .map(
+                        |activity| tokeira_edge::translate::PendingActivityDescription {
+                            activity_id: activity.activity_id.clone(),
+                            activity_type: activity.activity_type.clone(),
+                            is_started: activity.started_at.is_some(),
+                            attempt: activity.attempt,
+                            maximum_attempts: activity
+                                .retry_policy
+                                .as_ref()
+                                .map(|policy| policy.maximum_attempts)
+                                .unwrap_or_default(),
+                            scheduled_at: activity.scheduled_at,
+                            started_at: activity.started_at,
+                        },
+                    )
+                    .collect(),
+                pending_children: state
+                    .children
+                    .values()
+                    .map(|child| tokeira_edge::translate::PendingChildDescription {
+                        workflow_id: child.child_workflow_id.0.clone(),
+                        run_id: child
+                            .child_run_id
+                            .as_ref()
+                            .map(|run_id| run_id.0.to_string()),
+                        workflow_type: String::new(),
+                        initiated_event_id: child.initiated_event_id,
+                        parent_close_policy: child.parent_close_policy,
+                    })
+                    .collect(),
+                pending_workflow_task: state.pending_workflow_task.as_ref().map(|task| {
+                    tokeira_edge::translate::PendingWorkflowTaskDescription {
+                        is_started: task.started_event_id.is_some(),
+                        scheduled_at: task.scheduled_at,
+                        started_at: task.started_at,
+                        attempt: task.attempt,
+                    }
+                }),
             })),
             LoadedRun::Absent => {
                 Err(anyhow!("resolved run missing from storage: {:?}", run_key))

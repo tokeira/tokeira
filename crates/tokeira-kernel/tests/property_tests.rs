@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
+use prost::Message;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     ActivityOp, ActivityPauseInfo, ActivityResolution, ActivityResolvedRequest,
@@ -87,6 +88,8 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         last_event_id: 14,
         next_workflow_task_seq: LogicalTaskSeq(4),
         pending_workflow_task: None,
+        previous_started_event_id: 0,
+        workflow_task_attempt: 1,
         sticky: None,
         pause_info: None,
         wft_stamp: 0,
@@ -98,8 +101,13 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         retry_policy: Some(sample_retry_policy()),
         attempt: 2,
         first_execution_run_id: Some(RunId::new()),
+        original_execution_run_id: None,
         parent_run_key: None,
         parent_workflow_id: None,
+        parent_run_id: None,
+        parent_namespace_id: None,
+        parent_initiated_event_id: 0,
+        last_completion_result: None,
         activities: BTreeMap::new(),
         timers: BTreeMap::new(),
         children: BTreeMap::new(),
@@ -127,7 +135,9 @@ fn with_pending_wft(
     state.pending_workflow_task = Some(PendingWorkflowTask {
         logical_seq: LogicalTaskSeq(logical_seq),
         scheduled_event_id: state.last_event_id - 1,
+        scheduled_at: state.started_at,
         started_event_id,
+        started_at: started_event_id.map(|_| state.started_at + Duration::seconds(1)),
         attempt,
     });
     state
@@ -486,6 +496,20 @@ fn arb_payloads() -> impl Strategy<Value = Payloads> {
     prop::collection::vec(arb_payload(), 0..3).prop_map(Payloads)
 }
 
+fn arb_failure_payload() -> impl Strategy<Value = Payload> {
+    "[a-z ]{0,20}".prop_map(|msg| {
+        let failure = tokeira_proto::public::temporal::api::failure::v1::Failure {
+            message: msg,
+            ..Default::default()
+        };
+        let mut data = Vec::new();
+        failure.encode(&mut data).unwrap();
+        let mut metadata = BTreeMap::new();
+        metadata.insert("encoding".to_string(), "temporal/failure+proto".to_string());
+        Payload { data, metadata }
+    })
+}
+
 fn arb_memo() -> impl Strategy<Value = Memo> {
     prop::collection::btree_map(arb_small_string(), arb_payload(), 0..3).prop_map(Memo)
 }
@@ -668,6 +692,12 @@ fn arb_start_request() -> impl Strategy<Value = StartRequest> {
                     first_execution_run_id: Some(run_id),
                     parent_run_key: None,
                     parent_workflow_id: None,
+                    parent_run_id: None,
+                    parent_namespace_id: None,
+                    parent_initiated_event_id: 0,
+                    original_execution_run_id: Some(run_id),
+                    continued_failure: None,
+                    last_completion_result: None,
                     first_run_started_at,
                     request: request_context("prop-start", now),
                     now,
@@ -679,7 +709,7 @@ fn arb_start_request() -> impl Strategy<Value = StartRequest> {
 fn arb_activity_resolution() -> impl Strategy<Value = ActivityResolution> {
     prop_oneof![
         arb_payloads().prop_map(|result| ActivityResolution::Completed { result }),
-        arb_small_string().prop_map(|message| ActivityResolution::Failed { message }),
+        arb_failure_payload().prop_map(|failure| ActivityResolution::Failed { failure }),
         arb_small_string()
             .prop_map(|timeout_type| ActivityResolution::TimedOut { timeout_type }),
         prop::option::of(arb_payloads())
@@ -863,6 +893,7 @@ fn arb_continue_as_new_command() -> impl Strategy<Value = WorkflowCommand> {
                 workflow_execution_timeout,
                 workflow_run_timeout,
                 workflow_task_timeout,
+                retry_policy: None,
             },
         )
 }
@@ -888,7 +919,7 @@ fn arb_child_start_result() -> impl Strategy<Value = ChildStartResult> {
 fn arb_child_resolution() -> impl Strategy<Value = ChildResolution> {
     prop_oneof![
         arb_payloads().prop_map(|result| ChildResolution::Completed { result }),
-        arb_small_string().prop_map(|failure| ChildResolution::Failed { failure }),
+        arb_failure_payload().prop_map(|failure| ChildResolution::Failed { failure }),
         Just(ChildResolution::Canceled),
         Just(ChildResolution::Terminated),
         Just(ChildResolution::TimedOut),
@@ -934,7 +965,7 @@ fn arb_update_completed_command() -> impl Strategy<Value = WorkflowCommand> {
 }
 
 fn arb_update_rejected_command() -> impl Strategy<Value = WorkflowCommand> {
-    (arb_small_string(), arb_small_string()).prop_map(|(update_id, failure)| {
+    (arb_small_string(), arb_failure_payload()).prop_map(|(update_id, failure)| {
         WorkflowCommand::UpdateRejected { update_id, failure }
     })
 }
@@ -955,7 +986,7 @@ fn arb_nexus_resolution() -> impl Strategy<Value = NexusResolution> {
     prop_oneof![
         Just(NexusResolution::Started),
         arb_payloads().prop_map(|result| NexusResolution::Completed { result }),
-        arb_small_string().prop_map(|failure| NexusResolution::Failed { failure }),
+        arb_failure_payload().prop_map(|failure| NexusResolution::Failed { failure }),
         Just(NexusResolution::Canceled),
         Just(NexusResolution::TimedOut),
     ]
@@ -1071,12 +1102,8 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
             arb_schedule_nexus_operation_command().prop_map(|cmd| vec![cmd]),
             arb_payloads()
                 .prop_map(|result| vec![WorkflowCommand::CompleteWorkflow { result }]),
-            (arb_small_string(), prop::option::of(arb_payload())).prop_map(
-                |(message, details)| vec![WorkflowCommand::FailWorkflow {
-                    message,
-                    details
-                }]
-            ),
+            arb_failure_payload()
+                .prop_map(|failure| vec![WorkflowCommand::FailWorkflow { failure }]),
             arb_continue_as_new_command().prop_map(|cmd| vec![cmd]),
             (
                 arb_small_string(),
@@ -1117,6 +1144,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                             target_run_id: with_run_id.then(RunId::new),
                             signal_name,
                             input,
+                            control: "ctl".into(),
                         }]
                     }
                 ),
@@ -1126,6 +1154,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                         target_namespace_id: NamespaceId::new(),
                         target_workflow_id: WorkflowId(target_workflow_id),
                         target_run_id: with_run_id.then(RunId::new),
+                        control: "ctl".into(),
                     }]
                 }
             ),
@@ -1468,9 +1497,9 @@ proptest! {
                 prop_assert_eq!(activity_id, "activity-1");
                 prop_assert_eq!(result, &expected);
             }
-            (HistoryEventKind::ActivityTaskFailed { activity_id, message, .. }, ActivityResolution::Failed { message: expected }) => {
+            (HistoryEventKind::ActivityTaskFailed { activity_id, failure, .. }, ActivityResolution::Failed { failure: expected }) => {
                 prop_assert_eq!(activity_id, "activity-1");
-                prop_assert_eq!(message, &expected);
+                prop_assert_eq!(failure, &expected);
             }
             (HistoryEventKind::ActivityTaskTimedOut { activity_id, timeout_type, .. }, ActivityResolution::TimedOut { timeout_type: expected }) => {
                 prop_assert_eq!(activity_id, "activity-1");
@@ -1838,6 +1867,42 @@ proptest! {
     }
 
     #[test]
+    fn property_12b_previous_started_event_id_tracks_last_completion(
+        started_event_ids in prop::collection::vec(1i64..1_000i64, 1..8)
+    ) {
+        let now = fixed_now();
+        let mut state = make_open_state(now);
+
+        for (idx, started_event_id) in started_event_ids.iter().enumerate() {
+            let logical_seq = 100 + idx as u64;
+            state = with_pending_wft(state, logical_seq, Some(*started_event_id), 1);
+            let run_key = state.run_key;
+            let transition = kernel().apply(
+                LoadedRun::Existing(state),
+                Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                    token: WorkflowTaskToken {
+                        run_key,
+                        logical_seq: LogicalTaskSeq(logical_seq),
+                        started_event_id: *started_event_id,
+                        attempt: 1,
+                        shard_epoch: ShardEpoch::ZERO,
+                    },
+                    identity: WorkerIdentity("worker".into()),
+                    commands: vec![],
+                    force_new_workflow_task: false,
+                    now,
+                }),
+            ).unwrap();
+            state = transition.next_state;
+        }
+
+        prop_assert_eq!(
+            state.previous_started_event_id,
+            *started_event_ids.last().expect("non-empty sequence"),
+        );
+    }
+
+    #[test]
     fn property_13_failure_timeout_preserve_pending_wft_identity(req in arb_wft_failed_request(LogicalTaskSeq(60), 30, fixed_now())) {
         let now = fixed_now();
         let failed_transition = kernel().apply(
@@ -2109,6 +2174,7 @@ proptest! {
                     workflow_execution_timeout,
                     workflow_run_timeout,
                     workflow_task_timeout,
+                    ..
                 },
                 WorkflowCommand::ContinueAsNew {
                     new_run_id: expected_new_run_id,
@@ -2120,6 +2186,7 @@ proptest! {
                     workflow_execution_timeout: expected_execution_timeout,
                     workflow_run_timeout: expected_run_timeout,
                     workflow_task_timeout: expected_task_timeout,
+                    ..
                 },
             ) => {
                 prop_assert_eq!(new_run_id, expected_new_run_id);
@@ -2261,8 +2328,7 @@ proptest! {
                 },
                 identity: WorkerIdentity("worker".into()),
                 commands: vec![WorkflowCommand::FailWorkflow {
-                    message: "failed".into(),
-                    details: Some(payload("details")),
+                    failure: payload("failed"),
                 }],
                 force_new_workflow_task: false,
                 now,
@@ -2788,6 +2854,7 @@ proptest! {
                     target_run_id: Some(RunId::new()),
                     signal_name: signal_name.clone(),
                     input,
+                    control: "ctl".into(),
                 }],
                 force_new_workflow_task: false,
                 now,
@@ -2941,8 +3008,7 @@ fn property_42_parent_close_policy_all_paths() {
                 result: payloads("done"),
             }),
             wf_close(WorkflowCommand::FailWorkflow {
-                message: "fail".into(),
-                details: None,
+                failure: payload("fail"),
             }),
             wf_close(WorkflowCommand::CancelWorkflow),
             wf_close(WorkflowCommand::ContinueAsNew {
@@ -2955,6 +3021,7 @@ fn property_42_parent_close_policy_all_paths() {
                 workflow_execution_timeout: None,
                 workflow_run_timeout: None,
                 workflow_task_timeout: default_workflow_task_timeout(),
+                retry_policy: None,
             }),
         ];
 
@@ -3079,7 +3146,7 @@ proptest! {
     fn property_56_protocol_message_bodies(
         input in arb_payloads(),
         result in arb_payloads(),
-        failure in arb_small_string(),
+        failure in arb_failure_payload(),
     ) {
         let now = fixed_now();
         let base = with_pending_wft(make_open_state(now), 61, Some(21), 1);
@@ -3221,8 +3288,7 @@ fn property_57_close_clears_pending_updates() {
             result: payloads("done"),
         }),
         wf_close(WorkflowCommand::FailWorkflow {
-            message: "fail".into(),
-            details: None,
+            failure: payload("fail"),
         }),
         wf_close(WorkflowCommand::CancelWorkflow),
         wf_close(WorkflowCommand::ContinueAsNew {
@@ -3235,6 +3301,7 @@ fn property_57_close_clears_pending_updates() {
             workflow_execution_timeout: None,
             workflow_run_timeout: None,
             workflow_task_timeout: default_workflow_task_timeout(),
+            retry_policy: None,
         }),
     ];
 
@@ -3456,8 +3523,7 @@ fn property_63_close_preserves_execution_options() {
             result: payloads("done"),
         }),
         wf_close(WorkflowCommand::FailWorkflow {
-            message: "fail".into(),
-            details: None,
+            failure: payload("fail"),
         }),
         wf_close(WorkflowCommand::CancelWorkflow),
         wf_close(WorkflowCommand::ContinueAsNew {
@@ -3470,6 +3536,7 @@ fn property_63_close_preserves_execution_options() {
             workflow_execution_timeout: None,
             workflow_run_timeout: None,
             workflow_task_timeout: default_workflow_task_timeout(),
+            retry_policy: None,
         }),
     ];
 
@@ -3614,7 +3681,7 @@ proptest! {
     #[test]
     fn property_68_terminal_resolution_removes_from_pending_and_schedules_wft(operation_id in arb_small_string(), resolution in prop_oneof![
         arb_payloads().prop_map(|result| NexusResolution::Completed { result }),
-        arb_small_string().prop_map(|failure| NexusResolution::Failed { failure }),
+        arb_payload().prop_map(|failure| NexusResolution::Failed { failure }),
         Just(NexusResolution::Canceled),
         Just(NexusResolution::TimedOut),
     ]) {
@@ -3724,8 +3791,7 @@ fn property_70_close_clears_pending_nexus_operations_without_dispatch_ops() {
             result: payloads("done"),
         }),
         wf_close(WorkflowCommand::FailWorkflow {
-            message: "fail".into(),
-            details: None,
+            failure: payload("fail"),
         }),
         wf_close(WorkflowCommand::CancelWorkflow),
         wf_close(WorkflowCommand::ContinueAsNew {
@@ -3738,6 +3804,7 @@ fn property_70_close_clears_pending_nexus_operations_without_dispatch_ops() {
             workflow_execution_timeout: None,
             workflow_run_timeout: None,
             workflow_task_timeout: default_workflow_task_timeout(),
+            retry_policy: None,
         }),
     ];
 

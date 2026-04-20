@@ -41,7 +41,9 @@ use std::{
 use anyhow::Result;
 use time::OffsetDateTime;
 use tokeira_storage::{DispatchableActivityTask, DispatchableWorkflowTask};
-use tokeira_types::{LogicalTaskSeq, QueueKey, RunKey, WorkerIdentity};
+use tokeira_types::{
+    LogicalTaskSeq, NamespaceId, QueueKey, RunKey, TaskQueueName, WorkerIdentity,
+};
 use tokio::{
     sync::{Mutex, Notify},
     time::{Duration, Instant, timeout},
@@ -93,6 +95,7 @@ struct BrokerState {
     waiter_counts: HashMap<QueueKey, usize>,
     query_ready: HashMap<QueueKey, VecDeque<QueryTask>>,
     query_waiter_counts: HashMap<QueueKey, usize>,
+    denied_workers: HashSet<(NamespaceId, TaskQueueName, WorkerIdentity)>,
 }
 
 #[derive(Clone, Debug)]
@@ -194,6 +197,25 @@ impl InMemoryBroker {
         self.wake.notify_waiters();
     }
 
+    /// Stop future workflow-task deliveries for a worker on one sticky queue.
+    ///
+    /// The upstream shutdown API identifies a sticky workflow-task queue, not
+    /// every activity or non-sticky queue a worker may use, so the deny entry is
+    /// scoped to the namespace and task queue observed by workflow-task polls.
+    pub async fn deny_worker(
+        &self,
+        namespace_id: NamespaceId,
+        task_queue: TaskQueueName,
+        worker: WorkerIdentity,
+    ) {
+        let mut inner = self.inner.lock().await;
+        inner
+            .denied_workers
+            .insert((namespace_id, task_queue, worker));
+        drop(inner);
+        self.wake.notify_waiters();
+    }
+
     /// Long-poll for a workflow task on `queue`.
     ///
     /// Returns immediately if a task is available, otherwise
@@ -206,6 +228,9 @@ impl InMemoryBroker {
         worker: &WorkerIdentity,
         wait_for: Duration,
     ) -> Result<Option<(DispatchableWorkflowTask, Instant)>> {
+        if self.is_denied(queue, worker).await {
+            return Ok(None);
+        }
         if let Some(task) = self.try_take(queue, worker).await? {
             return Ok(Some(task));
         }
@@ -225,6 +250,9 @@ impl InMemoryBroker {
         let _ = timeout(wait_for, notified).await;
         self.decrement_waiter(queue).await;
 
+        if self.is_denied(queue, worker).await {
+            return Ok(None);
+        }
         self.try_take(queue, worker).await
     }
 
@@ -294,6 +322,13 @@ impl InMemoryBroker {
         worker: &WorkerIdentity,
     ) -> Result<Option<(DispatchableWorkflowTask, Instant)>> {
         let mut inner = self.inner.lock().await;
+        if inner.denied_workers.contains(&(
+            queue.namespace_id,
+            queue.task_queue.clone(),
+            worker.clone(),
+        )) {
+            return Ok(None);
+        }
         let now = OffsetDateTime::now_utc();
         let mut promote_to_general = Vec::new();
         let mut matched = None;
@@ -363,6 +398,14 @@ impl InMemoryBroker {
                 .remove(&(task.task.run_key, task.task.logical_seq));
         }
         Ok(task.map(|task| (task.task, task.entered_at)))
+    }
+
+    async fn is_denied(&self, queue: &QueueKey, worker: &WorkerIdentity) -> bool {
+        self.inner.lock().await.denied_workers.contains(&(
+            queue.namespace_id,
+            queue.task_queue.clone(),
+            worker.clone(),
+        ))
     }
 
     async fn increment_waiter(&self, queue: &QueueKey) {
@@ -739,6 +782,66 @@ mod tests {
 
         assert_eq!(wrong, None);
         assert_eq!(right.map(|entry| entry.0), Some(task));
+    }
+
+    #[tokio::test]
+    async fn denied_worker_cannot_receive_workflow_tasks() {
+        let broker = InMemoryBroker::default();
+        let queue = workflow_queue("queue-a", None, None);
+        let worker = WorkerIdentity("worker-a".to_string());
+        let task = workflow_task(queue.clone());
+
+        broker
+            .deny_worker(queue.namespace_id, queue.task_queue.clone(), worker.clone())
+            .await;
+        broker.publish_workflow_task(task, None).await;
+
+        let denied = broker
+            .poll_workflow_task(&queue, &worker, std::time::Duration::from_millis(5))
+            .await
+            .unwrap();
+        let other_worker = broker
+            .poll_workflow_task(
+                &queue,
+                &WorkerIdentity("worker-b".to_string()),
+                std::time::Duration::from_millis(5),
+            )
+            .await
+            .unwrap();
+
+        assert!(denied.is_none());
+        assert!(other_worker.is_some());
+    }
+
+    #[tokio::test]
+    async fn denied_workflow_worker_does_not_affect_activity_delivery() {
+        let workflow_broker = InMemoryBroker::default();
+        let activity_broker = InMemoryActivityBroker::default();
+        let workflow_queue = workflow_queue("queue-a", None, None);
+        let activity_queue = QueueKey {
+            task_kind: TaskKind::Activity,
+            ..workflow_queue.clone()
+        };
+        let activity = activity_task(activity_queue.clone());
+
+        workflow_broker
+            .deny_worker(
+                workflow_queue.namespace_id,
+                workflow_queue.task_queue,
+                WorkerIdentity("worker-a".to_string()),
+            )
+            .await;
+        activity_broker
+            .publish_activity_task(activity.clone(), None)
+            .await
+            .unwrap();
+
+        let delivered = activity_broker
+            .poll_activity_task(&activity_queue, std::time::Duration::from_millis(5))
+            .await
+            .unwrap();
+
+        assert_eq!(delivered.map(|entry| entry.0), Some(activity));
     }
 
     #[tokio::test]

@@ -78,6 +78,7 @@ pub(crate) struct SlidingWindowCounter {
 }
 
 impl SlidingWindowCounter {
+    #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -152,6 +153,12 @@ impl LatencyHistogram {
     }
 }
 
+impl Default for DeliveryMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DeliveryMetrics {
     pub fn new() -> Self {
         Self {
@@ -180,7 +187,7 @@ impl DeliveryMetrics {
             .unwrap()
             .sync_match
             .entry(queue.clone())
-            .or_insert_with(SlidingWindowCounter::new)
+            .or_default()
             .record_success();
     }
 
@@ -190,7 +197,7 @@ impl DeliveryMetrics {
             .unwrap()
             .sync_match
             .entry(queue.clone())
-            .or_insert_with(SlidingWindowCounter::new)
+            .or_default()
             .record_failure();
     }
 
@@ -200,7 +207,7 @@ impl DeliveryMetrics {
             .unwrap()
             .poll_success
             .entry(queue.clone())
-            .or_insert_with(SlidingWindowCounter::new)
+            .or_default()
             .record_success();
     }
 
@@ -210,7 +217,7 @@ impl DeliveryMetrics {
             .unwrap()
             .poll_success
             .entry(queue.clone())
-            .or_insert_with(SlidingWindowCounter::new)
+            .or_default()
             .record_failure();
     }
 
@@ -252,17 +259,11 @@ impl DeliveryMetrics {
                 (latency.percentile(0.50), latency.percentile(0.99))
             };
             let (sync_match_rate, _sync_total) = {
-                let sync = inner
-                    .sync_match
-                    .entry(queue.clone())
-                    .or_insert_with(SlidingWindowCounter::new);
+                let sync = inner.sync_match.entry(queue.clone()).or_default();
                 (sync.rate(), sync.total())
             };
             let (poll_success_rate, poll_total) = {
-                let poll = inner
-                    .poll_success
-                    .entry(queue.clone())
-                    .or_insert_with(SlidingWindowCounter::new);
+                let poll = inner.poll_success.entry(queue.clone()).or_default();
                 (poll.rate(), poll.total())
             };
             let backlog_age = inner
@@ -297,6 +298,12 @@ impl DeliveryMetrics {
             },
             poll_counts,
         )
+    }
+}
+
+impl Default for FairnessState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -343,7 +350,7 @@ impl FairnessState {
         let mut inner = self.inner.lock().unwrap();
         for (queue, share) in adjustments {
             let polls = recent_poll_counts.get(&queue).copied().unwrap_or(0);
-            let budget = ((share * polls as f64).floor() as u32).min(u32::MAX);
+            let budget = (share * polls as f64).floor() as u32;
             inner.queues.insert(
                 queue,
                 QueueFairnessState {

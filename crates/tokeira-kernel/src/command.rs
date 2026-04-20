@@ -158,6 +158,14 @@ pub enum RetryState {
     CancelRequested,
 }
 
+/// What triggered a continue-as-new transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContinueAsNewInitiator {
+    Workflow,
+    Retry,
+    CronSchedule,
+}
+
 /// Policy for handling workflow ID conflicts with running workflows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkflowIdConflictPolicy {
@@ -231,6 +239,18 @@ pub struct StartRequest {
     pub parent_run_key: Option<RunKey>,
     /// Parent workflow ID if this start creates a child workflow.
     pub parent_workflow_id: Option<WorkflowId>,
+    /// Parent run ID if this start creates a child workflow.
+    pub parent_run_id: Option<RunId>,
+    /// Parent namespace if this start creates a child workflow.
+    pub parent_namespace_id: Option<NamespaceId>,
+    /// Event ID of the parent initiation event for child starts.
+    pub parent_initiated_event_id: i64,
+    /// Run ID of the very first run in the execution chain.
+    pub original_execution_run_id: Option<RunId>,
+    /// Failure carried forward from the predecessor run.
+    pub continued_failure: Option<Payload>,
+    /// Completion result carried forward from the predecessor run.
+    pub last_completion_result: Option<Payloads>,
     /// Wall-clock `started_at` of the very first run in the
     /// execution chain.
     pub first_run_started_at: Option<OffsetDateTime>,
@@ -265,6 +285,12 @@ pub struct SignalWithStartRequest {
     pub first_execution_run_id: Option<RunId>,
     pub parent_run_key: Option<RunKey>,
     pub parent_workflow_id: Option<WorkflowId>,
+    pub parent_run_id: Option<RunId>,
+    pub parent_namespace_id: Option<NamespaceId>,
+    pub parent_initiated_event_id: i64,
+    pub original_execution_run_id: Option<RunId>,
+    pub continued_failure: Option<Payload>,
+    pub last_completion_result: Option<Payloads>,
     pub first_run_started_at: Option<OffsetDateTime>,
     pub request: RequestContext,
     pub now: OffsetDateTime,
@@ -612,7 +638,7 @@ pub enum ChildResolution {
     /// The child completed successfully.
     Completed { result: Payloads },
     /// The child failed with an application error.
-    Failed { failure: String },
+    Failed { failure: Payload },
     /// The child was canceled.
     Canceled,
     /// The child was forcibly terminated.
@@ -671,7 +697,7 @@ pub enum NexusResolution {
     /// The operation completed successfully.
     Completed { result: Payloads },
     /// The operation failed.
-    Failed { failure: String },
+    Failed { failure: Payload },
     /// The operation was canceled.
     Canceled,
     /// The operation exceeded its timeout.
@@ -709,7 +735,7 @@ pub enum UpdateProtocolBody {
     /// The worker completed the update with a result.
     Completed { update_id: String, result: Payloads },
     /// The worker rejected the update.
-    Rejected { update_id: String, failure: String },
+    Rejected { update_id: String, failure: Payload },
 }
 
 /// Request from the timer scanner when a timer's deadline
@@ -773,10 +799,7 @@ pub enum WorkflowCommand {
     CompleteWorkflow { result: Payloads },
     /// Fail the workflow with an application error. Closes
     /// the run.
-    FailWorkflow {
-        message: String,
-        details: Option<Payload>,
-    },
+    FailWorkflow { failure: Payload },
     /// Close the current run and start a new one with fresh
     /// parameters (continue-as-new pattern).
     ContinueAsNew {
@@ -789,6 +812,7 @@ pub enum WorkflowCommand {
         workflow_execution_timeout: Option<Duration>,
         workflow_run_timeout: Option<Duration>,
         workflow_task_timeout: Duration,
+        retry_policy: Option<RetryPolicy>,
     },
     /// Cancel the workflow (cooperative cancellation
     /// completed). Closes the run.
@@ -814,12 +838,14 @@ pub enum WorkflowCommand {
         target_run_id: Option<RunId>,
         signal_name: String,
         input: Payloads,
+        control: String,
     },
     /// Request cancellation of an external workflow.
     RequestCancelExternalWorkflowExecution {
         target_namespace_id: NamespaceId,
         target_workflow_id: WorkflowId,
         target_run_id: Option<RunId>,
+        control: String,
     },
     /// Schedule a Nexus operation.
     ScheduleNexusOperation {
@@ -835,7 +861,7 @@ pub enum WorkflowCommand {
     /// Complete a pending workflow update with a result.
     UpdateCompleted { update_id: String, result: Payloads },
     /// Reject a pending workflow update.
-    UpdateRejected { update_id: String, failure: String },
+    UpdateRejected { update_id: String, failure: Payload },
     /// Carry an update protocol message (accept, complete,
     /// or reject) identified by a message ID.
     ProtocolMessage {

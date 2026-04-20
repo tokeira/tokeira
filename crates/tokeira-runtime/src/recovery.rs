@@ -17,6 +17,7 @@ use crate::{
     nexus::{NexusTimeoutEntry, NexusTimeoutTrackingState},
     scanner::pick_lane,
     timeout::{WorkflowTimeoutEntry, WorkflowTimeoutTrackingState},
+    wft_timeout::{WftTimeoutEntry, WftTimeoutTrackingState},
 };
 
 /// Observability summary produced by a shard sweep.
@@ -26,6 +27,7 @@ pub struct SweepResult {
     pub activity_tasks_republished: usize,
     pub due_timers_injected: usize,
     pub workflow_timeout_entries_reconstructed: usize,
+    pub wft_timeout_entries_reconstructed: usize,
     pub activity_tracking_entries_reconstructed: usize,
     pub nexus_timeout_entries_reconstructed: usize,
     pub expired_sticky_claims_cleared: usize,
@@ -40,6 +42,7 @@ pub async fn sweep_shard<R>(
     lanes: &[LaneHandle],
     lane_count: usize,
     workflow_timeout_tracking: &WorkflowTimeoutTrackingState,
+    wft_timeout_tracking: &WftTimeoutTrackingState,
     activity_tracking: &ActivityTrackingState,
     nexus_timeout_tracking: &NexusTimeoutTrackingState,
 ) -> Result<SweepResult>
@@ -103,6 +106,21 @@ where
             has_retry_policy: entry.has_retry_policy,
         });
         result.workflow_timeout_entries_reconstructed += 1;
+    }
+
+    for entry in repo
+        .list_started_workflow_tasks_for_shard(shard_id, usize::MAX)
+        .await?
+    {
+        wft_timeout_tracking.insert(WftTimeoutEntry {
+            run_key: entry.run_key,
+            shard_id,
+            logical_seq: entry.logical_seq,
+            started_event_id: entry.started_event_id,
+            started_at: entry.started_at,
+            workflow_task_timeout: entry.workflow_task_timeout,
+        });
+        result.wft_timeout_entries_reconstructed += 1;
     }
 
     for entry in repo
@@ -262,9 +280,13 @@ mod tests {
             pending_workflow_task: Some(PendingWorkflowTask {
                 logical_seq: LogicalTaskSeq(1),
                 scheduled_event_id: 1,
+                scheduled_at: fixed_now(),
                 started_event_id: None,
-                attempt: 0,
+                started_at: None,
+                attempt: 1,
             }),
+            previous_started_event_id: 0,
+            workflow_task_attempt: 1,
             sticky: None,
             pause_info: None,
             wft_stamp: 0,
@@ -276,8 +298,13 @@ mod tests {
             retry_policy: None,
             attempt: 1,
             first_execution_run_id: None,
+            original_execution_run_id: None,
             parent_run_key: None,
             parent_workflow_id: None,
+            parent_run_id: None,
+            parent_namespace_id: None,
+            parent_initiated_event_id: 0,
+            last_completion_result: None,
             activities: Default::default(),
             timers: Default::default(),
             children: Default::default(),
@@ -323,11 +350,69 @@ mod tests {
             shard_owner,
             ActivityTrackingState::default(),
             WorkflowTimeoutTrackingState::default(),
+            crate::wft_timeout::WftTimeoutTrackingState::default(),
             NexusTimeoutTrackingState::default(),
             crate::update::UpdateRegistry::new(),
             LaneConfig::default(),
         );
         (vec![lane], 1)
+    }
+
+    #[tokio::test]
+    async fn sweep_shard_reconstructs_started_workflow_task_timeouts() {
+        let shard_count = 1u32;
+        let store = InMemoryStore::with_shard_count(shard_count);
+        let shard_id = ShardId(0);
+        let run_key = RunKey::new();
+        let mut transition = start_transition(run_key);
+        transition.next_state.workflow_task_timeout = Duration::seconds(15);
+        transition.next_state.pending_workflow_task = Some(PendingWorkflowTask {
+            logical_seq: LogicalTaskSeq(7),
+            scheduled_event_id: 1,
+            scheduled_at: fixed_now(),
+            started_event_id: Some(9),
+            started_at: Some(fixed_now() + Duration::seconds(2)),
+            attempt: 2,
+        });
+        let result = store
+            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .await
+            .unwrap();
+        assert!(matches!(result, CommitResult::Applied { .. }));
+
+        let broker = InMemoryBroker::default();
+        let activity_broker = InMemoryActivityBroker::default();
+        let (lanes, lane_count) = make_lanes(&store);
+        let wts = WorkflowTimeoutTrackingState::default();
+        let wfts = WftTimeoutTrackingState::default();
+        let ats = ActivityTrackingState::default();
+        let nts = NexusTimeoutTrackingState::default();
+
+        let result = sweep_shard(
+            shard_id,
+            &store,
+            &broker,
+            &activity_broker,
+            &lanes,
+            lane_count,
+            &wts,
+            &wfts,
+            &ats,
+            &nts,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.wft_timeout_entries_reconstructed, 1);
+        let entries = wfts.snapshot();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.run_key, run_key);
+        assert_eq!(entry.shard_id, shard_id);
+        assert_eq!(entry.logical_seq, LogicalTaskSeq(7));
+        assert_eq!(entry.started_event_id, 9);
+        assert_eq!(entry.started_at, fixed_now() + Duration::seconds(2));
+        assert_eq!(entry.workflow_task_timeout, Duration::seconds(15));
     }
 
     // ── Property 5: Workflow task sweep completeness ─
@@ -383,6 +468,8 @@ mod tests {
                     make_lanes(&store);
                 let wts =
                     WorkflowTimeoutTrackingState::default();
+                let wfts =
+                    WftTimeoutTrackingState::default();
                 let ats = ActivityTrackingState::default();
                 let nts =
                     NexusTimeoutTrackingState::default();
@@ -395,6 +482,7 @@ mod tests {
                     &lanes,
                     lane_count,
                     &wts,
+                    &wfts,
                     &ats,
                     &nts,
                 )
@@ -520,6 +608,8 @@ mod tests {
                     make_lanes(&store);
                 let wts =
                     WorkflowTimeoutTrackingState::default();
+                let wfts =
+                    WftTimeoutTrackingState::default();
                 let ats = ActivityTrackingState::default();
                 let nts =
                     NexusTimeoutTrackingState::default();
@@ -532,6 +622,7 @@ mod tests {
                     &lanes,
                     lane_count,
                     &wts,
+                    &wfts,
                     &ats,
                     &nts,
                 )
@@ -641,6 +732,8 @@ mod tests {
                     make_lanes(&store);
                 let wts =
                     WorkflowTimeoutTrackingState::default();
+                let wfts =
+                    WftTimeoutTrackingState::default();
                 let ats = ActivityTrackingState::default();
                 let nts =
                     NexusTimeoutTrackingState::default();
@@ -653,6 +746,7 @@ mod tests {
                     &lanes,
                     lane_count,
                     &wts,
+                    &wfts,
                     &ats,
                     &nts,
                 )
@@ -723,6 +817,8 @@ mod tests {
                     make_lanes(&store);
                 let wts =
                     WorkflowTimeoutTrackingState::default();
+                let wfts =
+                    WftTimeoutTrackingState::default();
                 let ats = ActivityTrackingState::default();
                 let nts =
                     NexusTimeoutTrackingState::default();
@@ -735,6 +831,7 @@ mod tests {
                     &lanes,
                     lane_count,
                     &wts,
+                    &wfts,
                     &ats,
                     &nts,
                 )
@@ -861,6 +958,8 @@ mod tests {
                     make_lanes(&store);
                 let wts =
                     WorkflowTimeoutTrackingState::default();
+                let wfts =
+                    WftTimeoutTrackingState::default();
                 let ats = ActivityTrackingState::default();
                 let nts =
                     NexusTimeoutTrackingState::default();
@@ -873,6 +972,7 @@ mod tests {
                     &lanes,
                     lane_count,
                     &wts,
+                    &wfts,
                     &ats,
                     &nts,
                 )
@@ -957,6 +1057,8 @@ mod tests {
                     make_lanes(&store);
                 let wts =
                     WorkflowTimeoutTrackingState::default();
+                let wfts =
+                    WftTimeoutTrackingState::default();
                 let ats = ActivityTrackingState::default();
                 let nts =
                     NexusTimeoutTrackingState::default();
@@ -969,6 +1071,7 @@ mod tests {
                     &lanes,
                     lane_count,
                     &wts,
+                    &wfts,
                     &ats,
                     &nts,
                 )
@@ -1064,6 +1167,8 @@ mod tests {
                     make_lanes(&store);
                 let wts =
                     WorkflowTimeoutTrackingState::default();
+                let wfts =
+                    WftTimeoutTrackingState::default();
                 let ats = ActivityTrackingState::default();
                 let nts =
                     NexusTimeoutTrackingState::default();
@@ -1076,6 +1181,7 @@ mod tests {
                     &lanes,
                     lane_count,
                     &wts,
+                    &wfts,
                     &ats,
                     &nts,
                 )

@@ -15,7 +15,8 @@ use tokeira_kernel::{HistoryEvent, LoadedRun, Transition};
 use tokeira_storage::{
     ActivitySweepEntry, BacklogEntry, CommitResult, DispatchableActivityTask,
     DispatchableWorkflowTask, DueTimer, LeaseOutcome, LeaseRepository, NexusSweepEntry,
-    RequestRecord, RunRepository, TransitionAuditRecord, WorkflowTimeoutSweepEntry,
+    RequestRecord, RunRepository, TransitionAuditRecord, WftTimeoutSweepEntry,
+    WorkflowTimeoutSweepEntry,
 };
 use tokeira_types::{
     ExecutionRef, NamespaceId, QueueKey, RequestId, RunId, RunKey, ShardEpoch, ShardId,
@@ -240,6 +241,16 @@ where
     ) -> Result<Vec<WorkflowTimeoutSweepEntry>> {
         self.inner
             .list_runs_with_workflow_timeouts_for_shard(shard_id, limit)
+            .await
+    }
+
+    async fn list_started_workflow_tasks_for_shard(
+        &self,
+        shard_id: ShardId,
+        limit: usize,
+    ) -> Result<Vec<WftTimeoutSweepEntry>> {
+        self.inner
+            .list_started_workflow_tasks_for_shard(shard_id, limit)
             .await
     }
 

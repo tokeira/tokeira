@@ -22,6 +22,7 @@ pub fn start_response(
         run_id: req.run_id,
         transition_seq: outcome.transition_seq,
         last_event_id: outcome.last_event_id,
+        started: true,
     }
 }
 
@@ -43,7 +44,10 @@ pub async fn poll_response(
     Ok(PollWorkflowTaskQueueResponse {
         task_token: serde_json::to_vec(&started.token)?,
         started_event_id: started.token.started_event_id,
+        previous_started_event_id: started.previous_started_event_id,
         attempt: started.token.attempt,
+        scheduled_time: Some(started.scheduled_time),
+        started_time: Some(started.started_time),
         payload: WorkflowTaskPayloadDto {
             workflow_id: started.workflow_id.0,
             run_key: started.run_key,

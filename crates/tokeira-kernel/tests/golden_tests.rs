@@ -94,6 +94,12 @@ fn make_start_request() -> StartRequest {
         first_execution_run_id: Some(run_id),
         parent_run_key: None,
         parent_workflow_id: None,
+        parent_run_id: None,
+        parent_namespace_id: None,
+        parent_initiated_event_id: 0,
+        original_execution_run_id: Some(run_id),
+        continued_failure: None,
+        last_completion_result: None,
         first_run_started_at: Some(now()),
         request: request_context("start-req"),
         now: now(),
@@ -125,6 +131,12 @@ fn make_signal_with_start_request() -> SignalWithStartRequest {
         first_execution_run_id: start.first_execution_run_id,
         parent_run_key: start.parent_run_key,
         parent_workflow_id: start.parent_workflow_id,
+        parent_run_id: start.parent_run_id,
+        parent_namespace_id: start.parent_namespace_id,
+        parent_initiated_event_id: start.parent_initiated_event_id,
+        original_execution_run_id: start.original_execution_run_id,
+        continued_failure: start.continued_failure,
+        last_completion_result: start.last_completion_result,
         first_run_started_at: start.first_run_started_at,
         request: start.request,
         now: start.now,
@@ -174,6 +186,8 @@ fn make_open_state() -> WorkflowState {
         last_event_id: 9,
         next_workflow_task_seq: LogicalTaskSeq(4),
         pending_workflow_task: None,
+        previous_started_event_id: 0,
+        workflow_task_attempt: 1,
         sticky: None,
         pause_info: None,
         wft_stamp: 0,
@@ -185,8 +199,13 @@ fn make_open_state() -> WorkflowState {
         retry_policy: Some(retry_policy()),
         attempt: 1,
         first_execution_run_id: Some(RunId::new()),
+        original_execution_run_id: None,
         parent_run_key: None,
         parent_workflow_id: None,
+        parent_run_id: None,
+        parent_namespace_id: None,
+        parent_initiated_event_id: 0,
+        last_completion_result: None,
         activities: BTreeMap::new(),
         timers: BTreeMap::new(),
         children: BTreeMap::new(),
@@ -230,6 +249,13 @@ fn replay_history_reconstructs_workflow_task_lifecycle() {
                 workflow_execution_timeout: start.workflow_execution_timeout,
                 workflow_run_timeout: start.workflow_run_timeout,
                 workflow_task_timeout: start.workflow_task_timeout,
+                parent_workflow_id: start.parent_workflow_id.clone(),
+                parent_run_id: start.parent_run_id,
+                parent_namespace_id: start.parent_namespace_id,
+                parent_initiated_event_id: start.parent_initiated_event_id,
+                original_execution_run_id: start.original_execution_run_id,
+                continued_failure: start.continued_failure.clone(),
+                last_completion_result: start.last_completion_result.clone(),
             },
         ),
         history_event(
@@ -237,6 +263,9 @@ fn replay_history_reconstructs_workflow_task_lifecycle() {
             started_at,
             HistoryEventKind::WorkflowTaskScheduled {
                 logical_seq: LogicalTaskSeq::ONE,
+                task_queue: start.task_queue.clone(),
+                workflow_task_timeout: start.workflow_task_timeout,
+                attempt: 1,
             },
         ),
         history_event(
@@ -294,6 +323,13 @@ fn replay_history_reconstructs_activity_and_timer_state() {
                 workflow_execution_timeout: start.workflow_execution_timeout,
                 workflow_run_timeout: start.workflow_run_timeout,
                 workflow_task_timeout: start.workflow_task_timeout,
+                parent_workflow_id: start.parent_workflow_id.clone(),
+                parent_run_id: start.parent_run_id,
+                parent_namespace_id: start.parent_namespace_id,
+                parent_initiated_event_id: start.parent_initiated_event_id,
+                original_execution_run_id: start.original_execution_run_id,
+                continued_failure: start.continued_failure.clone(),
+                last_completion_result: start.last_completion_result.clone(),
             },
         ),
         history_event(
@@ -365,6 +401,13 @@ fn replay_history_reconstructs_historical_execution_options_and_pause() {
                 workflow_execution_timeout: start.workflow_execution_timeout,
                 workflow_run_timeout: start.workflow_run_timeout,
                 workflow_task_timeout: start.workflow_task_timeout,
+                parent_workflow_id: start.parent_workflow_id.clone(),
+                parent_run_id: start.parent_run_id,
+                parent_namespace_id: start.parent_namespace_id,
+                parent_initiated_event_id: start.parent_initiated_event_id,
+                original_execution_run_id: start.original_execution_run_id,
+                continued_failure: start.continued_failure.clone(),
+                last_completion_result: start.last_completion_result.clone(),
             },
         ),
         history_event(
@@ -413,6 +456,9 @@ fn replay_history_rejects_empty_or_non_started_sequences() {
             now(),
             HistoryEventKind::WorkflowTaskScheduled {
                 logical_seq: LogicalTaskSeq::ONE,
+                task_queue: start.task_queue.clone(),
+                workflow_task_timeout: start.workflow_task_timeout,
+                attempt: 1,
             },
         )],
     );
@@ -424,8 +470,10 @@ fn make_open_state_with_pending_wft() -> WorkflowState {
     state.pending_workflow_task = Some(PendingWorkflowTask {
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 8,
+        scheduled_at: now(),
         started_event_id: None,
-        attempt: 0,
+        started_at: None,
+        attempt: state.workflow_task_attempt,
     });
     state
 }
@@ -435,7 +483,9 @@ fn make_open_state_with_started_wft() -> WorkflowState {
     state.pending_workflow_task = Some(PendingWorkflowTask {
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 8,
+        scheduled_at: now(),
         started_event_id: Some(9),
+        started_at: Some(now()),
         attempt: 1,
     });
     state
@@ -650,6 +700,7 @@ fn make_continue_as_new_command() -> WorkflowCommand {
         workflow_execution_timeout: Some(Duration::minutes(12)),
         workflow_run_timeout: Some(Duration::minutes(6)),
         workflow_task_timeout: Duration::seconds(11),
+        retry_policy: Some(retry_policy()),
     }
 }
 
@@ -1593,7 +1644,9 @@ fn wft_failed_paused_workflow_no_redispatch() {
     state.pending_workflow_task = Some(PendingWorkflowTask {
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 8,
+        scheduled_at: now(),
         started_event_id: Some(9),
+        started_at: Some(now()),
         attempt: 1,
     });
     let transition = kernel()
@@ -1630,7 +1683,9 @@ fn wft_timed_out_paused_workflow_no_redispatch() {
     state.pending_workflow_task = Some(PendingWorkflowTask {
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 8,
+        scheduled_at: now(),
         started_event_id: Some(9),
+        started_at: Some(now()),
         attempt: 1,
     });
     let transition = kernel()
@@ -1665,7 +1720,9 @@ fn wft_completed_paused_workflow_no_force_wft() {
     state.pending_workflow_task = Some(PendingWorkflowTask {
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 8,
+        scheduled_at: now(),
         started_event_id: Some(9),
+        started_at: Some(now()),
         attempt: 1,
     });
     let transition = kernel()
@@ -1688,6 +1745,34 @@ fn wft_completed_paused_workflow_no_force_wft() {
         .unwrap();
     assert!(transition.dispatch_ops.is_empty());
     assert!(transition.next_state.pending_workflow_task.is_none());
+}
+
+#[test]
+fn wft_completion_tracks_previous_started_event_id() {
+    let state = make_open_state_with_started_wft();
+    assert_eq!(state.previous_started_event_id, 0);
+
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 9,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                commands: vec![],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert_eq!(transition.next_state.previous_started_event_id, 9);
+    assert_eq!(transition.next_state.workflow_task_attempt, 1);
 }
 
 #[test]
@@ -1992,8 +2077,7 @@ fn workflow_task_completed_with_fail_workflow() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 commands: vec![WorkflowCommand::FailWorkflow {
-                    message: "nope".into(),
-                    details: Some(payload("details")),
+                    failure: payload("nope"),
                 }],
                 force_new_workflow_task: false,
                 now: now(),
@@ -2047,6 +2131,7 @@ fn continue_as_new_closes_run() {
             workflow_execution_timeout,
             workflow_run_timeout,
             workflow_task_timeout,
+            ..
         } => (
             new_run_id.clone(),
             workflow_type.clone(),
@@ -2099,6 +2184,7 @@ fn continue_as_new_closes_run() {
             workflow_execution_timeout,
             workflow_run_timeout,
             workflow_task_timeout,
+            ..
         } if *new_run_id == expected_new_run_id
             && *workflow_type == expected_workflow_type
             && *task_queue == expected_task_queue
@@ -2269,8 +2355,7 @@ fn fail_workflow_with_retry_policy() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 commands: vec![WorkflowCommand::FailWorkflow {
-                    message: "nope".into(),
-                    details: Some(payload("details")),
+                    failure: payload("nope"),
                 }],
                 force_new_workflow_task: false,
                 now: now(),
@@ -2305,8 +2390,7 @@ fn fail_workflow_without_retry_policy() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 commands: vec![WorkflowCommand::FailWorkflow {
-                    message: "nope".into(),
-                    details: Some(payload("details")),
+                    failure: payload("nope"),
                 }],
                 force_new_workflow_task: false,
                 now: now(),
@@ -3480,7 +3564,9 @@ fn cancel_then_cancel_workflow_e2e() {
         .unwrap_or(PendingWorkflowTask {
             logical_seq: LogicalTaskSeq(4),
             scheduled_event_id: 11,
+            scheduled_at: now(),
             started_event_id: Some(12),
+            started_at: Some(now()),
             attempt: 1,
         });
     let final_transition = kernel()
@@ -3795,6 +3881,7 @@ fn signal_external_workflow_happy_path() {
                     target_run_id: Some(RunId::new()),
                     signal_name: "sig".into(),
                     input: payloads("payload"),
+                    control: "ctl".into(),
                 }],
                 force_new_workflow_task: false,
                 now: now(),
@@ -3858,6 +3945,7 @@ fn request_cancel_external_workflow_happy_path() {
                     target_namespace_id: state.namespace_id,
                     target_workflow_id: WorkflowId("target".into()),
                     target_run_id: Some(RunId::new()),
+                    control: "ctl".into(),
                 }],
                 force_new_workflow_task: false,
                 now: now(),
@@ -4082,7 +4170,7 @@ fn update_rejected_happy_path() {
                 identity: WorkerIdentity("worker".into()),
                 commands: vec![WorkflowCommand::UpdateRejected {
                     update_id: "update-1".into(),
-                    failure: "nope".into(),
+                    failure: payload("nope"),
                 }],
                 force_new_workflow_task: false,
                 now: now(),
@@ -4148,7 +4236,7 @@ fn update_rejected_unknown_update() {
                 identity: WorkerIdentity("worker".into()),
                 commands: vec![WorkflowCommand::UpdateRejected {
                     update_id: "missing".into(),
-                    failure: "nope".into(),
+                    failure: payload("nope"),
                 }],
                 force_new_workflow_task: false,
                 now: now(),
@@ -4260,7 +4348,7 @@ fn protocol_message_rejected_body() {
                     message_id: "msg-3".into(),
                     body: UpdateProtocolBody::Rejected {
                         update_id: "update-1".into(),
-                        failure: "nope".into(),
+                        failure: payload("nope"),
                     },
                 }],
                 force_new_workflow_task: false,
@@ -4810,7 +4898,7 @@ fn nexus_operation_resolved_failed() {
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
                 resolution: NexusResolution::Failed {
-                    failure: "nope".into(),
+                    failure: payload("nope"),
                 },
                 now: now(),
             }),

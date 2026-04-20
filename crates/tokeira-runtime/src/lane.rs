@@ -20,6 +20,8 @@ use time::OffsetDateTime;
 use tokeira_kernel::{
     Command, DispatchOp, HistoryEvent, HistoryEventKind, Kernel, LoadedRun, StartRequest,
 };
+use tokeira_proto::conversions::common::failure_to_payload;
+use tokeira_proto::public::temporal::api::failure::v1 as failure_proto;
 use tokeira_storage::{CommitResult, RunRepository};
 use tokeira_types::{ExecutionStatus, RunKey, ShardEpoch};
 use tokio::sync::{mpsc, oneshot};
@@ -131,6 +133,7 @@ pub fn spawn_lane<K, R, P>(
     shard_owner: Arc<RwLock<ShardOwner>>,
     activity_tracking: crate::activity_timeout::ActivityTrackingState,
     workflow_timeout_tracking: crate::timeout::WorkflowTimeoutTrackingState,
+    wft_timeout_tracking: crate::wft_timeout::WftTimeoutTrackingState,
     nexus_timeout_tracking: crate::nexus::NexusTimeoutTrackingState,
     update_registry: UpdateRegistry,
     config: LaneConfig,
@@ -151,6 +154,7 @@ where
                 &shard_owner,
                 &activity_tracking,
                 &workflow_timeout_tracking,
+                &wft_timeout_tracking,
                 &nexus_timeout_tracking,
                 &update_registry,
                 &mut rx,
@@ -175,6 +179,7 @@ async fn run_activation<K, R, P>(
     shard_owner: &Arc<RwLock<ShardOwner>>,
     activity_tracking: &crate::activity_timeout::ActivityTrackingState,
     workflow_timeout_tracking: &crate::timeout::WorkflowTimeoutTrackingState,
+    wft_timeout_tracking: &crate::wft_timeout::WftTimeoutTrackingState,
     nexus_timeout_tracking: &crate::nexus::NexusTimeoutTrackingState,
     update_registry: &UpdateRegistry,
     rx: &mut mpsc::Receiver<LaneMessage>,
@@ -259,100 +264,97 @@ where
                     }
                     if new_state.closed_at.is_some() {
                         workflow_timeout_tracking.remove(message.run_key);
+                        wft_timeout_tracking.remove(message.run_key);
                         nexus_timeout_tracking.remove_all_for_run(message.run_key);
                         update_registry.drain_for_run(message.run_key);
                     }
-                    if new_state.closed_at.is_some() {
-                        if let Some((successor_run_id, fork_event_id)) =
+                    if new_state.closed_at.is_some()
+                        && let Some((successor_run_id, fork_event_id)) =
                             extract_reset_metadata(&history_events)
+                    {
+                        let successor_run_key = RunKey(successor_run_id.0);
+                        if let Err(error) = repo
+                            .materialize_reset_successor(
+                                message.run_key,
+                                fork_event_id,
+                                successor_run_key,
+                                successor_run_id,
+                            )
+                            .await
                         {
-                            let successor_run_key = RunKey(successor_run_id.0);
-                            if let Err(error) = repo
-                                .materialize_reset_successor(
-                                    message.run_key,
-                                    fork_event_id,
-                                    successor_run_key,
-                                    successor_run_id,
-                                )
-                                .await
+                            tracing::error!(
+                                ?error,
+                                predecessor_run_key = ?message.run_key,
+                                successor_run_key = ?successor_run_key,
+                                "failed to materialize reset successor"
+                            );
+                            reset_materialization_error = Some(error);
+                        } else if let Ok(LoadedRun::Existing(successor_state)) =
+                            repo.load_run(successor_run_key).await
+                        {
+                            let shard_id = {
+                                let owner = shard_owner.read().unwrap();
+                                shard_for(successor_run_key, owner.shard_count())
+                            };
+                            if successor_state.workflow_execution_timeout.is_some()
+                                || successor_state.workflow_run_timeout.is_some()
                             {
-                                tracing::error!(
-                                    ?error,
-                                    predecessor_run_key = ?message.run_key,
-                                    successor_run_key = ?successor_run_key,
-                                    "failed to materialize reset successor"
+                                workflow_timeout_tracking.insert(
+                                    crate::timeout::WorkflowTimeoutEntry {
+                                        run_key: successor_state.run_key,
+                                        shard_id,
+                                        workflow_execution_timeout: successor_state
+                                            .workflow_execution_timeout,
+                                        workflow_run_timeout: successor_state
+                                            .workflow_run_timeout,
+                                        started_at: successor_state.started_at,
+                                        first_run_started_at: successor_state
+                                            .first_run_started_at,
+                                        has_retry_policy: successor_state
+                                            .retry_policy
+                                            .is_some(),
+                                    },
                                 );
-                                reset_materialization_error = Some(error);
-                            } else if let Ok(LoadedRun::Existing(successor_state)) =
-                                repo.load_run(successor_run_key).await
+                            }
+                            for activity in successor_state.activities.values() {
+                                activity_tracking.insert(
+                                    crate::activity_timeout::ActivityTrackingEntry {
+                                        run_key: successor_state.run_key,
+                                        shard_id,
+                                        activity_id: activity.activity_id.clone(),
+                                        original_scheduled_at: activity.scheduled_at,
+                                        last_dispatched_at: activity.scheduled_at,
+                                        started_at: activity.started_at,
+                                        last_heartbeat_at: None,
+                                        cancel_requested: false,
+                                    },
+                                );
+                            }
+                            for nexus in successor_state.pending_nexus_operations.values()
                             {
-                                let shard_id = {
-                                    let owner = shard_owner.read().unwrap();
-                                    shard_for(successor_run_key, owner.shard_count())
-                                };
-                                if successor_state.workflow_execution_timeout.is_some()
-                                    || successor_state.workflow_run_timeout.is_some()
+                                if let Some(schedule_to_close_timeout) =
+                                    nexus.schedule_to_close_timeout
                                 {
-                                    workflow_timeout_tracking.insert(
-                                        crate::timeout::WorkflowTimeoutEntry {
+                                    nexus_timeout_tracking.insert(
+                                        crate::nexus::NexusTimeoutEntry {
                                             run_key: successor_state.run_key,
                                             shard_id,
-                                            workflow_execution_timeout: successor_state
-                                                .workflow_execution_timeout,
-                                            workflow_run_timeout: successor_state
-                                                .workflow_run_timeout,
-                                            started_at: successor_state.started_at,
-                                            first_run_started_at: successor_state
-                                                .first_run_started_at,
-                                            has_retry_policy: successor_state
-                                                .retry_policy
-                                                .is_some(),
+                                            operation_id: nexus.operation_id.clone(),
+                                            scheduled_event_id: nexus.scheduled_event_id,
+                                            schedule_to_close_timeout,
+                                            scheduled_at: nexus.scheduled_at,
                                         },
                                     );
-                                }
-                                for activity in successor_state.activities.values() {
-                                    activity_tracking.insert(
-                                        crate::activity_timeout::ActivityTrackingEntry {
-                                            run_key: successor_state.run_key,
-                                            shard_id,
-                                            activity_id: activity.activity_id.clone(),
-                                            original_scheduled_at: activity.scheduled_at,
-                                            last_dispatched_at: activity.scheduled_at,
-                                            started_at: activity.started_at,
-                                            last_heartbeat_at: None,
-                                            cancel_requested: false,
-                                        },
-                                    );
-                                }
-                                for nexus in
-                                    successor_state.pending_nexus_operations.values()
-                                {
-                                    if let Some(schedule_to_close_timeout) =
-                                        nexus.schedule_to_close_timeout
-                                    {
-                                        nexus_timeout_tracking.insert(
-                                            crate::nexus::NexusTimeoutEntry {
-                                                run_key: successor_state.run_key,
-                                                shard_id,
-                                                operation_id: nexus.operation_id.clone(),
-                                                scheduled_event_id: nexus
-                                                    .scheduled_event_id,
-                                                schedule_to_close_timeout,
-                                                scheduled_at: nexus.scheduled_at,
-                                            },
-                                        );
-                                    }
                                 }
                             }
                         }
                     }
                 }
-                if !dispatch_ops.is_empty() {
-                    if let Err(error) =
+                if !dispatch_ops.is_empty()
+                    && let Err(error) =
                         publisher.publish(message.run_key, &dispatch_ops).await
-                    {
-                        tracing::warn!(?error, run_key = ?message.run_key, "failed to publish dispatch ops");
-                    }
+                {
+                    tracing::warn!(?error, run_key = ?message.run_key, "failed to publish dispatch ops");
                 }
                 if let Some(error) = reset_materialization_error {
                     Err(error)
@@ -360,81 +362,85 @@ where
                     if let CommitResult::Applied { new_state } = &commit_result {
                         if let Command::NexusOperationResolved(request) =
                             &committed_command
-                        {
-                            if matches!(
+                            && matches!(
                                 request.resolution,
                                 tokeira_kernel::NexusResolution::Completed { .. }
                                     | tokeira_kernel::NexusResolution::Failed { .. }
                                     | tokeira_kernel::NexusResolution::Canceled
                                     | tokeira_kernel::NexusResolution::TimedOut
-                            ) {
-                                nexus_timeout_tracking
-                                    .remove(message.run_key, &request.operation_id);
-                            }
+                            )
+                        {
+                            nexus_timeout_tracking
+                                .remove(message.run_key, &request.operation_id);
                         }
                         if new_state.closed_at.is_some() {
-                            if let Some(parent_run_key) = new_state.parent_run_key {
-                                if extract_reset_metadata(&history_events).is_none() {
-                                    let maybe_resolution = match new_state.status {
-                                tokeira_types::ExecutionStatus::Completed => {
-                                    Some(tokeira_kernel::ChildResolution::Completed {
-                                        result: new_state
-                                            .close_result
-                                            .clone()
-                                            .unwrap_or_default(),
-                                    })
-                                }
-                                tokeira_types::ExecutionStatus::Failed => {
-                                    Some(tokeira_kernel::ChildResolution::Failed {
-                                        failure: new_state
-                                            .close_failure
-                                            .clone()
-                                            .unwrap_or_else(|| {
-                                                "child workflow failed".to_string()
-                                            }),
-                                    })
-                                }
-                                tokeira_types::ExecutionStatus::Cancelled => {
-                                    Some(tokeira_kernel::ChildResolution::Canceled)
-                                }
-                                tokeira_types::ExecutionStatus::Terminated => {
-                                    Some(tokeira_kernel::ChildResolution::Terminated)
-                                }
-                                tokeira_types::ExecutionStatus::TimedOut => {
-                                    Some(tokeira_kernel::ChildResolution::TimedOut)
-                                }
-                                _ => None,
-                            };
-                                    if let Some(resolution) = maybe_resolution {
-                                        let command =
-                                            tokeira_kernel::Command::ChildResolved(
-                                                tokeira_kernel::ChildResolvedRequest {
-                                                    child_workflow_id: new_state
-                                                        .workflow_id
-                                                        .clone(),
-                                                    resolution,
-                                                    now: time::OffsetDateTime::now_utc(),
-                                                },
-                                            );
-                                        let publisher = publisher.clone();
-                                        let child_run_key = message.run_key;
-                                        tokio::spawn(async move {
-                                            if let Err(error) = publisher
-                                                .submit_to_run(parent_run_key, command)
-                                                .await
-                                            {
-                                                let error_message = error.to_string();
-                                                if error_message
-                                                    .contains("kernel rejected")
-                                                    || error_message.contains("not found")
-                                                {
-                                                    tracing::debug!(?error, parent_run_key = ?parent_run_key, child_run_key = ?child_run_key, "failed to deliver child resolution to parent");
-                                                } else {
-                                                    tracing::warn!(?error, parent_run_key = ?parent_run_key, child_run_key = ?child_run_key, "failed to deliver child resolution to parent");
-                                                }
-                                            }
-                                        });
+                            if let Some(parent_run_key) = new_state.parent_run_key
+                                && extract_reset_metadata(&history_events).is_none()
+                            {
+                                let maybe_resolution = match new_state.status {
+                                    tokeira_types::ExecutionStatus::Completed => {
+                                        Some(tokeira_kernel::ChildResolution::Completed {
+                                            result: new_state
+                                                .close_result
+                                                .clone()
+                                                .unwrap_or_default(),
+                                        })
                                     }
+                                    tokeira_types::ExecutionStatus::Failed => {
+                                        Some(tokeira_kernel::ChildResolution::Failed {
+                                            failure: new_state
+                                                .close_failure
+                                                .clone()
+                                                .unwrap_or_else(|| {
+                                                    failure_to_payload(
+                                                        &failure_proto::Failure {
+                                                            message:
+                                                                "child workflow failed"
+                                                                    .to_string(),
+                                                            ..Default::default()
+                                                        },
+                                                    )
+                                                }),
+                                        })
+                                    }
+                                    tokeira_types::ExecutionStatus::Cancelled => {
+                                        Some(tokeira_kernel::ChildResolution::Canceled)
+                                    }
+                                    tokeira_types::ExecutionStatus::Terminated => {
+                                        Some(tokeira_kernel::ChildResolution::Terminated)
+                                    }
+                                    tokeira_types::ExecutionStatus::TimedOut => {
+                                        Some(tokeira_kernel::ChildResolution::TimedOut)
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(resolution) = maybe_resolution {
+                                    let command = tokeira_kernel::Command::ChildResolved(
+                                        tokeira_kernel::ChildResolvedRequest {
+                                            child_workflow_id: new_state
+                                                .workflow_id
+                                                .clone(),
+                                            resolution,
+                                            now: time::OffsetDateTime::now_utc(),
+                                        },
+                                    );
+                                    let publisher = publisher.clone();
+                                    let child_run_key = message.run_key;
+                                    tokio::spawn(async move {
+                                        if let Err(error) = publisher
+                                            .submit_to_run(parent_run_key, command)
+                                            .await
+                                        {
+                                            let error_message = error.to_string();
+                                            if error_message.contains("kernel rejected")
+                                                || error_message.contains("not found")
+                                            {
+                                                tracing::debug!(?error, parent_run_key = ?parent_run_key, child_run_key = ?child_run_key, "failed to deliver child resolution to parent");
+                                            } else {
+                                                tracing::warn!(?error, parent_run_key = ?parent_run_key, child_run_key = ?child_run_key, "failed to deliver child resolution to parent");
+                                            }
+                                        }
+                                    });
                                 }
                             }
                             if new_state.status == ExecutionStatus::ContinuedAsNew {
@@ -451,6 +457,7 @@ where
                                         workflow_execution_timeout,
                                         workflow_run_timeout,
                                         workflow_task_timeout,
+                                        ..
                                     } => Some((
                                         *new_run_id,
                                         workflow_type.clone(),
@@ -516,6 +523,18 @@ where
                                     first_execution_run_id,
                                     parent_run_key: None,
                                     parent_workflow_id: None,
+                                    parent_run_id: None,
+                                    parent_namespace_id: None,
+                                    parent_initiated_event_id: 0,
+                                    original_execution_run_id: Some(
+                                        new_state
+                                            .original_execution_run_id
+                                            .unwrap_or(new_state.run_id),
+                                    ),
+                                    continued_failure: new_state.close_failure.clone(),
+                                    last_completion_result: new_state
+                                        .close_result
+                                        .clone(),
                                     first_run_started_at,
                                     request: tokeira_types::RequestContext {
                                         request_id: tokeira_types::RequestId(format!(
@@ -1004,6 +1023,14 @@ mod tests {
             Ok(Vec::new())
         }
 
+        async fn list_started_workflow_tasks_for_shard(
+            &self,
+            _shard_id: ShardId,
+            _limit: usize,
+        ) -> Result<Vec<tokeira_storage::WftTimeoutSweepEntry>> {
+            Ok(Vec::new())
+        }
+
         async fn list_open_activities_for_shard(
             &self,
             _shard_id: ShardId,
@@ -1186,6 +1213,10 @@ mod tests {
                         workflow_execution_timeout: self.workflow_execution_timeout,
                         workflow_run_timeout: self.workflow_run_timeout,
                         workflow_task_timeout: Duration::seconds(15),
+                        retry_policy: None,
+                        initiator: tokeira_kernel::ContinueAsNewInitiator::Workflow,
+                        failure: None,
+                        last_completion_result: None,
                     },
                 }]
             } else {
@@ -1229,9 +1260,13 @@ mod tests {
             pending_workflow_task: Some(PendingWorkflowTask {
                 logical_seq: LogicalTaskSeq::ONE,
                 scheduled_event_id: 1,
+                scheduled_at: OffsetDateTime::now_utc(),
                 started_event_id: None,
+                started_at: None,
                 attempt: 1,
             }),
+            previous_started_event_id: 0,
+            workflow_task_attempt: 1,
             sticky: None,
             pause_info: None,
             wft_stamp: 0,
@@ -1243,8 +1278,13 @@ mod tests {
             retry_policy: None,
             attempt: 1,
             first_execution_run_id: None,
+            original_execution_run_id: None,
             parent_run_key: None,
             parent_workflow_id: None,
+            parent_run_id: None,
+            parent_namespace_id: None,
+            parent_initiated_event_id: 0,
+            last_completion_result: None,
             activities: BTreeMap::<String, ActivityState>::new(),
             timers: BTreeMap::new(),
             children: BTreeMap::new(),
@@ -1466,6 +1506,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let activity_tracking = crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
+        let wft_tracking = crate::wft_timeout::WftTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
         let update_registry = crate::UpdateRegistry::new();
         let shard_owner = test_shard_owner();
@@ -1479,6 +1520,7 @@ mod tests {
             &shard_owner,
             &activity_tracking,
             &tracking,
+            &wft_tracking,
             &nexus_tracking,
             &update_registry,
             &mut rx,
@@ -1538,6 +1580,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let activity_tracking = crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
+        let wft_tracking = crate::wft_timeout::WftTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
         let update_registry = crate::UpdateRegistry::new();
         let shard_owner = test_shard_owner();
@@ -1551,6 +1594,7 @@ mod tests {
             &shard_owner,
             &activity_tracking,
             &tracking,
+            &wft_tracking,
             &nexus_tracking,
             &update_registry,
             &mut rx,
@@ -1594,6 +1638,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let activity_tracking = crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
+        let wft_tracking = crate::wft_timeout::WftTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
         let update_registry = crate::UpdateRegistry::new();
         let shard_owner = test_shard_owner();
@@ -1607,6 +1652,7 @@ mod tests {
             &shard_owner,
             &activity_tracking,
             &tracking,
+            &wft_tracking,
             &nexus_tracking,
             &update_registry,
             &mut rx,
@@ -1639,6 +1685,7 @@ mod tests {
         let (_tx, mut rx) = mpsc::channel(8);
         let activity_tracking = crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
+        let wft_tracking = crate::wft_timeout::WftTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
         let update_registry = crate::UpdateRegistry::new();
         let shard_owner = test_shard_owner();
@@ -1650,6 +1697,7 @@ mod tests {
             &shard_owner,
             &activity_tracking,
             &tracking,
+            &wft_tracking,
             &nexus_tracking,
             &update_registry,
             &mut rx,
@@ -1683,6 +1731,7 @@ mod tests {
         let (_tx, mut rx) = mpsc::channel(8);
         let activity_tracking = crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
+        let wft_tracking = crate::wft_timeout::WftTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
         let update_registry = crate::UpdateRegistry::new();
         let shard_owner = test_shard_owner();
@@ -1694,6 +1743,7 @@ mod tests {
             &shard_owner,
             &activity_tracking,
             &tracking,
+            &wft_tracking,
             &nexus_tracking,
             &update_registry,
             &mut rx,
@@ -1733,6 +1783,7 @@ mod tests {
         let (_tx, mut rx) = mpsc::channel(8);
         let activity_tracking = crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
+        let wft_tracking = crate::wft_timeout::WftTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
         let update_registry = crate::UpdateRegistry::new();
         let shard_owner = test_shard_owner();
@@ -1744,6 +1795,7 @@ mod tests {
             &shard_owner,
             &activity_tracking,
             &tracking,
+            &wft_tracking,
             &nexus_tracking,
             &update_registry,
             &mut rx,
@@ -1795,6 +1847,7 @@ mod tests {
         let (_tx, mut rx) = mpsc::channel(8);
         let activity_tracking = crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
+        let wft_tracking = crate::wft_timeout::WftTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
         let update_registry = crate::UpdateRegistry::new();
         let shard_owner = test_shard_owner();
@@ -1806,6 +1859,7 @@ mod tests {
             &shard_owner,
             &activity_tracking,
             &tracking,
+            &wft_tracking,
             &nexus_tracking,
             &update_registry,
             &mut rx,
@@ -1864,6 +1918,7 @@ mod tests {
         let (_tx, mut rx) = mpsc::channel(8);
         let activity_tracking = crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
+        let wft_tracking = crate::wft_timeout::WftTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
         let update_registry = crate::UpdateRegistry::new();
         let shard_owner = test_shard_owner();
@@ -1875,6 +1930,7 @@ mod tests {
             &shard_owner,
             &activity_tracking,
             &tracking,
+            &wft_tracking,
             &nexus_tracking,
             &update_registry,
             &mut rx,
@@ -1942,6 +1998,7 @@ mod tests {
                 let activity_tracking =
                     crate::activity_timeout::ActivityTrackingState::default();
                 let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
+                let wft_tracking = crate::wft_timeout::WftTimeoutTrackingState::default();
                 let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
                 let update_registry = crate::UpdateRegistry::new();
                 let shard_owner = test_shard_owner();
@@ -1953,6 +2010,7 @@ mod tests {
                     &shard_owner,
                     &activity_tracking,
                     &tracking,
+                    &wft_tracking,
                     &nexus_tracking,
                     &update_registry,
                     &mut rx,
@@ -1987,6 +2045,7 @@ mod tests {
         let (_tx, mut rx) = mpsc::channel(8);
         let activity_tracking = crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
+        let wft_tracking = crate::wft_timeout::WftTimeoutTrackingState::default();
         let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
         let update_registry = crate::UpdateRegistry::new();
         let shard_owner = test_shard_owner();
@@ -1998,6 +2057,7 @@ mod tests {
             &shard_owner,
             &activity_tracking,
             &tracking,
+            &wft_tracking,
             &nexus_tracking,
             &update_registry,
             &mut rx,

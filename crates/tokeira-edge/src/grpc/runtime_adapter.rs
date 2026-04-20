@@ -12,7 +12,7 @@ use tokeira_runtime::{
     UpdateTransportResolution, UpdateWaitPolicy,
 };
 use tokeira_storage::{CommitResult, RunRepository};
-use tokeira_types::{ActivityTaskToken, ExecutionRef, Payloads, RequestContext};
+use tokeira_types::{ActivityTaskToken, ExecutionRef, Payload, Payloads, RequestContext};
 
 use crate::workflow_service::{WorkflowMutationOutcome, WorkflowRuntimeApi};
 
@@ -103,11 +103,12 @@ where
     async fn fail_activity_task(
         &self,
         token: ActivityTaskToken,
-        failure_message: String,
+        failure: Payload,
         failure_error_type: Option<String>,
+        is_non_retryable: bool,
     ) -> Result<()> {
         self.runtime
-            .fail_activity_task(token, failure_message, failure_error_type)
+            .fail_activity_task(token, failure, failure_error_type, is_non_retryable)
             .await
     }
 

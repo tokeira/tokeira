@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
     BuildId, DeploymentId, ExecutionStatus, Headers, LogicalTaskSeq, Memo, NamespaceId,
-    Payloads, RetryPolicy, RunId, RunKey, SearchAttributes, StickyAffinity,
+    Payload, Payloads, RetryPolicy, RunId, RunKey, SearchAttributes, StickyAffinity,
     TaskQueueName, TransitionSeq, WorkflowId, WorkflowType,
 };
 
@@ -45,6 +45,12 @@ pub struct WorkflowState {
     /// The currently pending workflow task, if any. At most
     /// one WFT is pending at a time.
     pub pending_workflow_task: Option<PendingWorkflowTask>,
+    /// started_event_id of the most recently completed
+    /// workflow task.
+    pub previous_started_event_id: i64,
+    /// Attempt number to assign to the next scheduled
+    /// workflow task.
+    pub workflow_task_attempt: u32,
     /// Sticky execution affinity recorded when a worker
     /// provides a `sticky_ttl`.
     pub sticky: Option<StickyAffinity>,
@@ -70,10 +76,20 @@ pub struct WorkflowState {
     pub attempt: u32,
     /// Run ID of the very first run in the execution chain.
     pub first_execution_run_id: Option<RunId>,
+    /// Run ID of the original execution in the chain.
+    pub original_execution_run_id: Option<RunId>,
     /// Parent run identity if this execution is a child.
     pub parent_run_key: Option<RunKey>,
     /// Parent workflow identity if this execution is a child.
     pub parent_workflow_id: Option<WorkflowId>,
+    /// Parent run ID if this execution is a child.
+    pub parent_run_id: Option<RunId>,
+    /// Parent namespace if this execution is a child.
+    pub parent_namespace_id: Option<NamespaceId>,
+    /// Parent initiation event ID if this execution is a child.
+    pub parent_initiated_event_id: i64,
+    /// Last successful predecessor completion result.
+    pub last_completion_result: Option<Payloads>,
     /// Open activities keyed by activity ID.
     pub activities: BTreeMap<String, ActivityState>,
     /// Open timers keyed by timer ID.
@@ -111,8 +127,8 @@ pub struct WorkflowState {
     pub closed_at: Option<OffsetDateTime>,
     /// Result payload retained for terminal completion.
     pub close_result: Option<Payloads>,
-    /// Failure message retained for terminal failure.
-    pub close_failure: Option<String>,
+    /// Opaque failure payload retained for terminal failure.
+    pub close_failure: Option<Payload>,
 }
 
 impl WorkflowState {
@@ -137,9 +153,14 @@ pub struct PendingWorkflowTask {
     pub logical_seq: LogicalTaskSeq,
     /// Event ID of the `WorkflowTaskScheduled` event.
     pub scheduled_event_id: i64,
+    /// Wall-clock time when the task was scheduled.
+    pub scheduled_at: OffsetDateTime,
     /// Event ID of the `WorkflowTaskStarted` event, or `None`
     /// if the task has not yet been picked up by a worker.
     pub started_event_id: Option<i64>,
+    /// Wall-clock time when the task was started, if it has
+    /// been picked up by a worker.
+    pub started_at: Option<OffsetDateTime>,
     /// Number of times this task has been started (incremented
     /// on each start, including retries after failure/timeout).
     pub attempt: u32,

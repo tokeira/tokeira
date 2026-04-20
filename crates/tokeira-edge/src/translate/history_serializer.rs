@@ -14,9 +14,9 @@ use tokeira_kernel::event::{HistoryEvent, HistoryEventKind};
 use tokeira_proto::public::temporal::api::update::v1 as proto_update;
 use tokeira_proto::{
     conversions::common::{
-        headers_from_domain, memo_from_domain, payload_from_domain, payloads_from_domain,
-        search_attributes_from_domain, task_queue_from_domain, to_opt_proto_duration,
-        to_proto_duration, to_proto_timestamp,
+        headers_from_domain, memo_from_domain, payload_from_domain, payload_to_failure,
+        payloads_from_domain, search_attributes_from_domain, task_queue_from_domain,
+        to_opt_proto_duration, to_proto_duration, to_proto_timestamp,
     },
     history,
 };
@@ -165,7 +165,7 @@ fn event_type_for_kind(kind: &HistoryEventKind) -> i32 {
 
 use history::history_event::Attributes;
 use tokeira_kernel::command::{
-    RetryState, WorkflowTaskFailedCause, WorkflowTaskTimeoutType,
+    ContinueAsNewInitiator, RetryState, WorkflowTaskFailedCause, WorkflowTaskTimeoutType,
 };
 use tokeira_kernel::state::ParentClosePolicy;
 use tokeira_proto::public::temporal::api::common::v1 as proto_common;
@@ -188,16 +188,38 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             workflow_execution_timeout,
             workflow_run_timeout,
             workflow_task_timeout,
+            parent_workflow_id,
+            parent_run_id,
+            parent_namespace_id,
+            parent_initiated_event_id,
+            original_execution_run_id,
+            continued_failure,
+            last_completion_result,
         } => Attributes::WorkflowExecutionStartedEventAttributes(
             history::WorkflowExecutionStartedEventAttributes {
                 workflow_type: Some(proto_common::WorkflowType {
                     name: workflow_type.0.clone(),
                 }),
+                parent_workflow_namespace_id: parent_namespace_id
+                    .map(|id| id.0.to_string())
+                    .unwrap_or_default(),
+                parent_workflow_execution: parent_workflow_id.as_ref().map(
+                    |workflow_id| proto_common::WorkflowExecution {
+                        workflow_id: workflow_id.0.clone(),
+                        run_id: opt_run_id(parent_run_id),
+                    },
+                ),
+                parent_initiated_event_id: *parent_initiated_event_id,
                 task_queue: Some(task_queue_from_domain(task_queue)),
                 input: Some(payloads_from_domain(input)),
                 memo: Some(memo_from_domain(memo)),
                 search_attributes: Some(search_attributes_from_domain(search_attributes)),
                 continued_execution_run_id: opt_run_id(continued_execution_run_id),
+                continued_failure: continued_failure.as_ref().map(payload_to_failure),
+                last_completion_result: last_completion_result
+                    .as_ref()
+                    .map(payloads_from_domain),
+                original_execution_run_id: opt_run_id(original_execution_run_id),
                 first_execution_run_id: opt_run_id(first_execution_run_id),
                 retry_policy: retry_policy.as_ref().map(retry_policy_to_proto),
                 attempt: *attempt as i32,
@@ -219,16 +241,11 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             )
         }
         HistoryEventKind::WorkflowExecutionFailed {
-            message,
-            details,
+            failure,
             retry_state,
             attempt: _,
         } => {
-            let failure = Some(proto_failure::Failure {
-                message: message.clone(),
-                encoded_attributes: details.as_ref().map(payload_from_domain),
-                ..Default::default()
-            });
+            let failure = Some(payload_to_failure(failure));
             Attributes::WorkflowExecutionFailedEventAttributes(
                 history::WorkflowExecutionFailedEventAttributes {
                     failure,
@@ -293,6 +310,10 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             workflow_execution_timeout: _,
             workflow_run_timeout,
             workflow_task_timeout,
+            retry_policy: _,
+            initiator,
+            failure,
+            last_completion_result,
         } => Attributes::WorkflowExecutionContinuedAsNewEventAttributes(
             history::WorkflowExecutionContinuedAsNewEventAttributes {
                 new_execution_run_id: new_run_id.0.to_string(),
@@ -305,6 +326,11 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 search_attributes: Some(search_attributes_from_domain(search_attributes)),
                 workflow_run_timeout: to_opt_proto_duration(*workflow_run_timeout),
                 workflow_task_timeout: Some(to_proto_duration(*workflow_task_timeout)),
+                initiator: continue_as_new_initiator_i32(initiator),
+                failure: failure.as_ref().map(payload_to_failure),
+                last_completion_result: last_completion_result
+                    .as_ref()
+                    .map(payloads_from_domain),
                 ..Default::default()
             },
         ),
@@ -337,13 +363,18 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 },
             )
         }
-        HistoryEventKind::WorkflowTaskScheduled { logical_seq: _ } => {
-            Attributes::WorkflowTaskScheduledEventAttributes(
-                history::WorkflowTaskScheduledEventAttributes {
-                    ..Default::default()
-                },
-            )
-        }
+        HistoryEventKind::WorkflowTaskScheduled {
+            logical_seq: _,
+            task_queue,
+            workflow_task_timeout,
+            attempt,
+        } => Attributes::WorkflowTaskScheduledEventAttributes(
+            history::WorkflowTaskScheduledEventAttributes {
+                task_queue: Some(task_queue_from_domain(task_queue)),
+                start_to_close_timeout: Some(to_proto_duration(*workflow_task_timeout)),
+                attempt: *attempt as i32,
+            },
+        ),
         HistoryEventKind::WorkflowTaskStarted {
             logical_seq: _,
             scheduled_event_id,
@@ -381,10 +412,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             fork_event_version,
             fork_event_id: _,
         } => {
-            let failure = failure_details.as_ref().map(|_p| proto_failure::Failure {
-                message: String::new(),
-                ..Default::default()
-            });
+            let failure = failure_details.as_ref().map(payload_to_failure);
             Attributes::WorkflowTaskFailedEventAttributes(
                 history::WorkflowTaskFailedEventAttributes {
                     scheduled_event_id: *scheduled_event_id,
@@ -473,12 +501,9 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             activity_id: _,
             scheduled_event_id,
             started_event_id,
-            message,
+            failure,
         } => {
-            let failure = Some(proto_failure::Failure {
-                message: message.clone(),
-                ..Default::default()
-            });
+            let failure = Some(payload_to_failure(failure));
             Attributes::ActivityTaskFailedEventAttributes(
                 history::ActivityTaskFailedEventAttributes {
                     failure,
@@ -571,10 +596,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                     .iter()
                     .map(|(k, v)| (k.clone(), payloads_from_domain(v)))
                     .collect(),
-                failure: failure.as_ref().map(|_p| proto_failure::Failure {
-                    message: String::new(),
-                    ..Default::default()
-                }),
+                failure: failure.as_ref().map(payload_to_failure),
                 header: header.as_ref().map(|h| proto_common::Header {
                     fields: h
                         .iter()
@@ -608,8 +630,10 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             child_workflow_id,
             child_run_id,
             workflow_type,
+            initiated_event_id,
         } => Attributes::ChildWorkflowExecutionStartedEventAttributes(
             history::ChildWorkflowExecutionStartedEventAttributes {
+                initiated_event_id: *initiated_event_id,
                 workflow_execution: Some(proto_common::WorkflowExecution {
                     workflow_id: child_workflow_id.0.clone(),
                     run_id: child_run_id.0.to_string(),
@@ -633,9 +657,13 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
         HistoryEventKind::ChildWorkflowExecutionCompleted {
             child_workflow_id,
             result,
+            initiated_event_id,
+            started_event_id,
         } => Attributes::ChildWorkflowExecutionCompletedEventAttributes(
             history::ChildWorkflowExecutionCompletedEventAttributes {
                 result: Some(payloads_from_domain(result)),
+                initiated_event_id: *initiated_event_id,
+                started_event_id: *started_event_id,
                 workflow_execution: Some(proto_common::WorkflowExecution {
                     workflow_id: child_workflow_id.0.clone(),
                     ..Default::default()
@@ -646,12 +674,13 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
         HistoryEventKind::ChildWorkflowExecutionFailed {
             child_workflow_id,
             failure,
+            initiated_event_id,
+            started_event_id,
         } => Attributes::ChildWorkflowExecutionFailedEventAttributes(
             history::ChildWorkflowExecutionFailedEventAttributes {
-                failure: Some(proto_failure::Failure {
-                    message: failure.clone(),
-                    ..Default::default()
-                }),
+                failure: Some(payload_to_failure(failure)),
+                initiated_event_id: *initiated_event_id,
+                started_event_id: *started_event_id,
                 workflow_execution: Some(proto_common::WorkflowExecution {
                     workflow_id: child_workflow_id.0.clone(),
                     ..Default::default()
@@ -659,44 +688,57 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 ..Default::default()
             },
         ),
-        HistoryEventKind::ChildWorkflowExecutionCanceled { child_workflow_id } => {
-            Attributes::ChildWorkflowExecutionCanceledEventAttributes(
-                history::ChildWorkflowExecutionCanceledEventAttributes {
-                    workflow_execution: Some(proto_common::WorkflowExecution {
-                        workflow_id: child_workflow_id.0.clone(),
-                        ..Default::default()
-                    }),
+        HistoryEventKind::ChildWorkflowExecutionCanceled {
+            child_workflow_id,
+            initiated_event_id,
+            started_event_id,
+        } => Attributes::ChildWorkflowExecutionCanceledEventAttributes(
+            history::ChildWorkflowExecutionCanceledEventAttributes {
+                initiated_event_id: *initiated_event_id,
+                started_event_id: *started_event_id,
+                workflow_execution: Some(proto_common::WorkflowExecution {
+                    workflow_id: child_workflow_id.0.clone(),
                     ..Default::default()
-                },
-            )
-        }
-        HistoryEventKind::ChildWorkflowExecutionTerminated { child_workflow_id } => {
-            Attributes::ChildWorkflowExecutionTerminatedEventAttributes(
-                history::ChildWorkflowExecutionTerminatedEventAttributes {
-                    workflow_execution: Some(proto_common::WorkflowExecution {
-                        workflow_id: child_workflow_id.0.clone(),
-                        ..Default::default()
-                    }),
+                }),
+                ..Default::default()
+            },
+        ),
+        HistoryEventKind::ChildWorkflowExecutionTerminated {
+            child_workflow_id,
+            initiated_event_id,
+            started_event_id,
+        } => Attributes::ChildWorkflowExecutionTerminatedEventAttributes(
+            history::ChildWorkflowExecutionTerminatedEventAttributes {
+                initiated_event_id: *initiated_event_id,
+                started_event_id: *started_event_id,
+                workflow_execution: Some(proto_common::WorkflowExecution {
+                    workflow_id: child_workflow_id.0.clone(),
                     ..Default::default()
-                },
-            )
-        }
-        HistoryEventKind::ChildWorkflowExecutionTimedOut { child_workflow_id } => {
-            Attributes::ChildWorkflowExecutionTimedOutEventAttributes(
-                history::ChildWorkflowExecutionTimedOutEventAttributes {
-                    workflow_execution: Some(proto_common::WorkflowExecution {
-                        workflow_id: child_workflow_id.0.clone(),
-                        ..Default::default()
-                    }),
+                }),
+                ..Default::default()
+            },
+        ),
+        HistoryEventKind::ChildWorkflowExecutionTimedOut {
+            child_workflow_id,
+            initiated_event_id,
+            started_event_id,
+        } => Attributes::ChildWorkflowExecutionTimedOutEventAttributes(
+            history::ChildWorkflowExecutionTimedOutEventAttributes {
+                initiated_event_id: *initiated_event_id,
+                started_event_id: *started_event_id,
+                workflow_execution: Some(proto_common::WorkflowExecution {
+                    workflow_id: child_workflow_id.0.clone(),
                     ..Default::default()
-                },
-            )
-        }
+                }),
+                ..Default::default()
+            },
+        ),
         HistoryEventKind::SignalExternalWorkflowExecutionInitiated {
             target_workflow_id,
             target_run_id,
             signal_name,
             input,
+            control,
         } => Attributes::SignalExternalWorkflowExecutionInitiatedEventAttributes(
             history::SignalExternalWorkflowExecutionInitiatedEventAttributes {
                 workflow_execution: Some(proto_common::WorkflowExecution {
@@ -705,6 +747,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 }),
                 signal_name: signal_name.clone(),
                 input: Some(payloads_from_domain(input)),
+                control: control.clone(),
                 ..Default::default()
             },
         ),
@@ -739,12 +782,14 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
         HistoryEventKind::RequestCancelExternalWorkflowExecutionInitiated {
             target_workflow_id,
             target_run_id,
+            control,
         } => Attributes::RequestCancelExternalWorkflowExecutionInitiatedEventAttributes(
             history::RequestCancelExternalWorkflowExecutionInitiatedEventAttributes {
                 workflow_execution: Some(proto_common::WorkflowExecution {
                     workflow_id: target_workflow_id.0.clone(),
                     run_id: opt_run_id(target_run_id),
                 }),
+                control: control.clone(),
                 ..Default::default()
             },
         ),
@@ -823,10 +868,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
         } => Attributes::NexusOperationFailedEventAttributes(
             history::NexusOperationFailedEventAttributes {
                 scheduled_event_id: *scheduled_event_id,
-                failure: Some(proto_failure::Failure {
-                    message: failure.clone(),
-                    ..Default::default()
-                }),
+                failure: Some(payload_to_failure(failure)),
                 ..Default::default()
             },
         ),
@@ -898,10 +940,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             Attributes::WorkflowExecutionUpdateRejectedEventAttributes(
                 history::WorkflowExecutionUpdateRejectedEventAttributes {
                     protocol_instance_id: update_id.clone(),
-                    failure: Some(proto_failure::Failure {
-                        message: failure.clone(),
-                        ..Default::default()
-                    }),
+                    failure: Some(payload_to_failure(failure)),
                     ..Default::default()
                 },
             )
@@ -936,6 +975,15 @@ fn retry_policy_to_proto(rp: &tokeira_types::RetryPolicy) -> proto_common::Retry
         maximum_interval: to_opt_proto_duration(rp.maximum_interval),
         maximum_attempts: rp.maximum_attempts as i32,
         non_retryable_error_types: rp.non_retryable_error_types.clone(),
+    }
+}
+
+fn continue_as_new_initiator_i32(initiator: &ContinueAsNewInitiator) -> i32 {
+    use tokeira_proto::enums::ContinueAsNewInitiator as I;
+    match initiator {
+        ContinueAsNewInitiator::Workflow => I::Workflow as i32,
+        ContinueAsNewInitiator::Retry => I::Retry as i32,
+        ContinueAsNewInitiator::CronSchedule => I::CronSchedule as i32,
     }
 }
 
@@ -1047,16 +1095,28 @@ mod tests {
     use proptest::prelude::*;
     use prost::Message;
     use time::OffsetDateTime;
-    use tokeira_kernel::command::RetryState;
+    use tokeira_kernel::command::{ContinueAsNewInitiator, RetryState};
     use tokeira_kernel::event::{HistoryEvent, HistoryEventKind};
     use tokeira_kernel::state::ParentClosePolicy;
+    use tokeira_proto::conversions::common::failure_to_payload;
     use tokeira_types::{
-        LogicalTaskSeq, Memo, NamespaceId, Payloads, RetryPolicy, RunId,
+        LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RetryPolicy, RunId,
         SearchAttributes, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
     };
+    use uuid::Uuid;
 
     fn arb_payloads() -> impl Strategy<Value = Payloads> {
         Just(Payloads::default())
+    }
+
+    fn arb_failure_payload() -> impl Strategy<Value = Payload> {
+        "[a-z ]{0,20}".prop_map(|msg| {
+            let failure = proto_failure::Failure {
+                message: msg,
+                ..Default::default()
+            };
+            failure_to_payload(&failure)
+        })
     }
 
     fn arb_run_id() -> impl Strategy<Value = RunId> {
@@ -1143,23 +1203,28 @@ mod tests {
                             workflow_execution_timeout: wet,
                             workflow_run_timeout: wrt,
                             workflow_task_timeout: wtt,
+                            parent_workflow_id: None,
+                            parent_run_id: None,
+                            parent_namespace_id: None,
+                            parent_initiated_event_id: 0,
+                            original_execution_run_id: None,
+                            continued_failure: None,
+                            last_completion_result: None,
                         }
                     }
                 ),
             arb_payloads().prop_map(|r| {
                 HistoryEventKind::WorkflowExecutionCompleted { result: r }
             }),
-            ("[a-z]{1,8}", arb_retry_state(), 0u32..5).prop_map(|(msg, rs, att)| {
-                HistoryEventKind::WorkflowExecutionFailed {
-                    message: msg,
-                    details: Some(tokeira_types::Payload {
-                        data: b"err-detail".to_vec(),
-                        metadata: Default::default(),
-                    }),
-                    retry_state: rs,
-                    attempt: att,
-                }
-            }),
+            (arb_failure_payload(), arb_retry_state(), 0u32..5).prop_map(
+                |(failure, rs, att)| {
+                    HistoryEventKind::WorkflowExecutionFailed {
+                        failure,
+                        retry_state: rs,
+                        attempt: att,
+                    }
+                },
+            ),
             Just(HistoryEventKind::WorkflowExecutionCanceled),
             "[a-z]{1,8}".prop_map(|r| {
                 HistoryEventKind::WorkflowExecutionTerminated {
@@ -1176,9 +1241,12 @@ mod tests {
                     identity: None,
                 }
             }),
-            (1u64..100).prop_map(|seq| {
+            (1u64..100, "[a-z]{1,6}", 1u32..5).prop_map(|(seq, tq, attempt)| {
                 HistoryEventKind::WorkflowTaskScheduled {
                     logical_seq: LogicalTaskSeq(seq),
+                    task_queue: TaskQueueName(tq),
+                    workflow_task_timeout: time::Duration::seconds(30),
+                    attempt,
                 }
             }),
             (1u64..100, 1i64..100, 1u32..5).prop_map(|(seq, sched, att)| {
@@ -1233,12 +1301,12 @@ mod tests {
                     result,
                 }
             }),
-            ("[a-z]{1,6}", "[a-z]{1,8}").prop_map(|(aid, msg)| {
+            ("[a-z]{1,6}", arb_failure_payload()).prop_map(|(aid, failure)| {
                 HistoryEventKind::ActivityTaskFailed {
                     activity_id: aid,
                     scheduled_event_id: 5,
                     started_event_id: 6,
-                    message: msg,
+                    failure,
                 }
             }),
             ("[a-z]{1,6}", 1i64..100, 1u32..5).prop_map(|(aid, sched, att)| {
@@ -1264,11 +1332,55 @@ mod tests {
             "[a-z]{1,6}".prop_map(|aid| {
                 HistoryEventKind::ActivityTaskCancelRequested { activity_id: aid }
             }),
-            ("[a-z]{1,6}", arb_run_id(), "[a-z]{1,6}").prop_map(|(cwid, crid, wt)| {
-                HistoryEventKind::ChildWorkflowExecutionStarted {
+            ("[a-z]{1,6}", arb_run_id(), "[a-z]{1,6}", 1i64..100).prop_map(
+                |(cwid, crid, wt, iei)| {
+                    HistoryEventKind::ChildWorkflowExecutionStarted {
+                        child_workflow_id: WorkflowId(cwid),
+                        child_run_id: crid,
+                        workflow_type: WorkflowType(wt),
+                        initiated_event_id: iei,
+                    }
+                },
+            ),
+            ("[a-z]{1,6}", arb_payloads(), 1i64..100, 1i64..100).prop_map(
+                |(cwid, result, iei, sei)| {
+                    HistoryEventKind::ChildWorkflowExecutionCompleted {
+                        child_workflow_id: WorkflowId(cwid),
+                        result,
+                        initiated_event_id: iei,
+                        started_event_id: sei,
+                    }
+                },
+            ),
+            ("[a-z]{1,6}", arb_failure_payload(), 1i64..100, 1i64..100).prop_map(
+                |(cwid, failure, iei, sei)| {
+                    HistoryEventKind::ChildWorkflowExecutionFailed {
+                        child_workflow_id: WorkflowId(cwid),
+                        failure,
+                        initiated_event_id: iei,
+                        started_event_id: sei,
+                    }
+                },
+            ),
+            ("[a-z]{1,6}", 1i64..100, 1i64..100).prop_map(|(cwid, iei, sei)| {
+                HistoryEventKind::ChildWorkflowExecutionCanceled {
                     child_workflow_id: WorkflowId(cwid),
-                    child_run_id: crid,
-                    workflow_type: WorkflowType(wt),
+                    initiated_event_id: iei,
+                    started_event_id: sei,
+                }
+            }),
+            ("[a-z]{1,6}", 1i64..100, 1i64..100).prop_map(|(cwid, iei, sei)| {
+                HistoryEventKind::ChildWorkflowExecutionTerminated {
+                    child_workflow_id: WorkflowId(cwid),
+                    initiated_event_id: iei,
+                    started_event_id: sei,
+                }
+            }),
+            ("[a-z]{1,6}", 1i64..100, 1i64..100).prop_map(|(cwid, iei, sei)| {
+                HistoryEventKind::ChildWorkflowExecutionTimedOut {
+                    child_workflow_id: WorkflowId(cwid),
+                    initiated_event_id: iei,
+                    started_event_id: sei,
                 }
             }),
             (
@@ -1304,7 +1416,7 @@ mod tests {
                     result,
                 }
             }),
-            ("[a-z]{1,6}", "[a-z]{1,8}").prop_map(|(uid, failure)| {
+            ("[a-z]{1,6}", arb_failure_payload()).prop_map(|(uid, failure)| {
                 HistoryEventKind::WorkflowExecutionUpdateRejected {
                     update_id: uid,
                     failure,
@@ -1368,6 +1480,13 @@ mod tests {
                 workflow_execution_timeout: None,
                 workflow_run_timeout: None,
                 workflow_task_timeout: time::Duration::seconds(10),
+                parent_workflow_id: None,
+                parent_run_id: None,
+                parent_namespace_id: None,
+                parent_initiated_event_id: 0,
+                original_execution_run_id: None,
+                continued_failure: None,
+                last_completion_result: None,
             },
         };
         let proto = history_event_to_proto(&event);
@@ -1468,6 +1587,730 @@ mod tests {
                 assert_eq!(attrs.workflow_type.unwrap().name, "ChildWf");
             }
             other => panic!("unexpected attributes: {other:?}"),
+        }
+    }
+
+    fn make_failure_payload(failure: &proto_failure::Failure) -> Payload {
+        failure_to_payload(failure)
+    }
+
+    fn arb_proto_failure() -> impl Strategy<Value = proto_failure::Failure> {
+        (
+            "[a-z ]{0,20}",
+            "[a-z]{0,10}",
+            "[a-z\n]{0,30}",
+            prop_oneof![
+                Just(None),
+                "[a-z]{0,10}".prop_map(|t| Some(
+                    proto_failure::failure::FailureInfo::ApplicationFailureInfo(
+                        proto_failure::ApplicationFailureInfo {
+                            r#type: t,
+                            non_retryable: false,
+                            ..Default::default()
+                        },
+                    )
+                )),
+            ],
+        )
+            .prop_map(|(msg, source, stack, failure_info)| {
+                proto_failure::Failure {
+                    message: msg,
+                    source,
+                    stack_trace: stack,
+                    failure_info,
+                    ..Default::default()
+                }
+            })
+    }
+
+    // ── Property 2: WorkflowExecutionFailed preserves failure ──
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn prop_workflow_execution_failed_preserves_failure(
+            failure in arb_proto_failure(),
+            retry_state in arb_retry_state(),
+            attempt in 0u32..5,
+        ) {
+            let payload = make_failure_payload(&failure);
+            let event = HistoryEvent {
+                event_id: 1,
+                happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
+                kind: HistoryEventKind::WorkflowExecutionFailed {
+                    failure: payload,
+                    retry_state,
+                    attempt,
+                },
+            };
+            let proto = history_event_to_proto(&event);
+            match proto.attributes.unwrap() {
+                Attributes::WorkflowExecutionFailedEventAttributes(attrs) => {
+                    let proto_failure = attrs.failure.unwrap();
+                    prop_assert_eq!(proto_failure.message, failure.message);
+                    prop_assert_eq!(
+                        proto_failure.failure_info.is_some(),
+                        failure.failure_info.is_some()
+                    );
+                }
+                other => panic!("unexpected attributes: {other:?}"),
+            }
+        }
+
+        // ── Property 3: ActivityTaskFailed preserves failure ──
+        #[test]
+        fn prop_activity_task_failed_preserves_failure(
+            failure in arb_proto_failure(),
+        ) {
+            let payload = make_failure_payload(&failure);
+            let event = HistoryEvent {
+                event_id: 7,
+                happened_at: OffsetDateTime::from_unix_timestamp(2000).unwrap(),
+                kind: HistoryEventKind::ActivityTaskFailed {
+                    activity_id: "act-1".to_string(),
+                    scheduled_event_id: 5,
+                    started_event_id: 6,
+                    failure: payload,
+                },
+            };
+            let proto = history_event_to_proto(&event);
+            match proto.attributes.unwrap() {
+                Attributes::ActivityTaskFailedEventAttributes(attrs) => {
+                    let proto_failure = attrs.failure.unwrap();
+                    prop_assert_eq!(proto_failure.message, failure.message);
+                    prop_assert_eq!(
+                        proto_failure.failure_info.is_some(),
+                        failure.failure_info.is_some()
+                    );
+                }
+                other => panic!("unexpected attributes: {other:?}"),
+            }
+        }
+
+        // ── Property 4: ChildWorkflowExecutionFailed preserves failure ──
+        #[test]
+        fn prop_child_workflow_failed_preserves_failure(
+            failure in arb_proto_failure(),
+        ) {
+            let payload = make_failure_payload(&failure);
+            let event = HistoryEvent {
+                event_id: 15,
+                happened_at: OffsetDateTime::from_unix_timestamp(3000).unwrap(),
+                kind: HistoryEventKind::ChildWorkflowExecutionFailed {
+                    child_workflow_id: WorkflowId("child-1".to_string()),
+                    failure: payload,
+                    initiated_event_id: 10,
+                    started_event_id: 11,
+                },
+            };
+            let proto = history_event_to_proto(&event);
+            match proto.attributes.unwrap() {
+                Attributes::ChildWorkflowExecutionFailedEventAttributes(attrs) => {
+                    let proto_failure = attrs.failure.unwrap();
+                    prop_assert_eq!(proto_failure.message, failure.message);
+                    prop_assert_eq!(
+                        proto_failure.failure_info.is_some(),
+                        failure.failure_info.is_some()
+                    );
+                }
+                other => panic!("unexpected attributes: {other:?}"),
+            }
+        }
+
+        // ── Property 5: WorkflowTaskFailed preserves failure ──
+        #[test]
+        fn prop_workflow_task_failed_preserves_failure(
+            failure in arb_proto_failure(),
+        ) {
+            let payload = make_failure_payload(&failure);
+            let event = HistoryEvent {
+                event_id: 8,
+                happened_at: OffsetDateTime::from_unix_timestamp(2000).unwrap(),
+                kind: HistoryEventKind::WorkflowTaskFailed {
+                    logical_seq: LogicalTaskSeq(1),
+                    scheduled_event_id: 5,
+                    started_event_id: 6,
+                    failure_cause: tokeira_kernel::command::WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+                    failure_details: Some(payload),
+                    identity: WorkerIdentity("w".to_string()),
+                    base_run_id: None,
+                    new_run_id: None,
+                    fork_event_version: None,
+                    fork_event_id: None,
+                },
+            };
+            let proto = history_event_to_proto(&event);
+            match proto.attributes.unwrap() {
+                Attributes::WorkflowTaskFailedEventAttributes(attrs) => {
+                    let proto_failure = attrs.failure.unwrap();
+                    prop_assert_eq!(proto_failure.message, failure.message);
+                    prop_assert_eq!(
+                        proto_failure.failure_info.is_some(),
+                        failure.failure_info.is_some()
+                    );
+                }
+                other => panic!("unexpected attributes: {other:?}"),
+            }
+        }
+
+        // ── Property 6: All failure-bearing events preserve failure_info ──
+        #[test]
+        fn prop_all_failure_events_preserve_failure_info(
+            failure in arb_proto_failure(),
+            variant in 0u8..5,
+        ) {
+            let payload = make_failure_payload(&failure);
+            let kind = match variant {
+                0 => HistoryEventKind::WorkflowExecutionFailed {
+                    failure: payload,
+                    retry_state: RetryState::InProgress,
+                    attempt: 1,
+                },
+                1 => HistoryEventKind::ActivityTaskFailed {
+                    activity_id: "act-1".to_string(),
+                    scheduled_event_id: 5,
+                    started_event_id: 6,
+                    failure: payload,
+                },
+                2 => HistoryEventKind::ChildWorkflowExecutionFailed {
+                    child_workflow_id: WorkflowId("child-1".to_string()),
+                    failure: payload,
+                    initiated_event_id: 10,
+                    started_event_id: 11,
+                },
+                3 => HistoryEventKind::NexusOperationFailed {
+                    operation_id: "op-1".to_string(),
+                    scheduled_event_id: 10,
+                    failure: payload,
+                },
+                _ => HistoryEventKind::WorkflowExecutionUpdateRejected {
+                    update_id: "update-1".to_string(),
+                    failure: payload,
+                },
+            };
+            let event = HistoryEvent {
+                event_id: 1,
+                happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
+                kind,
+            };
+            let proto = history_event_to_proto(&event);
+            let has_failure_info = failure.failure_info.is_some();
+            let proto_has_failure_info = match proto.attributes.unwrap() {
+                Attributes::WorkflowExecutionFailedEventAttributes(a) => {
+                    a.failure.unwrap().failure_info.is_some()
+                }
+                Attributes::ActivityTaskFailedEventAttributes(a) => {
+                    a.failure.unwrap().failure_info.is_some()
+                }
+                Attributes::ChildWorkflowExecutionFailedEventAttributes(a) => {
+                    a.failure.unwrap().failure_info.is_some()
+                }
+                Attributes::NexusOperationFailedEventAttributes(a) => {
+                    a.failure.unwrap().failure_info.is_some()
+                }
+                Attributes::WorkflowExecutionUpdateRejectedEventAttributes(a) => {
+                    a.failure.unwrap().failure_info.is_some()
+                }
+                other => panic!("unexpected attributes: {other:?}"),
+            };
+            prop_assert_eq!(has_failure_info, proto_has_failure_info);
+        }
+    }
+
+    // ── Task 10: Golden unit tests ──
+
+    #[test]
+    fn golden_workflow_execution_failed_with_application_failure_info() {
+        let failure = proto_failure::Failure {
+            message: "something went wrong".to_string(),
+            stack_trace: "at main.rs:42".to_string(),
+            failure_info: Some(
+                proto_failure::failure::FailureInfo::ApplicationFailureInfo(
+                    proto_failure::ApplicationFailureInfo {
+                        r#type: "MyAppError".to_string(),
+                        non_retryable: true,
+                        ..Default::default()
+                    },
+                ),
+            ),
+            ..Default::default()
+        };
+        let event = HistoryEvent {
+            event_id: 5,
+            happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
+            kind: HistoryEventKind::WorkflowExecutionFailed {
+                failure: make_failure_payload(&failure),
+                retry_state: RetryState::NonRetryableFailure,
+                attempt: 1,
+            },
+        };
+        let proto = history_event_to_proto(&event);
+        match proto.attributes.unwrap() {
+            Attributes::WorkflowExecutionFailedEventAttributes(attrs) => {
+                let f = attrs.failure.unwrap();
+                assert_eq!(f.message, "something went wrong");
+                assert_eq!(f.stack_trace, "at main.rs:42");
+                match f.failure_info.unwrap() {
+                    proto_failure::failure::FailureInfo::ApplicationFailureInfo(info) => {
+                        assert_eq!(info.r#type, "MyAppError");
+                        assert!(info.non_retryable);
+                    }
+                    other => panic!("unexpected failure_info: {other:?}"),
+                }
+            }
+            other => panic!("unexpected attributes: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn golden_activity_task_failed_with_cause_chain() {
+        let cause = proto_failure::Failure {
+            message: "root cause".to_string(),
+            failure_info: Some(
+                proto_failure::failure::FailureInfo::ApplicationFailureInfo(
+                    proto_failure::ApplicationFailureInfo {
+                        r#type: "RootError".to_string(),
+                        ..Default::default()
+                    },
+                ),
+            ),
+            ..Default::default()
+        };
+        let failure = proto_failure::Failure {
+            message: "activity failed".to_string(),
+            cause: Some(Box::new(cause)),
+            failure_info: Some(
+                proto_failure::failure::FailureInfo::ApplicationFailureInfo(
+                    proto_failure::ApplicationFailureInfo {
+                        r#type: "ActivityError".to_string(),
+                        ..Default::default()
+                    },
+                ),
+            ),
+            ..Default::default()
+        };
+        let event = HistoryEvent {
+            event_id: 7,
+            happened_at: OffsetDateTime::from_unix_timestamp(2000).unwrap(),
+            kind: HistoryEventKind::ActivityTaskFailed {
+                activity_id: "act-1".to_string(),
+                scheduled_event_id: 5,
+                started_event_id: 6,
+                failure: make_failure_payload(&failure),
+            },
+        };
+        let proto = history_event_to_proto(&event);
+        match proto.attributes.unwrap() {
+            Attributes::ActivityTaskFailedEventAttributes(attrs) => {
+                let f = attrs.failure.unwrap();
+                assert_eq!(f.message, "activity failed");
+                assert!(f.failure_info.is_some());
+                let c = f.cause.unwrap();
+                assert_eq!(c.message, "root cause");
+                assert!(c.failure_info.is_some());
+            }
+            other => panic!("unexpected attributes: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn golden_workflow_task_failed_with_failure_details() {
+        let failure = proto_failure::Failure {
+            message: "non-determinism detected".to_string(),
+            failure_info: Some(
+                proto_failure::failure::FailureInfo::ApplicationFailureInfo(
+                    proto_failure::ApplicationFailureInfo {
+                        r#type: "NonDeterminismError".to_string(),
+                        ..Default::default()
+                    },
+                ),
+            ),
+            ..Default::default()
+        };
+        let event = HistoryEvent {
+            event_id: 8,
+            happened_at: OffsetDateTime::from_unix_timestamp(2000).unwrap(),
+            kind: HistoryEventKind::WorkflowTaskFailed {
+                logical_seq: LogicalTaskSeq(1),
+                scheduled_event_id: 5,
+                started_event_id: 6,
+                failure_cause:
+                    tokeira_kernel::command::WorkflowTaskFailedCause::NonDeterminismError,
+                failure_details: Some(make_failure_payload(&failure)),
+                identity: WorkerIdentity("w".to_string()),
+                base_run_id: None,
+                new_run_id: None,
+                fork_event_version: None,
+                fork_event_id: None,
+            },
+        };
+        let proto = history_event_to_proto(&event);
+        match proto.attributes.unwrap() {
+            Attributes::WorkflowTaskFailedEventAttributes(attrs) => {
+                let f = attrs.failure.unwrap();
+                assert_eq!(f.message, "non-determinism detected");
+                assert!(f.failure_info.is_some());
+            }
+            other => panic!("unexpected attributes: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn golden_marker_recorded_with_failure() {
+        let failure = proto_failure::Failure {
+            message: "marker failure".to_string(),
+            failure_info: Some(
+                proto_failure::failure::FailureInfo::ApplicationFailureInfo(
+                    proto_failure::ApplicationFailureInfo {
+                        r#type: "MarkerError".to_string(),
+                        ..Default::default()
+                    },
+                ),
+            ),
+            ..Default::default()
+        };
+        let event = HistoryEvent {
+            event_id: 9,
+            happened_at: OffsetDateTime::from_unix_timestamp(2000).unwrap(),
+            kind: HistoryEventKind::MarkerRecorded {
+                marker_name: "test-marker".to_string(),
+                details: Default::default(),
+                failure: Some(make_failure_payload(&failure)),
+                header: None,
+            },
+        };
+        let proto = history_event_to_proto(&event);
+        match proto.attributes.unwrap() {
+            Attributes::MarkerRecordedEventAttributes(attrs) => {
+                let f = attrs.failure.unwrap();
+                assert_eq!(f.message, "marker failure");
+                assert!(f.failure_info.is_some());
+            }
+            other => panic!("unexpected attributes: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn golden_corrupted_payload_produces_fallback_failure() {
+        let corrupted = Payload {
+            data: b"not valid proto bytes".to_vec(),
+            metadata: Default::default(),
+        };
+        let decoded = payload_to_failure(&corrupted);
+        assert_eq!(decoded.message, "not valid proto bytes");
+        assert!(decoded.failure_info.is_none());
+    }
+
+    fn arb_namespace_id() -> impl Strategy<Value = NamespaceId> {
+        any::<u128>().prop_map(|v| NamespaceId(Uuid::from_u128(v)))
+    }
+
+    fn arb_workflow_id() -> impl Strategy<Value = WorkflowId> {
+        "[a-z]{1,10}".prop_map(WorkflowId)
+    }
+
+    fn arb_opt_failure_payload() -> impl Strategy<Value = Option<Payload>> {
+        proptest::option::of(arb_failure_payload())
+    }
+
+    fn arb_opt_payloads() -> impl Strategy<Value = Option<Payloads>> {
+        proptest::option::of(arb_payloads())
+    }
+
+    fn make_started_event(
+        parent_workflow_id: Option<WorkflowId>,
+        parent_run_id: Option<RunId>,
+        parent_namespace_id: Option<NamespaceId>,
+        parent_initiated_event_id: i64,
+        original_execution_run_id: Option<RunId>,
+        continued_failure: Option<Payload>,
+        last_completion_result: Option<Payloads>,
+    ) -> HistoryEvent {
+        HistoryEvent {
+            event_id: 1,
+            happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
+            kind: HistoryEventKind::WorkflowExecutionStarted {
+                workflow_type: WorkflowType("W".to_string()),
+                task_queue: TaskQueueName("q".to_string()),
+                input: Payloads::default(),
+                memo: Memo::default(),
+                search_attributes: SearchAttributes::default(),
+                request_id: "r".to_string(),
+                continued_execution_run_id: None,
+                first_execution_run_id: None,
+                retry_policy: None,
+                attempt: 1,
+                workflow_execution_timeout: None,
+                workflow_run_timeout: None,
+                workflow_task_timeout: time::Duration::seconds(10),
+                parent_workflow_id,
+                parent_run_id,
+                parent_namespace_id,
+                parent_initiated_event_id,
+                original_execution_run_id,
+                continued_failure,
+                last_completion_result,
+            },
+        }
+    }
+
+    // ── 7.1: WorkflowExecutionStarted parent metadata serialization (Property 1, 2) ──
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Property 1: when parent fields are present, proto reflects them
+        #[test]
+        fn prop_started_parent_metadata_present(
+            wid in arb_workflow_id(),
+            rid in arb_run_id(),
+            nsid in arb_namespace_id(),
+            initiated_eid in 1i64..1000,
+        ) {
+            let event = make_started_event(
+                Some(wid.clone()), Some(rid), Some(nsid), initiated_eid,
+                None, None, None,
+            );
+            let proto = history_event_to_proto(&event);
+            match proto.attributes.unwrap() {
+                Attributes::WorkflowExecutionStartedEventAttributes(attrs) => {
+                    let exec = attrs.parent_workflow_execution.as_ref().unwrap();
+                    prop_assert_eq!(&exec.workflow_id, &wid.0);
+                    prop_assert_eq!(&exec.run_id, &rid.0.to_string());
+                    prop_assert_eq!(
+                        &attrs.parent_workflow_namespace_id,
+                        &nsid.0.to_string()
+                    );
+                    prop_assert_eq!(attrs.parent_initiated_event_id, initiated_eid);
+                }
+                other => panic!("unexpected attributes: {other:?}"),
+            }
+        }
+
+        // Property 2: when parent_workflow_id is None, proto has no parent
+        #[test]
+        fn prop_started_parent_metadata_absent(
+            orig_rid in arb_opt_run_id(),
+        ) {
+            let event = make_started_event(
+                None, None, None, 0,
+                orig_rid, None, None,
+            );
+            let proto = history_event_to_proto(&event);
+            match proto.attributes.unwrap() {
+                Attributes::WorkflowExecutionStartedEventAttributes(attrs) => {
+                    prop_assert!(attrs.parent_workflow_execution.is_none());
+                    prop_assert!(attrs.parent_workflow_namespace_id.is_empty());
+                    prop_assert_eq!(attrs.parent_initiated_event_id, 0);
+                }
+                other => panic!("unexpected attributes: {other:?}"),
+            }
+        }
+    }
+
+    // ── 7.2: WorkflowExecutionStarted chain fields serialization (Property 3, 4, 5) ──
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn prop_started_chain_fields_serialization(
+            orig_rid in arb_opt_run_id(),
+            cont_failure in arb_opt_failure_payload(),
+            last_result in arb_opt_payloads(),
+        ) {
+            let event = make_started_event(
+                None, None, None, 0,
+                orig_rid.clone(), cont_failure.clone(), last_result.clone(),
+            );
+            let proto = history_event_to_proto(&event);
+            match proto.attributes.unwrap() {
+                Attributes::WorkflowExecutionStartedEventAttributes(attrs) => {
+                    if let Some(ref rid) = orig_rid {
+                        prop_assert_eq!(
+                            &attrs.original_execution_run_id,
+                            &rid.0.to_string()
+                        );
+                    } else {
+                        prop_assert!(attrs.original_execution_run_id.is_empty());
+                    }
+                    prop_assert_eq!(
+                        attrs.continued_failure.is_some(),
+                        cont_failure.is_some()
+                    );
+                    prop_assert_eq!(
+                        attrs.last_completion_result.is_some(),
+                        last_result.is_some()
+                    );
+                }
+                other => panic!("unexpected attributes: {other:?}"),
+            }
+        }
+    }
+
+    // ── 7.3: WorkflowExecutionContinuedAsNew enriched fields serialization (Property 6) ──
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn prop_continued_as_new_enriched_fields(
+            failure in arb_opt_failure_payload(),
+            last_result in arb_opt_payloads(),
+        ) {
+            let event = HistoryEvent {
+                event_id: 1,
+                happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
+                kind: HistoryEventKind::WorkflowExecutionContinuedAsNew {
+                    new_run_id: RunId(Uuid::from_u128(42)),
+                    workflow_type: WorkflowType("W".to_string()),
+                    task_queue: TaskQueueName("q".to_string()),
+                    input: Payloads::default(),
+                    memo: Memo::default(),
+                    search_attributes: SearchAttributes::default(),
+                    workflow_execution_timeout: None,
+                    workflow_run_timeout: None,
+                    workflow_task_timeout: time::Duration::seconds(10),
+                    retry_policy: None,
+                    initiator: ContinueAsNewInitiator::Workflow,
+                    failure: failure.clone(),
+                    last_completion_result: last_result.clone(),
+                },
+            };
+            let proto = history_event_to_proto(&event);
+            match proto.attributes.unwrap() {
+                Attributes::WorkflowExecutionContinuedAsNewEventAttributes(attrs) => {
+                    // Workflow variant maps to proto value 1
+                    prop_assert!(attrs.initiator != 0,
+                        "initiator should be non-zero for Workflow variant");
+                    prop_assert_eq!(
+                        attrs.failure.is_some(),
+                        failure.is_some()
+                    );
+                    prop_assert_eq!(
+                        attrs.last_completion_result.is_some(),
+                        last_result.is_some()
+                    );
+                }
+                other => panic!("unexpected attributes: {other:?}"),
+            }
+        }
+    }
+
+    // ── 7.4: Signal/cancel-external control field serialization (Property 7) ──
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn prop_signal_external_control_field(
+            control in "[a-z0-9]{0,20}",
+            wid in arb_workflow_id(),
+            rid in arb_opt_run_id(),
+        ) {
+            let event = HistoryEvent {
+                event_id: 1,
+                happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
+                kind: HistoryEventKind::SignalExternalWorkflowExecutionInitiated {
+                    target_workflow_id: wid,
+                    target_run_id: rid,
+                    signal_name: "sig".to_string(),
+                    input: Payloads::default(),
+                    control: control.clone(),
+                },
+            };
+            let proto = history_event_to_proto(&event);
+            match proto.attributes.unwrap() {
+                Attributes::SignalExternalWorkflowExecutionInitiatedEventAttributes(
+                    attrs,
+                ) => {
+                    prop_assert_eq!(&attrs.control, &control);
+                }
+                other => panic!("unexpected attributes: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn prop_cancel_external_control_field(
+            control in "[a-z0-9]{0,20}",
+            wid in arb_workflow_id(),
+            rid in arb_opt_run_id(),
+        ) {
+            let event = HistoryEvent {
+                event_id: 1,
+                happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
+                kind: HistoryEventKind::RequestCancelExternalWorkflowExecutionInitiated {
+                    target_workflow_id: wid,
+                    target_run_id: rid,
+                    control: control.clone(),
+                },
+            };
+            let proto = history_event_to_proto(&event);
+            match proto.attributes.unwrap() {
+                Attributes::RequestCancelExternalWorkflowExecutionInitiatedEventAttributes(
+                    attrs,
+                ) => {
+                    prop_assert_eq!(&attrs.control, &control);
+                }
+                other => panic!("unexpected attributes: {other:?}"),
+            }
+        }
+    }
+
+    // ── 7.5: ActivityTaskScheduled timeout completeness (Property 8) ──
+    // The existing `prop_history_serialization_round_trip` generates
+    // `ActivityTaskScheduled` events via `arb_history_event_kind` which
+    // already produces all four timeout fields (schedule_to_close,
+    // schedule_to_start, start_to_close, heartbeat) through
+    // `arb_opt_duration()`. The round-trip test encodes and decodes the
+    // proto, asserting full attribute equality. This covers Property 8.
+    //
+    // The following test adds an explicit assertion that all four timeout
+    // fields survive serialization.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn prop_activity_scheduled_timeout_completeness(
+            s2c in arb_opt_duration(),
+            s2s in arb_opt_duration(),
+            stc in arb_opt_duration(),
+            hb in arb_opt_duration(),
+        ) {
+            let event = HistoryEvent {
+                event_id: 5,
+                happened_at: OffsetDateTime::from_unix_timestamp(2000).unwrap(),
+                kind: HistoryEventKind::ActivityTaskScheduled {
+                    activity_id: "act-1".to_string(),
+                    activity_type: "at".to_string(),
+                    task_queue: TaskQueueName("q".to_string()),
+                    input: Payloads::default(),
+                    header: None,
+                    retry_policy: None,
+                    schedule_to_close_timeout: s2c,
+                    schedule_to_start_timeout: s2s,
+                    start_to_close_timeout: stc,
+                    heartbeat_timeout: hb,
+                },
+            };
+            let proto = history_event_to_proto(&event);
+            match proto.attributes.unwrap() {
+                Attributes::ActivityTaskScheduledEventAttributes(attrs) => {
+                    prop_assert_eq!(
+                        attrs.schedule_to_close_timeout.is_some(),
+                        s2c.is_some()
+                    );
+                    prop_assert_eq!(
+                        attrs.schedule_to_start_timeout.is_some(),
+                        s2s.is_some()
+                    );
+                    prop_assert_eq!(
+                        attrs.start_to_close_timeout.is_some(),
+                        stc.is_some()
+                    );
+                    prop_assert_eq!(
+                        attrs.heartbeat_timeout.is_some(),
+                        hb.is_some()
+                    );
+                }
+                other => panic!("unexpected attributes: {other:?}"),
+            }
         }
     }
 }

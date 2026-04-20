@@ -7,13 +7,16 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+dashmap.workspace = true
 smallvec.workspace = true
+thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing.workspace = true
 uuid.workspace = true
 tokeira-kernel = { path = "../tokeira-kernel" }
+tokeira-proto = { path = "../tokeira-proto" }
 tokeira-storage = { path = "../tokeira-storage" }
 tokeira-types = { path = "../tokeira-types" }
 

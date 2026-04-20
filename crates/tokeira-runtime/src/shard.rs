@@ -149,7 +149,7 @@ impl ShardOwner {
     pub fn is_active(&self, shard_id: ShardId) -> bool {
         self.shards
             .get(&shard_id)
-            .map_or(false, |o| o.state == ShardState::Active)
+            .is_some_and(|o| o.state == ShardState::Active)
     }
 
     /// Returns the epoch for a shard regardless of state.

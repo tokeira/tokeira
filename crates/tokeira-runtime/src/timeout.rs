@@ -96,20 +96,18 @@ pub fn evaluate_workflow_timeout(
     now: OffsetDateTime,
 ) -> Option<WorkflowTimeoutViolation> {
     let execution_started_at = entry.first_run_started_at.unwrap_or(entry.started_at);
-    if let Some(timeout) = entry.workflow_execution_timeout {
-        if now - execution_started_at > timeout
-            || timeout.is_zero() && now >= execution_started_at
-        {
-            return Some(WorkflowTimeoutViolation::ExecutionTimeout);
-        }
+    if let Some(timeout) = entry.workflow_execution_timeout
+        && (now - execution_started_at > timeout
+            || timeout.is_zero() && now >= execution_started_at)
+    {
+        return Some(WorkflowTimeoutViolation::ExecutionTimeout);
     }
 
-    if let Some(timeout) = entry.workflow_run_timeout {
-        if now - entry.started_at > timeout
-            || timeout.is_zero() && now >= entry.started_at
-        {
-            return Some(WorkflowTimeoutViolation::RunTimeout);
-        }
+    if let Some(timeout) = entry.workflow_run_timeout
+        && (now - entry.started_at > timeout
+            || timeout.is_zero() && now >= entry.started_at)
+    {
+        return Some(WorkflowTimeoutViolation::RunTimeout);
     }
 
     None

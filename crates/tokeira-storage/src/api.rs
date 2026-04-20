@@ -243,6 +243,14 @@ pub trait RunRepository: Send + Sync {
         limit: usize,
     ) -> Result<Vec<WorkflowTimeoutSweepEntry>>;
 
+    /// List started workflow tasks for a shard (for WFT timeout
+    /// tracking reconstruction).
+    async fn list_started_workflow_tasks_for_shard(
+        &self,
+        shard_id: ShardId,
+        limit: usize,
+    ) -> Result<Vec<WftTimeoutSweepEntry>>;
+
     /// List open activities for a shard (for timeout
     /// tracking reconstruction).
     async fn list_open_activities_for_shard(
@@ -378,6 +386,17 @@ pub struct WorkflowTimeoutSweepEntry {
     pub first_run_started_at: Option<OffsetDateTime>,
     /// Whether the run has a retry policy configured.
     pub has_retry_policy: bool,
+}
+
+/// Sweep entry for reconstructing workflow-task timeout
+/// tracking after shard acquisition.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WftTimeoutSweepEntry {
+    pub run_key: RunKey,
+    pub logical_seq: tokeira_types::LogicalTaskSeq,
+    pub started_event_id: i64,
+    pub started_at: time::OffsetDateTime,
+    pub workflow_task_timeout: time::Duration,
 }
 
 /// Sweep entry for reconstructing activity timeout tracking
@@ -735,6 +754,16 @@ where
     ) -> Result<Vec<WorkflowTimeoutSweepEntry>> {
         (**self)
             .list_runs_with_workflow_timeouts_for_shard(shard_id, limit)
+            .await
+    }
+
+    async fn list_started_workflow_tasks_for_shard(
+        &self,
+        shard_id: ShardId,
+        limit: usize,
+    ) -> Result<Vec<WftTimeoutSweepEntry>> {
+        (**self)
+            .list_started_workflow_tasks_for_shard(shard_id, limit)
             .await
     }
 

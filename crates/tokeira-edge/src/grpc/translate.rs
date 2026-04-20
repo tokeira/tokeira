@@ -27,24 +27,29 @@ use tokeira_proto::{
     conversions::{
         ProtoConversionError,
         common::{
-            headers_from_domain, headers_to_domain, memo_from_domain, memo_to_domain,
-            payload_from_domain, payload_to_domain, payloads_from_domain,
-            payloads_to_domain, search_attributes_from_domain,
+            failure_to_payload, headers_from_domain, headers_to_domain, memo_from_domain,
+            memo_to_domain, payload_from_domain, payload_to_domain, payload_to_failure,
+            payloads_from_domain, payloads_to_domain, search_attributes_from_domain,
             search_attributes_to_domain, task_queue_to_domain, to_proto_duration,
             to_proto_timestamp, workflow_execution_from_ids,
         },
     },
     enums,
     public::temporal::api::{
-        command::v1 as command, failure::v1 as failure_proto,
+        command::v1 as command, common::v1 as proto_common, failure::v1 as failure_proto,
         namespace::v1 as namespace_proto, replication::v1 as replication_proto,
+        taskqueue::v1 as taskqueue_proto, version::v1 as version_proto,
         workflow::v1 as workflow,
     },
     workflowservice,
 };
+use tokeira_runtime::{
+    AssignmentRule, RedirectRule, TaskReachabilityType, VersioningMutation,
+    VersioningRules,
+};
 use tokeira_types::{
-    ActivityTaskToken, BuildId, DeploymentId, ExecutionStatus, NamespaceId, Payload,
-    Payloads, RetryPolicy, RunId, RunKey, TaskKind, WorkflowId, WorkflowType,
+    ActivityTaskToken, BuildId, DeploymentId, ExecutionStatus, NamespaceId, Payloads,
+    RetryPolicy, RunId, RunKey, TaskKind, WorkflowId, WorkflowType,
 };
 use uuid::Uuid;
 
@@ -66,12 +71,13 @@ use crate::translate::{
     SignalWithStartWorkflowExecutionResponse as EdgeSignalWithStartWorkflowExecutionResponse,
     SignalWorkflowExecutionRequest, SignalWorkflowExecutionResponse,
     StartWorkflowExecutionRequest, StartWorkflowExecutionResponse, SystemInfo,
-    WorkflowExecutionDescription, WorkflowExecutionSummary,
+    VersioningOverride, WorkflowExecutionDescription, WorkflowExecutionSummary,
 };
 use tokeira_kernel::state::ParentClosePolicy;
 
 const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_STICKY_TTL: Duration = Duration::from_secs(30);
+const NON_RETRYABLE_ACTIVITY_SENTINEL: &str = "__tokeira_non_retryable__";
 
 fn proto_duration_to_time(
     value: Option<&prost_types::Duration>,
@@ -80,6 +86,29 @@ fn proto_duration_to_time(
         time::Duration::seconds(duration.seconds)
             + time::Duration::nanoseconds(i64::from(duration.nanos))
     })
+}
+
+fn activity_retry_classification(
+    failure: &failure_proto::Failure,
+) -> (Option<String>, bool) {
+    let mut cursor = Some(failure);
+    while let Some(current) = cursor {
+        if let Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(info)) =
+            &current.failure_info
+        {
+            let error_type = non_empty(info.r#type.clone())
+                .or_else(|| Some(NON_RETRYABLE_ACTIVITY_SENTINEL.to_string()));
+            return (error_type, info.non_retryable);
+        }
+        cursor = current.cause.as_deref();
+    }
+    (None, false)
+}
+
+pub struct ParsedVersioningMutation {
+    pub mutation: VersioningMutation,
+    pub commit_build_id: Option<String>,
+    pub commit_force: bool,
 }
 
 fn retry_policy_to_domain(value: &tokeira_proto::common::RetryPolicy) -> RetryPolicy {
@@ -105,24 +134,6 @@ fn retry_policy_from_domain(value: &RetryPolicy) -> tokeira_proto::common::Retry
         maximum_attempts: value.maximum_attempts as i32,
         non_retryable_error_types: value.non_retryable_error_types.clone(),
     }
-}
-
-fn failure_to_payload(value: &failure_proto::Failure) -> Payload {
-    let mut metadata = std::collections::BTreeMap::new();
-    metadata.insert("encoding".to_string(), "temporal/failure+proto".to_string());
-    Payload {
-        data: value.encode_to_vec(),
-        metadata,
-    }
-}
-
-fn payload_to_failure(value: &Payload) -> failure_proto::Failure {
-    failure_proto::Failure::decode(value.data.as_slice()).unwrap_or_else(|_| {
-        failure_proto::Failure {
-            message: String::from_utf8_lossy(&value.data).into_owned(),
-            ..Default::default()
-        }
-    })
 }
 
 fn parent_close_policy_to_domain(value: i32) -> ParentClosePolicy {
@@ -196,6 +207,37 @@ fn migrate_reuse_policy(
     }
 }
 
+fn versioning_override_to_edge(
+    override_: Option<workflow::VersioningOverride>,
+) -> Result<Option<VersioningOverride>, ProtoConversionError> {
+    let Some(override_) = override_ else {
+        return Ok(None);
+    };
+    match enums::VersioningBehavior::try_from(override_.behavior).ok() {
+        Some(enums::VersioningBehavior::Pinned) => {
+            let deployment =
+                override_
+                    .deployment
+                    .ok_or(ProtoConversionError::MissingField(
+                        "VersioningOverride.deployment",
+                    ))?;
+            if deployment.series_name.is_empty() || deployment.build_id.is_empty() {
+                return Err(ProtoConversionError::MissingField(
+                    "VersioningOverride.deployment.series_name/build_id",
+                ));
+            }
+            Ok(Some(VersioningOverride::Pinned {
+                deployment_series: deployment.series_name,
+                build_id: deployment.build_id,
+            }))
+        }
+        Some(enums::VersioningBehavior::AutoUpgrade) => {
+            Ok(Some(VersioningOverride::AutoUpgrade))
+        }
+        _ => Ok(None),
+    }
+}
+
 pub fn start_request_to_edge(
     req: workflowservice::StartWorkflowExecutionRequest,
 ) -> Result<StartWorkflowExecutionRequest, ProtoConversionError> {
@@ -242,6 +284,7 @@ pub fn start_request_to_edge(
         conflict_policy,
         reuse_policy,
         header: req.header.as_ref().map(headers_to_domain),
+        versioning_override: versioning_override_to_edge(req.versioning_override)?,
         run_key: None,
         run_id: None,
         now: None,
@@ -457,7 +500,7 @@ fn resolve_protocol_message_body(
                     ),
                 ) => Ok(tokeira_kernel::UpdateProtocolBody::Rejected {
                     update_id: protocol_instance_id,
-                    failure: failure.message,
+                    failure: failure_to_payload(&failure),
                 }),
                 None => Err(ProtoConversionError::MissingField(
                     "update.v1.Response missing outcome",
@@ -478,8 +521,14 @@ fn resolve_protocol_message_body(
                 update_id: protocol_instance_id,
                 failure: rejection
                     .failure
-                    .map(|f| f.message)
-                    .unwrap_or_else(|| "update rejected".to_string()),
+                    .as_ref()
+                    .map(failure_to_payload)
+                    .unwrap_or_else(|| {
+                        failure_to_payload(&failure_proto::Failure {
+                            message: "update rejected".to_string(),
+                            ..Default::default()
+                        })
+                    }),
             })
         }
         _ => Err(ProtoConversionError::MissingField(
@@ -541,6 +590,7 @@ pub fn start_response_to_proto(
 ) -> workflowservice::StartWorkflowExecutionResponse {
     workflowservice::StartWorkflowExecutionResponse {
         run_id: resp.run_id.0.to_string(),
+        started: resp.started,
         ..Default::default()
     }
 }
@@ -552,13 +602,6 @@ pub fn signal_response_to_proto(
 }
 
 /// Build the proto poll response from the edge DTO.
-///
-/// Populates `task_token`, `workflow_execution`, `workflow_type`, history,
-/// `started_event_id`, `attempt`, `queries`, and `messages`. Several proto
-/// fields are intentionally left at their defaults because the kernel does
-/// not yet track them — notably `previous_started_event_id` (needed for
-/// sticky replay boundaries) and `scheduled_time`/`started_time`. See
-/// `docs/proto-field-audit.md` §2 for the full list.
 pub fn poll_response_to_proto(
     resp: PollWorkflowTaskQueueResponse,
 ) -> workflowservice::PollWorkflowTaskQueueResponse {
@@ -594,9 +637,12 @@ pub fn poll_response_to_proto(
         workflow_type: Some(tokeira_proto::common::WorkflowType {
             name: workflow_type_name,
         }),
+        previous_started_event_id: resp.previous_started_event_id,
         started_event_id: resp.started_event_id,
         attempt: resp.attempt as i32,
         history,
+        scheduled_time: resp.scheduled_time.map(to_proto_timestamp),
+        started_time: resp.started_time.map(to_proto_timestamp),
         workflow_execution_task_queue: Some(
             tokeira_proto::conversions::common::task_queue_from_domain(
                 &tokeira_types::TaskQueueName(resp.payload.task_queue),
@@ -662,8 +708,75 @@ pub fn completed_response_to_proto(
 pub fn describe_response_to_proto(
     resp: WorkflowExecutionDescription,
 ) -> workflowservice::DescribeWorkflowExecutionResponse {
+    let pending_activities = resp
+        .pending_activities
+        .iter()
+        .map(pending_activity_to_proto)
+        .collect();
+    let pending_children = resp
+        .pending_children
+        .iter()
+        .map(pending_child_to_proto)
+        .collect();
+    let pending_workflow_task = resp
+        .pending_workflow_task
+        .as_ref()
+        .map(pending_wft_to_proto);
+
     workflowservice::DescribeWorkflowExecutionResponse {
         workflow_execution_info: Some(workflow_execution_info_from_description(resp)),
+        pending_activities,
+        pending_children,
+        pending_workflow_task,
+        ..Default::default()
+    }
+}
+
+fn pending_activity_to_proto(
+    act: &crate::translate::PendingActivityDescription,
+) -> workflow::PendingActivityInfo {
+    workflow::PendingActivityInfo {
+        activity_id: act.activity_id.clone(),
+        activity_type: Some(proto_common::ActivityType {
+            name: act.activity_type.clone(),
+        }),
+        state: if act.is_started {
+            enums::PendingActivityState::Started as i32
+        } else {
+            enums::PendingActivityState::Scheduled as i32
+        },
+        attempt: act.attempt as i32,
+        maximum_attempts: act.maximum_attempts as i32,
+        scheduled_time: Some(to_proto_timestamp(act.scheduled_at)),
+        last_started_time: act.started_at.map(to_proto_timestamp),
+        ..Default::default()
+    }
+}
+
+fn pending_child_to_proto(
+    child: &crate::translate::PendingChildDescription,
+) -> workflow::PendingChildExecutionInfo {
+    workflow::PendingChildExecutionInfo {
+        workflow_id: child.workflow_id.clone(),
+        run_id: child.run_id.clone().unwrap_or_default(),
+        workflow_type_name: child.workflow_type.clone(),
+        initiated_id: child.initiated_event_id,
+        parent_close_policy: parent_close_policy_from_domain(child.parent_close_policy),
+    }
+}
+
+fn pending_wft_to_proto(
+    wft: &crate::translate::PendingWorkflowTaskDescription,
+) -> workflow::PendingWorkflowTaskInfo {
+    workflow::PendingWorkflowTaskInfo {
+        state: if wft.is_started {
+            enums::PendingWorkflowTaskState::Started as i32
+        } else {
+            enums::PendingWorkflowTaskState::Scheduled as i32
+        },
+        scheduled_time: Some(to_proto_timestamp(wft.scheduled_at)),
+        started_time: wft.started_at.map(to_proto_timestamp),
+        attempt: wft.attempt as i32,
         ..Default::default()
     }
 }
@@ -708,12 +821,19 @@ pub fn cluster_info_to_proto(
     resp: crate::operator_service::ClusterInfo,
 ) -> workflowservice::GetClusterInfoResponse {
     workflowservice::GetClusterInfoResponse {
-        supported_clients: std::collections::BTreeMap::new(),
+        supported_clients: resp.supported_clients,
         server_version: resp.version.clone(),
         cluster_id: resp.cluster_name.clone(),
-        version_info: None,
+        version_info: Some(version_proto::VersionInfo {
+            current: Some(version_proto::ReleaseInfo {
+                version: resp.version.clone(),
+                release_time: None,
+                notes: resp.notes.join("\n"),
+            }),
+            ..Default::default()
+        }),
         cluster_name: resp.cluster_name,
-        history_shard_count: 0,
+        history_shard_count: resp.shard_count.max(1),
         persistence_store: "in-memory".to_string(),
         visibility_store: "in-memory".to_string(),
     }
@@ -755,8 +875,8 @@ pub fn namespace_to_proto(
             } else {
                 enums::NamespaceState::Registered as i32
             },
-            description: String::new(),
-            owner_email: String::new(),
+            description: namespace.description,
+            owner_email: namespace.owner_email,
             data: std::collections::BTreeMap::new(),
             id: namespace.namespace_id.unwrap_or_default(),
             capabilities: Some(namespace_proto::namespace_info::Capabilities {
@@ -769,18 +889,20 @@ pub fn namespace_to_proto(
         config: Some(namespace_proto::NamespaceConfig {
             workflow_execution_retention_ttl: None,
             bad_binaries: None,
-            history_archival_state: 0,
+            history_archival_state: enums::ArchivalState::Disabled as i32,
             history_archival_uri: String::new(),
-            visibility_archival_state: 0,
+            visibility_archival_state: enums::ArchivalState::Disabled as i32,
             visibility_archival_uri: String::new(),
-            custom_search_attribute_aliases: std::collections::BTreeMap::new(),
+            custom_search_attribute_aliases: namespace.custom_search_attribute_aliases,
         }),
         replication_config: Some(replication_proto::NamespaceReplicationConfig {
-            active_cluster_name: "local".to_string(),
-            clusters: Vec::new(),
+            active_cluster_name: namespace.cluster_name.clone(),
+            clusters: vec![replication_proto::ClusterReplicationConfig {
+                cluster_name: namespace.cluster_name,
+            }],
             state: 0,
         }),
-        failover_version: 0,
+        failover_version: 1,
         is_global_namespace: namespace.is_global,
         failover_history: Vec::new(),
     }
@@ -888,7 +1010,6 @@ pub fn get_history_reverse_response_to_proto(
     workflowservice::GetWorkflowExecutionHistoryReverseResponse {
         history,
         next_page_token: resp.next_page_token,
-        ..Default::default()
     }
 }
 
@@ -918,6 +1039,8 @@ pub fn describe_task_queue_request_to_edge(
 pub fn describe_task_queue_response_to_proto(
     resp: EdgeDescribeTaskQueueResponse,
 ) -> workflowservice::DescribeTaskQueueResponse {
+    // Tokeira does not yet publish worker-version capabilities or queue-level
+    // versions info on the DescribeTaskQueue surface, so those remain absent.
     workflowservice::DescribeTaskQueueResponse {
         pollers: resp
             .pollers
@@ -1039,6 +1162,7 @@ pub fn signal_with_start_request_to_edge(
         conflict_policy,
         reuse_policy,
         header: req.header.as_ref().map(headers_to_domain),
+        versioning_override: versioning_override_to_edge(req.versioning_override)?,
         signal_name: req.signal_name,
         signal_input: req
             .signal_input
@@ -1054,6 +1178,200 @@ pub fn signal_with_start_response_to_proto(
     workflowservice::SignalWithStartWorkflowExecutionResponse {
         run_id: resp.run_id.0.to_string(),
         started: resp.started,
+    }
+}
+
+pub fn versioning_mutation_from_proto(
+    operation: Option<workflowservice::update_worker_versioning_rules_request::Operation>,
+    now: OffsetDateTime,
+) -> Result<ParsedVersioningMutation, ProtoConversionError> {
+    use workflowservice::update_worker_versioning_rules_request::Operation;
+
+    let operation = operation.ok_or(ProtoConversionError::MissingField(
+        "UpdateWorkerVersioningRulesRequest.operation",
+    ))?;
+    let parsed = match operation {
+        Operation::InsertAssignmentRule(op) => ParsedVersioningMutation {
+            mutation: VersioningMutation::InsertAssignmentRule {
+                rule: assignment_rule_from_proto(op.rule, now)?,
+                index: op.rule_index.max(0) as usize,
+            },
+            commit_build_id: None,
+            commit_force: false,
+        },
+        Operation::ReplaceAssignmentRule(op) => ParsedVersioningMutation {
+            mutation: VersioningMutation::ReplaceAssignmentRule {
+                rule: assignment_rule_from_proto(op.rule, now)?,
+                index: op.rule_index.max(0) as usize,
+                force: op.force,
+            },
+            commit_build_id: None,
+            commit_force: false,
+        },
+        Operation::DeleteAssignmentRule(op) => ParsedVersioningMutation {
+            mutation: VersioningMutation::DeleteAssignmentRule {
+                index: op.rule_index.max(0) as usize,
+                force: op.force,
+            },
+            commit_build_id: None,
+            commit_force: false,
+        },
+        Operation::AddCompatibleRedirectRule(op) => ParsedVersioningMutation {
+            mutation: VersioningMutation::AddRedirectRule {
+                rule: redirect_rule_from_proto(op.rule, now)?,
+            },
+            commit_build_id: None,
+            commit_force: false,
+        },
+        Operation::ReplaceCompatibleRedirectRule(op) => {
+            let rule = redirect_rule_from_proto(op.rule, now)?;
+            ParsedVersioningMutation {
+                mutation: VersioningMutation::ReplaceRedirectRule {
+                    source_build_id: rule.source_build_id.clone(),
+                    rule,
+                },
+                commit_build_id: None,
+                commit_force: false,
+            }
+        }
+        Operation::DeleteCompatibleRedirectRule(op) => ParsedVersioningMutation {
+            mutation: VersioningMutation::DeleteRedirectRule {
+                source_build_id: op.source_build_id,
+            },
+            commit_build_id: None,
+            commit_force: false,
+        },
+        Operation::CommitBuildId(op) => ParsedVersioningMutation {
+            mutation: VersioningMutation::CommitBuildId {
+                build_id: op.target_build_id.clone(),
+            },
+            commit_build_id: Some(op.target_build_id),
+            commit_force: op.force,
+        },
+    };
+    Ok(parsed)
+}
+
+fn assignment_rule_from_proto(
+    rule: Option<taskqueue_proto::BuildIdAssignmentRule>,
+    now: OffsetDateTime,
+) -> Result<AssignmentRule, ProtoConversionError> {
+    let rule = rule.ok_or(ProtoConversionError::MissingField(
+        "BuildIdAssignmentRule.rule",
+    ))?;
+    let percentage_ramp = rule.ramp.map(|ramp| match ramp {
+        taskqueue_proto::build_id_assignment_rule::Ramp::PercentageRamp(ramp) => {
+            ramp.ramp_percentage
+        }
+    });
+    Ok(AssignmentRule {
+        target_build_id: rule.target_build_id,
+        percentage_ramp,
+        create_time: now,
+    })
+}
+
+fn redirect_rule_from_proto(
+    rule: Option<taskqueue_proto::CompatibleBuildIdRedirectRule>,
+    now: OffsetDateTime,
+) -> Result<RedirectRule, ProtoConversionError> {
+    let rule = rule.ok_or(ProtoConversionError::MissingField(
+        "CompatibleBuildIdRedirectRule.rule",
+    ))?;
+    Ok(RedirectRule {
+        source_build_id: rule.source_build_id,
+        target_build_id: rule.target_build_id,
+        create_time: now,
+    })
+}
+
+pub fn versioning_rules_to_update_proto(
+    rules: VersioningRules,
+) -> workflowservice::UpdateWorkerVersioningRulesResponse {
+    workflowservice::UpdateWorkerVersioningRulesResponse {
+        assignment_rules: assignment_rules_to_proto(&rules.assignment_rules),
+        compatible_redirect_rules: redirect_rules_to_proto(&rules.redirect_rules),
+        conflict_token: rules.conflict_token,
+    }
+}
+
+pub fn versioning_rules_to_get_proto(
+    rules: VersioningRules,
+) -> workflowservice::GetWorkerVersioningRulesResponse {
+    workflowservice::GetWorkerVersioningRulesResponse {
+        assignment_rules: assignment_rules_to_proto(&rules.assignment_rules),
+        compatible_redirect_rules: redirect_rules_to_proto(&rules.redirect_rules),
+        conflict_token: rules.conflict_token,
+    }
+}
+
+fn assignment_rules_to_proto(
+    rules: &[AssignmentRule],
+) -> Vec<taskqueue_proto::TimestampedBuildIdAssignmentRule> {
+    rules
+        .iter()
+        .map(|rule| taskqueue_proto::TimestampedBuildIdAssignmentRule {
+            rule: Some(taskqueue_proto::BuildIdAssignmentRule {
+                target_build_id: rule.target_build_id.clone(),
+                ramp: rule.percentage_ramp.map(|percentage| {
+                    taskqueue_proto::build_id_assignment_rule::Ramp::PercentageRamp(
+                        taskqueue_proto::RampByPercentage {
+                            ramp_percentage: percentage,
+                        },
+                    )
+                }),
+            }),
+            create_time: Some(to_proto_timestamp(rule.create_time)),
+        })
+        .collect()
+}
+
+fn redirect_rules_to_proto(
+    rules: &[RedirectRule],
+) -> Vec<taskqueue_proto::TimestampedCompatibleBuildIdRedirectRule> {
+    rules
+        .iter()
+        .map(
+            |rule| taskqueue_proto::TimestampedCompatibleBuildIdRedirectRule {
+                rule: Some(taskqueue_proto::CompatibleBuildIdRedirectRule {
+                    source_build_id: rule.source_build_id.clone(),
+                    target_build_id: rule.target_build_id.clone(),
+                }),
+                create_time: Some(to_proto_timestamp(rule.create_time)),
+            },
+        )
+        .collect()
+}
+
+pub fn reachability_to_proto(
+    results: Vec<tokeira_runtime::BuildIdReachabilityResult>,
+) -> workflowservice::GetWorkerTaskReachabilityResponse {
+    workflowservice::GetWorkerTaskReachabilityResponse {
+        build_id_reachability: results
+            .into_iter()
+            .map(|result| taskqueue_proto::BuildIdReachability {
+                build_id: result.build_id,
+                task_queue_reachability: result
+                    .task_queue_reachability
+                    .into_iter()
+                    .map(|queue| taskqueue_proto::TaskQueueReachability {
+                        task_queue: queue.task_queue.0,
+                        reachability: queue
+                            .reachability
+                            .into_iter()
+                            .map(|reachability| match reachability {
+                                TaskReachabilityType::NewWorkflows => {
+                                    enums::TaskReachability::NewWorkflows as i32
+                                }
+                                TaskReachabilityType::ExistingWorkflows => {
+                                    enums::TaskReachability::ExistingWorkflows as i32
+                                }
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            })
+            .collect(),
     }
 }
 
@@ -1154,14 +1472,14 @@ pub fn proto_command_to_workflow_command(
             })
         }
         Some(Attributes::FailWorkflowExecutionCommandAttributes(attrs)) => {
-            let message = attrs
-                .failure
-                .as_ref()
-                .map(|f| f.message.clone())
-                .unwrap_or_default();
             Ok(WorkflowCommand::FailWorkflow {
-                message,
-                details: None,
+                failure: attrs
+                    .failure
+                    .as_ref()
+                    .map(failure_to_payload)
+                    .unwrap_or_else(|| {
+                        failure_to_payload(&failure_proto::Failure::default())
+                    }),
             })
         }
         Some(Attributes::RequestCancelActivityTaskCommandAttributes(attrs)) => {
@@ -1185,6 +1503,7 @@ pub fn proto_command_to_workflow_command(
             target_run_id: non_empty(attrs.run_id)
                 .map(|run_id| parse_run_id(&run_id))
                 .transpose()?,
+            control: attrs.control,
         }),
         Some(Attributes::RecordMarkerCommandAttributes(attrs)) => {
             Ok(WorkflowCommand::RecordMarker {
@@ -1239,6 +1558,7 @@ pub fn proto_command_to_workflow_command(
                     attrs.workflow_task_timeout.as_ref(),
                 )
                 .unwrap_or(time::Duration::seconds(10)),
+                retry_policy: attrs.retry_policy.as_ref().map(retry_policy_to_domain),
             })
         }
         Some(Attributes::StartChildWorkflowExecutionCommandAttributes(attrs)) => {
@@ -1290,6 +1610,7 @@ pub fn proto_command_to_workflow_command(
                     .as_ref()
                     .map(payloads_to_domain)
                     .unwrap_or_default(),
+                control: attrs.control,
             })
         }
         Some(Attributes::ProtocolMessageCommandAttributes(attrs)) => {
@@ -1410,17 +1731,13 @@ pub fn workflow_command_to_proto(
                 },
             ))
         }
-        WorkflowCommand::FailWorkflow {
-            message,
-            details: _,
-        } => Some(Attributes::FailWorkflowExecutionCommandAttributes(
-            command::FailWorkflowExecutionCommandAttributes {
-                failure: Some(failure_proto::Failure {
-                    message: message.clone(),
-                    ..Default::default()
-                }),
-            },
-        )),
+        WorkflowCommand::FailWorkflow { failure } => {
+            Some(Attributes::FailWorkflowExecutionCommandAttributes(
+                command::FailWorkflowExecutionCommandAttributes {
+                    failure: Some(payload_to_failure(failure)),
+                },
+            ))
+        }
         WorkflowCommand::RequestCancelActivity { activity_id } => {
             Some(Attributes::RequestCancelActivityTaskCommandAttributes(
                 command::RequestCancelActivityTaskCommandAttributes {
@@ -1466,6 +1783,7 @@ pub fn workflow_command_to_proto(
             search_attributes,
             workflow_run_timeout,
             workflow_task_timeout,
+            retry_policy,
             ..
         } => Some(Attributes::ContinueAsNewWorkflowExecutionCommandAttributes(
             command::ContinueAsNewWorkflowExecutionCommandAttributes {
@@ -1480,6 +1798,7 @@ pub fn workflow_command_to_proto(
                 input: Some(payloads_from_domain(input)),
                 workflow_run_timeout: workflow_run_timeout.map(to_proto_duration),
                 workflow_task_timeout: Some(to_proto_duration(*workflow_task_timeout)),
+                retry_policy: retry_policy.as_ref().map(retry_policy_from_domain),
                 memo: Some(memo_from_domain(memo)),
                 search_attributes: Some(search_attributes_from_domain(search_attributes)),
                 ..Default::default()
@@ -1517,6 +1836,7 @@ pub fn workflow_command_to_proto(
             target_run_id,
             signal_name,
             input,
+            control,
         } => Some(
             Attributes::SignalExternalWorkflowExecutionCommandAttributes(
                 command::SignalExternalWorkflowExecutionCommandAttributes {
@@ -1527,6 +1847,7 @@ pub fn workflow_command_to_proto(
                     )),
                     signal_name: signal_name.clone(),
                     input: Some(payloads_from_domain(input)),
+                    control: control.clone(),
                     ..Default::default()
                 },
             ),
@@ -1535,6 +1856,7 @@ pub fn workflow_command_to_proto(
             target_namespace_id,
             target_workflow_id,
             target_run_id,
+            control,
         } => Some(
             Attributes::RequestCancelExternalWorkflowExecutionCommandAttributes(
                 command::RequestCancelExternalWorkflowExecutionCommandAttributes {
@@ -1543,6 +1865,7 @@ pub fn workflow_command_to_proto(
                     run_id: target_run_id
                         .map(|run_id| run_id.0.to_string())
                         .unwrap_or_default(),
+                    control: control.clone(),
                     ..Default::default()
                 },
             ),
@@ -1772,14 +2095,22 @@ pub fn respond_activity_failed_to_edge(
     req: workflowservice::RespondActivityTaskFailedRequest,
 ) -> Result<crate::translate::RespondActivityTaskFailedRequest, ProtoConversionError> {
     let token = deserialize_activity_token(&req.task_token)?;
-    let (failure_message, failure_error_type) = match req.failure {
-        Some(f) => (f.message, non_empty(f.source)),
-        None => (String::new(), None),
+    let (failure, failure_error_type, is_non_retryable) = match req.failure {
+        Some(f) => {
+            let (error_type, non_retryable) = activity_retry_classification(&f);
+            (failure_to_payload(&f), error_type, non_retryable)
+        }
+        None => (
+            failure_to_payload(&failure_proto::Failure::default()),
+            None,
+            false,
+        ),
     };
     Ok(crate::translate::RespondActivityTaskFailedRequest {
         token,
-        failure_message,
+        failure,
         failure_error_type,
+        is_non_retryable,
         identity: req.identity,
     })
 }
@@ -1970,12 +2301,9 @@ pub fn update_response_to_proto(
         crate::translate::UpdateOutcomeDto::Rejected { failure, .. } => {
             workflowservice::UpdateWorkflowExecutionResponse {
                 outcome: Some(update::Outcome {
-                    value: Some(update::outcome::Value::Failure(
-                        failure_proto::Failure {
-                            message: failure,
-                            ..Default::default()
-                        },
-                    )),
+                    value: Some(update::outcome::Value::Failure(payload_to_failure(
+                        &failure,
+                    ))),
                 }),
                 ..Default::default()
             }
@@ -1986,7 +2314,10 @@ pub fn update_response_to_proto(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operator_service::ClusterInfo;
+    use crate::translate::NamespaceDescription;
     use tokeira_proto::public::temporal::api::taskqueue::v1 as taskqueue;
+    use tokeira_runtime::{RedirectRule, VersioningRules};
 
     #[test]
     fn poll_request_applies_default_timeout_and_sticky_ttl() {
@@ -2044,6 +2375,89 @@ mod tests {
 
         assert_eq!(edge.deployment, Some(DeploymentId("deploy-a".to_string())));
         assert_eq!(edge.build_id, Some(BuildId("build-a".to_string())));
+    }
+
+    #[test]
+    fn versioning_rules_proto_emits_redirect_create_time() {
+        let create_time = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(42);
+        let proto = versioning_rules_to_get_proto(VersioningRules {
+            assignment_rules: Vec::new(),
+            redirect_rules: vec![RedirectRule {
+                source_build_id: "old".to_string(),
+                target_build_id: "new".to_string(),
+                create_time,
+            }],
+            conflict_token: 7_u64.to_be_bytes().to_vec(),
+        });
+
+        assert_eq!(proto.compatible_redirect_rules.len(), 1);
+        assert_eq!(
+            proto.compatible_redirect_rules[0].create_time,
+            Some(to_proto_timestamp(create_time))
+        );
+    }
+
+    #[test]
+    fn namespace_archival_disabled() {
+        let proto = namespace_to_proto(NamespaceDescription {
+            name: "default".to_string(),
+            namespace_id: Some("ns-1".to_string()),
+            is_global: false,
+            visibility_enabled: true,
+            deleted: false,
+            description: String::new(),
+            owner_email: String::new(),
+            cluster_name: "local".to_string(),
+            custom_search_attribute_aliases: std::collections::BTreeMap::new(),
+        });
+
+        let config = proto.config.expect("config");
+        assert_eq!(
+            config.history_archival_state,
+            enums::ArchivalState::Disabled as i32
+        );
+        assert_eq!(
+            config.visibility_archival_state,
+            enums::ArchivalState::Disabled as i32
+        );
+    }
+
+    #[test]
+    fn namespace_clusters_populated() {
+        let proto = namespace_to_proto(NamespaceDescription {
+            name: "default".to_string(),
+            namespace_id: Some("ns-1".to_string()),
+            is_global: false,
+            visibility_enabled: true,
+            deleted: false,
+            description: String::new(),
+            owner_email: String::new(),
+            cluster_name: "local".to_string(),
+            custom_search_attribute_aliases: std::collections::BTreeMap::new(),
+        });
+
+        let replication = proto.replication_config.expect("replication");
+        assert_eq!(replication.active_cluster_name, "local");
+        assert_eq!(replication.clusters.len(), 1);
+        assert_eq!(replication.clusters[0].cluster_name, "local");
+    }
+
+    #[test]
+    fn cluster_info_populated() {
+        let proto = cluster_info_to_proto(ClusterInfo {
+            cluster_name: "tokeira-local".to_string(),
+            version: "0.1.0-dev".to_string(),
+            notes: vec!["in-memory operator api".to_string()],
+            shard_count: 1,
+            supported_clients: std::collections::BTreeMap::from([(
+                "temporal-go".to_string(),
+                ">=1.26.0".to_string(),
+            )]),
+        });
+
+        assert!(!proto.supported_clients.is_empty());
+        assert!(proto.version_info.is_some());
+        assert!(proto.history_shard_count >= 1);
     }
 
     #[test]
@@ -2263,4 +2677,102 @@ mod tests {
     // The upstream RespondWorkflowTaskCompletedResponse no longer has
     // workflow_completed/new_run_id fields, so the old property test
     // and related tests are removed.
+
+    #[test]
+    fn fail_workflow_command_produces_failure_proto_encoding() {
+        let failure = failure_proto::Failure {
+            message: "app error".to_string(),
+            failure_info: Some(
+                failure_proto::failure::FailureInfo::ApplicationFailureInfo(
+                    failure_proto::ApplicationFailureInfo {
+                        r#type: "AppError".to_string(),
+                        non_retryable: false,
+                        ..Default::default()
+                    },
+                ),
+            ),
+            ..Default::default()
+        };
+        let proto_cmd = command::Command {
+            attributes: Some(
+                command::command::Attributes::FailWorkflowExecutionCommandAttributes(
+                    command::FailWorkflowExecutionCommandAttributes {
+                        failure: Some(failure),
+                    },
+                ),
+            ),
+            ..Default::default()
+        };
+        let edge = proto_command_to_workflow_command(proto_cmd).unwrap();
+        match edge {
+            WorkflowCommand::FailWorkflow { failure } => {
+                assert_eq!(
+                    failure.metadata.get("encoding").map(|s| s.as_str()),
+                    Some("temporal/failure+proto")
+                );
+                let decoded = payload_to_failure(&failure);
+                assert_eq!(decoded.message, "app error");
+                match decoded.failure_info.unwrap() {
+                    failure_proto::failure::FailureInfo::ApplicationFailureInfo(info) => {
+                        assert_eq!(info.r#type, "AppError");
+                    }
+                    other => panic!("unexpected failure_info: {other:?}"),
+                }
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn respond_activity_failed_extracts_type_from_application_failure_info() {
+        let failure = failure_proto::Failure {
+            message: "activity error".to_string(),
+            source: "GoSDK".to_string(),
+            failure_info: Some(
+                failure_proto::failure::FailureInfo::ApplicationFailureInfo(
+                    failure_proto::ApplicationFailureInfo {
+                        r#type: "CustomActivityError".to_string(),
+                        non_retryable: true,
+                        ..Default::default()
+                    },
+                ),
+            ),
+            ..Default::default()
+        };
+        let token = tokeira_types::ActivityTaskToken {
+            run_key: tokeira_types::RunKey::new(),
+            activity_id: "act-1".to_string(),
+            schedule_event_id: 5,
+            attempt: 1,
+            shard_epoch: tokeira_types::ShardEpoch::ZERO,
+        };
+        let token_bytes = serialize_activity_token(&token);
+        let req = workflowservice::RespondActivityTaskFailedRequest {
+            task_token: token_bytes,
+            failure: Some(failure),
+            identity: "worker".to_string(),
+            ..Default::default()
+        };
+        let edge = respond_activity_failed_to_edge(req).unwrap();
+        assert_eq!(
+            edge.failure.metadata.get("encoding").map(|s| s.as_str()),
+            Some("temporal/failure+proto")
+        );
+        assert_eq!(
+            edge.failure_error_type.as_deref(),
+            Some("CustomActivityError")
+        );
+        assert!(edge.is_non_retryable);
+    }
+
+    #[test]
+    fn corrupted_payload_produces_fallback_failure() {
+        let corrupted = tokeira_types::Payload {
+            data: b"garbage bytes".to_vec(),
+            metadata: Default::default(),
+        };
+        let decoded = payload_to_failure(&corrupted);
+        assert_eq!(decoded.message, "garbage bytes");
+        assert!(decoded.failure_info.is_none());
+    }
 }

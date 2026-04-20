@@ -20,6 +20,12 @@ use uuid::Uuid;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NamespaceId(pub Uuid);
 
+impl Default for NamespaceId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NamespaceId {
     /// Generate a fresh random namespace identifier.
     pub fn new() -> Self {
@@ -35,6 +41,12 @@ impl NamespaceId {
 /// [`RunKey`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RunId(pub Uuid);
+
+impl Default for RunId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl RunId {
     /// Generate a fresh random run identifier.
@@ -52,6 +64,12 @@ impl RunId {
 /// `RunKey`, not its `RunId`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RunKey(pub Uuid);
+
+impl Default for RunKey {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl RunKey {
     /// Generate a fresh random run key.

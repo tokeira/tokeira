@@ -49,7 +49,7 @@ async fn timer_scanner_fires_due_timer_end_to_end() -> Result<()> {
         history.iter().any(|event| {
             matches!(
                 &event.kind,
-                HistoryEventKind::TimerFired { timer_id } if timer_id == "timer-1"
+                HistoryEventKind::TimerFired { timer_id, .. } if timer_id == "timer-1"
             )
         })
     })
@@ -103,7 +103,7 @@ async fn canceled_timer_is_harmlessly_ignored_by_scanner() -> Result<()> {
     assert!(!history.iter().any(|event| {
         matches!(
             &event.kind,
-            HistoryEventKind::TimerFired { timer_id } if timer_id == "timer-1"
+            HistoryEventKind::TimerFired { timer_id, .. } if timer_id == "timer-1"
         )
     }));
 
@@ -226,11 +226,12 @@ fn start_request(
     workflow_id: WorkflowId,
     request_id: &str,
 ) -> StartRequest {
+    let run_id = tokeira_types::RunId::new();
     StartRequest {
         run_key: tokeira_types::RunKey::new(),
         namespace_id,
         workflow_id,
-        run_id: tokeira_types::RunId::new(),
+        run_id,
         workflow_type: WorkflowType("example".to_string()),
         task_queue: TaskQueueName("workflow-q".to_string()),
         input: Payloads::default(),
@@ -249,6 +250,12 @@ fn start_request(
         first_execution_run_id: None,
         parent_run_key: None,
         parent_workflow_id: None,
+        parent_run_id: None,
+        parent_namespace_id: None,
+        parent_initiated_event_id: 0,
+        original_execution_run_id: Some(run_id),
+        continued_failure: None,
+        last_completion_result: None,
         first_run_started_at: None,
         request: RequestContext {
             request_id: RequestId(request_id.to_string()),

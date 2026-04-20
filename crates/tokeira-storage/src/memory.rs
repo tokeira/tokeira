@@ -30,7 +30,8 @@ use crate::api::{
     CurrentExecutionConflictPolicy, DbClass, DbPermit, DispatchableActivityTask,
     DispatchableWorkflowTask, DueTimer, LeaseOutcome, LeaseRepository, NexusSweepEntry,
     ProjectionBatch, ProjectionContext, ProjectionLog, ProjectionRecord, RequestRecord,
-    RunRepository, TransitionAuditRecord, WorkflowTimeoutSweepEntry,
+    RunRepository, TransitionAuditRecord, WftTimeoutSweepEntry,
+    WorkflowTimeoutSweepEntry,
 };
 
 /// In-memory store intended for local development and semantic tests.
@@ -84,8 +85,10 @@ impl InMemoryStore {
     /// Create a store with a configured shard count for
     /// shard-filtered queries.
     pub fn with_shard_count(shard_count: u32) -> Self {
-        let mut state = StoreState::default();
-        state.shard_count = shard_count;
+        let state = StoreState {
+            shard_count,
+            ..StoreState::default()
+        };
         Self {
             inner: Arc::new(Mutex::new(state)),
         }
@@ -255,13 +258,13 @@ impl RunRepository for InMemoryStore {
                 }
             }
         }
-        if let Some(remaining) = store.conflict_injections.get_mut(&run_key) {
-            if *remaining > 0 {
-                *remaining -= 1;
-                return Ok(CommitResult::Conflict {
-                    reason: format!("injected conflict for run {:?}", run_key),
-                });
-            }
+        if let Some(remaining) = store.conflict_injections.get_mut(&run_key)
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            return Ok(CommitResult::Conflict {
+                reason: format!("injected conflict for run {:?}", run_key),
+            });
         }
 
         let current_seq = store
@@ -298,19 +301,17 @@ impl RunRepository for InMemoryStore {
             match store.conflict_policy {
                 CurrentExecutionConflictPolicy::Reject
                 | CurrentExecutionConflictPolicy::AllowAfterClose => {
-                    if let Some(existing_run) = store.current_open.get(&workflow_key) {
-                        if *existing_run != run_key {
-                            if let Some(existing_state) = store.runs.get(existing_run) {
-                                if existing_state.status.is_open() {
-                                    return Ok(CommitResult::Conflict {
-                                        reason: format!(
-                                            "current execution already exists for {}: {:?}",
-                                            state.workflow_id.0, existing_run
-                                        ),
-                                    });
-                                }
-                            }
-                        }
+                    if let Some(existing_run) = store.current_open.get(&workflow_key)
+                        && *existing_run != run_key
+                        && let Some(existing_state) = store.runs.get(existing_run)
+                        && existing_state.status.is_open()
+                    {
+                        return Ok(CommitResult::Conflict {
+                            reason: format!(
+                                "current execution already exists for {}: {:?}",
+                                state.workflow_id.0, existing_run
+                            ),
+                        });
                     }
                 }
             }
@@ -805,6 +806,39 @@ impl RunRepository for InMemoryStore {
         Ok(out)
     }
 
+    async fn list_started_workflow_tasks_for_shard(
+        &self,
+        shard_id: ShardId,
+        limit: usize,
+    ) -> Result<Vec<WftTimeoutSweepEntry>> {
+        let store = self.inner.lock().await;
+        let mut out = Vec::new();
+        for state in store.runs.values() {
+            if store.run_shard_map.get(&state.run_key) != Some(&shard_id) {
+                continue;
+            }
+            let Some(pending) = state.pending_workflow_task.as_ref() else {
+                continue;
+            };
+            let (Some(started_event_id), Some(started_at)) =
+                (pending.started_event_id, pending.started_at)
+            else {
+                continue;
+            };
+            out.push(WftTimeoutSweepEntry {
+                run_key: state.run_key,
+                logical_seq: pending.logical_seq,
+                started_event_id,
+                started_at,
+                workflow_task_timeout: state.workflow_task_timeout,
+            });
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     async fn list_open_activities_for_shard(
         &self,
         shard_id: ShardId,
@@ -1039,9 +1073,13 @@ mod tests {
             pending_workflow_task: Some(PendingWorkflowTask {
                 logical_seq: LogicalTaskSeq(1),
                 scheduled_event_id: 1,
+                scheduled_at: fixed_now(),
                 started_event_id: None,
-                attempt: 0,
+                started_at: None,
+                attempt: 1,
             }),
+            previous_started_event_id: 0,
+            workflow_task_attempt: 1,
             sticky: None,
             pause_info: None,
             wft_stamp: 0,
@@ -1053,14 +1091,20 @@ mod tests {
             retry_policy: None,
             attempt: 1,
             first_execution_run_id: None,
+            original_execution_run_id: None,
             parent_run_key: None,
             parent_workflow_id: None,
+            parent_run_id: None,
+            parent_namespace_id: None,
+            parent_initiated_event_id: 0,
+            last_completion_result: None,
             activities: Default::default(),
             timers: Default::default(),
             children: Default::default(),
             pending_external_signals: Default::default(),
             pending_external_cancels: Default::default(),
             pending_updates: Default::default(),
+            admitted_updates: Default::default(),
             pending_nexus_operations: Default::default(),
             versioning_override: None,
             completion_callbacks: Vec::new(),
@@ -1867,6 +1911,13 @@ mod tests {
                     workflow_execution_timeout: base_state.workflow_execution_timeout,
                     workflow_run_timeout: base_state.workflow_run_timeout,
                     workflow_task_timeout: base_state.workflow_task_timeout,
+                    parent_workflow_id: base_state.parent_workflow_id.clone(),
+                    parent_run_id: base_state.parent_run_id,
+                    parent_namespace_id: base_state.parent_namespace_id,
+                    parent_initiated_event_id: base_state.parent_initiated_event_id,
+                    original_execution_run_id: base_state.original_execution_run_id,
+                    continued_failure: None,
+                    last_completion_result: base_state.last_completion_result.clone(),
                 },
             ),
             history_event(
@@ -1874,6 +1925,9 @@ mod tests {
                 fixed_now(),
                 HistoryEventKind::WorkflowTaskScheduled {
                     logical_seq: LogicalTaskSeq::ONE,
+                    task_queue: base_state.task_queue.clone(),
+                    workflow_task_timeout: base_state.workflow_task_timeout,
+                    attempt: 1,
                 },
             ),
             history_event(
@@ -1977,6 +2031,13 @@ mod tests {
                     workflow_execution_timeout: base_state.workflow_execution_timeout,
                     workflow_run_timeout: base_state.workflow_run_timeout,
                     workflow_task_timeout: base_state.workflow_task_timeout,
+                    parent_workflow_id: base_state.parent_workflow_id.clone(),
+                    parent_run_id: base_state.parent_run_id,
+                    parent_namespace_id: base_state.parent_namespace_id,
+                    parent_initiated_event_id: base_state.parent_initiated_event_id,
+                    original_execution_run_id: base_state.original_execution_run_id,
+                    continued_failure: None,
+                    last_completion_result: base_state.last_completion_result.clone(),
                 },
             )],
         )
@@ -2029,6 +2090,13 @@ mod tests {
                         workflow_execution_timeout: base_state.workflow_execution_timeout,
                         workflow_run_timeout: base_state.workflow_run_timeout,
                         workflow_task_timeout: base_state.workflow_task_timeout,
+                        parent_workflow_id: base_state.parent_workflow_id.clone(),
+                        parent_run_id: base_state.parent_run_id,
+                        parent_namespace_id: base_state.parent_namespace_id,
+                        parent_initiated_event_id: base_state.parent_initiated_event_id,
+                        original_execution_run_id: base_state.original_execution_run_id,
+                        continued_failure: None,
+                        last_completion_result: base_state.last_completion_result.clone(),
                     },
                 ),
                 history_event(
@@ -2036,6 +2104,9 @@ mod tests {
                     fixed_now(),
                     HistoryEventKind::WorkflowTaskScheduled {
                         logical_seq: LogicalTaskSeq::ONE,
+                        task_queue: base_state.task_queue.clone(),
+                        workflow_task_timeout: base_state.workflow_task_timeout,
+                        attempt: 1,
                     },
                 ),
             ],

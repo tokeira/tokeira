@@ -59,11 +59,12 @@ mod tests {
     }
 
     fn start_request(ns: NamespaceId, wf_id: &str) -> StartRequest {
+        let run_id = RunId::new();
         StartRequest {
             run_key: RunKey::new(),
             namespace_id: ns,
             workflow_id: WorkflowId(wf_id.into()),
-            run_id: RunId::new(),
+            run_id,
             workflow_type: WorkflowType("wf".into()),
             task_queue: TaskQueueName("q".into()),
             deployment: None,
@@ -82,6 +83,12 @@ mod tests {
             first_execution_run_id: None,
             parent_run_key: None,
             parent_workflow_id: None,
+            parent_run_id: None,
+            parent_namespace_id: None,
+            parent_initiated_event_id: 0,
+            original_execution_run_id: Some(run_id),
+            continued_failure: None,
+            last_completion_result: None,
             first_run_started_at: None,
             request: RequestContext {
                 request_id: RequestId(format!("req-{wf_id}")),

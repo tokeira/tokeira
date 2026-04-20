@@ -12,4 +12,6 @@ tracing.workspace = true
 tokeira-types = { path = "../tokeira-types" }
 
 [dev-dependencies]
+prost = "0.12"
 proptest = "1.6"
+tokeira-proto = { path = "../tokeira-proto" }

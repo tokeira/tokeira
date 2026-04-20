@@ -16,12 +16,14 @@ use tokeira_kernel::{
     ExternalSignalResult, ExternalWorkflowExecution, SignalRequest, StartRequest,
     TerminateRequest,
 };
+use tokeira_proto::conversions::common::failure_to_payload;
+use tokeira_proto::public::temporal::api::failure::v1 as failure_proto;
 use tokeira_storage::{
     CommitResult, DispatchableActivityTask, DispatchableWorkflowTask, RunRepository,
 };
 use tokeira_types::{
-    ExecutionRef, Memo, NamespaceId, Payloads, RequestContext, RequestId, RunId, RunKey,
-    SearchAttributes, TaskQueueName, WorkflowId,
+    BuildId, ExecutionRef, Memo, NamespaceId, Payloads, QueueKey, RequestContext,
+    RequestId, RunId, RunKey, SearchAttributes, TaskQueueName, WorkflowId,
 };
 
 use crate::{
@@ -35,6 +37,7 @@ use crate::{
     },
     scanner::pick_lane,
     shard::shard_for,
+    versioning::VersioningRuleStore,
 };
 
 /// [`DispatchPublisher`] that forwards dispatch ops to
@@ -51,6 +54,7 @@ pub struct RuntimeDispatchPublisher<R> {
     nexus_timeout_tracking: NexusTimeoutTrackingState,
     activity_tracking: ActivityTrackingState,
     delivery_metrics: DeliveryMetrics,
+    versioning_rule_store: Option<Arc<VersioningRuleStore>>,
 }
 
 impl<R> Clone for RuntimeDispatchPublisher<R> {
@@ -67,6 +71,7 @@ impl<R> Clone for RuntimeDispatchPublisher<R> {
             nexus_timeout_tracking: self.nexus_timeout_tracking.clone(),
             activity_tracking: self.activity_tracking.clone(),
             delivery_metrics: self.delivery_metrics.clone(),
+            versioning_rule_store: self.versioning_rule_store.clone(),
         }
     }
 }
@@ -88,6 +93,7 @@ where
         nexus_timeout_tracking: NexusTimeoutTrackingState,
         activity_tracking: ActivityTrackingState,
         delivery_metrics: DeliveryMetrics,
+        versioning_rule_store: Option<Arc<VersioningRuleStore>>,
     ) -> Self {
         Self {
             broker,
@@ -101,12 +107,45 @@ where
             nexus_timeout_tracking,
             activity_tracking,
             delivery_metrics,
+            versioning_rule_store,
         }
     }
 
     fn pick_lane(&self, run_key: RunKey) -> LaneHandle {
         let lanes = self.lanes.lock().unwrap();
         pick_lane(&lanes, self.lane_count, run_key).clone()
+    }
+
+    fn redirected_queue(&self, queue: &QueueKey) -> QueueKey {
+        let Some(store) = &self.versioning_rule_store else {
+            return queue.clone();
+        };
+        // Redirect rules are a build-ID compatibility mechanism. Deployment
+        // pinned queues carry their own series identity and must not be mixed
+        // with redirected build IDs.
+        if queue.deployment.is_some() {
+            return queue.clone();
+        }
+        let Some(build_id) = &queue.build_id else {
+            return queue.clone();
+        };
+        match store.resolve_redirect(queue.namespace_id, &queue.task_queue, build_id) {
+            Ok(resolved) if resolved != *build_id => {
+                let mut redirected = queue.clone();
+                redirected.build_id = Some(BuildId(resolved.0));
+                redirected
+            }
+            Ok(_) => queue.clone(),
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    task_queue = %queue.task_queue.0,
+                    build_id = %build_id.0,
+                    "worker versioning redirect failed; using original queue"
+                );
+                queue.clone()
+            }
+        }
     }
 
     async fn resolve_child_run_key(
@@ -133,10 +172,13 @@ where
         input: Payloads,
         parent_run_key: RunKey,
         parent_workflow_id: WorkflowId,
+        parent_run_id: RunId,
+        parent_namespace_id: NamespaceId,
         initiated_event_id: i64,
     ) {
         let child_run_key = RunKey::new();
         let child_run_id = RunId::new();
+        let task_queue_name = task_queue.0.clone();
         let start_request = StartRequest {
             run_key: child_run_key,
             namespace_id,
@@ -160,6 +202,12 @@ where
             first_execution_run_id: None,
             parent_run_key: Some(parent_run_key),
             parent_workflow_id: Some(parent_workflow_id),
+            parent_run_id: Some(parent_run_id),
+            parent_namespace_id: Some(parent_namespace_id),
+            parent_initiated_event_id: initiated_event_id,
+            original_execution_run_id: None,
+            continued_failure: None,
+            last_completion_result: None,
             first_run_started_at: None,
             request: RequestContext {
                 request_id: RequestId(format!("child-start-{child_run_key:?}")),
@@ -174,19 +222,32 @@ where
             .submit(child_run_key, Command::Start(start_request))
             .await;
         let confirmation = match result {
-            Ok(CommitResult::Applied { .. }) => ChildStartResult::Started {
-                child_run_id,
-                workflow_type,
-            },
+            Ok(CommitResult::Applied { .. }) => {
+                tracing::debug!(
+                    ?child_workflow_id,
+                    ?child_run_key,
+                    ?child_run_id,
+                    task_queue = %task_queue_name,
+                    "child workflow started successfully"
+                );
+                ChildStartResult::Started {
+                    child_run_id,
+                    workflow_type,
+                }
+            }
             Ok(CommitResult::Conflict { reason }) => {
+                tracing::warn!(?child_workflow_id, %reason, "child workflow start conflict");
                 ChildStartResult::Failed { cause: reason }
             }
             Ok(CommitResult::Duplicate) => ChildStartResult::Failed {
                 cause: "duplicate start request".to_string(),
             },
-            Err(error) => ChildStartResult::Failed {
-                cause: error.to_string(),
-            },
+            Err(error) => {
+                tracing::warn!(?child_workflow_id, ?error, "child workflow start error");
+                ChildStartResult::Failed {
+                    cause: error.to_string(),
+                }
+            }
         };
 
         let confirm = Command::ChildStartConfirmed(ChildStartConfirmedRequest {
@@ -531,18 +592,56 @@ where
                         tokeira_kernel::NexusResolution::Completed { result }
                     }
                     Ok(NexusStartResult::SyncFailed { message }) => {
-                        tokeira_kernel::NexusResolution::Failed { failure: message }
+                        tokeira_kernel::NexusResolution::Failed {
+                            failure: failure_to_payload(&failure_proto::Failure {
+                                message,
+                                failure_info: Some(
+                                    failure_proto::failure::FailureInfo::ApplicationFailureInfo(
+                                        failure_proto::ApplicationFailureInfo {
+                                            r#type: "NexusOperationFailure".to_string(),
+                                            non_retryable: false,
+                                            ..Default::default()
+                                        },
+                                    ),
+                                ),
+                                ..Default::default()
+                            }),
+                        }
                     }
                     Ok(NexusStartResult::AsyncAccepted) => {
                         tokeira_kernel::NexusResolution::Started
                     }
                     Err(error) => tokeira_kernel::NexusResolution::Failed {
-                        failure: error.to_string(),
+                        failure: failure_to_payload(&failure_proto::Failure {
+                            message: error.to_string(),
+                            failure_info: Some(
+                                failure_proto::failure::FailureInfo::ApplicationFailureInfo(
+                                    failure_proto::ApplicationFailureInfo {
+                                        r#type: "NexusOperationFailure".to_string(),
+                                        non_retryable: false,
+                                        ..Default::default()
+                                    },
+                                ),
+                            ),
+                            ..Default::default()
+                        }),
                     },
                 }
             }
             None => tokeira_kernel::NexusResolution::Failed {
-                failure: format!("nexus endpoint not found: {endpoint_name}"),
+                failure: failure_to_payload(&failure_proto::Failure {
+                    message: format!("nexus endpoint not found: {endpoint_name}"),
+                    failure_info: Some(
+                        failure_proto::failure::FailureInfo::ApplicationFailureInfo(
+                            failure_proto::ApplicationFailureInfo {
+                                r#type: "NexusOperationFailure".to_string(),
+                                non_retryable: false,
+                                ..Default::default()
+                            },
+                        ),
+                    ),
+                    ..Default::default()
+                }),
             },
         };
 
@@ -641,7 +740,7 @@ where
                         .publish_workflow_task(
                             DispatchableWorkflowTask {
                                 run_key,
-                                queue: queue.clone(),
+                                queue: self.redirected_queue(queue),
                                 logical_seq: *logical_seq,
                                 sticky_preferred: sticky_preferred.clone(),
                                 sticky_expires_at: None,
@@ -665,7 +764,7 @@ where
                             .publish_activity_task(
                                 DispatchableActivityTask {
                                     run_key,
-                                    queue: queue.clone(),
+                                    queue: self.redirected_queue(queue),
                                     activity_id: activity_id.clone(),
                                     input: input.clone(),
                                     schedule_event_id: *schedule_event_id,
@@ -694,6 +793,8 @@ where
                     input,
                     parent_run_key,
                     parent_workflow_id,
+                    parent_run_id,
+                    parent_namespace_id,
                     initiated_event_id,
                 } => {
                     let publisher = RuntimeDispatchPublisher::clone(self);
@@ -702,6 +803,8 @@ where
                     let task_queue = task_queue.clone();
                     let input = input.clone();
                     let parent_workflow_id = parent_workflow_id.clone();
+                    let parent_run_id = *parent_run_id;
+                    let parent_namespace_id = *parent_namespace_id;
                     let namespace_id = *namespace_id;
                     let parent_run_key = *parent_run_key;
                     let initiated_event_id = *initiated_event_id;
@@ -715,6 +818,8 @@ where
                                 input,
                                 parent_run_key,
                                 parent_workflow_id,
+                                parent_run_id,
+                                parent_namespace_id,
                                 initiated_event_id,
                             )
                             .await;

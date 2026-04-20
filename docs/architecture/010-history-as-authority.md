@@ -1,6 +1,6 @@
 # 010 History as Authority
 
-**Status:** draft for architecture review  
+**Status:** accepted — resolved questions recorded in [005-decisions-and-boundaries](005-decisions-and-boundaries.md)  
 **Related docs:** [000-overview](000-overview.md), [020-kernel](020-kernel.md), [040-delivery-broker](040-delivery-broker.md), [050-dsql-storage](050-dsql-storage.md)
 
 ## The problem this document solves

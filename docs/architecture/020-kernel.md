@@ -1,6 +1,6 @@
 # 020 Kernel
 
-**Status:** draft for architecture review  
+**Status:** accepted — resolved questions recorded in [005-decisions-and-boundaries](005-decisions-and-boundaries.md)  
 **Related docs:** [010-history-as-authority](010-history-as-authority.md), [030-runtime-lanes](030-runtime-lanes.md), [050-dsql-storage](050-dsql-storage.md)
 
 ## Purpose

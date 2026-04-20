@@ -1,6 +1,6 @@
 # 090 Failover and Recovery
 
-**Status:** draft for architecture review  
+**Status:** accepted — resolved questions recorded in [005-decisions-and-boundaries](005-decisions-and-boundaries.md)  
 **Related docs:** [030-runtime-lanes](030-runtime-lanes.md), [040-delivery-broker](040-delivery-broker.md), [060-connection-management](060-connection-management.md)
 
 ## Purpose

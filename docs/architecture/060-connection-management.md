@@ -1,6 +1,6 @@
 # 060 Connection Management
 
-**Status:** draft for architecture review  
+**Status:** accepted — resolved questions recorded in [005-decisions-and-boundaries](005-decisions-and-boundaries.md)  
 **Related docs:** [050-dsql-storage](050-dsql-storage.md), [030-runtime-lanes](030-runtime-lanes.md), [090-failover-and-recovery](090-failover-and-recovery.md)
 
 ## Purpose

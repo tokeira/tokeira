@@ -1,6 +1,6 @@
 # 050 DSQL Storage
 
-**Status:** draft for architecture review  
+**Status:** accepted — resolved questions recorded in [005-decisions-and-boundaries](005-decisions-and-boundaries.md)  
 **Related docs:** [010-history-as-authority](010-history-as-authority.md), [020-kernel](020-kernel.md), [060-connection-management](060-connection-management.md)
 
 ## Purpose

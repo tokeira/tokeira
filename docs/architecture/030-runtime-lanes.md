@@ -1,6 +1,6 @@
 # 030 Runtime Lanes
 
-**Status:** draft for architecture review  
+**Status:** accepted — resolved questions recorded in [005-decisions-and-boundaries](005-decisions-and-boundaries.md)  
 **Related docs:** [020-kernel](020-kernel.md), [040-delivery-broker](040-delivery-broker.md), [090-failover-and-recovery](090-failover-and-recovery.md)
 
 ## Purpose

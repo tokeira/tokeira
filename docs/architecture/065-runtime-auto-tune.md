@@ -1,6 +1,6 @@
 # 065 Runtime Auto-Tune and Self-Healing
 
-**Status:** draft for architecture review  
+**Status:** future direction — not yet implemented; spec authors should treat as intent, not decided architecture  
 **Decision direction:** preferred  
 **Related docs:** [015-configuration](015-configuration.md), [030-runtime-lanes](030-runtime-lanes.md), [040-delivery-broker](040-delivery-broker.md), [045-autoscaling-on-ecs-ec2](045-autoscaling-on-ecs-ec2.md), [050-dsql-storage](050-dsql-storage.md), [055-admission-control](055-admission-control.md), [060-connection-management](060-connection-management.md), [090-failover-and-recovery](090-failover-and-recovery.md)
 

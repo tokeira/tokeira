@@ -1,6 +1,6 @@
 # 000 Overview
 
-**Status:** draft for architecture review  
+**Status:** accepted — resolved questions recorded in [005-decisions-and-boundaries](005-decisions-and-boundaries.md)  
 **Related docs:** [010-history-as-authority](010-history-as-authority.md), [015-configuration](015-configuration.md), [020-kernel](020-kernel.md), [025-system-services](025-system-services.md), [030-runtime-lanes](030-runtime-lanes.md), [035-placement-and-membership](035-placement-and-membership.md), [037-dynamic-placement](037-dynamic-placement.md), [040-delivery-broker](040-delivery-broker.md), [045-autoscaling-on-ecs-ec2](045-autoscaling-on-ecs-ec2.md), [050-dsql-storage](050-dsql-storage.md), [055-admission-control](055-admission-control.md), [060-connection-management](060-connection-management.md), [065-runtime-auto-tune](065-runtime-auto-tune.md), [070-projection-plane](070-projection-plane.md), [075-archival-to-s3](075-archival-to-s3.md), [080-sql-visibility](080-sql-visibility.md), [090-failover-and-recovery](090-failover-and-recovery.md)
 
 ## Intent

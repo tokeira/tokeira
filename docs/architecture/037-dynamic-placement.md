@@ -1,6 +1,6 @@
 # 037 Dynamic Placement (pure multi-DSQL clusters)
 
-**Status:** draft for architecture review  
+**Status:** future direction — not yet implemented; spec authors should treat as intent, not decided architecture  
 **Decision direction:** preferred if Tokeira uses multiple workflow DSQL clusters  
 **Related docs:** [000-overview](000-overview.md), [035-placement-and-membership](035-placement-and-membership.md), [040-delivery-broker](040-delivery-broker.md), [045-autoscaling-on-ecs-ec2](045-autoscaling-on-ecs-ec2.md), [050-dsql-storage](050-dsql-storage.md), [055-admission-control](055-admission-control.md), [065-runtime-auto-tune](065-runtime-auto-tune.md), [090-failover-and-recovery](090-failover-and-recovery.md)
 

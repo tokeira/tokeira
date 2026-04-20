@@ -1,6 +1,6 @@
 # 040 Delivery Broker
 
-**Status:** draft for architecture review  
+**Status:** accepted — resolved questions recorded in [005-decisions-and-boundaries](005-decisions-and-boundaries.md)  
 **Related docs:** [010-history-as-authority](010-history-as-authority.md), [030-runtime-lanes](030-runtime-lanes.md), [055-admission-control](055-admission-control.md), [060-connection-management](060-connection-management.md)
 
 ## Purpose

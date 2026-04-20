@@ -1,6 +1,6 @@
 # 055 Admission Control
 
-**Status:** draft for architecture review  
+**Status:** future direction — not yet implemented; spec authors should treat as intent, not decided architecture  
 **Decision direction:** preferred  
 **Related docs:** [015-configuration](015-configuration.md), [030-runtime-lanes](030-runtime-lanes.md), [040-delivery-broker](040-delivery-broker.md), [050-dsql-storage](050-dsql-storage.md), [060-connection-management](060-connection-management.md), [065-runtime-auto-tune](065-runtime-auto-tune.md), [090-failover-and-recovery](090-failover-and-recovery.md)
 

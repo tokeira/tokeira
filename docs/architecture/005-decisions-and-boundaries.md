@@ -47,22 +47,35 @@ The following are explicitly out of scope or deferred:
 
 - Multi-cluster replication
 - Archival (deferred)
-- Advanced visibility with Elasticsearch
-- Nexus (transport only, no routing)
-- Batch operations (transport only)
-- Schedule execution engine (in progress)
+
+### In progress
+
+The following are actively being implemented:
+
+- Schedules (execution engine and 7 gRPC handlers)
+- Batch operations (4 gRPC handlers)
+- Nexus (task transport — 3 gRPC handlers; full routing parity with Temporal is the goal)
+- Advanced visibility (SQL-native on DSQL — no Elasticsearch dependency)
 
 ---
 
 ## Performance Targets
 
+Theoretical best on a capable cloud platform (ECS on EC2, Aurora DSQL, single region). These are design targets — the architecture should not have structural bottlenecks that prevent reaching them.
+
 | Metric | Target | Notes |
 |---|---|---|
-| Workflow starts | 400+ WPS sustained | Validated |
-| Workflow task latency p99 | < 50 ms | Poll-to-completion, excluding worker execution time |
-| Activity dispatch latency p99 | < 10 ms | Sync match path |
-| History event append | Single DSQL transaction per transition | |
-| Connection budget | 10,000 connections per DSQL cluster | 100/sec sustained rate |
+| Workflow starts | 10,000+ WPS sustained | Per DSQL cluster; limited by commit throughput |
+| Workflow task dispatch p99 | < 5 ms | Sync match (poller waiting when task arrives) |
+| Workflow task dispatch p99 | < 50 ms | Async match (task waits for poller) |
+| Activity dispatch p99 | < 5 ms | Sync match path |
+| History event append | Single DSQL transaction per transition | Narrow, retryable |
+| End-to-end workflow latency | < 100 ms | Start → first WFT complete (single-step workflow, co-located worker) |
+| Connection budget | 10,000 connections per DSQL cluster | 100/sec sustained new-connection rate |
+| Concurrent open workflows | 10M+ per DSQL cluster | Limited by storage, not compute |
+| Node density | 50,000+ active runs per node | 8 vCPU ECS task |
+
+**Validated so far:** Production validation on ECS + DSQL pending.
 
 ---
 
@@ -103,6 +116,7 @@ The following are explicitly out of scope or deferred:
 - **Decision:** Fixed lane count per node (configurable, default 4). Shards are distributed across lanes by hash.
 - **Rationale:** Dynamic lane count adds complexity without clear benefit for MVP. Fixed lanes with hash-based routing gives good distribution.
 - **Evidence:** `TokeiraRuntime::new()` takes `lane_count` parameter; `lane_index_for()` uses hash routing.
+- **⚠️ REVISIT:** This decision may need reopening. Temporal's shard movement model shows that fixed lane counts can create performance cliffs when shard ownership changes — hot shards landing on the same lane cause head-of-line blocking. Dynamic lane count (or shard-aware lane affinity) may be worth the complexity cost. Scheduled for review.
 
 ### From 050 (DSQL Storage)
 

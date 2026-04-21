@@ -4,7 +4,9 @@
 
 This design implements the Batch Operations Transport layer for Tokeira — 4 gRPC handlers for Temporal's batch operations feature, plus the backing `BatchOperationStore` and `BatchExecutionEngine`. Batch operations allow operators to perform bulk actions (terminate, cancel, signal, delete, reset) on workflow executions matching a visibility query or an explicit execution list.
 
-The architecture follows the same principles as the schedule transport: the batch store lives in `tokeira-runtime` (using `DashMap`), proto translation stays in `tokeira-edge`, and the execution engine is a per-operation background task in `tokeira-runtime` using `CancellationToken` for cooperative stop.
+The architecture follows the same principles as the schedule transport: the batch store lives in `tokeira-runtime` (using `DashMap`), proto translation stays in `tokeira-edge`, and the execution engine lives in `tokeira-edge` as a per-operation background task using `CancellationToken` for cooperative stop.
+
+> **NOTE:** Unlike the schedule engine (which lives in runtime), the batch engine lives in `tokeira-edge` because it depends on `VisibilityApi` (for workflow discovery) and `WorkflowService` (for delete operations), both of which are edge-layer types. The store remains in `tokeira-runtime` for shared access. This avoids a crate cycle.
 
 This is simpler than schedule transport — no matching times computation, no overlap policies, no execution engine tick loop. Each batch operation spawns one tokio task that iterates workflows, applies the operation, and updates progress counters.
 
@@ -26,21 +28,21 @@ graph TD
         GH
         PT["Proto Translation<br/>(batch.rs)"]
         GH -->|translate| PT
+        BEE["BatchExecutionEngine<br/>(one task per batch op)"]
+        BEE -->|terminate/cancel/signal| WS["WorkflowService"]
+        BEE -->|delete| WS
+        BEE -->|list_workflow_executions| VIS["VisibilityApi"]
+        GH -->|spawn engine| BEE
     end
 
     subgraph "tokeira-runtime"
         BS["BatchOperationStore<br/>(DashMap)"]
-        BEE["BatchExecutionEngine<br/>(one task per batch op)"]
-        BEE -->|read/update progress| BS
-        BEE -->|terminate| RT["TokeiraRuntime"]
-        BEE -->|cancel| RT
-        BEE -->|signal| RT
-        BEE -->|reset| RT
-        BEE -->|list_workflow_executions| VIS["VisibilityApi"]
+        RT["TokeiraRuntime"]
+        WS -->|delegates| RT
     end
 
     GH -->|CRUD + stop| BS
-    GH -->|spawn engine| BEE
+    BEE -->|read/update progress| BS
 ```
 
 ### Key Design Decisions
@@ -55,11 +57,27 @@ graph TD
 
 5. **Rate limiting via `tokio::time::sleep`** — When `max_operations_per_second` is set, the engine sleeps `1.0 / rate` seconds between operations. Default rate limit of 50 ops/sec when unset, to prevent system overload.
 
-6. **Engine calls runtime methods directly** — The `BatchExecutionEngine` lives in `tokeira-runtime` and calls `TokeiraRuntime::terminate_workflow`, `cancel_workflow`, `signal_workflow`, `reset_workflow` directly. For delete, it calls the edge-layer `delete_workflow_execution` path (which terminates then removes from visibility). This avoids a crate cycle.
+6. **Engine lives in `tokeira-edge`, not runtime** — The `BatchExecutionEngine` needs `VisibilityApi` (for workflow discovery) and `WorkflowService` (for delete, which involves visibility removal). Both are edge-layer types. Placing the engine in runtime would create a crate cycle. The engine calls internal `WorkflowService` batch-dispatch methods for terminate, cancel, signal, delete, and reset. These methods are separate from the public gRPC-facing methods so they can reuse the already validated batch context and honor explicit run IDs. The store remains in `tokeira-runtime` for shared access.
 
-7. **Visibility query via existing path** — The engine uses the existing `VisibilityApi::list_workflows` path with pagination to discover matching workflows. For explicit execution lists, it iterates the provided list directly.
+7. **Visibility query via `WorkflowService::list_workflow_executions`** — The engine calls the existing edge-layer list method with pagination to discover matching workflows. For explicit execution lists, it iterates the provided list directly.
 
-8. **Shared ownership** — `Arc<BatchOperationStore>` shared between `WorkflowService` (handlers) and spawned engine tasks. Each engine task holds `Arc<TokeiraRuntime>` and `Arc<dyn VisibilityApi>`.
+8. **Shared ownership** — `Arc<BatchOperationStore>` (runtime crate) shared between `WorkflowService` (handlers) and spawned engine tasks (edge crate). Each engine task holds a reference to `WorkflowService` for operation dispatch and `VisibilityApi` for workflow discovery.
+
+9. **Internal dispatch context (no re-authentication)** — The batch engine lives in `tokeira-edge` and holds a `BatchDispatchContext` captured from the original `start_batch_operation` call. This is a new edge-owned struct:
+
+```rust
+/// Validated dispatch context for batch engine operations.
+/// Captured at spawn time from the authenticated gRPC request.
+/// Lives in tokeira-edge — NOT stored in the runtime batch store.
+pub struct BatchDispatchContext {
+    pub namespace_id: NamespaceId,
+    pub namespace_name: String,
+    pub identity: String,
+    pub edge_context: EdgeContext,  // validated by interceptors at start_batch_operation time
+}
+```
+
+The engine passes this context to internal `WorkflowService` dispatch methods (`*_batch_internal`) that accept `&BatchDispatchContext` rather than a `HeaderMap`. These methods do not call `interceptors.begin` again; they perform only the operation-specific local-routing, run-resolution, and mutation work. The `BatchOperationEntry` in the runtime store does NOT hold this context — only the edge-owned engine task does.
 
 ## Components and Interfaces
 
@@ -73,7 +91,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
-use tokeira_types::{NamespaceId, Payloads, Header};
+use tokeira_types::{NamespaceId, Payloads};
 
 /// Unique batch job identifier within a namespace.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -98,6 +116,7 @@ pub enum BatchOperationState {
 }
 
 /// Parameters specific to each operation type.
+/// These live in `tokeira-runtime` and use only runtime-level types.
 #[derive(Clone, Debug, PartialEq)]
 pub enum BatchOperationParams {
     Terminate {
@@ -110,7 +129,8 @@ pub enum BatchOperationParams {
     Signal {
         signal_name: String,
         input: Option<Payloads>,
-        header: Option<Header>,
+        // NOTE: BatchOperationSignal.header is dropped at translation time.
+        // Not stored, not delivered. Documented in UNSUPPORTED_FIELDS.md.
         identity: String,
     },
     Delete {
@@ -118,8 +138,25 @@ pub enum BatchOperationParams {
     },
     Reset {
         identity: String,
-        options: Option<tokeira_kernel::ResetOptions>,
+        /// The reset target — preserved from the proto so the engine can
+        /// resolve a concrete fork_event_id per-workflow at dispatch time.
+        target: BatchResetTarget,
+        reason: String,
     },
+}
+
+/// What to reset to. Mirrors the upstream `ResetOptions.target` oneof
+/// plus the deprecated `reset_type` fallback.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BatchResetTarget {
+    /// Reset to a specific workflow task finish event ID.
+    WorkflowTaskId(i64),
+    /// Reset to the first workflow task.
+    FirstWorkflowTask,
+    /// Reset to the last workflow task.
+    LastWorkflowTask,
+    /// Reset to a specific build ID.
+    BuildId(String),
 }
 ```
 
@@ -213,29 +250,30 @@ pub struct BatchOperationInfo {
 
 ### BatchExecutionEngine
 
-Background task in `crates/tokeira-runtime/src/batch.rs`:
+Background task in `crates/tokeira-edge/src/batch_engine.rs`:
 
 ```rust
 /// Run a single batch operation to completion or cancellation.
 ///
 /// This function is spawned as a tokio task per batch operation.
-/// It iterates matching workflows (via visibility query or explicit list),
-/// applies the requested operation, and updates progress counters.
-pub async fn run_batch_operation<R>(
+/// It lives in tokeira-edge because it needs VisibilityApi and
+/// WorkflowService (for delete and visibility queries).
+/// The `dispatch_ctx` is the validated context from the original
+/// start_batch_operation call — captured at spawn time, not stored in
+/// the runtime batch store.
+pub async fn run_batch_operation(
     store: Arc<BatchOperationStore>,
-    runtime: Arc<TokeiraRuntime<R>>,
-    visibility: Arc<dyn VisibilityApi>,
+    service: WorkflowService,
+    dispatch_ctx: BatchDispatchContext,
     namespace_id: NamespaceId,
     job_id: JobId,
     cancellation_token: CancellationToken,
-) where
-    R: RunRepository + 'static,
-{
+) {
     // 1. Read operation params from store
-    // 2. Discover workflows (visibility query with pagination, or explicit list)
+    // 2. Discover workflows (visibility query with pagination via service, or explicit list)
     // 3. For each workflow:
     //    a. Check cancellation_token.is_cancelled()
-    //    b. Apply operation (terminate/cancel/signal/delete/reset)
+    //    b. Apply operation via WorkflowService methods
     //    c. Increment complete or failure counter
     //    d. Sleep for rate limiting
     // 4. Set state to Completed (or Failed on unrecoverable error)
@@ -261,36 +299,35 @@ fn compute_sleep_duration(max_ops_per_second: f32) -> tokio::time::Duration {
 
 ```rust
 /// Apply the batch operation to a single workflow execution.
-async fn apply_operation<R>(
-    runtime: &TokeiraRuntime<R>,
+/// Uses internal WorkflowService dispatch methods with the captured
+/// BatchDispatchContext (validated EdgeContext, no re-authentication).
+async fn apply_operation(
+    service: &WorkflowService,
+    ctx: &BatchDispatchContext,
     namespace_id: NamespaceId,
     workflow_ref: &WorkflowExecutionRef,
     params: &BatchOperationParams,
-) -> Result<(), anyhow::Error>
-where
-    R: RunRepository + 'static,
-{
-    let execution = ExecutionRef {
-        namespace_id,
-        workflow_id: workflow_ref.workflow_id.clone(),
-        run_id: workflow_ref.run_id.clone(),
-    };
+) -> Result<(), anyhow::Error> {
     match params {
         BatchOperationParams::Terminate { details, identity } => {
-            runtime.terminate_workflow(execution, TerminateRequest { ... }).await?;
+            service.terminate_workflow_batch_internal(ctx, workflow_ref, TerminateBatchParams { ... }).await?;
         }
         BatchOperationParams::Cancel { identity } => {
-            runtime.cancel_workflow(execution, CancelRequest { ... }).await?;
+            service.cancel_workflow_batch_internal(ctx, workflow_ref, CancelBatchParams { ... }).await?;
         }
         BatchOperationParams::Signal { signal_name, input, .. } => {
-            runtime.signal_workflow(execution, SignalRequest { ... }).await?;
+            service.signal_workflow_batch_internal(ctx, workflow_ref, SignalBatchParams { ... }).await?;
         }
         BatchOperationParams::Delete { identity } => {
-            // Delete uses terminate + visibility removal
-            runtime.terminate_workflow(execution, TerminateRequest { ... }).await?;
+            service.delete_workflow_batch_internal(ctx, workflow_ref, DeleteBatchParams { ... }).await?;
         }
-        BatchOperationParams::Reset { options, identity } => {
-            runtime.reset_workflow(execution, ResetRequest { ... }).await?;
+        BatchOperationParams::Reset { reason, identity, target } => {
+            let fork_event_id = resolve_reset_target(service, ctx, workflow_ref, target).await?;
+            service.reset_workflow_batch_internal(ctx, workflow_ref, ResetBatchParams {
+                fork_event_id,
+                reason: reason.clone(),
+                ...
+            }).await?;
         }
     }
     Ok(())

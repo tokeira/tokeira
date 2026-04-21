@@ -53,12 +53,18 @@ Implement the Batch Operations Transport layer in three phases: (1) domain types
   - [ ] 2.2 Add `pub mod batch;` to `crates/tokeira-edge/src/translate/mod.rs`
     - _Requirements: 3.1_
 
-  - [ ]* 2.3 Write property test: proto translation round-trip (Property 3)
+  - [ ] 2.3 Update `crates/tokeira-edge/UNSUPPORTED_FIELDS.md` for batch types
+    - Add: `BatchOperationSignal.header` — dropped at translation, not stored or delivered (kernel SignalRequest has no header field)
+    - Add: `BatchOperationUpdateWorkflowExecutionOptions` — entire operation variant scoped out for MVP
+    - Add: `BatchOperationReset.reset_reapply_type`, `current_run_only`, `reset_reapply_exclude_types` — not supported
+    - _Requirements: 3.4_
+
+  - [ ]* 2.4 Write property test: proto translation round-trip (Property 3)
     - **Property 3: Proto translation round-trip for batch types**
     - Generate random `BatchOperationType` and `BatchOperationState` values, verify round-trip through proto conversion; generate random `BatchOperationSnapshot`, verify describe response preserves all fields
     - **Validates: Requirements 3.1, 3.2, 3.3, 3.5, 3.6**
 
-  - [ ]* 2.4 Write property test: proto validation rejects invalid inputs (Property 4)
+  - [ ]* 2.5 Write property test: proto validation rejects invalid inputs (Property 4)
     - **Property 4: Proto validation rejects invalid inputs**
     - Generate `StartBatchOperationRequest` protos with empty job_id, missing operation variant, missing query+executions; verify translation returns errors
     - **Validates: Requirements 3.4**
@@ -74,7 +80,8 @@ Implement the Batch Operations Transport layer in three phases: (1) domain types
     - Validate: empty job_id → `INVALID_ARGUMENT`, missing query+executions → `INVALID_ARGUMENT`, missing operation variant → `INVALID_ARGUMENT`
     - Create `BatchOperationEntry` with state `Running`, `start_time` = now, store reason/identity/max_operations_per_second
     - Insert into `batch_store` (handle `ALREADY_EXISTS`)
-    - Spawn `run_batch_operation` as a tokio task
+    - Capture a `BatchDispatchContext` from the validated `EdgeContext` produced by the start handler
+    - Spawn `run_batch_operation` as a tokio task with the captured dispatch context
     - Return success response
     - Modify `crates/tokeira-edge/src/workflow_service.rs`
     - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10_
@@ -95,18 +102,24 @@ Implement the Batch Operations Transport layer in three phases: (1) domain types
   - Ensure all tests pass, ask the user if questions arise.
 
 - [ ] 5. Implement BatchExecutionEngine
-  - [ ] 5.1 Implement `run_batch_operation` async function in `crates/tokeira-runtime/src/batch.rs`
+  - [ ] 5.1 Implement `run_batch_operation` async function in `crates/tokeira-edge/src/batch_engine.rs`
+    - Create new file `crates/tokeira-edge/src/batch_engine.rs`
     - Read operation params from store entry
-    - Discover workflows: if `visibility_query` is set, call `list_workflows` with pagination; if `executions` is set, iterate the explicit list
+    - Discover workflows: if `visibility_query` is set, call `WorkflowService::list_workflow_executions` with pagination; if `executions` is set, iterate the explicit list
     - Update `total_operation_count` after discovery
-    - For each workflow: check `cancellation_token.is_cancelled()`, apply operation via `apply_operation`, increment complete or failure counter, sleep for rate limiting
+    - For each workflow: check `cancellation_token.is_cancelled()`, apply operation via `apply_operation` (calls WorkflowService methods), increment complete or failure counter, sleep for rate limiting
     - On completion: set state to `Completed`, record `close_time`
     - On unrecoverable visibility error: set state to `Failed`, record `close_time`
     - On cancellation: stop processing, set state to `Completed`, record `close_time`
     - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, 4.9, 4.10, 5.1, 5.2, 6.1, 6.2, 6.3_
 
   - [ ] 5.2 Implement `apply_operation` dispatch function
-    - Match on `BatchOperationParams` and call the corresponding runtime method: `terminate_workflow`, `cancel_workflow`, `signal_workflow`, `delete_workflow_execution`, `reset_workflow`
+    - Add internal `WorkflowService` batch-dispatch methods: `terminate_workflow_batch_internal`, `cancel_workflow_batch_internal`, `signal_workflow_batch_internal`, `delete_workflow_batch_internal`, and `reset_workflow_batch_internal`
+    - Each internal method accepts `&BatchDispatchContext` and `&WorkflowExecutionRef`, does not call `interceptors.begin`, and resolves the exact run from `workflow_ref.run_id` when present
+    - Match on `BatchOperationParams` and call the corresponding internal batch-dispatch method
+    - For Reset: resolve concrete `fork_event_id` per-workflow from the stored `BatchResetTarget` by reading the exact workflow execution's history
+    - For Signal: pass signal_name and input (header is dropped at translation — not stored)
+    - Use captured `BatchDispatchContext.edge_context` for request identity, principal, and audit context without re-authenticating from headers
     - _Requirements: 4.3, 4.4, 4.5, 4.6, 4.7_
 
   - [ ] 5.3 Implement rate limiting with `compute_sleep_duration`

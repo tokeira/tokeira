@@ -2,17 +2,19 @@
 
 ## Introduction
 
-This spec implements the Batch Operations Transport layer — the 4 gRPC handlers for Temporal's batch operations feature in the `tokeira-edge` crate, plus the backing batch operation store and execution engine in `tokeira-runtime`. Batch operations allow operators to perform bulk actions (terminate, cancel, signal, delete, reset, update execution options) on workflow executions matching a visibility query or an explicit execution list.
+This spec implements the Batch Operations Transport layer — the 4 gRPC handlers for Temporal's batch operations feature in the `tokeira-edge` crate, plus the backing batch operation store and execution engine. Batch operations allow operators to perform bulk actions (terminate, cancel, signal, delete, reset) on workflow executions matching a visibility query or an explicit execution list.
+
+> **Scoped out for MVP:** `BatchOperationUpdateWorkflowExecutionOptions` is defined in the upstream proto but is not implemented. The `start_batch_operation` handler SHALL return `INVALID_ARGUMENT` if this operation variant is requested.
 
 This is Feature 7 from the umbrella spec `edge-complete-implementation`. It has no dependencies on other features in the umbrella spec. The work covers 4 gRPC handlers across two categories:
 
 1. **Store + Start** (Phase 1): `BatchOperationStore` in-memory store keyed by (namespace_id, job_id), and the `start_batch_operation` handler that validates the request, creates the store entry, and spawns the background execution engine.
-2. **Execution Engine** (Phase 2): A background task per batch operation that queries visibility (or iterates an explicit execution list), applies the requested operation to each matching workflow, and tracks progress counts.
+2. **Execution Engine** (Phase 2): A background task per batch operation that queries visibility (or iterates an explicit execution list), applies the requested operation to each matching workflow, and tracks progress counts. The engine lives in `tokeira-edge` (not runtime) because it depends on `VisibilityApi` and `WorkflowService` for operation dispatch.
 3. **Lifecycle Handlers** (Phase 3): `stop_batch_operation` (cooperative stop via cancellation flag), `describe_batch_operation` (query state and progress), `list_batch_operations` (paginated listing).
 
 The batch operation store is in-memory for MVP — a `DashMap<(NamespaceId, JobId), BatchOperationEntry>` (same pattern as `VersioningRuleStore` and `ScheduleStore`). Durable persistence is deferred to the DSQL storage spec.
 
-The execution engine applies operations using existing runtime methods: `terminate_workflow`, `cancel_workflow`, `signal_workflow`, `delete_workflow_execution`, and `reset_workflow`. Proto translation stays in `tokeira-edge`. The engine lives in `tokeira-runtime`.
+The execution engine applies operations using internal `WorkflowService` batch-dispatch methods: `terminate_workflow_batch_internal`, `cancel_workflow_batch_internal`, `signal_workflow_batch_internal`, `delete_workflow_batch_internal`, and `reset_workflow_batch_internal`. These methods accept the pre-validated batch dispatch context plus the exact `WorkflowExecutionRef`, including `run_id` when present, so background execution does not re-authenticate from headers and does not accidentally target the current run. Proto translation stays in `tokeira-edge`. The store lives in `tokeira-runtime`.
 
 Currently all 4 handler stubs exist in `tokeira-edge/src/grpc/workflow_service.rs` returning `Status::unimplemented`.
 
@@ -23,9 +25,9 @@ Currently all 4 handler stubs exist in `tokeira-edge/src/grpc/workflow_service.r
 - **BatchOperationStore**: The in-memory store (in `tokeira-runtime`) that persists batch operation entries per (namespace_id, job_id).
 - **JobId**: A string identifier for a batch operation, unique within a namespace.
 - **BatchOperationEntry**: The full stored state of a batch operation: job_id, namespace_id, operation type, operation parameters, state, progress counts, start/close times, identity, reason, and a cancellation flag.
-- **BatchOperationType**: The enum `temporal.api.enums.v1.BatchOperationType` identifying the bulk action: Terminate, Cancel, Signal, Delete, Reset, or UpdateExecutionOptions.
+- **BatchOperationType**: The enum `temporal.api.enums.v1.BatchOperationType` identifying the bulk action: Terminate, Cancel, Signal, Delete, or Reset. `UpdateExecutionOptions` is defined in the proto but scoped out for MVP.
 - **BatchOperationState**: The enum `temporal.api.enums.v1.BatchOperationState` tracking lifecycle: Running, Completed, or Failed.
-- **BatchExecutionEngine**: The background task (in `tokeira-runtime`) that iterates matching workflows and applies the batch operation to each one, tracking progress.
+- **BatchExecutionEngine**: The background task (in `tokeira-edge`) that iterates matching workflows and applies the batch operation to each one, tracking progress. Lives in edge because it depends on `VisibilityApi` and `WorkflowService`.
 - **VisibilityQuery**: A string query used by `list_workflow_executions` to find matching workflow executions.
 - **Upstream_Proto**: The Temporal API protobuf definitions at version 1.43.0.
 - **CancellationFlag**: A `CancellationToken` (from `tokio_util`) checked between iterations by the BatchExecutionEngine to support cooperative stop.
@@ -61,9 +63,9 @@ Currently all 4 handler stubs exist in `tokeira-edge/src/grpc/workflow_service.r
 5. WHEN a batch operation with the same job_id already exists in the namespace, THE handler SHALL return `ALREADY_EXISTS`.
 6. WHEN the request is valid, THE handler SHALL spawn a BatchExecutionEngine background task for the new batch operation.
 7. THE handler SHALL store the `reason`, `identity` (from the request metadata), and `max_operations_per_second` alongside the batch operation entry.
-8. WHEN the operation variant is `signal_operation`, THE handler SHALL store the signal name, input payloads, and header from the `BatchOperationSignal` message.
+8. WHEN the operation variant is `signal_operation`, THE handler SHALL store the signal name and input payloads from the `BatchOperationSignal` message. The `header` field is dropped at translation time — it is not stored or delivered. The kernel `SignalRequest` has no header field. This is documented in UNSUPPORTED_FIELDS.md.
 9. WHEN the operation variant is `termination_operation`, THE handler SHALL store the termination details from the `BatchOperationTermination` message.
-10. WHEN the operation variant is `reset_operation`, THE handler SHALL store the reset options from the `BatchOperationReset` message.
+10. WHEN the operation variant is `reset_operation`, THE handler SHALL translate the `BatchOperationReset` message into a `BatchResetTarget` enum preserving the supported target variants: `WorkflowTaskId(i64)`, `FirstWorkflowTask`, `LastWorkflowTask`, `BuildId(String)`. The `reset_reapply_type`, `current_run_only`, and `reset_reapply_exclude_types` fields are not supported and are documented in UNSUPPORTED_FIELDS.md. The engine resolves the concrete `fork_event_id` per-workflow at dispatch time.
 
 ### Requirement 3: Proto Translation for Batch Operation Types
 
@@ -88,13 +90,13 @@ Currently all 4 handler stubs exist in `tokeira-edge/src/grpc/workflow_service.r
 
 #### Acceptance Criteria
 
-1. WHEN a batch operation uses a `visibility_query`, THE BatchExecutionEngine SHALL call `list_workflow_executions` with the query to discover matching workflows, following pagination to process all results.
+1. WHEN a batch operation uses a `visibility_query`, THE BatchExecutionEngine SHALL call `WorkflowService::list_workflow_executions` with the query to discover matching workflows, following pagination to process all results.
 2. WHEN a batch operation uses an explicit `executions` list, THE BatchExecutionEngine SHALL iterate through the provided workflow executions directly.
-3. WHEN the operation type is `Terminate`, THE BatchExecutionEngine SHALL call `terminate_workflow` on the Runtime for each matching workflow, passing the termination details from the stored operation parameters.
-4. WHEN the operation type is `Cancel`, THE BatchExecutionEngine SHALL call `cancel_workflow` on the Runtime for each matching workflow.
-5. WHEN the operation type is `Signal`, THE BatchExecutionEngine SHALL call `signal_workflow` on the Runtime for each matching workflow, passing the signal name and input from the stored operation parameters.
-6. WHEN the operation type is `Delete`, THE BatchExecutionEngine SHALL call `delete_workflow_execution` on the Runtime for each matching workflow.
-7. WHEN the operation type is `Reset`, THE BatchExecutionEngine SHALL call `reset_workflow` on the Runtime for each matching workflow, passing the reset options from the stored operation parameters.
+3. WHEN the operation type is `Terminate`, THE BatchExecutionEngine SHALL call `WorkflowService::terminate_workflow_batch_internal` for each matching workflow, passing the exact `WorkflowExecutionRef` and termination details from the stored operation parameters.
+4. WHEN the operation type is `Cancel`, THE BatchExecutionEngine SHALL call `WorkflowService::cancel_workflow_batch_internal` for each matching workflow, passing the exact `WorkflowExecutionRef`.
+5. WHEN the operation type is `Signal`, THE BatchExecutionEngine SHALL call `WorkflowService::signal_workflow_batch_internal` for each matching workflow, passing the exact `WorkflowExecutionRef`, signal name, and input from the stored operation parameters. The signal `header` field is not delivered (documented as unsupported).
+6. WHEN the operation type is `Delete`, THE BatchExecutionEngine SHALL call `WorkflowService::delete_workflow_batch_internal` for each matching workflow, passing the exact `WorkflowExecutionRef`.
+7. WHEN the operation type is `Reset`, THE BatchExecutionEngine SHALL resolve the concrete `fork_event_id` for each matching workflow by reading that exact workflow execution's history (including `run_id` when present), then call `WorkflowService::reset_workflow_batch_internal` with the exact `WorkflowExecutionRef`, resolved `fork_event_id`, and `reason`.
 8. WHEN an individual operation succeeds, THE BatchExecutionEngine SHALL increment `complete_operation_count` in the store entry.
 9. WHEN an individual operation fails, THE BatchExecutionEngine SHALL increment `failure_operation_count` in the store entry and continue processing remaining workflows.
 10. THE BatchExecutionEngine SHALL update `total_operation_count` in the store entry to reflect the total number of workflows discovered (from visibility query pagination or explicit list length).

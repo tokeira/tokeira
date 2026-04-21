@@ -104,5 +104,5 @@ Replace hash-based lane routing (`hash(run_key) % lane_count`) with shard-aware 
 - Tasks marked with `*` are optional and can be skipped for faster MVP
 - The design uses Rust throughout — all code examples use Rust
 - Property tests use `proptest` crate with minimum 100 iterations
-- Callers split into two patterns: scanners pass `shard_id` directly (already in scope from loop), publisher/runtime derive it via `shard_for(run_key, shard_count)`
+- Callers split into two patterns: timer scanner/sweeper pass loop/parameter `shard_id` directly; timeout scanners (WFT, activity, nexus, workflow execution) use `entry.shard_id` from tracking entries; publisher/runtime derive via `shard_for(run_key, shard_count)`
 - No new data models, error types, or dependencies introduced

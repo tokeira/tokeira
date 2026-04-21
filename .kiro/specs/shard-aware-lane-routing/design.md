@@ -231,4 +231,4 @@ All property tests use `proptest` with `ProptestConfig { cases: 100, .. }` minim
 
 ### Integration Tests
 
-Scanner integration tests (timer, WFT, activity, nexus) should verify that commands submitted by each scanner land on the lane corresponding to the shard being scanned. These are existing test patterns extended to assert lane affinity.
+Scanner integration tests (timer, WFT, activity, nexus, workflow execution timeout) should verify that commands submitted by each scanner land on the lane corresponding to the shard being scanned. These are existing test patterns extended to assert lane affinity.

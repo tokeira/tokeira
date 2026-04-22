@@ -55,7 +55,7 @@ graph TD
 
 3. **Endpoint registry extended with target enum** — `NexusEndpointConfig` gains an `EndpointTarget` enum (`External { address }` | `Worker { namespace_id, task_queue }`). The publisher inspects the target to choose dispatch path. Existing HTTP-only configs map to `External`.
 
-4. **Completion handlers submit kernel commands directly** — `respond_nexus_task_completed` and `respond_nexus_task_failed` decode the task token, translate the proto response to a `NexusResolution`, and submit `Command::NexusOperationResolved` to the originating run via `LaneHandle`. Same pattern as the publisher's existing HTTP callback path.
+4. **Completion handlers use `WorkflowRuntimeApi::resolve_nexus_operation`** — `respond_nexus_task_completed` and `respond_nexus_task_failed` decode the task token, translate the proto response to a `NexusResolution`, and call a new `WorkflowRuntimeApi::resolve_nexus_operation(run_key, operation_id, scheduled_event_id, resolution)` method. This method is added to the runtime API trait so the edge layer can submit Nexus resolutions without depending on `LaneHandle` (which is runtime-internal). The runtime adapter implements it by submitting `Command::NexusOperationResolved` to the appropriate lane.
 
 5. **Idempotent completion** — If the kernel rejects `NexusOperationResolved` (operation already resolved, run closed, etc.), the handler returns success. The operation was already resolved — no error to the worker.
 
@@ -105,11 +105,11 @@ pub enum NexusTaskRequest {
         service: String,
         operation: String,
         request_id: String,
-        payload: Option<Payloads>,
-        callback: String,
-        callback_header: HashMap<String, String>,
-        links: Vec<NexusLink>,
-        header: HashMap<String, String>,
+        /// Single payload encoded from the dispatch op's `input: Payloads`.
+        /// The first payload in the Payloads vec is used as the proto
+        /// `common.v1.Payload`. If empty, payload is None.
+        payload: Option<Payload>,
+        /// Scheduled time from the dispatch op's timestamp.
         scheduled_time: Option<OffsetDateTime>,
     },
     CancelOperation {
@@ -118,13 +118,9 @@ pub enum NexusTaskRequest {
         operation_id: String,
     },
 }
-
-#[derive(Clone, Debug)]
-pub struct NexusLink {
-    pub url: String,
-    pub link_type: String,
-}
 ```
+
+> **NOTE:** The upstream proto `StartOperationRequest` has `callback`, `callback_header`, `links`, and `header` fields. For worker-dispatched operations, these are not populated because the dispatch op does not carry them — the callback path is internal (the completion handler submits directly to the runtime). `callback` is set to empty string, `callback_header` and `links` are empty, and `header` is empty. These fields are only meaningful for external HTTP-dispatched operations.
 
 ### NexusTaskBroker
 
@@ -161,6 +157,10 @@ The `poll` method follows the same Notify pattern as `InMemoryActivityBroker::po
 #[derive(Clone, Debug, PartialEq)]
 pub enum EndpointTarget {
     External { address: String },
+    /// Worker target stores the pre-resolved NamespaceId and task queue.
+    /// Namespace name → NamespaceId resolution happens at endpoint registration
+    /// time (when the operator configures the endpoint), not at dispatch time.
+    /// This avoids the publisher needing a namespace resolver.
     Worker { namespace_id: NamespaceId, task_queue: TaskQueueName },
 }
 
@@ -169,6 +169,8 @@ pub struct NexusEndpointConfig {
     pub target: EndpointTarget,
 }
 ```
+
+> **NOTE:** The upstream proto uses `namespace: String` (name) on `EndpointTarget::Worker`. Resolution from namespace name to `NamespaceId` happens at endpoint registration/configuration time — when the endpoint is inserted into the `NexusEndpointRegistry`. The registry stores the resolved `NamespaceId`. The publisher does not need a namespace resolver at dispatch time, avoiding a crate cycle with `tokeira-edge`'s `NamespaceCache`.
 
 The existing `NexusEndpointRegistry` API (`resolve`) is unchanged — callers inspect the returned `NexusEndpointConfig.target` to determine dispatch path.
 
@@ -190,10 +192,17 @@ match config.target {
     EndpointTarget::External { ref address } => {
         // existing NexusHttpClient path
     }
-    EndpointTarget::Worker { ref namespace_id, ref task_queue } => {
+    EndpointTarget::Worker { namespace_id, ref task_queue } => {
         let token = NexusTaskToken { run_key, operation_id, scheduled_event_id };
-        let task = NexusTask { token, request: NexusTaskRequest::StartOperation { ... } };
-        self.nexus_broker.publish(*namespace_id, task_queue.clone(), task).await;
+        let payload = input.0.first().cloned(); // Payloads → single Payload
+        let task = NexusTask {
+            token,
+            request: NexusTaskRequest::StartOperation {
+                service, operation, request_id: operation_id,
+                payload, scheduled_time: Some(now),
+            },
+        };
+        self.nexus_broker.publish(namespace_id, task_queue.clone(), task).await;
     }
 }
 ```
@@ -212,6 +221,7 @@ New file: `crates/tokeira-edge/src/translate/nexus.rs`
 | `proto_response_to_resolution()` | proto → domain | Convert `Response` to `NexusResolution` |
 | `proto_start_response_to_resolution()` | proto → domain | Convert `StartOperationResponse` variant to `NexusResolution` |
 | `proto_handler_error_to_resolution()` | proto → domain | Convert `HandlerError` to `NexusResolution::Failed` |
+| `nexus_failure_to_kernel_payload()` | proto → domain | Serialize `nexus.v1.Failure` or `HandlerError` into a kernel `Payload` via `serde_json::to_vec` of a canonical JSON envelope `{ "error_type": "...", "message": "...", "metadata": {...}, "details": "..." }`. This is the concrete encoding contract for Nexus failures into the opaque kernel `Payload` field. |
 
 ### Handler Integration
 
@@ -219,9 +229,11 @@ The 3 handlers in `WorkflowService`:
 
 **`poll_nexus_task_queue`**: Validate namespace + task_queue → long-poll `NexusTaskBroker` → translate `NexusTask` to proto `PollNexusTaskQueueResponse` with encoded task token.
 
-**`respond_nexus_task_completed`**: Validate task_token + response → decode `NexusTaskToken` → translate proto `Response` to `NexusResolution` → submit `Command::NexusOperationResolved` to originating run via `LaneHandle`. Return success even if kernel rejects (idempotent).
+**`respond_nexus_task_completed`**: Validate task_token + response → decode `NexusTaskToken` → translate proto `Response` to `NexusResolution` → call `WorkflowRuntimeApi::resolve_nexus_operation`. Return success even if kernel rejects (idempotent).
 
-**`respond_nexus_task_failed`**: Validate task_token + error → decode `NexusTaskToken` → translate proto `HandlerError` to `NexusResolution::Failed` → submit `Command::NexusOperationResolved`. Return success even if kernel rejects (idempotent).
+> **Async start response handling:** When the worker returns `StartOperationResponse::Async`, the handler validates that the returned `operation_id` matches the scheduled operation's ID (from the task token). If it differs, the handler logs a warning but still submits `NexusResolution::Started` — the kernel tracks operations by its own ID, not the worker-returned one. The `links` field on the async response is ignored (the kernel has no field to store it). This is documented in UNSUPPORTED_FIELDS.md.
+
+**`respond_nexus_task_failed`**: Validate task_token + error → decode `NexusTaskToken` → translate proto `HandlerError` to `NexusResolution::Failed` → call `WorkflowRuntimeApi::resolve_nexus_operation`. Return success even if kernel rejects (idempotent).
 
 The `WorkflowService` struct gains a `nexus_broker: NexusTaskBroker` field (same pattern as `broker: InMemoryBroker`).
 
@@ -249,12 +261,10 @@ The `WorkflowService` struct gains a `nexus_broker: NexusTaskBroker` field (same
 | `service` | `String` | Nexus service name |
 | `operation` | `String` | Operation type |
 | `request_id` | `String` | Idempotency key (operation_id) |
-| `payload` | `Option<Payloads>` | Request body |
-| `callback` | `String` | Callback URL (empty for worker-dispatched) |
-| `callback_header` | `HashMap<String, String>` | Callback headers |
-| `links` | `Vec<NexusLink>` | Caller information links |
-| `header` | `HashMap<String, String>` | Request headers |
+| `payload` | `Option<Payload>` | Single payload (first entry from dispatch op's `input: Payloads`) |
 | `scheduled_time` | `Option<OffsetDateTime>` | When the request was scheduled |
+
+> **NOTE:** The upstream proto `StartOperationRequest` also has `callback`, `callback_header`, `links`, and `header` fields. These are not stored on the internal `NexusTaskRequest` — they are synthesized as empty at proto translation time for worker-dispatched tasks. They are only meaningful for external HTTP dispatch.
 
 ### NexusTaskRequest::CancelOperation
 
@@ -269,7 +279,7 @@ The `WorkflowService` struct gains a `nexus_broker: NexusTaskBroker` field (same
 | Variant | Fields | Description |
 |---------|--------|-------------|
 | `External` | `address: String` | HTTP endpoint URL |
-| `Worker` | `namespace_id: NamespaceId, task_queue: TaskQueueName` | Worker poll target |
+| `Worker` | `namespace_id: NamespaceId, task_queue: TaskQueueName` | Worker poll target (namespace resolved at registration time) |
 
 
 ## Correctness Properties
@@ -288,9 +298,9 @@ The `WorkflowService` struct gains a `nexus_broker: NexusTaskBroker` field (same
 
 **Validates: Requirements 1.1, 1.4**
 
-### Property 3: Request translation preserves fields
+### Property 3: Request translation preserves stored fields
 
-*For any* valid `NexusTaskRequest` (either `StartOperation` or `CancelOperation` variant), translating to a proto `temporal.api.nexus.v1.Request` and inspecting the resulting proto SHALL preserve all fields: for `StartOperation` — `service`, `operation`, `request_id`, `payload`, `callback`, `callback_header`, `links`, `header`, `scheduled_time`; for `CancelOperation` — `service`, `operation`, `operation_id`.
+*For any* valid `NexusTaskRequest` (either `StartOperation` or `CancelOperation` variant), translating to a proto `temporal.api.nexus.v1.Request` and inspecting the resulting proto SHALL preserve all stored fields: for `StartOperation` — `service`, `operation`, `request_id`, `payload`, `scheduled_time`; for `CancelOperation` — `service`, `operation`, `operation_id`. The synthesized fields (`callback`, `callback_header`, `links`, `header`) SHALL be empty/default on the proto output.
 
 **Validates: Requirements 4.1, 4.2, 4.3**
 
@@ -302,7 +312,7 @@ The `WorkflowService` struct gains a `nexus_broker: NexusTaskBroker` field (same
 
 ### Property 5: Dispatch-to-broker field preservation
 
-*For any* `DispatchOp::ScheduleNexusOperation` or `DispatchOp::CancelNexusOperation` targeting a Worker endpoint, the `NexusTask` published to the broker SHALL carry a token with the originator's `run_key`, `operation_id`, and `scheduled_event_id`, and a request with the dispatch op's `service`, `operation`, and input fields.
+*For any* `DispatchOp::ScheduleNexusOperation` or `DispatchOp::CancelNexusOperation` targeting a Worker endpoint, the `NexusTask` published to the broker SHALL carry a token with the originator's `run_key`, `operation_id`, and `scheduled_event_id`, and a request with the dispatch op's `service` and `operation`. For `ScheduleNexusOperation`, the request's `payload` SHALL be the first entry from the dispatch op's `input: Payloads`, or `None` if the input is empty. For `CancelNexusOperation`, the request's `operation_id` SHALL match the dispatch op's operation ID.
 
 **Validates: Requirements 8.3, 8.4, 9.2**
 

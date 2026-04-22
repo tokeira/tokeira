@@ -113,10 +113,9 @@ Theoretical best on a capable cloud platform (ECS on EC2, Aurora DSQL, single re
 
 **Q: "Do we want lanes strictly per node, or should shard ownership define lane count dynamically?"**
 
-- **Decision:** Fixed lane count per node (configurable, default 4). Shards are distributed across lanes by hash.
-- **Rationale:** Dynamic lane count adds complexity without clear benefit for MVP. Fixed lanes with hash-based routing gives good distribution.
-- **Evidence:** `TokeiraRuntime::new()` takes `lane_count` parameter; `lane_index_for()` uses hash routing.
-- **⚠️ REVISIT:** This decision may need reopening. Temporal's shard movement model shows that fixed lane counts can create performance cliffs when shard ownership changes — hot shards landing on the same lane cause head-of-line blocking. Dynamic lane count (or shard-aware lane affinity) may be worth the complexity cost. Scheduled for review.
+- **Decision:** Fixed lane count per node (configurable, default 4). Shards are distributed across lanes by `shard_id % lane_count`.
+- **Rationale:** Dynamic lane count remains deferred, but routing by shard rather than run hash reduces shard movement blast radius from every lane to the one lane that owns the shard's command stream. Multiple shards may still share a lane.
+- **Evidence:** `TokeiraRuntime::new()` takes `lane_count`; runtime and publisher paths derive `ShardId` with `shard_for(run_key, shard_count)` before lane selection; scanner paths route with shard context already present on the scan loop or timeout tracking entry.
 
 ### From 050 (DSQL Storage)
 

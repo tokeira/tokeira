@@ -84,8 +84,8 @@ Currently all 3 handler stubs exist in `tokeira-edge/src/grpc/workflow_service.r
 
 #### Acceptance Criteria
 
-1. THE Edge_Layer SHALL provide a translation function to construct a proto `temporal.api.nexus.v1.Request` from the internal Nexus task representation, including the `header`, `scheduled_time`, and the `variant` (start_operation or cancel_operation).
-2. THE Edge_Layer SHALL provide a translation function to construct a `StartOperationRequest` from the internal representation, preserving `service`, `operation`, `request_id`, `callback`, `payload`, `callback_header`, and `links` fields.
+1. THE Edge_Layer SHALL provide a translation function to construct a proto `temporal.api.nexus.v1.Request` from the internal Nexus task representation, including `scheduled_time` and the `variant` (start_operation or cancel_operation). For worker-dispatched tasks, `header` is empty.
+2. THE Edge_Layer SHALL provide a translation function to construct a `StartOperationRequest` from the internal representation, preserving `service`, `operation`, `request_id`, and `payload` fields. The `callback`, `callback_header`, `links`, and `header` fields are set to empty/default for worker-dispatched tasks (these fields are only meaningful for external HTTP dispatch). The `payload` field is a single `common.v1.Payload` — the first entry from the dispatch op's `input: Payloads`, or absent if empty.
 3. THE Edge_Layer SHALL provide a translation function to construct a `CancelOperationRequest` from the internal representation, preserving `service`, `operation`, and `operation_id` fields.
 4. WHEN a proto field contains an invalid value (e.g., empty task_queue name), THE translation function SHALL return a descriptive error rather than silently defaulting.
 
@@ -100,10 +100,10 @@ Currently all 3 handler stubs exist in `tokeira-edge/src/grpc/workflow_service.r
 #### Acceptance Criteria
 
 1. WHEN the `respond_nexus_task_completed` endpoint is called with a valid namespace, identity, task_token, and response, THE handler SHALL decode the task_token to extract the originator's run_key, operation_id, and scheduled_event_id.
-2. WHEN the response contains a `StartOperationResponse::Sync` variant, THE handler SHALL submit a `Command::NexusOperationResolved` with `NexusResolution::Completed` containing the result payload to the originating run.
-3. WHEN the response contains a `StartOperationResponse::Async` variant, THE handler SHALL submit a `Command::NexusOperationResolved` with `NexusResolution::Started` to the originating run.
-4. WHEN the response contains a `StartOperationResponse::operation_error` variant, THE handler SHALL submit a `Command::NexusOperationResolved` with `NexusResolution::Failed` containing the failure information to the originating run.
-5. WHEN the response contains a `CancelOperationResponse` variant, THE handler SHALL submit a `Command::NexusOperationResolved` with `NexusResolution::Canceled` to the originating run.
+2. WHEN the response contains a `StartOperationResponse::Sync` variant, THE handler SHALL call `WorkflowRuntimeApi::resolve_nexus_operation` with `NexusResolution::Completed` containing the result payload.
+3. WHEN the response contains a `StartOperationResponse::Async` variant, THE handler SHALL call `WorkflowRuntimeApi::resolve_nexus_operation` with `NexusResolution::Started`. The returned `operation_id` is validated to match the scheduled operation ID (log warning on mismatch but proceed). The `links` field is ignored.
+4. WHEN the response contains a `StartOperationResponse::operation_error` variant, THE handler SHALL call `WorkflowRuntimeApi::resolve_nexus_operation` with `NexusResolution::Failed` containing the failure information serialized as a JSON-encoded kernel `Payload` via `nexus_failure_to_kernel_payload`.
+5. WHEN the response contains a `CancelOperationResponse` variant, THE handler SHALL call `WorkflowRuntimeApi::resolve_nexus_operation` with `NexusResolution::Canceled`.
 6. WHEN the task_token is empty or cannot be decoded, THE handler SHALL return `INVALID_ARGUMENT`.
 7. WHEN the response is missing (no variant set), THE handler SHALL return `INVALID_ARGUMENT`.
 8. IF the kernel rejects the `NexusOperationResolved` command (e.g., operation already resolved or run closed), THEN THE handler SHALL return a successful response (idempotent completion — the operation was already resolved).
@@ -115,7 +115,7 @@ Currently all 3 handler stubs exist in `tokeira-edge/src/grpc/workflow_service.r
 #### Acceptance Criteria
 
 1. WHEN the `respond_nexus_task_failed` endpoint is called with a valid namespace, identity, task_token, and error, THE handler SHALL decode the task_token to extract the originator's run_key, operation_id, and scheduled_event_id.
-2. WHEN the request contains a `HandlerError`, THE handler SHALL submit a `Command::NexusOperationResolved` with `NexusResolution::Failed` containing the error information to the originating run.
+2. WHEN the request contains a `HandlerError`, THE handler SHALL call `WorkflowRuntimeApi::resolve_nexus_operation` with `NexusResolution::Failed` containing the error information serialized as a JSON-encoded kernel `Payload` via `nexus_failure_to_kernel_payload`.
 3. WHEN the task_token is empty or cannot be decoded, THE handler SHALL return `INVALID_ARGUMENT`.
 4. WHEN the error is missing, THE handler SHALL return `INVALID_ARGUMENT`.
 5. IF the kernel rejects the `NexusOperationResolved` command (e.g., operation already resolved or run closed), THEN THE handler SHALL return a successful response (idempotent failure — the operation was already resolved).
@@ -174,6 +174,7 @@ Currently all 3 handler stubs exist in `tokeira-edge/src/grpc/workflow_service.r
 
 #### Acceptance Criteria
 
-1. THE `NexusEndpointConfig` SHALL support both `External` (address-based) and `Worker` (namespace + task_queue) target variants.
-2. WHEN the RuntimeDispatchPublisher resolves a Nexus endpoint, THE publisher SHALL inspect the target variant to determine whether to dispatch via NexusHttpClient (External) or NexusTaskBroker (Worker).
-3. WHEN a `DispatchOp::ScheduleNexusOperation` references an endpoint name that is not present in the NexusEndpointRegistry, THE RuntimeDispatchPublisher SHALL submit a `Command::NexusOperationResolved` with `NexusResolution::Failed` containing a descriptive "endpoint not found" message (existing behavior preserved).
+1. THE `NexusEndpointConfig` SHALL support both `External` (address-based) and `Worker` (pre-resolved NamespaceId + task_queue) target variants. Namespace name → NamespaceId resolution happens at endpoint registration time, not at dispatch time.
+2. WHEN operator configuration defines a Worker endpoint using a namespace name that cannot be resolved to a `NamespaceId` at registration time, THE registration/configuration step SHALL fail with a descriptive error and SHALL NOT insert the endpoint into the `NexusEndpointRegistry`.
+3. WHEN the RuntimeDispatchPublisher resolves a Nexus endpoint, THE publisher SHALL inspect the target variant to determine whether to dispatch via NexusHttpClient (External) or NexusTaskBroker (Worker). The Worker target's `namespace_id` is used directly for broker publish — no runtime namespace resolution needed.
+4. WHEN a `DispatchOp::ScheduleNexusOperation` references an endpoint name that is not present in the NexusEndpointRegistry, THE RuntimeDispatchPublisher SHALL submit a `Command::NexusOperationResolved` with `NexusResolution::Failed` containing a descriptive "endpoint not found" message (existing behavior preserved).

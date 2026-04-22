@@ -4,221 +4,213 @@ This document is the intended entry point for machine-assisted
 contributions. It captures what has been built, what remains,
 and where to contribute safely.
 
+Last updated: 2026-04-22
+
 ## Codebase snapshot
 
 | Crate | Source lines | Tests | Status |
 |-------|-------------|-------|--------|
-| `tokeira-types` | 725 | — | Stable. Fully documented. |
-| `tokeira-kernel` | 3,811 | 221 (153 golden + 68 property) | Stable. All 10 kernel features implemented. |
-| `tokeira-storage` | 2,705 | 21 | Stable. In-memory store with shard-filtered queries. |
-| `tokeira-runtime` | 13,231 | 125 unit + 37 integration | Complete. All 15 runtime features implemented. |
-| `tokeira-edge` | 3,010 | 15 + 1 integration | Stable. Workflow gRPC transport. |
-| `tokeira-proto` | 508 | — | Stable. Protobuf codegen. |
-| `tokeira-projection` | 137 | — | Stub. |
+| `tokeira-types` | 794 | — | Stable. Fully documented. |
+| `tokeira-kernel` | 4,969 | 230 | Stable. All kernel features implemented. |
+| `tokeira-storage` | 3,306 | 24 | Stable. In-memory store with shard-filtered queries. |
+| `tokeira-runtime` | 19,907 | 246 | Complete. All runtime features + schedule/batch/nexus/versioning stores. |
+| `tokeira-edge` | 17,460 | 141 | Active. All gRPC handlers implemented except eager dispatch. |
+| `tokeira-proto` | 439 | — | Stable. Protobuf codegen. |
+| `tokeira-projection` | 3,957 | 30 | Working. Visibility sink, rollups, filter compilation, query service. |
 
-Total: ~37k lines of Rust, 162 runtime tests + 221 kernel tests + 21 storage tests + 16 edge tests, all passing.
+Total: ~67k lines of Rust, 671 tests, all passing.
 
 ## What has been built
 
-### `tokeira-kernel` — complete
+### Kernel — complete
 
-All 10 features from the kernel master spec are implemented:
+Pure deterministic state machine. All command variants handled.
+Start, signal, WFT lifecycle, activities, timers, children,
+external signals/cancels, nexus, updates, continue-as-new,
+reset, pause/unpause, markers, execution options. 230 tests
+(golden + property).
 
-1. Foundation + WFT lifecycle
-2. WFT failure/timeout recovery
-3. Cancel and terminate
-4. Continue-as-new + workflow timeout
-5. Child workflows
-6. External signals and cancel requests
-7. Updates (two-phase)
-8. Markers and execution options
-9. Nexus operations
-10. Reset
+### Storage — in-memory complete
 
-The kernel is pure, deterministic, and has no I/O. Every
-command variant in the `Command` enum is handled. Every
-`WorkflowCommand` variant is processed. Property tests
-cover all correctness properties.
+Full storage contract: OCC fencing, request dedup, history
+append with pagination, activity/timer/nexus side tables,
+dispatch backlog, projection log, lease management, shard
+mapping, epoch validation. 24 tests.
 
-### `tokeira-storage::memory` — complete
+### Runtime — complete
 
-The in-memory dev store implements the full storage contract:
+Lane executors, workflow + activity brokers, dispatch publisher,
+timer/WFT/activity/nexus/workflow timeout scanners, child
+orchestration, external signal/cancel delivery, nexus dispatch
+(HTTP + worker-targeted), continue-as-new, OCC retry, recovery
+sweeper, worker registry, versioning rule store, schedule store
++ execution engine, batch operation store, shard-aware lane
+routing. 246 tests.
 
-- OCC fencing with conflict injection for tests
-- Request dedup
-- History append with pagination
-- Independent activity state and timer bucket tables
-- Activity task dispatch tracking and sweep
-- Explicit-persist dispatch backlog (Tier C model)
-- Projection log with partition/fanout
-- Lease management with epoch fencing
-- `AllowAfterClose` conflict policy
-- Shard-to-run mapping with deterministic assignment
-- Six shard-filtered query methods for sweep reconstruction
-- Epoch validation on `commit_transition`
-- 21 property and unit tests
+### Edge — nearly complete
 
-### `tokeira-runtime` — all 15 features implemented
+All WorkflowService gRPC handlers implemented:
 
-The runtime crate is organized into focused modules:
+**Working handlers (tested end-to-end with SDK):**
+- StartWorkflowExecution, SignalWorkflowExecution, SignalWithStartWorkflowExecution
+- PollWorkflowTaskQueue, RespondWorkflowTaskCompleted, RespondWorkflowTaskFailed
+- PollActivityTaskQueue, RespondActivityTaskCompleted, RespondActivityTaskFailed
+- RecordActivityTaskHeartbeat
+- TerminateWorkflowExecution, RequestCancelWorkflowExecution
+- QueryWorkflow, UpdateWorkflowExecution, PollWorkflowExecutionUpdate
+- DescribeWorkflowExecution, ListWorkflowExecutions, CountWorkflowExecutions
+- GetWorkflowExecutionHistory, GetWorkflowExecutionHistoryReverse
+- DeleteWorkflowExecution, ResetWorkflowExecution
+- RegisterNamespace, DescribeNamespace, ListNamespaces
+- DescribeTaskQueue, GetClusterInfo, GetSystemInfo
+- ResetStickyTaskQueue, RespondQueryTaskCompleted
 
-```
-tokeira-runtime/src/
-  runtime.rs    — TokeiraRuntime facade
-  lane.rs       — lane executor, OCC retry, mailbox coalescing
-  broker.rs     — workflow + activity task brokers
-  publisher.rs  — RuntimeDispatchPublisher (all dispatch ops)
-  backlog.rs    — grace scanner, drain loop, durable backlog
-  retry.rs      — activity retry evaluation (pure functions)
-  timeout.rs    — workflow timeout tracking + scanner
-  scanner.rs    — timer scanner + lane routing helpers
-  nexus.rs      — Nexus types, endpoint registry, timeout scanner
-  query.rs      — query dispatch (QueryTask, QueryResult)
-  update.rs     — update lifecycle (UpdateRegistry, UpdateOutcome)
-  fairness.rs   — delivery metrics, drain share, control loop
-  activity_timeout.rs — activity tracking + timeout scanner
-  shard.rs      — shard ownership, epoch fencing
-  recovery.rs   — sweep_shard, lease renewer
-  worker_registry.rs — worker version metadata
-```
+**Implemented in this cycle (spec'd + coded):**
+- CreateSchedule, DescribeSchedule, UpdateSchedule, DeleteSchedule
+- PatchSchedule, ListSchedules, ListScheduleMatchingTimes
+- StartBatchOperation, StopBatchOperation, DescribeBatchOperation, ListBatchOperations
+- UpdateWorkerVersioningRules, GetWorkerVersioningRules, GetWorkerTaskReachability
+- ShutdownWorker
+- PollNexusTaskQueue (broker + worker-targeted dispatch)
+- RespondNexusTaskCompleted, RespondNexusTaskFailed
 
-Implemented features:
+**Returning UNIMPLEMENTED (documented):**
+- Legacy versioning (UpdateWorkerBuildIdCompatibility, GetWorkerBuildIdCompatibility)
+- Deployment management (5 handlers)
+- Legacy listing (4 handlers)
+- Activity by-ID (5 handlers)
+- Namespace mutation (UpdateNamespace, DeprecateNamespace)
+- ExecuteMultiOperation, GetSearchAttributes, ListTaskQueuePartitions
+- Activity/WF options (5 handlers)
 
-| # | Feature | Status |
-|---|---------|--------|
-| 1 | Lane OCC retry + mailbox coalescing | ✅ Implemented |
-| 2 | Activity pump (dispatch, poll, complete, retry) | ✅ Implemented |
-| 3 | Activity heartbeat + timeouts | ✅ Implemented (1 optional integration test remaining) |
-| 4 | Timer scanner | ✅ Implemented |
-| 5 | Workflow timeouts | ✅ Implemented |
-| 6 | Child workflow orchestration | ✅ Implemented |
-| 7 | External signal + cancel delivery | ✅ Implemented |
-| 8 | Continue-as-new | ✅ Implemented |
-| 9 | Nexus operation dispatch | ✅ Implemented |
-| 10 | Worker versioning + deployment routing | ✅ Implemented |
-| 11 | Sweeper and recovery | ✅ Implemented (1 optional integration test remaining) |
-| 12 | Durable backlog integration | ✅ Implemented |
-| 13 | Query dispatch | ✅ Implemented |
-| 14 | Update two-phase lifecycle | ✅ Implemented (2 optional tests remaining) |
-| 15 | Broker fairness and admission | ✅ Implemented (12 property tests remaining) |
+**Not yet implemented (spec'd, ready for implementation):**
+- Eager dispatch (Feature 9) — spec complete
 
-### `tokeira-edge` — workflow transport complete
+### Projection — working
 
-The gRPC edge layer handles:
+Visibility sink, rollups, filter compilation, query service,
+worker — all working against InMemoryVisibilityStore. 30 tests.
 
-- StartWorkflowExecution
-- SignalWorkflowExecution
-- PollWorkflowTaskQueue
-- RespondWorkflowTaskCompleted
-- DescribeWorkflowExecution
-- ListWorkflowExecutions (stub)
-- GetSystemInfo
-- Operator service (namespace CRUD)
+### Architecture documentation — organized
 
-Missing edge endpoints (not yet specced):
+- 005-decisions-and-boundaries.md: ground truth for resolved decisions
+- 9 docs promoted to "accepted" status
+- 3 docs marked as "future direction"
+- All umbrella features (1-9) have complete specs
 
-- PollActivityTaskQueue gRPC handler
-- RespondActivityTaskCompleted/Failed gRPC handler
-- RecordActivityTaskHeartbeat gRPC handler
-- TerminateWorkflowExecution gRPC handler
-- RequestCancelWorkflowExecution gRPC handler
-- QueryWorkflow gRPC handler
-- UpdateWorkflow gRPC handler
+### SDK examples working
 
-## What remains to be built
+- hello_world, message_passing, continue_as_new, child_workflows,
+  timers, schedules — all running against tokeirad
 
-### Remaining optional tests
+## Completion assessment
 
-Several completed features have optional tests that were
-skipped during implementation:
+| Plane | Estimate | Notes |
+|-------|----------|-------|
+| Compatibility Edge | ~85% | All handlers except eager dispatch. Proto field fidelity Features 1-4 done. |
+| Runtime & Storage | ~55% | Runtime complete for in-memory. DSQL storage not started. |
+| Projection | ~65% | Working against in-memory. SQL visibility (DSQL) not started. |
+| Platform / Ops | ~15% | Missing placement, autoscaling, telemetry, admin tooling. |
+| **Overall** | **~45%** | Core correctness works end-to-end. DSQL + ops are the remaining bulk. |
 
-- Feature 3 (Activity timeouts): 1 optional integration test
-- Feature 11 (Sweeper and recovery): 1 optional integration test
-- Feature 14 (Update lifecycle): 2 optional tests
-- Feature 15 (Broker fairness): 12 property tests
+## What to work on next (priority order)
 
-### Edge layer gaps
+### P0: DSQL Storage Layer
 
-The edge layer needs activity and advanced workflow gRPC
-endpoints. These are not covered by any existing spec:
+The single largest remaining work item. Everything else runs
+against InMemoryStore. Production requires Aurora DSQL.
 
-- `PollActivityTaskQueue` → `runtime.poll_activity_task`
-- `RespondActivityTaskCompleted` → `runtime.complete_activity_task`
-- `RespondActivityTaskFailed` → `runtime.fail_activity_task`
-- `RecordActivityTaskHeartbeat` → `runtime.record_activity_heartbeat`
-- `TerminateWorkflowExecution` → `runtime.terminate_workflow`
-- `RequestCancelWorkflowExecution` → `runtime.cancel_workflow`
-- `QueryWorkflow` → query dispatch (Feature 13)
-- `UpdateWorkflow` → update lifecycle (Feature 14)
+- Schema implementation (schema already designed in docs/dsql/)
+- DSQL plugin for tokeira-storage (connection reservoir already built)
+- Transaction mapping: one workflow transition = one DSQL transaction
+- OCC retry with DSQL conflict detection
+- Shard lease management via DynamoDB
+- Migration tooling
 
-The existing `grpc-edge-transport` spec could be extended,
-or new edge specs created for each endpoint group.
+**Why P0:** Nothing else matters for production without durable storage.
 
-### Projection plane
+### P1: Eager Dispatch (Feature 9)
 
-`tokeira-projection` is a stub (137 lines). The storage
-layer has `ProjectionLog` and `ProjectionRecord` types, and
-the kernel emits `ProjectionOp`s, but no projection sink or
-visibility query engine exists yet.
+Spec complete, ready for implementation. Eliminates a poll
+round-trip for workflow starts and activity scheduling.
 
-Work needed:
-- Projection sink that consumes `ProjectionOp`s and
-  materializes visibility rows
-- SQL visibility query planner
-- Page tokens for list queries
-- Rollup aggregations
+- Broker try_claim methods (targeted by run_key/activity_id)
+- PollerRegistry compatible-poller check
+- Eager WFT on StartWorkflowExecution
+- Eager activity tasks on RespondWorkflowTaskCompleted
+
+**Why P1:** Direct latency improvement. SDK expects it.
+
+### P1: SQL Visibility on DSQL
+
+The projection plane works against in-memory. Production needs
+DSQL-backed visibility.
+
+- SQL query planner for DSQL
+- Visibility table schema
+- Projection sink writing to DSQL
 - Search attribute indexing
 
-## The safest places to contribute next
+**Why P1:** ListWorkflowExecutions and CountWorkflowExecutions
+need durable visibility for production.
 
-### Add activity gRPC endpoints to `tokeira-edge`
+### P2: Connection Reservoir Integration
 
-The runtime already has `poll_activity_task`,
-`complete_activity_task`, `fail_activity_task`, and
-`record_activity_heartbeat`. The edge layer just needs gRPC
-handlers that translate proto ↔ internal types.
+The reservoir is already built (in temporal-dsql workspace).
+Needs integration with tokeira-storage's DSQL plugin.
 
-### Add advanced workflow gRPC endpoints to `tokeira-edge`
+- Wire reservoir into DSQL connection pool
+- Token bucket rate limiter integration
+- Slot block manager for distributed connection limiting
 
-The runtime now has `query_workflow`, `update_workflow`,
-`terminate_workflow`, and `cancel_workflow`. The edge layer
-needs gRPC handlers for these.
+**Why P2:** Required for DSQL at scale (10K connection limit).
 
-### Complete remaining optional tests
+### P2: Shard Placement and Membership
 
-Features 3, 11, 14, and 15 have optional tests that were
-skipped. These are safe, isolated contributions.
+Currently single-node with in-memory shard ownership. Production
+needs distributed shard assignment.
 
-### Extend `tokeira-projection`
+- DynamoDB-based shard lease table
+- Shard acquisition/relinquishment protocol
+- Multi-node membership discovery
+- Shard rebalancing on node join/leave
 
-The projection plane is independent of the runtime features.
-It consumes committed `ProjectionOp`s and materializes
-visibility rows. Safe to work on in parallel.
+**Why P2:** Required for horizontal scaling.
+
+### P3: Telemetry and Observability
+
+Metrics, tracing, and logging for production operations.
+
+- Prometheus metrics export
+- OpenTelemetry tracing integration
+- DSQL-specific metrics (conflicts, retries, latency)
+- Broker/scheduler/scanner operational metrics
+
+### P3: Archival to S3
+
+Deferred but needed for long-term history retention.
+
+- Archival service design
+- S3 sink for completed workflow histories
+- Archival configuration per namespace
+
+### P3: Remaining Proto Field Gaps
+
+Features 1-4 from the edge-complete-implementation umbrella
+are spec'd but some have remaining implementation work:
+
+- Feature 4 (Describe and Operational Responses) — pending fields
+- History serializer completeness for all event types
 
 ## Invariants to preserve
 
-- Never let transport or storage details leak into the
-  kernel.
+- Never let transport or storage details leak into the kernel.
 - Never make the projection path authoritative.
-- Never let pollers or waiters become durable correctness
-  objects.
+- Never let pollers or waiters become durable correctness objects.
 - Never assume a lane owns a run forever.
 - Never make inactivity expensive.
-- No state visible to the system unless explained by a
-  committed transition (010-history-as-authority).
-
-## TODO style
-
-The codebase uses rich TODO comments:
-
-- `TODO(correctness): ...`
-- `TODO(perf): ...`
-- `TODO(storage): ...`
-- `TODO(edge): ...`
-- `TODO(ops): ...`
-- `TODO(runtime): ...`
-
-Extend that convention instead of adding generic TODOs.
+- No state visible to the system unless explained by a committed
+  transition (010-history-as-authority).
 
 ## Spec structure
 
@@ -232,7 +224,18 @@ Each feature has a spec directory under `.kiro/specs/`:
   tasks.md          — implementation plan with checkpoints
 ```
 
-The master specs provide the dependency graph:
+Architecture decisions are recorded in:
+- `docs/architecture/005-decisions-and-boundaries.md`
 
-- `.kiro/specs/kernel-complete-implementation/requirements.md`
-- `.kiro/specs/runtime-complete-implementation/requirements.md`
+## TODO style
+
+The codebase uses rich TODO comments:
+
+- `TODO(correctness): ...`
+- `TODO(perf): ...`
+- `TODO(storage): ...`
+- `TODO(edge): ...`
+- `TODO(ops): ...`
+- `TODO(runtime): ...`
+
+Extend that convention instead of adding generic TODOs.

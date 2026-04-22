@@ -99,7 +99,7 @@ The table below maps every `RunRepository`, `ProjectionLog`, `LeaseRepository`, 
 
 ### DSQL Rust Connector
 
-The implementation SHALL use the official AWS DSQL Rust connector (`aurora-dsql-connectors/rust/sqlx`) from https://github.com/awslabs/aurora-dsql-connectors/tree/main/rust/sqlx as the database driver layer. This provides native sqlx integration with DSQL-specific IAM token authentication, connection lifecycle management, and compatibility with DSQL's PostgreSQL wire protocol. The temporal-dsql workspace's custom DSQL plugin approach is superseded by this official connector.
+The implementation SHALL evaluate the official AWS DSQL Rust connector (`aurora-dsql-connectors/rust/sqlx`) from https://github.com/awslabs/aurora-dsql-connectors/tree/main/rust/sqlx as the database driver layer. This provides native sqlx integration with DSQL-specific IAM token authentication and PostgreSQL wire protocol compatibility. The temporal-dsql workspace's connection lifecycle management (reservoir, token-refreshing driver, proactive expiry scanning, guard windows, in-flight semaphores) may still be needed as a layer above the official connector — the child spec for Feature 1 should evaluate what the official connector provides vs. what must be retained from the temporal-dsql implementation.
 
 ### Schema Analysis
 

@@ -174,14 +174,16 @@ The official `aurora-dsql-sqlx-connector` (v0.1.2) provides automatic IAM token 
 
 ### Requirement 9: Connection Rate Limiting
 
-**User Story:** As a Tokeira developer, I want connection creation rate-limited by a token-bucket algorithm, so that the node respects DSQL's cluster-wide 100 connections/second sustained rate and 1,000 burst capacity.
+**User Story:** As a Tokeira developer, I want connection creation rate-limited to respect DSQL's cluster-wide 100 connections/second sustained rate, so that a multi-node deployment does not exceed the cluster limit.
 
 #### Acceptance Criteria
 
-1. THE ConnectionDirector SHALL implement a Token_Bucket rate limiter for new connection creation with a configurable sustained rate (default 100 tokens/second) and burst capacity (default 1,000 tokens).
-2. WHEN a new connection needs to be created and no token is available, THE ConnectionDirector SHALL wait until a token becomes available rather than exceeding the rate limit.
-3. THE Token_Bucket SHALL refill at the configured sustained rate, allowing burst creation up to the burst capacity when tokens have accumulated.
-4. THE Token_Bucket parameters SHALL be configurable at startup to accommodate different cluster-wide budget allocations per node.
+1. THE ConnectionDirector SHALL implement a distributed rate limiter for new connection creation that coordinates across all nodes in the deployment to respect DSQL's cluster-wide 100 connections/second sustained rate and 1,000 burst capacity.
+2. WHEN a new connection needs to be created and the node's share of the cluster-wide budget is exhausted, THE ConnectionDirector SHALL wait until budget becomes available rather than exceeding the rate limit.
+3. THE distributed rate limiter SHALL divide the cluster-wide budget across active nodes, so that each node's local rate limit is approximately `cluster_rate / node_count`.
+4. THE distributed rate limiter SHALL use a coordination backend (e.g., DynamoDB-backed token bucket, as implemented in the temporal-dsql workspace) to track cluster-wide consumption and allocate per-node budgets.
+5. THE per-node budget allocation SHALL adapt dynamically as nodes join or leave the deployment, without requiring manual reconfiguration.
+6. FOR single-node deployments, THE rate limiter SHALL allocate the full cluster-wide budget to the single node.
 
 ### Requirement 10: Class-Based Connection Budget
 

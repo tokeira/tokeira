@@ -56,9 +56,9 @@ The implementation is organized into three phases:
 
 #### Acceptance Criteria
 
-1. WHEN `request_eager_execution` is `true` on a `StartWorkflowExecution` request, THE Edge_Layer SHALL check the WorkerRegistry for a registration matching the request's (identity, namespace, task_queue) combination.
-2. WHEN the WorkerRegistry contains a matching registration for the caller, THE Edge_Layer SHALL consider the caller a Compatible_Poller and proceed with eager dispatch.
-3. WHEN the WorkerRegistry does not contain a matching registration for the caller, THE Edge_Layer SHALL skip eager dispatch and return the response without an `eager_workflow_task` field.
+1. WHEN `request_eager_execution` is `true` on a `StartWorkflowExecution` request, THE Edge_Layer SHALL check the `PollerRegistry` for an active poller matching the request's (identity, namespace, task_queue) combination. The `PollerRegistry` is the authoritative source for active poll registrations — it is populated by the live long-poll path and cleaned up when polls complete or time out.
+2. WHEN the PollerRegistry contains a matching active poller for the caller, THE Edge_Layer SHALL consider the caller a Compatible_Poller and proceed with eager dispatch.
+3. WHEN the PollerRegistry does not contain a matching active poller for the caller, THE Edge_Layer SHALL skip eager dispatch and return the response without an `eager_workflow_task` field.
 
 ### Requirement 3: Eager Workflow Task Claim and Return
 
@@ -130,27 +130,27 @@ The implementation is organized into three phases:
 
 ## Phase 3: Broker Coordination
 
-### Requirement 9: InMemoryBroker Atomic Claim for Workflow Tasks
+### Requirement 9: InMemoryBroker Targeted Claim for Workflow Tasks
 
-**User Story:** As a Tokeira developer, I want the InMemoryBroker to support an atomic claim operation that removes a specific workflow task from the ready queue without blocking, so that the eager dispatch path can claim a just-published task before any poller takes it.
+**User Story:** As a Tokeira developer, I want the InMemoryBroker to support a targeted claim operation that removes a specific workflow task (identified by run_key) from the ready queue without blocking, so that the eager dispatch path claims the just-started workflow's task and not an unrelated workflow's task.
 
 #### Acceptance Criteria
 
-1. THE InMemoryBroker SHALL expose a `try_claim_workflow_task` method that accepts a `QueueKey` and attempts to remove the next available workflow task from the general ready queue.
-2. WHEN a task is available in the general ready queue for the specified `QueueKey`, THE `try_claim_workflow_task` method SHALL remove and return the task atomically (within a single lock acquisition).
-3. WHEN no task is available in the general ready queue, THE `try_claim_workflow_task` method SHALL return `None` without blocking.
+1. THE InMemoryBroker SHALL expose a `try_claim_workflow_task` method that accepts a `QueueKey` and a `RunKey`, and attempts to remove the workflow task matching that `RunKey` from the general ready queue.
+2. WHEN a task matching the specified `RunKey` is available in the general ready queue for the specified `QueueKey`, THE `try_claim_workflow_task` method SHALL remove and return the task atomically (within a single lock acquisition).
+3. WHEN no task matching the specified `RunKey` is available in the general ready queue, THE `try_claim_workflow_task` method SHALL return `None` without blocking.
 4. THE `try_claim_workflow_task` method SHALL remove the task from the deduplication set (`enqueued`) so that the task is not delivered again via normal polling.
 5. THE `try_claim_workflow_task` method SHALL NOT wake any waiting pollers (the task is being claimed, not published).
 
-### Requirement 10: InMemoryActivityBroker Atomic Claim for Activity Tasks
+### Requirement 10: InMemoryActivityBroker Targeted Claim for Activity Tasks
 
-**User Story:** As a Tokeira developer, I want the InMemoryActivityBroker to support an atomic claim operation that removes activity tasks from the ready queue without blocking, so that the eager dispatch path can claim just-published activity tasks before any poller takes them.
+**User Story:** As a Tokeira developer, I want the InMemoryActivityBroker to support a targeted claim operation that removes a specific activity task (identified by run_key and activity_id) from the ready queue without blocking, so that the eager dispatch path claims the just-scheduled activity and not an unrelated activity.
 
 #### Acceptance Criteria
 
-1. THE InMemoryActivityBroker SHALL expose a `try_claim_activity_task` method that accepts a `QueueKey` and attempts to remove the next available activity task from the ready queue.
-2. WHEN a task is available in the ready queue for the specified `QueueKey`, THE `try_claim_activity_task` method SHALL remove and return the task atomically (within a single lock acquisition).
-3. WHEN no task is available in the ready queue, THE `try_claim_activity_task` method SHALL return `None` without blocking.
+1. THE InMemoryActivityBroker SHALL expose a `try_claim_activity_task` method that accepts a `QueueKey`, a `RunKey`, and an `activity_id: &str`, and attempts to remove the activity task matching that `(RunKey, activity_id)` from the ready queue.
+2. WHEN a task matching the specified `(RunKey, activity_id)` is available in the ready queue for the specified `QueueKey`, THE `try_claim_activity_task` method SHALL remove and return the task atomically (within a single lock acquisition).
+3. WHEN no task matching the specified `(RunKey, activity_id)` is available in the ready queue, THE `try_claim_activity_task` method SHALL return `None` without blocking.
 4. THE `try_claim_activity_task` method SHALL remove the task from the deduplication set (`enqueued`) so that the task is not delivered again via normal polling.
 5. THE `try_claim_activity_task` method SHALL NOT wake any waiting pollers.
 

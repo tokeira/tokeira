@@ -58,56 +58,61 @@ Two new public methods on existing structs:
 
 ```rust
 impl InMemoryBroker {
-    /// Non-blocking claim of the next general-tier workflow task for `queue`.
-    /// Returns `None` if the queue is empty. Removes the task from the
-    /// deduplication set so it cannot be delivered again via normal polling.
+    /// Targeted non-blocking claim of a specific workflow task by run_key.
+    /// Scans the general-tier ready queue for `queue` and removes the task
+    /// matching `run_key`. Returns `None` if no matching task is found.
+    /// Removes the task from the deduplication set.
     /// Does not wake any waiting pollers.
     pub async fn try_claim_workflow_task(
         &self,
         queue: &QueueKey,
+        run_key: RunKey,
     ) -> Option<DispatchableWorkflowTask>;
 }
 
 impl InMemoryActivityBroker {
-    /// Non-blocking claim of the next activity task for `queue`.
-    /// Returns `None` if the queue is empty. Removes the task from the
-    /// deduplication set so it cannot be delivered again via normal polling.
+    /// Targeted non-blocking claim of a specific activity task by
+    /// (run_key, activity_id). Scans the ready queue for `queue` and
+    /// removes the task matching the identity. Returns `None` if no
+    /// matching task is found. Removes from dedup set.
     /// Does not wake any waiting pollers.
     pub async fn try_claim_activity_task(
         &self,
         queue: &QueueKey,
+        run_key: RunKey,
+        activity_id: &str,
     ) -> Option<DispatchableActivityTask>;
 }
 ```
 
-Both follow the same pattern as the existing `try_take` private methods but skip sticky-tier logic (eager claims target the general tier only) and skip the worker-deny check (the caller has already been validated as a compatible poller).
+Both scan the `VecDeque` for the matching task (by `run_key` for WFT, by `(run_key, activity_id)` for activities), remove it with `VecDeque::remove`, and clear the dedup entry. This is O(n) in queue depth but eager dispatch is a latency optimization on the fast path — the queue is typically short (just-published task is at the front or near it).
 
-### Worker Registry Check (`tokeira-runtime/src/worker_registry.rs`)
+### Compatible Poller Check (`tokeira-edge/src/poller_registry.rs`)
 
-A new method on `WorkerRegistry`:
+The existing `PollerRegistry` already tracks active pollers by `QueueKey` with RAII-based `PollerGuard` cleanup. A new convenience method:
 
 ```rust
-impl WorkerRegistry {
-    /// Returns true if a worker with the given identity is registered
-    /// on the specified (namespace, task_queue) combination.
-    pub fn is_compatible_poller(
+impl PollerRegistry {
+    /// Returns true if any active poller with the given identity is
+    /// registered on the specified queue. Used by the eager WFT path
+    /// to verify the caller is actually polling on the workflow's queue.
+    pub fn has_active_poller(
         &self,
+        queue: &QueueKey,
         worker_identity: &WorkerIdentity,
-        namespace_id: NamespaceId,
-        task_queue: &TaskQueueName,
     ) -> bool;
 }
 ```
 
-This is a simple `HashMap::contains_key` check on the existing `inner` map using a `WorkerRegistrationKey`.
+This iterates the `pollers(queue)` list and checks if any entry's `identity` matches. The `PollerRegistry` is the authoritative source for active poll registrations — it is populated by the live long-poll path and cleaned up when polls complete or time out. `WorkerRegistry` is NOT used for this check because it tracks version/build metadata, not active poll liveness.
 
 ### Edge Layer — Start Handler (`tokeira-edge/src/workflow_service.rs`)
 
 `start_workflow_execution` gains an eager dispatch tail after the `Started` branch:
 
 1. Check `request_eager_execution` flag on the request.
-2. If true, call `worker_registry.is_compatible_poller(identity, namespace_id, task_queue)`.
-3. If compatible, call `broker.try_claim_workflow_task(&queue_key)`.
+2. If true, call `self.poller_registry.has_active_poller(&queue_key, &identity)`.
+3. If compatible, call `self.broker.try_claim_workflow_task(&queue_key, run_key)` — targeted by the just-started workflow's `run_key`.
 4. If claimed, build a `PollWorkflowTaskQueueResponse` using `from_internal::poll_response` (same path as normal polling) and attach it to the response.
 
 ### Edge Layer — Complete Handler (`tokeira-edge/src/workflow_service.rs`)
@@ -115,7 +120,7 @@ This is a simple `HashMap::contains_key` check on the existing `inner` map using
 `respond_workflow_task_completed` gains an eager activity dispatch tail after the commit:
 
 1. Collect eager-eligible activity commands (those with `request_eager_execution=true`).
-2. For each eligible command (up to the configured max), call `activity_broker.try_claim_activity_task(&queue_key)`.
+2. For each eligible command (up to the configured max), call `activity_broker.try_claim_activity_task(&queue_key, run_key, &activity_id)` — targeted by the specific activity's identity.
 3. For each claimed task, build a `PollActivityTaskQueueResponse` using `from_internal::poll_activity_response` (same path as normal polling).
 4. Attach the list to the response.
 
@@ -200,19 +205,19 @@ No new storage tables or persistent state. The broker's in-memory `HashMap<Queue
 
 ### Property 2: Compatible poller lookup correctness
 
-*For any* `WorkerRegistrationKey` (worker_identity, namespace_id, task_queue), `is_compatible_poller` SHALL return `true` if and only if the key has been registered in the `WorkerRegistry`.
+*For any* `(QueueKey, WorkerIdentity)` pair, `PollerRegistry::has_active_poller` SHALL return `true` if and only if an active poller with that identity is currently registered on that queue (via a live `PollerGuard`).
 
 **Validates: Requirements 2.2, 2.3**
 
-### Property 3: Workflow broker try_claim correctness
+### Property 3: Workflow broker targeted claim correctness
 
-*For any* sequence of workflow tasks published to the `InMemoryBroker` on a given `QueueKey`, calling `try_claim_workflow_task` SHALL return `Some(task)` when the general ready queue is non-empty (removing the task from both the ready queue and the deduplication set), and SHALL return `None` without blocking when the queue is empty.
+*For any* sequence of workflow tasks published to the `InMemoryBroker` on a given `QueueKey`, calling `try_claim_workflow_task(queue, run_key)` SHALL return `Some(task)` only when a task matching that `run_key` exists in the general ready queue (removing it from both the ready queue and the deduplication set), and SHALL return `None` without blocking when no matching task exists. Tasks for other `run_key` values SHALL remain in the queue.
 
 **Validates: Requirements 9.1, 9.2, 9.3, 9.4**
 
-### Property 4: Activity broker try_claim correctness
+### Property 4: Activity broker targeted claim correctness
 
-*For any* sequence of activity tasks published to the `InMemoryActivityBroker` on a given `QueueKey`, calling `try_claim_activity_task` SHALL return `Some(task)` when the ready queue is non-empty (removing the task from both the ready queue and the deduplication set), and SHALL return `None` without blocking when the queue is empty.
+*For any* sequence of activity tasks published to the `InMemoryActivityBroker` on a given `QueueKey`, calling `try_claim_activity_task(queue, run_key, activity_id)` SHALL return `Some(task)` only when a task matching that `(run_key, activity_id)` exists in the ready queue (removing it from both the ready queue and the deduplication set), and SHALL return `None` without blocking when no matching task exists. Tasks for other identities SHALL remain in the queue.
 
 **Validates: Requirements 10.1, 10.2, 10.3, 10.4**
 

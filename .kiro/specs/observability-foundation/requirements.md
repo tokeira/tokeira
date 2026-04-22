@@ -79,7 +79,7 @@ The authoritative architecture documents are [005-decisions-and-boundaries](../.
 
 #### Acceptance Criteria
 
-1. THE Metrics_Registry SHALL enforce the naming pattern `tokeira_{crate}_{subsystem}_{metric}_{unit}` for all metrics (e.g., `tokeira_runtime_broker_publish_total`, `tokeira_edge_grpc_request_duration_seconds`).
+1. THE Metrics_Registry SHALL follow the naming pattern `tokeira_{crate}_{subsystem}_{metric}_{unit}` for all metrics (e.g., `tokeira_runtime_broker_publish_total`, `tokeira_edge_grpc_request_duration_seconds`). Each crate's `metrics.rs` SHALL export a `METRIC_NAMES` manifest that is validated against this convention in tests.
 2. THE Metrics_Registry SHALL use `_total` suffix for counters, `_seconds` suffix for duration histograms, and `_bytes` suffix for size histograms.
 3. THE Metrics_Registry SHALL define standard label names: `namespace` for the Temporal namespace, `task_queue` for the task queue name, `operation` for the operation type, and `status` for success/failure outcome.
 4. THE Metrics_Registry SHALL document histogram bucket boundaries for latency metrics: `[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]` seconds.
@@ -200,7 +200,7 @@ The authoritative architecture documents are [005-decisions-and-boundaries](../.
 1. WHEN a gRPC request arrives with `traceparent` and `tracestate` metadata headers, THE Edge SHALL extract the W3C Trace Context and create a child span linked to the incoming trace.
 2. WHEN a gRPC request arrives without trace context headers, THE Edge SHALL create a new root span for the request.
 3. THE Edge SHALL attach the `namespace`, `workflow_id`, and `method` as span attributes on every gRPC handler span.
-4. WHEN the Edge makes outgoing gRPC calls (e.g., Nexus HTTP dispatch), THE Edge SHALL inject the current trace context into outgoing request headers.
+4. WHEN the Runtime makes outgoing HTTP calls via `NexusHttpClient` (Nexus operation dispatch), THE Runtime SHALL inject the current trace context into outgoing request headers. This injection happens at the `NexusHttpClient` boundary in `tokeira-runtime`, not in the edge layer, because Nexus HTTP dispatch is performed by `RuntimeDispatchPublisher`.
 
 ### Requirement 3.3: Span Conventions
 
@@ -256,5 +256,5 @@ The authoritative architecture documents are [005-decisions-and-boundaries](../.
 #### Acceptance Criteria
 
 1. THE Logging_Layer SHALL support per-module log level configuration via the `RUST_LOG` environment variable using `tracing_subscriber::EnvFilter` syntax (e.g., `tokeira_runtime=debug,tokeira_edge=info`).
-2. THE Logging_Layer SHALL support runtime log level changes via a reload handle, so that operators can adjust verbosity without restarting the process.
+2. THE Logging_Layer SHALL support runtime log level changes via a reload handle exposed through the Prometheus HTTP server as a `PUT /loglevel` endpoint. The endpoint accepts a `RUST_LOG`-compatible filter string in the request body and applies it via the `ReloadHandle`. This gives operators a concrete control surface without requiring process restart.
 3. THE Logging_Layer SHALL default to `info` level for all Tokeira crates when `RUST_LOG` is not set.

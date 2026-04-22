@@ -77,6 +77,16 @@ Establish Tokeira's cross-cutting observability infrastructure in 4 phases: metr
     - Remove `DeliveryMetrics` and `DeliveryMetricsInner` structs after wiring the parallel snapshot
     - _Requirements: 2.7.1, 2.7.2, 2.7.3_
 
+  - [ ] 3.6 Wire metric recording into existing subsystems
+    - **Runtime broker:** Add `metrics.rs` calls to `InMemoryBroker::publish_workflow_task`, `poll_workflow_task` (sync match / timeout paths), and `InMemoryActivityBroker` equivalents. Add queue depth gauge updates after publish/poll.
+    - **Runtime lanes:** Add `record_lane_submit_duration` around `lane.submit()` in `runtime.rs`. Add `record_occ_retry` in the OCC retry loop in `lane.rs`.
+    - **Runtime scanners:** Add `record_scanner_tick` and `record_scanner_dispatched` in `run_timer_scanner`, `run_wft_timeout_scanner`, `run_activity_timeout_scanner`, `run_nexus_timeout_scanner`, `run_workflow_timeout_scanner`.
+    - **Runtime kernel metrics:** Add `record_transition_committed`, `record_events_emitted`, `record_commands_processed` after `kernel.apply()` returns in `lane.rs` (the runtime sees every transition result — the kernel stays pure).
+    - **Edge gRPC:** Add a tonic interceptor or per-handler wrapper that records `record_grpc_request`, `record_grpc_request_duration`, `record_grpc_error`, and `set_grpc_active_requests` for every handler in `workflow_service.rs`.
+    - **Storage:** Add `record_commit_transition_duration`, `record_load_run_duration`, `record_read_history_duration`, `record_storage_operation` in `InMemoryStore` methods (and later in `DsqlStore`).
+    - **Projection:** Add `record_records_processed`, `set_projection_lag`, `record_sink_write_duration`, `record_sink_error` in the projection worker and visibility sink.
+    - _Requirements: 2.1.1, 2.1.2, 2.1.3, 2.2.1, 2.2.2, 2.2.3, 2.2.4, 2.2.5, 2.3.1, 2.3.2, 2.3.3, 2.3.4, 2.4.1, 2.4.2, 2.4.3, 2.4.4, 2.5.1, 2.5.2, 2.5.3, 2.5.4, 2.6.1, 2.6.2, 2.6.3, 2.6.4_
+
   - [ ]* 3.6 Write property test for metric accounting accuracy
     - **Property 2: Metric accounting accuracy**
     - Generate random sequences of (operation_type, count) pairs; install a test recorder; replay the sequence; assert counters equal sum of increments, gauges equal last set value, histograms contain exactly N observations
@@ -92,7 +102,8 @@ Establish Tokeira's cross-cutting observability infrastructure in 4 phases: metr
   - [ ]* 3.8 Write unit tests for Phase 2 metrics modules
     - Test each recording helper emits the correct metric name and labels using a test recorder
     - Test `DeliveryMetrics` removal compiles cleanly and fairness control loop tests still pass
-    - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7_
+    - Add a per-crate metric manifest test: each crate's `metrics.rs` exports a `METRIC_NAMES` constant array; a test iterates the array and calls `validate_metric_name` on each entry, failing if any name violates the convention. This ensures naming enforcement is not just tested in isolation but applied to every actual metric definition.
+    - _Requirements: 1.3.1, 1.3.2, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7_
 
 - [ ] 4. Checkpoint — Ensure all Phase 2 tests pass
   - Ensure all tests pass, ask the user if questions arise.
@@ -141,18 +152,19 @@ Establish Tokeira's cross-cutting observability infrastructure in 4 phases: metr
   - Ensure all tests pass, ask the user if questions arise.
 
 - [ ] 7. Phase 4 — Structured Logging Enhancements
-  - [ ] 7.1 Create `apps/tokeirad/src/correlation_layer.rs` — correlation ID layer
-    - Implement a custom `tracing_subscriber::Layer` that reads the current OpenTelemetry span context and injects `trace_id` and `span_id` fields into log records
-    - When no span context is active, omit `trace_id` and `span_id` fields
-    - Ensure correlation IDs appear in both text and JSON log formats
-    - Wire the correlation layer into the subscriber stack in `observability.rs`
+  - [ ] 7.1 Create `apps/tokeirad/src/correlation_format.rs` — correlation ID formatter
+    - Implement a custom `FormatEvent` wrapper that reads the current OpenTelemetry span context from span extensions and prepends `trace_id` and `span_id` fields to each log record
+    - For text format: prepend `trace_id=... span_id=...` before the standard format output
+    - For JSON format: emit `trace_id` and `span_id` as JSON fields within the record object
+    - When no span context is active, omit `trace_id` and `span_id` fields entirely
+    - Wire the correlation formatter into the subscriber stack in `observability.rs` by wrapping the `fmt` layer's event formatter
     - _Requirements: 4.1.1, 4.1.2, 4.1.3_
 
   - [ ] 7.2 Add JSON log format support and per-module log levels
     - In `install_tracing()`, select `fmt::layer().json()` when `log_format` is `Json`, otherwise use default text format
     - Ensure JSON output emits each record as a single JSON object with fields: `timestamp`, `level`, `target`, `message`, `trace_id`, `span_id`, plus structured span fields
     - Wire `EnvFilter` with `RUST_LOG` support and default to `info` when unset
-    - Expose the `ReloadHandle` for runtime log level changes without process restart
+    - Expose the `ReloadHandle` through a `PUT /loglevel` endpoint on the Prometheus HTTP server. The endpoint accepts a `RUST_LOG`-compatible filter string in the request body and applies it via the reload handle. This gives operators a concrete control surface for runtime log level changes.
     - _Requirements: 4.2.1, 4.2.2, 4.2.3, 4.3.1, 4.3.2, 4.3.3_
 
   - [ ]* 7.3 Write property test for JSON log record validity

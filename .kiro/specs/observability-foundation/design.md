@@ -201,24 +201,45 @@ pub fn extract_trace_context(metadata: &MetadataMap) -> Option<SpanContext> {
 }
 ```
 
-For outgoing calls (Nexus HTTP dispatch), the interceptor injects the current span context into outgoing headers using the same propagator.
+For outgoing calls (Nexus HTTP dispatch), the `NexusHttpClient` implementation in `tokeira-runtime` injects the current span context into outgoing HTTP headers using the same propagator. This happens at the runtime boundary, not in the edge layer, because Nexus HTTP dispatch is performed by `RuntimeDispatchPublisher`.
 
-### 5. Correlation ID Layer
+### 5. Correlation ID Formatting
 
-A custom `tracing_subscriber::Layer` implementation reads the current OpenTelemetry span context and injects `trace_id` and `span_id` as fields into log records. When no span context is active, the fields are omitted.
+Correlation IDs are injected via a custom `FormatEvent` implementation (not a `Layer::on_event` override, which cannot mutate event fields). The custom formatter wraps the standard `fmt::format::Full` or `fmt::format::Json` formatter and prepends `trace_id` and `span_id` fields by reading the current OpenTelemetry span context from the span extensions.
 
 ```rust
-// tokeirad/src/correlation_layer.rs
-impl<S: Subscriber> Layer<S> for CorrelationIdLayer {
-    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+// tokeirad/src/correlation_format.rs
+use tracing_subscriber::fmt::FormatEvent;
+
+pub struct CorrelationFormat<F> {
+    inner: F,
+}
+
+impl<S, N, F> FormatEvent<S, N> for CorrelationFormat<F>
+where
+    F: FormatEvent<S, N>,
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: format::Writer<'_>,
+        event: &Event<'_>,
+    ) -> fmt::Result {
+        // Read OtelData from the current span's extensions
+        // If present, write trace_id and span_id before delegating to inner
         if let Some(span_ref) = ctx.lookup_current() {
             if let Some(otel_data) = span_ref.extensions().get::<OtelData>() {
-                // Attach trace_id and span_id to the event's field set
+                write!(writer, "trace_id={} span_id={} ", otel_data.trace_id, otel_data.span_id)?;
             }
         }
+        self.inner.format_event(ctx, writer, event)
     }
 }
 ```
+
+For JSON output, the custom formatter emits `trace_id` and `span_id` as JSON fields within the record object. When no span context is active, the fields are omitted entirely.
 
 ### 6. DeliveryMetrics Migration
 

@@ -73,6 +73,8 @@ All WorkflowService gRPC handlers implemented:
 - ShutdownWorker
 - PollNexusTaskQueue (broker + worker-targeted dispatch)
 - RespondNexusTaskCompleted, RespondNexusTaskFailed
+- Eager workflow task on StartWorkflowExecution
+- Eager activity tasks on RespondWorkflowTaskCompleted
 
 **Returning UNIMPLEMENTED (documented):**
 - Legacy versioning (UpdateWorkerBuildIdCompatibility, GetWorkerBuildIdCompatibility)
@@ -84,7 +86,7 @@ All WorkflowService gRPC handlers implemented:
 - Activity/WF options (5 handlers)
 
 **Not yet implemented (spec'd, ready for implementation):**
-- Eager dispatch (Feature 9) — spec complete
+- *(none — all spec'd features are now implemented)*
 
 ### Projection — working
 
@@ -107,7 +109,7 @@ worker — all working against InMemoryVisibilityStore. 30 tests.
 
 | Plane | Estimate | Notes |
 |-------|----------|-------|
-| Compatibility Edge | ~85% | All handlers except eager dispatch. Proto field fidelity Features 1-4 done. |
+| Compatibility Edge | ~90% | All handlers implemented including eager dispatch. Proto field fidelity Features 1-4 done. |
 | Runtime & Storage | ~55% | Runtime complete for in-memory. DSQL storage not started. |
 | Projection | ~65% | Working against in-memory. SQL visibility (DSQL) not started. |
 | Platform / Ops | ~15% | Missing placement, autoscaling, telemetry, admin tooling. |
@@ -128,18 +130,6 @@ against InMemoryStore. Production requires Aurora DSQL.
 - Migration tooling
 
 **Why P0:** Nothing else matters for production without durable storage.
-
-### P1: Eager Dispatch (Feature 9)
-
-Spec complete, ready for implementation. Eliminates a poll
-round-trip for workflow starts and activity scheduling.
-
-- Broker try_claim methods (targeted by run_key/activity_id)
-- PollerRegistry compatible-poller check
-- Eager WFT on StartWorkflowExecution
-- Eager activity tasks on RespondWorkflowTaskCompleted
-
-**Why P1:** Direct latency improvement. SDK expects it.
 
 ### P1: SQL Visibility on DSQL
 

@@ -122,27 +122,33 @@ Establish Tokeira's cross-cutting observability infrastructure in 4 phases: metr
     - Spawn the Prometheus HTTP server task after recorder installation
     - _Requirements: 1.1.4, 3.1.2_
 
-  - [ ] 5.3 Create `crates/tokeira-edge/src/grpc/tracing_interceptor.rs` — W3C trace context extraction
+  - [ ] 5.3 Create `crates/tokeira-edge/src/grpc/tracing_interceptor.rs` — inbound W3C trace context extraction
     - Implement `extract_trace_context()` using `TraceContextPropagator` to extract `traceparent`/`tracestate` from gRPC `MetadataMap`
     - Create a child span linked to the incoming trace when context is present; create a new root span when absent
-    - Attach `namespace`, `workflow_id`, `method` as span attributes on every gRPC handler span
-    - Implement trace context injection for outgoing calls (Nexus HTTP dispatch)
-    - _Requirements: 3.2.1, 3.2.2, 3.2.3, 3.2.4_
+    - Attach `method` as a span attribute on every gRPC handler span. Attach `namespace` when present in the request. Attach `workflow_id` only when the request semantically identifies a workflow execution (not on poll, list, count, or operator endpoints).
+    - This task covers INBOUND gRPC extraction only
+    - _Requirements: 3.2.1, 3.2.2, 3.2.3_
 
-  - [ ] 5.4 Add span instrumentation following naming conventions
+  - [ ] 5.4 Add outgoing trace context injection to `NexusHttpClient` in `crates/tokeira-runtime`
+    - In the `NexusHttpClient` implementation, inject the current span context into outgoing HTTP request headers using `TraceContextPropagator`
+    - This happens at the runtime/NexusHttpClient boundary because Nexus HTTP dispatch is performed by `RuntimeDispatchPublisher`, not the edge layer
+    - Add `opentelemetry` and `opentelemetry-sdk` as dependencies of `tokeira-runtime` for propagation only (no exporter)
+    - _Requirements: 3.2.4_
+
+  - [ ] 5.5 Add span instrumentation following naming conventions
     - Edge: one span per gRPC handler named `grpc.{method}`
     - Runtime: one span per kernel transition named `kernel.transition` with attributes `command_type`, `run_key`, `transition_seq`
     - Storage: one span per storage operation named `storage.{operation}`
     - Ensure span hierarchy follows `grpc.{method}` → `kernel.transition` → `storage.{operation}`
     - _Requirements: 3.3.1, 3.3.2, 3.3.3, 3.3.4_
 
-  - [ ]* 5.5 Write property test for W3C trace context round-trip
+  - [ ]* 5.6 Write property test for W3C trace context round-trip
     - **Property 4: W3C trace context extraction round-trip**
     - Generate random 16-byte trace IDs, 8-byte span IDs, and flag bytes; format as `traceparent`; extract via `extract_trace_context`; re-inject via `TraceContextPropagator`; assert trace ID and span ID are preserved
     - Use `proptest` crate, minimum 100 iterations
     - **Validates: Requirements 3.2.1**
 
-  - [ ]* 5.6 Write unit tests for Phase 3
+  - [ ]* 5.7 Write unit tests for Phase 3
     - Test OTLP layer is not installed when `otlp_enabled = false`
     - Test root span creation when no `traceparent` header is present
     - Test span names match `grpc.{method}`, `kernel.transition`, `storage.{operation}` conventions

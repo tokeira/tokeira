@@ -50,7 +50,7 @@ Only `tokeirad` depends on exporter crates. Library crates depend only on the re
 
 | Crate | New dependencies |
 |---|---|
-| `tokeira-kernel` | `metrics` (recording API only) |
+| `tokeira-kernel` | *(none — kernel stays pure; metrics recorded by runtime after apply)* |
 | `tokeira-runtime` | `metrics` |
 | `tokeira-storage` | `metrics`, `tracing` (already present) |
 | `tokeira-edge` | `metrics`, `tracing` (already present), `opentelemetry` (for trace context extraction) |

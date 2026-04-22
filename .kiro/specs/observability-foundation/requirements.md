@@ -106,9 +106,9 @@ The authoritative architecture documents are [005-decisions-and-boundaries](../.
 
 #### Acceptance Criteria
 
-1. WHEN the Kernel completes a transition, THE Kernel SHALL increment `tokeira_kernel_transition_committed_total` with labels `namespace` and `command_type`.
-2. WHEN the Kernel emits history events, THE Kernel SHALL increment `tokeira_kernel_events_emitted_total` by the number of events, with label `event_type`.
-3. WHEN the Kernel processes a command, THE Kernel SHALL increment `tokeira_kernel_commands_processed_total` with label `command_type`.
+1. WHEN the Runtime observes a committed transition (after `kernel.apply()` returns in the lane), THE Runtime SHALL increment `tokeira_kernel_transition_committed_total` with labels `namespace` and `command_type`. The kernel itself stays pure and does not record metrics — the runtime is the observation point.
+2. WHEN the Runtime observes emitted history events in a committed transition, THE Runtime SHALL increment `tokeira_kernel_events_emitted_total` by the number of events, with label `event_type`.
+3. WHEN the Runtime observes a processed command in a committed transition, THE Runtime SHALL increment `tokeira_kernel_commands_processed_total` with label `command_type`.
 
 ### Requirement 2.2: Runtime Broker Metrics
 
@@ -199,7 +199,7 @@ The authoritative architecture documents are [005-decisions-and-boundaries](../.
 
 1. WHEN a gRPC request arrives with `traceparent` and `tracestate` metadata headers, THE Edge SHALL extract the W3C Trace Context and create a child span linked to the incoming trace.
 2. WHEN a gRPC request arrives without trace context headers, THE Edge SHALL create a new root span for the request.
-3. THE Edge SHALL attach the `namespace`, `workflow_id`, and `method` as span attributes on every gRPC handler span.
+3. THE Edge SHALL attach `method` as a span attribute on every gRPC handler span. THE Edge SHALL attach `namespace` when the request includes a namespace field. THE Edge SHALL attach `workflow_id` only when the request semantically identifies a specific workflow execution (e.g., `StartWorkflowExecution`, `SignalWorkflowExecution`, `DescribeWorkflowExecution`), NOT on poll, list, count, or operator endpoints where no workflow ID is present.
 4. WHEN the Runtime makes outgoing HTTP calls via `NexusHttpClient` (Nexus operation dispatch), THE Runtime SHALL inject the current trace context into outgoing request headers. This injection happens at the `NexusHttpClient` boundary in `tokeira-runtime`, not in the edge layer, because Nexus HTTP dispatch is performed by `RuntimeDispatchPublisher`.
 
 ### Requirement 3.3: Span Conventions

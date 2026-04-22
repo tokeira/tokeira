@@ -6,6 +6,7 @@
 //! timer behavior, or task durability, that change almost certainly belongs in
 //! `tokeira-kernel`, `tokeira-runtime`, or `tokeira-storage` instead.
 
+pub mod batch_engine;
 pub mod errors;
 pub mod grpc;
 pub mod health_service;
@@ -22,6 +23,7 @@ pub mod routing;
 pub mod translate;
 pub mod workflow_service;
 
+pub use batch_engine::*;
 pub use errors::*;
 pub use grpc::*;
 pub use health_service::*;

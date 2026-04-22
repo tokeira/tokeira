@@ -50,6 +50,12 @@ pub enum EdgeError {
         run_id: String,
     },
 
+    #[error("batch operation already exists: {namespace}/{job_id}")]
+    BatchOperationAlreadyExists { namespace: String, job_id: String },
+
+    #[error("batch operation not found: {namespace}/{job_id}")]
+    BatchOperationNotFound { namespace: String, job_id: String },
+
     #[error("too many concurrent long polls")]
     TooManyLongPolls,
 
@@ -75,10 +81,11 @@ impl EdgeError {
             EdgeError::BadRequest(_) => StatusCode::BAD_REQUEST,
             EdgeError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             EdgeError::Forbidden { .. } => StatusCode::FORBIDDEN,
-            EdgeError::NamespaceNotFound(_) | EdgeError::WorkflowNotFound { .. } => {
-                StatusCode::NOT_FOUND
-            }
-            EdgeError::WorkflowAlreadyStarted { .. } => StatusCode::CONFLICT,
+            EdgeError::NamespaceNotFound(_)
+            | EdgeError::WorkflowNotFound { .. }
+            | EdgeError::BatchOperationNotFound { .. } => StatusCode::NOT_FOUND,
+            EdgeError::WorkflowAlreadyStarted { .. }
+            | EdgeError::BatchOperationAlreadyExists { .. } => StatusCode::CONFLICT,
             EdgeError::NamespaceDeleted(_) => StatusCode::GONE,
             EdgeError::NamespaceAlreadyExists(_) => StatusCode::CONFLICT,
             EdgeError::TooManyLongPolls => StatusCode::TOO_MANY_REQUESTS,
@@ -98,6 +105,10 @@ impl EdgeError {
             EdgeError::NamespaceAlreadyExists(_) => "namespace_already_exists",
             EdgeError::WorkflowNotFound { .. } => "workflow_not_found",
             EdgeError::WorkflowAlreadyStarted { .. } => "workflow_already_started",
+            EdgeError::BatchOperationAlreadyExists { .. } => {
+                "batch_operation_already_exists"
+            }
+            EdgeError::BatchOperationNotFound { .. } => "batch_operation_not_found",
             EdgeError::TooManyLongPolls => "too_many_long_polls",
             EdgeError::LongPollAdmissionTimeout => "long_poll_admission_timeout",
             EdgeError::RemoteRouteUnsupported { .. } => "remote_route_unsupported",

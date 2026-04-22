@@ -190,7 +190,7 @@ pub(crate) async fn run_workflow_timeout_scanner(
                 Some(shard_id),
                 &config,
                 |entry, violation, now| {
-                    let lane = pick_lane(&lanes, lane_count, entry.run_key).clone();
+                    let lane = pick_lane(&lanes, lane_count, entry.shard_id).clone();
                     async move {
                         lane.submit(
                             entry.run_key,

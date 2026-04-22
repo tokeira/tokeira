@@ -9,6 +9,7 @@
 
 pub mod activity_timeout;
 pub mod backlog;
+pub mod batch;
 pub mod broker;
 pub mod buffered_queries;
 pub mod fairness;
@@ -31,6 +32,7 @@ pub mod worker_registry;
 
 pub use activity_timeout::*;
 pub use backlog::*;
+pub use batch::*;
 pub use broker::*;
 pub use buffered_queries::*;
 pub use fairness::*;

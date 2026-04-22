@@ -3,8 +3,8 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use tokeira_kernel::{
-    CancelRequest, LoadedRun, ResetRequest, SignalRequest, StartRequest,
-    TerminateRequest, WorkflowTaskCompletedRequest,
+    CancelRequest, LoadedRun, NexusResolution, ResetRequest, SignalRequest,
+    StartRequest, TerminateRequest, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
     PendingUpdateTransport, QueryResult, ResetWorkflowResult, SignalWithStartResult,
@@ -210,6 +210,23 @@ where
             .runtime
             .update_registry()
             .peek_update_info(run_key, &update_id))
+    }
+
+    async fn resolve_nexus_operation(
+        &self,
+        run_key: tokeira_types::RunKey,
+        operation_id: String,
+        scheduled_event_id: i64,
+        resolution: NexusResolution,
+    ) -> Result<bool> {
+        self.runtime
+            .resolve_nexus_operation(
+                run_key,
+                operation_id,
+                scheduled_event_id,
+                resolution,
+            )
+            .await
     }
 }
 

@@ -35,6 +35,12 @@ impl From<EdgeError> for Status {
             } => Status::already_exists(format!(
                 "{namespace}/{workflow_id} already started as {run_id}"
             )),
+            EdgeError::BatchOperationAlreadyExists { namespace, job_id } => {
+                Status::already_exists(format!("{namespace}/{job_id}"))
+            }
+            EdgeError::BatchOperationNotFound { namespace, job_id } => {
+                Status::not_found(format!("{namespace}/{job_id}"))
+            }
             EdgeError::TooManyLongPolls => {
                 Status::resource_exhausted(err_static("too many concurrent long polls"))
             }

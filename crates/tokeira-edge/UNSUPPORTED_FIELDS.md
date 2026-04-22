@@ -69,6 +69,16 @@ does not support or cannot yet populate, along with rationale.
 | `header` | Not extracted | Signal headers not threaded |
 | `links` | Not extracted | Link tracking not implemented |
 
+## Batch Operations
+
+| Field | Status | Rationale |
+|---|---|---|
+| `BatchOperationSignal.header` | Dropped at translation | Kernel `SignalRequest` has no header field |
+| `BatchOperationUpdateWorkflowExecutionOptions` | Not supported | Workflow execution options update is outside the batch MVP |
+| `BatchOperationReset.reset_reapply_type` | Not supported | Reset reapply semantics are not modeled by kernel reset |
+| `BatchOperationReset.options.current_run_only` | Not supported | Batch reset resolves only within the exact execution reference being processed |
+| `BatchOperationReset.options.reset_reapply_exclude_types` | Not supported | Reset reapply exclusion semantics are not modeled by kernel reset |
+
 ## History Event Attributes — Activity Events
 
 Activity completion/failure/timeout/cancel events have `scheduled_event_id` and

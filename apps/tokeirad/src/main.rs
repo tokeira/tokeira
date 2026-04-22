@@ -5,7 +5,7 @@
 //! can see which pieces are authoritative, which are transport-only, and where
 //! background tasks such as projection and history notification are attached.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -32,12 +32,30 @@ use tokeira_projection::{
     InMemoryVisibilityStore, ProjectionWorker, VisibilityQueryService, VisibilitySink,
 };
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, ScheduleEngineConfig, ScheduleStore, TimerScannerConfig,
+    ActivityTimeoutScannerConfig, BacklogConfig, EndpointTarget, LaneConfig,
+    NexusEndpointConfig, NexusEndpointRegistry, NexusTimeoutScannerConfig,
+    NoopNexusHttpClient, ScheduleEngineConfig, ScheduleStore, TimerScannerConfig,
     TokeiraRuntime, VersioningRuleStore, WorkflowTimeoutScannerConfig,
     run_schedule_engine,
 };
 use tokeira_storage::{InMemoryStore, RunRepository};
 use tokeira_types::{ExecutionRef, NamespaceId, ProjectionCursor, WorkflowId};
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+enum BootstrapNexusEndpointTarget {
+    External { address: String },
+    Worker {
+        namespace_name: String,
+        task_queue: String,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct BootstrapNexusEndpointConfig {
+    target: BootstrapNexusEndpointTarget,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -55,17 +73,33 @@ async fn main() -> Result<()> {
         Arc::new(store.clone()),
         history_waits.clone(),
     ));
+    let default_namespace = ResolvedNamespace::active("default");
+    let default_namespace_id = namespace_id_for("default");
+
+    // Bootstrap edge-facing namespace/operator state.
+    let namespaces = Arc::new(InMemoryNamespaceCache::new());
+    namespaces.insert(default_namespace).await?;
+    let nexus_registry = build_nexus_endpoint_registry(
+        namespaces.as_ref(),
+        HashMap::<String, BootstrapNexusEndpointConfig>::new(),
+    )
+    .await?;
+
     // The runtime owns execution orchestration, scanners, brokers, and all
     // run-local in-memory coordination such as buffered consistent queries.
     let versioning_rule_store = Arc::new(VersioningRuleStore::default());
     let schedule_store = Arc::new(ScheduleStore::default());
-    let runtime = Arc::new(TokeiraRuntime::new_with_versioning(
+    let runtime = Arc::new(TokeiraRuntime::new_with_nexus_and_versioning(
         repo.clone(),
         4,
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
         BacklogConfig::default(),
+        ActivityTimeoutScannerConfig::default(),
+        NexusTimeoutScannerConfig::default(),
+        nexus_registry,
+        Arc::new(NoopNexusHttpClient),
         versioning_rule_store.clone(),
     ));
     let schedule_engine_cancel = CancellationToken::new();
@@ -77,18 +111,12 @@ async fn main() -> Result<()> {
         schedule_engine_cancel,
     );
 
-    let default_namespace = ResolvedNamespace::active("default");
-    let default_namespace_id = namespace_id_for("default");
-
-    // Bootstrap edge-facing namespace/operator state.
-    let namespaces = Arc::new(InMemoryNamespaceCache::new());
-    namespaces.insert(default_namespace).await?;
-
     let interceptors = Arc::new(EdgeInterceptors::permissive(namespaces.clone()));
     let router = Arc::new(LocalOnlyRouter);
     let workflow_broker = runtime.broker();
     let buffered_queries = runtime.buffered_queries();
     let worker_registry = runtime.worker_registry();
+    let nexus_task_broker = runtime.nexus_task_broker();
     let runtime_adapter = Arc::new(RuntimeAdapter::new(runtime.clone()));
     let resolver = Arc::new(StoreExecutionResolver::new(
         repo.clone(),
@@ -141,12 +169,14 @@ async fn main() -> Result<()> {
             PendingQueryStore::default(),
             buffered_queries,
             workflow_broker,
+            nexus_task_broker,
             long_polls,
             router,
             history_waits,
             versioning_rule_store,
             worker_registry,
             schedule_store,
+            Arc::new(tokeira_runtime::BatchOperationStore::default()),
         );
     let operator_service = OperatorService::new(operator_api, interceptors);
 
@@ -179,6 +209,39 @@ fn grpc_addr_from_env() -> Result<SocketAddr> {
         std::env::var("TOKEIRA_GRPC_ADDR").unwrap_or_else(|_| "[::1]:7233".to_string());
     raw.parse()
         .with_context(|| format!("invalid TOKEIRA_GRPC_ADDR value: {raw}"))
+}
+
+async fn build_nexus_endpoint_registry(
+    namespaces: &dyn NamespaceCache,
+    configs: HashMap<String, BootstrapNexusEndpointConfig>,
+) -> Result<NexusEndpointRegistry> {
+    let mut resolved = HashMap::with_capacity(configs.len());
+    for (endpoint_name, config) in configs {
+        let target = match config.target {
+            BootstrapNexusEndpointTarget::External { address } => {
+                EndpointTarget::External { address }
+            }
+            BootstrapNexusEndpointTarget::Worker {
+                namespace_name,
+                task_queue,
+            } => {
+                let namespace = namespaces
+                    .get(&namespace_name)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "failed to register nexus worker endpoint `{endpoint_name}`: namespace `{namespace_name}` not found"
+                        )
+                    })?;
+                EndpointTarget::Worker {
+                    namespace_id: namespace_id_for(&namespace.name),
+                    task_queue: tokeira_types::TaskQueueName(task_queue),
+                }
+            }
+        };
+        resolved.insert(endpoint_name, NexusEndpointConfig { target });
+    }
+    Ok(NexusEndpointRegistry::new(resolved))
 }
 
 struct StoreExecutionResolver<R> {
@@ -312,5 +375,70 @@ where
                 Err(anyhow!("resolved run missing from storage: {:?}", run_key))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn build_nexus_endpoint_registry_resolves_worker_namespace_names() {
+        let cache = InMemoryNamespaceCache::new();
+        let namespace = ResolvedNamespace::active("payments");
+        let namespace_id = namespace_id_for("payments");
+        cache.insert(namespace).await.expect("namespace insert");
+
+        let registry = build_nexus_endpoint_registry(
+            &cache,
+            HashMap::from([(
+                "payments-endpoint".to_string(),
+                BootstrapNexusEndpointConfig {
+                    target: BootstrapNexusEndpointTarget::Worker {
+                        namespace_name: "payments".to_string(),
+                        task_queue: "nexus-q".to_string(),
+                    },
+                },
+            )]),
+        )
+        .await
+        .expect("registry should build");
+
+        let config = registry.resolve("payments-endpoint").expect("endpoint");
+        assert_eq!(
+            config,
+            &NexusEndpointConfig {
+                target: EndpointTarget::Worker {
+                    namespace_id,
+                    task_queue: tokeira_types::TaskQueueName("nexus-q".to_string()),
+                },
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn build_nexus_endpoint_registry_rejects_unknown_worker_namespace() {
+        let cache = InMemoryNamespaceCache::new();
+
+        let result = build_nexus_endpoint_registry(
+            &cache,
+            HashMap::from([(
+                "payments-endpoint".to_string(),
+                BootstrapNexusEndpointConfig {
+                    target: BootstrapNexusEndpointTarget::Worker {
+                        namespace_name: "missing".to_string(),
+                        task_queue: "nexus-q".to_string(),
+                    },
+                },
+            )]),
+        )
+        .await;
+
+        assert!(result.is_err(), "missing namespace should fail");
+        let error = result.err().expect("error");
+
+        assert!(error
+            .to_string()
+            .contains("namespace `missing` not found"));
     }
 }

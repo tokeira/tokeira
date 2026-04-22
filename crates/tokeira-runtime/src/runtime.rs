@@ -45,8 +45,8 @@ use crate::{
     fairness::{DeliveryMetrics, FairnessState, run_control_loop},
     lane::{LaneConfig, LaneHandle, spawn_lane},
     nexus::{
-        NexusEndpointRegistry, NexusHttpClient, NexusTimeoutScannerConfig,
-        NexusTimeoutTrackingState, NoopNexusHttpClient,
+        NexusEndpointRegistry, NexusHttpClient, NexusTaskBroker,
+        NexusTimeoutScannerConfig, NexusTimeoutTrackingState, NoopNexusHttpClient,
     },
     publisher::RuntimeDispatchPublisher,
     query::{QueryResult, QueryTask},
@@ -109,6 +109,8 @@ pub struct TokeiraRuntime<R> {
     wft_timeout_scanner_cancel: CancellationToken,
     /// Runtime-local Nexus timeout tracking.
     nexus_timeout_tracking: NexusTimeoutTrackingState,
+    /// In-memory Nexus worker-task broker.
+    nexus_task_broker: NexusTaskBroker,
     /// In-memory update caller registry.
     update_registry: UpdateRegistry,
     /// Run-local buffered consistent queries.
@@ -327,6 +329,7 @@ where
         let wft_timeout_tracking = WftTimeoutTrackingState::default();
         let activity_tracking = ActivityTrackingState::default();
         let nexus_timeout_tracking = NexusTimeoutTrackingState::default();
+        let nexus_task_broker = NexusTaskBroker::default();
         let update_registry = UpdateRegistry::new();
         let buffered_queries = BufferedQueryRegistry::default();
         let worker_registry = WorkerRegistry::default();
@@ -347,6 +350,7 @@ where
                     shard_count,
                     nexus_client.clone(),
                     nexus_registry.clone(),
+                    nexus_task_broker.clone(),
                     nexus_timeout_tracking.clone(),
                     activity_tracking.clone(),
                     delivery_metrics.clone(),
@@ -461,6 +465,7 @@ where
             wft_timeout_scanner_handle,
             wft_timeout_scanner_cancel,
             nexus_timeout_tracking,
+            nexus_task_broker,
             update_registry,
             buffered_queries,
             worker_registry,
@@ -523,6 +528,10 @@ where
 
     pub fn nexus_timeout_tracking(&self) -> NexusTimeoutTrackingState {
         self.nexus_timeout_tracking.clone()
+    }
+
+    pub fn nexus_task_broker(&self) -> NexusTaskBroker {
+        self.nexus_task_broker.clone()
     }
 
     pub fn register_worker(
@@ -1346,6 +1355,40 @@ where
             .unwrap_or(false))
     }
 
+    /// Resolve a Nexus operation back into its originator workflow.
+    ///
+    /// Returns `Ok(false)` when the kernel rejects the resolution as stale or
+    /// otherwise already-applied. That lets the edge treat duplicate worker
+    /// completions as idempotent success.
+    pub async fn resolve_nexus_operation(
+        &self,
+        run_key: RunKey,
+        operation_id: String,
+        scheduled_event_id: i64,
+        resolution: tokeira_kernel::NexusResolution,
+    ) -> Result<bool> {
+        match self
+            .submit_for_owned_shard(
+                run_key,
+                Command::NexusOperationResolved(
+                    tokeira_kernel::NexusOperationResolvedRequest {
+                        operation_id,
+                        scheduled_event_id,
+                        resolution,
+                        now: OffsetDateTime::now_utc(),
+                    },
+                ),
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(error) if error.to_string().contains("kernel rejected command") => {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Atomically transition a polled workflow task into the Started state.
     ///
     /// Sets a sticky TTL so subsequent tasks for this run are preferentially
@@ -1586,12 +1629,16 @@ where
     }
 
     fn pick_lane(&self, run_key: RunKey) -> &LaneHandle {
-        pick_lane(&self.lanes, self.lanes.len(), run_key)
+        let shard_count = self.shard_owner.read().unwrap().shard_count();
+        let shard_id = shard_for(run_key, shard_count);
+        pick_lane(&self.lanes, self.lanes.len(), shard_id)
     }
 
     #[cfg(test)]
     fn lane_index(&self, run_key: RunKey) -> usize {
-        crate::scanner::lane_index_for(run_key, self.lanes.len())
+        let shard_count = self.shard_owner.read().unwrap().shard_count();
+        let shard_id = shard_for(run_key, shard_count);
+        crate::scanner::lane_index_for(shard_id, self.lanes.len())
     }
 
     /// Cancel the background timer scanner and wait for
@@ -2049,9 +2096,9 @@ mod tests {
     use crate::broker::InMemoryBroker;
     use crate::lane::DispatchPublisher;
     use crate::nexus::{
-        NexusEndpointConfig, NexusEndpointRegistry, NexusTimeoutEntry,
-        NexusTimeoutScannerConfig, NexusTimeoutTrackingState, NoopNexusHttpClient,
-        evaluate_nexus_timeout,
+        EndpointTarget, NexusEndpointConfig, NexusEndpointRegistry, NexusTaskBroker,
+        NexusTimeoutEntry, NexusTimeoutScannerConfig, NexusTimeoutTrackingState,
+        NoopNexusHttpClient, evaluate_nexus_timeout,
     };
     use crate::publisher::RuntimeDispatchPublisher;
     use crate::retry::{RetryDecision, compute_retry_backoff, evaluate_activity_retry};
@@ -2077,7 +2124,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn property_deterministic_hash_routing(run in any::<u128>(), lane_count in 1usize..16usize) {
+        fn property_deterministic_shard_routing(run in any::<u128>(), lane_count in 1usize..16usize) {
             let rt = Runtime::new().unwrap();
             let (first, second) = rt.block_on(async move {
                 let repo = Arc::new(InMemoryStore::default());
@@ -2095,6 +2142,70 @@ mod tests {
             prop_assert_eq!(first, second);
             prop_assert!(first < lane_count);
         }
+    }
+
+    #[test]
+    fn test_pick_lane_returns_correct_handle() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async move {
+            let repo = Arc::new(InMemoryStore::with_shard_count(8));
+            let runtime = TokeiraRuntime::new_with_nexus_and_shards(
+                repo,
+                4,
+                LaneConfig::default(),
+                TimerScannerConfig::default(),
+                WorkflowTimeoutScannerConfig::default(),
+                BacklogConfig::default(),
+                ActivityTimeoutScannerConfig::default(),
+                NexusTimeoutScannerConfig::default(),
+                NexusEndpointRegistry::default(),
+                Arc::new(NoopNexusHttpClient),
+                8,
+                "test-owner".to_string(),
+                true,
+                Arc::new(VersioningRuleStore::default()),
+            );
+            let shard_id = ShardId(7);
+            let lane_ptr = pick_lane(&runtime.lanes, runtime.lanes.len(), shard_id)
+                as *const LaneHandle;
+            let expected_ptr = &runtime.lanes[3] as *const LaneHandle;
+
+            assert_eq!(lane_ptr, expected_ptr);
+        });
+    }
+
+    #[test]
+    fn test_runtime_pick_lane_uses_shard() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async move {
+            let shard_count = 8;
+            let repo = Arc::new(InMemoryStore::with_shard_count(shard_count));
+            let runtime = TokeiraRuntime::new_with_nexus_and_shards(
+                repo,
+                4,
+                LaneConfig::default(),
+                TimerScannerConfig::default(),
+                WorkflowTimeoutScannerConfig::default(),
+                BacklogConfig::default(),
+                ActivityTimeoutScannerConfig::default(),
+                NexusTimeoutScannerConfig::default(),
+                NexusEndpointRegistry::default(),
+                Arc::new(NoopNexusHttpClient),
+                shard_count,
+                "test-owner".to_string(),
+                true,
+                Arc::new(VersioningRuleStore::default()),
+            );
+            let first = RunKey(Uuid::from_u128(3));
+            let second = (4u128..10_000)
+                .map(|value| RunKey(Uuid::from_u128(value)))
+                .find(|candidate| {
+                    shard_for(*candidate, shard_count) == shard_for(first, shard_count)
+                })
+                .expect("same-shard run key");
+
+            assert_eq!(runtime.lane_index(first), runtime.lane_index(second));
+        });
     }
 
     proptest! {
@@ -2192,6 +2303,7 @@ mod tests {
             1,
             Arc::new(NoopNexusHttpClient),
             NexusEndpointRegistry::default(),
+            NexusTaskBroker::default(),
             NexusTimeoutTrackingState::default(),
             ActivityTrackingState::default(),
             DeliveryMetrics::new(),
@@ -2269,6 +2381,7 @@ mod tests {
             1,
             Arc::new(NoopNexusHttpClient),
             NexusEndpointRegistry::default(),
+            NexusTaskBroker::default(),
             NexusTimeoutTrackingState::default(),
             ActivityTrackingState::default(),
             DeliveryMetrics::new(),
@@ -2347,6 +2460,7 @@ mod tests {
             1,
             Arc::new(NoopNexusHttpClient),
             NexusEndpointRegistry::default(),
+            NexusTaskBroker::default(),
             NexusTimeoutTrackingState::default(),
             ActivityTrackingState::default(),
             DeliveryMetrics::new(),
@@ -2432,6 +2546,7 @@ mod tests {
             1,
             Arc::new(NoopNexusHttpClient),
             NexusEndpointRegistry::default(),
+            NexusTaskBroker::default(),
             NexusTimeoutTrackingState::default(),
             ActivityTrackingState::default(),
             DeliveryMetrics::new(),
@@ -2587,13 +2702,18 @@ mod tests {
         let registry = NexusEndpointRegistry::new(HashMap::from([(
             "payments".to_string(),
             NexusEndpointConfig {
-                address: "http://payments".to_string(),
+                target: EndpointTarget::External {
+                    address: "http://payments".to_string(),
+                },
             },
         )]));
         assert_eq!(
             registry
                 .resolve("payments")
-                .map(|config| config.address.as_str()),
+                .and_then(|config| match &config.target {
+                    EndpointTarget::External { address } => Some(address.as_str()),
+                    EndpointTarget::Worker { .. } => None,
+                }),
             Some("http://payments")
         );
         assert!(registry.resolve("missing").is_none());
@@ -2735,7 +2855,8 @@ mod tests {
                     BacklogConfig::default(),
                 );
                 let run_key = RunKey(Uuid::from_u128(run));
-                let lane_ptr = pick_lane(&runtime.lanes, lane_count, run_key) as *const LaneHandle as usize;
+                let shard_id = shard_for(run_key, runtime.shard_owner.read().unwrap().shard_count());
+                let lane_ptr = pick_lane(&runtime.lanes, lane_count, shard_id) as *const LaneHandle as usize;
                 let expected_ptr = &runtime.lanes[runtime.lane_index(run_key)] as *const LaneHandle as usize;
                 (lane_ptr, expected_ptr)
             });
@@ -2749,6 +2870,7 @@ mod tests {
             runs in proptest::collection::vec(any::<u128>(), 0..20),
             timer_ids in proptest::collection::vec("[a-z0-9]{1,8}", 0..20),
             lane_count in 1usize..16usize,
+            shard_count in 1u32..16u32,
         ) {
             let rt = Runtime::new().unwrap();
             rt.block_on(async move {
@@ -2774,7 +2896,7 @@ mod tests {
                         captured.lock().unwrap().push((
                             due.run_key,
                             due.timer_id,
-                            lane_index_for(due.run_key, lane_count),
+                            lane_index_for(shard_for(due.run_key, shard_count), lane_count),
                             fired_at,
                         ));
                         Ok(())
@@ -2787,7 +2909,10 @@ mod tests {
                     let (run_key, timer_id, lane_index, _) = &captured[index];
                     prop_assert_eq!(*run_key, due.run_key);
                     prop_assert_eq!(timer_id, &due.timer_id);
-                    prop_assert_eq!(*lane_index, lane_index_for(due.run_key, lane_count));
+                    prop_assert_eq!(
+                        *lane_index,
+                        lane_index_for(shard_for(due.run_key, shard_count), lane_count)
+                    );
                 }
                 Ok::<(), proptest::test_runner::TestCaseError>(())
             })?;

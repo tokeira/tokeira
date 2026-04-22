@@ -598,18 +598,35 @@ async fn grpc_roundtrip_update_completed_through_protocol_messages() -> Result<(
 
     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
-    let poll = workflow
-        .poll_workflow_task_queue(PollWorkflowTaskQueueRequest {
-            namespace: "default".to_string(),
-            task_queue: Some(TaskQueue {
-                name: "queue-a".to_string(),
+    let poll = loop {
+        let poll = workflow
+            .poll_workflow_task_queue(PollWorkflowTaskQueueRequest {
+                namespace: "default".to_string(),
+                task_queue: Some(TaskQueue {
+                    name: "queue-a".to_string(),
+                    ..Default::default()
+                }),
+                identity: "worker-1".to_string(),
                 ..Default::default()
-            }),
-            identity: "worker-1".to_string(),
-            ..Default::default()
-        })
-        .await?
-        .into_inner();
+            })
+            .await?
+            .into_inner();
+
+        if !poll.messages.is_empty() {
+            break poll;
+        }
+
+        workflow
+            .respond_workflow_task_completed(RespondWorkflowTaskCompletedRequest {
+                task_token: poll.task_token,
+                identity: "worker-1".to_string(),
+                commands: Vec::new(),
+                ..Default::default()
+            })
+            .await?;
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
 
     assert_eq!(poll.messages.len(), 1);
     let update_id = poll.messages[0].protocol_instance_id.clone();

@@ -80,7 +80,7 @@ where
         .list_due_timers_for_shard(shard_id, now, usize::MAX)
         .await?
     {
-        let lane = pick_lane(lanes, lane_count, due.run_key).clone();
+        let lane = pick_lane(lanes, lane_count, shard_id).clone();
         lane.submit(
             due.run_key,
             Command::TimerDue(tokeira_kernel::TimerDueRequest {

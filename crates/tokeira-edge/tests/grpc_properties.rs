@@ -436,10 +436,11 @@ fn expected_code(err: &EdgeError) -> Code {
         EdgeError::BadRequest(_) => Code::InvalidArgument,
         EdgeError::Unauthorized(_) => Code::Unauthenticated,
         EdgeError::Forbidden { .. } => Code::PermissionDenied,
-        EdgeError::NamespaceNotFound(_) | EdgeError::WorkflowNotFound { .. } => {
-            Code::NotFound
-        }
-        EdgeError::WorkflowAlreadyStarted { .. } => Code::AlreadyExists,
+        EdgeError::NamespaceNotFound(_)
+        | EdgeError::WorkflowNotFound { .. }
+        | EdgeError::BatchOperationNotFound { .. } => Code::NotFound,
+        EdgeError::WorkflowAlreadyStarted { .. }
+        | EdgeError::BatchOperationAlreadyExists { .. } => Code::AlreadyExists,
         EdgeError::NamespaceDeleted(_) => Code::FailedPrecondition,
         EdgeError::NamespaceAlreadyExists(_) => Code::AlreadyExists,
         EdgeError::TooManyLongPolls => Code::ResourceExhausted,

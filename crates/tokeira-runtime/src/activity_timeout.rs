@@ -265,7 +265,7 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
             continue;
         };
 
-        let lane = pick_lane(lanes, lane_count, entry.run_key).clone();
+        let lane = pick_lane(lanes, lane_count, entry.shard_id).clone();
         let result = lane
             .submit(
                 entry.run_key,

@@ -24,7 +24,7 @@ use crate::{
     grpc::{
         errors::proto_conversion_status, metadata::metadata_to_header_map, translate,
     },
-    translate::{schedule, to_internal},
+    translate::{batch, nexus, schedule, to_internal},
     workflow_service::WorkflowService,
 };
 
@@ -76,6 +76,22 @@ fn schedule_error_status(error: ScheduleError) -> Status {
         }
         ScheduleError::InvalidArgument(message) => Status::invalid_argument(message),
     }
+}
+
+fn batch_translate_error_status(error: batch::BatchTranslateError) -> Status {
+    match error {
+        batch::BatchTranslateError::MissingField(_)
+        | batch::BatchTranslateError::InvalidArgument(_) => {
+            Status::invalid_argument(error.to_string())
+        }
+        batch::BatchTranslateError::Unsupported(_) => {
+            Status::invalid_argument(error.to_string())
+        }
+    }
+}
+
+fn nexus_translate_error_status(error: nexus::NexusTranslateError) -> Status {
+    Status::invalid_argument(error.to_string())
 }
 
 fn proto_timestamp_to_time(value: &prost_types::Timestamp) -> Option<OffsetDateTime> {
@@ -1089,46 +1105,97 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     }
     async fn start_batch_operation(
         &self,
-        _request: Request<workflowservice::StartBatchOperationRequest>,
+        request: Request<workflowservice::StartBatchOperationRequest>,
     ) -> Result<Response<workflowservice::StartBatchOperationResponse>, Status> {
-        Err(Status::unimplemented("start_batch_operation"))
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = batch::start_batch_request_to_edge(request.into_inner())
+            .map_err(batch_translate_error_status)?;
+        self.inner.start_batch_operation(&headers, edge_req).await?;
+        Ok(Response::new(
+            workflowservice::StartBatchOperationResponse::default(),
+        ))
     }
     async fn stop_batch_operation(
         &self,
-        _request: Request<workflowservice::StopBatchOperationRequest>,
+        request: Request<workflowservice::StopBatchOperationRequest>,
     ) -> Result<Response<workflowservice::StopBatchOperationResponse>, Status> {
-        Err(Status::unimplemented("stop_batch_operation"))
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = batch::stop_batch_request_to_edge(request.into_inner())
+            .map_err(batch_translate_error_status)?;
+        self.inner.stop_batch_operation(&headers, edge_req).await?;
+        Ok(Response::new(
+            workflowservice::StopBatchOperationResponse::default(),
+        ))
     }
     async fn describe_batch_operation(
         &self,
-        _request: Request<workflowservice::DescribeBatchOperationRequest>,
+        request: Request<workflowservice::DescribeBatchOperationRequest>,
     ) -> Result<Response<workflowservice::DescribeBatchOperationResponse>, Status> {
-        Err(Status::unimplemented("describe_batch_operation"))
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = batch::describe_batch_request_to_edge(request.into_inner())
+            .map_err(batch_translate_error_status)?;
+        let snapshot = self
+            .inner
+            .describe_batch_operation(&headers, edge_req)
+            .await?;
+        Ok(Response::new(batch::describe_batch_response_to_proto(
+            snapshot,
+        )))
     }
     async fn list_batch_operations(
         &self,
-        _request: Request<workflowservice::ListBatchOperationsRequest>,
+        request: Request<workflowservice::ListBatchOperationsRequest>,
     ) -> Result<Response<workflowservice::ListBatchOperationsResponse>, Status> {
-        Err(Status::unimplemented("list_batch_operations"))
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = batch::list_batch_request_to_edge(request.into_inner())
+            .map_err(batch_translate_error_status)?;
+        let (entries, next_page_token) =
+            self.inner.list_batch_operations(&headers, edge_req).await?;
+        Ok(Response::new(batch::list_batch_response_to_proto(
+            entries,
+            next_page_token,
+        )))
     }
     async fn poll_nexus_task_queue(
         &self,
-        _request: Request<workflowservice::PollNexusTaskQueueRequest>,
+        request: Request<workflowservice::PollNexusTaskQueueRequest>,
     ) -> Result<Response<workflowservice::PollNexusTaskQueueResponse>, Status> {
-        Err(Status::unimplemented("poll_nexus_task_queue"))
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = nexus::poll_request_to_edge(request.into_inner())
+            .map_err(nexus_translate_error_status)?;
+        let edge_resp = self.inner.poll_nexus_task_queue(&headers, edge_req).await?;
+        Ok(Response::new(match edge_resp {
+            Some(resp) => nexus::poll_response_to_proto(resp)
+                .map_err(nexus_translate_error_status)?,
+            None => workflowservice::PollNexusTaskQueueResponse::default(),
+        }))
     }
     async fn respond_nexus_task_completed(
         &self,
-        _request: Request<workflowservice::RespondNexusTaskCompletedRequest>,
+        request: Request<workflowservice::RespondNexusTaskCompletedRequest>,
     ) -> Result<Response<workflowservice::RespondNexusTaskCompletedResponse>, Status>
     {
-        Err(Status::unimplemented("respond_nexus_task_completed"))
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = nexus::completed_request_to_edge(request.into_inner())
+            .map_err(nexus_translate_error_status)?;
+        self.inner
+            .respond_nexus_task_completed(&headers, edge_req)
+            .await?;
+        Ok(Response::new(
+            workflowservice::RespondNexusTaskCompletedResponse::default(),
+        ))
     }
     async fn respond_nexus_task_failed(
         &self,
-        _request: Request<workflowservice::RespondNexusTaskFailedRequest>,
+        request: Request<workflowservice::RespondNexusTaskFailedRequest>,
     ) -> Result<Response<workflowservice::RespondNexusTaskFailedResponse>, Status> {
-        Err(Status::unimplemented("respond_nexus_task_failed"))
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = nexus::failed_request_to_edge(request.into_inner())
+            .map_err(nexus_translate_error_status)?;
+        self.inner.respond_nexus_task_failed(&headers, edge_req).await?;
+        Ok(Response::new(
+            workflowservice::RespondNexusTaskFailedResponse::default(),
+        ))
     }
     async fn update_activity_options_by_id(
         &self,
@@ -1166,7 +1233,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use anyhow::Result;
     use async_trait::async_trait;
@@ -1176,6 +1243,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use tokeira_proto::public::temporal::api::nexus::v1 as nexus_v1;
     use crate::{
         history_wait::{HistoryNotifyingRepository, HistoryWaitRegistry},
         interceptors::EdgeInterceptors,
@@ -1191,9 +1259,11 @@ mod tests {
         },
     };
     use tokeira_kernel::{
-        BasicKernel, Command, Kernel, LoadedRun, SignalRequest, StartRequest,
+        BasicKernel, Command, Kernel, LoadedRun, NexusResolution, SignalRequest,
+        StartRequest,
     };
     use tokeira_runtime::{
+        NexusTask, NexusTaskBroker, NexusTaskRequest, NexusTaskToken,
         VersioningRuleStore, WorkerRegistrationKey, WorkerRegistry, WorkerVersionMetadata,
     };
     use tokeira_storage::{CommitResult, DispatchableWorkflowTask, RunRepository};
@@ -1208,6 +1278,24 @@ mod tests {
     struct BlockingPollRuntime {
         ready: Arc<Notify>,
         release: Arc<Notify>,
+    }
+
+    struct NexusRecordingRuntime {
+        applied: bool,
+        resolutions: Mutex<Vec<(RunKey, String, i64, NexusResolution)>>,
+    }
+
+    impl NexusRecordingRuntime {
+        fn new(applied: bool) -> Self {
+            Self {
+                applied,
+                resolutions: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn recorded(&self) -> Vec<(RunKey, String, i64, NexusResolution)> {
+            self.resolutions.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
@@ -1359,6 +1447,16 @@ mod tests {
             _update_id: String,
         ) -> Result<Option<(String, tokeira_types::Payloads)>> {
             Ok(None)
+        }
+
+        async fn resolve_nexus_operation(
+            &self,
+            _run_key: tokeira_types::RunKey,
+            _operation_id: String,
+            _scheduled_event_id: i64,
+            _resolution: NexusResolution,
+        ) -> Result<bool> {
+            Ok(false)
         }
     }
 
@@ -1514,10 +1612,192 @@ mod tests {
         ) -> Result<Option<(String, tokeira_types::Payloads)>> {
             Ok(None)
         }
+
+        async fn resolve_nexus_operation(
+            &self,
+            _run_key: tokeira_types::RunKey,
+            _operation_id: String,
+            _scheduled_event_id: i64,
+            _resolution: NexusResolution,
+        ) -> Result<bool> {
+            Ok(false)
+        }
+    }
+
+    #[async_trait]
+    impl WorkflowRuntimeApi for NexusRecordingRuntime {
+        async fn start_workflow(
+            &self,
+            _req: tokeira_kernel::StartRequest,
+        ) -> Result<WorkflowMutationOutcome> {
+            unreachable!()
+        }
+
+        async fn start_workflow_with_policy(
+            &self,
+            _req: tokeira_kernel::StartRequest,
+        ) -> Result<tokeira_runtime::StartWorkflowResult> {
+            unreachable!()
+        }
+
+        async fn signal_with_start_workflow(
+            &self,
+            _req: tokeira_kernel::SignalWithStartRequest,
+        ) -> Result<tokeira_runtime::SignalWithStartResult> {
+            unreachable!()
+        }
+
+        async fn signal_workflow(
+            &self,
+            _run_key: tokeira_types::RunKey,
+            _req: tokeira_kernel::SignalRequest,
+        ) -> Result<WorkflowMutationOutcome> {
+            unreachable!()
+        }
+
+        async fn poll_workflow_task(
+            &self,
+            _queue: tokeira_types::QueueKey,
+            _worker_identity: tokeira_types::WorkerIdentity,
+            _timeout: std::time::Duration,
+        ) -> Result<Option<tokeira_runtime::StartedWorkflowTask>> {
+            Ok(None)
+        }
+
+        async fn complete_workflow_task(
+            &self,
+            _req: tokeira_kernel::WorkflowTaskCompletedRequest,
+        ) -> Result<WorkflowMutationOutcome> {
+            unreachable!()
+        }
+
+        async fn poll_activity_task(
+            &self,
+            _queue: tokeira_types::QueueKey,
+            _worker_identity: tokeira_types::WorkerIdentity,
+            _timeout: std::time::Duration,
+        ) -> Result<Option<tokeira_runtime::StartedActivityTask>> {
+            Ok(None)
+        }
+
+        async fn complete_activity_task(
+            &self,
+            _token: tokeira_types::ActivityTaskToken,
+            _result: tokeira_types::Payloads,
+        ) -> Result<WorkflowMutationOutcome> {
+            unreachable!()
+        }
+
+        async fn fail_activity_task(
+            &self,
+            _token: tokeira_types::ActivityTaskToken,
+            _failure: tokeira_types::Payload,
+            _failure_error_type: Option<String>,
+            _is_non_retryable: bool,
+        ) -> Result<()> {
+            unreachable!()
+        }
+
+        async fn record_activity_heartbeat(
+            &self,
+            _token: tokeira_types::ActivityTaskToken,
+        ) -> Result<bool> {
+            unreachable!()
+        }
+
+        async fn terminate_workflow(
+            &self,
+            _run_key: tokeira_types::RunKey,
+            _req: tokeira_kernel::TerminateRequest,
+        ) -> Result<WorkflowMutationOutcome> {
+            unreachable!()
+        }
+
+        async fn cancel_workflow(
+            &self,
+            _run_key: tokeira_types::RunKey,
+            _req: tokeira_kernel::CancelRequest,
+        ) -> Result<WorkflowMutationOutcome> {
+            unreachable!()
+        }
+
+        async fn reset_workflow(
+            &self,
+            _execution: tokeira_types::ExecutionRef,
+            _req: tokeira_kernel::ResetRequest,
+        ) -> Result<tokeira_runtime::ResetWorkflowResult> {
+            unreachable!()
+        }
+
+        async fn query_workflow(
+            &self,
+            _execution: tokeira_types::ExecutionRef,
+            _query_type: String,
+            _query_args: tokeira_types::Payloads,
+            _timeout: std::time::Duration,
+        ) -> Result<tokeira_runtime::QueryResult> {
+            unreachable!()
+        }
+
+        async fn update_workflow(
+            &self,
+            _execution: tokeira_types::ExecutionRef,
+            _update_id: String,
+            _update_name: String,
+            _input: tokeira_types::Payloads,
+            _request: tokeira_types::RequestContext,
+            _timeout: std::time::Duration,
+            _wait_policy: tokeira_runtime::UpdateWaitPolicy,
+        ) -> Result<tokeira_runtime::UpdateOutcome> {
+            unreachable!()
+        }
+
+        async fn pending_update_transports(
+            &self,
+            _run_key: tokeira_types::RunKey,
+        ) -> Result<Vec<tokeira_runtime::PendingUpdateTransport>> {
+            Ok(Vec::new())
+        }
+
+        async fn resolve_update_transport(
+            &self,
+            _run_key: tokeira_types::RunKey,
+            _update_id: String,
+            _resolution: tokeira_runtime::UpdateTransportResolution,
+        ) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn peek_update_info(
+            &self,
+            _run_key: tokeira_types::RunKey,
+            _update_id: String,
+        ) -> Result<Option<(String, tokeira_types::Payloads)>> {
+            Ok(None)
+        }
+
+        async fn resolve_nexus_operation(
+            &self,
+            run_key: tokeira_types::RunKey,
+            operation_id: String,
+            scheduled_event_id: i64,
+            resolution: NexusResolution,
+        ) -> Result<bool> {
+            self.resolutions.lock().unwrap().push((
+                run_key,
+                operation_id,
+                scheduled_event_id,
+                resolution,
+            ));
+            Ok(self.applied)
+        }
     }
 
     #[derive(Default)]
     struct NoopResolver;
+
+    #[derive(Default)]
+    struct StaticNamespaceCache;
 
     #[async_trait]
     impl ExecutionResolver for NoopResolver {
@@ -1535,6 +1815,21 @@ mod tests {
             _workflow_id: &str,
         ) -> Result<Option<crate::WorkflowExecutionDescription>> {
             Ok(None)
+        }
+    }
+
+    #[async_trait]
+    impl NamespaceCache for StaticNamespaceCache {
+        async fn get(&self, name: &str) -> Result<Option<ResolvedNamespace>> {
+            Ok(Some(ResolvedNamespace::active(name)))
+        }
+
+        async fn list_all(&self) -> Result<Vec<ResolvedNamespace>> {
+            Ok(vec![ResolvedNamespace::active("default")])
+        }
+
+        async fn insert(&self, _ns: ResolvedNamespace) -> Result<()> {
+            Ok(())
         }
     }
 
@@ -1562,12 +1857,14 @@ mod tests {
                 crate::PendingQueryStore::default(),
                 tokeira_runtime::BufferedQueryRegistry::default(),
                 broker.clone(),
+                tokeira_runtime::NexusTaskBroker::default(),
                 LongPollGate::new(LongPollConfig::default()),
                 Arc::new(LocalOnlyRouter),
                 HistoryWaitRegistry::default(),
                 store.clone(),
                 worker_registry.clone(),
                 Arc::new(tokeira_runtime::ScheduleStore::default()),
+                Arc::new(tokeira_runtime::BatchOperationStore::default()),
             );
         (
             WorkflowServiceGrpc::new(service),
@@ -1575,6 +1872,38 @@ mod tests {
             worker_registry,
             broker,
         )
+    }
+
+    fn nexus_test_service(
+        runtime: Arc<dyn WorkflowRuntimeApi>,
+    ) -> (WorkflowServiceGrpc, NexusTaskBroker) {
+        let cache = Arc::new(StaticNamespaceCache);
+        let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
+        let broker = tokeira_runtime::InMemoryBroker::default();
+        let nexus_broker = NexusTaskBroker::default();
+        let service =
+            WorkflowService::new_with_versioning_and_buffered_queries_and_history_wait_registry(
+                runtime,
+                Arc::new(NoopResolver),
+                Arc::new(EmptyVisibilityApi),
+                Arc::new(tokeira_storage::InMemoryStore::default()),
+                operator_api,
+                cache.clone(),
+                Arc::new(EdgeInterceptors::permissive(cache)),
+                PollerRegistry::default(),
+                crate::PendingQueryStore::default(),
+                tokeira_runtime::BufferedQueryRegistry::default(),
+                broker,
+                nexus_broker.clone(),
+                LongPollGate::new(LongPollConfig::default()),
+                Arc::new(LocalOnlyRouter),
+                HistoryWaitRegistry::default(),
+                Arc::new(VersioningRuleStore::default()),
+                WorkerRegistry::default(),
+                Arc::new(tokeira_runtime::ScheduleStore::default()),
+                Arc::new(tokeira_runtime::BatchOperationStore::default()),
+            );
+        (WorkflowServiceGrpc::new(service), nexus_broker)
     }
 
     fn commit_build_id_request(
@@ -2596,5 +2925,321 @@ mod tests {
         for pair in second_history.events.windows(2) {
             assert!(pair[0].event_id > pair[1].event_id);
         }
+    }
+
+    #[tokio::test]
+    async fn poll_nexus_task_queue_rejects_empty_namespace() {
+        let (grpc, _broker) = nexus_test_service(Arc::new(PollNoneRuntime));
+
+        let error = grpc
+            .poll_nexus_task_queue(Request::new(
+                workflowservice::PollNexusTaskQueueRequest {
+                    namespace: String::new(),
+                    task_queue: Some(
+                        tokeira_proto::public::temporal::api::taskqueue::v1::TaskQueue {
+                            name: "nexus-q".to_string(),
+                            ..Default::default()
+                        },
+                    ),
+                    identity: "worker".to_string(),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect_err("empty namespace should fail");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn poll_nexus_task_queue_rejects_empty_task_queue() {
+        let (grpc, _broker) = nexus_test_service(Arc::new(PollNoneRuntime));
+
+        let error = grpc
+            .poll_nexus_task_queue(Request::new(
+                workflowservice::PollNexusTaskQueueRequest {
+                    namespace: "default".to_string(),
+                    task_queue: Some(
+                        tokeira_proto::public::temporal::api::taskqueue::v1::TaskQueue {
+                            name: String::new(),
+                            ..Default::default()
+                        },
+                    ),
+                    identity: "worker".to_string(),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect_err("empty task queue should fail");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_nexus_task_queue_timeout_returns_default_response() {
+        let (grpc, _broker) = nexus_test_service(Arc::new(PollNoneRuntime));
+
+        let task = tokio::spawn({
+            let grpc = grpc.clone();
+            async move {
+                grpc.poll_nexus_task_queue(Request::new(
+                    workflowservice::PollNexusTaskQueueRequest {
+                        namespace: "default".to_string(),
+                        task_queue: Some(
+                            tokeira_proto::public::temporal::api::taskqueue::v1::TaskQueue {
+                                name: "nexus-q".to_string(),
+                                ..Default::default()
+                            },
+                        ),
+                        identity: "worker".to_string(),
+                        ..Default::default()
+                    },
+                ))
+                .await
+                .expect("poll should succeed")
+                .into_inner()
+            }
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+
+        let response = task.await.expect("join");
+        assert!(response.task_token.is_empty());
+        assert!(response.request.is_none());
+    }
+
+    #[tokio::test]
+    async fn poll_nexus_task_queue_wakes_on_publish() {
+        let (grpc, broker) = nexus_test_service(Arc::new(PollNoneRuntime));
+
+        let task = tokio::spawn({
+            let grpc = grpc.clone();
+            async move {
+                grpc.poll_nexus_task_queue(Request::new(
+                    workflowservice::PollNexusTaskQueueRequest {
+                        namespace: "default".to_string(),
+                        task_queue: Some(
+                            tokeira_proto::public::temporal::api::taskqueue::v1::TaskQueue {
+                                name: "nexus-q".to_string(),
+                                ..Default::default()
+                            },
+                        ),
+                        identity: "worker".to_string(),
+                        ..Default::default()
+                    },
+                ))
+                .await
+                .expect("poll should succeed")
+                .into_inner()
+            }
+        });
+
+        tokio::task::yield_now().await;
+        broker
+            .publish(
+                namespace_id_for("default"),
+                TaskQueueName("nexus-q".to_string()),
+                NexusTask {
+                    token: NexusTaskToken {
+                        run_key: RunKey(Uuid::from_u128(7)),
+                        operation_id: "op-1".to_string(),
+                        scheduled_event_id: 11,
+                    },
+                    request: NexusTaskRequest::StartOperation {
+                        service: "svc".to_string(),
+                        operation: "op".to_string(),
+                        request_id: "req-1".to_string(),
+                        payload: None,
+                        scheduled_time: Some(OffsetDateTime::UNIX_EPOCH),
+                    },
+                },
+            )
+            .await;
+
+        let response = task.await.expect("join");
+        assert!(!response.task_token.is_empty());
+        let request = response.request.expect("request");
+        match request.variant.expect("variant") {
+            nexus_v1::request::Variant::StartOperation(start) => {
+                assert_eq!(start.service, "svc");
+                assert_eq!(start.operation, "op");
+                assert_eq!(start.request_id, "req-1");
+            }
+            other => panic!("unexpected nexus request variant: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn respond_nexus_task_completed_rejects_empty_task_token() {
+        let (grpc, _broker) = nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
+
+        let error = grpc
+            .respond_nexus_task_completed(Request::new(
+                workflowservice::RespondNexusTaskCompletedRequest {
+                    namespace: "default".to_string(),
+                    task_token: Vec::new(),
+                    response: Some(nexus_v1::Response {
+                        variant: Some(nexus_v1::response::Variant::CancelOperation(
+                            nexus_v1::CancelOperationResponse {},
+                        )),
+                    }),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect_err("empty token should fail");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn respond_nexus_task_completed_rejects_missing_response() {
+        let (grpc, _broker) = nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
+
+        let token = NexusTaskToken {
+            run_key: RunKey::new(),
+            operation_id: "op-1".to_string(),
+            scheduled_event_id: 1,
+        }
+        .encode()
+        .expect("token");
+        let error = grpc
+            .respond_nexus_task_completed(Request::new(
+                workflowservice::RespondNexusTaskCompletedRequest {
+                    namespace: "default".to_string(),
+                    task_token: token,
+                    response: None,
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect_err("missing response should fail");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn respond_nexus_task_completed_rejects_malformed_task_token() {
+        let (grpc, _broker) = nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
+
+        let error = grpc
+            .respond_nexus_task_completed(Request::new(
+                workflowservice::RespondNexusTaskCompletedRequest {
+                    namespace: "default".to_string(),
+                    task_token: b"not-json".to_vec(),
+                    response: Some(nexus_v1::Response {
+                        variant: Some(nexus_v1::response::Variant::CancelOperation(
+                            nexus_v1::CancelOperationResponse {},
+                        )),
+                    }),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect_err("malformed token should fail");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("invalid nexus task token"));
+    }
+
+    #[tokio::test]
+    async fn respond_nexus_task_completed_kernel_rejection_returns_success() {
+        let runtime = Arc::new(NexusRecordingRuntime::new(false));
+        let (grpc, _broker) = nexus_test_service(runtime.clone());
+
+        let token = NexusTaskToken {
+            run_key: RunKey::new(),
+            operation_id: "op-1".to_string(),
+            scheduled_event_id: 1,
+        }
+        .encode()
+        .expect("token");
+        grpc.respond_nexus_task_completed(Request::new(
+            workflowservice::RespondNexusTaskCompletedRequest {
+                namespace: "default".to_string(),
+                task_token: token,
+                response: Some(nexus_v1::Response {
+                    variant: Some(nexus_v1::response::Variant::CancelOperation(
+                        nexus_v1::CancelOperationResponse {},
+                    )),
+                }),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("kernel rejection should be swallowed");
+
+        assert_eq!(runtime.recorded().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn respond_nexus_task_failed_rejects_empty_task_token() {
+        let (grpc, _broker) = nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
+
+        let error = grpc
+            .respond_nexus_task_failed(Request::new(
+                workflowservice::RespondNexusTaskFailedRequest {
+                    namespace: "default".to_string(),
+                    task_token: Vec::new(),
+                    error: Some(nexus_v1::HandlerError {
+                        error_type: "Handler".to_string(),
+                        failure: None,
+                    }),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect_err("empty token should fail");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn respond_nexus_task_failed_rejects_missing_error() {
+        let (grpc, _broker) = nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
+
+        let token = NexusTaskToken {
+            run_key: RunKey::new(),
+            operation_id: "op-1".to_string(),
+            scheduled_event_id: 1,
+        }
+        .encode()
+        .expect("token");
+        let error = grpc
+            .respond_nexus_task_failed(Request::new(
+                workflowservice::RespondNexusTaskFailedRequest {
+                    namespace: "default".to_string(),
+                    task_token: token,
+                    error: None,
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect_err("missing error should fail");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn respond_nexus_task_failed_kernel_rejection_returns_success() {
+        let runtime = Arc::new(NexusRecordingRuntime::new(false));
+        let (grpc, _broker) = nexus_test_service(runtime.clone());
+
+        let token = NexusTaskToken {
+            run_key: RunKey::new(),
+            operation_id: "op-1".to_string(),
+            scheduled_event_id: 1,
+        }
+        .encode()
+        .expect("token");
+        grpc.respond_nexus_task_failed(Request::new(
+            workflowservice::RespondNexusTaskFailedRequest {
+                namespace: "default".to_string(),
+                task_token: token,
+                error: Some(nexus_v1::HandlerError {
+                    error_type: "Handler".to_string(),
+                    failure: None,
+                }),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("kernel rejection should be swallowed");
+
+        assert_eq!(runtime.recorded().len(), 1);
     }
 }

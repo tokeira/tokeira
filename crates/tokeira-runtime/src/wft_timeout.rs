@@ -146,7 +146,7 @@ pub(crate) async fn run_wft_timeout_scanner(
         let active_shards: Vec<_> = shard_owner.read().unwrap().active_shards().collect();
         for shard_id in active_shards {
             scan_wft_timeouts_once(&tracking, Some(shard_id), &config, |entry, now| {
-                let lane = pick_lane(&lanes, lane_count, entry.run_key).clone();
+                let lane = pick_lane(&lanes, lane_count, entry.shard_id).clone();
                 async move {
                     lane.submit(
                         entry.run_key,

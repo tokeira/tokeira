@@ -13,8 +13,8 @@ use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     CancelRequest, ChildStartConfirmedRequest, ChildStartResult, Command, DispatchOp,
     ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
-    ExternalSignalResult, ExternalWorkflowExecution, SignalRequest, StartRequest,
-    TerminateRequest,
+    ExternalSignalResult, ExternalWorkflowExecution, LoadedRun, SignalRequest,
+    StartRequest, TerminateRequest,
 };
 use tokeira_proto::conversions::common::failure_to_payload;
 use tokeira_proto::public::temporal::api::failure::v1 as failure_proto;
@@ -32,7 +32,8 @@ use crate::{
     fairness::DeliveryMetrics,
     lane::{DispatchPublisher, LaneHandle},
     nexus::{
-        NexusEndpointRegistry, NexusHttpClient, NexusStartResult, NexusTimeoutEntry,
+        EndpointTarget, NexusEndpointRegistry, NexusHttpClient, NexusStartResult,
+        NexusTask, NexusTaskBroker, NexusTaskRequest, NexusTaskToken, NexusTimeoutEntry,
         NexusTimeoutTrackingState,
     },
     scanner::pick_lane,
@@ -51,6 +52,7 @@ pub struct RuntimeDispatchPublisher<R> {
     shard_count: u32,
     nexus_client: Arc<dyn NexusHttpClient>,
     nexus_registry: NexusEndpointRegistry,
+    nexus_broker: NexusTaskBroker,
     nexus_timeout_tracking: NexusTimeoutTrackingState,
     activity_tracking: ActivityTrackingState,
     delivery_metrics: DeliveryMetrics,
@@ -68,6 +70,7 @@ impl<R> Clone for RuntimeDispatchPublisher<R> {
             shard_count: self.shard_count,
             nexus_client: self.nexus_client.clone(),
             nexus_registry: self.nexus_registry.clone(),
+            nexus_broker: self.nexus_broker.clone(),
             nexus_timeout_tracking: self.nexus_timeout_tracking.clone(),
             activity_tracking: self.activity_tracking.clone(),
             delivery_metrics: self.delivery_metrics.clone(),
@@ -90,6 +93,7 @@ where
         shard_count: u32,
         nexus_client: Arc<dyn NexusHttpClient>,
         nexus_registry: NexusEndpointRegistry,
+        nexus_broker: NexusTaskBroker,
         nexus_timeout_tracking: NexusTimeoutTrackingState,
         activity_tracking: ActivityTrackingState,
         delivery_metrics: DeliveryMetrics,
@@ -104,6 +108,7 @@ where
             shard_count,
             nexus_client,
             nexus_registry,
+            nexus_broker,
             nexus_timeout_tracking,
             activity_tracking,
             delivery_metrics,
@@ -112,8 +117,9 @@ where
     }
 
     fn pick_lane(&self, run_key: RunKey) -> LaneHandle {
+        let shard_id = shard_for(run_key, self.shard_count);
         let lanes = self.lanes.lock().unwrap();
-        pick_lane(&lanes, self.lane_count, run_key).clone()
+        pick_lane(&lanes, self.lane_count, shard_id).clone()
     }
 
     fn redirected_queue(&self, queue: &QueueKey) -> QueueKey {
@@ -574,28 +580,49 @@ where
         schedule_to_close_timeout: Option<Duration>,
         originator_run_key: RunKey,
         scheduled_event_id: i64,
+        scheduled_at: OffsetDateTime,
     ) {
         let resolution = match self.nexus_registry.resolve(&endpoint_name) {
-            Some(config) => {
-                match self
-                    .nexus_client
-                    .start_operation(
-                        &config.address,
-                        &operation_id,
-                        &service,
-                        &operation,
-                        &input,
-                        schedule_to_close_timeout,
-                    )
-                    .await
-                {
-                    Ok(NexusStartResult::SyncCompleted { result }) => {
-                        tokeira_kernel::NexusResolution::Completed { result }
-                    }
-                    Ok(NexusStartResult::SyncFailed { message }) => {
-                        tokeira_kernel::NexusResolution::Failed {
+            Some(config) => match &config.target {
+                EndpointTarget::External { address } => {
+                    match self
+                        .nexus_client
+                        .start_operation(
+                            address,
+                            &operation_id,
+                            &service,
+                            &operation,
+                            &input,
+                            schedule_to_close_timeout,
+                        )
+                        .await
+                    {
+                        Ok(NexusStartResult::SyncCompleted { result }) => {
+                            tokeira_kernel::NexusResolution::Completed { result }
+                        }
+                        Ok(NexusStartResult::SyncFailed { message }) => {
+                            tokeira_kernel::NexusResolution::Failed {
+                                failure: failure_to_payload(&failure_proto::Failure {
+                                    message,
+                                    failure_info: Some(
+                                        failure_proto::failure::FailureInfo::ApplicationFailureInfo(
+                                            failure_proto::ApplicationFailureInfo {
+                                                r#type: "NexusOperationFailure".to_string(),
+                                                non_retryable: false,
+                                                ..Default::default()
+                                            },
+                                        ),
+                                    ),
+                                    ..Default::default()
+                                }),
+                            }
+                        }
+                        Ok(NexusStartResult::AsyncAccepted) => {
+                            tokeira_kernel::NexusResolution::Started
+                        }
+                        Err(error) => tokeira_kernel::NexusResolution::Failed {
                             failure: failure_to_payload(&failure_proto::Failure {
-                                message,
+                                message: error.to_string(),
                                 failure_info: Some(
                                     failure_proto::failure::FailureInfo::ApplicationFailureInfo(
                                         failure_proto::ApplicationFailureInfo {
@@ -607,28 +634,33 @@ where
                                 ),
                                 ..Default::default()
                             }),
-                        }
+                        },
                     }
-                    Ok(NexusStartResult::AsyncAccepted) => {
-                        tokeira_kernel::NexusResolution::Started
-                    }
-                    Err(error) => tokeira_kernel::NexusResolution::Failed {
-                        failure: failure_to_payload(&failure_proto::Failure {
-                            message: error.to_string(),
-                            failure_info: Some(
-                                failure_proto::failure::FailureInfo::ApplicationFailureInfo(
-                                    failure_proto::ApplicationFailureInfo {
-                                        r#type: "NexusOperationFailure".to_string(),
-                                        non_retryable: false,
-                                        ..Default::default()
-                                    },
-                                ),
-                            ),
-                            ..Default::default()
-                        }),
-                    },
                 }
-            }
+                EndpointTarget::Worker {
+                    namespace_id,
+                    task_queue,
+                } => {
+                    let task = NexusTask {
+                        token: NexusTaskToken {
+                            run_key: originator_run_key,
+                            operation_id: operation_id.clone(),
+                            scheduled_event_id,
+                        },
+                        request: NexusTaskRequest::StartOperation {
+                            service,
+                            operation,
+                            request_id: operation_id.clone(),
+                            payload: input.0.first().cloned(),
+                            scheduled_time: Some(scheduled_at),
+                        },
+                    };
+                    self.nexus_broker
+                        .publish(*namespace_id, task_queue.clone(), task)
+                        .await;
+                    return;
+                }
+            },
             None => tokeira_kernel::NexusResolution::Failed {
                 failure: failure_to_payload(&failure_proto::Failure {
                     message: format!("nexus endpoint not found: {endpoint_name}"),
@@ -685,41 +717,100 @@ where
             return;
         };
 
-        match self
-            .nexus_client
-            .cancel_operation(&config.address, &operation_id, &service)
-            .await
-        {
-            Ok(()) => {
-                let command = Command::NexusOperationResolved(
-                    tokeira_kernel::NexusOperationResolvedRequest {
-                        operation_id,
-                        scheduled_event_id,
-                        resolution: tokeira_kernel::NexusResolution::Canceled,
-                        now: OffsetDateTime::now_utc(),
-                    },
-                );
-                if let Err(error) = self
-                    .pick_lane(originator_run_key)
-                    .submit(originator_run_key, command)
-                    .await
-                {
-                    tracing::warn!(
+        match &config.target {
+            EndpointTarget::External { address } => match self
+                .nexus_client
+                .cancel_operation(address, &operation_id, &service)
+                .await
+            {
+                Ok(()) => {
+                    let command = Command::NexusOperationResolved(
+                        tokeira_kernel::NexusOperationResolvedRequest {
+                            operation_id,
+                            scheduled_event_id,
+                            resolution: tokeira_kernel::NexusResolution::Canceled,
+                            now: OffsetDateTime::now_utc(),
+                        },
+                    );
+                    if let Err(error) = self
+                        .pick_lane(originator_run_key)
+                        .submit(originator_run_key, command)
+                        .await
+                    {
+                        tracing::warn!(
+                            ?error,
+                            originator_run_key = ?originator_run_key,
+                            scheduled_event_id,
+                            "failed to deliver NexusOperationResolved(Canceled) to originator"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(
                         ?error,
-                        originator_run_key = ?originator_run_key,
-                        scheduled_event_id,
-                        "failed to deliver NexusOperationResolved(Canceled) to originator"
+                        operation_id,
+                        endpoint = endpoint_name,
+                        "cancel nexus operation failed (treating as no-op)"
                     );
                 }
+            },
+            EndpointTarget::Worker {
+                namespace_id,
+                task_queue,
+            } => {
+                let operation = match self
+                    .lookup_nexus_operation_name(originator_run_key, &operation_id)
+                    .await
+                {
+                    Ok(Some(operation)) => operation,
+                    Ok(None) => {
+                        tracing::warn!(
+                            originator_run_key = ?originator_run_key,
+                            operation_id,
+                            "cancel nexus operation skipped: pending operation not found"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            ?error,
+                            originator_run_key = ?originator_run_key,
+                            operation_id,
+                            "cancel nexus operation skipped: failed to load pending operation"
+                        );
+                        return;
+                    }
+                };
+                let task = NexusTask {
+                    token: NexusTaskToken {
+                        run_key: originator_run_key,
+                        operation_id: operation_id.clone(),
+                        scheduled_event_id,
+                    },
+                    request: NexusTaskRequest::CancelOperation {
+                        service,
+                        operation_id,
+                        operation,
+                    },
+                };
+                self.nexus_broker
+                    .publish(*namespace_id, task_queue.clone(), task)
+                    .await;
             }
-            Err(error) => {
-                tracing::debug!(
-                    ?error,
-                    operation_id,
-                    endpoint = endpoint_name,
-                    "cancel nexus operation failed (treating as no-op)"
-                );
-            }
+        }
+    }
+
+    async fn lookup_nexus_operation_name(
+        &self,
+        run_key: RunKey,
+        operation_id: &str,
+    ) -> Result<Option<String>> {
+        match self.repo.load_run(run_key).await? {
+            LoadedRun::Existing(state) => Ok(state
+                .pending_nexus_operations
+                .get(operation_id)
+                .map(|pending| pending.operation.clone())),
+            LoadedRun::Absent => Ok(None),
         }
     }
 }
@@ -968,6 +1059,7 @@ where
                     let schedule_to_close_timeout = *schedule_to_close_timeout;
                     let originator_run_key = *originator_run_key;
                     let scheduled_event_id = *scheduled_event_id;
+                    let scheduled_at = *scheduled_at;
                     tokio::spawn(async move {
                         publisher
                             .handle_schedule_nexus_operation(
@@ -979,6 +1071,7 @@ where
                                 schedule_to_close_timeout,
                                 originator_run_key,
                                 scheduled_event_id,
+                                scheduled_at,
                             )
                             .await;
                     });

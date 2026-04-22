@@ -21,29 +21,33 @@ use http::HeaderMap;
 use prost::Message as _;
 use time::OffsetDateTime;
 use tokeira_kernel::{
-    CancelRequest, HistoryEvent, HistoryEventKind, ResetRequest, SignalRequest,
-    SignalWithStartRequest, StartRequest, TerminateRequest, WorkflowTaskCompletedRequest,
+    CancelRequest, HistoryEvent, HistoryEventKind, NexusResolution, ResetRequest,
+    SignalRequest, SignalWithStartRequest, StartRequest, TerminateRequest,
+    WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    BufferedQueryRegistry, InMemoryBroker, OverlapDecision, OverlapPolicy,
-    PendingUpdateTransport, QueryResult, ResetWorkflowResult, ScheduleActionResult,
-    SchedulePatch, ScheduleStore, SignalWithStartResult, StartWorkflowResult,
-    StartedActivityTask, StartedWorkflowTask, UpdateOutcome, UpdateTransportResolution,
-    UpdateWaitPolicy, VersioningRuleStore, WorkerRegistry, WorkflowExecution,
-    WorkflowExecutionStatus, compute_matching_times, decide_overlap,
-    schedule_workflow_id,
+    BatchError, BatchOperationEntry, BatchOperationStore, BatchProgressCounters,
+    BatchResetTarget, BufferedQueryRegistry, InMemoryBroker, NexusTaskBroker,
+    NexusTaskToken, OverlapDecision, OverlapPolicy, PendingUpdateTransport,
+    QueryResult, ResetWorkflowResult, ScheduleActionResult, SchedulePatch,
+    ScheduleStore, SignalWithStartResult, StartWorkflowResult, StartedActivityTask,
+    StartedWorkflowTask, UpdateOutcome, UpdateTransportResolution, UpdateWaitPolicy,
+    VersioningRuleStore, WorkerRegistry, WorkflowExecution, WorkflowExecutionStatus,
+    compute_matching_times, decide_overlap, schedule_workflow_id,
 };
 use tokeira_storage::RunRepository;
 use tokeira_types::{
     ActivityTaskToken, ExecutionRef, ExecutionStatus, Payload, Payloads, QueueKey,
     RequestContext, RequestId, RunId, RunKey, TaskKind, TaskQueueName, WorkerIdentity,
+    WorkflowId,
 };
 use uuid::Uuid;
 
 use crate::{
+    batch_engine::{resolve_reset_target_from_history, run_batch_operation},
     errors::{EdgeError, EdgeResult},
     history_wait::HistoryWaitRegistry,
-    interceptors::{Action, EdgeInterceptors},
+    interceptors::{Action, EdgeContext, EdgeInterceptors},
     long_poll::LongPollGate,
     namespace_cache::{NamespaceCache, ResolvedNamespace},
     operator_service::{ClusterInfo, OperatorApi},
@@ -76,6 +80,14 @@ use crate::{
         WorkflowExecutionDescription, WorkflowQueryDto, from_internal, to_internal,
     },
 };
+
+#[derive(Clone, Debug)]
+pub struct BatchDispatchContext {
+    pub namespace_id: tokeira_types::NamespaceId,
+    pub namespace_name: String,
+    pub identity: String,
+    pub edge_context: EdgeContext,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkflowMutationOutcome {
@@ -210,6 +222,14 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         run_key: RunKey,
         update_id: String,
     ) -> Result<Option<(String, Payloads)>>;
+
+    async fn resolve_nexus_operation(
+        &self,
+        run_key: RunKey,
+        operation_id: String,
+        scheduled_event_id: i64,
+        resolution: NexusResolution,
+    ) -> Result<bool>;
 }
 
 #[async_trait]
@@ -350,12 +370,14 @@ pub struct WorkflowService {
     pending_queries: PendingQueryStore,
     buffered_queries: BufferedQueryRegistry,
     broker: InMemoryBroker,
+    nexus_broker: NexusTaskBroker,
     long_polls: LongPollGate,
     router: Arc<dyn EdgeRouter>,
     history_waiters: HistoryWaitRegistry,
     versioning_rule_store: Arc<VersioningRuleStore>,
     worker_registry: WorkerRegistry,
     schedule_store: Arc<ScheduleStore>,
+    batch_store: Arc<BatchOperationStore>,
 }
 
 impl std::fmt::Debug for WorkflowService {
@@ -391,12 +413,14 @@ impl WorkflowService {
             pending_queries,
             BufferedQueryRegistry::default(),
             broker,
+            NexusTaskBroker::default(),
             long_polls,
             router,
             HistoryWaitRegistry::default(),
             Arc::new(VersioningRuleStore::default()),
             WorkerRegistry::default(),
             Arc::new(ScheduleStore::default()),
+            Arc::new(BatchOperationStore::default()),
         )
     }
 
@@ -427,12 +451,14 @@ impl WorkflowService {
             pending_queries,
             buffered_queries,
             broker,
+            NexusTaskBroker::default(),
             long_polls,
             router,
             HistoryWaitRegistry::default(),
             Arc::new(VersioningRuleStore::default()),
             WorkerRegistry::default(),
             Arc::new(ScheduleStore::default()),
+            Arc::new(BatchOperationStore::default()),
         )
     }
 
@@ -463,12 +489,14 @@ impl WorkflowService {
             pending_queries,
             BufferedQueryRegistry::default(),
             broker,
+            NexusTaskBroker::default(),
             long_polls,
             router,
             history_waiters,
             Arc::new(VersioningRuleStore::default()),
             WorkerRegistry::default(),
             Arc::new(ScheduleStore::default()),
+            Arc::new(BatchOperationStore::default()),
         )
     }
 
@@ -484,12 +512,14 @@ impl WorkflowService {
         pending_queries: PendingQueryStore,
         buffered_queries: BufferedQueryRegistry,
         broker: InMemoryBroker,
+        nexus_broker: NexusTaskBroker,
         long_polls: LongPollGate,
         router: Arc<dyn EdgeRouter>,
         history_waiters: HistoryWaitRegistry,
         versioning_rule_store: Arc<VersioningRuleStore>,
         worker_registry: WorkerRegistry,
         schedule_store: Arc<ScheduleStore>,
+        batch_store: Arc<BatchOperationStore>,
     ) -> Self {
         Self {
             runtime,
@@ -503,12 +533,14 @@ impl WorkflowService {
             pending_queries,
             buffered_queries,
             broker,
+            nexus_broker,
             long_polls,
             router,
             history_waiters,
             versioning_rule_store,
             worker_registry,
             schedule_store,
+            batch_store,
         }
     }
 
@@ -522,6 +554,502 @@ impl WorkflowService {
 
     pub fn schedule_store(&self) -> Arc<ScheduleStore> {
         self.schedule_store.clone()
+    }
+
+    pub fn batch_store(&self) -> Arc<BatchOperationStore> {
+        self.batch_store.clone()
+    }
+
+    pub async fn poll_nexus_task_queue(
+        &self,
+        headers: &HeaderMap,
+        req: crate::translate::nexus::PollNexusTaskQueueRequest,
+    ) -> EdgeResult<Option<crate::translate::nexus::PollNexusTaskQueueResponse>> {
+        let _ctx = self
+            .interceptors
+            .begin(
+                headers,
+                Some(&req.namespace),
+                Action::PollNexusTaskQueue,
+                true,
+            )
+            .await?;
+
+        ensure_local(
+            self.router
+                .route_task_queue(&req.namespace, &req.task_queue)
+                .await?,
+        )?;
+
+        let _permit = self.long_polls.acquire().await?;
+        let (namespace_id, task_queue) =
+            crate::translate::nexus::broker_queue(&req.namespace, &req.task_queue);
+        let task = self
+            .nexus_broker
+            .poll(
+                namespace_id,
+                task_queue,
+                std::time::Duration::from_secs(60),
+            )
+            .await;
+
+        match task {
+            Some(task) => Ok(Some(crate::translate::nexus::PollNexusTaskQueueResponse {
+                task_token: task.token.encode().map_err(EdgeError::from)?,
+                request: task.request,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn respond_nexus_task_completed(
+        &self,
+        headers: &HeaderMap,
+        req: crate::translate::nexus::RespondNexusTaskCompletedRequest,
+    ) -> EdgeResult<()> {
+        let _ctx = self
+            .interceptors
+            .begin(
+                headers,
+                Some(&req.namespace),
+                Action::RespondNexusTaskCompleted,
+                false,
+            )
+            .await?;
+
+        if req.task_token.is_empty() {
+            return Err(EdgeError::BadRequest("task_token is required".to_string()));
+        }
+        let token = NexusTaskToken::decode(&req.task_token)
+            .map_err(|error| EdgeError::BadRequest(error.to_string()))?;
+        let response = req
+            .response
+            .ok_or_else(|| EdgeError::BadRequest("response is required".to_string()))?;
+        let resolution = crate::translate::nexus::proto_response_to_resolution(
+            response,
+            &token.operation_id,
+        )
+        .map_err(|error| EdgeError::BadRequest(error.to_string()))?;
+
+        let applied = self
+            .runtime
+            .resolve_nexus_operation(
+                token.run_key,
+                token.operation_id.clone(),
+                token.scheduled_event_id,
+                resolution,
+            )
+            .await
+            .map_err(EdgeError::from)?;
+        if applied {
+            self.notify_history_run_key(
+                token.run_key,
+                read_last_event_id(self.repo.as_ref(), token.run_key).await?,
+            )
+            .await;
+        }
+
+        Ok(())
+    }
+
+    pub async fn respond_nexus_task_failed(
+        &self,
+        headers: &HeaderMap,
+        req: crate::translate::nexus::RespondNexusTaskFailedRequest,
+    ) -> EdgeResult<()> {
+        let _ctx = self
+            .interceptors
+            .begin(
+                headers,
+                Some(&req.namespace),
+                Action::RespondNexusTaskFailed,
+                false,
+            )
+            .await?;
+
+        if req.task_token.is_empty() {
+            return Err(EdgeError::BadRequest("task_token is required".to_string()));
+        }
+        let token = NexusTaskToken::decode(&req.task_token)
+            .map_err(|error| EdgeError::BadRequest(error.to_string()))?;
+        let error = req
+            .error
+            .ok_or_else(|| EdgeError::BadRequest("error is required".to_string()))?;
+        let resolution = crate::translate::nexus::proto_handler_error_to_resolution(error)
+            .map_err(|error| EdgeError::BadRequest(error.to_string()))?;
+
+        let applied = self
+            .runtime
+            .resolve_nexus_operation(
+                token.run_key,
+                token.operation_id.clone(),
+                token.scheduled_event_id,
+                resolution,
+            )
+            .await
+            .map_err(EdgeError::from)?;
+        if applied {
+            self.notify_history_run_key(
+                token.run_key,
+                read_last_event_id(self.repo.as_ref(), token.run_key).await?,
+            )
+            .await;
+        }
+
+        Ok(())
+    }
+
+    pub async fn start_batch_operation(
+        &self,
+        headers: &HeaderMap,
+        req: crate::translate::batch::StartBatchOperationRequest,
+    ) -> EdgeResult<()> {
+        let ctx = self
+            .interceptors
+            .begin(
+                headers,
+                Some(&req.namespace),
+                Action::StartBatchOperation,
+                false,
+            )
+            .await?;
+        let namespace_id = to_internal::namespace_id_for(&req.namespace);
+        let identity = if req.operation_params.identity().trim().is_empty() {
+            ctx.principal.subject.clone()
+        } else {
+            req.operation_params.identity().to_string()
+        };
+        let cancellation_token = tokio_util::sync::CancellationToken::new();
+        let entry = BatchOperationEntry {
+            job_id: req.job_id.clone(),
+            namespace_id,
+            operation_type: req.operation_type,
+            operation_params: req.operation_params,
+            state: tokeira_runtime::BatchOperationState::Running,
+            start_time: OffsetDateTime::now_utc(),
+            close_time: None,
+            counters: Arc::new(BatchProgressCounters::default()),
+            visibility_query: req.visibility_query,
+            executions: req.executions,
+            reason: req.reason,
+            identity: identity.clone(),
+            max_operations_per_second: req.max_operations_per_second,
+            cancellation_token: cancellation_token.clone(),
+            stop_reason: None,
+            stop_identity: None,
+        };
+        self.batch_store
+            .create(entry)
+            .map_err(|err| batch_error_to_edge(err, &req.namespace, &req.job_id))?;
+
+        let dispatch_ctx = BatchDispatchContext {
+            namespace_id,
+            namespace_name: req.namespace,
+            identity,
+            edge_context: ctx,
+        };
+        tokio::spawn(run_batch_operation(
+            self.batch_store.clone(),
+            self.clone(),
+            dispatch_ctx,
+            namespace_id,
+            req.job_id,
+            cancellation_token,
+        ));
+        Ok(())
+    }
+
+    pub async fn stop_batch_operation(
+        &self,
+        headers: &HeaderMap,
+        req: crate::translate::batch::StopBatchOperationRequest,
+    ) -> EdgeResult<()> {
+        let _ctx = self
+            .interceptors
+            .begin(
+                headers,
+                Some(&req.namespace),
+                Action::StopBatchOperation,
+                false,
+            )
+            .await?;
+        self.batch_store
+            .stop(
+                to_internal::namespace_id_for(&req.namespace),
+                &req.job_id,
+                req.reason,
+                req.identity,
+            )
+            .map_err(|err| batch_error_to_edge(err, &req.namespace, &req.job_id))
+    }
+
+    pub async fn describe_batch_operation(
+        &self,
+        headers: &HeaderMap,
+        req: crate::translate::batch::DescribeBatchOperationRequest,
+    ) -> EdgeResult<tokeira_runtime::BatchOperationSnapshot> {
+        let _ctx = self
+            .interceptors
+            .begin(
+                headers,
+                Some(&req.namespace),
+                Action::DescribeBatchOperation,
+                false,
+            )
+            .await?;
+        self.batch_store
+            .describe(to_internal::namespace_id_for(&req.namespace), &req.job_id)
+            .map_err(|err| batch_error_to_edge(err, &req.namespace, &req.job_id))
+    }
+
+    pub async fn list_batch_operations(
+        &self,
+        headers: &HeaderMap,
+        req: crate::translate::batch::ListBatchOperationsRequest,
+    ) -> EdgeResult<(Vec<tokeira_runtime::BatchOperationInfo>, Option<Vec<u8>>)> {
+        let _ctx = self
+            .interceptors
+            .begin(
+                headers,
+                Some(&req.namespace),
+                Action::ListBatchOperations,
+                false,
+            )
+            .await?;
+        Ok(self.batch_store.list(
+            to_internal::namespace_id_for(&req.namespace),
+            req.page_size,
+            &req.next_page_token,
+        ))
+    }
+
+    pub(crate) async fn list_workflows_batch_internal(
+        &self,
+        ctx: &BatchDispatchContext,
+        query: Option<String>,
+        next_page_token: Option<String>,
+    ) -> EdgeResult<ListWorkflowExecutionsResponse> {
+        self.visibility
+            .list_workflows(ListWorkflowExecutionsRequest {
+                namespace: ctx.namespace_name.clone(),
+                query,
+                page_size: 100,
+                next_page_token,
+            })
+            .await
+            .map_err(EdgeError::from)
+    }
+
+    pub(crate) async fn terminate_workflow_batch_internal(
+        &self,
+        ctx: &BatchDispatchContext,
+        workflow_ref: &tokeira_runtime::WorkflowExecutionRef,
+        details: Option<Payloads>,
+        identity: String,
+    ) -> EdgeResult<()> {
+        ensure_local(
+            self.router
+                .route_workflow(&ctx.namespace_name, &workflow_ref.workflow_id)
+                .await?,
+        )?;
+        let run_key = self.resolve_batch_run_key(ctx, workflow_ref).await?;
+        let outcome = self
+            .runtime
+            .terminate_workflow(
+                run_key,
+                TerminateRequest {
+                    reason: "batch terminate".to_string(),
+                    details,
+                    identity,
+                    request: batch_request_context(ctx),
+                    now: OffsetDateTime::now_utc(),
+                },
+            )
+            .await
+            .map_err(EdgeError::from)?;
+        self.notify_history_run_key(run_key, outcome.last_event_id)
+            .await;
+        Ok(())
+    }
+
+    pub(crate) async fn cancel_workflow_batch_internal(
+        &self,
+        ctx: &BatchDispatchContext,
+        workflow_ref: &tokeira_runtime::WorkflowExecutionRef,
+    ) -> EdgeResult<()> {
+        ensure_local(
+            self.router
+                .route_workflow(&ctx.namespace_name, &workflow_ref.workflow_id)
+                .await?,
+        )?;
+        let run_key = self.resolve_batch_run_key(ctx, workflow_ref).await?;
+        let outcome = self
+            .runtime
+            .cancel_workflow(
+                run_key,
+                CancelRequest {
+                    reason: "batch cancel".to_string(),
+                    external_initiator: None,
+                    request: batch_request_context(ctx),
+                    now: OffsetDateTime::now_utc(),
+                },
+            )
+            .await
+            .map_err(EdgeError::from)?;
+        self.notify_history_run_key(run_key, outcome.last_event_id)
+            .await;
+        Ok(())
+    }
+
+    pub(crate) async fn signal_workflow_batch_internal(
+        &self,
+        ctx: &BatchDispatchContext,
+        workflow_ref: &tokeira_runtime::WorkflowExecutionRef,
+        signal_name: String,
+        input: Payloads,
+    ) -> EdgeResult<()> {
+        ensure_local(
+            self.router
+                .route_workflow(&ctx.namespace_name, &workflow_ref.workflow_id)
+                .await?,
+        )?;
+        let run_key = self.resolve_batch_run_key(ctx, workflow_ref).await?;
+        let outcome = self
+            .runtime
+            .signal_workflow(
+                run_key,
+                SignalRequest {
+                    signal_name,
+                    input,
+                    request: batch_request_context(ctx),
+                    now: OffsetDateTime::now_utc(),
+                },
+            )
+            .await
+            .map_err(EdgeError::from)?;
+        self.notify_history_run_key(run_key, outcome.last_event_id)
+            .await;
+        Ok(())
+    }
+
+    pub(crate) async fn delete_workflow_batch_internal(
+        &self,
+        ctx: &BatchDispatchContext,
+        workflow_ref: &tokeira_runtime::WorkflowExecutionRef,
+        identity: String,
+    ) -> EdgeResult<()> {
+        ensure_local(
+            self.router
+                .route_workflow(&ctx.namespace_name, &workflow_ref.workflow_id)
+                .await?,
+        )?;
+        let run_key = self.resolve_batch_run_key(ctx, workflow_ref).await?;
+        let loaded = self.repo.load_run(run_key).await.map_err(EdgeError::from)?;
+        let tokeira_kernel::LoadedRun::Existing(state) = loaded else {
+            return Err(EdgeError::WorkflowNotFound {
+                namespace: ctx.namespace_name.clone(),
+                workflow_id: workflow_ref.workflow_id.clone(),
+            });
+        };
+        if state.status.is_open() {
+            let outcome = self
+                .runtime
+                .terminate_workflow(
+                    run_key,
+                    TerminateRequest {
+                        reason: "deleted via batch operation".to_string(),
+                        details: None,
+                        identity,
+                        request: batch_request_context(ctx),
+                        now: OffsetDateTime::now_utc(),
+                    },
+                )
+                .await
+                .map_err(EdgeError::from)?;
+            self.notify_history_run_key(run_key, outcome.last_event_id)
+                .await;
+        }
+        self.visibility
+            .delete_execution(run_key)
+            .await
+            .map_err(EdgeError::from)
+    }
+
+    pub(crate) async fn reset_workflow_batch_internal(
+        &self,
+        ctx: &BatchDispatchContext,
+        workflow_ref: &tokeira_runtime::WorkflowExecutionRef,
+        fork_event_id: i64,
+        reason: String,
+    ) -> EdgeResult<()> {
+        ensure_local(
+            self.router
+                .route_workflow(&ctx.namespace_name, &workflow_ref.workflow_id)
+                .await?,
+        )?;
+        let execution = self.execution_ref_from_batch(ctx, workflow_ref)?;
+        let run_key = self.resolve_batch_run_key(ctx, workflow_ref).await?;
+        let history = self
+            .repo
+            .read_history(run_key, 0, usize::MAX)
+            .await
+            .map_err(EdgeError::from)?;
+        validate_reset_target(&history, fork_event_id)?;
+        let new_run_id = RunId::new();
+        let result = self
+            .runtime
+            .reset_workflow(
+                execution,
+                ResetRequest {
+                    fork_event_id,
+                    new_run_id,
+                    reason,
+                    request: batch_request_context(ctx),
+                    now: OffsetDateTime::now_utc(),
+                },
+            )
+            .await
+            .map_err(EdgeError::from)?;
+        self.notify_history_run_key(result.successor_run_key, 0)
+            .await;
+        Ok(())
+    }
+
+    pub(crate) async fn resolve_reset_target_batch_internal(
+        &self,
+        ctx: &BatchDispatchContext,
+        workflow_ref: &tokeira_runtime::WorkflowExecutionRef,
+        target: &BatchResetTarget,
+    ) -> EdgeResult<i64> {
+        let run_key = self.resolve_batch_run_key(ctx, workflow_ref).await?;
+        let history = self
+            .repo
+            .read_history(run_key, 0, usize::MAX)
+            .await
+            .map_err(EdgeError::from)?;
+        if let BatchResetTarget::BuildId(build_id) = target {
+            let loaded = self.repo.load_run(run_key).await.map_err(EdgeError::from)?;
+            let tokeira_kernel::LoadedRun::Existing(state) = loaded else {
+                return Err(EdgeError::WorkflowNotFound {
+                    namespace: ctx.namespace_name.clone(),
+                    workflow_id: workflow_ref.workflow_id.clone(),
+                });
+            };
+            if state
+                .build_id
+                .as_ref()
+                .is_none_or(|value| value.0 != *build_id)
+            {
+                return Err(EdgeError::BadRequest(format!(
+                    "workflow was not processed by build id `{build_id}`"
+                )));
+            }
+            return resolve_reset_target_from_history(
+                &history,
+                &BatchResetTarget::FirstWorkflowTask,
+            );
+        }
+        resolve_reset_target_from_history(&history, target)
     }
 
     pub async fn apply_schedule_patch(
@@ -830,12 +1358,14 @@ impl WorkflowService {
             pending_queries,
             buffered_queries,
             broker,
+            NexusTaskBroker::default(),
             long_polls,
             router,
             history_waiters,
             Arc::new(VersioningRuleStore::default()),
             WorkerRegistry::default(),
             Arc::new(ScheduleStore::default()),
+            Arc::new(BatchOperationStore::default()),
         )
     }
 
@@ -2462,6 +2992,40 @@ impl WorkflowService {
             })
     }
 
+    fn execution_ref_from_batch(
+        &self,
+        ctx: &BatchDispatchContext,
+        workflow_ref: &tokeira_runtime::WorkflowExecutionRef,
+    ) -> EdgeResult<ExecutionRef> {
+        Ok(ExecutionRef {
+            namespace_id: ctx.namespace_id,
+            workflow_id: WorkflowId(workflow_ref.workflow_id.clone()),
+            run_id: workflow_ref
+                .run_id
+                .as_deref()
+                .map(Uuid::parse_str)
+                .transpose()
+                .map_err(|err| EdgeError::BadRequest(err.to_string()))?
+                .map(RunId),
+        })
+    }
+
+    async fn resolve_batch_run_key(
+        &self,
+        ctx: &BatchDispatchContext,
+        workflow_ref: &tokeira_runtime::WorkflowExecutionRef,
+    ) -> EdgeResult<RunKey> {
+        let execution = self.execution_ref_from_batch(ctx, workflow_ref)?;
+        self.repo
+            .resolve_execution(&execution)
+            .await
+            .map_err(EdgeError::from)?
+            .ok_or(EdgeError::WorkflowNotFound {
+                namespace: ctx.namespace_name.clone(),
+                workflow_id: workflow_ref.workflow_id.clone(),
+            })
+    }
+
     async fn notify_history_run_key(&self, run_key: RunKey, last_event_id: i64) {
         self.history_waiters.notify(run_key, last_event_id).await;
     }
@@ -2549,6 +3113,32 @@ fn validate_reset_target(history: &[HistoryEvent], fork_event_id: i64) -> EdgeRe
     }
 
     Ok(())
+}
+
+fn batch_request_context(ctx: &BatchDispatchContext) -> RequestContext {
+    RequestContext {
+        request_id: RequestId(ctx.edge_context.request_id.as_str().to_string()),
+        caller_identity: Some(ctx.identity.clone()),
+        received_at: ctx.edge_context.received_at,
+    }
+}
+
+fn batch_error_to_edge(
+    error: BatchError,
+    namespace: &str,
+    job_id: &tokeira_runtime::JobId,
+) -> EdgeError {
+    match error {
+        BatchError::AlreadyExists => EdgeError::BatchOperationAlreadyExists {
+            namespace: namespace.to_string(),
+            job_id: job_id.0.clone(),
+        },
+        BatchError::NotFound => EdgeError::BatchOperationNotFound {
+            namespace: namespace.to_string(),
+            job_id: job_id.0.clone(),
+        },
+        BatchError::InvalidArgument(message) => EdgeError::BadRequest(message),
+    }
 }
 
 async fn read_last_event_id(repo: &dyn RunRepository, run_key: RunKey) -> Result<i64> {

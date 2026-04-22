@@ -117,17 +117,40 @@ worker — all working against InMemoryVisibilityStore. 30 tests.
 
 ## What to work on next (priority order)
 
+### P0: Observability Foundation
+
+Establish the metrics, tracing, and logging foundation before
+DSQL work begins. Every DSQL feature should be instrumented
+from day one, not retrofitted.
+
+- Metrics registry (Prometheus-compatible)
+- OpenTelemetry tracing integration with span propagation
+- Structured logging with correlation IDs
+- Per-crate instrumentation conventions and macros
+- Export pipeline (Prometheus scrape endpoint, OTLP export)
+- Baseline metrics for existing subsystems (broker, lanes,
+  scanners, kernel transitions, edge handlers)
+
+**Why P0:** You cannot operate what you cannot observe. DSQL
+introduces fundamentally different performance characteristics
+(OCC conflicts, connection rate limits, commit latency) that
+require metrics to debug. The architecture docs (065) explicitly
+require the system to measure its own mechanics. Establishing
+the practice and approach now means every subsequent feature
+ships instrumented.
+
 ### P0: DSQL Storage Layer
 
 The single largest remaining work item. Everything else runs
 against InMemoryStore. Production requires Aurora DSQL.
 
-- Schema implementation (schema already designed in docs/dsql/)
-- DSQL plugin for tokeira-storage (connection reservoir already built)
+- Schema implementation (clean design for tokeira + DSQL)
+- DSQL plugin for tokeira-storage (official connector + reservoir)
 - Transaction mapping: one workflow transition = one DSQL transaction
 - OCC retry with DSQL conflict detection
 - Shard lease management via DynamoDB
 - Migration tooling
+- Connection reservoir with distributed rate limiting
 
 **Why P0:** Nothing else matters for production without durable storage.
 
@@ -144,17 +167,6 @@ DSQL-backed visibility.
 **Why P1:** ListWorkflowExecutions and CountWorkflowExecutions
 need durable visibility for production.
 
-### P2: Connection Reservoir Integration
-
-The reservoir is already built (in temporal-dsql workspace).
-Needs integration with tokeira-storage's DSQL plugin.
-
-- Wire reservoir into DSQL connection pool
-- Token bucket rate limiter integration
-- Slot block manager for distributed connection limiting
-
-**Why P2:** Required for DSQL at scale (10K connection limit).
-
 ### P2: Shard Placement and Membership
 
 Currently single-node with in-memory shard ownership. Production
@@ -166,15 +178,6 @@ needs distributed shard assignment.
 - Shard rebalancing on node join/leave
 
 **Why P2:** Required for horizontal scaling.
-
-### P3: Telemetry and Observability
-
-Metrics, tracing, and logging for production operations.
-
-- Prometheus metrics export
-- OpenTelemetry tracing integration
-- DSQL-specific metrics (conflicts, retries, latency)
-- Broker/scheduler/scanner operational metrics
 
 ### P3: Archival to S3
 

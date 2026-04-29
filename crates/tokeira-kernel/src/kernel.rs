@@ -2255,6 +2255,7 @@ fn apply_workflow_command(
             task_queue,
             input,
             header,
+            request_eager_execution: _,
             retry_policy,
             deployment,
             build_id,

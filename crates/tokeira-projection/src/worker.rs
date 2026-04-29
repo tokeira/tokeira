@@ -11,6 +11,7 @@ use tokeira_types::ProjectionCursor;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
+use crate::metrics as projection_metrics;
 use crate::{sink::ProjectionSink, store::VisibilityStore, types::beginning_cursor};
 
 /// Drives one `(partition_id, fanout)` projection substream.
@@ -34,6 +35,7 @@ where
     pub async fn run_once(&self, cursor: ProjectionCursor) -> Result<ProjectionCursor> {
         let batch = self.log.read_from(&cursor, self.batch_size).await?;
         if batch.records.is_empty() {
+            projection_metrics::set_projection_lag(cursor.partition_id, 0);
             debug!(
                 partition = cursor.partition_id,
                 fanout = cursor.fanout,
@@ -42,9 +44,16 @@ where
             return Ok(cursor);
         }
 
+        projection_metrics::set_projection_lag(cursor.partition_id, batch.records.len());
+
         for record in &batch.records {
             self.sink.apply(record).await?;
         }
+        projection_metrics::record_records_processed(
+            cursor.partition_id,
+            batch.records.len(),
+        );
+        projection_metrics::set_projection_lag(cursor.partition_id, 0);
 
         info!(
             partition = batch.next_cursor.partition_id,
@@ -87,6 +96,7 @@ where
 
             let batch = self.log.read_from(&cursor, self.batch_size).await?;
             if batch.records.is_empty() {
+                projection_metrics::set_projection_lag(cursor.partition_id, 0);
                 debug!("projection substream idle");
                 tokio::select! {
                     _ = cancel.cancelled() => {
@@ -99,6 +109,10 @@ where
                 continue;
             }
             backoff = tokio::time::Duration::from_millis(100);
+            projection_metrics::set_projection_lag(
+                cursor.partition_id,
+                batch.records.len(),
+            );
 
             let mut failed = false;
             for record in &batch.records {
@@ -119,7 +133,12 @@ where
                 backoff = std::cmp::min(backoff.saturating_mul(2), max_backoff);
                 continue;
             }
+            projection_metrics::record_records_processed(
+                cursor.partition_id,
+                batch.records.len(),
+            );
             cursor = batch.next_cursor;
+            projection_metrics::set_projection_lag(cursor.partition_id, 0);
             self.sink.save_checkpoint(sink_id, &cursor).await?;
             info!(
                 partition = cursor.partition_id,

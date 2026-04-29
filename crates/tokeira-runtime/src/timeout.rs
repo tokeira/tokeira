@@ -18,6 +18,7 @@ use tokeira_types::{RunKey, ShardId};
 use tokio_util::sync::CancellationToken;
 
 use crate::lane::LaneHandle;
+use crate::metrics as runtime_metrics;
 use crate::scanner::pick_lane;
 use crate::shard::ShardOwner;
 
@@ -185,11 +186,16 @@ pub(crate) async fn run_workflow_timeout_scanner(
 
         let active_shards: Vec<_> = shard_owner.read().unwrap().active_shards().collect();
         for shard_id in active_shards {
+            runtime_metrics::record_scanner_tick("workflow_timeout", shard_id.0);
             scan_workflow_timeouts_once(
                 &tracking,
                 Some(shard_id),
                 &config,
                 |entry, violation, now| {
+                    runtime_metrics::record_scanner_dispatched(
+                        "workflow_timeout",
+                        shard_id.0,
+                    );
                     let lane = pick_lane(&lanes, lane_count, entry.shard_id).clone();
                     async move {
                         lane.submit(

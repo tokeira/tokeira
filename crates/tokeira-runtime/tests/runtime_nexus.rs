@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use opentelemetry::KeyValue;
 use proptest::prelude::*;
 use time::OffsetDateTime;
 use tokeira_kernel::{
@@ -20,9 +21,8 @@ use tokeira_runtime::{
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
-    ExecutionRef, Memo, NamespaceId, Payload, Payloads, RequestContext, RequestId,
-    RunId, RunKey, SearchAttributes, TaskQueueName, WorkerIdentity, WorkflowId,
-    WorkflowType,
+    ExecutionRef, Memo, NamespaceId, Payload, Payloads, RequestContext, RequestId, RunId,
+    RunKey, SearchAttributes, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
 };
 use tokio::runtime::Runtime;
 use uuid::Uuid;
@@ -74,6 +74,7 @@ impl NexusHttpClient for MockNexusClient {
         operation: &str,
         input: &Payloads,
         schedule_to_close_timeout: Option<time::Duration>,
+        _trace_headers: &[KeyValue],
     ) -> Result<NexusStartResult> {
         let mut state = self.state.lock().unwrap();
         state.start_calls.push((
@@ -92,6 +93,7 @@ impl NexusHttpClient for MockNexusClient {
         address: &str,
         operation_id: &str,
         service: &str,
+        _trace_headers: &[KeyValue],
     ) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         state.cancel_calls.push((
@@ -393,11 +395,7 @@ async fn worker_targeted_nexus_schedule_publishes_to_broker() -> Result<()> {
 
     let run_key = applied_state(
         &runtime
-            .start_workflow(start_request(
-                namespace_id,
-                workflow_id,
-                "req-start",
-            ))
+            .start_workflow(start_request(namespace_id, workflow_id, "req-start"))
             .await?,
     )
     .run_key;
@@ -759,8 +757,11 @@ proptest! {
 async fn nexus_unknown_endpoint_delivers_failed_resolution() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
     let client = Arc::new(MockNexusClient::new(NexusStartResult::AsyncAccepted, true));
-    let mut runtime =
-        runtime_with_registry(store.clone(), client.clone(), NexusEndpointRegistry::default());
+    let mut runtime = runtime_with_registry(
+        store.clone(),
+        client.clone(),
+        NexusEndpointRegistry::default(),
+    );
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("nexus-missing-endpoint".to_string());
 

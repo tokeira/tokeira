@@ -371,6 +371,7 @@ async fn start_and_schedule_activity_with_version(
                 task_queue: TaskQueueName("activity-q".to_string()),
                 input: payloads("input"),
                 header: None,
+                request_eager_execution: false,
                 retry_policy,
                 deployment,
                 build_id,

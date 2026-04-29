@@ -23,6 +23,7 @@ pub fn start_response(
         transition_seq: outcome.transition_seq,
         last_event_id: outcome.last_event_id,
         started: true,
+        eager_workflow_task: None,
     }
 }
 
@@ -69,6 +70,7 @@ pub fn completed_response(
         new_run_id: outcome.new_run_id,
         was_duplicate: outcome.was_duplicate,
         workflow_task: None,
+        activity_tasks: Vec::new(),
     }
 }
 

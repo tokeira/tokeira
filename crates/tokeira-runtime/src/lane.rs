@@ -27,7 +27,7 @@ use tokeira_types::{ExecutionStatus, RunKey, ShardEpoch};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    UpdateRegistry, UpdateResolution,
+    UpdateRegistry, UpdateResolution, metrics as runtime_metrics,
     shard::{ShardOwner, shard_for},
 };
 
@@ -671,6 +671,13 @@ where
 {
     let mut attempts = 0u32;
     loop {
+        let transition_span = tracing::info_span!(
+            "kernel.transition",
+            command_type = command_type_name(&command),
+            run_key = %run_key.0,
+            transition_seq = tracing::field::Empty,
+        );
+        let _entered = transition_span.enter();
         let loaded = repo.load_run(run_key).await?;
         let epoch = {
             let owner = shard_owner.read().unwrap();
@@ -680,11 +687,26 @@ where
         let transition = kernel
             .apply(loaded, command.clone())
             .map_err(|reject| anyhow!("kernel rejected command: {reject}"))?;
+        transition_span.record(
+            "transition_seq",
+            transition.next_state.transition_seq.0 as i64,
+        );
         let dispatch_ops = transition.dispatch_ops.clone();
         let history_events = transition.history_events.clone();
 
         match repo.commit_transition(run_key, transition, epoch).await? {
             CommitResult::Applied { new_state } => {
+                runtime_metrics::record_transition_committed(
+                    &new_state.namespace_id.0.to_string(),
+                    command_type_name(&command),
+                );
+                runtime_metrics::record_commands_processed(command_type_name(&command));
+                for event in &history_events {
+                    runtime_metrics::record_events_emitted(
+                        history_event_type_name(event),
+                        1,
+                    );
+                }
                 return Ok((
                     CommitResult::Applied { new_state },
                     dispatch_ops,
@@ -695,7 +717,9 @@ where
                 return Ok((CommitResult::Duplicate, SmallVec::new(), SmallVec::new()));
             }
             CommitResult::Conflict { reason } => {
+                runtime_metrics::record_occ_retry("retry");
                 if attempts >= max_retries {
+                    runtime_metrics::record_occ_retry("exhausted");
                     return Err(anyhow!(
                         "lane OCC retry exhausted after {} conflicts for {:?}: {}",
                         attempts + 1,
@@ -706,6 +730,143 @@ where
                 attempts += 1;
             }
         }
+    }
+}
+
+fn command_type_name(command: &Command) -> &'static str {
+    match command {
+        Command::Start(_) => "Start",
+        Command::SignalWithStart(_) => "SignalWithStart",
+        Command::Update(_) => "Update",
+        Command::Signal(_) => "Signal",
+        Command::Cancel(_) => "Cancel",
+        Command::Terminate(_) => "Terminate",
+        Command::Reset(_) => "Reset",
+        Command::PauseWorkflow(_) => "PauseWorkflow",
+        Command::UnpauseWorkflow(_) => "UnpauseWorkflow",
+        Command::UpdateActivityOptions(_) => "UpdateActivityOptions",
+        Command::PauseActivity(_) => "PauseActivity",
+        Command::UnpauseActivity(_) => "UnpauseActivity",
+        Command::ResetActivity(_) => "ResetActivity",
+        Command::UpdateExecutionOptions(_) => "UpdateExecutionOptions",
+        Command::WorkflowExecutionTimedOut(_) => "WorkflowExecutionTimedOut",
+        Command::WorkflowTaskStarted(_) => "WorkflowTaskStarted",
+        Command::WorkflowTaskCompleted(_) => "WorkflowTaskCompleted",
+        Command::WorkflowTaskFailed(_) => "WorkflowTaskFailed",
+        Command::WorkflowTaskTimedOut(_) => "WorkflowTaskTimedOut",
+        Command::ActivityResolved(_) => "ActivityResolved",
+        Command::ChildStartConfirmed(_) => "ChildStartConfirmed",
+        Command::ChildResolved(_) => "ChildResolved",
+        Command::ExternalSignalResolved(_) => "ExternalSignalResolved",
+        Command::ExternalCancelResolved(_) => "ExternalCancelResolved",
+        Command::NexusOperationResolved(_) => "NexusOperationResolved",
+        Command::TimerDue(_) => "TimerDue",
+        Command::ScheduleQueryTask(_) => "ScheduleQueryTask",
+    }
+}
+
+fn history_event_type_name(event: &HistoryEvent) -> &'static str {
+    match &event.kind {
+        HistoryEventKind::WorkflowExecutionStarted { .. } => "WorkflowExecutionStarted",
+        HistoryEventKind::WorkflowExecutionSignaled { .. } => "WorkflowExecutionSignaled",
+        HistoryEventKind::WorkflowExecutionCancelRequested { .. } => {
+            "WorkflowExecutionCancelRequested"
+        }
+        HistoryEventKind::WorkflowExecutionPaused { .. } => "WorkflowExecutionPaused",
+        HistoryEventKind::WorkflowExecutionUnpaused { .. } => "WorkflowExecutionUnpaused",
+        HistoryEventKind::WorkflowExecutionTerminated { .. } => {
+            "WorkflowExecutionTerminated"
+        }
+        HistoryEventKind::WorkflowExecutionTimedOut { .. } => "WorkflowExecutionTimedOut",
+        HistoryEventKind::WorkflowTaskScheduled { .. } => "WorkflowTaskScheduled",
+        HistoryEventKind::WorkflowTaskStarted { .. } => "WorkflowTaskStarted",
+        HistoryEventKind::WorkflowTaskCompleted { .. } => "WorkflowTaskCompleted",
+        HistoryEventKind::WorkflowTaskFailed { .. } => "WorkflowTaskFailed",
+        HistoryEventKind::WorkflowTaskTimedOut { .. } => "WorkflowTaskTimedOut",
+        HistoryEventKind::ActivityTaskScheduled { .. } => "ActivityTaskScheduled",
+        HistoryEventKind::ActivityTaskStarted { .. } => "ActivityTaskStarted",
+        HistoryEventKind::ActivityTaskCompleted { .. } => "ActivityTaskCompleted",
+        HistoryEventKind::ActivityTaskFailed { .. } => "ActivityTaskFailed",
+        HistoryEventKind::ActivityTaskTimedOut { .. } => "ActivityTaskTimedOut",
+        HistoryEventKind::ActivityTaskCanceled { .. } => "ActivityTaskCanceled",
+        HistoryEventKind::TimerStarted { .. } => "TimerStarted",
+        HistoryEventKind::MarkerRecorded { .. } => "MarkerRecorded",
+        HistoryEventKind::TimerCanceled { .. } => "TimerCanceled",
+        HistoryEventKind::TimerFired { .. } => "TimerFired",
+        HistoryEventKind::ActivityTaskCancelRequested { .. } => {
+            "ActivityTaskCancelRequested"
+        }
+        HistoryEventKind::StartChildWorkflowExecutionInitiated { .. } => {
+            "StartChildWorkflowExecutionInitiated"
+        }
+        HistoryEventKind::ChildWorkflowExecutionStarted { .. } => {
+            "ChildWorkflowExecutionStarted"
+        }
+        HistoryEventKind::StartChildWorkflowExecutionFailed { .. } => {
+            "StartChildWorkflowExecutionFailed"
+        }
+        HistoryEventKind::ChildWorkflowExecutionCompleted { .. } => {
+            "ChildWorkflowExecutionCompleted"
+        }
+        HistoryEventKind::ChildWorkflowExecutionFailed { .. } => {
+            "ChildWorkflowExecutionFailed"
+        }
+        HistoryEventKind::ChildWorkflowExecutionCanceled { .. } => {
+            "ChildWorkflowExecutionCanceled"
+        }
+        HistoryEventKind::ChildWorkflowExecutionTerminated { .. } => {
+            "ChildWorkflowExecutionTerminated"
+        }
+        HistoryEventKind::ChildWorkflowExecutionTimedOut { .. } => {
+            "ChildWorkflowExecutionTimedOut"
+        }
+        HistoryEventKind::SignalExternalWorkflowExecutionInitiated { .. } => {
+            "SignalExternalWorkflowExecutionInitiated"
+        }
+        HistoryEventKind::ExternalWorkflowExecutionSignaled { .. } => {
+            "ExternalWorkflowExecutionSignaled"
+        }
+        HistoryEventKind::SignalExternalWorkflowExecutionFailed { .. } => {
+            "SignalExternalWorkflowExecutionFailed"
+        }
+        HistoryEventKind::RequestCancelExternalWorkflowExecutionInitiated { .. } => {
+            "RequestCancelExternalWorkflowExecutionInitiated"
+        }
+        HistoryEventKind::ExternalWorkflowExecutionCancelRequested { .. } => {
+            "ExternalWorkflowExecutionCancelRequested"
+        }
+        HistoryEventKind::RequestCancelExternalWorkflowExecutionFailed { .. } => {
+            "RequestCancelExternalWorkflowExecutionFailed"
+        }
+        HistoryEventKind::NexusOperationScheduled { .. } => "NexusOperationScheduled",
+        HistoryEventKind::NexusOperationStarted { .. } => "NexusOperationStarted",
+        HistoryEventKind::NexusOperationCompleted { .. } => "NexusOperationCompleted",
+        HistoryEventKind::NexusOperationFailed { .. } => "NexusOperationFailed",
+        HistoryEventKind::NexusOperationCanceled { .. } => "NexusOperationCanceled",
+        HistoryEventKind::NexusOperationTimedOut { .. } => "NexusOperationTimedOut",
+        HistoryEventKind::NexusOperationCancelRequested { .. } => {
+            "NexusOperationCancelRequested"
+        }
+        HistoryEventKind::WorkflowExecutionUpdateAccepted { .. } => {
+            "WorkflowExecutionUpdateAccepted"
+        }
+        HistoryEventKind::WorkflowExecutionUpdateCompleted { .. } => {
+            "WorkflowExecutionUpdateCompleted"
+        }
+        HistoryEventKind::WorkflowExecutionUpdateRejected { .. } => {
+            "WorkflowExecutionUpdateRejected"
+        }
+        HistoryEventKind::WorkflowExecutionOptionsUpdated { .. } => {
+            "WorkflowExecutionOptionsUpdated"
+        }
+        HistoryEventKind::WorkflowExecutionCompleted { .. } => {
+            "WorkflowExecutionCompleted"
+        }
+        HistoryEventKind::WorkflowExecutionFailed { .. } => "WorkflowExecutionFailed",
+        HistoryEventKind::WorkflowExecutionContinuedAsNew { .. } => {
+            "WorkflowExecutionContinuedAsNew"
+        }
+        HistoryEventKind::WorkflowExecutionCanceled => "WorkflowExecutionCanceled",
     }
 }
 
@@ -750,6 +911,7 @@ mod tests {
     };
     use tokio::runtime::Runtime;
     use tokio::sync::Mutex as AsyncMutex;
+    use tracing_subscriber::layer::SubscriberExt;
 
     use super::*;
 
@@ -1239,6 +1401,44 @@ mod tests {
                 expected_seq: current.transition_seq,
                 next_state,
                 history_events,
+                request_dedupe_ops: SmallVec::new(),
+                activity_ops: SmallVec::new(),
+                timer_ops: SmallVec::new(),
+                dispatch_ops: SmallVec::new(),
+                projection_ops: SmallVec::new(),
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct CapturingKernel {
+        observed: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Kernel for CapturingKernel {
+        fn apply(
+            &self,
+            loaded: LoadedRun,
+            _command: Command,
+        ) -> Result<Transition, Reject> {
+            if let Some(metadata) = tracing::Span::current().metadata() {
+                self.observed
+                    .lock()
+                    .unwrap()
+                    .push(metadata.name().to_string());
+            }
+            let LoadedRun::Existing(current) = loaded else {
+                panic!("tests expect an existing run");
+            };
+
+            let mut next_state = current.clone();
+            next_state.transition_seq = current.transition_seq.next();
+            next_state.last_event_id += 1;
+
+            Ok(Transition {
+                expected_seq: current.transition_seq,
+                next_state,
+                history_events: SmallVec::new(),
                 request_dedupe_ops: SmallVec::new(),
                 activity_ops: SmallVec::new(),
                 timer_ops: SmallVec::new(),
@@ -2115,5 +2315,36 @@ mod tests {
         let (load_calls, commit_calls, _) = repo.snapshot().await;
         assert_eq!(load_calls, 1);
         assert_eq!(commit_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn handle_message_uses_kernel_transition_span_name() {
+        let run_key = RunKey::new();
+        let state = sample_state(run_key);
+        let repo =
+            MockRepo::new(LoadedRun::Existing(state), vec![CommitBehavior::Applied]);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let kernel = CapturingKernel {
+            observed: observed.clone(),
+        };
+        let shard_owner = test_shard_owner();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_test_writer());
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        let _ = handle_message(
+            &kernel,
+            &repo,
+            &shard_owner,
+            run_key,
+            sample_command("span"),
+            0,
+        )
+        .await
+        .unwrap();
+
+        let observed = observed.lock().unwrap();
+        assert!(observed.iter().any(|name| name == "kernel.transition"));
     }
 }

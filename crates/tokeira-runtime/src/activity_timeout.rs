@@ -13,7 +13,9 @@ use tokeira_storage::RunRepository;
 use tokeira_types::{RunKey, ShardId};
 use tokio_util::sync::CancellationToken;
 
-use crate::{lane::LaneHandle, scanner::pick_lane, shard::ShardOwner};
+use crate::{
+    lane::LaneHandle, metrics as runtime_metrics, scanner::pick_lane, shard::ShardOwner,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActivityTrackingEntry {
@@ -315,6 +317,7 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
             }
         }
 
+        runtime_metrics::record_scanner_dispatched("activity_timeout", entry.shard_id.0);
         submitted += 1;
     }
 }
@@ -338,6 +341,7 @@ pub(crate) async fn run_activity_timeout_scanner<R>(
 
         let active_shards: Vec<_> = shard_owner.read().unwrap().active_shards().collect();
         for shard_id in active_shards {
+            runtime_metrics::record_scanner_tick("activity_timeout", shard_id.0);
             scan_activity_timeouts_once(
                 repo.as_ref(),
                 &tracking,

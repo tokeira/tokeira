@@ -3,15 +3,13 @@ use std::{collections::VecDeque, sync::Arc, time::Duration};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use http::HeaderMap;
-use tokio::sync::{Mutex, Notify};
 use tokeira_edge::{
-    BatchDispatchContext, EdgeContext, EdgeInterceptors,
-    EmptyVisibilityApi, InMemoryExecutionResolver, InMemoryNamespaceCache,
-    InMemoryOperatorApi, ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse,
-    LocalOnlyRouter, LongPollConfig, LongPollGate, NamespaceCache,
-    PendingQueryStore, PollerRegistry, Principal, RequestId, ResolvedNamespace,
-    VisibilityApi, WorkflowExecutionSummary, WorkflowMutationOutcome,
-    WorkflowRuntimeApi, WorkflowService, batch_engine,
+    BatchDispatchContext, EdgeContext, EdgeInterceptors, EmptyVisibilityApi,
+    InMemoryExecutionResolver, InMemoryNamespaceCache, InMemoryOperatorApi,
+    ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, LocalOnlyRouter,
+    LongPollConfig, LongPollGate, NamespaceCache, PendingQueryStore, PollerRegistry,
+    Principal, RequestId, ResolvedNamespace, VisibilityApi, WorkflowExecutionSummary,
+    WorkflowMutationOutcome, WorkflowRuntimeApi, WorkflowService, batch_engine,
     translate::batch::{
         DescribeBatchOperationRequest, ListBatchOperationsRequest,
         StartBatchOperationRequest, StopBatchOperationRequest,
@@ -25,28 +23,39 @@ use tokeira_kernel::{
 };
 use tokeira_runtime::{
     BacklogConfig, BatchOperationEntry, BatchOperationParams, BatchOperationState,
-    BatchOperationStore, BatchOperationType, BatchProgressCounters,
-    BatchResetTarget, BufferedQueryRegistry, InMemoryBroker, JobId, LaneConfig,
-    PendingUpdateTransport, QueryResult, ResetWorkflowResult, ScheduleStore,
-    SignalWithStartResult, StartWorkflowResult, TimerScannerConfig,
-    TokeiraRuntime, UpdateOutcome, UpdateTransportResolution, UpdateWaitPolicy,
-    VersioningRuleStore, WorkerRegistry,
-    WorkflowTimeoutScannerConfig, WorkflowExecutionRef,
+    BatchOperationStore, BatchOperationType, BatchProgressCounters, BatchResetTarget,
+    BufferedQueryRegistry, InMemoryBroker, JobId, LaneConfig, PendingUpdateTransport,
+    QueryResult, ResetWorkflowResult, ScheduleStore, SignalWithStartResult,
+    StartWorkflowResult, TimerScannerConfig, TokeiraRuntime, UpdateOutcome,
+    UpdateTransportResolution, UpdateWaitPolicy, VersioningRuleStore, WorkerRegistry,
+    WorkflowExecutionRef, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::InMemoryStore;
 use tokeira_types::{
-    ActivityTaskToken, BuildId, ExecutionRef, ExecutionStatus, Memo, Payload,
-    Payloads, QueueKey, RequestContext, RequestId as DomainRequestId, RunId,
-    RunKey, SearchAttributes,
-    TaskKind, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
+    ActivityTaskToken, BuildId, ExecutionRef, ExecutionStatus, Memo, Payload, Payloads,
+    QueueKey, RequestContext, RequestId as DomainRequestId, RunId, RunKey,
+    SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
 };
+use tokio::sync::{Mutex, Notify};
 
 #[derive(Clone, Debug, PartialEq)]
 enum RecordedCall {
-    Terminate { run_key: RunKey, identity: String },
-    Cancel { run_key: RunKey },
-    Signal { run_key: RunKey, signal_name: String },
-    Reset { execution: ExecutionRef, fork_event_id: i64, reason: String },
+    Terminate {
+        run_key: RunKey,
+        identity: String,
+    },
+    Cancel {
+        run_key: RunKey,
+    },
+    Signal {
+        run_key: RunKey,
+        signal_name: String,
+    },
+    Reset {
+        execution: ExecutionRef,
+        fork_event_id: i64,
+        reason: String,
+    },
 }
 
 #[derive(Default)]
@@ -165,10 +174,7 @@ impl WorkflowRuntimeApi for RecordingRuntime {
         unreachable!()
     }
 
-    async fn record_activity_heartbeat(
-        &self,
-        _token: ActivityTaskToken,
-    ) -> Result<bool> {
+    async fn record_activity_heartbeat(&self, _token: ActivityTaskToken) -> Result<bool> {
         unreachable!()
     }
 
@@ -289,16 +295,12 @@ impl VisibilityApi for ScriptedVisibility {
         &self,
         _req: ListWorkflowExecutionsRequest,
     ) -> Result<ListWorkflowExecutionsResponse> {
-        self.responses
-            .lock()
-            .await
-            .pop_front()
-            .unwrap_or_else(|| {
-                Ok(ListWorkflowExecutionsResponse {
-                    executions: Vec::new(),
-                    next_page_token: None,
-                })
+        self.responses.lock().await.pop_front().unwrap_or_else(|| {
+            Ok(ListWorkflowExecutionsResponse {
+                executions: Vec::new(),
+                next_page_token: None,
             })
+        })
     }
 
     async fn count_workflows(
@@ -446,7 +448,10 @@ async fn seed_workflow(
             )
             .await
             .expect("poll workflow task");
-        assert!(poll.is_some(), "seeded workflow should yield a workflow task");
+        assert!(
+            poll.is_some(),
+            "seeded workflow should yield a workflow task"
+        );
     }
 
     WorkflowExecutionRef {
@@ -477,7 +482,8 @@ async fn start_batch_operation_creates_running_entry_and_duplicate_rejected() {
     let repo = Arc::new(InMemoryStore::default());
     let workflow = seed_workflow(repo.clone(), "wf-start", None, false).await;
     let runtime = Arc::new(RecordingRuntime::blocking());
-    let service = build_service(runtime.clone(), Arc::new(EmptyVisibilityApi), repo).await;
+    let service =
+        build_service(runtime.clone(), Arc::new(EmptyVisibilityApi), repo).await;
     let headers = HeaderMap::new();
 
     service
@@ -553,7 +559,8 @@ async fn stop_describe_and_list_handlers_work() {
     let repo = Arc::new(InMemoryStore::default());
     let workflow = seed_workflow(repo.clone(), "wf-stop", None, false).await;
     let runtime = Arc::new(RecordingRuntime::blocking());
-    let service = build_service(runtime.clone(), Arc::new(EmptyVisibilityApi), repo).await;
+    let service =
+        build_service(runtime.clone(), Arc::new(EmptyVisibilityApi), repo).await;
     let headers = HeaderMap::new();
     let job_id = JobId("job-stop".to_string());
 
@@ -633,33 +640,35 @@ async fn run_batch_operation_processes_explicit_executions_and_counts_progress()
     let wf1 = seed_workflow(repo.clone(), "wf-explicit-1", None, false).await;
     let wf2 = seed_workflow(repo.clone(), "wf-explicit-2", None, false).await;
     let runtime = Arc::new(RecordingRuntime::default());
-    let service = build_service(runtime.clone(), Arc::new(EmptyVisibilityApi), repo).await;
+    let service =
+        build_service(runtime.clone(), Arc::new(EmptyVisibilityApi), repo).await;
     let store = service.batch_store();
     let namespace_id = namespace_id_for("default");
     let job_id = JobId("job-explicit".to_string());
     let cancellation = tokio_util::sync::CancellationToken::new();
 
-    store.create(BatchOperationEntry {
-        job_id: job_id.clone(),
-        namespace_id,
-        operation_type: BatchOperationType::Cancel,
-        operation_params: BatchOperationParams::Cancel {
+    store
+        .create(BatchOperationEntry {
+            job_id: job_id.clone(),
+            namespace_id,
+            operation_type: BatchOperationType::Cancel,
+            operation_params: BatchOperationParams::Cancel {
+                identity: "starter".to_string(),
+            },
+            state: BatchOperationState::Running,
+            start_time: time::OffsetDateTime::now_utc(),
+            close_time: None,
+            counters: Arc::new(BatchProgressCounters::default()),
+            visibility_query: None,
+            executions: Some(vec![wf1, wf2]),
+            reason: "reason".to_string(),
             identity: "starter".to_string(),
-        },
-        state: BatchOperationState::Running,
-        start_time: time::OffsetDateTime::now_utc(),
-        close_time: None,
-        counters: Arc::new(BatchProgressCounters::default()),
-        visibility_query: None,
-        executions: Some(vec![wf1, wf2]),
-        reason: "reason".to_string(),
-        identity: "starter".to_string(),
-        max_operations_per_second: 1000.0,
-        cancellation_token: cancellation.clone(),
-        stop_reason: None,
-        stop_identity: None,
-    })
-    .expect("create batch");
+            max_operations_per_second: 1000.0,
+            cancellation_token: cancellation.clone(),
+            stop_reason: None,
+            stop_identity: None,
+        })
+        .expect("create batch");
 
     batch_engine::run_batch_operation(
         store.clone(),
@@ -697,29 +706,30 @@ async fn run_batch_operation_fails_on_visibility_error() {
     let job_id = JobId("job-fail".to_string());
     let cancellation = tokio_util::sync::CancellationToken::new();
 
-    store.create(BatchOperationEntry {
-        job_id: job_id.clone(),
-        namespace_id,
-        operation_type: BatchOperationType::Signal,
-        operation_params: BatchOperationParams::Signal {
-            signal_name: "sig".to_string(),
-            input: None,
+    store
+        .create(BatchOperationEntry {
+            job_id: job_id.clone(),
+            namespace_id,
+            operation_type: BatchOperationType::Signal,
+            operation_params: BatchOperationParams::Signal {
+                signal_name: "sig".to_string(),
+                input: None,
+                identity: "starter".to_string(),
+            },
+            state: BatchOperationState::Running,
+            start_time: time::OffsetDateTime::now_utc(),
+            close_time: None,
+            counters: Arc::new(BatchProgressCounters::default()),
+            visibility_query: Some("WorkflowType = 'test'".to_string()),
+            executions: None,
+            reason: "reason".to_string(),
             identity: "starter".to_string(),
-        },
-        state: BatchOperationState::Running,
-        start_time: time::OffsetDateTime::now_utc(),
-        close_time: None,
-        counters: Arc::new(BatchProgressCounters::default()),
-        visibility_query: Some("WorkflowType = 'test'".to_string()),
-        executions: None,
-        reason: "reason".to_string(),
-        identity: "starter".to_string(),
-        max_operations_per_second: 1.0,
-        cancellation_token: cancellation.clone(),
-        stop_reason: None,
-        stop_identity: None,
-    })
-    .expect("create batch");
+            max_operations_per_second: 1.0,
+            cancellation_token: cancellation.clone(),
+            stop_reason: None,
+            stop_identity: None,
+        })
+        .expect("create batch");
 
     batch_engine::run_batch_operation(
         store.clone(),
@@ -746,33 +756,35 @@ async fn run_batch_operation_stops_on_cancellation_without_rollback() {
     let wf1 = seed_workflow(repo.clone(), "wf-cancel-1", None, false).await;
     let wf2 = seed_workflow(repo.clone(), "wf-cancel-2", None, false).await;
     let runtime = Arc::new(RecordingRuntime::blocking());
-    let service = build_service(runtime.clone(), Arc::new(EmptyVisibilityApi), repo).await;
+    let service =
+        build_service(runtime.clone(), Arc::new(EmptyVisibilityApi), repo).await;
     let store = service.batch_store();
     let namespace_id = namespace_id_for("default");
     let job_id = JobId("job-cancel".to_string());
     let cancellation = tokio_util::sync::CancellationToken::new();
 
-    store.create(BatchOperationEntry {
-        job_id: job_id.clone(),
-        namespace_id,
-        operation_type: BatchOperationType::Cancel,
-        operation_params: BatchOperationParams::Cancel {
+    store
+        .create(BatchOperationEntry {
+            job_id: job_id.clone(),
+            namespace_id,
+            operation_type: BatchOperationType::Cancel,
+            operation_params: BatchOperationParams::Cancel {
+                identity: "starter".to_string(),
+            },
+            state: BatchOperationState::Running,
+            start_time: time::OffsetDateTime::now_utc(),
+            close_time: None,
+            counters: Arc::new(BatchProgressCounters::default()),
+            visibility_query: None,
+            executions: Some(vec![wf1, wf2]),
+            reason: "reason".to_string(),
             identity: "starter".to_string(),
-        },
-        state: BatchOperationState::Running,
-        start_time: time::OffsetDateTime::now_utc(),
-        close_time: None,
-        counters: Arc::new(BatchProgressCounters::default()),
-        visibility_query: None,
-        executions: Some(vec![wf1, wf2]),
-        reason: "reason".to_string(),
-        identity: "starter".to_string(),
-        max_operations_per_second: 1000.0,
-        cancellation_token: cancellation.clone(),
-        stop_reason: None,
-        stop_identity: None,
-    })
-    .expect("create batch");
+            max_operations_per_second: 1000.0,
+            cancellation_token: cancellation.clone(),
+            stop_reason: None,
+            stop_identity: None,
+        })
+        .expect("create batch");
 
     let task = tokio::spawn(batch_engine::run_batch_operation(
         store.clone(),
@@ -809,7 +821,9 @@ async fn run_batch_operation_uses_visibility_pagination() {
             executions: vec![WorkflowExecutionSummary {
                 namespace: "default".to_string(),
                 workflow_id: wf1.workflow_id.clone(),
-                run_id: RunId(uuid::Uuid::parse_str(wf1.run_id.as_deref().unwrap()).unwrap()),
+                run_id: RunId(
+                    uuid::Uuid::parse_str(wf1.run_id.as_deref().unwrap()).unwrap(),
+                ),
                 workflow_type: "test".to_string(),
                 task_queue: "queue".to_string(),
                 status: ExecutionStatus::Running,
@@ -826,7 +840,9 @@ async fn run_batch_operation_uses_visibility_pagination() {
             executions: vec![WorkflowExecutionSummary {
                 namespace: "default".to_string(),
                 workflow_id: wf2.workflow_id.clone(),
-                run_id: RunId(uuid::Uuid::parse_str(wf2.run_id.as_deref().unwrap()).unwrap()),
+                run_id: RunId(
+                    uuid::Uuid::parse_str(wf2.run_id.as_deref().unwrap()).unwrap(),
+                ),
                 workflow_type: "test".to_string(),
                 task_queue: "queue".to_string(),
                 status: ExecutionStatus::Running,
@@ -847,29 +863,30 @@ async fn run_batch_operation_uses_visibility_pagination() {
     let job_id = JobId("job-pages".to_string());
     let cancellation = tokio_util::sync::CancellationToken::new();
 
-    store.create(BatchOperationEntry {
-        job_id: job_id.clone(),
-        namespace_id,
-        operation_type: BatchOperationType::Signal,
-        operation_params: BatchOperationParams::Signal {
-            signal_name: "sig".to_string(),
-            input: None,
+    store
+        .create(BatchOperationEntry {
+            job_id: job_id.clone(),
+            namespace_id,
+            operation_type: BatchOperationType::Signal,
+            operation_params: BatchOperationParams::Signal {
+                signal_name: "sig".to_string(),
+                input: None,
+                identity: "starter".to_string(),
+            },
+            state: BatchOperationState::Running,
+            start_time: time::OffsetDateTime::now_utc(),
+            close_time: None,
+            counters: Arc::new(BatchProgressCounters::default()),
+            visibility_query: Some("WorkflowType = 'test'".to_string()),
+            executions: None,
+            reason: "reason".to_string(),
             identity: "starter".to_string(),
-        },
-        state: BatchOperationState::Running,
-        start_time: time::OffsetDateTime::now_utc(),
-        close_time: None,
-        counters: Arc::new(BatchProgressCounters::default()),
-        visibility_query: Some("WorkflowType = 'test'".to_string()),
-        executions: None,
-        reason: "reason".to_string(),
-        identity: "starter".to_string(),
-        max_operations_per_second: 1000.0,
-        cancellation_token: cancellation.clone(),
-        stop_reason: None,
-        stop_identity: None,
-    })
-    .expect("create batch");
+            max_operations_per_second: 1000.0,
+            cancellation_token: cancellation.clone(),
+            stop_reason: None,
+            stop_identity: None,
+        })
+        .expect("create batch");
 
     batch_engine::run_batch_operation(
         store.clone(),
@@ -985,7 +1002,11 @@ async fn run_batch_operation_dispatches_delete_and_reset() {
     .await;
 
     let calls = runtime.calls().await;
-    assert!(calls.iter().any(|call| matches!(call, RecordedCall::Terminate { .. })));
+    assert!(
+        calls
+            .iter()
+            .any(|call| matches!(call, RecordedCall::Terminate { .. }))
+    );
     assert!(calls.iter().any(|call| matches!(call, RecordedCall::Reset { fork_event_id, reason, .. } if *fork_event_id > 0 && reason == "reset reason")));
 }
 

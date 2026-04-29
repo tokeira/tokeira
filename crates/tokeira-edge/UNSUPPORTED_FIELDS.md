@@ -10,7 +10,7 @@ does not support or cannot yet populate, along with rationale.
 | `workflow_id_reuse_policy` | Not supported | Tokeira uses simple ID-based dedup |
 | `workflow_id_conflict_policy` | Not supported | Tokeira uses simple ID-based dedup |
 | `cron_schedule` | Server-managed | Populated for schedule-triggered runs; client-supplied cron starts are still not accepted |
-| `request_eager_execution` | Not supported | Eager dispatch not implemented |
+| `request_eager_execution` | Supported | Used for eager workflow-task dispatch on start |
 | `continued_failure` | Not supported | Server-internal field for schedules |
 | `last_completion_result` | Not supported | Server-internal field for schedules |
 | `workflow_start_delay` | Not supported | Start delay not implemented |
@@ -34,7 +34,7 @@ does not support or cannot yet populate, along with rationale.
 | Field | Status | Rationale |
 |---|---|---|
 | `sticky_attributes` | Not supported | Sticky task queues partially implemented |
-| `return_new_workflow_task` | Not supported | Inline WFT return not implemented |
+| `return_new_workflow_task` | Partially supported | Used for inline query WFT return and eager activity dispatch; full upstream semantics are not implemented |
 | `binary_checksum` | Deprecated | Superseded by worker versioning |
 | `worker_version_stamp` | Deprecated | Superseded by deployment-based versioning |
 | `sdk_metadata` | Not supported | SDK metadata not threaded |

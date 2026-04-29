@@ -309,6 +309,7 @@ mod tests {
             memo: Memo::default(),
             search_attributes: SearchAttributes::default(),
             identity: None,
+            request_eager_execution: false,
             workflow_execution_timeout: None,
             workflow_run_timeout: None,
             workflow_task_timeout: None,

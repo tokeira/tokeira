@@ -1,0 +1,26 @@
+use anyhow::Result;
+
+use crate::deployment_dir::DeploymentContext;
+
+pub async fn run(
+    service: &str,
+    follow: bool,
+    tail: Option<u32>,
+    ctx: DeploymentContext,
+) -> Result<()> {
+    if follow {
+        eprintln!(
+            "log follow is not supported by the current local provider; printing recent logs"
+        );
+    }
+    if let Some(tail) = tail {
+        eprintln!(
+            "tail={tail} is accepted by the CLI but provider-side tailing is not yet supported"
+        );
+    }
+    let ops = super::PlatformOps::from_context(&ctx)?;
+    for line in ops.logs(service).await? {
+        println!("{line}");
+    }
+    Ok(())
+}

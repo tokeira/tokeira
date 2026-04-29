@@ -16,6 +16,7 @@ use tokeira_storage::ProjectionRecord;
 use tokeira_types::{Memo, SearchAttributes};
 
 use crate::{
+    metrics as projection_metrics,
     rollup::compute_rollup_deltas,
     sink::ProjectionSink,
     store::VisibilityStore,
@@ -150,6 +151,7 @@ where
     S: VisibilityStore,
 {
     async fn apply(&self, record: &ProjectionRecord) -> Result<()> {
+        let started = std::time::Instant::now();
         let mut row = self
             .store
             .get_row(record.run_key)
@@ -208,11 +210,13 @@ where
                 .resolve_attr(record.context.namespace_id, name)
                 .await?
             else {
+                projection_metrics::record_sink_error(record.partition_id);
                 return Err(anyhow!("unknown search attribute: {name}"));
             };
             let expected = attr.attr_type;
             let actual = search_attr_type_of(value);
             if expected != actual {
+                projection_metrics::record_sink_error(record.partition_id);
                 return Err(anyhow!(
                     "search attribute type mismatch for {name}: expected {:?}, got {:?}",
                     expected,
@@ -241,6 +245,10 @@ where
         self.store.upsert_execution(&row).await?;
         let deltas = compute_rollup_deltas(previous.as_ref(), &row);
         self.store.accumulate_rollup(&deltas).await?;
+        projection_metrics::record_sink_write_duration(
+            record.partition_id,
+            started.elapsed(),
+        );
         Ok(())
     }
 }

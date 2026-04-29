@@ -13,7 +13,7 @@ use tokeira_storage::{DueTimer, RunRepository};
 use tokeira_types::ShardId;
 use tokio_util::sync::CancellationToken;
 
-use crate::{lane::LaneHandle, shard::ShardOwner};
+use crate::{lane::LaneHandle, metrics as runtime_metrics, shard::ShardOwner};
 
 /// Configuration knobs for the background timer scanner.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -159,7 +159,9 @@ pub(crate) async fn run_timer_scanner<R>(
 
         let active_shards: Vec<_> = shard_owner.read().unwrap().active_shards().collect();
         for shard_id in active_shards {
+            runtime_metrics::record_scanner_tick("timer", shard_id.0);
             scan_due_timers_once_for_shard(&*repo, shard_id, &config, |due, fired_at| {
+                runtime_metrics::record_scanner_dispatched("timer", shard_id.0);
                 let lane = pick_lane(&lanes, lane_count, shard_id).clone();
                 async move {
                     lane.submit(

@@ -5,16 +5,20 @@
 //! can see which pieces are authoritative, which are transport-only, and where
 //! background tasks such as projection and history notification are attached.
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use tonic_web::GrpcWebLayer;
 use tower_http::cors::CorsLayer;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
 
+mod correlation_format;
+mod observability;
+
+use tokeira_config::{Cli, TokeiraConfig};
 use tokeira_edge::{
     EdgeInterceptors, HistoryNotifyingRepository, HistoryWaitRegistry,
     InMemoryNamespaceCache, InMemoryOperatorApi, LocalOnlyRouter, LongPollConfig,
@@ -32,11 +36,9 @@ use tokeira_projection::{
     InMemoryVisibilityStore, ProjectionWorker, VisibilityQueryService, VisibilitySink,
 };
 use tokeira_runtime::{
-    ActivityTimeoutScannerConfig, BacklogConfig, EndpointTarget, LaneConfig,
-    NexusEndpointConfig, NexusEndpointRegistry, NexusTimeoutScannerConfig,
-    NoopNexusHttpClient, ScheduleEngineConfig, ScheduleStore, TimerScannerConfig,
-    TokeiraRuntime, VersioningRuleStore, WorkflowTimeoutScannerConfig,
-    run_schedule_engine,
+    EndpointTarget, NexusEndpointConfig, NexusEndpointRegistry, NoopNexusHttpClient,
+    RuntimeConfig, ScheduleEngineConfig, ScheduleStore, TokeiraRuntime,
+    VersioningRuleStore, run_schedule_engine,
 };
 use tokeira_storage::{InMemoryStore, RunRepository};
 use tokeira_types::{ExecutionRef, NamespaceId, ProjectionCursor, WorkflowId};
@@ -44,7 +46,9 @@ use tokeira_types::{ExecutionRef, NamespaceId, ProjectionCursor, WorkflowId};
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 enum BootstrapNexusEndpointTarget {
-    External { address: String },
+    External {
+        address: String,
+    },
     Worker {
         namespace_name: String,
         task_queue: String,
@@ -59,11 +63,40 @@ struct BootstrapNexusEndpointConfig {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    let cli = Cli::parse();
+    let (effective_config, config_source) =
+        TokeiraConfig::resolve(cli.config.as_deref())?;
+    if cli.dump_config {
+        println!("{}", effective_config.to_toml()?);
+        return Ok(());
+    }
+    let observability =
+        observability::ObservabilityConfig::from_tokeira_config(&effective_config)?;
+    let metrics_handle = observability::install_metrics(&observability)?;
+    let log_reload = observability::install_tracing(&observability)?;
+    for warning in effective_config.emergency_warnings() {
+        tracing::warn!("{warning}");
+    }
+    let effective_config = Arc::new(effective_config);
+    let _observability_server = observability::spawn_observability_server(
+        &observability,
+        effective_config.clone(),
+        metrics_handle,
+        log_reload,
+    );
 
-    let addr = grpc_addr_from_env()?;
+    let addr = effective_config
+        .infrastructure
+        .network
+        .grpc_addr
+        .parse()
+        .with_context(|| {
+            format!(
+                "invalid infrastructure.network.grpc_addr value: {}",
+                effective_config.infrastructure.network.grpc_addr
+            )
+        })?;
+    info!(config_source, "loaded tokeirad configuration");
 
     // Build the authoritative dev store first, then wrap it with the
     // history-notifying repository used by edge long-poll.
@@ -89,15 +122,9 @@ async fn main() -> Result<()> {
     // run-local in-memory coordination such as buffered consistent queries.
     let versioning_rule_store = Arc::new(VersioningRuleStore::default());
     let schedule_store = Arc::new(ScheduleStore::default());
-    let runtime = Arc::new(TokeiraRuntime::new_with_nexus_and_versioning(
+    let runtime = Arc::new(TokeiraRuntime::new_with_nexus_and_versioning_config(
         repo.clone(),
-        4,
-        LaneConfig::default(),
-        TimerScannerConfig::default(),
-        WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
-        ActivityTimeoutScannerConfig::default(),
-        NexusTimeoutScannerConfig::default(),
+        RuntimeConfig::default(),
         nexus_registry,
         Arc::new(NoopNexusHttpClient),
         versioning_rule_store.clone(),
@@ -202,13 +229,6 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to bind or serve gRPC transport on {addr}"))?;
 
     Ok(())
-}
-
-fn grpc_addr_from_env() -> Result<SocketAddr> {
-    let raw =
-        std::env::var("TOKEIRA_GRPC_ADDR").unwrap_or_else(|_| "[::1]:7233".to_string());
-    raw.parse()
-        .with_context(|| format!("invalid TOKEIRA_GRPC_ADDR value: {raw}"))
 }
 
 async fn build_nexus_endpoint_registry(
@@ -437,8 +457,6 @@ mod tests {
         assert!(result.is_err(), "missing namespace should fail");
         let error = result.err().expect("error");
 
-        assert!(error
-            .to_string()
-            .contains("namespace `missing` not found"));
+        assert!(error.to_string().contains("namespace `missing` not found"));
     }
 }

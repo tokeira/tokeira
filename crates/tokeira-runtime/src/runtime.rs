@@ -44,6 +44,7 @@ use crate::{
     buffered_queries::{BufferedQuery, BufferedQueryRegistry},
     fairness::{DeliveryMetrics, FairnessState, run_control_loop},
     lane::{LaneConfig, LaneHandle, spawn_lane},
+    metrics as runtime_metrics,
     nexus::{
         NexusEndpointRegistry, NexusHttpClient, NexusTaskBroker,
         NexusTimeoutScannerConfig, NexusTimeoutTrackingState, NoopNexusHttpClient,
@@ -52,7 +53,7 @@ use crate::{
     query::{QueryResult, QueryTask},
     recovery::{lease_rejected_error, run_lease_renewer, sweep_shard},
     retry::{RetryDecision, evaluate_activity_retry},
-    scanner::{TimerScannerConfig, pick_lane, run_timer_scanner},
+    scanner::{TimerScannerConfig, lane_index_for, pick_lane, run_timer_scanner},
     shard::{ShardOwner, shard_for},
     timeout::{
         WorkflowTimeoutEntry, WorkflowTimeoutScannerConfig, WorkflowTimeoutTrackingState,
@@ -170,6 +171,31 @@ pub enum SignalWithStartResult {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeConfig {
+    pub lane_count: usize,
+    pub lane: LaneConfig,
+    pub timer_scanner: TimerScannerConfig,
+    pub workflow_timeout_scanner: WorkflowTimeoutScannerConfig,
+    pub backlog: BacklogConfig,
+    pub activity_timeout_scanner: ActivityTimeoutScannerConfig,
+    pub nexus_timeout_scanner: NexusTimeoutScannerConfig,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            lane_count: 4,
+            lane: LaneConfig::default(),
+            timer_scanner: TimerScannerConfig::default(),
+            workflow_timeout_scanner: WorkflowTimeoutScannerConfig::default(),
+            backlog: BacklogConfig::default(),
+            activity_timeout_scanner: ActivityTimeoutScannerConfig::default(),
+            nexus_timeout_scanner: NexusTimeoutScannerConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 enum ConflictResolution {
     Absent,
     UseExisting { run_key: RunKey, run_id: RunId },
@@ -222,6 +248,17 @@ where
             workflow_timeout_config,
             backlog_config,
             versioning_rule_store,
+        )
+    }
+
+    pub fn new_with_config(repo: Arc<R>, runtime_config: RuntimeConfig) -> Self {
+        Self::new(
+            repo,
+            runtime_config.lane_count,
+            runtime_config.lane,
+            runtime_config.timer_scanner,
+            runtime_config.workflow_timeout_scanner,
+            runtime_config.backlog,
         )
     }
 
@@ -303,6 +340,28 @@ where
             1,
             "local-runtime".to_string(),
             true,
+            versioning_rule_store,
+        )
+    }
+
+    pub fn new_with_nexus_and_versioning_config(
+        repo: Arc<R>,
+        runtime_config: RuntimeConfig,
+        nexus_registry: NexusEndpointRegistry,
+        nexus_client: Arc<dyn NexusHttpClient>,
+        versioning_rule_store: Arc<VersioningRuleStore>,
+    ) -> Self {
+        Self::new_with_nexus_and_versioning(
+            repo,
+            runtime_config.lane_count,
+            runtime_config.lane,
+            runtime_config.timer_scanner,
+            runtime_config.workflow_timeout_scanner,
+            runtime_config.backlog,
+            runtime_config.activity_timeout_scanner,
+            runtime_config.nexus_timeout_scanner,
+            nexus_registry,
+            nexus_client,
             versioning_rule_store,
         )
     }
@@ -1217,6 +1276,29 @@ where
         Ok(Some(started))
     }
 
+    pub async fn try_claim_workflow_task(
+        &self,
+        queue: QueueKey,
+        run_key: RunKey,
+        worker_identity: WorkerIdentity,
+    ) -> Result<Option<StartedWorkflowTask>> {
+        let Some(offered) = self.broker.try_claim_workflow_task(&queue, run_key).await
+        else {
+            return Ok(None);
+        };
+        self.delivery_metrics.record_poll_success(&queue);
+        match self
+            .start_polled_workflow_task(offered.0, offered.1, worker_identity)
+            .await
+        {
+            Ok(started) => Ok(Some(started)),
+            Err(error) => {
+                tracing::debug!(?error, "eager workflow task claim did not start");
+                Ok(None)
+            }
+        }
+    }
+
     /// Record the completion of a workflow task and
     /// apply any resulting commands.
     ///
@@ -1258,6 +1340,25 @@ where
             }
         };
 
+        self.start_activity_task(&offered.0, offered.1, &worker_identity)
+            .await
+    }
+
+    pub async fn try_claim_activity_task(
+        &self,
+        queue: QueueKey,
+        run_key: RunKey,
+        activity_id: String,
+        worker_identity: WorkerIdentity,
+    ) -> Result<Option<StartedActivityTask>> {
+        let Some(offered) = self
+            .activity_broker
+            .try_claim_activity_task(&queue, run_key, &activity_id)
+            .await
+        else {
+            return Ok(None);
+        };
+        self.delivery_metrics.record_poll_success(&queue);
         self.start_activity_task(&offered.0, offered.1, &worker_identity)
             .await
     }
@@ -1471,7 +1572,14 @@ where
             return Err(anyhow!("shard not active for run {:?}", run_key));
         }
         let lane = self.pick_lane(run_key);
+        let lane_id = {
+            let shard_count = self.shard_owner.read().unwrap().shard_count();
+            let shard_id = shard_for(run_key, shard_count);
+            lane_index_for(shard_id, self.lanes.len())
+        };
+        let started = std::time::Instant::now();
         let result = lane.submit(run_key, command).await?;
+        runtime_metrics::record_lane_submit_duration(lane_id, started.elapsed());
         self.handle_post_commit(run_key, &result);
         Ok(result)
     }
@@ -1492,7 +1600,14 @@ where
             return Err(anyhow!("shard not owned for run {:?}", run_key));
         }
         let lane = self.pick_lane(run_key);
+        let lane_id = {
+            let shard_count = self.shard_owner.read().unwrap().shard_count();
+            let shard_id = shard_for(run_key, shard_count);
+            lane_index_for(shard_id, self.lanes.len())
+        };
+        let started = std::time::Instant::now();
         let result = lane.submit(run_key, command).await?;
+        runtime_metrics::record_lane_submit_duration(lane_id, started.elapsed());
         self.handle_post_commit(run_key, &result);
         Ok(result)
     }

@@ -10,9 +10,9 @@ use tokeira_edge::{
         errors::proto_conversion_status,
         metadata::metadata_to_header_map,
         translate::{
-            count_request_to_edge, count_response_to_proto, describe_request_to_edge,
-            describe_response_to_proto, list_request_to_edge, list_response_to_proto,
-            poll_request_to_edge, poll_response_to_proto,
+            completed_response_to_proto, count_request_to_edge, count_response_to_proto,
+            describe_request_to_edge, describe_response_to_proto, list_request_to_edge,
+            list_response_to_proto, poll_request_to_edge, poll_response_to_proto,
             proto_command_to_workflow_command, signal_request_to_edge,
             start_request_to_edge, start_response_to_proto, workflow_command_to_proto,
         },
@@ -23,9 +23,9 @@ use tokeira_edge::{
         ListWorkflowExecutionsResponse, PendingActivityDescription,
         PendingChildDescription, PendingWorkflowTaskDescription,
         PollWorkflowTaskQueueRequest, PollWorkflowTaskQueueResponse,
-        SignalWorkflowExecutionRequest, StartWorkflowExecutionRequest,
-        StartWorkflowExecutionResponse, WorkflowExecutionDescription,
-        WorkflowExecutionSummary, WorkflowTaskPayloadDto,
+        RespondWorkflowTaskCompletedResponse, SignalWorkflowExecutionRequest,
+        StartWorkflowExecutionRequest, StartWorkflowExecutionResponse,
+        WorkflowExecutionDescription, WorkflowExecutionSummary, WorkflowTaskPayloadDto,
     },
 };
 use tokeira_kernel::WorkflowCommand;
@@ -53,6 +53,14 @@ proptest! {
         let proto = start_request_to_proto(&edge);
         let roundtrip = start_request_to_edge(proto).unwrap();
         prop_assert_eq!(roundtrip, edge);
+    }
+
+    #[test]
+    fn property_start_request_preserves_request_eager_execution(edge in arb_start_request()) {
+        let expected = edge.request_eager_execution;
+        let proto = start_request_to_proto(&edge);
+        let roundtrip = start_request_to_edge(proto).unwrap();
+        prop_assert_eq!(roundtrip.request_eager_execution, expected);
     }
 
     #[test]
@@ -110,6 +118,10 @@ proptest! {
         let proto = start_response_to_proto(edge.clone());
         prop_assert_eq!(proto.run_id, edge.run_id.0.to_string());
         prop_assert_eq!(proto.started, edge.started);
+        prop_assert_eq!(
+            proto.eager_workflow_task.is_some(),
+            edge.eager_workflow_task.is_some()
+        );
     }
 
     #[test]
@@ -355,6 +367,15 @@ proptest! {
             prop_assert_eq!(actual, values);
         }
     }
+
+    #[test]
+    fn property_schedule_activity_preserves_request_eager_execution(
+        cmd in arb_schedule_activity_command()
+    ) {
+        let proto = workflow_command_to_proto(&cmd).unwrap();
+        let roundtrip = proto_command_to_workflow_command(proto).unwrap();
+        prop_assert_eq!(roundtrip, cmd);
+    }
 }
 
 #[test]
@@ -380,6 +401,7 @@ fn start_request_to_proto(
         }),
         input: Some(payloads_from_domain(&edge.input)),
         request_id: edge.request_id.clone().unwrap_or_default(),
+        request_eager_execution: edge.request_eager_execution,
         memo: Some(memo_from_domain(&edge.memo)),
         search_attributes: Some(search_attributes_from_domain(&edge.search_attributes)),
         ..Default::default()
@@ -517,6 +539,7 @@ fn arb_start_request() -> impl Strategy<Value = StartWorkflowExecutionRequest> {
         prop::option::of(arb_small_string()),
         arb_memo(),
         arb_search_attributes(),
+        any::<bool>(),
     )
         .prop_map(
             |(
@@ -528,6 +551,7 @@ fn arb_start_request() -> impl Strategy<Value = StartWorkflowExecutionRequest> {
                 request_id,
                 memo,
                 search_attributes,
+                request_eager_execution,
             )| StartWorkflowExecutionRequest {
                 namespace,
                 workflow_id,
@@ -538,6 +562,7 @@ fn arb_start_request() -> impl Strategy<Value = StartWorkflowExecutionRequest> {
                 memo,
                 search_attributes,
                 identity: None,
+                request_eager_execution,
                 workflow_execution_timeout: None,
                 workflow_run_timeout: None,
                 workflow_task_timeout: None,
@@ -635,18 +660,42 @@ fn arb_start_response() -> impl Strategy<Value = StartWorkflowExecutionResponse>
         any::<u64>(),
         any::<i64>(),
         any::<bool>(),
+        prop::option::of(arb_poll_response()),
     )
         .prop_map(
-            |(run_key, run_id, transition_seq, last_event_id, started)| {
+            |(
+                run_key,
+                run_id,
+                transition_seq,
+                last_event_id,
+                started,
+                eager_workflow_task,
+            )| {
                 StartWorkflowExecutionResponse {
                     run_key: RunKey(Uuid::from_u128(run_key)),
                     run_id: RunId(Uuid::from_u128(run_id)),
                     transition_seq,
                     last_event_id,
                     started,
+                    eager_workflow_task,
                 }
             },
         )
+}
+
+fn arb_completed_response() -> impl Strategy<Value = RespondWorkflowTaskCompletedResponse>
+{
+    prop::collection::vec(arb_poll_activity_response(), 0..6).prop_map(|activity_tasks| {
+        RespondWorkflowTaskCompletedResponse {
+            transition_seq: 0,
+            last_event_id: 0,
+            execution_status: ExecutionStatus::Running,
+            new_run_id: None,
+            was_duplicate: false,
+            workflow_task: None,
+            activity_tasks,
+        }
+    })
 }
 
 fn arb_poll_response() -> impl Strategy<Value = PollWorkflowTaskQueueResponse> {
@@ -935,6 +984,7 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
                 task_queue: tokeira_types::TaskQueueName(task_queue),
                 input,
                 header: None,
+                request_eager_execution: false,
                 retry_policy: None,
                 deployment: None,
                 build_id: None,
@@ -1067,6 +1117,34 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
             },
         }),
     ]
+}
+
+fn arb_schedule_activity_command() -> impl Strategy<Value = WorkflowCommand> {
+    (
+        arb_small_string(),
+        arb_small_string(),
+        arb_payloads(),
+        any::<bool>(),
+    )
+        .prop_map(
+            |(activity_id, task_queue, input, request_eager_execution)| {
+                WorkflowCommand::ScheduleActivity {
+                    activity_id,
+                    activity_type: "activity-type".into(),
+                    task_queue: tokeira_types::TaskQueueName(task_queue),
+                    input,
+                    header: None,
+                    request_eager_execution,
+                    retry_policy: None,
+                    deployment: None,
+                    build_id: None,
+                    schedule_to_close_timeout: None,
+                    schedule_to_start_timeout: None,
+                    start_to_close_timeout: None,
+                    heartbeat_timeout: None,
+                }
+            },
+        )
 }
 
 fn arb_edge_error() -> impl Strategy<Value = EdgeError> {
@@ -1218,6 +1296,14 @@ proptest! {
         prop_assert_eq!(
             proto.attempt, edge.attempt as i32
         );
+    }
+
+    #[test]
+    fn property_completed_response_projection(
+        edge in arb_completed_response()
+    ) {
+        let proto = completed_response_to_proto(edge.clone());
+        prop_assert_eq!(proto.activity_tasks.len(), edge.activity_tasks.len());
     }
 
     // Property 5c: Terminate request round-trip

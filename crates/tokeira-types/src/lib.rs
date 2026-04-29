@@ -32,6 +32,8 @@
 pub mod execution;
 /// Core identity newtypes: `RunKey`, `RunId`, `ShardEpoch`, etc.
 pub mod ids;
+/// Shared observability naming and metric conventions.
+pub mod observability;
 /// Codec-neutral payload, header, and memo containers.
 pub mod payload;
 /// Edge-to-core request context for idempotency.
@@ -49,6 +51,7 @@ pub mod visibility;
 
 pub use execution::*;
 pub use ids::*;
+pub use observability::*;
 pub use payload::*;
 pub use request::*;
 pub use retry::*;

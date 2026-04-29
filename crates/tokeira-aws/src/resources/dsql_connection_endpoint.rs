@@ -1,0 +1,579 @@
+use std::collections::HashMap;
+use std::time::Duration;
+
+use tokeira_iac::error::IacError;
+use tokeira_iac::{
+    InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+};
+
+/// Configuration for a single DSQL connection endpoint resource.
+#[derive(Debug)]
+pub struct DsqlConnectionEndpointConfig {
+    /// Logical dependency on the VPC resource.
+    pub vpc_dependency: ResourceId,
+    /// Logical dependency on the endpoint security group resource.
+    pub security_group_dependency: ResourceId,
+    /// Logical dependency on the target DSQL cluster resource.
+    pub dsql_cluster_dependency: ResourceId,
+    pub module: String,
+}
+
+/// One cluster-specific Aurora DSQL connection endpoint (Interface VPCE).
+#[derive(Debug)]
+pub struct DsqlConnectionEndpoint {
+    /// Logical identity (for example `proj-monitored`).
+    pub endpoint_identity: String,
+    pub config: DsqlConnectionEndpointConfig,
+    pub project: String,
+    pub region: String,
+    pub tags: HashMap<String, String>,
+}
+
+impl DsqlConnectionEndpoint {
+    pub fn new(
+        endpoint_identity: String,
+        config: DsqlConnectionEndpointConfig,
+        rctx: &crate::ResourceContext,
+    ) -> Self {
+        Self {
+            endpoint_identity,
+            config,
+            project: rctx.project.clone(),
+            region: rctx.region.clone(),
+            tags: rctx.tags.clone(),
+        }
+    }
+
+    fn endpoint_tag_name(&self) -> String {
+        format!("{}-dsql-ce-{}", self.project, self.endpoint_identity)
+    }
+
+    fn dsql_cluster_identifier(state: &ResourceState) -> Option<String> {
+        if let Some(id) = state.properties.get("cluster_id").and_then(|v| v.as_str())
+            && !id.is_empty()
+        {
+            return Some(id.to_string());
+        }
+        state
+            .properties
+            .get("cluster_endpoint")
+            .and_then(|v| v.as_str())
+            .and_then(|endpoint| endpoint.split('.').next().map(str::to_string))
+            .filter(|id| !id.is_empty())
+    }
+
+    fn adopted_state_from_existing(
+        &self,
+        existing: ResourceState,
+        tags: HashMap<String, String>,
+    ) -> ResourceState {
+        ResourceState {
+            resource_type: ResourceType::new("DsqlConnectionEndpoint"),
+            physical_id: existing.physical_id,
+            properties: serde_json::json!({
+                "endpoint_id": existing.properties.get("endpoint_id").and_then(|v| v.as_str()).unwrap_or_default(),
+                "service_name": existing.properties.get("service_name").and_then(|v| v.as_str()).unwrap_or_default(),
+                "cluster_id": existing.properties.get("cluster_id").and_then(|v| v.as_str()).unwrap_or_default(),
+                "cluster_vpc_endpoint": existing.properties.get("cluster_vpc_endpoint").and_then(|v| v.as_str()).unwrap_or_default(),
+                "private_hostname": existing.properties.get("private_hostname").and_then(|v| v.as_str()).unwrap_or_default(),
+                "tags": tags,
+            }),
+            dependencies: self.dependencies(),
+            created_at: existing.created_at,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            module: self.module().to_owned(),
+        }
+    }
+
+    fn is_vpc_endpoint_not_found_delete_error(message: &str) -> bool {
+        message.contains("InvalidVpcEndpointId.NotFound")
+    }
+
+    fn endpoint_state_summary(endpoint: &aws_sdk_ec2::types::VpcEndpoint) -> &str {
+        endpoint
+            .state()
+            .map(|state| state.as_str())
+            .unwrap_or("unknown")
+    }
+
+    fn endpoint_is_usable(
+        endpoint: &aws_sdk_ec2::types::VpcEndpoint,
+    ) -> Result<bool, IacError> {
+        match Self::endpoint_state_summary(endpoint) {
+            "available" => Ok(true),
+            "pending" => Ok(false),
+            "pendingAcceptance" => Ok(false),
+            "deleting" => Ok(false),
+            "deleted" => Ok(false),
+            "failed" | "rejected" | "expired" => Err(IacError::ResourceCreationFailed {
+                resource_type: "DSQL connection endpoint".into(),
+                resource_id: endpoint.vpc_endpoint_id().unwrap_or_default().to_string(),
+                details: format!(
+                    "endpoint entered terminal failure state '{}'",
+                    Self::endpoint_state_summary(endpoint)
+                ),
+            }),
+            _ => Ok(false),
+        }
+    }
+
+    async fn wait_until_usable(
+        &self,
+        endpoint_id: &str,
+        ctx: &ProvisionContext,
+    ) -> Result<(), IacError> {
+        let endpoint_id = endpoint_id.to_string();
+        let ec2_client = &ctx
+            .extension::<crate::AwsClients>()
+            .expect("AwsClients")
+            .ec2;
+        super::poll_until(
+            Duration::from_secs(5),
+            Duration::from_secs(300),
+            ctx,
+            super::PollTarget {
+                resource_desc: "DSQL connection endpoint",
+                resource_id: &self.resource_id(),
+                resource_type: self.resource_type(),
+                phase: "waiting for DSQL connection endpoint availability",
+            },
+            || async {
+                let output = match ec2_client
+                    .describe_vpc_endpoints()
+                    .vpc_endpoint_ids(&endpoint_id)
+                    .send()
+                    .await
+                {
+                    Ok(output) => output,
+                    Err(e) => {
+                        let svc_err = e.into_service_error();
+                        let message = format!("{svc_err}");
+                        if Self::is_vpc_endpoint_not_found_delete_error(&message) {
+                            return Ok(false);
+                        }
+                        return Err(IacError::AwsSdk(format!(
+                            "ec2:DescribeVpcEndpoints: {svc_err}"
+                        )));
+                    }
+                };
+                let Some(endpoint) = output.vpc_endpoints().first() else {
+                    return Ok(false);
+                };
+                Self::endpoint_is_usable(endpoint)
+            },
+        )
+        .await
+    }
+}
+
+#[async_trait::async_trait]
+impl Resource for DsqlConnectionEndpoint {
+    fn resource_type(&self) -> ResourceType {
+        ResourceType::new("DsqlConnectionEndpoint")
+    }
+
+    fn resource_id(&self) -> ResourceId {
+        ResourceId(format!("dsql-ce-{}", self.endpoint_identity))
+    }
+
+    fn dependencies(&self) -> Vec<ResourceId> {
+        vec![
+            self.config.vpc_dependency.clone(),
+            self.config.security_group_dependency.clone(),
+            self.config.dsql_cluster_dependency.clone(),
+        ]
+    }
+
+    fn module(&self) -> &str {
+        &self.config.module
+    }
+
+    fn diff(&self, _current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {
+        // Endpoint shape is static after creation.
+        InternalChange::NoChange {
+            resource_id: self.resource_id(),
+        }
+    }
+
+    async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, IacError> {
+        let tags = ctx.resource_tags(&self.endpoint_tag_name());
+
+        if let Some(existing) = self.describe(ctx).await? {
+            tracing::warn!(
+                resource = %self.resource_id().0,
+                endpoint = %existing.physical_id,
+                "DSQL connection endpoint already exists, adopting"
+            );
+            let endpoint_id = existing.physical_id.clone();
+            self.wait_until_usable(&endpoint_id, ctx).await?;
+            return Ok(self.adopted_state_from_existing(existing, tags));
+        }
+
+        let vpc_state = ctx.get_resource_state(&self.config.vpc_dependency)?;
+        let vpc_id = vpc_state
+            .properties
+            .get("vpc_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                IacError::StateNotFound("vpc_id not found in VPC state".into())
+            })?
+            .to_string();
+        let subnet_ids: Vec<String> = vpc_state
+            .properties
+            .get("subnet_ids")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        let sg_state = ctx.get_resource_state(&self.config.security_group_dependency)?;
+        let security_group_id = sg_state
+            .properties
+            .get("security_group_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                IacError::StateNotFound("security_group_id not found in SG state".into())
+            })?
+            .to_string();
+
+        let dsql_state = ctx.get_resource_state(&self.config.dsql_cluster_dependency)?;
+        let cluster_id = Self::dsql_cluster_identifier(dsql_state).ok_or_else(|| {
+            IacError::StateNotFound(
+                "cluster_id/cluster_endpoint not found in DSQL state".into(),
+            )
+        })?;
+
+        let svc = ctx
+            .extension::<crate::AwsClients>()
+            .expect("AwsClients")
+            .dsql
+            .get_vpc_endpoint_service_name()
+            .identifier(&cluster_id)
+            .send()
+            .await
+            .map_err(|e| {
+                IacError::AwsSdk(format!(
+                    "dsql:GetVpcEndpointServiceName: {}",
+                    e.into_service_error()
+                ))
+            })?;
+        let service_name = svc.service_name().to_string();
+        if service_name.is_empty() {
+            return Err(IacError::AwsSdk(
+                "dsql:GetVpcEndpointServiceName: empty service_name".into(),
+            ));
+        }
+        let cluster_vpc_endpoint =
+            svc.cluster_vpc_endpoint().unwrap_or_default().to_string();
+        let private_hostname = if cluster_vpc_endpoint.is_empty() {
+            dsql_state
+                .properties
+                .get("cluster_endpoint")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            cluster_vpc_endpoint.clone()
+        };
+
+        let ep_tag_spec = aws_sdk_ec2::types::TagSpecification::builder()
+            .resource_type(aws_sdk_ec2::types::ResourceType::VpcEndpoint)
+            .set_tags(Some(super::ec2_tags(&tags)))
+            .build();
+
+        let mut builder = ctx
+            .extension::<crate::AwsClients>()
+            .expect("AwsClients")
+            .ec2
+            .create_vpc_endpoint()
+            .vpc_id(&vpc_id)
+            .service_name(&service_name)
+            .vpc_endpoint_type(aws_sdk_ec2::types::VpcEndpointType::Interface)
+            .private_dns_enabled(true)
+            .tag_specifications(ep_tag_spec)
+            .security_group_ids(&security_group_id);
+        for subnet_id in &subnet_ids {
+            builder = builder.subnet_ids(subnet_id);
+        }
+
+        let created = builder.send().await.map_err(|e| {
+            IacError::AwsSdk(format!("ec2:CreateVpcEndpoint: {}", e.into_service_error()))
+        })?;
+        let endpoint_id = created
+            .vpc_endpoint()
+            .and_then(|e| e.vpc_endpoint_id())
+            .unwrap_or_default()
+            .to_string();
+
+        self.wait_until_usable(&endpoint_id, ctx).await?;
+
+        let now = chrono::Utc::now().to_rfc3339();
+        Ok(ResourceState {
+            resource_type: ResourceType::new("DsqlConnectionEndpoint"),
+            physical_id: endpoint_id.clone(),
+            properties: serde_json::json!({
+                "endpoint_id": endpoint_id,
+                "service_name": service_name,
+                "cluster_id": cluster_id,
+                "cluster_vpc_endpoint": cluster_vpc_endpoint,
+                "private_hostname": private_hostname,
+                "vpc_id": vpc_id,
+                "security_group_id": security_group_id,
+                "tags": tags,
+            }),
+            dependencies: self.dependencies(),
+            created_at: now.clone(),
+            updated_at: now,
+            module: self.module().to_owned(),
+        })
+    }
+
+    async fn update(
+        &self,
+        current: &ResourceState,
+        ctx: &ProvisionContext,
+    ) -> Result<ResourceState, IacError> {
+        let tags = ctx.resource_tags(&self.endpoint_tag_name());
+        let ec2_tags = super::ec2_tags(&tags);
+
+        let endpoint_id = current
+            .properties
+            .get("endpoint_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&current.physical_id)
+            .to_string();
+
+        if !endpoint_id.is_empty() {
+            ctx.extension::<crate::AwsClients>()
+                .expect("AwsClients")
+                .ec2
+                .create_tags()
+                .resources(&endpoint_id)
+                .set_tags(Some(ec2_tags))
+                .send()
+                .await
+                .map_err(|e| {
+                    IacError::AwsSdk(format!(
+                        "ec2:CreateTags: {}",
+                        e.into_service_error()
+                    ))
+                })?;
+        }
+
+        Ok(ResourceState {
+            resource_type: current.resource_type.clone(),
+            physical_id: current.physical_id.clone(),
+            properties: serde_json::json!({
+                "endpoint_id": endpoint_id,
+                "service_name": current.properties.get("service_name").and_then(|v| v.as_str()).unwrap_or_default(),
+                "cluster_id": current.properties.get("cluster_id").and_then(|v| v.as_str()).unwrap_or_default(),
+                "cluster_vpc_endpoint": current.properties.get("cluster_vpc_endpoint").and_then(|v| v.as_str()).unwrap_or_default(),
+                "private_hostname": current.properties.get("private_hostname").and_then(|v| v.as_str()).unwrap_or_default(),
+                "tags": tags,
+            }),
+            dependencies: self.dependencies(),
+            created_at: current.created_at.clone(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            module: self.module().to_owned(),
+        })
+    }
+
+    async fn delete(
+        &self,
+        current: &ResourceState,
+        ctx: &ProvisionContext,
+    ) -> Result<(), IacError> {
+        let endpoint_id = current
+            .properties
+            .get("endpoint_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&current.physical_id)
+            .to_string();
+
+        if endpoint_id.is_empty() {
+            return Ok(());
+        }
+
+        match ctx
+            .extension::<crate::AwsClients>()
+            .expect("AwsClients")
+            .ec2
+            .delete_vpc_endpoints()
+            .vpc_endpoint_ids(&endpoint_id)
+            .send()
+            .await
+        {
+            Ok(_) => {
+                let ec2_client = &ctx
+                    .extension::<crate::AwsClients>()
+                    .expect("AwsClients")
+                    .ec2;
+                let endpoint_id_for_poll = endpoint_id.clone();
+                super::poll_until(
+                    Duration::from_secs(5),
+                    Duration::from_secs(300),
+                    ctx,
+                    super::PollTarget {
+                        resource_desc: "DSQL connection endpoint deletion",
+                        resource_id: &self.resource_id(),
+                        resource_type: self.resource_type(),
+                        phase: "waiting for DSQL connection endpoint deletion",
+                    },
+                    || async {
+                        match ec2_client
+                            .describe_vpc_endpoints()
+                            .vpc_endpoint_ids(&endpoint_id_for_poll)
+                            .send()
+                            .await
+                        {
+                            Ok(output) => Ok(output.vpc_endpoints().is_empty()),
+                            Err(e) => {
+                                let msg = format!("{}", e.into_service_error());
+                                if Self::is_vpc_endpoint_not_found_delete_error(&msg) {
+                                    Ok(true)
+                                } else {
+                                    Err(IacError::AwsSdk(format!(
+                                        "ec2:DescribeVpcEndpoints: {msg}"
+                                    )))
+                                }
+                            }
+                        }
+                    },
+                )
+                .await
+            }
+            Err(e) => {
+                let msg = format!("{}", e.into_service_error());
+                if Self::is_vpc_endpoint_not_found_delete_error(&msg) {
+                    tracing::warn!(endpoint_id = %endpoint_id, "endpoint not found, skipping delete");
+                    Ok(())
+                } else {
+                    Err(IacError::AwsSdk(format!("ec2:DeleteVpcEndpoints: {msg}")))
+                }
+            }
+        }
+    }
+
+    async fn describe(
+        &self,
+        ctx: &ProvisionContext,
+    ) -> Result<Option<ResourceState>, IacError> {
+        let Some(vpc_state) = ctx.state.resources.get(&self.config.vpc_dependency) else {
+            return Ok(None);
+        };
+        let vpc_id = vpc_state
+            .properties
+            .get("vpc_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                IacError::StateNotFound("vpc_id not found in VPC state".into())
+            })?
+            .to_string();
+
+        let Some(dsql_state) = ctx
+            .state
+            .resources
+            .get(&self.config.dsql_cluster_dependency)
+        else {
+            return Ok(None);
+        };
+        let cluster_id = Self::dsql_cluster_identifier(dsql_state).ok_or_else(|| {
+            IacError::StateNotFound(
+                "cluster_id/cluster_endpoint not found in DSQL state".into(),
+            )
+        })?;
+
+        let svc = ctx
+            .extension::<crate::AwsClients>()
+            .expect("AwsClients")
+            .dsql
+            .get_vpc_endpoint_service_name()
+            .identifier(&cluster_id)
+            .send()
+            .await
+            .map_err(|e| {
+                let svc_err = e.into_service_error();
+                if svc_err.is_resource_not_found_exception() {
+                    IacError::ResourceNotFound {
+                        resource_type: "dsql cluster".into(),
+                        resource_id: cluster_id.clone(),
+                    }
+                } else {
+                    IacError::AwsSdk(format!("dsql:GetVpcEndpointServiceName: {svc_err}"))
+                }
+            });
+        let svc = match svc {
+            Ok(svc) => svc,
+            Err(IacError::ResourceNotFound { .. }) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let service_name = svc.service_name().to_string();
+        if service_name.is_empty() {
+            return Ok(None);
+        }
+
+        let out = ctx
+            .extension::<crate::AwsClients>()
+            .expect("AwsClients")
+            .ec2
+            .describe_vpc_endpoints()
+            .filters(
+                aws_sdk_ec2::types::Filter::builder()
+                    .name("vpc-id")
+                    .values(vpc_id)
+                    .build(),
+            )
+            .filters(
+                aws_sdk_ec2::types::Filter::builder()
+                    .name("service-name")
+                    .values(&service_name)
+                    .build(),
+            )
+            .send()
+            .await
+            .map_err(|e| {
+                IacError::AwsSdk(format!(
+                    "ec2:DescribeVpcEndpoints: {}",
+                    e.into_service_error()
+                ))
+            })?;
+
+        let ep = out.vpc_endpoints().iter().find(|ep| {
+            ep.vpc_endpoint_id().is_some()
+                && !matches!(Self::endpoint_state_summary(ep), "deleted" | "deleting")
+        });
+
+        let Some(ep) = ep else {
+            return Ok(None);
+        };
+        let endpoint_id = ep.vpc_endpoint_id().unwrap_or_default().to_string();
+        let cluster_vpc_endpoint =
+            svc.cluster_vpc_endpoint().unwrap_or_default().to_string();
+        let private_hostname = if cluster_vpc_endpoint.is_empty() {
+            dsql_state
+                .properties
+                .get("cluster_endpoint")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            cluster_vpc_endpoint.clone()
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+
+        Ok(Some(ResourceState {
+            resource_type: ResourceType::new("DsqlConnectionEndpoint"),
+            physical_id: endpoint_id.clone(),
+            properties: serde_json::json!({
+                "endpoint_id": endpoint_id,
+                "service_name": service_name,
+                "cluster_id": cluster_id,
+                "cluster_vpc_endpoint": cluster_vpc_endpoint,
+                "private_hostname": private_hostname,
+                "endpoint_state": Self::endpoint_state_summary(ep),
+            }),
+            dependencies: self.dependencies(),
+            created_at: now.clone(),
+            updated_at: now,
+            module: self.module().to_owned(),
+        }))
+    }
+}

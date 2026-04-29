@@ -7,14 +7,17 @@
 //! hot queues to drain their backlogs.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
+use dashmap::DashMap;
 use time::OffsetDateTime;
 use tokeira_types::QueueKey;
 use tokio_util::sync::CancellationToken;
+
+use crate::metrics as runtime_metrics;
 
 pub(crate) const DEFAULT_DRAIN_SHARE: f64 = 0.1;
 pub(crate) const MIN_DRAIN_SHARE: f64 = 0.0;
@@ -43,14 +46,15 @@ pub struct DeliveryMetricsSnapshot {
 
 #[derive(Clone)]
 pub struct DeliveryMetrics {
-    inner: Arc<Mutex<DeliveryMetricsInner>>,
+    queues: Arc<DashMap<QueueKey, QueueCounters>>,
 }
 
-struct DeliveryMetricsInner {
-    latency: HashMap<QueueKey, LatencyHistogram>,
-    sync_match: HashMap<QueueKey, SlidingWindowCounter>,
-    poll_success: HashMap<QueueKey, SlidingWindowCounter>,
-    backlog_age: HashMap<QueueKey, Duration>,
+#[derive(Default)]
+struct QueueCounters {
+    latency: LatencyHistogram,
+    sync_match: SlidingWindowCounter,
+    poll_success: SlidingWindowCounter,
+    backlog_age: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -118,6 +122,12 @@ pub(crate) struct LatencyHistogram {
     count: u64,
 }
 
+impl Default for LatencyHistogram {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LatencyHistogram {
     pub(crate) fn new() -> Self {
         Self {
@@ -162,71 +172,55 @@ impl Default for DeliveryMetrics {
 impl DeliveryMetrics {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(DeliveryMetricsInner {
-                latency: HashMap::new(),
-                sync_match: HashMap::new(),
-                poll_success: HashMap::new(),
-                backlog_age: HashMap::new(),
-            })),
+            queues: Arc::new(DashMap::new()),
         }
     }
 
     pub fn record_latency(&self, queue: &QueueKey, duration: Duration) {
-        self.inner
-            .lock()
-            .unwrap()
-            .latency
+        self.queues
             .entry(queue.clone())
-            .or_insert_with(LatencyHistogram::new)
+            .or_default()
+            .latency
             .record(duration);
     }
 
     pub fn record_sync_match(&self, queue: &QueueKey) {
-        self.inner
-            .lock()
-            .unwrap()
-            .sync_match
+        runtime_metrics::record_sync_match(queue);
+        self.queues
             .entry(queue.clone())
             .or_default()
+            .sync_match
             .record_success();
     }
 
     pub fn record_non_sync_match(&self, queue: &QueueKey) {
-        self.inner
-            .lock()
-            .unwrap()
-            .sync_match
+        runtime_metrics::record_non_sync_match(queue);
+        self.queues
             .entry(queue.clone())
             .or_default()
+            .sync_match
             .record_failure();
     }
 
     pub fn record_poll_success(&self, queue: &QueueKey) {
-        self.inner
-            .lock()
-            .unwrap()
-            .poll_success
+        self.queues
             .entry(queue.clone())
             .or_default()
+            .poll_success
             .record_success();
     }
 
     pub fn record_poll_timeout(&self, queue: &QueueKey) {
-        self.inner
-            .lock()
-            .unwrap()
-            .poll_success
+        runtime_metrics::record_poll_timeout(queue);
+        self.queues
             .entry(queue.clone())
             .or_default()
+            .poll_success
             .record_failure();
     }
 
     pub fn set_backlog_age(&self, queue: &QueueKey, age: Duration) {
-        self.inner
-            .lock()
-            .unwrap()
-            .backlog_age
-            .insert(queue.clone(), age);
+        self.queues.entry(queue.clone()).or_default().backlog_age = age;
     }
 
     pub fn take_snapshot(&self) -> DeliveryMetricsSnapshot {
@@ -241,36 +235,16 @@ impl DeliveryMetrics {
         &self,
         destructive: bool,
     ) -> (DeliveryMetricsSnapshot, HashMap<QueueKey, u64>) {
-        let mut inner = self.inner.lock().unwrap();
-        let mut queues = HashSet::new();
-        queues.extend(inner.latency.keys().cloned());
-        queues.extend(inner.sync_match.keys().cloned());
-        queues.extend(inner.poll_success.keys().cloned());
-        queues.extend(inner.backlog_age.keys().cloned());
-
         let mut poll_counts = HashMap::new();
         let mut snapshot_queues = HashMap::new();
-        for queue in queues {
-            let (latency_p50, latency_p99) = {
-                let latency = inner
-                    .latency
-                    .entry(queue.clone())
-                    .or_insert_with(LatencyHistogram::new);
-                (latency.percentile(0.50), latency.percentile(0.99))
-            };
-            let (sync_match_rate, _sync_total) = {
-                let sync = inner.sync_match.entry(queue.clone()).or_default();
-                (sync.rate(), sync.total())
-            };
-            let (poll_success_rate, poll_total) = {
-                let poll = inner.poll_success.entry(queue.clone()).or_default();
-                (poll.rate(), poll.total())
-            };
-            let backlog_age = inner
-                .backlog_age
-                .get(&queue)
-                .copied()
-                .unwrap_or(Duration::ZERO);
+        for mut entry in self.queues.iter_mut() {
+            let queue = entry.key().clone();
+            let latency_p50 = entry.latency.percentile(0.50);
+            let latency_p99 = entry.latency.percentile(0.99);
+            let sync_match_rate = entry.sync_match.rate();
+            let poll_total = entry.poll_success.total();
+            let poll_success_rate = entry.poll_success.rate();
+            let backlog_age = entry.backlog_age;
 
             snapshot_queues.insert(
                 queue.clone(),
@@ -285,9 +259,9 @@ impl DeliveryMetrics {
             poll_counts.insert(queue.clone(), poll_total);
 
             if destructive {
-                inner.latency.get_mut(&queue).unwrap().reset();
-                inner.sync_match.get_mut(&queue).unwrap().advance();
-                inner.poll_success.get_mut(&queue).unwrap().advance();
+                entry.latency.reset();
+                entry.sync_match.advance();
+                entry.poll_success.advance();
             }
         }
 
@@ -551,6 +525,47 @@ mod tests {
 
         fn arb_drain_share() -> impl Strategy<Value = f64> {
             (MIN_DRAIN_SHARE)..=(MAX_DRAIN_SHARE)
+        }
+
+        fn normalized_metrics(metrics: QueueMetricsSnapshot) -> QueueMetricsSnapshot {
+            let latency_p50 = metrics.latency_p50;
+            let latency_p99 = metrics.latency_p99.max(latency_p50);
+            let sync_match_rate =
+                ((metrics.sync_match_rate * 100.0).round() / 100.0).clamp(0.0, 1.0);
+            let poll_success_rate =
+                ((metrics.poll_success_rate * 100.0).round() / 100.0).clamp(0.0, 1.0);
+            QueueMetricsSnapshot {
+                latency_p50,
+                latency_p99,
+                sync_match_rate,
+                poll_success_rate,
+                backlog_age: metrics.backlog_age,
+            }
+        }
+
+        fn delivery_metrics_from_snapshot(
+            snapshot: &QueueMetricsSnapshot,
+        ) -> DeliveryMetrics {
+            let metrics = DeliveryMetrics::new();
+            let queue = fixed_queue();
+            let mut counters = QueueCounters::default();
+
+            for _ in 0..50 {
+                counters.latency.record(snapshot.latency_p50);
+            }
+            for _ in 0..50 {
+                counters.latency.record(snapshot.latency_p99);
+            }
+
+            counters.sync_match.current_total = 100;
+            counters.sync_match.current_success =
+                (snapshot.sync_match_rate * 100.0).round() as u64;
+            counters.poll_success.current_total = 100;
+            counters.poll_success.current_success =
+                (snapshot.poll_success_rate * 100.0).round() as u64;
+            counters.backlog_age = snapshot.backlog_age;
+            metrics.queues.insert(queue, counters);
+            metrics
         }
 
         // ── P1: Poll path priority ordering ───────
@@ -1288,6 +1303,64 @@ mod tests {
                 prop_assert!(
                     interval_hi <= MAX_CONTROL_INTERVAL
                 );
+            }
+        }
+
+        // ── P13: Fairness control loop equivalence ─
+
+        // The live control loop should compute the same
+        // next drain share and interval as a direct
+        // application of `evaluate_drain_share` over the
+        // equivalent snapshot.
+        proptest! {
+            #![proptest_config(
+                ProptestConfig::with_cases(100)
+            )]
+            #[test]
+            fn p13_fairness_control_loop_equivalence(
+                current in arb_drain_share(),
+                metrics in arb_metrics(),
+            ) {
+                let metrics = normalized_metrics(metrics);
+                let delivery = delivery_metrics_from_snapshot(&metrics);
+                let fairness = FairnessState::new();
+                let queue = fixed_queue();
+                let mut adjustments = HashMap::new();
+                adjustments.insert(queue.clone(), current);
+                let mut polls = HashMap::new();
+                polls.insert(queue.clone(), 100);
+                fairness.apply_adjustment(
+                    adjustments,
+                    &polls,
+                    OffsetDateTime::now_utc(),
+                );
+
+                let expected_share =
+                    evaluate_drain_share(current, &metrics);
+                let expected_delta =
+                    (expected_share - current).abs();
+                let expected_interval = Duration::from_secs_f64(
+                    MIN_CONTROL_INTERVAL.as_secs_f64()
+                        + (MAX_CONTROL_INTERVAL.as_secs_f64()
+                            - MIN_CONTROL_INTERVAL.as_secs_f64())
+                            * (1.0 - (expected_delta / MAX_DELTA_PER_INTERVAL).clamp(0.0, 1.0)),
+                );
+
+                let interval = control_loop_tick(&delivery, &fairness);
+                let snapshot = fairness.snapshot();
+                let state = snapshot.get(&queue).unwrap();
+
+                prop_assert!(
+                    (state.drain_share - expected_share).abs() <= f64::EPSILON,
+                    "share mismatch: actual={} expected={}",
+                    state.drain_share,
+                    expected_share
+                );
+                prop_assert_eq!(
+                    state.remaining_budget,
+                    (expected_share * 100.0).floor() as u32
+                );
+                prop_assert_eq!(interval, expected_interval);
             }
         }
     }

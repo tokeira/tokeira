@@ -1,1 +1,1 @@
-pub struct AppConfig;
+pub use tokeira_config::*;

@@ -1,0 +1,717 @@
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use tokeira_iac::error::IacError;
+use tokeira_iac::{
+    InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+};
+
+/// DynamoDB key type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KeyType {
+    Hash,
+    Range,
+}
+
+/// DynamoDB scalar attribute type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttributeType {
+    String,
+    Number,
+    Binary,
+}
+
+/// DynamoDB billing mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BillingMode {
+    OnDemand,
+    Provisioned,
+}
+
+/// A single key attribute in the table schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyAttribute {
+    pub name: String,
+    pub key_type: KeyType,
+    pub attribute_type: AttributeType,
+}
+
+/// Configuration for a single DynamoDB table provider resource.
+#[derive(Debug)]
+pub struct DynamoDbTableConfig {
+    pub key_schema: Vec<KeyAttribute>,
+    pub billing_mode: BillingMode,
+    pub ttl_attribute: Option<String>,
+    pub module: String,
+}
+
+/// Generic provider resource that provisions exactly one DynamoDB table.
+#[derive(Debug)]
+pub struct DynamoDbTable {
+    pub table_name: String,
+    pub config: DynamoDbTableConfig,
+    pub project: String,
+    pub region: String,
+    pub tags: HashMap<String, String>,
+}
+
+impl DynamoDbTable {
+    pub fn new(
+        table_name: String,
+        config: DynamoDbTableConfig,
+        rctx: &crate::ResourceContext,
+    ) -> Self {
+        Self {
+            table_name,
+            config,
+            project: rctx.project.clone(),
+            region: rctx.region.clone(),
+            tags: rctx.tags.clone(),
+        }
+    }
+
+    fn sdk_key_type(kt: KeyType) -> aws_sdk_dynamodb::types::KeyType {
+        match kt {
+            KeyType::Hash => aws_sdk_dynamodb::types::KeyType::Hash,
+            KeyType::Range => aws_sdk_dynamodb::types::KeyType::Range,
+        }
+    }
+
+    fn sdk_attribute_type(
+        at: AttributeType,
+    ) -> aws_sdk_dynamodb::types::ScalarAttributeType {
+        match at {
+            AttributeType::String => aws_sdk_dynamodb::types::ScalarAttributeType::S,
+            AttributeType::Number => aws_sdk_dynamodb::types::ScalarAttributeType::N,
+            AttributeType::Binary => aws_sdk_dynamodb::types::ScalarAttributeType::B,
+        }
+    }
+
+    fn sdk_billing_mode(bm: BillingMode) -> aws_sdk_dynamodb::types::BillingMode {
+        match bm {
+            BillingMode::OnDemand => aws_sdk_dynamodb::types::BillingMode::PayPerRequest,
+            BillingMode::Provisioned => aws_sdk_dynamodb::types::BillingMode::Provisioned,
+        }
+    }
+
+    fn desired_tags(&self) -> HashMap<String, String> {
+        let mut tags = self.tags.clone();
+        tags.insert("Name".into(), self.table_name.clone());
+        tags.insert("Project".into(), self.project.clone());
+        tags.insert("ManagedBy".into(), "tokeira-cli".into());
+        tags
+    }
+
+    async fn wait_until_active(&self, ctx: &ProvisionContext) -> Result<(), IacError> {
+        let table_name = self.table_name.clone();
+        let dynamodb_client = &ctx
+            .extension::<crate::AwsClients>()
+            .expect("AwsClients")
+            .dynamodb;
+        super::poll_until(
+            Duration::from_secs(5),
+            Duration::from_secs(300),
+            ctx,
+            super::PollTarget {
+                resource_desc: "DynamoDB table",
+                resource_id: &self.resource_id(),
+                resource_type: self.resource_type(),
+                phase: "waiting for table to become ACTIVE",
+            },
+            || async {
+                let output = dynamodb_client
+                    .describe_table()
+                    .table_name(&table_name)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        let svc_err = e.into_service_error();
+                        if svc_err.is_resource_not_found_exception() {
+                            IacError::ResourceCreationFailed {
+                                resource_type: "DynamoDB table".into(),
+                                resource_id: table_name.clone(),
+                                details: "table is not yet describable".into(),
+                            }
+                        } else {
+                            IacError::AwsSdk(format!("dynamodb:DescribeTable: {svc_err}"))
+                        }
+                    })?;
+
+                let status = output
+                    .table()
+                    .and_then(|table| table.table_status())
+                    .map(|status| status.as_str())
+                    .unwrap_or_default();
+                Ok(status == "ACTIVE")
+            },
+        )
+        .await
+    }
+
+    async fn wait_for_ttl_reflection(
+        &self,
+        ctx: &ProvisionContext,
+        desired_attribute: Option<&str>,
+        enable: bool,
+    ) -> Result<(), IacError> {
+        let table_name = self.table_name.clone();
+        let desired_attribute = desired_attribute.map(str::to_string);
+        let dynamodb_client = &ctx
+            .extension::<crate::AwsClients>()
+            .expect("AwsClients")
+            .dynamodb;
+        let phase = if enable {
+            "waiting for TTL enablement to be reflected"
+        } else {
+            "waiting for TTL disablement to be reflected"
+        };
+
+        super::poll_until(
+            Duration::from_secs(5),
+            Duration::from_secs(300),
+            ctx,
+            super::PollTarget {
+                resource_desc: "DynamoDB TTL configuration",
+                resource_id: &self.resource_id(),
+                resource_type: self.resource_type(),
+                phase,
+            },
+            || async {
+                let output = dynamodb_client
+                    .describe_time_to_live()
+                    .table_name(&table_name)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        IacError::AwsSdk(format!(
+                            "dynamodb:DescribeTimeToLive: {}",
+                            e.into_service_error()
+                        ))
+                    })?;
+
+                let ttl = output.time_to_live_description();
+                let current_attr =
+                    ttl.and_then(|ttl| ttl.attribute_name()).unwrap_or_default();
+                let current_status = ttl
+                    .and_then(|ttl| ttl.time_to_live_status())
+                    .map(|status| status.as_str())
+                    .unwrap_or("DISABLED");
+
+                if enable {
+                    Ok(desired_attribute.as_deref() == Some(current_attr)
+                        && matches!(current_status, "ENABLING" | "ENABLED"))
+                } else {
+                    Ok(matches!(current_status, "DISABLING" | "DISABLED"))
+                }
+            },
+        )
+        .await
+    }
+
+    async fn wait_until_deleted(&self, ctx: &ProvisionContext) -> Result<(), IacError> {
+        let table_name = self.table_name.clone();
+        let dynamodb_client = &ctx
+            .extension::<crate::AwsClients>()
+            .expect("AwsClients")
+            .dynamodb;
+        super::poll_until(
+            Duration::from_secs(5),
+            Duration::from_secs(300),
+            ctx,
+            super::PollTarget {
+                resource_desc: "DynamoDB table deletion",
+                resource_id: &self.resource_id(),
+                resource_type: self.resource_type(),
+                phase: "waiting for table deletion",
+            },
+            || async {
+                match dynamodb_client
+                    .describe_table()
+                    .table_name(&table_name)
+                    .send()
+                    .await
+                {
+                    Ok(_) => Ok(false),
+                    Err(e) => {
+                        let svc_err = e.into_service_error();
+                        if svc_err.is_resource_not_found_exception() {
+                            Ok(true)
+                        } else {
+                            Err(IacError::AwsSdk(format!(
+                                "dynamodb:DescribeTable: {svc_err}"
+                            )))
+                        }
+                    }
+                }
+            },
+        )
+        .await
+    }
+}
+
+#[async_trait::async_trait]
+impl Resource for DynamoDbTable {
+    fn resource_type(&self) -> ResourceType {
+        ResourceType::new("DynamoDbTable")
+    }
+
+    fn resource_id(&self) -> ResourceId {
+        ResourceId(format!("dynamodb-{}", self.table_name))
+    }
+
+    fn dependencies(&self) -> Vec<ResourceId> {
+        vec![]
+    }
+
+    fn module(&self) -> &str {
+        &self.config.module
+    }
+
+    fn diff(&self, current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {
+        let current_tags: HashMap<String, String> = current
+            .properties
+            .get("tags")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        let current_ttl_attribute = current
+            .properties
+            .get("ttl_attribute")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if current_tags != self.desired_tags() {
+            InternalChange::Update {
+                resource_id: self.resource_id(),
+                resource_type: self.resource_type(),
+                details: "tags changed".into(),
+            }
+        } else if current_ttl_attribute != self.config.ttl_attribute {
+            InternalChange::Update {
+                resource_id: self.resource_id(),
+                resource_type: self.resource_type(),
+                details: "ttl attribute changed".into(),
+            }
+        } else {
+            InternalChange::NoChange {
+                resource_id: self.resource_id(),
+            }
+        }
+    }
+
+    async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, IacError> {
+        let name = &self.table_name;
+        let tags = ctx.resource_tags(name);
+
+        let key_schema: Vec<aws_sdk_dynamodb::types::KeySchemaElement> = self
+            .config
+            .key_schema
+            .iter()
+            .map(|ka| {
+                aws_sdk_dynamodb::types::KeySchemaElement::builder()
+                    .attribute_name(&ka.name)
+                    .key_type(Self::sdk_key_type(ka.key_type))
+                    .build()
+                    .map_err(|e| {
+                        IacError::AwsSdk(format!("dynamodb:CreateTable key_schema: {e}"))
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+
+        let attribute_defs: Vec<aws_sdk_dynamodb::types::AttributeDefinition> = self
+            .config
+            .key_schema
+            .iter()
+            .map(|ka| {
+                aws_sdk_dynamodb::types::AttributeDefinition::builder()
+                    .attribute_name(&ka.name)
+                    .attribute_type(Self::sdk_attribute_type(ka.attribute_type))
+                    .build()
+                    .map_err(|e| {
+                        IacError::AwsSdk(format!(
+                            "dynamodb:CreateTable attribute_definitions: {e}"
+                        ))
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+
+        // dynamodb:CreateTable
+        let adopted_existing = match ctx
+            .extension::<crate::AwsClients>()
+            .expect("AwsClients")
+            .dynamodb
+            .create_table()
+            .table_name(name)
+            .set_key_schema(Some(key_schema))
+            .set_attribute_definitions(Some(attribute_defs))
+            .billing_mode(Self::sdk_billing_mode(self.config.billing_mode))
+            .send()
+            .await
+        {
+            Ok(_) => false,
+            Err(e) => {
+                let svc_err = e.into_service_error();
+                if svc_err.is_resource_in_use_exception() {
+                    tracing::warn!(table = %name, "table already exists, adopting");
+                    true
+                } else {
+                    return Err(IacError::AwsSdk(format!(
+                        "dynamodb:CreateTable: {svc_err}"
+                    )));
+                }
+            }
+        };
+
+        self.wait_until_active(ctx).await?;
+
+        let table_arn = ctx
+            .extension::<crate::AwsClients>()
+            .expect("AwsClients")
+            .dynamodb
+            .describe_table()
+            .table_name(name)
+            .send()
+            .await
+            .map_err(|e| {
+                IacError::AwsSdk(format!(
+                    "dynamodb:DescribeTable: {}",
+                    e.into_service_error()
+                ))
+            })?
+            .table()
+            .and_then(|t| t.table_arn())
+            .unwrap_or_default()
+            .to_string();
+
+        // dynamodb:UpdateTimeToLive if TTL configured.
+        // For adopted tables, call DescribeTimeToLive first and only issue an
+        // update when TTL is not already enabled on the desired attribute.
+        if let Some(ttl_attr) = &self.config.ttl_attribute {
+            let mut should_update_ttl = true;
+            if adopted_existing {
+                let ttl_desc = ctx
+                    .extension::<crate::AwsClients>()
+                    .expect("AwsClients")
+                    .dynamodb
+                    .describe_time_to_live()
+                    .table_name(name)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        IacError::AwsSdk(format!(
+                            "dynamodb:DescribeTimeToLive: {}",
+                            e.into_service_error()
+                        ))
+                    })?;
+
+                if let Some(ttl) = ttl_desc.time_to_live_description() {
+                    let current_attr = ttl.attribute_name().unwrap_or_default();
+                    let current_status = ttl
+                        .time_to_live_status()
+                        .map(|s| s.as_str())
+                        .unwrap_or_default();
+
+                    let enabled_for_attr = current_attr == ttl_attr
+                        && (current_status == "ENABLED" || current_status == "ENABLING");
+                    should_update_ttl = !enabled_for_attr;
+                }
+            }
+
+            if should_update_ttl {
+                let ttl_spec =
+                    aws_sdk_dynamodb::types::TimeToLiveSpecification::builder()
+                        .attribute_name(ttl_attr)
+                        .enabled(true)
+                        .build()
+                        .map_err(|e| {
+                            IacError::AwsSdk(format!(
+                                "dynamodb:UpdateTimeToLive build: {e}"
+                            ))
+                        })?;
+                ctx.extension::<crate::AwsClients>()
+                    .expect("AwsClients")
+                    .dynamodb
+                    .update_time_to_live()
+                    .table_name(name)
+                    .time_to_live_specification(ttl_spec)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        IacError::AwsSdk(format!(
+                            "dynamodb:UpdateTimeToLive: {}",
+                            e.into_service_error()
+                        ))
+                    })?;
+                self.wait_for_ttl_reflection(ctx, Some(ttl_attr), true)
+                    .await?;
+            }
+        }
+
+        // dynamodb:TagResource
+        let ddb_tags = super::dynamodb_tags(&tags);
+        if !table_arn.is_empty() {
+            ctx.extension::<crate::AwsClients>()
+                .expect("AwsClients")
+                .dynamodb
+                .tag_resource()
+                .resource_arn(&table_arn)
+                .set_tags(Some(ddb_tags))
+                .send()
+                .await
+                .map_err(|e| {
+                    IacError::AwsSdk(format!(
+                        "dynamodb:TagResource: {}",
+                        e.into_service_error()
+                    ))
+                })?;
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        Ok(ResourceState {
+            resource_type: ResourceType::new("DynamoDbTable"),
+            physical_id: table_arn,
+            properties: serde_json::json!({
+                "table_name": self.table_name,
+                "billing_mode": format!("{:?}", self.config.billing_mode),
+                "ttl_attribute": self.config.ttl_attribute,
+                "tags": tags,
+            }),
+            dependencies: vec![],
+            created_at: now.clone(),
+            updated_at: now,
+            module: self.module().to_owned(),
+        })
+    }
+
+    async fn update(
+        &self,
+        current: &ResourceState,
+        ctx: &ProvisionContext,
+    ) -> Result<ResourceState, IacError> {
+        let tags = ctx.resource_tags(&self.table_name);
+        let ddb_tags = super::dynamodb_tags(&tags);
+
+        // dynamodb:TagResource to update tags
+        if !current.physical_id.is_empty() {
+            ctx.extension::<crate::AwsClients>()
+                .expect("AwsClients")
+                .dynamodb
+                .tag_resource()
+                .resource_arn(&current.physical_id)
+                .set_tags(Some(ddb_tags))
+                .send()
+                .await
+                .map_err(|e| {
+                    IacError::AwsSdk(format!(
+                        "dynamodb:TagResource: {}",
+                        e.into_service_error()
+                    ))
+                })?;
+        }
+
+        let current_ttl_attribute = current
+            .properties
+            .get("ttl_attribute")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if current_ttl_attribute != self.config.ttl_attribute {
+            let ttl_spec = match self.config.ttl_attribute.as_deref() {
+                Some(attr) => aws_sdk_dynamodb::types::TimeToLiveSpecification::builder()
+                    .attribute_name(attr)
+                    .enabled(true)
+                    .build()
+                    .map_err(|e| {
+                        IacError::AwsSdk(format!("dynamodb:UpdateTimeToLive build: {e}"))
+                    })?,
+                None => {
+                    let disable_attr =
+                        current_ttl_attribute.as_deref().unwrap_or("ttl_epoch");
+                    aws_sdk_dynamodb::types::TimeToLiveSpecification::builder()
+                        .attribute_name(disable_attr)
+                        .enabled(false)
+                        .build()
+                        .map_err(|e| {
+                            IacError::AwsSdk(format!(
+                                "dynamodb:UpdateTimeToLive build: {e}"
+                            ))
+                        })?
+                }
+            };
+
+            ctx.extension::<crate::AwsClients>()
+                .expect("AwsClients")
+                .dynamodb
+                .update_time_to_live()
+                .table_name(&self.table_name)
+                .time_to_live_specification(ttl_spec)
+                .send()
+                .await
+                .map_err(|e| {
+                    IacError::AwsSdk(format!(
+                        "dynamodb:UpdateTimeToLive: {}",
+                        e.into_service_error()
+                    ))
+                })?;
+
+            self.wait_for_ttl_reflection(
+                ctx,
+                self.config.ttl_attribute.as_deref(),
+                self.config.ttl_attribute.is_some(),
+            )
+            .await?;
+        }
+
+        Ok(ResourceState {
+            resource_type: current.resource_type.clone(),
+            physical_id: current.physical_id.clone(),
+            properties: serde_json::json!({
+                "table_name": self.table_name,
+                "billing_mode": format!("{:?}", self.config.billing_mode),
+                "ttl_attribute": self.config.ttl_attribute,
+                "tags": tags,
+            }),
+            dependencies: vec![],
+            created_at: current.created_at.clone(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            module: self.module().to_owned(),
+        })
+    }
+
+    async fn delete(
+        &self,
+        _current: &ResourceState,
+        ctx: &ProvisionContext,
+    ) -> Result<(), IacError> {
+        let name = &self.table_name;
+
+        match ctx
+            .extension::<crate::AwsClients>()
+            .expect("AwsClients")
+            .dynamodb
+            .delete_table()
+            .table_name(name)
+            .send()
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                let svc_err = e.into_service_error();
+                if svc_err.is_resource_not_found_exception() {
+                    tracing::warn!(table = %name, "table not found, skipping deletion");
+                } else {
+                    return Err(IacError::AwsSdk(format!(
+                        "dynamodb:DeleteTable: {svc_err}"
+                    )));
+                }
+            }
+        }
+
+        self.wait_until_deleted(ctx).await
+    }
+
+    async fn describe(
+        &self,
+        ctx: &ProvisionContext,
+    ) -> Result<Option<ResourceState>, IacError> {
+        let name = &self.table_name;
+
+        match ctx
+            .extension::<crate::AwsClients>()
+            .expect("AwsClients")
+            .dynamodb
+            .describe_table()
+            .table_name(name)
+            .send()
+            .await
+        {
+            Ok(output) => {
+                let arn = output
+                    .table()
+                    .and_then(|t| t.table_arn())
+                    .unwrap_or_default()
+                    .to_string();
+                let billing_mode = output
+                    .table()
+                    .and_then(|t| t.billing_mode_summary())
+                    .and_then(|s| s.billing_mode())
+                    .map(|m| match m {
+                        aws_sdk_dynamodb::types::BillingMode::PayPerRequest => "OnDemand",
+                        aws_sdk_dynamodb::types::BillingMode::Provisioned => {
+                            "Provisioned"
+                        }
+                        _ => "",
+                    })
+                    .unwrap_or_default()
+                    .to_string();
+                let tags = if arn.is_empty() {
+                    HashMap::new()
+                } else {
+                    ctx.extension::<crate::AwsClients>()
+                        .expect("AwsClients")
+                        .dynamodb
+                        .list_tags_of_resource()
+                        .resource_arn(&arn)
+                        .send()
+                        .await
+                        .map_err(|e| {
+                            IacError::AwsSdk(format!(
+                                "dynamodb:ListTagsOfResource: {}",
+                                e.into_service_error()
+                            ))
+                        })?
+                        .tags()
+                        .iter()
+                        .map(|tag| (tag.key().to_string(), tag.value().to_string()))
+                        .collect()
+                };
+                let ttl_attribute = ctx
+                    .extension::<crate::AwsClients>()
+                    .expect("AwsClients")
+                    .dynamodb
+                    .describe_time_to_live()
+                    .table_name(name)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        IacError::AwsSdk(format!(
+                            "dynamodb:DescribeTimeToLive: {}",
+                            e.into_service_error()
+                        ))
+                    })?
+                    .time_to_live_description()
+                    .and_then(|ttl| {
+                        match ttl.time_to_live_status().map(|s| s.as_str()) {
+                            Some("ENABLED") | Some("ENABLING") => {
+                                ttl.attribute_name().map(str::to_string)
+                            }
+                            _ => None,
+                        }
+                    });
+                let now = chrono::Utc::now().to_rfc3339();
+                Ok(Some(ResourceState {
+                    resource_type: ResourceType::new("DynamoDbTable"),
+                    physical_id: arn,
+                    properties: serde_json::json!({
+                        "table_name": self.table_name,
+                        "billing_mode": billing_mode,
+                        "ttl_attribute": ttl_attribute,
+                        "tags": tags,
+                    }),
+                    dependencies: vec![],
+                    created_at: now.clone(),
+                    updated_at: now,
+                    module: self.module().to_owned(),
+                }))
+            }
+            Err(e) => {
+                let svc_err = e.into_service_error();
+                if svc_err.is_resource_not_found_exception() {
+                    Ok(None)
+                } else {
+                    Err(IacError::AwsSdk(format!(
+                        "dynamodb:DescribeTable: {svc_err}"
+                    )))
+                }
+            }
+        }
+    }
+}

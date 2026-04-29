@@ -771,6 +771,7 @@ pub enum WorkflowCommand {
         task_queue: TaskQueueName,
         input: Payloads,
         header: Option<Headers>,
+        request_eager_execution: bool,
         retry_policy: Option<RetryPolicy>,
         deployment: Option<DeploymentId>,
         build_id: Option<BuildId>,

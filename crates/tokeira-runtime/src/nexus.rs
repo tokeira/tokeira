@@ -11,16 +11,16 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use opentelemetry::KeyValue;
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::Command;
-use tokeira_types::{
-    NamespaceId, Payload, Payloads, RunKey, ShardId, TaskQueueName,
-};
+use tokeira_types::{NamespaceId, Payload, Payloads, RunKey, ShardId, TaskQueueName};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 use crate::lane::LaneHandle;
+use crate::metrics as runtime_metrics;
 use crate::scanner::pick_lane;
 use crate::shard::ShardOwner;
 
@@ -41,6 +41,7 @@ pub trait NexusHttpClient: Send + Sync {
         operation: &str,
         input: &Payloads,
         schedule_to_close_timeout: Option<Duration>,
+        trace_headers: &[KeyValue],
     ) -> Result<NexusStartResult>;
 
     async fn cancel_operation(
@@ -48,12 +49,15 @@ pub trait NexusHttpClient: Send + Sync {
         address: &str,
         operation_id: &str,
         service: &str,
+        trace_headers: &[KeyValue],
     ) -> Result<()>;
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum EndpointTarget {
-    External { address: String },
+    External {
+        address: String,
+    },
     Worker {
         namespace_id: NamespaceId,
         task_queue: TaskQueueName,
@@ -199,6 +203,7 @@ impl NexusHttpClient for NoopNexusHttpClient {
         _operation: &str,
         _input: &Payloads,
         _schedule_to_close_timeout: Option<Duration>,
+        _trace_headers: &[KeyValue],
     ) -> Result<NexusStartResult> {
         Err(anyhow!("nexus http client not configured"))
     }
@@ -208,6 +213,7 @@ impl NexusHttpClient for NoopNexusHttpClient {
         _address: &str,
         _operation_id: &str,
         _service: &str,
+        _trace_headers: &[KeyValue],
     ) -> Result<()> {
         Err(anyhow!("nexus http client not configured"))
     }
@@ -359,7 +365,9 @@ pub(crate) async fn run_nexus_timeout_scanner(
 
         let active_shards: Vec<_> = shard_owner.read().unwrap().active_shards().collect();
         for shard_id in active_shards {
+            runtime_metrics::record_scanner_tick("nexus_timeout", shard_id.0);
             scan_nexus_timeouts_once(&tracking, Some(shard_id), &config, |entry, now| {
+                runtime_metrics::record_scanner_dispatched("nexus_timeout", shard_id.0);
                 let lane = pick_lane(&lanes, lane_count, entry.shard_id).clone();
                 async move {
                     lane.submit(

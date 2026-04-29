@@ -1192,7 +1192,9 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         let headers = metadata_to_header_map(request.metadata());
         let edge_req = nexus::failed_request_to_edge(request.into_inner())
             .map_err(nexus_translate_error_status)?;
-        self.inner.respond_nexus_task_failed(&headers, edge_req).await?;
+        self.inner
+            .respond_nexus_task_failed(&headers, edge_req)
+            .await?;
         Ok(Response::new(
             workflowservice::RespondNexusTaskFailedResponse::default(),
         ))
@@ -1243,7 +1245,6 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use tokeira_proto::public::temporal::api::nexus::v1 as nexus_v1;
     use crate::{
         history_wait::{HistoryNotifyingRepository, HistoryWaitRegistry},
         interceptors::EdgeInterceptors,
@@ -1262,9 +1263,11 @@ mod tests {
         BasicKernel, Command, Kernel, LoadedRun, NexusResolution, SignalRequest,
         StartRequest,
     };
+    use tokeira_proto::public::temporal::api::nexus::v1 as nexus_v1;
     use tokeira_runtime::{
         NexusTask, NexusTaskBroker, NexusTaskRequest, NexusTaskToken,
-        VersioningRuleStore, WorkerRegistrationKey, WorkerRegistry, WorkerVersionMetadata,
+        VersioningRuleStore, WorkerRegistrationKey, WorkerRegistry,
+        WorkerVersionMetadata,
     };
     use tokeira_storage::{CommitResult, DispatchableWorkflowTask, RunRepository};
     use tokeira_types::{
@@ -3070,7 +3073,8 @@ mod tests {
 
     #[tokio::test]
     async fn respond_nexus_task_completed_rejects_empty_task_token() {
-        let (grpc, _broker) = nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
+        let (grpc, _broker) =
+            nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
 
         let error = grpc
             .respond_nexus_task_completed(Request::new(
@@ -3092,7 +3096,8 @@ mod tests {
 
     #[tokio::test]
     async fn respond_nexus_task_completed_rejects_missing_response() {
-        let (grpc, _broker) = nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
+        let (grpc, _broker) =
+            nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
 
         let token = NexusTaskToken {
             run_key: RunKey::new(),
@@ -3117,7 +3122,8 @@ mod tests {
 
     #[tokio::test]
     async fn respond_nexus_task_completed_rejects_malformed_task_token() {
-        let (grpc, _broker) = nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
+        let (grpc, _broker) =
+            nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
 
         let error = grpc
             .respond_nexus_task_completed(Request::new(
@@ -3170,7 +3176,8 @@ mod tests {
 
     #[tokio::test]
     async fn respond_nexus_task_failed_rejects_empty_task_token() {
-        let (grpc, _broker) = nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
+        let (grpc, _broker) =
+            nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
 
         let error = grpc
             .respond_nexus_task_failed(Request::new(
@@ -3191,7 +3198,8 @@ mod tests {
 
     #[tokio::test]
     async fn respond_nexus_task_failed_rejects_missing_error() {
-        let (grpc, _broker) = nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
+        let (grpc, _broker) =
+            nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
 
         let token = NexusTaskToken {
             run_key: RunKey::new(),

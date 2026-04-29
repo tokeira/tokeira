@@ -27,11 +27,11 @@ The implementation is organized into three phases:
 - **Kernel**: The pure state-machine in `tokeira-kernel` that computes all workflow state transitions with zero I/O.
 - **InMemoryBroker**: The in-memory workflow task broker in `tokeira-runtime/src/broker.rs` that queues `DispatchableWorkflowTask` entries by `QueueKey` (namespace, task_queue), with sticky/general tiers and `Notify`-based long-poll wake.
 - **InMemoryActivityBroker**: The in-memory activity task broker in `tokeira-runtime/src/broker.rs` that queues `DispatchableActivityTask` entries by `QueueKey`.
-- **WorkerRegistry**: The `WorkerRegistry` in `tokeira-runtime/src/worker_registry.rs` that tracks active worker registrations by (worker_identity, namespace_id, task_queue), including version metadata and last-seen timestamps.
+- **PollerRegistry**: The `PollerRegistry` in `tokeira-edge/src/poller_registry.rs` that tracks active long-poll registrations by `QueueKey` and `WorkerIdentity`, with RAII cleanup when polls complete or time out.
 - **Eager_Workflow_Task**: A `PollWorkflowTaskQueueResponse` returned inline in `StartWorkflowExecutionResponse.eager_workflow_task`, containing the first workflow task for a just-started workflow.
 - **Eager_Activity_Task**: A `PollActivityTaskQueueResponse` returned inline in `RespondWorkflowTaskCompletedResponse.activity_tasks`, containing an activity task scheduled by the just-completed workflow task.
 - **Atomic_Claim**: A broker operation that removes a task from the ready queue in a single lock acquisition, preventing the task from being delivered to a normal poller concurrently.
-- **Compatible_Poller**: A worker that is registered in the WorkerRegistry as actively polling on the same (namespace, task_queue) as the workflow being started, making it eligible to receive an eager workflow task.
+- **Compatible_Poller**: A worker that has an active `PollerRegistry` entry on the same `QueueKey` as the workflow being started, making it eligible to receive an eager workflow task.
 - **Poll_Response**: The proto `PollWorkflowTaskQueueResponse` or `PollActivityTaskQueueResponse` returned to SDK workers.
 - **QueueKey**: The (namespace_id, task_queue, versioning) tuple used to key broker queues.
 

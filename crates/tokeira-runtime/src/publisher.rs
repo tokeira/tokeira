@@ -9,6 +9,10 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use opentelemetry::{
+    KeyValue,
+    propagation::{Injector, TextMapPropagator},
+};
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     CancelRequest, ChildStartConfirmedRequest, ChildStartResult, Command, DispatchOp,
@@ -40,6 +44,7 @@ use crate::{
     shard::shard_for,
     versioning::VersioningRuleStore,
 };
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// [`DispatchPublisher`] that forwards dispatch ops to
 /// the runtime's in-memory brokers.
@@ -120,6 +125,23 @@ where
         let shard_id = shard_for(run_key, self.shard_count);
         let lanes = self.lanes.lock().unwrap();
         pick_lane(&lanes, self.lane_count, shard_id).clone()
+    }
+
+    fn nexus_trace_headers(&self) -> Vec<KeyValue> {
+        struct KeyValueInjector {
+            values: Vec<KeyValue>,
+        }
+
+        impl Injector for KeyValueInjector {
+            fn set(&mut self, key: &str, value: String) {
+                self.values.push(KeyValue::new(key.to_string(), value));
+            }
+        }
+
+        let mut injector = KeyValueInjector { values: Vec::new() };
+        opentelemetry_sdk::propagation::TraceContextPropagator::new()
+            .inject_context(&tracing::Span::current().context(), &mut injector);
+        injector.values
     }
 
     fn redirected_queue(&self, queue: &QueueKey) -> QueueKey {
@@ -585,6 +607,7 @@ where
         let resolution = match self.nexus_registry.resolve(&endpoint_name) {
             Some(config) => match &config.target {
                 EndpointTarget::External { address } => {
+                    let trace_headers = self.nexus_trace_headers();
                     match self
                         .nexus_client
                         .start_operation(
@@ -594,6 +617,7 @@ where
                             &operation,
                             &input,
                             schedule_to_close_timeout,
+                            &trace_headers,
                         )
                         .await
                     {
@@ -718,42 +742,45 @@ where
         };
 
         match &config.target {
-            EndpointTarget::External { address } => match self
-                .nexus_client
-                .cancel_operation(address, &operation_id, &service)
-                .await
-            {
-                Ok(()) => {
-                    let command = Command::NexusOperationResolved(
-                        tokeira_kernel::NexusOperationResolvedRequest {
-                            operation_id,
-                            scheduled_event_id,
-                            resolution: tokeira_kernel::NexusResolution::Canceled,
-                            now: OffsetDateTime::now_utc(),
-                        },
-                    );
-                    if let Err(error) = self
-                        .pick_lane(originator_run_key)
-                        .submit(originator_run_key, command)
-                        .await
-                    {
-                        tracing::warn!(
+            EndpointTarget::External { address } => {
+                let trace_headers = self.nexus_trace_headers();
+                match self
+                    .nexus_client
+                    .cancel_operation(address, &operation_id, &service, &trace_headers)
+                    .await
+                {
+                    Ok(()) => {
+                        let command = Command::NexusOperationResolved(
+                            tokeira_kernel::NexusOperationResolvedRequest {
+                                operation_id,
+                                scheduled_event_id,
+                                resolution: tokeira_kernel::NexusResolution::Canceled,
+                                now: OffsetDateTime::now_utc(),
+                            },
+                        );
+                        if let Err(error) = self
+                            .pick_lane(originator_run_key)
+                            .submit(originator_run_key, command)
+                            .await
+                        {
+                            tracing::warn!(
+                                ?error,
+                                originator_run_key = ?originator_run_key,
+                                scheduled_event_id,
+                                "failed to deliver NexusOperationResolved(Canceled) to originator"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(
                             ?error,
-                            originator_run_key = ?originator_run_key,
-                            scheduled_event_id,
-                            "failed to deliver NexusOperationResolved(Canceled) to originator"
+                            operation_id,
+                            endpoint = endpoint_name,
+                            "cancel nexus operation failed (treating as no-op)"
                         );
                     }
                 }
-                Err(error) => {
-                    tracing::debug!(
-                        ?error,
-                        operation_id,
-                        endpoint = endpoint_name,
-                        "cancel nexus operation failed (treating as no-op)"
-                    );
-                }
-            },
+            }
             EndpointTarget::Worker {
                 namespace_id,
                 task_queue,

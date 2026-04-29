@@ -11,6 +11,12 @@
 		},
 		{
 			"path": "../sdk-core"
+		},
+		{
+			"path": "../../temporalio/temporal-dsql-deploy-eks"
+		},
+		{
+			"path": "../../temporalio/temporal-loom"
 		}
 	],
 	"settings": {

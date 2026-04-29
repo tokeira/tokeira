@@ -275,6 +275,7 @@ pub fn start_request_to_edge(
             .transpose()?
             .unwrap_or_default(),
         identity: non_empty(req.identity),
+        request_eager_execution: req.request_eager_execution,
         workflow_execution_timeout: proto_duration_to_time(
             req.workflow_execution_timeout.as_ref(),
         ),
@@ -591,6 +592,7 @@ pub fn start_response_to_proto(
     workflowservice::StartWorkflowExecutionResponse {
         run_id: resp.run_id.0.to_string(),
         started: resp.started,
+        eager_workflow_task: resp.eager_workflow_task.map(poll_response_to_proto),
         ..Default::default()
     }
 }
@@ -701,6 +703,11 @@ pub fn completed_response_to_proto(
 ) -> workflowservice::RespondWorkflowTaskCompletedResponse {
     workflowservice::RespondWorkflowTaskCompletedResponse {
         workflow_task: resp.workflow_task.map(poll_response_to_proto),
+        activity_tasks: resp
+            .activity_tasks
+            .into_iter()
+            .map(poll_activity_response_to_proto)
+            .collect(),
         ..Default::default()
     }
 }
@@ -1416,6 +1423,7 @@ pub fn proto_command_to_workflow_command(
                     .map(payloads_to_domain)
                     .unwrap_or_default(),
                 header: attrs.header.as_ref().map(headers_to_domain),
+                request_eager_execution: attrs.request_eager_execution,
                 retry_policy: attrs.retry_policy.as_ref().map(retry_policy_to_domain),
                 deployment: None,
                 build_id: None,
@@ -1664,6 +1672,7 @@ pub fn workflow_command_to_proto(
             task_queue,
             input,
             header,
+            request_eager_execution,
             retry_policy,
             schedule_to_close_timeout,
             schedule_to_start_timeout,
@@ -1683,6 +1692,7 @@ pub fn workflow_command_to_proto(
                 ),
                 header: header.as_ref().map(headers_from_domain),
                 input: Some(payloads_from_domain(input)),
+                request_eager_execution: *request_eager_execution,
                 schedule_to_close_timeout: schedule_to_close_timeout
                     .map(to_proto_duration),
                 schedule_to_start_timeout: schedule_to_start_timeout

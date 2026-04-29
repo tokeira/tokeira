@@ -1,0 +1,39 @@
+[package]
+name = "tokeira-aws"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokeira-iac = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+secrecy = "0.10"
+http = "1"
+urlencoding = "2"
+
+# AWS SDK
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-ec2 = "1"
+aws-sdk-eks = "1"
+aws-sdk-iam = "1"
+aws-sdk-opensearch = "1"
+aws-sdk-ecr = "1"
+aws-sdk-s3 = "1"
+aws-sdk-dsql = "1"
+aws-sdk-dynamodb = "1"
+aws-sdk-secretsmanager = "1"
+aws-sdk-sts = "1"
+aws-iam = "0.2.2"
+
+[dev-dependencies]
+proptest = "1"

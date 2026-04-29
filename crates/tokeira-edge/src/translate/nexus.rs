@@ -182,7 +182,9 @@ pub fn proto_start_response_to_resolution(
                 result: single_payload_to_payloads(sync.payload),
             })
         }
-        Some(nexus_v1::start_operation_response::Variant::AsyncSuccess(async_success)) => {
+        Some(nexus_v1::start_operation_response::Variant::AsyncSuccess(
+            async_success,
+        )) => {
             if async_success.operation_id != expected_operation_id {
                 tracing::warn!(
                     expected_operation_id,
@@ -243,7 +245,9 @@ pub fn nexus_failure_to_kernel_payload(
     Ok(Payload { data, metadata })
 }
 
-fn single_payload_to_payloads(payload: Option<tokeira_proto::public::common::Payload>) -> Payloads {
+fn single_payload_to_payloads(
+    payload: Option<tokeira_proto::public::common::Payload>,
+) -> Payloads {
     match payload {
         Some(payload) => Payloads(vec![payload_to_domain(&payload)]),
         None => Payloads::default(),
@@ -259,7 +263,10 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-pub fn broker_queue(namespace: &str, task_queue: &str) -> (tokeira_types::NamespaceId, TaskQueueName) {
+pub fn broker_queue(
+    namespace: &str,
+    task_queue: &str,
+) -> (tokeira_types::NamespaceId, TaskQueueName) {
     (
         crate::translate::to_internal::namespace_id_for(namespace),
         TaskQueueName(task_queue.to_string()),

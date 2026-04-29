@@ -4,9 +4,9 @@
 
 Eager dispatch is a latency optimization that returns a workflow task or activity task inline with the gRPC response that triggered it, eliminating a separate poll round-trip. This design covers two independent paths:
 
-1. **Eager WFT on `StartWorkflowExecution`**: After `runtime.start_workflow_with_policy` commits and the dispatch publisher publishes the first WFT to the `InMemoryBroker`, the edge start handler attempts a non-blocking `try_claim_workflow_task` on the broker. If the claim succeeds and the caller is a compatible poller (verified via `WorkerRegistry`), the claimed task is built into a `PollWorkflowTaskQueueResponse` and returned in `StartWorkflowExecutionResponse.eager_workflow_task`.
+1. **Eager WFT on `StartWorkflowExecution`**: After `runtime.start_workflow_with_policy` commits and the dispatch publisher publishes the first WFT to the `InMemoryBroker`, the edge start handler attempts a non-blocking `try_claim_workflow_task(&queue_key, run_key)` on the broker. If the claim succeeds and the caller is a compatible poller (verified via `PollerRegistry`), the claimed task is built into a `PollWorkflowTaskQueueResponse` and returned in `StartWorkflowExecutionResponse.eager_workflow_task`.
 
-2. **Eager activity tasks on `RespondWorkflowTaskCompleted`**: After `runtime.complete_workflow_task` commits and the dispatch publisher publishes activity tasks to the `InMemoryActivityBroker`, the edge complete handler attempts non-blocking `try_claim_activity_task` calls for each eager-eligible activity command. Claimed tasks are built into `PollActivityTaskQueueResponse` entries and returned in `RespondWorkflowTaskCompletedResponse.activity_tasks`.
+2. **Eager activity tasks on `RespondWorkflowTaskCompleted`**: After `runtime.complete_workflow_task` commits and the dispatch publisher publishes activity tasks to the `InMemoryActivityBroker`, the edge complete handler attempts non-blocking `try_claim_activity_task(&queue_key, run_key, activity_id)` calls for each eager-eligible activity command. Claimed tasks are built into `PollActivityTaskQueueResponse` entries and returned in `RespondWorkflowTaskCompletedResponse.activity_tasks`.
 
 Both paths reuse the existing poll response building and task token encoding. No new timeout or recovery mechanisms are introduced — eagerly claimed tasks are indistinguishable from normally polled tasks once claimed, so the existing WFT timeout scanner and activity timeout scanners handle recovery if the client drops.
 
@@ -21,16 +21,16 @@ sequenceDiagram
     participant Runtime as Runtime
     participant WFBroker as InMemoryBroker
     participant ABroker as InMemoryActivityBroker
-    participant WReg as WorkerRegistry
+    participant PReg as PollerRegistry
 
-    Note over SDK,WReg: Path 1: Eager WFT on StartWorkflow
+    Note over SDK,PReg: Path 1: Eager WFT on StartWorkflow
     SDK->>Edge: StartWorkflowExecution(request_eager_execution=true)
-    Edge->>WReg: lookup(identity, namespace, task_queue)
-    WReg-->>Edge: registration found (compatible poller)
+    Edge->>PReg: has_active_poller(queue_key, identity)
+    PReg-->>Edge: active poller found
     Edge->>Runtime: start_workflow_with_policy(req)
     Runtime-->>Edge: Started { run_key, run_id }
     Note over Runtime,WFBroker: Dispatch publisher publishes WFT
-    Edge->>WFBroker: try_claim_workflow_task(queue_key)
+    Edge->>WFBroker: try_claim_workflow_task(queue_key, run_key)
     WFBroker-->>Edge: Some(DispatchableWorkflowTask)
     Edge->>Edge: build PollWorkflowTaskQueueResponse
     Edge-->>SDK: StartWorkflowExecutionResponse { eager_workflow_task }
@@ -41,14 +41,14 @@ sequenceDiagram
     Runtime-->>Edge: CommitResult::Applied
     Note over Runtime,ABroker: Dispatch publisher publishes activity tasks
     loop For each eager-eligible activity (up to max)
-        Edge->>ABroker: try_claim_activity_task(queue_key)
+        Edge->>ABroker: try_claim_activity_task(queue_key, run_key, activity_id)
         ABroker-->>Edge: Some(DispatchableActivityTask)
         Edge->>Edge: build PollActivityTaskQueueResponse
     end
     Edge-->>SDK: RespondWorkflowTaskCompletedResponse { activity_tasks }
 ```
 
-The `try_claim_*` methods are simple non-blocking take operations: acquire the broker's `Mutex`, pop from the front of the ready queue, remove from the dedup set, release the lock, return. They never wake pollers and never block.
+The `try_claim_*` methods are simple non-blocking targeted claim operations: acquire the broker's `Mutex`, scan the ready queue for the requested identity, remove the matching entry from the queue and dedup set, release the lock, return. They never wake pollers and never block.
 
 ## Components and Interfaces
 
@@ -277,7 +277,7 @@ No special error handling is needed because eagerly claimed tasks are indistingu
 
 ### Incompatible Poller
 
-If the caller is not a compatible poller (not registered in `WorkerRegistry`), the eager dispatch path is skipped entirely. The response is returned without the eager field. This is not an error — it's the expected behavior for clients that don't poll on the workflow's task queue.
+If the caller is not a compatible poller (no active `PollerRegistry` entry for the queue and identity), the eager dispatch path is skipped entirely. The response is returned without the eager field. This is not an error — it's the expected behavior for clients that don't actively poll on the workflow's task queue.
 
 ## Testing Strategy
 
@@ -285,8 +285,8 @@ If the caller is not a compatible poller (not registered in `WorkerRegistry`), t
 
 Each correctness property maps to a property-based test with minimum 100 iterations:
 
-- **Broker claim tests** (Properties 3, 4, 9, 10): Generate random `QueueKey` values and task sequences, publish to the broker, claim, and verify the invariants. These are pure in-memory operations — fast and deterministic.
-- **WorkerRegistry tests** (Property 2): Generate random registration keys, register/unregister, verify `is_compatible_poller` correctness. The registry is already tested with proptest; extend the existing suite.
+- **Broker claim tests** (Properties 3, 4, 9, 10): Generate random `QueueKey` values and task sequences, publish to the broker, perform targeted claims, and verify the invariants. These are pure in-memory operations — fast and deterministic.
+- **PollerRegistry tests** (Property 2): Generate random queue/identity pairs, register/unregister active pollers, verify `has_active_poller` correctness. The registry already has RAII semantics via `PollerGuard`; extend the existing suite.
 - **Proto translation tests** (Properties 1, 6, 7, 8): Generate random DTO instances, translate to/from proto, verify field preservation.
 - **Limit enforcement** (Property 5): Generate random counts of eager-eligible commands, verify the response never exceeds the configured maximum.
 

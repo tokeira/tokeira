@@ -49,7 +49,7 @@ use tokio::{
     time::{Duration, Instant, timeout},
 };
 
-use crate::{DeliveryMetrics, QueryTask};
+use crate::{DeliveryMetrics, QueryTask, metrics as runtime_metrics};
 
 /// Lightweight in-memory workflow-task broker.
 ///
@@ -113,6 +113,37 @@ pub(crate) struct TimestampedActivityTask {
 }
 
 impl InMemoryBroker {
+    fn emit_queue_depths(inner: &BrokerState, queue: &QueueKey) {
+        let sticky = inner
+            .sticky_ready
+            .get(queue)
+            .map(|entries| entries.len())
+            .unwrap_or(0);
+        let general = inner
+            .general_ready
+            .get(queue)
+            .map(|entries| entries.len())
+            .unwrap_or(0);
+        runtime_metrics::set_queue_depth(queue, "sticky", sticky);
+        runtime_metrics::set_queue_depth(queue, "general", general);
+    }
+
+    pub async fn try_claim_workflow_task(
+        &self,
+        queue: &QueueKey,
+        run_key: RunKey,
+    ) -> Option<(DispatchableWorkflowTask, Instant)> {
+        let mut inner = self.inner.lock().await;
+        let ready = inner.general_ready.get_mut(queue)?;
+        let index = ready.iter().position(|task| task.task.run_key == run_key)?;
+        let removed = ready.remove(index)?;
+        inner
+            .enqueued
+            .remove(&(removed.task.run_key, removed.task.logical_seq));
+        Self::emit_queue_depths(&inner, queue);
+        Some((removed.task, removed.entered_at))
+    }
+
     /// Publish a query task without deduplication or backlog participation.
     pub async fn publish_query_task(&self, task: QueryTask) {
         let mut inner = self.inner.lock().await;
@@ -161,6 +192,8 @@ impl InMemoryBroker {
         task: DispatchableWorkflowTask,
         metrics: Option<&DeliveryMetrics>,
     ) {
+        runtime_metrics::record_broker_publish(&task.queue);
+        let queue = task.queue.clone();
         let mut inner = self.inner.lock().await;
         let dedupe_key = (task.run_key, task.logical_seq);
         if !inner.enqueued.insert(dedupe_key) {
@@ -193,6 +226,7 @@ impl InMemoryBroker {
                 .or_default()
                 .push_back(timestamped);
         }
+        Self::emit_queue_depths(&inner, &queue);
         drop(inner);
         self.wake.notify_waiters();
     }
@@ -385,6 +419,7 @@ impl InMemoryBroker {
             inner
                 .enqueued
                 .remove(&(task.task.run_key, task.task.logical_seq));
+            Self::emit_queue_depths(&inner, queue);
             return Ok(Some((task.task, task.entered_at)));
         }
 
@@ -397,6 +432,7 @@ impl InMemoryBroker {
                 .enqueued
                 .remove(&(task.task.run_key, task.task.logical_seq));
         }
+        Self::emit_queue_depths(&inner, queue);
         Ok(task.map(|task| (task.task, task.entered_at)))
     }
 
@@ -465,6 +501,36 @@ impl InMemoryBroker {
 }
 
 impl InMemoryActivityBroker {
+    fn emit_queue_depth(inner: &ActivityBrokerState, queue: &QueueKey) {
+        let depth = inner
+            .ready
+            .get(queue)
+            .map(|entries| entries.len())
+            .unwrap_or(0);
+        runtime_metrics::set_queue_depth(queue, "general", depth);
+    }
+
+    pub async fn try_claim_activity_task(
+        &self,
+        queue: &QueueKey,
+        run_key: RunKey,
+        activity_id: &str,
+    ) -> Option<(DispatchableActivityTask, Instant)> {
+        let mut inner = self.inner.lock().await;
+        let ready = inner.ready.get_mut(queue)?;
+        let index = ready.iter().position(|task| {
+            task.task.run_key == run_key && task.task.activity_id == activity_id
+        })?;
+        let removed = ready.remove(index)?;
+        inner.enqueued.remove(&(
+            removed.task.run_key,
+            removed.task.activity_id.clone(),
+            removed.task.attempt,
+        ));
+        Self::emit_queue_depth(&inner, queue);
+        Some((removed.task, removed.entered_at))
+    }
+
     /// Enqueue an activity task for delivery.
     ///
     /// Duplicate publications (same `run_key` +
@@ -474,6 +540,8 @@ impl InMemoryActivityBroker {
         task: DispatchableActivityTask,
         metrics: Option<&DeliveryMetrics>,
     ) -> Result<()> {
+        runtime_metrics::record_broker_publish(&task.queue);
+        let queue = task.queue.clone();
         let mut inner = self.inner.lock().await;
         let dedupe_key = (task.run_key, task.activity_id.clone(), task.attempt);
         if !inner.enqueued.insert(dedupe_key) {
@@ -497,6 +565,7 @@ impl InMemoryActivityBroker {
                 entered_at: Instant::now(),
                 scheduled_at: OffsetDateTime::now_utc(),
             });
+        Self::emit_queue_depth(&inner, &queue);
         drop(inner);
         self.wake.notify_waiters();
         Ok(())
@@ -584,6 +653,7 @@ impl InMemoryActivityBroker {
                 task.task.attempt,
             ));
         }
+        Self::emit_queue_depth(&inner, queue);
         Ok(task.map(|task| (task.task, task.entered_at)))
     }
 
@@ -619,6 +689,12 @@ mod tests {
         BuildId, DeploymentId, NamespaceId, Payloads, TaskKind, TaskQueueName,
     };
     use tokio::sync::oneshot;
+    use uuid::Uuid;
+
+    fn arb_small_string() -> impl Strategy<Value = String> {
+        prop::collection::vec(prop::char::range('a', 'z'), 1..8)
+            .prop_map(|chars| chars.into_iter().collect())
+    }
 
     fn activity_queue(name: &str) -> QueueKey {
         QueueKey {
@@ -1025,6 +1101,154 @@ mod tests {
                     let entry = inner.general_ready.get(&queue).and_then(|q| q.front()).unwrap();
                     prop_assert!(entry.entered_at >= before);
                 }
+                Ok::<(), proptest::test_runner::TestCaseError>(())
+            })?;
+        }
+
+        #[test]
+        fn property_try_claim_workflow_task_targets_requested_run(
+            queue_name in arb_small_string(),
+            target_run in any::<u128>(),
+            other_run in any::<u128>(),
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let broker = InMemoryBroker::default();
+                let queue = workflow_queue(&queue_name, None, None);
+                let target = DispatchableWorkflowTask {
+                    run_key: RunKey(Uuid::from_u128(target_run)),
+                    ..workflow_task(queue.clone())
+                };
+                let other = DispatchableWorkflowTask {
+                    run_key: RunKey(Uuid::from_u128(other_run.wrapping_add(1))),
+                    logical_seq: LogicalTaskSeq(2),
+                    ..workflow_task(queue.clone())
+                };
+
+                broker.publish_workflow_task(other.clone(), None).await;
+                broker.publish_workflow_task(target.clone(), None).await;
+
+                let claimed = broker
+                    .try_claim_workflow_task(&queue, target.run_key)
+                    .await;
+                let remaining = broker
+                    .poll_workflow_task(
+                        &queue,
+                        &WorkerIdentity("worker-a".into()),
+                        std::time::Duration::from_millis(5),
+                    )
+                    .await
+                    .unwrap()
+                    .map(|entry| entry.0);
+
+                prop_assert_eq!(claimed.map(|entry| entry.0), Some(target));
+                prop_assert_eq!(remaining, Some(other));
+                Ok::<(), proptest::test_runner::TestCaseError>(())
+            })?;
+        }
+
+        #[test]
+        fn property_try_claim_activity_task_targets_requested_identity(
+            queue_name in arb_small_string(),
+            target_run in any::<u128>(),
+            other_run in any::<u128>(),
+            target_activity_id in arb_small_string(),
+            other_activity_id in arb_small_string(),
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let broker = InMemoryActivityBroker::default();
+                let queue = activity_queue(&queue_name);
+                let target = DispatchableActivityTask {
+                    run_key: RunKey(Uuid::from_u128(target_run)),
+                    activity_id: target_activity_id.clone(),
+                    ..activity_task(queue.clone())
+                };
+                let other = DispatchableActivityTask {
+                    run_key: RunKey(Uuid::from_u128(other_run.wrapping_add(1))),
+                    activity_id: format!("{other_activity_id}-other"),
+                    attempt: 2,
+                    ..activity_task(queue.clone())
+                };
+
+                broker.publish_activity_task(other.clone(), None).await.unwrap();
+                broker.publish_activity_task(target.clone(), None).await.unwrap();
+
+                let claimed = broker
+                    .try_claim_activity_task(&queue, target.run_key, &target_activity_id)
+                    .await;
+                let remaining = broker
+                    .poll_activity_task(&queue, std::time::Duration::from_millis(5))
+                    .await
+                    .unwrap()
+                    .map(|entry| entry.0);
+
+                prop_assert_eq!(claimed.map(|entry| entry.0), Some(target));
+                prop_assert_eq!(remaining, Some(other));
+                Ok::<(), proptest::test_runner::TestCaseError>(())
+            })?;
+        }
+
+        #[test]
+        fn property_claimed_workflow_task_is_excluded_from_normal_poll(
+            queue_name in arb_small_string(),
+            run in any::<u128>(),
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let broker = InMemoryBroker::default();
+                let queue = workflow_queue(&queue_name, None, None);
+                let task = DispatchableWorkflowTask {
+                    run_key: RunKey(Uuid::from_u128(run)),
+                    ..workflow_task(queue.clone())
+                };
+
+                broker.publish_workflow_task(task.clone(), None).await;
+                let claimed = broker
+                    .try_claim_workflow_task(&queue, task.run_key)
+                    .await;
+                let polled = broker
+                    .poll_workflow_task(
+                        &queue,
+                        &WorkerIdentity("worker-a".into()),
+                        std::time::Duration::from_millis(5),
+                    )
+                    .await
+                    .unwrap();
+
+                prop_assert_eq!(claimed.map(|entry| entry.0), Some(task));
+                prop_assert_eq!(polled, None);
+                Ok::<(), proptest::test_runner::TestCaseError>(())
+            })?;
+        }
+
+        #[test]
+        fn property_claimed_activity_task_is_excluded_from_normal_poll(
+            queue_name in arb_small_string(),
+            run in any::<u128>(),
+            activity_id in arb_small_string(),
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let broker = InMemoryActivityBroker::default();
+                let queue = activity_queue(&queue_name);
+                let task = DispatchableActivityTask {
+                    run_key: RunKey(Uuid::from_u128(run)),
+                    activity_id: activity_id.clone(),
+                    ..activity_task(queue.clone())
+                };
+
+                broker.publish_activity_task(task.clone(), None).await.unwrap();
+                let claimed = broker
+                    .try_claim_activity_task(&queue, task.run_key, &activity_id)
+                    .await;
+                let polled = broker
+                    .poll_activity_task(&queue, std::time::Duration::from_millis(5))
+                    .await
+                    .unwrap();
+
+                prop_assert_eq!(claimed.map(|entry| entry.0), Some(task));
+                prop_assert_eq!(polled, None);
                 Ok::<(), proptest::test_runner::TestCaseError>(())
             })?;
         }

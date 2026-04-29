@@ -11,6 +11,8 @@
 
 pub mod api;
 pub mod memory;
+pub mod metrics;
 
 pub use api::*;
 pub use memory::*;
+pub use metrics::*;

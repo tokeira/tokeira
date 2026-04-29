@@ -5,10 +5,20 @@ members = [
     "crates/tokeira-types",
     "crates/tokeira-proto",
     "crates/tokeira-kernel",
+    "crates/tokeira-state",
+    "crates/tokeira-iac",
+    "crates/tokeira-deploy-engine",
+    "crates/tokeira-config",
+    "crates/tokeira-aws",
+    "crates/tokeira-orchestrator",
+    "crates/tokeira-compose",
     "crates/tokeira-storage",
     "crates/tokeira-runtime",
     "crates/tokeira-projection",
     "crates/tokeira-edge",
+    "platforms/local",
+    "platforms/compose",
+    "apps/tkr",
     "apps/tokeirad",
 ]
 exclude = [
@@ -24,18 +34,46 @@ authors = ["OpenAI"]
 [workspace.dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
+bollard = "0.17"
+clap = { version = "4.5", features = ["derive"] }
 chrono = "0.4"
 chrono-tz = "0.10"
 dashmap = "6"
+fs2 = "0.4"
+hex = "0.4"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["server", "tokio"] }
+libc = "0.2"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+metrics-util = "0.19"
+opentelemetry = "0.31"
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "reqwest-client"] }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 smallvec = "1.13"
+sha2 = "0.10"
+tempfile = "3"
 thiserror = "2.0"
 time = { version = "0.3", features = ["serde", "macros", "formatting", "parsing"] }
-tokio = { version = "1.41", features = ["macros", "rt-multi-thread", "sync", "time"] }
+toml = "0.8"
+toml_edit = "0.22"
+tokio = { version = "1.41", features = ["full"] }
+tokio-stream = "0.1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing-opentelemetry = "0.32"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
 tonic = { version = "0.11", features = ["transport"] }
 tonic-reflection = "0.11"
 tonic-web = "0.11"
 tower-http = { version = "0.4", features = ["cors"] }
 uuid = { version = "1.10", features = ["serde", "v4"] }
+serde_yaml = "0.9"
+tokeira-state = { path = "crates/tokeira-state" }
+tokeira-iac = { path = "crates/tokeira-iac" }
+tokeira-deploy-engine = { path = "crates/tokeira-deploy-engine" }
+tokeira-config-loader = { path = "crates/tokeira-config-loader" }
+tokeira-config = { path = "crates/tokeira-config" }
+tokeira-aws = { path = "crates/tokeira-aws" }

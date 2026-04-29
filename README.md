@@ -1,53 +1,209 @@
-# Tokeira minimal foundation workspace
+# Tokeira
 
-This workspace is intentionally **small** and **architecturally opinionated**.
-It is not meant to be a feature-complete Temporal replacement. It is meant to be:
+A Temporal-compatible durable execution engine built in Rust and specialized for Aurora DSQL.
 
-- small enough for a new contributor or Codex to understand quickly,
-- explicit enough that architectural invariants are visible in code,
-- structured enough that new features have obvious homes,
-- incomplete enough that the next steps are obvious rather than hidden.
+Tokeira preserves the public Temporal contract that SDKs, operators, and tooling depend on — WorkflowService, OperatorService, workflow history semantics, replay model, task-start/completion semantics, sticky execution, polling, retries, signals, timers, Continue-As-New, and archival — while changing the internal architecture to collapse correctness around a single authoritative per-run transition log.
 
-## Included crates
+This is not a service-by-service port of Temporal's Frontend / History / Matching / Worker layout. Workflow durability comes from event history; queue delivery is an implementation detail with weaker ordering guarantees. Tokeira makes that distinction explicit: per-workflow event history is the only semantic ordering domain, and everything else — internal queue ordering, delivery ordering, visibility update ordering — becomes derived.
 
-- `tokeira-types` — shared identifiers and durable-domain value types.
-- `tokeira-kernel` — pure workflow transition engine.
-- `tokeira-storage` — persistence and lease interfaces plus an in-memory dev store.
-- `tokeira-runtime` — lane-based orchestration and a broker for workflow task delivery.
-- `tokeira-projection` — projection worker and a small in-memory visibility sink.
-- `tokeirad` — a tiny binary shell that wires the pieces together for local exploration.
+## Design Principles
 
-## Deliberately omitted
+**History is the authority.** Every state-changing request becomes a per-run transition that appends history, updates the run summary, and emits derived effects atomically. The system never relies on an external queue write as the canonical record that work exists.
 
-The following are intentionally **not** included in this minimal foundation set:
+**Per-run total order, not global total order.** Tokeira enforces a total order per workflow run, plus explicit causal edges across runs and side effects. Queue delivery and visibility are derived domains.
 
-- full gRPC/HTTP edge transport,
-- proto generation,
-- SQL/DSQL implementation,
-- autoscaler,
-- placement controller,
-- archival service,
-- production observability plumbing.
+**Delivery is ephemeral-first.** Worker polling and sync matching live primarily in memory. Durable backlog is a fallback and recovery aid, not the default path.
 
-Those pieces are important, but they are easier to add once the kernel/runtime/storage seams are clear.
+**Visibility is a projection.** The projection plane owns read models and operates outside the correctness path. A lagging projection is a quality problem, not a correctness failure.
 
-## Architectural invariants
+**The kernel is pure.** The deterministic state machine transforms commands into transitions with no I/O, no storage access, and no delivery concerns.
 
-These are the invariants Codex should treat as design constraints, not accidents.
+**Configuration stays minimal.** Prefer policies and auto-tuning over exposed mechanical knobs.
 
-1. **A workflow run is the unit of correctness.**
-   A shard, lane, broker, or projector may move or fail, but correctness lives at the run.
-2. **The kernel is pure.**
-   It should not know about DSQL, ECS, load balancers, or worker connections.
-3. **History is authoritative.**
-   Dispatch and projection are derived effects.
-4. **Projection is outside the correctness path.**
-   A lagging projection is acceptable; a corrupt commit path is not.
-5. **Lanes are execution-locality tools, not correctness boundaries.**
-   They exist to reduce coordination and improve cache locality.
-6. **Configuration surface should stay minimal.**
-   Prefer policies and auto-tuning over exposed mechanical knobs.
+## Architecture
 
-## Suggested first contributions
+Tokeira is organized into three planes:
 
-See `docs/CODEX_START_HERE.md` for a contribution map and safe next tasks.
+**Compatibility edge** — admits and translates requests. Exposes WorkflowService, OperatorService, and health endpoints. Performs authn/authz, namespace lookup, and request ID handling. Gates long polls before they reach deeper runtime resources.
+
+**Authoritative runtime and storage** — owns correctness. Shard/bundle ownership and fencing, lane-local execution of workflow actors, durable state transitions, durable timers, activity state, task-start validation, and derived dispatch intents.
+
+**Projection plane** — owns read models. SQL visibility, rollups, operational summaries, and custom sinks with independent checkpoints and replay.
+
+## Workspace
+
+### Core Crates
+
+| Crate | Purpose |
+|-------|---------|
+| `tokeira-types` | Shared identifiers and durable-domain value types |
+| `tokeira-proto` | Wire types for public and internal control-plane protocols |
+| `tokeira-kernel` | Pure deterministic workflow transition engine |
+| `tokeira-storage` | Persistence interfaces, in-memory dev store, and DSQL storage |
+| `tokeira-runtime` | Lane-based orchestration, delivery broker, sweepers, timer scanners |
+| `tokeira-edge` | Compatibility shell — thin translation layer for public APIs |
+| `tokeira-projection` | Projection workers, visibility query service, and visibility API types |
+
+### Infrastructure Crates
+
+| Crate | Purpose |
+|-------|---------|
+| `tokeira-state` | Deployment state persistence — CAS store and S3 store |
+| `tokeira-iac` | Generic infrastructure lifecycle engine — plan/apply/destroy with dependency ordering |
+| `tokeira-deploy-engine` | Service lifecycle engine — manifest planning, platform apply, image tracking |
+| `tokeira-config` | Server runtime configuration — TOML loading, validation, redaction |
+| `tokeira-orchestrator` | Deployment orchestration facade — connects IaC and deploy engines to platform specializations |
+| `tokeira-compose` | Docker Compose provider — bollard-based container lifecycle |
+| `tokeira-aws` | AWS resource implementations |
+
+### Platform Crates
+
+| Crate | Purpose |
+|-------|---------|
+| `platforms/local` | Bare-process local execution — spawns tokeirad directly |
+| `platforms/compose` | Docker Compose stack with observability services (Mimir, Loki, Grafana, Alloy) |
+
+### Applications
+
+| Binary | Purpose |
+|--------|---------|
+| `tokeirad` | Server process — wires kernel, runtime, storage, edge, and projection into one binary |
+| `tkr` | CLI — deployment lifecycle, infrastructure management, and developer workflows |
+
+## Quick Start
+
+```bash
+# Install tkr
+cargo install --path apps/tkr
+
+# Create and start a local deployment
+tkr deployment create --name dev --platform local --storage in-memory
+tkr deploy apply --yes
+```
+
+## `tkr` — Operator and Developer CLI
+
+`tkr` is the single entry point for deployment lifecycle, infrastructure management, and developer workflows. It manages named deployments stored under `$XDG_STATE_HOME/tokeira/tkr/`.
+
+### Command Tree
+
+```
+tkr
+├── deployment
+│   ├── create --name <name> --platform <local|compose> --storage <in-memory|dsql>
+│   ├── list
+│   ├── use <name>
+│   └── destroy <name> --yes
+├── infra
+│   ├── plan [--module <name>]
+│   ├── apply --yes [--module <name>]
+│   ├── destroy --yes [--module <name>]
+│   └── status
+├── deploy
+│   ├── plan
+│   ├── apply --yes
+│   └── status
+├── schema
+│   ├── setup --yes
+│   └── status
+├── scale
+│   ├── up [<service>] [<replicas>]
+│   ├── down [<service>] [<replicas>]
+│   └── status
+├── logs <service> [--follow] [--tail <n>]
+├── port-forward <service>
+├── config
+│   └── show
+├── dev
+│   ├── build
+│   ├── test [--crate <name>]
+│   ├── check
+│   ├── lint
+│   ├── fmt
+│   └── docs
+└── version
+```
+
+### Local Platform
+
+The local platform runs `tokeirad` as a bare child process on the host. No containers, no Docker, no observability stack. This is the fastest path from zero to a running server for development and testing.
+
+```bash
+# Create
+tkr deployment create --name dev --platform local --storage in-memory
+
+# Start tokeirad (blocks, inherits stdio, forwards SIGINT)
+tkr deploy apply --yes
+
+# In another terminal
+tkr config show
+tkr version
+```
+
+No `infra` step is needed — the local platform has no infrastructure to provision. `deploy apply` spawns `tokeirad` directly.
+
+For DSQL persistence, replace `in-memory` with `dsql` and configure the DSQL endpoint in `tokeirad.toml` before starting.
+
+### Compose Platform
+
+The compose platform runs a full Docker Compose stack: `tokeirad` plus an observability suite (Mimir, Loki, Grafana, Alloy). Requires Docker.
+
+```bash
+# Create
+tkr deployment create --name dev-compose --platform compose --storage in-memory
+
+# Provision infrastructure (creates containers via bollard)
+tkr infra plan
+tkr infra apply --yes
+
+# Deploy services
+tkr deploy apply --yes
+
+# Operations
+tkr scale status
+tkr logs tokeirad --follow --tail 50
+tkr logs grafana --tail 20
+tkr port-forward grafana
+
+# Module-scoped operations
+tkr infra apply --yes --module observability
+tkr infra destroy --yes --module observability
+
+# Tear down
+tkr infra destroy --yes
+tkr deployment destroy dev-compose --yes
+```
+
+The compose platform organizes services into two modules:
+
+- **runtime** — `tokeirad`
+- **observability** — `mimir`, `loki`, `grafana`, `alloy` (pinned to `grafana/mimir:3.0.6`, `grafana/loki:3.7.1`, `grafana/grafana-oss:12.4.3`, `grafana/alloy:v1.16.0`)
+
+## Rust Development
+
+```bash
+cargo build                              # build all crates
+cargo clippy --workspace --all-targets   # lint
+cargo test                               # unit tests
+cargo +nightly fmt                       # format
+```
+
+## Architecture Documentation
+
+Detailed design documents are in `docs/architecture/`:
+
+- [000 — Overview](docs/architecture/000-overview.md) — system shape, design principles, crate map
+- [010 — History as Authority](docs/architecture/010-history-as-authority.md) — the core invariant
+- [020 — Kernel](docs/architecture/020-kernel.md) — deterministic state transition contract
+- [030 — Runtime Lanes](docs/architecture/030-runtime-lanes.md) — execution and delivery
+- [035 — Placement and Membership](docs/architecture/035-placement-and-membership.md) — queue-aware placement, DSQL fencing
+- [050 — DSQL Storage](docs/architecture/050-dsql-storage.md) — persistence design
+- [070 — Projection Plane](docs/architecture/070-projection-plane.md) — read models and visibility
+
+## Acknowledgements
+
+The architecture, requirements specification, and technical design of this project were developed in close collaboration with [Kiro](https://kiro.dev), which made significant contributions to the design and realisation of the system.
+
+## License
+
+[MIT](LICENSE)

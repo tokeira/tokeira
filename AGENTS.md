@@ -1,0 +1,209 @@
+# AGENTS.md — Tokeira
+
+## Mission
+
+Build a Temporal-compatible durable execution engine in Rust, specialized for Aurora DSQL. Preserve the public Temporal contract that SDKs, operators, and tooling depend on. Collapse internal correctness around a single authoritative per-run transition log.
+
+This is a product-from-scratch. The architecture is informed by Temporal but the implementation is original. Do not port Temporal code.
+
+---
+
+## Non-Negotiable Rules
+
+### 1. Rust Standards
+
+- Edition 2024, stable toolchain.
+- `cargo clippy --workspace --all-targets` must pass. No suppressed warnings without a comment explaining why.
+- `cargo +nightly fmt` for formatting (some settings require nightly).
+- Error handling: `thiserror` in library crates, `anyhow` in binary crates. No `.unwrap()` outside tests.
+- All public types derive `Debug`. Serializable types derive `Serialize, Deserialize`.
+- No `unsafe`. No `Box<dyn Any>`. No runtime reflection.
+- Prefer `&str` over `String` in function signatures where ownership isn't needed.
+- Use `tracing` for structured logging. No `println!` or `eprintln!` in library code.
+- Comments explain WHY, not WHAT. Do not add comments that restate type signatures or obvious control flow.
+- Do NOT put `use` statements in function scope. Always at the top of the file or module.
+
+### 2. The Kernel Stays Pure
+
+`tokeira-kernel` is a deterministic state machine. No I/O, no async, no storage, no metrics, no network. If a change would add any of these to the kernel, it belongs in `tokeira-runtime`, `tokeira-storage`, or `tokeira-edge` instead.
+
+### 3. History is Authority
+
+Every state-changing request becomes a per-run transition. Dispatch and projection are derived effects. If a design puts correctness weight on a queue write or a visibility update, the design is wrong.
+
+### 4. Review Before Action
+
+The CLI follows a `plan → confirm → apply` model. Silent mutations are a bug.
+
+- `tkr infra plan` shows what will change before `tkr infra apply` does it.
+- `tkr deploy plan` shows service manifest changes.
+- Destructive operations (`infra destroy`, `deployment destroy`, `scale down`) require `--yes` or interactive confirmation.
+
+---
+
+## Architecture
+
+Three planes:
+
+- **Compatibility edge** (`tokeira-edge`, `tokeira-proto`, `tokeira-types`) — admits and translates requests. Does not own workflow semantics.
+- **Authoritative runtime and storage** (`tokeira-kernel`, `tokeira-runtime`, `tokeira-storage`) — owns correctness. Shard/bundle ownership, lane-local execution, durable transitions, derived dispatch.
+- **Projection plane** (`tokeira-projection`) — owns read models. Visibility, rollups, custom sinks. Outside the correctness path.
+
+Detailed architecture docs: `docs/architecture/000-overview.md` and linked documents.
+
+---
+
+## Workspace Structure
+
+```
+tokeira/
+├── Cargo.toml                    # Workspace root
+├── apps/
+│   ├── tokeirad/                 # Server binary
+│   └── tkr/                      # Operator/developer CLI
+├── crates/
+│   ├── tokeira-types/            # Shared identifiers and value types
+│   ├── tokeira-proto/            # Wire types (public + internal)
+│   ├── tokeira-kernel/           # Pure deterministic transition engine
+│   ├── tokeira-storage/          # Persistence interfaces + in-memory store
+│   ├── tokeira-runtime/          # Lanes, broker, sweepers, timers
+│   ├── tokeira-edge/             # Compatibility shell for public APIs
+│   ├── tokeira-projection/       # Projection workers + visibility API
+│   ├── tokeira-state/            # Deployment state (CAS store + S3 store)
+│   ├── tokeira-iac/              # IaC engine (plan/apply/destroy)
+│   ├── tokeira-deploy-engine/    # Service lifecycle engine
+│   ├── tokeira-config/           # Server config + generic TOML loader
+│   ├── tokeira-orchestrator/     # Deployment orchestration facade
+│   ├── tokeira-compose/          # Docker Compose provider (bollard)
+│   └── tokeira-aws/              # AWS resource implementations
+├── platforms/
+│   ├── local/                    # Bare-process local platform
+│   └── compose/                  # Docker Compose platform with observability
+├── docs/
+│   └── architecture/             # Design documents (000–110)
+└── .kiro/specs/                  # Feature specs (requirements, design, tasks)
+```
+
+---
+
+## Package Boundaries
+
+- `tokeira-kernel` is pure — no I/O, no async, no storage, no metrics.
+- `tokeira-edge` is thin — translates requests, does not implement workflow semantics.
+- `tokeira-projection` owns visibility types and the `VisibilityApi` trait. Edge re-exports them.
+- `tokeira-state` provides two store implementations: `CasStore` (backend-agnostic single-document CAS) and `S3StateStore` (manifest + immutable snapshots).
+- `tokeira-iac` and `tokeira-deploy-engine` are provider-agnostic. Platform-specific resources and services live in platform crates.
+- Platform crates (`platforms/local`, `platforms/compose`) follow the deploy-eks `project` pattern: `config.rs`, `modules.rs`, `services.rs`, `compose.rs`.
+- `tokeira-config` owns both the server runtime config model (`TokeiraConfig`) and the generic TOML loader. These are in the same crate because there is currently one consumer.
+
+---
+
+## IaC Engine Contracts
+
+The engine distinguishes **desired** resources (what should exist) from **known** resources (everything the deployment can manage, including resources that may need deletion). The `InfraComposition` carries both sets plus `active_modules` for scoped operations.
+
+- Resources implement `create()`, `update()`, `delete()`, `describe()`, `diff()`, `dependencies()`.
+- Modules implement `name()`, `dependencies()`, `resources()`.
+- Both modules and resources are topologically sorted by dependencies before execution.
+- `describe()` is called during `refresh_state` to get live provider state before diffing.
+- The engine calls an optional `StateSaver` callback after each mutating operation for incremental crash-safety.
+- State backends must tolerate a missing backing store on `load()` (return default) so the remote-state module can bootstrap the store during the first apply.
+
+---
+
+## Configuration
+
+- Server config: `tokeirad.toml` — `TokeiraConfig` with four sections: infrastructure, policy, capacity, emergency.
+- Platform config: `deployment.toml` — platform-specific (`LocalConfig` or `ComposeConfig`).
+- `serde(deny_unknown_fields)` on all config structs — typos are caught at parse time.
+- `RuntimeConfig` is always `Default` — not configurable from TOML. Mechanical settings are auto-tuned.
+- No env vars on invocation. Defaults characterized by expected performance, not deployment environment.
+- Emergency overrides (`disable_stickiness`, `freeze_projection`, `cap_poll_admission`) are logged as warnings.
+
+---
+
+## Testing
+
+- Unit tests co-located in each module (`#[cfg(test)]`).
+- Property-based tests using `proptest` for config validation, serialization round-trips, dependency ordering.
+- `cargo test` runs all unit tests. All tests must pass before committing.
+- No tests that require live AWS credentials or Docker in the default test suite.
+- Key properties to maintain:
+  - Config TOML round-trips without loss.
+  - Unknown config fields are rejected.
+  - Module dependency graph is a DAG (no cycles).
+  - Service dependency graph is a DAG (no cycles, no missing deps).
+  - State CAS: two concurrent saves from the same version — at most one succeeds.
+
+---
+
+## Decision Process
+
+1. **Check the spec first.** Requirements and design docs are in `.kiro/specs/`. They're the source of truth.
+2. **Check existing patterns.** Look at how similar things are done in the codebase before inventing a new approach.
+3. **Prefer boring solutions.** The simplest approach that satisfies the requirement is the right one.
+4. **Ask if unsure.** If a decision has architectural implications, surface it rather than guessing.
+
+### Change Classification
+
+| Change Type | Examples | Required |
+|-------------|----------|----------|
+| **Trivial** | Fix typo, add doc comment, rename local variable | Tests pass |
+| **Standard** | New resource, new service, new CLI command | Tests pass + follows existing patterns |
+| **Architectural** | New crate, new dependency, change to state format | Spec update or explicit approval |
+| **Destructive** | Remove crate, change config schema, break state compatibility | Spec update AND explicit approval |
+
+---
+
+## Working Agreements
+
+### Adding a New Platform
+
+1. Create `platforms/{name}/` with `config.rs`, `modules.rs`, `services.rs`, `compose.rs` (or equivalent).
+2. Implement `Deployment` and `Ops` traits from `tokeira-orchestrator`.
+3. Add `PlatformKind` variant and `CliPlatformKind` variant.
+4. Add prototypical config generation in `tkr/src/prototypical.rs`.
+5. Add tests for config generation, module composition, and service ordering.
+
+### Adding a New IaC Module
+
+1. Create the module in the platform's `modules.rs`.
+2. Implement `Module` trait with `name()`, `dependencies()`, `resources()`.
+3. Register it in the platform's `infra_modules()` method.
+4. Add tests for resource enumeration and dependency ordering.
+
+### Adding a New CLI Command
+
+1. Add subcommand enum variant in `tkr/src/cli.rs`.
+2. Create handler in `tkr/src/commands/{group}.rs`.
+3. Wire into the command tree in `main.rs`.
+4. Add CLI parse tests.
+
+---
+
+## Observability Stack (Compose Platform)
+
+Pinned versions:
+- Mimir: `grafana/mimir:3.0.6`
+- Loki: `grafana/loki:3.7.1`
+- Grafana: `grafana/grafana-oss:12.4.3`
+- Alloy: `grafana/alloy:v1.16.0`
+
+Two modules: `runtime` (tokeirad) and `observability` (mimir, loki, grafana, alloy).
+
+---
+
+## Repository Values
+
+1. **Correctness over speed.** A slow transition that commits correctly beats a fast one that corrupts state.
+2. **Explicitness over magic.** Every resource, every permission, every config field — visible in code.
+3. **Operator empathy.** Error messages tell the operator what happened, why, and what to do next.
+4. **Minimal surface.** Every dependency, every abstraction, every config option must earn its place.
+
+---
+
+## Spec Reference
+
+- `.kiro/specs/*/` — feature specs (requirements, design, tasks)
+- `docs/architecture/` — architecture design documents
+- `docs/config-system.md` — configuration system documentation

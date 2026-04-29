@@ -1,0 +1,22 @@
+[package]
+name = "tokeira-compose"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+bollard.workspace = true
+futures-util = "0.3"
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+tokeira-deploy-engine = { path = "../tokeira-deploy-engine" }
+tokeira-iac = { path = "../tokeira-iac" }
+
+[dev-dependencies]
+proptest = "1"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

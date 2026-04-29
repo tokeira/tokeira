@@ -1,0 +1,15 @@
+project_name = "tokeira"
+state_dir = ".tokeira-state"
+compose_file = ".tokeira-state/docker-compose.yml"
+
+[tokeirad]
+image = "tokeirad:local"
+grpc_port = 7233
+metrics_port = 9090
+
+[observability]
+mimir_image = "grafana/mimir:3.0.6"
+grafana_image = "grafana/grafana-oss:12.4.3"
+loki_image = "grafana/loki:3.7.1"
+alloy_image = "grafana/alloy:v1.16.0"
+grafana_port = 3000

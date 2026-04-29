@@ -1,0 +1,21 @@
+[package]
+name = "tokeira-orchestrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokeira-config = { path = "../tokeira-config" }
+tokeira-deploy-engine = { path = "../tokeira-deploy-engine" }
+tokeira-iac = { path = "../tokeira-iac" }
+tokeira-state = { path = "../tokeira-state" }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

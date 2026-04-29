@@ -42,3 +42,12 @@ tarpaulin-report.html
 
 # Benchmarks output
 criterion/
+
+# Runtime logs
+tokeirad.log
+
+# Archives
+*.zip
+
+# Proptest regressions (generated, not committed)
+**/proptest-regressions/

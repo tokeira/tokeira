@@ -1,0 +1,93 @@
+//! Image lifecycle abstractions.
+//!
+//! An [`Image`] represents a named deployable artifact with a source type
+//! and a desired reference. [`ImageContext`] carries persisted state and
+//! typed extensions for resolution.
+
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
+use std::fmt::Debug;
+
+use serde::{Deserialize, Serialize};
+
+use crate::RuntimeError;
+
+/// How an image is produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImageSourceType {
+    /// Built from source via a build pipeline.
+    Build,
+    /// Mirrored from an upstream registry.
+    Mirror,
+    /// Pulled from a registry as-is.
+    Registry,
+}
+
+/// Resolved desired image reference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesiredImageRef {
+    /// Target repository name.
+    pub repository: String,
+    /// Tag or digest to resolve against.
+    pub tag: String,
+    /// Upstream source reference for mirrored images.
+    pub upstream_ref: Option<String>,
+}
+
+/// Context passed to [`Image::desired_ref`] for image resolution.
+///
+/// Extensions provide access to configuration and platform handles without
+/// coupling this crate to specific implementations.
+pub struct ImageContext {
+    pub state: tokeira_iac::RuntimeState,
+    extensions: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
+}
+
+impl ImageContext {
+    pub fn new(state: tokeira_iac::RuntimeState) -> Self {
+        Self {
+            state,
+            extensions: HashMap::new(),
+        }
+    }
+
+    /// Retrieve a typed extension by type.
+    pub fn extension<T: 'static + Send + Sync>(&self) -> Option<&T> {
+        self.extensions
+            .get(&TypeId::of::<T>())
+            .and_then(|boxed| boxed.downcast_ref::<T>())
+    }
+
+    /// Register a typed extension.
+    pub fn set_extension<T: 'static + Send + Sync>(&mut self, value: T) {
+        self.extensions.insert(TypeId::of::<T>(), Box::new(value));
+    }
+}
+
+impl Default for ImageContext {
+    fn default() -> Self {
+        Self::new(tokeira_iac::RuntimeState::default())
+    }
+}
+
+/// A named deployable artifact.
+///
+/// Implement this trait for every image a deployment needs to resolve before
+/// applying services. Registry-only deployments can return the configured
+/// reference directly. Build or mirror deployments can use [`ImageContext`]
+/// extensions to access build systems, registries, credentials, or previously
+/// persisted image state.
+pub trait Image: Debug + Send + Sync {
+    /// Stable image name.
+    fn name(&self) -> &str;
+
+    /// How this image is produced.
+    fn source_type(&self) -> ImageSourceType;
+
+    /// Compute the desired image reference given current state and context.
+    ///
+    /// The returned string is persisted in runtime state and used by services
+    /// when constructing manifests. Keep it deterministic for the same input
+    /// config unless the image has intentionally been rebuilt or republished.
+    fn desired_ref(&self, ctx: &ImageContext) -> Result<String, RuntimeError>;
+}

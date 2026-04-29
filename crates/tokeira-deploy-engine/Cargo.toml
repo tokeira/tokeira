@@ -1,0 +1,20 @@
+[package]
+name = "tokeira-deploy-engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokeira-iac = { workspace = true }
+tokeira-state = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+async-trait = "0.1"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = "0.4"
+sha2 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+proptest = "1"

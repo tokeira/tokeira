@@ -63,6 +63,7 @@ pub struct StartWorkflowExecutionRequest {
     pub memo: Memo,
     pub search_attributes: SearchAttributes,
     pub identity: Option<String>,
+    pub request_eager_execution: bool,
     pub workflow_execution_timeout: Option<time::Duration>,
     pub workflow_run_timeout: Option<time::Duration>,
     pub workflow_task_timeout: Option<time::Duration>,
@@ -83,6 +84,7 @@ pub struct StartWorkflowExecutionResponse {
     pub transition_seq: u64,
     pub last_event_id: i64,
     pub started: bool,
+    pub eager_workflow_task: Option<PollWorkflowTaskQueueResponse>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -175,6 +177,7 @@ pub struct RespondWorkflowTaskCompletedResponse {
     pub new_run_id: Option<RunId>,
     pub was_duplicate: bool,
     pub workflow_task: Option<PollWorkflowTaskQueueResponse>,
+    pub activity_tasks: Vec<PollActivityTaskQueueResponse>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -231,54 +234,12 @@ pub struct PendingWorkflowTaskDescription {
     pub attempt: u32,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct WorkflowExecutionSummary {
-    pub namespace: String,
-    pub workflow_id: String,
-    pub run_id: RunId,
-    pub workflow_type: String,
-    pub task_queue: String,
-    pub status: ExecutionStatus,
-    pub start_time: Option<OffsetDateTime>,
-    pub close_time: Option<OffsetDateTime>,
-    pub history_length: i64,
-    pub state_transition_count: i64,
-    pub memo: Memo,
-    pub search_attributes: SearchAttributes,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ListWorkflowExecutionsRequest {
-    pub namespace: String,
-    pub query: Option<String>,
-    pub page_size: usize,
-    pub next_page_token: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ListWorkflowExecutionsResponse {
-    pub executions: Vec<WorkflowExecutionSummary>,
-    pub next_page_token: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct GroupCount {
-    pub value: String,
-    pub count: i64,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct CountWorkflowExecutionsRequest {
-    pub namespace: String,
-    pub query: Option<String>,
-    pub group_by: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct CountWorkflowExecutionsResponse {
-    pub total_count: i64,
-    pub groups: Vec<GroupCount>,
-}
+// Visibility types re-exported from tokeira-projection (the authoritative owner).
+pub use tokeira_projection::{
+    CountWorkflowExecutionsRequest, CountWorkflowExecutionsResponse, GroupCount,
+    ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse,
+    WorkflowExecutionSummary,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SystemCapabilities {

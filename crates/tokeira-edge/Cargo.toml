@@ -7,6 +7,9 @@ edition = "2024"
 anyhow = "1"
 async-trait = "0.1"
 http = "1"
+metrics.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
 prost = "0.12"
 prost-types = "0.12"
 serde = { version = "1", features = ["derive"] }
@@ -17,6 +20,7 @@ tokio = { version = "1", features = ["sync", "time", "macros", "rt", "test-util"
 tokio-util = { version = "0.7", features = ["rt"] }
 tonic.workspace = true
 tracing = "0.1"
+tracing-opentelemetry.workspace = true
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dependencies.tokeira-kernel]
@@ -34,5 +38,10 @@ path = "../tokeira-storage"
 [dependencies.tokeira-types]
 path = "../tokeira-types"
 
+[dependencies.tokeira-projection]
+path = "../tokeira-projection"
+
 [dev-dependencies]
+metrics-util.workspace = true
 proptest = "1"
+tracing-subscriber.workspace = true

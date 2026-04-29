@@ -6,13 +6,13 @@
 //! encoding, and namespace resolution happen here so that the store
 //! implementations stay purely mechanical.
 
-use anyhow::{Result, anyhow};
-use async_trait::async_trait;
-use tokeira_edge::{
+use crate::visibility_api::{
     CountWorkflowExecutionsRequest, CountWorkflowExecutionsResponse, GroupCount,
     ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, VisibilityApi,
     WorkflowExecutionSummary,
 };
+use anyhow::{Result, anyhow};
+use async_trait::async_trait;
 use tokeira_types::{NamespaceId, SearchAttributes};
 use uuid::Uuid;
 

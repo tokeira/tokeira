@@ -124,7 +124,7 @@ The official `aurora-dsql-sqlx-connector` (v0.1.2) provides automatic IAM token 
 
 #### Acceptance Criteria
 
-1. THE DDL SHALL NOT contain any CHECK constraints; application-level validation in Rust SHALL enforce data integrity rules instead.
+1. THE DDL SHALL NOT contain any CHECK constraints; although DSQL supports CHECK in CREATE TABLE, Tokeira uses application-level validation in Rust for testability and flexibility.
 2. THE DDL SHALL NOT contain any temporary table definitions; CTE-based query compilation SHALL be used where temporary staging is needed.
 3. THE DDL SHALL NOT contain any BIGSERIAL or SERIAL column types; application-generated identifiers (UUID, Snowflake ID) SHALL be used instead.
 4. THE DDL SHALL NOT contain any foreign key constraints for MVP; referential integrity SHALL be maintained by application logic.
@@ -172,18 +172,27 @@ The official `aurora-dsql-sqlx-connector` (v0.1.2) provides automatic IAM token 
 6. THE Reservoir SHALL assign each connection a base lifetime of 50–55 minutes with per-connection jitter to prevent mass recycling events.
 7. WHEN a connection is returned to the Reservoir after use, THE Reservoir SHALL validate the connection is still alive and within its lifetime before making it available for reuse; expired or broken connections SHALL be discarded.
 
-### Requirement 9: Connection Rate Limiting
+### Requirement 9: Node-Local Connection Rate Limiting
 
-**User Story:** As a Tokeira developer, I want connection creation rate-limited to respect DSQL's cluster-wide 100 connections/second sustained rate, so that a multi-node deployment does not exceed the cluster limit.
+**User Story:** As a Tokeira developer, I want connection creation rate-limited at the node level to respect DSQL's cluster-wide 100 connections/second sustained rate, so that a single node does not overwhelm the DSQL endpoint.
 
 #### Acceptance Criteria
 
-1. THE ConnectionDirector SHALL implement a distributed rate limiter for new connection creation that coordinates across all nodes in the deployment to respect DSQL's cluster-wide 100 connections/second sustained rate and 1,000 burst capacity.
-2. WHEN a new connection needs to be created and the node's share of the cluster-wide budget is exhausted, THE ConnectionDirector SHALL wait until budget becomes available rather than exceeding the rate limit.
-3. THE distributed rate limiter SHALL divide the cluster-wide budget across active nodes, so that each node's local rate limit is approximately `cluster_rate / node_count`.
-4. THE distributed rate limiter SHALL use a coordination backend (e.g., DynamoDB-backed token bucket, as implemented in the temporal-dsql workspace) to track cluster-wide consumption and allocate per-node budgets.
-5. THE per-node budget allocation SHALL adapt dynamically as nodes join or leave the deployment, without requiring manual reconfiguration.
-6. FOR single-node deployments, THE rate limiter SHALL allocate the full cluster-wide budget to the single node.
+1. THE ConnectionDirector SHALL implement a node-local token-bucket rate limiter for new connection creation, enforcing a configurable sustained rate and burst capacity.
+2. WHEN a new connection needs to be created and the local token bucket is exhausted, THE ConnectionDirector SHALL wait until tokens become available rather than exceeding the rate limit.
+3. FOR single-node deployments (local or compose platform with no distributed coordination configured), THE rate limiter SHALL use the full cluster-wide budget (default: 100/sec sustained, 1,000 burst).
+4. THE rate limiter SHALL expose a `reconfigure(rate, capacity)` method so a future distributed coordination backend can adjust the per-node share at runtime. This spec implements the method; the backend that calls it is deferred to the `connection-budget-allocator` spec.
+5. THE node-local rate limiter SHALL always be active when DSQL storage is selected, regardless of whether distributed coordination is configured.
+
+### Requirement 9b: Distributed Rate Coordination Interface (Deferred)
+
+**User Story:** As a Tokeira operator running a multi-node deployment, I want the rate limiter to support future distributed coordination, so that the cluster-wide DSQL rate limit can be respected across nodes without manual per-node configuration.
+
+#### Acceptance Criteria
+
+1. THE `TokenBucketRateLimiter` SHALL expose a `reconfigure(rate_per_second, capacity)` method that a future distributed coordination backend can call to adjust the per-node share at runtime.
+2. WHEN no coordination backend is configured (the default), THE rate limiter SHALL use the full cluster-wide budget as set at construction.
+3. THE distributed coordination backend itself (DynamoDB-backed token bucket, node discovery, budget allocation) is NOT implemented in this spec. It is deferred to the `connection-budget-allocator` spec.
 
 ### Requirement 10: Class-Based Connection Budget
 
@@ -191,11 +200,11 @@ The official `aurora-dsql-sqlx-connector` (v0.1.2) provides automatic IAM token 
 
 #### Acceptance Criteria
 
-1. THE ConnectionDirector SHALL accept a `DbClass` parameter on every `acquire` call and return a `DbPermit` scoped to that class.
+1. THE ConnectionDirector SHALL accept a `DbClass` parameter on every `acquire` call and return a permit (`Self::Permit`) scoped to that class. For the in-memory backend this is `DbPermit` (a no-op marker); for DSQL this is `DsqlPermit` (carrying a real connection).
 2. THE ConnectionDirector SHALL enforce per-class connection limits that sum to the node's total connection budget.
 3. WHEN the total connection budget is exhausted, THE ConnectionDirector SHALL degrade workload classes in priority order: stop Maintenance first, then Projection, then throttle Read, while protecting Control and Commit traffic.
 4. THE ConnectionDirector SHALL support runtime reconfiguration of per-class budget allocations without requiring a restart.
-5. WHEN a `DbPermit` is dropped, THE ConnectionDirector SHALL return the connection to the Reservoir for reuse or discard it if expired.
+5. WHEN a permit is dropped, THE ConnectionDirector SHALL return the connection to the Reservoir for reuse or discard it if expired. For `DsqlPermit`, the connection field is `Option<PoolConnection>` so `Drop` can `take()` ownership.
 
 ### Requirement 11: Connection Lifecycle Management
 
@@ -228,7 +237,7 @@ The official `aurora-dsql-sqlx-connector` (v0.1.2) provides automatic IAM token 
 #### Acceptance Criteria
 
 1. THE ConnectionDirector SHALL expose a metric for current pool utilization: total connections, idle connections, in-use connections, and connections pending creation.
-2. THE ConnectionDirector SHALL expose a metric for checkout latency (time from `acquire` call to `DbPermit` return) with per-class breakdown.
+2. THE ConnectionDirector SHALL expose a metric for checkout latency (time from `acquire` call to permit return) with per-class breakdown.
 3. THE ConnectionDirector SHALL expose a counter for empty-reservoir events (when a checkout finds no ready connections and must wait for creation).
 4. THE ConnectionDirector SHALL expose counters for connection lifecycle events: connections created, connections retired (lifetime expiry), connections discarded (broken/error), and connections returned.
 5. THE ConnectionDirector SHALL expose the current refill rate and token-bucket state (available tokens, current sustained rate).
@@ -240,8 +249,8 @@ The official `aurora-dsql-sqlx-connector` (v0.1.2) provides automatic IAM token 
 
 #### Acceptance Criteria
 
-1. THE DsqlStore SHALL use a single serialization format (Protocol Buffers or MessagePack) for all BYTEA columns across all tables, documented in the migration file comments.
-2. THE DsqlStore SHALL define Rust serialization/deserialization functions for each BYTEA column type: `WorkflowState`, `Vec<HistoryEvent>`, `ActivityState`, `TimerState`, `ProjectionContext`, `Vec<ProjectionOp>`, `BacklogPayload`, and `ProjectionCursor`.
+1. THE DsqlStore SHALL use `postcard` (compact binary serde encoding) for all BYTEA columns across all tables, documented in the migration file comments. This spec adds `Serialize, Deserialize` derives to the domain types that do not yet have them (see Task 1.3).
+2. THE DsqlStore SHALL define Rust serialization/deserialization functions for each BYTEA column type: `WorkflowState`, `Vec<HistoryEvent>`, `ActivityState`, `TimerState`, `ProjectionContext`, `Vec<ProjectionOp>`, `BacklogPayload`, and `ProjectionCursor`. These functions depend on the serde derives added in Task 1.3.
 3. FOR ALL serializable types, serializing then deserializing SHALL produce a value equal to the original (round-trip property).
 4. THE serialization format choice SHALL be documented in the first migration file and in the crate-level documentation for `tokeira-storage`.
 

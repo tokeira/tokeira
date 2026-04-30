@@ -254,8 +254,19 @@ Aurora DSQL’s migration guide explicitly warns that large cascading operations
 Because DSQL separates DDL and DML transaction concerns and offers non-blocking `CREATE INDEX ASYNC`, Tokeira should adopt a conservative migration discipline:
 
 - schema migrations happen separately from hot-path runtime traffic,
+- each migration file contains exactly one DDL statement (DSQL requires one DDL per transaction),
 - visibility/index evolution uses async index creation,
 - rollout state is tracked operationally, not via runtime hot path.[^dsql-create-index]
+
+DSQL supports CHECK constraints in CREATE TABLE, but Tokeira uses application-level validation in Rust for testability and flexibility. Foreign keys are not used in the hot path; referential integrity is application-managed.
+
+### Serialization format
+
+All BYTEA columns use `postcard` (compact binary serde encoding). Domain types derive `Serialize, Deserialize`; no separate schema definitions or mapping code is needed. Postcard's varint encoding produces smaller payloads for typical workflow data (small integers, short strings) while staying within DSQL's 1 MiB BYTEA limit.
+
+### Implementation reference
+
+The complete schema DDL, migration tooling, connection pool, and codec are specified in `.kiro/specs/dsql-schema-connection/` and implemented in `tokeira-storage/src/dsql/`.
 
 ## Suggested internal API shape
 

@@ -1016,6 +1016,8 @@ impl LeaseRepository for InMemoryStore {
 
 #[async_trait]
 impl ConnectionDirector for InMemoryStore {
+    type Permit = DbPermit;
+
     async fn acquire(&self, class: DbClass) -> Result<DbPermit> {
         Ok(DbPermit { class })
     }

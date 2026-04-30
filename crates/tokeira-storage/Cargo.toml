@@ -6,13 +6,32 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-channel = { version = "2.3", optional = true }
 async-trait.workspace = true
+aurora-dsql-sqlx-connector = { version = "=0.1.2", features = ["pool"], optional = true }
 metrics.workspace = true
+postcard = { version = "1.0", features = ["alloc"], optional = true }
+rand = { version = "0.8", optional = true }
+serde.workspace = true
+sha2 = { workspace = true, optional = true }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "time", "uuid"], optional = true }
 time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tokeira-kernel = { path = "../tokeira-kernel" }
 tokeira-types = { path = "../tokeira-types" }
+
+[features]
+default = []
+dsql = [
+    "dep:async-channel",
+    "dep:aurora-dsql-sqlx-connector",
+    "dep:postcard",
+    "dep:rand",
+    "dep:sha2",
+    "dep:sqlx",
+]
+dsql-integration = ["dsql"]
 
 [dev-dependencies]
 metrics-util.workspace = true

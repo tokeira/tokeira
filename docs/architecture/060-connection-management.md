@@ -249,6 +249,20 @@ This design gives Tokeira:
 - no DSQL cost for long polls or parked workflows,
 - a direct match to Aurora DSQL’s real constraints.
 
+
+## Implementation status
+
+The node-local `ConnectionDirector` is implemented in `tokeira-storage/src/dsql/` using the official `aurora-dsql-sqlx-connector` (v0.1.2) as the underlying driver. The implementation includes:
+
+- **Reservoir**: async-channel-based buffer with three background tasks (refiller, expiry scanner, return processor). Connections are pre-created and validated before checkout.
+- **Token-bucket rate limiter**: lock-free atomic implementation with `reconfigure()` hook for future distributed coordination. Defaults to full cluster budget (100/sec, 1,000 burst) for single-node deployments.
+- **Class budgets**: per-`DbClass` semaphores (Control, Commit, Read, Projection, Maintenance) with runtime reconfiguration.
+
+The cluster-wide `BudgetAllocator` (DynamoDB-backed) is deferred to the `connection-budget-allocator` spec. The node-local rate limiter exposes a `reconfigure(rate, capacity)` method that the future allocator will call to adjust per-node shares.
+
+### Implementation reference
+
+See `.kiro/specs/dsql-schema-connection/` for the full spec and `tokeira-storage/src/dsql/` for the code.
 ## Review questions
 
 1. Should the allocator weight `owned_shards` more heavily than `pending_commits`, or vice versa?

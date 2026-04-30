@@ -10,6 +10,8 @@
 //! It is *not* a concurrency or correctness reference for a real cluster.
 
 pub mod api;
+#[cfg(feature = "dsql")]
+pub mod dsql;
 pub mod memory;
 pub mod metrics;
 

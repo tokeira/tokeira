@@ -11,6 +11,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokeira_kernel::{
     ActivityOp, DispatchOp, HistoryEvent, LoadedRun, ProjectionOp, TimerOp, Transition,
@@ -296,7 +297,7 @@ pub struct DispatchableActivityTask {
 }
 
 /// Durable payload stored for one backlog task.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum BacklogPayload {
     /// Workflow backlog entry keyed by logical workflow-task sequence.
     Workflow {
@@ -452,7 +453,7 @@ pub trait ProjectionLog: Send + Sync {
 
 /// One row in the projection log, grouping all
 /// projection ops from a single transition.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProjectionContext {
     pub namespace_id: NamespaceId,
     pub workflow_id: WorkflowId,
@@ -566,9 +567,12 @@ pub enum DbClass {
 /// limits and open-rate budgets.
 #[async_trait]
 pub trait ConnectionDirector: Send + Sync {
+    /// Permit type returned by this director.
+    type Permit: Send;
+
     /// Acquire a connection permit for the given work
     /// class. Blocks until a permit is available.
-    async fn acquire(&self, class: DbClass) -> Result<DbPermit>;
+    async fn acquire(&self, class: DbClass) -> Result<Self::Permit>;
 }
 
 /// A held connection permit, scoped to a [`DbClass`].
@@ -788,7 +792,9 @@ impl<T> ConnectionDirector for std::sync::Arc<T>
 where
     T: ConnectionDirector + ?Sized,
 {
-    async fn acquire(&self, class: DbClass) -> Result<DbPermit> {
+    type Permit = T::Permit;
+
+    async fn acquire(&self, class: DbClass) -> Result<Self::Permit> {
         (**self).acquire(class).await
     }
 }

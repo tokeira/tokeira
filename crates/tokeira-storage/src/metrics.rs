@@ -1,6 +1,6 @@
 //! Storage metric definitions and recording helpers.
 
-use metrics::{counter, histogram};
+use metrics::{counter, gauge, histogram};
 use tokeira_types::MetricType;
 #[cfg(test)]
 use tokeira_types::validate_metric_name;
@@ -10,6 +10,18 @@ pub const COMMIT_TRANSITION_DURATION_SECONDS: &str =
 pub const LOAD_RUN_DURATION_SECONDS: &str = "tokeira_storage_load_run_duration_seconds";
 pub const READ_HISTORY_DURATION_SECONDS: &str = "tokeira_storage_read_history_duration_seconds";
 pub const OPERATION_TOTAL: &str = "tokeira_storage_repository_operation_total";
+pub const DSQL_POOL_CONNECTIONS_TOTAL: &str = "tokeira_dsql_pool_connections_total";
+pub const DSQL_POOL_CHECKOUT_DURATION_SECONDS: &str = "tokeira_dsql_pool_checkout_duration_seconds";
+pub const DSQL_POOL_EMPTY_RESERVOIR_TOTAL: &str = "tokeira_dsql_pool_empty_reservoir_total";
+pub const DSQL_POOL_CONNECTIONS_CREATED_TOTAL: &str = "tokeira_dsql_pool_connections_created_total";
+pub const DSQL_POOL_CONNECTIONS_RETIRED_TOTAL: &str = "tokeira_dsql_pool_connections_retired_total";
+pub const DSQL_POOL_CONNECTIONS_RETURNED_TOTAL: &str =
+    "tokeira_dsql_pool_connections_returned_total";
+pub const DSQL_POOL_RATE_LIMITER_TOKENS: &str = "tokeira_dsql_pool_rate_limiter_tokens";
+pub const DSQL_POOL_RATE_LIMITER_RATE: &str = "tokeira_dsql_pool_rate_limiter_rate";
+pub const DSQL_POOL_CLASS_BUDGET_TOTAL: &str = "tokeira_dsql_pool_class_budget_total";
+pub const DSQL_POOL_CLASS_IN_USE: &str = "tokeira_dsql_pool_class_in_use";
+pub const DSQL_POOL_CLASS_WAITERS: &str = "tokeira_dsql_pool_class_waiters";
 
 pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (
@@ -19,6 +31,20 @@ pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (LOAD_RUN_DURATION_SECONDS, MetricType::DurationHistogram),
     (READ_HISTORY_DURATION_SECONDS, MetricType::DurationHistogram),
     (OPERATION_TOTAL, MetricType::Counter),
+    (DSQL_POOL_CONNECTIONS_TOTAL, MetricType::Gauge),
+    (
+        DSQL_POOL_CHECKOUT_DURATION_SECONDS,
+        MetricType::DurationHistogram,
+    ),
+    (DSQL_POOL_EMPTY_RESERVOIR_TOTAL, MetricType::Counter),
+    (DSQL_POOL_CONNECTIONS_CREATED_TOTAL, MetricType::Counter),
+    (DSQL_POOL_CONNECTIONS_RETIRED_TOTAL, MetricType::Counter),
+    (DSQL_POOL_CONNECTIONS_RETURNED_TOTAL, MetricType::Counter),
+    (DSQL_POOL_RATE_LIMITER_TOKENS, MetricType::Gauge),
+    (DSQL_POOL_RATE_LIMITER_RATE, MetricType::Gauge),
+    (DSQL_POOL_CLASS_BUDGET_TOTAL, MetricType::Gauge),
+    (DSQL_POOL_CLASS_IN_USE, MetricType::Gauge),
+    (DSQL_POOL_CLASS_WAITERS, MetricType::Gauge),
 ];
 
 pub fn record_commit_transition_duration(
@@ -45,6 +71,47 @@ pub fn record_read_history_duration(duration: std::time::Duration) {
 
 pub fn record_storage_operation(operation: &'static str, outcome: &'static str) {
     counter!(OPERATION_TOTAL, "operation" => operation, "outcome" => outcome).increment(1);
+}
+
+pub fn record_dsql_pool_connections_total(count: usize) {
+    gauge!(DSQL_POOL_CONNECTIONS_TOTAL).set(count as f64);
+}
+
+pub fn record_dsql_pool_checkout_duration(class: &'static str, duration: std::time::Duration) {
+    histogram!(DSQL_POOL_CHECKOUT_DURATION_SECONDS, "class" => class)
+        .record(duration.as_secs_f64());
+}
+
+pub fn record_dsql_pool_empty_reservoir() {
+    counter!(DSQL_POOL_EMPTY_RESERVOIR_TOTAL).increment(1);
+}
+
+pub fn record_dsql_pool_connection_created() {
+    counter!(DSQL_POOL_CONNECTIONS_CREATED_TOTAL).increment(1);
+}
+
+pub fn record_dsql_pool_connection_retired(reason: &'static str) {
+    counter!(DSQL_POOL_CONNECTIONS_RETIRED_TOTAL, "reason" => reason).increment(1);
+}
+
+pub fn record_dsql_pool_connection_returned() {
+    counter!(DSQL_POOL_CONNECTIONS_RETURNED_TOTAL).increment(1);
+}
+
+pub fn record_dsql_pool_rate_limiter(tokens: f64, rate: f64) {
+    gauge!(DSQL_POOL_RATE_LIMITER_TOKENS).set(tokens);
+    gauge!(DSQL_POOL_RATE_LIMITER_RATE).set(rate);
+}
+
+pub fn record_dsql_pool_class_budget(
+    class: &'static str,
+    total: usize,
+    in_use: usize,
+    waiters: usize,
+) {
+    gauge!(DSQL_POOL_CLASS_BUDGET_TOTAL, "class" => class).set(total as f64);
+    gauge!(DSQL_POOL_CLASS_IN_USE, "class" => class).set(in_use as f64);
+    gauge!(DSQL_POOL_CLASS_WAITERS, "class" => class).set(waiters as f64);
 }
 
 #[cfg(test)]
@@ -94,6 +161,14 @@ mod tests {
             record_load_run_duration(std::time::Duration::from_millis(7));
             record_read_history_duration(std::time::Duration::from_millis(9));
             record_storage_operation("load_run", "success");
+            record_dsql_pool_connections_total(2);
+            record_dsql_pool_checkout_duration("commit", std::time::Duration::from_millis(11));
+            record_dsql_pool_empty_reservoir();
+            record_dsql_pool_connection_created();
+            record_dsql_pool_connection_retired("expired");
+            record_dsql_pool_connection_returned();
+            record_dsql_pool_rate_limiter(4.0, 100.0);
+            record_dsql_pool_class_budget("commit", 5, 1, 0);
         });
 
         let snapshot = snapshot_map(&recorder);
@@ -129,5 +204,17 @@ mod tests {
         assert_eq!(labels.get("operation"), Some(&"load_run".to_string()));
         assert_eq!(labels.get("outcome"), Some(&"success".to_string()));
         assert_eq!(value, &DebugValue::Counter(1));
+
+        assert!(snapshot.contains_key(DSQL_POOL_CONNECTIONS_TOTAL));
+        assert!(snapshot.contains_key(DSQL_POOL_CHECKOUT_DURATION_SECONDS));
+        assert!(snapshot.contains_key(DSQL_POOL_EMPTY_RESERVOIR_TOTAL));
+        assert!(snapshot.contains_key(DSQL_POOL_CONNECTIONS_CREATED_TOTAL));
+        assert!(snapshot.contains_key(DSQL_POOL_CONNECTIONS_RETIRED_TOTAL));
+        assert!(snapshot.contains_key(DSQL_POOL_CONNECTIONS_RETURNED_TOTAL));
+        assert!(snapshot.contains_key(DSQL_POOL_RATE_LIMITER_TOKENS));
+        assert!(snapshot.contains_key(DSQL_POOL_RATE_LIMITER_RATE));
+        assert!(snapshot.contains_key(DSQL_POOL_CLASS_BUDGET_TOTAL));
+        assert!(snapshot.contains_key(DSQL_POOL_CLASS_IN_USE));
+        assert!(snapshot.contains_key(DSQL_POOL_CLASS_WAITERS));
     }
 }

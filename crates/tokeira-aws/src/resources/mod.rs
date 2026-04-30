@@ -18,12 +18,9 @@ pub mod security_group;
 pub mod vpc;
 pub mod vpc_endpoint;
 
-use std::collections::HashMap;
-use std::future::Future;
-use std::time::Duration;
+use std::{collections::HashMap, future::Future, time::Duration};
 
-use tokeira_iac::error::IacError;
-use tokeira_iac::{ProvisionContext, ResourceId, ResourceType};
+use tokeira_iac::{ProvisionContext, ResourceId, ResourceType, error::IacError};
 use tokio::time::Instant;
 
 // ── Poll helper ──────────────────────────────────────────────────
@@ -95,9 +92,7 @@ pub fn iam_tags(tags: &HashMap<String, String>) -> Vec<aws_sdk_iam::types::Tag> 
 }
 
 /// Convert a tag map to OpenSearch tag format.
-pub fn opensearch_tags(
-    tags: &HashMap<String, String>,
-) -> Vec<aws_sdk_opensearch::types::Tag> {
+pub fn opensearch_tags(tags: &HashMap<String, String>) -> Vec<aws_sdk_opensearch::types::Tag> {
     tags.iter()
         .map(|(k, v)| {
             aws_sdk_opensearch::types::Tag::builder()
@@ -136,9 +131,7 @@ pub fn s3_tags(tags: &HashMap<String, String>) -> Vec<aws_sdk_s3::types::Tag> {
 }
 
 /// Convert a tag map to DynamoDB tag format.
-pub fn dynamodb_tags(
-    tags: &HashMap<String, String>,
-) -> Vec<aws_sdk_dynamodb::types::Tag> {
+pub fn dynamodb_tags(tags: &HashMap<String, String>) -> Vec<aws_sdk_dynamodb::types::Tag> {
     tags.iter()
         .map(|(k, v)| {
             aws_sdk_dynamodb::types::Tag::builder()

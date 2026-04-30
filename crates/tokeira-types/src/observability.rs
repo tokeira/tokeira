@@ -48,10 +48,7 @@ pub enum NamingError {
 }
 
 /// Validate a metric name against the Tokeira naming convention.
-pub fn validate_metric_name(
-    name: &str,
-    metric_type: MetricType,
-) -> Result<(), NamingError> {
+pub fn validate_metric_name(name: &str, metric_type: MetricType) -> Result<(), NamingError> {
     let Some(without_prefix) = name.strip_prefix("tokeira_") else {
         return Err(NamingError::InvalidPrefix(name.to_string()));
     };
@@ -82,11 +79,8 @@ mod tests {
     #[test]
     fn accepts_valid_names() {
         assert!(
-            validate_metric_name(
-                "tokeira_runtime_broker_publish_total",
-                MetricType::Counter
-            )
-            .is_ok()
+            validate_metric_name("tokeira_runtime_broker_publish_total", MetricType::Counter)
+                .is_ok()
         );
         assert!(
             validate_metric_name(
@@ -96,11 +90,8 @@ mod tests {
             .is_ok()
         );
         assert!(
-            validate_metric_name(
-                "tokeira_projection_worker_lag_records",
-                MetricType::Gauge
-            )
-            .is_ok()
+            validate_metric_name("tokeira_projection_worker_lag_records", MetricType::Gauge)
+                .is_ok()
         );
     }
 

@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use tokeira_types::{NamespaceId, ProjectionCursor, RunKey, SearchAttrValue};
 
 use crate::types::{
-    AttrDescriptor, AttrId, CompiledFilter, CountResult, ExecutionRow, GroupByField,
-    ListResult, PageBounds, RollupDelta, RollupDimension, SearchAttrType, SortOrder,
+    AttrDescriptor, AttrId, CompiledFilter, CountResult, ExecutionRow, GroupByField, ListResult,
+    PageBounds, RollupDelta, RollupDimension, SearchAttrType, SortOrder,
 };
 
 #[async_trait]
@@ -48,11 +48,7 @@ pub trait VisibilityStore: Send + Sync {
     ) -> Result<CountResult>;
 
     async fn load_checkpoint(&self, sink_id: &str) -> Result<Option<ProjectionCursor>>;
-    async fn save_checkpoint(
-        &self,
-        sink_id: &str,
-        cursor: &ProjectionCursor,
-    ) -> Result<()>;
+    async fn save_checkpoint(&self, sink_id: &str, cursor: &ProjectionCursor) -> Result<()>;
 
     async fn resolve_attr(
         &self,

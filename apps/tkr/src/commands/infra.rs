@@ -1,5 +1,4 @@
-use std::fs;
-use std::path::Path;
+use std::{fs, path::Path};
 
 use anyhow::{Result, anyhow, bail};
 use tokeira_compose_deployment::ComposeDeployment;
@@ -7,12 +6,13 @@ use tokeira_iac::{Change, ChangeKind, ModuleSelection};
 use tokeira_local_deployment::LocalDeployment;
 use tokeira_orchestrator::InfraEngine;
 
-use crate::cli::InfraAction;
-use crate::deployment_dir::TOKEIRAD_TOML;
-use crate::deployment_dir::{
-    DeploymentContext, DeploymentResolver, PlatformDeploymentConfig,
+use crate::{
+    cli::InfraAction,
+    deployment_dir::{
+        DeploymentContext, DeploymentResolver, PlatformDeploymentConfig, TOKEIRAD_TOML,
+    },
+    metadata::DeploymentStatus,
 };
-use crate::metadata::DeploymentStatus;
 
 pub async fn run(
     action: InfraAction,

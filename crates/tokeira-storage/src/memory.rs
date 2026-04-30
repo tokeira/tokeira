@@ -21,20 +21,21 @@ use tokeira_kernel::{
     WorkflowState,
 };
 use tokeira_types::{
-    ExecutionRef, NamespaceId, ProjectionCursor, QueueKey, RequestId, RunId, RunKey,
-    ShardEpoch, ShardId, WorkflowId,
+    ExecutionRef, NamespaceId, ProjectionCursor, QueueKey, RequestId, RunId, RunKey, ShardEpoch,
+    ShardId, WorkflowId,
 };
 use tokio::sync::Mutex;
 
-use crate::api::{
-    ActivitySweepEntry, BacklogEntry, CommitResult, ConnectionDirector,
-    CurrentExecutionConflictPolicy, DbClass, DbPermit, DispatchableActivityTask,
-    DispatchableWorkflowTask, DueTimer, LeaseOutcome, LeaseRepository, NexusSweepEntry,
-    ProjectionBatch, ProjectionContext, ProjectionLog, ProjectionRecord, RequestRecord,
-    RunRepository, TransitionAuditRecord, WftTimeoutSweepEntry,
-    WorkflowTimeoutSweepEntry,
+use crate::{
+    api::{
+        ActivitySweepEntry, BacklogEntry, CommitResult, ConnectionDirector,
+        CurrentExecutionConflictPolicy, DbClass, DbPermit, DispatchableActivityTask,
+        DispatchableWorkflowTask, DueTimer, LeaseOutcome, LeaseRepository, NexusSweepEntry,
+        ProjectionBatch, ProjectionContext, ProjectionLog, ProjectionRecord, RequestRecord,
+        RunRepository, TransitionAuditRecord, WftTimeoutSweepEntry, WorkflowTimeoutSweepEntry,
+    },
+    metrics as storage_metrics,
 };
-use crate::metrics as storage_metrics;
 
 /// In-memory store intended for local development and semantic tests.
 ///
@@ -122,10 +123,7 @@ impl InMemoryStore {
 #[async_trait]
 impl RunRepository for InMemoryStore {
     #[tracing::instrument(name = "storage.resolve_execution", skip(self), fields(namespace_id = %execution.namespace_id.0, workflow_id = %execution.workflow_id.0))]
-    async fn resolve_execution(
-        &self,
-        execution: &ExecutionRef,
-    ) -> Result<Option<RunKey>> {
+    async fn resolve_execution(&self, execution: &ExecutionRef) -> Result<Option<RunKey>> {
         let _started = Instant::now();
         let store = self.inner.lock().await;
         let result = if let Some(run_id) = execution.run_id {
@@ -156,9 +154,7 @@ impl RunRepository for InMemoryStore {
         Ok(store
             .runs
             .values()
-            .filter(|state| {
-                state.namespace_id == namespace_id && state.workflow_id == *workflow_id
-            })
+            .filter(|state| state.namespace_id == namespace_id && state.workflow_id == *workflow_id)
             .max_by(|left, right| {
                 left.started_at
                     .cmp(&right.started_at)
@@ -228,10 +224,7 @@ impl RunRepository for InMemoryStore {
         })
     }
 
-    async fn read_transition_audit(
-        &self,
-        run_key: RunKey,
-    ) -> Result<Vec<TransitionAuditRecord>> {
+    async fn read_transition_audit(&self, run_key: RunKey) -> Result<Vec<TransitionAuditRecord>> {
         let store = self.inner.lock().await;
         Ok(store
             .transition_audit
@@ -251,14 +244,11 @@ impl RunRepository for InMemoryStore {
         let namespace = Some(transition.next_state.namespace_id.0.to_string());
         let mut store = self.inner.lock().await;
         if epoch != ShardEpoch::ZERO {
-            let shard_id =
-                store
-                    .run_shard_map
-                    .get(&run_key)
-                    .copied()
-                    .unwrap_or_else(|| {
-                        shard_for_run_key(run_key, Self::effective_shard_count(&store))
-                    });
+            let shard_id = store
+                .run_shard_map
+                .get(&run_key)
+                .copied()
+                .unwrap_or_else(|| shard_for_run_key(run_key, Self::effective_shard_count(&store)));
             match store.bundle_leases.get(&shard_id) {
                 Some((_owner, current_epoch)) if *current_epoch == epoch => {}
                 Some((_owner, current_epoch)) => {
@@ -267,10 +257,7 @@ impl RunRepository for InMemoryStore {
                         "conflict",
                         started.elapsed(),
                     );
-                    storage_metrics::record_storage_operation(
-                        "commit_transition",
-                        "conflict",
-                    );
+                    storage_metrics::record_storage_operation("commit_transition", "conflict");
                     return Ok(CommitResult::Conflict {
                         reason: format!(
                             "stale shard epoch {:?} for shard {:?}; current {:?}",
@@ -284,10 +271,7 @@ impl RunRepository for InMemoryStore {
                         "conflict",
                         started.elapsed(),
                     );
-                    storage_metrics::record_storage_operation(
-                        "commit_transition",
-                        "conflict",
-                    );
+                    storage_metrics::record_storage_operation("commit_transition", "conflict");
                     return Ok(CommitResult::Conflict {
                         reason: format!(
                             "no active lease for shard {:?} at epoch {:?}",
@@ -347,17 +331,12 @@ impl RunRepository for InMemoryStore {
                     "duplicate",
                     started.elapsed(),
                 );
-                storage_metrics::record_storage_operation(
-                    "commit_transition",
-                    "duplicate",
-                );
+                storage_metrics::record_storage_operation("commit_transition", "duplicate");
                 return Ok(CommitResult::Duplicate);
             }
         }
 
-        if transition.expected_seq == tokeira_types::TransitionSeq::ZERO
-            && state.status.is_open()
-        {
+        if transition.expected_seq == tokeira_types::TransitionSeq::ZERO && state.status.is_open() {
             match store.conflict_policy {
                 CurrentExecutionConflictPolicy::Reject
                 | CurrentExecutionConflictPolicy::AllowAfterClose => {
@@ -371,10 +350,7 @@ impl RunRepository for InMemoryStore {
                             "conflict",
                             started.elapsed(),
                         );
-                        storage_metrics::record_storage_operation(
-                            "commit_transition",
-                            "conflict",
-                        );
+                        storage_metrics::record_storage_operation("commit_transition", "conflict");
                         return Ok(CommitResult::Conflict {
                             reason: format!(
                                 "current execution already exists for {}: {:?}",
@@ -428,10 +404,9 @@ impl RunRepository for InMemoryStore {
         for op in &transition.activity_ops {
             match op {
                 ActivityOp::Upsert(activity) => {
-                    store.activity_state_table.insert(
-                        (run_key, activity.activity_id.clone()),
-                        activity.clone(),
-                    );
+                    store
+                        .activity_state_table
+                        .insert((run_key, activity.activity_id.clone()), activity.clone());
                 }
                 ActivityOp::Delete { activity_id } => {
                     store
@@ -530,16 +505,11 @@ impl RunRepository for InMemoryStore {
         }
 
         if transition.expected_seq == tokeira_types::TransitionSeq::ZERO {
-            let shard_id =
-                shard_for_run_key(run_key, Self::effective_shard_count(&store));
+            let shard_id = shard_for_run_key(run_key, Self::effective_shard_count(&store));
             store.run_shard_map.insert(run_key, shard_id);
         }
 
-        storage_metrics::record_commit_transition_duration(
-            namespace,
-            "applied",
-            started.elapsed(),
-        );
+        storage_metrics::record_commit_transition_duration(namespace, "applied", started.elapsed());
         storage_metrics::record_storage_operation("commit_transition", "success");
         Ok(CommitResult::Applied { new_state: state })
     }
@@ -561,14 +531,16 @@ impl RunRepository for InMemoryStore {
             );
         }
 
-        let base_state =
-            store.runs.get(&base_run_key).cloned().ok_or_else(|| {
-                anyhow::anyhow!("base run not found: {:?}", base_run_key)
-            })?;
+        let base_state = store
+            .runs
+            .get(&base_run_key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("base run not found: {:?}", base_run_key))?;
 
-        let base_history = store.history.get(&base_run_key).ok_or_else(|| {
-            anyhow::anyhow!("base history not found: {:?}", base_run_key)
-        })?;
+        let base_history = store
+            .history
+            .get(&base_run_key)
+            .ok_or_else(|| anyhow::anyhow!("base history not found: {:?}", base_run_key))?;
 
         let prefix_len = base_history
             .iter()
@@ -595,8 +567,7 @@ impl RunRepository for InMemoryStore {
             parent_workflow_id: base_state.parent_workflow_id.clone(),
             first_run_started_at: base_state.first_run_started_at,
         };
-        let successor_state =
-            kernel.replay_history_prefix(replay_ctx, &copied_history)?;
+        let successor_state = kernel.replay_history_prefix(replay_ctx, &copied_history)?;
 
         store.history.insert(successor_run_key, copied_history);
         store
@@ -632,8 +603,7 @@ impl RunRepository for InMemoryStore {
                 .insert((successor_run_key, timer.timer_id.clone()), timer.clone());
         }
 
-        let shard_id =
-            shard_for_run_key(successor_run_key, Self::effective_shard_count(&store));
+        let shard_id = shard_for_run_key(successor_run_key, Self::effective_shard_count(&store));
         store.run_shard_map.insert(successor_run_key, shard_id);
 
         Ok(())
@@ -672,10 +642,7 @@ impl RunRepository for InMemoryStore {
                 run_key: state.run_key,
                 queue: candidate,
                 logical_seq: pending.logical_seq,
-                sticky_preferred: state
-                    .sticky
-                    .as_ref()
-                    .map(|s| s.worker_identity.clone()),
+                sticky_preferred: state.sticky.as_ref().map(|s| s.worker_identity.clone()),
                 sticky_expires_at: state.sticky.as_ref().map(|s| s.expires_at),
             });
             if out.len() >= limit {
@@ -713,11 +680,7 @@ impl RunRepository for InMemoryStore {
         Ok(())
     }
 
-    async fn drain_backlog(
-        &self,
-        queue: &QueueKey,
-        limit: usize,
-    ) -> Result<Vec<BacklogEntry>> {
+    async fn drain_backlog(&self, queue: &QueueKey, limit: usize) -> Result<Vec<BacklogEntry>> {
         let mut store = self.inner.lock().await;
         let mut drained = Vec::new();
         let mut kept = VecDeque::new();
@@ -732,11 +695,7 @@ impl RunRepository for InMemoryStore {
         Ok(drained)
     }
 
-    async fn list_due_timers(
-        &self,
-        now: OffsetDateTime,
-        limit: usize,
-    ) -> Result<Vec<DueTimer>> {
+    async fn list_due_timers(&self, now: OffsetDateTime, limit: usize) -> Result<Vec<DueTimer>> {
         let store = self.inner.lock().await;
         let mut due = Vec::new();
         for ((run_key, _), timer) in &store.timer_bucket {
@@ -792,10 +751,7 @@ impl RunRepository for InMemoryStore {
                     build_id: None,
                 },
                 logical_seq: pending.logical_seq,
-                sticky_preferred: state
-                    .sticky
-                    .as_ref()
-                    .map(|s| s.worker_identity.clone()),
+                sticky_preferred: state.sticky.as_ref().map(|s| s.worker_identity.clone()),
                 sticky_expires_at: state.sticky.as_ref().map(|s| s.expires_at),
             });
             if out.len() >= limit {
@@ -814,9 +770,7 @@ impl RunRepository for InMemoryStore {
         Ok(store
             .activity_dispatch
             .values()
-            .filter(|entry| {
-                store.run_shard_map.get(&entry.task.run_key) == Some(&shard_id)
-            })
+            .filter(|entry| store.run_shard_map.get(&entry.task.run_key) == Some(&shard_id))
             .take(limit)
             .map(|entry| entry.task.clone())
             .collect())
@@ -861,9 +815,7 @@ impl RunRepository for InMemoryStore {
             if !state.is_open() {
                 continue;
             }
-            if state.workflow_execution_timeout.is_none()
-                && state.workflow_run_timeout.is_none()
-            {
+            if state.workflow_execution_timeout.is_none() && state.workflow_run_timeout.is_none() {
                 continue;
             }
             out.push(WorkflowTimeoutSweepEntry {
@@ -983,18 +935,12 @@ impl RunRepository for InMemoryStore {
 
 #[async_trait]
 impl ProjectionLog for InMemoryStore {
-    async fn read_from(
-        &self,
-        cursor: &ProjectionCursor,
-        limit: usize,
-    ) -> Result<ProjectionBatch> {
+    async fn read_from(&self, cursor: &ProjectionCursor, limit: usize) -> Result<ProjectionBatch> {
         let store = self.inner.lock().await;
         let mut started = cursor.last_transition_seq.is_none();
         let mut out = Vec::new();
         for record in store.projection_log.iter() {
-            if record.partition_id != cursor.partition_id
-                || record.fanout != cursor.fanout
-            {
+            if record.partition_id != cursor.partition_id || record.fanout != cursor.fanout {
                 continue;
             }
             if !started {
@@ -1028,11 +974,7 @@ impl ProjectionLog for InMemoryStore {
 
 #[async_trait]
 impl LeaseRepository for InMemoryStore {
-    async fn try_acquire_bundle(
-        &self,
-        bundle: ShardId,
-        owner: String,
-    ) -> Result<LeaseOutcome> {
+    async fn try_acquire_bundle(&self, bundle: ShardId, owner: String) -> Result<LeaseOutcome> {
         let mut store = self.inner.lock().await;
         match store.bundle_leases.get(&bundle) {
             Some((current_owner, current_epoch)) => Ok(LeaseOutcome::Rejected {
@@ -1109,16 +1051,18 @@ mod tests {
         event::{HistoryEvent, HistoryEventKind},
     };
     use tokeira_types::{
-        ExecutionRef, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, QueueKey,
-        RequestId, RunId, RunKey, SearchAttributes, TaskKind, TaskQueueName,
-        TransitionSeq, WorkerIdentity, WorkflowId, WorkflowType,
+        ExecutionRef, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, QueueKey, RequestId,
+        RunId, RunKey, SearchAttributes, TaskKind, TaskQueueName, TransitionSeq, WorkerIdentity,
+        WorkflowId, WorkflowType,
     };
     use tracing::{
         Subscriber,
         span::{Attributes, Id},
     };
     use tracing_subscriber::{
-        Layer, layer::Context, layer::SubscriberExt, registry::LookupSpan,
+        Layer,
+        layer::{Context, SubscriberExt},
+        registry::LookupSpan,
     };
 
     use crate::api::RunRepository;
@@ -1253,10 +1197,7 @@ mod tests {
         }
     }
 
-    fn timer_state(
-        timer_id: &str,
-        fire_at: OffsetDateTime,
-    ) -> tokeira_kernel::TimerState {
+    fn timer_state(timer_id: &str, fire_at: OffsetDateTime) -> tokeira_kernel::TimerState {
         tokeira_kernel::TimerState {
             timer_id: timer_id.into(),
             started_event_id: 11,
@@ -2088,10 +2029,9 @@ mod tests {
         .await
         .unwrap();
 
-        let LoadedRun::Existing(successor) =
-            RunRepository::load_run(&store, successor_run_key)
-                .await
-                .unwrap()
+        let LoadedRun::Existing(successor) = RunRepository::load_run(&store, successor_run_key)
+            .await
+            .unwrap()
         else {
             panic!("expected successor run to exist");
         };

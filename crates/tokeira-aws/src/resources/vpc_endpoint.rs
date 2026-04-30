@@ -1,9 +1,8 @@
-use std::collections::HashMap;
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
-use tokeira_iac::error::IacError;
 use tokeira_iac::{
     InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    error::IacError,
 };
 
 /// Whether a VPC endpoint uses the Gateway or Interface type.
@@ -68,9 +67,7 @@ impl VpcEndpoint {
             .unwrap_or("unknown")
     }
 
-    fn endpoint_is_usable(
-        endpoint: &aws_sdk_ec2::types::VpcEndpoint,
-    ) -> Result<bool, IacError> {
+    fn endpoint_is_usable(endpoint: &aws_sdk_ec2::types::VpcEndpoint) -> Result<bool, IacError> {
         match Self::endpoint_state_summary(endpoint) {
             "available" => Ok(true),
             "pending" => Ok(false),
@@ -209,9 +206,7 @@ impl Resource for VpcEndpoint {
             .properties
             .get("vpc_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                IacError::StateNotFound("vpc_id not found in VPC state".into())
-            })?
+            .ok_or_else(|| IacError::StateNotFound("vpc_id not found in VPC state".into()))?
             .to_string();
 
         let ep_tag_spec = aws_sdk_ec2::types::TagSpecification::builder()
@@ -300,10 +295,7 @@ impl Resource for VpcEndpoint {
                 }
 
                 let output = builder.send().await.map_err(|e| {
-                    IacError::AwsSdk(format!(
-                        "ec2:CreateVpcEndpoint: {}",
-                        e.into_service_error()
-                    ))
+                    IacError::AwsSdk(format!("ec2:CreateVpcEndpoint: {}", e.into_service_error()))
                 })?;
 
                 output
@@ -364,10 +356,7 @@ impl Resource for VpcEndpoint {
                 .send()
                 .await
                 .map_err(|e| {
-                    IacError::AwsSdk(format!(
-                        "ec2:CreateTags: {}",
-                        e.into_service_error()
-                    ))
+                    IacError::AwsSdk(format!("ec2:CreateTags: {}", e.into_service_error()))
                 })?;
         }
 
@@ -470,10 +459,7 @@ impl Resource for VpcEndpoint {
         }
     }
 
-    async fn describe(
-        &self,
-        ctx: &ProvisionContext,
-    ) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
         // Read VPC state for vpc_id to filter endpoints.
         let vpc_state = ctx.get_resource_state(&self.config.vpc_dependency);
         let vpc_id = vpc_state.ok().and_then(|s| {

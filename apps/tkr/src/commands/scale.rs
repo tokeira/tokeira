@@ -1,8 +1,10 @@
 use anyhow::Result;
 
-use crate::cli::ScaleAction;
-use crate::deployment_dir::{DeploymentContext, DeploymentResolver};
-use crate::metadata::DeploymentStatus;
+use crate::{
+    cli::ScaleAction,
+    deployment_dir::{DeploymentContext, DeploymentResolver},
+    metadata::DeploymentStatus,
+};
 
 pub async fn run(
     action: ScaleAction,

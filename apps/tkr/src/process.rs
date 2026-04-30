@@ -1,11 +1,12 @@
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 use anyhow::{Context, Result, bail};
 
-use crate::deployment_dir::TOKEIRAD_TOML;
-use crate::metadata::DeploymentStatus;
+use crate::{deployment_dir::TOKEIRAD_TOML, metadata::DeploymentStatus};
 
 pub async fn spawn_tokeirad(deployment_path: &Path) -> Result<()> {
     let config_path = deployment_path.join(TOKEIRAD_TOML);

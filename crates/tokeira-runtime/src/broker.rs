@@ -41,9 +41,7 @@ use std::{
 use anyhow::Result;
 use time::OffsetDateTime;
 use tokeira_storage::{DispatchableActivityTask, DispatchableWorkflowTask};
-use tokeira_types::{
-    LogicalTaskSeq, NamespaceId, QueueKey, RunKey, TaskQueueName, WorkerIdentity,
-};
+use tokeira_types::{LogicalTaskSeq, NamespaceId, QueueKey, RunKey, TaskQueueName, WorkerIdentity};
 use tokio::{
     sync::{Mutex, Notify},
     time::{Duration, Instant, timeout},
@@ -300,11 +298,7 @@ impl InMemoryBroker {
             .collect()
     }
 
-    async fn try_take_query(
-        &self,
-        queue: &QueueKey,
-        worker: &WorkerIdentity,
-    ) -> Option<QueryTask> {
+    async fn try_take_query(&self, queue: &QueueKey, worker: &WorkerIdentity) -> Option<QueryTask> {
         let mut inner = self.inner.lock().await;
         let ready = inner.query_ready.get_mut(queue)?;
 
@@ -382,9 +376,7 @@ impl InMemoryBroker {
                     {
                         StickyAction::Promote
                     }
-                    Some(task) if task.task.sticky_preferred.is_none() => {
-                        StickyAction::Promote
-                    }
+                    Some(task) if task.task.sticky_preferred.is_none() => StickyAction::Promote,
                     Some(_) => StickyAction::Keep,
                     None => break,
                 };
@@ -685,9 +677,7 @@ mod tests {
     use crate::QueryTask;
     use proptest::prelude::*;
     use time::Duration as TimeDuration;
-    use tokeira_types::{
-        BuildId, DeploymentId, NamespaceId, Payloads, TaskKind, TaskQueueName,
-    };
+    use tokeira_types::{BuildId, DeploymentId, NamespaceId, Payloads, TaskKind, TaskQueueName};
     use tokio::sync::oneshot;
     use uuid::Uuid;
 
@@ -717,11 +707,7 @@ mod tests {
         }
     }
 
-    fn workflow_queue(
-        name: &str,
-        deployment: Option<&str>,
-        build_id: Option<&str>,
-    ) -> QueueKey {
+    fn workflow_queue(name: &str, deployment: Option<&str>, build_id: Option<&str>) -> QueueKey {
         QueueKey {
             namespace_id: NamespaceId::new(),
             task_queue: TaskQueueName(name.to_string()),

@@ -11,8 +11,7 @@ use tokeira_types::MetricType;
 use tokeira_types::validate_metric_name;
 
 pub const GRPC_REQUEST_TOTAL: &str = "tokeira_edge_grpc_request_total";
-pub const GRPC_REQUEST_DURATION_SECONDS: &str =
-    "tokeira_edge_grpc_request_duration_seconds";
+pub const GRPC_REQUEST_DURATION_SECONDS: &str = "tokeira_edge_grpc_request_duration_seconds";
 pub const GRPC_ERROR_TOTAL: &str = "tokeira_edge_grpc_error_total";
 pub const GRPC_ACTIVE_REQUESTS: &str = "tokeira_edge_grpc_active_requests";
 
@@ -39,11 +38,7 @@ pub fn record_grpc_request(method: &str, namespace: &str, status: &str) {
     .increment(1);
 }
 
-pub fn record_grpc_request_duration(
-    method: &str,
-    namespace: &str,
-    duration: std::time::Duration,
-) {
+pub fn record_grpc_request_duration(method: &str, namespace: &str, duration: std::time::Duration) {
     histogram!(
         GRPC_REQUEST_DURATION_SECONDS,
         "method" => method.to_string(),

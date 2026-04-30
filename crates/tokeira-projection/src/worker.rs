@@ -11,8 +11,10 @@ use tokeira_types::ProjectionCursor;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-use crate::metrics as projection_metrics;
-use crate::{sink::ProjectionSink, store::VisibilityStore, types::beginning_cursor};
+use crate::{
+    metrics as projection_metrics, sink::ProjectionSink, store::VisibilityStore,
+    types::beginning_cursor,
+};
 
 /// Drives one `(partition_id, fanout)` projection substream.
 ///
@@ -49,10 +51,7 @@ where
         for record in &batch.records {
             self.sink.apply(record).await?;
         }
-        projection_metrics::record_records_processed(
-            cursor.partition_id,
-            batch.records.len(),
-        );
+        projection_metrics::record_records_processed(cursor.partition_id, batch.records.len());
         projection_metrics::set_projection_lag(cursor.partition_id, 0);
 
         info!(
@@ -109,10 +108,7 @@ where
                 continue;
             }
             backoff = tokio::time::Duration::from_millis(100);
-            projection_metrics::set_projection_lag(
-                cursor.partition_id,
-                batch.records.len(),
-            );
+            projection_metrics::set_projection_lag(cursor.partition_id, batch.records.len());
 
             let mut failed = false;
             for record in &batch.records {
@@ -133,10 +129,7 @@ where
                 backoff = std::cmp::min(backoff.saturating_mul(2), max_backoff);
                 continue;
             }
-            projection_metrics::record_records_processed(
-                cursor.partition_id,
-                batch.records.len(),
-            );
+            projection_metrics::record_records_processed(cursor.partition_id, batch.records.len());
             cursor = batch.next_cursor;
             projection_metrics::set_projection_lag(cursor.partition_id, 0);
             self.sink.save_checkpoint(sink_id, &cursor).await?;
@@ -164,8 +157,8 @@ mod tests {
     use tokeira_kernel::ProjectionOp;
     use tokeira_storage::{ProjectionBatch, ProjectionContext, ProjectionRecord};
     use tokeira_types::{
-        ExecutionStatus, Memo, NamespaceId, RunId, RunKey, SearchAttributes,
-        TaskQueueName, TransitionSeq, WorkflowId, WorkflowType,
+        ExecutionStatus, Memo, NamespaceId, RunId, RunKey, SearchAttributes, TaskQueueName,
+        TransitionSeq, WorkflowId, WorkflowType,
     };
     use tokio::sync::Mutex;
     use uuid::Uuid;
@@ -340,13 +333,7 @@ mod tests {
             value: &tokeira_types::SearchAttrValue,
         ) -> Result<()> {
             self.store
-                .upsert_search_attr_index(
-                    run_key,
-                    namespace_id,
-                    attr_id,
-                    attr_type,
-                    value,
-                )
+                .upsert_search_attr_index(run_key, namespace_id, attr_id, attr_type, value)
                 .await
         }
         async fn remove_search_attr_index(
@@ -360,10 +347,7 @@ mod tests {
                 .remove_search_attr_index(run_key, namespace_id, attr_id, attr_type)
                 .await
         }
-        async fn accumulate_rollup(
-            &self,
-            entries: &[crate::types::RollupDelta],
-        ) -> Result<()> {
+        async fn accumulate_rollup(&self, entries: &[crate::types::RollupDelta]) -> Result<()> {
             self.store.accumulate_rollup(entries).await
         }
         async fn list_executions(
@@ -394,17 +378,10 @@ mod tests {
         ) -> Result<crate::types::CountResult> {
             self.store.count_from_rollup(namespace_id, dimension).await
         }
-        async fn load_checkpoint(
-            &self,
-            sink_id: &str,
-        ) -> Result<Option<ProjectionCursor>> {
+        async fn load_checkpoint(&self, sink_id: &str) -> Result<Option<ProjectionCursor>> {
             self.store.load_checkpoint(sink_id).await
         }
-        async fn save_checkpoint(
-            &self,
-            sink_id: &str,
-            cursor: &ProjectionCursor,
-        ) -> Result<()> {
+        async fn save_checkpoint(&self, sink_id: &str, cursor: &ProjectionCursor) -> Result<()> {
             self.store.save_checkpoint(sink_id, cursor).await
         }
         async fn resolve_attr(

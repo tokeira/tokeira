@@ -1,2 +1,15 @@
+[env]
+LOOM_WORKSPACE_ROOT = { value = "", relative = true }
+
 [alias]
-lint = "clippy --workspace --all-targets"
+lint = [
+    "clippy",
+    "--workspace",
+    "--all-targets",
+]
+test-lint = [
+    "clippy",
+    "--workspace",
+    "--all-targets",
+    "--tests",
+]

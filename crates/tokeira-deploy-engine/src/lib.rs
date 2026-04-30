@@ -23,9 +23,7 @@ mod image;
 mod platform;
 mod service;
 
-pub use engine::{
-    PlannedServiceManifest, ServiceChange, ServiceChangeKind, ServiceEngine,
-};
+pub use engine::{PlannedServiceManifest, ServiceChange, ServiceChangeKind, ServiceEngine};
 pub use error::RuntimeError;
 pub use image::{DesiredImageRef, Image, ImageContext, ImageSourceType};
 pub use platform::Platform;

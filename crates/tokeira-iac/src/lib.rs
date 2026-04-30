@@ -27,21 +27,21 @@ pub mod module;
 pub mod types;
 
 pub use document::{
-    ImageSource, ImageState, InfraState, InfraStateStore, RuntimeState,
-    RuntimeStateStore, ServiceState,
+    ImageSource, ImageState, InfraState, InfraStateStore, RuntimeState, RuntimeStateStore,
+    ServiceState,
 };
-pub use engine::Engine;
-pub use engine::StateSaver;
+pub use engine::{Engine, StateSaver};
 pub use error::IacError;
 pub use module::{Module, ModuleContext};
-pub use types::Change;
-pub use types::{ChangeKind, FieldDiff, InfraComposition, ModuleSelection, ResourceDiff};
+pub use types::{Change, ChangeKind, FieldDiff, InfraComposition, ModuleSelection, ResourceDiff};
 
-use std::any::{Any, TypeId};
-use std::collections::HashMap;
-use std::fmt;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    any::{Any, TypeId},
+    collections::HashMap,
+    fmt,
+    sync::Arc,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -147,8 +147,7 @@ pub struct ProvisionContext {
     extensions: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
 }
 
-type ApplyProgressReporter =
-    dyn Fn(&str, &ResourceId, &ResourceType, usize, usize) + Send + Sync;
+type ApplyProgressReporter = dyn Fn(&str, &ResourceId, &ResourceType, usize, usize) + Send + Sync;
 type WaitProgressReporter =
     dyn Fn(&ResourceId, &ResourceType, &str, Duration, Duration) + Send + Sync;
 type NoteProgressReporter = dyn Fn(&ResourceId, &ResourceType, &str) + Send + Sync;
@@ -205,10 +204,7 @@ impl ProvisionContext {
 
     pub fn set_wait_progress<F>(&mut self, reporter: F)
     where
-        F: Fn(&ResourceId, &ResourceType, &str, Duration, Duration)
-            + Send
-            + Sync
-            + 'static,
+        F: Fn(&ResourceId, &ResourceType, &str, Duration, Duration) + Send + Sync + 'static,
     {
         self.wait_progress = Some(Arc::new(reporter));
     }
@@ -245,15 +241,9 @@ impl ProvisionContext {
     }
 
     /// Look up a dependent resource's persisted state by ID.
-    pub fn get_resource_state(
-        &self,
-        id: &ResourceId,
-    ) -> Result<&ResourceState, error::IacError> {
+    pub fn get_resource_state(&self, id: &ResourceId) -> Result<&ResourceState, error::IacError> {
         self.state.resources.get(id).ok_or_else(|| {
-            error::IacError::StateNotFound(format!(
-                "resource {:?} not found in state",
-                id.0
-            ))
+            error::IacError::StateNotFound(format!("resource {:?} not found in state", id.0))
         })
     }
 
@@ -303,10 +293,7 @@ pub trait Resource: Send + Sync {
     /// Module that owns this resource.
     fn module(&self) -> &str;
 
-    async fn create(
-        &self,
-        ctx: &ProvisionContext,
-    ) -> Result<ResourceState, error::IacError>;
+    async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, error::IacError>;
     async fn update(
         &self,
         current: &ResourceState,

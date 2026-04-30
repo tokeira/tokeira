@@ -13,24 +13,24 @@ use tokeira_edge::{
             completed_response_to_proto, count_request_to_edge, count_response_to_proto,
             describe_request_to_edge, describe_response_to_proto, list_request_to_edge,
             list_response_to_proto, poll_request_to_edge, poll_response_to_proto,
-            proto_command_to_workflow_command, signal_request_to_edge,
-            start_request_to_edge, start_response_to_proto, workflow_command_to_proto,
+            proto_command_to_workflow_command, signal_request_to_edge, start_request_to_edge,
+            start_response_to_proto, workflow_command_to_proto,
         },
     },
     translate::{
         CountWorkflowExecutionsRequest, CountWorkflowExecutionsResponse,
         DescribeWorkflowExecutionRequest, GroupCount, ListWorkflowExecutionsRequest,
-        ListWorkflowExecutionsResponse, PendingActivityDescription,
-        PendingChildDescription, PendingWorkflowTaskDescription,
-        PollWorkflowTaskQueueRequest, PollWorkflowTaskQueueResponse,
-        RespondWorkflowTaskCompletedResponse, SignalWorkflowExecutionRequest,
-        StartWorkflowExecutionRequest, StartWorkflowExecutionResponse,
-        WorkflowExecutionDescription, WorkflowExecutionSummary, WorkflowTaskPayloadDto,
+        ListWorkflowExecutionsResponse, PendingActivityDescription, PendingChildDescription,
+        PendingWorkflowTaskDescription, PollWorkflowTaskQueueRequest,
+        PollWorkflowTaskQueueResponse, RespondWorkflowTaskCompletedResponse,
+        SignalWorkflowExecutionRequest, StartWorkflowExecutionRequest,
+        StartWorkflowExecutionResponse, WorkflowExecutionDescription, WorkflowExecutionSummary,
+        WorkflowTaskPayloadDto,
     },
 };
-use tokeira_kernel::WorkflowCommand;
-use tokeira_kernel::state::ParentClosePolicy;
-use tokeira_kernel::{WorkflowIdConflictPolicy, WorkflowIdReusePolicy};
+use tokeira_kernel::{
+    WorkflowCommand, WorkflowIdConflictPolicy, WorkflowIdReusePolicy, state::ParentClosePolicy,
+};
 use tokeira_proto::{
     conversions::common::{
         failure_to_payload, memo_from_domain, payload_to_failure, payloads_from_domain,
@@ -41,8 +41,7 @@ use tokeira_proto::{
     workflowservice,
 };
 use tokeira_types::{
-    ExecutionStatus, Memo, Payload, Payloads, RunId, RunKey, SearchAttrValue,
-    SearchAttributes,
+    ExecutionStatus, Memo, Payload, Payloads, RunId, RunKey, SearchAttrValue, SearchAttributes,
 };
 use tonic::{Code, metadata::MetadataMap};
 use uuid::Uuid;
@@ -511,12 +510,10 @@ fn arb_memo() -> impl Strategy<Value = Memo> {
 fn arb_search_attr_value() -> impl Strategy<Value = SearchAttrValue> {
     prop_oneof![
         arb_small_string().prop_map(SearchAttrValue::Keyword),
-        prop::collection::vec(arb_small_string(), 0..4)
-            .prop_map(SearchAttrValue::KeywordList),
+        prop::collection::vec(arb_small_string(), 0..4).prop_map(SearchAttrValue::KeywordList),
         any::<i64>().prop_map(SearchAttrValue::Int),
         any::<bool>().prop_map(SearchAttrValue::Bool),
-        (-1_000_000i64..1_000_000i64)
-            .prop_map(|v| SearchAttrValue::Double(v as f64 / 10.0)),
+        (-1_000_000i64..1_000_000i64).prop_map(|v| SearchAttrValue::Double(v as f64 / 10.0)),
         (0i64..4_000_000_000i64).prop_map(|secs| SearchAttrValue::Datetime(
             OffsetDateTime::from_unix_timestamp(secs).unwrap()
         )),
@@ -644,13 +641,13 @@ fn arb_list_request() -> impl Strategy<Value = ListWorkflowExecutionsRequest> {
 }
 
 fn arb_count_request() -> impl Strategy<Value = CountWorkflowExecutionsRequest> {
-    (arb_small_string(), prop::option::of(arb_small_string())).prop_map(
-        |(namespace, query)| CountWorkflowExecutionsRequest {
+    (arb_small_string(), prop::option::of(arb_small_string())).prop_map(|(namespace, query)| {
+        CountWorkflowExecutionsRequest {
             namespace,
             query,
             group_by: None,
-        },
-    )
+        }
+    })
 }
 
 fn arb_start_response() -> impl Strategy<Value = StartWorkflowExecutionResponse> {
@@ -663,14 +660,7 @@ fn arb_start_response() -> impl Strategy<Value = StartWorkflowExecutionResponse>
         prop::option::of(arb_poll_response()),
     )
         .prop_map(
-            |(
-                run_key,
-                run_id,
-                transition_seq,
-                last_event_id,
-                started,
-                eager_workflow_task,
-            )| {
+            |(run_key, run_id, transition_seq, last_event_id, started, eager_workflow_task)| {
                 StartWorkflowExecutionResponse {
                     run_key: RunKey(Uuid::from_u128(run_key)),
                     run_id: RunId(Uuid::from_u128(run_id)),
@@ -683,8 +673,7 @@ fn arb_start_response() -> impl Strategy<Value = StartWorkflowExecutionResponse>
         )
 }
 
-fn arb_completed_response() -> impl Strategy<Value = RespondWorkflowTaskCompletedResponse>
-{
+fn arb_completed_response() -> impl Strategy<Value = RespondWorkflowTaskCompletedResponse> {
     prop::collection::vec(arb_poll_activity_response(), 0..6).prop_map(|activity_tasks| {
         RespondWorkflowTaskCompletedResponse {
             transition_seq: 0,
@@ -771,15 +760,7 @@ fn arb_description() -> impl Strategy<Value = WorkflowExecutionDescription> {
     )
         .prop_map(
             |(
-                (
-                    namespace,
-                    workflow_id,
-                    run_key,
-                    run_id,
-                    workflow_type,
-                    task_queue,
-                    status,
-                ),
+                (namespace, workflow_id, run_key, run_id, workflow_type, task_queue, status),
                 (
                     start_time,
                     close_time,
@@ -859,13 +840,7 @@ fn arb_pending_child() -> impl Strategy<Value = PendingChildDescription> {
         ],
     )
         .prop_map(
-            |(
-                workflow_id,
-                run_id,
-                workflow_type,
-                initiated_event_id,
-                parent_close_policy,
-            )| {
+            |(workflow_id, run_id, workflow_type, initiated_event_id, parent_close_policy)| {
                 PendingChildDescription {
                     workflow_id,
                     run_id,
@@ -1042,9 +1017,8 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
                 }
             ),
         Just(WorkflowCommand::CancelWorkflow),
-        arb_small_string().prop_map(|activity_id| {
-            WorkflowCommand::RequestCancelActivity { activity_id }
-        }),
+        arb_small_string()
+            .prop_map(|activity_id| { WorkflowCommand::RequestCancelActivity { activity_id } }),
         arb_small_string().prop_map(|timer_id| WorkflowCommand::CancelTimer { timer_id }),
         (
             arb_small_string(),
@@ -1170,8 +1144,7 @@ fn arb_edge_error() -> impl Strategy<Value = EdgeError> {
         }),
         any::<bool>().prop_map(|_| EdgeError::TooManyLongPolls),
         any::<bool>().prop_map(|_| EdgeError::LongPollAdmissionTimeout),
-        arb_small_string()
-            .prop_map(|target| EdgeError::RemoteRouteUnsupported { target }),
+        arb_small_string().prop_map(|target| EdgeError::RemoteRouteUnsupported { target }),
         arb_small_string().prop_map(EdgeError::Internal),
     ]
 }
@@ -1182,18 +1155,16 @@ fn arb_edge_error() -> impl Strategy<Value = EdgeError> {
 
 use tokeira_edge::{
     grpc::translate::{
-        cancel_request_to_edge, deserialize_activity_token,
-        poll_activity_request_to_edge, poll_activity_response_to_proto,
-        query_request_to_edge, query_response_to_proto,
-        respond_activity_completed_to_edge, serialize_activity_token,
-        terminate_request_to_edge, update_request_to_edge, update_response_to_proto,
+        cancel_request_to_edge, deserialize_activity_token, poll_activity_request_to_edge,
+        poll_activity_response_to_proto, query_request_to_edge, query_response_to_proto,
+        respond_activity_completed_to_edge, serialize_activity_token, terminate_request_to_edge,
+        update_request_to_edge, update_response_to_proto,
     },
     translate::{
-        PollActivityTaskQueueRequest, PollActivityTaskQueueResponse,
-        QueryWorkflowRequest, QueryWorkflowResponse,
-        RequestCancelWorkflowExecutionRequest, TerminateWorkflowExecutionRequest,
-        UpdateOutcomeDto, UpdateWaitPolicyDto, UpdateWorkflowExecutionRequest,
-        UpdateWorkflowExecutionResponse,
+        PollActivityTaskQueueRequest, PollActivityTaskQueueResponse, QueryWorkflowRequest,
+        QueryWorkflowResponse, RequestCancelWorkflowExecutionRequest,
+        TerminateWorkflowExecutionRequest, UpdateOutcomeDto, UpdateWaitPolicyDto,
+        UpdateWorkflowExecutionRequest, UpdateWorkflowExecutionResponse,
     },
 };
 use tokeira_types::{ActivityTaskToken, ShardEpoch};
@@ -1205,15 +1176,15 @@ fn arb_activity_task_token() -> impl Strategy<Value = ActivityTaskToken> {
         any::<i64>(),
         1u32..100u32,
     )
-        .prop_map(|(run_key, activity_id, schedule_event_id, attempt)| {
-            ActivityTaskToken {
+        .prop_map(
+            |(run_key, activity_id, schedule_event_id, attempt)| ActivityTaskToken {
                 run_key: RunKey(Uuid::from_u128(run_key)),
                 activity_id,
                 schedule_event_id,
                 attempt,
                 shard_epoch: ShardEpoch::ZERO,
-            }
-        })
+            },
+        )
 }
 
 fn arb_poll_activity_request() -> impl Strategy<Value = PollActivityTaskQueueRequest> {
@@ -1586,8 +1557,7 @@ fn arb_proto_failure() -> impl Strategy<Value = failure_proto::Failure> {
         )
 }
 
-fn arb_failure_info() -> impl Strategy<Value = Option<failure_proto::failure::FailureInfo>>
-{
+fn arb_failure_info() -> impl Strategy<Value = Option<failure_proto::failure::FailureInfo>> {
     prop_oneof![
         Just(None),
         "[a-z]{0,10}".prop_map(|t| Some(

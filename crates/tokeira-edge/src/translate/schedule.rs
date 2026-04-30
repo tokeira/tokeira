@@ -11,20 +11,20 @@ use time::{Duration, OffsetDateTime};
 use tokeira_proto::{
     conversions::common::{
         memo_from_domain, memo_to_domain, payloads_from_domain, payloads_to_domain,
-        search_attributes_from_domain, search_attributes_to_domain,
-        task_queue_from_domain, to_proto_duration, to_proto_timestamp,
+        search_attributes_from_domain, search_attributes_to_domain, task_queue_from_domain,
+        to_proto_duration, to_proto_timestamp,
     },
     enums,
     public::temporal::api::{
-        common::v1 as common, schedule::v1 as proto_schedule,
-        schedule::v1::schedule_action, workflow::v1 as workflow,
+        common::v1 as common,
+        schedule::{v1 as proto_schedule, v1::schedule_action},
+        workflow::v1 as workflow,
     },
     workflowservice,
 };
 use tokeira_runtime::schedule as domain;
 use tokeira_types::{
-    Memo, NamespaceId, RetryPolicy, SearchAttributes, TaskQueueName, WorkflowId,
-    WorkflowType,
+    Memo, NamespaceId, RetryPolicy, SearchAttributes, TaskQueueName, WorkflowId, WorkflowType,
 };
 use tonic::Status;
 
@@ -161,9 +161,7 @@ pub fn list_schedules_response_to_proto(
             .map(|entry| proto_schedule::ScheduleListEntry {
                 schedule_id: entry.schedule_id.0.clone(),
                 memo: Some(memo_from_domain(&entry.memo)),
-                search_attributes: Some(search_attributes_from_domain(
-                    &entry.search_attributes,
-                )),
+                search_attributes: Some(search_attributes_from_domain(&entry.search_attributes)),
                 info: Some(proto_schedule::ScheduleListInfo {
                     spec: Some(schedule_spec_to_proto_without_timezone_data(&entry.spec)),
                     workflow_type: Some(common::WorkflowType {
@@ -203,24 +201,20 @@ pub fn schedule_patch_to_domain(
     patch: proto_schedule::SchedulePatch,
 ) -> Result<domain::SchedulePatch, Status> {
     Ok(domain::SchedulePatch {
-        trigger_immediately: patch.trigger_immediately.map(|trigger| {
-            domain::TriggerImmediately {
+        trigger_immediately: patch
+            .trigger_immediately
+            .map(|trigger| domain::TriggerImmediately {
                 overlap_policy: overlap_policy_to_domain(trigger.overlap_policy),
-            }
-        }),
+            }),
         backfill_request: patch
             .backfill_request
             .into_iter()
             .map(|backfill| {
                 Ok(domain::BackfillRequest {
                     start_time: proto_timestamp_to_time(backfill.start_time.as_ref())
-                        .ok_or_else(|| {
-                            Status::invalid_argument("backfill start_time required")
-                        })?,
+                        .ok_or_else(|| Status::invalid_argument("backfill start_time required"))?,
                     end_time: proto_timestamp_to_time(backfill.end_time.as_ref())
-                        .ok_or_else(|| {
-                            Status::invalid_argument("backfill end_time required")
-                        })?,
+                        .ok_or_else(|| Status::invalid_argument("backfill end_time required"))?,
                     overlap_policy: overlap_policy_to_domain(backfill.overlap_policy),
                 })
             })
@@ -303,9 +297,7 @@ pub fn schedule_spec_to_domain(
     })
 }
 
-pub fn schedule_spec_to_proto(
-    spec: &domain::ScheduleSpec,
-) -> proto_schedule::ScheduleSpec {
+pub fn schedule_spec_to_proto(spec: &domain::ScheduleSpec) -> proto_schedule::ScheduleSpec {
     schedule_spec_to_proto_inner(spec, Vec::new())
 }
 
@@ -381,12 +373,8 @@ pub fn schedule_action_to_domain(
             workflow_execution_timeout: proto_duration_to_time(
                 start.workflow_execution_timeout.as_ref(),
             ),
-            workflow_run_timeout: proto_duration_to_time(
-                start.workflow_run_timeout.as_ref(),
-            ),
-            workflow_task_timeout: proto_duration_to_time(
-                start.workflow_task_timeout.as_ref(),
-            ),
+            workflow_run_timeout: proto_duration_to_time(start.workflow_run_timeout.as_ref()),
+            workflow_task_timeout: proto_duration_to_time(start.workflow_task_timeout.as_ref()),
             retry_policy: start.retry_policy.as_ref().map(retry_policy_to_domain),
             memo: start.memo.as_ref().map(memo_to_domain).unwrap_or_default(),
             search_attributes: match start.search_attributes.as_ref() {
@@ -398,9 +386,7 @@ pub fn schedule_action_to_domain(
     })
 }
 
-pub fn schedule_action_to_proto(
-    action: &domain::ScheduleAction,
-) -> proto_schedule::ScheduleAction {
+pub fn schedule_action_to_proto(action: &domain::ScheduleAction) -> proto_schedule::ScheduleAction {
     let start = &action.start_workflow;
     proto_schedule::ScheduleAction {
         action: Some(schedule_action::Action::StartWorkflow(
@@ -411,19 +397,14 @@ pub fn schedule_action_to_proto(
                 }),
                 task_queue: Some(task_queue_from_domain(&start.task_queue)),
                 input: Some(payloads_from_domain(&start.input)),
-                workflow_execution_timeout: start
-                    .workflow_execution_timeout
-                    .map(to_proto_duration),
+                workflow_execution_timeout: start.workflow_execution_timeout.map(to_proto_duration),
                 workflow_run_timeout: start.workflow_run_timeout.map(to_proto_duration),
                 workflow_task_timeout: start.workflow_task_timeout.map(to_proto_duration),
-                workflow_id_reuse_policy: enums::WorkflowIdReusePolicy::AllowDuplicate
-                    as i32,
+                workflow_id_reuse_policy: enums::WorkflowIdReusePolicy::AllowDuplicate as i32,
                 retry_policy: start.retry_policy.as_ref().map(retry_policy_from_domain),
                 cron_schedule: String::new(),
                 memo: Some(memo_from_domain(&start.memo)),
-                search_attributes: Some(search_attributes_from_domain(
-                    &start.search_attributes,
-                )),
+                search_attributes: Some(search_attributes_from_domain(&start.search_attributes)),
                 header: None,
                 user_metadata: None,
                 versioning_override: None,
@@ -455,9 +436,7 @@ pub fn schedule_policies_to_proto(
     }
 }
 
-pub fn schedule_state_to_domain(
-    state: proto_schedule::ScheduleState,
-) -> domain::ScheduleState {
+pub fn schedule_state_to_domain(state: proto_schedule::ScheduleState) -> domain::ScheduleState {
     domain::ScheduleState {
         notes: state.notes,
         paused: state.paused,
@@ -466,9 +445,7 @@ pub fn schedule_state_to_domain(
     }
 }
 
-pub fn schedule_state_to_proto(
-    state: &domain::ScheduleState,
-) -> proto_schedule::ScheduleState {
+pub fn schedule_state_to_proto(state: &domain::ScheduleState) -> proto_schedule::ScheduleState {
     proto_schedule::ScheduleState {
         notes: state.notes.clone(),
         paused: state.paused,
@@ -477,9 +454,7 @@ pub fn schedule_state_to_proto(
     }
 }
 
-pub fn schedule_info_to_proto(
-    info: &domain::ScheduleInfo,
-) -> proto_schedule::ScheduleInfo {
+pub fn schedule_info_to_proto(info: &domain::ScheduleInfo) -> proto_schedule::ScheduleInfo {
     #[allow(deprecated)]
     let info = proto_schedule::ScheduleInfo {
         action_count: info.action_count,
@@ -533,9 +508,7 @@ fn schedule_action_result_to_proto(
     }
 }
 
-fn workflow_execution_to_proto(
-    execution: &domain::WorkflowExecution,
-) -> common::WorkflowExecution {
+fn workflow_execution_to_proto(execution: &domain::WorkflowExecution) -> common::WorkflowExecution {
     common::WorkflowExecution {
         workflow_id: execution.workflow_id.0.clone(),
         run_id: execution.run_id.0.to_string(),
@@ -544,28 +517,16 @@ fn workflow_execution_to_proto(
 
 fn workflow_status_to_proto(status: domain::WorkflowExecutionStatus) -> i32 {
     (match status {
-        domain::WorkflowExecutionStatus::Running => {
-            enums::WorkflowExecutionStatus::Running
-        }
-        domain::WorkflowExecutionStatus::Completed => {
-            enums::WorkflowExecutionStatus::Completed
-        }
+        domain::WorkflowExecutionStatus::Running => enums::WorkflowExecutionStatus::Running,
+        domain::WorkflowExecutionStatus::Completed => enums::WorkflowExecutionStatus::Completed,
         domain::WorkflowExecutionStatus::Failed => enums::WorkflowExecutionStatus::Failed,
-        domain::WorkflowExecutionStatus::Cancelled => {
-            enums::WorkflowExecutionStatus::Canceled
-        }
-        domain::WorkflowExecutionStatus::Terminated => {
-            enums::WorkflowExecutionStatus::Terminated
-        }
+        domain::WorkflowExecutionStatus::Cancelled => enums::WorkflowExecutionStatus::Canceled,
+        domain::WorkflowExecutionStatus::Terminated => enums::WorkflowExecutionStatus::Terminated,
         domain::WorkflowExecutionStatus::ContinuedAsNew => {
             enums::WorkflowExecutionStatus::ContinuedAsNew
         }
-        domain::WorkflowExecutionStatus::TimedOut => {
-            enums::WorkflowExecutionStatus::TimedOut
-        }
-        domain::WorkflowExecutionStatus::StartFailed => {
-            enums::WorkflowExecutionStatus::Failed
-        }
+        domain::WorkflowExecutionStatus::TimedOut => enums::WorkflowExecutionStatus::TimedOut,
+        domain::WorkflowExecutionStatus::StartFailed => enums::WorkflowExecutionStatus::Failed,
     }) as i32
 }
 
@@ -573,12 +534,8 @@ fn overlap_policy_to_domain(value: i32) -> domain::OverlapPolicy {
     match enums::ScheduleOverlapPolicy::try_from(value).ok() {
         Some(enums::ScheduleOverlapPolicy::BufferOne) => domain::OverlapPolicy::BufferOne,
         Some(enums::ScheduleOverlapPolicy::BufferAll) => domain::OverlapPolicy::BufferAll,
-        Some(enums::ScheduleOverlapPolicy::CancelOther) => {
-            domain::OverlapPolicy::CancelOther
-        }
-        Some(enums::ScheduleOverlapPolicy::TerminateOther) => {
-            domain::OverlapPolicy::TerminateOther
-        }
+        Some(enums::ScheduleOverlapPolicy::CancelOther) => domain::OverlapPolicy::CancelOther,
+        Some(enums::ScheduleOverlapPolicy::TerminateOther) => domain::OverlapPolicy::TerminateOther,
         Some(enums::ScheduleOverlapPolicy::AllowAll) => domain::OverlapPolicy::AllowAll,
         _ => domain::OverlapPolicy::Skip,
     }
@@ -590,9 +547,7 @@ fn overlap_policy_to_proto(value: domain::OverlapPolicy) -> i32 {
         domain::OverlapPolicy::BufferOne => enums::ScheduleOverlapPolicy::BufferOne,
         domain::OverlapPolicy::BufferAll => enums::ScheduleOverlapPolicy::BufferAll,
         domain::OverlapPolicy::CancelOther => enums::ScheduleOverlapPolicy::CancelOther,
-        domain::OverlapPolicy::TerminateOther => {
-            enums::ScheduleOverlapPolicy::TerminateOther
-        }
+        domain::OverlapPolicy::TerminateOther => enums::ScheduleOverlapPolicy::TerminateOther,
         domain::OverlapPolicy::AllowAll => enums::ScheduleOverlapPolicy::AllowAll,
     }) as i32
 }
@@ -805,8 +760,7 @@ fn parse_named_int(value: &str) -> Result<i32, Status> {
 
 fn proto_duration_to_time(value: Option<&ProtoDuration>) -> Option<Duration> {
     value.map(|duration| {
-        Duration::seconds(duration.seconds)
-            + Duration::nanoseconds(i64::from(duration.nanos))
+        Duration::seconds(duration.seconds) + Duration::nanoseconds(i64::from(duration.nanos))
     })
 }
 
@@ -887,14 +841,13 @@ mod tests {
 
     #[test]
     fn empty_schedule_id_rejected() {
-        let err =
-            create_schedule_request_to_edge(workflowservice::CreateScheduleRequest {
-                namespace: "default".to_string(),
-                schedule_id: String::new(),
-                schedule: Some(minimal_schedule()),
-                ..Default::default()
-            })
-            .expect_err("empty schedule id should be invalid");
+        let err = create_schedule_request_to_edge(workflowservice::CreateScheduleRequest {
+            namespace: "default".to_string(),
+            schedule_id: String::new(),
+            schedule: Some(minimal_schedule()),
+            ..Default::default()
+        })
+        .expect_err("empty schedule id should be invalid");
 
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("schedule_id"));
@@ -902,17 +855,16 @@ mod tests {
 
     #[test]
     fn missing_spec_rejected() {
-        let err =
-            create_schedule_request_to_edge(workflowservice::CreateScheduleRequest {
-                namespace: "default".to_string(),
-                schedule_id: "s1".to_string(),
-                schedule: Some(proto_schedule::Schedule {
-                    action: Some(minimal_action()),
-                    ..Default::default()
-                }),
+        let err = create_schedule_request_to_edge(workflowservice::CreateScheduleRequest {
+            namespace: "default".to_string(),
+            schedule_id: "s1".to_string(),
+            schedule: Some(proto_schedule::Schedule {
+                action: Some(minimal_action()),
                 ..Default::default()
-            })
-            .expect_err("missing spec should be invalid");
+            }),
+            ..Default::default()
+        })
+        .expect_err("missing spec should be invalid");
 
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("schedule.spec"));

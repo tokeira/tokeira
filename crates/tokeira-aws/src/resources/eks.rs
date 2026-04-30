@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use aws_sdk_eks::client::Waiters as EksWaiters;
-use tokeira_iac::error::IacError;
 use tokeira_iac::{
     InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    error::IacError,
 };
 
 /// EKS cluster with Auto Mode.
@@ -31,11 +31,7 @@ pub struct EksConfig {
 }
 
 impl EksClusterResource {
-    pub fn new(
-        rctx: &crate::ResourceContext,
-        eks: EksConfig,
-        module: impl Into<String>,
-    ) -> Self {
+    pub fn new(rctx: &crate::ResourceContext, eks: EksConfig, module: impl Into<String>) -> Self {
         Self {
             project: rctx.project.clone(),
             version: eks.version,
@@ -75,10 +71,7 @@ impl EksClusterResource {
             || lower.contains("already exists")
     }
 
-    async fn admin_principal_arn(
-        &self,
-        ctx: &ProvisionContext,
-    ) -> Result<String, IacError> {
+    async fn admin_principal_arn(&self, ctx: &ProvisionContext) -> Result<String, IacError> {
         match &self.cluster_admin_principal_arn {
             Some(arn) if !arn.is_empty() => Ok(arn.clone()),
             _ => {
@@ -141,9 +134,7 @@ impl EksClusterResource {
             .associate_access_policy()
             .cluster_name(cluster_name)
             .principal_arn(admin_arn)
-            .policy_arn(
-                "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy",
-            )
+            .policy_arn("arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy")
             .access_scope(
                 aws_sdk_eks::types::AccessScope::builder()
                     .r#type(aws_sdk_eks::types::AccessScopeType::Cluster)
@@ -197,8 +188,7 @@ impl Resource for EksClusterResource {
         let cluster_name = self.cluster_name();
 
         // Read VPC state for subnet_ids
-        let vpc_state =
-            ctx.get_resource_state(&ResourceId(format!("{}-vpc", self.project)))?;
+        let vpc_state = ctx.get_resource_state(&ResourceId(format!("{}-vpc", self.project)))?;
         let subnet_ids: Vec<String> = vpc_state
             .properties
             .get("subnet_ids")
@@ -206,10 +196,8 @@ impl Resource for EksClusterResource {
             .unwrap_or_default();
 
         // Read security group state for security_group_id
-        let sg_state = ctx.get_resource_state(&ResourceId(format!(
-            "sg-{}-eks-nodes-sg",
-            self.project
-        )))?;
+        let sg_state =
+            ctx.get_resource_state(&ResourceId(format!("sg-{}-eks-nodes-sg", self.project)))?;
         let sg_id = sg_state
             .properties
             .get("security_group_id")
@@ -229,9 +217,7 @@ impl Resource for EksClusterResource {
             .get("role_arn")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                IacError::StateNotFound(
-                    "role_arn not found in cluster IAM role state".into(),
-                )
+                IacError::StateNotFound("role_arn not found in cluster IAM role state".into())
             })?
             .to_string();
 
@@ -245,9 +231,7 @@ impl Resource for EksClusterResource {
             .get("role_arn")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                IacError::StateNotFound(
-                    "role_arn not found in node IAM role state".into(),
-                )
+                IacError::StateNotFound("role_arn not found in node IAM role state".into())
             })?
             .to_string();
 
@@ -356,9 +340,7 @@ impl Resource for EksClusterResource {
                     );
                     true
                 } else {
-                    return Err(IacError::AwsSdk(format!(
-                        "eks:CreateCluster: {svc_err}"
-                    )));
+                    return Err(IacError::AwsSdk(format!("eks:CreateCluster: {svc_err}")));
                 }
             }
         };
@@ -386,10 +368,7 @@ impl Resource for EksClusterResource {
             .send()
             .await
             .map_err(|e| {
-                IacError::AwsSdk(format!(
-                    "eks:DescribeCluster: {}",
-                    e.into_service_error()
-                ))
+                IacError::AwsSdk(format!("eks:DescribeCluster: {}", e.into_service_error()))
             })?;
 
         let cluster = desc_output.cluster();
@@ -481,9 +460,7 @@ impl Resource for EksClusterResource {
                 .name(&cluster_name)
                 .wait(Duration::from_secs(1200))
                 .await
-                .map_err(|e| {
-                    IacError::AwsSdk(format!("eks:WaitUntilClusterActive: {e}"))
-                })?;
+                .map_err(|e| IacError::AwsSdk(format!("eks:WaitUntilClusterActive: {e}")))?;
         }
 
         // eks:TagResource for tag updates
@@ -504,10 +481,7 @@ impl Resource for EksClusterResource {
                 .send()
                 .await
                 .map_err(|e| {
-                    IacError::AwsSdk(format!(
-                        "eks:TagResource: {}",
-                        e.into_service_error()
-                    ))
+                    IacError::AwsSdk(format!("eks:TagResource: {}", e.into_service_error()))
                 })?;
         }
 
@@ -621,9 +595,7 @@ impl Resource for EksClusterResource {
                 .name(&cluster_name)
                 .wait(Duration::from_secs(300))
                 .await
-                .map_err(|e| {
-                    IacError::AwsSdk(format!("eks:WaitUntilClusterActive: {e}"))
-                })?;
+                .map_err(|e| IacError::AwsSdk(format!("eks:WaitUntilClusterActive: {e}")))?;
         }
 
         // 2. eks:DeleteCluster
@@ -644,18 +616,14 @@ impl Resource for EksClusterResource {
                     .name(&cluster_name)
                     .wait(Duration::from_secs(900))
                     .await
-                    .map_err(|e| {
-                        IacError::AwsSdk(format!("eks:WaitUntilClusterDeleted: {e}"))
-                    })?;
+                    .map_err(|e| IacError::AwsSdk(format!("eks:WaitUntilClusterDeleted: {e}")))?;
             }
             Err(e) => {
                 let svc_err = e.into_service_error();
                 if svc_err.is_resource_not_found_exception() {
                     tracing::warn!(cluster = %cluster_name, "EKS cluster not found, skipping");
                 } else {
-                    return Err(IacError::AwsSdk(format!(
-                        "eks:DeleteCluster: {svc_err}"
-                    )));
+                    return Err(IacError::AwsSdk(format!("eks:DeleteCluster: {svc_err}")));
                 }
             }
         }
@@ -663,10 +631,7 @@ impl Resource for EksClusterResource {
         Ok(())
     }
 
-    async fn describe(
-        &self,
-        ctx: &ProvisionContext,
-    ) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
         let cluster_name = self.cluster_name();
 
         match ctx

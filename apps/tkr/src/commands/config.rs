@@ -2,8 +2,7 @@ use std::fs;
 
 use anyhow::Result;
 
-use crate::deployment_dir::DeploymentContext;
-use crate::deployment_dir::{DEPLOYMENT_TOML, TOKEIRAD_TOML};
+use crate::deployment_dir::{DEPLOYMENT_TOML, DeploymentContext, TOKEIRAD_TOML};
 
 pub fn run_show(ctx: DeploymentContext) -> Result<()> {
     println!(

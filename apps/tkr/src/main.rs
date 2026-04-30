@@ -19,9 +19,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Dev { action } => commands::dev::run(action),
-        Command::Deployment { action } => {
-            commands::deployment::run(action, &deployments, cli.json)
-        }
+        Command::Deployment { action } => commands::deployment::run(action, &deployments, cli.json),
         Command::Infra { action } => {
             let ctx = load_context(&deployments, cli.deployment.as_deref())?;
             commands::infra::run(action, &deployments, ctx).await
@@ -68,10 +66,10 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::cli::{
-        ConfigAction, DeployAction, DeploymentAction, DevAction, InfraAction, ScaleAction,
+    use crate::{
+        cli::{ConfigAction, DeployAction, DeploymentAction, DevAction, InfraAction, ScaleAction},
+        deployment_dir::{DEPLOYMENT_TOML, METADATA_JSON, TOKEIRAD_TOML},
     };
-    use crate::deployment_dir::{DEPLOYMENT_TOML, METADATA_JSON, TOKEIRAD_TOML};
     use serde_json::json;
     use tokeira_local_deployment::LocalConfig;
     use tokeira_orchestrator::{PlatformConfig, PlatformKind, StorageKind};
@@ -308,12 +306,10 @@ mod tests {
             .unwrap();
         let deployment_path = deployments.path("dev");
         let _: LocalConfig =
-            tokeira_config::load_config(&deployment_path.join(DEPLOYMENT_TOML), None)
+            tokeira_config::load_config(&deployment_path.join(DEPLOYMENT_TOML), None).unwrap();
+        let _: tokeira_config::TokeiraConfig =
+            toml::from_str(&fs::read_to_string(deployment_path.join(TOKEIRAD_TOML)).unwrap())
                 .unwrap();
-        let _: tokeira_config::TokeiraConfig = toml::from_str(
-            &fs::read_to_string(deployment_path.join(TOKEIRAD_TOML)).unwrap(),
-        )
-        .unwrap();
     }
 
     #[test]
@@ -426,8 +422,7 @@ mod tests {
         )
         .unwrap();
         let config =
-            commands::infra::read_tokeirad_config(&temp.path().join(TOKEIRAD_TOML))
-                .unwrap();
+            commands::infra::read_tokeirad_config(&temp.path().join(TOKEIRAD_TOML)).unwrap();
         assert_eq!(
             config.infrastructure.dsql.endpoint.as_deref(),
             Some("https://example.test")
@@ -481,8 +476,7 @@ mod tests {
             .create("test-local", PlatformKind::Local, StorageKind::InMemory)
             .unwrap();
         let toml_content =
-            fs::read_to_string(deployments.path("test-local").join(DEPLOYMENT_TOML))
-                .unwrap();
+            fs::read_to_string(deployments.path("test-local").join(DEPLOYMENT_TOML)).unwrap();
         assert!(!toml_content.contains("compose_file"));
         assert!(!toml_content.contains("observability"));
         assert!(!toml_content.contains("mimir"));
@@ -499,8 +493,7 @@ mod tests {
             .create("test-compose", PlatformKind::Compose, StorageKind::InMemory)
             .unwrap();
         let toml_content =
-            fs::read_to_string(deployments.path("test-compose").join(DEPLOYMENT_TOML))
-                .unwrap();
+            fs::read_to_string(deployments.path("test-compose").join(DEPLOYMENT_TOML)).unwrap();
         // compose_file removed — derived from deployment directory
         assert!(!toml_content.contains("compose_file"));
         assert!(toml_content.contains("observability"));

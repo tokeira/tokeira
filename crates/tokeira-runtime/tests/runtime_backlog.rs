@@ -4,8 +4,7 @@ use time::{Duration, OffsetDateTime};
 
 use tokeira_kernel::StartRequest;
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime,
-    WorkflowTimeoutScannerConfig,
+    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::InMemoryStore;
 use tokeira_types::{

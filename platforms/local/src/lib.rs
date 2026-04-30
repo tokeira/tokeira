@@ -36,8 +36,7 @@ impl PlatformConfig for LocalDeployment {
     fn prototypical_server_config(storage: StorageKind) -> String {
         let mut config = TokeiraConfig::default();
         if storage == StorageKind::Dsql {
-            config.infrastructure.dsql.endpoint =
-                Some("replace-with-dsql-endpoint".to_string());
+            config.infrastructure.dsql.endpoint = Some("replace-with-dsql-endpoint".to_string());
         }
         config.to_toml().expect("server config serializes")
     }
@@ -222,11 +221,7 @@ impl tokeira_orchestrator::Deployment for LocalDeployment {
         Box::new(LocalBackend::new(deployment_dir.join("state/deploy")))
     }
 
-    fn hydrate_config(
-        &self,
-        config: &Self::Config,
-        _state: &iac::InfraState,
-    ) -> Self::Config {
+    fn hydrate_config(&self, config: &Self::Config, _state: &iac::InfraState) -> Self::Config {
         config.clone()
     }
 
@@ -255,12 +250,7 @@ impl Ops for LocalDeployment {
         }]
     }
 
-    async fn scale_up(
-        &self,
-        _service: &str,
-        _replicas: u32,
-        _config: &Self::Config,
-    ) -> Result<()> {
+    async fn scale_up(&self, _service: &str, _replicas: u32, _config: &Self::Config) -> Result<()> {
         Err(anyhow::anyhow!("not supported for local platform").into())
     }
 

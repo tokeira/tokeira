@@ -18,8 +18,7 @@ pub const MODULE_OBSERVABILITY: &str = "observability";
 
 /// Build all compose service descriptors from config.
 pub fn compose_services(config: &ComposeConfig) -> Vec<ComposeService> {
-    let tokeirad_metrics =
-        format!("host.docker.internal:{}", config.tokeirad.metrics_port);
+    let tokeirad_metrics = format!("host.docker.internal:{}", config.tokeirad.metrics_port);
     vec![
         ComposeService {
             name: "mimir".into(),

@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use tokeira_iac::error::IacError;
 use tokeira_iac::{
     InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    error::IacError,
 };
 
 /// DynamoDB key type.
@@ -78,9 +78,7 @@ impl DynamoDbTable {
         }
     }
 
-    fn sdk_attribute_type(
-        at: AttributeType,
-    ) -> aws_sdk_dynamodb::types::ScalarAttributeType {
+    fn sdk_attribute_type(at: AttributeType) -> aws_sdk_dynamodb::types::ScalarAttributeType {
         match at {
             AttributeType::String => aws_sdk_dynamodb::types::ScalarAttributeType::S,
             AttributeType::Number => aws_sdk_dynamodb::types::ScalarAttributeType::N,
@@ -191,8 +189,7 @@ impl DynamoDbTable {
                     })?;
 
                 let ttl = output.time_to_live_description();
-                let current_attr =
-                    ttl.and_then(|ttl| ttl.attribute_name()).unwrap_or_default();
+                let current_attr = ttl.and_then(|ttl| ttl.attribute_name()).unwrap_or_default();
                 let current_status = ttl
                     .and_then(|ttl| ttl.time_to_live_status())
                     .map(|status| status.as_str())
@@ -311,9 +308,7 @@ impl Resource for DynamoDbTable {
                     .attribute_name(&ka.name)
                     .key_type(Self::sdk_key_type(ka.key_type))
                     .build()
-                    .map_err(|e| {
-                        IacError::AwsSdk(format!("dynamodb:CreateTable key_schema: {e}"))
-                    })
+                    .map_err(|e| IacError::AwsSdk(format!("dynamodb:CreateTable key_schema: {e}")))
             })
             .collect::<Result<_, _>>()?;
 
@@ -327,9 +322,7 @@ impl Resource for DynamoDbTable {
                     .attribute_type(Self::sdk_attribute_type(ka.attribute_type))
                     .build()
                     .map_err(|e| {
-                        IacError::AwsSdk(format!(
-                            "dynamodb:CreateTable attribute_definitions: {e}"
-                        ))
+                        IacError::AwsSdk(format!("dynamodb:CreateTable attribute_definitions: {e}"))
                     })
             })
             .collect::<Result<_, _>>()?;
@@ -354,9 +347,7 @@ impl Resource for DynamoDbTable {
                     tracing::warn!(table = %name, "table already exists, adopting");
                     true
                 } else {
-                    return Err(IacError::AwsSdk(format!(
-                        "dynamodb:CreateTable: {svc_err}"
-                    )));
+                    return Err(IacError::AwsSdk(format!("dynamodb:CreateTable: {svc_err}")));
                 }
             }
         };
@@ -417,16 +408,13 @@ impl Resource for DynamoDbTable {
             }
 
             if should_update_ttl {
-                let ttl_spec =
-                    aws_sdk_dynamodb::types::TimeToLiveSpecification::builder()
-                        .attribute_name(ttl_attr)
-                        .enabled(true)
-                        .build()
-                        .map_err(|e| {
-                            IacError::AwsSdk(format!(
-                                "dynamodb:UpdateTimeToLive build: {e}"
-                            ))
-                        })?;
+                let ttl_spec = aws_sdk_dynamodb::types::TimeToLiveSpecification::builder()
+                    .attribute_name(ttl_attr)
+                    .enabled(true)
+                    .build()
+                    .map_err(|e| {
+                        IacError::AwsSdk(format!("dynamodb:UpdateTimeToLive build: {e}"))
+                    })?;
                 ctx.extension::<crate::AwsClients>()
                     .expect("AwsClients")
                     .dynamodb
@@ -458,10 +446,7 @@ impl Resource for DynamoDbTable {
                 .send()
                 .await
                 .map_err(|e| {
-                    IacError::AwsSdk(format!(
-                        "dynamodb:TagResource: {}",
-                        e.into_service_error()
-                    ))
+                    IacError::AwsSdk(format!("dynamodb:TagResource: {}", e.into_service_error()))
                 })?;
         }
 
@@ -501,10 +486,7 @@ impl Resource for DynamoDbTable {
                 .send()
                 .await
                 .map_err(|e| {
-                    IacError::AwsSdk(format!(
-                        "dynamodb:TagResource: {}",
-                        e.into_service_error()
-                    ))
+                    IacError::AwsSdk(format!("dynamodb:TagResource: {}", e.into_service_error()))
                 })?;
         }
 
@@ -523,16 +505,13 @@ impl Resource for DynamoDbTable {
                         IacError::AwsSdk(format!("dynamodb:UpdateTimeToLive build: {e}"))
                     })?,
                 None => {
-                    let disable_attr =
-                        current_ttl_attribute.as_deref().unwrap_or("ttl_epoch");
+                    let disable_attr = current_ttl_attribute.as_deref().unwrap_or("ttl_epoch");
                     aws_sdk_dynamodb::types::TimeToLiveSpecification::builder()
                         .attribute_name(disable_attr)
                         .enabled(false)
                         .build()
                         .map_err(|e| {
-                            IacError::AwsSdk(format!(
-                                "dynamodb:UpdateTimeToLive build: {e}"
-                            ))
+                            IacError::AwsSdk(format!("dynamodb:UpdateTimeToLive build: {e}"))
                         })?
                 }
             };
@@ -598,9 +577,7 @@ impl Resource for DynamoDbTable {
                 if svc_err.is_resource_not_found_exception() {
                     tracing::warn!(table = %name, "table not found, skipping deletion");
                 } else {
-                    return Err(IacError::AwsSdk(format!(
-                        "dynamodb:DeleteTable: {svc_err}"
-                    )));
+                    return Err(IacError::AwsSdk(format!("dynamodb:DeleteTable: {svc_err}")));
                 }
             }
         }
@@ -608,10 +585,7 @@ impl Resource for DynamoDbTable {
         self.wait_until_deleted(ctx).await
     }
 
-    async fn describe(
-        &self,
-        ctx: &ProvisionContext,
-    ) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
         let name = &self.table_name;
 
         match ctx
@@ -635,9 +609,7 @@ impl Resource for DynamoDbTable {
                     .and_then(|s| s.billing_mode())
                     .map(|m| match m {
                         aws_sdk_dynamodb::types::BillingMode::PayPerRequest => "OnDemand",
-                        aws_sdk_dynamodb::types::BillingMode::Provisioned => {
-                            "Provisioned"
-                        }
+                        aws_sdk_dynamodb::types::BillingMode::Provisioned => "Provisioned",
                         _ => "",
                     })
                     .unwrap_or_default()
@@ -678,13 +650,11 @@ impl Resource for DynamoDbTable {
                         ))
                     })?
                     .time_to_live_description()
-                    .and_then(|ttl| {
-                        match ttl.time_to_live_status().map(|s| s.as_str()) {
-                            Some("ENABLED") | Some("ENABLING") => {
-                                ttl.attribute_name().map(str::to_string)
-                            }
-                            _ => None,
+                    .and_then(|ttl| match ttl.time_to_live_status().map(|s| s.as_str()) {
+                        Some("ENABLED") | Some("ENABLING") => {
+                            ttl.attribute_name().map(str::to_string)
                         }
+                        _ => None,
                     });
                 let now = chrono::Utc::now().to_rfc3339();
                 Ok(Some(ResourceState {

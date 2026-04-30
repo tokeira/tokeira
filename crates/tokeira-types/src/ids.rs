@@ -112,9 +112,7 @@ impl ShardEpoch {
 /// `TransitionSeq` matches the stored value.
 ///
 /// See `docs/architecture/010-history-as-authority.md`.
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TransitionSeq(pub u64);
 
 impl TransitionSeq {
@@ -143,9 +141,7 @@ impl TransitionSeq {
 /// detected and discarded.
 ///
 /// [`WorkflowTaskToken`]: crate::WorkflowTaskToken
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct LogicalTaskSeq(pub u64);
 
 impl LogicalTaskSeq {

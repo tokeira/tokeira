@@ -1,5 +1,7 @@
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use directories::ProjectDirs;
@@ -212,17 +214,13 @@ pub fn load_context(
     let deployment_config_path = path.join(DEPLOYMENT_TOML);
     let platform_config = match metadata.platform {
         PlatformKind::Local => {
-            let config: LocalConfig =
-                tokeira_config::load_config(&deployment_config_path, None).with_context(
-                    || format!("failed to load {}", deployment_config_path.display()),
-                )?;
+            let config: LocalConfig = tokeira_config::load_config(&deployment_config_path, None)
+                .with_context(|| format!("failed to load {}", deployment_config_path.display()))?;
             PlatformDeploymentConfig::Local(config)
         }
         PlatformKind::Compose => {
-            let config: ComposeConfig =
-                tokeira_config::load_config(&deployment_config_path, None).with_context(
-                    || format!("failed to load {}", deployment_config_path.display()),
-                )?;
+            let config: ComposeConfig = tokeira_config::load_config(&deployment_config_path, None)
+                .with_context(|| format!("failed to load {}", deployment_config_path.display()))?;
             PlatformDeploymentConfig::Compose(config)
         }
     };

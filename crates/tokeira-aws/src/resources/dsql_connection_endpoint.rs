@@ -1,9 +1,8 @@
-use std::collections::HashMap;
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
-use tokeira_iac::error::IacError;
 use tokeira_iac::{
     InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    error::IacError,
 };
 
 /// Configuration for a single DSQL connection endpoint resource.
@@ -96,9 +95,7 @@ impl DsqlConnectionEndpoint {
             .unwrap_or("unknown")
     }
 
-    fn endpoint_is_usable(
-        endpoint: &aws_sdk_ec2::types::VpcEndpoint,
-    ) -> Result<bool, IacError> {
+    fn endpoint_is_usable(endpoint: &aws_sdk_ec2::types::VpcEndpoint) -> Result<bool, IacError> {
         match Self::endpoint_state_summary(endpoint) {
             "available" => Ok(true),
             "pending" => Ok(false),
@@ -214,9 +211,7 @@ impl Resource for DsqlConnectionEndpoint {
             .properties
             .get("vpc_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                IacError::StateNotFound("vpc_id not found in VPC state".into())
-            })?
+            .ok_or_else(|| IacError::StateNotFound("vpc_id not found in VPC state".into()))?
             .to_string();
         let subnet_ids: Vec<String> = vpc_state
             .properties
@@ -236,9 +231,7 @@ impl Resource for DsqlConnectionEndpoint {
 
         let dsql_state = ctx.get_resource_state(&self.config.dsql_cluster_dependency)?;
         let cluster_id = Self::dsql_cluster_identifier(dsql_state).ok_or_else(|| {
-            IacError::StateNotFound(
-                "cluster_id/cluster_endpoint not found in DSQL state".into(),
-            )
+            IacError::StateNotFound("cluster_id/cluster_endpoint not found in DSQL state".into())
         })?;
 
         let svc = ctx
@@ -261,8 +254,7 @@ impl Resource for DsqlConnectionEndpoint {
                 "dsql:GetVpcEndpointServiceName: empty service_name".into(),
             ));
         }
-        let cluster_vpc_endpoint =
-            svc.cluster_vpc_endpoint().unwrap_or_default().to_string();
+        let cluster_vpc_endpoint = svc.cluster_vpc_endpoint().unwrap_or_default().to_string();
         let private_hostname = if cluster_vpc_endpoint.is_empty() {
             dsql_state
                 .properties
@@ -351,10 +343,7 @@ impl Resource for DsqlConnectionEndpoint {
                 .send()
                 .await
                 .map_err(|e| {
-                    IacError::AwsSdk(format!(
-                        "ec2:CreateTags: {}",
-                        e.into_service_error()
-                    ))
+                    IacError::AwsSdk(format!("ec2:CreateTags: {}", e.into_service_error()))
                 })?;
         }
 
@@ -452,10 +441,7 @@ impl Resource for DsqlConnectionEndpoint {
         }
     }
 
-    async fn describe(
-        &self,
-        ctx: &ProvisionContext,
-    ) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
         let Some(vpc_state) = ctx.state.resources.get(&self.config.vpc_dependency) else {
             return Ok(None);
         };
@@ -463,9 +449,7 @@ impl Resource for DsqlConnectionEndpoint {
             .properties
             .get("vpc_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                IacError::StateNotFound("vpc_id not found in VPC state".into())
-            })?
+            .ok_or_else(|| IacError::StateNotFound("vpc_id not found in VPC state".into()))?
             .to_string();
 
         let Some(dsql_state) = ctx
@@ -476,9 +460,7 @@ impl Resource for DsqlConnectionEndpoint {
             return Ok(None);
         };
         let cluster_id = Self::dsql_cluster_identifier(dsql_state).ok_or_else(|| {
-            IacError::StateNotFound(
-                "cluster_id/cluster_endpoint not found in DSQL state".into(),
-            )
+            IacError::StateNotFound("cluster_id/cluster_endpoint not found in DSQL state".into())
         })?;
 
         let svc = ctx
@@ -545,8 +527,7 @@ impl Resource for DsqlConnectionEndpoint {
             return Ok(None);
         };
         let endpoint_id = ep.vpc_endpoint_id().unwrap_or_default().to_string();
-        let cluster_vpc_endpoint =
-            svc.cluster_vpc_endpoint().unwrap_or_default().to_string();
+        let cluster_vpc_endpoint = svc.cluster_vpc_endpoint().unwrap_or_default().to_string();
         let private_hostname = if cluster_vpc_endpoint.is_empty() {
             dsql_state
                 .properties

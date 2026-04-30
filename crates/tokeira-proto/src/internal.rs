@@ -26,7 +26,6 @@ pub mod tokeira {
 pub const FILE_DESCRIPTOR_SET: &[u8] =
     tonic::include_file_descriptor_set!("tokeira_internal_descriptor");
 
-pub use tokeira::internal::admin::v1 as admin;
-pub use tokeira::internal::runtime::v1 as runtime;
+pub use tokeira::internal::{admin::v1 as admin, runtime::v1 as runtime};
 
 pub const ADMIN_SERVICE_NAME: &str = "tokeira.internal.admin.v1.AdminService";

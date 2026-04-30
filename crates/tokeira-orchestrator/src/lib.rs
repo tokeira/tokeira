@@ -19,8 +19,10 @@
 //!   [`Deployment::register_deploy_extensions`] attach clients, platforms, and
 //!   other provider handles to the execution contexts.
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -167,11 +169,7 @@ pub trait Deployment: Send + Sync {
     ///
     /// This lets later deployment phases consume values discovered during
     /// infrastructure apply without coupling them to a concrete state layout.
-    fn hydrate_config(
-        &self,
-        config: &Self::Config,
-        state: &iac::InfraState,
-    ) -> Self::Config;
+    fn hydrate_config(&self, config: &Self::Config, state: &iac::InfraState) -> Self::Config;
 
     /// Return config-file updates derived from the applied infrastructure state.
     ///
@@ -195,30 +193,17 @@ pub trait Ops: Send + Sync {
     fn desired_replicas(&self, config: &Self::Config) -> Vec<ServiceReplicas>;
 
     /// Increase the number of service instances by the requested amount.
-    async fn scale_up(
-        &self,
-        service: &str,
-        replicas: u32,
-        config: &Self::Config,
-    ) -> Result<()>;
+    async fn scale_up(&self, service: &str, replicas: u32, config: &Self::Config) -> Result<()>;
 
     /// Decrease the number of service instances by the requested amount.
-    async fn scale_down(
-        &self,
-        service: &str,
-        replicas: u32,
-        config: &Self::Config,
-    ) -> Result<()>;
+    async fn scale_down(&self, service: &str, replicas: u32, config: &Self::Config) -> Result<()>;
 
     /// Return recent logs for the named service.
     async fn logs(&self, service: &str, config: &Self::Config) -> Result<Vec<String>>;
 
     /// Return all host/container port mappings for the named service.
-    async fn port_mappings(
-        &self,
-        service: &str,
-        config: &Self::Config,
-    ) -> Result<Vec<PortMapping>>;
+    async fn port_mappings(&self, service: &str, config: &Self::Config)
+    -> Result<Vec<PortMapping>>;
 }
 
 pub struct InfraEngine<D: Deployment> {
@@ -237,11 +222,7 @@ impl<D: Deployment> InfraEngine<D> {
     /// extensions, and keeps the hydrated config after apply. Custom
     /// deployments do not normally implement their own engine; they implement
     /// [`Deployment`] and let this facade coordinate state and ordering.
-    pub async fn new(
-        deployment: D,
-        config: &D::Config,
-        deployment_dir: &Path,
-    ) -> Result<Self> {
+    pub async fn new(deployment: D, config: &D::Config, deployment_dir: &Path) -> Result<Self> {
         let mut ctx = iac::ProvisionContext::default();
         let state_store = Arc::new(StateStore::new(
             deployment.create_infra_store(config, deployment_dir),
@@ -262,10 +243,7 @@ impl<D: Deployment> InfraEngine<D> {
         })
     }
 
-    pub fn compose(
-        &self,
-        selection: iac::ModuleSelection,
-    ) -> Result<iac::InfraComposition> {
+    pub fn compose(&self, selection: iac::ModuleSelection) -> Result<iac::InfraComposition> {
         let remote_state = self
             .deployment
             .remote_state_module(&self.config, &self.deployment_dir);
@@ -301,20 +279,14 @@ impl<D: Deployment> InfraEngine<D> {
 
     /// Plan infrastructure changes without calling resource lifecycle methods
     /// that mutate provider state.
-    pub async fn plan(
-        &mut self,
-        composition: &iac::InfraComposition,
-    ) -> Result<Vec<iac::Change>> {
+    pub async fn plan(&mut self, composition: &iac::InfraComposition) -> Result<Vec<iac::Change>> {
         let (state, _) = self.state_store.load().await?;
         self.ctx.state = state;
         Ok(self.engine.plan(composition, &mut self.ctx).await?)
     }
 
     /// Apply infrastructure changes and persist the resulting state document.
-    pub async fn apply(
-        &mut self,
-        composition: &iac::InfraComposition,
-    ) -> Result<Vec<iac::Change>> {
+    pub async fn apply(&mut self, composition: &iac::InfraComposition) -> Result<Vec<iac::Change>> {
         let (state, version) = self.state_store.load().await?;
         self.ctx.state = state;
         let saver = self.make_saver(version.clone());
@@ -382,11 +354,7 @@ impl<D: Deployment> DeployEngine<D> {
     ///
     /// The facade loads runtime state on each plan/apply call and delegates
     /// provider-specific manifest application to the supplied platform.
-    pub async fn new(
-        deployment: D,
-        config: &D::Config,
-        deployment_dir: &Path,
-    ) -> Result<Self> {
+    pub async fn new(deployment: D, config: &D::Config, deployment_dir: &Path) -> Result<Self> {
         let mut service_ctx = deploy_engine::ServiceContext::default();
         let image_ctx = deploy_engine::ImageContext::default();
         deployment
@@ -574,8 +542,7 @@ mod tests {
         fn manifests(
             &self,
             _ctx: &deploy_engine::ServiceContext,
-        ) -> std::result::Result<Vec<serde_json::Value>, deploy_engine::DeployError>
-        {
+        ) -> std::result::Result<Vec<serde_json::Value>, deploy_engine::DeployError> {
             Ok(vec![serde_json::json!({"service": "ok"})])
         }
     }
@@ -615,10 +582,7 @@ mod tests {
             vec![Box::new(TestModule("app"))]
         }
 
-        fn services(
-            &self,
-            _config: &Self::Config,
-        ) -> Vec<Box<dyn deploy_engine::Service>> {
+        fn services(&self, _config: &Self::Config) -> Vec<Box<dyn deploy_engine::Service>> {
             vec![Box::new(TestService)]
         }
 
@@ -662,11 +626,7 @@ mod tests {
             Box::new(LocalBackend::new(deployment_dir.join("state/deploy")))
         }
 
-        fn hydrate_config(
-            &self,
-            config: &Self::Config,
-            _state: &iac::InfraState,
-        ) -> Self::Config {
+        fn hydrate_config(&self, config: &Self::Config, _state: &iac::InfraState) -> Self::Config {
             config.clone()
         }
 

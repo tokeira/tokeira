@@ -4,12 +4,12 @@ use tokeira_deploy_engine::Platform;
 use tokeira_local_deployment::LocalDeployment;
 use tokeira_orchestrator::{DeployEngine, PlatformKind};
 
-use crate::cli::DeployAction;
-use crate::deployment_dir::{
-    DeploymentContext, DeploymentResolver, PlatformDeploymentConfig,
+use crate::{
+    cli::DeployAction,
+    deployment_dir::{DeploymentContext, DeploymentResolver, PlatformDeploymentConfig},
+    metadata::DeploymentStatus,
+    process,
 };
-use crate::metadata::DeploymentStatus;
-use crate::process;
 
 pub async fn run(
     action: DeployAction,
@@ -19,13 +19,11 @@ pub async fn run(
     match action {
         DeployAction::Plan => match &ctx.platform_config {
             PlatformDeploymentConfig::Local(config) => {
-                let mut engine =
-                    DeployEngine::new(LocalDeployment, config, &ctx.path).await?;
+                let mut engine = DeployEngine::new(LocalDeployment, config, &ctx.path).await?;
                 print_plan(&engine.plan().await?);
             }
             PlatformDeploymentConfig::Compose(config) => {
-                let mut engine =
-                    DeployEngine::new(ComposeDeployment, config, &ctx.path).await?;
+                let mut engine = DeployEngine::new(ComposeDeployment, config, &ctx.path).await?;
                 print_plan(&engine.plan().await?);
             }
         },
@@ -42,10 +40,8 @@ pub async fn run(
                     let mut engine =
                         DeployEngine::new(ComposeDeployment, config, &ctx.path).await?;
                     let compose_file = ctx.path.join("docker-compose.yml");
-                    let platform = ComposeDeployment::compose_platform(
-                        &compose_file,
-                        &config.project_name,
-                    )?;
+                    let platform =
+                        ComposeDeployment::compose_platform(&compose_file, &config.project_name)?;
                     print_plan(&engine.apply(&platform as &dyn Platform).await?);
                     deployments.update_status(&ctx.name, DeploymentStatus::Running)?;
                 }

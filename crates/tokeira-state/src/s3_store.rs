@@ -18,23 +18,22 @@
 //! - Reads follow the manifest head, fetch the referenced snapshot, and verify
 //!   its SHA-256 digest against the checksum recorded in the manifest.
 
-use std::marker::PhantomData;
-use std::process;
-use std::time::Duration;
+use std::{marker::PhantomData, process, time::Duration};
 
-use aws_sdk_s3::error::ProvideErrorMetadata;
-use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode, ServerSideEncryption};
+use aws_sdk_s3::{
+    error::ProvideErrorMetadata,
+    primitives::ByteStream,
+    types::{ChecksumAlgorithm, ChecksumMode, ServerSideEncryption},
+};
 use chrono::{Duration as ChronoDuration, Utc};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::Validate;
-use crate::error::StateError;
-use crate::manifest::{
-    LockGuard, ManifestState, SnapshotRef, StateLeaseLock, StateManifest,
+use crate::{
+    Validate,
+    error::StateError,
+    manifest::{LockGuard, ManifestState, SnapshotRef, StateLeaseLock, StateManifest},
 };
 
 /// Generic S3-backed state store with CAS-updated manifest and immutable snapshots.
@@ -87,9 +86,8 @@ impl<T: Serialize + DeserializeOwned + Default + Validate> S3StateStore<T> {
 
     /// Persist a new state snapshot and atomically move the manifest head.
     pub async fn save(&self, state: &T) -> Result<(), StateError> {
-        let bytes = serde_json::to_vec_pretty(state).map_err(|e| {
-            StateError::Corrupted(format!("failed to serialize state: {e}"))
-        })?;
+        let bytes = serde_json::to_vec_pretty(state)
+            .map_err(|e| StateError::Corrupted(format!("failed to serialize state: {e}")))?;
         let guard = self
             .acquire_lock(self.owner_id.clone(), Self::DEFAULT_LEASE_DURATION)
             .await?;
@@ -120,9 +118,8 @@ impl<T: Serialize + DeserializeOwned + Default + Validate> S3StateStore<T> {
         lease_duration: Duration,
     ) -> Result<LockGuard, StateError> {
         let owner_id = owner_id.into();
-        let lease_delta = ChronoDuration::from_std(lease_duration).map_err(|e| {
-            StateError::Other(anyhow::anyhow!("invalid lease duration: {e}"))
-        })?;
+        let lease_delta = ChronoDuration::from_std(lease_duration)
+            .map_err(|e| StateError::Other(anyhow::anyhow!("invalid lease duration: {e}")))?;
 
         loop {
             let current = self.ensure_manifest().await?;
@@ -169,14 +166,14 @@ impl<T: Serialize + DeserializeOwned + Default + Validate> S3StateStore<T> {
         guard: &mut LockGuard,
         lease_duration: Duration,
     ) -> Result<(), StateError> {
-        let lease_delta = ChronoDuration::from_std(lease_duration).map_err(|e| {
-            StateError::Other(anyhow::anyhow!("invalid lease duration: {e}"))
-        })?;
+        let lease_delta = ChronoDuration::from_std(lease_duration)
+            .map_err(|e| StateError::Other(anyhow::anyhow!("invalid lease duration: {e}")))?;
         let current = self.ensure_manifest().await?;
-        let current_lock =
-            current.manifest.lock.as_ref().ok_or_else(|| {
-                StateError::LockLost("manifest has no active lock".into())
-            })?;
+        let current_lock = current
+            .manifest
+            .lock
+            .as_ref()
+            .ok_or_else(|| StateError::LockLost("manifest has no active lock".into()))?;
 
         if current_lock.token != guard.token || current_lock.owner_id != guard.owner_id {
             return Err(StateError::LockLost(
@@ -202,10 +199,11 @@ impl<T: Serialize + DeserializeOwned + Default + Validate> S3StateStore<T> {
         state_bytes: &[u8],
     ) -> Result<SnapshotRef, StateError> {
         let current = self.ensure_manifest().await?;
-        let current_lock =
-            current.manifest.lock.as_ref().ok_or_else(|| {
-                StateError::LockLost("manifest has no active lock".into())
-            })?;
+        let current_lock = current
+            .manifest
+            .lock
+            .as_ref()
+            .ok_or_else(|| StateError::LockLost("manifest has no active lock".into()))?;
 
         if current_lock.token != guard.token || current_lock.owner_id != guard.owner_id {
             return Err(StateError::LockLost(
@@ -229,8 +227,7 @@ impl<T: Serialize + DeserializeOwned + Default + Validate> S3StateStore<T> {
         match self.put_manifest_if_match(&current.etag, &next).await {
             Ok(_) => Ok(snapshot),
             Err(StateError::Conflict(_)) => Err(StateError::Conflict(
-                "manifest changed during commit; snapshot was uploaded but not committed"
-                    .into(),
+                "manifest changed during commit; snapshot was uploaded but not committed".into(),
             )),
             Err(err) => Err(err),
         }
@@ -239,10 +236,11 @@ impl<T: Serialize + DeserializeOwned + Default + Validate> S3StateStore<T> {
     /// Release a held manifest lease without moving the head pointer.
     pub async fn unlock(&self, guard: &LockGuard) -> Result<(), StateError> {
         let current = self.ensure_manifest().await?;
-        let current_lock =
-            current.manifest.lock.as_ref().ok_or_else(|| {
-                StateError::LockLost("manifest has no active lock".into())
-            })?;
+        let current_lock = current
+            .manifest
+            .lock
+            .as_ref()
+            .ok_or_else(|| StateError::LockLost("manifest has no active lock".into()))?;
 
         if current_lock.token != guard.token || current_lock.owner_id != guard.owner_id {
             return Err(StateError::LockLost(
@@ -274,10 +272,7 @@ impl<T: Serialize + DeserializeOwned + Default + Validate> S3StateStore<T> {
 
     // ── Private helpers ──────────────────────────────────────────
 
-    async fn load_snapshot(
-        &self,
-        manifest_state: &ManifestState,
-    ) -> Result<T, StateError> {
+    async fn load_snapshot(&self, manifest_state: &ManifestState) -> Result<T, StateError> {
         let head = match &manifest_state.manifest.head {
             Some(head) => head,
             None => return Ok(T::default()),
@@ -384,9 +379,8 @@ impl<T: Serialize + DeserializeOwned + Default + Validate> S3StateStore<T> {
         &self,
         manifest: &StateManifest,
     ) -> Result<ManifestState, StateError> {
-        let body = serde_json::to_vec_pretty(manifest).map_err(|e| {
-            StateError::Corrupted(format!("failed to serialize manifest: {e}"))
-        })?;
+        let body = serde_json::to_vec_pretty(manifest)
+            .map_err(|e| StateError::Corrupted(format!("failed to serialize manifest: {e}")))?;
         let (etag, version_id) = self
             .put_bytes(
                 &self.manifest_key,
@@ -409,9 +403,8 @@ impl<T: Serialize + DeserializeOwned + Default + Validate> S3StateStore<T> {
         expected_etag: &str,
         manifest: &StateManifest,
     ) -> Result<ManifestState, StateError> {
-        let body = serde_json::to_vec_pretty(manifest).map_err(|e| {
-            StateError::Corrupted(format!("failed to serialize manifest: {e}"))
-        })?;
+        let body = serde_json::to_vec_pretty(manifest)
+            .map_err(|e| StateError::Corrupted(format!("failed to serialize manifest: {e}")))?;
         let (etag, version_id) = self
             .put_bytes(
                 &self.manifest_key,
@@ -519,10 +512,7 @@ impl<T: Serialize + DeserializeOwned + Default + Validate> S3StateStore<T> {
         Ok((etag.to_string(), output.version_id().map(ToOwned::to_owned)))
     }
 
-    fn lock_has_expired(
-        expires_at: chrono::DateTime<Utc>,
-        now: chrono::DateTime<Utc>,
-    ) -> bool {
+    fn lock_has_expired(expires_at: chrono::DateTime<Utc>, now: chrono::DateTime<Utc>) -> bool {
         let tolerance = ChronoDuration::from_std(Self::LOCK_SKEW_TOLERANCE)
             .expect("lock skew tolerance should be a valid chrono duration");
         expires_at + tolerance <= now
@@ -555,9 +545,7 @@ fn has_missing_status(
         .unwrap_or(false)
 }
 
-fn format_sdk_error<E: ProvideErrorMetadata>(
-    err: &aws_sdk_s3::error::SdkError<E>,
-) -> String {
+fn format_sdk_error<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) -> String {
     let mut details = Vec::new();
 
     details.push(format!("kind={err}"));

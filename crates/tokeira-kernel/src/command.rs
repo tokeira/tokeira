@@ -1,12 +1,14 @@
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
     BuildId, DeploymentId, Headers, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads,
-    RequestContext, RetryPolicy, RunId, RunKey, SearchAttributes, TaskQueueName,
-    WorkerIdentity, WorkflowId, WorkflowTaskToken, WorkflowType,
+    RequestContext, RetryPolicy, RunId, RunKey, SearchAttributes, TaskQueueName, WorkerIdentity,
+    WorkflowId, WorkflowTaskToken, WorkflowType,
 };
 
-use crate::event::ActivityResolution;
-use crate::state::{CompletionCallback, ParentClosePolicy, VersioningOverride};
+use crate::{
+    event::ActivityResolution,
+    state::{CompletionCallback, ParentClosePolicy, VersioningOverride},
+};
 
 /// Commands are authoritative things that the server has decided happened.
 ///

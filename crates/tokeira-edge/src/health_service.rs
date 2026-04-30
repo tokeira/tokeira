@@ -72,10 +72,7 @@ impl std::fmt::Debug for HealthService {
 }
 
 impl HealthService {
-    pub fn new(
-        reporter: Arc<dyn HealthReporter>,
-        interceptors: Arc<EdgeInterceptors>,
-    ) -> Self {
+    pub fn new(reporter: Arc<dyn HealthReporter>, interceptors: Arc<EdgeInterceptors>) -> Self {
         Self {
             reporter,
             interceptors,

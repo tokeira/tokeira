@@ -70,9 +70,7 @@ impl WorkerRegistry {
 mod tests {
     use proptest::prelude::*;
     use time::{Duration, OffsetDateTime};
-    use tokeira_types::{
-        BuildId, DeploymentId, NamespaceId, TaskQueueName, WorkerIdentity,
-    };
+    use tokeira_types::{BuildId, DeploymentId, NamespaceId, TaskQueueName, WorkerIdentity};
 
     use super::{WorkerRegistrationKey, WorkerRegistry, WorkerVersionMetadata};
 

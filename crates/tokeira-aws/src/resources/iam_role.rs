@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
-use tokeira_iac::error::IacError;
 use tokeira_iac::{
     InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    error::IacError,
 };
 
 // ── Config and resource structs ──────────────────────────────────────────────
@@ -27,11 +27,7 @@ pub struct IamRole {
 }
 
 impl IamRole {
-    pub fn new(
-        role_name: String,
-        config: IamRoleConfig,
-        rctx: &crate::ResourceContext,
-    ) -> Self {
+    pub fn new(role_name: String, config: IamRoleConfig, rctx: &crate::ResourceContext) -> Self {
         Self {
             role_name,
             config,
@@ -105,10 +101,7 @@ impl Resource for IamRole {
                         .send()
                         .await
                         .map_err(|e| {
-                            IacError::AwsSdk(format!(
-                                "iam:GetRole: {}",
-                                e.into_service_error()
-                            ))
+                            IacError::AwsSdk(format!("iam:GetRole: {}", e.into_service_error()))
                         })?;
                     get_output
                         .role()
@@ -129,9 +122,7 @@ impl Resource for IamRole {
             .set_tags(Some(super::iam_tags(&tags)))
             .send()
             .await
-            .map_err(|e| {
-                IacError::AwsSdk(format!("iam:TagRole: {}", e.into_service_error()))
-            })?;
+            .map_err(|e| IacError::AwsSdk(format!("iam:TagRole: {}", e.into_service_error())))?;
 
         // iam:PutRolePolicy per inline policy
         for (policy_name, policy_document) in &self.config.inline_policies {
@@ -145,10 +136,7 @@ impl Resource for IamRole {
                 .send()
                 .await
                 .map_err(|e| {
-                    IacError::AwsSdk(format!(
-                        "iam:PutRolePolicy: {}",
-                        e.into_service_error()
-                    ))
+                    IacError::AwsSdk(format!("iam:PutRolePolicy: {}", e.into_service_error()))
                 })?;
         }
 
@@ -163,10 +151,7 @@ impl Resource for IamRole {
                 .send()
                 .await
                 .map_err(|e| {
-                    IacError::AwsSdk(format!(
-                        "iam:AttachRolePolicy: {}",
-                        e.into_service_error()
-                    ))
+                    IacError::AwsSdk(format!("iam:AttachRolePolicy: {}", e.into_service_error()))
                 })?;
         }
 
@@ -268,9 +253,7 @@ impl Resource for IamRole {
             Err(e) => {
                 let svc_err = e.into_service_error();
                 if !svc_err.is_no_such_entity_exception() {
-                    return Err(IacError::AwsSdk(format!(
-                        "iam:ListRolePolicies: {svc_err}"
-                    )));
+                    return Err(IacError::AwsSdk(format!("iam:ListRolePolicies: {svc_err}")));
                 }
             }
         }
@@ -299,10 +282,7 @@ impl Resource for IamRole {
         Ok(())
     }
 
-    async fn describe(
-        &self,
-        ctx: &ProvisionContext,
-    ) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
         let name = &self.role_name;
 
         match ctx
@@ -328,10 +308,7 @@ impl Resource for IamRole {
                     .send()
                     .await
                     .map_err(|e| {
-                        IacError::AwsSdk(format!(
-                            "iam:ListRoleTags: {}",
-                            e.into_service_error()
-                        ))
+                        IacError::AwsSdk(format!("iam:ListRoleTags: {}", e.into_service_error()))
                     })?;
                 let inline_policies = ctx
                     .extension::<crate::AwsClients>()
@@ -382,8 +359,7 @@ impl Resource for IamRole {
                     let raw_policy_document = response.policy_document().to_string();
                     let parsed_policy_document =
                         crate::iam_policy::canonical_policy_string(&raw_policy_document);
-                    inline_policy_documents
-                        .insert(policy_name.to_string(), parsed_policy_document);
+                    inline_policy_documents.insert(policy_name.to_string(), parsed_policy_document);
                 }
 
                 let live_tags = normalize_string_map(
@@ -480,9 +456,7 @@ impl Resource for IamRole {
             .set_tags(Some(iam_tags))
             .send()
             .await
-            .map_err(|e| {
-                IacError::AwsSdk(format!("iam:TagRole: {}", e.into_service_error()))
-            })?;
+            .map_err(|e| IacError::AwsSdk(format!("iam:TagRole: {}", e.into_service_error())))?;
 
         let stale_inline_policy_names: Vec<String> = current_inline_policies
             .keys()
@@ -499,10 +473,7 @@ impl Resource for IamRole {
                 .send()
                 .await
                 .map_err(|e| {
-                    IacError::AwsSdk(format!(
-                        "iam:DeleteRolePolicy: {}",
-                        e.into_service_error()
-                    ))
+                    IacError::AwsSdk(format!("iam:DeleteRolePolicy: {}", e.into_service_error()))
                 })?;
         }
 
@@ -518,10 +489,7 @@ impl Resource for IamRole {
                 .send()
                 .await
                 .map_err(|e| {
-                    IacError::AwsSdk(format!(
-                        "iam:PutRolePolicy: {}",
-                        e.into_service_error()
-                    ))
+                    IacError::AwsSdk(format!("iam:PutRolePolicy: {}", e.into_service_error()))
                 })?;
         }
 
@@ -540,10 +508,7 @@ impl Resource for IamRole {
                 .send()
                 .await
                 .map_err(|e| {
-                    IacError::AwsSdk(format!(
-                        "iam:DetachRolePolicy: {}",
-                        e.into_service_error()
-                    ))
+                    IacError::AwsSdk(format!("iam:DetachRolePolicy: {}", e.into_service_error()))
                 })?;
         }
         for policy_arn in desired_managed_policy_arns
@@ -559,10 +524,7 @@ impl Resource for IamRole {
                 .send()
                 .await
                 .map_err(|e| {
-                    IacError::AwsSdk(format!(
-                        "iam:AttachRolePolicy: {}",
-                        e.into_service_error()
-                    ))
+                    IacError::AwsSdk(format!("iam:AttachRolePolicy: {}", e.into_service_error()))
                 })?;
         }
 

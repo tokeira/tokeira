@@ -37,10 +37,7 @@ where
         commit_result_to_outcome(result)
     }
 
-    async fn start_workflow_with_policy(
-        &self,
-        req: StartRequest,
-    ) -> Result<StartWorkflowResult> {
+    async fn start_workflow_with_policy(&self, req: StartRequest) -> Result<StartWorkflowResult> {
         self.runtime.start_workflow_with_policy(req).await
     }
 
@@ -243,12 +240,7 @@ where
         resolution: NexusResolution,
     ) -> Result<bool> {
         self.runtime
-            .resolve_nexus_operation(
-                run_key,
-                operation_id,
-                scheduled_event_id,
-                resolution,
-            )
+            .resolve_nexus_operation(run_key, operation_id, scheduled_event_id, resolution)
             .await
     }
 }
@@ -256,17 +248,16 @@ where
 pub fn commit_result_to_outcome(result: CommitResult) -> Result<WorkflowMutationOutcome> {
     match result {
         CommitResult::Applied { new_state } => {
-            let new_run_id =
-                if new_state.status == tokeira_types::ExecutionStatus::ContinuedAsNew {
-                    // The new run ID is not directly
-                    // available on WorkflowState; the
-                    // caller should extract it from the
-                    // ContinuedAsNew history event. For
-                    // now we leave it as None.
-                    None
-                } else {
-                    None
-                };
+            let new_run_id = if new_state.status == tokeira_types::ExecutionStatus::ContinuedAsNew {
+                // The new run ID is not directly
+                // available on WorkflowState; the
+                // caller should extract it from the
+                // ContinuedAsNew history event. For
+                // now we leave it as None.
+                None
+            } else {
+                None
+            };
             Ok(WorkflowMutationOutcome {
                 transition_seq: new_state.transition_seq.0,
                 last_event_id: new_state.last_event_id,

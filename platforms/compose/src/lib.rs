@@ -34,10 +34,7 @@ use services::{ComposeImage, ComposeWorkload};
 pub struct ComposeDeployment;
 
 impl ComposeDeployment {
-    pub fn compose_platform(
-        compose_file: &Path,
-        project_name: &str,
-    ) -> Result<ComposePlatform> {
+    pub fn compose_platform(compose_file: &Path, project_name: &str) -> Result<ComposePlatform> {
         ComposePlatform::connect(compose_file, project_name)
             .map_err(anyhow::Error::from)
             .map_err(Into::into)
@@ -81,8 +78,7 @@ impl PlatformConfig for ComposeDeployment {
     fn prototypical_server_config(storage: StorageKind) -> String {
         let mut config = TokeiraConfig::default();
         if storage == StorageKind::Dsql {
-            config.infrastructure.dsql.endpoint =
-                Some("replace-with-dsql-endpoint".to_string());
+            config.infrastructure.dsql.endpoint = Some("replace-with-dsql-endpoint".to_string());
         }
         config.to_toml().expect("server config serializes")
     }
@@ -122,9 +118,7 @@ impl tokeira_orchestrator::Deployment for ComposeDeployment {
     fn services(&self, config: &Self::Config) -> Vec<Box<dyn deploy_engine::Service>> {
         compose_services(config)
             .into_iter()
-            .map(|service| {
-                Box::new(ComposeWorkload { service }) as Box<dyn deploy_engine::Service>
-            })
+            .map(|service| Box::new(ComposeWorkload { service }) as Box<dyn deploy_engine::Service>)
             .collect()
     }
 
@@ -176,11 +170,7 @@ impl tokeira_orchestrator::Deployment for ComposeDeployment {
         Box::new(LocalBackend::new(deployment_dir.join("state/deploy")))
     }
 
-    fn hydrate_config(
-        &self,
-        config: &Self::Config,
-        _state: &iac::InfraState,
-    ) -> Self::Config {
+    fn hydrate_config(&self, config: &Self::Config, _state: &iac::InfraState) -> Self::Config {
         config.clone()
     }
 
@@ -206,12 +196,7 @@ impl Ops for ComposeDeployment {
         Self::desired_service_replicas(config)
     }
 
-    async fn scale_up(
-        &self,
-        _service: &str,
-        _replicas: u32,
-        _config: &Self::Config,
-    ) -> Result<()> {
+    async fn scale_up(&self, _service: &str, _replicas: u32, _config: &Self::Config) -> Result<()> {
         Err(anyhow::anyhow!("use scale_up_with_dir for compose platform").into())
     }
 
@@ -250,10 +235,8 @@ impl ComposeDeployment {
         config: &ComposeConfig,
         deployment_dir: &Path,
     ) -> Result<()> {
-        let compose = Self::compose_platform(
-            &compose_file_for(deployment_dir),
-            &config.project_name,
-        )?;
+        let compose =
+            Self::compose_platform(&compose_file_for(deployment_dir), &config.project_name)?;
         let desired = compose_services(config)
             .into_iter()
             .find(|candidate| candidate.name == service)
@@ -274,10 +257,8 @@ impl ComposeDeployment {
         config: &ComposeConfig,
         deployment_dir: &Path,
     ) -> Result<()> {
-        let compose = Self::compose_platform(
-            &compose_file_for(deployment_dir),
-            &config.project_name,
-        )?;
+        let compose =
+            Self::compose_platform(&compose_file_for(deployment_dir), &config.project_name)?;
         for replica in 0..replicas {
             compose
                 .delete_service(&format!("{service}-{replica}"))
@@ -294,11 +275,9 @@ impl ComposeDeployment {
         deployment_dir: &Path,
     ) -> Result<Vec<String>> {
         if !self.valid_services().contains(&service) {
-            return Err(anyhow::anyhow!(invalid_service_message(
-                self.valid_services(),
-                service
-            ))
-            .into());
+            return Err(
+                anyhow::anyhow!(invalid_service_message(self.valid_services(), service)).into(),
+            );
         }
         Self::compose_platform(&compose_file_for(deployment_dir), &config.project_name)?
             .logs(service)
@@ -314,11 +293,9 @@ impl ComposeDeployment {
         deployment_dir: &Path,
     ) -> Result<Vec<PortMapping>> {
         if !self.valid_services().contains(&service) {
-            return Err(anyhow::anyhow!(invalid_service_message(
-                self.valid_services(),
-                service
-            ))
-            .into());
+            return Err(
+                anyhow::anyhow!(invalid_service_message(self.valid_services(), service)).into(),
+            );
         }
         Self::compose_platform(&compose_file_for(deployment_dir), &config.project_name)?
             .port_mappings(service)
@@ -358,8 +335,7 @@ mod tests {
     fn arb_invalid_service() -> impl Strategy<Value = String> {
         "[a-z][a-z0-9_-]{0,15}"
             .prop_filter("must not collide with a valid service", |candidate| {
-                !["tokeirad", "mimir", "grafana", "loki", "alloy"]
-                    .contains(&candidate.as_str())
+                !["tokeirad", "mimir", "grafana", "loki", "alloy"].contains(&candidate.as_str())
             })
             .prop_map(|s| s.to_string())
     }
@@ -380,8 +356,7 @@ mod tests {
     #[test]
     fn infra_modules_use_logical_names() {
         let config = ComposeConfig::default();
-        let modules =
-            ComposeDeployment.infra_modules(&config, &iac::ModuleSelection::All);
+        let modules = ComposeDeployment.infra_modules(&config, &iac::ModuleSelection::All);
         let names: Vec<String> = modules
             .iter()
             .map(|module| module.name().to_string())

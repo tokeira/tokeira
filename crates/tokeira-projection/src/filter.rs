@@ -14,8 +14,7 @@ use tokeira_types::{ExecutionStatus, NamespaceId};
 use crate::{
     store::VisibilityStore,
     types::{
-        CompareOp, CompiledFilter, FieldRef, FilterExpr, FilterValue, SearchAttrType,
-        SystemField,
+        CompareOp, CompiledFilter, FieldRef, FilterExpr, FilterValue, SearchAttrType, SystemField,
     },
 };
 
@@ -205,8 +204,7 @@ fn ensure_value_type(field: &FieldRef, value: &FilterValue) -> Result<()> {
         FieldRef::System(SystemField::ExecutionStatus) => {
             matches!(value, FilterValue::Status(_))
         }
-        FieldRef::System(SystemField::StartTime)
-        | FieldRef::System(SystemField::CloseTime) => {
+        FieldRef::System(SystemField::StartTime) | FieldRef::System(SystemField::CloseTime) => {
             matches!(value, FilterValue::Datetime(_))
         }
         FieldRef::System(SystemField::HistoryLength)
@@ -214,9 +212,7 @@ fn ensure_value_type(field: &FieldRef, value: &FilterValue) -> Result<()> {
             matches!(value, FilterValue::Int(_))
         }
         FieldRef::Custom { attr_type, .. } => match attr_type {
-            SearchAttrType::Keyword
-            | SearchAttrType::KeywordList
-            | SearchAttrType::Text => {
+            SearchAttrType::Keyword | SearchAttrType::KeywordList | SearchAttrType::Text => {
                 matches!(value, FilterValue::String(_))
             }
             SearchAttrType::Int => matches!(value, FilterValue::Int(_)),
@@ -240,8 +236,7 @@ fn ensure_starts_with_field(field: &FieldRef) -> Result<()> {
         | FieldRef::System(SystemField::WorkflowType)
         | FieldRef::System(SystemField::TaskQueue)
         | FieldRef::Custom {
-            attr_type:
-                SearchAttrType::Keyword | SearchAttrType::KeywordList | SearchAttrType::Text,
+            attr_type: SearchAttrType::Keyword | SearchAttrType::KeywordList | SearchAttrType::Text,
             ..
         } => Ok(()),
         _ => Err(anyhow!("type mismatch for filter field")),

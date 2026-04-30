@@ -6,14 +6,13 @@ use tokeira_kernel::{
     StartRequest, UpdateProtocolBody, WorkflowCommand, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, UpdateOutcome,
-    UpdateWaitPolicy, WorkflowTimeoutScannerConfig,
+    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, UpdateOutcome, UpdateWaitPolicy,
+    WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
-    ExecutionRef, Memo, NamespaceId, Payload, Payloads, QueueKey, RequestContext,
-    RequestId, SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId,
-    WorkflowType,
+    ExecutionRef, Memo, NamespaceId, Payload, Payloads, QueueKey, RequestContext, RequestId,
+    SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
 };
 
 #[tokio::test]
@@ -22,8 +21,7 @@ async fn update_completed_notifies_waiting_caller() -> Result<()> {
     let runtime = Arc::new(make_runtime(store.clone()));
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("update-complete".into());
-    let run_key =
-        start_workflow(&runtime, namespace_id, workflow_id.clone(), "queue-a").await?;
+    let run_key = start_workflow(&runtime, namespace_id, workflow_id.clone(), "queue-a").await?;
 
     let runtime_for_update = runtime.clone();
     let workflow_id_for_update = workflow_id.clone();
@@ -87,8 +85,7 @@ async fn update_rejected_notifies_waiting_caller() -> Result<()> {
     let runtime = Arc::new(make_runtime(store.clone()));
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("update-reject".into());
-    let run_key =
-        start_workflow(&runtime, namespace_id, workflow_id.clone(), "queue-a").await?;
+    let run_key = start_workflow(&runtime, namespace_id, workflow_id.clone(), "queue-a").await?;
 
     let runtime_for_update = runtime.clone();
     let workflow_id_for_update = workflow_id.clone();
@@ -152,8 +149,7 @@ async fn update_timeout_does_not_block_late_completion_commit() -> Result<()> {
     let runtime = Arc::new(make_runtime(store.clone()));
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("update-timeout".into());
-    let run_key =
-        start_workflow(&runtime, namespace_id, workflow_id.clone(), "queue-a").await?;
+    let run_key = start_workflow(&runtime, namespace_id, workflow_id.clone(), "queue-a").await?;
 
     let error = runtime
         .update_workflow(
@@ -219,8 +215,7 @@ async fn run_close_notifies_waiting_update_callers() -> Result<()> {
     let runtime = Arc::new(make_runtime(store.clone()));
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("update-run-close".into());
-    let run_key =
-        start_workflow(&runtime, namespace_id, workflow_id.clone(), "queue-a").await?;
+    let run_key = start_workflow(&runtime, namespace_id, workflow_id.clone(), "queue-a").await?;
 
     let runtime_for_update = runtime.clone();
     let workflow_id_for_update = workflow_id.clone();
@@ -270,8 +265,7 @@ async fn multiple_updates_resolved_in_single_wft() -> Result<()> {
     let runtime = Arc::new(make_runtime(store.clone()));
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("update-multi".into());
-    let run_key =
-        start_workflow(&runtime, namespace_id, workflow_id.clone(), "queue-a").await?;
+    let run_key = start_workflow(&runtime, namespace_id, workflow_id.clone(), "queue-a").await?;
 
     // Submit two updates concurrently.
     let r1 = runtime.clone();

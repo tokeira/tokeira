@@ -4,9 +4,11 @@
 //! and a desired reference. [`ImageContext`] carries persisted state and
 //! typed extensions for resolution.
 
-use std::any::{Any, TypeId};
-use std::collections::HashMap;
-use std::fmt::Debug;
+use std::{
+    any::{Any, TypeId},
+    collections::HashMap,
+    fmt::Debug,
+};
 
 use serde::{Deserialize, Serialize};
 

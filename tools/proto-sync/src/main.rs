@@ -86,8 +86,7 @@ fn buf_export(version: &str, output: &Path) -> Result<()> {
 
 fn write_version_file(path: &Path, version: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     fs::write(path, version).with_context(|| format!("write {}", path.display()))?;
     Ok(())

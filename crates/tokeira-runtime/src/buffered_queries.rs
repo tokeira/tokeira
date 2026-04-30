@@ -46,11 +46,7 @@ impl BufferedQueryRegistry {
     ///
     /// Capacity is per run so one hot execution cannot consume unbounded memory
     /// and starve unrelated workflows.
-    pub fn buffer(
-        &self,
-        run_key: RunKey,
-        query: BufferedQuery,
-    ) -> Result<(), BufferedQuery> {
+    pub fn buffer(&self, run_key: RunKey, query: BufferedQuery) -> Result<(), BufferedQuery> {
         let mut inner = self.inner.lock().expect("buffered query registry poisoned");
         let queries = inner.entry(run_key).or_default();
         if queries.len() >= MAX_BUFFERED_QUERIES_PER_RUN {
@@ -60,11 +56,7 @@ impl BufferedQueryRegistry {
         Ok(())
     }
 
-    pub fn drain_satisfied(
-        &self,
-        run_key: RunKey,
-        observable_barrier: i64,
-    ) -> Vec<BufferedQuery> {
+    pub fn drain_satisfied(&self, run_key: RunKey, observable_barrier: i64) -> Vec<BufferedQuery> {
         let mut inner = self.inner.lock().expect("buffered query registry poisoned");
         let Some(queries) = inner.get_mut(&run_key) else {
             return Vec::new();

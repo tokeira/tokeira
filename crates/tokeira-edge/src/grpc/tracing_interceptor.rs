@@ -75,8 +75,11 @@ mod tests {
         field::{Field, Visit},
         span::{Attributes, Id},
     };
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
+    use tracing_subscriber::{
+        Layer,
+        layer::{Context, SubscriberExt},
+        registry::LookupSpan,
+    };
 
     #[derive(Clone, Default)]
     struct SpanCapture(Arc<Mutex<Vec<(String, HashMap<String, String>)>>>);
@@ -158,8 +161,8 @@ mod tests {
     async fn creates_root_span_without_traceparent() {
         let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
         let tracer = provider.tracer("test");
-        let subscriber = tracing_subscriber::registry()
-            .with(tracing_opentelemetry::layer().with_tracer(tracer));
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
         let dispatch = tracing::Dispatch::new(subscriber);
         let _guard = tracing::dispatcher::set_default(&dispatch);
 
@@ -172,8 +175,7 @@ mod tests {
             Some("default"),
             None,
             async move {
-                *observed_clone.lock().unwrap() =
-                    Some(tracing::Span::current().id().is_some());
+                *observed_clone.lock().unwrap() = Some(tracing::Span::current().id().is_some());
             },
         )
         .await;
@@ -201,8 +203,7 @@ mod tests {
         let spans = capture.0.lock().unwrap();
         assert!(spans.iter().any(|(name, fields)| {
             name == "grpc.request"
-                && fields.get("otel.name")
-                    == Some(&"grpc.poll_workflow_task_queue".to_string())
+                && fields.get("otel.name") == Some(&"grpc.poll_workflow_task_queue".to_string())
         }));
     }
 }

@@ -24,16 +24,20 @@
 //! return compose resources. The same platform can be passed to the deploy
 //! facade for runtime service apply.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use async_trait::async_trait;
-use bollard::Docker;
-use bollard::container::{
-    Config as ContainerConfig, CreateContainerOptions, ListContainersOptions,
-    LogsOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
+use bollard::{
+    Docker,
+    container::{
+        Config as ContainerConfig, CreateContainerOptions, ListContainersOptions, LogsOptions,
+        RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
+    },
+    models::{ContainerInspectResponse, HostConfig, PortBinding},
 };
-use bollard::models::{ContainerInspectResponse, HostConfig, PortBinding};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokeira_deploy_engine as deploy_engine;
@@ -260,11 +264,10 @@ impl ComposePlatform {
         socket_path: impl Into<String>,
     ) -> Result<Self, ComposeError> {
         let socket_path = socket_path.into();
-        let docker =
-            Docker::connect_with_unix(&socket_path, 120, bollard::API_DEFAULT_VERSION)
-                .map_err(|_| ComposeError::DockerNotAvailable {
-                    socket_path: socket_path.clone(),
-                })?;
+        let docker = Docker::connect_with_unix(&socket_path, 120, bollard::API_DEFAULT_VERSION)
+            .map_err(|_| ComposeError::DockerNotAvailable {
+                socket_path: socket_path.clone(),
+            })?;
         Ok(Self {
             docker,
             compose_file: compose_file.into(),
@@ -275,19 +278,18 @@ impl ComposePlatform {
 
     /// Verify that Docker is reachable before performing an operation.
     pub async fn ensure_reachable(&self) -> Result<(), ComposeError> {
-        self.docker.version().await.map(|_| ()).map_err(|error| {
-            ComposeError::DockerNotAvailable {
+        self.docker
+            .version()
+            .await
+            .map(|_| ())
+            .map_err(|error| ComposeError::DockerNotAvailable {
                 socket_path: format!("{} ({error})", self.socket_path),
-            }
-        })
+            })
     }
 
     /// Reconcile one compose service by updating the compose file and replacing
     /// the corresponding local container.
-    pub async fn reconcile_service(
-        &self,
-        service: &ComposeService,
-    ) -> Result<(), ComposeError> {
+    pub async fn reconcile_service(&self, service: &ComposeService) -> Result<(), ComposeError> {
         self.ensure_reachable().await?;
         let mut state = self.load_compose_state()?;
         state.services.insert(service.name.clone(), service.clone());
@@ -503,8 +505,7 @@ impl ComposePlatform {
                 .services
                 .insert(format!("{}-{replica}", instance.name), instance.clone());
             self.save_compose_state(&state)?;
-            let container_name =
-                format!("{}_{}-{replica}", self.project_name, service.name);
+            let container_name = format!("{}_{}-{replica}", self.project_name, service.name);
             let config = container_config(service, &self.project_name);
             self.docker
                 .create_container(
@@ -534,12 +535,11 @@ impl ComposePlatform {
         if !self.compose_file.exists() {
             return Ok(ComposeFile::default());
         }
-        let contents = std::fs::read_to_string(&self.compose_file).map_err(|source| {
-            ComposeError::Io {
+        let contents =
+            std::fs::read_to_string(&self.compose_file).map_err(|source| ComposeError::Io {
                 path: self.compose_file.display().to_string(),
                 source,
-            }
-        })?;
+            })?;
         serde_yaml::from_str(&contents).map_err(ComposeError::YamlError)
     }
 
@@ -569,9 +569,7 @@ impl deploy_engine::Platform for ComposePlatform {
         let mut count = 0;
         for manifest in manifests {
             let service: ComposeService = serde_json::from_value(manifest.clone())
-                .map_err(|error| {
-                    deploy_engine::DeployError::Other(anyhow::anyhow!(error))
-                })?;
+                .map_err(|error| deploy_engine::DeployError::Other(anyhow::anyhow!(error)))?;
             state.services.insert(service.name.clone(), service.clone());
             self.reconcile_service(&service).await?;
             count += 1;
@@ -598,10 +596,7 @@ fn parse_port_mapping(value: &str) -> Option<(u16, u16)> {
     Some((host.parse().ok()?, container.parse().ok()?))
 }
 
-fn container_config(
-    service: &ComposeService,
-    project_name: &str,
-) -> ContainerConfig<String> {
+fn container_config(service: &ComposeService, project_name: &str) -> ContainerConfig<String> {
     let exposed_ports = if service.ports.is_empty() {
         None
     } else {
@@ -667,10 +662,7 @@ fn container_config(
     }
 }
 
-fn service_from_inspect(
-    name: &str,
-    inspect: &ContainerInspectResponse,
-) -> ComposeService {
+fn service_from_inspect(name: &str, inspect: &ContainerInspectResponse) -> ComposeService {
     let image = inspect
         .config
         .as_ref()
@@ -753,9 +745,7 @@ pub fn compose_yaml_fragment(service: &ComposeService) -> Result<String, Compose
     serde_yaml::to_string(&file).map_err(ComposeError::YamlError)
 }
 
-pub fn service_from_manifest(
-    value: serde_json::Value,
-) -> Result<ComposeService, ComposeError> {
+pub fn service_from_manifest(value: serde_json::Value) -> Result<ComposeService, ComposeError> {
     serde_json::from_value(value).map_err(|error| ComposeError::ContainerFailed {
         container: "manifest".into(),
         source: anyhow::anyhow!(error),
@@ -791,15 +781,7 @@ mod tests {
             )),
         )
             .prop_map(
-                |(
-                    name,
-                    image_tag,
-                    ports,
-                    volumes,
-                    environment,
-                    depends_on,
-                    healthcheck,
-                )| {
+                |(name, image_tag, ports, volumes, environment, depends_on, healthcheck)| {
                     ComposeService {
                         image: format!("example/{name}:{image_tag}"),
                         name: name.clone(),
@@ -813,14 +795,14 @@ mod tests {
                             .collect(),
                         environment: environment.into_iter().collect(),
                         depends_on,
-                        healthcheck: healthcheck.map(
-                            |(test, interval, timeout, retries)| Healthcheck {
+                        healthcheck: healthcheck.map(|(test, interval, timeout, retries)| {
+                            Healthcheck {
                                 test,
                                 interval,
                                 timeout,
                                 retries,
-                            },
-                        ),
+                            }
+                        }),
                     }
                 },
             )
@@ -892,10 +874,7 @@ mod tests {
             image: "grafana/grafana-oss:12.4.3".into(),
             ports: vec!["3000:3000".into()],
             volumes: vec!["/tmp/data:/var/lib/grafana".into()],
-            environment: HashMap::from([(
-                "GF_SECURITY_ADMIN_PASSWORD".into(),
-                "admin".into(),
-            )]),
+            environment: HashMap::from([("GF_SECURITY_ADMIN_PASSWORD".into(), "admin".into())]),
             depends_on: vec!["mimir".into()],
             healthcheck: Some(Healthcheck {
                 test: vec!["CMD".into(), "curl".into(), "http://localhost:3000".into()],

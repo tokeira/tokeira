@@ -233,8 +233,7 @@ impl BatchOperationStore {
             .map(|entry| info_from_entry(entry.value()))
             .collect();
         entries.sort_by(|a, b| a.job_id.cmp(&b.job_id));
-        let start =
-            (decode_page_token(page_token).unwrap_or(0) as usize).min(entries.len());
+        let start = (decode_page_token(page_token).unwrap_or(0) as usize).min(entries.len());
         let limit = page_size.max(1);
         let end = (start + limit).min(entries.len());
         let next = (end < entries.len()).then(|| encode_page_token(end as u64));

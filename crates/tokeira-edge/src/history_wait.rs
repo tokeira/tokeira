@@ -19,8 +19,7 @@ use tokeira_storage::{
     WorkflowTimeoutSweepEntry,
 };
 use tokeira_types::{
-    ExecutionRef, NamespaceId, QueueKey, RequestId, RunId, RunKey, ShardEpoch, ShardId,
-    WorkflowId,
+    ExecutionRef, NamespaceId, QueueKey, RequestId, RunId, RunKey, ShardEpoch, ShardId, WorkflowId,
 };
 use tokio::sync::{RwLock, watch};
 
@@ -78,10 +77,7 @@ impl<R> RunRepository for HistoryNotifyingRepository<R>
 where
     R: RunRepository + Send + Sync + 'static,
 {
-    async fn resolve_execution(
-        &self,
-        execution: &ExecutionRef,
-    ) -> Result<Option<RunKey>> {
+    async fn resolve_execution(&self, execution: &ExecutionRef) -> Result<Option<RunKey>> {
         self.inner.resolve_execution(execution).await
     }
 
@@ -118,10 +114,7 @@ where
             .await
     }
 
-    async fn read_transition_audit(
-        &self,
-        run_key: RunKey,
-    ) -> Result<Vec<TransitionAuditRecord>> {
+    async fn read_transition_audit(&self, run_key: RunKey) -> Result<Vec<TransitionAuditRecord>> {
         self.inner.read_transition_audit(run_key).await
     }
 
@@ -187,19 +180,11 @@ where
         self.inner.persist_to_backlog(entries).await
     }
 
-    async fn drain_backlog(
-        &self,
-        queue: &QueueKey,
-        limit: usize,
-    ) -> Result<Vec<BacklogEntry>> {
+    async fn drain_backlog(&self, queue: &QueueKey, limit: usize) -> Result<Vec<BacklogEntry>> {
         self.inner.drain_backlog(queue, limit).await
     }
 
-    async fn list_due_timers(
-        &self,
-        now: OffsetDateTime,
-        limit: usize,
-    ) -> Result<Vec<DueTimer>> {
+    async fn list_due_timers(&self, now: OffsetDateTime, limit: usize) -> Result<Vec<DueTimer>> {
         self.inner.list_due_timers(now, limit).await
     }
 
@@ -280,11 +265,7 @@ impl<R> LeaseRepository for HistoryNotifyingRepository<R>
 where
     R: LeaseRepository + Send + Sync + 'static,
 {
-    async fn try_acquire_bundle(
-        &self,
-        bundle: ShardId,
-        owner: String,
-    ) -> Result<LeaseOutcome> {
+    async fn try_acquire_bundle(&self, bundle: ShardId, owner: String) -> Result<LeaseOutcome> {
         self.inner.try_acquire_bundle(bundle, owner).await
     }
 

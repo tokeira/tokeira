@@ -105,9 +105,7 @@ impl EdgeError {
             EdgeError::NamespaceAlreadyExists(_) => "namespace_already_exists",
             EdgeError::WorkflowNotFound { .. } => "workflow_not_found",
             EdgeError::WorkflowAlreadyStarted { .. } => "workflow_already_started",
-            EdgeError::BatchOperationAlreadyExists { .. } => {
-                "batch_operation_already_exists"
-            }
+            EdgeError::BatchOperationAlreadyExists { .. } => "batch_operation_already_exists",
             EdgeError::BatchOperationNotFound { .. } => "batch_operation_not_found",
             EdgeError::TooManyLongPolls => "too_many_long_polls",
             EdgeError::LongPollAdmissionTimeout => "long_poll_admission_timeout",

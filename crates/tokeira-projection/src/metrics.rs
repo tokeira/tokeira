@@ -7,8 +7,7 @@ use tokeira_types::validate_metric_name;
 
 pub const RECORDS_PROCESSED_TOTAL: &str = "tokeira_projection_records_processed_total";
 pub const LAG_RECORDS: &str = "tokeira_projection_worker_lag_records";
-pub const SINK_WRITE_DURATION_SECONDS: &str =
-    "tokeira_projection_sink_write_duration_seconds";
+pub const SINK_WRITE_DURATION_SECONDS: &str = "tokeira_projection_sink_write_duration_seconds";
 pub const SINK_ERROR_TOTAL: &str = "tokeira_projection_sink_error_total";
 
 pub const METRIC_NAMES: &[(&str, MetricType)] = &[
@@ -24,8 +23,7 @@ pub fn record_records_processed(partition_id: u32, count: usize) {
 }
 
 pub fn set_projection_lag(partition_id: u32, lag_records: usize) {
-    gauge!(LAG_RECORDS, "partition_id" => partition_id.to_string())
-        .set(lag_records as f64);
+    gauge!(LAG_RECORDS, "partition_id" => partition_id.to_string()).set(lag_records as f64);
 }
 
 pub fn record_sink_write_duration(partition_id: u32, duration: std::time::Duration) {

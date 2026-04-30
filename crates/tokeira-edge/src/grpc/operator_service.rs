@@ -3,8 +3,10 @@ use tonic::{Request, Response, Status};
 use tokeira_proto::{
     enums::IndexedValueType,
     operatorservice::{
-        self, operator_service_server::OperatorService as OperatorServiceGrpcApi,
-        operator_service_server::OperatorServiceServer,
+        self,
+        operator_service_server::{
+            OperatorService as OperatorServiceGrpcApi, OperatorServiceServer,
+        },
     },
 };
 
@@ -157,9 +159,8 @@ impl OperatorServiceGrpcApi for OperatorServiceGrpc {
 }
 
 fn indexed_value_type_to_edge(value: i32) -> Result<String, Status> {
-    let value = IndexedValueType::try_from(value).map_err(|_| {
-        Status::invalid_argument(format!("unknown IndexedValueType: {value}"))
-    })?;
+    let value = IndexedValueType::try_from(value)
+        .map_err(|_| Status::invalid_argument(format!("unknown IndexedValueType: {value}")))?;
 
     let name = match value {
         IndexedValueType::Unspecified => {
@@ -180,9 +181,7 @@ fn indexed_value_type_to_edge(value: i32) -> Result<String, Status> {
 fn indexed_value_type_from_edge(value: &str) -> Result<IndexedValueType, Status> {
     match value {
         "keyword" | "INDEXED_VALUE_TYPE_KEYWORD" => Ok(IndexedValueType::Keyword),
-        "keyword_list" | "INDEXED_VALUE_TYPE_KEYWORD_LIST" => {
-            Ok(IndexedValueType::KeywordList)
-        }
+        "keyword_list" | "INDEXED_VALUE_TYPE_KEYWORD_LIST" => Ok(IndexedValueType::KeywordList),
         "int" | "INDEXED_VALUE_TYPE_INT" => Ok(IndexedValueType::Int),
         "bool" | "INDEXED_VALUE_TYPE_BOOL" => Ok(IndexedValueType::Bool),
         "double" | "INDEXED_VALUE_TYPE_DOUBLE" => Ok(IndexedValueType::Double),
@@ -219,20 +218,18 @@ mod tests {
         );
         let grpc = OperatorServiceGrpc::new(service);
 
-        grpc.add_search_attributes(Request::new(
-            operatorservice::AddSearchAttributesRequest {
-                namespace: "default".to_string(),
-                search_attributes: [
-                    (
-                        "CustomKeyword".to_string(),
-                        IndexedValueType::Keyword as i32,
-                    ),
-                    ("CustomInt".to_string(), IndexedValueType::Int as i32),
-                ]
-                .into_iter()
-                .collect(),
-            },
-        ))
+        grpc.add_search_attributes(Request::new(operatorservice::AddSearchAttributesRequest {
+            namespace: "default".to_string(),
+            search_attributes: [
+                (
+                    "CustomKeyword".to_string(),
+                    IndexedValueType::Keyword as i32,
+                ),
+                ("CustomInt".to_string(), IndexedValueType::Int as i32),
+            ]
+            .into_iter()
+            .collect(),
+        }))
         .await
         .expect("add search attributes should succeed");
 

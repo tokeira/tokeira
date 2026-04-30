@@ -41,9 +41,7 @@ pub use backend::StateBackend;
 pub use cas_store::CasStore;
 pub use error::StateError;
 pub use local::LocalBackend;
-pub use manifest::{
-    LockGuard, ManifestState, SnapshotRef, StateLeaseLock, StateManifest,
-};
+pub use manifest::{LockGuard, ManifestState, SnapshotRef, StateLeaseLock, StateManifest};
 pub use s3_store::S3StateStore;
 
 /// Backward-compatible alias. Prefer [`CasStore`] in new code.

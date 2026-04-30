@@ -18,12 +18,12 @@ use std::{
 use time::OffsetDateTime;
 
 use tokeira_kernel::{
-    WorkflowCommand, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
-    event::HistoryEvent, state::ParentClosePolicy,
+    WorkflowCommand, WorkflowIdConflictPolicy, WorkflowIdReusePolicy, event::HistoryEvent,
+    state::ParentClosePolicy,
 };
 use tokeira_types::{
-    ActivityTaskToken, BuildId, DeploymentId, ExecutionStatus, Headers, Memo, Payload,
-    Payloads, RetryPolicy, RunId, RunKey, SearchAttributes, TaskKind,
+    ActivityTaskToken, BuildId, DeploymentId, ExecutionStatus, Headers, Memo, Payload, Payloads,
+    RetryPolicy, RunId, RunKey, SearchAttributes, TaskKind,
 };
 
 pub mod batch;
@@ -237,8 +237,7 @@ pub struct PendingWorkflowTaskDescription {
 // Visibility types re-exported from tokeira-projection (the authoritative owner).
 pub use tokeira_projection::{
     CountWorkflowExecutionsRequest, CountWorkflowExecutionsResponse, GroupCount,
-    ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse,
-    WorkflowExecutionSummary,
+    ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, WorkflowExecutionSummary,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]

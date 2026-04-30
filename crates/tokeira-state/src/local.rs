@@ -2,8 +2,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 
-use crate::StateError;
-use crate::backend::StateBackend;
+use crate::{StateError, backend::StateBackend};
 
 /// Filesystem-backed state storage for local development and tests.
 ///
@@ -65,10 +64,7 @@ fn unique_tmp_name() -> String {
 
 #[async_trait]
 impl StateBackend for LocalBackend {
-    async fn read_manifest(
-        &self,
-        key: &str,
-    ) -> Result<Option<(Vec<u8>, String)>, StateError> {
+    async fn read_manifest(&self, key: &str) -> Result<Option<(Vec<u8>, String)>, StateError> {
         let path = self.root.join(key).join("manifest.json");
         match tokio::fs::read(&path).await {
             Ok(data) => {
@@ -96,9 +92,9 @@ impl StateBackend for LocalBackend {
         if expected_version.is_empty() {
             // Create-only: fail if manifest already exists
             if path.exists() {
-                let existing = tokio::fs::read(&path).await.map_err(|e| {
-                    StateError::Backend(format!("read {}: {e}", path.display()))
-                })?;
+                let existing = tokio::fs::read(&path)
+                    .await
+                    .map_err(|e| StateError::Backend(format!("read {}: {e}", path.display())))?;
                 let current_version = content_hash(&existing);
                 return Err(StateError::Conflict(format!(
                     "manifest already exists (version {current_version}); \
@@ -123,10 +119,7 @@ impl StateBackend for LocalBackend {
                     )));
                 }
                 Err(e) => {
-                    return Err(StateError::Backend(format!(
-                        "read {}: {e}",
-                        path.display()
-                    )));
+                    return Err(StateError::Backend(format!("read {}: {e}", path.display())));
                 }
             }
         }
@@ -147,24 +140,24 @@ impl StateBackend for LocalBackend {
 
     async fn read_snapshot(&self, key: &str) -> Result<Vec<u8>, StateError> {
         let path = self.root.join(key);
-        tokio::fs::read(&path).await.map_err(|e| {
-            StateError::Backend(format!("read snapshot {}: {e}", path.display()))
-        })
+        tokio::fs::read(&path)
+            .await
+            .map_err(|e| StateError::Backend(format!("read snapshot {}: {e}", path.display())))
     }
 
     async fn write_snapshot(&self, key: &str, data: &[u8]) -> Result<(), StateError> {
         let path = self.root.join(key);
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                StateError::Backend(format!("mkdir {}: {e}", parent.display()))
-            })?;
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| StateError::Backend(format!("mkdir {}: {e}", parent.display())))?;
         }
         if path.exists() {
             return Ok(());
         }
-        tokio::fs::write(&path, data).await.map_err(|e| {
-            StateError::Backend(format!("write snapshot {}: {e}", path.display()))
-        })
+        tokio::fs::write(&path, data)
+            .await
+            .map_err(|e| StateError::Backend(format!("write snapshot {}: {e}", path.display())))
     }
 
     async fn list_snapshots(&self, prefix: &str) -> Result<Vec<String>, StateError> {
@@ -173,9 +166,9 @@ impl StateBackend for LocalBackend {
             return Ok(Vec::new());
         }
         let mut entries = Vec::new();
-        let mut read_dir = tokio::fs::read_dir(&dir).await.map_err(|e| {
-            StateError::Backend(format!("readdir {}: {e}", dir.display()))
-        })?;
+        let mut read_dir = tokio::fs::read_dir(&dir)
+            .await
+            .map_err(|e| StateError::Backend(format!("readdir {}: {e}", dir.display())))?;
         while let Some(entry) = read_dir
             .next_entry()
             .await

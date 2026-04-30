@@ -4,9 +4,11 @@
 //! deployment manifests. [`ServiceContext`] carries persisted state and
 //! typed extensions for platform access.
 
-use std::any::{Any, TypeId};
-use std::collections::HashMap;
-use std::fmt::Debug;
+use std::{
+    any::{Any, TypeId},
+    collections::HashMap,
+    fmt::Debug,
+};
 
 use crate::RuntimeError;
 
@@ -27,10 +29,7 @@ pub struct ServiceContext {
 }
 
 impl ServiceContext {
-    pub fn new(
-        state: tokeira_iac::RuntimeState,
-        infra_state: tokeira_iac::InfraState,
-    ) -> Self {
+    pub fn new(state: tokeira_iac::RuntimeState, infra_state: tokeira_iac::InfraState) -> Self {
         Self {
             state,
             infra_state,
@@ -93,8 +92,5 @@ pub trait Service: Debug + Send + Sync {
     /// The manifest values are provider-specific JSON documents. They must be
     /// stable for unchanged desired state because the engine hashes them to
     /// decide whether a service needs to be applied.
-    fn manifests(
-        &self,
-        ctx: &ServiceContext,
-    ) -> Result<Vec<serde_json::Value>, RuntimeError>;
+    fn manifests(&self, ctx: &ServiceContext) -> Result<Vec<serde_json::Value>, RuntimeError>;
 }

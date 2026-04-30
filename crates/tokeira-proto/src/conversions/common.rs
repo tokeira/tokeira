@@ -1,16 +1,18 @@
 //! Small shared conversions for public protobuf common types.
 
-use crate::conversions::ProtoConversionError;
-use crate::public::common;
-use crate::public::temporal::api::failure::v1 as failure_proto;
-use crate::public::temporal::api::taskqueue::v1 as taskqueue;
+use crate::{
+    conversions::ProtoConversionError,
+    public::{
+        common,
+        temporal::api::{failure::v1 as failure_proto, taskqueue::v1 as taskqueue},
+    },
+};
 use prost::Message as _;
 use prost_types::{Duration as ProtoDuration, Timestamp};
 use time::OffsetDateTime;
 use tokeira_types::{
-    Headers, Memo, Payload as DomainPayload, Payloads as DomainPayloads, RunId,
-    SearchAttrValue, SearchAttributes as DomainSearchAttributes, TaskQueueName,
-    TaskToken, WorkflowId,
+    Headers, Memo, Payload as DomainPayload, Payloads as DomainPayloads, RunId, SearchAttrValue,
+    SearchAttributes as DomainSearchAttributes, TaskQueueName, TaskToken, WorkflowId,
 };
 
 pub fn payload_from_domain(value: &DomainPayload) -> common::Payload {
@@ -103,9 +105,7 @@ pub fn memo_to_domain(value: &common::Memo) -> Memo {
     )
 }
 
-pub fn search_attributes_from_domain(
-    value: &DomainSearchAttributes,
-) -> common::SearchAttributes {
+pub fn search_attributes_from_domain(value: &DomainSearchAttributes) -> common::SearchAttributes {
     common::SearchAttributes {
         indexed_fields: value
             .0

@@ -25,16 +25,20 @@
 //! create/update/delete operation. This gives the orchestrator incremental
 //! crash-safety without coupling the engine to a specific store type.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::future::Future;
-use std::pin::Pin;
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    future::Future,
+    pin::Pin,
+};
 
 use tracing::{info, warn};
 
-use crate::error::IacError;
-use crate::module::ModuleContext;
-use crate::types::{Change, ChangeKind, FieldDiff, InfraComposition};
-use crate::{InternalChange, ProvisionContext, Resource, ResourceId};
+use crate::{
+    InternalChange, ProvisionContext, Resource, ResourceId,
+    error::IacError,
+    module::ModuleContext,
+    types::{Change, ChangeKind, FieldDiff, InfraComposition},
+};
 
 /// Callback invoked after each mutating operation so the orchestrator can
 /// persist state incrementally. Receives the current state snapshot.
@@ -74,8 +78,7 @@ impl Engine {
     ) -> Result<Vec<Change>, IacError> {
         let desired = collect_resources_from(&composition.desired_modules, ctx)?;
         let known = collect_resources_from(&composition.known_modules, ctx)?;
-        let desired_refs: Vec<&dyn Resource> =
-            desired.iter().map(|r| r.as_ref()).collect();
+        let desired_refs: Vec<&dyn Resource> = desired.iter().map(|r| r.as_ref()).collect();
         let known_refs: Vec<&dyn Resource> = known.iter().map(|r| r.as_ref()).collect();
         self.plan_with_known(&desired_refs, &known_refs, ctx).await
     }
@@ -100,8 +103,7 @@ impl Engine {
     ) -> Result<Vec<Change>, IacError> {
         let desired = collect_resources_from(&composition.desired_modules, ctx)?;
         let known = collect_resources_from(&composition.known_modules, ctx)?;
-        let desired_refs: Vec<&dyn Resource> =
-            desired.iter().map(|r| r.as_ref()).collect();
+        let desired_refs: Vec<&dyn Resource> = desired.iter().map(|r| r.as_ref()).collect();
         let known_refs: Vec<&dyn Resource> = known.iter().map(|r| r.as_ref()).collect();
         let refreshed = refresh_state(&known_refs, &desired_refs, ctx).await?;
         ctx.state = refreshed.state;
@@ -123,8 +125,7 @@ impl Engine {
     ) -> Result<Vec<Change>, IacError> {
         let desired = collect_resources_from(&composition.desired_modules, ctx)?;
         let known = collect_resources_from(&composition.known_modules, ctx)?;
-        let desired_refs: Vec<&dyn Resource> =
-            desired.iter().map(|r| r.as_ref()).collect();
+        let desired_refs: Vec<&dyn Resource> = desired.iter().map(|r| r.as_ref()).collect();
         let known_refs: Vec<&dyn Resource> = known.iter().map(|r| r.as_ref()).collect();
         self.apply_with_known(&desired_refs, &known_refs, ctx, saver)
             .await
@@ -163,8 +164,7 @@ impl Engine {
     ) -> Result<Vec<Change>, IacError> {
         let desired = collect_resources_from(&composition.desired_modules, ctx)?;
         let known = collect_resources_from(&composition.known_modules, ctx)?;
-        let desired_refs: Vec<&dyn Resource> =
-            desired.iter().map(|r| r.as_ref()).collect();
+        let desired_refs: Vec<&dyn Resource> = desired.iter().map(|r| r.as_ref()).collect();
         let known_refs: Vec<&dyn Resource> = known.iter().map(|r| r.as_ref()).collect();
         let refreshed = refresh_state(&known_refs, &desired_refs, ctx).await?;
         if refreshed.has_managed_missing {
@@ -278,9 +278,7 @@ fn collect_resources_from(
 /// Returns module names in dependency order (dependencies first).
 /// Only considers dependencies that are present in the input set —
 /// external dependencies are silently ignored.
-fn topological_sort_modules(
-    modules: &[Box<dyn crate::Module>],
-) -> Result<Vec<String>, IacError> {
+fn topological_sort_modules(modules: &[Box<dyn crate::Module>]) -> Result<Vec<String>, IacError> {
     let names: HashSet<&str> = modules.iter().map(|m| m.name()).collect();
 
     let mut in_degree: HashMap<&str, usize> = HashMap::new();
@@ -374,8 +372,7 @@ async fn refresh_state(
     desired: &[&dyn Resource],
     ctx: &mut ProvisionContext,
 ) -> Result<RefreshReport, IacError> {
-    let desired_ids: HashSet<ResourceId> =
-        desired.iter().map(|r| r.resource_id()).collect();
+    let desired_ids: HashSet<ResourceId> = desired.iter().map(|r| r.resource_id()).collect();
     let sorted = topological_sort(known)?;
     let resource_map: HashMap<ResourceId, &dyn Resource> =
         known.iter().map(|r| (r.resource_id(), *r)).collect();
@@ -444,8 +441,7 @@ fn compute_changes(
     state: &crate::document::InfraState,
     ctx: &ProvisionContext,
 ) -> Vec<Change> {
-    let desired_ids: HashSet<ResourceId> =
-        desired.iter().map(|r| r.resource_id()).collect();
+    let desired_ids: HashSet<ResourceId> = desired.iter().map(|r| r.resource_id()).collect();
     let mut changes = Vec::new();
 
     for resource in desired {
@@ -695,9 +691,7 @@ fn filter_changes_by_modules(
 
 /// Kahn's algorithm for topological sort on resource dependencies.
 /// Returns resource IDs in creation order (dependencies first).
-pub fn topological_sort(
-    resources: &[&dyn Resource],
-) -> Result<Vec<ResourceId>, IacError> {
+pub fn topological_sort(resources: &[&dyn Resource]) -> Result<Vec<ResourceId>, IacError> {
     let ids: HashSet<ResourceId> = resources.iter().map(|r| r.resource_id()).collect();
 
     let mut in_degree: HashMap<ResourceId, usize> = HashMap::new();

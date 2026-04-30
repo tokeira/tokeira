@@ -83,11 +83,7 @@ impl ShardOwner {
     /// Returns a `CancellationToken` that can be used to
     /// cancel shard-scoped background tasks when the shard
     /// is relinquished.
-    pub fn record_acquired(
-        &mut self,
-        shard_id: ShardId,
-        epoch: ShardEpoch,
-    ) -> CancellationToken {
+    pub fn record_acquired(&mut self, shard_id: ShardId, epoch: ShardEpoch) -> CancellationToken {
         let cancel = CancellationToken::new();
         self.shards.insert(
             shard_id,

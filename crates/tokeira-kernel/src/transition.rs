@@ -1,6 +1,5 @@
 use smallvec::SmallVec;
-use time::Duration;
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use tokeira_types::{
     ExecutionStatus, Memo, NamespaceId, Payloads, QueueKey, RequestId, RunId, RunKey,
     SearchAttributes, TaskQueueName, TransitionSeq, WorkflowId, WorkflowType,

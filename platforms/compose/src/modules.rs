@@ -10,10 +10,10 @@ use async_trait::async_trait;
 use tokeira_compose::ComposeService;
 use tokeira_iac as iac;
 
-use crate::compose::{
-    MODULE_OBSERVABILITY, MODULE_RUNTIME, compose_services, module_for_service,
+use crate::{
+    compose::{MODULE_OBSERVABILITY, MODULE_RUNTIME, compose_services, module_for_service},
+    config::ComposeConfig,
 };
-use crate::config::ComposeConfig;
 
 // ── Local state module (remote-state bootstrap) ───────────────────
 

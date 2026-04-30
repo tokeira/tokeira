@@ -1,14 +1,13 @@
 use anyhow::Result;
 use time::OffsetDateTime;
 use tokeira_kernel::{
-    ResetRequest, SignalRequest, SignalWithStartRequest, StartRequest,
-    WorkflowTaskCompletedRequest,
+    ResetRequest, SignalRequest, SignalWithStartRequest, StartRequest, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::VersioningRuleStore;
 use tokeira_types::{
-    BuildId, DeploymentId, NamespaceId, QueueKey, RequestContext,
-    RequestId as CoreRequestId, RunId, RunKey, ShardEpoch, TaskKind, TaskQueueName,
-    WorkerIdentity, WorkflowId, WorkflowTaskToken, WorkflowType,
+    BuildId, DeploymentId, NamespaceId, QueueKey, RequestContext, RequestId as CoreRequestId,
+    RunId, RunKey, ShardEpoch, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId,
+    WorkflowTaskToken, WorkflowType,
 };
 use uuid::Uuid;
 
@@ -180,9 +179,8 @@ fn start_versioning(
             Some(BuildId(build_id.clone())),
         ),
         Some(VersioningOverride::AutoUpgrade) | None => {
-            let build_id = versioning_rules.and_then(|rules| {
-                rules.evaluate_assignment(namespace_id, task_queue, workflow_id)
-            });
+            let build_id = versioning_rules
+                .and_then(|rules| rules.evaluate_assignment(namespace_id, task_queue, workflow_id));
             (None, build_id)
         }
     }
@@ -324,8 +322,7 @@ mod tests {
         }
     }
 
-    fn signal_with_start_dto() -> crate::translate::SignalWithStartWorkflowExecutionRequest
-    {
+    fn signal_with_start_dto() -> crate::translate::SignalWithStartWorkflowExecutionRequest {
         crate::translate::SignalWithStartWorkflowExecutionRequest {
             namespace: "default".to_string(),
             workflow_id: "workflow-a".to_string(),
@@ -416,10 +413,7 @@ mod tests {
     }
 }
 
-pub fn reset_request(
-    req: ResetWorkflowExecutionRequest,
-    request_id: &RequestId,
-) -> ResetRequest {
+pub fn reset_request(req: ResetWorkflowExecutionRequest, request_id: &RequestId) -> ResetRequest {
     let now = OffsetDateTime::now_utc();
     ResetRequest {
         fork_event_id: req.workflow_task_finish_event_id,

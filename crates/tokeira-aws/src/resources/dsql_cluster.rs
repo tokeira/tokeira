@@ -1,10 +1,9 @@
-use std::collections::HashMap;
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use aws_sdk_dsql::client::Waiters as DsqlWaiters;
-use tokeira_iac::error::IacError;
 use tokeira_iac::{
     InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    error::IacError,
 };
 
 /// Lifecycle mode for a single DSQL cluster resource.
@@ -110,8 +109,7 @@ impl Resource for DsqlCluster {
                     .preexisting_endpoint
                     .as_deref()
                     .unwrap_or_default();
-                let desired_arn =
-                    self.config.preexisting_arn.as_deref().unwrap_or_default();
+                let desired_arn = self.config.preexisting_arn.as_deref().unwrap_or_default();
 
                 if current_endpoint != desired_endpoint || current_arn != desired_arn {
                     InternalChange::Update {
@@ -133,8 +131,7 @@ impl Resource for DsqlCluster {
 
         match self.config.mode {
             DsqlClusterMode::Preexisting => {
-                let endpoint =
-                    self.config.preexisting_endpoint.clone().unwrap_or_default();
+                let endpoint = self.config.preexisting_endpoint.clone().unwrap_or_default();
                 let arn = self.config.preexisting_arn.clone().unwrap_or_default();
 
                 if endpoint.is_empty() && arn.is_empty() {
@@ -176,10 +173,7 @@ impl Resource for DsqlCluster {
                     .send()
                     .await
                     .map_err(|e| {
-                        IacError::AwsSdk(format!(
-                            "dsql:CreateCluster: {}",
-                            e.into_service_error()
-                        ))
+                        IacError::AwsSdk(format!("dsql:CreateCluster: {}", e.into_service_error()))
                     })?;
 
                 let cluster_id = create.identifier().to_string();
@@ -192,9 +186,7 @@ impl Resource for DsqlCluster {
                     .identifier(&cluster_id)
                     .wait(Duration::from_secs(900))
                     .await
-                    .map_err(|e| {
-                        IacError::AwsSdk(format!("dsql:WaitUntilClusterActive: {e}"))
-                    })?;
+                    .map_err(|e| IacError::AwsSdk(format!("dsql:WaitUntilClusterActive: {e}")))?;
 
                 let cluster = ctx
                     .extension::<crate::AwsClients>()
@@ -205,10 +197,7 @@ impl Resource for DsqlCluster {
                     .send()
                     .await
                     .map_err(|e| {
-                        IacError::AwsSdk(format!(
-                            "dsql:GetCluster: {}",
-                            e.into_service_error()
-                        ))
+                        IacError::AwsSdk(format!("dsql:GetCluster: {}", e.into_service_error()))
                     })?;
 
                 let cluster_endpoint = cluster.endpoint().unwrap_or_default().to_string();
@@ -258,10 +247,7 @@ impl Resource for DsqlCluster {
                     .send()
                     .await
                     .map_err(|e| {
-                        IacError::AwsSdk(format!(
-                            "dsql:TagResource: {}",
-                            e.into_service_error()
-                        ))
+                        IacError::AwsSdk(format!("dsql:TagResource: {}", e.into_service_error()))
                     })?;
             }
         }
@@ -272,10 +258,11 @@ impl Resource for DsqlCluster {
             "preexisting"
         };
         let cluster_id = prop_str(current, "cluster_id").unwrap_or_default();
-        let cluster_endpoint =
-            self.config.preexisting_endpoint.clone().unwrap_or_else(|| {
-                prop_str(current, "cluster_endpoint").unwrap_or_default()
-            });
+        let cluster_endpoint = self
+            .config
+            .preexisting_endpoint
+            .clone()
+            .unwrap_or_else(|| prop_str(current, "cluster_endpoint").unwrap_or_default());
         let cluster_arn = self
             .config
             .preexisting_arn
@@ -384,10 +371,7 @@ impl Resource for DsqlCluster {
                 .send()
                 .await
                 .map_err(|e| {
-                    IacError::AwsSdk(format!(
-                        "dsql:UpdateCluster: {}",
-                        e.into_service_error()
-                    ))
+                    IacError::AwsSdk(format!("dsql:UpdateCluster: {}", e.into_service_error()))
                 })?;
 
             let dsql_client = &ctx
@@ -411,10 +395,7 @@ impl Resource for DsqlCluster {
                         .send()
                         .await
                         .map_err(|e| {
-                            IacError::AwsSdk(format!(
-                                "dsql:GetCluster: {}",
-                                e.into_service_error()
-                            ))
+                            IacError::AwsSdk(format!("dsql:GetCluster: {}", e.into_service_error()))
                         })?;
                     Ok(!refreshed.deletion_protection_enabled())
                 },
@@ -536,14 +517,10 @@ impl Resource for DsqlCluster {
         }
     }
 
-    async fn describe(
-        &self,
-        ctx: &ProvisionContext,
-    ) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
         match self.config.mode {
             DsqlClusterMode::Preexisting => {
-                let endpoint =
-                    self.config.preexisting_endpoint.clone().unwrap_or_default();
+                let endpoint = self.config.preexisting_endpoint.clone().unwrap_or_default();
                 let arn = self.config.preexisting_arn.clone().unwrap_or_default();
                 if endpoint.is_empty() && arn.is_empty() {
                     return Ok(None);
@@ -591,9 +568,7 @@ impl Resource for DsqlCluster {
                         if msg.contains("ResourceNotFoundException") {
                             return Ok(None);
                         }
-                        return Err(IacError::AwsSdk(format!(
-                            "dsql:GetCluster: {svc_err}"
-                        )));
+                        return Err(IacError::AwsSdk(format!("dsql:GetCluster: {svc_err}")));
                     }
                 };
 

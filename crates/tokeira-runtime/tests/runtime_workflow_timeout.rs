@@ -6,13 +6,12 @@ use tokio::time::Instant;
 
 use tokeira_kernel::{HistoryEventKind, StartRequest, TerminateRequest};
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime,
-    WorkflowTimeoutScannerConfig,
+    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
-    ExecutionRef, ExecutionStatus, Memo, NamespaceId, Payloads, RequestContext,
-    RequestId, SearchAttributes, TaskQueueName, WorkflowId, WorkflowType,
+    ExecutionRef, ExecutionStatus, Memo, NamespaceId, Payloads, RequestContext, RequestId,
+    SearchAttributes, TaskQueueName, WorkflowId, WorkflowType,
 };
 
 #[tokio::test]
@@ -32,20 +31,16 @@ async fn execution_timeout_fires_end_to_end() -> Result<()> {
     )
     .await?;
 
-    wait_for_run(
-        &store,
-        run_key,
-        |state, history| {
-            state.status == ExecutionStatus::TimedOut
-                && history.iter().any(|event| {
-                    matches!(
-                        &event.kind,
-                        HistoryEventKind::WorkflowExecutionTimedOut { timeout_type, .. }
-                            if *timeout_type == tokeira_kernel::WorkflowTimeoutType::ExecutionTimeout
-                    )
-                })
-        },
-    )
+    wait_for_run(&store, run_key, |state, history| {
+        state.status == ExecutionStatus::TimedOut
+            && history.iter().any(|event| {
+                matches!(
+                    &event.kind,
+                    HistoryEventKind::WorkflowExecutionTimedOut { timeout_type, .. }
+                        if *timeout_type == tokeira_kernel::WorkflowTimeoutType::ExecutionTimeout
+                )
+            })
+    })
     .await?;
 
     shutdown(&mut runtime).await
@@ -69,13 +64,14 @@ async fn run_timeout_fires_end_to_end() -> Result<()> {
     .await?;
 
     wait_for_run(&store, run_key, |state, history| {
-        state.status == ExecutionStatus::TimedOut && history.iter().any(|event| {
-            matches!(
-                &event.kind,
-                HistoryEventKind::WorkflowExecutionTimedOut { timeout_type, .. }
-                    if *timeout_type == tokeira_kernel::WorkflowTimeoutType::RunTimeout
-            )
-        })
+        state.status == ExecutionStatus::TimedOut
+            && history.iter().any(|event| {
+                matches!(
+                    &event.kind,
+                    HistoryEventKind::WorkflowExecutionTimedOut { timeout_type, .. }
+                        if *timeout_type == tokeira_kernel::WorkflowTimeoutType::RunTimeout
+                )
+            })
     })
     .await?;
 
@@ -220,10 +216,7 @@ async fn start_workflow(
 async fn wait_for_run(
     store: &Arc<InMemoryStore>,
     run_key: tokeira_types::RunKey,
-    predicate: impl Fn(
-        &tokeira_kernel::WorkflowState,
-        &[tokeira_kernel::HistoryEvent],
-    ) -> bool,
+    predicate: impl Fn(&tokeira_kernel::WorkflowState, &[tokeira_kernel::HistoryEvent]) -> bool,
 ) -> Result<()> {
     let deadline = Instant::now() + tokio::time::Duration::from_secs(2);
     loop {

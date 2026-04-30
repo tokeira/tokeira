@@ -74,6 +74,11 @@ serde_yaml = "0.9"
 tokeira-state = { path = "crates/tokeira-state" }
 tokeira-iac = { path = "crates/tokeira-iac" }
 tokeira-deploy-engine = { path = "crates/tokeira-deploy-engine" }
-tokeira-config-loader = { path = "crates/tokeira-config-loader" }
 tokeira-config = { path = "crates/tokeira-config" }
 tokeira-aws = { path = "crates/tokeira-aws" }
+
+[workspace.lints.rust]
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"

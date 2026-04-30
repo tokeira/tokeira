@@ -6,35 +6,35 @@ use http::HeaderMap;
 use tokeira_edge::{
     BatchDispatchContext, EdgeContext, EdgeInterceptors, EmptyVisibilityApi,
     InMemoryExecutionResolver, InMemoryNamespaceCache, InMemoryOperatorApi,
-    ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, LocalOnlyRouter,
-    LongPollConfig, LongPollGate, NamespaceCache, PendingQueryStore, PollerRegistry,
-    Principal, RequestId, ResolvedNamespace, VisibilityApi, WorkflowExecutionSummary,
-    WorkflowMutationOutcome, WorkflowRuntimeApi, WorkflowService, batch_engine,
-    translate::batch::{
-        DescribeBatchOperationRequest, ListBatchOperationsRequest,
-        StartBatchOperationRequest, StopBatchOperationRequest,
+    ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, LocalOnlyRouter, LongPollConfig,
+    LongPollGate, NamespaceCache, PendingQueryStore, PollerRegistry, Principal, RequestId,
+    ResolvedNamespace, VisibilityApi, WorkflowExecutionSummary, WorkflowMutationOutcome,
+    WorkflowRuntimeApi, WorkflowService, batch_engine,
+    translate::{
+        batch::{
+            DescribeBatchOperationRequest, ListBatchOperationsRequest, StartBatchOperationRequest,
+            StopBatchOperationRequest,
+        },
+        to_internal::namespace_id_for,
     },
-    translate::to_internal::namespace_id_for,
 };
 use tokeira_kernel::{
-    CancelRequest, NexusResolution, ResetRequest, SignalRequest, StartRequest,
-    TerminateRequest, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
-    WorkflowTaskCompletedRequest,
+    CancelRequest, NexusResolution, ResetRequest, SignalRequest, StartRequest, TerminateRequest,
+    WorkflowIdConflictPolicy, WorkflowIdReusePolicy, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
     BacklogConfig, BatchOperationEntry, BatchOperationParams, BatchOperationState,
     BatchOperationStore, BatchOperationType, BatchProgressCounters, BatchResetTarget,
-    BufferedQueryRegistry, InMemoryBroker, JobId, LaneConfig, PendingUpdateTransport,
-    QueryResult, ResetWorkflowResult, ScheduleStore, SignalWithStartResult,
-    StartWorkflowResult, TimerScannerConfig, TokeiraRuntime, UpdateOutcome,
-    UpdateTransportResolution, UpdateWaitPolicy, VersioningRuleStore, WorkerRegistry,
-    WorkflowExecutionRef, WorkflowTimeoutScannerConfig,
+    BufferedQueryRegistry, InMemoryBroker, JobId, LaneConfig, PendingUpdateTransport, QueryResult,
+    ResetWorkflowResult, ScheduleStore, SignalWithStartResult, StartWorkflowResult,
+    TimerScannerConfig, TokeiraRuntime, UpdateOutcome, UpdateTransportResolution, UpdateWaitPolicy,
+    VersioningRuleStore, WorkerRegistry, WorkflowExecutionRef, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::InMemoryStore;
 use tokeira_types::{
-    ActivityTaskToken, BuildId, ExecutionRef, ExecutionStatus, Memo, Payload, Payloads,
-    QueueKey, RequestContext, RequestId as DomainRequestId, RunId, RunKey,
-    SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
+    ActivityTaskToken, BuildId, ExecutionRef, ExecutionStatus, Memo, Payload, Payloads, QueueKey,
+    RequestContext, RequestId as DomainRequestId, RunId, RunKey, SearchAttributes, TaskKind,
+    TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
 };
 use tokio::sync::{Mutex, Notify};
 
@@ -97,17 +97,11 @@ impl RecordingRuntime {
 
 #[async_trait]
 impl WorkflowRuntimeApi for RecordingRuntime {
-    async fn start_workflow(
-        &self,
-        _req: StartRequest,
-    ) -> Result<WorkflowMutationOutcome> {
+    async fn start_workflow(&self, _req: StartRequest) -> Result<WorkflowMutationOutcome> {
         unreachable!()
     }
 
-    async fn start_workflow_with_policy(
-        &self,
-        _req: StartRequest,
-    ) -> Result<StartWorkflowResult> {
+    async fn start_workflow_with_policy(&self, _req: StartRequest) -> Result<StartWorkflowResult> {
         unreachable!()
     }
 
@@ -482,8 +476,7 @@ async fn start_batch_operation_creates_running_entry_and_duplicate_rejected() {
     let repo = Arc::new(InMemoryStore::default());
     let workflow = seed_workflow(repo.clone(), "wf-start", None, false).await;
     let runtime = Arc::new(RecordingRuntime::blocking());
-    let service =
-        build_service(runtime.clone(), Arc::new(EmptyVisibilityApi), repo).await;
+    let service = build_service(runtime.clone(), Arc::new(EmptyVisibilityApi), repo).await;
     let headers = HeaderMap::new();
 
     service
@@ -559,8 +552,7 @@ async fn stop_describe_and_list_handlers_work() {
     let repo = Arc::new(InMemoryStore::default());
     let workflow = seed_workflow(repo.clone(), "wf-stop", None, false).await;
     let runtime = Arc::new(RecordingRuntime::blocking());
-    let service =
-        build_service(runtime.clone(), Arc::new(EmptyVisibilityApi), repo).await;
+    let service = build_service(runtime.clone(), Arc::new(EmptyVisibilityApi), repo).await;
     let headers = HeaderMap::new();
     let job_id = JobId("job-stop".to_string());
 
@@ -640,8 +632,7 @@ async fn run_batch_operation_processes_explicit_executions_and_counts_progress()
     let wf1 = seed_workflow(repo.clone(), "wf-explicit-1", None, false).await;
     let wf2 = seed_workflow(repo.clone(), "wf-explicit-2", None, false).await;
     let runtime = Arc::new(RecordingRuntime::default());
-    let service =
-        build_service(runtime.clone(), Arc::new(EmptyVisibilityApi), repo).await;
+    let service = build_service(runtime.clone(), Arc::new(EmptyVisibilityApi), repo).await;
     let store = service.batch_store();
     let namespace_id = namespace_id_for("default");
     let job_id = JobId("job-explicit".to_string());
@@ -756,8 +747,7 @@ async fn run_batch_operation_stops_on_cancellation_without_rollback() {
     let wf1 = seed_workflow(repo.clone(), "wf-cancel-1", None, false).await;
     let wf2 = seed_workflow(repo.clone(), "wf-cancel-2", None, false).await;
     let runtime = Arc::new(RecordingRuntime::blocking());
-    let service =
-        build_service(runtime.clone(), Arc::new(EmptyVisibilityApi), repo).await;
+    let service = build_service(runtime.clone(), Arc::new(EmptyVisibilityApi), repo).await;
     let store = service.batch_store();
     let namespace_id = namespace_id_for("default");
     let job_id = JobId("job-cancel".to_string());
@@ -821,9 +811,7 @@ async fn run_batch_operation_uses_visibility_pagination() {
             executions: vec![WorkflowExecutionSummary {
                 namespace: "default".to_string(),
                 workflow_id: wf1.workflow_id.clone(),
-                run_id: RunId(
-                    uuid::Uuid::parse_str(wf1.run_id.as_deref().unwrap()).unwrap(),
-                ),
+                run_id: RunId(uuid::Uuid::parse_str(wf1.run_id.as_deref().unwrap()).unwrap()),
                 workflow_type: "test".to_string(),
                 task_queue: "queue".to_string(),
                 status: ExecutionStatus::Running,
@@ -840,9 +828,7 @@ async fn run_batch_operation_uses_visibility_pagination() {
             executions: vec![WorkflowExecutionSummary {
                 namespace: "default".to_string(),
                 workflow_id: wf2.workflow_id.clone(),
-                run_id: RunId(
-                    uuid::Uuid::parse_str(wf2.run_id.as_deref().unwrap()).unwrap(),
-                ),
+                run_id: RunId(uuid::Uuid::parse_str(wf2.run_id.as_deref().unwrap()).unwrap()),
                 workflow_type: "test".to_string(),
                 task_queue: "queue".to_string(),
                 status: ExecutionStatus::Running,

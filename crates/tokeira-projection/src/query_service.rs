@@ -19,9 +19,7 @@ use uuid::Uuid;
 use crate::{
     filter::compile_filter,
     store::VisibilityStore,
-    types::{
-        GroupByField, PageBounds, PageToken, RollupDimension, SortOrder, SystemField,
-    },
+    types::{GroupByField, PageBounds, PageToken, RollupDimension, SortOrder, SystemField},
 };
 
 pub struct VisibilityQueryService<S> {
@@ -44,8 +42,7 @@ where
         req: ListWorkflowExecutionsRequest,
     ) -> Result<ListWorkflowExecutionsResponse> {
         let namespace_id = parse_namespace(&req.namespace)?;
-        let filter =
-            compile_filter(req.query.as_deref(), namespace_id, &self.store).await?;
+        let filter = compile_filter(req.query.as_deref(), namespace_id, &self.store).await?;
         let page = PageBounds {
             limit: req.page_size.clamp(1, crate::types::MAX_PAGE_SIZE),
             after: req
@@ -69,10 +66,8 @@ where
         req: CountWorkflowExecutionsRequest,
     ) -> Result<CountWorkflowExecutionsResponse> {
         let namespace_id = parse_namespace(&req.namespace)?;
-        let filter =
-            compile_filter(req.query.as_deref(), namespace_id, &self.store).await?;
-        let group_by =
-            parse_group_by(req.group_by.as_deref(), namespace_id, &self.store).await?;
+        let filter = compile_filter(req.query.as_deref(), namespace_id, &self.store).await?;
+        let group_by = parse_group_by(req.group_by.as_deref(), namespace_id, &self.store).await?;
         let result = match (&filter.expr, &group_by) {
             (None, Some(GroupByField::System(SystemField::ExecutionStatus))) => {
                 self.store
@@ -185,15 +180,14 @@ fn map_summary(row: crate::types::ExecutionRow) -> WorkflowExecutionSummary {
 mod tests {
     use super::*;
     use crate::{
-        memory::InMemoryVisibilityStore, sink::ProjectionSink,
-        visibility_sink::VisibilitySink,
+        memory::InMemoryVisibilityStore, sink::ProjectionSink, visibility_sink::VisibilitySink,
     };
     use time::OffsetDateTime;
     use tokeira_kernel::ProjectionOp;
     use tokeira_storage::{ProjectionContext, ProjectionRecord};
     use tokeira_types::{
-        ExecutionStatus, Memo, NamespaceId, RunId, RunKey, SearchAttrValue,
-        SearchAttributes, TaskQueueName, TransitionSeq, WorkflowId, WorkflowType,
+        ExecutionStatus, Memo, NamespaceId, RunId, RunKey, SearchAttrValue, SearchAttributes,
+        TaskQueueName, TransitionSeq, WorkflowId, WorkflowType,
     };
     use uuid::Uuid;
 
@@ -226,10 +220,8 @@ mod tests {
                 } else {
                     ExecutionStatus::Running
                 },
-                start_time: OffsetDateTime::from_unix_timestamp(
-                    run_key.0.as_u128() as i64
-                )
-                .unwrap(),
+                start_time: OffsetDateTime::from_unix_timestamp(run_key.0.as_u128() as i64)
+                    .unwrap(),
                 execution_time: None,
                 close_time,
                 history_length: 10,
@@ -247,8 +239,7 @@ mod tests {
         }
     }
 
-    async fn build_service()
-    -> (NamespaceId, VisibilityQueryService<InMemoryVisibilityStore>) {
+    async fn build_service() -> (NamespaceId, VisibilityQueryService<InMemoryVisibilityStore>) {
         let namespace_id = NamespaceId(Uuid::from_u128(1));
         let store = InMemoryVisibilityStore::default();
         store
@@ -319,12 +310,10 @@ mod tests {
                         workflow_type: WorkflowType(wf_type),
                         task_queue: TaskQueueName(tq),
                         status,
-                        start_time: time::OffsetDateTime::from_unix_timestamp(start)
-                            .unwrap(),
+                        start_time: time::OffsetDateTime::from_unix_timestamp(start).unwrap(),
                         execution_time: None,
-                        close_time: close.map(|c| {
-                            time::OffsetDateTime::from_unix_timestamp(c).unwrap()
-                        }),
+                        close_time: close
+                            .map(|c| time::OffsetDateTime::from_unix_timestamp(c).unwrap()),
                         history_length: hl,
                         state_transition_count: stc,
                         memo: Memo::default(),

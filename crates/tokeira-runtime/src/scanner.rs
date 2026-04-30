@@ -37,11 +37,7 @@ pub(crate) fn lane_index_for(shard_id: ShardId, lane_count: usize) -> usize {
     (shard_id.0 as usize) % lane_count.max(1)
 }
 
-pub(crate) fn pick_lane(
-    lanes: &[LaneHandle],
-    lane_count: usize,
-    shard_id: ShardId,
-) -> &LaneHandle {
+pub(crate) fn pick_lane(lanes: &[LaneHandle], lane_count: usize, shard_id: ShardId) -> &LaneHandle {
     debug_assert!(!lanes.is_empty());
     debug_assert_eq!(lanes.len(), lane_count.max(1));
     &lanes[lane_index_for(shard_id, lane_count.max(1)) % lanes.len()]

@@ -14,15 +14,14 @@ use tokeira_kernel::{
     WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    ActivityTimeoutScannerConfig, BacklogConfig, EndpointTarget, LaneConfig,
-    NexusEndpointConfig, NexusEndpointRegistry, NexusHttpClient, NexusStartResult,
-    NexusTaskRequest, NexusTimeoutScannerConfig, TimerScannerConfig, TokeiraRuntime,
-    WorkflowTimeoutScannerConfig,
+    ActivityTimeoutScannerConfig, BacklogConfig, EndpointTarget, LaneConfig, NexusEndpointConfig,
+    NexusEndpointRegistry, NexusHttpClient, NexusStartResult, NexusTaskRequest,
+    NexusTimeoutScannerConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
-    ExecutionRef, Memo, NamespaceId, Payload, Payloads, RequestContext, RequestId, RunId,
-    RunKey, SearchAttributes, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
+    ExecutionRef, Memo, NamespaceId, Payload, Payloads, RequestContext, RequestId, RunId, RunKey,
+    SearchAttributes, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
 };
 use tokio::runtime::Runtime;
 use uuid::Uuid;
@@ -828,11 +827,7 @@ async fn poll_wft(
         .ok_or_else(|| anyhow!("expected workflow task"))
 }
 
-async fn wait_for_history<F>(
-    store: &InMemoryStore,
-    run_key: RunKey,
-    predicate: F,
-) -> Result<()>
+async fn wait_for_history<F>(store: &InMemoryStore, run_key: RunKey, predicate: F) -> Result<()>
 where
     F: Fn(&[HistoryEvent]) -> bool,
 {

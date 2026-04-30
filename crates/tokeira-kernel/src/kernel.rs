@@ -13,35 +13,31 @@ use smallvec::SmallVec;
 use thiserror::Error;
 use time::OffsetDateTime;
 use tokeira_types::{
-    BuildId, DeploymentId, ExecutionStatus, LogicalTaskSeq, NamespaceId, QueueKey, RunId,
-    RunKey, StickyAffinity, TransitionSeq, WorkerIdentity, WorkflowId,
+    BuildId, DeploymentId, ExecutionStatus, LogicalTaskSeq, NamespaceId, QueueKey, RunId, RunKey,
+    StickyAffinity, TransitionSeq, WorkerIdentity, WorkflowId,
 };
 
 use crate::{
     command::{
         ActivityResolvedRequest, CancelRequest, ChildResolution, ChildResolvedRequest,
         ChildStartConfirmedRequest, ChildStartResult, Command, ContinueAsNewInitiator,
-        ExternalCancelResolvedRequest, ExternalCancelResult,
-        ExternalSignalResolvedRequest, ExternalSignalResult, FieldChange,
-        NexusOperationResolvedRequest, NexusResolution, PauseActivityRequest,
-        PauseWorkflowRequest, ResetActivityRequest, ResetRequest, RetryState,
+        ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
+        ExternalSignalResult, FieldChange, NexusOperationResolvedRequest, NexusResolution,
+        PauseActivityRequest, PauseWorkflowRequest, ResetActivityRequest, ResetRequest, RetryState,
         ScheduleQueryTaskRequest, SignalRequest, SignalWithStartRequest, StartRequest,
-        StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest,
-        UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
-        UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest,
-        WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowTaskCompletedRequest,
-        WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
+        StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, UnpauseActivityRequest,
+        UnpauseWorkflowRequest, UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest,
+        UpdateProtocolBody, UpdateRequest, WorkflowCommand, WorkflowExecutionTimedOutRequest,
+        WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
+        WorkflowTaskTimedOutRequest,
     },
     event::{ActivityResolution, HistoryEvent, HistoryEventKind},
     state::{
-        ActivityPauseInfo, ActivityState, ChildWorkflowState, LoadedRun,
-        ParentClosePolicy, PauseInfo, PendingExternalCancel, PendingExternalSignal,
-        PendingNexusOperation, PendingUpdate, PendingWorkflowTask, TimerState,
-        WorkflowState,
+        ActivityPauseInfo, ActivityState, ChildWorkflowState, LoadedRun, ParentClosePolicy,
+        PauseInfo, PendingExternalCancel, PendingExternalSignal, PendingNexusOperation,
+        PendingUpdate, PendingWorkflowTask, TimerState, WorkflowState,
     },
-    transition::{
-        ActivityOp, DispatchOp, ProjectionOp, RequestDedupeOp, TimerOp, Transition,
-    },
+    transition::{ActivityOp, DispatchOp, ProjectionOp, RequestDedupeOp, TimerOp, Transition},
 };
 
 /// Pure transition engine.
@@ -97,9 +93,7 @@ impl Kernel for BasicKernel {
             Command::Reset(req) => self.apply_reset(loaded, req),
             Command::PauseWorkflow(req) => self.apply_pause_workflow(loaded, req),
             Command::UnpauseWorkflow(req) => self.apply_unpause_workflow(loaded, req),
-            Command::UpdateActivityOptions(req) => {
-                self.apply_update_activity_options(loaded, req)
-            }
+            Command::UpdateActivityOptions(req) => self.apply_update_activity_options(loaded, req),
             Command::PauseActivity(req) => self.apply_pause_activity(loaded, req),
             Command::UnpauseActivity(req) => self.apply_unpause_activity(loaded, req),
             Command::ResetActivity(req) => self.apply_reset_activity(loaded, req),
@@ -109,22 +103,12 @@ impl Kernel for BasicKernel {
             Command::WorkflowExecutionTimedOut(req) => {
                 self.apply_workflow_execution_timed_out(loaded, req)
             }
-            Command::WorkflowTaskStarted(req) => {
-                self.apply_workflow_task_started(loaded, req)
-            }
-            Command::WorkflowTaskCompleted(req) => {
-                self.apply_workflow_task_completed(loaded, req)
-            }
-            Command::WorkflowTaskFailed(req) => {
-                self.apply_workflow_task_failed(loaded, req)
-            }
-            Command::WorkflowTaskTimedOut(req) => {
-                self.apply_workflow_task_timed_out(loaded, req)
-            }
+            Command::WorkflowTaskStarted(req) => self.apply_workflow_task_started(loaded, req),
+            Command::WorkflowTaskCompleted(req) => self.apply_workflow_task_completed(loaded, req),
+            Command::WorkflowTaskFailed(req) => self.apply_workflow_task_failed(loaded, req),
+            Command::WorkflowTaskTimedOut(req) => self.apply_workflow_task_timed_out(loaded, req),
             Command::ActivityResolved(req) => self.apply_activity_resolved(loaded, req),
-            Command::ChildStartConfirmed(req) => {
-                self.apply_child_start_confirmed(loaded, req)
-            }
+            Command::ChildStartConfirmed(req) => self.apply_child_start_confirmed(loaded, req),
             Command::ChildResolved(req) => self.apply_child_resolved(loaded, req),
             Command::ExternalSignalResolved(req) => {
                 self.apply_external_signal_resolved(loaded, req)
@@ -136,9 +120,7 @@ impl Kernel for BasicKernel {
                 self.apply_nexus_operation_resolved(loaded, req)
             }
             Command::TimerDue(req) => self.apply_timer_due(loaded, req),
-            Command::ScheduleQueryTask(req) => {
-                self.apply_schedule_query_task(loaded, req)
-            }
+            Command::ScheduleQueryTask(req) => self.apply_schedule_query_task(loaded, req),
         }
     }
 }
@@ -238,11 +220,7 @@ impl BasicKernel {
 
     /// Bootstrap a brand-new workflow run from a `StartWorkflowExecution` request.
     /// Requires `LoadedRun::Absent` — the run must not already exist in storage.
-    fn apply_start(
-        &self,
-        loaded: LoadedRun,
-        req: StartRequest,
-    ) -> Result<Transition, Reject> {
+    fn apply_start(&self, loaded: LoadedRun, req: StartRequest) -> Result<Transition, Reject> {
         if !matches!(loaded, LoadedRun::Absent) {
             return Err(Reject::RunAlreadyExists);
         }
@@ -441,11 +419,7 @@ impl BasicKernel {
     /// Deliver an external signal to a running workflow.
     /// Only schedules a new WFT if none is already pending — see the
     /// "at most one outstanding WFT" invariant comment below.
-    fn apply_signal(
-        &self,
-        loaded: LoadedRun,
-        req: SignalRequest,
-    ) -> Result<Transition, Reject> {
+    fn apply_signal(&self, loaded: LoadedRun, req: SignalRequest) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
         let mut builder = TransitionBuilder::new(state, req.now);
         builder.request_dedupe_ops.push(RequestDedupeOp {
@@ -472,11 +446,7 @@ impl BasicKernel {
     /// Admit a workflow update request. Updates go through a two-phase
     /// lifecycle (admitted → accepted/rejected) because the worker must
     /// validate the update before it becomes durable.
-    fn apply_update(
-        &self,
-        loaded: LoadedRun,
-        req: UpdateRequest,
-    ) -> Result<Transition, Reject> {
+    fn apply_update(&self, loaded: LoadedRun, req: UpdateRequest) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
         if state.status == ExecutionStatus::Paused {
             return Err(Reject::WorkflowPaused);
@@ -509,11 +479,7 @@ impl BasicKernel {
 
     /// Record a cancellation request. This does not close the workflow —
     /// the worker decides how to honour the request during its next WFT.
-    fn apply_cancel(
-        &self,
-        loaded: LoadedRun,
-        req: CancelRequest,
-    ) -> Result<Transition, Reject> {
+    fn apply_cancel(&self, loaded: LoadedRun, req: CancelRequest) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
         let mut builder = TransitionBuilder::new(state, req.now);
         builder.request_dedupe_ops.push(RequestDedupeOp {
@@ -897,19 +863,12 @@ impl BasicKernel {
 
     /// Fork the workflow history at a prior event, closing this run
     /// and pointing to a new run that will replay from the fork point.
-    fn apply_reset(
-        &self,
-        loaded: LoadedRun,
-        req: ResetRequest,
-    ) -> Result<Transition, Reject> {
+    fn apply_reset(&self, loaded: LoadedRun, req: ResetRequest) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
 
         if req.fork_event_id <= 0 {
             return Err(Reject::ResetConstraintViolation {
-                reason: format!(
-                    "fork_event_id must be positive, got {}",
-                    req.fork_event_id
-                ),
+                reason: format!("fork_event_id must be positive, got {}", req.fork_event_id),
             });
         }
         if req.fork_event_id > state.last_event_id {
@@ -1125,12 +1084,11 @@ impl BasicKernel {
             .pending_workflow_task
             .clone()
             .ok_or(Reject::NoPendingWorkflowTask)?;
-        let started_event_id =
-            pending
-                .started_event_id
-                .ok_or(Reject::WorkflowTaskNotStarted {
-                    logical_seq: pending.logical_seq.0,
-                })?;
+        let started_event_id = pending
+            .started_event_id
+            .ok_or(Reject::WorkflowTaskNotStarted {
+                logical_seq: pending.logical_seq.0,
+            })?;
 
         if pending.logical_seq != req.token.logical_seq {
             return Err(Reject::WorkflowTaskSeqMismatch {
@@ -1138,9 +1096,7 @@ impl BasicKernel {
                 got: req.token.logical_seq.0,
             });
         }
-        if pending.attempt != req.token.attempt
-            || started_event_id != req.token.started_event_id
-        {
+        if pending.attempt != req.token.attempt || started_event_id != req.token.started_event_id {
             return Err(Reject::WorkflowTaskTokenMismatch);
         }
 
@@ -1326,9 +1282,7 @@ impl BasicKernel {
                         workflow_type,
                         initiated_event_id: child.initiated_event_id,
                     });
-                if let Some(current) =
-                    builder.state.children.get_mut(&child.child_workflow_id)
-                {
+                if let Some(current) = builder.state.children.get_mut(&child.child_workflow_id) {
                     current.child_run_id = Some(child_run_id_for_state);
                     current.started_event_id = Some(started_event_id);
                 }
@@ -1474,12 +1428,10 @@ impl BasicKernel {
 
         match req.result {
             ExternalCancelResult::CancelRequested => {
-                builder.emit(
-                    HistoryEventKind::ExternalWorkflowExecutionCancelRequested {
-                        initiated_event_id: pending.initiated_event_id,
-                        target_workflow_id: pending.target_workflow_id,
-                    },
-                );
+                builder.emit(HistoryEventKind::ExternalWorkflowExecutionCancelRequested {
+                    initiated_event_id: pending.initiated_event_id,
+                    target_workflow_id: pending.target_workflow_id,
+                });
             }
             ExternalCancelResult::Failed { cause } => {
                 builder.emit(
@@ -1618,12 +1570,11 @@ impl BasicKernel {
             .pending_workflow_task
             .clone()
             .ok_or(Reject::NoPendingWorkflowTask)?;
-        let started_event_id =
-            pending
-                .started_event_id
-                .ok_or(Reject::WorkflowTaskNotStarted {
-                    logical_seq: pending.logical_seq.0,
-                })?;
+        let started_event_id = pending
+            .started_event_id
+            .ok_or(Reject::WorkflowTaskNotStarted {
+                logical_seq: pending.logical_seq.0,
+            })?;
 
         if pending.logical_seq != req.logical_seq {
             return Err(Reject::WorkflowTaskSeqMismatch {
@@ -1690,12 +1641,11 @@ impl BasicKernel {
             .pending_workflow_task
             .clone()
             .ok_or(Reject::NoPendingWorkflowTask)?;
-        let started_event_id =
-            pending
-                .started_event_id
-                .ok_or(Reject::WorkflowTaskNotStarted {
-                    logical_seq: pending.logical_seq.0,
-                })?;
+        let started_event_id = pending
+            .started_event_id
+            .ok_or(Reject::WorkflowTaskNotStarted {
+                logical_seq: pending.logical_seq.0,
+            })?;
 
         if pending.logical_seq != req.logical_seq {
             return Err(Reject::WorkflowTaskSeqMismatch {
@@ -1875,11 +1825,7 @@ impl BasicKernel {
                 ..
             } => {
                 if *failure_cause == WorkflowTaskFailedCause::ResetWorkflow {
-                    close_replayed_run(
-                        state,
-                        ExecutionStatus::Terminated,
-                        event.happened_at,
-                    );
+                    close_replayed_run(state, ExecutionStatus::Terminated, event.happened_at);
                 } else {
                     let attempt = state
                         .pending_workflow_task
@@ -2031,27 +1977,22 @@ impl BasicKernel {
                 }
             }
             HistoryEventKind::StartChildWorkflowExecutionFailed {
-                child_workflow_id,
-                ..
+                child_workflow_id, ..
             }
             | HistoryEventKind::ChildWorkflowExecutionCompleted {
-                child_workflow_id,
-                ..
+                child_workflow_id, ..
             }
             | HistoryEventKind::ChildWorkflowExecutionFailed {
                 child_workflow_id, ..
             }
             | HistoryEventKind::ChildWorkflowExecutionCanceled {
-                child_workflow_id,
-                ..
+                child_workflow_id, ..
             }
             | HistoryEventKind::ChildWorkflowExecutionTerminated {
-                child_workflow_id,
-                ..
+                child_workflow_id, ..
             }
             | HistoryEventKind::ChildWorkflowExecutionTimedOut {
-                child_workflow_id,
-                ..
+                child_workflow_id, ..
             } => {
                 state.children.remove(child_workflow_id);
             }
@@ -2072,12 +2013,10 @@ impl BasicKernel {
                 );
             }
             HistoryEventKind::ExternalWorkflowExecutionSignaled {
-                initiated_event_id,
-                ..
+                initiated_event_id, ..
             }
             | HistoryEventKind::SignalExternalWorkflowExecutionFailed {
-                initiated_event_id,
-                ..
+                initiated_event_id, ..
             } => {
                 state.pending_external_signals.remove(initiated_event_id);
             }
@@ -2128,9 +2067,7 @@ impl BasicKernel {
                 );
             }
             HistoryEventKind::NexusOperationStarted { operation_id, .. } => {
-                if let Some(operation) =
-                    state.pending_nexus_operations.get_mut(operation_id)
-                {
+                if let Some(operation) = state.pending_nexus_operations.get_mut(operation_id) {
                     operation.started = true;
                 }
             }
@@ -2192,11 +2129,7 @@ impl BasicKernel {
                 state.close_failure = Some(failure.clone());
             }
             HistoryEventKind::WorkflowExecutionContinuedAsNew { .. } => {
-                close_replayed_run(
-                    state,
-                    ExecutionStatus::ContinuedAsNew,
-                    event.happened_at,
-                );
+                close_replayed_run(state, ExecutionStatus::ContinuedAsNew, event.happened_at);
             }
             HistoryEventKind::WorkflowExecutionCanceled => {
                 close_replayed_run(state, ExecutionStatus::Cancelled, event.happened_at);
@@ -2268,19 +2201,18 @@ fn apply_workflow_command(
                 return Err(Reject::DuplicateActivityId(activity_id));
             }
 
-            let schedule_event_id =
-                builder.emit(HistoryEventKind::ActivityTaskScheduled {
-                    activity_id: activity_id.clone(),
-                    activity_type: activity_type.clone(),
-                    task_queue: task_queue.clone(),
-                    input: input.clone(),
-                    header: header.clone(),
-                    retry_policy: retry_policy.clone(),
-                    schedule_to_close_timeout,
-                    schedule_to_start_timeout,
-                    start_to_close_timeout,
-                    heartbeat_timeout,
-                });
+            let schedule_event_id = builder.emit(HistoryEventKind::ActivityTaskScheduled {
+                activity_id: activity_id.clone(),
+                activity_type: activity_type.clone(),
+                task_queue: task_queue.clone(),
+                input: input.clone(),
+                header: header.clone(),
+                retry_policy: retry_policy.clone(),
+                schedule_to_close_timeout,
+                schedule_to_start_timeout,
+                start_to_close_timeout,
+                heartbeat_timeout,
+            });
 
             let activity = ActivityState {
                 activity_id: activity_id.clone(),
@@ -2534,15 +2466,14 @@ fn apply_workflow_command(
             input,
             control,
         } => {
-            let initiated_event_id = builder.emit(
-                HistoryEventKind::SignalExternalWorkflowExecutionInitiated {
+            let initiated_event_id =
+                builder.emit(HistoryEventKind::SignalExternalWorkflowExecutionInitiated {
                     target_workflow_id: target_workflow_id.clone(),
                     target_run_id,
                     signal_name: signal_name.clone(),
                     input: input.clone(),
                     control: control.clone(),
-                },
-            );
+                });
             builder.state.pending_external_signals.insert(
                 initiated_event_id,
                 PendingExternalSignal {
@@ -2619,15 +2550,14 @@ fn apply_workflow_command(
             {
                 return Err(Reject::DuplicateNexusOperationId(operation_id));
             }
-            let scheduled_event_id =
-                builder.emit(HistoryEventKind::NexusOperationScheduled {
-                    operation_id: operation_id.clone(),
-                    endpoint: endpoint.clone(),
-                    service: service.clone(),
-                    operation: operation.clone(),
-                    input: input.clone(),
-                    schedule_to_close_timeout,
-                });
+            let scheduled_event_id = builder.emit(HistoryEventKind::NexusOperationScheduled {
+                operation_id: operation_id.clone(),
+                endpoint: endpoint.clone(),
+                service: service.clone(),
+                operation: operation.clone(),
+                input: input.clone(),
+                schedule_to_close_timeout,
+            });
             builder.state.pending_nexus_operations.insert(
                 operation_id.clone(),
                 PendingNexusOperation {
@@ -2668,9 +2598,7 @@ fn apply_workflow_command(
                         "scheduled_event_id={scheduled_event_id}"
                     ))
                 })?;
-            builder.emit(HistoryEventKind::NexusOperationCancelRequested {
-                scheduled_event_id,
-            });
+            builder.emit(HistoryEventKind::NexusOperationCancelRequested { scheduled_event_id });
             builder.dispatch_ops.push(DispatchOp::CancelNexusOperation {
                 scheduled_event_id,
                 originator_run_key: builder.state.run_key,
@@ -2746,8 +2674,7 @@ fn apply_workflow_command(
                     // A rejection can come for an admitted update (worker
                     // rejects during validation) or a pending update.
                     let was_admitted = builder.state.admitted_updates.remove(&update_id);
-                    let was_pending =
-                        builder.state.pending_updates.contains_key(&update_id);
+                    let was_pending = builder.state.pending_updates.contains_key(&update_id);
                     if !was_admitted && !was_pending {
                         return Err(Reject::UnknownUpdate(update_id));
                     }

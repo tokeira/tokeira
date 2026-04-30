@@ -21,10 +21,7 @@ pub trait StateBackend: Send + Sync {
     /// Return `Ok(None)` when no state has been committed yet. The version tag
     /// is opaque to callers; the same value must be accepted by
     /// [`write_manifest`](Self::write_manifest) as the expected version.
-    async fn read_manifest(
-        &self,
-        key: &str,
-    ) -> Result<Option<(Vec<u8>, String)>, StateError>;
+    async fn read_manifest(&self, key: &str) -> Result<Option<(Vec<u8>, String)>, StateError>;
 
     /// Commit a new serialized state document if the expected version matches.
     ///

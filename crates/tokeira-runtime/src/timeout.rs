@@ -11,16 +11,11 @@ use std::{
 
 use anyhow::Result;
 use time::{Duration, OffsetDateTime};
-use tokeira_kernel::{
-    Command, RetryState, WorkflowExecutionTimedOutRequest, WorkflowTimeoutType,
-};
+use tokeira_kernel::{Command, RetryState, WorkflowExecutionTimedOutRequest, WorkflowTimeoutType};
 use tokeira_types::{RunKey, ShardId};
 use tokio_util::sync::CancellationToken;
 
-use crate::lane::LaneHandle;
-use crate::metrics as runtime_metrics;
-use crate::scanner::pick_lane;
-use crate::shard::ShardOwner;
+use crate::{lane::LaneHandle, metrics as runtime_metrics, scanner::pick_lane, shard::ShardOwner};
 
 /// Runtime-local timeout tracking entry for one open run.
 #[derive(Clone, Debug, PartialEq)]
@@ -105,8 +100,7 @@ pub fn evaluate_workflow_timeout(
     }
 
     if let Some(timeout) = entry.workflow_run_timeout
-        && (now - entry.started_at > timeout
-            || timeout.is_zero() && now >= entry.started_at)
+        && (now - entry.started_at > timeout || timeout.is_zero() && now >= entry.started_at)
     {
         return Some(WorkflowTimeoutViolation::RunTimeout);
     }
@@ -192,28 +186,23 @@ pub(crate) async fn run_workflow_timeout_scanner(
                 Some(shard_id),
                 &config,
                 |entry, violation, now| {
-                    runtime_metrics::record_scanner_dispatched(
-                        "workflow_timeout",
-                        shard_id.0,
-                    );
+                    runtime_metrics::record_scanner_dispatched("workflow_timeout", shard_id.0);
                     let lane = pick_lane(&lanes, lane_count, entry.shard_id).clone();
                     async move {
                         lane.submit(
                             entry.run_key,
-                            Command::WorkflowExecutionTimedOut(
-                                WorkflowExecutionTimedOutRequest {
-                                    timeout_type: match violation {
-                                        WorkflowTimeoutViolation::ExecutionTimeout => {
-                                            WorkflowTimeoutType::ExecutionTimeout
-                                        }
-                                        WorkflowTimeoutViolation::RunTimeout => {
-                                            WorkflowTimeoutType::RunTimeout
-                                        }
-                                    },
-                                    retry_state: workflow_timeout_retry_state(&entry),
-                                    now,
+                            Command::WorkflowExecutionTimedOut(WorkflowExecutionTimedOutRequest {
+                                timeout_type: match violation {
+                                    WorkflowTimeoutViolation::ExecutionTimeout => {
+                                        WorkflowTimeoutType::ExecutionTimeout
+                                    }
+                                    WorkflowTimeoutViolation::RunTimeout => {
+                                        WorkflowTimeoutType::RunTimeout
+                                    }
                                 },
-                            ),
+                                retry_state: workflow_timeout_retry_state(&entry),
+                                now,
+                            }),
                         )
                         .await
                         .map(|_| ())

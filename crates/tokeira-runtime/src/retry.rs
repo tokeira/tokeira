@@ -53,8 +53,7 @@ pub fn compute_retry_backoff(policy: &RetryPolicy, attempt: u32) -> Duration {
 
     let coefficient = policy.backoff_coefficient.max(1.0);
     let exponent = attempt.saturating_sub(1) as i32;
-    let millis = (policy.initial_interval.whole_milliseconds() as f64)
-        * coefficient.powi(exponent);
+    let millis = (policy.initial_interval.whole_milliseconds() as f64) * coefficient.powi(exponent);
     let mut computed = Duration::milliseconds(millis.round() as i64);
     if let Some(maximum) = policy.maximum_interval
         && computed > maximum

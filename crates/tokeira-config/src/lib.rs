@@ -1,7 +1,7 @@
 pub mod loader;
 pub use loader::{ConfigLoaderError, load_config, write_config_toml};
 
-use std::{path::Path, path::PathBuf};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -264,9 +264,7 @@ impl TokeiraConfig {
         Ok(config)
     }
 
-    pub fn resolve(
-        config_path: Option<&Path>,
-    ) -> Result<(Self, &'static str), ConfigError> {
+    pub fn resolve(config_path: Option<&Path>) -> Result<(Self, &'static str), ConfigError> {
         if let Some(path) = config_path {
             return Ok((Self::load(path)?, "cli --config"));
         }
@@ -290,8 +288,7 @@ impl TokeiraConfig {
         }
         if self.capacity.performance.target_workflow_starts_per_second == 0 {
             errors.push(ValidationError::Field {
-                field: "capacity.performance.target_workflow_starts_per_second"
-                    .to_string(),
+                field: "capacity.performance.target_workflow_starts_per_second".to_string(),
                 message: "must be positive".to_string(),
             });
         }
@@ -349,12 +346,10 @@ impl TokeiraConfig {
     pub fn emergency_warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
         if self.emergency.disable_stickiness {
-            warnings
-                .push("emergency override active: disable_stickiness = true".to_string());
+            warnings.push("emergency override active: disable_stickiness = true".to_string());
         }
         if self.emergency.freeze_projection {
-            warnings
-                .push("emergency override active: freeze_projection = true".to_string());
+            warnings.push("emergency override active: freeze_projection = true".to_string());
         }
         if let Some(cap) = self.emergency.cap_poll_admission {
             warnings.push(format!(
@@ -772,8 +767,7 @@ mod tests {
             std::process::id(),
             std::thread::current().name().unwrap_or("thread")
         ));
-        std::fs::write(&path, format!("[infrastructure]\n{infrastructure_body}\n"))
-            .unwrap();
+        std::fs::write(&path, format!("[infrastructure]\n{infrastructure_body}\n")).unwrap();
         path
     }
 }

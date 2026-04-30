@@ -4,16 +4,16 @@ use metrics::with_local_recorder;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use proptest::prelude::*;
 use tokeira_edge::{
-    GRPC_ACTIVE_REQUESTS, GRPC_REQUEST_DURATION_SECONDS, GRPC_REQUEST_TOTAL,
-    record_grpc_request, record_grpc_request_duration, set_grpc_active_requests,
+    GRPC_ACTIVE_REQUESTS, GRPC_REQUEST_DURATION_SECONDS, GRPC_REQUEST_TOTAL, record_grpc_request,
+    record_grpc_request_duration, set_grpc_active_requests,
 };
 use tokeira_projection::{
-    LAG_RECORDS, RECORDS_PROCESSED_TOTAL, SINK_WRITE_DURATION_SECONDS,
-    record_records_processed, record_sink_write_duration, set_projection_lag,
+    LAG_RECORDS, RECORDS_PROCESSED_TOTAL, SINK_WRITE_DURATION_SECONDS, record_records_processed,
+    record_sink_write_duration, set_projection_lag,
 };
 use tokeira_runtime::{
-    BROKER_PUBLISH_TOTAL, BROKER_QUEUE_DEPTH, LANE_SUBMIT_DURATION_SECONDS,
-    record_broker_publish, record_lane_submit_duration, set_queue_depth,
+    BROKER_PUBLISH_TOTAL, BROKER_QUEUE_DEPTH, LANE_SUBMIT_DURATION_SECONDS, record_broker_publish,
+    record_lane_submit_duration, set_queue_depth,
 };
 use tokeira_types::{NamespaceId, QueueKey, TaskKind, TaskQueueName};
 

@@ -19,10 +19,7 @@ use tokeira_types::{NamespaceId, Payload, Payloads, RunKey, ShardId, TaskQueueNa
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 
-use crate::lane::LaneHandle;
-use crate::metrics as runtime_metrics;
-use crate::scanner::pick_lane;
-use crate::shard::ShardOwner;
+use crate::{lane::LaneHandle, metrics as runtime_metrics, scanner::pick_lane, shard::ShardOwner};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum NexusStartResult {
@@ -99,8 +96,7 @@ impl NexusTaskToken {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        serde_json::from_slice(bytes)
-            .map_err(|error| anyhow!("invalid nexus task token: {error}"))
+        serde_json::from_slice(bytes).map_err(|error| anyhow!("invalid nexus task token: {error}"))
     }
 }
 

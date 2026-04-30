@@ -63,8 +63,7 @@ mod tests {
     use proptest::prelude::*;
     use time::OffsetDateTime;
     use tokeira_types::{
-        ExecutionStatus, Memo, NamespaceId, RunId, RunKey, TaskQueueName, WorkflowId,
-        WorkflowType,
+        ExecutionStatus, Memo, NamespaceId, RunId, RunKey, TaskQueueName, WorkflowId, WorkflowType,
     };
     use uuid::Uuid;
 

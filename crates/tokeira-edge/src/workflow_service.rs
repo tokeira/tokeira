@@ -25,25 +25,22 @@ use http::HeaderMap;
 use prost::Message as _;
 use time::OffsetDateTime;
 use tokeira_kernel::{
-    CancelRequest, HistoryEvent, HistoryEventKind, NexusResolution, ResetRequest,
-    SignalRequest, SignalWithStartRequest, StartRequest, TerminateRequest,
-    WorkflowTaskCompletedRequest,
+    CancelRequest, HistoryEvent, HistoryEventKind, NexusResolution, ResetRequest, SignalRequest,
+    SignalWithStartRequest, StartRequest, TerminateRequest, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    BatchError, BatchOperationEntry, BatchOperationStore, BatchProgressCounters,
-    BatchResetTarget, BufferedQueryRegistry, InMemoryBroker, NexusTaskBroker,
-    NexusTaskToken, OverlapDecision, OverlapPolicy, PendingUpdateTransport, QueryResult,
-    ResetWorkflowResult, ScheduleActionResult, SchedulePatch, ScheduleStore,
-    SignalWithStartResult, StartWorkflowResult, StartedActivityTask, StartedWorkflowTask,
-    UpdateOutcome, UpdateTransportResolution, UpdateWaitPolicy, VersioningRuleStore,
-    WorkerRegistry, WorkflowExecution, WorkflowExecutionStatus, compute_matching_times,
-    decide_overlap, schedule_workflow_id,
+    BatchError, BatchOperationEntry, BatchOperationStore, BatchProgressCounters, BatchResetTarget,
+    BufferedQueryRegistry, InMemoryBroker, NexusTaskBroker, NexusTaskToken, OverlapDecision,
+    OverlapPolicy, PendingUpdateTransport, QueryResult, ResetWorkflowResult, ScheduleActionResult,
+    SchedulePatch, ScheduleStore, SignalWithStartResult, StartWorkflowResult, StartedActivityTask,
+    StartedWorkflowTask, UpdateOutcome, UpdateTransportResolution, UpdateWaitPolicy,
+    VersioningRuleStore, WorkerRegistry, WorkflowExecution, WorkflowExecutionStatus,
+    compute_matching_times, decide_overlap, schedule_workflow_id,
 };
 use tokeira_storage::RunRepository;
 use tokeira_types::{
-    ActivityTaskToken, ExecutionRef, ExecutionStatus, Payload, Payloads, QueueKey,
-    RequestContext, RequestId, RunId, RunKey, TaskKind, TaskQueueName, WorkerIdentity,
-    WorkflowId,
+    ActivityTaskToken, ExecutionRef, ExecutionStatus, Payload, Payloads, QueueKey, RequestContext,
+    RequestId, RunId, RunKey, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId,
 };
 use uuid::Uuid;
 
@@ -57,31 +54,27 @@ use crate::{
     metrics as edge_metrics,
     namespace_cache::{NamespaceCache, ResolvedNamespace},
     operator_service::{ClusterInfo, OperatorApi},
-    pending_queries::LEGACY_QUERY_ID,
-    pending_queries::PendingQueryStore,
+    pending_queries::{LEGACY_QUERY_ID, PendingQueryStore},
     poller_registry::{ActivePoller, PollerRegistry},
     routing::{EdgeRouter, ensure_local},
     translate::{
         CountWorkflowExecutionsRequest, CountWorkflowExecutionsResponse,
-        DeleteWorkflowExecutionRequest, DescribeTaskQueueRequest,
-        DescribeTaskQueueResponse, DescribeWorkflowExecutionRequest,
-        ListNamespacesResponse as EdgeListNamespacesResponse,
-        ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse,
-        NamespaceDescription, PollActivityTaskQueueRequest,
-        PollActivityTaskQueueResponse, PollWorkflowTaskQueueRequest,
-        PollWorkflowTaskQueueResponse, ProtocolMessageDto, QueryResultDto,
-        QueryWorkflowRequest, QueryWorkflowResponse, RecordActivityTaskHeartbeatRequest,
+        DeleteWorkflowExecutionRequest, DescribeTaskQueueRequest, DescribeTaskQueueResponse,
+        DescribeWorkflowExecutionRequest, ListNamespacesResponse as EdgeListNamespacesResponse,
+        ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, NamespaceDescription,
+        PollActivityTaskQueueRequest, PollActivityTaskQueueResponse, PollWorkflowTaskQueueRequest,
+        PollWorkflowTaskQueueResponse, ProtocolMessageDto, QueryResultDto, QueryWorkflowRequest,
+        QueryWorkflowResponse, RecordActivityTaskHeartbeatRequest,
         RecordActivityTaskHeartbeatResponse, RegisterNamespaceRequest,
         RequestCancelWorkflowExecutionRequest, RequestCancelWorkflowExecutionResponse,
         ResetWorkflowExecutionRequest, ResetWorkflowExecutionResponse,
         RespondActivityTaskCompletedRequest, RespondActivityTaskCompletedResponse,
         RespondActivityTaskFailedRequest, RespondActivityTaskFailedResponse,
         RespondWorkflowTaskCompletedRequest, RespondWorkflowTaskCompletedResponse,
-        SignalWithStartWorkflowExecutionRequest,
-        SignalWithStartWorkflowExecutionResponse, SignalWorkflowExecutionRequest,
-        SignalWorkflowExecutionResponse, StartWorkflowExecutionRequest,
-        StartWorkflowExecutionResponse, SystemCapabilities, SystemInfo,
-        TerminateWorkflowExecutionRequest, TerminateWorkflowExecutionResponse,
+        SignalWithStartWorkflowExecutionRequest, SignalWithStartWorkflowExecutionResponse,
+        SignalWorkflowExecutionRequest, SignalWorkflowExecutionResponse,
+        StartWorkflowExecutionRequest, StartWorkflowExecutionResponse, SystemCapabilities,
+        SystemInfo, TerminateWorkflowExecutionRequest, TerminateWorkflowExecutionResponse,
         UpdateWorkflowExecutionRequest, UpdateWorkflowExecutionResponse,
         WorkflowExecutionDescription, WorkflowQueryDto, from_internal, to_internal,
     },
@@ -120,10 +113,7 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
 
     /// Start a workflow while preserving richer conflict/reuse results needed
     /// by edge APIs such as `SignalWithStartWorkflowExecution`.
-    async fn start_workflow_with_policy(
-        &self,
-        req: StartRequest,
-    ) -> Result<StartWorkflowResult>;
+    async fn start_workflow_with_policy(&self, req: StartRequest) -> Result<StartWorkflowResult>;
 
     /// Start a new execution or signal an existing one according to the
     /// workflow-id conflict policy carried in the request.
@@ -261,11 +251,7 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
 
 #[async_trait]
 pub trait ExecutionResolver: Send + Sync + 'static {
-    async fn current_run_key(
-        &self,
-        namespace: &str,
-        workflow_id: &str,
-    ) -> Result<Option<RunKey>>;
+    async fn current_run_key(&self, namespace: &str, workflow_id: &str) -> Result<Option<RunKey>>;
 
     async fn describe_execution(
         &self,
@@ -315,11 +301,7 @@ impl InMemoryExecutionResolver {
 
 #[async_trait]
 impl ExecutionResolver for InMemoryExecutionResolver {
-    async fn current_run_key(
-        &self,
-        namespace: &str,
-        workflow_id: &str,
-    ) -> Result<Option<RunKey>> {
+    async fn current_run_key(&self, namespace: &str, workflow_id: &str) -> Result<Option<RunKey>> {
         Ok(self
             .current
             .read()
@@ -632,22 +614,18 @@ impl WorkflowService {
                 )?;
 
                 let _permit = self.long_polls.acquire().await?;
-                let (namespace_id, task_queue) = crate::translate::nexus::broker_queue(
-                    &req.namespace,
-                    &req.task_queue,
-                );
+                let (namespace_id, task_queue) =
+                    crate::translate::nexus::broker_queue(&req.namespace, &req.task_queue);
                 let task = self
                     .nexus_broker
                     .poll(namespace_id, task_queue, std::time::Duration::from_secs(60))
                     .await;
 
                 match task {
-                    Some(task) => {
-                        Ok(Some(crate::translate::nexus::PollNexusTaskQueueResponse {
-                            task_token: task.token.encode().map_err(EdgeError::from)?,
-                            request: task.request,
-                        }))
-                    }
+                    Some(task) => Ok(Some(crate::translate::nexus::PollNexusTaskQueueResponse {
+                        task_token: task.token.encode().map_err(EdgeError::from)?,
+                        request: task.request,
+                    })),
                     None => Ok(None),
                 }
             },
@@ -678,15 +656,13 @@ impl WorkflowService {
                     .await?;
 
                 if req.task_token.is_empty() {
-                    return Err(EdgeError::BadRequest(
-                        "task_token is required".to_string(),
-                    ));
+                    return Err(EdgeError::BadRequest("task_token is required".to_string()));
                 }
                 let token = NexusTaskToken::decode(&req.task_token)
                     .map_err(|error| EdgeError::BadRequest(error.to_string()))?;
-                let response = req.response.ok_or_else(|| {
-                    EdgeError::BadRequest("response is required".to_string())
-                })?;
+                let response = req
+                    .response
+                    .ok_or_else(|| EdgeError::BadRequest("response is required".to_string()))?;
                 let resolution = crate::translate::nexus::proto_response_to_resolution(
                     response,
                     &token.operation_id,
@@ -740,18 +716,15 @@ impl WorkflowService {
                     .await?;
 
                 if req.task_token.is_empty() {
-                    return Err(EdgeError::BadRequest(
-                        "task_token is required".to_string(),
-                    ));
+                    return Err(EdgeError::BadRequest("task_token is required".to_string()));
                 }
                 let token = NexusTaskToken::decode(&req.task_token)
                     .map_err(|error| EdgeError::BadRequest(error.to_string()))?;
-                let error = req.error.ok_or_else(|| {
-                    EdgeError::BadRequest("error is required".to_string())
-                })?;
-                let resolution =
-                    crate::translate::nexus::proto_handler_error_to_resolution(error)
-                        .map_err(|error| EdgeError::BadRequest(error.to_string()))?;
+                let error = req
+                    .error
+                    .ok_or_else(|| EdgeError::BadRequest("error is required".to_string()))?;
+                let resolution = crate::translate::nexus::proto_handler_error_to_resolution(error)
+                    .map_err(|error| EdgeError::BadRequest(error.to_string()))?;
 
                 let applied = self
                     .runtime
@@ -823,9 +796,9 @@ impl WorkflowService {
                     stop_reason: None,
                     stop_identity: None,
                 };
-                self.batch_store.create(entry).map_err(|err| {
-                    batch_error_to_edge(err, &req.namespace, &req.job_id)
-                })?;
+                self.batch_store
+                    .create(entry)
+                    .map_err(|err| batch_error_to_edge(err, &req.namespace, &req.job_id))?;
 
                 let dispatch_ctx = BatchDispatchContext {
                     namespace_id,
@@ -1273,12 +1246,13 @@ impl WorkflowService {
                             entry.info.buffered_actions.pop_front();
                             entry.info.buffer_dropped += 1;
                         }
-                        entry.info.buffered_actions.push_back(
-                            tokeira_runtime::BufferedAction {
+                        entry
+                            .info
+                            .buffered_actions
+                            .push_back(tokeira_runtime::BufferedAction {
                                 nominal_time,
                                 overlap_policy_override: overlap_override,
-                            },
-                        );
+                            });
                     })
                     .map_err(|err| EdgeError::BadRequest(err.to_string()))?;
                 Ok(())
@@ -1365,10 +1339,7 @@ impl WorkflowService {
             input: entry.action.start_workflow.input.clone(),
             memo: entry.action.start_workflow.memo.clone(),
             search_attributes: entry.action.start_workflow.search_attributes.clone(),
-            workflow_execution_timeout: entry
-                .action
-                .start_workflow
-                .workflow_execution_timeout,
+            workflow_execution_timeout: entry.action.start_workflow.workflow_execution_timeout,
             workflow_run_timeout: entry.action.start_workflow.workflow_run_timeout,
             workflow_task_timeout: entry
                 .action
@@ -1652,9 +1623,7 @@ impl WorkflowService {
                     )
                     .await?;
 
-                ensure_local(
-                    self.router.route_workflow(&namespace, &workflow_id).await?,
-                )?;
+                ensure_local(self.router.route_workflow(&namespace, &workflow_id).await?)?;
 
                 let internal = to_internal::start_request(
                     req,
@@ -1686,11 +1655,8 @@ impl WorkflowService {
                                 internal.run_key
                             )));
                         };
-                        self.notify_history_run_key(
-                            internal.run_key,
-                            state.last_event_id,
-                        )
-                        .await;
+                        self.notify_history_run_key(internal.run_key, state.last_event_id)
+                            .await;
                         let mut response = from_internal::start_response(
                             &internal,
                             WorkflowMutationOutcome {
@@ -1708,11 +1674,7 @@ impl WorkflowService {
                                 .has_active_poller(&eager_queue, &identity)
                             && let Some(started) = self
                                 .runtime
-                                .try_claim_workflow_task(
-                                    eager_queue,
-                                    internal.run_key,
-                                    identity,
-                                )
+                                .try_claim_workflow_task(eager_queue, internal.run_key, identity)
                                 .await
                                 .map_err(EdgeError::from)?
                         {
@@ -1973,26 +1935,20 @@ impl WorkflowService {
 
                 let query_only = {
                     let token: tokeira_types::WorkflowTaskToken =
-                        serde_json::from_slice(&req.task_token)
-                            .map_err(EdgeError::from)?;
+                        serde_json::from_slice(&req.task_token).map_err(EdgeError::from)?;
                     token.logical_seq.0 == 0
                 };
 
                 for (query_id, result) in &req.query_results {
-                    if let Some(sender) =
-                        self.pending_queries.take(&req.task_token, query_id).await
+                    if let Some(sender) = self.pending_queries.take(&req.task_token, query_id).await
                     {
                         let _ = sender.send(match result {
-                            QueryResultDto::Answered { result } => {
-                                QueryResult::Completed {
-                                    result: result.clone(),
-                                }
-                            }
-                            QueryResultDto::Failed { error_message } => {
-                                QueryResult::Failed {
-                                    message: error_message.clone(),
-                                }
-                            }
+                            QueryResultDto::Answered { result } => QueryResult::Completed {
+                                result: result.clone(),
+                            },
+                            QueryResultDto::Failed { error_message } => QueryResult::Failed {
+                                message: error_message.clone(),
+                            },
                         });
                     }
                 }
@@ -2001,10 +1957,7 @@ impl WorkflowService {
                     serde_json::from_slice(&req.task_token).map_err(EdgeError::from)?;
 
                 for cmd in &mut req.commands {
-                    if let tokeira_kernel::WorkflowCommand::ProtocolMessage {
-                        body, ..
-                    } = cmd
-                    {
+                    if let tokeira_kernel::WorkflowCommand::ProtocolMessage { body, .. } = cmd {
                         match body {
                             tokeira_kernel::UpdateProtocolBody::Accepted {
                                 update_id,
@@ -2013,20 +1966,14 @@ impl WorkflowService {
                             } => {
                                 if let Ok(Some((name, inp))) = self
                                     .runtime
-                                    .peek_update_info(
-                                        task_token.run_key,
-                                        update_id.clone(),
-                                    )
+                                    .peek_update_info(task_token.run_key, update_id.clone())
                                     .await
                                 {
                                     *update_name = name;
                                     *input = inp;
                                 }
                             }
-                            tokeira_kernel::UpdateProtocolBody::Completed {
-                                update_id,
-                                result,
-                            } => {
+                            tokeira_kernel::UpdateProtocolBody::Completed { update_id, result } => {
                                 let _ = self
                                     .runtime
                                     .resolve_update_transport(
@@ -2038,10 +1985,7 @@ impl WorkflowService {
                                     )
                                     .await;
                             }
-                            tokeira_kernel::UpdateProtocolBody::Rejected {
-                                update_id,
-                                failure,
-                            } => {
+                            tokeira_kernel::UpdateProtocolBody::Rejected { update_id, failure } => {
                                 let _ = self
                                     .runtime
                                     .resolve_update_transport(
@@ -2078,8 +2022,8 @@ impl WorkflowService {
                 let saved_task_token = req.task_token.clone();
                 let wants_eager_return = req.return_new_workflow_task;
 
-                let internal = to_internal::workflow_task_completed_request(req)
-                    .map_err(EdgeError::from)?;
+                let internal =
+                    to_internal::workflow_task_completed_request(req).map_err(EdgeError::from)?;
                 let run_key = internal.token.run_key;
                 let outcome = self
                     .runtime
@@ -2092,23 +2036,17 @@ impl WorkflowService {
                 let mut resp = from_internal::completed_response(outcome);
 
                 if !eager_activity_specs.is_empty() {
-                    let namespace_id = match self
-                        .repo
-                        .load_run(run_key)
-                        .await
-                        .map_err(EdgeError::from)?
-                    {
-                        tokeira_kernel::LoadedRun::Existing(state) => state.namespace_id,
-                        tokeira_kernel::LoadedRun::Absent => {
-                            return Err(EdgeError::Internal(format!(
-                                "completed run {:?} not found after commit",
-                                run_key
-                            )));
-                        }
-                    };
-                    for (activity_id, task_queue, deployment, build_id) in
-                        eager_activity_specs
-                    {
+                    let namespace_id =
+                        match self.repo.load_run(run_key).await.map_err(EdgeError::from)? {
+                            tokeira_kernel::LoadedRun::Existing(state) => state.namespace_id,
+                            tokeira_kernel::LoadedRun::Absent => {
+                                return Err(EdgeError::Internal(format!(
+                                    "completed run {:?} not found after commit",
+                                    run_key
+                                )));
+                            }
+                        };
+                    for (activity_id, task_queue, deployment, build_id) in eager_activity_specs {
                         let queue = tokeira_types::QueueKey {
                             namespace_id,
                             task_queue,
@@ -2135,12 +2073,9 @@ impl WorkflowService {
                     }
                 }
 
-                if resp.execution_status.is_open()
-                    && self.buffered_queries.has_buffered(run_key)
-                {
+                if resp.execution_status.is_open() && self.buffered_queries.has_buffered(run_key) {
                     let token: tokeira_types::WorkflowTaskToken =
-                        serde_json::from_slice(&saved_task_token)
-                            .map_err(EdgeError::from)?;
+                        serde_json::from_slice(&saved_task_token).map_err(EdgeError::from)?;
                     let loaded = self
                         .repo
                         .load_run(token.run_key)
@@ -2377,8 +2312,7 @@ impl WorkflowService {
                 .begin(headers, None, Action::ListNamespaces, false)
                 .await?;
 
-            let mut namespaces =
-                self.namespaces.list_all().await.map_err(EdgeError::from)?;
+            let mut namespaces = self.namespaces.list_all().await.map_err(EdgeError::from)?;
             namespaces.sort_by(|left, right| left.name.cmp(&right.name));
 
             Ok(EdgeListNamespacesResponse {
@@ -2419,9 +2353,7 @@ impl WorkflowService {
                     .get(namespace_name)
                     .await
                     .map_err(EdgeError::from)?
-                    .ok_or_else(|| {
-                        EdgeError::NamespaceNotFound(namespace_name.to_string())
-                    })?;
+                    .ok_or_else(|| EdgeError::NamespaceNotFound(namespace_name.to_string()))?;
 
                 Ok(namespace_to_description(namespace))
             },
@@ -2500,13 +2432,8 @@ impl WorkflowService {
                         .await?,
                 )?;
 
-                let queue = queue_key_for_poll(
-                    &req.namespace,
-                    &req.task_queue,
-                    req.task_kind,
-                    None,
-                    None,
-                );
+                let queue =
+                    queue_key_for_poll(&req.namespace, &req.task_queue, req.task_kind, None, None);
 
                 Ok(DescribeTaskQueueResponse {
                     pollers: self
@@ -2558,8 +2485,7 @@ impl WorkflowService {
                     )
                     .await?;
 
-                let loaded =
-                    self.repo.load_run(run_key).await.map_err(EdgeError::from)?;
+                let loaded = self.repo.load_run(run_key).await.map_err(EdgeError::from)?;
                 let tokeira_kernel::LoadedRun::Existing(state) = loaded else {
                     return Err(EdgeError::WorkflowNotFound {
                         namespace: req.namespace,
@@ -2573,8 +2499,7 @@ impl WorkflowService {
                         .terminate_workflow(
                             run_key,
                             TerminateRequest {
-                                reason: "deleted via delete_workflow_execution"
-                                    .to_string(),
+                                reason: "deleted via delete_workflow_execution".to_string(),
                                 details: None,
                                 identity: "temporal-ui".to_string(),
                                 request: RequestContext {
@@ -2661,8 +2586,7 @@ impl WorkflowService {
                     .map_err(EdgeError::from)?;
 
                 let last_event_id =
-                    read_last_event_id(self.repo.as_ref(), outcome.successor_run_key)
-                        .await?;
+                    read_last_event_id(self.repo.as_ref(), outcome.successor_run_key).await?;
                 self.notify_history_run_key(outcome.successor_run_key, last_event_id)
                     .await;
 
@@ -2711,8 +2635,7 @@ impl WorkflowService {
                     .map_err(EdgeError::from)?
                 {
                     SignalWithStartResult::Started { run_key, run_id } => {
-                        let last_event_id =
-                            read_last_event_id(self.repo.as_ref(), run_key).await?;
+                        let last_event_id = read_last_event_id(self.repo.as_ref(), run_key).await?;
                         self.notify_history_run_key(run_key, last_event_id).await;
                         Ok(SignalWithStartWorkflowExecutionResponse {
                             run_id,
@@ -2720,8 +2643,7 @@ impl WorkflowService {
                         })
                     }
                     SignalWithStartResult::Signaled { run_key, run_id } => {
-                        let last_event_id =
-                            read_last_event_id(self.repo.as_ref(), run_key).await?;
+                        let last_event_id = read_last_event_id(self.repo.as_ref(), run_key).await?;
                         self.notify_history_run_key(run_key, last_event_id).await;
                         Ok(SignalWithStartWorkflowExecutionResponse {
                             run_id,
@@ -2785,18 +2707,13 @@ impl WorkflowService {
                 let internal = to_internal::poll_activity_request(req);
                 let started = self
                     .runtime
-                    .poll_activity_task(
-                        internal.queue,
-                        internal.worker_identity,
-                        internal.timeout,
-                    )
+                    .poll_activity_task(internal.queue, internal.worker_identity, internal.timeout)
                     .await
                     .map_err(EdgeError::from)?;
 
                 match started {
                     Some(started) => Ok(Some(
-                        from_internal::poll_activity_response(started)
-                            .map_err(EdgeError::from)?,
+                        from_internal::poll_activity_response(started).map_err(EdgeError::from)?,
                     )),
                     None => Ok(None),
                 }
@@ -3046,12 +2963,7 @@ impl WorkflowService {
 
                 let result = self
                     .runtime
-                    .query_workflow(
-                        execution,
-                        req.query_type,
-                        req.query_args,
-                        req.timeout,
-                    )
+                    .query_workflow(execution, req.query_type, req.query_args, req.timeout)
                     .await
                     .map_err(EdgeError::from)?;
 
@@ -3110,18 +3022,12 @@ impl WorkflowService {
                 };
 
                 let wait_policy = match req.wait_policy {
-                    crate::translate::UpdateWaitPolicyDto::Accepted => {
-                        UpdateWaitPolicy::Accepted
-                    }
-                    crate::translate::UpdateWaitPolicyDto::Completed => {
-                        UpdateWaitPolicy::Completed
-                    }
+                    crate::translate::UpdateWaitPolicyDto::Accepted => UpdateWaitPolicy::Accepted,
+                    crate::translate::UpdateWaitPolicyDto::Completed => UpdateWaitPolicy::Completed,
                 };
 
                 let request = RequestContext {
-                    request_id: tokeira_types::RequestId(
-                        uuid::Uuid::new_v4().to_string(),
-                    ),
+                    request_id: tokeira_types::RequestId(uuid::Uuid::new_v4().to_string()),
                     caller_identity: None,
                     received_at: time::OffsetDateTime::now_utc(),
                 };
@@ -3142,8 +3048,7 @@ impl WorkflowService {
                 let run_key = self
                     .resolve_execution_run_key(&req.namespace, &req.workflow_id, None)
                     .await?;
-                let last_event_id =
-                    read_last_event_id(self.repo.as_ref(), run_key).await?;
+                let last_event_id = read_last_event_id(self.repo.as_ref(), run_key).await?;
                 self.notify_history_run_key(run_key, last_event_id).await;
 
                 Ok(from_internal::update_response(outcome))
@@ -3177,9 +3082,7 @@ impl WorkflowService {
                     )
                     .await?;
 
-                ensure_local(
-                    self.router.route_workflow(&namespace, &workflow_id).await?,
-                )?;
+                ensure_local(self.router.route_workflow(&namespace, &workflow_id).await?)?;
 
                 let run_key = self.resolve_run_key(&namespace, &workflow_id).await?;
 
@@ -3193,8 +3096,7 @@ impl WorkflowService {
                         .await
                         .map_err(EdgeError::from)?;
 
-                    let current_last_event_id =
-                        history.last().map(|e| e.event_id).unwrap_or(0);
+                    let current_last_event_id = history.last().map(|e| e.event_id).unwrap_or(0);
 
                     for event in &history {
                         match &event.kind {
@@ -3226,8 +3128,7 @@ impl WorkflowService {
                         }
                     }
 
-                    let remaining =
-                        deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                     if remaining.is_zero() {
                         return Ok(None);
                     }
@@ -3284,9 +3185,8 @@ impl WorkflowService {
                         req.run_id.as_deref(),
                     )
                     .await?;
-                let caller_last_event_id =
-                    decode_history_page_token(&req.next_page_token)
-                        .map_err(EdgeError::BadRequest)?;
+                let caller_last_event_id = decode_history_page_token(&req.next_page_token)
+                    .map_err(EdgeError::BadRequest)?;
                 let limit = if req.maximum_page_size > 0 {
                     req.maximum_page_size
                 } else {
@@ -3303,8 +3203,7 @@ impl WorkflowService {
                         .last()
                         .map(|event| event.event_id)
                         .unwrap_or(caller_last_event_id);
-                    let filtered =
-                        filter_history_events(&history, req.history_event_filter_type);
+                    let filtered = filter_history_events(&history, req.history_event_filter_type);
 
                     tracing::debug!(
                         run_key = ?run_key,
@@ -3318,27 +3217,19 @@ impl WorkflowService {
                     );
 
                     if !filtered.is_empty() || !req.wait_new_event {
-                        return Ok(
-                            crate::translate::GetWorkflowExecutionHistoryResponse {
-                                history: filtered.into_iter().take(limit).collect(),
-                                next_page_token: encode_history_page_token(
-                                    current_last_event_id,
-                                ),
-                            },
-                        );
+                        return Ok(crate::translate::GetWorkflowExecutionHistoryResponse {
+                            history: filtered.into_iter().take(limit).collect(),
+                            next_page_token: encode_history_page_token(current_last_event_id),
+                        });
                     }
 
                     if req.history_event_filter_type != 2
                         && current_last_event_id > caller_last_event_id
                     {
-                        return Ok(
-                            crate::translate::GetWorkflowExecutionHistoryResponse {
-                                history: Vec::new(),
-                                next_page_token: encode_history_page_token(
-                                    current_last_event_id,
-                                ),
-                            },
-                        );
+                        return Ok(crate::translate::GetWorkflowExecutionHistoryResponse {
+                            history: Vec::new(),
+                            next_page_token: encode_history_page_token(current_last_event_id),
+                        });
                     }
 
                     let mut wait = self
@@ -3349,14 +3240,10 @@ impl WorkflowService {
                         .await
                         .is_err()
                     {
-                        return Ok(
-                            crate::translate::GetWorkflowExecutionHistoryResponse {
-                                history: Vec::new(),
-                                next_page_token: encode_history_page_token(
-                                    current_last_event_id,
-                                ),
-                            },
-                        );
+                        return Ok(crate::translate::GetWorkflowExecutionHistoryResponse {
+                            history: Vec::new(),
+                            next_page_token: encode_history_page_token(current_last_event_id),
+                        });
                     }
                 }
             },
@@ -3405,9 +3292,8 @@ impl WorkflowService {
                     .await
                     .map_err(EdgeError::from)?;
 
-                let before_event_id =
-                    decode_reverse_history_page_token(&req.next_page_token)
-                        .map_err(EdgeError::BadRequest)?;
+                let before_event_id = decode_reverse_history_page_token(&req.next_page_token)
+                    .map_err(EdgeError::BadRequest)?;
                 let limit = if req.maximum_page_size > 0 {
                     req.maximum_page_size
                 } else {
@@ -3555,9 +3441,7 @@ fn encode_history_page_token(last_event_id: i64) -> Vec<u8> {
     last_event_id.to_be_bytes().to_vec()
 }
 
-fn decode_reverse_history_page_token(
-    token: &[u8],
-) -> std::result::Result<Option<i64>, String> {
+fn decode_reverse_history_page_token(token: &[u8]) -> std::result::Result<Option<i64>, String> {
     if token.is_empty() {
         return Ok(None);
     }
@@ -3573,10 +3457,7 @@ fn encode_reverse_history_page_token(before_event_id: i64) -> Vec<u8> {
     before_event_id.to_be_bytes().to_vec()
 }
 
-fn filter_history_events(
-    history: &[HistoryEvent],
-    filter_type: i32,
-) -> Vec<HistoryEvent> {
+fn filter_history_events(history: &[HistoryEvent], filter_type: i32) -> Vec<HistoryEvent> {
     if filter_type != 2 {
         return history.to_vec();
     }
@@ -3783,8 +3664,7 @@ mod tests {
                     }
                 }
             ),
-            arb_small_string()
-                .prop_map(|timer_id| WorkflowCommand::CancelTimer { timer_id }),
+            arb_small_string().prop_map(|timer_id| WorkflowCommand::CancelTimer { timer_id }),
             Just(WorkflowCommand::CancelWorkflow),
         ]
     }

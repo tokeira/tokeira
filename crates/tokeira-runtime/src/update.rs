@@ -173,11 +173,7 @@ impl UpdateRegistry {
     }
 
     /// Read the update_name and input for a registered update without removing it.
-    pub fn peek_update_info(
-        &self,
-        run_key: RunKey,
-        update_id: &str,
-    ) -> Option<(String, Payloads)> {
+    pub fn peek_update_info(&self, run_key: RunKey, update_id: &str) -> Option<(String, Payloads)> {
         self.inner
             .lock()
             .unwrap()
@@ -980,13 +976,12 @@ mod tests {
     use tokeira_kernel::{LoadedRun, StartRequest, TerminateRequest};
     use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
     use tokeira_types::{
-        ExecutionRef, Memo, NamespaceId, RequestContext, RequestId, RunId,
-        SearchAttributes, TaskQueueName, WorkflowId, WorkflowType,
+        ExecutionRef, Memo, NamespaceId, RequestContext, RequestId, RunId, SearchAttributes,
+        TaskQueueName, WorkflowId, WorkflowType,
     };
 
     use crate::{
-        BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime,
-        WorkflowTimeoutScannerConfig,
+        BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
     };
 
     fn make_runtime(store: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {

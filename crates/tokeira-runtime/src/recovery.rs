@@ -219,9 +219,11 @@ pub(crate) fn lease_rejected_error(shard_id: ShardId) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::broker::{InMemoryActivityBroker, InMemoryBroker};
-    use crate::lane::{DispatchPublisher, LaneConfig, LaneHandle, spawn_lane};
-    use crate::shard::ShardOwner;
+    use crate::{
+        broker::{InMemoryActivityBroker, InMemoryBroker},
+        lane::{DispatchPublisher, LaneConfig, LaneHandle, spawn_lane},
+        shard::ShardOwner,
+    };
     use proptest::prelude::*;
     use std::sync::RwLock;
     use time::Duration;
@@ -231,9 +233,9 @@ mod tests {
     };
     use tokeira_storage::{CommitResult, InMemoryStore};
     use tokeira_types::{
-        ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payloads, QueueKey, RunId,
-        RunKey, SearchAttributes, ShardEpoch, ShardId, TaskKind, TaskQueueName,
-        TransitionSeq, WorkerIdentity, WorkflowId, WorkflowType,
+        ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payloads, QueueKey, RunId, RunKey,
+        SearchAttributes, ShardEpoch, ShardId, TaskKind, TaskQueueName, TransitionSeq,
+        WorkerIdentity, WorkflowId, WorkflowType,
     };
 
     #[derive(Clone)]
@@ -241,11 +243,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl DispatchPublisher for NoopPublisher {
-        async fn publish(
-            &self,
-            _run_key: RunKey,
-            _ops: &[DispatchOp],
-        ) -> anyhow::Result<()> {
+        async fn publish(&self, _run_key: RunKey, _ops: &[DispatchOp]) -> anyhow::Result<()> {
             Ok(())
         }
         async fn submit_to_run(

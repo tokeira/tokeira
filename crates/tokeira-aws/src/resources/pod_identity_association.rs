@@ -1,9 +1,8 @@
-use std::collections::HashMap;
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
-use tokeira_iac::error::IacError;
 use tokeira_iac::{
     InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    error::IacError,
 };
 
 /// Configuration for a single EKS Pod Identity Association provider resource.
@@ -29,10 +28,7 @@ pub struct PodIdentityAssociation {
 }
 
 impl PodIdentityAssociation {
-    pub fn new(
-        config: PodIdentityAssociationConfig,
-        rctx: &crate::ResourceContext,
-    ) -> Self {
+    pub fn new(config: PodIdentityAssociationConfig, rctx: &crate::ResourceContext) -> Self {
         Self {
             config,
             project: rctx.project.clone(),
@@ -133,15 +129,12 @@ impl PodIdentityAssociation {
                                 resource_id: cluster_name.clone(),
                             }
                         } else {
-                            IacError::AwsSdk(format!(
-                                "eks:ListPodIdentityAssociations: {svc_err}"
-                            ))
+                            IacError::AwsSdk(format!("eks:ListPodIdentityAssociations: {svc_err}"))
                         }
                     });
                 match output {
                     Ok(output) => Ok(!output.associations().iter().any(|association| {
-                        association.association_id()
-                            == Some(deleted_association_id.as_str())
+                        association.association_id() == Some(deleted_association_id.as_str())
                     })),
                     Err(IacError::ResourceNotFound { .. }) => Ok(true),
                     Err(err) => Err(err),
@@ -318,10 +311,7 @@ impl Resource for PodIdentityAssociation {
         self.wait_until_deleted(ctx, association_id).await
     }
 
-    async fn describe(
-        &self,
-        ctx: &ProvisionContext,
-    ) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
         if !ctx
             .state
             .resources
@@ -351,9 +341,7 @@ impl Resource for PodIdentityAssociation {
                         resource_id: cluster_name.clone(),
                     }
                 } else {
-                    IacError::AwsSdk(format!(
-                        "eks:ListPodIdentityAssociations: {svc_err}"
-                    ))
+                    IacError::AwsSdk(format!("eks:ListPodIdentityAssociations: {svc_err}"))
                 }
             });
         let list_output = match list_output {

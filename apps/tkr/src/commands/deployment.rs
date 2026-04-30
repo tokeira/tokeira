@@ -1,15 +1,13 @@
 use anyhow::Result;
 
-use crate::cli::DeploymentAction;
-use crate::deployment_dir::{DeploymentResolver, normalize_name};
-use crate::metadata::DeploymentMetadata;
-use crate::output::OutputFormatter;
+use crate::{
+    cli::DeploymentAction,
+    deployment_dir::{DeploymentResolver, normalize_name},
+    metadata::DeploymentMetadata,
+    output::OutputFormatter,
+};
 
-pub fn run(
-    action: DeploymentAction,
-    deployments: &DeploymentResolver,
-    json: bool,
-) -> Result<()> {
+pub fn run(action: DeploymentAction, deployments: &DeploymentResolver, json: bool) -> Result<()> {
     match action {
         DeploymentAction::Create {
             name,
@@ -17,8 +15,7 @@ pub fn run(
             storage,
         } => {
             let resolved_name = name.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            let metadata =
-                deployments.create(&resolved_name, platform.into(), storage.into())?;
+            let metadata = deployments.create(&resolved_name, platform.into(), storage.into())?;
             print_metadata(&metadata, json)?;
         }
         DeploymentAction::List => {

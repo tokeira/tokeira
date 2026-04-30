@@ -3,17 +3,15 @@ use std::{sync::Arc, time::Instant};
 use anyhow::Result;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    HistoryEvent, HistoryEventKind, StartRequest, WorkflowCommand,
-    WorkflowTaskCompletedRequest,
+    HistoryEvent, HistoryEventKind, StartRequest, WorkflowCommand, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime,
-    WorkflowTimeoutScannerConfig,
+    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
-    Memo, NamespaceId, Payload, Payloads, QueueKey, RequestContext, RequestId,
-    SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
+    Memo, NamespaceId, Payload, Payloads, QueueKey, RequestContext, RequestId, SearchAttributes,
+    TaskKind, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
 };
 
 #[tokio::test]
@@ -41,8 +39,7 @@ async fn external_signal_delivery_signals_target_and_resolves_originator() -> Re
     )
     .await?;
 
-    let originator_task =
-        poll_wft(&runtime, workflow_queue(namespace_id, "originator-q")).await?;
+    let originator_task = poll_wft(&runtime, workflow_queue(namespace_id, "originator-q")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: originator_task.token,
@@ -65,14 +62,17 @@ async fn external_signal_delivery_signals_target_and_resolves_originator() -> Re
             &event.kind,
             HistoryEventKind::WorkflowExecutionSignaled { signal_name, .. } if signal_name == "poke"
         ))
-    }).await?;
+    })
+    .await?;
 
     wait_for_history(&*store, originator_run_key, |history| {
-        history.iter().any(|event| matches!(
-            &event.kind,
-            HistoryEventKind::ExternalWorkflowExecutionSignaled { target_workflow_id, .. }
-                if target_workflow_id == &target_id
-        ))
+        history.iter().any(|event| {
+            matches!(
+                &event.kind,
+                HistoryEventKind::ExternalWorkflowExecutionSignaled { target_workflow_id, .. }
+                    if target_workflow_id == &target_id
+            )
+        })
     })
     .await?;
 
@@ -80,8 +80,8 @@ async fn external_signal_delivery_signals_target_and_resolves_originator() -> Re
 }
 
 #[tokio::test]
-async fn external_cancel_delivery_requests_cancel_on_target_and_resolves_originator()
--> Result<()> {
+async fn external_cancel_delivery_requests_cancel_on_target_and_resolves_originator() -> Result<()>
+{
     let store = Arc::new(InMemoryStore::default());
     let runtime = runtime(store.clone());
     let namespace_id = NamespaceId::new();
@@ -105,8 +105,7 @@ async fn external_cancel_delivery_requests_cancel_on_target_and_resolves_origina
     )
     .await?;
 
-    let originator_task =
-        poll_wft(&runtime, workflow_queue(namespace_id, "originator-q")).await?;
+    let originator_task = poll_wft(&runtime, workflow_queue(namespace_id, "originator-q")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: originator_task.token,
@@ -141,7 +140,8 @@ async fn external_cancel_delivery_requests_cancel_on_target_and_resolves_origina
             HistoryEventKind::ExternalWorkflowExecutionCancelRequested { target_workflow_id, .. }
                 if target_workflow_id == &target_id
         ))
-    }).await?;
+    })
+    .await?;
 
     Ok(())
 }
@@ -172,8 +172,7 @@ async fn external_signal_cross_namespace_uses_target_namespace() -> Result<()> {
     )
     .await?;
 
-    let originator_task =
-        poll_wft(&runtime, workflow_queue(originator_ns, "originator-q")).await?;
+    let originator_task = poll_wft(&runtime, workflow_queue(originator_ns, "originator-q")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: originator_task.token,
@@ -199,11 +198,13 @@ async fn external_signal_cross_namespace_uses_target_namespace() -> Result<()> {
     }).await?;
 
     wait_for_history(&*store, originator_run_key, |history| {
-        history.iter().any(|event| matches!(
-            &event.kind,
-            HistoryEventKind::ExternalWorkflowExecutionSignaled { target_workflow_id, .. }
-                if target_workflow_id == &target_id
-        ))
+        history.iter().any(|event| {
+            matches!(
+                &event.kind,
+                HistoryEventKind::ExternalWorkflowExecutionSignaled { target_workflow_id, .. }
+                    if target_workflow_id == &target_id
+            )
+        })
     })
     .await?;
 
@@ -227,8 +228,7 @@ async fn external_signal_not_found_delivers_failed_resolution() -> Result<()> {
     )
     .await?;
 
-    let originator_task =
-        poll_wft(&runtime, workflow_queue(namespace_id, "originator-q")).await?;
+    let originator_task = poll_wft(&runtime, workflow_queue(namespace_id, "originator-q")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: originator_task.token,

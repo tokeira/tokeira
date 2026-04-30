@@ -22,8 +22,8 @@ use tokeira_kernel::{
 };
 use tokeira_storage::RunRepository;
 use tokeira_types::{
-    BuildId, ExecutionRef, ExecutionStatus, Memo, NamespaceId, Payloads, RequestContext,
-    RequestId, RunId, RunKey, SearchAttributes, TaskQueueName, WorkflowId, WorkflowType,
+    BuildId, ExecutionRef, ExecutionStatus, Memo, NamespaceId, Payloads, RequestContext, RequestId,
+    RunId, RunKey, SearchAttributes, TaskQueueName, WorkflowId, WorkflowType,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -252,9 +252,7 @@ impl ScheduleStore {
         let key = (entry.namespace_id, entry.schedule_id.clone());
         entry.conflict_token = encode_token(1);
         match self.schedules.entry(key) {
-            dashmap::mapref::entry::Entry::Occupied(_) => {
-                Err(ScheduleError::AlreadyExists)
-            }
+            dashmap::mapref::entry::Entry::Occupied(_) => Err(ScheduleError::AlreadyExists),
             dashmap::mapref::entry::Entry::Vacant(slot) => {
                 let token = entry.conflict_token.clone();
                 slot.insert(entry);
@@ -321,8 +319,7 @@ impl ScheduleStore {
             .map(|entry| entry.value().clone())
             .collect();
         entries.sort_by(|a, b| a.schedule_id.cmp(&b.schedule_id));
-        let start =
-            (decode_page_token(page_token).unwrap_or(0) as usize).min(entries.len());
+        let start = (decode_page_token(page_token).unwrap_or(0) as usize).min(entries.len());
         let limit = page_size.max(1);
         let end = (start + limit).min(entries.len());
         let next = (end < entries.len()).then(|| encode_token(end as u64));
@@ -360,9 +357,7 @@ pub fn decide_overlap(
         OverlapPolicy::BufferOne if current_buffer_size < 1 => OverlapDecision::Buffer,
         OverlapPolicy::BufferOne => OverlapDecision::Skip,
         OverlapPolicy::BufferAll => OverlapDecision::Buffer,
-        OverlapPolicy::CancelOther => {
-            OverlapDecision::CancelOther(running_workflows.to_vec())
-        }
+        OverlapPolicy::CancelOther => OverlapDecision::CancelOther(running_workflows.to_vec()),
         OverlapPolicy::TerminateOther => {
             OverlapDecision::TerminateOther(running_workflows.to_vec())
         }
@@ -472,8 +467,7 @@ fn interval_matches(
         let mut n = div_floor(start_ns, interval_ns);
         loop {
             let candidate_ns = n * interval_ns + phase_ns;
-            let Ok(candidate) = OffsetDateTime::from_unix_timestamp_nanos(candidate_ns)
-            else {
+            let Ok(candidate) = OffsetDateTime::from_unix_timestamp_nanos(candidate_ns) else {
                 break;
             };
             if candidate < start {
@@ -504,9 +498,7 @@ fn ranges_match(ranges: &[Range], value: i32) -> bool {
     ranges.is_empty()
         || ranges.iter().any(|range| {
             let step = range.step.max(1);
-            value >= range.start
-                && value <= range.end
-                && (value - range.start) % step == 0
+            value >= range.start && value <= range.end && (value - range.start) % step == 0
         })
 }
 
@@ -517,8 +509,7 @@ fn to_schedule_local_time(time: OffsetDateTime, timezone_name: &str) -> OffsetDa
     let Ok(timezone) = timezone_name.parse::<chrono_tz::Tz>() else {
         return time;
     };
-    let Some(utc) =
-        DateTime::<Utc>::from_timestamp(time.unix_timestamp(), time.nanosecond())
+    let Some(utc) = DateTime::<Utc>::from_timestamp(time.unix_timestamp(), time.nanosecond())
     else {
         return time;
     };
@@ -696,9 +687,7 @@ pub async fn handle_due_action<R>(
         }
         OverlapDecision::Buffer => {
             let _ = store.update(namespace_id, schedule_id, &[], |current| {
-                if policy == OverlapPolicy::BufferOne
-                    && current.info.buffered_actions.len() >= 1
-                {
+                if policy == OverlapPolicy::BufferOne && current.info.buffered_actions.len() >= 1 {
                     current.info.buffered_actions.pop_front();
                     current.info.buffer_dropped += 1;
                 }
@@ -733,10 +722,8 @@ pub async fn handle_due_action<R>(
     }
 }
 
-pub async fn reconcile_running_workflows<R>(
-    store: &ScheduleStore,
-    runtime: &TokeiraRuntime<R>,
-) where
+pub async fn reconcile_running_workflows<R>(store: &ScheduleStore, runtime: &TokeiraRuntime<R>)
+where
     R: RunRepository + 'static,
 {
     for entry in store.all_active_schedules() {
@@ -747,9 +734,7 @@ pub async fn reconcile_running_workflows<R>(
         let mut still_running = Vec::new();
         for workflow in &entry.info.running_workflows {
             let keep = match runtime.repo().load_run(workflow.run_key).await {
-                Ok(LoadedRun::Existing(state)) => {
-                    state.status == ExecutionStatus::Running
-                }
+                Ok(LoadedRun::Existing(state)) => state.status == ExecutionStatus::Running,
                 _ => false,
             };
             completed |= !keep;
@@ -762,13 +747,9 @@ pub async fn reconcile_running_workflows<R>(
             current.info.running_workflows = still_running;
             if completed && current.policies.pause_on_failure {
                 current.state.paused = true;
-                current.state.notes =
-                    "paused after scheduled workflow completed".to_string();
+                current.state.notes = "paused after scheduled workflow completed".to_string();
             }
-            if completed
-                && current.info.running_workflows.is_empty()
-                && !current.state.paused
-            {
+            if completed && current.info.running_workflows.is_empty() && !current.state.paused {
                 if let Some(buffered) = current.info.buffered_actions.pop_front() {
                     buffered_to_run.push(buffered);
                 }
@@ -825,10 +806,7 @@ where
         input: entry.action.start_workflow.input.clone(),
         memo: entry.action.start_workflow.memo.clone(),
         search_attributes: entry.action.start_workflow.search_attributes.clone(),
-        workflow_execution_timeout: entry
-            .action
-            .start_workflow
-            .workflow_execution_timeout,
+        workflow_execution_timeout: entry.action.start_workflow.workflow_execution_timeout,
         workflow_run_timeout: entry.action.start_workflow.workflow_run_timeout,
         workflow_task_timeout: entry
             .action
@@ -1212,8 +1190,7 @@ mod tests {
         let start = OffsetDateTime::from_unix_timestamp(1_767_275_940).unwrap();
         let end = OffsetDateTime::from_unix_timestamp(1_767_276_060).unwrap();
 
-        let times =
-            compute_matching_times(&spec, start, end, &ScheduleId("tz".to_string()));
+        let times = compute_matching_times(&spec, start, end, &ScheduleId("tz".to_string()));
 
         assert_eq!(
             times,
@@ -1232,8 +1209,7 @@ mod tests {
         };
         let start = OffsetDateTime::UNIX_EPOCH + Duration::seconds(5);
         let end = OffsetDateTime::UNIX_EPOCH + Duration::seconds(31);
-        let times =
-            compute_matching_times(&spec, start, end, &ScheduleId("s".to_string()));
+        let times = compute_matching_times(&spec, start, end, &ScheduleId("s".to_string()));
         assert_eq!(
             times,
             vec![

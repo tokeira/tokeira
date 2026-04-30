@@ -16,9 +16,7 @@ use tokeira_types::{
 };
 use uuid::Uuid;
 
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct AttrId(pub u64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -177,11 +175,10 @@ impl PageToken {
         let decoded = STANDARD
             .decode(s)
             .map_err(|e| anyhow!("malformed page token: {e}"))?;
-        let wire: PageTokenWire = serde_json::from_slice(&decoded)
-            .map_err(|e| anyhow!("malformed page token: {e}"))?;
+        let wire: PageTokenWire =
+            serde_json::from_slice(&decoded).map_err(|e| anyhow!("malformed page token: {e}"))?;
         let run_key = RunKey(
-            Uuid::parse_str(&wire.rk)
-                .map_err(|e| anyhow!("malformed page token run key: {e}"))?,
+            Uuid::parse_str(&wire.rk).map_err(|e| anyhow!("malformed page token run key: {e}"))?,
         );
         Ok(Self {
             close_time: wire

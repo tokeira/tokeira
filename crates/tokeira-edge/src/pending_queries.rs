@@ -29,12 +29,7 @@ impl PendingQueryStore {
         Self::default()
     }
 
-    pub async fn insert(
-        &self,
-        token: &[u8],
-        query_id: String,
-        tx: oneshot::Sender<QueryResult>,
-    ) {
+    pub async fn insert(&self, token: &[u8], query_id: String, tx: oneshot::Sender<QueryResult>) {
         self.inner
             .lock()
             .await
@@ -43,11 +38,7 @@ impl PendingQueryStore {
             .insert(query_id, tx);
     }
 
-    pub async fn take(
-        &self,
-        token: &[u8],
-        query_id: &str,
-    ) -> Option<oneshot::Sender<QueryResult>> {
+    pub async fn take(&self, token: &[u8], query_id: &str) -> Option<oneshot::Sender<QueryResult>> {
         let mut inner = self.inner.lock().await;
         let queries = inner.get_mut(token)?;
         let sender = queries.remove(query_id);
@@ -57,10 +48,7 @@ impl PendingQueryStore {
         sender
     }
 
-    pub async fn drain(
-        &self,
-        token: &[u8],
-    ) -> Vec<(String, oneshot::Sender<QueryResult>)> {
+    pub async fn drain(&self, token: &[u8]) -> Vec<(String, oneshot::Sender<QueryResult>)> {
         self.inner
             .lock()
             .await

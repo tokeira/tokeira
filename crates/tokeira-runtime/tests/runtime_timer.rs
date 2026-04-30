@@ -8,13 +8,12 @@ use tokeira_kernel::{
     HistoryEventKind, StartRequest, WorkflowCommand, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime,
-    WorkflowTimeoutScannerConfig,
+    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
-    Memo, NamespaceId, Payloads, QueueKey, RequestContext, RequestId, SearchAttributes,
-    TaskKind, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
+    Memo, NamespaceId, Payloads, QueueKey, RequestContext, RequestId, SearchAttributes, TaskKind,
+    TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
 };
 
 #[tokio::test]
@@ -33,8 +32,7 @@ async fn timer_scanner_fires_due_timer_end_to_end() -> Result<()> {
     );
     let namespace_id = NamespaceId::new();
 
-    let run_key =
-        start_workflow(&runtime, namespace_id, WorkflowId("timer-fire".into())).await?;
+    let run_key = start_workflow(&runtime, namespace_id, WorkflowId("timer-fire".into())).await?;
     complete_with_commands(
         &runtime,
         namespace_id,
@@ -75,8 +73,7 @@ async fn canceled_timer_is_harmlessly_ignored_by_scanner() -> Result<()> {
     );
     let namespace_id = NamespaceId::new();
 
-    let run_key =
-        start_workflow(&runtime, namespace_id, WorkflowId("timer-cancel".into())).await?;
+    let run_key = start_workflow(&runtime, namespace_id, WorkflowId("timer-cancel".into())).await?;
     complete_with_commands(
         &runtime,
         namespace_id,
@@ -127,8 +124,7 @@ async fn multiple_due_timers_all_fire() -> Result<()> {
     );
     let namespace_id = NamespaceId::new();
 
-    let run_key =
-        start_workflow(&runtime, namespace_id, WorkflowId("timer-multi".into())).await?;
+    let run_key = start_workflow(&runtime, namespace_id, WorkflowId("timer-multi".into())).await?;
     complete_with_commands(
         &runtime,
         namespace_id,

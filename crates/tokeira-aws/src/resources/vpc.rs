@@ -1,8 +1,8 @@
 use std::time::Duration;
 
-use tokeira_iac::error::IacError;
 use tokeira_iac::{
     InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    error::IacError,
 };
 
 /// VPC resource: creates VPC, private subnets, and route tables.
@@ -24,11 +24,7 @@ pub struct VpcConfig {
 }
 
 impl VpcResource {
-    pub fn new(
-        rctx: &crate::ResourceContext,
-        vpc: VpcConfig,
-        module: impl Into<String>,
-    ) -> Self {
+    pub fn new(rctx: &crate::ResourceContext, vpc: VpcConfig, module: impl Into<String>) -> Self {
         Self {
             project: rctx.project.clone(),
             cidr: vpc.cidr,
@@ -104,16 +100,12 @@ impl Resource for VpcResource {
             .tag_specifications(vpc_tag_spec)
             .send()
             .await
-            .map_err(|e| {
-                IacError::AwsSdk(format!("ec2:CreateVpc: {}", e.into_service_error()))
-            })?;
+            .map_err(|e| IacError::AwsSdk(format!("ec2:CreateVpc: {}", e.into_service_error())))?;
 
         let vpc_id = create_vpc_output
             .vpc()
             .and_then(|v| v.vpc_id())
-            .ok_or_else(|| {
-                IacError::AwsSdk("ec2:CreateVpc: no VPC ID in response".into())
-            })?
+            .ok_or_else(|| IacError::AwsSdk("ec2:CreateVpc: no VPC ID in response".into()))?
             .to_string();
 
         // 2. ec2:ModifyVpcAttribute — explicitly enable DNS hostnames and DNS support
@@ -178,10 +170,7 @@ impl Resource for VpcResource {
                 .send()
                 .await
                 .map_err(|e| {
-                    IacError::AwsSdk(format!(
-                        "ec2:CreateSubnet: {}",
-                        e.into_service_error()
-                    ))
+                    IacError::AwsSdk(format!("ec2:CreateSubnet: {}", e.into_service_error()))
                 })?;
 
             let subnet_id = create_subnet_output
@@ -211,19 +200,14 @@ impl Resource for VpcResource {
             .send()
             .await
             .map_err(|e| {
-                IacError::AwsSdk(format!(
-                    "ec2:CreateRouteTable: {}",
-                    e.into_service_error()
-                ))
+                IacError::AwsSdk(format!("ec2:CreateRouteTable: {}", e.into_service_error()))
             })?;
 
         let route_table_id = rt_output
             .route_table()
             .and_then(|rt| rt.route_table_id())
             .ok_or_else(|| {
-                IacError::AwsSdk(
-                    "ec2:CreateRouteTable: no route table ID in response".into(),
-                )
+                IacError::AwsSdk("ec2:CreateRouteTable: no route table ID in response".into())
             })?
             .to_string();
 
@@ -303,10 +287,7 @@ impl Resource for VpcResource {
                 .send()
                 .await
                 .map_err(|e| {
-                    IacError::AwsSdk(format!(
-                        "ec2:CreateTags: {}",
-                        e.into_service_error()
-                    ))
+                    IacError::AwsSdk(format!("ec2:CreateTags: {}", e.into_service_error()))
                 })?;
         }
 
@@ -323,10 +304,7 @@ impl Resource for VpcResource {
                 .send()
                 .await
                 .map_err(|e| {
-                    IacError::AwsSdk(format!(
-                        "ec2:CreateTags: {}",
-                        e.into_service_error()
-                    ))
+                    IacError::AwsSdk(format!("ec2:CreateTags: {}", e.into_service_error()))
                 })?;
         }
 
@@ -447,9 +425,7 @@ impl Resource for VpcResource {
                             if Self::is_route_table_not_found(&msg) {
                                 Ok(true)
                             } else {
-                                Err(IacError::AwsSdk(format!(
-                                    "ec2:DescribeRouteTables: {msg}"
-                                )))
+                                Err(IacError::AwsSdk(format!("ec2:DescribeRouteTables: {msg}")))
                             }
                         }
                     }
@@ -475,9 +451,7 @@ impl Resource for VpcResource {
                     if msg.contains("InvalidRouteTableID.NotFound") {
                         tracing::warn!(route_table = %route_table_id, "route table not found, skipping");
                     } else {
-                        return Err(IacError::AwsSdk(format!(
-                            "ec2:DeleteRouteTable: {msg}"
-                        )));
+                        return Err(IacError::AwsSdk(format!("ec2:DeleteRouteTable: {msg}")));
                     }
                 }
             }
@@ -533,9 +507,7 @@ impl Resource for VpcResource {
                             if Self::is_subnet_not_found(&msg) {
                                 Ok(true)
                             } else {
-                                Err(IacError::AwsSdk(format!(
-                                    "ec2:DescribeSubnets: {msg}"
-                                )))
+                                Err(IacError::AwsSdk(format!("ec2:DescribeSubnets: {msg}")))
                             }
                         }
                     }
@@ -584,9 +556,7 @@ impl Resource for VpcResource {
                                     if Self::is_vpc_not_found(&msg) {
                                         Ok(true)
                                     } else {
-                                        Err(IacError::AwsSdk(format!(
-                                            "ec2:DescribeVpcs: {msg}"
-                                        )))
+                                        Err(IacError::AwsSdk(format!("ec2:DescribeVpcs: {msg}")))
                                     }
                                 }
                             }
@@ -608,10 +578,7 @@ impl Resource for VpcResource {
         Ok(())
     }
 
-    async fn describe(
-        &self,
-        ctx: &ProvisionContext,
-    ) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
         let vpc_name = format!("{}-vpc", self.project);
 
         // ec2:DescribeVpcs with tag filter Name={project}-vpc
@@ -661,10 +628,7 @@ impl Resource for VpcResource {
             .send()
             .await
             .map_err(|e| {
-                IacError::AwsSdk(format!(
-                    "ec2:DescribeSubnets: {}",
-                    e.into_service_error()
-                ))
+                IacError::AwsSdk(format!("ec2:DescribeSubnets: {}", e.into_service_error()))
             })?;
 
         let subnet_ids: Vec<String> = subnets_output
@@ -713,9 +677,7 @@ impl Resource for VpcResource {
                 rt.associations()
                     .iter()
                     .filter(|assoc| !assoc.main().unwrap_or(false))
-                    .filter_map(|assoc| {
-                        assoc.route_table_association_id().map(str::to_string)
-                    })
+                    .filter_map(|assoc| assoc.route_table_association_id().map(str::to_string))
                     .collect()
             })
             .unwrap_or_default();

@@ -2,8 +2,7 @@ use std::sync::Arc;
 
 use time::OffsetDateTime;
 use tokeira_storage::{
-    BacklogEntry, BacklogPayload, DispatchableActivityTask, DispatchableWorkflowTask,
-    RunRepository,
+    BacklogEntry, BacklogPayload, DispatchableActivityTask, DispatchableWorkflowTask, RunRepository,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -231,9 +230,7 @@ pub(crate) async fn run_drain_loop<R>(
     }
 }
 
-fn workflow_to_backlog_entry(
-    task: &crate::broker::TimestampedWorkflowTask,
-) -> BacklogEntry {
+fn workflow_to_backlog_entry(task: &crate::broker::TimestampedWorkflowTask) -> BacklogEntry {
     BacklogEntry {
         run_key: task.task.run_key,
         queue: task.task.queue.clone(),
@@ -245,9 +242,7 @@ fn workflow_to_backlog_entry(
     }
 }
 
-fn activity_to_backlog_entry(
-    task: &crate::broker::TimestampedActivityTask,
-) -> BacklogEntry {
+fn activity_to_backlog_entry(task: &crate::broker::TimestampedActivityTask) -> BacklogEntry {
     BacklogEntry {
         run_key: task.task.run_key,
         queue: task.task.queue.clone(),
@@ -274,13 +269,12 @@ mod tests {
     use proptest::prelude::*;
     use tokeira_kernel::{LoadedRun, Transition};
     use tokeira_storage::{
-        ActivitySweepEntry, CommitResult, DispatchableWorkflowTask, DueTimer,
-        NexusSweepEntry, RequestRecord, RunRepository, TransitionAuditRecord,
-        WorkflowTimeoutSweepEntry,
+        ActivitySweepEntry, CommitResult, DispatchableWorkflowTask, DueTimer, NexusSweepEntry,
+        RequestRecord, RunRepository, TransitionAuditRecord, WorkflowTimeoutSweepEntry,
     };
     use tokeira_types::{
-        ExecutionRef, LogicalTaskSeq, NamespaceId, QueueKey, RequestId, RunKey,
-        ShardEpoch, ShardId, TaskKind, TaskQueueName,
+        ExecutionRef, LogicalTaskSeq, NamespaceId, QueueKey, RequestId, RunKey, ShardEpoch,
+        ShardId, TaskKind, TaskQueueName,
     };
 
     use super::*;
@@ -295,10 +289,7 @@ mod tests {
 
     #[async_trait]
     impl RunRepository for MockBacklogRepo {
-        async fn resolve_execution(
-            &self,
-            _execution: &ExecutionRef,
-        ) -> Result<Option<RunKey>> {
+        async fn resolve_execution(&self, _execution: &ExecutionRef) -> Result<Option<RunKey>> {
             Ok(None)
         }
         async fn find_latest_run(
@@ -370,11 +361,7 @@ mod tests {
             self.persisted.lock().unwrap().extend(entries);
             Ok(())
         }
-        async fn drain_backlog(
-            &self,
-            queue: &QueueKey,
-            limit: usize,
-        ) -> Result<Vec<BacklogEntry>> {
+        async fn drain_backlog(&self, queue: &QueueKey, limit: usize) -> Result<Vec<BacklogEntry>> {
             self.drain_calls.lock().unwrap().push(queue.clone());
             let mut drained = Vec::new();
             let mut guard = self.drained.lock().unwrap();

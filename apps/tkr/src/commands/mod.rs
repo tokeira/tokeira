@@ -46,16 +46,10 @@ impl PlatformOps {
         }
     }
 
-    pub async fn scale_up(
-        &self,
-        service: &str,
-        replicas: u32,
-    ) -> tokeira_orchestrator::Result<()> {
+    pub async fn scale_up(&self, service: &str, replicas: u32) -> tokeira_orchestrator::Result<()> {
         match self {
             Self::Local(d, c) => d.scale_up(service, replicas, c).await,
-            Self::Compose(d, c, dir) => {
-                d.scale_up_with_dir(service, replicas, c, dir).await
-            }
+            Self::Compose(d, c, dir) => d.scale_up_with_dir(service, replicas, c, dir).await,
         }
     }
 
@@ -66,9 +60,7 @@ impl PlatformOps {
     ) -> tokeira_orchestrator::Result<()> {
         match self {
             Self::Local(d, c) => d.scale_down(service, replicas, c).await,
-            Self::Compose(d, c, dir) => {
-                d.scale_down_with_dir(service, replicas, c, dir).await
-            }
+            Self::Compose(d, c, dir) => d.scale_down_with_dir(service, replicas, c, dir).await,
         }
     }
 

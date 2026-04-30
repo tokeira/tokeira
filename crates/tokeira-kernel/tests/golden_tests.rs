@@ -7,25 +7,24 @@ use tokeira_kernel::{
     ChildStartResult, ChildWorkflowState, Command, CompletionCallback, DispatchOp,
     ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
     ExternalSignalResult, ExternalWorkflowExecution, FieldChange, LoadedRun,
-    NexusOperationResolvedRequest, NexusResolution, ParentClosePolicy,
-    PauseActivityRequest, PauseInfo, PauseWorkflowRequest, PendingExternalCancel,
-    PendingExternalSignal, PendingNexusOperation, PendingUpdate, PendingWorkflowTask,
-    ProjectionOp, Reject, ReplayContext, ResetActivityRequest, ResetRequest, RetryState,
-    SignalRequest, SignalWithStartRequest, StartRequest, StartWorkflowTaskRequest,
-    TerminateRequest, TimerDueRequest, TimerState, UnpauseActivityRequest,
-    UnpauseWorkflowRequest, UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest,
-    UpdateProtocolBody, UpdateRequest, VersioningOverride, WorkflowCommand,
-    WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
+    NexusOperationResolvedRequest, NexusResolution, ParentClosePolicy, PauseActivityRequest,
+    PauseInfo, PauseWorkflowRequest, PendingExternalCancel, PendingExternalSignal,
+    PendingNexusOperation, PendingUpdate, PendingWorkflowTask, ProjectionOp, Reject, ReplayContext,
+    ResetActivityRequest, ResetRequest, RetryState, SignalRequest, SignalWithStartRequest,
+    StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerState,
+    UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
+    UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, VersioningOverride,
+    WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
     WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
     WorkflowTaskTimeoutType, WorkflowTimeoutType,
     event::{HistoryEvent, HistoryEventKind},
     kernel::Kernel,
 };
 use tokeira_types::{
-    ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads,
-    RequestContext, RequestId, RetryPolicy, RunId, RunKey, SearchAttrValue,
-    SearchAttributes, ShardEpoch, StickyAffinity, TaskQueueName, TransitionSeq,
-    WorkerIdentity, WorkflowId, WorkflowTaskToken, WorkflowType,
+    ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RequestContext,
+    RequestId, RetryPolicy, RunId, RunKey, SearchAttrValue, SearchAttributes, ShardEpoch,
+    StickyAffinity, TaskQueueName, TransitionSeq, WorkerIdentity, WorkflowId, WorkflowTaskToken,
+    WorkflowType,
 };
 
 fn now() -> OffsetDateTime {
@@ -643,9 +642,7 @@ fn make_unpause_workflow_request() -> UnpauseWorkflowRequest {
     }
 }
 
-fn make_update_activity_options_request(
-    activity_id: &str,
-) -> UpdateActivityOptionsRequest {
+fn make_update_activity_options_request(activity_id: &str) -> UpdateActivityOptionsRequest {
     UpdateActivityOptionsRequest {
         activity_id: activity_id.into(),
         task_queue: FieldChange::Set(TaskQueueName("activity-updated".into())),
@@ -721,10 +718,7 @@ fn with_execution_options(mut state: WorkflowState) -> WorkflowState {
     state
 }
 
-fn with_pending_nexus_operation(
-    mut state: WorkflowState,
-    operation_id: &str,
-) -> WorkflowState {
+fn with_pending_nexus_operation(mut state: WorkflowState, operation_id: &str) -> WorkflowState {
     state.pending_nexus_operations.insert(
         operation_id.into(),
         PendingNexusOperation {
@@ -741,10 +735,7 @@ fn with_pending_nexus_operation(
     state
 }
 
-fn with_started_nexus_operation(
-    mut state: WorkflowState,
-    operation_id: &str,
-) -> WorkflowState {
+fn with_started_nexus_operation(mut state: WorkflowState, operation_id: &str) -> WorkflowState {
     state = with_pending_nexus_operation(state, operation_id);
     if let Some(pending) = state.pending_nexus_operations.get_mut(operation_id) {
         pending.started = true;
@@ -1784,9 +1775,7 @@ fn update_activity_options_happy_path() {
     let transition = kernel()
         .apply(
             LoadedRun::Existing(make_open_state_with_activity("activity-1")),
-            Command::UpdateActivityOptions(make_update_activity_options_request(
-                "activity-1",
-            )),
+            Command::UpdateActivityOptions(make_update_activity_options_request("activity-1")),
         )
         .unwrap();
     assert!(transition.history_events.is_empty());
@@ -1804,9 +1793,7 @@ fn update_activity_options_unknown_activity() {
     let reject = kernel()
         .apply(
             LoadedRun::Existing(make_open_state()),
-            Command::UpdateActivityOptions(make_update_activity_options_request(
-                "missing",
-            )),
+            Command::UpdateActivityOptions(make_update_activity_options_request("missing")),
         )
         .unwrap_err();
     assert_eq!(reject, Reject::UnknownActivity("missing".into()));
@@ -1992,10 +1979,12 @@ fn workflow_task_completed_with_activity_and_timer() {
         transition.history_events[0].kind,
         HistoryEventKind::WorkflowTaskCompleted { .. }
     ));
-    assert!(transition.history_events.iter().any(|event| matches!(
-        event.kind,
-        HistoryEventKind::ActivityTaskScheduled { .. }
-    )));
+    assert!(
+        transition
+            .history_events
+            .iter()
+            .any(|event| matches!(event.kind, HistoryEventKind::ActivityTaskScheduled { .. }))
+    );
     assert!(
         transition
             .history_events
@@ -2430,15 +2419,19 @@ fn activity_resolved_completed_schedules_wft() {
         )
         .unwrap();
 
-    assert!(transition.history_events.iter().any(|event| matches!(
-        event.kind,
-        HistoryEventKind::ActivityTaskCompleted { .. }
-    )));
+    assert!(
+        transition
+            .history_events
+            .iter()
+            .any(|event| matches!(event.kind, HistoryEventKind::ActivityTaskCompleted { .. }))
+    );
     assert!(transition.activity_ops.iter().any(|op| matches!(op, tokeira_kernel::ActivityOp::Delete { activity_id } if activity_id == "activity-1")));
-    assert!(transition.history_events.iter().any(|event| matches!(
-        event.kind,
-        HistoryEventKind::WorkflowTaskScheduled { .. }
-    )));
+    assert!(
+        transition
+            .history_events
+            .iter()
+            .any(|event| matches!(event.kind, HistoryEventKind::WorkflowTaskScheduled { .. }))
+    );
     assert!(
         transition
             .dispatch_ops
@@ -2466,10 +2459,12 @@ fn activity_resolved_timed_out_schedules_wft() {
         )
         .unwrap();
 
-    assert!(transition.history_events.iter().any(|event| matches!(
-        event.kind,
-        HistoryEventKind::ActivityTaskTimedOut { .. }
-    )));
+    assert!(
+        transition
+            .history_events
+            .iter()
+            .any(|event| matches!(event.kind, HistoryEventKind::ActivityTaskTimedOut { .. }))
+    );
     assert!(transition.next_state.pending_workflow_task.is_some());
 }
 
@@ -2490,10 +2485,12 @@ fn activity_resolved_canceled_schedules_wft() {
         )
         .unwrap();
 
-    assert!(transition.history_events.iter().any(|event| matches!(
-        event.kind,
-        HistoryEventKind::ActivityTaskCanceled { .. }
-    )));
+    assert!(
+        transition
+            .history_events
+            .iter()
+            .any(|event| matches!(event.kind, HistoryEventKind::ActivityTaskCanceled { .. }))
+    );
     assert!(transition.next_state.pending_workflow_task.is_some());
 }
 
@@ -3533,10 +3530,12 @@ fn request_cancel_activity_then_resolved_canceled() {
             }),
         )
         .unwrap();
-    assert!(second.history_events.iter().any(|event| matches!(
-        event.kind,
-        HistoryEventKind::ActivityTaskCanceled { .. }
-    )));
+    assert!(
+        second
+            .history_events
+            .iter()
+            .any(|event| matches!(event.kind, HistoryEventKind::ActivityTaskCanceled { .. }))
+    );
     assert!(!second.next_state.activities.contains_key("activity-1"));
     assert!(second.activity_ops.iter().any(|op| matches!(
         op,
@@ -5055,8 +5054,7 @@ fn terminate_clears_pending_nexus_operations() {
             .iter()
             .filter(|op| matches!(
                 op,
-                DispatchOp::ScheduleNexusOperation { .. }
-                    | DispatchOp::CancelNexusOperation { .. }
+                DispatchOp::ScheduleNexusOperation { .. } | DispatchOp::CancelNexusOperation { .. }
             ))
             .count(),
         0
@@ -5094,8 +5092,7 @@ fn close_via_complete_clears_pending_nexus_operations() {
             .iter()
             .filter(|op| matches!(
                 op,
-                DispatchOp::ScheduleNexusOperation { .. }
-                    | DispatchOp::CancelNexusOperation { .. }
+                DispatchOp::ScheduleNexusOperation { .. } | DispatchOp::CancelNexusOperation { .. }
             ))
             .count(),
         0

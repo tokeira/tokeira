@@ -1,11 +1,8 @@
 use std::marker::PhantomData;
 
-use serde::Serialize;
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 
-use crate::Validate;
-use crate::backend::StateBackend;
-use crate::error::StateError;
+use crate::{Validate, backend::StateBackend, error::StateError};
 
 /// Single-document compare-and-swap state store.
 ///
@@ -49,15 +46,10 @@ where
 
     /// Save a state document with CAS semantics.
     /// Returns the new version tag on success.
-    pub async fn save(
-        &self,
-        doc: &T,
-        expected_version: &str,
-    ) -> Result<String, StateError> {
+    pub async fn save(&self, doc: &T, expected_version: &str) -> Result<String, StateError> {
         doc.validate()?;
-        let bytes = serde_json::to_vec_pretty(doc).map_err(|e| {
-            StateError::Corrupted(format!("failed to serialize state: {e}"))
-        })?;
+        let bytes = serde_json::to_vec_pretty(doc)
+            .map_err(|e| StateError::Corrupted(format!("failed to serialize state: {e}")))?;
         self.backend
             .write_manifest(&self.key_prefix, &bytes, expected_version)
             .await?;

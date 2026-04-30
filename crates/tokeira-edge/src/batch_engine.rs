@@ -8,8 +8,8 @@ use std::sync::{Arc, atomic::Ordering};
 
 use time::OffsetDateTime;
 use tokeira_runtime::{
-    BatchOperationParams, BatchOperationState, BatchOperationStore, BatchResetTarget,
-    JobId, WorkflowExecutionRef,
+    BatchOperationParams, BatchOperationState, BatchOperationStore, BatchResetTarget, JobId,
+    WorkflowExecutionRef,
 };
 use tokeira_types::NamespaceId;
 use tokio_util::sync::CancellationToken;
@@ -110,18 +110,16 @@ async fn discover_workflows(
     let mut workflows = Vec::new();
     loop {
         let page: ListWorkflowExecutionsResponse = service
-            .list_workflows_batch_internal(
-                dispatch_ctx,
-                Some(query.clone()),
-                next_page_token,
-            )
+            .list_workflows_batch_internal(dispatch_ctx, Some(query.clone()), next_page_token)
             .await?;
-        workflows.extend(page.executions.into_iter().map(|execution| {
-            WorkflowExecutionRef {
-                workflow_id: execution.workflow_id,
-                run_id: Some(execution.run_id.0.to_string()),
-            }
-        }));
+        workflows.extend(
+            page.executions
+                .into_iter()
+                .map(|execution| WorkflowExecutionRef {
+                    workflow_id: execution.workflow_id,
+                    run_id: Some(execution.run_id.0.to_string()),
+                }),
+        );
         match page.next_page_token {
             Some(token) if !token.is_empty() => next_page_token = Some(token),
             _ => break,
@@ -178,12 +176,7 @@ async fn apply_operation(
                 .resolve_reset_target_batch_internal(ctx, workflow_ref, target)
                 .await?;
             service
-                .reset_workflow_batch_internal(
-                    ctx,
-                    workflow_ref,
-                    fork_event_id,
-                    reason.clone(),
-                )
+                .reset_workflow_batch_internal(ctx, workflow_ref, fork_event_id, reason.clone())
                 .await
         }
     }
@@ -218,10 +211,7 @@ pub(crate) fn resolve_reset_target_from_history(
                 .iter()
                 .find(|event| event.event_id == *event_id)
                 .ok_or_else(|| {
-                    EdgeError::BadRequest(format!(
-                        "reset target event_id {} not found",
-                        event_id
-                    ))
+                    EdgeError::BadRequest(format!("reset target event_id {} not found", event_id))
                 })?;
             if is_reset_target_event(&event.kind) {
                 Ok(*event_id)
@@ -236,17 +226,13 @@ pub(crate) fn resolve_reset_target_from_history(
             .iter()
             .find(|event| is_reset_target_event(&event.kind))
             .map(|event| event.event_id)
-            .ok_or_else(|| {
-                EdgeError::BadRequest("no workflow task event found".to_string())
-            }),
+            .ok_or_else(|| EdgeError::BadRequest("no workflow task event found".to_string())),
         BatchResetTarget::LastWorkflowTask => history
             .iter()
             .rev()
             .find(|event| is_reset_target_event(&event.kind))
             .map(|event| event.event_id)
-            .ok_or_else(|| {
-                EdgeError::BadRequest("no workflow task event found".to_string())
-            }),
+            .ok_or_else(|| EdgeError::BadRequest("no workflow task event found".to_string())),
         BatchResetTarget::BuildId(_) => Err(EdgeError::BadRequest(
             "batch reset BuildId target is not supported yet".to_string(),
         )),

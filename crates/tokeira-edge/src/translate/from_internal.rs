@@ -7,8 +7,7 @@ use tokeira_storage::RunRepository;
 use crate::{
     translate::{
         PollWorkflowTaskQueueResponse, RespondWorkflowTaskCompletedResponse,
-        SignalWorkflowExecutionResponse, StartWorkflowExecutionResponse,
-        WorkflowTaskPayloadDto,
+        SignalWorkflowExecutionResponse, StartWorkflowExecutionResponse, WorkflowTaskPayloadDto,
     },
     workflow_service::WorkflowMutationOutcome,
 };
@@ -27,9 +26,7 @@ pub fn start_response(
     }
 }
 
-pub fn signal_response(
-    outcome: WorkflowMutationOutcome,
-) -> SignalWorkflowExecutionResponse {
+pub fn signal_response(outcome: WorkflowMutationOutcome) -> SignalWorkflowExecutionResponse {
     SignalWorkflowExecutionResponse {
         accepted: !outcome.was_duplicate,
         transition_seq: outcome.transition_seq,

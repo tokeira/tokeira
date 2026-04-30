@@ -6,13 +6,11 @@
 
 use thiserror::Error;
 use tokeira_proto::{
-    common as proto_common, enums, public::temporal::api::batch::v1 as proto_batch,
-    workflowservice,
+    common as proto_common, enums, public::temporal::api::batch::v1 as proto_batch, workflowservice,
 };
 use tokeira_runtime::{
-    BatchOperationInfo, BatchOperationParams, BatchOperationSnapshot,
-    BatchOperationState, BatchOperationType, BatchResetTarget, JobId,
-    WorkflowExecutionRef,
+    BatchOperationInfo, BatchOperationParams, BatchOperationSnapshot, BatchOperationState,
+    BatchOperationType, BatchResetTarget, JobId, WorkflowExecutionRef,
 };
 
 #[derive(Debug, Error)]
@@ -244,9 +242,7 @@ pub fn list_batch_response_to_proto(
     }
 }
 
-pub fn batch_operation_type_to_proto(
-    value: BatchOperationType,
-) -> enums::BatchOperationType {
+pub fn batch_operation_type_to_proto(value: BatchOperationType) -> enums::BatchOperationType {
     match value {
         BatchOperationType::Terminate => enums::BatchOperationType::Terminate,
         BatchOperationType::Cancel => enums::BatchOperationType::Cancel,
@@ -256,9 +252,7 @@ pub fn batch_operation_type_to_proto(
     }
 }
 
-pub fn batch_operation_state_to_proto(
-    value: BatchOperationState,
-) -> enums::BatchOperationState {
+pub fn batch_operation_state_to_proto(value: BatchOperationState) -> enums::BatchOperationState {
     match value {
         BatchOperationState::Running => enums::BatchOperationState::Running,
         BatchOperationState::Completed => enums::BatchOperationState::Completed,
@@ -266,9 +260,7 @@ pub fn batch_operation_state_to_proto(
     }
 }
 
-fn workflow_execution_to_ref(
-    value: &proto_common::WorkflowExecution,
-) -> WorkflowExecutionRef {
+fn workflow_execution_to_ref(value: &proto_common::WorkflowExecution) -> WorkflowExecutionRef {
     WorkflowExecutionRef {
         workflow_id: value.workflow_id.clone(),
         run_id: (!value.run_id.trim().is_empty()).then(|| value.run_id.clone()),
@@ -299,16 +291,12 @@ fn reset_target_from_proto(
             }
             Some(Target::FirstWorkflowTask(_)) => Ok(BatchResetTarget::FirstWorkflowTask),
             Some(Target::LastWorkflowTask(_)) => Ok(BatchResetTarget::LastWorkflowTask),
-            Some(Target::BuildId(build_id)) => {
-                Ok(BatchResetTarget::BuildId(build_id.clone()))
-            }
+            Some(Target::BuildId(build_id)) => Ok(BatchResetTarget::BuildId(build_id.clone())),
             None => Err(BatchTranslateError::MissingField("reset.options.target")),
         };
     }
 
-    match enums::ResetType::try_from(value.reset_type)
-        .unwrap_or(enums::ResetType::Unspecified)
-    {
+    match enums::ResetType::try_from(value.reset_type).unwrap_or(enums::ResetType::Unspecified) {
         enums::ResetType::FirstWorkflowTask => Ok(BatchResetTarget::FirstWorkflowTask),
         enums::ResetType::LastWorkflowTask => Ok(BatchResetTarget::LastWorkflowTask),
         enums::ResetType::Unspecified => Err(BatchTranslateError::MissingField(

@@ -1,1 +1,1 @@
-# add repo-wide clippy configuration here
+allow-dbg-in-tests = true

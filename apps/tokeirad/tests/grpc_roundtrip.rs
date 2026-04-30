@@ -5,18 +5,16 @@ use async_trait::async_trait;
 use tokio::sync::oneshot;
 use tokio_stream::{StreamExt, wrappers::TcpListenerStream};
 use tokio_util::sync::CancellationToken;
-use tonic::Code;
-use tonic::{Request, transport::Server};
+use tonic::{Code, Request, transport::Server};
 use tonic_reflection::pb::{
     ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
-    server_reflection_request::MessageRequest,
-    server_reflection_response::MessageResponse,
+    server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
 };
 
 use tokeira_edge::{
-    EdgeInterceptors, InMemoryNamespaceCache, InMemoryOperatorApi, LocalOnlyRouter,
-    LongPollConfig, LongPollGate, NamespaceCache, OperatorService, PendingQueryStore,
-    PollerRegistry, ResolvedNamespace, WorkflowExecutionDescription, WorkflowService,
+    EdgeInterceptors, InMemoryNamespaceCache, InMemoryOperatorApi, LocalOnlyRouter, LongPollConfig,
+    LongPollGate, NamespaceCache, OperatorService, PendingQueryStore, PollerRegistry,
+    ResolvedNamespace, WorkflowExecutionDescription, WorkflowService,
     grpc::{
         operator_service::OperatorServiceGrpc, runtime_adapter::RuntimeAdapter,
         workflow_service::WorkflowServiceGrpc,
@@ -33,16 +31,15 @@ use tokeira_proto::{
     taskqueue::TaskQueue,
     workflowservice::{
         DescribeWorkflowExecutionRequest, ListWorkflowExecutionsRequest,
-        PollWorkflowTaskQueueRequest, QueryWorkflowRequest,
-        ResetWorkflowExecutionRequest, RespondWorkflowTaskCompletedRequest,
-        SignalWithStartWorkflowExecutionRequest, SignalWorkflowExecutionRequest,
-        StartWorkflowExecutionRequest, TerminateWorkflowExecutionRequest,
-        UpdateWorkflowExecutionRequest, workflow_service_client::WorkflowServiceClient,
+        PollWorkflowTaskQueueRequest, QueryWorkflowRequest, ResetWorkflowExecutionRequest,
+        RespondWorkflowTaskCompletedRequest, SignalWithStartWorkflowExecutionRequest,
+        SignalWorkflowExecutionRequest, StartWorkflowExecutionRequest,
+        TerminateWorkflowExecutionRequest, UpdateWorkflowExecutionRequest,
+        workflow_service_client::WorkflowServiceClient,
     },
 };
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime,
-    WorkflowTimeoutScannerConfig,
+    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{InMemoryStore, RunRepository};
 use tokeira_types::{ExecutionRef, ProjectionCursor, WorkflowId};
@@ -133,12 +130,10 @@ async fn grpc_roundtrip_start_describe_and_reflection() -> Result<()> {
     let reflection_channel = tonic::transport::Endpoint::new(endpoint)?.connect().await?;
     let mut reflection = ServerReflectionClient::new(reflection_channel);
     let mut stream = reflection
-        .server_reflection_info(Request::new(tokio_stream::once(
-            ServerReflectionRequest {
-                host: String::new(),
-                message_request: Some(MessageRequest::ListServices(String::new())),
-            },
-        )))
+        .server_reflection_info(Request::new(tokio_stream::once(ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(MessageRequest::ListServices(String::new())),
+        })))
         .await?
         .into_inner();
 
@@ -567,23 +562,17 @@ async fn grpc_roundtrip_update_completed_through_protocol_messages() -> Result<(
                     workflow_id: "workflow-update-transport".to_string(),
                     run_id: run_id_for_update,
                 }),
-                request: Some(
-                    tokeira_proto::public::temporal::api::update::v1::Request {
-                        meta: Some(
-                            tokeira_proto::public::temporal::api::update::v1::Meta {
-                                update_id: "update-1".to_string(),
-                                identity: "starter".to_string(),
-                            },
-                        ),
-                        input: Some(
-                            tokeira_proto::public::temporal::api::update::v1::Input {
-                                header: None,
-                                name: "set_counter".to_string(),
-                                args: Some(payloads("10")),
-                            },
-                        ),
-                    },
-                ),
+                request: Some(tokeira_proto::public::temporal::api::update::v1::Request {
+                    meta: Some(tokeira_proto::public::temporal::api::update::v1::Meta {
+                        update_id: "update-1".to_string(),
+                        identity: "starter".to_string(),
+                    }),
+                    input: Some(tokeira_proto::public::temporal::api::update::v1::Input {
+                        header: None,
+                        name: "set_counter".to_string(),
+                        args: Some(payloads("10")),
+                    }),
+                }),
                 wait_policy: Some(
                     tokeira_proto::public::temporal::api::update::v1::WaitPolicy {
                         lifecycle_stage: 2,
@@ -661,11 +650,9 @@ async fn grpc_roundtrip_update_completed_through_protocol_messages() -> Result<(
     let update = update_handle.await??;
     let outcome = update.outcome.expect("update outcome should be present");
     match outcome.value {
-        Some(
-            tokeira_proto::public::temporal::api::update::v1::outcome::Value::Success(
-                result,
-            ),
-        ) => assert_eq!(result, payloads("5")),
+        Some(tokeira_proto::public::temporal::api::update::v1::outcome::Value::Success(result)) => {
+            assert_eq!(result, payloads("5"))
+        }
         other => panic!("unexpected update outcome: {other:?}"),
     }
 
@@ -924,9 +911,7 @@ where
                     }
                 }),
             })),
-            LoadedRun::Absent => {
-                Err(anyhow!("resolved run missing from storage: {:?}", run_key))
-            }
+            LoadedRun::Absent => Err(anyhow!("resolved run missing from storage: {:?}", run_key)),
         }
     }
 }

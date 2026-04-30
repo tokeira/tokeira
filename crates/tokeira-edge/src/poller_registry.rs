@@ -59,11 +59,7 @@ impl PollerRegistry {
             .unwrap_or_default()
     }
 
-    pub fn has_active_poller(
-        &self,
-        queue: &QueueKey,
-        worker_identity: &WorkerIdentity,
-    ) -> bool {
+    pub fn has_active_poller(&self, queue: &QueueKey, worker_identity: &WorkerIdentity) -> bool {
         self.state
             .pollers
             .read()

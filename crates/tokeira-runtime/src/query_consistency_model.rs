@@ -343,10 +343,7 @@ mod tests {
         assert!(state.buffered.is_empty());
         assert_eq!(state.delivered.len(), 1);
         assert_eq!(state.delivered[0].worker_eval_event_id, 7);
-        assert!(
-            state.delivered[0].worker_eval_event_id
-                >= state.delivered[0].required_barrier
-        );
+        assert!(state.delivered[0].worker_eval_event_id >= state.delivered[0].required_barrier);
 
         // Check invariant.
         state.check_invariant();

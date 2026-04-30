@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
 /// Errors from the generic config loader.
@@ -34,11 +33,9 @@ pub fn load_config<T: DeserializeOwned>(
     base_path: &Path,
     profile_path: Option<&Path>,
 ) -> Result<T, ConfigLoaderError> {
-    let raw = std::fs::read_to_string(base_path).map_err(|source| {
-        ConfigLoaderError::ReadFile {
-            path: base_path.to_path_buf(),
-            source,
-        }
+    let raw = std::fs::read_to_string(base_path).map_err(|source| ConfigLoaderError::ReadFile {
+        path: base_path.to_path_buf(),
+        source,
     })?;
     let mut base: toml::Value =
         toml::from_str(&raw).map_err(|source| ConfigLoaderError::Parse {
@@ -47,12 +44,11 @@ pub fn load_config<T: DeserializeOwned>(
         })?;
 
     if let Some(profile) = profile_path {
-        let profile_raw = std::fs::read_to_string(profile).map_err(|source| {
-            ConfigLoaderError::ReadFile {
+        let profile_raw =
+            std::fs::read_to_string(profile).map_err(|source| ConfigLoaderError::ReadFile {
                 path: profile.to_path_buf(),
                 source,
-            }
-        })?;
+            })?;
         let overlay: toml::Value =
             toml::from_str(&profile_raw).map_err(|source| ConfigLoaderError::Parse {
                 path: profile.to_path_buf(),

@@ -245,10 +245,7 @@ where
         self.store.upsert_execution(&row).await?;
         let deltas = compute_rollup_deltas(previous.as_ref(), &row);
         self.store.accumulate_rollup(&deltas).await?;
-        projection_metrics::record_sink_write_duration(
-            record.partition_id,
-            started.elapsed(),
-        );
+        projection_metrics::record_sink_write_duration(record.partition_id, started.elapsed());
         Ok(())
     }
 }
@@ -261,8 +258,8 @@ mod tests {
     use tokeira_kernel::ProjectionOp;
     use tokeira_storage::ProjectionContext;
     use tokeira_types::{
-        ExecutionStatus, NamespaceId, Payload, RunId, RunKey, SearchAttrValue,
-        TaskQueueName, TransitionSeq, WorkflowId, WorkflowType,
+        ExecutionStatus, NamespaceId, Payload, RunId, RunKey, SearchAttrValue, TaskQueueName,
+        TransitionSeq, WorkflowId, WorkflowType,
     };
     use uuid::Uuid;
 
@@ -337,20 +334,18 @@ mod tests {
             1i64..100,
         )
             .prop_map(
-                move |(status, wf_id, run_id, wf_type, tq, start, hl, stc)| {
-                    ProjectionContext {
-                        namespace_id: ns,
-                        workflow_id: WorkflowId(wf_id),
-                        run_id: RunId(Uuid::from_u128(run_id)),
-                        workflow_type: WorkflowType(wf_type),
-                        task_queue: TaskQueueName(tq),
-                        execution_status: status,
-                        start_time: OffsetDateTime::from_unix_timestamp(start).unwrap(),
-                        execution_time: None,
-                        close_time: None,
-                        history_length: hl,
-                        state_transition_count: stc,
-                    }
+                move |(status, wf_id, run_id, wf_type, tq, start, hl, stc)| ProjectionContext {
+                    namespace_id: ns,
+                    workflow_id: WorkflowId(wf_id),
+                    run_id: RunId(Uuid::from_u128(run_id)),
+                    workflow_type: WorkflowType(wf_type),
+                    task_queue: TaskQueueName(tq),
+                    execution_status: status,
+                    start_time: OffsetDateTime::from_unix_timestamp(start).unwrap(),
+                    execution_time: None,
+                    close_time: None,
+                    history_length: hl,
+                    state_transition_count: stc,
                 },
             )
     }
@@ -561,10 +556,8 @@ mod tests {
             .await
             .unwrap();
         let sink = VisibilitySink::new(store.clone(), "sink");
-        let record = record_with_search_attr(
-            namespace_id,
-            SearchAttrValue::Keyword("blue".to_string()),
-        );
+        let record =
+            record_with_search_attr(namespace_id, SearchAttrValue::Keyword("blue".to_string()));
 
         sink.apply(&record).await.unwrap();
 

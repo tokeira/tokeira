@@ -17,17 +17,18 @@ use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     CancelRequest, ChildStartConfirmedRequest, ChildStartResult, Command, DispatchOp,
     ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
-    ExternalSignalResult, ExternalWorkflowExecution, LoadedRun, SignalRequest,
-    StartRequest, TerminateRequest,
+    ExternalSignalResult, ExternalWorkflowExecution, LoadedRun, SignalRequest, StartRequest,
+    TerminateRequest,
 };
-use tokeira_proto::conversions::common::failure_to_payload;
-use tokeira_proto::public::temporal::api::failure::v1 as failure_proto;
+use tokeira_proto::{
+    conversions::common::failure_to_payload, public::temporal::api::failure::v1 as failure_proto,
+};
 use tokeira_storage::{
     CommitResult, DispatchableActivityTask, DispatchableWorkflowTask, RunRepository,
 };
 use tokeira_types::{
-    BuildId, ExecutionRef, Memo, NamespaceId, Payloads, QueueKey, RequestContext,
-    RequestId, RunId, RunKey, SearchAttributes, TaskQueueName, WorkflowId,
+    BuildId, ExecutionRef, Memo, NamespaceId, Payloads, QueueKey, RequestContext, RequestId, RunId,
+    RunKey, SearchAttributes, TaskQueueName, WorkflowId,
 };
 
 use crate::{
@@ -36,8 +37,8 @@ use crate::{
     fairness::DeliveryMetrics,
     lane::{DispatchPublisher, LaneHandle},
     nexus::{
-        EndpointTarget, NexusEndpointRegistry, NexusHttpClient, NexusStartResult,
-        NexusTask, NexusTaskBroker, NexusTaskRequest, NexusTaskToken, NexusTimeoutEntry,
+        EndpointTarget, NexusEndpointRegistry, NexusHttpClient, NexusStartResult, NexusTask,
+        NexusTaskBroker, NexusTaskRequest, NexusTaskToken, NexusTimeoutEntry,
         NexusTimeoutTrackingState,
     },
     scanner::pick_lane,
@@ -316,9 +317,7 @@ where
                     details: None,
                     identity: "parent-close-policy".to_string(),
                     request: RequestContext {
-                        request_id: RequestId(format!(
-                            "terminate-child-{child_run_id:?}"
-                        )),
+                        request_id: RequestId(format!("terminate-child-{child_run_id:?}")),
                         caller_identity: Some("runtime-child-orchestrator".to_string()),
                         received_at: OffsetDateTime::now_utc(),
                     },
@@ -330,9 +329,7 @@ where
                     .await
                 {
                     let message = error.to_string();
-                    if message.contains("kernel rejected")
-                        || message.contains("not found")
-                    {
+                    if message.contains("kernel rejected") || message.contains("not found") {
                         tracing::debug!(
                             ?error,
                             child_run_key = ?child_run_key,
@@ -395,9 +392,7 @@ where
                     .await
                 {
                     let message = error.to_string();
-                    if message.contains("kernel rejected")
-                        || message.contains("not found")
-                    {
+                    if message.contains("kernel rejected") || message.contains("not found") {
                         tracing::debug!(
                             ?error,
                             child_run_key = ?child_run_key,
@@ -459,9 +454,7 @@ where
                         request_id: RequestId(format!(
                             "ext-signal-{originator_run_key:?}-{initiated_event_id}"
                         )),
-                        caller_identity: Some(
-                            "runtime-external-signal-orchestrator".to_string(),
-                        ),
+                        caller_identity: Some("runtime-external-signal-orchestrator".to_string()),
                         received_at: OffsetDateTime::now_utc(),
                     },
                     now: OffsetDateTime::now_utc(),
@@ -542,9 +535,7 @@ where
                         request_id: RequestId(format!(
                             "ext-cancel-{originator_run_key:?}-{initiated_event_id}"
                         )),
-                        caller_identity: Some(
-                            "runtime-external-cancel-orchestrator".to_string(),
-                        ),
+                        caller_identity: Some("runtime-external-cancel-orchestrator".to_string()),
                         received_at: OffsetDateTime::now_utc(),
                     },
                     now: OffsetDateTime::now_utc(),
@@ -702,14 +693,13 @@ where
             },
         };
 
-        let command = Command::NexusOperationResolved(
-            tokeira_kernel::NexusOperationResolvedRequest {
+        let command =
+            Command::NexusOperationResolved(tokeira_kernel::NexusOperationResolvedRequest {
                 operation_id,
                 scheduled_event_id,
                 resolution,
                 now: OffsetDateTime::now_utc(),
-            },
-        );
+            });
         if let Err(error) = self
             .pick_lane(originator_run_key)
             .submit(originator_run_key, command)
@@ -1133,11 +1123,7 @@ where
         Ok(())
     }
 
-    async fn submit_to_run(
-        &self,
-        run_key: RunKey,
-        command: Command,
-    ) -> Result<CommitResult> {
+    async fn submit_to_run(&self, run_key: RunKey, command: Command) -> Result<CommitResult> {
         self.pick_lane(run_key).submit(run_key, command).await
     }
 }

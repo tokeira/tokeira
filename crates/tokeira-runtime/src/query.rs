@@ -36,9 +36,8 @@ mod tests {
     use tokeira_kernel::{LoadedRun, StartRequest, WorkflowTaskCompletedRequest};
     use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
     use tokeira_types::{
-        ExecutionRef, Memo, NamespaceId, QueueKey, RequestContext, RequestId, RunId,
-        RunKey, SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId,
-        WorkflowType,
+        ExecutionRef, Memo, NamespaceId, QueueKey, RequestContext, RequestId, RunId, RunKey,
+        SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
     };
     use tokio::sync::oneshot;
 

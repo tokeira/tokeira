@@ -11,8 +11,8 @@ use tracing::debug;
 
 use time::OffsetDateTime;
 use tokeira_proto::workflowservice::{
-    self, workflow_service_server::WorkflowService as WorkflowServiceGrpcApi,
-    workflow_service_server::WorkflowServiceServer,
+    self,
+    workflow_service_server::{WorkflowService as WorkflowServiceGrpcApi, WorkflowServiceServer},
 };
 use tokeira_runtime::{
     BuildIdReachabilityResult, ScheduleError, TaskQueueReachability, VersioningError,
@@ -21,9 +21,7 @@ use tokeira_runtime::{
 use tokeira_types::{BuildId, TaskQueueName, WorkerIdentity};
 
 use crate::{
-    grpc::{
-        errors::proto_conversion_status, metadata::metadata_to_header_map, translate,
-    },
+    grpc::{errors::proto_conversion_status, metadata::metadata_to_header_map, translate},
     translate::{batch, nexus, schedule, to_internal},
     workflow_service::WorkflowService,
 };
@@ -53,17 +51,13 @@ impl WorkflowServiceGrpc {
 fn versioning_error_status(error: VersioningError) -> Status {
     match error {
         VersioningError::StaleConflictToken => Status::aborted(error.to_string()),
-        VersioningError::DuplicateRedirectSource => {
-            Status::already_exists(error.to_string())
-        }
+        VersioningError::DuplicateRedirectSource => Status::already_exists(error.to_string()),
         VersioningError::OutOfBounds
         | VersioningError::EmptyBuildId
         | VersioningError::UnknownRedirectSource
         | VersioningError::LastUnconditionalRule
         | VersioningError::RedirectCycle
-        | VersioningError::RedirectChainTooDeep => {
-            Status::failed_precondition(error.to_string())
-        }
+        | VersioningError::RedirectChainTooDeep => Status::failed_precondition(error.to_string()),
     }
 }
 
@@ -71,9 +65,7 @@ fn schedule_error_status(error: ScheduleError) -> Status {
     match error {
         ScheduleError::AlreadyExists => Status::already_exists(error.to_string()),
         ScheduleError::NotFound => Status::not_found(error.to_string()),
-        ScheduleError::StaleConflictToken => {
-            Status::failed_precondition(error.to_string())
-        }
+        ScheduleError::StaleConflictToken => Status::failed_precondition(error.to_string()),
         ScheduleError::InvalidArgument(message) => Status::invalid_argument(message),
     }
 }
@@ -84,9 +76,7 @@ fn batch_translate_error_status(error: batch::BatchTranslateError) -> Status {
         | batch::BatchTranslateError::InvalidArgument(_) => {
             Status::invalid_argument(error.to_string())
         }
-        batch::BatchTranslateError::Unsupported(_) => {
-            Status::invalid_argument(error.to_string())
-        }
+        batch::BatchTranslateError::Unsupported(_) => Status::invalid_argument(error.to_string()),
     }
 }
 
@@ -163,8 +153,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn respond_workflow_task_completed(
         &self,
         request: Request<workflowservice::RespondWorkflowTaskCompletedRequest>,
-    ) -> Result<Response<workflowservice::RespondWorkflowTaskCompletedResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::RespondWorkflowTaskCompletedResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
         let edge_req = translate::respond_completed_request_to_edge(request.into_inner())
             .map_err(proto_conversion_status)?;
@@ -187,8 +176,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn describe_workflow_execution(
         &self,
         request: Request<workflowservice::DescribeWorkflowExecutionRequest>,
-    ) -> Result<Response<workflowservice::DescribeWorkflowExecutionResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::DescribeWorkflowExecutionResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
         let edge_req = translate::describe_request_to_edge(request.into_inner())
             .map_err(proto_conversion_status)?;
@@ -261,12 +249,10 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn respond_activity_task_completed(
         &self,
         request: Request<workflowservice::RespondActivityTaskCompletedRequest>,
-    ) -> Result<Response<workflowservice::RespondActivityTaskCompletedResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::RespondActivityTaskCompletedResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
-        let edge_req =
-            translate::respond_activity_completed_to_edge(request.into_inner())
-                .map_err(proto_conversion_status)?;
+        let edge_req = translate::respond_activity_completed_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
         debug!("respond_activity_task_completed");
         let _edge_resp = self
             .inner
@@ -281,8 +267,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn respond_activity_task_failed(
         &self,
         request: Request<workflowservice::RespondActivityTaskFailedRequest>,
-    ) -> Result<Response<workflowservice::RespondActivityTaskFailedResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::RespondActivityTaskFailedResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
         let edge_req = translate::respond_activity_failed_to_edge(request.into_inner())
             .map_err(proto_conversion_status)?;
@@ -296,8 +281,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn record_activity_task_heartbeat(
         &self,
         request: Request<workflowservice::RecordActivityTaskHeartbeatRequest>,
-    ) -> Result<Response<workflowservice::RecordActivityTaskHeartbeatResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::RecordActivityTaskHeartbeatResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
         let edge_req = translate::record_heartbeat_to_edge(request.into_inner())
             .map_err(proto_conversion_status)?;
@@ -313,8 +297,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn terminate_workflow_execution(
         &self,
         request: Request<workflowservice::TerminateWorkflowExecutionRequest>,
-    ) -> Result<Response<workflowservice::TerminateWorkflowExecutionResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::TerminateWorkflowExecutionResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
         let edge_req = translate::terminate_request_to_edge(request.into_inner())
             .map_err(proto_conversion_status)?;
@@ -328,8 +311,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn request_cancel_workflow_execution(
         &self,
         request: Request<workflowservice::RequestCancelWorkflowExecutionRequest>,
-    ) -> Result<Response<workflowservice::RequestCancelWorkflowExecutionResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::RequestCancelWorkflowExecutionResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
         let edge_req = translate::cancel_request_to_edge(request.into_inner())
             .map_err(proto_conversion_status)?;
@@ -376,8 +358,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn get_workflow_execution_history(
         &self,
         request: Request<workflowservice::GetWorkflowExecutionHistoryRequest>,
-    ) -> Result<Response<workflowservice::GetWorkflowExecutionHistoryResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::GetWorkflowExecutionHistoryResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
         let edge_req = translate::get_history_request_to_edge(request.into_inner())
             .map_err(proto_conversion_status)?;
@@ -407,9 +388,8 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         request: Request<workflowservice::RegisterNamespaceRequest>,
     ) -> Result<Response<workflowservice::RegisterNamespaceResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
-        let edge_req =
-            translate::register_namespace_request_to_edge(request.into_inner())
-                .map_err(proto_conversion_status)?;
+        let edge_req = translate::register_namespace_request_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
         self.inner.register_namespace(&headers, edge_req).await?;
         Ok(Response::new(workflowservice::RegisterNamespaceResponse {}))
     }
@@ -460,14 +440,10 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn get_workflow_execution_history_reverse(
         &self,
         request: Request<workflowservice::GetWorkflowExecutionHistoryReverseRequest>,
-    ) -> Result<
-        Response<workflowservice::GetWorkflowExecutionHistoryReverseResponse>,
-        Status,
-    > {
+    ) -> Result<Response<workflowservice::GetWorkflowExecutionHistoryReverseResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
-        let edge_req =
-            translate::get_history_reverse_request_to_edge(request.into_inner())
-                .map_err(proto_conversion_status)?;
+        let edge_req = translate::get_history_reverse_request_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
         let edge_resp = self
             .inner
             .get_workflow_execution_history_reverse(&headers, edge_req)
@@ -479,8 +455,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn respond_workflow_task_failed(
         &self,
         request: Request<workflowservice::RespondWorkflowTaskFailedRequest>,
-    ) -> Result<Response<workflowservice::RespondWorkflowTaskFailedResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::RespondWorkflowTaskFailedResponse>, Status> {
         let req = request.into_inner();
         let cause = req.cause;
         let failure_msg = req
@@ -496,8 +471,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn record_activity_task_heartbeat_by_id(
         &self,
         _request: Request<workflowservice::RecordActivityTaskHeartbeatByIdRequest>,
-    ) -> Result<Response<workflowservice::RecordActivityTaskHeartbeatByIdResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::RecordActivityTaskHeartbeatByIdResponse>, Status> {
         Err(Status::unimplemented(
             "record_activity_task_heartbeat_by_id",
         ))
@@ -505,8 +479,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn respond_activity_task_completed_by_id(
         &self,
         _request: Request<workflowservice::RespondActivityTaskCompletedByIdRequest>,
-    ) -> Result<Response<workflowservice::RespondActivityTaskCompletedByIdResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::RespondActivityTaskCompletedByIdResponse>, Status> {
         Err(Status::unimplemented(
             "respond_activity_task_completed_by_id",
         ))
@@ -514,22 +487,19 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn respond_activity_task_failed_by_id(
         &self,
         _request: Request<workflowservice::RespondActivityTaskFailedByIdRequest>,
-    ) -> Result<Response<workflowservice::RespondActivityTaskFailedByIdResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::RespondActivityTaskFailedByIdResponse>, Status> {
         Err(Status::unimplemented("respond_activity_task_failed_by_id"))
     }
     async fn respond_activity_task_canceled(
         &self,
         _request: Request<workflowservice::RespondActivityTaskCanceledRequest>,
-    ) -> Result<Response<workflowservice::RespondActivityTaskCanceledResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::RespondActivityTaskCanceledResponse>, Status> {
         Err(Status::unimplemented("respond_activity_task_canceled"))
     }
     async fn respond_activity_task_canceled_by_id(
         &self,
         _request: Request<workflowservice::RespondActivityTaskCanceledByIdRequest>,
-    ) -> Result<Response<workflowservice::RespondActivityTaskCanceledByIdResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::RespondActivityTaskCanceledByIdResponse>, Status> {
         Err(Status::unimplemented(
             "respond_activity_task_canceled_by_id",
         ))
@@ -537,8 +507,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn signal_with_start_workflow_execution(
         &self,
         request: Request<workflowservice::SignalWithStartWorkflowExecutionRequest>,
-    ) -> Result<Response<workflowservice::SignalWithStartWorkflowExecutionResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::SignalWithStartWorkflowExecutionResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
         let edge_req = translate::signal_with_start_request_to_edge(request.into_inner())
             .map_err(proto_conversion_status)?;
@@ -580,22 +549,19 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn list_open_workflow_executions(
         &self,
         _request: Request<workflowservice::ListOpenWorkflowExecutionsRequest>,
-    ) -> Result<Response<workflowservice::ListOpenWorkflowExecutionsResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::ListOpenWorkflowExecutionsResponse>, Status> {
         Err(Status::unimplemented("list_open_workflow_executions"))
     }
     async fn list_closed_workflow_executions(
         &self,
         _request: Request<workflowservice::ListClosedWorkflowExecutionsRequest>,
-    ) -> Result<Response<workflowservice::ListClosedWorkflowExecutionsResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::ListClosedWorkflowExecutionsResponse>, Status> {
         Err(Status::unimplemented("list_closed_workflow_executions"))
     }
     async fn list_archived_workflow_executions(
         &self,
         _request: Request<workflowservice::ListArchivedWorkflowExecutionsRequest>,
-    ) -> Result<Response<workflowservice::ListArchivedWorkflowExecutionsResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::ListArchivedWorkflowExecutionsResponse>, Status> {
         Err(Status::unimplemented("list_archived_workflow_executions"))
     }
     async fn scan_workflow_executions(
@@ -613,31 +579,29 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn respond_query_task_completed(
         &self,
         _request: Request<workflowservice::RespondQueryTaskCompletedRequest>,
-    ) -> Result<Response<workflowservice::RespondQueryTaskCompletedResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::RespondQueryTaskCompletedResponse>, Status> {
         let request = _request;
         let headers = metadata_to_header_map(request.metadata());
         let req = request.into_inner();
-        let result =
-            match tokeira_proto::enums::QueryResultType::try_from(req.completed_type)
-                .unwrap_or(tokeira_proto::enums::QueryResultType::Failed)
-            {
-                tokeira_proto::enums::QueryResultType::Answered => {
-                    tokeira_runtime::QueryResult::Completed {
-                        result: req
-                            .query_result
-                            .as_ref()
-                            .map(tokeira_proto::conversions::common::payloads_to_domain)
-                            .unwrap_or_default(),
-                    }
+        let result = match tokeira_proto::enums::QueryResultType::try_from(req.completed_type)
+            .unwrap_or(tokeira_proto::enums::QueryResultType::Failed)
+        {
+            tokeira_proto::enums::QueryResultType::Answered => {
+                tokeira_runtime::QueryResult::Completed {
+                    result: req
+                        .query_result
+                        .as_ref()
+                        .map(tokeira_proto::conversions::common::payloads_to_domain)
+                        .unwrap_or_default(),
                 }
-                tokeira_proto::enums::QueryResultType::Failed
-                | tokeira_proto::enums::QueryResultType::Unspecified => {
-                    tokeira_runtime::QueryResult::Failed {
-                        message: req.error_message,
-                    }
+            }
+            tokeira_proto::enums::QueryResultType::Failed
+            | tokeira_proto::enums::QueryResultType::Unspecified => {
+                tokeira_runtime::QueryResult::Failed {
+                    message: req.error_message,
                 }
-            };
+            }
+        };
         self.inner
             .respond_query_task_completed(&headers, req.task_token, result)
             .await?;
@@ -679,9 +643,8 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         request: Request<workflowservice::DescribeTaskQueueRequest>,
     ) -> Result<Response<workflowservice::DescribeTaskQueueResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
-        let edge_req =
-            translate::describe_task_queue_request_to_edge(request.into_inner())
-                .map_err(proto_conversion_status)?;
+        let edge_req = translate::describe_task_queue_request_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
         let edge_resp = self.inner.describe_task_queue(&headers, edge_req).await?;
         Ok(Response::new(
             translate::describe_task_queue_response_to_proto(edge_resp),
@@ -780,8 +743,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn list_schedule_matching_times(
         &self,
         request: Request<workflowservice::ListScheduleMatchingTimesRequest>,
-    ) -> Result<Response<workflowservice::ListScheduleMatchingTimesResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::ListScheduleMatchingTimesResponse>, Status> {
         let req = request.into_inner();
         let namespace_id = to_internal::namespace_id_for(&req.namespace);
         let schedule_id = tokeira_runtime::ScheduleId(req.schedule_id);
@@ -830,11 +792,10 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         } else {
             req.maximum_page_size as usize
         };
-        let (mut entries, next_page_token) = self.inner.schedule_store().list(
-            namespace_id,
-            page_size,
-            &req.next_page_token,
-        );
+        let (mut entries, next_page_token) =
+            self.inner
+                .schedule_store()
+                .list(namespace_id, page_size, &req.next_page_token);
         let now = OffsetDateTime::now_utc();
         for entry in &mut entries {
             entry.info.future_action_times =
@@ -848,8 +809,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn update_worker_build_id_compatibility(
         &self,
         _request: Request<workflowservice::UpdateWorkerBuildIdCompatibilityRequest>,
-    ) -> Result<Response<workflowservice::UpdateWorkerBuildIdCompatibilityResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::UpdateWorkerBuildIdCompatibilityResponse>, Status> {
         Err(Status::unimplemented(
             "Legacy worker versioning API (v1 version sets) is not supported. Use UpdateWorkerVersioningRules (v2 rule-based API) instead.",
         ))
@@ -857,8 +817,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn get_worker_build_id_compatibility(
         &self,
         _request: Request<workflowservice::GetWorkerBuildIdCompatibilityRequest>,
-    ) -> Result<Response<workflowservice::GetWorkerBuildIdCompatibilityResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::GetWorkerBuildIdCompatibilityResponse>, Status> {
         Err(Status::unimplemented(
             "Legacy worker versioning API (v1 version sets) is not supported. Use GetWorkerVersioningRules (v2 rule-based API) instead.",
         ))
@@ -866,8 +825,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn update_worker_versioning_rules(
         &self,
         request: Request<workflowservice::UpdateWorkerVersioningRulesRequest>,
-    ) -> Result<Response<workflowservice::UpdateWorkerVersioningRulesResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::UpdateWorkerVersioningRulesResponse>, Status> {
         let req = request.into_inner();
         if req.namespace.is_empty() || req.task_queue.is_empty() {
             return Err(Status::invalid_argument(
@@ -930,8 +888,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn get_worker_task_reachability(
         &self,
         request: Request<workflowservice::GetWorkerTaskReachabilityRequest>,
-    ) -> Result<Response<workflowservice::GetWorkerTaskReachabilityResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::GetWorkerTaskReachabilityResponse>, Status> {
         let req = request.into_inner();
         if req.namespace.is_empty() {
             return Err(Status::invalid_argument("namespace is required"));
@@ -990,8 +947,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn get_deployment_reachability(
         &self,
         _request: Request<workflowservice::GetDeploymentReachabilityRequest>,
-    ) -> Result<Response<workflowservice::GetDeploymentReachabilityResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::GetDeploymentReachabilityResponse>, Status> {
         Err(Status::unimplemented(
             "Deployment management is not yet supported. Use GetWorkerTaskReachability for build ID reachability.",
         ))
@@ -1015,8 +971,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn poll_workflow_execution_update(
         &self,
         request: Request<workflowservice::PollWorkflowExecutionUpdateRequest>,
-    ) -> Result<Response<workflowservice::PollWorkflowExecutionUpdateResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::PollWorkflowExecutionUpdateResponse>, Status> {
         use tokeira_proto::public::temporal::api::update::v1 as update;
 
         let headers = metadata_to_header_map(request.metadata());
@@ -1025,9 +980,9 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         let update_ref = req
             .update_ref
             .ok_or_else(|| Status::invalid_argument("update_ref is required"))?;
-        let execution = update_ref.workflow_execution.ok_or_else(|| {
-            Status::invalid_argument("update_ref.workflow_execution is required")
-        })?;
+        let execution = update_ref
+            .workflow_execution
+            .ok_or_else(|| Status::invalid_argument("update_ref.workflow_execution is required"))?;
         let update_id = update_ref.update_id;
         if update_id.is_empty() {
             return Err(Status::invalid_argument("update_ref.update_id is required"));
@@ -1053,21 +1008,22 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                                 tokeira_proto::conversions::common::payloads_from_domain(&result),
                             )),
                         }),
-                        tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Completed as i32,
+                        tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Completed
+                            as i32,
                     ),
                     tokeira_runtime::UpdateOutcome::Rejected { failure, .. } => (
                         Some(update::Outcome {
                             value: Some(update::outcome::Value::Failure(
-                                tokeira_proto::conversions::common::payload_to_failure(
-                                    &failure,
-                                ),
+                                tokeira_proto::conversions::common::payload_to_failure(&failure),
                             )),
                         }),
-                        tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Completed as i32,
+                        tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Completed
+                            as i32,
                     ),
                     tokeira_runtime::UpdateOutcome::Accepted { .. } => (
                         None,
-                        tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Accepted as i32,
+                        tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Accepted
+                            as i32,
                     ),
                 };
 
@@ -1076,12 +1032,10 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                         outcome: proto_outcome,
                         stage,
                         update_ref: Some(update::UpdateRef {
-                            workflow_execution: Some(
-                                tokeira_proto::common::WorkflowExecution {
-                                    workflow_id: execution.workflow_id,
-                                    run_id: execution.run_id,
-                                },
-                            ),
+                            workflow_execution: Some(tokeira_proto::common::WorkflowExecution {
+                                workflow_id: execution.workflow_id,
+                                run_id: execution.run_id,
+                            }),
                             update_id,
                         }),
                     },
@@ -1089,17 +1043,21 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             }
             None => {
                 // Timeout — return empty response so the SDK retries.
-                Ok(Response::new(workflowservice::PollWorkflowExecutionUpdateResponse {
-                    outcome: None,
-                    stage: tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Unspecified as i32,
-                    update_ref: Some(update::UpdateRef {
-                        workflow_execution: Some(tokeira_proto::common::WorkflowExecution {
-                            workflow_id: execution.workflow_id,
-                            run_id: execution.run_id,
+                Ok(Response::new(
+                    workflowservice::PollWorkflowExecutionUpdateResponse {
+                        outcome: None,
+                        stage:
+                            tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Unspecified
+                                as i32,
+                        update_ref: Some(update::UpdateRef {
+                            workflow_execution: Some(tokeira_proto::common::WorkflowExecution {
+                                workflow_id: execution.workflow_id,
+                                run_id: execution.run_id,
+                            }),
+                            update_id,
                         }),
-                        update_id,
-                    }),
-                }))
+                    },
+                ))
             }
         }
     }
@@ -1165,16 +1123,16 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             .map_err(nexus_translate_error_status)?;
         let edge_resp = self.inner.poll_nexus_task_queue(&headers, edge_req).await?;
         Ok(Response::new(match edge_resp {
-            Some(resp) => nexus::poll_response_to_proto(resp)
-                .map_err(nexus_translate_error_status)?,
+            Some(resp) => {
+                nexus::poll_response_to_proto(resp).map_err(nexus_translate_error_status)?
+            }
             None => workflowservice::PollNexusTaskQueueResponse::default(),
         }))
     }
     async fn respond_nexus_task_completed(
         &self,
         request: Request<workflowservice::RespondNexusTaskCompletedRequest>,
-    ) -> Result<Response<workflowservice::RespondNexusTaskCompletedResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::RespondNexusTaskCompletedResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
         let edge_req = nexus::completed_request_to_edge(request.into_inner())
             .map_err(nexus_translate_error_status)?;
@@ -1202,15 +1160,13 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     async fn update_activity_options_by_id(
         &self,
         _request: Request<workflowservice::UpdateActivityOptionsByIdRequest>,
-    ) -> Result<Response<workflowservice::UpdateActivityOptionsByIdResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::UpdateActivityOptionsByIdResponse>, Status> {
         Err(Status::unimplemented("update_activity_options_by_id"))
     }
     async fn update_workflow_execution_options(
         &self,
         _request: Request<workflowservice::UpdateWorkflowExecutionOptionsRequest>,
-    ) -> Result<Response<workflowservice::UpdateWorkflowExecutionOptionsResponse>, Status>
-    {
+    ) -> Result<Response<workflowservice::UpdateWorkflowExecutionOptionsResponse>, Status> {
         Err(Status::unimplemented("update_workflow_execution_options"))
     }
     async fn pause_activity_by_id(
@@ -1255,25 +1211,22 @@ mod tests {
         routing::LocalOnlyRouter,
         to_internal::namespace_id_for,
         workflow_service::{
-            EmptyVisibilityApi, ExecutionResolver, WorkflowMutationOutcome,
-            WorkflowRuntimeApi,
+            EmptyVisibilityApi, ExecutionResolver, WorkflowMutationOutcome, WorkflowRuntimeApi,
         },
     };
     use tokeira_kernel::{
-        BasicKernel, Command, Kernel, LoadedRun, NexusResolution, SignalRequest,
-        StartRequest,
+        BasicKernel, Command, Kernel, LoadedRun, NexusResolution, SignalRequest, StartRequest,
     };
     use tokeira_proto::public::temporal::api::nexus::v1 as nexus_v1;
     use tokeira_runtime::{
-        NexusTask, NexusTaskBroker, NexusTaskRequest, NexusTaskToken,
-        VersioningRuleStore, WorkerRegistrationKey, WorkerRegistry,
-        WorkerVersionMetadata,
+        NexusTask, NexusTaskBroker, NexusTaskRequest, NexusTaskToken, VersioningRuleStore,
+        WorkerRegistrationKey, WorkerRegistry, WorkerVersionMetadata,
     };
     use tokeira_storage::{CommitResult, DispatchableWorkflowTask, RunRepository};
     use tokeira_types::{
-        BuildId, LogicalTaskSeq, Memo, Payloads, QueueKey, RequestContext, RequestId,
-        RunId, RunKey, SearchAttributes, ShardEpoch, TaskKind, TaskQueueName,
-        WorkerIdentity, WorkflowId, WorkflowType,
+        BuildId, LogicalTaskSeq, Memo, Payloads, QueueKey, RequestContext, RequestId, RunId,
+        RunKey, SearchAttributes, ShardEpoch, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId,
+        WorkflowType,
     };
 
     struct PollNoneRuntime;
@@ -2358,20 +2311,18 @@ mod tests {
             .expect("poll should register before describe");
 
         let describe = grpc
-            .describe_task_queue(Request::new(
-                workflowservice::DescribeTaskQueueRequest {
-                    namespace: "default".to_string(),
-                    task_queue: Some(
-                        tokeira_proto::public::temporal::api::taskqueue::v1::TaskQueue {
-                            name: "queue".to_string(),
-                            ..Default::default()
-                        },
-                    ),
-                    task_queue_type: tokeira_proto::enums::TaskQueueType::Workflow as i32,
-                    include_task_queue_status: true,
-                    ..Default::default()
-                },
-            ))
+            .describe_task_queue(Request::new(workflowservice::DescribeTaskQueueRequest {
+                namespace: "default".to_string(),
+                task_queue: Some(
+                    tokeira_proto::public::temporal::api::taskqueue::v1::TaskQueue {
+                        name: "queue".to_string(),
+                        ..Default::default()
+                    },
+                ),
+                task_queue_type: tokeira_proto::enums::TaskQueueType::Workflow as i32,
+                include_task_queue_status: true,
+                ..Default::default()
+            }))
             .await
             .expect("describe should succeed")
             .into_inner();
@@ -2531,8 +2482,7 @@ mod tests {
             .respond_query_task_completed(Request::new(
                 workflowservice::RespondQueryTaskCompletedRequest {
                     task_token: b"missing".to_vec(),
-                    completed_type: tokeira_proto::enums::QueryResultType::Answered
-                        as i32,
+                    completed_type: tokeira_proto::enums::QueryResultType::Answered as i32,
                     query_result: Some(tokeira_proto::common::Payloads::default()),
                     error_message: String::new(),
                     namespace: "default".to_string(),
@@ -2935,19 +2885,17 @@ mod tests {
         let (grpc, _broker) = nexus_test_service(Arc::new(PollNoneRuntime));
 
         let error = grpc
-            .poll_nexus_task_queue(Request::new(
-                workflowservice::PollNexusTaskQueueRequest {
-                    namespace: String::new(),
-                    task_queue: Some(
-                        tokeira_proto::public::temporal::api::taskqueue::v1::TaskQueue {
-                            name: "nexus-q".to_string(),
-                            ..Default::default()
-                        },
-                    ),
-                    identity: "worker".to_string(),
-                    ..Default::default()
-                },
-            ))
+            .poll_nexus_task_queue(Request::new(workflowservice::PollNexusTaskQueueRequest {
+                namespace: String::new(),
+                task_queue: Some(
+                    tokeira_proto::public::temporal::api::taskqueue::v1::TaskQueue {
+                        name: "nexus-q".to_string(),
+                        ..Default::default()
+                    },
+                ),
+                identity: "worker".to_string(),
+                ..Default::default()
+            }))
             .await
             .expect_err("empty namespace should fail");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
@@ -2958,19 +2906,17 @@ mod tests {
         let (grpc, _broker) = nexus_test_service(Arc::new(PollNoneRuntime));
 
         let error = grpc
-            .poll_nexus_task_queue(Request::new(
-                workflowservice::PollNexusTaskQueueRequest {
-                    namespace: "default".to_string(),
-                    task_queue: Some(
-                        tokeira_proto::public::temporal::api::taskqueue::v1::TaskQueue {
-                            name: String::new(),
-                            ..Default::default()
-                        },
-                    ),
-                    identity: "worker".to_string(),
-                    ..Default::default()
-                },
-            ))
+            .poll_nexus_task_queue(Request::new(workflowservice::PollNexusTaskQueueRequest {
+                namespace: "default".to_string(),
+                task_queue: Some(
+                    tokeira_proto::public::temporal::api::taskqueue::v1::TaskQueue {
+                        name: String::new(),
+                        ..Default::default()
+                    },
+                ),
+                identity: "worker".to_string(),
+                ..Default::default()
+            }))
             .await
             .expect_err("empty task queue should fail");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
@@ -3073,8 +3019,7 @@ mod tests {
 
     #[tokio::test]
     async fn respond_nexus_task_completed_rejects_empty_task_token() {
-        let (grpc, _broker) =
-            nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
+        let (grpc, _broker) = nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
 
         let error = grpc
             .respond_nexus_task_completed(Request::new(
@@ -3096,8 +3041,7 @@ mod tests {
 
     #[tokio::test]
     async fn respond_nexus_task_completed_rejects_missing_response() {
-        let (grpc, _broker) =
-            nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
+        let (grpc, _broker) = nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
 
         let token = NexusTaskToken {
             run_key: RunKey::new(),
@@ -3122,8 +3066,7 @@ mod tests {
 
     #[tokio::test]
     async fn respond_nexus_task_completed_rejects_malformed_task_token() {
-        let (grpc, _broker) =
-            nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
+        let (grpc, _broker) = nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
 
         let error = grpc
             .respond_nexus_task_completed(Request::new(
@@ -3176,8 +3119,7 @@ mod tests {
 
     #[tokio::test]
     async fn respond_nexus_task_failed_rejects_empty_task_token() {
-        let (grpc, _broker) =
-            nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
+        let (grpc, _broker) = nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
 
         let error = grpc
             .respond_nexus_task_failed(Request::new(
@@ -3198,8 +3140,7 @@ mod tests {
 
     #[tokio::test]
     async fn respond_nexus_task_failed_rejects_missing_error() {
-        let (grpc, _broker) =
-            nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
+        let (grpc, _broker) = nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
 
         let token = NexusTaskToken {
             run_key: RunKey::new(),

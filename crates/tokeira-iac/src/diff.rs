@@ -1,7 +1,6 @@
 //! Change computation: compare desired resources against persisted state.
 
-use crate::document::InfraState;
-use crate::{InternalChange, Resource, ResourceId};
+use crate::{InternalChange, Resource, ResourceId, document::InfraState};
 
 /// Compare desired resources against actual state and produce a list of changes.
 ///
@@ -43,8 +42,7 @@ pub fn compute_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::IacError;
-    use crate::{ProvisionContext, ResourceState, ResourceType};
+    use crate::{ProvisionContext, ResourceState, ResourceType, error::IacError};
 
     fn make_ctx() -> ProvisionContext {
         ProvisionContext::new("test", std::collections::HashMap::new())
@@ -71,10 +69,7 @@ mod tests {
         fn module(&self) -> &str {
             "foundation"
         }
-        async fn create(
-            &self,
-            _ctx: &ProvisionContext,
-        ) -> Result<ResourceState, IacError> {
+        async fn create(&self, _ctx: &ProvisionContext) -> Result<ResourceState, IacError> {
             unimplemented!()
         }
         async fn update(
@@ -97,11 +92,7 @@ mod tests {
         ) -> Result<Option<ResourceState>, IacError> {
             unimplemented!()
         }
-        fn diff(
-            &self,
-            _current: &ResourceState,
-            _ctx: &ProvisionContext,
-        ) -> InternalChange {
+        fn diff(&self, _current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {
             match &self.update_detail {
                 Some(detail) => InternalChange::Update {
                     resource_id: self.id.clone(),

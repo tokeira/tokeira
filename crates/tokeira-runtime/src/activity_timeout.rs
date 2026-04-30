@@ -13,9 +13,7 @@ use tokeira_storage::RunRepository;
 use tokeira_types::{RunKey, ShardId};
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    lane::LaneHandle, metrics as runtime_metrics, scanner::pick_lane, shard::ShardOwner,
-};
+use crate::{lane::LaneHandle, metrics as runtime_metrics, scanner::pick_lane, shard::ShardOwner};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActivityTrackingEntry {
@@ -78,12 +76,7 @@ impl ActivityTrackingState {
         }
     }
 
-    pub fn record_started(
-        &self,
-        run_key: RunKey,
-        activity_id: &str,
-        now: OffsetDateTime,
-    ) {
+    pub fn record_started(&self, run_key: RunKey, activity_id: &str, now: OffsetDateTime) {
         if let Some(entry) = self
             .inner
             .lock()
@@ -118,11 +111,7 @@ impl ActivityTrackingState {
         }
     }
 
-    pub fn is_cancel_requested(
-        &self,
-        run_key: RunKey,
-        activity_id: &str,
-    ) -> Option<bool> {
+    pub fn is_cancel_requested(&self, run_key: RunKey, activity_id: &str) -> Option<bool> {
         self.inner
             .lock()
             .unwrap()
@@ -197,8 +186,7 @@ pub fn evaluate_activity_timeout(
     if let Some(started_at) = entry.started_at {
         if let Some(timeout) = activity.heartbeat_timeout {
             let heartbeat_at = entry.last_heartbeat_at.unwrap_or(started_at);
-            if now - heartbeat_at > timeout || (timeout.is_zero() && now >= heartbeat_at)
-            {
+            if now - heartbeat_at > timeout || (timeout.is_zero() && now >= heartbeat_at) {
                 return Some(TimeoutViolation::Heartbeat);
             }
         }
@@ -275,15 +263,9 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
                     activity_id: entry.activity_id.clone(),
                     resolution: ActivityResolution::TimedOut {
                         timeout_type: match violation {
-                            TimeoutViolation::ScheduleToClose => {
-                                "schedule_to_close".to_string()
-                            }
-                            TimeoutViolation::ScheduleToStart => {
-                                "schedule_to_start".to_string()
-                            }
-                            TimeoutViolation::StartToClose => {
-                                "start_to_close".to_string()
-                            }
+                            TimeoutViolation::ScheduleToClose => "schedule_to_close".to_string(),
+                            TimeoutViolation::ScheduleToStart => "schedule_to_start".to_string(),
+                            TimeoutViolation::StartToClose => "start_to_close".to_string(),
                             TimeoutViolation::Heartbeat => "heartbeat".to_string(),
                         },
                     },

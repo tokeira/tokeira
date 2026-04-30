@@ -38,28 +38,24 @@ use tokeira_proto::{
     public::temporal::api::{
         command::v1 as command, common::v1 as proto_common, failure::v1 as failure_proto,
         namespace::v1 as namespace_proto, replication::v1 as replication_proto,
-        taskqueue::v1 as taskqueue_proto, version::v1 as version_proto,
-        workflow::v1 as workflow,
+        taskqueue::v1 as taskqueue_proto, version::v1 as version_proto, workflow::v1 as workflow,
     },
     workflowservice,
 };
 use tokeira_runtime::{
-    AssignmentRule, RedirectRule, TaskReachabilityType, VersioningMutation,
-    VersioningRules,
+    AssignmentRule, RedirectRule, TaskReachabilityType, VersioningMutation, VersioningRules,
 };
 use tokeira_types::{
-    ActivityTaskToken, BuildId, DeploymentId, ExecutionStatus, NamespaceId, Payloads,
-    RetryPolicy, RunId, RunKey, TaskKind, WorkflowId, WorkflowType,
+    ActivityTaskToken, BuildId, DeploymentId, ExecutionStatus, NamespaceId, Payloads, RetryPolicy,
+    RunId, RunKey, TaskKind, WorkflowId, WorkflowType,
 };
 use uuid::Uuid;
 
-use crate::translate::to_internal::namespace_id_for;
 use crate::translate::{
     CountWorkflowExecutionsRequest, CountWorkflowExecutionsResponse,
     DeleteWorkflowExecutionRequest as EdgeDeleteWorkflowExecutionRequest,
     DescribeTaskQueueRequest as EdgeDescribeTaskQueueRequest,
-    DescribeTaskQueueResponse as EdgeDescribeTaskQueueResponse,
-    DescribeWorkflowExecutionRequest,
+    DescribeTaskQueueResponse as EdgeDescribeTaskQueueResponse, DescribeWorkflowExecutionRequest,
     ListNamespacesResponse as EdgeListNamespacesResponse, ListWorkflowExecutionsRequest,
     ListWorkflowExecutionsResponse, NamespaceDescription, PollWorkflowTaskQueueRequest,
     PollWorkflowTaskQueueResponse, ProtocolMessageDto, QueryResultDto,
@@ -69,9 +65,9 @@ use crate::translate::{
     RespondWorkflowTaskCompletedRequest, RespondWorkflowTaskCompletedResponse,
     SignalWithStartWorkflowExecutionRequest as EdgeSignalWithStartWorkflowExecutionRequest,
     SignalWithStartWorkflowExecutionResponse as EdgeSignalWithStartWorkflowExecutionResponse,
-    SignalWorkflowExecutionRequest, SignalWorkflowExecutionResponse,
-    StartWorkflowExecutionRequest, StartWorkflowExecutionResponse, SystemInfo,
-    VersioningOverride, WorkflowExecutionDescription, WorkflowExecutionSummary,
+    SignalWorkflowExecutionRequest, SignalWorkflowExecutionResponse, StartWorkflowExecutionRequest,
+    StartWorkflowExecutionResponse, SystemInfo, VersioningOverride, WorkflowExecutionDescription,
+    WorkflowExecutionSummary, to_internal::namespace_id_for,
 };
 use tokeira_kernel::state::ParentClosePolicy;
 
@@ -79,18 +75,14 @@ const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_STICKY_TTL: Duration = Duration::from_secs(30);
 const NON_RETRYABLE_ACTIVITY_SENTINEL: &str = "__tokeira_non_retryable__";
 
-fn proto_duration_to_time(
-    value: Option<&prost_types::Duration>,
-) -> Option<time::Duration> {
+fn proto_duration_to_time(value: Option<&prost_types::Duration>) -> Option<time::Duration> {
     value.map(|duration| {
         time::Duration::seconds(duration.seconds)
             + time::Duration::nanoseconds(i64::from(duration.nanos))
     })
 }
 
-fn activity_retry_classification(
-    failure: &failure_proto::Failure,
-) -> (Option<String>, bool) {
+fn activity_retry_classification(failure: &failure_proto::Failure) -> (Option<String>, bool) {
     let mut cursor = Some(failure);
     while let Some(current) = cursor {
         if let Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(info)) =
@@ -215,12 +207,11 @@ fn versioning_override_to_edge(
     };
     match enums::VersioningBehavior::try_from(override_.behavior).ok() {
         Some(enums::VersioningBehavior::Pinned) => {
-            let deployment =
-                override_
-                    .deployment
-                    .ok_or(ProtoConversionError::MissingField(
-                        "VersioningOverride.deployment",
-                    ))?;
+            let deployment = override_
+                .deployment
+                .ok_or(ProtoConversionError::MissingField(
+                    "VersioningOverride.deployment",
+                ))?;
             if deployment.series_name.is_empty() || deployment.build_id.is_empty() {
                 return Err(ProtoConversionError::MissingField(
                     "VersioningOverride.deployment.series_name/build_id",
@@ -231,9 +222,7 @@ fn versioning_override_to_edge(
                 build_id: deployment.build_id,
             }))
         }
-        Some(enums::VersioningBehavior::AutoUpgrade) => {
-            Ok(Some(VersioningOverride::AutoUpgrade))
-        }
+        Some(enums::VersioningBehavior::AutoUpgrade) => Ok(Some(VersioningOverride::AutoUpgrade)),
         _ => Ok(None),
     }
 }
@@ -241,12 +230,12 @@ fn versioning_override_to_edge(
 pub fn start_request_to_edge(
     req: workflowservice::StartWorkflowExecutionRequest,
 ) -> Result<StartWorkflowExecutionRequest, ProtoConversionError> {
-    let task_queue =
-        req.task_queue
-            .as_ref()
-            .ok_or(ProtoConversionError::MissingField(
-                "StartWorkflowExecutionRequest.task_queue",
-            ))?;
+    let task_queue = req
+        .task_queue
+        .as_ref()
+        .ok_or(ProtoConversionError::MissingField(
+            "StartWorkflowExecutionRequest.task_queue",
+        ))?;
 
     let mut conflict_policy = extract_conflict_policy(req.workflow_id_conflict_policy);
     let mut reuse_policy = extract_reuse_policy(req.workflow_id_reuse_policy);
@@ -276,9 +265,7 @@ pub fn start_request_to_edge(
             .unwrap_or_default(),
         identity: non_empty(req.identity),
         request_eager_execution: req.request_eager_execution,
-        workflow_execution_timeout: proto_duration_to_time(
-            req.workflow_execution_timeout.as_ref(),
-        ),
+        workflow_execution_timeout: proto_duration_to_time(req.workflow_execution_timeout.as_ref()),
         workflow_run_timeout: proto_duration_to_time(req.workflow_run_timeout.as_ref()),
         workflow_task_timeout: proto_duration_to_time(req.workflow_task_timeout.as_ref()),
         retry_policy: req.retry_policy.as_ref().map(retry_policy_to_domain),
@@ -295,12 +282,12 @@ pub fn start_request_to_edge(
 pub fn signal_request_to_edge(
     req: workflowservice::SignalWorkflowExecutionRequest,
 ) -> Result<SignalWorkflowExecutionRequest, ProtoConversionError> {
-    let execution =
-        req.workflow_execution
-            .as_ref()
-            .ok_or(ProtoConversionError::MissingField(
-                "SignalWorkflowExecutionRequest.workflow_execution",
-            ))?;
+    let execution = req
+        .workflow_execution
+        .as_ref()
+        .ok_or(ProtoConversionError::MissingField(
+            "SignalWorkflowExecutionRequest.workflow_execution",
+        ))?;
     Ok(SignalWorkflowExecutionRequest {
         namespace: req.namespace,
         workflow_id: execution.workflow_id.clone(),
@@ -319,20 +306,19 @@ pub fn signal_request_to_edge(
 pub fn poll_request_to_edge(
     req: workflowservice::PollWorkflowTaskQueueRequest,
 ) -> Result<PollWorkflowTaskQueueRequest, ProtoConversionError> {
-    let task_queue =
-        req.task_queue
-            .as_ref()
-            .ok_or(ProtoConversionError::MissingField(
-                "PollWorkflowTaskQueueRequest.task_queue",
-            ))?;
+    let task_queue = req
+        .task_queue
+        .as_ref()
+        .ok_or(ProtoConversionError::MissingField(
+            "PollWorkflowTaskQueueRequest.task_queue",
+        ))?;
 
     let (deployment, build_id) = req
         .worker_version_capabilities
         .as_ref()
         .filter(|caps| caps.use_versioning)
         .map(|caps| {
-            let deployment =
-                non_empty(caps.deployment_series_name.clone()).map(DeploymentId);
+            let deployment = non_empty(caps.deployment_series_name.clone()).map(DeploymentId);
             let build_id = non_empty(caps.build_id.clone()).map(BuildId);
             (deployment, build_id)
         })
@@ -383,10 +369,7 @@ pub fn respond_completed_request_to_edge(
                         .unwrap_or_default();
                     commands.push(WorkflowCommand::ProtocolMessage {
                         message_id,
-                        body: resolve_protocol_message_body(
-                            &body,
-                            msg.protocol_instance_id,
-                        )?,
+                        body: resolve_protocol_message_body(&body, msg.protocol_instance_id)?,
                     });
                 }
             }
@@ -441,10 +424,11 @@ pub fn respond_completed_request_to_edge(
                             .map(payloads_to_domain)
                             .unwrap_or_default(),
                     },
-                    enums::QueryResultType::Failed
-                    | enums::QueryResultType::Unspecified => QueryResultDto::Failed {
-                        error_message: result.error_message,
-                    },
+                    enums::QueryResultType::Failed | enums::QueryResultType::Unspecified => {
+                        QueryResultDto::Failed {
+                            error_message: result.error_message,
+                        }
+                    }
                 };
                 Ok((id, dto))
             })
@@ -467,9 +451,8 @@ fn resolve_protocol_message_body(
     protocol_instance_id: String,
 ) -> Result<tokeira_kernel::UpdateProtocolBody, ProtoConversionError> {
     use prost::Message as _;
-    let any = prost_types::Any::decode(body_bytes).map_err(|_| {
-        ProtoConversionError::MissingField("ProtocolMessage body decode failed")
-    })?;
+    let any = prost_types::Any::decode(body_bytes)
+        .map_err(|_| ProtoConversionError::MissingField("ProtocolMessage body decode failed"))?;
     match any.type_url.as_str() {
         url if url.ends_with("update.v1.Acceptance") => {
             Ok(tokeira_kernel::UpdateProtocolBody::Accepted {
@@ -479,13 +462,10 @@ fn resolve_protocol_message_body(
             })
         }
         url if url.ends_with("update.v1.Response") => {
-            let response =
-                tokeira_proto::public::temporal::api::update::v1::Response::decode(
-                    any.value.as_slice(),
-                )
-                .map_err(|_| {
-                    ProtoConversionError::MissingField("update.v1.Response decode failed")
-                })?;
+            let response = tokeira_proto::public::temporal::api::update::v1::Response::decode(
+                any.value.as_slice(),
+            )
+            .map_err(|_| ProtoConversionError::MissingField("update.v1.Response decode failed"))?;
             match response.outcome.and_then(|o| o.value) {
                 Some(
                     tokeira_proto::public::temporal::api::update::v1::outcome::Value::Success(
@@ -509,15 +489,10 @@ fn resolve_protocol_message_body(
             }
         }
         url if url.ends_with("update.v1.Rejection") => {
-            let rejection =
-                tokeira_proto::public::temporal::api::update::v1::Rejection::decode(
-                    any.value.as_slice(),
-                )
-                .map_err(|_| {
-                    ProtoConversionError::MissingField(
-                        "update.v1.Rejection decode failed",
-                    )
-                })?;
+            let rejection = tokeira_proto::public::temporal::api::update::v1::Rejection::decode(
+                any.value.as_slice(),
+            )
+            .map_err(|_| ProtoConversionError::MissingField("update.v1.Rejection decode failed"))?;
             Ok(tokeira_kernel::UpdateProtocolBody::Rejected {
                 update_id: protocol_instance_id,
                 failure: rejection
@@ -617,21 +592,22 @@ pub fn poll_response_to_proto(
     let history = tokeira_proto::history::History::decode(&history_bytes[..]).ok();
 
     // Extract workflow_type from the first history event (WorkflowExecutionStarted)
-    let workflow_type_name =
-        resp.payload
-            .history
-            .first()
-            .and_then(|ev| {
-                if let tokeira_kernel::event::HistoryEventKind::WorkflowExecutionStarted {
-            ref workflow_type, ..
-        } = ev.kind
-        {
-            Some(workflow_type.0.clone())
-        } else {
-            None
-        }
-            })
-            .unwrap_or_default();
+    let workflow_type_name = resp
+        .payload
+        .history
+        .first()
+        .and_then(|ev| {
+            if let tokeira_kernel::event::HistoryEventKind::WorkflowExecutionStarted {
+                ref workflow_type,
+                ..
+            } = ev.kind
+            {
+                Some(workflow_type.0.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
 
     workflowservice::PollWorkflowTaskQueueResponse {
         task_token: resp.task_token,
@@ -851,9 +827,7 @@ pub fn system_info_to_proto(resp: SystemInfo) -> workflowservice::GetSystemInfoR
         server_version: resp.server_version,
         capabilities: Some(workflowservice::get_system_info_response::Capabilities {
             signal_and_query_header: resp.capabilities.signal_and_query_header,
-            internal_error_differentiation: resp
-                .capabilities
-                .internal_error_differentiation,
+            internal_error_differentiation: resp.capabilities.internal_error_differentiation,
             activity_failure_include_heartbeat: resp
                 .capabilities
                 .activity_failure_include_heartbeat,
@@ -863,9 +837,7 @@ pub fn system_info_to_proto(resp: SystemInfo) -> workflowservice::GetSystemInfoR
             upsert_memo: resp.capabilities.upsert_memo,
             eager_workflow_start: resp.capabilities.eager_workflow_start,
             sdk_metadata: resp.capabilities.sdk_metadata,
-            count_group_by_execution_status: resp
-                .capabilities
-                .count_group_by_execution_status,
+            count_group_by_execution_status: resp.capabilities.count_group_by_execution_status,
             nexus: resp.capabilities.nexus,
         }),
     }
@@ -953,10 +925,7 @@ pub fn get_history_request_to_edge(
 
 pub fn get_history_reverse_request_to_edge(
     req: workflowservice::GetWorkflowExecutionHistoryReverseRequest,
-) -> Result<
-    crate::translate::GetWorkflowExecutionHistoryReverseRequest,
-    ProtoConversionError,
-> {
+) -> Result<crate::translate::GetWorkflowExecutionHistoryReverseRequest, ProtoConversionError> {
     let execution = req
         .execution
         .as_ref()
@@ -979,8 +948,7 @@ pub fn get_history_response_to_proto(
     filter_type: i32,
 ) -> workflowservice::GetWorkflowExecutionHistoryResponse {
     use prost::Message;
-    let history_bytes =
-        crate::translate::history_serializer::serialize_history(&resp.history);
+    let history_bytes = crate::translate::history_serializer::serialize_history(&resp.history);
     let mut history = tokeira_proto::history::History::decode(&history_bytes[..]).ok();
 
     // HISTORY_EVENT_FILTER_TYPE_CLOSE_EVENT = 2
@@ -1010,8 +978,7 @@ pub fn get_history_reverse_response_to_proto(
     resp: crate::translate::GetWorkflowExecutionHistoryReverseResponse,
 ) -> workflowservice::GetWorkflowExecutionHistoryReverseResponse {
     use prost::Message;
-    let history_bytes =
-        crate::translate::history_serializer::serialize_history(&resp.history);
+    let history_bytes = crate::translate::history_serializer::serialize_history(&resp.history);
     let history = tokeira_proto::history::History::decode(&history_bytes[..]).ok();
 
     workflowservice::GetWorkflowExecutionHistoryReverseResponse {
@@ -1023,12 +990,12 @@ pub fn get_history_reverse_response_to_proto(
 pub fn describe_task_queue_request_to_edge(
     req: workflowservice::DescribeTaskQueueRequest,
 ) -> Result<EdgeDescribeTaskQueueRequest, ProtoConversionError> {
-    let task_queue =
-        req.task_queue
-            .as_ref()
-            .ok_or(ProtoConversionError::MissingField(
-                "DescribeTaskQueueRequest.task_queue",
-            ))?;
+    let task_queue = req
+        .task_queue
+        .as_ref()
+        .ok_or(ProtoConversionError::MissingField(
+            "DescribeTaskQueueRequest.task_queue",
+        ))?;
 
     let task_kind = match req.task_queue_type {
         x if x == enums::TaskQueueType::Activity as i32 => TaskKind::Activity,
@@ -1052,14 +1019,14 @@ pub fn describe_task_queue_response_to_proto(
         pollers: resp
             .pollers
             .into_iter()
-            .map(|poller| {
-                tokeira_proto::public::temporal::api::taskqueue::v1::PollerInfo {
+            .map(
+                |poller| tokeira_proto::public::temporal::api::taskqueue::v1::PollerInfo {
                     last_access_time: poller.last_access_time.map(to_proto_timestamp),
                     identity: poller.identity,
                     rate_per_second: poller.rate_per_second,
                     worker_version_capabilities: None,
-                }
-            })
+                },
+            )
             .collect(),
         task_queue_status: resp.backlog_count_hint.map(|backlog_count_hint| {
             tokeira_proto::public::temporal::api::taskqueue::v1::TaskQueueStatus {
@@ -1074,12 +1041,12 @@ pub fn describe_task_queue_response_to_proto(
 pub fn delete_request_to_edge(
     req: workflowservice::DeleteWorkflowExecutionRequest,
 ) -> Result<EdgeDeleteWorkflowExecutionRequest, ProtoConversionError> {
-    let execution =
-        req.workflow_execution
-            .as_ref()
-            .ok_or(ProtoConversionError::MissingField(
-                "DeleteWorkflowExecutionRequest.workflow_execution",
-            ))?;
+    let execution = req
+        .workflow_execution
+        .as_ref()
+        .ok_or(ProtoConversionError::MissingField(
+            "DeleteWorkflowExecutionRequest.workflow_execution",
+        ))?;
 
     Ok(EdgeDeleteWorkflowExecutionRequest {
         namespace: req.namespace,
@@ -1091,12 +1058,12 @@ pub fn delete_request_to_edge(
 pub fn reset_request_to_edge(
     req: workflowservice::ResetWorkflowExecutionRequest,
 ) -> Result<EdgeResetWorkflowExecutionRequest, ProtoConversionError> {
-    let execution =
-        req.workflow_execution
-            .as_ref()
-            .ok_or(ProtoConversionError::MissingField(
-                "ResetWorkflowExecutionRequest.workflow_execution",
-            ))?;
+    let execution = req
+        .workflow_execution
+        .as_ref()
+        .ok_or(ProtoConversionError::MissingField(
+            "ResetWorkflowExecutionRequest.workflow_execution",
+        ))?;
 
     Ok(EdgeResetWorkflowExecutionRequest {
         namespace: req.namespace,
@@ -1119,12 +1086,12 @@ pub fn reset_response_to_proto(
 pub fn signal_with_start_request_to_edge(
     req: workflowservice::SignalWithStartWorkflowExecutionRequest,
 ) -> Result<EdgeSignalWithStartWorkflowExecutionRequest, ProtoConversionError> {
-    let task_queue =
-        req.task_queue
-            .as_ref()
-            .ok_or(ProtoConversionError::MissingField(
-                "SignalWithStartWorkflowExecutionRequest.task_queue",
-            ))?;
+    let task_queue = req
+        .task_queue
+        .as_ref()
+        .ok_or(ProtoConversionError::MissingField(
+            "SignalWithStartWorkflowExecutionRequest.task_queue",
+        ))?;
 
     let mut conflict_policy = if matches!(
         enums::WorkflowIdConflictPolicy::try_from(req.workflow_id_conflict_policy).ok(),
@@ -1160,9 +1127,7 @@ pub fn signal_with_start_request_to_edge(
             .transpose()?
             .unwrap_or_default(),
         identity: non_empty(req.identity),
-        workflow_execution_timeout: proto_duration_to_time(
-            req.workflow_execution_timeout.as_ref(),
-        ),
+        workflow_execution_timeout: proto_duration_to_time(req.workflow_execution_timeout.as_ref()),
         workflow_run_timeout: proto_duration_to_time(req.workflow_run_timeout.as_ref()),
         workflow_task_timeout: proto_duration_to_time(req.workflow_task_timeout.as_ref()),
         retry_policy: req.retry_policy.as_ref().map(retry_policy_to_domain),
@@ -1436,9 +1401,7 @@ pub fn proto_command_to_workflow_command(
                 start_to_close_timeout: proto_duration_to_time(
                     attrs.start_to_close_timeout.as_ref(),
                 ),
-                heartbeat_timeout: proto_duration_to_time(
-                    attrs.heartbeat_timeout.as_ref(),
-                ),
+                heartbeat_timeout: proto_duration_to_time(attrs.heartbeat_timeout.as_ref()),
             })
         }
         Some(Attributes::StartTimerCommandAttributes(attrs)) => {
@@ -1485,9 +1448,7 @@ pub fn proto_command_to_workflow_command(
                     .failure
                     .as_ref()
                     .map(failure_to_payload)
-                    .unwrap_or_else(|| {
-                        failure_to_payload(&failure_proto::Failure::default())
-                    }),
+                    .unwrap_or_else(|| failure_to_payload(&failure_proto::Failure::default())),
             })
         }
         Some(Attributes::RequestCancelActivityTaskCommandAttributes(attrs)) => {
@@ -1495,24 +1456,22 @@ pub fn proto_command_to_workflow_command(
                 activity_id: attrs.scheduled_event_id.to_string(),
             })
         }
-        Some(Attributes::CancelTimerCommandAttributes(attrs)) => {
-            Ok(WorkflowCommand::CancelTimer {
-                timer_id: attrs.timer_id,
-            })
-        }
+        Some(Attributes::CancelTimerCommandAttributes(attrs)) => Ok(WorkflowCommand::CancelTimer {
+            timer_id: attrs.timer_id,
+        }),
         Some(Attributes::CancelWorkflowExecutionCommandAttributes(_attrs)) => {
             Ok(WorkflowCommand::CancelWorkflow)
         }
-        Some(Attributes::RequestCancelExternalWorkflowExecutionCommandAttributes(
-            attrs,
-        )) => Ok(WorkflowCommand::RequestCancelExternalWorkflowExecution {
-            target_namespace_id: namespace_name_to_domain(&attrs.namespace),
-            target_workflow_id: WorkflowId(attrs.workflow_id),
-            target_run_id: non_empty(attrs.run_id)
-                .map(|run_id| parse_run_id(&run_id))
-                .transpose()?,
-            control: attrs.control,
-        }),
+        Some(Attributes::RequestCancelExternalWorkflowExecutionCommandAttributes(attrs)) => {
+            Ok(WorkflowCommand::RequestCancelExternalWorkflowExecution {
+                target_namespace_id: namespace_name_to_domain(&attrs.namespace),
+                target_workflow_id: WorkflowId(attrs.workflow_id),
+                target_run_id: non_empty(attrs.run_id)
+                    .map(|run_id| parse_run_id(&run_id))
+                    .transpose()?,
+                control: attrs.control,
+            })
+        }
         Some(Attributes::RecordMarkerCommandAttributes(attrs)) => {
             Ok(WorkflowCommand::RecordMarker {
                 marker_name: attrs.marker_name,
@@ -1559,13 +1518,9 @@ pub fn proto_command_to_workflow_command(
                     .transpose()?
                     .unwrap_or_default(),
                 workflow_execution_timeout: None,
-                workflow_run_timeout: proto_duration_to_time(
-                    attrs.workflow_run_timeout.as_ref(),
-                ),
-                workflow_task_timeout: proto_duration_to_time(
-                    attrs.workflow_task_timeout.as_ref(),
-                )
-                .unwrap_or(time::Duration::seconds(10)),
+                workflow_run_timeout: proto_duration_to_time(attrs.workflow_run_timeout.as_ref()),
+                workflow_task_timeout: proto_duration_to_time(attrs.workflow_task_timeout.as_ref())
+                    .unwrap_or(time::Duration::seconds(10)),
                 retry_policy: attrs.retry_policy.as_ref().map(retry_policy_to_domain),
             })
         }
@@ -1593,19 +1548,16 @@ pub fn proto_command_to_workflow_command(
                     .as_ref()
                     .map(payloads_to_domain)
                     .unwrap_or_default(),
-                parent_close_policy: parent_close_policy_to_domain(
-                    attrs.parent_close_policy,
-                ),
+                parent_close_policy: parent_close_policy_to_domain(attrs.parent_close_policy),
             })
         }
         Some(Attributes::SignalExternalWorkflowExecutionCommandAttributes(attrs)) => {
-            let execution =
-                attrs
-                    .execution
-                    .as_ref()
-                    .ok_or(ProtoConversionError::MissingField(
-                        "SignalExternalWorkflowExecutionCommandAttributes.execution",
-                    ))?;
+            let execution = attrs
+                .execution
+                .as_ref()
+                .ok_or(ProtoConversionError::MissingField(
+                    "SignalExternalWorkflowExecutionCommandAttributes.execution",
+                ))?;
             Ok(WorkflowCommand::SignalExternalWorkflowExecution {
                 target_namespace_id: namespace_name_to_domain(&attrs.namespace),
                 target_workflow_id: WorkflowId(execution.workflow_id.clone()),
@@ -1685,18 +1637,14 @@ pub fn workflow_command_to_proto(
                 activity_type: Some(tokeira_proto::common::ActivityType {
                     name: activity_type.clone(),
                 }),
-                task_queue: Some(
-                    tokeira_proto::conversions::common::task_queue_from_domain(
-                        task_queue,
-                    ),
-                ),
+                task_queue: Some(tokeira_proto::conversions::common::task_queue_from_domain(
+                    task_queue,
+                )),
                 header: header.as_ref().map(headers_from_domain),
                 input: Some(payloads_from_domain(input)),
                 request_eager_execution: *request_eager_execution,
-                schedule_to_close_timeout: schedule_to_close_timeout
-                    .map(to_proto_duration),
-                schedule_to_start_timeout: schedule_to_start_timeout
-                    .map(to_proto_duration),
+                schedule_to_close_timeout: schedule_to_close_timeout.map(to_proto_duration),
+                schedule_to_start_timeout: schedule_to_start_timeout.map(to_proto_duration),
                 start_to_close_timeout: start_to_close_timeout.map(to_proto_duration),
                 heartbeat_timeout: heartbeat_timeout.map(to_proto_duration),
                 retry_policy: retry_policy.as_ref().map(retry_policy_from_domain),
@@ -1721,9 +1669,7 @@ pub fn workflow_command_to_proto(
         WorkflowCommand::UpsertSearchAttributes(search_attributes) => {
             Some(Attributes::UpsertWorkflowSearchAttributesCommandAttributes(
                 command::UpsertWorkflowSearchAttributesCommandAttributes {
-                    search_attributes: Some(search_attributes_from_domain(
-                        search_attributes,
-                    )),
+                    search_attributes: Some(search_attributes_from_domain(search_attributes)),
                 },
             ))
         }
@@ -1755,13 +1701,11 @@ pub fn workflow_command_to_proto(
                 },
             ))
         }
-        WorkflowCommand::CancelTimer { timer_id } => {
-            Some(Attributes::CancelTimerCommandAttributes(
-                command::CancelTimerCommandAttributes {
-                    timer_id: timer_id.clone(),
-                },
-            ))
-        }
+        WorkflowCommand::CancelTimer { timer_id } => Some(
+            Attributes::CancelTimerCommandAttributes(command::CancelTimerCommandAttributes {
+                timer_id: timer_id.clone(),
+            }),
+        ),
         WorkflowCommand::CancelWorkflow => {
             Some(Attributes::CancelWorkflowExecutionCommandAttributes(
                 command::CancelWorkflowExecutionCommandAttributes::default(),
@@ -1779,9 +1723,9 @@ pub fn workflow_command_to_proto(
                     .iter()
                     .map(|(key, payloads)| (key.clone(), payloads_from_domain(payloads)))
                     .collect(),
-                header: header.as_ref().map(|header| {
-                    headers_from_domain(&tokeira_types::Headers(header.clone()))
-                }),
+                header: header
+                    .as_ref()
+                    .map(|header| headers_from_domain(&tokeira_types::Headers(header.clone()))),
                 failure: failure.as_ref().map(payload_to_failure),
             },
         )),
@@ -1800,11 +1744,9 @@ pub fn workflow_command_to_proto(
                 workflow_type: Some(tokeira_proto::common::WorkflowType {
                     name: workflow_type.0.clone(),
                 }),
-                task_queue: Some(
-                    tokeira_proto::conversions::common::task_queue_from_domain(
-                        task_queue,
-                    ),
-                ),
+                task_queue: Some(tokeira_proto::conversions::common::task_queue_from_domain(
+                    task_queue,
+                )),
                 input: Some(payloads_from_domain(input)),
                 workflow_run_timeout: workflow_run_timeout.map(to_proto_duration),
                 workflow_task_timeout: Some(to_proto_duration(*workflow_task_timeout)),
@@ -1828,15 +1770,11 @@ pub fn workflow_command_to_proto(
                 workflow_type: Some(tokeira_proto::common::WorkflowType {
                     name: workflow_type.0.clone(),
                 }),
-                task_queue: Some(
-                    tokeira_proto::conversions::common::task_queue_from_domain(
-                        task_queue,
-                    ),
-                ),
+                task_queue: Some(tokeira_proto::conversions::common::task_queue_from_domain(
+                    task_queue,
+                )),
                 input: Some(payloads_from_domain(input)),
-                parent_close_policy: parent_close_policy_from_domain(
-                    *parent_close_policy,
-                ),
+                parent_close_policy: parent_close_policy_from_domain(*parent_close_policy),
                 ..Default::default()
             },
         )),
@@ -1893,8 +1831,7 @@ pub fn workflow_command_to_proto(
                 service: service.clone(),
                 operation: operation.clone(),
                 input: input.0.first().map(payload_from_domain),
-                schedule_to_close_timeout: schedule_to_close_timeout
-                    .map(to_proto_duration),
+                schedule_to_close_timeout: schedule_to_close_timeout.map(to_proto_duration),
                 ..Default::default()
             },
         )),
@@ -2012,27 +1949,24 @@ pub fn serialize_activity_token(token: &ActivityTaskToken) -> Vec<u8> {
     serde_json::to_vec(token).unwrap_or_default()
 }
 
-pub fn deserialize_activity_token(
-    bytes: &[u8],
-) -> Result<ActivityTaskToken, ProtoConversionError> {
+pub fn deserialize_activity_token(bytes: &[u8]) -> Result<ActivityTaskToken, ProtoConversionError> {
     if bytes.is_empty() {
         return Err(ProtoConversionError::InvalidTaskToken(
             "task_token is empty".to_string(),
         ));
     }
-    serde_json::from_slice(bytes)
-        .map_err(|e| ProtoConversionError::InvalidTaskToken(e.to_string()))
+    serde_json::from_slice(bytes).map_err(|e| ProtoConversionError::InvalidTaskToken(e.to_string()))
 }
 
 pub fn poll_activity_request_to_edge(
     req: workflowservice::PollActivityTaskQueueRequest,
 ) -> Result<crate::translate::PollActivityTaskQueueRequest, ProtoConversionError> {
-    let task_queue =
-        req.task_queue
-            .as_ref()
-            .ok_or(ProtoConversionError::MissingField(
-                "PollActivityTaskQueueRequest.task_queue",
-            ))?;
+    let task_queue = req
+        .task_queue
+        .as_ref()
+        .ok_or(ProtoConversionError::MissingField(
+            "PollActivityTaskQueueRequest.task_queue",
+        ))?;
 
     Ok(crate::translate::PollActivityTaskQueueRequest {
         namespace: req.namespace,
@@ -2096,8 +2030,8 @@ pub fn respond_activity_completed_to_edge(
     })
 }
 
-pub fn respond_activity_completed_to_proto()
--> workflowservice::RespondActivityTaskCompletedResponse {
+pub fn respond_activity_completed_to_proto() -> workflowservice::RespondActivityTaskCompletedResponse
+{
     workflowservice::RespondActivityTaskCompletedResponse {}
 }
 
@@ -2125,8 +2059,7 @@ pub fn respond_activity_failed_to_edge(
     })
 }
 
-pub fn respond_activity_failed_to_proto()
--> workflowservice::RespondActivityTaskFailedResponse {
+pub fn respond_activity_failed_to_proto() -> workflowservice::RespondActivityTaskFailedResponse {
     workflowservice::RespondActivityTaskFailedResponse {
         ..Default::default()
     }
@@ -2156,12 +2089,12 @@ pub fn record_heartbeat_to_proto(
 pub fn terminate_request_to_edge(
     req: workflowservice::TerminateWorkflowExecutionRequest,
 ) -> Result<crate::translate::TerminateWorkflowExecutionRequest, ProtoConversionError> {
-    let execution =
-        req.workflow_execution
-            .as_ref()
-            .ok_or(ProtoConversionError::MissingField(
-                "TerminateWorkflowExecutionRequest.workflow_execution",
-            ))?;
+    let execution = req
+        .workflow_execution
+        .as_ref()
+        .ok_or(ProtoConversionError::MissingField(
+            "TerminateWorkflowExecutionRequest.workflow_execution",
+        ))?;
     Ok(crate::translate::TerminateWorkflowExecutionRequest {
         namespace: req.namespace,
         workflow_id: execution.workflow_id.clone(),
@@ -2172,21 +2105,19 @@ pub fn terminate_request_to_edge(
     })
 }
 
-pub fn terminate_response_to_proto() -> workflowservice::TerminateWorkflowExecutionResponse
-{
+pub fn terminate_response_to_proto() -> workflowservice::TerminateWorkflowExecutionResponse {
     workflowservice::TerminateWorkflowExecutionResponse {}
 }
 
 pub fn cancel_request_to_edge(
     req: workflowservice::RequestCancelWorkflowExecutionRequest,
-) -> Result<crate::translate::RequestCancelWorkflowExecutionRequest, ProtoConversionError>
-{
-    let execution =
-        req.workflow_execution
-            .as_ref()
-            .ok_or(ProtoConversionError::MissingField(
-                "RequestCancelWorkflowExecutionRequest.workflow_execution",
-            ))?;
+) -> Result<crate::translate::RequestCancelWorkflowExecutionRequest, ProtoConversionError> {
+    let execution = req
+        .workflow_execution
+        .as_ref()
+        .ok_or(ProtoConversionError::MissingField(
+            "RequestCancelWorkflowExecutionRequest.workflow_execution",
+        ))?;
     Ok(crate::translate::RequestCancelWorkflowExecutionRequest {
         namespace: req.namespace,
         workflow_id: execution.workflow_id.clone(),
@@ -2196,8 +2127,7 @@ pub fn cancel_request_to_edge(
     })
 }
 
-pub fn cancel_response_to_proto()
--> workflowservice::RequestCancelWorkflowExecutionResponse {
+pub fn cancel_response_to_proto() -> workflowservice::RequestCancelWorkflowExecutionResponse {
     workflowservice::RequestCancelWorkflowExecutionResponse {}
 }
 
@@ -2247,12 +2177,12 @@ pub fn query_response_to_proto(
 pub fn update_request_to_edge(
     req: workflowservice::UpdateWorkflowExecutionRequest,
 ) -> Result<crate::translate::UpdateWorkflowExecutionRequest, ProtoConversionError> {
-    let execution =
-        req.workflow_execution
-            .as_ref()
-            .ok_or(ProtoConversionError::MissingField(
-                "UpdateWorkflowExecutionRequest.workflow_execution",
-            ))?;
+    let execution = req
+        .workflow_execution
+        .as_ref()
+        .ok_or(ProtoConversionError::MissingField(
+            "UpdateWorkflowExecutionRequest.workflow_execution",
+        ))?;
 
     let request = req
         .request
@@ -2324,8 +2254,7 @@ pub fn update_response_to_proto(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operator_service::ClusterInfo;
-    use crate::translate::NamespaceDescription;
+    use crate::{operator_service::ClusterInfo, translate::NamespaceDescription};
     use tokeira_proto::public::temporal::api::taskqueue::v1 as taskqueue;
     use tokeira_runtime::{RedirectRule, VersioningRules};
 
@@ -2496,8 +2425,8 @@ mod tests {
 
     #[test]
     fn invalid_task_token_returns_error() {
-        let err = deserialize_activity_token(b"not-json")
-            .expect_err("should fail on invalid bytes");
+        let err =
+            deserialize_activity_token(b"not-json").expect_err("should fail on invalid bytes");
         match err {
             ProtoConversionError::InvalidTaskToken(_) => {}
             other => {
@@ -2508,8 +2437,7 @@ mod tests {
 
     #[test]
     fn empty_task_token_returns_error() {
-        let err =
-            deserialize_activity_token(b"").expect_err("should fail on empty bytes");
+        let err = deserialize_activity_token(b"").expect_err("should fail on empty bytes");
         match err {
             ProtoConversionError::InvalidTaskToken(_) => {}
             other => {
@@ -2692,15 +2620,13 @@ mod tests {
     fn fail_workflow_command_produces_failure_proto_encoding() {
         let failure = failure_proto::Failure {
             message: "app error".to_string(),
-            failure_info: Some(
-                failure_proto::failure::FailureInfo::ApplicationFailureInfo(
-                    failure_proto::ApplicationFailureInfo {
-                        r#type: "AppError".to_string(),
-                        non_retryable: false,
-                        ..Default::default()
-                    },
-                ),
-            ),
+            failure_info: Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(
+                failure_proto::ApplicationFailureInfo {
+                    r#type: "AppError".to_string(),
+                    non_retryable: false,
+                    ..Default::default()
+                },
+            )),
             ..Default::default()
         };
         let proto_cmd = command::Command {
@@ -2738,15 +2664,13 @@ mod tests {
         let failure = failure_proto::Failure {
             message: "activity error".to_string(),
             source: "GoSDK".to_string(),
-            failure_info: Some(
-                failure_proto::failure::FailureInfo::ApplicationFailureInfo(
-                    failure_proto::ApplicationFailureInfo {
-                        r#type: "CustomActivityError".to_string(),
-                        non_retryable: true,
-                        ..Default::default()
-                    },
-                ),
-            ),
+            failure_info: Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(
+                failure_proto::ApplicationFailureInfo {
+                    r#type: "CustomActivityError".to_string(),
+                    non_retryable: true,
+                    ..Default::default()
+                },
+            )),
             ..Default::default()
         };
         let token = tokeira_types::ActivityTaskToken {

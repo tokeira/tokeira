@@ -77,11 +77,8 @@ mod store_layout_tests {
 
     #[test]
     fn trailing_slash_is_trimmed() {
-        let store = S3StateStore::<TestDoc>::new(
-            stub_client(),
-            "bucket".into(),
-            "prefix/infra/".into(),
-        );
+        let store =
+            S3StateStore::<TestDoc>::new(stub_client(), "bucket".into(), "prefix/infra/".into());
         assert_eq!(store.manifest_key(), "prefix/infra/manifest.json");
         assert_eq!(store.snapshot_prefix(), "prefix/infra/snapshots");
     }

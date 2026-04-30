@@ -165,9 +165,7 @@ pub fn proto_response_to_resolution(
         Some(nexus_v1::response::Variant::StartOperation(start)) => {
             proto_start_response_to_resolution(start, expected_operation_id)
         }
-        Some(nexus_v1::response::Variant::CancelOperation(_)) => {
-            Ok(NexusResolution::Canceled)
-        }
+        Some(nexus_v1::response::Variant::CancelOperation(_)) => Ok(NexusResolution::Canceled),
         None => Err(NexusTranslateError::MissingField("response.variant")),
     }
 }
@@ -182,9 +180,7 @@ pub fn proto_start_response_to_resolution(
                 result: single_payload_to_payloads(sync.payload),
             })
         }
-        Some(nexus_v1::start_operation_response::Variant::AsyncSuccess(
-            async_success,
-        )) => {
+        Some(nexus_v1::start_operation_response::Variant::AsyncSuccess(async_success)) => {
             if async_success.operation_id != expected_operation_id {
                 tracing::warn!(
                     expected_operation_id,
@@ -212,10 +208,7 @@ pub fn proto_handler_error_to_resolution(
     error: nexus_v1::HandlerError,
 ) -> Result<NexusResolution, NexusTranslateError> {
     Ok(NexusResolution::Failed {
-        failure: nexus_failure_to_kernel_payload(
-            error.error_type,
-            error.failure.as_ref(),
-        )?,
+        failure: nexus_failure_to_kernel_payload(error.error_type, error.failure.as_ref())?,
     })
 }
 
@@ -245,9 +238,7 @@ pub fn nexus_failure_to_kernel_payload(
     Ok(Payload { data, metadata })
 }
 
-fn single_payload_to_payloads(
-    payload: Option<tokeira_proto::public::common::Payload>,
-) -> Payloads {
+fn single_payload_to_payloads(payload: Option<tokeira_proto::public::common::Payload>) -> Payloads {
     match payload {
         Some(payload) => Payloads(vec![payload_to_domain(&payload)]),
         None => Payloads::default(),

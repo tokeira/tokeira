@@ -1,8 +1,8 @@
 use std::time::Duration;
 
-use tokeira_iac::error::IacError;
 use tokeira_iac::{
     InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    error::IacError,
 };
 
 /// OpenSearch domain for Temporal visibility.
@@ -52,18 +52,15 @@ impl OpenSearchResource {
         let created = status.created().unwrap_or(false);
         let deleted = status.deleted().unwrap_or(false);
         let processing = status.processing().unwrap_or(true);
-        let domain_processing_active =
-            status.domain_processing_status().is_none_or(|state| {
-                *state == aws_sdk_opensearch::types::DomainProcessingStatusType::Active
-            });
+        let domain_processing_active = status.domain_processing_status().is_none_or(|state| {
+            *state == aws_sdk_opensearch::types::DomainProcessingStatusType::Active
+        });
         let endpoint_present = Self::resolved_endpoint(status).is_some();
 
         created && !deleted && !processing && domain_processing_active && endpoint_present
     }
 
-    fn creation_status_summary(
-        status: &aws_sdk_opensearch::types::DomainStatus,
-    ) -> String {
+    fn creation_status_summary(status: &aws_sdk_opensearch::types::DomainStatus) -> String {
         format!(
             "created={}, deleted={}, processing={}, domain_processing_status={}, endpoint_present={}, endpoint_v2_present={}, endpoints_present={}",
             status.created().unwrap_or(false),
@@ -85,9 +82,7 @@ impl OpenSearchResource {
         )
     }
 
-    fn resolved_endpoint(
-        status: &aws_sdk_opensearch::types::DomainStatus,
-    ) -> Option<String> {
+    fn resolved_endpoint(status: &aws_sdk_opensearch::types::DomainStatus) -> Option<String> {
         status
             .endpoint()
             .filter(|endpoint| !endpoint.is_empty())
@@ -185,8 +180,7 @@ impl Resource for OpenSearchResource {
         let domain_name = self.domain_name();
 
         // Read VPC state for subnet_ids
-        let vpc_state =
-            ctx.get_resource_state(&ResourceId(format!("{}-vpc", self.project)))?;
+        let vpc_state = ctx.get_resource_state(&ResourceId(format!("{}-vpc", self.project)))?;
         let subnet_ids: Vec<String> = vpc_state
             .properties
             .get("subnet_ids")
@@ -194,10 +188,8 @@ impl Resource for OpenSearchResource {
             .unwrap_or_default();
 
         // Read security group state for security_group_id
-        let sg_state = ctx.get_resource_state(&ResourceId(format!(
-            "sg-{}-eks-nodes-sg",
-            self.project
-        )))?;
+        let sg_state =
+            ctx.get_resource_state(&ResourceId(format!("sg-{}-eks-nodes-sg", self.project)))?;
         let sg_id = sg_state
             .properties
             .get("security_group_id")
@@ -308,19 +300,17 @@ impl Resource for OpenSearchResource {
                                 details: "domain disappeared during provisioning".into(),
                             }
                         } else {
-                            IacError::AwsSdk(format!(
-                                "opensearch:DescribeDomain: {svc_err}"
-                            ))
+                            IacError::AwsSdk(format!("opensearch:DescribeDomain: {svc_err}"))
                         }
                     })?;
 
-                let status = desc.domain_status().ok_or_else(|| {
-                    IacError::ResourceCreationFailed {
-                        resource_type: "OpenSearch domain".into(),
-                        resource_id: dn.clone(),
-                        details: "DescribeDomain returned no domain status".into(),
-                    }
-                })?;
+                let status =
+                    desc.domain_status()
+                        .ok_or_else(|| IacError::ResourceCreationFailed {
+                            resource_type: "OpenSearch domain".into(),
+                            resource_id: dn.clone(),
+                            details: "DescribeDomain returned no domain status".into(),
+                        })?;
 
                 if status.deleted().unwrap_or(false) {
                     return Err(IacError::ResourceCreationFailed {
@@ -351,13 +341,14 @@ impl Resource for OpenSearchResource {
                 ))
             })?;
 
-        let final_status = desc_output.domain_status().ok_or_else(|| {
-            IacError::ResourceCreationFailed {
-                resource_type: "OpenSearch domain".into(),
-                resource_id: domain_name.clone(),
-                details: "DescribeDomain returned no final domain status".into(),
-            }
-        })?;
+        let final_status =
+            desc_output
+                .domain_status()
+                .ok_or_else(|| IacError::ResourceCreationFailed {
+                    resource_type: "OpenSearch domain".into(),
+                    resource_id: domain_name.clone(),
+                    details: "DescribeDomain returned no final domain status".into(),
+                })?;
 
         if !Self::creation_ready(final_status) {
             return Err(IacError::ResourceCreationFailed {
@@ -497,19 +488,17 @@ impl Resource for OpenSearchResource {
                                     details: "domain disappeared during update".into(),
                                 }
                             } else {
-                                IacError::AwsSdk(format!(
-                                    "opensearch:DescribeDomain: {svc_err}"
-                                ))
+                                IacError::AwsSdk(format!("opensearch:DescribeDomain: {svc_err}"))
                             }
                         })?;
 
-                    let status = desc.domain_status().ok_or_else(|| {
-                        IacError::ResourceCreationFailed {
-                            resource_type: "OpenSearch domain update".into(),
-                            resource_id: dn.clone(),
-                            details: "DescribeDomain returned no domain status".into(),
-                        }
-                    })?;
+                    let status =
+                        desc.domain_status()
+                            .ok_or_else(|| IacError::ResourceCreationFailed {
+                                resource_type: "OpenSearch domain update".into(),
+                                resource_id: dn.clone(),
+                                details: "DescribeDomain returned no domain status".into(),
+                            })?;
 
                     if status.deleted().unwrap_or(false) {
                         return Err(IacError::ResourceCreationFailed {
@@ -547,10 +536,7 @@ impl Resource for OpenSearchResource {
                 .send()
                 .await
                 .map_err(|e| {
-                    IacError::AwsSdk(format!(
-                        "opensearch:AddTags: {}",
-                        e.into_service_error()
-                    ))
+                    IacError::AwsSdk(format!("opensearch:AddTags: {}", e.into_service_error()))
                 })?;
         }
 
@@ -575,13 +561,14 @@ impl Resource for OpenSearchResource {
                 }
             })?;
 
-        let final_status = desc_output.domain_status().ok_or_else(|| {
-            IacError::ResourceCreationFailed {
-                resource_type: "OpenSearch domain update".into(),
-                resource_id: domain_name.clone(),
-                details: "DescribeDomain returned no final domain status".into(),
-            }
-        })?;
+        let final_status =
+            desc_output
+                .domain_status()
+                .ok_or_else(|| IacError::ResourceCreationFailed {
+                    resource_type: "OpenSearch domain update".into(),
+                    resource_id: domain_name.clone(),
+                    details: "DescribeDomain returned no final domain status".into(),
+                })?;
 
         if !Self::creation_ready(final_status) {
             return Err(IacError::ResourceCreationFailed {
@@ -679,10 +666,7 @@ impl Resource for OpenSearchResource {
         Ok(())
     }
 
-    async fn describe(
-        &self,
-        ctx: &ProvisionContext,
-    ) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
         let domain_name = self.domain_name();
 
         match ctx
@@ -697,8 +681,7 @@ impl Resource for OpenSearchResource {
             Ok(output) => {
                 let status = output.domain_status().ok_or_else(|| {
                     IacError::AwsSdk(
-                        "opensearch:DescribeDomain: response contained no domain status"
-                            .into(),
+                        "opensearch:DescribeDomain: response contained no domain status".into(),
                     )
                 })?;
                 Ok(Some(self.state_from_status(

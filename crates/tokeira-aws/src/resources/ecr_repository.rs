@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use tokeira_iac::error::IacError;
 use tokeira_iac::{
     InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    error::IacError,
 };
 
 /// Configuration for a single ECR repository provider resource.
@@ -159,9 +159,7 @@ impl Resource for EcrRepository {
                 resource_type: self.resource_type(),
                 details: "tags changed".into(),
             }
-        } else if current_lifecycle_policy_normalized
-            != desired_lifecycle_policy_normalized
-        {
+        } else if current_lifecycle_policy_normalized != desired_lifecycle_policy_normalized {
             InternalChange::Update {
                 resource_id: self.resource_id(),
                 resource_type: self.resource_type(),
@@ -224,10 +222,8 @@ impl Resource for EcrRepository {
                             ))
                         })?;
                     if let Some(r) = desc.repositories().first() {
-                        repository_uri =
-                            r.repository_uri().unwrap_or_default().to_string();
-                        repository_arn =
-                            r.repository_arn().unwrap_or_default().to_string();
+                        repository_uri = r.repository_uri().unwrap_or_default().to_string();
+                        repository_arn = r.repository_arn().unwrap_or_default().to_string();
                     }
 
                     // ecr:TagResource to ensure tags are up-to-date on adopted repo
@@ -248,9 +244,7 @@ impl Resource for EcrRepository {
                             })?;
                     }
                 } else {
-                    return Err(IacError::AwsSdk(format!(
-                        "ecr:CreateRepository: {svc_err}"
-                    )));
+                    return Err(IacError::AwsSdk(format!("ecr:CreateRepository: {svc_err}")));
                 }
             }
         }
@@ -309,10 +303,7 @@ impl Resource for EcrRepository {
                 .send()
                 .await
                 .map_err(|e| {
-                    IacError::AwsSdk(format!(
-                        "ecr:TagResource: {}",
-                        e.into_service_error()
-                    ))
+                    IacError::AwsSdk(format!("ecr:TagResource: {}", e.into_service_error()))
                 })?;
         }
 
@@ -375,9 +366,7 @@ impl Resource for EcrRepository {
                 if svc_err.is_repository_not_found_exception() {
                     tracing::warn!(repo = %name, "repository does not exist, skipping deletion");
                 } else {
-                    return Err(IacError::AwsSdk(format!(
-                        "ecr:DeleteRepository: {svc_err}"
-                    )));
+                    return Err(IacError::AwsSdk(format!("ecr:DeleteRepository: {svc_err}")));
                 }
             }
         }
@@ -385,10 +374,7 @@ impl Resource for EcrRepository {
         Ok(())
     }
 
-    async fn describe(
-        &self,
-        ctx: &ProvisionContext,
-    ) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
         let name = &self.repo_name;
 
         // ecr:DescribeRepositories for this single repo
@@ -403,8 +389,7 @@ impl Resource for EcrRepository {
         {
             Ok(output) => {
                 if let Some(r) = output.repositories().first() {
-                    let repository_arn =
-                        r.repository_arn().unwrap_or_default().to_string();
+                    let repository_arn = r.repository_arn().unwrap_or_default().to_string();
                     let tags = if repository_arn.is_empty() {
                         HashMap::new()
                     } else {

@@ -20,8 +20,9 @@ use time::OffsetDateTime;
 use tokeira_kernel::{
     Command, DispatchOp, HistoryEvent, HistoryEventKind, Kernel, LoadedRun, StartRequest,
 };
-use tokeira_proto::conversions::common::failure_to_payload;
-use tokeira_proto::public::temporal::api::failure::v1 as failure_proto;
+use tokeira_proto::{
+    conversions::common::failure_to_payload, public::temporal::api::failure::v1 as failure_proto,
+};
 use tokeira_storage::{CommitResult, RunRepository};
 use tokeira_types::{ExecutionStatus, RunKey, ShardEpoch};
 use tokio::sync::{mpsc, oneshot};
@@ -69,11 +70,7 @@ pub trait DispatchPublisher: Send + Sync {
     /// Submit a command to a specific run, used by
     /// orchestration follow-up paths such as child
     /// resolution delivery.
-    async fn submit_to_run(
-        &self,
-        run_key: RunKey,
-        command: Command,
-    ) -> Result<CommitResult>;
+    async fn submit_to_run(&self, run_key: RunKey, command: Command) -> Result<CommitResult>;
 }
 
 /// A lane is a single serial command processor.
@@ -94,11 +91,7 @@ impl LaneHandle {
     /// The command is serialized through the lane's
     /// single-threaded executor, so callers never need
     /// external locking on the run.
-    pub async fn submit(
-        &self,
-        run_key: RunKey,
-        command: Command,
-    ) -> Result<CommitResult> {
+    pub async fn submit(&self, run_key: RunKey, command: Command) -> Result<CommitResult> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(LaneMessage {
@@ -216,25 +209,16 @@ where
                 if let CommitResult::Applied { new_state } = &commit_result {
                     for event in &history_events {
                         match &event.kind {
-                            HistoryEventKind::ActivityTaskCancelRequested {
-                                activity_id,
-                            } => activity_tracking
-                                .mark_cancel_requested(message.run_key, activity_id),
-                            HistoryEventKind::ActivityTaskCompleted {
-                                activity_id,
-                                ..
+                            HistoryEventKind::ActivityTaskCancelRequested { activity_id } => {
+                                activity_tracking
+                                    .mark_cancel_requested(message.run_key, activity_id)
                             }
-                            | HistoryEventKind::ActivityTaskFailed {
-                                activity_id, ..
+                            HistoryEventKind::ActivityTaskCompleted { activity_id, .. }
+                            | HistoryEventKind::ActivityTaskFailed { activity_id, .. }
+                            | HistoryEventKind::ActivityTaskTimedOut { activity_id, .. }
+                            | HistoryEventKind::ActivityTaskCanceled { activity_id, .. } => {
+                                activity_tracking.remove(message.run_key, activity_id)
                             }
-                            | HistoryEventKind::ActivityTaskTimedOut {
-                                activity_id,
-                                ..
-                            }
-                            | HistoryEventKind::ActivityTaskCanceled {
-                                activity_id,
-                                ..
-                            } => activity_tracking.remove(message.run_key, activity_id),
                             HistoryEventKind::WorkflowExecutionUpdateCompleted {
                                 update_id,
                                 result,
@@ -305,14 +289,10 @@ where
                                         shard_id,
                                         workflow_execution_timeout: successor_state
                                             .workflow_execution_timeout,
-                                        workflow_run_timeout: successor_state
-                                            .workflow_run_timeout,
+                                        workflow_run_timeout: successor_state.workflow_run_timeout,
                                         started_at: successor_state.started_at,
-                                        first_run_started_at: successor_state
-                                            .first_run_started_at,
-                                        has_retry_policy: successor_state
-                                            .retry_policy
-                                            .is_some(),
+                                        first_run_started_at: successor_state.first_run_started_at,
+                                        has_retry_policy: successor_state.retry_policy.is_some(),
                                     },
                                 );
                             }
@@ -330,8 +310,7 @@ where
                                     },
                                 );
                             }
-                            for nexus in successor_state.pending_nexus_operations.values()
-                            {
+                            for nexus in successor_state.pending_nexus_operations.values() {
                                 if let Some(schedule_to_close_timeout) =
                                     nexus.schedule_to_close_timeout
                                 {
@@ -351,8 +330,7 @@ where
                     }
                 }
                 if !dispatch_ops.is_empty()
-                    && let Err(error) =
-                        publisher.publish(message.run_key, &dispatch_ops).await
+                    && let Err(error) = publisher.publish(message.run_key, &dispatch_ops).await
                 {
                     tracing::warn!(?error, run_key = ?message.run_key, "failed to publish dispatch ops");
                 }
@@ -360,8 +338,7 @@ where
                     Err(error)
                 } else {
                     if let CommitResult::Applied { new_state } = &commit_result {
-                        if let Command::NexusOperationResolved(request) =
-                            &committed_command
+                        if let Command::NexusOperationResolved(request) = &committed_command
                             && matches!(
                                 request.resolution,
                                 tokeira_kernel::NexusResolution::Completed { .. }
@@ -370,8 +347,7 @@ where
                                     | tokeira_kernel::NexusResolution::TimedOut
                             )
                         {
-                            nexus_timeout_tracking
-                                .remove(message.run_key, &request.operation_id);
+                            nexus_timeout_tracking.remove(message.run_key, &request.operation_id);
                         }
                         if new_state.closed_at.is_some() {
                             if let Some(parent_run_key) = new_state.parent_run_key
@@ -392,14 +368,11 @@ where
                                                 .close_failure
                                                 .clone()
                                                 .unwrap_or_else(|| {
-                                                    failure_to_payload(
-                                                        &failure_proto::Failure {
-                                                            message:
-                                                                "child workflow failed"
-                                                                    .to_string(),
-                                                            ..Default::default()
-                                                        },
-                                                    )
+                                                    failure_to_payload(&failure_proto::Failure {
+                                                        message: "child workflow failed"
+                                                            .to_string(),
+                                                        ..Default::default()
+                                                    })
                                                 }),
                                         })
                                     }
@@ -417,9 +390,7 @@ where
                                 if let Some(resolution) = maybe_resolution {
                                     let command = tokeira_kernel::Command::ChildResolved(
                                         tokeira_kernel::ChildResolvedRequest {
-                                            child_workflow_id: new_state
-                                                .workflow_id
-                                                .clone(),
+                                            child_workflow_id: new_state.workflow_id.clone(),
                                             resolution,
                                             now: time::OffsetDateTime::now_utc(),
                                         },
@@ -427,9 +398,8 @@ where
                                     let publisher = publisher.clone();
                                     let child_run_key = message.run_key;
                                     tokio::spawn(async move {
-                                        if let Err(error) = publisher
-                                            .submit_to_run(parent_run_key, command)
-                                            .await
+                                        if let Err(error) =
+                                            publisher.submit_to_run(parent_run_key, command).await
                                         {
                                             let error_message = error.to_string();
                                             if error_message.contains("kernel rejected")
@@ -445,34 +415,32 @@ where
                             }
                             if new_state.status == ExecutionStatus::ContinuedAsNew {
                                 let successor_event =
-                                    history_events.iter().find_map(|event| {
-                                        match &event.kind {
-                                    HistoryEventKind::WorkflowExecutionContinuedAsNew {
-                                        new_run_id,
-                                        workflow_type,
-                                        task_queue,
-                                        input,
-                                        memo,
-                                        search_attributes,
-                                        workflow_execution_timeout,
-                                        workflow_run_timeout,
-                                        workflow_task_timeout,
-                                        retry_policy,
-                                        ..
-                                    } => Some((
-                                        *new_run_id,
-                                        workflow_type.clone(),
-                                        task_queue.clone(),
-                                        input.clone(),
-                                        memo.clone(),
-                                        search_attributes.clone(),
-                                        *workflow_execution_timeout,
-                                        *workflow_run_timeout,
-                                        *workflow_task_timeout,
-                                        retry_policy.clone(),
-                                    )),
-                                    _ => None,
-                                }
+                                    history_events.iter().find_map(|event| match &event.kind {
+                                        HistoryEventKind::WorkflowExecutionContinuedAsNew {
+                                            new_run_id,
+                                            workflow_type,
+                                            task_queue,
+                                            input,
+                                            memo,
+                                            search_attributes,
+                                            workflow_execution_timeout,
+                                            workflow_run_timeout,
+                                            workflow_task_timeout,
+                                            retry_policy,
+                                            ..
+                                        } => Some((
+                                            *new_run_id,
+                                            workflow_type.clone(),
+                                            task_queue.clone(),
+                                            input.clone(),
+                                            memo.clone(),
+                                            search_attributes.clone(),
+                                            *workflow_execution_timeout,
+                                            *workflow_run_timeout,
+                                            *workflow_task_timeout,
+                                            retry_policy.clone(),
+                                        )),
+                                        _ => None,
                                     });
                                 if let Some((
                                     successor_run_id,
@@ -499,57 +467,57 @@ where
                                     );
                                     let successor_run_key = RunKey::new();
                                     let start_request = StartRequest {
-                                    run_key: successor_run_key,
-                                    namespace_id: new_state.namespace_id,
-                                    workflow_id: new_state.workflow_id.clone(),
-                                    run_id: successor_run_id,
-                                    workflow_type,
-                                    // Empty task_queue means "reuse the predecessor's queue"
-                                    task_queue: if task_queue.0.is_empty() {
-                                        new_state.task_queue.clone()
-                                    } else {
-                                        task_queue
-                                    },
-                                    deployment: new_state.deployment.clone(),
-                                    build_id: new_state.build_id.clone(),
-                                    input,
-                                    memo,
-                                    search_attributes,
-                                    workflow_execution_timeout,
-                                    workflow_run_timeout,
-                                    workflow_task_timeout,
-                                    retry_policy,
-                                    conflict_policy: tokeira_kernel::WorkflowIdConflictPolicy::Fail,
-                                    reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
-                                    attempt: 1,
-                                    continued_execution_run_id: Some(new_state.run_id),
-                                    first_execution_run_id,
-                                    parent_run_key: None,
-                                    parent_workflow_id: None,
-                                    parent_run_id: None,
-                                    parent_namespace_id: None,
-                                    parent_initiated_event_id: 0,
-                                    original_execution_run_id: Some(
-                                        new_state
-                                            .original_execution_run_id
-                                            .unwrap_or(new_state.run_id),
-                                    ),
-                                    continued_failure: new_state.close_failure.clone(),
-                                    last_completion_result: new_state
-                                        .close_result
-                                        .clone(),
-                                    first_run_started_at,
-                                    request: tokeira_types::RequestContext {
-                                        request_id: tokeira_types::RequestId(format!(
-                                            "continue-as-new:{}:{}",
-                                            new_state.run_id.0, successor_run_id.0
-                                        )),
-                                        caller_identity: None,
-                                        received_at: OffsetDateTime::now_utc(),
-                                    },
-                                    now: OffsetDateTime::now_utc(),
-                                    cron_schedule: None,
-                                };
+                                        run_key: successor_run_key,
+                                        namespace_id: new_state.namespace_id,
+                                        workflow_id: new_state.workflow_id.clone(),
+                                        run_id: successor_run_id,
+                                        workflow_type,
+                                        // Empty task_queue means "reuse the predecessor's queue"
+                                        task_queue: if task_queue.0.is_empty() {
+                                            new_state.task_queue.clone()
+                                        } else {
+                                            task_queue
+                                        },
+                                        deployment: new_state.deployment.clone(),
+                                        build_id: new_state.build_id.clone(),
+                                        input,
+                                        memo,
+                                        search_attributes,
+                                        workflow_execution_timeout,
+                                        workflow_run_timeout,
+                                        workflow_task_timeout,
+                                        retry_policy,
+                                        conflict_policy:
+                                            tokeira_kernel::WorkflowIdConflictPolicy::Fail,
+                                        reuse_policy:
+                                            tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
+                                        attempt: 1,
+                                        continued_execution_run_id: Some(new_state.run_id),
+                                        first_execution_run_id,
+                                        parent_run_key: None,
+                                        parent_workflow_id: None,
+                                        parent_run_id: None,
+                                        parent_namespace_id: None,
+                                        parent_initiated_event_id: 0,
+                                        original_execution_run_id: Some(
+                                            new_state
+                                                .original_execution_run_id
+                                                .unwrap_or(new_state.run_id),
+                                        ),
+                                        continued_failure: new_state.close_failure.clone(),
+                                        last_completion_result: new_state.close_result.clone(),
+                                        first_run_started_at,
+                                        request: tokeira_types::RequestContext {
+                                            request_id: tokeira_types::RequestId(format!(
+                                                "continue-as-new:{}:{}",
+                                                new_state.run_id.0, successor_run_id.0
+                                            )),
+                                            caller_identity: None,
+                                            received_at: OffsetDateTime::now_utc(),
+                                        },
+                                        now: OffsetDateTime::now_utc(),
+                                        cron_schedule: None,
+                                    };
                                     let publisher = publisher.clone();
                                     let workflow_timeout_tracking =
                                         workflow_timeout_tracking.clone();
@@ -563,32 +531,28 @@ where
                                             .await
                                         {
                                             Ok(CommitResult::Applied { new_state }) => {
-                                                if new_state
-                                                    .workflow_execution_timeout
-                                                    .is_some()
-                                                    || new_state
-                                                        .workflow_run_timeout
-                                                        .is_some()
+                                                if new_state.workflow_execution_timeout.is_some()
+                                                    || new_state.workflow_run_timeout.is_some()
                                                 {
                                                     workflow_timeout_tracking.insert(
-                                                    crate::timeout::WorkflowTimeoutEntry {
-                                                        run_key: new_state.run_key,
-                                                        shard_id: crate::shard::shard_for(
-                                                            new_state.run_key,
-                                                            1,
-                                                        ),
-                                                        workflow_execution_timeout: new_state
-                                                            .workflow_execution_timeout,
-                                                        workflow_run_timeout: new_state
-                                                            .workflow_run_timeout,
-                                                        started_at: new_state.started_at,
-                                                        first_run_started_at: new_state
-                                                            .first_run_started_at,
-                                                        has_retry_policy: new_state
-                                                            .retry_policy
-                                                            .is_some(),
-                                                    },
-                                                );
+                                                        crate::timeout::WorkflowTimeoutEntry {
+                                                            run_key: new_state.run_key,
+                                                            shard_id: crate::shard::shard_for(
+                                                                new_state.run_key,
+                                                                1,
+                                                            ),
+                                                            workflow_execution_timeout: new_state
+                                                                .workflow_execution_timeout,
+                                                            workflow_run_timeout: new_state
+                                                                .workflow_run_timeout,
+                                                            started_at: new_state.started_at,
+                                                            first_run_started_at: new_state
+                                                                .first_run_started_at,
+                                                            has_retry_policy: new_state
+                                                                .retry_policy
+                                                                .is_some(),
+                                                        },
+                                                    );
                                                 }
                                             }
                                             Ok(CommitResult::Duplicate) => {
@@ -702,10 +666,7 @@ where
                 );
                 runtime_metrics::record_commands_processed(command_type_name(&command));
                 for event in &history_events {
-                    runtime_metrics::record_events_emitted(
-                        history_event_type_name(event),
-                        1,
-                    );
+                    runtime_metrics::record_events_emitted(history_event_type_name(event), 1);
                 }
                 return Ok((
                     CommitResult::Applied { new_state },
@@ -774,9 +735,7 @@ fn history_event_type_name(event: &HistoryEvent) -> &'static str {
         }
         HistoryEventKind::WorkflowExecutionPaused { .. } => "WorkflowExecutionPaused",
         HistoryEventKind::WorkflowExecutionUnpaused { .. } => "WorkflowExecutionUnpaused",
-        HistoryEventKind::WorkflowExecutionTerminated { .. } => {
-            "WorkflowExecutionTerminated"
-        }
+        HistoryEventKind::WorkflowExecutionTerminated { .. } => "WorkflowExecutionTerminated",
         HistoryEventKind::WorkflowExecutionTimedOut { .. } => "WorkflowExecutionTimedOut",
         HistoryEventKind::WorkflowTaskScheduled { .. } => "WorkflowTaskScheduled",
         HistoryEventKind::WorkflowTaskStarted { .. } => "WorkflowTaskStarted",
@@ -793,33 +752,23 @@ fn history_event_type_name(event: &HistoryEvent) -> &'static str {
         HistoryEventKind::MarkerRecorded { .. } => "MarkerRecorded",
         HistoryEventKind::TimerCanceled { .. } => "TimerCanceled",
         HistoryEventKind::TimerFired { .. } => "TimerFired",
-        HistoryEventKind::ActivityTaskCancelRequested { .. } => {
-            "ActivityTaskCancelRequested"
-        }
+        HistoryEventKind::ActivityTaskCancelRequested { .. } => "ActivityTaskCancelRequested",
         HistoryEventKind::StartChildWorkflowExecutionInitiated { .. } => {
             "StartChildWorkflowExecutionInitiated"
         }
-        HistoryEventKind::ChildWorkflowExecutionStarted { .. } => {
-            "ChildWorkflowExecutionStarted"
-        }
+        HistoryEventKind::ChildWorkflowExecutionStarted { .. } => "ChildWorkflowExecutionStarted",
         HistoryEventKind::StartChildWorkflowExecutionFailed { .. } => {
             "StartChildWorkflowExecutionFailed"
         }
         HistoryEventKind::ChildWorkflowExecutionCompleted { .. } => {
             "ChildWorkflowExecutionCompleted"
         }
-        HistoryEventKind::ChildWorkflowExecutionFailed { .. } => {
-            "ChildWorkflowExecutionFailed"
-        }
-        HistoryEventKind::ChildWorkflowExecutionCanceled { .. } => {
-            "ChildWorkflowExecutionCanceled"
-        }
+        HistoryEventKind::ChildWorkflowExecutionFailed { .. } => "ChildWorkflowExecutionFailed",
+        HistoryEventKind::ChildWorkflowExecutionCanceled { .. } => "ChildWorkflowExecutionCanceled",
         HistoryEventKind::ChildWorkflowExecutionTerminated { .. } => {
             "ChildWorkflowExecutionTerminated"
         }
-        HistoryEventKind::ChildWorkflowExecutionTimedOut { .. } => {
-            "ChildWorkflowExecutionTimedOut"
-        }
+        HistoryEventKind::ChildWorkflowExecutionTimedOut { .. } => "ChildWorkflowExecutionTimedOut",
         HistoryEventKind::SignalExternalWorkflowExecutionInitiated { .. } => {
             "SignalExternalWorkflowExecutionInitiated"
         }
@@ -844,9 +793,7 @@ fn history_event_type_name(event: &HistoryEvent) -> &'static str {
         HistoryEventKind::NexusOperationFailed { .. } => "NexusOperationFailed",
         HistoryEventKind::NexusOperationCanceled { .. } => "NexusOperationCanceled",
         HistoryEventKind::NexusOperationTimedOut { .. } => "NexusOperationTimedOut",
-        HistoryEventKind::NexusOperationCancelRequested { .. } => {
-            "NexusOperationCancelRequested"
-        }
+        HistoryEventKind::NexusOperationCancelRequested { .. } => "NexusOperationCancelRequested",
         HistoryEventKind::WorkflowExecutionUpdateAccepted { .. } => {
             "WorkflowExecutionUpdateAccepted"
         }
@@ -859,9 +806,7 @@ fn history_event_type_name(event: &HistoryEvent) -> &'static str {
         HistoryEventKind::WorkflowExecutionOptionsUpdated { .. } => {
             "WorkflowExecutionOptionsUpdated"
         }
-        HistoryEventKind::WorkflowExecutionCompleted { .. } => {
-            "WorkflowExecutionCompleted"
-        }
+        HistoryEventKind::WorkflowExecutionCompleted { .. } => "WorkflowExecutionCompleted",
         HistoryEventKind::WorkflowExecutionFailed { .. } => "WorkflowExecutionFailed",
         HistoryEventKind::WorkflowExecutionContinuedAsNew { .. } => {
             "WorkflowExecutionContinuedAsNew"
@@ -870,9 +815,7 @@ fn history_event_type_name(event: &HistoryEvent) -> &'static str {
     }
 }
 
-fn extract_reset_metadata(
-    history_events: &[HistoryEvent],
-) -> Option<(tokeira_types::RunId, i64)> {
+fn extract_reset_metadata(history_events: &[HistoryEvent]) -> Option<(tokeira_types::RunId, i64)> {
     history_events.iter().find_map(|event| match &event.kind {
         HistoryEventKind::WorkflowTaskFailed {
             failure_cause: tokeira_kernel::WorkflowTaskFailedCause::ResetWorkflow,
@@ -895,22 +838,21 @@ mod tests {
     use smallvec::smallvec;
     use time::{Duration, OffsetDateTime};
     use tokeira_kernel::{
-        ActivityState, HistoryEvent, LoadedRun, PendingWorkflowTask, ProjectionOp,
-        Reject, RequestDedupeOp, TimerOp, Transition, WorkflowState,
+        ActivityState, HistoryEvent, LoadedRun, PendingWorkflowTask, ProjectionOp, Reject,
+        RequestDedupeOp, TimerOp, Transition, WorkflowState,
     };
     use tokeira_storage::{
-        BacklogEntry, CommitResult, DispatchableActivityTask, DispatchableWorkflowTask,
-        DueTimer, LeaseOutcome, LeaseRepository, ProjectionBatch, ProjectionLog,
-        ProjectionRecord, RequestRecord, TransitionAuditRecord,
+        BacklogEntry, CommitResult, DispatchableActivityTask, DispatchableWorkflowTask, DueTimer,
+        LeaseOutcome, LeaseRepository, ProjectionBatch, ProjectionLog, ProjectionRecord,
+        RequestRecord, TransitionAuditRecord,
     };
     use tokeira_types::{
         ExecutionRef, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payloads,
-        ProjectionCursor, QueueKey, RequestContext, RequestId, RunId, RunKey,
-        SearchAttributes, ShardEpoch, ShardId, TaskKind, TaskQueueName,
-        TransitionSeq as DurableTransitionSeq, WorkerIdentity, WorkflowId, WorkflowType,
+        ProjectionCursor, QueueKey, RequestContext, RequestId, RunId, RunKey, SearchAttributes,
+        ShardEpoch, ShardId, TaskKind, TaskQueueName, TransitionSeq as DurableTransitionSeq,
+        WorkerIdentity, WorkflowId, WorkflowType,
     };
-    use tokio::runtime::Runtime;
-    use tokio::sync::Mutex as AsyncMutex;
+    use tokio::{runtime::Runtime, sync::Mutex as AsyncMutex};
     use tracing_subscriber::layer::SubscriberExt;
 
     use super::*;
@@ -951,11 +893,7 @@ mod tests {
     }
 
     impl Kernel for MockKernel {
-        fn apply(
-            &self,
-            loaded: LoadedRun,
-            command: Command,
-        ) -> Result<Transition, Reject> {
+        fn apply(&self, loaded: LoadedRun, command: Command) -> Result<Transition, Reject> {
             let mut state = self.state.lock().unwrap();
             state.applied_commands.push(command);
             state.loaded_runs.push(loaded.clone());
@@ -1033,10 +971,7 @@ mod tests {
 
     #[async_trait]
     impl RunRepository for MockRepo {
-        async fn resolve_execution(
-            &self,
-            _execution: &ExecutionRef,
-        ) -> Result<Option<RunKey>> {
+        async fn resolve_execution(&self, _execution: &ExecutionRef) -> Result<Option<RunKey>> {
             Ok(None)
         }
 
@@ -1308,11 +1243,7 @@ mod tests {
             Ok(())
         }
 
-        async fn submit_to_run(
-            &self,
-            run_key: RunKey,
-            command: Command,
-        ) -> Result<CommitResult> {
+        async fn submit_to_run(&self, run_key: RunKey, command: Command) -> Result<CommitResult> {
             let mut state = self.state.lock().await;
             state.submits.push((run_key, command));
             if state.fail {
@@ -1349,11 +1280,7 @@ mod tests {
     }
 
     impl Kernel for ContinueAsNewKernel {
-        fn apply(
-            &self,
-            loaded: LoadedRun,
-            _command: Command,
-        ) -> Result<Transition, Reject> {
+        fn apply(&self, loaded: LoadedRun, _command: Command) -> Result<Transition, Reject> {
             let LoadedRun::Existing(current) = loaded else {
                 panic!("tests expect an existing run");
             };
@@ -1416,11 +1343,7 @@ mod tests {
     }
 
     impl Kernel for CapturingKernel {
-        fn apply(
-            &self,
-            loaded: LoadedRun,
-            _command: Command,
-        ) -> Result<Transition, Reject> {
+        fn apply(&self, loaded: LoadedRun, _command: Command) -> Result<Transition, Reject> {
             if let Some(metadata) = tracing::Span::current().metadata() {
                 self.observed
                     .lock()
@@ -2296,8 +2219,7 @@ mod tests {
             LoadedRun::Existing(state.clone()),
             vec![CommitBehavior::Applied],
         );
-        let kernel =
-            MockKernel::new(sample_dispatch_ops(state.namespace_id)).with_reject();
+        let kernel = MockKernel::new(sample_dispatch_ops(state.namespace_id)).with_reject();
         let shard_owner = test_shard_owner();
 
         let error = handle_message(
@@ -2321,8 +2243,7 @@ mod tests {
     async fn handle_message_uses_kernel_transition_span_name() {
         let run_key = RunKey::new();
         let state = sample_state(run_key);
-        let repo =
-            MockRepo::new(LoadedRun::Existing(state), vec![CommitBehavior::Applied]);
+        let repo = MockRepo::new(LoadedRun::Existing(state), vec![CommitBehavior::Applied]);
         let observed = Arc::new(Mutex::new(Vec::new()));
         let kernel = CapturingKernel {
             observed: observed.clone(),

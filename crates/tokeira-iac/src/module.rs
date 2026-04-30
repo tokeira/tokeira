@@ -10,12 +10,13 @@
 //! or local objects belong in [`crate::Resource`] implementations returned by
 //! [`Module::resources`].
 
-use std::any::{Any, TypeId};
-use std::collections::HashMap;
-use std::fmt::Debug;
+use std::{
+    any::{Any, TypeId},
+    collections::HashMap,
+    fmt::Debug,
+};
 
-use crate::Resource;
-use crate::error::IacError;
+use crate::{Resource, error::IacError};
 
 /// Context passed to [`Module::resources`] for resource assembly.
 ///

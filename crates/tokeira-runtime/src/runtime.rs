@@ -15,26 +15,24 @@ use anyhow::{Result, anyhow};
 use smallvec::{SmallVec, smallvec};
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    ActivityOp, ActivityResolution, ActivityResolvedRequest, BasicKernel, Command,
-    DispatchOp, HistoryEvent, HistoryEventKind, LoadedRun, SignalRequest,
-    SignalWithStartRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest,
-    Transition, UpdateRequest, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
-    WorkflowTaskCompletedRequest,
+    ActivityOp, ActivityResolution, ActivityResolvedRequest, BasicKernel, Command, DispatchOp,
+    HistoryEvent, HistoryEventKind, LoadedRun, SignalRequest, SignalWithStartRequest, StartRequest,
+    StartWorkflowTaskRequest, TerminateRequest, Transition, UpdateRequest,
+    WorkflowIdConflictPolicy, WorkflowIdReusePolicy, WorkflowTaskCompletedRequest,
 };
 use tokeira_storage::{
     CommitResult, DispatchableActivityTask, DispatchableWorkflowTask, LeaseOutcome,
     LeaseRepository, RunRepository,
 };
 use tokeira_types::{
-    ActivityTaskToken, BuildId, DeploymentId, ExecutionRef, Headers, NamespaceId,
-    Payload, Payloads, QueueKey, RequestContext, RetryPolicy, RunId, RunKey, ShardEpoch,
-    ShardId, TaskKind, TaskQueueName, WorkerIdentity, WorkflowTaskToken,
+    ActivityTaskToken, BuildId, DeploymentId, ExecutionRef, Headers, NamespaceId, Payload,
+    Payloads, QueueKey, RequestContext, RetryPolicy, RunId, RunKey, ShardEpoch, ShardId, TaskKind,
+    TaskQueueName, WorkerIdentity, WorkflowTaskToken,
 };
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::nexus::run_nexus_timeout_scanner;
 use crate::{
     activity_timeout::{
         ActivityTimeoutScannerConfig, ActivityTrackingState, run_activity_timeout_scanner,
@@ -46,8 +44,8 @@ use crate::{
     lane::{LaneConfig, LaneHandle, spawn_lane},
     metrics as runtime_metrics,
     nexus::{
-        NexusEndpointRegistry, NexusHttpClient, NexusTaskBroker,
-        NexusTimeoutScannerConfig, NexusTimeoutTrackingState, NoopNexusHttpClient,
+        NexusEndpointRegistry, NexusHttpClient, NexusTaskBroker, NexusTimeoutScannerConfig,
+        NexusTimeoutTrackingState, NoopNexusHttpClient, run_nexus_timeout_scanner,
     },
     publisher::RuntimeDispatchPublisher,
     query::{QueryResult, QueryTask},
@@ -65,8 +63,7 @@ use crate::{
     },
     versioning::VersioningRuleStore,
     wft_timeout::{
-        WftTimeoutEntry, WftTimeoutScannerConfig, WftTimeoutTrackingState,
-        run_wft_timeout_scanner,
+        WftTimeoutEntry, WftTimeoutScannerConfig, WftTimeoutTrackingState, run_wft_timeout_scanner,
     },
     worker_registry::{WorkerRegistrationKey, WorkerRegistry, WorkerVersionMetadata},
 };
@@ -446,15 +443,14 @@ where
             timer_scanner_cancel.clone(),
         )));
         let workflow_timeout_scanner_cancel = CancellationToken::new();
-        let workflow_timeout_scanner_handle =
-            Some(tokio::spawn(run_workflow_timeout_scanner(
-                workflow_timeout_tracking.clone(),
-                lanes.clone(),
-                lane_count,
-                shard_owner.clone(),
-                workflow_timeout_config,
-                workflow_timeout_scanner_cancel.clone(),
-            )));
+        let workflow_timeout_scanner_handle = Some(tokio::spawn(run_workflow_timeout_scanner(
+            workflow_timeout_tracking.clone(),
+            lanes.clone(),
+            lane_count,
+            shard_owner.clone(),
+            workflow_timeout_config,
+            workflow_timeout_scanner_cancel.clone(),
+        )));
         let wft_timeout_scanner_cancel = CancellationToken::new();
         let wft_timeout_scanner_handle = Some(tokio::spawn(run_wft_timeout_scanner(
             wft_timeout_tracking.clone(),
@@ -465,16 +461,15 @@ where
             wft_timeout_scanner_cancel.clone(),
         )));
         let activity_timeout_scanner_cancel = CancellationToken::new();
-        let activity_timeout_scanner_handle =
-            Some(tokio::spawn(run_activity_timeout_scanner(
-                repo.clone(),
-                activity_tracking.clone(),
-                lanes.clone(),
-                lane_count,
-                shard_owner.clone(),
-                activity_timeout_config,
-                activity_timeout_scanner_cancel.clone(),
-            )));
+        let activity_timeout_scanner_handle = Some(tokio::spawn(run_activity_timeout_scanner(
+            repo.clone(),
+            activity_tracking.clone(),
+            lanes.clone(),
+            lane_count,
+            shard_owner.clone(),
+            activity_timeout_config,
+            activity_timeout_scanner_cancel.clone(),
+        )));
         let grace_scanner_cancel = CancellationToken::new();
         let grace_scanner_handle = Some(tokio::spawn(run_grace_scanner(
             broker.clone(),
@@ -627,10 +622,7 @@ where
         self.update_registry.clone()
     }
 
-    pub fn pending_update_transports(
-        &self,
-        run_key: RunKey,
-    ) -> Vec<PendingUpdateTransport> {
+    pub fn pending_update_transports(&self, run_key: RunKey) -> Vec<PendingUpdateTransport> {
         self.update_registry
             .drain_pending_updates(run_key)
             .into_iter()
@@ -653,12 +645,16 @@ where
     ) -> bool {
         match resolution {
             UpdateTransportResolution::Accepted => true,
-            UpdateTransportResolution::Completed { result } => self
-                .update_registry
-                .notify(run_key, update_id, UpdateResolution::Completed { result }),
-            UpdateTransportResolution::Rejected { failure } => self
-                .update_registry
-                .notify(run_key, update_id, UpdateResolution::Rejected { failure }),
+            UpdateTransportResolution::Completed { result } => self.update_registry.notify(
+                run_key,
+                update_id,
+                UpdateResolution::Completed { result },
+            ),
+            UpdateTransportResolution::Rejected { failure } => self.update_registry.notify(
+                run_key,
+                update_id,
+                UpdateResolution::Rejected { failure },
+            ),
         }
     }
 
@@ -726,9 +722,7 @@ where
                         response_tx,
                     },
                 )
-                .map_err(|_| {
-                    anyhow!("too many buffered queries for run {:?}", run_key)
-                })?;
+                .map_err(|_| anyhow!("too many buffered queries for run {:?}", run_key))?;
         } else {
             self.broker
                 .publish_query_task(QueryTask {
@@ -855,18 +849,14 @@ where
         let complete_rx = complete_rx.expect("completion receiver should exist");
 
         match tokio::time::timeout(timeout_after, complete_rx).await {
-            Ok(Ok(UpdateResolution::Completed { result })) => {
-                Ok(UpdateOutcome::Completed {
-                    accepted_event_id: 0,
-                    result,
-                })
-            }
-            Ok(Ok(UpdateResolution::Rejected { failure })) => {
-                Ok(UpdateOutcome::Rejected {
-                    accepted_event_id: 0,
-                    failure,
-                })
-            }
+            Ok(Ok(UpdateResolution::Completed { result })) => Ok(UpdateOutcome::Completed {
+                accepted_event_id: 0,
+                result,
+            }),
+            Ok(Ok(UpdateResolution::Rejected { failure })) => Ok(UpdateOutcome::Rejected {
+                accepted_event_id: 0,
+                failure,
+            }),
             Ok(Ok(UpdateResolution::RunClosed)) => {
                 Err(anyhow!("run closed before update completed"))
             }
@@ -924,9 +914,7 @@ where
                         "unexpected duplicate start commit for {:?}",
                         request.run_key
                     )),
-                    CommitResult::Conflict { reason } => {
-                        Err(anyhow!("conflict: {reason}"))
-                    }
+                    CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
                 }
             }
             ConflictResolution::UseExisting { run_key, run_id } => {
@@ -949,9 +937,7 @@ where
                         "unexpected duplicate start commit for {:?}",
                         request.run_key
                     )),
-                    CommitResult::Conflict { reason } => {
-                        Err(anyhow!("conflict: {reason}"))
-                    }
+                    CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
                 }
             }
             ConflictResolution::Rejected { run_key, run_id } => {
@@ -986,9 +972,7 @@ where
                         "unexpected duplicate signal-with-start commit for {:?}",
                         request.run_key
                     )),
-                    CommitResult::Conflict { reason } => {
-                        Err(anyhow!("conflict: {reason}"))
-                    }
+                    CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
                 }
             }
             ConflictResolution::UseExisting { run_key, run_id } => {
@@ -1012,9 +996,7 @@ where
                     CommitResult::Applied { .. } | CommitResult::Duplicate => {
                         Ok(SignalWithStartResult::Signaled { run_key, run_id })
                     }
-                    CommitResult::Conflict { reason } => {
-                        Err(anyhow!("conflict: {reason}"))
-                    }
+                    CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
                 }
             }
             ConflictResolution::TerminateAndStart { run_key } => {
@@ -1037,9 +1019,7 @@ where
                         "unexpected duplicate signal-with-start commit for {:?}",
                         request.run_key
                     )),
-                    CommitResult::Conflict { reason } => {
-                        Err(anyhow!("conflict: {reason}"))
-                    }
+                    CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
                 }
             }
             ConflictResolution::Rejected { run_key, run_id } => {
@@ -1140,12 +1120,10 @@ where
                         run_key,
                         run_id: state.run_id,
                     },
-                    WorkflowIdConflictPolicy::UseExisting => {
-                        ConflictResolution::UseExisting {
-                            run_key,
-                            run_id: state.run_id,
-                        }
-                    }
+                    WorkflowIdConflictPolicy::UseExisting => ConflictResolution::UseExisting {
+                        run_key,
+                        run_id: state.run_id,
+                    },
                     WorkflowIdConflictPolicy::TerminateExisting => {
                         ConflictResolution::TerminateAndStart { run_key }
                     }
@@ -1153,8 +1131,7 @@ where
             }
         }
 
-        let Some(run_key) = self.repo.find_latest_run(namespace_id, workflow_id).await?
-        else {
+        let Some(run_key) = self.repo.find_latest_run(namespace_id, workflow_id).await? else {
             return Ok(ConflictResolution::Absent);
         };
         let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
@@ -1166,12 +1143,10 @@ where
                     run_key,
                     run_id: state.run_id,
                 },
-                WorkflowIdConflictPolicy::UseExisting => {
-                    ConflictResolution::UseExisting {
-                        run_key,
-                        run_id: state.run_id,
-                    }
-                }
+                WorkflowIdConflictPolicy::UseExisting => ConflictResolution::UseExisting {
+                    run_key,
+                    run_id: state.run_id,
+                },
                 WorkflowIdConflictPolicy::TerminateExisting => {
                     ConflictResolution::TerminateAndStart { run_key }
                 }
@@ -1282,8 +1257,7 @@ where
         run_key: RunKey,
         worker_identity: WorkerIdentity,
     ) -> Result<Option<StartedWorkflowTask>> {
-        let Some(offered) = self.broker.try_claim_workflow_task(&queue, run_key).await
-        else {
+        let Some(offered) = self.broker.try_claim_workflow_task(&queue, run_key).await else {
             return Ok(None);
         };
         self.delivery_metrics.record_poll_success(&queue);
@@ -1403,8 +1377,7 @@ where
         failure_error_type: Option<String>,
         is_non_retryable: bool,
     ) -> Result<()> {
-        let (activity, workflow_retry_policy) =
-            self.validate_activity_token(&token).await?;
+        let (activity, workflow_retry_policy) = self.validate_activity_token(&token).await?;
         let activity_id = token.activity_id.clone();
         let retry_policy = activity.retry_policy.clone().or(workflow_retry_policy);
 
@@ -1441,18 +1414,11 @@ where
         Ok(())
     }
 
-    pub async fn record_activity_heartbeat(
-        &self,
-        token: ActivityTaskToken,
-    ) -> Result<bool> {
+    pub async fn record_activity_heartbeat(&self, token: ActivityTaskToken) -> Result<bool> {
         self.validate_activity_token(&token).await?;
         Ok(self
             .activity_tracking
-            .record_heartbeat(
-                token.run_key,
-                &token.activity_id,
-                OffsetDateTime::now_utc(),
-            )
+            .record_heartbeat(token.run_key, &token.activity_id, OffsetDateTime::now_utc())
             .unwrap_or(false))
     }
 
@@ -1471,21 +1437,17 @@ where
         match self
             .submit_for_owned_shard(
                 run_key,
-                Command::NexusOperationResolved(
-                    tokeira_kernel::NexusOperationResolvedRequest {
-                        operation_id,
-                        scheduled_event_id,
-                        resolution,
-                        now: OffsetDateTime::now_utc(),
-                    },
-                ),
+                Command::NexusOperationResolved(tokeira_kernel::NexusOperationResolvedRequest {
+                    operation_id,
+                    scheduled_event_id,
+                    resolution,
+                    now: OffsetDateTime::now_utc(),
+                }),
             )
             .await
         {
             Ok(_) => Ok(true),
-            Err(error) if error.to_string().contains("kernel rejected command") => {
-                Ok(false)
-            }
+            Err(error) if error.to_string().contains("kernel rejected command") => Ok(false),
             Err(error) => Err(error),
         }
     }
@@ -1562,11 +1524,7 @@ where
         })
     }
 
-    pub async fn submit(
-        &self,
-        run_key: RunKey,
-        command: Command,
-    ) -> Result<CommitResult> {
+    pub async fn submit(&self, run_key: RunKey, command: Command) -> Result<CommitResult> {
         let shard_id = self.shard_id_for(run_key).await;
         if !self.shard_owner.read().unwrap().is_active(shard_id) {
             return Err(anyhow!("shard not active for run {:?}", run_key));
@@ -1653,10 +1611,7 @@ where
         shard_for(run_key, shard_count)
     }
 
-    async fn validate_workflow_task_token(
-        &self,
-        token: &WorkflowTaskToken,
-    ) -> Result<()> {
+    async fn validate_workflow_task_token(&self, token: &WorkflowTaskToken) -> Result<()> {
         let current_epoch = self.shard_epoch_for_completion(token.run_key).await?;
         if token.shard_epoch != current_epoch {
             return Err(anyhow!("workflow task shard epoch mismatch"));
@@ -1775,9 +1730,7 @@ where
             tokio::time::timeout(tokio::time::Duration::from_secs(5), handle)
                 .await
                 .map_err(|_| anyhow!("workflow timeout scanner shutdown timed out"))?
-                .map_err(|error| {
-                    anyhow!("workflow timeout scanner join failed: {error}")
-                })?;
+                .map_err(|error| anyhow!("workflow timeout scanner join failed: {error}"))?;
         }
         Ok(())
     }
@@ -1810,9 +1763,7 @@ where
             tokio::time::timeout(tokio::time::Duration::from_secs(5), handle)
                 .await
                 .map_err(|_| anyhow!("activity timeout scanner shutdown timed out"))?
-                .map_err(|error| {
-                    anyhow!("activity timeout scanner join failed: {error}")
-                })?;
+                .map_err(|error| anyhow!("activity timeout scanner join failed: {error}"))?;
         }
         Ok(())
     }
@@ -1871,11 +1822,7 @@ where
 
     /// Like [`republish_queue`](Self::republish_queue) but
     /// for activity tasks.
-    pub async fn republish_activity_queue(
-        &self,
-        queue: QueueKey,
-        limit: usize,
-    ) -> Result<usize> {
+    pub async fn republish_activity_queue(&self, queue: QueueKey, limit: usize) -> Result<usize> {
         let tasks = self
             .repo
             .list_dispatchable_activity_tasks(&queue, limit)
@@ -1897,8 +1844,7 @@ where
     ) -> Result<Option<StartedActivityTask>> {
         let mut attempts = 0u32;
         loop {
-            let LoadedRun::Existing(state) = self.repo.load_run(task.run_key).await?
-            else {
+            let LoadedRun::Existing(state) = self.repo.load_run(task.run_key).await? else {
                 return Ok(None);
             };
             if !state.is_open() {
@@ -1984,8 +1930,7 @@ where
                         workflow_namespace: state.namespace_id.0.to_string(),
                         header: next_activity.header.clone(),
                         retry_policy: next_activity.retry_policy.clone(),
-                        schedule_to_close_timeout: next_activity
-                            .schedule_to_close_timeout,
+                        schedule_to_close_timeout: next_activity.schedule_to_close_timeout,
                         start_to_close_timeout: next_activity.start_to_close_timeout,
                         heartbeat_timeout: next_activity.heartbeat_timeout,
                     }));
@@ -1994,10 +1939,7 @@ where
                     if attempts >= self.config.max_occ_retries {
                         if let Err(error) = self
                             .activity_broker
-                            .publish_activity_task(
-                                task.clone(),
-                                Some(&self.delivery_metrics),
-                            )
+                            .publish_activity_task(task.clone(), Some(&self.delivery_metrics))
                             .await
                         {
                             tracing::warn!(?error, run_key = ?task.run_key, activity_id = task.activity_id, "failed to republish activity task after start conflict exhaustion");
@@ -2040,8 +1982,7 @@ where
     ) -> Result<()> {
         let mut attempts = 0u32;
         loop {
-            let LoadedRun::Existing(state) = self.repo.load_run(token.run_key).await?
-            else {
+            let LoadedRun::Existing(state) = self.repo.load_run(token.run_key).await? else {
                 return Err(anyhow!("run not found for activity retry"));
             };
             let Some(current) = state.activities.get(&token.activity_id).cloned() else {
@@ -2113,10 +2054,7 @@ where
                 CommitResult::Applied { .. } => {
                     if let Err(error) = self
                         .activity_broker
-                        .publish_activity_task(
-                            dispatch_task,
-                            Some(&self.delivery_metrics),
-                        )
+                        .publish_activity_task(dispatch_task, Some(&self.delivery_metrics))
                         .await
                     {
                         tracing::warn!(?error, run_key = ?token.run_key, activity_id = token.activity_id, "failed to publish retried activity task");
@@ -2208,33 +2146,33 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::broker::InMemoryBroker;
-    use crate::lane::DispatchPublisher;
-    use crate::nexus::{
-        EndpointTarget, NexusEndpointConfig, NexusEndpointRegistry, NexusTaskBroker,
-        NexusTimeoutEntry, NexusTimeoutScannerConfig, NexusTimeoutTrackingState,
-        NoopNexusHttpClient, evaluate_nexus_timeout,
+    use crate::{
+        broker::InMemoryBroker,
+        lane::DispatchPublisher,
+        nexus::{
+            EndpointTarget, NexusEndpointConfig, NexusEndpointRegistry, NexusTaskBroker,
+            NexusTimeoutEntry, NexusTimeoutScannerConfig, NexusTimeoutTrackingState,
+            NoopNexusHttpClient, evaluate_nexus_timeout,
+        },
+        publisher::RuntimeDispatchPublisher,
+        retry::{RetryDecision, compute_retry_backoff, evaluate_activity_retry},
+        scanner::{TimerScannerConfig, lane_index_for, pick_lane, scan_due_timers_once},
+        timeout::{
+            WorkflowTimeoutEntry, WorkflowTimeoutScannerConfig, WorkflowTimeoutTrackingState,
+            WorkflowTimeoutViolation, evaluate_workflow_timeout, scan_workflow_timeouts_once,
+            workflow_timeout_retry_state,
+        },
+        versioning::{RedirectRule, VersioningMutation},
     };
-    use crate::publisher::RuntimeDispatchPublisher;
-    use crate::retry::{RetryDecision, compute_retry_backoff, evaluate_activity_retry};
-    use crate::scanner::{
-        TimerScannerConfig, lane_index_for, pick_lane, scan_due_timers_once,
-    };
-    use crate::timeout::{
-        WorkflowTimeoutEntry, WorkflowTimeoutScannerConfig, WorkflowTimeoutTrackingState,
-        WorkflowTimeoutViolation, evaluate_workflow_timeout, scan_workflow_timeouts_once,
-        workflow_timeout_retry_state,
-    };
-    use crate::versioning::{RedirectRule, VersioningMutation};
     use std::collections::HashMap;
     use tokeira_kernel::RetryState;
     use tokeira_storage::{
-        BacklogEntry, CommitResult, DispatchableWorkflowTask, InMemoryStore,
-        RequestRecord, TransitionAuditRecord,
+        BacklogEntry, CommitResult, DispatchableWorkflowTask, InMemoryStore, RequestRecord,
+        TransitionAuditRecord,
     };
     use tokeira_types::{
-        ExecutionRef, LogicalTaskSeq, Memo, NamespaceId, Payloads, RequestContext,
-        RequestId, SearchAttributes, TaskKind, WorkflowId,
+        ExecutionRef, LogicalTaskSeq, Memo, NamespaceId, Payloads, RequestContext, RequestId,
+        SearchAttributes, TaskKind, WorkflowId,
     };
 
     proptest! {
@@ -2281,8 +2219,8 @@ mod tests {
                 Arc::new(VersioningRuleStore::default()),
             );
             let shard_id = ShardId(7);
-            let lane_ptr = pick_lane(&runtime.lanes, runtime.lanes.len(), shard_id)
-                as *const LaneHandle;
+            let lane_ptr =
+                pick_lane(&runtime.lanes, runtime.lanes.len(), shard_id) as *const LaneHandle;
             let expected_ptr = &runtime.lanes[3] as *const LaneHandle;
 
             assert_eq!(lane_ptr, expected_ptr);
@@ -3253,8 +3191,7 @@ mod tests {
             WorkflowTimeoutScannerConfig::default(),
             BacklogConfig::default(),
         );
-        let request =
-            sample_start_request(Some(Duration::seconds(5)), Some(Duration::seconds(3)));
+        let request = sample_start_request(Some(Duration::seconds(5)), Some(Duration::seconds(3)));
         let result = runtime.start_workflow(request.clone()).await.unwrap();
         assert!(matches!(result, CommitResult::Applied { .. }));
 
@@ -3509,10 +3446,7 @@ mod tests {
 
     #[async_trait]
     impl RunRepository for MockTimerRepo {
-        async fn resolve_execution(
-            &self,
-            _execution: &ExecutionRef,
-        ) -> Result<Option<RunKey>> {
+        async fn resolve_execution(&self, _execution: &ExecutionRef) -> Result<Option<RunKey>> {
             panic!("unused in timer scanner tests")
         }
 

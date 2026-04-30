@@ -17,8 +17,6 @@ use crate::RuntimeError;
 #[async_trait::async_trait]
 pub trait Platform: Send + Sync {
     /// Apply a set of manifests and return the number applied.
-    async fn apply_manifests(
-        &self,
-        manifests: &[serde_json::Value],
-    ) -> Result<usize, RuntimeError>;
+    async fn apply_manifests(&self, manifests: &[serde_json::Value])
+    -> Result<usize, RuntimeError>;
 }

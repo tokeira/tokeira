@@ -20,10 +20,10 @@ mod observability;
 
 use tokeira_config::{Cli, TokeiraConfig};
 use tokeira_edge::{
-    EdgeInterceptors, HistoryNotifyingRepository, HistoryWaitRegistry,
-    InMemoryNamespaceCache, InMemoryOperatorApi, LocalOnlyRouter, LongPollConfig,
-    LongPollGate, NamespaceCache, OperatorService, PendingQueryStore, PollerRegistry,
-    ResolvedNamespace, WorkflowExecutionDescription, WorkflowService,
+    EdgeInterceptors, HistoryNotifyingRepository, HistoryWaitRegistry, InMemoryNamespaceCache,
+    InMemoryOperatorApi, LocalOnlyRouter, LongPollConfig, LongPollGate, NamespaceCache,
+    OperatorService, PendingQueryStore, PollerRegistry, ResolvedNamespace,
+    WorkflowExecutionDescription, WorkflowService,
     grpc::{
         operator_service::OperatorServiceGrpc, runtime_adapter::RuntimeAdapter,
         workflow_service::WorkflowServiceGrpc,
@@ -36,9 +36,8 @@ use tokeira_projection::{
     InMemoryVisibilityStore, ProjectionWorker, VisibilityQueryService, VisibilitySink,
 };
 use tokeira_runtime::{
-    EndpointTarget, NexusEndpointConfig, NexusEndpointRegistry, NoopNexusHttpClient,
-    RuntimeConfig, ScheduleEngineConfig, ScheduleStore, TokeiraRuntime,
-    VersioningRuleStore, run_schedule_engine,
+    EndpointTarget, NexusEndpointConfig, NexusEndpointRegistry, NoopNexusHttpClient, RuntimeConfig,
+    ScheduleEngineConfig, ScheduleStore, TokeiraRuntime, VersioningRuleStore, run_schedule_engine,
 };
 use tokeira_storage::{InMemoryStore, RunRepository};
 use tokeira_types::{ExecutionRef, NamespaceId, ProjectionCursor, WorkflowId};
@@ -64,14 +63,12 @@ struct BootstrapNexusEndpointConfig {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let (effective_config, config_source) =
-        TokeiraConfig::resolve(cli.config.as_deref())?;
+    let (effective_config, config_source) = TokeiraConfig::resolve(cli.config.as_deref())?;
     if cli.dump_config {
         println!("{}", effective_config.to_toml()?);
         return Ok(());
     }
-    let observability =
-        observability::ObservabilityConfig::from_tokeira_config(&effective_config)?;
+    let observability = observability::ObservabilityConfig::from_tokeira_config(&effective_config)?;
     let metrics_handle = observability::install_metrics(&observability)?;
     let log_reload = observability::install_tracing(&observability)?;
     for warning in effective_config.emergency_warnings() {
@@ -322,10 +319,7 @@ where
                 // Workflow may be closed — find the latest run by scanning all runs
                 match self
                     .repo
-                    .find_latest_run(
-                        self.namespace_id,
-                        &WorkflowId(workflow_id.to_string()),
-                    )
+                    .find_latest_run(self.namespace_id, &WorkflowId(workflow_id.to_string()))
                     .await?
                 {
                     Some(rk) => rk,
@@ -391,9 +385,7 @@ where
                     }
                 }),
             })),
-            LoadedRun::Absent => {
-                Err(anyhow!("resolved run missing from storage: {:?}", run_key))
-            }
+            LoadedRun::Absent => Err(anyhow!("resolved run missing from storage: {:?}", run_key)),
         }
     }
 }

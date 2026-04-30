@@ -8,8 +8,7 @@ use tokeira_types::validate_metric_name;
 pub const COMMIT_TRANSITION_DURATION_SECONDS: &str =
     "tokeira_storage_commit_transition_duration_seconds";
 pub const LOAD_RUN_DURATION_SECONDS: &str = "tokeira_storage_load_run_duration_seconds";
-pub const READ_HISTORY_DURATION_SECONDS: &str =
-    "tokeira_storage_read_history_duration_seconds";
+pub const READ_HISTORY_DURATION_SECONDS: &str = "tokeira_storage_read_history_duration_seconds";
 pub const OPERATION_TOTAL: &str = "tokeira_storage_repository_operation_total";
 
 pub const METRIC_NAMES: &[(&str, MetricType)] = &[
@@ -45,8 +44,7 @@ pub fn record_read_history_duration(duration: std::time::Duration) {
 }
 
 pub fn record_storage_operation(operation: &'static str, outcome: &'static str) {
-    counter!(OPERATION_TOTAL, "operation" => operation, "outcome" => outcome)
-        .increment(1);
+    counter!(OPERATION_TOTAL, "operation" => operation, "outcome" => outcome).increment(1);
 }
 
 #[cfg(test)]

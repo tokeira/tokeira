@@ -1,17 +1,17 @@
 use anyhow::{Result, bail};
 use tokeira_orchestrator::StorageKind;
 
-use crate::cli::SchemaAction;
-use crate::deployment_dir::DeploymentContext;
-use crate::deployment_dir::TOKEIRAD_TOML;
+use crate::{
+    cli::SchemaAction,
+    deployment_dir::{DeploymentContext, TOKEIRAD_TOML},
+};
 
 pub fn run(action: SchemaAction, ctx: DeploymentContext) -> Result<()> {
     if ctx.metadata.storage != StorageKind::Dsql {
         bail!("schema commands require dsql storage");
     }
     let server_config_path = ctx.path.join(TOKEIRAD_TOML);
-    let server_config =
-        crate::commands::infra::read_tokeirad_config(&server_config_path)?;
+    let server_config = crate::commands::infra::read_tokeirad_config(&server_config_path)?;
     let Some(endpoint) = server_config.infrastructure.dsql.endpoint else {
         bail!(
             "dsql endpoint is not configured in {}",

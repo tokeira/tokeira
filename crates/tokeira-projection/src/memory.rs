@@ -18,10 +18,9 @@ use tokio::sync::Mutex;
 use crate::{
     store::VisibilityStore,
     types::{
-        AttrDescriptor, AttrId, CompareOp, CompiledFilter, CountResult, ExecutionRow,
-        FieldRef, FilterExpr, FilterValue, GroupByField, ListResult, PageBounds,
-        PageToken, RollupCounter, RollupDelta, RollupDimension, SearchAttrType,
-        SortOrder, SystemField,
+        AttrDescriptor, AttrId, CompareOp, CompiledFilter, CountResult, ExecutionRow, FieldRef,
+        FilterExpr, FilterValue, GroupByField, ListResult, PageBounds, PageToken, RollupCounter,
+        RollupDelta, RollupDimension, SearchAttrType, SortOrder, SystemField,
     },
 };
 
@@ -100,36 +99,31 @@ impl VisibilityStore for InMemoryVisibilityStore {
             };
             match previous {
                 SearchAttrValue::Keyword(v) => {
-                    if let Some(set) =
-                        inner
-                            .sa_keyword_idx
-                            .get_mut(&(row.namespace_id, attr_id, v))
+                    if let Some(set) = inner
+                        .sa_keyword_idx
+                        .get_mut(&(row.namespace_id, attr_id, v))
                     {
                         set.remove(&run_key);
                     }
                 }
                 SearchAttrValue::KeywordList(values) => {
                     for v in values {
-                        if let Some(set) = inner.sa_keyword_list_idx.get_mut(&(
-                            row.namespace_id,
-                            attr_id,
-                            v,
-                        )) {
+                        if let Some(set) =
+                            inner
+                                .sa_keyword_list_idx
+                                .get_mut(&(row.namespace_id, attr_id, v))
+                        {
                             set.remove(&run_key);
                         }
                     }
                 }
                 SearchAttrValue::Int(v) => {
-                    if let Some(set) =
-                        inner.sa_int_idx.get_mut(&(row.namespace_id, attr_id, v))
-                    {
+                    if let Some(set) = inner.sa_int_idx.get_mut(&(row.namespace_id, attr_id, v)) {
                         set.remove(&run_key);
                     }
                 }
                 SearchAttrValue::Bool(v) => {
-                    if let Some(set) =
-                        inner.sa_bool_idx.get_mut(&(row.namespace_id, attr_id, v))
-                    {
+                    if let Some(set) = inner.sa_bool_idx.get_mut(&(row.namespace_id, attr_id, v)) {
                         set.remove(&run_key);
                     }
                 }
@@ -267,21 +261,20 @@ impl VisibilityStore for InMemoryVisibilityStore {
         };
         match (attr_type, previous) {
             (SearchAttrType::Keyword, SearchAttrValue::Keyword(v)) => {
-                if let Some(set) =
-                    inner
-                        .sa_keyword_idx
-                        .get_mut(&(namespace_id, attr_id, v.clone()))
+                if let Some(set) = inner
+                    .sa_keyword_idx
+                    .get_mut(&(namespace_id, attr_id, v.clone()))
                 {
                     set.remove(&run_key);
                 }
             }
             (SearchAttrType::KeywordList, SearchAttrValue::KeywordList(values)) => {
                 for v in values {
-                    if let Some(set) = inner.sa_keyword_list_idx.get_mut(&(
-                        namespace_id,
-                        attr_id,
-                        v.clone(),
-                    )) {
+                    if let Some(set) =
+                        inner
+                            .sa_keyword_list_idx
+                            .get_mut(&(namespace_id, attr_id, v.clone()))
+                    {
                         set.remove(&run_key);
                     }
                 }
@@ -292,17 +285,16 @@ impl VisibilityStore for InMemoryVisibilityStore {
                 }
             }
             (SearchAttrType::Bool, SearchAttrValue::Bool(v)) => {
-                if let Some(set) = inner.sa_bool_idx.get_mut(&(namespace_id, attr_id, v))
-                {
+                if let Some(set) = inner.sa_bool_idx.get_mut(&(namespace_id, attr_id, v)) {
                     set.remove(&run_key);
                 }
             }
             (SearchAttrType::Double, SearchAttrValue::Double(v)) => {
-                if let Some(set) = inner.sa_double_idx.get_mut(&(
-                    namespace_id,
-                    attr_id,
-                    format!("{v:.17}"),
-                )) {
+                if let Some(set) =
+                    inner
+                        .sa_double_idx
+                        .get_mut(&(namespace_id, attr_id, format!("{v:.17}")))
+                {
                     set.remove(&run_key);
                 }
             }
@@ -317,9 +309,7 @@ impl VisibilityStore for InMemoryVisibilityStore {
             }
             (SearchAttrType::Text, SearchAttrValue::Text(v)) => {
                 for token in Self::index_text(&v) {
-                    if let Some(set) =
-                        inner.sa_text_idx.get_mut(&(namespace_id, attr_id, token))
-                    {
+                    if let Some(set) = inner.sa_text_idx.get_mut(&(namespace_id, attr_id, token)) {
                         set.remove(&run_key);
                     }
                 }
@@ -437,11 +427,7 @@ impl VisibilityStore for InMemoryVisibilityStore {
         Ok(self.inner.lock().await.checkpoints.get(sink_id).cloned())
     }
 
-    async fn save_checkpoint(
-        &self,
-        sink_id: &str,
-        cursor: &ProjectionCursor,
-    ) -> Result<()> {
+    async fn save_checkpoint(&self, sink_id: &str, cursor: &ProjectionCursor) -> Result<()> {
         self.inner
             .lock()
             .await
@@ -518,11 +504,7 @@ fn row_after(row: &ExecutionRow, token: &PageToken) -> bool {
         < (token.close_time, token.start_time, token.run_key.0)
 }
 
-fn matches_filter(
-    inner: &VisibilityState,
-    row: &ExecutionRow,
-    filter: &CompiledFilter,
-) -> bool {
+fn matches_filter(inner: &VisibilityState, row: &ExecutionRow, filter: &CompiledFilter) -> bool {
     filter
         .expr
         .as_ref()
@@ -531,12 +513,8 @@ fn matches_filter(
 
 fn eval_expr(inner: &VisibilityState, row: &ExecutionRow, expr: &FilterExpr) -> bool {
     match expr {
-        FilterExpr::And(lhs, rhs) => {
-            eval_expr(inner, row, lhs) && eval_expr(inner, row, rhs)
-        }
-        FilterExpr::Or(lhs, rhs) => {
-            eval_expr(inner, row, lhs) || eval_expr(inner, row, rhs)
-        }
+        FilterExpr::And(lhs, rhs) => eval_expr(inner, row, lhs) && eval_expr(inner, row, rhs),
+        FilterExpr::Or(lhs, rhs) => eval_expr(inner, row, lhs) || eval_expr(inner, row, rhs),
         FilterExpr::Compare { field, op, value } => {
             compare(field_value(inner, row, field), *op, value)
         }
@@ -562,27 +540,17 @@ fn field_value(
         FieldRef::System(SystemField::WorkflowId) => {
             Some(FilterValue::String(row.workflow_id.0.clone()))
         }
-        FieldRef::System(SystemField::RunId) => {
-            Some(FilterValue::String(row.run_id.0.to_string()))
-        }
+        FieldRef::System(SystemField::RunId) => Some(FilterValue::String(row.run_id.0.to_string())),
         FieldRef::System(SystemField::WorkflowType) => {
             Some(FilterValue::String(row.workflow_type.0.clone()))
         }
         FieldRef::System(SystemField::TaskQueue) => {
             Some(FilterValue::String(row.task_queue.0.clone()))
         }
-        FieldRef::System(SystemField::ExecutionStatus) => {
-            Some(FilterValue::Status(row.status))
-        }
-        FieldRef::System(SystemField::StartTime) => {
-            Some(FilterValue::Datetime(row.start_time))
-        }
-        FieldRef::System(SystemField::CloseTime) => {
-            row.close_time.map(FilterValue::Datetime)
-        }
-        FieldRef::System(SystemField::HistoryLength) => {
-            Some(FilterValue::Int(row.history_length))
-        }
+        FieldRef::System(SystemField::ExecutionStatus) => Some(FilterValue::Status(row.status)),
+        FieldRef::System(SystemField::StartTime) => Some(FilterValue::Datetime(row.start_time)),
+        FieldRef::System(SystemField::CloseTime) => row.close_time.map(FilterValue::Datetime),
+        FieldRef::System(SystemField::HistoryLength) => Some(FilterValue::Int(row.history_length)),
         FieldRef::System(SystemField::StateTransitionCount) => {
             Some(FilterValue::Int(row.state_transition_count))
         }
@@ -650,37 +618,31 @@ fn group_value(
     field: &GroupByField,
 ) -> Option<String> {
     match field {
-        GroupByField::System(SystemField::ExecutionStatus) => {
-            Some(format!("{:?}", row.status))
-        }
-        GroupByField::System(SystemField::WorkflowType) => {
-            Some(row.workflow_type.0.clone())
-        }
+        GroupByField::System(SystemField::ExecutionStatus) => Some(format!("{:?}", row.status)),
+        GroupByField::System(SystemField::WorkflowType) => Some(row.workflow_type.0.clone()),
         GroupByField::System(SystemField::TaskQueue) => Some(row.task_queue.0.clone()),
         GroupByField::System(SystemField::WorkflowId) => Some(row.workflow_id.0.clone()),
         GroupByField::System(SystemField::RunId) => Some(row.run_id.0.to_string()),
         GroupByField::System(SystemField::StartTime) => Some(row.start_time.to_string()),
-        GroupByField::System(SystemField::CloseTime) => {
-            row.close_time.map(|v| v.to_string())
-        }
-        GroupByField::System(SystemField::HistoryLength) => {
-            Some(row.history_length.to_string())
-        }
+        GroupByField::System(SystemField::CloseTime) => row.close_time.map(|v| v.to_string()),
+        GroupByField::System(SystemField::HistoryLength) => Some(row.history_length.to_string()),
         GroupByField::System(SystemField::StateTransitionCount) => {
             Some(row.state_transition_count.to_string())
         }
-        GroupByField::Custom { attr_id, .. } => inner
-            .sa_current
-            .get(&(row.run_key, *attr_id))
-            .map(|v| match v {
-                SearchAttrValue::Keyword(v) => v.clone(),
-                SearchAttrValue::KeywordList(v) => v.join(","),
-                SearchAttrValue::Int(v) => v.to_string(),
-                SearchAttrValue::Double(v) => v.to_string(),
-                SearchAttrValue::Bool(v) => v.to_string(),
-                SearchAttrValue::Datetime(v) => v.to_string(),
-                SearchAttrValue::Text(v) => v.clone(),
-            }),
+        GroupByField::Custom { attr_id, .. } => {
+            inner
+                .sa_current
+                .get(&(row.run_key, *attr_id))
+                .map(|v| match v {
+                    SearchAttrValue::Keyword(v) => v.clone(),
+                    SearchAttrValue::KeywordList(v) => v.join(","),
+                    SearchAttrValue::Int(v) => v.to_string(),
+                    SearchAttrValue::Double(v) => v.to_string(),
+                    SearchAttrValue::Bool(v) => v.to_string(),
+                    SearchAttrValue::Datetime(v) => v.to_string(),
+                    SearchAttrValue::Text(v) => v.clone(),
+                })
+        }
     }
 }
 
@@ -747,8 +709,7 @@ mod tests {
                         status,
                         start_time: OffsetDateTime::from_unix_timestamp(start).unwrap(),
                         execution_time: None,
-                        close_time: close
-                            .map(|c| OffsetDateTime::from_unix_timestamp(c).unwrap()),
+                        close_time: close.map(|c| OffsetDateTime::from_unix_timestamp(c).unwrap()),
                         history_length: hl,
                         state_transition_count: stc,
                         memo: Memo::default(),

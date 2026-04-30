@@ -18,12 +18,8 @@ impl From<EdgeError> for Status {
                 Status::permission_denied(message)
             }
             EdgeError::NamespaceNotFound(namespace) => Status::not_found(namespace),
-            EdgeError::NamespaceDeleted(namespace) => {
-                Status::failed_precondition(namespace)
-            }
-            EdgeError::NamespaceAlreadyExists(namespace) => {
-                Status::already_exists(namespace)
-            }
+            EdgeError::NamespaceDeleted(namespace) => Status::failed_precondition(namespace),
+            EdgeError::NamespaceAlreadyExists(namespace) => Status::already_exists(namespace),
             EdgeError::WorkflowNotFound {
                 namespace,
                 workflow_id,

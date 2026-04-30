@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
-use tokeira_iac::error::IacError;
 use tokeira_iac::{
     InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    error::IacError,
 };
 
 /// Configuration for a single S3 bucket provider resource.
@@ -26,11 +26,7 @@ pub struct S3Bucket {
 }
 
 impl S3Bucket {
-    pub fn new(
-        bucket_name: String,
-        config: S3BucketConfig,
-        rctx: &crate::ResourceContext,
-    ) -> Self {
+    pub fn new(bucket_name: String, config: S3BucketConfig, rctx: &crate::ResourceContext) -> Self {
         let key_prefix = config.key_prefix.clone();
         Self {
             bucket_name,
@@ -42,10 +38,7 @@ impl S3Bucket {
         }
     }
 
-    fn snapshot_delete_prevention_policy(
-        &self,
-        _ctx: &ProvisionContext,
-    ) -> Option<String> {
+    fn snapshot_delete_prevention_policy(&self, _ctx: &ProvisionContext) -> Option<String> {
         let key_prefix = self.key_prefix.as_deref()?.trim_matches('/');
         if key_prefix.is_empty() {
             return None;
@@ -91,15 +84,12 @@ fn extract_snapshot_policy_prefix(
             "s3:GetBucketPolicy: invalid bucket policy JSON: {e}"
         ))
     })?;
-    let Some(statements) = value.get("Statement").and_then(|value| value.as_array())
-    else {
+    let Some(statements) = value.get("Statement").and_then(|value| value.as_array()) else {
         return Ok(None);
     };
 
     for statement in statements {
-        if statement.get("Sid").and_then(|value| value.as_str())
-            != Some("DenySnapshotDeletes")
-        {
+        if statement.get("Sid").and_then(|value| value.as_str()) != Some("DenySnapshotDeletes") {
             continue;
         }
         let resource = statement
@@ -154,8 +144,7 @@ impl Resource for S3Bucket {
 
         // Build the desired tag set via ProvisionContext.
         let desired_tags = ctx.resource_tags(&self.bucket_name);
-        let desired_snapshot_policy =
-            self.snapshot_delete_prevention_prefix().unwrap_or_default();
+        let desired_snapshot_policy = self.snapshot_delete_prevention_prefix().unwrap_or_default();
 
         if current_tags != desired_tags {
             InternalChange::Update {
@@ -199,11 +188,9 @@ impl Resource for S3Bucket {
         if region != "us-east-1" {
             req = req.create_bucket_configuration(
                 aws_sdk_s3::types::CreateBucketConfiguration::builder()
-                    .location_constraint(
-                        aws_sdk_s3::types::BucketLocationConstraint::from(
-                            region.as_str(),
-                        ),
-                    )
+                    .location_constraint(aws_sdk_s3::types::BucketLocationConstraint::from(
+                        region.as_str(),
+                    ))
                     .build(),
             );
         }
@@ -257,10 +244,7 @@ impl Resource for S3Bucket {
             .send()
             .await
             .map_err(|e| {
-                IacError::AwsSdk(format!(
-                    "s3:PutBucketTagging: {}",
-                    e.into_service_error()
-                ))
+                IacError::AwsSdk(format!("s3:PutBucketTagging: {}", e.into_service_error()))
             })?;
 
         // s3:PutBucketVersioning — only when versioning is enabled
@@ -296,10 +280,7 @@ impl Resource for S3Bucket {
                     .send()
                     .await
                     .map_err(|e| {
-                        IacError::AwsSdk(format!(
-                            "s3:PutBucketPolicy: {}",
-                            e.into_service_error()
-                        ))
+                        IacError::AwsSdk(format!("s3:PutBucketPolicy: {}", e.into_service_error()))
                     })?;
                 self.snapshot_delete_prevention_prefix()
             } else {
@@ -345,10 +326,7 @@ impl Resource for S3Bucket {
             .send()
             .await
             .map_err(|e| {
-                IacError::AwsSdk(format!(
-                    "s3:PutBucketTagging: {}",
-                    e.into_service_error()
-                ))
+                IacError::AwsSdk(format!("s3:PutBucketTagging: {}", e.into_service_error()))
             })?;
 
         if self.config.versioning {
@@ -383,10 +361,7 @@ impl Resource for S3Bucket {
                     .send()
                     .await
                     .map_err(|e| {
-                        IacError::AwsSdk(format!(
-                            "s3:PutBucketPolicy: {}",
-                            e.into_service_error()
-                        ))
+                        IacError::AwsSdk(format!("s3:PutBucketPolicy: {}", e.into_service_error()))
                     })?;
                 self.snapshot_delete_prevention_prefix()
             } else {
@@ -441,10 +416,7 @@ impl Resource for S3Bucket {
         Ok(())
     }
 
-    async fn describe(
-        &self,
-        ctx: &ProvisionContext,
-    ) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
         let name = &self.bucket_name;
 
         match ctx
@@ -502,19 +474,16 @@ impl Resource for S3Bucket {
                     .send()
                     .await
                 {
-                    Ok(output) => extract_snapshot_policy_prefix(
-                        output.policy().unwrap_or_default(),
-                        name,
-                    )?,
+                    Ok(output) => {
+                        extract_snapshot_policy_prefix(output.policy().unwrap_or_default(), name)?
+                    }
                     Err(e) => {
                         let svc_err = e.into_service_error();
                         let message = format!("{svc_err}");
                         if message.contains("NoSuchBucketPolicy") {
                             None
                         } else {
-                            return Err(IacError::AwsSdk(format!(
-                                "s3:GetBucketPolicy: {svc_err}"
-                            )));
+                            return Err(IacError::AwsSdk(format!("s3:GetBucketPolicy: {svc_err}")));
                         }
                     }
                 };

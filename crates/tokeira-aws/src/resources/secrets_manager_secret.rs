@@ -1,9 +1,8 @@
-use std::collections::HashMap;
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
-use tokeira_iac::error::IacError;
 use tokeira_iac::{
     InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    error::IacError,
 };
 
 /// Configuration for a single Secrets Manager secret provider resource.
@@ -220,10 +219,7 @@ impl Resource for SecretsManagerSecret {
         self.wait_until_deleted(ctx).await
     }
 
-    async fn describe(
-        &self,
-        ctx: &ProvisionContext,
-    ) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
         let name = &self.secret_name;
 
         // secretsmanager:DescribeSecret for this single secret

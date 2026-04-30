@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use tokeira_iac::error::IacError;
 use tokeira_iac::{
     InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    error::IacError,
 };
 
 /// Security group rule descriptor for testing and diffing.
@@ -137,10 +137,7 @@ fn collect_live_tags(sg: &aws_sdk_ec2::types::SecurityGroup) -> HashMap<String, 
 
 /// Build an EC2 IpPermission from a SecurityRule.
 /// `sg_id` is used when source="self" to reference the SG's own ID.
-fn build_ip_permission(
-    rule: &SecurityRule,
-    sg_id: &str,
-) -> aws_sdk_ec2::types::IpPermission {
+fn build_ip_permission(rule: &SecurityRule, sg_id: &str) -> aws_sdk_ec2::types::IpPermission {
     let mut builder = aws_sdk_ec2::types::IpPermission::builder()
         .ip_protocol(&rule.protocol)
         .from_port(rule.from_port as i32)
@@ -185,11 +182,7 @@ pub struct SecurityGroup {
 }
 
 impl SecurityGroup {
-    pub fn new(
-        name: String,
-        config: SecurityGroupConfig,
-        rctx: &crate::ResourceContext,
-    ) -> Self {
+    pub fn new(name: String, config: SecurityGroupConfig, rctx: &crate::ResourceContext) -> Self {
         Self {
             name,
             config,
@@ -229,9 +222,7 @@ impl Resource for SecurityGroup {
             .properties
             .get("vpc_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                IacError::StateNotFound("vpc_id not found in VPC state".into())
-            })?
+            .ok_or_else(|| IacError::StateNotFound("vpc_id not found in VPC state".into()))?
             .to_string();
 
         // ec2:CreateSecurityGroup
@@ -264,9 +255,7 @@ impl Resource for SecurityGroup {
         let sg_id = sg_output
             .group_id()
             .ok_or_else(|| {
-                IacError::AwsSdk(
-                    "ec2:CreateSecurityGroup: no group ID in response".into(),
-                )
+                IacError::AwsSdk("ec2:CreateSecurityGroup: no group ID in response".into())
             })?
             .to_string();
 
@@ -403,9 +392,7 @@ impl Resource for SecurityGroup {
             .set_tags(Some(ec2_tags))
             .send()
             .await
-            .map_err(|e| {
-                IacError::AwsSdk(format!("ec2:CreateTags: {}", e.into_service_error()))
-            })?;
+            .map_err(|e| IacError::AwsSdk(format!("ec2:CreateTags: {}", e.into_service_error())))?;
 
         Ok(ResourceState {
             resource_type: current.resource_type.clone(),
@@ -465,10 +452,7 @@ impl Resource for SecurityGroup {
         }
     }
 
-    async fn describe(
-        &self,
-        ctx: &ProvisionContext,
-    ) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
         let desc_output = ctx
             .extension::<crate::AwsClients>()
             .expect("AwsClients")

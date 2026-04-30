@@ -3,8 +3,7 @@ use std::{convert::Infallible, fmt::Display, net::SocketAddr, sync::Arc};
 use anyhow::{Context, Result};
 use http_body_util::{BodyExt, Full};
 use hyper::{
-    Method, Request, Response, StatusCode, body::Bytes, server::conn::http1,
-    service::service_fn,
+    Method, Request, Response, StatusCode, body::Bytes, server::conn::http1, service::service_fn,
 };
 use hyper_util::rt::TokioIo;
 use metrics::gauge;
@@ -39,8 +38,7 @@ pub struct ObservabilityConfig {
     pub log_filter: String,
 }
 
-pub type ReloadHandle =
-    tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>;
+pub type ReloadHandle = tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>;
 
 #[derive(Clone)]
 struct ObservabilityServerState {
@@ -100,23 +98,22 @@ pub fn install_metrics(config: &ObservabilityConfig) -> Result<Option<Prometheus
 pub fn install_tracing(config: &ObservabilityConfig) -> Result<ReloadHandle> {
     global::set_text_map_propagator(TraceContextPropagator::new());
 
-    let filter = EnvFilter::try_new(config.log_filter.clone())
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter =
+        EnvFilter::try_new(config.log_filter.clone()).unwrap_or_else(|_| EnvFilter::new("info"));
     let (filter_layer, handle) = tracing_subscriber::reload::Layer::new(filter);
     let otel_layer = install_otlp_tracer(config)?
         .map(|tracer| tracing_opentelemetry::layer().with_tracer(tracer));
 
     match config.log_format {
-        LogFormat::Text => {
-            tracing_subscriber::registry()
-                .with(filter_layer)
-                .with(otel_layer)
-                .with(tracing_subscriber::fmt::layer().event_format(
-                    CorrelationFormat::text(tracing_subscriber::fmt::format()),
-                ))
-                .try_init()
-                .context("failed to install text tracing subscriber")?
-        }
+        LogFormat::Text => tracing_subscriber::registry()
+            .with(filter_layer)
+            .with(otel_layer)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .event_format(CorrelationFormat::text(tracing_subscriber::fmt::format())),
+            )
+            .try_init()
+            .context("failed to install text tracing subscriber")?,
         LogFormat::Json => tracing_subscriber::registry()
             .with(filter_layer)
             .with(otel_layer)
@@ -177,9 +174,9 @@ pub fn spawn_observability_server(
         config: effective_config,
     };
     tokio::spawn(async move {
-        let listener = TcpListener::bind(addr).await.with_context(|| {
-            format!("failed to bind observability listener on {addr}")
-        })?;
+        let listener = TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("failed to bind observability listener on {addr}"))?;
         loop {
             let (stream, _) = listener.accept().await?;
             let state = state.clone();
@@ -189,9 +186,7 @@ pub fn spawn_observability_server(
                     let state = state.clone();
                     async move { handle_observability(request, state).await }
                 });
-                if let Err(error) =
-                    http1::Builder::new().serve_connection(io, service).await
-                {
+                if let Err(error) = http1::Builder::new().serve_connection(io, service).await {
                     tracing::warn!(?error, "observability connection failed");
                 }
             });
@@ -261,11 +256,7 @@ where
     Ok(response)
 }
 
-fn response(
-    status: StatusCode,
-    body: String,
-    content_type: Option<&str>,
-) -> Response<Full<Bytes>> {
+fn response(status: StatusCode, body: String, content_type: Option<&str>) -> Response<Full<Bytes>> {
     let mut builder = Response::builder().status(status);
     if let Some(content_type) = content_type {
         builder = builder.header("content-type", content_type);
@@ -302,8 +293,7 @@ mod tests {
 
     #[test]
     fn config_from_tokeira_defaults() {
-        let config =
-            ObservabilityConfig::from_tokeira_config(&TokeiraConfig::default()).unwrap();
+        let config = ObservabilityConfig::from_tokeira_config(&TokeiraConfig::default()).unwrap();
         assert!(config.metrics_enabled);
         assert_eq!(config.metrics_addr, "0.0.0.0:9090".parse().unwrap());
         assert!(!config.otlp_enabled);
@@ -320,8 +310,7 @@ mod tests {
         tokeira_config.infrastructure.network.metrics_addr = "127.0.0.1:9191".to_string();
         tokeira_config.infrastructure.observability.metrics_enabled = false;
         tokeira_config.infrastructure.observability.otlp_enabled = true;
-        tokeira_config.infrastructure.observability.otlp_endpoint =
-            "http://tempo:4317".to_string();
+        tokeira_config.infrastructure.observability.otlp_endpoint = "http://tempo:4317".to_string();
         tokeira_config.infrastructure.observability.otlp_protocol = OtlpProtocol::Http;
         tokeira_config
             .infrastructure
@@ -386,8 +375,7 @@ mod tests {
 
     #[test]
     fn log_format_defaults_to_text_and_filter_defaults_to_info() {
-        let config =
-            ObservabilityConfig::from_tokeira_config(&TokeiraConfig::default()).unwrap();
+        let config = ObservabilityConfig::from_tokeira_config(&TokeiraConfig::default()).unwrap();
         assert_eq!(config.log_format, LogFormat::Text);
         assert_eq!(config.log_filter, "info");
     }
@@ -404,8 +392,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_endpoint_returns_redacted_json_with_warnings() {
-        let (layer, reload) =
-            tracing_subscriber::reload::Layer::new(EnvFilter::new("info"));
+        let (layer, reload) = tracing_subscriber::reload::Layer::new(EnvFilter::new("info"));
         let _layer = layer;
         let mut config = TokeiraConfig::default();
         config.infrastructure.dsql.endpoint = Some("secret.example".to_string());

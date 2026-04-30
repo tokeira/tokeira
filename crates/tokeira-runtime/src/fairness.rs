@@ -346,8 +346,7 @@ pub(crate) fn evaluate_drain_share(current: f64, metrics: &QueueMetricsSnapshot)
 
     let age_threshold = metrics.latency_p99.saturating_mul(2);
     if metrics.backlog_age > age_threshold && age_threshold > Duration::ZERO {
-        let pressure =
-            (metrics.backlog_age.as_secs_f64() / age_threshold.as_secs_f64()).min(3.0);
+        let pressure = (metrics.backlog_age.as_secs_f64() / age_threshold.as_secs_f64()).min(3.0);
         delta += 0.03 * pressure;
     }
 
@@ -368,10 +367,7 @@ pub(crate) fn evaluate_drain_share(current: f64, metrics: &QueueMetricsSnapshot)
     (current + delta).clamp(MIN_DRAIN_SHARE, MAX_DRAIN_SHARE)
 }
 
-pub(crate) fn control_loop_tick(
-    metrics: &DeliveryMetrics,
-    fairness: &FairnessState,
-) -> Duration {
+pub(crate) fn control_loop_tick(metrics: &DeliveryMetrics, fairness: &FairnessState) -> Duration {
     let (snapshot, poll_counts) = metrics.take_snapshot_internal(true);
     let current = fairness.snapshot();
     let mut adjustments = HashMap::new();
@@ -543,9 +539,7 @@ mod tests {
             }
         }
 
-        fn delivery_metrics_from_snapshot(
-            snapshot: &QueueMetricsSnapshot,
-        ) -> DeliveryMetrics {
+        fn delivery_metrics_from_snapshot(snapshot: &QueueMetricsSnapshot) -> DeliveryMetrics {
             let metrics = DeliveryMetrics::new();
             let queue = fixed_queue();
             let mut counters = QueueCounters::default();
@@ -558,8 +552,7 @@ mod tests {
             }
 
             counters.sync_match.current_total = 100;
-            counters.sync_match.current_success =
-                (snapshot.sync_match_rate * 100.0).round() as u64;
+            counters.sync_match.current_success = (snapshot.sync_match_rate * 100.0).round() as u64;
             counters.poll_success.current_total = 100;
             counters.poll_success.current_success =
                 (snapshot.poll_success_rate * 100.0).round() as u64;

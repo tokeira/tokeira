@@ -5,14 +5,12 @@ use time::{Duration, OffsetDateTime};
 
 use tokeira_kernel::{StartRequest, WorkflowTaskCompletedRequest};
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime,
-    WorkflowTimeoutScannerConfig,
+    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
-    ExecutionRef, LogicalTaskSeq, Memo, NamespaceId, Payloads, QueueKey, RequestContext,
-    RequestId, SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId,
-    WorkflowType,
+    ExecutionRef, LogicalTaskSeq, Memo, NamespaceId, Payloads, QueueKey, RequestContext, RequestId,
+    SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
 };
 
 #[tokio::test]

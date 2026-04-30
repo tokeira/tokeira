@@ -267,9 +267,7 @@ pub fn compute_reachability(
 ) -> TaskQueueReachability {
     let mut new_reachable = HashSet::new();
     for rule in assignment_rules {
-        if let Ok(target) =
-            resolve_redirect_from_rules(redirect_rules, &rule.target_build_id)
-        {
+        if let Ok(target) = resolve_redirect_from_rules(redirect_rules, &rule.target_build_id) {
             new_reachable.insert(target);
         }
     }
@@ -389,9 +387,8 @@ mod tests {
     use tokeira_types::{BuildId, NamespaceId, TaskQueueName, WorkflowId};
 
     use super::{
-        AssignmentRule, RedirectRule, TaskReachabilityType, VersioningError,
-        VersioningMutation, VersioningRuleStore, assignment_applies,
-        compute_reachability, is_unconditional,
+        AssignmentRule, RedirectRule, TaskReachabilityType, VersioningError, VersioningMutation,
+        VersioningRuleStore, assignment_applies, compute_reachability, is_unconditional,
     };
 
     fn assignment(build_id: &str) -> AssignmentRule {
@@ -454,18 +451,15 @@ mod tests {
 
     fn arb_crud_op() -> impl Strategy<Value = CrudOp> {
         prop_oneof![
-            (arb_build_id(), 0usize..6).prop_map(|(build_id, index)| {
-                CrudOp::InsertAssignment { build_id, index }
-            }),
-            (arb_build_id(), 0usize..6).prop_map(|(build_id, index)| {
-                CrudOp::ReplaceAssignment { build_id, index }
-            }),
+            (arb_build_id(), 0usize..6)
+                .prop_map(|(build_id, index)| { CrudOp::InsertAssignment { build_id, index } }),
+            (arb_build_id(), 0usize..6)
+                .prop_map(|(build_id, index)| { CrudOp::ReplaceAssignment { build_id, index } }),
             (0usize..6).prop_map(|index| CrudOp::DeleteAssignment { index }),
             (arb_build_id(), arb_build_id())
                 .prop_map(|(source, target)| { CrudOp::AddRedirect { source, target } }),
-            (arb_build_id(), arb_build_id()).prop_map(|(source, target)| {
-                CrudOp::ReplaceRedirect { source, target }
-            }),
+            (arb_build_id(), arb_build_id())
+                .prop_map(|(source, target)| { CrudOp::ReplaceRedirect { source, target } }),
             arb_build_id().prop_map(|source| CrudOp::DeleteRedirect { source }),
             arb_build_id().prop_map(|build_id| CrudOp::Commit { build_id }),
         ]
@@ -502,8 +496,7 @@ mod tests {
                 Ok(mutation)
             }
             CrudOp::DeleteAssignment { index } => {
-                let mutation =
-                    VersioningMutation::DeleteAssignmentRule { index, force: true };
+                let mutation = VersioningMutation::DeleteAssignmentRule { index, force: true };
                 if index >= assignments.len() {
                     return Err((VersioningError::OutOfBounds, mutation));
                 }
@@ -1188,11 +1181,7 @@ mod tests {
 
         assert_eq!(
             store
-                .resolve_redirect(
-                    namespace_id,
-                    &task_queue,
-                    &BuildId("build-a".to_string())
-                )
+                .resolve_redirect(namespace_id, &task_queue, &BuildId("build-a".to_string()))
                 .unwrap(),
             BuildId("build-a".to_string())
         );

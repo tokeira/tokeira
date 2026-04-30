@@ -17,9 +17,9 @@ use tokeira_kernel::{
     WorkflowState,
 };
 use tokeira_types::{
-    ExecutionRef, ExecutionStatus, NamespaceId, Payloads, ProjectionCursor, QueueKey,
-    RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskQueueName, TransitionSeq,
-    WorkerIdentity, WorkflowId, WorkflowType,
+    ExecutionRef, ExecutionStatus, NamespaceId, Payloads, ProjectionCursor, QueueKey, RequestId,
+    RunId, RunKey, ShardEpoch, ShardId, TaskQueueName, TransitionSeq, WorkerIdentity, WorkflowId,
+    WorkflowType,
 };
 
 /// Write result from persisting one authoritative
@@ -102,8 +102,7 @@ pub trait RunRepository: Send + Sync {
     ///   exists;
     /// - when `execution.run_id` is `Some`, return that specific run if known,
     ///   even if it is closed.
-    async fn resolve_execution(&self, execution: &ExecutionRef)
-    -> Result<Option<RunKey>>;
+    async fn resolve_execution(&self, execution: &ExecutionRef) -> Result<Option<RunKey>>;
 
     /// Resolve the latest known run for a workflow, whether open or closed.
     ///
@@ -139,10 +138,7 @@ pub trait RunRepository: Send + Sync {
     /// TODO(storage): once a real DSQL backend lands, decide whether this stays
     /// in the main trait, moves behind a test-only feature, or becomes an admin
     /// API. It is extremely useful for semantic tests right now.
-    async fn read_transition_audit(
-        &self,
-        run_key: RunKey,
-    ) -> Result<Vec<TransitionAuditRecord>>;
+    async fn read_transition_audit(&self, run_key: RunKey) -> Result<Vec<TransitionAuditRecord>>;
 
     /// Atomically persist a kernel-produced transition.
     ///
@@ -195,19 +191,11 @@ pub trait RunRepository: Send + Sync {
 
     /// Remove and return up to `limit` backlog entries
     /// for the given queue (FIFO order).
-    async fn drain_backlog(
-        &self,
-        queue: &QueueKey,
-        limit: usize,
-    ) -> Result<Vec<BacklogEntry>>;
+    async fn drain_backlog(&self, queue: &QueueKey, limit: usize) -> Result<Vec<BacklogEntry>>;
 
     /// Return timers whose `fire_at` is at or before
     /// `now`, up to `limit`.
-    async fn list_due_timers(
-        &self,
-        now: OffsetDateTime,
-        limit: usize,
-    ) -> Result<Vec<DueTimer>>;
+    async fn list_due_timers(&self, now: OffsetDateTime, limit: usize) -> Result<Vec<DueTimer>>;
 
     // ── Shard-filtered sweep queries ────────────────────
 
@@ -459,11 +447,7 @@ pub trait ProjectionLog: Send + Sync {
     /// Read projection records from `cursor` forward,
     /// returning at most `limit` records and an
     /// updated cursor for the next call.
-    async fn read_from(
-        &self,
-        cursor: &ProjectionCursor,
-        limit: usize,
-    ) -> Result<ProjectionBatch>;
+    async fn read_from(&self, cursor: &ProjectionCursor, limit: usize) -> Result<ProjectionBatch>;
 }
 
 /// One row in the projection log, grouping all
@@ -525,11 +509,7 @@ pub trait LeaseRepository: Send + Sync {
     /// Returns [`LeaseOutcome::Acquired`] on success,
     /// or [`LeaseOutcome::Rejected`] if another owner
     /// already holds the lease.
-    async fn try_acquire_bundle(
-        &self,
-        bundle: ShardId,
-        owner: String,
-    ) -> Result<LeaseOutcome>;
+    async fn try_acquire_bundle(&self, bundle: ShardId, owner: String) -> Result<LeaseOutcome>;
     /// Renew an existing lease for `bundle` at the
     /// given `epoch`. Fails if the epoch is stale.
     async fn renew_bundle(
@@ -607,10 +587,7 @@ impl<T> RunRepository for std::sync::Arc<T>
 where
     T: RunRepository + ?Sized,
 {
-    async fn resolve_execution(
-        &self,
-        execution: &ExecutionRef,
-    ) -> Result<Option<RunKey>> {
+    async fn resolve_execution(&self, execution: &ExecutionRef) -> Result<Option<RunKey>> {
         (**self).resolve_execution(execution).await
     }
 
@@ -643,10 +620,7 @@ where
         (**self).lookup_request_dedupe(execution, request_id).await
     }
 
-    async fn read_transition_audit(
-        &self,
-        run_key: RunKey,
-    ) -> Result<Vec<TransitionAuditRecord>> {
+    async fn read_transition_audit(&self, run_key: RunKey) -> Result<Vec<TransitionAuditRecord>> {
         (**self).read_transition_audit(run_key).await
     }
 
@@ -700,19 +674,11 @@ where
         (**self).persist_to_backlog(entries).await
     }
 
-    async fn drain_backlog(
-        &self,
-        queue: &QueueKey,
-        limit: usize,
-    ) -> Result<Vec<BacklogEntry>> {
+    async fn drain_backlog(&self, queue: &QueueKey, limit: usize) -> Result<Vec<BacklogEntry>> {
         (**self).drain_backlog(queue, limit).await
     }
 
-    async fn list_due_timers(
-        &self,
-        now: OffsetDateTime,
-        limit: usize,
-    ) -> Result<Vec<DueTimer>> {
+    async fn list_due_timers(&self, now: OffsetDateTime, limit: usize) -> Result<Vec<DueTimer>> {
         (**self).list_due_timers(now, limit).await
     }
 
@@ -793,11 +759,7 @@ impl<T> ProjectionLog for std::sync::Arc<T>
 where
     T: ProjectionLog + ?Sized,
 {
-    async fn read_from(
-        &self,
-        cursor: &ProjectionCursor,
-        limit: usize,
-    ) -> Result<ProjectionBatch> {
+    async fn read_from(&self, cursor: &ProjectionCursor, limit: usize) -> Result<ProjectionBatch> {
         (**self).read_from(cursor, limit).await
     }
 }
@@ -807,11 +769,7 @@ impl<T> LeaseRepository for std::sync::Arc<T>
 where
     T: LeaseRepository + ?Sized,
 {
-    async fn try_acquire_bundle(
-        &self,
-        bundle: ShardId,
-        owner: String,
-    ) -> Result<LeaseOutcome> {
+    async fn try_acquire_bundle(&self, bundle: ShardId, owner: String) -> Result<LeaseOutcome> {
         (**self).try_acquire_bundle(bundle, owner).await
     }
 

@@ -7,20 +7,16 @@ use tokeira_types::{MetricType, QueueKey, TaskKind};
 
 pub const BROKER_PUBLISH_TOTAL: &str = "tokeira_runtime_broker_publish_total";
 pub const BROKER_SYNC_MATCH_TOTAL: &str = "tokeira_runtime_broker_sync_match_total";
-pub const BROKER_NON_SYNC_MATCH_TOTAL: &str =
-    "tokeira_runtime_broker_non_sync_match_total";
+pub const BROKER_NON_SYNC_MATCH_TOTAL: &str = "tokeira_runtime_broker_non_sync_match_total";
 pub const BROKER_POLL_TIMEOUT_TOTAL: &str = "tokeira_runtime_broker_poll_timeout_total";
 pub const BROKER_QUEUE_DEPTH: &str = "tokeira_runtime_broker_queue_depth";
-pub const LANE_SUBMIT_DURATION_SECONDS: &str =
-    "tokeira_runtime_lane_submit_duration_seconds";
+pub const LANE_SUBMIT_DURATION_SECONDS: &str = "tokeira_runtime_lane_submit_duration_seconds";
 pub const SCANNER_TICK_TOTAL: &str = "tokeira_runtime_scanner_tick_total";
 pub const SCANNER_DISPATCHED_TOTAL: &str = "tokeira_runtime_scanner_dispatched_total";
 pub const OCC_RETRY_TOTAL: &str = "tokeira_runtime_occ_retry_total";
-pub const KERNEL_TRANSITION_COMMITTED_TOTAL: &str =
-    "tokeira_kernel_transition_committed_total";
+pub const KERNEL_TRANSITION_COMMITTED_TOTAL: &str = "tokeira_kernel_transition_committed_total";
 pub const KERNEL_EVENTS_EMITTED_TOTAL: &str = "tokeira_kernel_events_emitted_total";
-pub const KERNEL_COMMANDS_PROCESSED_TOTAL: &str =
-    "tokeira_kernel_commands_processed_total";
+pub const KERNEL_COMMANDS_PROCESSED_TOTAL: &str = "tokeira_kernel_commands_processed_total";
 
 pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (BROKER_PUBLISH_TOTAL, MetricType::Counter),
@@ -143,14 +139,12 @@ pub fn record_transition_committed(namespace: &str, command_type: &'static str) 
 
 /// Record emitted history events by event type.
 pub fn record_events_emitted(event_type: &'static str, count: usize) {
-    counter!(KERNEL_EVENTS_EMITTED_TOTAL, "event_type" => event_type)
-        .increment(count as u64);
+    counter!(KERNEL_EVENTS_EMITTED_TOTAL, "event_type" => event_type).increment(count as u64);
 }
 
 /// Record processed commands by command type.
 pub fn record_commands_processed(command_type: &'static str) {
-    counter!(KERNEL_COMMANDS_PROCESSED_TOTAL, "command_type" => command_type)
-        .increment(1);
+    counter!(KERNEL_COMMANDS_PROCESSED_TOTAL, "command_type" => command_type).increment(1);
 }
 
 #[cfg(test)]

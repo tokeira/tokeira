@@ -10,8 +10,8 @@ use tokeira_runtime::{
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
-    ExecutionRef, Memo, NamespaceId, Payloads, RequestContext, RequestId,
-    SearchAttributes, WorkerIdentity, WorkflowId, WorkflowType,
+    ExecutionRef, Memo, NamespaceId, Payloads, RequestContext, RequestId, SearchAttributes,
+    WorkerIdentity, WorkflowId, WorkflowType,
 };
 
 #[tokio::test]

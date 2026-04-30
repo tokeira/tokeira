@@ -6,21 +6,17 @@ use tokeira_edge::{
     EdgeInterceptors, EmptyVisibilityApi, InMemoryNamespaceCache, InMemoryOperatorApi,
     LocalOnlyRouter, LongPollConfig, LongPollGate, NamespaceCache, PendingQueryStore,
     PollerRegistry, ResolvedNamespace, WorkflowExecutionDescription, WorkflowService,
-    grpc::workflow_service::WorkflowServiceGrpc,
-    translate::to_internal::namespace_id_for, workflow_service::ExecutionResolver,
+    grpc::workflow_service::WorkflowServiceGrpc, translate::to_internal::namespace_id_for,
+    workflow_service::ExecutionResolver,
 };
 use tokeira_kernel::LoadedRun;
-use tokeira_proto::workflowservice::{
-    self, workflow_service_server::WorkflowService as WfApi,
-};
+use tokeira_proto::workflowservice::{self, workflow_service_server::WorkflowService as WfApi};
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime,
-    WorkflowTimeoutScannerConfig,
+    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{InMemoryStore, RunRepository};
 use tokeira_types::{ExecutionRef, NamespaceId, WorkflowId};
-use tonic::Code;
-use tonic::Request;
+use tonic::{Code, Request};
 
 use tokeira_edge::grpc::runtime_adapter::RuntimeAdapter;
 

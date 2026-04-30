@@ -136,14 +136,11 @@ pub mod temporal {
 pub const FILE_DESCRIPTOR_SET: &[u8] =
     tonic::include_file_descriptor_set!("tokeira_public_descriptor");
 
-pub use temporal::api::common::v1 as common;
-pub use temporal::api::enums::v1 as enums;
-pub use temporal::api::failure::v1 as failure;
-pub use temporal::api::history::v1 as history;
-pub use temporal::api::operatorservice::v1 as operatorservice;
-pub use temporal::api::taskqueue::v1 as taskqueue;
-pub use temporal::api::workflow::v1 as workflow;
-pub use temporal::api::workflowservice::v1 as workflowservice;
+pub use temporal::api::{
+    common::v1 as common, enums::v1 as enums, failure::v1 as failure, history::v1 as history,
+    operatorservice::v1 as operatorservice, taskqueue::v1 as taskqueue, workflow::v1 as workflow,
+    workflowservice::v1 as workflowservice,
+};
 
 /// Fully-qualified gRPC service name.
 pub const WORKFLOW_SERVICE_NAME: &str = "temporal.api.workflowservice.v1.WorkflowService";

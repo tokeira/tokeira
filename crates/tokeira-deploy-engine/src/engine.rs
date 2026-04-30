@@ -12,10 +12,12 @@ use std::collections::{BTreeSet, HashSet};
 
 use tracing::info;
 
-use crate::error::RuntimeError;
-use crate::image::{Image, ImageContext};
-use crate::platform::Platform;
-use crate::service::{Service, ServiceContext};
+use crate::{
+    error::RuntimeError,
+    image::{Image, ImageContext},
+    platform::Platform,
+    service::{Service, ServiceContext},
+};
 
 /// A planned service change for reporting.
 #[derive(Debug, Clone)]
@@ -69,9 +71,7 @@ impl ServiceEngine {
             let manifests = service.manifests(ctx)?;
             let hash = hash_manifests(&manifests);
             let kind = match state.services.get(service.name()) {
-                Some(existing) if existing.desired_hash == hash => {
-                    ServiceChangeKind::NoChange
-                }
+                Some(existing) if existing.desired_hash == hash => ServiceChangeKind::NoChange,
                 Some(_) => ServiceChangeKind::Update,
                 None => ServiceChangeKind::Create,
             };
@@ -100,9 +100,7 @@ impl ServiceEngine {
             let manifests = service.manifests(ctx)?;
             let hash = hash_manifests(&manifests);
             let kind = match state.services.get(service.name()) {
-                Some(existing) if existing.desired_hash == hash => {
-                    ServiceChangeKind::NoChange
-                }
+                Some(existing) if existing.desired_hash == hash => ServiceChangeKind::NoChange,
                 Some(_) => ServiceChangeKind::Update,
                 None => ServiceChangeKind::Create,
             };
@@ -167,9 +165,7 @@ impl ServiceEngine {
 /// Returns services in dependency order (dependencies first). Detects
 /// duplicate names, missing dependencies, and cycles with specific error
 /// messages.
-fn ordered_services(
-    services: &[Box<dyn Service>],
-) -> Result<Vec<&dyn Service>, RuntimeError> {
+fn ordered_services(services: &[Box<dyn Service>]) -> Result<Vec<&dyn Service>, RuntimeError> {
     let mut seen = HashSet::new();
     let mut all_names = HashSet::new();
     for service in services {
@@ -267,10 +263,7 @@ mod tests {
         fn dependencies(&self) -> &[&str] {
             self.deps
         }
-        fn manifests(
-            &self,
-            _ctx: &ServiceContext,
-        ) -> Result<Vec<serde_json::Value>, RuntimeError> {
+        fn manifests(&self, _ctx: &ServiceContext) -> Result<Vec<serde_json::Value>, RuntimeError> {
             Ok(vec![])
         }
     }
@@ -304,8 +297,7 @@ mod tests {
             deps: &["history"],
         })];
 
-        let error =
-            ordered_services(&services).expect_err("missing dependency should fail");
+        let error = ordered_services(&services).expect_err("missing dependency should fail");
         assert!(error.to_string().contains("missing dependencies: history"));
     }
 

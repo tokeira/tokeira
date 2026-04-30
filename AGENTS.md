@@ -224,4 +224,3 @@ Two modules: `runtime` (tokeirad) and `observability` (mimir, loki, grafana, all
 
 - `.kiro/specs/*/` — feature specs (requirements, design, tasks)
 - `docs/architecture/` — architecture design documents
-- `docs/config-system.md` — configuration system documentation

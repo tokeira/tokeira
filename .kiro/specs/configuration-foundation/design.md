@@ -106,7 +106,7 @@ pub struct InfrastructureConfig {
     #[serde(default)]
     pub network: NetworkConfig,
     #[serde(default)]
-    pub observability: ObservabilityTomlConfig,
+    pub observability: ObservabilityConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -127,7 +127,7 @@ pub struct NetworkConfig {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ObservabilityTomlConfig {
+pub struct ObservabilityConfig {
     #[serde(default = "default_true")]
     pub metrics_enabled: bool,          // true
     #[serde(default)]

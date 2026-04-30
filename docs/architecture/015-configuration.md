@@ -201,45 +201,53 @@ Aurora DSQL’s own metrics make this practical because AWS exposes metrics such
 
 ## One-screen configuration target
 
-The platform-level config for a cluster should fit on roughly one screen.
+The server-level config for `tokeirad` fits on roughly one screen.
 
-Illustrative example:
+Implemented example (`tokeirad.toml`):
 
-```yaml
-cluster:
-  name: tokeira-prod-eu-west-1
-  region: eu-west-1
-  private_only: true
+```toml
+[infrastructure]
+cluster_name = "tokeira-prod-eu-west-1"
+region = "eu-west-1"
 
-network:
-  service_connect_namespace: tokeira.internal
-  dsql_endpoint: cluster-xyz.dsql.eu-west-1.on.aws
+[infrastructure.dsql]
+endpoint = "cluster-xyz.dsql.eu-west-1.on.aws"
 
-security:
-  tls:
-    mode: mtls
-    server_cert_secret: arn:aws:secretsmanager:...
-  auth:
-    mode: oidc
+[infrastructure.network]
+grpc_addr = "[::]:7233"
+metrics_addr = "0.0.0.0:9090"
 
-capacity:
-  runtime_hosts:
-    min: 12
-    max: 80
-  edge_api_tasks:
-    min: 4
-    max: 24
-  edge_poll_tasks:
-    min: 6
-    max: 80
-  projection_tasks:
-    min: 2
-    max: 20
+[infrastructure.observability]
+metrics_enabled = true
+otlp_enabled = true
+otlp_endpoint = "http://tempo:4317"
+otlp_protocol = "grpc"
+trace_sample_rate = 0.1
+log_format = "json"
+log_filter = "info,tokeira_runtime=debug"
 
-policy:
-  default_retention_days: 30
-  namespace_creation: controlled
-  public_ingress: false
+[policy]
+default_retention_days = 30
+namespace_creation = "controlled"
+
+[policy.quotas]
+max_workflow_timeout_seconds = 315360000
+max_signal_payload_bytes = 4194304
+
+[capacity.performance]
+target_workflow_starts_per_second = 5000
+target_p99_wft_latency_ms = 25
+
+[capacity.dsql]
+max_connections = 10000
+connection_rate_per_second = 100
+burst_capacity = 1000
+
+[emergency]
+# Break-glass only — uncomment during incidents
+# disable_stickiness = true
+# freeze_projection = true
+# cap_poll_admission = 500
 ```
 
 What is intentionally **absent**:
@@ -248,9 +256,27 @@ What is intentionally **absent**:
 - queue partitions,
 - poller counts,
 - sticky timeouts,
-- connection-pool sizes,
+- connection-pool sizes beyond the DSQL envelope,
 - projector concurrency,
-- retry knobs.
+- retry knobs,
+- lane count,
+- scanner intervals,
+- backlog thresholds.
+
+### Implementation
+
+The config is implemented in `tokeira-config` as a `TokeiraConfig` struct with four top-level sections matching the four configuration classes. TOML is the file format. Every field has a sensible default so that zero-config startup works for local development.
+
+Key implementation details:
+
+- `serde(deny_unknown_fields)` on all structs — typos produce errors, not silent misconfiguration.
+- `--config <path>` CLI arg or `TOKEIRA_CONFIG` env var to locate the file. Neither provided → all defaults.
+- `--dump-config` prints resolved TOML to stdout and exits.
+- `GET /config` on the observability HTTP server returns the effective config as JSON with sensitive fields (`endpoint`, `arn`) redacted.
+- `RuntimeConfig` (lane count, scanner intervals, backlog thresholds, timeout configs) is `Default`-only — not exposed in TOML. These are mechanical settings owned by auto-tune.
+- Emergency overrides are logged as warnings at startup.
+
+See `.kiro/specs/configuration-foundation/` for the full spec.
 
 ## Namespace configuration should also stay small
 

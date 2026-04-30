@@ -12,9 +12,9 @@ This is a product-from-scratch. The architecture is informed by Temporal but the
 
 ### 1. Rust Standards
 
-- Edition 2024, stable toolchain.
+- Edition 2024, stable toolchain pinned to 1.95.
 - `cargo clippy --workspace --all-targets` must pass. No suppressed warnings without a comment explaining why.
-- `cargo +nightly fmt` for formatting (some settings require nightly).
+- `cargo +nightly fmt` for formatting (some settings require nightly). Just run it — don't check first.
 - Error handling: `thiserror` in library crates, `anyhow` in binary crates. No `.unwrap()` outside tests.
 - All public types derive `Debug`. Serializable types derive `Serialize, Deserialize`.
 - No `unsafe`. No `Box<dyn Any>`. No runtime reflection.
@@ -22,6 +22,8 @@ This is a product-from-scratch. The architecture is informed by Temporal but the
 - Use `tracing` for structured logging. No `println!` or `eprintln!` in library code.
 - Comments explain WHY, not WHAT. Do not add comments that restate type signatures or obvious control flow.
 - Do NOT put `use` statements in function scope. Always at the top of the file or module.
+- No explicit sleeps in test code. Use synchronization (channels, `tokio::sync::Notify`, condition variables) instead of `tokio::time::sleep` or `std::thread::sleep`.
+- Rust compilation takes time. Do not interrupt builds or tests unless they are taking more than 5 minutes.
 
 ### 2. The Kernel Stays Pure
 
@@ -128,12 +130,28 @@ The engine distinguishes **desired** resources (what should exist) from **known*
 - Property-based tests using `proptest` for config validation, serialization round-trips, dependency ordering.
 - `cargo test` runs all unit tests. All tests must pass before committing.
 - No tests that require live AWS credentials or Docker in the default test suite.
+- Some tests cause intentional panics. Only consider tests that have failed according to the test harness to be a real problem.
 - Key properties to maintain:
   - Config TOML round-trips without loss.
   - Unknown config fields are rejected.
   - Module dependency graph is a DAG (no cycles).
   - Service dependency graph is a DAG (no cycles, no missing deps).
   - State CAS: two concurrent saves from the same version — at most one succeeds.
+
+## Enforced Commands
+
+The following commands are enforced for each pull request:
+
+```bash
+cargo +nightly fmt --all --check   # formatting
+cargo lint                         # clippy on workspace + all targets
+cargo test-lint                    # clippy on tests
+cargo check --workspace            # compilation
+cargo test --workspace             # unit tests
+cargo doc --workspace --no-deps    # documentation (RUSTDOCFLAGS="-D warnings")
+```
+
+Use `cargo lint` to check if everything compiles without running tests. `cargo check` alone does not build test targets.
 
 ---
 

@@ -51,6 +51,14 @@ pub struct InfrastructureConfig {
 pub struct DsqlInfraConfig {
     #[serde(default)]
     pub endpoint: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub admin_role_arn: Option<String>,
+    #[serde(default)]
+    pub runtime_role_arn: Option<String>,
+    #[serde(default)]
+    pub readonly_role_arn: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

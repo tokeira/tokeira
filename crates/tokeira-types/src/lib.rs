@@ -22,8 +22,8 @@
 //!    protobuf or gRPC.
 //! 4. **Strong typing** — newtypes prevent mixing up `RunId`
 //!    with `WorkflowId` or `NamespaceId`.
-//! 5. **Minimal dependencies** — only `serde`, `time`, and
-//!    `uuid`.
+//! 5. **Minimal dependencies** — `serde`, `time`, `uuid`,
+//!    and `blake3` (for spread-key derivation).
 //!
 //! See `docs/crates/types.md` for the full module map and
 //! feature-coverage matrix.
@@ -42,6 +42,8 @@ pub mod request;
 pub mod retry;
 /// Typed search-attribute values for SQL-native visibility.
 pub mod search_attributes;
+/// DSQL-friendly deterministic spread-key helpers.
+pub mod spread;
 /// Task-queue naming, queue keys, and sticky affinity.
 pub mod task_queue;
 /// Opaque task tokens used for fencing stale completions.
@@ -56,6 +58,7 @@ pub use payload::*;
 pub use request::*;
 pub use retry::*;
 pub use search_attributes::*;
+pub use spread::*;
 pub use task_queue::*;
 pub use tokens::*;
 pub use visibility::*;

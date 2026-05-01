@@ -81,7 +81,11 @@ impl DdlValidator {
                     "foreign keys are out of scope for the MVP schema",
                 ));
             }
-            if normalized.contains("create index") && !normalized.contains("create index async") {
+            let creates_index =
+                normalized.contains("create index") || normalized.contains("create unique index");
+            let creates_async_index = normalized.contains("create index async")
+                || normalized.contains("create unique index async");
+            if creates_index && !creates_async_index {
                 issues.push(issue(
                     filename,
                     line_no,
@@ -142,6 +146,22 @@ mod tests {
     #[test]
     fn allows_async_index() {
         let issues = DdlValidator::validate("CREATE INDEX ASYNC idx ON t (a);", "V001.sql");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn catches_unique_index_without_async() {
+        let issues = DdlValidator::validate("CREATE UNIQUE INDEX idx ON t (a);", "V001.sql");
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.kind == ValidationKind::MissingAsyncKeyword)
+        );
+    }
+
+    #[test]
+    fn allows_unique_async_index() {
+        let issues = DdlValidator::validate("CREATE UNIQUE INDEX ASYNC idx ON t (a);", "V001.sql");
         assert!(issues.is_empty());
     }
 

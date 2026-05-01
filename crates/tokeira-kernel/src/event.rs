@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
     ExecutionStatus, Headers, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RetryPolicy,
@@ -16,7 +17,7 @@ use crate::{
 ///
 /// The exact storage encoding may change, but the semantic shape matters. Event
 /// IDs are client-observable and should remain stable within a run.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HistoryEvent {
     /// Monotonically increasing event ID within this run.
     /// Contiguous and never reused.
@@ -37,7 +38,7 @@ pub struct HistoryEvent {
 ///
 /// See `docs/architecture/020-kernel.md` for the full command
 /// taxonomy and which commands produce which events.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HistoryEventKind {
     /// The workflow run was created. This is always the first
     /// event in a run's history.
@@ -402,7 +403,7 @@ pub enum HistoryEventKind {
 ///
 /// The kernel uses this to emit the correct terminal activity
 /// event and remove the activity from the open set.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ActivityResolution {
     /// The activity returned a successful result.
     Completed { result: Payloads },
@@ -418,7 +419,7 @@ pub enum ActivityResolution {
 ///
 /// Used by the projection plane to record the terminal state
 /// without reading the full history.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CloseInfo {
     /// Terminal status the execution reached.
     pub status: ExecutionStatus,

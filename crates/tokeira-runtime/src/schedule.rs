@@ -790,7 +790,7 @@ where
         entry.policies.keep_original_workflow_id,
     );
     let run_id = RunId::new();
-    let run_key = RunKey::new();
+    let run_key = RunKey::derive(namespace_id, &workflow_id, run_id);
     let build_id: Option<BuildId> = versioning_rules.evaluate_assignment(
         namespace_id,
         &entry.action.start_workflow.task_queue,

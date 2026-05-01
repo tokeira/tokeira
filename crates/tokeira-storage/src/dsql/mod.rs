@@ -1,8 +1,9 @@
 //! Aurora DSQL storage foundation.
 //!
 //! This module contains the schema/migration and connection-management
-//! primitives used by the production DSQL backend. The full `RunRepository`
-//! implementation lands in the follow-on DSQL persistence specs.
+//! primitives used by the production DSQL backend.
+
+use std::sync::Arc;
 
 pub mod codec;
 pub mod config;
@@ -10,6 +11,7 @@ pub mod connection;
 pub mod migration;
 pub mod rate_limiter;
 pub mod reservoir;
+pub mod run_repository;
 pub mod validation;
 
 pub use config::*;
@@ -17,13 +19,15 @@ pub use connection::*;
 pub use migration::*;
 pub use rate_limiter::*;
 pub use reservoir::*;
+pub use run_repository::*;
 pub use validation::*;
 
 /// Production DSQL storage foundation.
 #[derive(Debug)]
 pub struct DsqlStore {
-    director: connection::DsqlConnectionDirector,
+    director: Arc<connection::DsqlConnectionDirector>,
     migration_runner: migration::MigrationRunner,
+    run_repository: run_repository::DsqlRunRepository,
 }
 
 impl DsqlStore {
@@ -57,10 +61,17 @@ impl DsqlStore {
         config: config::DsqlPoolConfig,
     ) -> anyhow::Result<Self> {
         let director = connection::DsqlConnectionDirector::start(config.clone(), connector).await?;
+        let director = Arc::new(director);
         let migration_runner = migration::MigrationRunner::new(config.migration);
+        let run_repository = run_repository::DsqlRunRepository::new(
+            Arc::clone(&director),
+            config.shard_count,
+            config.conflict_policy,
+        )?;
         Ok(Self {
             director,
             migration_runner,
+            run_repository,
         })
     }
 
@@ -71,7 +82,12 @@ impl DsqlStore {
 
     /// Access the connection director used by the DSQL backend.
     pub fn connection_director(&self) -> &connection::DsqlConnectionDirector {
-        &self.director
+        self.director.as_ref()
+    }
+
+    /// Access the DSQL-backed run repository.
+    pub fn run_repository(&self) -> &run_repository::DsqlRunRepository {
+        &self.run_repository
     }
 }
 

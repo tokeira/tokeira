@@ -205,8 +205,8 @@ where
         parent_namespace_id: NamespaceId,
         initiated_event_id: i64,
     ) {
-        let child_run_key = RunKey::new();
         let child_run_id = RunId::new();
+        let child_run_key = RunKey::derive(namespace_id, &child_workflow_id, child_run_id);
         let task_queue_name = task_queue.0.clone();
         let start_request = StartRequest {
             run_key: child_run_key,

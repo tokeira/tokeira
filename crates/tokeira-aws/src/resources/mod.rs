@@ -10,7 +10,6 @@ pub mod dynamodb_table;
 pub mod ecr_repository;
 pub mod eks;
 pub mod iam_role;
-pub mod opensearch;
 pub mod pod_identity_association;
 pub mod s3_bucket;
 pub mod secrets_manager_secret;
@@ -83,19 +82,6 @@ pub fn iam_tags(tags: &HashMap<String, String>) -> Vec<aws_sdk_iam::types::Tag> 
     tags.iter()
         .map(|(k, v)| {
             aws_sdk_iam::types::Tag::builder()
-                .key(k)
-                .value(v)
-                .build()
-                .expect("key and value are set")
-        })
-        .collect()
-}
-
-/// Convert a tag map to OpenSearch tag format.
-pub fn opensearch_tags(tags: &HashMap<String, String>) -> Vec<aws_sdk_opensearch::types::Tag> {
-    tags.iter()
-        .map(|(k, v)| {
-            aws_sdk_opensearch::types::Tag::builder()
                 .key(k)
                 .value(v)
                 .build()

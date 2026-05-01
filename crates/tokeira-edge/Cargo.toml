@@ -44,4 +44,5 @@ path = "../tokeira-projection"
 [dev-dependencies]
 metrics-util.workspace = true
 proptest = "1"
+tokeira-types = { path = "../tokeira-types", features = ["test-support"] }
 tracing-subscriber.workspace = true

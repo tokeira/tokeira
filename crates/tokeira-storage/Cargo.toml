@@ -20,6 +20,7 @@ tokio.workspace = true
 tracing.workspace = true
 tokeira-kernel = { path = "../tokeira-kernel" }
 tokeira-types = { path = "../tokeira-types" }
+uuid = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -30,10 +31,13 @@ dsql = [
     "dep:rand",
     "dep:sha2",
     "dep:sqlx",
+    "dep:uuid",
 ]
 dsql-integration = ["dsql"]
 
 [dev-dependencies]
 metrics-util.workspace = true
 proptest = "1"
+tokeira-types = { path = "../tokeira-types", features = ["test-support"] }
 tracing-subscriber.workspace = true
+uuid.workspace = true

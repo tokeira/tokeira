@@ -32,5 +32,6 @@ tokeira-types = { path = "../tokeira-types" }
 metrics-util.workspace = true
 proptest = "1"
 tokio-util = { version = "0.7", features = ["rt"] }
+tokeira-types = { path = "../tokeira-types", features = ["test-support"] }
 tracing-subscriber.workspace = true
 uuid.workspace = true

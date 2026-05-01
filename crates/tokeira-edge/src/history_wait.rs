@@ -141,18 +141,20 @@ where
         &self,
         base_run_key: RunKey,
         fork_event_id: i64,
-        successor_run_key: RunKey,
         successor_run_id: RunId,
     ) -> Result<()> {
         self.inner
-            .materialize_reset_successor(
-                base_run_key,
-                fork_event_id,
-                successor_run_key,
-                successor_run_id,
-            )
+            .materialize_reset_successor(base_run_key, fork_event_id, successor_run_id)
             .await?;
-        self.waits.notify(successor_run_key, fork_event_id).await;
+        let loaded = self.inner.load_run(base_run_key).await?;
+        if let LoadedRun::Existing(base_state) = loaded {
+            let successor_run_key = RunKey::derive(
+                base_state.namespace_id,
+                &base_state.workflow_id,
+                successor_run_id,
+            );
+            self.waits.notify(successor_run_key, fork_event_id).await;
+        }
         Ok(())
     }
 

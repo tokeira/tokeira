@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+serde.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true
 time.workspace = true
@@ -15,3 +16,4 @@ tokeira-types = { path = "../tokeira-types" }
 prost = "0.12"
 proptest = "1.6"
 tokeira-proto = { path = "../tokeira-proto" }
+tokeira-types = { path = "../tokeira-types", features = ["test-support"] }

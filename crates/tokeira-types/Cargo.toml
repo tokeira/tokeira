@@ -5,10 +5,15 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+blake3 = "1"
 serde.workspace = true
 thiserror.workspace = true
 time.workspace = true
 uuid.workspace = true
+
+[features]
+default = []
+test-support = []
 
 [dev-dependencies]
 proptest = "1"

@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
     BuildId, DeploymentId, Headers, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads,
@@ -15,7 +16,7 @@ use crate::{
 /// A command is not the same as a transport message. By the time something gets
 /// here, routing, auth, idempotency lookup, and request shaping should already
 /// have happened.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Command {
     /// Create a brand-new workflow execution.
     Start(StartRequest),
@@ -78,7 +79,7 @@ pub enum Command {
 ///
 /// Used when a caller may leave a field alone, set it to a new
 /// value, or explicitly remove it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum FieldChange<T> {
     /// The field should keep its current value.
     Unchanged,
@@ -92,7 +93,7 @@ pub enum FieldChange<T> {
 ///
 /// The kernel records this in the `WorkflowTaskFailed` history
 /// event so operators and SDKs can diagnose replay failures.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum WorkflowTaskFailedCause {
     /// Replay produced a different command sequence than the
     /// recorded history, indicating a code change broke
@@ -120,7 +121,7 @@ pub enum WorkflowTaskFailedCause {
 }
 
 /// Which timeout fired on a workflow task.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum WorkflowTaskTimeoutType {
     /// The worker did not complete the task within the
     /// configured start-to-close deadline.
@@ -128,7 +129,7 @@ pub enum WorkflowTaskTimeoutType {
 }
 
 /// Which workflow-level timeout fired.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum WorkflowTimeoutType {
     /// The overall execution timeout (spans all runs including
     /// continue-as-new chains) was exceeded.
@@ -139,7 +140,7 @@ pub enum WorkflowTimeoutType {
 
 /// Outcome of the retry decision when a workflow or activity
 /// fails or times out.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum RetryState {
     /// The entity is still eligible for retry and will be
     /// rescheduled.
@@ -161,7 +162,7 @@ pub enum RetryState {
 }
 
 /// What triggered a continue-as-new transition.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContinueAsNewInitiator {
     Workflow,
     Retry,
@@ -169,7 +170,7 @@ pub enum ContinueAsNewInitiator {
 }
 
 /// Policy for handling workflow ID conflicts with running workflows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkflowIdConflictPolicy {
     Fail,
     UseExisting,
@@ -177,7 +178,7 @@ pub enum WorkflowIdConflictPolicy {
 }
 
 /// Policy for handling workflow ID reuse with closed workflows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkflowIdReusePolicy {
     AllowDuplicate,
     AllowDuplicateFailedOnly,
@@ -191,7 +192,7 @@ pub enum WorkflowIdReusePolicy {
 /// performed idempotency checks.
 ///
 /// See `docs/architecture/010-history-as-authority.md`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StartRequest {
     /// Composite storage key for this run.
     pub run_key: RunKey,
@@ -266,7 +267,7 @@ pub struct StartRequest {
 }
 
 /// Request to create a brand-new workflow and immediately deliver a signal.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SignalWithStartRequest {
     pub run_key: RunKey,
     pub namespace_id: NamespaceId,
@@ -304,7 +305,7 @@ pub struct SignalWithStartRequest {
 }
 
 /// Request to deliver a signal to a running workflow.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SignalRequest {
     /// Name of the signal (matched by the SDK handler).
     pub signal_name: String,
@@ -317,7 +318,7 @@ pub struct SignalRequest {
 }
 
 /// Request to deliver a workflow update (synchronous mutation).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UpdateRequest {
     /// Caller-assigned identifier for this update instance.
     pub update_id: String,
@@ -336,7 +337,7 @@ pub struct UpdateRequest {
 ///
 /// Recorded in history so operators can trace the origin of
 /// cross-workflow interactions.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExternalWorkflowExecution {
     /// Namespace of the initiating workflow.
     pub namespace_id: NamespaceId,
@@ -347,7 +348,7 @@ pub struct ExternalWorkflowExecution {
 }
 
 /// Request to cancel a running workflow.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CancelRequest {
     /// Human-readable reason for the cancellation.
     pub reason: String,
@@ -362,7 +363,7 @@ pub struct CancelRequest {
 
 /// Request to forcibly terminate a workflow without running
 /// cancellation logic.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TerminateRequest {
     /// Human-readable reason for the termination.
     pub reason: String,
@@ -378,7 +379,7 @@ pub struct TerminateRequest {
 
 /// Request to reset a workflow to an earlier point in its
 /// history, forking into a new run.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ResetRequest {
     /// History event ID to fork from. Events after this point
     /// are discarded in the new run.
@@ -398,7 +399,7 @@ pub struct ResetRequest {
 /// While paused, no new workflow tasks are dispatched and
 /// activity tasks are stamped to invalidate in-flight
 /// deliveries.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PauseWorkflowRequest {
     /// Identity of the caller who issued the pause.
     pub identity: String,
@@ -414,7 +415,7 @@ pub struct PauseWorkflowRequest {
 ///
 /// Re-dispatches all pending activity tasks and schedules a
 /// new workflow task if none is pending.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UnpauseWorkflowRequest {
     /// Identity of the caller who issued the unpause.
     pub identity: String,
@@ -428,7 +429,7 @@ pub struct UnpauseWorkflowRequest {
 
 /// Request to update timeout and routing options on a
 /// pending activity without canceling it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UpdateActivityOptionsRequest {
     /// Activity to update (must be in the open set).
     pub activity_id: String,
@@ -450,7 +451,7 @@ pub struct UpdateActivityOptionsRequest {
 
 /// Request to pause a specific activity. Paused activities
 /// are not dispatched until explicitly unpaused.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PauseActivityRequest {
     /// Activity to pause (must be in the open set).
     pub activity_id: String,
@@ -465,7 +466,7 @@ pub struct PauseActivityRequest {
 }
 
 /// Request to resume a paused activity and re-dispatch it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UnpauseActivityRequest {
     /// Activity to unpause (must be paused).
     pub activity_id: String,
@@ -477,7 +478,7 @@ pub struct UnpauseActivityRequest {
 
 /// Request to reset a pending activity back to attempt 1
 /// and re-dispatch it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ResetActivityRequest {
     /// Activity to reset (must be in the open set).
     pub activity_id: String,
@@ -491,7 +492,7 @@ pub struct ResetActivityRequest {
 
 /// Request to update execution-level options such as
 /// versioning overrides and completion callbacks.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UpdateExecutionOptionsRequest {
     /// Versioning override change.
     pub versioning_override: FieldChange<VersioningOverride>,
@@ -507,7 +508,7 @@ pub struct UpdateExecutionOptionsRequest {
 
 /// Request from the runtime indicating a worker has picked
 /// up a workflow task.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StartWorkflowTaskRequest {
     /// Logical task sequence that must match the pending WFT.
     pub logical_seq: tokeira_types::LogicalTaskSeq,
@@ -522,7 +523,7 @@ pub struct StartWorkflowTaskRequest {
 
 /// Request from a worker that has finished processing a
 /// workflow task and is returning a batch of commands.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowTaskCompletedRequest {
     /// Token that proves the worker held the correct task.
     pub token: WorkflowTaskToken,
@@ -540,7 +541,7 @@ pub struct WorkflowTaskCompletedRequest {
 
 /// Request from the runtime when a workflow task fails
 /// (non-determinism, bad commands, or reset).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowTaskFailedRequest {
     /// Logical task sequence of the failed task.
     pub logical_seq: LogicalTaskSeq,
@@ -558,7 +559,7 @@ pub struct WorkflowTaskFailedRequest {
 
 /// Request from the runtime when a workflow task exceeds its
 /// start-to-close timeout.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowTaskTimedOutRequest {
     /// Logical task sequence of the timed-out task.
     pub logical_seq: LogicalTaskSeq,
@@ -572,7 +573,7 @@ pub struct WorkflowTaskTimedOutRequest {
 
 /// Request from the runtime when a workflow-level timeout
 /// fires (execution or run timeout).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowExecutionTimedOutRequest {
     /// Which workflow-level timeout fired.
     pub timeout_type: WorkflowTimeoutType,
@@ -585,7 +586,7 @@ pub struct WorkflowExecutionTimedOutRequest {
 /// Request from the runtime when an activity task reaches a
 /// terminal state (completed, failed, timed out, or
 /// canceled).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ActivityResolvedRequest {
     /// Activity that was resolved.
     pub activity_id: String,
@@ -600,7 +601,7 @@ pub struct ActivityResolvedRequest {
 
 /// Request from the runtime confirming whether a child
 /// workflow was successfully started or failed to start.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChildStartConfirmedRequest {
     /// Workflow ID of the child.
     pub child_workflow_id: WorkflowId,
@@ -614,7 +615,7 @@ pub struct ChildStartConfirmedRequest {
 }
 
 /// Outcome of a child workflow start attempt.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ChildStartResult {
     /// The child was successfully created and assigned a run.
     Started {
@@ -627,7 +628,7 @@ pub enum ChildStartResult {
 
 /// Request from the runtime when a child workflow reaches a
 /// terminal state.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChildResolvedRequest {
     /// Workflow ID of the child.
     pub child_workflow_id: WorkflowId,
@@ -638,7 +639,7 @@ pub struct ChildResolvedRequest {
 }
 
 /// Terminal state of a child workflow execution.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ChildResolution {
     /// The child completed successfully.
     Completed { result: Payloads },
@@ -654,7 +655,7 @@ pub enum ChildResolution {
 
 /// Request from the runtime when an external signal delivery
 /// completes or fails.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExternalSignalResolvedRequest {
     /// Event ID of the initiation event (used for lookup).
     pub initiated_event_id: i64,
@@ -665,7 +666,7 @@ pub struct ExternalSignalResolvedRequest {
 }
 
 /// Outcome of an external signal delivery attempt.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ExternalSignalResult {
     /// The signal was successfully delivered.
     Signaled,
@@ -675,7 +676,7 @@ pub enum ExternalSignalResult {
 
 /// Request from the runtime when an external cancel delivery
 /// completes or fails.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExternalCancelResolvedRequest {
     /// Event ID of the initiation event (used for lookup).
     pub initiated_event_id: i64,
@@ -686,7 +687,7 @@ pub struct ExternalCancelResolvedRequest {
 }
 
 /// Outcome of an external cancel delivery attempt.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ExternalCancelResult {
     /// The cancel request was successfully delivered.
     CancelRequested,
@@ -695,7 +696,7 @@ pub enum ExternalCancelResult {
 }
 
 /// Terminal state of a Nexus operation.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum NexusResolution {
     /// The operation transitioned to async-started.
     Started,
@@ -711,7 +712,7 @@ pub enum NexusResolution {
 
 /// Request from the runtime when a Nexus operation reaches a
 /// terminal or started state.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NexusOperationResolvedRequest {
     /// Operation ID of the Nexus operation.
     pub operation_id: String,
@@ -729,7 +730,7 @@ pub struct NexusOperationResolvedRequest {
 ///
 /// Updates span two transitions (acceptance and completion),
 /// so the protocol message can carry any of the three phases.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum UpdateProtocolBody {
     /// The worker accepted the update.
     Accepted {
@@ -745,7 +746,7 @@ pub enum UpdateProtocolBody {
 
 /// Request from the timer scanner when a timer's deadline
 /// has passed.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TimerDueRequest {
     /// Timer that fired.
     pub timer_id: String,
@@ -755,7 +756,7 @@ pub struct TimerDueRequest {
 
 /// Request from the runtime to schedule a WFT so a pending
 /// query can be piggybacked on the worker's next poll.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScheduleQueryTaskRequest {
     pub now: OffsetDateTime,
 }
@@ -764,7 +765,7 @@ pub struct ScheduleQueryTaskRequest {
 ///
 /// TODO(correctness): add child workflows, updates, versioning markers, local
 /// activities, cancellation scopes, patch markers, and continue-as-new.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum WorkflowCommand {
     /// Schedule an activity task for execution on a worker.
     ScheduleActivity {

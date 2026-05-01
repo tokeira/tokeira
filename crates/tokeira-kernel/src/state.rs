@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
     BuildId, DeploymentId, ExecutionStatus, Headers, LogicalTaskSeq, Memo, NamespaceId, Payload,
@@ -12,7 +13,7 @@ use tokeira_types::{
 /// This state is intentionally *summary shaped*. The authoritative event stream
 /// is still history, but the runtime needs a compact, mutation-friendly view so
 /// it can process commands without replaying the whole run every time.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowState {
     /// Composite storage key for this run.
     pub run_key: RunKey,
@@ -147,7 +148,7 @@ impl WorkflowState {
 ///
 /// See `docs/architecture/020-kernel.md` §Pending workflow
 /// task model.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingWorkflowTask {
     /// Logical task sequence assigned at schedule time.
     pub logical_seq: LogicalTaskSeq,
@@ -172,7 +173,7 @@ pub struct PendingWorkflowTask {
 /// the activity after pause/unpause or retry. The `stamp`
 /// field is a monotonic invalidation counter used to detect
 /// stale deliveries.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ActivityState {
     /// User-assigned activity identifier.
     pub activity_id: String,
@@ -219,7 +220,7 @@ pub struct ActivityState {
 }
 
 /// Metadata recorded when a workflow is paused.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PauseInfo {
     /// Wall-clock time the pause was applied.
     pub pause_time: OffsetDateTime,
@@ -233,7 +234,7 @@ pub struct PauseInfo {
 }
 
 /// Metadata recorded when an individual activity is paused.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ActivityPauseInfo {
     /// Wall-clock time the pause was applied.
     pub pause_time: OffsetDateTime,
@@ -244,7 +245,7 @@ pub struct ActivityPauseInfo {
 }
 
 /// Durable state for a single open timer.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TimerState {
     /// User-assigned timer identifier.
     pub timer_id: String,
@@ -255,7 +256,7 @@ pub struct TimerState {
 }
 
 /// Durable state for a single open child workflow.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChildWorkflowState {
     /// Workflow ID of the child.
     pub child_workflow_id: WorkflowId,
@@ -274,7 +275,7 @@ pub struct ChildWorkflowState {
 }
 
 /// What happens to a child workflow when its parent closes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParentClosePolicy {
     /// Forcibly terminate the child.
     Terminate,
@@ -285,7 +286,7 @@ pub enum ParentClosePolicy {
 }
 
 /// Tracks an in-flight signal to an external workflow.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PendingExternalSignal {
     /// Event ID of the initiation event (used as map key).
     pub initiated_event_id: i64,
@@ -299,7 +300,7 @@ pub struct PendingExternalSignal {
 
 /// Tracks an in-flight cancel request to an external
 /// workflow.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PendingExternalCancel {
     /// Event ID of the initiation event (used as map key).
     pub initiated_event_id: i64,
@@ -311,7 +312,7 @@ pub struct PendingExternalCancel {
 
 /// Tracks a workflow update that has been accepted but not
 /// yet completed or rejected by the worker.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PendingUpdate {
     /// Caller-assigned update identifier.
     pub update_id: String,
@@ -324,7 +325,7 @@ pub struct PendingUpdate {
 
 /// Tracks a Nexus operation that has been scheduled but not
 /// yet reached a terminal state.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PendingNexusOperation {
     /// Operation identifier.
     pub operation_id: String,
@@ -348,18 +349,18 @@ pub struct PendingNexusOperation {
 ///
 /// TODO(correctness): flesh out once versioning is
 /// implemented.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VersioningOverride;
 
 /// Placeholder for completion callback configuration.
 ///
 /// TODO(correctness): flesh out once completion callbacks are
 /// implemented.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CompletionCallback;
 
 /// Either the run does not yet exist or it already has durable state.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum LoadedRun {
     /// The run does not yet exist in durable storage. Only
     /// the `Start` command accepts this variant.

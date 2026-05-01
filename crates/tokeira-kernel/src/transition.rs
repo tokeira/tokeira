@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
@@ -174,7 +175,7 @@ pub enum DispatchOp {
 
 /// Projection operations are the contract between the correctness path and the
 /// read-model plane. They are intentionally semantic, not SQL-shaped.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ProjectionOp {
     /// Update the execution's status and metadata in the
     /// read model.

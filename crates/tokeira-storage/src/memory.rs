@@ -518,10 +518,20 @@ impl RunRepository for InMemoryStore {
         &self,
         base_run_key: RunKey,
         fork_event_id: i64,
-        successor_run_key: RunKey,
         successor_run_id: RunId,
     ) -> Result<()> {
         let mut store = self.inner.lock().await;
+
+        let base_state = store
+            .runs
+            .get(&base_run_key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("base run not found: {:?}", base_run_key))?;
+        let successor_run_key = RunKey::derive(
+            base_state.namespace_id,
+            &base_state.workflow_id,
+            successor_run_id,
+        );
 
         if store.runs.contains_key(&successor_run_key) {
             anyhow::bail!(
@@ -530,12 +540,6 @@ impl RunRepository for InMemoryStore {
                 successor_run_key
             );
         }
-
-        let base_state = store
-            .runs
-            .get(&base_run_key)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("base run not found: {:?}", base_run_key))?;
 
         let base_history = store
             .history
@@ -1929,8 +1933,12 @@ mod tests {
         let store = InMemoryStore::default();
         let base_run_key = RunKey::new();
         let successor_run_id = RunId::new();
-        let successor_run_key = RunKey(successor_run_id.0);
         let mut base_state = sample_state(base_run_key);
+        let successor_run_key = RunKey::derive(
+            base_state.namespace_id,
+            &base_state.workflow_id,
+            successor_run_id,
+        );
         base_state.status = ExecutionStatus::Terminated;
         base_state.closed_at = Some(fixed_now());
         base_state.pending_workflow_task = None;
@@ -2021,15 +2029,9 @@ mod tests {
         ];
         seed_base_run(&store, base_run_key, base_state.clone(), history).await;
 
-        RunRepository::materialize_reset_successor(
-            &store,
-            base_run_key,
-            6,
-            successor_run_key,
-            successor_run_id,
-        )
-        .await
-        .unwrap();
+        RunRepository::materialize_reset_successor(&store, base_run_key, 6, successor_run_id)
+            .await
+            .unwrap();
 
         let LoadedRun::Existing(successor) = RunRepository::load_run(&store, successor_run_key)
             .await
@@ -2087,15 +2089,10 @@ mod tests {
         )
         .await;
 
-        let err = RunRepository::materialize_reset_successor(
-            &store,
-            base_run_key,
-            99,
-            RunKey::new(),
-            RunId::new(),
-        )
-        .await
-        .unwrap_err();
+        let err =
+            RunRepository::materialize_reset_successor(&store, base_run_key, 99, RunId::new())
+                .await
+                .unwrap_err();
 
         assert!(err.to_string().contains("outside committed history"));
     }
@@ -2105,8 +2102,12 @@ mod tests {
         let store = InMemoryStore::default();
         let base_run_key = RunKey::new();
         let successor_run_id = RunId::new();
-        let successor_run_key = RunKey(successor_run_id.0);
         let mut base_state = sample_state(base_run_key);
+        let successor_run_key = RunKey::derive(
+            base_state.namespace_id,
+            &base_state.workflow_id,
+            successor_run_id,
+        );
         base_state.status = ExecutionStatus::Terminated;
         base_state.closed_at = Some(fixed_now());
         base_state.pending_workflow_task = None;
@@ -2158,15 +2159,9 @@ mod tests {
         )
         .await;
 
-        RunRepository::materialize_reset_successor(
-            &store,
-            base_run_key,
-            2,
-            successor_run_key,
-            successor_run_id,
-        )
-        .await
-        .unwrap();
+        RunRepository::materialize_reset_successor(&store, base_run_key, 2, successor_run_id)
+            .await
+            .unwrap();
 
         let resolved = RunRepository::resolve_execution(
             &store,
@@ -2185,6 +2180,82 @@ mod tests {
             .unwrap();
         assert_eq!(history.len(), 2);
         assert_eq!(history[1].event_id, 2);
+    }
+
+    proptest! {
+        #[test]
+        fn property_reset_successor_key_consistency(
+            namespace in any::<u128>(),
+            workflow in "[a-z0-9-]{1,64}",
+            successor in any::<u128>(),
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let store = InMemoryStore::default();
+                let base_run_key = RunKey::new();
+                let successor_run_id = RunId(uuid::Uuid::from_u128(successor));
+                let mut base_state = sample_state(base_run_key);
+                base_state.namespace_id = NamespaceId(uuid::Uuid::from_u128(namespace));
+                base_state.workflow_id = WorkflowId(workflow);
+                base_state.status = ExecutionStatus::Terminated;
+                base_state.closed_at = Some(fixed_now());
+                base_state.pending_workflow_task = None;
+                let expected_successor_key = RunKey::derive(
+                    base_state.namespace_id,
+                    &base_state.workflow_id,
+                    successor_run_id,
+                );
+
+                seed_base_run(
+                    &store,
+                    base_run_key,
+                    base_state.clone(),
+                    vec![history_event(
+                        1,
+                        fixed_now(),
+                        HistoryEventKind::WorkflowExecutionStarted {
+                            workflow_type: base_state.workflow_type.clone(),
+                            task_queue: base_state.task_queue.clone(),
+                            input: tokeira_types::Payloads::default(),
+                            memo: base_state.memo.clone(),
+                            search_attributes: base_state.search_attributes.clone(),
+                            request_id: "start".into(),
+                            continued_execution_run_id: None,
+                            first_execution_run_id: base_state.first_execution_run_id,
+                            retry_policy: base_state.retry_policy.clone(),
+                            attempt: base_state.attempt,
+                            workflow_execution_timeout: base_state.workflow_execution_timeout,
+                            workflow_run_timeout: base_state.workflow_run_timeout,
+                            workflow_task_timeout: base_state.workflow_task_timeout,
+                            parent_workflow_id: base_state.parent_workflow_id.clone(),
+                            parent_run_id: base_state.parent_run_id,
+                            parent_namespace_id: base_state.parent_namespace_id,
+                            parent_initiated_event_id: base_state.parent_initiated_event_id,
+                            original_execution_run_id: base_state.original_execution_run_id,
+                            continued_failure: None,
+                            cron_schedule: None,
+                            last_completion_result: base_state.last_completion_result.clone(),
+                        },
+                    )],
+                )
+                .await;
+
+                RunRepository::materialize_reset_successor(
+                    &store,
+                    base_run_key,
+                    1,
+                    successor_run_id,
+                )
+                .await
+                .unwrap();
+
+                let loaded = RunRepository::load_run(&store, expected_successor_key)
+                    .await
+                    .unwrap();
+                prop_assert!(matches!(loaded, LoadedRun::Existing(_)));
+                Ok(())
+            })?;
+        }
     }
 
     // ── Property 17: Shard-filtered query correctness ──

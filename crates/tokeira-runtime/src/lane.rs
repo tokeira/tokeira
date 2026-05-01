@@ -256,12 +256,15 @@ where
                         && let Some((successor_run_id, fork_event_id)) =
                             extract_reset_metadata(&history_events)
                     {
-                        let successor_run_key = RunKey(successor_run_id.0);
+                        let successor_run_key = RunKey::derive(
+                            new_state.namespace_id,
+                            &new_state.workflow_id,
+                            successor_run_id,
+                        );
                         if let Err(error) = repo
                             .materialize_reset_successor(
                                 message.run_key,
                                 fork_event_id,
-                                successor_run_key,
                                 successor_run_id,
                             )
                             .await
@@ -465,7 +468,11 @@ where
                                             .first_run_started_at
                                             .unwrap_or(new_state.started_at),
                                     );
-                                    let successor_run_key = RunKey::new();
+                                    let successor_run_key = RunKey::derive(
+                                        new_state.namespace_id,
+                                        &new_state.workflow_id,
+                                        successor_run_id,
+                                    );
                                     let start_request = StartRequest {
                                         run_key: successor_run_key,
                                         namespace_id: new_state.namespace_id,
@@ -1044,10 +1051,14 @@ mod tests {
             &self,
             _base_run_key: RunKey,
             _fork_event_id: i64,
-            successor_run_key: RunKey,
             successor_run_id: RunId,
         ) -> Result<()> {
             let mut state = self.state.lock().await;
+            let successor_run_key = RunKey::derive(
+                NamespaceId(uuid::Uuid::nil()),
+                &WorkflowId("test".to_owned()),
+                successor_run_id,
+            );
             state.loaded = LoadedRun::Existing(sample_state(successor_run_key));
             if let LoadedRun::Existing(run) = &mut state.loaded {
                 run.run_id = successor_run_id;

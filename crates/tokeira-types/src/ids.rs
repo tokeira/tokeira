@@ -9,6 +9,8 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::{WorkflowId, dsql_spread_uuid};
+
 /// Stable identifier for a namespace.
 ///
 /// We keep this distinct from the human-facing namespace name
@@ -65,6 +67,7 @@ impl RunId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RunKey(pub Uuid);
 
+#[cfg(any(test, feature = "test-support"))]
 impl Default for RunKey {
     fn default() -> Self {
         Self::new()
@@ -73,8 +76,70 @@ impl Default for RunKey {
 
 impl RunKey {
     /// Generate a fresh random run key.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
+    }
+
+    /// Derive the durable run key from the public execution identity.
+    pub fn derive(namespace_id: NamespaceId, workflow_id: &WorkflowId, run_id: RunId) -> Self {
+        Self(dsql_spread_uuid(&[
+            b"run",
+            namespace_id.0.as_bytes(),
+            workflow_id.0.as_bytes(),
+            run_id.0.as_bytes(),
+        ]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+    use uuid::Uuid;
+
+    use super::{NamespaceId, RunId, RunKey};
+    use crate::WorkflowId;
+
+    #[test]
+    fn run_key_derive_is_deterministic() {
+        let namespace_id = NamespaceId::new();
+        let workflow_id = WorkflowId("workflow".to_owned());
+        let run_id = RunId::new();
+
+        assert_eq!(
+            RunKey::derive(namespace_id, &workflow_id, run_id),
+            RunKey::derive(namespace_id, &workflow_id, run_id)
+        );
+    }
+
+    #[test]
+    fn run_key_derive_changes_with_identity() {
+        let namespace_id = NamespaceId::new();
+        let workflow_id = WorkflowId("workflow".to_owned());
+        let run_id = RunId::new();
+
+        assert_ne!(
+            RunKey::derive(namespace_id, &workflow_id, run_id),
+            RunKey::derive(namespace_id, &WorkflowId("other".to_owned()), run_id)
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn run_key_derive_round_trip(
+            namespace in any::<u128>(),
+            workflow_id in "[a-z0-9-]{1,64}",
+            run_id in any::<u128>(),
+        ) {
+            let namespace_id = NamespaceId(Uuid::from_u128(namespace));
+            let workflow_id = WorkflowId(workflow_id);
+            let run_id = RunId(Uuid::from_u128(run_id));
+
+            prop_assert_eq!(
+                RunKey::derive(namespace_id, &workflow_id, run_id),
+                RunKey::derive(namespace_id, &workflow_id, run_id)
+            );
+        }
     }
 }
 

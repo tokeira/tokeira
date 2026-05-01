@@ -55,8 +55,11 @@ pub fn start_request(
         req.versioning_override.as_ref(),
         versioning_rules,
     );
+    let run_key = req
+        .run_key
+        .unwrap_or_else(|| RunKey::derive(namespace_id, &workflow_id, run_id));
     StartRequest {
-        run_key: req.run_key.unwrap_or_default(),
+        run_key,
         namespace_id,
         workflow_id,
         run_id,
@@ -117,8 +120,9 @@ pub fn signal_with_start_request(
         req.versioning_override.as_ref(),
         versioning_rules,
     );
+    let run_key = RunKey::derive(namespace_id, &workflow_id, run_id);
     SignalWithStartRequest {
-        run_key: RunKey::new(),
+        run_key,
         namespace_id,
         workflow_id,
         run_id,

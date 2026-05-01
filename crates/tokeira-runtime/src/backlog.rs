@@ -335,7 +335,6 @@ mod tests {
             &self,
             _base_run_key: RunKey,
             _fork_event_id: i64,
-            _successor_run_key: RunKey,
             _successor_run_id: tokeira_types::RunId,
         ) -> Result<()> {
             Err(anyhow!("unused"))

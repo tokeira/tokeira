@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use time::Duration;
 
+use crate::CurrentExecutionConflictPolicy;
+
 const DSQL_HARD_CUTOFF: Duration = Duration::minutes(60);
 
 fn default_target_ready() -> usize {
@@ -37,6 +39,10 @@ fn default_rate_per_second() -> f64 {
 
 fn default_burst_capacity() -> u64 {
     1_000
+}
+
+fn default_shard_count() -> u32 {
+    64
 }
 
 fn default_migrations_dir() -> PathBuf {
@@ -208,6 +214,10 @@ pub struct DsqlPoolConfig {
     pub connection_rate_per_second: f64,
     #[serde(default = "default_burst_capacity")]
     pub burst_capacity: u64,
+    #[serde(default = "default_shard_count")]
+    pub shard_count: u32,
+    #[serde(default)]
+    pub conflict_policy: CurrentExecutionConflictPolicy,
 }
 
 impl Default for DsqlPoolConfig {
@@ -217,6 +227,8 @@ impl Default for DsqlPoolConfig {
             migration: MigrationConfig::default(),
             connection_rate_per_second: default_rate_per_second(),
             burst_capacity: default_burst_capacity(),
+            shard_count: default_shard_count(),
+            conflict_policy: CurrentExecutionConflictPolicy::default(),
         }
     }
 }
@@ -229,6 +241,9 @@ impl DsqlPoolConfig {
         }
         if self.burst_capacity == 0 {
             bail!("burst_capacity must be greater than zero");
+        }
+        if self.shard_count == 0 {
+            bail!("shard_count must be greater than zero");
         }
         Ok(())
     }

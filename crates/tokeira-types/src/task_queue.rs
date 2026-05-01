@@ -7,6 +7,7 @@
 //! broker uses to index its internal dispatch state.
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use time::OffsetDateTime;
 
 use crate::NamespaceId;
@@ -26,6 +27,50 @@ pub enum TaskKind {
     /// An activity task executes a side-effecting operation
     /// outside the deterministic kernel.
     Activity,
+}
+
+/// Error returned when decoding a durable task-kind value from storage.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("unknown task kind database value {value}")]
+pub struct TaskKindDecodeError {
+    /// Unknown database value.
+    pub value: i16,
+}
+
+impl TaskKind {
+    /// Stable database encoding used by DSQL persistence.
+    pub fn to_db_smallint(self) -> i16 {
+        match self {
+            Self::Workflow => 0,
+            Self::Activity => 1,
+        }
+    }
+}
+
+impl TryFrom<i16> for TaskKind {
+    type Error = TaskKindDecodeError;
+
+    fn try_from(value: i16) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Workflow),
+            1 => Ok(Self::Activity),
+            value => Err(TaskKindDecodeError { value }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TaskKind;
+
+    #[test]
+    fn task_kind_database_mapping_is_stable() {
+        assert_eq!(TaskKind::Workflow.to_db_smallint(), 0);
+        assert_eq!(TaskKind::Activity.to_db_smallint(), 1);
+        assert_eq!(TaskKind::try_from(0), Ok(TaskKind::Workflow));
+        assert_eq!(TaskKind::try_from(1), Ok(TaskKind::Activity));
+        assert!(TaskKind::try_from(2).is_err());
+    }
 }
 
 /// Logical task-queue name as seen by workers and the SDK.

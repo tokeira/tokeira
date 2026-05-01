@@ -1081,7 +1081,11 @@ where
             .resolve_execution(&execution)
             .await?
             .ok_or_else(|| anyhow!("execution not found"))?;
-        let successor_run_key = RunKey(request.new_run_id.0);
+        let successor_run_key = RunKey::derive(
+            execution.namespace_id,
+            &execution.workflow_id,
+            request.new_run_id,
+        );
         match self
             .submit(run_key, Command::Reset(request.clone()))
             .await?
@@ -3499,7 +3503,6 @@ mod tests {
             &self,
             _base_run_key: RunKey,
             _fork_event_id: i64,
-            _successor_run_key: RunKey,
             _successor_run_id: RunId,
         ) -> Result<()> {
             panic!("unused in timer scanner tests")

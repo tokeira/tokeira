@@ -166,7 +166,6 @@ pub trait RunRepository: Send + Sync {
         &self,
         base_run_key: RunKey,
         fork_event_id: i64,
-        successor_run_key: RunKey,
         successor_run_id: RunId,
     ) -> Result<()>;
 
@@ -339,7 +338,7 @@ pub struct BacklogEntry {
 /// Policy for handling a start-workflow request when
 /// a current execution already exists for the same
 /// `(namespace, workflow_id)`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CurrentExecutionConflictPolicy {
     /// Reject the new start if an open execution
     /// already exists (default).
@@ -641,16 +640,10 @@ where
         &self,
         base_run_key: RunKey,
         fork_event_id: i64,
-        successor_run_key: RunKey,
         successor_run_id: RunId,
     ) -> Result<()> {
         (**self)
-            .materialize_reset_successor(
-                base_run_key,
-                fork_event_id,
-                successor_run_key,
-                successor_run_id,
-            )
+            .materialize_reset_successor(base_run_key, fork_event_id, successor_run_id)
             .await
     }
 

@@ -1,3 +1,11 @@
+//! Configuration for the DSQL storage foundation.
+//!
+//! These settings are intentionally internal to the DSQL backend. The server
+//! configuration currently exposes only high-level deployment metadata; this
+//! module captures the mechanical details needed to keep DSQL connections
+//! healthy under IAM token lifetimes, per-class budgets, and migration safety
+//! rules.
+
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
@@ -7,6 +15,10 @@ use time::Duration;
 
 use crate::CurrentExecutionConflictPolicy;
 
+/// IAM-authenticated DSQL connections should not be reused past this bound.
+///
+/// The reservoir retires connections before the hard cutoff so callers do not
+/// receive a connection that will expire mid-transaction.
 const DSQL_HARD_CUTOFF: Duration = Duration::minutes(60);
 
 fn default_target_ready() -> usize {
@@ -53,16 +65,34 @@ fn default_migrations_dir() -> PathBuf {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReservoirConfig {
+    /// Desired number of warm connections available for checkout.
+    ///
+    /// This is a target, not a guarantee: rate limiting, endpoint failures, and
+    /// class-budget pressure can temporarily keep the ready pool below it.
     #[serde(default = "default_target_ready")]
     pub target_ready: usize,
+    /// Maximum number of connection creation attempts in flight.
+    ///
+    /// This protects the DSQL endpoint and IAM token path from a thundering herd
+    /// after process start or after a transient network outage.
     #[serde(default = "default_inflight_limit")]
     pub inflight_limit: usize,
+    /// Base connection lifetime before jitter is applied.
     #[serde(default = "default_base_lifetime")]
     pub base_lifetime: Duration,
+    /// Positive jitter added to the base lifetime.
+    ///
+    /// Jitter prevents a process from retiring all warmed connections in one
+    /// synchronized wave.
     #[serde(default = "default_lifetime_jitter")]
     pub lifetime_jitter: Duration,
+    /// Time reserved before the DSQL hard cutoff.
+    ///
+    /// Returned and idle connections inside this guard window are retired
+    /// instead of being handed to new work.
     #[serde(default = "default_guard_window")]
     pub guard_window: Duration,
+    /// Interval for scanning the ready pool for near-expired connections.
     #[serde(default = "default_scan_interval")]
     pub scan_interval: Duration,
 }
@@ -81,6 +111,8 @@ impl Default for ReservoirConfig {
 }
 
 impl ReservoirConfig {
+    /// Validate bounds that protect connection correctness rather than just
+    /// syntactic shape.
     pub fn validate(&self) -> Result<()> {
         if self.target_ready == 0 {
             bail!("reservoir target_ready must be greater than zero");
@@ -115,6 +147,10 @@ impl ReservoirConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MigrationConfig {
+    /// Directory containing forward-only `VNNN__name.sql` migration files.
+    ///
+    /// The default points at the workspace migrations directory so tests and
+    /// local runs exercise the same schema files.
     #[serde(default = "default_migrations_dir")]
     pub migrations_dir: PathBuf,
 }
@@ -131,13 +167,19 @@ impl Default for MigrationConfig {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DsqlAuthConfig {
+    /// DSQL cluster endpoint, without a PostgreSQL URL prefix.
     pub endpoint: String,
+    /// Optional region override. If absent, region is inferred from the
+    /// standard `*.dsql.{region}.on.aws` endpoint shape.
     #[serde(default)]
     pub region: Option<String>,
+    /// IAM role used for schema migrations and other administrative actions.
     #[serde(default)]
     pub admin_role_arn: Option<String>,
+    /// IAM role used by transition commits and runtime reads.
     #[serde(default)]
     pub runtime_role_arn: Option<String>,
+    /// IAM role reserved for future read-only operators or projection readers.
     #[serde(default)]
     pub readonly_role_arn: Option<String>,
 }
@@ -151,6 +193,8 @@ pub enum DsqlRole {
 }
 
 impl DsqlAuthConfig {
+    /// Check only local invariants. Network/auth failures are left to the
+    /// connector so configuration errors fail before opening sockets.
     pub fn validate(&self) -> Result<()> {
         if self.endpoint.trim().is_empty() {
             bail!("dsql endpoint must not be empty");
@@ -192,6 +236,7 @@ impl DsqlAuthConfig {
     }
 }
 
+/// Extract `{region}` from the canonical DSQL endpoint format.
 pub fn detect_region_from_endpoint(endpoint: &str) -> Option<String> {
     let marker = ".dsql.";
     let suffix = ".on.aws";
@@ -206,16 +251,24 @@ pub fn detect_region_from_endpoint(endpoint: &str) -> Option<String> {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DsqlPoolConfig {
+    /// Warm-connection reservoir behavior.
     #[serde(default)]
     pub reservoir: ReservoirConfig,
+    /// Migration discovery settings.
     #[serde(default)]
     pub migration: MigrationConfig,
+    /// Node-local connection creation rate.
+    ///
+    /// This caps new physical connections, not logical operation throughput.
     #[serde(default = "default_rate_per_second")]
     pub connection_rate_per_second: f64,
+    /// Burst capacity for the node-local connection creation limiter.
     #[serde(default = "default_burst_capacity")]
     pub burst_capacity: u64,
+    /// Runtime shard count used for deterministic run-key ownership.
     #[serde(default = "default_shard_count")]
     pub shard_count: u32,
+    /// Workflow-id conflict behavior used by repository start commits.
     #[serde(default)]
     pub conflict_policy: CurrentExecutionConflictPolicy,
 }
@@ -234,6 +287,8 @@ impl Default for DsqlPoolConfig {
 }
 
 impl DsqlPoolConfig {
+    /// Validate config that must be true before constructing any background
+    /// reservoir tasks.
     pub fn validate(&self) -> Result<()> {
         self.reservoir.validate()?;
         if self.connection_rate_per_second <= 0.0 {

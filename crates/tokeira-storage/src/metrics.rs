@@ -1,4 +1,8 @@
 //! Storage metric definitions and recording helpers.
+//!
+//! Metric names live in one manifest so naming validation can cover the whole
+//! crate. Callers should use the small recording helpers instead of constructing
+//! ad hoc metrics, which keeps label sets stable for dashboards and alerts.
 
 use metrics::{counter, gauge, histogram};
 use tokeira_types::MetricType;
@@ -52,6 +56,8 @@ pub fn record_commit_transition_duration(
     outcome: &'static str,
     duration: std::time::Duration,
 ) {
+    // Unknown is explicit rather than omitted so dashboard aggregations do not
+    // silently split on missing labels.
     let namespace = namespace.unwrap_or_else(|| "unknown".to_string());
     histogram!(
         COMMIT_TRANSITION_DURATION_SECONDS,
@@ -109,6 +115,8 @@ pub fn record_dsql_pool_class_budget(
     in_use: usize,
     waiters: usize,
 ) {
+    // Class-budget metrics are recorded together so operators can compare
+    // configured permits, live usage, and wait pressure on the same label set.
     gauge!(DSQL_POOL_CLASS_BUDGET_TOTAL, "class" => class).set(total as f64);
     gauge!(DSQL_POOL_CLASS_IN_USE, "class" => class).set(in_use as f64);
     gauge!(DSQL_POOL_CLASS_WAITERS, "class" => class).set(waiters as f64);

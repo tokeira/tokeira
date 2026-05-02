@@ -1,3 +1,11 @@
+//! DSQL connection acquisition and operation-class admission control.
+//!
+//! Runtime storage is not a single homogeneous workload. Transition commits,
+//! recovery reads, projection reads, and control-plane maintenance have
+//! different failure impact and latency sensitivity. This module wraps the
+//! physical connection reservoir with per-class semaphores so a large read or
+//! projection burst cannot starve commits.
+
 use std::{
     collections::HashMap,
     sync::{
@@ -26,10 +34,19 @@ pub struct DsqlConnector {
 }
 
 impl DsqlConnector {
+    /// Wrap an existing SQLx pool.
+    ///
+    /// Tests and embedding applications can use this to provide their own pool
+    /// policy while still exercising Tokeira's reservoir and class budgets.
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
 
+    /// Build a DSQL-aware SQLx pool from IAM auth settings.
+    ///
+    /// The current connector uses the same PostgreSQL username for all roles;
+    /// the role distinction is captured in the auth config and left available
+    /// for future assume-role plumbing.
     pub async fn connect(
         auth: &DsqlAuthConfig,
         config: &DsqlPoolConfig,
@@ -59,12 +76,20 @@ impl DsqlConnector {
 
 #[derive(Debug)]
 pub struct ClassBudgets {
+    /// Per-operation-class semaphores.
+    ///
+    /// The map is behind an `RwLock` so reconfiguration can atomically replace
+    /// all class budgets without stopping in-flight operations that already
+    /// hold permits from the old semaphores.
     budgets: RwLock<HashMap<DbClass, Arc<Semaphore>>>,
+    /// Configured totals kept separately from semaphore state for metrics.
     totals: RwLock<HashMap<DbClass, usize>>,
+    /// Fast aggregate used by tests and observability.
     total_budget: AtomicUsize,
 }
 
 impl ClassBudgets {
+    /// Construct class budgets from a complete allocation map.
     pub fn new(allocations: &HashMap<DbClass, usize>) -> Result<Self> {
         let total_budget = validate_allocations(allocations)?;
         let budgets = build_budget_map(allocations);
@@ -129,11 +154,14 @@ impl ClassBudgets {
 
 #[derive(Debug)]
 pub struct DsqlConnectionDirector {
+    /// Warm physical connections managed independently of operation class.
     reservoir: Reservoir,
+    /// Logical admission limits layered on top of the reservoir.
     class_budgets: ClassBudgets,
 }
 
 impl DsqlConnectionDirector {
+    /// Start the background connection reservoir and class-budget controller.
     pub async fn start(config: DsqlPoolConfig, connector: DsqlConnector) -> Result<Self> {
         let rate_limiter =
             TokenBucketRateLimiter::new(config.connection_rate_per_second, config.burst_capacity);
@@ -173,11 +201,21 @@ impl ConnectionDirector for DsqlConnectionDirector {
 
 #[derive(Debug)]
 pub struct DsqlPermit {
+    /// Operation class that consumed this permit.
     pub class: DbClass,
+    /// Checked-out connection.
+    ///
+    /// The `Option` is required because `Drop` only receives `&mut self`; taking
+    /// the connection allows the permit to return ownership to the reservoir
+    /// without unsafe code or an explicit close API.
     connection: Option<PoolConnection<Postgres>>,
+    /// Creation timestamp of the physical connection, not the checkout time.
     created_at: std::time::Instant,
+    /// Maximum lifetime assigned when the connection was created.
     max_lifetime: std::time::Duration,
+    /// Semaphore permit enforcing operation-class admission.
     _class_guard: OwnedSemaphorePermit,
+    /// Synchronous return path into the reservoir return processor.
     reservoir_return: tokio::sync::mpsc::UnboundedSender<ReservoirEntry>,
 }
 
@@ -208,6 +246,10 @@ impl DsqlPermit {
 
 impl Drop for DsqlPermit {
     fn drop(&mut self) {
+        // Dropping the permit is the storage-layer "return connection" API.
+        // Expired connections are intentionally discarded here because handing
+        // them back to the ready pool would create rare mid-transaction expiry
+        // failures that are hard to diagnose.
         if let Some(connection) = self.connection.take() {
             if self.created_at.elapsed() <= self.max_lifetime {
                 let _ = self.reservoir_return.send(ReservoirEntry {

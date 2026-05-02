@@ -1862,6 +1862,9 @@ where
             {
                 return Ok(None);
             }
+            if current.started_event_id.is_some() {
+                return Ok(None);
+            }
 
             let mut next_state = state.clone();
             next_state.transition_seq = state.transition_seq.next();
@@ -2004,6 +2007,7 @@ where
             next_activity.attempt = next_attempt;
             next_activity.stamp += 1;
             next_activity.started_at = None;
+            next_activity.started_event_id = None;
             next_state
                 .activities
                 .insert(token.activity_id.clone(), next_activity.clone());

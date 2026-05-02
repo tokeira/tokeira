@@ -21,8 +21,8 @@ use tokeira_kernel::{
     WorkflowState,
 };
 use tokeira_types::{
-    ExecutionRef, NamespaceId, ProjectionCursor, QueueKey, RequestId, RunId, RunKey, ShardEpoch,
-    ShardId, WorkflowId,
+    ExecutionRef, ExecutionStatus, NamespaceId, ProjectionCursor, QueueKey, RequestId, RunId,
+    RunKey, ShardEpoch, ShardId, TaskKind, WorkflowId,
 };
 use tokio::sync::Mutex;
 
@@ -54,20 +54,45 @@ pub struct InMemoryStore {
 
 #[derive(Default)]
 struct StoreState {
+    /// Current open run per workflow.
+    ///
+    /// Closed workflows are removed from this map, but remain present in
+    /// `latest_run` and `execution_index` equivalents below.
     current_open: HashMap<(NamespaceId, String), RunKey>,
+    /// Durable run lookup by full execution identity.
+    ///
+    /// This mirrors the DSQL explicit-run path: older closed runs remain
+    /// addressable even after a newer run becomes current.
     execution_index: HashMap<(NamespaceId, String, RunId), RunKey>,
+    /// Materialized hot state by run key.
     runs: HashMap<RunKey, WorkflowState>,
+    /// Authoritative event stream by run key.
     history: HashMap<RunKey, Vec<tokeira_kernel::HistoryEvent>>,
+    /// Workflow-scoped request dedupe records.
     request_dedupe: HashMap<(NamespaceId, String, String), RequestRecord>,
+    /// Test/admin transition audit records.
     transition_audit: HashMap<RunKey, Vec<TransitionAuditRecord>>,
+    /// Projection records awaiting projection workers.
     projection_log: Vec<ProjectionRecord>,
+    /// Shard lease state keyed by shard id.
     bundle_leases: HashMap<ShardId, (String, ShardEpoch)>,
+    /// Durable dispatch source for activity work.
+    ///
+    /// Do not infer dispatchability from `activity_state_table`: started,
+    /// paused, or workflow-paused activities can still have durable activity
+    /// state while being intentionally absent from this map.
     activity_dispatch: HashMap<(RunKey, String), ActivityDispatchEntry>,
+    /// FIFO backlog for tasks that could not be immediately handed to a worker.
     dispatch_backlog: VecDeque<BacklogEntry>,
+    /// Monotonic insertion sequence assigned by `persist_to_backlog`.
     backlog_next_seq: u64,
+    /// Test hook for injecting OCC conflicts.
     conflict_injections: HashMap<RunKey, usize>,
+    /// Current workflow-id conflict behavior for start transitions.
     conflict_policy: CurrentExecutionConflictPolicy,
+    /// Activity timeout/sweep materialization.
     activity_state_table: HashMap<(RunKey, String), tokeira_kernel::ActivityState>,
+    /// Timer sweep materialization.
     timer_bucket: HashMap<(RunKey, String), tokeira_kernel::TimerState>,
     /// Deterministic run-to-shard mapping.
     run_shard_map: HashMap<RunKey, ShardId>,
@@ -407,6 +432,36 @@ impl RunRepository for InMemoryStore {
                     store
                         .activity_state_table
                         .insert((run_key, activity.activity_id.clone()), activity.clone());
+                    // Activity state and activity dispatch are intentionally
+                    // separate. Upserts always refresh state, but dispatch rows
+                    // only survive while the activity remains eligible to be
+                    // offered to a worker.
+                    if activity.started_at.is_some() || activity.pause_info.is_some() {
+                        store
+                            .activity_dispatch
+                            .remove(&(run_key, activity.activity_id.clone()));
+                    } else if let Some(entry) = store
+                        .activity_dispatch
+                        .get_mut(&(run_key, activity.activity_id.clone()))
+                    {
+                        entry.task.queue = QueueKey {
+                            namespace_id: state.namespace_id,
+                            task_queue: activity.task_queue.clone(),
+                            task_kind: TaskKind::Activity,
+                            deployment: activity
+                                .deployment
+                                .clone()
+                                .or_else(|| state.deployment.clone()),
+                            build_id: activity.build_id.clone().or_else(|| state.build_id.clone()),
+                        };
+                        entry.task.input = activity.input.clone();
+                        entry.task.schedule_event_id = activity.schedule_event_id;
+                        entry.task.attempt = activity.attempt;
+                        entry.schedule_to_close_timeout = activity.schedule_to_close_timeout;
+                        entry.schedule_to_start_timeout = activity.schedule_to_start_timeout;
+                        entry.start_to_close_timeout = activity.start_to_close_timeout;
+                        entry.heartbeat_timeout = activity.heartbeat_timeout;
+                    }
                 }
                 ActivityOp::Delete { activity_id } => {
                     store
@@ -445,6 +500,9 @@ impl RunRepository for InMemoryStore {
                 heartbeat_timeout,
             } = op
             {
+                // Enqueue is the only state transition effect that creates an
+                // activity dispatch entry. Later ActivityOp::Upsert values may
+                // update or remove this entry, but they cannot create it.
                 store.activity_dispatch.insert(
                     (run_key, activity_id.clone()),
                     ActivityDispatchEntry {
@@ -463,6 +521,13 @@ impl RunRepository for InMemoryStore {
                     },
                 );
             }
+        }
+        if state.status == ExecutionStatus::Paused {
+            // Workflow pause suppresses all queued activity dispatch for this
+            // run while preserving activity_state_table for later unpause.
+            store
+                .activity_dispatch
+                .retain(|(entry_run_key, _), _| entry_run_key != &run_key);
         }
 
         store.runs.insert(run_key, state.clone());
@@ -1053,7 +1118,7 @@ mod tests {
     use proptest::prelude::*;
     use time::Duration;
     use tokeira_kernel::{
-        PendingWorkflowTask, RequestDedupeOp,
+        ActivityPauseInfo, PauseInfo, PendingWorkflowTask, RequestDedupeOp,
         event::{HistoryEvent, HistoryEventKind},
     };
     use tokeira_types::{
@@ -1201,6 +1266,301 @@ mod tests {
             pause_info: None,
             stamp: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn started_activity_upsert_removes_dispatch_entry() {
+        let store = InMemoryStore::default();
+        let run_key = RunKey::new();
+        let mut transition = start_transition(run_key);
+        let queue = QueueKey {
+            namespace_id: transition.next_state.namespace_id,
+            task_queue: TaskQueueName("queue".into()),
+            task_kind: TaskKind::Activity,
+            deployment: None,
+            build_id: None,
+        };
+        transition
+            .activity_ops
+            .push(ActivityOp::Upsert(activity_state("activity-1")));
+        transition
+            .dispatch_ops
+            .push(DispatchOp::EnqueueActivityTask {
+                queue: queue.clone(),
+                activity_id: "activity-1".to_owned(),
+                input: tokeira_types::Payloads::default(),
+                schedule_event_id: 7,
+                attempt: 1,
+                schedule_to_close_timeout: None,
+                schedule_to_start_timeout: None,
+                start_to_close_timeout: None,
+                heartbeat_timeout: None,
+            });
+        store
+            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .await
+            .unwrap();
+
+        let mut started = activity_state("activity-1");
+        started.started_at = Some(fixed_now());
+        started.started_event_id = Some(9);
+        let mut started_transition = start_transition(run_key);
+        started_transition.expected_seq = TransitionSeq(1);
+        started_transition.next_state.transition_seq = TransitionSeq(2);
+        started_transition.next_state.namespace_id = queue.namespace_id;
+        started_transition
+            .activity_ops
+            .push(ActivityOp::Upsert(started));
+        store
+            .commit_transition(run_key, started_transition, ShardEpoch::ZERO)
+            .await
+            .unwrap();
+
+        let tasks = store
+            .list_dispatchable_activity_tasks(&queue, 10)
+            .await
+            .unwrap();
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn still_dispatchable_activity_upsert_updates_existing_dispatch_entry() {
+        let store = InMemoryStore::default();
+        let run_key = RunKey::new();
+        let mut transition = start_transition(run_key);
+        let old_queue = QueueKey {
+            namespace_id: transition.next_state.namespace_id,
+            task_queue: TaskQueueName("old-queue".into()),
+            task_kind: TaskKind::Activity,
+            deployment: None,
+            build_id: None,
+        };
+        transition
+            .activity_ops
+            .push(ActivityOp::Upsert(activity_state("activity-1")));
+        transition
+            .dispatch_ops
+            .push(DispatchOp::EnqueueActivityTask {
+                queue: old_queue.clone(),
+                activity_id: "activity-1".to_owned(),
+                input: tokeira_types::Payloads::default(),
+                schedule_event_id: 7,
+                attempt: 1,
+                schedule_to_close_timeout: None,
+                schedule_to_start_timeout: None,
+                start_to_close_timeout: None,
+                heartbeat_timeout: None,
+            });
+        store
+            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .await
+            .unwrap();
+
+        let mut updated = activity_state("activity-1");
+        updated.task_queue = TaskQueueName("new-queue".into());
+        updated.attempt = 2;
+        let mut update_transition = start_transition(run_key);
+        update_transition.expected_seq = TransitionSeq(1);
+        update_transition.next_state.transition_seq = TransitionSeq(2);
+        update_transition.next_state.namespace_id = old_queue.namespace_id;
+        update_transition
+            .activity_ops
+            .push(ActivityOp::Upsert(updated));
+        store
+            .commit_transition(run_key, update_transition, ShardEpoch::ZERO)
+            .await
+            .unwrap();
+
+        let new_queue = QueueKey {
+            task_queue: TaskQueueName("new-queue".into()),
+            ..old_queue.clone()
+        };
+        assert!(
+            store
+                .list_dispatchable_activity_tasks(&old_queue, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let tasks = store
+            .list_dispatchable_activity_tasks(&new_queue, 10)
+            .await
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn paused_activity_upsert_removes_dispatch_entry() {
+        let store = InMemoryStore::default();
+        let run_key = RunKey::new();
+        let mut transition = start_transition(run_key);
+        let queue = QueueKey {
+            namespace_id: transition.next_state.namespace_id,
+            task_queue: TaskQueueName("queue".into()),
+            task_kind: TaskKind::Activity,
+            deployment: None,
+            build_id: None,
+        };
+        transition
+            .activity_ops
+            .push(ActivityOp::Upsert(activity_state("activity-1")));
+        transition
+            .dispatch_ops
+            .push(DispatchOp::EnqueueActivityTask {
+                queue: queue.clone(),
+                activity_id: "activity-1".to_owned(),
+                input: tokeira_types::Payloads::default(),
+                schedule_event_id: 7,
+                attempt: 1,
+                schedule_to_close_timeout: None,
+                schedule_to_start_timeout: None,
+                start_to_close_timeout: None,
+                heartbeat_timeout: None,
+            });
+        store
+            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .await
+            .unwrap();
+
+        let mut paused = activity_state("activity-1");
+        paused.pause_info = Some(ActivityPauseInfo {
+            pause_time: fixed_now(),
+            identity: "tester".to_owned(),
+            reason: "maintenance".to_owned(),
+        });
+        let mut pause_transition = start_transition(run_key);
+        pause_transition.expected_seq = TransitionSeq(1);
+        pause_transition.next_state.transition_seq = TransitionSeq(2);
+        pause_transition.next_state.namespace_id = queue.namespace_id;
+        pause_transition
+            .activity_ops
+            .push(ActivityOp::Upsert(paused));
+        store
+            .commit_transition(run_key, pause_transition, ShardEpoch::ZERO)
+            .await
+            .unwrap();
+
+        let tasks = store
+            .list_dispatchable_activity_tasks(&queue, 10)
+            .await
+            .unwrap();
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn workflow_pause_removes_activity_dispatch_entries_for_run() {
+        let store = InMemoryStore::default();
+        let run_key = RunKey::new();
+        let mut transition = start_transition(run_key);
+        let queue = QueueKey {
+            namespace_id: transition.next_state.namespace_id,
+            task_queue: TaskQueueName("queue".into()),
+            task_kind: TaskKind::Activity,
+            deployment: None,
+            build_id: None,
+        };
+        for activity_id in ["activity-1", "activity-2"] {
+            transition
+                .activity_ops
+                .push(ActivityOp::Upsert(activity_state(activity_id)));
+            transition
+                .dispatch_ops
+                .push(DispatchOp::EnqueueActivityTask {
+                    queue: queue.clone(),
+                    activity_id: activity_id.to_owned(),
+                    input: tokeira_types::Payloads::default(),
+                    schedule_event_id: 7,
+                    attempt: 1,
+                    schedule_to_close_timeout: None,
+                    schedule_to_start_timeout: None,
+                    start_to_close_timeout: None,
+                    heartbeat_timeout: None,
+                });
+        }
+        store
+            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .await
+            .unwrap();
+
+        let mut pause_transition = start_transition(run_key);
+        pause_transition.expected_seq = TransitionSeq(1);
+        pause_transition.next_state.transition_seq = TransitionSeq(2);
+        pause_transition.next_state.namespace_id = queue.namespace_id;
+        pause_transition.next_state.status = ExecutionStatus::Paused;
+        pause_transition.next_state.pause_info = Some(PauseInfo {
+            pause_time: fixed_now(),
+            identity: "tester".to_owned(),
+            reason: "maintenance".to_owned(),
+            request_id: "pause-1".to_owned(),
+        });
+        store
+            .commit_transition(run_key, pause_transition, ShardEpoch::ZERO)
+            .await
+            .unwrap();
+
+        let tasks = store
+            .list_dispatchable_activity_tasks(&queue, 10)
+            .await
+            .unwrap();
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unpaused_activity_reenqueue_restores_dispatch_entry() {
+        let store = InMemoryStore::default();
+        let run_key = RunKey::new();
+        let mut transition = start_transition(run_key);
+        let queue = QueueKey {
+            namespace_id: transition.next_state.namespace_id,
+            task_queue: TaskQueueName("queue".into()),
+            task_kind: TaskKind::Activity,
+            deployment: None,
+            build_id: None,
+        };
+        let mut paused = activity_state("activity-1");
+        paused.pause_info = Some(ActivityPauseInfo {
+            pause_time: fixed_now(),
+            identity: "tester".to_owned(),
+            reason: "maintenance".to_owned(),
+        });
+        transition.activity_ops.push(ActivityOp::Upsert(paused));
+        store
+            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .await
+            .unwrap();
+
+        let mut unpause_transition = start_transition(run_key);
+        unpause_transition.expected_seq = TransitionSeq(1);
+        unpause_transition.next_state.transition_seq = TransitionSeq(2);
+        unpause_transition.next_state.namespace_id = queue.namespace_id;
+        unpause_transition
+            .activity_ops
+            .push(ActivityOp::Upsert(activity_state("activity-1")));
+        unpause_transition
+            .dispatch_ops
+            .push(DispatchOp::EnqueueActivityTask {
+                queue: queue.clone(),
+                activity_id: "activity-1".to_owned(),
+                input: tokeira_types::Payloads::default(),
+                schedule_event_id: 7,
+                attempt: 1,
+                schedule_to_close_timeout: None,
+                schedule_to_start_timeout: None,
+                start_to_close_timeout: None,
+                heartbeat_timeout: None,
+            });
+        store
+            .commit_transition(run_key, unpause_transition, ShardEpoch::ZERO)
+            .await
+            .unwrap();
+
+        let tasks = store
+            .list_dispatchable_activity_tasks(&queue, 10)
+            .await
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].activity_id, "activity-1");
     }
 
     fn timer_state(timer_id: &str, fire_at: OffsetDateTime) -> tokeira_kernel::TimerState {

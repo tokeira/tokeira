@@ -1,3 +1,10 @@
+//! Warm DSQL connection reservoir.
+//!
+//! The runtime wants fast checkouts, but DSQL connections have finite IAM token
+//! lifetimes. The reservoir continuously fills a bounded ready pool, retires
+//! connections before the guard window, and validates returned connections
+//! before making them available again.
+
 use std::{
     sync::Arc,
     time::{Duration as StdDuration, Instant},
@@ -17,12 +24,17 @@ use super::{DsqlConnector, ReservoirConfig, TokenBucketRateLimiter};
 
 #[derive(Debug)]
 pub struct ReservoirEntry {
+    /// Checked-out physical SQLx connection.
     pub(crate) connection: PoolConnection<Postgres>,
+    /// Physical creation time. Used for lifetime enforcement even after many
+    /// logical checkouts.
     pub(crate) created_at: Instant,
+    /// Jittered lifetime assigned at creation.
     pub(crate) max_lifetime: StdDuration,
 }
 
 impl ReservoirEntry {
+    /// Return true when a connection is too close to expiry to safely reuse.
     fn should_retire(&self, guard_window: StdDuration) -> bool {
         self.created_at.elapsed().saturating_add(guard_window) >= self.max_lifetime
     }
@@ -30,15 +42,27 @@ impl ReservoirEntry {
 
 #[derive(Debug)]
 pub struct Reservoir {
+    /// Bounded ready pool. The sender lives in background tasks; checkouts only
+    /// need the receiver.
     ready: async_channel::Receiver<ReservoirEntry>,
+    /// Non-async return path used by `DsqlPermit::drop`.
     return_tx: mpsc::UnboundedSender<ReservoirEntry>,
+    /// Background task that opens new physical connections.
     refiller_handle: JoinHandle<()>,
+    /// Background task that retires near-expired idle connections.
     scanner_handle: JoinHandle<()>,
+    /// Background task that validates returned connections before reuse.
     return_processor_handle: JoinHandle<()>,
+    /// Retained for inspection and tests.
     config: ReservoirConfig,
 }
 
 impl Reservoir {
+    /// Start all reservoir background tasks.
+    ///
+    /// The ready pool is bounded at `target_ready`; connection creation is also
+    /// bounded by `inflight_limit` and the token bucket. Those three controls
+    /// together prevent both memory growth and endpoint hammering.
     pub async fn start(
         config: ReservoirConfig,
         connector: DsqlConnector,
@@ -67,6 +91,7 @@ impl Reservoir {
         })
     }
 
+    /// Checkout one ready connection, waiting until the refiller supplies one.
     pub async fn checkout(&self) -> Result<ReservoirEntry> {
         if self.ready.is_empty() {
             metrics::record_dsql_pool_empty_reservoir();
@@ -76,14 +101,17 @@ impl Reservoir {
         Ok(entry)
     }
 
+    /// Clone the return channel used by permits.
     pub fn return_sender(&self) -> mpsc::UnboundedSender<ReservoirEntry> {
         self.return_tx.clone()
     }
 
+    /// Number of currently ready connections.
     pub fn ready_count(&self) -> usize {
         self.ready.len()
     }
 
+    /// Original reservoir configuration.
     pub fn config(&self) -> &ReservoirConfig {
         &self.config
     }
@@ -91,6 +119,8 @@ impl Reservoir {
 
 impl Drop for Reservoir {
     fn drop(&mut self) {
+        // The reservoir owns these infinite-loop tasks. Aborting them on drop
+        // avoids detached background work after a test or store shuts down.
         self.refiller_handle.abort();
         self.scanner_handle.abort();
         self.return_processor_handle.abort();

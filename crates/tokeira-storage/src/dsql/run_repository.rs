@@ -1,3 +1,11 @@
+//! DSQL-backed implementation of the semantic `RunRepository` contract.
+//!
+//! The physical schema is spread-key-first: hot write tables use UUID keys
+//! derived from logical identifiers, while secondary indexes serve targeted
+//! read paths. The repository is the only module that should know how those
+//! tables combine into workflow semantics; callers continue to use the storage
+//! trait in terms of runs, history, leases, dispatch, and sweep entries.
+
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -5,12 +13,13 @@ use async_trait::async_trait;
 use sqlx::Connection;
 use time::OffsetDateTime;
 use tokeira_kernel::{
-    ActivityOp, BasicKernel, HistoryEvent, LoadedRun, ProjectionOp, ReplayContext, TimerOp,
-    Transition, WorkflowState,
+    ActivityOp, BasicKernel, DispatchOp, HistoryEvent, LoadedRun, ProjectionOp, ReplayContext,
+    TimerOp, Transition, WorkflowState,
 };
 use tokeira_types::{
-    BuildId, DeploymentId, ExecutionRef, NamespaceId, QueueKey, RequestId, RunId, RunKey,
-    ShardEpoch, ShardId, TaskKind, TransitionSeq, WorkflowId, dsql_spread_uuid,
+    BuildId, DeploymentId, ExecutionRef, ExecutionStatus, NamespaceId, Payloads, QueueKey,
+    RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskKind, TaskQueueName, TransitionSeq,
+    WorkerIdentity, WorkflowId, dsql_spread_uuid,
 };
 use tracing::instrument;
 use uuid::Uuid;
@@ -25,14 +34,25 @@ use crate::{
 use super::{DsqlConnectionDirector, DsqlPermit, codec};
 use crate::ConnectionDirector;
 
+/// Current projection fanout for records written by this repository.
+///
+/// The schema supports partitioned projection scans; the MVP uses one logical
+/// fanout value while still assigning deterministic partitions.
 const PROJECTION_FANOUT: i16 = 1;
+/// Number of projection partitions used to distribute projection log reads.
 const PROJECTION_PARTITION_COUNT: u32 = 16;
 
 /// Production `RunRepository` backed by Aurora DSQL.
 #[derive(Debug)]
 pub struct DsqlRunRepository {
+    /// Abstracted acquisition boundary.
+    ///
+    /// Production uses `DsqlConnectionDirector`; tests use a fake acquirer to
+    /// prove routing and zero-limit behavior without opening SQL connections.
     director: Arc<dyn DsqlConnectionAcquirer>,
+    /// Non-zero runtime shard count used to map run keys to shard ownership.
     shard_count: u32,
+    /// Workflow-id conflict policy applied during start commits.
     conflict_policy: CurrentExecutionConflictPolicy,
 }
 
@@ -49,6 +69,7 @@ impl DsqlConnectionAcquirer for DsqlConnectionDirector {
 }
 
 impl DsqlRunRepository {
+    /// Build a repository using the production DSQL connection director.
     pub fn new(
         director: Arc<DsqlConnectionDirector>,
         shard_count: u32,
@@ -97,6 +118,10 @@ impl DsqlRunRepository {
     }
 
     /// Stable encoding of `ShardId(u32)` to UUID for SQL binding.
+    ///
+    /// Feature specs originally modeled shard IDs as UUID columns. This helper
+    /// preserves that schema without changing the public `ShardId(pub u32)`
+    /// type used throughout runtime ownership code.
     pub(crate) fn shard_id_to_uuid(shard_id: ShardId) -> Uuid {
         dsql_spread_uuid(&[b"shard", &shard_id.0.to_le_bytes()])
     }
@@ -149,6 +174,14 @@ impl DsqlRunRepository {
         ])
     }
 
+    pub(crate) fn activity_dispatch_key(run_key: RunKey, activity_id: &str) -> Uuid {
+        dsql_spread_uuid(&[
+            b"activity-dispatch",
+            run_key.0.as_bytes(),
+            activity_id.as_bytes(),
+        ])
+    }
+
     pub(crate) fn is_serialization_failure(err: &sqlx::Error) -> bool {
         matches!(err, sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("40001"))
     }
@@ -160,6 +193,8 @@ impl RunRepository for DsqlRunRepository {
     async fn resolve_execution(&self, execution: &ExecutionRef) -> Result<Option<RunKey>> {
         let mut permit = self.director.acquire(DbClass::Read).await?;
         if let Some(requested_run_id) = execution.run_id {
+            // Explicit run IDs do not use `current_execution`; that row is
+            // intentionally replaced by newer runs of the same workflow.
             let run_key = RunKey::derive(
                 execution.namespace_id,
                 &execution.workflow_id,
@@ -191,6 +226,8 @@ impl RunRepository for DsqlRunRepository {
     ) -> Result<Option<RunKey>> {
         let mut permit = self.director.acquire(DbClass::Read).await?;
         let key = Self::current_execution_key(namespace_id, workflow_id);
+        // `current_execution` is the latest-run pointer even after the run is
+        // closed. Only `resolve_execution(None)` filters this row to open runs.
         let row = sqlx::query_as::<_, (Uuid,)>(
             "SELECT run_key FROM current_execution
              WHERE key = $1",
@@ -230,6 +267,8 @@ impl RunRepository for DsqlRunRepository {
         }
 
         let mut permit = self.director.acquire(DbClass::Read).await?;
+        // History is stored in transition batches. A batch may straddle
+        // `after_event_id`, so decoding and per-event filtering remain in Rust.
         let rows = sqlx::query_as::<_, (i64, i64, Vec<u8>)>(
             "SELECT first_event_id, last_event_id, events_data
              FROM history_batch
@@ -278,6 +317,9 @@ impl RunRepository for DsqlRunRepository {
             return Ok(None);
         };
         let run_id = RunId(stored_run_id);
+        // A workflow-scoped dedupe key can still be queried through an
+        // execution reference that names a specific run. In that case the
+        // stored run must match the caller's run filter.
         if execution
             .run_id
             .is_some_and(|requested| requested != run_id)
@@ -348,6 +390,8 @@ impl RunRepository for DsqlRunRepository {
         let shard_id = self.shard_for_run_key(run_key);
 
         if should_check_epoch(epoch) {
+            // Epoch fencing ties a commit to the lane/shard lease that produced
+            // it. A stale owner must fail before reading or writing run state.
             let row =
                 sqlx::query_as::<_, (i64,)>("SELECT epoch FROM shard_lease WHERE shard_id = $1")
                     .bind(Self::shard_id_to_uuid(shard_id))
@@ -383,6 +427,9 @@ impl RunRepository for DsqlRunRepository {
             Some((seq,)) => TransitionSeq(u64_from_i64(seq, "workflow_hot.transition_seq")?),
             None => TransitionSeq::ZERO,
         };
+        // The transition sequence is the per-run OCC fence. We check it inside
+        // the same transaction as the write set so successful commits remain
+        // linearizable for a single run.
         if current_seq != transition.expected_seq {
             tx.rollback().await?;
             return Ok(CommitResult::Conflict {
@@ -404,6 +451,9 @@ impl RunRepository for DsqlRunRepository {
             .fetch_optional(&mut *tx)
             .await?;
             if row.is_some() {
+                // Dedupe is checked before any state mutation. Returning
+                // Duplicate lets callers short-circuit idempotent requests
+                // without turning them into conflicts.
                 tx.rollback().await?;
                 return Ok(CommitResult::Duplicate);
             }
@@ -445,6 +495,9 @@ impl RunRepository for DsqlRunRepository {
         write_transition(&mut tx, run_key, shard_id, &transition, &state).await?;
         match tx.commit().await {
             Ok(()) => Ok(CommitResult::Applied { new_state: state }),
+            // Aurora DSQL can reject a transaction at commit because another
+            // transaction won serialization. The runtime already knows how to
+            // reload and retry `Conflict`, so normalize SQLSTATE 40001 here.
             Err(err) if Self::is_serialization_failure(&err) => Ok(CommitResult::Conflict {
                 reason: "DSQL serialization conflict".to_owned(),
             }),
@@ -488,6 +541,9 @@ impl RunRepository for DsqlRunRepository {
         .await?;
         let mut copied_events = Vec::new();
         let mut found_fork = false;
+        // Reset materialization copies only the committed prefix through the
+        // fork event. Replay then derives the successor state, avoiding a
+        // second source of truth for reset snapshots.
         for (events_data, _first_event_id, _last_event_id) in history_rows {
             for event in codec::decode_history_events(&events_data)? {
                 let is_fork = event.event_id == fork_event_id;
@@ -557,20 +613,64 @@ impl RunRepository for DsqlRunRepository {
         Ok(())
     }
 
+    #[instrument(name = "dsql.list_dispatchable_workflow_tasks", skip(self), fields(namespace_id = %queue.namespace_id.0, task_queue = %queue.task_queue.0, limit))]
     async fn list_dispatchable_workflow_tasks(
         &self,
-        _queue: &QueueKey,
-        _limit: usize,
+        queue: &QueueKey,
+        limit: usize,
     ) -> Result<Vec<DispatchableWorkflowTask>> {
-        bail!("Feature 3: dsql-side-tables")
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut permit = self.director.acquire(DbClass::Read).await?;
+        let rows = sqlx::query_as::<_, (Uuid, Vec<u8>)>(
+            "SELECT run_key, state_data
+             FROM workflow_hot
+             WHERE namespace_id = $1",
+        )
+        .bind(queue.namespace_id.0)
+        .fetch_all(permit.connection()?)
+        .await?;
+
+        collect_dispatchable_workflow_tasks(rows, Some(queue), limit)
     }
 
+    #[instrument(name = "dsql.list_dispatchable_activity_tasks", skip(self), fields(namespace_id = %queue.namespace_id.0, task_queue = %queue.task_queue.0, limit))]
     async fn list_dispatchable_activity_tasks(
         &self,
-        _queue: &QueueKey,
-        _limit: usize,
+        queue: &QueueKey,
+        limit: usize,
     ) -> Result<Vec<DispatchableActivityTask>> {
-        bail!("Feature 3: dsql-side-tables")
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut permit = self.director.acquire(DbClass::Read).await?;
+        let deployment = queue.deployment.as_ref().map(|value| value.0.as_str());
+        let build_id = queue.build_id.as_ref().map(|value| value.0.as_str());
+        let rows = sqlx::query_as::<_, ActivityDispatchRow>(
+            "SELECT run_key, activity_id, queue_namespace, queue_name, task_kind,
+                    deployment, build_id, schedule_event_id, attempt, input_data
+             FROM activity_dispatch
+             WHERE queue_namespace = $1
+               AND queue_name = $2
+               AND task_kind = $3
+               AND deployment IS NOT DISTINCT FROM $4
+               AND build_id IS NOT DISTINCT FROM $5
+             ORDER BY created_at ASC
+             LIMIT $6",
+        )
+        .bind(queue.namespace_id.0)
+        .bind(&queue.task_queue.0)
+        .bind(queue.task_kind.to_db_smallint())
+        .bind(deployment)
+        .bind(build_id)
+        .bind(i64::try_from(limit)?)
+        .fetch_all(permit.connection()?)
+        .await?;
+
+        rows.into_iter().map(activity_dispatch_from_row).collect()
     }
 
     async fn persist_to_backlog(&self, entries: Vec<BacklogEntry>) -> Result<()> {
@@ -650,7 +750,17 @@ impl RunRepository for DsqlRunRepository {
         .await?;
 
         let mut drained = Vec::with_capacity(rows.len());
-        for (key, run_key, payload_data, scheduled_at, insertion_seq, task_kind_raw, stored_deployment, stored_build_id) in rows {
+        for (
+            key,
+            run_key,
+            payload_data,
+            scheduled_at,
+            insertion_seq,
+            task_kind_raw,
+            stored_deployment,
+            stored_build_id,
+        ) in rows
+        {
             sqlx::query("DELETE FROM dispatch_backlog WHERE key = $1")
                 .bind(key)
                 .execute(&mut *tx)
@@ -673,66 +783,421 @@ impl RunRepository for DsqlRunRepository {
         Ok(drained)
     }
 
-    async fn list_due_timers(&self, _now: OffsetDateTime, _limit: usize) -> Result<Vec<DueTimer>> {
-        bail!("Feature 3: dsql-side-tables")
+    #[instrument(name = "dsql.list_due_timers", skip(self), fields(limit))]
+    async fn list_due_timers(&self, now: OffsetDateTime, limit: usize) -> Result<Vec<DueTimer>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut due = Vec::new();
+        for shard_index in 0..self.shard_count {
+            let remaining = limit - due.len();
+            if remaining == 0 {
+                break;
+            }
+            due.extend(
+                self.list_due_timers_for_shard(ShardId(shard_index), now, remaining)
+                    .await?,
+            );
+        }
+        due.truncate(limit);
+        Ok(due)
     }
 
+    #[instrument(name = "dsql.list_dispatchable_workflow_tasks_for_shard", skip(self), fields(shard_id = shard_id.0, limit))]
     async fn list_dispatchable_workflow_tasks_for_shard(
         &self,
-        _shard_id: ShardId,
-        _limit: usize,
+        shard_id: ShardId,
+        limit: usize,
     ) -> Result<Vec<DispatchableWorkflowTask>> {
-        bail!("Feature 3: dsql-side-tables")
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut permit = self.director.acquire(DbClass::Read).await?;
+        let rows = sqlx::query_as::<_, (Uuid, Vec<u8>)>(
+            "SELECT run_key, state_data
+             FROM workflow_hot
+             WHERE shard_id = $1",
+        )
+        .bind(Self::shard_id_to_uuid(shard_id))
+        .fetch_all(permit.connection()?)
+        .await?;
+
+        collect_dispatchable_workflow_tasks(rows, None, limit)
     }
 
+    #[instrument(name = "dsql.list_dispatchable_activity_tasks_for_shard", skip(self), fields(shard_id = shard_id.0, limit))]
     async fn list_dispatchable_activity_tasks_for_shard(
         &self,
-        _shard_id: ShardId,
-        _limit: usize,
+        shard_id: ShardId,
+        limit: usize,
     ) -> Result<Vec<DispatchableActivityTask>> {
-        bail!("Feature 3: dsql-side-tables")
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut permit = self.director.acquire(DbClass::Read).await?;
+        let rows = sqlx::query_as::<_, ActivityDispatchRow>(
+            "SELECT run_key, activity_id, queue_namespace, queue_name, task_kind,
+                    deployment, build_id, schedule_event_id, attempt, input_data
+             FROM activity_dispatch
+             WHERE shard_id = $1
+             ORDER BY created_at ASC
+             LIMIT $2",
+        )
+        .bind(Self::shard_id_to_uuid(shard_id))
+        .bind(i64::try_from(limit)?)
+        .fetch_all(permit.connection()?)
+        .await?;
+
+        rows.into_iter().map(activity_dispatch_from_row).collect()
     }
 
+    #[instrument(name = "dsql.list_due_timers_for_shard", skip(self), fields(shard_id = shard_id.0, limit))]
     async fn list_due_timers_for_shard(
         &self,
-        _shard_id: ShardId,
-        _now: OffsetDateTime,
-        _limit: usize,
+        shard_id: ShardId,
+        now: OffsetDateTime,
+        limit: usize,
     ) -> Result<Vec<DueTimer>> {
-        bail!("Feature 3: dsql-side-tables")
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut permit = self.director.acquire(DbClass::Read).await?;
+        let rows = sqlx::query_as::<_, (Uuid, String)>(
+            "SELECT run_key, timer_id
+             FROM timer_bucket
+             WHERE shard_id = $1 AND fire_at <= $2
+             ORDER BY fire_at ASC
+             LIMIT $3",
+        )
+        .bind(Self::shard_id_to_uuid(shard_id))
+        .bind(now)
+        .bind(i64::try_from(limit)?)
+        .fetch_all(permit.connection()?)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(run_key, timer_id)| DueTimer {
+                run_key: RunKey(run_key),
+                timer_id,
+            })
+            .collect())
     }
 
+    #[instrument(name = "dsql.list_runs_with_workflow_timeouts_for_shard", skip(self), fields(shard_id = shard_id.0, limit))]
     async fn list_runs_with_workflow_timeouts_for_shard(
         &self,
-        _shard_id: ShardId,
-        _limit: usize,
+        shard_id: ShardId,
+        limit: usize,
     ) -> Result<Vec<WorkflowTimeoutSweepEntry>> {
-        bail!("Feature 3: dsql-side-tables")
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut permit = self.director.acquire(DbClass::Read).await?;
+        let rows = sqlx::query_as::<_, (Uuid, Vec<u8>)>(
+            "SELECT run_key, state_data
+             FROM workflow_hot
+             WHERE shard_id = $1",
+        )
+        .bind(Self::shard_id_to_uuid(shard_id))
+        .fetch_all(permit.connection()?)
+        .await?;
+
+        collect_workflow_timeout_entries(rows, limit)
     }
 
+    #[instrument(name = "dsql.list_started_workflow_tasks_for_shard", skip(self), fields(shard_id = shard_id.0, limit))]
     async fn list_started_workflow_tasks_for_shard(
         &self,
-        _shard_id: ShardId,
-        _limit: usize,
+        shard_id: ShardId,
+        limit: usize,
     ) -> Result<Vec<WftTimeoutSweepEntry>> {
-        bail!("Feature 3: dsql-side-tables")
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut permit = self.director.acquire(DbClass::Read).await?;
+        let rows = sqlx::query_as::<_, (Uuid, Vec<u8>)>(
+            "SELECT run_key, state_data
+             FROM workflow_hot
+             WHERE shard_id = $1",
+        )
+        .bind(Self::shard_id_to_uuid(shard_id))
+        .fetch_all(permit.connection()?)
+        .await?;
+
+        collect_started_workflow_task_entries(rows, limit)
     }
 
+    #[instrument(name = "dsql.list_open_activities_for_shard", skip(self), fields(shard_id = shard_id.0, limit))]
     async fn list_open_activities_for_shard(
         &self,
-        _shard_id: ShardId,
-        _limit: usize,
+        shard_id: ShardId,
+        limit: usize,
     ) -> Result<Vec<ActivitySweepEntry>> {
-        bail!("Feature 3: dsql-side-tables")
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut permit = self.director.acquire(DbClass::Read).await?;
+        let rows = sqlx::query_as::<_, (Uuid, Vec<u8>)>(
+            "SELECT run_key, state_data
+             FROM activity_state
+             WHERE shard_id = $1
+             LIMIT $2",
+        )
+        .bind(Self::shard_id_to_uuid(shard_id))
+        .bind(i64::try_from(limit)?)
+        .fetch_all(permit.connection()?)
+        .await?;
+
+        collect_activity_sweep_entries(rows)
     }
 
+    #[instrument(name = "dsql.list_pending_nexus_operations_for_shard", skip(self), fields(shard_id = shard_id.0, limit))]
     async fn list_pending_nexus_operations_for_shard(
         &self,
-        _shard_id: ShardId,
-        _limit: usize,
+        shard_id: ShardId,
+        limit: usize,
     ) -> Result<Vec<NexusSweepEntry>> {
-        bail!("Feature 3: dsql-side-tables")
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut permit = self.director.acquire(DbClass::Read).await?;
+        let rows = sqlx::query_as::<_, (Uuid, Vec<u8>)>(
+            "SELECT run_key, state_data
+             FROM workflow_hot
+             WHERE shard_id = $1",
+        )
+        .bind(Self::shard_id_to_uuid(shard_id))
+        .fetch_all(permit.connection()?)
+        .await?;
+
+        collect_nexus_sweep_entries(rows, limit)
     }
+}
+
+type ActivityDispatchRow = (
+    Uuid,
+    String,
+    Uuid,
+    String,
+    i16,
+    Option<String>,
+    Option<String>,
+    i64,
+    i32,
+    Vec<u8>,
+);
+
+fn collect_dispatchable_workflow_tasks(
+    rows: Vec<(Uuid, Vec<u8>)>,
+    queue_filter: Option<&QueueKey>,
+    limit: usize,
+) -> Result<Vec<DispatchableWorkflowTask>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let now = OffsetDateTime::now_utc();
+    let mut tasks = Vec::new();
+    for (run_key, state_data) in rows {
+        let state = codec::decode_workflow_state(&state_data)?;
+        if state.status != ExecutionStatus::Running {
+            continue;
+        }
+        let Some(task) = state.pending_workflow_task.as_ref() else {
+            continue;
+        };
+        if task.started_event_id.is_some() {
+            continue;
+        }
+        let queue = QueueKey {
+            namespace_id: state.namespace_id,
+            task_queue: state.task_queue.clone(),
+            task_kind: TaskKind::Workflow,
+            deployment: state.deployment.clone(),
+            build_id: state.build_id.clone(),
+        };
+        if queue_filter.is_some_and(|filter| filter != &queue) {
+            continue;
+        }
+        let (sticky_preferred, sticky_expires_at) = sticky_fields(&state, now);
+        tasks.push(DispatchableWorkflowTask {
+            run_key: RunKey(run_key),
+            queue,
+            logical_seq: task.logical_seq,
+            sticky_preferred,
+            sticky_expires_at,
+        });
+        if tasks.len() == limit {
+            break;
+        }
+    }
+    Ok(tasks)
+}
+
+fn sticky_fields(
+    state: &WorkflowState,
+    now: OffsetDateTime,
+) -> (Option<WorkerIdentity>, Option<OffsetDateTime>) {
+    let Some(sticky) = &state.sticky else {
+        return (None, None);
+    };
+    if sticky.expires_at <= now {
+        return (None, None);
+    }
+    (
+        Some(sticky.worker_identity.clone()),
+        Some(sticky.expires_at),
+    )
+}
+
+fn activity_dispatch_from_row(row: ActivityDispatchRow) -> Result<DispatchableActivityTask> {
+    let (
+        run_key,
+        activity_id,
+        queue_namespace,
+        queue_name,
+        task_kind,
+        deployment,
+        build_id,
+        schedule_event_id,
+        attempt,
+        input_data,
+    ) = row;
+    Ok(DispatchableActivityTask {
+        run_key: RunKey(run_key),
+        queue: QueueKey {
+            namespace_id: NamespaceId(queue_namespace),
+            task_queue: TaskQueueName(queue_name),
+            task_kind: TaskKind::try_from(task_kind)?,
+            deployment: deployment.map(DeploymentId),
+            build_id: build_id.map(BuildId),
+        },
+        activity_id,
+        input: codec::decode_payloads(&input_data)?,
+        schedule_event_id,
+        attempt: u32_from_i32(attempt, "activity_dispatch.attempt")?,
+    })
+}
+
+fn collect_workflow_timeout_entries(
+    rows: Vec<(Uuid, Vec<u8>)>,
+    limit: usize,
+) -> Result<Vec<WorkflowTimeoutSweepEntry>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut entries = Vec::new();
+    for (run_key, state_data) in rows {
+        let state = codec::decode_workflow_state(&state_data)?;
+        if !state.status.is_open()
+            || (state.workflow_execution_timeout.is_none() && state.workflow_run_timeout.is_none())
+        {
+            continue;
+        }
+        entries.push(WorkflowTimeoutSweepEntry {
+            run_key: RunKey(run_key),
+            workflow_execution_timeout: state.workflow_execution_timeout,
+            workflow_run_timeout: state.workflow_run_timeout,
+            started_at: state.started_at,
+            first_run_started_at: state.first_run_started_at,
+            has_retry_policy: state.retry_policy.is_some(),
+        });
+        if entries.len() == limit {
+            break;
+        }
+    }
+    Ok(entries)
+}
+
+fn collect_started_workflow_task_entries(
+    rows: Vec<(Uuid, Vec<u8>)>,
+    limit: usize,
+) -> Result<Vec<WftTimeoutSweepEntry>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut entries = Vec::new();
+    for (run_key, state_data) in rows {
+        let state = codec::decode_workflow_state(&state_data)?;
+        let Some(task) = state.pending_workflow_task else {
+            continue;
+        };
+        let (Some(started_event_id), Some(started_at)) = (task.started_event_id, task.started_at)
+        else {
+            continue;
+        };
+        entries.push(WftTimeoutSweepEntry {
+            run_key: RunKey(run_key),
+            logical_seq: task.logical_seq,
+            started_event_id,
+            started_at,
+            workflow_task_timeout: state.workflow_task_timeout,
+        });
+        if entries.len() == limit {
+            break;
+        }
+    }
+    Ok(entries)
+}
+
+fn collect_activity_sweep_entries(rows: Vec<(Uuid, Vec<u8>)>) -> Result<Vec<ActivitySweepEntry>> {
+    rows.into_iter()
+        .map(|(run_key, state_data)| {
+            let activity = codec::decode_activity_state(&state_data)?;
+            Ok(ActivitySweepEntry {
+                run_key: RunKey(run_key),
+                activity_id: activity.activity_id,
+                schedule_event_id: activity.schedule_event_id,
+                attempt: activity.attempt,
+                original_scheduled_at: activity.scheduled_at,
+                started_at: activity.started_at,
+                schedule_to_close_timeout: activity.schedule_to_close_timeout,
+                schedule_to_start_timeout: activity.schedule_to_start_timeout,
+                start_to_close_timeout: activity.start_to_close_timeout,
+                heartbeat_timeout: activity.heartbeat_timeout,
+            })
+        })
+        .collect()
+}
+
+fn collect_nexus_sweep_entries(
+    rows: Vec<(Uuid, Vec<u8>)>,
+    limit: usize,
+) -> Result<Vec<NexusSweepEntry>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut entries = Vec::new();
+    for (run_key, state_data) in rows {
+        let state = codec::decode_workflow_state(&state_data)?;
+        if !state.status.is_open() {
+            continue;
+        }
+        for operation in state.pending_nexus_operations.values() {
+            let Some(schedule_to_close_timeout) = operation.schedule_to_close_timeout else {
+                continue;
+            };
+            entries.push(NexusSweepEntry {
+                run_key: RunKey(run_key),
+                operation_id: operation.operation_id.clone(),
+                scheduled_event_id: operation.scheduled_event_id,
+                schedule_to_close_timeout,
+                scheduled_at: operation.scheduled_at,
+            });
+            if entries.len() == limit {
+                return Ok(entries);
+            }
+        }
+    }
+    Ok(entries)
 }
 
 async fn write_transition(
@@ -742,6 +1207,10 @@ async fn write_transition(
     transition: &Transition,
     state: &WorkflowState,
 ) -> Result<()> {
+    // The commit path intentionally writes the hot state first, then derives
+    // every side table from the same transition/state pair. History remains the
+    // authority; side tables are rebuildable projections that make dispatch and
+    // sweep queries efficient.
     insert_workflow_hot(tx, run_key, shard_id, state).await?;
     if !transition.history_events.is_empty() {
         insert_history_batch(
@@ -776,7 +1245,18 @@ async fn write_transition(
     for op in &transition.activity_ops {
         match op {
             ActivityOp::Upsert(activity) => {
-                upsert_activity(tx, run_key, shard_id, state.namespace_id, activity).await?
+                upsert_activity(tx, run_key, shard_id, state.namespace_id, activity).await?;
+                // `activity_dispatch` is the durable dispatch source, not
+                // `activity_state`. Started or paused activities must disappear
+                // from dispatch immediately; still-dispatchable upserts only
+                // update an existing row so a paused workflow cannot create a
+                // dispatch row by changing activity options.
+                if activity.started_at.is_some() || activity.pause_info.is_some() {
+                    delete_activity_dispatch(tx, run_key, &activity.activity_id).await?;
+                } else {
+                    update_existing_activity_dispatch(tx, run_key, shard_id, state, activity)
+                        .await?;
+                }
             }
             ActivityOp::Delete { activity_id } => {
                 sqlx::query("DELETE FROM activity_state WHERE run_key = $1 AND activity_id = $2")
@@ -784,8 +1264,39 @@ async fn write_transition(
                     .bind(activity_id)
                     .execute(&mut **tx)
                     .await?;
+                delete_activity_dispatch(tx, run_key, activity_id).await?;
             }
         }
+    }
+    for op in &transition.dispatch_ops {
+        if let DispatchOp::EnqueueActivityTask {
+            queue,
+            activity_id,
+            input,
+            schedule_event_id,
+            attempt,
+            ..
+        } = op
+        {
+            // Enqueue is the only path that creates a dispatch row. Re-enqueue
+            // after retry/reset/unpause is idempotent via ON CONFLICT.
+            upsert_activity_dispatch_from_dispatch_op(
+                tx,
+                run_key,
+                shard_id,
+                queue,
+                activity_id,
+                input,
+                *schedule_event_id,
+                *attempt,
+            )
+            .await?;
+        }
+    }
+    if state.status == ExecutionStatus::Paused {
+        // Workflow pause suppresses all activity dispatch for the run. The
+        // state table still carries activities for later unpause/retry logic.
+        delete_activity_dispatch_for_run(tx, run_key).await?;
     }
     for op in &transition.timer_ops {
         match op {
@@ -800,9 +1311,12 @@ async fn write_transition(
         }
     }
     if transition.expected_seq == TransitionSeq::ZERO && state.status.is_open() {
+        // Only start transitions publish a new current-execution open pointer.
         upsert_current_execution_start(tx, run_key, state).await?;
     } else if !state.status.is_open() {
         let key = DsqlRunRepository::current_execution_key(state.namespace_id, &state.workflow_id);
+        // Closing an older run must not close a successor that has already
+        // replaced this workflow-level pointer, hence the run_key guard.
         sqlx::query(
             "UPDATE current_execution SET is_open = false
              WHERE key = $1 AND run_key = $2",
@@ -824,6 +1338,8 @@ async fn insert_workflow_hot(
     shard_id: ShardId,
     state: &WorkflowState,
 ) -> Result<()> {
+    // `workflow_hot` is a materialized snapshot for recovery and read paths.
+    // It is not the audit trail; history_batch carries the append-only events.
     sqlx::query(
         "INSERT INTO workflow_hot
          (run_key, namespace_id, workflow_id, shard_id, transition_seq, state_data, updated_at)
@@ -881,6 +1397,9 @@ async fn upsert_activity(
     namespace_id: NamespaceId,
     activity: &tokeira_kernel::ActivityState,
 ) -> Result<()> {
+    // Activity state is keyed by schedule_event_id for timer/sweep stability.
+    // The human activity_id is still stored for operator-facing mapping and
+    // secondary delete predicates.
     sqlx::query(
         "INSERT INTO activity_state
          (run_key, schedule_event_id, shard_id, activity_id, queue_namespace, queue_name, attempt, state_data, updated_at)
@@ -903,12 +1422,124 @@ async fn upsert_activity(
     Ok(())
 }
 
+async fn upsert_activity_dispatch_from_dispatch_op(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_key: RunKey,
+    shard_id: ShardId,
+    queue: &QueueKey,
+    activity_id: &str,
+    input: &Payloads,
+    schedule_event_id: i64,
+    attempt: u32,
+) -> Result<()> {
+    let key = DsqlRunRepository::activity_dispatch_key(run_key, activity_id);
+    let deployment = queue.deployment.as_ref().map(|value| value.0.as_str());
+    let build_id = queue.build_id.as_ref().map(|value| value.0.as_str());
+    sqlx::query(
+        "INSERT INTO activity_dispatch
+         (key, run_key, activity_id, shard_id, queue_namespace, queue_name, task_kind,
+          deployment, build_id, schedule_event_id, attempt, input_data, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
+         ON CONFLICT (key) DO UPDATE SET
+             shard_id = EXCLUDED.shard_id,
+             queue_namespace = EXCLUDED.queue_namespace,
+             queue_name = EXCLUDED.queue_name,
+             task_kind = EXCLUDED.task_kind,
+             deployment = EXCLUDED.deployment,
+             build_id = EXCLUDED.build_id,
+             schedule_event_id = EXCLUDED.schedule_event_id,
+             attempt = EXCLUDED.attempt,
+             input_data = EXCLUDED.input_data",
+    )
+    .bind(key)
+    .bind(run_key.0)
+    .bind(activity_id)
+    .bind(DsqlRunRepository::shard_id_to_uuid(shard_id))
+    .bind(queue.namespace_id.0)
+    .bind(&queue.task_queue.0)
+    .bind(queue.task_kind.to_db_smallint())
+    .bind(deployment)
+    .bind(build_id)
+    .bind(schedule_event_id)
+    .bind(i32::try_from(attempt)?)
+    .bind(codec::encode_payloads(input)?)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn update_existing_activity_dispatch(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_key: RunKey,
+    shard_id: ShardId,
+    state: &WorkflowState,
+    activity: &tokeira_kernel::ActivityState,
+) -> Result<()> {
+    let key = DsqlRunRepository::activity_dispatch_key(run_key, &activity.activity_id);
+    // This is deliberately UPDATE-only. If no dispatch row exists, the activity
+    // is not currently dispatchable; an ActivityOp::Upsert must not invent one.
+    let deployment = activity.deployment.as_ref().or(state.deployment.as_ref());
+    let build_id = activity.build_id.as_ref().or(state.build_id.as_ref());
+    sqlx::query(
+        "UPDATE activity_dispatch SET
+             shard_id = $2,
+             queue_namespace = $3,
+             queue_name = $4,
+             task_kind = $5,
+             deployment = $6,
+             build_id = $7,
+             schedule_event_id = $8,
+             attempt = $9,
+             input_data = $10
+         WHERE key = $1",
+    )
+    .bind(key)
+    .bind(DsqlRunRepository::shard_id_to_uuid(shard_id))
+    .bind(state.namespace_id.0)
+    .bind(&activity.task_queue.0)
+    .bind(TaskKind::Activity.to_db_smallint())
+    .bind(deployment.map(|value| value.0.as_str()))
+    .bind(build_id.map(|value| value.0.as_str()))
+    .bind(activity.schedule_event_id)
+    .bind(i32::try_from(activity.attempt)?)
+    .bind(codec::encode_payloads(&activity.input)?)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn delete_activity_dispatch(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_key: RunKey,
+    activity_id: &str,
+) -> Result<()> {
+    let key = DsqlRunRepository::activity_dispatch_key(run_key, activity_id);
+    sqlx::query("DELETE FROM activity_dispatch WHERE key = $1")
+        .bind(key)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn delete_activity_dispatch_for_run(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_key: RunKey,
+) -> Result<()> {
+    sqlx::query("DELETE FROM activity_dispatch WHERE run_key = $1")
+        .bind(run_key.0)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 async fn upsert_timer(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run_key: RunKey,
     shard_id: ShardId,
     timer: &tokeira_kernel::TimerState,
 ) -> Result<()> {
+    // Timer rows are keyed by shard and fire time so sweepers can ask one shard
+    // for due work without scanning all timers.
     sqlx::query(
         "INSERT INTO timer_bucket
          (shard_id, fire_at, run_key, timer_id, timer_data, created_at)
@@ -932,6 +1563,9 @@ async fn upsert_current_execution_start(
     state: &WorkflowState,
 ) -> Result<()> {
     let key = DsqlRunRepository::current_execution_key(state.namespace_id, &state.workflow_id);
+    // This row is a workflow-level pointer, so the primary key is derived from
+    // namespace/workflow_id rather than run_id. Explicit run lookup goes
+    // through `workflow_hot`.
     sqlx::query(
         "INSERT INTO current_execution
          (key, namespace_id, workflow_id, run_key, run_id, is_open, created_at)
@@ -957,6 +1591,8 @@ async fn insert_projection_log(
     state: &WorkflowState,
     ops: &[ProjectionOp],
 ) -> Result<()> {
+    // Projection log rows are grouped per transition. Visibility sinks can
+    // replay the projection stream without rereading workflow state/history.
     let context = ProjectionContext {
         namespace_id: state.namespace_id,
         workflow_id: state.workflow_id.clone(),
@@ -987,6 +1623,8 @@ async fn insert_projection_log(
 }
 
 fn partition_for(run_key: RunKey) -> u32 {
+    // The projection partition is stable because it is derived from the spread
+    // run UUID, not from insertion order.
     (run_key.0.as_u128() as u32) % PROJECTION_PARTITION_COUNT
 }
 
@@ -1016,7 +1654,13 @@ fn u64_from_i64(value: i64, field: &str) -> Result<u64> {
     u64::try_from(value).with_context(|| format!("{field} is negative"))
 }
 
+fn u32_from_i32(value: i32, field: &str) -> Result<u32> {
+    u32::try_from(value).with_context(|| format!("{field} is negative"))
+}
+
 fn should_check_epoch(epoch: ShardEpoch) -> bool {
+    // `ShardEpoch::ZERO` is reserved for tests and unfenced local flows. Real
+    // DSQL commit paths should pass a lease epoch obtained from the controller.
     epoch != ShardEpoch::ZERO
 }
 
@@ -1034,16 +1678,21 @@ mod tests {
     use proptest::prelude::*;
     use time::{Duration, OffsetDateTime};
     use tokeira_kernel::{
-        ActivityState, HistoryEvent, HistoryEventKind, PendingWorkflowTask, ProjectionOp,
-        TimerState, Transition, WorkflowState,
+        ActivityState, HistoryEvent, HistoryEventKind, PendingNexusOperation, PendingWorkflowTask,
+        ProjectionOp, TimerState, Transition, WorkflowState,
     };
     use tokeira_types::{
-        ExecutionRef, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payloads, RequestId,
-        RunId, RunKey, SearchAttributes, TaskKind, TaskQueueName, TransitionSeq, WorkflowId,
-        WorkflowType,
+        BuildId, DeploymentId, ExecutionRef, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId,
+        Payloads, QueueKey, RequestId, RunId, RunKey, SearchAttributes, StickyAffinity, TaskKind,
+        TaskQueueName, TransitionSeq, WorkerIdentity, WorkflowId, WorkflowType,
     };
 
-    use super::{DsqlConnectionAcquirer, DsqlRunRepository, should_check_epoch};
+    use super::{
+        ActivityDispatchRow, DsqlConnectionAcquirer, DsqlRunRepository, activity_dispatch_from_row,
+        collect_activity_sweep_entries, collect_dispatchable_workflow_tasks,
+        collect_nexus_sweep_entries, collect_started_workflow_task_entries,
+        collect_workflow_timeout_entries, should_check_epoch, sticky_fields,
+    };
     use crate::{
         CurrentExecutionConflictPolicy, DbClass, ProjectionContext, RunRepository, dsql::codec,
     };
@@ -1108,6 +1757,10 @@ mod tests {
                     seq,
                 )
             );
+            prop_assert_eq!(
+                DsqlRunRepository::activity_dispatch_key(RunKey(uuid::Uuid::from_u128(seed)), "activity"),
+                DsqlRunRepository::activity_dispatch_key(RunKey(uuid::Uuid::from_u128(seed)), "activity")
+            );
         }
 
         #[test]
@@ -1165,6 +1818,15 @@ mod tests {
         }
 
         #[test]
+        fn activity_dispatch_key_includes_activity_identity(seed in any::<u128>()) {
+            let run_key = RunKey(uuid::Uuid::from_u128(seed));
+            prop_assert_ne!(
+                DsqlRunRepository::activity_dispatch_key(run_key, "activity-a"),
+                DsqlRunRepository::activity_dispatch_key(run_key, "activity-b")
+            );
+        }
+
+        #[test]
         fn codec_round_trips_core_persistence_types(seed in 1u64..1_000_000) {
             let run_key = RunKey(uuid::Uuid::from_u128(seed as u128));
             let workflow_state = sample_state(run_key);
@@ -1201,6 +1863,38 @@ mod tests {
                 codec::decode_projection_ops(&codec::encode_projection_ops(&projection_ops).unwrap()).unwrap(),
                 projection_ops
             );
+        }
+
+        #[test]
+        fn sticky_affinity_expiry_clearing(delta_seconds in -100i64..100i64) {
+            let now = fixed_now();
+            let mut state = sample_state(RunKey::new());
+            state.sticky = Some(StickyAffinity {
+                worker_identity: WorkerIdentity("sticky-worker".to_owned()),
+                expires_at: now + Duration::seconds(delta_seconds),
+            });
+
+            let (worker, expires_at) = sticky_fields(&state, now);
+            if delta_seconds > 0 {
+                prop_assert_eq!(worker, Some(WorkerIdentity("sticky-worker".to_owned())));
+                prop_assert_eq!(expires_at, Some(now + Duration::seconds(delta_seconds)));
+            } else {
+                prop_assert_eq!(worker, None);
+                prop_assert_eq!(expires_at, None);
+            }
+        }
+
+        #[test]
+        fn result_limit_invariant_for_collect_helpers(limit in 0usize..16usize) {
+            let rows = vec![
+                encoded_workflow_row(sample_state(RunKey::new())),
+                encoded_workflow_row(sample_state(RunKey::new())),
+                encoded_workflow_row(sample_state(RunKey::new())),
+            ];
+            prop_assert!(collect_dispatchable_workflow_tasks(rows.clone(), None, limit).unwrap().len() <= limit);
+            prop_assert!(collect_workflow_timeout_entries(rows.clone(), limit).unwrap().len() <= limit);
+            prop_assert!(collect_started_workflow_task_entries(rows.clone(), limit).unwrap().len() <= limit);
+            prop_assert!(collect_nexus_sweep_entries(rows, limit).unwrap().len() <= limit);
         }
     }
 
@@ -1266,6 +1960,208 @@ mod tests {
     fn zero_epoch_bypasses_fence_check() {
         assert!(!should_check_epoch(tokeira_types::ShardEpoch::ZERO));
         assert!(should_check_epoch(tokeira_types::ShardEpoch(1)));
+    }
+
+    #[test]
+    fn sticky_fields_without_affinity_or_expired_affinity_returns_none() {
+        let now = fixed_now();
+        let mut state = sample_state(RunKey::new());
+
+        assert_eq!(sticky_fields(&state, now), (None, None));
+
+        state.sticky = Some(StickyAffinity {
+            worker_identity: WorkerIdentity("worker".to_owned()),
+            expires_at: now,
+        });
+        assert_eq!(sticky_fields(&state, now), (None, None));
+    }
+
+    #[test]
+    fn sticky_fields_with_live_affinity_returns_values() {
+        let now = fixed_now();
+        let mut state = sample_state(RunKey::new());
+        let expires_at = now + Duration::seconds(30);
+        state.sticky = Some(StickyAffinity {
+            worker_identity: WorkerIdentity("worker".to_owned()),
+            expires_at,
+        });
+
+        assert_eq!(
+            sticky_fields(&state, now),
+            (Some(WorkerIdentity("worker".to_owned())), Some(expires_at))
+        );
+    }
+
+    #[test]
+    fn workflow_dispatch_collects_only_scheduled_unstarted_tasks() {
+        let run_key = RunKey::new();
+        let eligible = sample_state(run_key);
+        let mut no_task = sample_state(RunKey::new());
+        no_task.pending_workflow_task = None;
+        let mut started = sample_state(RunKey::new());
+        if let Some(task) = started.pending_workflow_task.as_mut() {
+            task.started_event_id = Some(10);
+        }
+
+        let tasks = collect_dispatchable_workflow_tasks(
+            vec![
+                encoded_workflow_row(no_task),
+                encoded_workflow_row(started),
+                encoded_workflow_row(eligible),
+            ],
+            None,
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].run_key, run_key);
+        assert_eq!(tasks[0].queue.task_kind, TaskKind::Workflow);
+    }
+
+    #[test]
+    fn workflow_timeout_collects_only_open_runs_with_timeouts() {
+        let run_key = RunKey::new();
+        let mut eligible = sample_state(run_key);
+        eligible.workflow_run_timeout = Some(Duration::seconds(60));
+        let mut no_timeout = sample_state(RunKey::new());
+        no_timeout.workflow_run_timeout = None;
+        no_timeout.workflow_execution_timeout = None;
+        let mut closed = sample_state(RunKey::new());
+        closed.status = ExecutionStatus::Completed;
+        closed.workflow_run_timeout = Some(Duration::seconds(60));
+
+        let entries = collect_workflow_timeout_entries(
+            vec![
+                encoded_workflow_row(no_timeout),
+                encoded_workflow_row(closed),
+                encoded_workflow_row(eligible.clone()),
+            ],
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].run_key, run_key);
+        assert_eq!(
+            entries[0].workflow_run_timeout,
+            eligible.workflow_run_timeout
+        );
+    }
+
+    #[test]
+    fn started_wft_collects_only_started_pending_tasks() {
+        let run_key = RunKey::new();
+        let mut started = sample_state(run_key);
+        if let Some(task) = started.pending_workflow_task.as_mut() {
+            task.started_event_id = Some(10);
+            task.started_at = Some(fixed_now());
+        }
+        let scheduled = sample_state(RunKey::new());
+
+        let entries = collect_started_workflow_task_entries(
+            vec![
+                encoded_workflow_row(scheduled),
+                encoded_workflow_row(started.clone()),
+            ],
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].run_key, run_key);
+        assert_eq!(entries[0].started_event_id, 10);
+    }
+
+    #[test]
+    fn nexus_collect_applies_total_limit_across_runs() {
+        let mut first = sample_state(RunKey::new());
+        first
+            .pending_nexus_operations
+            .insert("op-1".to_owned(), sample_nexus_operation("op-1", true));
+        first
+            .pending_nexus_operations
+            .insert("op-2".to_owned(), sample_nexus_operation("op-2", false));
+        let mut second = sample_state(RunKey::new());
+        second
+            .pending_nexus_operations
+            .insert("op-3".to_owned(), sample_nexus_operation("op-3", true));
+
+        let entries = collect_nexus_sweep_entries(
+            vec![encoded_workflow_row(first), encoded_workflow_row(second)],
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].operation_id, "op-1");
+    }
+
+    #[test]
+    fn activity_dispatch_row_preserves_field_fidelity() {
+        let run_key = RunKey::new();
+        let namespace_id = NamespaceId::new();
+        let payloads = Payloads::default();
+        let row: ActivityDispatchRow = (
+            run_key.0,
+            "activity".to_owned(),
+            namespace_id.0,
+            "queue".to_owned(),
+            TaskKind::Activity.to_db_smallint(),
+            Some("deployment".to_owned()),
+            Some("build".to_owned()),
+            42,
+            3,
+            codec::encode_payloads(&payloads).unwrap(),
+        );
+
+        let task = activity_dispatch_from_row(row).unwrap();
+
+        assert_eq!(task.run_key, run_key);
+        assert_eq!(task.activity_id, "activity");
+        assert_eq!(task.input, payloads);
+        assert_eq!(task.schedule_event_id, 42);
+        assert_eq!(task.attempt, 3);
+        assert_eq!(task.queue.namespace_id, namespace_id);
+        assert_eq!(task.queue.task_kind, TaskKind::Activity);
+        assert_eq!(
+            task.queue.deployment,
+            Some(DeploymentId("deployment".to_owned()))
+        );
+        assert_eq!(task.queue.build_id, Some(BuildId("build".to_owned())));
+    }
+
+    #[test]
+    fn activity_sweep_mapping_preserves_state_fields() {
+        let run_key = RunKey::new();
+        let activity = sample_activity_state(7);
+
+        let entries = collect_activity_sweep_entries(vec![(
+            run_key.0,
+            codec::encode_activity_state(&activity).unwrap(),
+        )])
+        .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].run_key, run_key);
+        assert_eq!(entries[0].activity_id, activity.activity_id);
+        assert_eq!(entries[0].schedule_event_id, activity.schedule_event_id);
+        assert_eq!(entries[0].attempt, activity.attempt);
+        assert_eq!(entries[0].original_scheduled_at, activity.scheduled_at);
+        assert_eq!(entries[0].started_at, activity.started_at);
+        assert_eq!(
+            entries[0].schedule_to_close_timeout,
+            activity.schedule_to_close_timeout
+        );
+        assert_eq!(
+            entries[0].schedule_to_start_timeout,
+            activity.schedule_to_start_timeout
+        );
+        assert_eq!(
+            entries[0].start_to_close_timeout,
+            activity.start_to_close_timeout
+        );
+        assert_eq!(entries[0].heartbeat_timeout, activity.heartbeat_timeout);
     }
 
     #[tokio::test]
@@ -1334,6 +2230,82 @@ mod tests {
         assert!(recorder.classes().is_empty());
     }
 
+    #[tokio::test]
+    async fn side_table_queries_zero_limit_do_not_acquire_connection() {
+        let recorder = Arc::new(RecordingAcquirer::default());
+        let repo = test_repo(Arc::clone(&recorder));
+        let queue = QueueKey {
+            namespace_id: NamespaceId::new(),
+            task_queue: TaskQueueName("queue".to_owned()),
+            task_kind: TaskKind::Workflow,
+            deployment: None,
+            build_id: None,
+        };
+        let shard_id = tokeira_types::ShardId(0);
+
+        assert!(
+            repo.list_dispatchable_workflow_tasks(&queue, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repo.list_dispatchable_activity_tasks(&queue, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repo.list_due_timers(fixed_now(), 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repo.list_dispatchable_workflow_tasks_for_shard(shard_id, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repo.list_dispatchable_activity_tasks_for_shard(shard_id, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repo.list_due_timers_for_shard(shard_id, fixed_now(), 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repo.list_runs_with_workflow_timeouts_for_shard(shard_id, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repo.list_started_workflow_tasks_for_shard(shard_id, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repo.list_open_activities_for_shard(shard_id, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repo.list_pending_nexus_operations_for_shard(shard_id, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(recorder.classes().is_empty());
+    }
+
     #[derive(Debug, Default)]
     struct RecordingAcquirer {
         classes: Mutex<Vec<DbClass>>,
@@ -1360,6 +2332,26 @@ mod tests {
 
     fn fixed_now() -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()
+    }
+
+    fn encoded_workflow_row(state: WorkflowState) -> (uuid::Uuid, Vec<u8>) {
+        (
+            state.run_key.0,
+            codec::encode_workflow_state(&state).unwrap(),
+        )
+    }
+
+    fn sample_nexus_operation(operation_id: &str, with_timeout: bool) -> PendingNexusOperation {
+        PendingNexusOperation {
+            operation_id: operation_id.to_owned(),
+            scheduled_event_id: 42,
+            endpoint: "endpoint".to_owned(),
+            service: "service".to_owned(),
+            operation: "operation".to_owned(),
+            schedule_to_close_timeout: with_timeout.then_some(Duration::seconds(30)),
+            scheduled_at: fixed_now(),
+            started: false,
+        }
     }
 
     fn sample_transition(run_key: RunKey) -> Transition {

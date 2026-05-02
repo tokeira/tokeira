@@ -1,3 +1,10 @@
+//! Forward-only DSQL migration discovery, validation, and application.
+//!
+//! Aurora DSQL has schema-change constraints that matter for correctness and
+//! operational safety: secondary indexes must be asynchronous, migrations are
+//! one DDL statement per file, and version gaps must be rejected so every
+//! environment converges through the same ordered schema path.
+
 use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -10,28 +17,38 @@ use super::{MigrationConfig, validation::DdlValidator};
 /// Forward-only schema migration runner for DSQL.
 #[derive(Clone, Debug)]
 pub struct MigrationRunner {
+    /// Source of migration files. The runner is intentionally stateless; the
+    /// authoritative applied state lives in the database `schema_version` table.
     config: MigrationConfig,
 }
 
 /// Summary returned after applying pending migrations.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MigrationReport {
+    /// Number of migration files applied during this invocation.
     pub applied: usize,
 }
 
 /// One migration statement that would be applied.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MigrationPlan {
+    /// Numeric migration version parsed from the filename.
     pub version: u32,
+    /// Snake-case migration name parsed from the filename.
     pub name: String,
+    /// SHA-256 checksum of the SQL file contents.
     pub checksum: String,
+    /// Full SQL statement. DSQL migrations are constrained to exactly one
+    /// statement per file.
     pub sql: String,
 }
 
 /// Current migration state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SchemaStatus {
+    /// Highest applied version known to the target database.
     pub current_version: Option<u32>,
+    /// Wall-clock time at which the status query completed.
     pub checked_at: OffsetDateTime,
 }
 
@@ -49,6 +66,11 @@ impl MigrationRunner {
         Self { config }
     }
 
+    /// Apply every unapplied migration in strict version order.
+    ///
+    /// Each migration statement is executed in its own transaction, then the
+    /// checksum is recorded. If a previously applied migration has different
+    /// contents, application fails before any later migration is attempted.
     pub async fn apply(&self, pool: &PgPool) -> Result<MigrationReport> {
         self.ensure_schema_version(pool).await?;
         let mut applied = 0;
@@ -81,6 +103,10 @@ impl MigrationRunner {
         Ok(MigrationReport { applied })
     }
 
+    /// Return the ordered migration plan without touching the database.
+    ///
+    /// The pool parameter is retained so callers can share command signatures
+    /// between dry-run and apply flows without a separate orchestration branch.
     pub async fn dry_run(&self, _pool: &PgPool) -> Result<Vec<MigrationPlan>> {
         self.discover()?
             .into_iter()
@@ -95,6 +121,10 @@ impl MigrationRunner {
             .collect()
     }
 
+    /// Validate migration files against Tokeira's DSQL-safe subset.
+    ///
+    /// This is intentionally local/static: it catches schema mistakes before a
+    /// migration ever reaches a DSQL cluster.
     pub fn validate(&self) -> Result<Vec<super::ValidationIssue>> {
         let mut issues = Vec::new();
         for migration in self.discover()? {
@@ -114,6 +144,7 @@ impl MigrationRunner {
         Ok(issues)
     }
 
+    /// Read the highest applied schema version from the target database.
     pub async fn status(&self, pool: &PgPool) -> Result<SchemaStatus> {
         let current_version =
             sqlx::query_scalar::<_, Option<i32>>("SELECT max(version) FROM schema_version")
@@ -128,6 +159,7 @@ impl MigrationRunner {
         })
     }
 
+    /// Discover and validate migration filenames, ordering, and contiguity.
     fn discover(&self) -> Result<Vec<MigrationFile>> {
         let mut migrations = Vec::new();
         for entry in fs::read_dir(&self.config.migrations_dir).with_context(|| {
@@ -172,6 +204,10 @@ impl MigrationRunner {
         Ok(migrations)
     }
 
+    /// Bootstrap the migration metadata table.
+    ///
+    /// This statement is intentionally embedded instead of represented as a
+    /// normal migration so a brand-new database can record V001 immediately.
     async fn ensure_schema_version(&self, pool: &PgPool) -> Result<()> {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS schema_version (
@@ -187,6 +223,8 @@ impl MigrationRunner {
         Ok(())
     }
 
+    /// Check whether one migration has already been applied and still matches
+    /// its recorded checksum.
     async fn is_applied(&self, pool: &PgPool, migration: &MigrationFile) -> Result<bool> {
         let row = sqlx::query_as::<_, (String,)>(
             "SELECT checksum FROM schema_version WHERE version = $1",
@@ -208,6 +246,10 @@ fn verify_checksum(version: u32, stored: &str, file: &str) -> Result<bool> {
     bail!("checksum mismatch for migration {version}: stored={stored}, file={file}")
 }
 
+/// Parse `VNNN__snake_case_name.sql`.
+///
+/// The zero-padded format keeps filesystem order readable, while the numeric
+/// version is still parsed as an integer for gap detection.
 pub fn parse_migration_filename(filename: &str) -> Result<(u32, String)> {
     let Some(rest) = filename.strip_prefix('V') else {
         bail!("migration filename must start with V");

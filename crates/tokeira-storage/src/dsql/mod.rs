@@ -1,7 +1,9 @@
 //! Aurora DSQL storage foundation.
 //!
 //! This module contains the schema/migration and connection-management
-//! primitives used by the production DSQL backend.
+//! primitives used by the production DSQL backend. The public entry point is
+//! [`DsqlStore`], which wires a connection director, migration runner, and
+//! DSQL `RunRepository` over the same physical pool/reservoir foundation.
 
 use std::sync::Arc;
 
@@ -25,8 +27,11 @@ pub use validation::*;
 /// Production DSQL storage foundation.
 #[derive(Debug)]
 pub struct DsqlStore {
+    /// Shared connection admission and reservoir controller.
     director: Arc<connection::DsqlConnectionDirector>,
+    /// Forward-only schema migration runner.
     migration_runner: migration::MigrationRunner,
+    /// Semantic run repository backed by DSQL tables.
     run_repository: run_repository::DsqlRunRepository,
 }
 
@@ -60,6 +65,8 @@ impl DsqlStore {
         connector: connection::DsqlConnector,
         config: config::DsqlPoolConfig,
     ) -> anyhow::Result<Self> {
+        // One `Arc<DsqlConnectionDirector>` is shared by all DSQL surfaces so
+        // class budgets and reservoir state remain globally coordinated.
         let director = connection::DsqlConnectionDirector::start(config.clone(), connector).await?;
         let director = Arc::new(director);
         let migration_runner = migration::MigrationRunner::new(config.migration);

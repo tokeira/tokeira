@@ -1,3 +1,10 @@
+//! Static validator for the subset of SQL DDL Tokeira permits on DSQL.
+//!
+//! The validator is deliberately conservative. It is not a SQL parser and does
+//! not try to prove arbitrary statements safe; instead it rejects constructs
+//! known to violate the DSQL schema strategy or Tokeira's hot-key avoidance
+//! rules before migrations are applied.
+
 /// Static DSQL DDL validator.
 #[derive(Clone, Debug, Default)]
 pub struct DdlValidator;
@@ -5,21 +12,34 @@ pub struct DdlValidator;
 /// One validation problem found in a migration file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidationIssue {
+    /// Migration filename or synthetic test filename.
     pub file: String,
+    /// One-based line number for the issue. Whole-file checks use line 1.
     pub line: usize,
+    /// Machine-readable classification used by tests and tooling.
     pub kind: ValidationKind,
+    /// Human-readable explanation suitable for operator/developer output.
     pub message: String,
 }
 
 /// DDL constructs rejected by the schema rules.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValidationKind {
+    /// Monotonic sequence-backed columns create write hot spots.
     BigSerial,
+    /// Business invariants stay in Rust so kernel/storage behavior has one
+    /// authoritative implementation.
     CheckConstraint,
+    /// Temporary tables are avoided so migrations stay deterministic.
     TempTable,
+    /// Triggers/functions are rejected; transition semantics live in Rust.
     PlPgsql,
+    /// Foreign keys are deferred for the MVP schema to avoid cross-table write
+    /// coupling on the hot transition path.
     ForeignKey,
+    /// DSQL secondary indexes must be created asynchronously.
     MissingAsyncKeyword,
+    /// Primary keys must be spread keys, not plain monotonic identifiers.
     MonotonicPrimaryKey,
 }
 
@@ -81,6 +101,9 @@ impl DdlValidator {
                     "foreign keys are out of scope for the MVP schema",
                 ));
             }
+            // DSQL requires asynchronous secondary index creation. Unique
+            // indexes have a different textual prefix, so both forms must be
+            // checked explicitly.
             let creates_index =
                 normalized.contains("create index") || normalized.contains("create unique index");
             let creates_async_index = normalized.contains("create index async")

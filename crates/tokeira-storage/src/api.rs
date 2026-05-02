@@ -380,10 +380,15 @@ pub struct WorkflowTimeoutSweepEntry {
 /// tracking after shard acquisition.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WftTimeoutSweepEntry {
+    /// Durable storage key for the owning run.
     pub run_key: RunKey,
+    /// Logical workflow-task sequence currently in progress.
     pub logical_seq: tokeira_types::LogicalTaskSeq,
+    /// History event ID that recorded worker pickup.
     pub started_event_id: i64,
+    /// Wall-clock time when the workflow task was started.
     pub started_at: time::OffsetDateTime,
+    /// Timeout configured for this workflow task attempt.
     pub workflow_task_timeout: time::Duration,
 }
 
@@ -454,16 +459,27 @@ pub trait ProjectionLog: Send + Sync {
 /// projection ops from a single transition.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProjectionContext {
+    /// Namespace owning the workflow execution.
     pub namespace_id: NamespaceId,
+    /// Workflow identifier visible to operators and SDKs.
     pub workflow_id: WorkflowId,
+    /// Run identifier visible through the Temporal compatibility surface.
     pub run_id: RunId,
+    /// Workflow type used by visibility filters and aggregations.
     pub workflow_type: WorkflowType,
+    /// Primary workflow task queue at the time of the transition.
     pub task_queue: TaskQueueName,
+    /// Execution status after the transition.
     pub execution_status: ExecutionStatus,
+    /// Workflow start timestamp.
     pub start_time: OffsetDateTime,
+    /// Scheduled execution timestamp when distinct from start time.
     pub execution_time: Option<OffsetDateTime>,
+    /// Close timestamp for terminal transitions.
     pub close_time: Option<OffsetDateTime>,
+    /// Durable history length after the transition.
     pub history_length: i64,
+    /// Number of state transitions after this transition.
     pub state_transition_count: i64,
 }
 

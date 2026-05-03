@@ -11,7 +11,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use sqlx::Connection;
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     ActivityOp, BasicKernel, DispatchOp, HistoryEvent, LoadedRun, ProjectionOp, ReplayContext,
     TimerOp, Transition, WorkflowState,
@@ -26,9 +26,9 @@ use uuid::Uuid;
 
 use crate::{
     ActivitySweepEntry, BacklogEntry, CommitResult, CurrentExecutionConflictPolicy, DbClass,
-    DispatchableActivityTask, DispatchableWorkflowTask, DueTimer, NexusSweepEntry,
-    ProjectionContext, RequestRecord, RunRepository, TransitionAuditRecord, WftTimeoutSweepEntry,
-    WorkflowTimeoutSweepEntry,
+    DispatchableActivityTask, DispatchableWorkflowTask, DueTimer, LeaseOutcome, LeaseRepository,
+    NexusSweepEntry, ProjectionContext, RequestRecord, RunRepository, TransitionAuditRecord,
+    WftTimeoutSweepEntry, WorkflowTimeoutSweepEntry,
 };
 
 use super::{DsqlConnectionDirector, DsqlPermit, codec};
@@ -54,6 +54,8 @@ pub struct DsqlRunRepository {
     shard_count: u32,
     /// Workflow-id conflict policy applied during start commits.
     conflict_policy: CurrentExecutionConflictPolicy,
+    /// Duration added to one captured application timestamp for lease expiry.
+    lease_duration: Duration,
 }
 
 #[async_trait]
@@ -74,14 +76,19 @@ impl DsqlRunRepository {
         director: Arc<DsqlConnectionDirector>,
         shard_count: u32,
         conflict_policy: CurrentExecutionConflictPolicy,
+        lease_duration: Duration,
     ) -> Result<Self> {
         if shard_count == 0 {
             bail!("shard_count must be greater than zero");
+        }
+        if lease_duration <= Duration::ZERO {
+            bail!("lease_duration must be positive");
         }
         Ok(Self {
             director: director as Arc<dyn DsqlConnectionAcquirer>,
             shard_count,
             conflict_policy,
+            lease_duration,
         })
     }
 
@@ -90,14 +97,19 @@ impl DsqlRunRepository {
         director: Arc<dyn DsqlConnectionAcquirer>,
         shard_count: u32,
         conflict_policy: CurrentExecutionConflictPolicy,
+        lease_duration: Duration,
     ) -> Result<Self> {
         if shard_count == 0 {
             bail!("shard_count must be greater than zero");
+        }
+        if lease_duration <= Duration::ZERO {
+            bail!("lease_duration must be positive");
         }
         Ok(Self {
             director,
             shard_count,
             conflict_policy,
+            lease_duration,
         })
     }
 
@@ -983,6 +995,192 @@ impl RunRepository for DsqlRunRepository {
     }
 }
 
+#[async_trait]
+impl LeaseRepository for DsqlRunRepository {
+    #[instrument(name = "dsql.try_acquire_bundle", skip(self), fields(shard_id = bundle.0, owner = %owner))]
+    async fn try_acquire_bundle(&self, bundle: ShardId, owner: String) -> Result<LeaseOutcome> {
+        let shard_uuid = Self::shard_id_to_uuid(bundle);
+        let app_now = OffsetDateTime::now_utc();
+        let new_expiry = app_now + self.lease_duration;
+
+        let mut permit = self.director.acquire(DbClass::Control).await?;
+        let mut tx = permit.connection()?.begin().await?;
+
+        let insert_result = sqlx::query(
+            "INSERT INTO shard_lease (shard_id, owner, epoch, lease_expiry)
+             VALUES ($1, $2, 1, $3)
+             ON CONFLICT (shard_id) DO NOTHING",
+        )
+        .bind(shard_uuid)
+        .bind(&owner)
+        .bind(new_expiry)
+        .execute(&mut *tx)
+        .await;
+
+        let insert_rows_affected = match insert_result {
+            Ok(result) => result.rows_affected(),
+            Err(err) if Self::is_serialization_failure(&err) => {
+                tx.rollback().await?;
+                return Err(anyhow!(err))
+                    .context("DSQL serialization conflict during lease acquire");
+            }
+            Err(err) => {
+                tx.rollback().await?;
+                return Err(err).context("failed to insert shard lease");
+            }
+        };
+
+        let mut update_rows_affected = 0;
+        if insert_rows_affected == 0 {
+            let update_result = sqlx::query(
+                "UPDATE shard_lease
+                 SET owner = $2,
+                     epoch = CASE
+                         WHEN owner = $2 AND lease_expiry > $4 THEN epoch
+                         ELSE epoch + 1
+                     END,
+                     lease_expiry = $3
+                 WHERE shard_id = $1
+                   AND (owner = $2 OR lease_expiry <= $4)",
+            )
+            .bind(shard_uuid)
+            .bind(&owner)
+            .bind(new_expiry)
+            .bind(app_now)
+            .execute(&mut *tx)
+            .await;
+
+            update_rows_affected = match update_result {
+                Ok(result) => result.rows_affected(),
+                Err(err) if Self::is_serialization_failure(&err) => {
+                    tx.rollback().await?;
+                    return Err(anyhow!(err))
+                        .context("DSQL serialization conflict during lease acquire");
+                }
+                Err(err) => {
+                    tx.rollback().await?;
+                    return Err(err).context("failed to update shard lease");
+                }
+            };
+        }
+
+        let outcome = if insert_rows_affected == 1 || update_rows_affected == 1 {
+            let (epoch,) =
+                sqlx::query_as::<_, (i64,)>("SELECT epoch FROM shard_lease WHERE shard_id = $1")
+                    .bind(shard_uuid)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .context("failed to read acquired shard lease epoch")?;
+            interpret_acquire(
+                insert_rows_affected,
+                update_rows_affected,
+                Some(epoch),
+                None,
+            )?
+        } else {
+            let row = sqlx::query_as::<_, (String, i64)>(
+                "SELECT owner, epoch FROM shard_lease WHERE shard_id = $1",
+            )
+            .bind(shard_uuid)
+            .fetch_optional(&mut *tx)
+            .await
+            .context("failed to read rejected shard lease holder")?;
+            interpret_acquire(insert_rows_affected, update_rows_affected, None, row)?
+        };
+
+        match outcome {
+            LeaseOutcome::Acquired { .. } => match tx.commit().await {
+                Ok(()) => Ok(outcome),
+                Err(err) if Self::is_serialization_failure(&err) => {
+                    Err(anyhow!(err)).context("DSQL serialization conflict during lease acquire")
+                }
+                Err(err) => Err(err).context("failed to commit shard lease acquire"),
+            },
+            LeaseOutcome::Rejected { .. } => {
+                tx.rollback().await?;
+                Ok(outcome)
+            }
+            LeaseOutcome::Renewed { .. } => {
+                tx.rollback().await?;
+                bail!("acquire interpretation unexpectedly returned renewed outcome");
+            }
+        }
+    }
+
+    #[instrument(name = "dsql.renew_bundle", skip(self), fields(shard_id = bundle.0, owner = %owner, epoch = epoch.0))]
+    async fn renew_bundle(
+        &self,
+        bundle: ShardId,
+        owner: String,
+        epoch: ShardEpoch,
+    ) -> Result<LeaseOutcome> {
+        let caller_epoch = epoch_to_sql(epoch)?;
+        let shard_uuid = Self::shard_id_to_uuid(bundle);
+        let new_expiry = OffsetDateTime::now_utc() + self.lease_duration;
+
+        let mut permit = self.director.acquire(DbClass::Control).await?;
+        let mut tx = permit.connection()?.begin().await?;
+
+        let row = sqlx::query_as::<_, (String, i64)>(
+            "SELECT owner, epoch
+             FROM shard_lease
+             WHERE shard_id = $1
+             FOR UPDATE",
+        )
+        .bind(shard_uuid)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("failed to read shard lease for renewal")?;
+
+        let decision = decide_renew(
+            row.as_ref().map(|(owner, epoch)| (owner.as_str(), *epoch)),
+            &owner,
+            caller_epoch,
+        )?;
+        match decision {
+            RenewDecision::Renew => {
+                let update_result = sqlx::query(
+                    "UPDATE shard_lease
+                     SET lease_expiry = $1
+                     WHERE shard_id = $2",
+                )
+                .bind(new_expiry)
+                .bind(shard_uuid)
+                .execute(&mut *tx)
+                .await;
+
+                match update_result {
+                    Ok(_) => match tx.commit().await {
+                        Ok(()) => Ok(LeaseOutcome::Renewed { epoch }),
+                        Err(err) if Self::is_serialization_failure(&err) => Err(anyhow!(err))
+                            .context("DSQL serialization conflict during lease renewal"),
+                        Err(err) => Err(err).context("failed to commit shard lease renewal"),
+                    },
+                    Err(err) if Self::is_serialization_failure(&err) => {
+                        tx.rollback().await?;
+                        Err(anyhow!(err))
+                            .context("DSQL serialization conflict during lease renewal")
+                    }
+                    Err(err) => {
+                        tx.rollback().await?;
+                        Err(err).context("failed to update shard lease renewal")
+                    }
+                }
+            }
+            RenewDecision::Reject {
+                current_owner,
+                current_epoch,
+            } => {
+                tx.rollback().await?;
+                Ok(LeaseOutcome::Rejected {
+                    current_owner,
+                    current_epoch,
+                })
+            }
+        }
+    }
+}
+
 type ActivityDispatchRow = (
     Uuid,
     String,
@@ -1658,6 +1856,81 @@ fn u32_from_i32(value: i32, field: &str) -> Result<u32> {
     u32::try_from(value).with_context(|| format!("{field} is negative"))
 }
 
+fn epoch_to_sql(epoch: ShardEpoch) -> Result<i64> {
+    i64_from_u64(epoch.0, "shard_lease.epoch")
+}
+
+fn epoch_from_sql(value: i64) -> Result<ShardEpoch> {
+    Ok(ShardEpoch(u64_from_i64(value, "shard_lease.epoch")?))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RenewDecision {
+    Renew,
+    Reject {
+        current_owner: String,
+        current_epoch: ShardEpoch,
+    },
+}
+
+fn interpret_acquire(
+    insert_rows_affected: u64,
+    update_rows_affected: u64,
+    acquired_epoch: Option<i64>,
+    rejected_row: Option<(String, i64)>,
+) -> Result<LeaseOutcome> {
+    match (insert_rows_affected, update_rows_affected) {
+        (1, 0) => {
+            let epoch = acquired_epoch
+                .map(epoch_from_sql)
+                .transpose()?
+                .ok_or_else(|| anyhow!("acquired shard lease epoch was not returned"))?;
+            if epoch != ShardEpoch(1) {
+                bail!("new shard lease returned unexpected epoch {}", epoch.0);
+            }
+            Ok(LeaseOutcome::Acquired { epoch })
+        }
+        (0, 1) => {
+            let epoch = acquired_epoch
+                .map(epoch_from_sql)
+                .transpose()?
+                .ok_or_else(|| anyhow!("updated shard lease epoch was not returned"))?;
+            Ok(LeaseOutcome::Acquired { epoch })
+        }
+        (0, 0) => {
+            let (current_owner, current_epoch) =
+                rejected_row.ok_or_else(|| anyhow!("rejected shard lease holder was not found"))?;
+            Ok(LeaseOutcome::Rejected {
+                current_owner,
+                current_epoch: epoch_from_sql(current_epoch)?,
+            })
+        }
+        _ => bail!(
+            "invalid shard lease acquire row counts: insert={insert_rows_affected}, update={update_rows_affected}"
+        ),
+    }
+}
+
+fn decide_renew(
+    row: Option<(&str, i64)>,
+    caller_owner: &str,
+    caller_epoch: i64,
+) -> Result<RenewDecision> {
+    let Some((current_owner, current_epoch)) = row else {
+        return Ok(RenewDecision::Reject {
+            current_owner: String::new(),
+            current_epoch: ShardEpoch::ZERO,
+        });
+    };
+    if current_owner == caller_owner && current_epoch == caller_epoch {
+        return Ok(RenewDecision::Renew);
+    }
+    Ok(RenewDecision::Reject {
+        current_owner: current_owner.to_owned(),
+        current_epoch: epoch_from_sql(current_epoch)?,
+    })
+}
+
 fn should_check_epoch(epoch: ShardEpoch) -> bool {
     // `ShardEpoch::ZERO` is reserved for tests and unfenced local flows. Real
     // DSQL commit paths should pass a lease epoch obtained from the controller.
@@ -1683,18 +1956,20 @@ mod tests {
     };
     use tokeira_types::{
         BuildId, DeploymentId, ExecutionRef, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId,
-        Payloads, QueueKey, RequestId, RunId, RunKey, SearchAttributes, StickyAffinity, TaskKind,
-        TaskQueueName, TransitionSeq, WorkerIdentity, WorkflowId, WorkflowType,
+        Payloads, QueueKey, RequestId, RunId, RunKey, SearchAttributes, ShardEpoch, StickyAffinity,
+        TaskKind, TaskQueueName, TransitionSeq, WorkerIdentity, WorkflowId, WorkflowType,
     };
 
     use super::{
-        ActivityDispatchRow, DsqlConnectionAcquirer, DsqlRunRepository, activity_dispatch_from_row,
-        collect_activity_sweep_entries, collect_dispatchable_workflow_tasks,
-        collect_nexus_sweep_entries, collect_started_workflow_task_entries,
-        collect_workflow_timeout_entries, should_check_epoch, sticky_fields,
+        ActivityDispatchRow, DsqlConnectionAcquirer, DsqlRunRepository, RenewDecision,
+        activity_dispatch_from_row, collect_activity_sweep_entries,
+        collect_dispatchable_workflow_tasks, collect_nexus_sweep_entries,
+        collect_started_workflow_task_entries, collect_workflow_timeout_entries, decide_renew,
+        epoch_from_sql, epoch_to_sql, interpret_acquire, should_check_epoch, sticky_fields,
     };
     use crate::{
-        CurrentExecutionConflictPolicy, DbClass, ProjectionContext, RunRepository, dsql::codec,
+        CurrentExecutionConflictPolicy, DbClass, LeaseOutcome, LeaseRepository, ProjectionContext,
+        RunRepository, dsql::codec,
     };
 
     proptest! {
@@ -1896,6 +2171,72 @@ mod tests {
             prop_assert!(collect_started_workflow_task_entries(rows.clone(), limit).unwrap().len() <= limit);
             prop_assert!(collect_nexus_sweep_entries(rows, limit).unwrap().len() <= limit);
         }
+
+        #[test]
+        fn shard_epoch_round_trip(value in 1u64..=i64::MAX as u64) {
+            let epoch = ShardEpoch(value);
+
+            prop_assert_eq!(epoch_from_sql(epoch_to_sql(epoch).unwrap()).unwrap(), epoch);
+        }
+
+        #[test]
+        fn acquire_interpretation_accepts_valid_outcomes(epoch in 1i64..i64::MAX) {
+            prop_assert_eq!(
+                interpret_acquire(1, 0, Some(1), None).unwrap(),
+                LeaseOutcome::Acquired { epoch: ShardEpoch(1) }
+            );
+            prop_assert_eq!(
+                interpret_acquire(0, 1, Some(epoch), None).unwrap(),
+                LeaseOutcome::Acquired { epoch: ShardEpoch(epoch as u64) }
+            );
+            prop_assert_eq!(
+                interpret_acquire(0, 0, None, Some(("owner".to_owned(), epoch))).unwrap(),
+                LeaseOutcome::Rejected {
+                    current_owner: "owner".to_owned(),
+                    current_epoch: ShardEpoch(epoch as u64),
+                }
+            );
+        }
+
+        #[test]
+        fn active_lease_rejection_preserves_owner_and_epoch(owner in "\\PC{1,64}", epoch in 1i64..i64::MAX) {
+            let outcome = interpret_acquire(0, 0, None, Some((owner.clone(), epoch))).unwrap();
+
+            prop_assert_eq!(
+                outcome,
+                LeaseOutcome::Rejected {
+                    current_owner: owner,
+                    current_epoch: ShardEpoch(epoch as u64),
+                }
+            );
+        }
+
+        #[test]
+        fn renew_decision_requires_owner_and_epoch_match(
+            current_owner in "\\PC{1,64}",
+            caller_owner in "\\PC{1,64}",
+            current_epoch in 1i64..i64::MAX,
+            caller_epoch in 1i64..i64::MAX,
+        ) {
+            let decision = decide_renew(
+                Some((current_owner.as_str(), current_epoch)),
+                caller_owner.as_str(),
+                caller_epoch,
+            )
+            .unwrap();
+
+            if current_owner == caller_owner && current_epoch == caller_epoch {
+                prop_assert_eq!(decision, RenewDecision::Renew);
+            } else {
+                prop_assert_eq!(
+                    decision,
+                    RenewDecision::Reject {
+                        current_owner,
+                        current_epoch: ShardEpoch(current_epoch as u64),
+                    }
+                );
+            }
+        }
     }
 
     #[test]
@@ -1931,8 +2272,51 @@ mod tests {
                 recorder,
                 0,
                 CurrentExecutionConflictPolicy::Reject,
+                Duration::seconds(30),
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn constructor_rejects_non_positive_lease_duration() {
+        let recorder = Arc::new(RecordingAcquirer::default());
+        assert!(
+            DsqlRunRepository::new_with_acquirer(
+                recorder,
+                4,
+                CurrentExecutionConflictPolicy::Reject,
+                Duration::ZERO,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn epoch_conversion_rejects_out_of_range_values() {
+        assert!(epoch_to_sql(ShardEpoch(i64::MAX as u64 + 1)).is_err());
+        assert!(epoch_from_sql(-1).is_err());
+    }
+
+    #[test]
+    fn acquire_interpretation_rejects_invalid_sql_outcomes() {
+        assert!(interpret_acquire(1, 1, Some(1), None).is_err());
+        assert!(interpret_acquire(0, 0, None, None).is_err());
+        assert!(interpret_acquire(1, 0, None, None).is_err());
+        assert!(interpret_acquire(0, 1, None, None).is_err());
+        assert!(interpret_acquire(1, 0, Some(2), None).is_err());
+        assert!(interpret_acquire(0, 1, Some(-1), None).is_err());
+        assert!(interpret_acquire(0, 0, None, Some(("owner".to_owned(), -1))).is_err());
+    }
+
+    #[test]
+    fn absent_lease_renewal_is_rejected() {
+        assert_eq!(
+            decide_renew(None, "owner", 1).unwrap(),
+            RenewDecision::Reject {
+                current_owner: String::new(),
+                current_epoch: ShardEpoch::ZERO,
+            }
         );
     }
 
@@ -2220,6 +2604,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lease_operations_request_control_class() {
+        let recorder = Arc::new(RecordingAcquirer::default());
+        let repo = test_repo(Arc::clone(&recorder));
+
+        let _ = repo
+            .try_acquire_bundle(tokeira_types::ShardId(1), "owner".to_owned())
+            .await;
+        let _ = repo
+            .renew_bundle(tokeira_types::ShardId(1), "owner".to_owned(), ShardEpoch(1))
+            .await;
+
+        assert_eq!(recorder.classes(), vec![DbClass::Control, DbClass::Control]);
+    }
+
+    #[tokio::test]
     async fn read_history_zero_limit_does_not_acquire_connection() {
         let recorder = Arc::new(RecordingAcquirer::default());
         let repo = test_repo(Arc::clone(&recorder));
@@ -2326,8 +2725,13 @@ mod tests {
     }
 
     fn test_repo(recorder: Arc<RecordingAcquirer>) -> DsqlRunRepository {
-        DsqlRunRepository::new_with_acquirer(recorder, 4, CurrentExecutionConflictPolicy::Reject)
-            .unwrap()
+        DsqlRunRepository::new_with_acquirer(
+            recorder,
+            4,
+            CurrentExecutionConflictPolicy::Reject,
+            Duration::seconds(30),
+        )
+        .unwrap()
     }
 
     fn fixed_now() -> OffsetDateTime {

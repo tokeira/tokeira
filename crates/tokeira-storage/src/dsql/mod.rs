@@ -74,6 +74,7 @@ impl DsqlStore {
             Arc::clone(&director),
             config.shard_count,
             config.conflict_policy,
+            config.lease_duration,
         )?;
         Ok(Self {
             director,

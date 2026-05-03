@@ -38,6 +38,7 @@ dsql-integration = ["dsql"]
 [dev-dependencies]
 metrics-util.workspace = true
 proptest = "1"
+toml.workspace = true
 tokeira-types = { path = "../tokeira-types", features = ["test-support"] }
 tracing-subscriber.workspace = true
 uuid.workspace = true

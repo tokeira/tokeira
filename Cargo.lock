@@ -4839,6 +4839,7 @@ dependencies = [
  "tokeira-kernel",
  "tokeira-types",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "uuid",

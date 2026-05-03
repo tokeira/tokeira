@@ -57,6 +57,10 @@ fn default_shard_count() -> u32 {
     64
 }
 
+fn default_lease_duration() -> Duration {
+    Duration::seconds(30)
+}
+
 fn default_migrations_dir() -> PathBuf {
     PathBuf::from("crates/tokeira-storage/migrations")
 }
@@ -271,6 +275,9 @@ pub struct DsqlPoolConfig {
     /// Workflow-id conflict behavior used by repository start commits.
     #[serde(default)]
     pub conflict_policy: CurrentExecutionConflictPolicy,
+    /// Duration added to the repository's application clock for shard leases.
+    #[serde(default = "default_lease_duration")]
+    pub lease_duration: Duration,
 }
 
 impl Default for DsqlPoolConfig {
@@ -282,6 +289,7 @@ impl Default for DsqlPoolConfig {
             burst_capacity: default_burst_capacity(),
             shard_count: default_shard_count(),
             conflict_policy: CurrentExecutionConflictPolicy::default(),
+            lease_duration: default_lease_duration(),
         }
     }
 }
@@ -300,6 +308,9 @@ impl DsqlPoolConfig {
         if self.shard_count == 0 {
             bail!("shard_count must be greater than zero");
         }
+        if self.lease_duration <= Duration::ZERO {
+            bail!("lease_duration must be positive");
+        }
         Ok(())
     }
 }
@@ -313,6 +324,34 @@ mod tests {
     #[test]
     fn defaults_validate() {
         DsqlPoolConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn validates_lease_duration() {
+        let mut config = DsqlPoolConfig {
+            lease_duration: Duration::ZERO,
+            ..DsqlPoolConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        config.lease_duration = Duration::seconds(-1);
+        assert!(config.validate().is_err());
+
+        config.lease_duration = Duration::seconds(1);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn serde_round_trip_preserves_lease_duration() {
+        let config = DsqlPoolConfig {
+            lease_duration: Duration::seconds(17),
+            ..DsqlPoolConfig::default()
+        };
+
+        let encoded = toml::to_string(&config).unwrap();
+        let decoded: DsqlPoolConfig = toml::from_str(&encoded).unwrap();
+
+        assert_eq!(decoded.lease_duration, Duration::seconds(17));
     }
 
     #[test]

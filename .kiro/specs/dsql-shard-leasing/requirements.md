@@ -162,6 +162,6 @@ The `shard_lease` table was created by Feature 1 (`dsql-schema-connection`). The
 
 #### Acceptance Criteria
 
-1. WHEN `try_acquire_bundle` acquires a lease, THE DsqlLeaseRepository SHALL use `INSERT ... ON CONFLICT (shard_id) DO NOTHING` followed by a conditional `UPDATE ... WHERE shard_id = $1 AND (owner = $2 OR lease_expiry <= $4)` in the same transaction. The UPDATE uses `CASE WHEN owner = $2 AND lease_expiry > $4 THEN epoch ELSE epoch + 1 END` to preserve the epoch for active same-owner re-acquire and increment it for all other successful paths. This two-statement approach eliminates the no-row race and is validated against live DSQL.
+1. WHEN `try_acquire_bundle` acquires a lease, THE DsqlLeaseRepository SHALL use `INSERT ... ON CONFLICT (shard_id) DO NOTHING` for the new-lease path and SHALL run the conditional `UPDATE ... WHERE shard_id = $1 AND (owner = $2 OR lease_expiry <= $4)` only when the insert affects zero rows. The UPDATE uses `CASE WHEN owner = $2 AND lease_expiry > $4 THEN epoch ELSE epoch + 1 END` to preserve the epoch for active same-owner re-acquire and increment it for all takeover paths. This two-statement transactional approach eliminates the no-row race and is validated against live DSQL.
 2. WHEN `renew_bundle` reads the `shard_lease` row, THE DsqlLeaseRepository SHALL use `SELECT ... FOR UPDATE` with an equality predicate on the `shard_id` primary key to lock the row within the transaction.
 3. THE lease read and subsequent write SHALL occur within the same DSQL transaction to prevent TOCTOU races.

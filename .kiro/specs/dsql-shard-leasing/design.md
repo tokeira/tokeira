@@ -4,7 +4,7 @@
 
 This design covers the `LeaseRepository` implementation for `DsqlRunRepository`, providing `try_acquire_bundle` and `renew_bundle` against the existing `shard_lease` table. This is Feature 4 from the umbrella `dsql-storage-implementation` spec.
 
-The central design principle is **one lease operation = one fenced DSQL transaction**. Both methods acquire a `DbClass::Control` permit and open a transaction. `try_acquire_bundle` uses an atomic `INSERT ... ON CONFLICT DO UPDATE ... WHERE` to handle new-lease, takeover, and rejection in a single statement. `renew_bundle` uses `SELECT ... FOR UPDATE` followed by a conditional `UPDATE`. DSQL's OCC detects concurrent mutations at commit time — conflicts surface as errors without silent retry.
+The central design principle is **one lease operation = one fenced DSQL transaction**. Both methods acquire a `DbClass::Control` permit and open a transaction. `try_acquire_bundle` first attempts `INSERT ... ON CONFLICT DO NOTHING`; if the insert is a no-op because the row already exists, it then executes a conditional `UPDATE` to handle active same-owner refresh, expired takeover, or rejection. `renew_bundle` uses `SELECT ... FOR UPDATE` followed by a conditional `UPDATE`. DSQL's OCC detects concurrent mutations at commit time — conflicts surface as errors without silent retry.
 
 The in-memory `LeaseRepository` in `memory.rs` is the behavioral reference for basic semantics, but the DSQL implementation adds two capabilities the in-memory store omits:
 
@@ -179,10 +179,10 @@ impl LeaseRepository for DsqlRunRepository {
 
 ### `try_acquire_bundle` SQL
 
-The method uses a single atomic `INSERT ... ON CONFLICT` statement within a transaction, eliminating the race condition where two first-time acquirers both observe no row and race on INSERT:
+The method uses a two-statement transactional acquire path. It first attempts `INSERT ... ON CONFLICT DO NOTHING` for the new-lease path. If that insert affects zero rows, the row already exists, so the method executes a conditional `UPDATE` for active same-owner refresh, expired takeover, or rejection. This eliminates the race condition where two first-time acquirers both observe no row and race on a plain INSERT, while keeping the rows-affected contract unambiguous.
 
 ```sql
--- Atomic acquire: insert new lease or update existing.
+-- Transactional acquire: insert new lease or update existing.
 -- Uses two SQL statements in one transaction to handle the three cases:
 --
 -- 1. No row exists → INSERT succeeds, epoch = 1
@@ -198,7 +198,7 @@ INSERT INTO shard_lease (shard_id, owner, epoch, lease_expiry)
 VALUES ($1, $2, 1, $3)
 ON CONFLICT (shard_id) DO NOTHING
 
--- Step 2: If insert was a no-op (row exists), attempt conditional update
+-- Step 2: Only if insert affected 0 rows, attempt conditional update.
 -- Active same owner: refresh expiry, keep epoch (idempotent)
 -- Expired same owner: takeover with epoch + 1
 -- Expired different owner: takeover with new owner, epoch + 1
@@ -214,10 +214,10 @@ WHERE shard_id = $1
   AND (owner = $2 OR lease_expiry <= $4)
 ```
 
-After executing both statements, the application reads the result:
-- If the INSERT affected 1 row: new lease acquired at epoch 1.
-- If the UPDATE affected 1 row: either same-owner refresh (epoch unchanged) or expired takeover (epoch incremented). Read the authoritative epoch with `SELECT epoch FROM shard_lease WHERE shard_id = $1`.
-- If neither affected any rows: active lease held by a different owner. Read the current holder with `SELECT owner, epoch FROM shard_lease WHERE shard_id = $1` and return `Rejected`.
+After executing the necessary statement(s), the application reads the result:
+- If the INSERT affected 1 row: new lease acquired at epoch 1. Do not run the UPDATE, because the newly inserted row would also match the active same-owner predicate.
+- If the INSERT affected 0 rows and the UPDATE affected 1 row: either same-owner refresh (epoch unchanged) or expired takeover (epoch incremented). Read the authoritative epoch with `SELECT epoch FROM shard_lease WHERE shard_id = $1`.
+- If both INSERT and UPDATE affected 0 rows: active lease held by a different owner. Read the current holder with `SELECT owner, epoch FROM shard_lease WHERE shard_id = $1` and return `Rejected`.
 
 Both `$3` (new expiry = `app_now + lease_duration`) and `$4` (comparison = `app_now`) use the same application `OffsetDateTime::now_utc()` captured once at the start of the method. No SQL `now()` is used.
 
@@ -351,7 +351,8 @@ The `shard_lease` row for a given `shard_id` follows this state machine:
 stateDiagram-v2
     [*] --> Unleased: no row exists
     Unleased --> Leased: try_acquire_bundle (INSERT)
-    Leased --> Leased: try_acquire_bundle by same owner (UPDATE, epoch+1)
+    Leased --> Leased: try_acquire_bundle by same owner when active (UPDATE, epoch unchanged)
+    Leased --> Leased: try_acquire_bundle by same owner when expired (UPDATE, epoch+1)
     Leased --> Leased: try_acquire_bundle by different owner when expired (UPDATE, epoch+1)
     Leased --> Leased: renew_bundle by matching owner+epoch (UPDATE expiry)
     Leased --> Rejected: try_acquire_bundle by different owner when active

@@ -18,20 +18,25 @@ The implementation is organized into 6 features with explicit dependency orderin
 
 **Dependency graph:**
 
-- Feature 1 (Schema and Connection Foundation) — no dependencies
-- Feature 2 (Core Persistence — RunRepository on DSQL) — depends on Feature 1
-- Feature 3 (Side Tables — Activity, Timer, Nexus State) — depends on Feature 2
-- Feature 4 (Shard Lease Management) — depends on Feature 1
-- Feature 5 (Dispatch Backlog Persistence) — depends on Feature 2
-- Feature 6 (Projection Persistence) — depends on Feature 1, independent of Features 2–5
+- Feature 1 (Schema and Connection Foundation) — no dependencies — ✅ Complete
+- Feature 2 (Core Persistence — RunRepository on DSQL) — depends on Feature 1 — ✅ Complete
+- `dsql-spread-keys` (cross-cutting) — depends on Features 1, 2 — ✅ Complete (absorbed Feature 5)
+- Feature 3 (Side Tables — Activity, Timer, Nexus State) — depends on Feature 2, `dsql-spread-keys` — ✅ Complete
+- Feature 4 (Shard Lease Management) — depends on Feature 1 — ✅ Complete
+- Feature 5 (Dispatch Backlog Persistence) — ✅ Absorbed into `dsql-spread-keys`
+- Feature 6 (Projection Persistence) — depends on Feature 1, independent of Features 2–5 — Not started
 
 The actual design and tasks for each feature will live in child specs:
-- `dsql-schema-connection` (Feature 1)
-- `dsql-core-persistence` (Feature 2)
-- `dsql-side-tables` (Feature 3)
-- `dsql-shard-leasing` (Feature 4)
-- `dsql-dispatch-backlog` (Feature 5)
-- `dsql-projection-persistence` (Feature 6)
+- `dsql-schema-connection` (Feature 1) — ✅ Complete
+- `dsql-core-persistence` (Feature 2) — ✅ Complete
+- `dsql-side-tables` (Feature 3) — ✅ Complete (includes `activity_dispatch` table and write-path integration)
+- `dsql-shard-leasing` (Feature 4) — ✅ Complete
+- `dsql-dispatch-backlog` (Feature 5) — ✅ Absorbed into `dsql-spread-keys` (schema revision with spread UUID PK, full QueueKey columns, `IS NOT DISTINCT FROM` drain predicate)
+- `dsql-projection-persistence` (Feature 6) — Not started
+
+Additionally, two cross-cutting specs were created during implementation:
+- `dsql-spread-keys` — Hash-derived UUIDv8 primary keys (BLAKE3), `RunKey::derive`, schema revisions for `current_execution`/`request_dedupe`/`dispatch_backlog`, `TaskKind` stable numeric mapping. Also absorbed Feature 5 (`persist_to_backlog`, `drain_backlog`).
+- `dsql-core-persistence` code review findings — `shard_id_to_uuid` sparse UUID fix, tracing instrumentation, `run_id` as UUID, TransitionSeq pre-validation, `AllowAfterClose` documentation, `partition_for` constant extraction.
 
 ## Audit Gap Traceability
 
@@ -50,17 +55,17 @@ The table below maps every `RunRepository`, `ProjectionLog`, `LeaseRepository`, 
 | `read_transition_audit` | Feature 2 | Debug/test audit log (may be test-only) |
 | `materialize_reset_successor` | Feature 2 | Reset fork materialization |
 | `list_dispatchable_workflow_tasks` | Feature 3 | Queue-filtered query on `workflow_hot` |
-| `list_dispatchable_activity_tasks` | Feature 3 | Queue-filtered query on `activity_state` |
-| `list_due_timers` | Feature 3 | Time-filtered query on `timer_bucket` |
+| `list_dispatchable_activity_tasks` | Feature 3 | Queue-filtered query on `activity_dispatch` table (not `activity_state`) |
+| `list_due_timers` | Feature 3 | Shard fanout — iterates all shards, calls shard-filtered path |
 | `list_dispatchable_workflow_tasks_for_shard` | Feature 3 | Shard-filtered sweep |
-| `list_dispatchable_activity_tasks_for_shard` | Feature 3 | Shard-filtered sweep |
+| `list_dispatchable_activity_tasks_for_shard` | Feature 3 | Shard-filtered query on `activity_dispatch` table |
 | `list_due_timers_for_shard` | Feature 3 | Shard-filtered sweep |
 | `list_runs_with_workflow_timeouts_for_shard` | Feature 3 | Shard-filtered sweep |
 | `list_started_workflow_tasks_for_shard` | Feature 3 | Shard-filtered sweep |
 | `list_open_activities_for_shard` | Feature 3 | Shard-filtered sweep |
 | `list_pending_nexus_operations_for_shard` | Feature 3 | Shard-filtered sweep |
-| `persist_to_backlog` | Feature 5 | Backlog insert |
-| `drain_backlog` | Feature 5 | Backlog drain (FIFO) |
+| `persist_to_backlog` | ~~Feature 5~~ `dsql-spread-keys` | Backlog insert (implemented with spread UUID PK and full QueueKey columns) |
+| `drain_backlog` | ~~Feature 5~~ `dsql-spread-keys` | Backlog drain (FIFO, `IS NOT DISTINCT FROM` for versioned queues) |
 
 ### Other Trait Methods
 
@@ -200,11 +205,12 @@ All schema designs SHALL be validated using the Kiro DSQL Power for compatibilit
 
 #### Acceptance Criteria
 
-1. THE DsqlStore SHALL use UUID-typed primary keys for `workflow_hot`, `current_execution`, and `request_dedupe`.
-2. THE DsqlStore SHALL use composite keys `(run_key, first_event_id)` for `history_batch` to cluster events by run.
-3. THE DsqlStore SHALL use composite keys `(run_key, schedule_event_id)` for `activity_state` to cluster by run.
-4. THE DsqlStore SHALL use composite keys `(shard_id, fire_at, run_key, timer_id)` for `timer_bucket` to enable efficient shard-filtered time-range scans.
-5. THE DsqlStore SHALL prepend a hash-based `partition_id` to `dispatch_backlog` and `projection_log` primary keys to distribute append traffic.
+1. THE DsqlStore SHALL use spread UUID primary keys (hash-derived UUIDv8 via `dsql_spread_uuid`) for `current_execution` and `request_dedupe` to eliminate namespace-leading hot-key concentration.
+2. THE DsqlStore SHALL use `RunKey::derive(namespace_id, workflow_id, run_id)` for `workflow_hot`, producing hash-derived UUIDv8 keys that distribute uniformly.
+3. THE DsqlStore SHALL use composite keys `(run_key, first_event_id)` for `history_batch` to cluster events by run.
+4. THE DsqlStore SHALL use composite keys `(run_key, schedule_event_id)` for `activity_state` to cluster by run.
+5. THE DsqlStore SHALL use composite keys `(shard_id, fire_at, run_key, timer_id)` for `timer_bucket` to enable efficient shard-filtered time-range scans. `shard_id` is a spread UUID derived from `ShardId(u32)`.
+6. THE DsqlStore SHALL use spread UUID primary keys for `dispatch_backlog` and `activity_dispatch` with full queue identity columns.
 
 ---
 

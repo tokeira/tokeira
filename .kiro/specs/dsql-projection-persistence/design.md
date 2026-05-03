@@ -8,17 +8,17 @@ The central design principle is **projection reads and writes are lower-priority
 
 ### Key Design Decisions
 
-1. **`DsqlProjectionLog` in a new file `dsql/projection_log.rs`.** The `ProjectionLog` trait implementation and checkpoint methods are logically distinct from `DsqlRunRepository`. A separate struct avoids growing the already-large `run_repository.rs` and makes the projection read path independently testable. The struct holds an `Arc<dyn DsqlConnectionAcquirer>` (same test seam as `DsqlRunRepository`).
+1. **`DsqlProjectionLog` in a new file `dsql/projection_log.rs`.** The `ProjectionLog` trait implementation is logically distinct from `DsqlRunRepository`. A separate struct avoids growing the already-large `run_repository.rs` and makes the projection read path independently testable. The struct holds an `Arc<dyn DsqlConnectionAcquirer>` (same storage-crate test seam as `DsqlRunRepository`).
 
-2. **`DsqlVisibilitySink` in a new file `dsql/visibility_sink.rs`.** The visibility sink is a standalone struct per Requirement 7. It accepts a `DsqlConnectionDirector` reference and processes `ProjectionRecord` batches. It is not part of `DsqlProjectionLog` because the sink writes to `vis_execution` while the log reads from `projection_log` — different tables, different concerns.
+2. **`DsqlVisibilityStore` implements `VisibilityStore` and `ProjectionSink` from `tokeira-projection`.** The live `ProjectionWorker` accepts sinks implementing `ProjectionSink + VisibilityStore`. The `VisibilityStore` trait (in `tokeira-projection/src/store.rs`) defines `load_checkpoint`, `save_checkpoint`, and the visibility query surface. The DSQL store implements both traits directly so it can be used by the worker without wrapping it in the generic `VisibilitySink<S>` helper. The store struct lives in `tokeira-projection` (not `tokeira-storage`) to avoid a dependency cycle — `tokeira-projection` already depends on `tokeira-storage`, so the DSQL store in `tokeira-projection` can import `DsqlConnectionDirector` from `tokeira-storage`.
 
 3. **Cursor-based pagination using row-value comparison.** The `read_from` query uses `WHERE (run_key, transition_seq) > ($3, $4)` for cursor advancement. This leverages the composite primary key `(partition_id, fanout, run_key, transition_seq)` and avoids DSQL's prohibition on temp tables. The beginning-of-partition case (no `last_run_key`) uses a simpler query without the cursor predicate.
 
-4. **Checkpoint upsert via `INSERT ... ON CONFLICT ... DO UPDATE`.** The `projector_checkpoint` table has a composite PK `(sink_id, partition_id, fanout)`. The upsert atomically inserts or updates the `last_applied_cursor` and `updated_at` columns. This is a single statement — no transaction needed.
+4. **Checkpoint upsert via `INSERT ... ON CONFLICT ... DO UPDATE`.** The `projector_checkpoint` table has a composite PK `(sink_id, partition_id, fanout)`. The current `VisibilityStore::load_checkpoint` signature only receives `sink_id`, so callers must use a sink ID that is unique per `(partition_id, fanout)` substream, such as `visibility-p0-f1`. Writes still persist the cursor's partition and fanout for future multi-substream APIs.
 
 5. **`ExecutionStatus` stable numeric mapping in `tokeira-types`.** Following the `TaskKind::to_db_smallint` / `TryFrom<i16>` pattern exactly. The mapping is: `Running=0, Paused=1, Completed=2, Failed=3, Cancelled=4, Terminated=5, ContinuedAsNew=6, TimedOut=7`. A stability test asserts the exact values to prevent accidental reordering.
 
-6. **`vis_execution.run_id` updated from `TEXT` to `UUID` in-place.** The `run_id` column in `vis_execution` is currently `TEXT` but `RunId` is a UUID newtype. The visibility sink binds `run_id.0` (a `Uuid`) directly. A migration `V013__vis_execution_run_id_uuid.sql` alters the column type from `TEXT` to `UUID` using `ALTER COLUMN run_id TYPE UUID USING run_id::uuid`. This is safe because no rows exist yet (the table was created by Feature 1 but no sink has written to it).
+6. **`vis_execution.run_id` updated from `TEXT` to `UUID` in-place.** The `run_id` column in `vis_execution` is currently `TEXT` but `RunId` is a UUID newtype. The visibility sink binds `run_id.0` (a `Uuid`) directly. The `V012__vis_execution.sql` DDL is updated in-place to use `UUID` since Tokeira targets schema version 1 — no separate migration needed.
 
 7. **Memo merge semantics.** When `UpsertExecution` carries a non-empty `memo_patch`, the sink merges the patch into the stored memo by reading the existing BYTEA, deserializing, applying the patch keys, re-serializing, and writing back. An empty `memo_patch` skips the memo column entirely (SQL `COALESCE` or conditional SET).
 
@@ -32,11 +32,10 @@ tokeira-storage/
 │   ├── api.rs                    # ProjectionLog trait (unchanged)
 │   ├── memory.rs                 # InMemoryStore (behavioral reference)
 │   ├── dsql/
-│   │   ├── mod.rs                # DsqlStore + NEW: projection_log, visibility_sink modules
-│   │   ├── projection_log.rs     # NEW: DsqlProjectionLog (ProjectionLog impl + checkpoints)
-│   │   ├── visibility_sink.rs    # NEW: DsqlVisibilitySink (vis_execution writes)
+│   │   ├── mod.rs                # DsqlStore + NEW: projection_log module
+│   │   ├── projection_log.rs     # NEW: DsqlProjectionLog (ProjectionLog impl)
 │   │   ├── run_repository.rs     # DsqlRunRepository (unchanged)
-│   │   ├── connection.rs         # DsqlConnectionDirector, DsqlPermit
+│   │   ├── connection.rs         # DsqlConnectionDirector, DsqlPermit + NEW: pub(crate) DsqlConnectionAcquirer
 │   │   ├── codec.rs              # Postcard encode/decode helpers (unchanged)
 │   │   ├── config.rs             # DsqlPoolConfig (unchanged)
 │   │   ├── reservoir.rs          # Reservoir channel + refiller
@@ -44,6 +43,11 @@ tokeira-storage/
 │   │   ├── migration.rs          # MigrationRunner
 │   │   └── validation.rs         # DDL validator
 │   └── lib.rs
+│
+tokeira-projection/
+├── src/
+│   ├── dsql_store.rs             # NEW: DsqlVisibilityStore (VisibilityStore + ProjectionSink impl)
+│   └── ...
 │
 tokeira-types/
 ├── src/
@@ -54,8 +58,7 @@ tokeira-storage/
 ├── migrations/
 │   ├── V010__projection_log.sql      # (existing)
 │   ├── V011__projector_checkpoint.sql # (existing)
-│   ├── V012__vis_execution.sql        # (existing)
-│   └── V013__vis_execution_run_id_uuid.sql  # NEW: ALTER run_id TEXT → UUID
+│   ├── V012__vis_execution.sql        # (updated in-place: run_id TEXT → UUID)
 ```
 
 ### Dependency Flow
@@ -70,17 +73,24 @@ graph TD
         API[api.rs — ProjectionLog trait]
         MEM[memory.rs — InMemoryStore]
         PL[dsql/projection_log.rs — DsqlProjectionLog]
-        VS[dsql/visibility_sink.rs — DsqlVisibilitySink]
         CODEC[dsql/codec.rs — encode/decode helpers]
-        CONN[dsql/connection.rs — DsqlConnectionDirector]
+        CONN[dsql/connection.rs — DsqlConnectionDirector + DsqlConnectionAcquirer]
+    end
+
+    subgraph "tokeira-projection"
+        SINK[sink.rs — ProjectionSink trait]
+        STORE[store.rs — VisibilityStore trait]
+        DSQL_VS[dsql_store.rs — DsqlVisibilityStore]
     end
 
     PL -->|impl ProjectionLog| API
     PL --> CONN
     PL --> CODEC
-    VS --> CONN
-    VS --> CODEC
-    VS --> ES
+    DSQL_VS -->|impl VisibilityStore| STORE
+    DSQL_VS -->|impl ProjectionSink| SINK
+    DSQL_VS --> CONN
+    DSQL_VS --> CODEC
+    DSQL_VS --> ES
     MEM -->|impl ProjectionLog| API
 ```
 
@@ -113,23 +123,21 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant PW as Projection Worker
-    participant VS as DsqlVisibilitySink
+    participant VS as DsqlVisibilityStore
     participant DIR as DsqlConnectionDirector
     participant DB as Aurora DSQL
 
-    PW->>VS: apply_batch(records)
+    PW->>VS: apply(record)
     VS->>DIR: acquire(DbClass::Projection)
     DIR-->>VS: DsqlPermit
 
-    loop for each ProjectionRecord
-        loop for each ProjectionOp in record.ops
-            alt UpsertExecution
-                VS->>DB: INSERT INTO vis_execution (...)<br/>ON CONFLICT (run_key) DO UPDATE SET ...
-            else CloseExecution
-                VS->>DB: UPDATE vis_execution SET<br/>execution_status=$1, close_time=$2, ...<br/>WHERE run_key=$3
-                alt no row updated (catch-up case)
-                    VS->>DB: INSERT INTO vis_execution (...)
-                end
+    loop for each ProjectionOp in record.ops
+        alt UpsertExecution
+            VS->>DB: INSERT INTO vis_execution (...)<br/>ON CONFLICT (run_key) DO UPDATE SET ...
+        else CloseExecution
+            VS->>DB: UPDATE vis_execution SET<br/>execution_status=$1, close_time=$2, ...<br/>WHERE run_key=$3
+            alt no row updated (catch-up case)
+                VS->>DB: INSERT INTO vis_execution (...)
             end
         end
     end
@@ -142,7 +150,11 @@ sequenceDiagram
 ### `DsqlProjectionLog`
 
 ```rust
-/// DSQL-backed projection log reader and checkpoint manager.
+/// DSQL-backed projection log reader.
+///
+/// Checkpoint management is NOT on this struct — the `ProjectionWorker`
+/// calls `VisibilityStore::load_checkpoint`/`save_checkpoint` through
+/// the sink, which for DSQL is `DsqlVisibilityStore` in `tokeira-projection`.
 #[derive(Debug)]
 pub struct DsqlProjectionLog {
     director: Arc<dyn DsqlConnectionAcquirer>,
@@ -153,23 +165,6 @@ impl DsqlProjectionLog {
 
     #[cfg(test)]
     fn new_with_acquirer(director: Arc<dyn DsqlConnectionAcquirer>) -> Self;
-
-    /// Read the last-applied cursor for a projection sink's substream.
-    #[instrument(name = "dsql.read_checkpoint", skip(self), fields(sink_id = %sink_id, partition_id, fanout))]
-    pub async fn read_checkpoint(
-        &self,
-        sink_id: &str,
-        partition_id: u32,
-        fanout: u16,
-    ) -> Result<Option<ProjectionCursor>>;
-
-    /// Upsert the last-applied cursor for a projection sink's substream.
-    #[instrument(name = "dsql.write_checkpoint", skip(self, cursor), fields(sink_id = %sink_id, partition_id = cursor.partition_id, fanout = cursor.fanout))]
-    pub async fn write_checkpoint(
-        &self,
-        sink_id: &str,
-        cursor: &ProjectionCursor,
-    ) -> Result<()>;
 }
 
 #[async_trait]
@@ -209,10 +204,10 @@ The `(run_key, transition_seq) > ($3, $4)` row-value comparison is equivalent to
 ### Checkpoint SQL
 
 ```sql
--- Read checkpoint
+-- Read checkpoint. The caller must use a sink_id unique to one substream.
 SELECT last_applied_cursor
 FROM projector_checkpoint
-WHERE sink_id = $1 AND partition_id = $2 AND fanout = $3
+WHERE sink_id = $1
 
 -- Write checkpoint (upsert)
 INSERT INTO projector_checkpoint (sink_id, partition_id, fanout, last_applied_cursor, updated_at)
@@ -221,29 +216,60 @@ ON CONFLICT (sink_id, partition_id, fanout)
 DO UPDATE SET last_applied_cursor = EXCLUDED.last_applied_cursor, updated_at = now()
 ```
 
-### `DsqlVisibilitySink`
+### `DsqlVisibilityStore`
+
+Lives in `tokeira-projection/src/dsql_store.rs`. Implements both `VisibilityStore` and `ProjectionSink`.
 
 ```rust
-/// Standalone visibility sink that materializes vis_execution rows
-/// from projection operations.
+/// DSQL-backed visibility store implementing both the sink and
+/// checkpoint/query interfaces the ProjectionWorker requires.
+///
+/// Lives in tokeira-projection (not tokeira-storage) to avoid a
+/// dependency cycle — tokeira-projection already depends on
+/// tokeira-storage for DsqlConnectionDirector.
 #[derive(Debug)]
-pub struct DsqlVisibilitySink {
-    director: Arc<dyn DsqlConnectionAcquirer>,
+pub struct DsqlVisibilityStore {
+    director: Arc<DsqlConnectionDirector>,
 }
 
-impl DsqlVisibilitySink {
+impl DsqlVisibilityStore {
     pub fn new(director: Arc<DsqlConnectionDirector>) -> Self;
+}
 
-    #[cfg(test)]
-    fn new_with_acquirer(director: Arc<dyn DsqlConnectionAcquirer>) -> Self;
+/// Single-record apply — called by ProjectionWorker in a loop.
+#[async_trait]
+impl ProjectionSink for DsqlVisibilityStore {
+    #[instrument(name = "dsql.visibility_store.apply", skip(self, record), fields(run_key = %record.run_key.0))]
+    async fn apply(&self, record: &ProjectionRecord) -> Result<()>;
+}
 
-    /// Apply a batch of projection records to vis_execution.
-    ///
-    /// Operations within each record are processed in order so that
-    /// an UpsertExecution followed by a CloseExecution in the same
-    /// record produces the correct final state.
-    #[instrument(name = "dsql.visibility_sink.apply_batch", skip(self, records), fields(record_count = records.len()))]
-    pub async fn apply_batch(&self, records: &[ProjectionRecord]) -> Result<()>;
+/// Checkpoint + visibility query surface.
+/// Checkpoint plus execution-row write methods are fully implemented.
+/// Search-attribute, rollup, and query methods return
+/// bail!("projection-visibility spec") stubs for this spec.
+/// ProjectionSink::apply writes vis_execution directly and does not call
+/// the stubbed methods.
+#[async_trait]
+impl VisibilityStore for DsqlVisibilityStore {
+    // Checkpoint: load_checkpoint takes only sink_id (no partition/fanout),
+    // so callers must use one sink ID per partition/fanout substream.
+    async fn load_checkpoint(&self, sink_id: &str) -> Result<Option<ProjectionCursor>>;
+    async fn save_checkpoint(&self, sink_id: &str, cursor: &ProjectionCursor) -> Result<()>;
+
+    // Write methods — implemented or explicitly stubbed:
+    async fn upsert_execution(&self, row: &ExecutionRow) -> Result<()>;
+    async fn delete_execution(&self, run_key: RunKey) -> Result<()>;
+    async fn upsert_search_attr_index(...) -> Result<()> { bail!("projection-visibility spec") }
+    async fn remove_search_attr_index(...) -> Result<()> { bail!("projection-visibility spec") }
+    async fn accumulate_rollup(&self, entries: &[RollupDelta]) -> Result<()> { bail!("projection-visibility spec") }
+
+    // Query methods — stubs for this spec:
+    async fn list_executions(...) -> Result<ListResult> { bail!("projection-visibility spec") }
+    async fn count_executions(...) -> Result<CountResult> { bail!("projection-visibility spec") }
+    async fn count_from_rollup(...) -> Result<CountResult> { bail!("projection-visibility spec") }
+    async fn resolve_attr(...) -> Result<Option<AttrDescriptor>> { bail!("projection-visibility spec") }
+    async fn register_attr(...) -> Result<AttrId> { bail!("projection-visibility spec") }
+    async fn get_row(&self, run_key: RunKey) -> Option<ExecutionRow> { None }
 }
 ```
 
@@ -354,16 +380,14 @@ impl TryFrom<i16> for ExecutionStatus {
 
 ### `DsqlStore` Wiring
 
-`DsqlStore` gains accessors for the new components:
+`DsqlStore` gains an accessor for the projection log only. The visibility store lives in `tokeira-projection` and is constructed separately by the application:
 
 ```rust
 impl DsqlStore {
     pub fn projection_log(&self) -> &DsqlProjectionLog { ... }
-    pub fn visibility_sink(&self) -> &DsqlVisibilitySink { ... }
+    // No visibility_sink accessor — DsqlVisibilityStore is in tokeira-projection
 }
 ```
-
-Both are constructed in `from_connector` using the shared `Arc<DsqlConnectionDirector>`.
 
 ## Data Models
 
@@ -372,10 +396,10 @@ Both are constructed in `from_connector` using the shared `Arc<DsqlConnectionDir
 | Operation | Tables Read | Tables Written |
 |-----------|------------|----------------|
 | `read_from` | `projection_log` | — |
-| `read_checkpoint` | `projector_checkpoint` | — |
-| `write_checkpoint` | — | `projector_checkpoint` |
-| `apply_batch` (UpsertExecution) | `vis_execution` (memo read for merge) | `vis_execution` |
-| `apply_batch` (CloseExecution) | — | `vis_execution` |
+| `load_checkpoint` | `projector_checkpoint` | — |
+| `save_checkpoint` | — | `projector_checkpoint` |
+| `ProjectionSink::apply` (UpsertExecution) | `vis_execution` (memo read for merge) | `vis_execution` |
+| `ProjectionSink::apply` (CloseExecution) | — | `vis_execution` |
 
 ### `projection_log` Table (Existing — No Changes)
 
@@ -414,7 +438,7 @@ CREATE TABLE IF NOT EXISTS vis_execution (
     run_key                UUID        NOT NULL,
     namespace_id           UUID        NOT NULL,
     workflow_id            TEXT        NOT NULL,
-    run_id                 TEXT        NOT NULL,  -- changed to UUID in V013
+    run_id                 TEXT        NOT NULL,  -- updated in place to UUID
     workflow_type          TEXT        NOT NULL,
     task_queue             TEXT        NOT NULL,
     execution_status       SMALLINT    NOT NULL,
@@ -428,13 +452,18 @@ CREATE TABLE IF NOT EXISTS vis_execution (
 );
 ```
 
-Migration V013 changes `run_id` from `TEXT` to `UUID`:
+Migration: `V012__vis_execution.sql` is updated in-place to change `run_id` from `TEXT` to `UUID`:
 
 ```sql
-ALTER TABLE vis_execution ALTER COLUMN run_id TYPE UUID USING run_id::uuid;
+CREATE TABLE IF NOT EXISTS vis_execution (
+    run_key                UUID        NOT NULL,
+    namespace_id           UUID        NOT NULL,
+    workflow_id            TEXT        NOT NULL,
+    run_id                 UUID        NOT NULL,  -- was TEXT, updated in-place
+    ...
 ```
 
-This is safe because no rows exist yet — the table was created by Feature 1 but no visibility sink has written to it.
+No separate migration file is needed — Tokeira targets schema version 1.
 
 ### Type Mappings
 
@@ -443,7 +472,7 @@ This is safe because no rows exist yet — the table was created by Feature 1 bu
 | `RunKey(Uuid)` | `run_key UUID` | Direct UUID binding |
 | `NamespaceId(Uuid)` | `namespace_id UUID` | Direct UUID binding |
 | `WorkflowId(String)` | `workflow_id TEXT` | Direct string binding |
-| `RunId(Uuid)` | `run_id UUID` | Direct UUID binding (after V013) |
+| `RunId(Uuid)` | `run_id UUID` | Direct UUID binding (after V012 in-place update) |
 | `WorkflowType(String)` | `workflow_type TEXT` | Direct string binding |
 | `TaskQueueName(String)` | `task_queue TEXT` | Direct string binding |
 | `ExecutionStatus` | `execution_status SMALLINT` | `to_db_smallint()` / `TryFrom<i16>` |
@@ -457,8 +486,8 @@ This is safe because no rows exist yet — the table was created by Feature 1 bu
 ### Write Set Size
 
 - `read_from`: 0 writes (read-only).
-- `write_checkpoint`: 1 row in `projector_checkpoint`.
-- `apply_batch`: 1 row per `ProjectionOp` in `vis_execution` (typically 1–2 ops per record).
+- `save_checkpoint`: 1 row in `projector_checkpoint`.
+- `ProjectionSink::apply`: 1 row per `ProjectionOp` in `vis_execution` (typically 1–2 ops per record).
 
 All well within DSQL's 3,000-row mutation limit.
 
@@ -532,7 +561,7 @@ Property-based tests validate the correctness properties above. Each test runs a
 | P2: Projection codec round-trip | `tokeira-storage/src/dsql/codec.rs` | `proptest` |
 | P3: ExecutionStatus numeric round-trip | `tokeira-types/src/execution.rs` | `proptest` |
 | P4: Memo codec round-trip | `tokeira-storage/src/dsql/codec.rs` | `proptest` |
-| P5: Visibility sink operation ordering | `tokeira-storage/src/dsql/visibility_sink.rs` | `proptest` |
+| P5: Visibility sink operation ordering | `tokeira-projection/src/dsql_store.rs` | `proptest` |
 
 **Tag format:** `Feature: dsql-projection-persistence, Property {N}: {title}`
 
@@ -550,7 +579,7 @@ Property-based tests validate the correctness properties above. Each test runs a
 
 Unit tests cover specific examples and edge cases:
 
-- **DbClass::Projection routing**: Verify `read_from`, `read_checkpoint`, `write_checkpoint`, and `apply_batch` all acquire `DbClass::Projection` permits using the mock acquirer.
+- **DbClass::Projection routing**: Verify `read_from` acquires `DbClass::Projection` using the storage mock acquirer. Verify `DsqlVisibilityStore` checkpoint/apply routing in gated DSQL integration tests because the projection-crate store holds a concrete `DsqlConnectionDirector`.
 - **Beginning-of-partition read**: Verify `read_from` with a beginning cursor returns the first records.
 - **Empty partition read**: Verify `read_from` on an empty partition returns an empty batch with the original cursor.
 - **Checkpoint read/write round-trip**: Write a checkpoint, read it back, verify equality.

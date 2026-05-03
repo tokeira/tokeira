@@ -199,6 +199,18 @@ impl ConnectionDirector for DsqlConnectionDirector {
     }
 }
 
+#[async_trait]
+pub(crate) trait DsqlConnectionAcquirer: std::fmt::Debug + Send + Sync {
+    async fn acquire(&self, class: DbClass) -> Result<DsqlPermit>;
+}
+
+#[async_trait]
+impl DsqlConnectionAcquirer for DsqlConnectionDirector {
+    async fn acquire(&self, class: DbClass) -> Result<DsqlPermit> {
+        ConnectionDirector::acquire(self, class).await
+    }
+}
+
 #[derive(Debug)]
 pub struct DsqlPermit {
     /// Operation class that consumed this permit.

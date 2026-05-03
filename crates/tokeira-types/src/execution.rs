@@ -6,6 +6,7 @@
 //! `ExecutionSummary` is the read-model projection for visibility queries.
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use time::OffsetDateTime;
 
 use crate::{NamespaceId, RunId};
@@ -69,6 +70,12 @@ pub enum ExecutionStatus {
     TimedOut,
 }
 
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("unknown execution status database value {value}")]
+pub struct ExecutionStatusDecodeError {
+    pub value: i16,
+}
+
 impl ExecutionStatus {
     /// Returns `true` for states that represent an in-progress
     /// execution (`Running` or `Paused`).
@@ -77,6 +84,41 @@ impl ExecutionStatus {
     /// `false`.
     pub fn is_open(self) -> bool {
         matches!(self, Self::Running | Self::Paused)
+    }
+
+    /// Stable database encoding for visibility rows.
+    ///
+    /// These values are persisted in DSQL `SMALLINT` columns, so they must not
+    /// depend on enum declaration order.
+    pub fn to_db_smallint(self) -> i16 {
+        match self {
+            Self::Running => 0,
+            Self::Paused => 1,
+            Self::Completed => 2,
+            Self::Failed => 3,
+            Self::Cancelled => 4,
+            Self::Terminated => 5,
+            Self::ContinuedAsNew => 6,
+            Self::TimedOut => 7,
+        }
+    }
+}
+
+impl TryFrom<i16> for ExecutionStatus {
+    type Error = ExecutionStatusDecodeError;
+
+    fn try_from(value: i16) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Running),
+            1 => Ok(Self::Paused),
+            2 => Ok(Self::Completed),
+            3 => Ok(Self::Failed),
+            4 => Ok(Self::Cancelled),
+            5 => Ok(Self::Terminated),
+            6 => Ok(Self::ContinuedAsNew),
+            7 => Ok(Self::TimedOut),
+            value => Err(ExecutionStatusDecodeError { value }),
+        }
     }
 }
 
@@ -125,4 +167,36 @@ pub struct ExecutionSummary {
     /// Timestamp when the execution reached a terminal state.
     /// `None` while the execution is still open.
     pub closed_at: Option<OffsetDateTime>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn execution_status_database_encoding_is_stable() {
+        let cases = [
+            (ExecutionStatus::Running, 0),
+            (ExecutionStatus::Paused, 1),
+            (ExecutionStatus::Completed, 2),
+            (ExecutionStatus::Failed, 3),
+            (ExecutionStatus::Cancelled, 4),
+            (ExecutionStatus::Terminated, 5),
+            (ExecutionStatus::ContinuedAsNew, 6),
+            (ExecutionStatus::TimedOut, 7),
+        ];
+
+        for (status, value) in cases {
+            assert_eq!(status.to_db_smallint(), value);
+            assert_eq!(ExecutionStatus::try_from(value), Ok(status));
+        }
+    }
+
+    #[test]
+    fn execution_status_rejects_unknown_database_values() {
+        assert_eq!(
+            ExecutionStatus::try_from(42),
+            Err(ExecutionStatusDecodeError { value: 42 })
+        );
+    }
 }

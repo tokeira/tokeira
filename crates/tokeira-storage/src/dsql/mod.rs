@@ -10,7 +10,9 @@ use std::sync::Arc;
 pub mod codec;
 pub mod config;
 pub mod connection;
+pub(crate) mod convert;
 pub mod migration;
+pub mod projection_log;
 pub mod rate_limiter;
 pub mod reservoir;
 pub mod run_repository;
@@ -19,6 +21,7 @@ pub mod validation;
 pub use config::*;
 pub use connection::*;
 pub use migration::*;
+pub use projection_log::*;
 pub use rate_limiter::*;
 pub use reservoir::*;
 pub use run_repository::*;
@@ -31,6 +34,8 @@ pub struct DsqlStore {
     director: Arc<connection::DsqlConnectionDirector>,
     /// Forward-only schema migration runner.
     migration_runner: migration::MigrationRunner,
+    /// Projection log reader used by projection workers.
+    projection_log: projection_log::DsqlProjectionLog,
     /// Semantic run repository backed by DSQL tables.
     run_repository: run_repository::DsqlRunRepository,
 }
@@ -76,9 +81,11 @@ impl DsqlStore {
             config.conflict_policy,
             config.lease_duration,
         )?;
+        let projection_log = projection_log::DsqlProjectionLog::new(Arc::clone(&director));
         Ok(Self {
             director,
             migration_runner,
+            projection_log,
             run_repository,
         })
     }
@@ -96,6 +103,11 @@ impl DsqlStore {
     /// Access the DSQL-backed run repository.
     pub fn run_repository(&self) -> &run_repository::DsqlRunRepository {
         &self.run_repository
+    }
+
+    /// Access the DSQL-backed projection log reader.
+    pub fn projection_log(&self) -> &projection_log::DsqlProjectionLog {
+        &self.projection_log
     }
 }
 

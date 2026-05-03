@@ -2,7 +2,7 @@ CREATE TABLE IF NOT EXISTS vis_execution (
     run_key                UUID        NOT NULL,
     namespace_id           UUID        NOT NULL,
     workflow_id            TEXT        NOT NULL,
-    run_id                 TEXT        NOT NULL,
+    run_id                 UUID        NOT NULL,
     workflow_type          TEXT        NOT NULL,
     task_queue             TEXT        NOT NULL,
     execution_status       SMALLINT    NOT NULL,

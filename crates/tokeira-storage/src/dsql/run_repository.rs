@@ -31,8 +31,7 @@ use crate::{
     WftTimeoutSweepEntry, WorkflowTimeoutSweepEntry,
 };
 
-use super::{DsqlConnectionDirector, DsqlPermit, codec};
-use crate::ConnectionDirector;
+use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, codec, convert};
 
 /// Current projection fanout for records written by this repository.
 ///
@@ -56,18 +55,6 @@ pub struct DsqlRunRepository {
     conflict_policy: CurrentExecutionConflictPolicy,
     /// Duration added to one captured application timestamp for lease expiry.
     lease_duration: Duration,
-}
-
-#[async_trait]
-trait DsqlConnectionAcquirer: std::fmt::Debug + Send + Sync {
-    async fn acquire(&self, class: DbClass) -> Result<DsqlPermit>;
-}
-
-#[async_trait]
-impl DsqlConnectionAcquirer for DsqlConnectionDirector {
-    async fn acquire(&self, class: DbClass) -> Result<DsqlPermit> {
-        ConnectionDirector::acquire(self, class).await
-    }
 }
 
 impl DsqlRunRepository {
@@ -345,7 +332,7 @@ impl RunRepository for DsqlRunRepository {
             run_id,
             run_key: RunKey(run_key),
             request_id: RequestId(stored_request_id),
-            first_seen_transition_seq: TransitionSeq(u64_from_i64(
+            first_seen_transition_seq: TransitionSeq(convert::u64_from_i64(
                 transition_seq,
                 "request_dedupe.first_seen_transition_seq",
             )?),
@@ -367,7 +354,7 @@ impl RunRepository for DsqlRunRepository {
             .map(|(transition_seq, events_data)| {
                 Ok(TransitionAuditRecord {
                     run_key,
-                    transition_seq: TransitionSeq(u64_from_i64(
+                    transition_seq: TransitionSeq(convert::u64_from_i64(
                         transition_seq,
                         "history_batch.transition_seq",
                     )?),
@@ -391,9 +378,9 @@ impl RunRepository for DsqlRunRepository {
         // Validate i64 conversions before acquiring a connection or starting a
         // transaction. This prevents mid-transaction failures from overflow on
         // values that are structurally u64 but stored as BIGINT (i64) in DSQL.
-        i64_from_u64(transition.next_state.transition_seq.0, "transition_seq")?;
+        convert::i64_from_u64(transition.next_state.transition_seq.0, "transition_seq")?;
         if should_check_epoch(epoch) {
-            i64_from_u64(epoch.0, "caller shard epoch")?;
+            convert::i64_from_u64(epoch.0, "caller shard epoch")?;
         }
 
         let mut permit = self.director.acquire(DbClass::Commit).await?;
@@ -418,7 +405,7 @@ impl RunRepository for DsqlRunRepository {
                     ),
                 });
             };
-            if durable_epoch != i64_from_u64(epoch.0, "caller shard epoch")? {
+            if durable_epoch != convert::i64_from_u64(epoch.0, "caller shard epoch")? {
                 tx.rollback().await?;
                 return Ok(CommitResult::Conflict {
                     reason: format!(
@@ -436,7 +423,9 @@ impl RunRepository for DsqlRunRepository {
         .fetch_optional(&mut *tx)
         .await?;
         let current_seq = match row {
-            Some((seq,)) => TransitionSeq(u64_from_i64(seq, "workflow_hot.transition_seq")?),
+            Some((seq,)) => {
+                TransitionSeq(convert::u64_from_i64(seq, "workflow_hot.transition_seq")?)
+            }
             None => TransitionSeq::ZERO,
         };
         // The transition sequence is the per-run OCC fence. We check it inside
@@ -721,7 +710,7 @@ impl RunRepository for DsqlRunRepository {
             .bind(entry.queue.task_kind.to_db_smallint())
             .bind(deployment)
             .bind(build_id)
-            .bind(i64_from_u64(entry.insertion_seq, "dispatch_backlog.insertion_seq")?)
+            .bind(convert::i64_from_u64(entry.insertion_seq, "dispatch_backlog.insertion_seq")?)
             .bind(entry.run_key.0)
             .bind(codec::encode_backlog_payload(&entry.payload)?)
             .bind(entry.scheduled_at)
@@ -788,7 +777,10 @@ impl RunRepository for DsqlRunRepository {
                 },
                 payload: codec::decode_backlog_payload(&payload_data)?,
                 scheduled_at,
-                insertion_seq: u64_from_i64(insertion_seq, "dispatch_backlog.insertion_seq")?,
+                insertion_seq: convert::u64_from_i64(
+                    insertion_seq,
+                    "dispatch_backlog.insertion_seq",
+                )?,
             });
         }
         tx.commit().await?;
@@ -1281,7 +1273,7 @@ fn activity_dispatch_from_row(row: ActivityDispatchRow) -> Result<DispatchableAc
         activity_id,
         input: codec::decode_payloads(&input_data)?,
         schedule_event_id,
-        attempt: u32_from_i32(attempt, "activity_dispatch.attempt")?,
+        attempt: convert::u32_from_i32(attempt, "activity_dispatch.attempt")?,
     })
 }
 
@@ -1436,7 +1428,7 @@ async fn write_transition(
         .bind(&op.request_id.0)
         .bind(run_key.0)
         .bind(state.run_id.0)
-        .bind(i64_from_u64(state.transition_seq.0, "transition_seq")?)
+        .bind(convert::i64_from_u64(state.transition_seq.0, "transition_seq")?)
         .execute(&mut **tx)
         .await?;
     }
@@ -1552,7 +1544,10 @@ async fn insert_workflow_hot(
     .bind(state.namespace_id.0)
     .bind(&state.workflow_id.0)
     .bind(DsqlRunRepository::shard_id_to_uuid(shard_id))
-    .bind(i64_from_u64(state.transition_seq.0, "transition_seq")?)
+    .bind(convert::i64_from_u64(
+        state.transition_seq.0,
+        "transition_seq",
+    )?)
     .bind(codec::encode_workflow_state(state)?)
     .execute(&mut **tx)
     .await?;
@@ -1581,7 +1576,7 @@ async fn insert_history_batch(
     .bind(run_key.0)
     .bind(first_event_id)
     .bind(last_event_id)
-    .bind(i64_from_u64(transition_seq.0, "transition_seq")?)
+    .bind(convert::i64_from_u64(transition_seq.0, "transition_seq")?)
     .bind(codec::encode_history_events(events)?)
     .execute(&mut **tx)
     .await?;
@@ -1802,7 +1797,7 @@ async fn insert_projection_log(
         execution_time: None,
         close_time: state.closed_at,
         history_length: state.last_event_id,
-        state_transition_count: i64_from_u64(state.transition_seq.0, "transition_seq")?,
+        state_transition_count: convert::i64_from_u64(state.transition_seq.0, "transition_seq")?,
     };
     sqlx::query(
         "INSERT INTO projection_log
@@ -1812,7 +1807,10 @@ async fn insert_projection_log(
     .bind(i32::try_from(partition_for(run_key))?)
     .bind(PROJECTION_FANOUT)
     .bind(run_key.0)
-    .bind(i64_from_u64(state.transition_seq.0, "transition_seq")?)
+    .bind(convert::i64_from_u64(
+        state.transition_seq.0,
+        "transition_seq",
+    )?)
     .bind(codec::encode_projection_context(&context)?)
     .bind(codec::encode_projection_ops(ops)?)
     .execute(&mut **tx)
@@ -1844,24 +1842,15 @@ fn option_key_part(value: Option<&str>) -> Vec<u8> {
     }
 }
 
-fn i64_from_u64(value: u64, field: &str) -> Result<i64> {
-    i64::try_from(value).with_context(|| format!("{field} exceeds i64 range"))
-}
-
-fn u64_from_i64(value: i64, field: &str) -> Result<u64> {
-    u64::try_from(value).with_context(|| format!("{field} is negative"))
-}
-
-fn u32_from_i32(value: i32, field: &str) -> Result<u32> {
-    u32::try_from(value).with_context(|| format!("{field} is negative"))
-}
-
 fn epoch_to_sql(epoch: ShardEpoch) -> Result<i64> {
-    i64_from_u64(epoch.0, "shard_lease.epoch")
+    convert::i64_from_u64(epoch.0, "shard_lease.epoch")
 }
 
 fn epoch_from_sql(value: i64) -> Result<ShardEpoch> {
-    Ok(ShardEpoch(u64_from_i64(value, "shard_lease.epoch")?))
+    Ok(ShardEpoch(convert::u64_from_i64(
+        value,
+        "shard_lease.epoch",
+    )?))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1969,7 +1958,8 @@ mod tests {
     };
     use crate::{
         CurrentExecutionConflictPolicy, DbClass, LeaseOutcome, LeaseRepository, ProjectionContext,
-        RunRepository, dsql::codec,
+        RunRepository,
+        dsql::{DsqlPermit, codec},
     };
 
     proptest! {
@@ -2718,7 +2708,7 @@ mod tests {
 
     #[async_trait]
     impl DsqlConnectionAcquirer for RecordingAcquirer {
-        async fn acquire(&self, class: DbClass) -> Result<super::DsqlPermit> {
+        async fn acquire(&self, class: DbClass) -> Result<DsqlPermit> {
             self.classes.lock().unwrap().push(class);
             bail!("test acquirer has no database connection")
         }

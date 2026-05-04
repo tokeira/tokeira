@@ -31,11 +31,10 @@ pub async fn compile_filter<S: VisibilityStore + ?Sized>(
 }
 
 #[async_recursion]
-async fn compile_expr<S: VisibilityStore + ?Sized>(
-    input: &str,
-    namespace_id: NamespaceId,
-    store: &S,
-) -> Result<FilterExpr> {
+async fn compile_expr<S>(input: &str, namespace_id: NamespaceId, store: &S) -> Result<FilterExpr>
+where
+    S: VisibilityStore + ?Sized,
+{
     if let Some((lhs, rhs)) = split_top_level(input, " AND ") {
         return Ok(FilterExpr::And(
             Box::new(compile_expr(lhs, namespace_id, store).await?),

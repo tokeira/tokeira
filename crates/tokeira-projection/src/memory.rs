@@ -10,7 +10,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use tokeira_types::{NamespaceId, ProjectionCursor, RunKey, SearchAttrValue};
 use tokio::sync::Mutex;
@@ -20,7 +20,7 @@ use crate::{
     types::{
         AttrDescriptor, AttrId, CompareOp, CompiledFilter, CountResult, ExecutionRow, FieldRef,
         FilterExpr, FilterValue, GroupByField, ListResult, PageBounds, PageToken, RollupCounter,
-        RollupDelta, RollupDimension, SearchAttrType, SortOrder, SystemField,
+        RollupDelta, RollupDimension, SearchAttrType, SortOrder, SystemField, text_search_tokens,
     },
 };
 
@@ -47,20 +47,8 @@ struct VisibilityState {
 }
 
 impl InMemoryVisibilityStore {
-    fn index_text(text: &str) -> Vec<String> {
-        let mut out = HashSet::new();
-        let mut token = String::new();
-        for ch in text.chars() {
-            if ch.is_ascii_alphanumeric() {
-                token.push(ch.to_ascii_lowercase());
-            } else if !token.is_empty() {
-                out.insert(std::mem::take(&mut token));
-            }
-        }
-        if !token.is_empty() {
-            out.insert(token);
-        }
-        out.into_iter().collect()
+    pub(crate) fn index_text(text: &str) -> Vec<String> {
+        text_search_tokens(text)
     }
 }
 
@@ -338,13 +326,12 @@ impl VisibilityStore for InMemoryVisibilityStore {
         page: &PageBounds,
     ) -> Result<ListResult> {
         let inner = self.inner.lock().await;
-        let mut rows: Vec<_> = inner
-            .rows
-            .values()
-            .filter(|row| row.namespace_id == namespace_id)
-            .filter(|row| matches_filter(&inner, row, filter))
-            .cloned()
-            .collect();
+        let mut rows = Vec::new();
+        for row in inner.rows.values() {
+            if row.namespace_id == namespace_id && matches_filter(&inner, row, filter)? {
+                rows.push(row.clone());
+            }
+        }
         sort_rows(&mut rows, sort);
         if let Some(after) = &page.after {
             rows.retain(|row| row_after(row, after));
@@ -375,12 +362,12 @@ impl VisibilityStore for InMemoryVisibilityStore {
         group_by: Option<GroupByField>,
     ) -> Result<CountResult> {
         let inner = self.inner.lock().await;
-        let rows: Vec<_> = inner
-            .rows
-            .values()
-            .filter(|row| row.namespace_id == namespace_id)
-            .filter(|row| matches_filter(&inner, row, filter))
-            .collect();
+        let mut rows = Vec::new();
+        for row in inner.rows.values() {
+            if row.namespace_id == namespace_id && matches_filter(&inner, row, filter)? {
+                rows.push(row);
+            }
+        }
         let total_count = rows.len() as i64;
         let mut groups = Vec::new();
         if let Some(group_by) = group_by {
@@ -504,31 +491,187 @@ fn row_after(row: &ExecutionRow, token: &PageToken) -> bool {
         < (token.close_time, token.start_time, token.run_key.0)
 }
 
-fn matches_filter(inner: &VisibilityState, row: &ExecutionRow, filter: &CompiledFilter) -> bool {
-    filter
-        .expr
-        .as_ref()
-        .is_none_or(|expr| eval_expr(inner, row, expr))
+fn matches_filter(
+    inner: &VisibilityState,
+    row: &ExecutionRow,
+    filter: &CompiledFilter,
+) -> Result<bool> {
+    match &filter.expr {
+        Some(expr) => eval_expr(inner, row, expr),
+        None => Ok(true),
+    }
 }
 
-fn eval_expr(inner: &VisibilityState, row: &ExecutionRow, expr: &FilterExpr) -> bool {
+fn eval_expr(inner: &VisibilityState, row: &ExecutionRow, expr: &FilterExpr) -> Result<bool> {
     match expr {
-        FilterExpr::And(lhs, rhs) => eval_expr(inner, row, lhs) && eval_expr(inner, row, rhs),
-        FilterExpr::Or(lhs, rhs) => eval_expr(inner, row, lhs) || eval_expr(inner, row, rhs),
-        FilterExpr::Compare { field, op, value } => {
-            compare(field_value(inner, row, field), *op, value)
-        }
-        FilterExpr::In { field, values } => values
-            .iter()
-            .any(|v| compare(field_value(inner, row, field), CompareOp::Eq, v)),
+        FilterExpr::And(lhs, rhs) => Ok(eval_expr(inner, row, lhs)? && eval_expr(inner, row, rhs)?),
+        FilterExpr::Or(lhs, rhs) => Ok(eval_expr(inner, row, lhs)? || eval_expr(inner, row, rhs)?),
+        FilterExpr::Compare { field, op, value } => eval_compare(inner, row, field, *op, value),
+        FilterExpr::In { field, values } => eval_in(inner, row, field, values),
         FilterExpr::Between { field, low, high } => {
-            compare(field_value(inner, row, field), CompareOp::Ge, low)
-                && compare(field_value(inner, row, field), CompareOp::Le, high)
+            reject_multi_value_range(field, "BETWEEN")?;
+            Ok(compare(field_value(inner, row, field), CompareOp::Ge, low)
+                && compare(field_value(inner, row, field), CompareOp::Le, high))
         }
-        FilterExpr::StartsWith { field, prefix } => {
-            matches!(field_value(inner, row, field), Some(FilterValue::String(v)) if v.starts_with(prefix))
+        FilterExpr::StartsWith { field, prefix } => eval_starts_with(inner, row, field, prefix),
+    }
+}
+
+fn eval_compare(
+    inner: &VisibilityState,
+    row: &ExecutionRow,
+    field: &FieldRef,
+    op: CompareOp,
+    value: &FilterValue,
+) -> Result<bool> {
+    if matches!(
+        op,
+        CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge
+    ) {
+        reject_multi_value_range(field, "range comparison")?;
+    }
+    match (field, custom_value(inner, row, field)) {
+        (_, Some(SearchAttrValue::KeywordList(values))) => {
+            eval_keyword_list_compare(&values, op, value)
+        }
+        (_, Some(SearchAttrValue::Text(text))) => eval_text_compare(&text, op, value),
+        (
+            FieldRef::Custom {
+                attr_type: SearchAttrType::KeywordList | SearchAttrType::Text,
+                ..
+            },
+            None,
+        ) => Ok(matches!(op, CompareOp::Ne)),
+        _ => Ok(compare(field_value(inner, row, field), op, value)),
+    }
+}
+
+fn eval_in(
+    inner: &VisibilityState,
+    row: &ExecutionRow,
+    field: &FieldRef,
+    values: &[FilterValue],
+) -> Result<bool> {
+    match custom_value(inner, row, field) {
+        Some(SearchAttrValue::KeywordList(elements)) => Ok(values.iter().any(|value| {
+            let FilterValue::String(candidate) = value else {
+                return false;
+            };
+            elements.iter().any(|element| element == candidate)
+        })),
+        Some(SearchAttrValue::Text(text)) => {
+            let candidates = values
+                .iter()
+                .filter_map(|value| {
+                    let FilterValue::String(candidate) = value else {
+                        return None;
+                    };
+                    normalize_text_literal(candidate)
+                })
+                .collect::<HashSet<_>>();
+            if candidates.is_empty() {
+                return Ok(false);
+            }
+            Ok(InMemoryVisibilityStore::index_text(&text)
+                .iter()
+                .any(|token| candidates.contains(token)))
+        }
+        _ => Ok(values
+            .iter()
+            .any(|v| compare(field_value(inner, row, field), CompareOp::Eq, v))),
+    }
+}
+
+fn eval_starts_with(
+    inner: &VisibilityState,
+    row: &ExecutionRow,
+    field: &FieldRef,
+    prefix: &str,
+) -> Result<bool> {
+    match custom_value(inner, row, field) {
+        Some(SearchAttrValue::KeywordList(values)) => {
+            Ok(values.iter().any(|value| value.starts_with(prefix)))
+        }
+        Some(SearchAttrValue::Text(text)) => {
+            let prefix = prefix.to_ascii_lowercase();
+            Ok(InMemoryVisibilityStore::index_text(&text)
+                .iter()
+                .any(|token| token.starts_with(&prefix)))
+        }
+        _ => Ok(matches!(
+            field_value(inner, row, field),
+            Some(FilterValue::String(v)) if v.starts_with(prefix)
+        )),
+    }
+}
+
+fn eval_keyword_list_compare(
+    values: &[String],
+    op: CompareOp,
+    value: &FilterValue,
+) -> Result<bool> {
+    let FilterValue::String(candidate) = value else {
+        return Ok(false);
+    };
+    match op {
+        CompareOp::Eq => Ok(values.iter().any(|value| value == candidate)),
+        CompareOp::Ne => Ok(values.iter().all(|value| value != candidate)),
+        CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge => {
+            bail!("KeywordList does not support ordered comparison operators")
         }
     }
+}
+
+fn eval_text_compare(text: &str, op: CompareOp, value: &FilterValue) -> Result<bool> {
+    let FilterValue::String(candidate) = value else {
+        return Ok(false);
+    };
+    let Some(candidate) = normalize_text_literal(candidate) else {
+        return Ok(matches!(op, CompareOp::Ne));
+    };
+    let contains = InMemoryVisibilityStore::index_text(text)
+        .iter()
+        .any(|token| token == &candidate);
+    match op {
+        CompareOp::Eq => Ok(contains),
+        CompareOp::Ne => Ok(!contains),
+        CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge => {
+            bail!("Text does not support ordered comparison operators")
+        }
+    }
+}
+
+fn normalize_text_literal(value: &str) -> Option<String> {
+    let mut tokens = text_search_tokens(value);
+    if tokens.len() == 1 {
+        tokens.pop()
+    } else {
+        None
+    }
+}
+
+fn custom_value(
+    inner: &VisibilityState,
+    row: &ExecutionRow,
+    field: &FieldRef,
+) -> Option<SearchAttrValue> {
+    let FieldRef::Custom { attr_id, .. } = field else {
+        return None;
+    };
+    inner.sa_current.get(&(row.run_key, *attr_id)).cloned()
+}
+
+fn reject_multi_value_range(field: &FieldRef, op: &str) -> Result<()> {
+    if matches!(
+        field,
+        FieldRef::Custom {
+            attr_type: SearchAttrType::KeywordList | SearchAttrType::Text,
+            ..
+        }
+    ) {
+        bail!("{op} is not supported for KeywordList or Text search attributes");
+    }
+    Ok(())
 }
 
 fn field_value(
@@ -717,6 +860,170 @@ mod tests {
                     }
                 },
             )
+    }
+
+    fn row(run_key: u128) -> ExecutionRow {
+        ExecutionRow {
+            run_key: RunKey(Uuid::from_u128(run_key)),
+            namespace_id: NamespaceId(Uuid::from_u128(1)),
+            workflow_id: WorkflowId(format!("wf-{run_key}")),
+            run_id: RunId(Uuid::from_u128(run_key + 100)),
+            workflow_type: WorkflowType("Example".to_owned()),
+            task_queue: tokeira_types::TaskQueueName("main".to_owned()),
+            status: ExecutionStatus::Running,
+            start_time: OffsetDateTime::from_unix_timestamp(1).unwrap(),
+            execution_time: None,
+            close_time: None,
+            history_length: 1,
+            state_transition_count: 1,
+            memo: Memo::default(),
+            search_attr_version: 0,
+        }
+    }
+
+    fn page() -> PageBounds {
+        PageBounds {
+            limit: 10,
+            after: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn keyword_list_filter_uses_element_membership() {
+        let store = InMemoryVisibilityStore::default();
+        let ns = NamespaceId(Uuid::from_u128(1));
+        let row = row(1);
+        let attr_id = store
+            .register_attr(ns, "tags".to_owned(), SearchAttrType::KeywordList)
+            .await
+            .unwrap();
+        store.upsert_execution(&row).await.unwrap();
+        store
+            .upsert_search_attr_index(
+                row.run_key,
+                ns,
+                attr_id,
+                SearchAttrType::KeywordList,
+                &SearchAttrValue::KeywordList(vec!["a".to_owned(), "b".to_owned()]),
+            )
+            .await
+            .unwrap();
+        let field = FieldRef::Custom {
+            name: "tags".to_owned(),
+            attr_id,
+            attr_type: SearchAttrType::KeywordList,
+        };
+
+        let result = store
+            .list_executions(
+                ns,
+                &CompiledFilter {
+                    expr: Some(FilterExpr::Compare {
+                        field: field.clone(),
+                        op: CompareOp::Eq,
+                        value: FilterValue::String("a".to_owned()),
+                    }),
+                },
+                SortOrder::Default,
+                &page(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
+
+        let result = store
+            .list_executions(
+                ns,
+                &CompiledFilter {
+                    expr: Some(FilterExpr::Compare {
+                        field,
+                        op: CompareOp::Ne,
+                        value: FilterValue::String("a".to_owned()),
+                    }),
+                },
+                SortOrder::Default,
+                &page(),
+            )
+            .await
+            .unwrap();
+        assert!(result.rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn text_filter_uses_normalized_token_matching() {
+        let store = InMemoryVisibilityStore::default();
+        let ns = NamespaceId(Uuid::from_u128(1));
+        let row = row(2);
+        let attr_id = store
+            .register_attr(ns, "text".to_owned(), SearchAttrType::Text)
+            .await
+            .unwrap();
+        store.upsert_execution(&row).await.unwrap();
+        store
+            .upsert_search_attr_index(
+                row.run_key,
+                ns,
+                attr_id,
+                SearchAttrType::Text,
+                &SearchAttrValue::Text("Hello World".to_owned()),
+            )
+            .await
+            .unwrap();
+        let field = FieldRef::Custom {
+            name: "text".to_owned(),
+            attr_id,
+            attr_type: SearchAttrType::Text,
+        };
+
+        let result = store
+            .list_executions(
+                ns,
+                &CompiledFilter {
+                    expr: Some(FilterExpr::Compare {
+                        field: field.clone(),
+                        op: CompareOp::Eq,
+                        value: FilterValue::String("hello".to_owned()),
+                    }),
+                },
+                SortOrder::Default,
+                &page(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
+
+        let result = store
+            .list_executions(
+                ns,
+                &CompiledFilter {
+                    expr: Some(FilterExpr::Compare {
+                        field: field.clone(),
+                        op: CompareOp::Eq,
+                        value: FilterValue::String("hello world".to_owned()),
+                    }),
+                },
+                SortOrder::Default,
+                &page(),
+            )
+            .await
+            .unwrap();
+        assert!(result.rows.is_empty());
+
+        let result = store
+            .list_executions(
+                ns,
+                &CompiledFilter {
+                    expr: Some(FilterExpr::In {
+                        field,
+                        values: vec![FilterValue::String("HEL".to_owned())],
+                    }),
+                },
+                SortOrder::Default,
+                &page(),
+            )
+            .await
+            .unwrap();
+        assert!(result.rows.is_empty());
     }
 
     // Feature: projection-visibility, Property 15:

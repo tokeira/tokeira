@@ -23,6 +23,7 @@ members = [
 ]
 exclude = [
     "examples/hello-world",
+    "tools/placement-sim",
 ]
 
 [workspace.package]

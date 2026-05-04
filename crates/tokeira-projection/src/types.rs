@@ -9,6 +9,7 @@
 use anyhow::{Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use time::OffsetDateTime;
 use tokeira_types::{
     ExecutionStatus, Memo, NamespaceId, ProjectionCursor, RunId, RunKey, SearchAttrValue,
@@ -28,6 +29,43 @@ pub enum SearchAttrType {
     Double,
     Datetime,
     Text,
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("unknown search attribute type database value {value}")]
+pub struct SearchAttrTypeDecodeError {
+    pub value: i16,
+}
+
+impl SearchAttrType {
+    pub fn to_db_smallint(self) -> i16 {
+        match self {
+            Self::Keyword => 0,
+            Self::KeywordList => 1,
+            Self::Int => 2,
+            Self::Bool => 3,
+            Self::Double => 4,
+            Self::Datetime => 5,
+            Self::Text => 6,
+        }
+    }
+}
+
+impl TryFrom<i16> for SearchAttrType {
+    type Error = SearchAttrTypeDecodeError;
+
+    fn try_from(value: i16) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Keyword),
+            1 => Ok(Self::KeywordList),
+            2 => Ok(Self::Int),
+            3 => Ok(Self::Bool),
+            4 => Ok(Self::Double),
+            5 => Ok(Self::Datetime),
+            6 => Ok(Self::Text),
+            value => Err(SearchAttrTypeDecodeError { value }),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -199,6 +237,35 @@ pub enum RollupDimension {
     TaskQueue,
 }
 
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("unknown rollup dimension database value {value}")]
+pub struct RollupDimensionDecodeError {
+    pub value: i16,
+}
+
+impl RollupDimension {
+    pub fn to_db_smallint(self) -> i16 {
+        match self {
+            Self::ExecutionStatus => 0,
+            Self::WorkflowType => 1,
+            Self::TaskQueue => 2,
+        }
+    }
+}
+
+impl TryFrom<i16> for RollupDimension {
+    type Error = RollupDimensionDecodeError;
+
+    fn try_from(value: i16) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::ExecutionStatus),
+            1 => Ok(Self::WorkflowType),
+            2 => Ok(Self::TaskQueue),
+            value => Err(RollupDimensionDecodeError { value }),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RollupDelta {
     pub namespace_id: NamespaceId,
@@ -247,6 +314,22 @@ pub fn search_attr_type_of(value: &SearchAttrValue) -> SearchAttrType {
     }
 }
 
+pub(crate) fn text_search_tokens(text: &str) -> Vec<String> {
+    let mut out = std::collections::HashSet::new();
+    let mut token = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            token.push(ch.to_ascii_lowercase());
+        } else if !token.is_empty() {
+            out.insert(std::mem::take(&mut token));
+        }
+    }
+    if !token.is_empty() {
+        out.insert(token);
+    }
+    out.into_iter().collect()
+}
+
 pub fn beginning_cursor() -> ProjectionCursor {
     ProjectionCursor::beginning(0, 1)
 }
@@ -254,6 +337,7 @@ pub fn beginning_cursor() -> ProjectionCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn page_token_round_trips() {
@@ -274,5 +358,93 @@ mod tests {
     fn page_token_decode_rejects_invalid_input() {
         let error = PageToken::decode("not-base64").unwrap_err();
         assert!(error.to_string().contains("malformed page token"));
+    }
+
+    #[test]
+    fn search_attr_type_database_encoding_is_stable() {
+        let cases = [
+            (SearchAttrType::Keyword, 0),
+            (SearchAttrType::KeywordList, 1),
+            (SearchAttrType::Int, 2),
+            (SearchAttrType::Bool, 3),
+            (SearchAttrType::Double, 4),
+            (SearchAttrType::Datetime, 5),
+            (SearchAttrType::Text, 6),
+        ];
+
+        for (attr_type, value) in cases {
+            assert_eq!(attr_type.to_db_smallint(), value);
+            assert_eq!(SearchAttrType::try_from(value), Ok(attr_type));
+        }
+    }
+
+    #[test]
+    fn search_attr_type_rejects_unknown_database_values() {
+        for value in [7, -1, 100] {
+            assert_eq!(
+                SearchAttrType::try_from(value),
+                Err(SearchAttrTypeDecodeError { value })
+            );
+        }
+    }
+
+    #[test]
+    fn rollup_dimension_database_encoding_is_stable() {
+        let cases = [
+            (RollupDimension::ExecutionStatus, 0),
+            (RollupDimension::WorkflowType, 1),
+            (RollupDimension::TaskQueue, 2),
+        ];
+
+        for (dimension, value) in cases {
+            assert_eq!(dimension.to_db_smallint(), value);
+            assert_eq!(RollupDimension::try_from(value), Ok(dimension));
+        }
+    }
+
+    #[test]
+    fn rollup_dimension_rejects_unknown_database_values() {
+        for value in [3, -1, 100] {
+            assert_eq!(
+                RollupDimension::try_from(value),
+                Err(RollupDimensionDecodeError { value })
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn search_attr_type_database_encoding_round_trips(
+            attr_type in prop_oneof![
+                Just(SearchAttrType::Keyword),
+                Just(SearchAttrType::KeywordList),
+                Just(SearchAttrType::Int),
+                Just(SearchAttrType::Bool),
+                Just(SearchAttrType::Double),
+                Just(SearchAttrType::Datetime),
+                Just(SearchAttrType::Text),
+            ],
+        ) {
+            prop_assert_eq!(
+                SearchAttrType::try_from(attr_type.to_db_smallint()),
+                Ok(attr_type)
+            );
+        }
+
+        #[test]
+        fn rollup_dimension_database_encoding_round_trips(
+            dimension in prop_oneof![
+                Just(RollupDimension::ExecutionStatus),
+                Just(RollupDimension::WorkflowType),
+                Just(RollupDimension::TaskQueue),
+            ],
+        ) {
+            prop_assert_eq!(
+                RollupDimension::try_from(dimension.to_db_smallint()),
+                Ok(dimension)
+            );
+        }
     }
 }

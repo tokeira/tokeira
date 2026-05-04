@@ -1,715 +1,884 @@
-# Design Document: Projection Visibility
+# Design Document: Projection Visibility (DSQL Query Surface)
 
 ## Overview
 
-This design extends `tokeira-projection` from a 137-line stub into a working visibility layer that materializes SQL-queryable execution rows from committed `ProjectionOp`s. The pipeline flows:
+This design completes the DSQL visibility store by replacing the `bail!("projection-visibility spec")` stubs in `DsqlVisibilityStore` with real implementations. The write path (`ProjectionSink::apply`, checkpoint, `upsert_execution`, `delete_execution`) was delivered by `dsql-projection-persistence`. This spec adds:
 
-```
-Kernel transitions → ProjectionOp → ProjectionLog → ProjectionWorker → VisibilitySink → VisibilityStore → VisibilityApi
-```
+1. **Query methods** — `list_executions`, `count_executions`, `count_from_rollup`, `get_row` with filter-to-SQL compilation, keyset pagination, and rollup-accelerated counts.
+2. **Search attribute registry** — `resolve_attr` and `register_attr` against a new `sa_registry` table.
+3. **Search attribute indexing** — `upsert_search_attr_index` and `remove_search_attr_index` maintaining typed side-index tables and `sa_current`.
+4. **Rollup accumulation** — `accumulate_rollup` updating pre-aggregated counters in `vis_rollup`.
+5. **Schema DDL** — 14 new migration files (V029–V042) for tables, indexes, and the rollup table.
 
-The projection plane is explicitly **not on the correctness path**. A lagging or temporarily unavailable visibility layer does not affect workflow execution semantics. Sinks are independently checkpointed and replayable.
+### Key Design Decisions
 
-The primary implementation target is an in-memory `VisibilityStore` for dev/test. The trait surface is designed so a DSQL backend can be added later without changing callers.
+1. **Filter-to-SQL as a pure function producing `(sql_fragment, bind_values)`.** The `FilterExpr` tree is walked recursively. System field predicates compile to direct column comparisons on `vis_execution`. Custom search attribute predicates compile to `run_key IN (SELECT run_key FROM sa_{type}_idx WHERE ...)` subqueries. This keeps the SQL compiler testable in isolation — the pure function takes a `FilterExpr` and returns a SQL string with positional parameters and a `Vec<SqlValue>` of bind values. The caller appends these to the base query.
+
+2. **Keyset pagination using row-value comparison.** The default sort order is `(close_time DESC NULLS LAST, start_time DESC, run_key DESC)`, matching Rust's `Option::cmp` where `None < Some` — closed executions sort before open ones in descending order. The page token encodes the last row's sort-key tuple. The cursor predicate uses row-value comparison with `COALESCE(close_time, '-infinity')` to map NULL to negative infinity so open executions sort last. Other sort orders use analogous two-column `(sort_col, run_key)` comparisons. The query fetches `limit + 1` rows; the caller returns only the first `limit` and emits a page token only when the extra row exists.
+
+3. **Application-generated `attr_id` via deterministic namespace/name hash.** Since DSQL doesn't support BIGSERIAL, `register_attr` generates `attr_id` by hashing `(namespace_id, attr_name)` to a positive i64 using BLAKE3 (via `dsql_spread_uuid` lower 63 bits). This is deterministic — the same `(namespace_id, attr_name)` always produces the same `attr_id`, making primary-key collisions cryptographically unlikely (~2^63 space). If a primary-key conflict occurs where the existing row has a different `(namespace_id, attr_name)`, the implementation returns a clear collision error. The `INSERT ... ON CONFLICT (namespace_id, attr_name) DO NOTHING` pattern handles concurrent registrations — a follow-up SELECT retrieves the winning row's `attr_id`.
+
+4. **Text tokenization matches `InMemoryVisibilityStore::index_text`.** Lowercase alphanumeric token extraction: split on non-alphanumeric characters, lowercase each token, deduplicate. One row per token in `sa_text_token_idx`. KeywordList indexing inserts one row per list element into `sa_keyword_list_idx`, matching the in-memory store's per-element indexing.
+
+5. **Rollup upsert via `INSERT ... ON CONFLICT DO UPDATE SET counter = vis_rollup.counter + EXCLUDED.counter`.** Atomic delta application. The `dimension` column uses a stable SMALLINT encoding: `ExecutionStatus = 0`, `WorkflowType = 1`, `TaskQueue = 2`.
+
+6. **`SearchAttrType` and `RollupDimension` stable numeric mappings in `tokeira-projection/src/types.rs`.** Following the `ExecutionStatus::to_db_smallint` / `TryFrom<i16>` pattern. These live in the projection crate because they are projection-specific types, unlike `ExecutionStatus` which is a core type.
+
+7. **Migration numbering V029–V042.** Continues from the existing V028. One DDL statement per file. All indexes use `CREATE INDEX ASYNC`.
+
+8. **`sa_current.value_data` stores postcard-serialized `SearchAttrValue`.** This allows `remove_search_attr_index` to read the previous value for index cleanup without needing to know the type at the call site (the type is passed as a parameter, but the stored value is needed for deletion from the typed index table).
+
+9. **`get_row` reuses the existing `get_execution_row` helper.** The current implementation already works — it just needs to be wired through instead of returning `None` on the happy path. The existing `get_row` implementation already handles errors by logging and returning `None`, matching the `Option` return type of the trait.
 
 ## Architecture
 
-```mermaid
-graph TD
-    K[Kernel Transition] -->|ProjectionOp| PL[ProjectionLog]
-    PL -->|read_from cursor| PW[ProjectionWorker]
-    PW -->|apply batch| VS[VisibilitySink]
-    VS -->|upsert row + indexes| STORE[VisibilityStore]
-    VS -->|compute deltas| RP[RollupPlanner]
-    RP -->|accumulate| STORE
-    PW -->|persist cursor| CP[CheckpointStore]
+### Module Layout
 
-    QS[VisibilityQueryService] -->|list/count| STORE
-    QS -->|parse filter| QP[QueryPlanner]
-    QP -->|compile| FE[FilterExpr AST]
-    FE -->|execute| STORE
+All new code goes into `tokeira-projection/src/dsql_store.rs` (replacing stubs) plus new migration files in `tokeira-storage/migrations/`. The stable numeric mappings for `SearchAttrType` and `RollupDimension` go into `tokeira-projection/src/types.rs`.
 
-    EDGE[Edge VisibilityApi] -->|delegate| QS
+```
+tokeira-projection/
+├── src/
+│   ├── dsql_store.rs         # DsqlVisibilityStore — stubs replaced with real implementations
+│   ├── types.rs              # SearchAttrType + RollupDimension stable numeric mappings (NEW)
+│   ├── filter.rs             # FilterExpr types (unchanged — compile_filter stays here)
+│   ├── memory.rs             # InMemoryVisibilityStore (behavioral reference, unchanged)
+│   ├── store.rs              # VisibilityStore trait (unchanged)
+│   └── ...
+│
+tokeira-storage/
+├── migrations/
+│   ├── V029__sa_registry.sql
+│   ├── V030__idx_sa_registry_ns_name.sql
+│   ├── V031__sa_current.sql
+│   ├── V032__sa_keyword_idx.sql
+│   ├── V033__sa_keyword_list_idx.sql
+│   ├── V034__sa_int_idx.sql
+│   ├── V035__sa_bool_idx.sql
+│   ├── V036__sa_datetime_idx.sql
+│   ├── V037__sa_double_idx.sql
+│   ├── V038__sa_text_token_idx.sql
+│   ├── V039__vis_rollup.sql
+│   ├── V040__idx_vis_execution_ns_status.sql
+│   ├── V041__idx_vis_execution_ns_start.sql
+│   └── V042__idx_vis_execution_ns_tq.sql
 ```
 
-### Component Ownership
+### Data Flow — List Query
 
-| Component | Crate | Responsibility |
-|---|---|---|
-| `ProjectionOp` | `tokeira-kernel` | Exists; `UpsertExecution`, `CloseExecution` |
-| `ProjectionLog` | `tokeira-storage` | Exists; cursor-based read |
-| `ProjectionSink` | `tokeira-projection` | Exists; `apply(record)` trait |
-| `VisibilitySink` | `tokeira-projection` | New; materializes rows + indexes |
-| `VisibilityStore` | `tokeira-projection` | New; storage trait for rows, indexes, rollups |
-| `QueryPlanner` | `tokeira-projection` | New; filter parse + compile |
-| `VisibilityQueryService` | `tokeira-projection` | New; implements `VisibilityApi` |
-| `InMemoryVisibilityStore` | `tokeira-projection` | New; replaces `InMemoryVisibilitySink` |
-| `ProjectionWorker` | `tokeira-projection` | Exists; extended with loop + checkpoint |
+```mermaid
+sequenceDiagram
+    participant QS as VisibilityQueryService
+    participant VS as DsqlVisibilityStore
+    participant FC as Filter SQL Compiler
+    participant DIR as DsqlConnectionDirector
+    participant DB as Aurora DSQL
 
-All new code lives in `tokeira-projection`. The edge crate already defines `VisibilityApi` and the DTOs; no changes needed there.
+    QS->>VS: list_executions(ns, filter, sort, page)
+    VS->>FC: compile_filter_sql(filter)
+    FC-->>VS: (where_clause, bind_values)
+    VS->>DIR: acquire(DbClass::Projection)
+    DIR-->>VS: DsqlPermit
+    VS->>DB: SELECT ... FROM vis_execution<br/>WHERE namespace_id = $1<br/>AND {where_clause}<br/>AND {cursor_predicate}<br/>ORDER BY {sort_clause}<br/>LIMIT $N
+    DB-->>VS: rows
+    VS->>VS: decode rows → Vec<ExecutionRow>
+    VS->>VS: build PageToken from last row
+    VS-->>QS: ListResult { rows, next_page_token }
+```
+
+### Data Flow — Search Attribute Index Write
+
+```mermaid
+sequenceDiagram
+    participant SINK as VisibilitySink
+    participant VS as DsqlVisibilityStore
+    participant DIR as DsqlConnectionDirector
+    participant DB as Aurora DSQL
+
+    SINK->>VS: upsert_search_attr_index(run_key, ns, attr_id, type, value)
+    VS->>DIR: acquire(DbClass::Projection)
+    DIR-->>VS: DsqlPermit
+    VS->>DB: INSERT INTO sa_current (run_key, attr_id, value_data)<br/>ON CONFLICT DO UPDATE SET value_data = EXCLUDED.value_data
+    VS->>DB: INSERT INTO sa_{type}_idx (namespace_id, attr_id, value, run_key)<br/>ON CONFLICT DO NOTHING
+    DB-->>VS: Ok
+    VS-->>SINK: Ok(())
+```
+
+### Data Flow — Rollup Accumulation
+
+```mermaid
+sequenceDiagram
+    participant SINK as VisibilitySink
+    participant VS as DsqlVisibilityStore
+    participant DIR as DsqlConnectionDirector
+    participant DB as Aurora DSQL
+
+    SINK->>VS: accumulate_rollup(deltas)
+    VS->>DIR: acquire(DbClass::Projection)
+    DIR-->>VS: DsqlPermit
+    loop for each RollupDelta
+        VS->>DB: INSERT INTO vis_rollup (namespace_id, dimension, value, counter)<br/>VALUES ($1, $2, $3, $4)<br/>ON CONFLICT (namespace_id, dimension, value)<br/>DO UPDATE SET counter = vis_rollup.counter + EXCLUDED.counter
+    end
+    DB-->>VS: Ok
+    VS-->>SINK: Ok(())
+```
 
 ## Components and Interfaces
 
-### VisibilityStore Trait
+### Filter-to-SQL Compiler
 
-The core storage abstraction behind the visibility sink and query service.
-
-```rust
-#[async_trait]
-pub trait VisibilityStore: Send + Sync {
-    // ── Write path (sink) ──
-    async fn upsert_execution(
-        &self,
-        row: &ExecutionRow,
-    ) -> Result<()>;
-
-    async fn upsert_search_attr_index(
-        &self,
-        run_key: RunKey,
-        attr_id: AttrId,
-        attr_type: SearchAttrType,
-        value: &SearchAttrValue,
-    ) -> Result<()>;
-
-    async fn remove_search_attr_index(
-        &self,
-        run_key: RunKey,
-        attr_id: AttrId,
-        attr_type: SearchAttrType,
-    ) -> Result<()>;
-
-    async fn accumulate_rollup(
-        &self,
-        entries: &[RollupDelta],
-    ) -> Result<()>;
-
-    // ── Read path (query) ──
-    async fn list_executions(
-        &self,
-        namespace_id: NamespaceId,
-        filter: &CompiledFilter,
-        sort: SortOrder,
-        page: &PageBounds,
-    ) -> Result<ListResult>;
-
-    async fn count_executions(
-        &self,
-        namespace_id: NamespaceId,
-        filter: &CompiledFilter,
-        group_by: Option<GroupByField>,
-    ) -> Result<CountResult>;
-
-    async fn count_from_rollup(
-        &self,
-        namespace_id: NamespaceId,
-        dimension: RollupDimension,
-    ) -> Result<CountResult>;
-
-    // ── Checkpoint ──
-    async fn load_checkpoint(
-        &self,
-        sink_id: &str,
-    ) -> Result<Option<ProjectionCursor>>;
-
-    async fn save_checkpoint(
-        &self,
-        sink_id: &str,
-        cursor: &ProjectionCursor,
-    ) -> Result<()>;
-
-    // ── Registry ──
-    async fn resolve_attr(
-        &self,
-        namespace_id: NamespaceId,
-        name: &str,
-    ) -> Result<Option<AttrDescriptor>>;
-
-    async fn register_attr(
-        &self,
-        namespace_id: NamespaceId,
-        name: String,
-        attr_type: SearchAttrType,
-    ) -> Result<AttrId>;
-
-    // ── Backward compat ──
-    async fn get_row(
-        &self,
-        run_key: RunKey,
-    ) -> Option<ExecutionRow>;
-}
-```
-
-### VisibilitySink
-
-Implements `ProjectionSink`. Consumes `ProjectionRecord`s and writes to `VisibilityStore`.
+A new internal module within `dsql_store.rs` (or a private submodule). The compiler is a pure function — no I/O, no async.
 
 ```rust
-pub struct VisibilitySink<S: VisibilityStore> {
-    store: S,
-    sink_id: String,
+/// Compiled SQL fragment with positional bind values.
+struct SqlFragment {
+    /// SQL WHERE clause fragment (e.g., "workflow_type = $2")
+    sql: String,
+    /// Bind values in positional order
+    values: Vec<SqlValue>,
 }
 
-#[async_trait]
-impl<S: VisibilityStore> ProjectionSink
-    for VisibilitySink<S>
-{
-    async fn apply(
-        &self,
-        record: &ProjectionRecord,
-    ) -> Result<()>;
-}
-```
-
-The `apply` method:
-1. Loads or creates the `ExecutionRow` for `record.run_key`.
-2. Populates system fields (namespace_id, workflow_id, run_id, workflow_type, task_queue, start_time, history_length, state_transition_count) from `record.context`. **Note:** The current `ProjectionRecord` in `tokeira-storage` does not carry a `ProjectionContext`. This feature adds a `context: ProjectionContext` field to `ProjectionRecord` (following the pattern from the prototyping crate), populated by `InMemoryStore::commit_transition` from `WorkflowState` at commit time.
-3. Applies each `ProjectionOp` in order:
-   - `UpsertExecution`: merges status, memo, search attributes.
-   - `CloseExecution`: sets terminal status and `closed_at`.
-4. For each search attribute in the patch, resolves via registry, removes old index entries, inserts new ones.
-5. Computes rollup deltas for status/workflow_type/task_queue dimension changes.
-6. Writes the updated row, index entries, and rollup deltas to the store.
-
-**Checkpoint ownership:** The `ProjectionSink` trait only has `apply(record)` and does not see batch or cursor boundaries. Checkpointing is a `ProjectionWorker` responsibility — the worker calls `store.save_checkpoint` after each successfully applied batch and `store.load_checkpoint` on startup.
-
-### SearchAttributeRegistry
-
-Namespace-scoped mapping from attribute names to typed descriptors.
-
-```rust
-pub struct AttrDescriptor {
-    pub attr_id: AttrId,
-    pub attr_type: SearchAttrType,
-}
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, Hash,
-)]
-pub struct AttrId(pub u64);
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, Hash,
-)]
-pub enum SearchAttrType {
-    Keyword,
-    KeywordList,
-    Int,
-    Bool,
-    Double,
-    Datetime,
-    Text,
-}
-```
-
-The registry lives inside `VisibilityStore`. The sink calls `resolve_attr` during apply; the query planner calls it during filter compilation.
-
-### QueryPlanner
-
-Parses Temporal-compatible list-filter expressions and compiles them into a `CompiledFilter` that the store can execute.
-
-```rust
-/// Parsed filter expression AST.
-#[derive(Clone, Debug, PartialEq)]
-pub enum FilterExpr {
-    And(Box<FilterExpr>, Box<FilterExpr>),
-    Or(Box<FilterExpr>, Box<FilterExpr>),
-    Compare {
-        field: FieldRef,
-        op: CompareOp,
-        value: FilterValue,
-    },
-    In {
-        field: FieldRef,
-        values: Vec<FilterValue>,
-    },
-    Between {
-        field: FieldRef,
-        low: FilterValue,
-        high: FilterValue,
-    },
-    StartsWith {
-        field: FieldRef,
-        prefix: String,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum FieldRef {
-    System(SystemField),
-    Custom(AttrId, SearchAttrType),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SystemField {
-    WorkflowId,
-    RunId,
-    WorkflowType,
-    TaskQueue,
-    ExecutionStatus,
-    StartTime,
-    CloseTime,
-    HistoryLength,
-    StateTransitionCount,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CompareOp {
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum FilterValue {
-    String(String),
+/// A typed bind value for parameterized queries.
+enum SqlValue {
+    Text(String),
     Int(i64),
     Float(f64),
     Bool(bool),
-    Datetime(OffsetDateTime),
-    Status(ExecutionStatus),
+    Timestamp(OffsetDateTime),
+    Smallint(i16),
+    Uuid(Uuid),
 }
+
+/// Compile a FilterExpr tree into a SQL WHERE clause fragment.
+///
+/// `param_offset` is the starting parameter index (e.g., 2 if $1 is
+/// already used for namespace_id). Returns the SQL fragment and the
+/// next available parameter index.
+fn compile_filter_sql(
+    expr: &FilterExpr,
+    param_offset: usize,
+) -> (SqlFragment, usize);
 ```
 
-Compilation pipeline:
-1. **Parse** filter string → `FilterExpr` AST.
-2. **Resolve** custom attribute names via registry → `FieldRef::Custom(attr_id, attr_type)`.
-3. **Type-check** each predicate (value type matches field type).
-4. **Wrap** into `CompiledFilter` for store execution.
+**System field mapping:**
+
+| SystemField | SQL Column | SQL Type |
+|---|---|---|
+| `WorkflowId` | `workflow_id` | TEXT |
+| `RunId` | `run_id::TEXT` | TEXT (cast UUID to text for string comparison) |
+| `WorkflowType` | `workflow_type` | TEXT |
+| `TaskQueue` | `task_queue` | TEXT |
+| `ExecutionStatus` | `execution_status` | SMALLINT (via `to_db_smallint()`) |
+| `StartTime` | `start_time` | TIMESTAMPTZ |
+| `CloseTime` | `close_time` | TIMESTAMPTZ |
+| `HistoryLength` | `history_length` | BIGINT |
+| `StateTransitionCount` | `state_transition_count` | BIGINT |
+
+**Custom attribute predicate patterns:**
+
+Filter predicates on custom search attributes use the typed index tables directly. For scalar types (Keyword, Int, Bool, Datetime, Double), the index contains one row per value. For KeywordList and Text, the index tables contain one row per element/token, which naturally provides the correct Temporal semantics: element-membership for KeywordList and token-matching for Text.
+
+```sql
+-- Keyword equality (one value per row)
+run_key IN (SELECT run_key FROM sa_keyword_idx WHERE namespace_id = $1 AND attr_id = $2 AND value = $3)
+
+-- KeywordList element-membership: matches if any element equals the filter value
+run_key IN (SELECT run_key FROM sa_keyword_list_idx WHERE namespace_id = $1 AND attr_id = $2 AND value = $3)
+
+-- KeywordList inequality: matches only if no element equals the filter value
+NOT EXISTS (
+  SELECT 1 FROM sa_keyword_list_idx idx
+  WHERE idx.namespace_id = vis_execution.namespace_id
+    AND idx.run_key = vis_execution.run_key
+    AND idx.attr_id = $2
+    AND idx.value = $3
+)
+
+-- Text token-matching: query literal is normalized (lowercased) before comparison
+-- matches if any token equals the normalized filter value
+run_key IN (SELECT run_key FROM sa_text_token_idx WHERE namespace_id = $1 AND attr_id = $2 AND value = $3)
+
+-- Text inequality: matches only if no token equals the normalized filter value
+NOT EXISTS (
+  SELECT 1 FROM sa_text_token_idx idx
+  WHERE idx.namespace_id = vis_execution.namespace_id
+    AND idx.run_key = vis_execution.run_key
+    AND idx.attr_id = $2
+    AND idx.value = $3
+)
+
+-- Int range
+run_key IN (SELECT run_key FROM sa_int_idx WHERE namespace_id = $1 AND attr_id = $2 AND value >= $3 AND value <= $4)
+
+-- Keyword STARTS_WITH
+run_key IN (SELECT run_key FROM sa_keyword_idx WHERE namespace_id = $1 AND attr_id = $2 AND value LIKE $3)
+
+-- KeywordList STARTS_WITH: matches if any element starts with the prefix
+run_key IN (SELECT run_key FROM sa_keyword_list_idx WHERE namespace_id = $1 AND attr_id = $2 AND value LIKE $3)
+
+-- Text STARTS_WITH: prefix is lowercased and LIKE-escaped before matching against tokens
+run_key IN (SELECT run_key FROM sa_text_token_idx WHERE namespace_id = $1 AND attr_id = $2 AND value LIKE $3)
+```
+
+The per-element/per-token index structure means positive membership operators (`Eq`, `In`, `StartsWith`) naturally return the correct run_keys — a row exists in the index if and only if the attribute contains that element/token. Negative membership (`Ne`) must use `NOT EXISTS` anti-semijoin semantics; `value <> $N` is incorrect because a multi-value attribute containing both the rejected value and another value would still have a row satisfying the inequality.
+
+**Text literal normalization:** Text stored values and Text query literals both use the same tokenizer: lowercase alphanumeric token extraction. `Eq` and `Ne` accept a query literal only when it normalizes to exactly one token. A zero-token or multi-token literal compiles/evaluates as `FALSE` for `Eq` and `TRUE` for `Ne`. `In` normalizes each candidate independently, discards candidates that do not normalize to exactly one token, and compiles/evaluates as `FALSE` if no normalized candidates remain. `StartsWith` lowercases the prefix and applies LIKE escaping; it does not require full-token extraction because it is a prefix predicate.
+
+**`FilterExpr::StartsWith` LIKE escaping:** The prefix is escaped by replacing `\` with `\\`, `%` with `\%`, and `_` with `\_` (in that order — backslash first to avoid double-escaping), then appending `%`. The query uses `LIKE $N ESCAPE '\'`. The backslash escape is required because `ESCAPE '\'` makes backslash a semantic character in the LIKE pattern.
+
+### Pagination SQL
+
+**Default sort order** (`SortOrder::Default`):
+
+```sql
+ORDER BY close_time DESC NULLS LAST,
+         start_time DESC,
+         run_key DESC
+```
+
+Rust's `Option::cmp` sorts `None < Some`, so in descending order `Some(close_time)` values come first and `None` (open executions) come last. `NULLS LAST` in SQL matches this behavior.
+
+**Cursor predicate for default sort:**
+
+```sql
+AND (COALESCE(close_time, '-infinity'::timestamptz), start_time, run_key)
+    < (COALESCE($p1, '-infinity'::timestamptz), $p2, $p3)
+```
+
+Where `$p1`, `$p2`, `$p3` are the `PageToken`'s `close_time`, `start_time`, and `run_key`. `COALESCE` maps NULL to negative infinity so that open executions sort last in descending order, matching the Rust `None < Some` comparison.
+
+**Other sort orders:**
+
+| SortOrder | ORDER BY | Cursor Predicate |
+|---|---|---|
+| `StartTimeAsc` | `start_time ASC, run_key ASC` | `(start_time, run_key) > ($p1, $p2)` |
+| `StartTimeDesc` | `start_time DESC, run_key DESC` | `(start_time, run_key) < ($p1, $p2)` |
+| `CloseTimeAsc` | `close_time ASC NULLS FIRST, run_key ASC` | `(COALESCE(close_time, '-infinity'), run_key) > (COALESCE($p1, '-infinity'), $p2)` |
+| `CloseTimeDesc` | `close_time DESC NULLS LAST, run_key DESC` | `(COALESCE(close_time, '-infinity'), run_key) < (COALESCE($p1, '-infinity'), $p2)` |
+
+### `list_executions` SQL Template
+
+```sql
+SELECT run_key, namespace_id, workflow_id, run_id, workflow_type,
+       task_queue, execution_status, start_time, execution_time,
+       close_time, history_length, state_transition_count, memo
+FROM vis_execution
+WHERE namespace_id = $1
+  AND {filter_where_clause}
+  AND {cursor_predicate}
+ORDER BY {sort_clause}
+LIMIT $N  -- page.limit + 1 to detect next page
+```
+
+When the filter is empty (`CompiledFilter { expr: None }`), the `{filter_where_clause}` is omitted (or replaced with `TRUE`). The query fetches `limit + 1` rows; the caller returns only the first `limit` and emits a page token only when the extra row exists.
+
+### `count_executions` SQL
+
+**Without group_by:**
+
+```sql
+SELECT COUNT(*) AS total_count
+FROM vis_execution
+WHERE namespace_id = $1
+  AND {filter_where_clause}
+```
+
+**With system field group_by:**
+
+```sql
+SELECT {group_column} AS group_value, COUNT(*) AS group_count
+FROM vis_execution
+WHERE namespace_id = $1
+  AND {filter_where_clause}
+GROUP BY {group_column}
+```
+
+For `ExecutionStatus` group-by, the query returns the SMALLINT value. The Rust code converts each SMALLINT back to `ExecutionStatus` via `TryFrom<i16>` and then formats it as `format!("{:?}", status)` to match the `InMemoryVisibilityStore` behavior (e.g., `"Running"`, `"Completed"`).
+
+**With custom attribute group_by:**
+
+Custom group-by is restricted to **scalar attribute types** (Keyword, Int, Bool, Datetime, Double). KeywordList and Text are multi-value types where the typed index tables contain one row per element/token, which would over-count rows into multiple groups and return different group labels than the `InMemoryVisibilityStore` reference. If a group-by request targets a KeywordList or Text attribute, the implementation SHALL return an error.
+
+For scalar custom group-by, use a LEFT JOIN against the typed index table and format group labels in Rust through a shared helper that matches `InMemoryVisibilityStore::group_value`, rather than relying on SQL `::TEXT` casts which produce database-specific formatting:
+
+```sql
+-- Scalar custom attribute group-by (Keyword, Int, Bool, Datetime, Double)
+-- Fetch raw typed values, format labels in Rust
+SELECT idx.value AS group_value, COUNT(*) AS group_count
+FROM vis_execution ve
+LEFT JOIN sa_{type}_idx idx ON idx.run_key = ve.run_key
+  AND idx.namespace_id = ve.namespace_id
+  AND idx.attr_id = $2
+WHERE ve.namespace_id = $1
+  AND {filter_where_clause}
+GROUP BY idx.value
+```
+
+The LEFT JOIN ensures rows without the attribute appear with `NULL` group_value. The Rust code maps `NULL` to `""` (empty string) and formats non-NULL values through the same label helper used by the in-memory store. For typed index tables where the SQL value type matches the Rust type directly (e.g., `TEXT` for Keyword, `BIGINT` for Int), the SQL `GROUP BY` operates on the native type and the Rust formatter converts to the label string.
+
+### `count_from_rollup` SQL
+
+```sql
+SELECT value, counter
+FROM vis_rollup
+WHERE namespace_id = $1 AND dimension = $2
+```
+
+The Rust code sums `counter` values for `total_count` and returns individual `(value, counter)` pairs as `RollupCounter` groups.
+
+### `resolve_attr` SQL
+
+```sql
+SELECT attr_id, attr_type
+FROM sa_registry
+WHERE namespace_id = $1 AND attr_name = $2
+```
+
+### `register_attr` SQL
+
+```sql
+INSERT INTO sa_registry (attr_id, namespace_id, attr_name, attr_type)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (namespace_id, attr_name) DO NOTHING
+RETURNING attr_id
+```
+
+If `RETURNING` yields no rows (conflict), a follow-up SELECT retrieves the existing `attr_id`:
+
+```sql
+SELECT attr_id FROM sa_registry WHERE namespace_id = $1 AND attr_name = $2
+```
+
+### `upsert_search_attr_index` SQL
+
+**Step 1 — Update `sa_current`:**
+
+```sql
+INSERT INTO sa_current (run_key, attr_id, value_data)
+VALUES ($1, $2, $3)
+ON CONFLICT (run_key, attr_id) DO UPDATE SET value_data = EXCLUDED.value_data
+```
+
+**Step 2 — Insert into typed index table (example for Keyword):**
+
+```sql
+INSERT INTO sa_keyword_idx (namespace_id, attr_id, value, run_key)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT DO NOTHING
+```
+
+**KeywordList type — insert one row per list element:**
+
+```sql
+-- For each element in the keyword list:
+INSERT INTO sa_keyword_list_idx (namespace_id, attr_id, value, run_key)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT DO NOTHING
+```
+
+**Text type — tokenize and insert one row per token:**
+
+```sql
+-- For each token extracted from the text value:
+INSERT INTO sa_text_token_idx (namespace_id, attr_id, value, run_key)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT DO NOTHING
+```
+
+### `remove_search_attr_index` SQL
+
+**Step 1 — Read current value from `sa_current`:**
+
+```sql
+SELECT value_data FROM sa_current WHERE run_key = $1 AND attr_id = $2
+```
+
+If no row exists, return `Ok(())`.
+
+**Step 2 — Delete from typed index table (example for Keyword):**
+
+```sql
+DELETE FROM sa_keyword_idx
+WHERE namespace_id = $1 AND attr_id = $2 AND value = $3 AND run_key = $4
+```
+
+**KeywordList type — delete all per-element rows:**
+
+```sql
+-- For each element in the stored keyword list:
+DELETE FROM sa_keyword_list_idx
+WHERE namespace_id = $1 AND attr_id = $2 AND value = $3 AND run_key = $4
+```
+
+**Text type — tokenize stored value and delete each token:**
+
+```sql
+DELETE FROM sa_text_token_idx
+WHERE namespace_id = $1 AND attr_id = $2 AND value = $3 AND run_key = $4
+```
+
+**Step 3 — Delete from `sa_current`:**
+
+```sql
+DELETE FROM sa_current WHERE run_key = $1 AND attr_id = $2
+```
+
+### `accumulate_rollup` SQL
+
+```sql
+INSERT INTO vis_rollup (namespace_id, dimension, value, counter)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (namespace_id, dimension, value)
+DO UPDATE SET counter = vis_rollup.counter + EXCLUDED.counter
+```
+
+### Stable Numeric Mappings
+
+**`SearchAttrType` (in `tokeira-projection/src/types.rs`):**
 
 ```rust
-pub struct CompiledFilter {
-    pub expr: Option<FilterExpr>,
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("unknown search attribute type database value {value}")]
+pub struct SearchAttrTypeDecodeError {
+    pub value: i16,
 }
 
-pub fn compile_filter(
-    input: Option<&str>,
-    namespace_id: NamespaceId,
-    store: &dyn VisibilityStore,
-) -> Result<CompiledFilter>;
+impl SearchAttrType {
+    pub fn to_db_smallint(self) -> i16 {
+        match self {
+            Self::Keyword => 0,
+            Self::KeywordList => 1,
+            Self::Int => 2,
+            Self::Bool => 3,
+            Self::Double => 4,
+            Self::Datetime => 5,
+            Self::Text => 6,
+        }
+    }
+}
+
+impl TryFrom<i16> for SearchAttrType {
+    type Error = SearchAttrTypeDecodeError;
+    fn try_from(value: i16) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Keyword),
+            1 => Ok(Self::KeywordList),
+            2 => Ok(Self::Int),
+            3 => Ok(Self::Bool),
+            4 => Ok(Self::Double),
+            5 => Ok(Self::Datetime),
+            6 => Ok(Self::Text),
+            value => Err(SearchAttrTypeDecodeError { value }),
+        }
+    }
+}
 ```
 
-### Pagination
+**`RollupDimension` (in `tokeira-projection/src/types.rs`):**
 
 ```rust
-#[derive(Clone, Debug, PartialEq)]
-pub struct PageToken {
-    pub close_time: Option<OffsetDateTime>,
-    pub start_time: OffsetDateTime,
-    pub run_key: RunKey,
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("unknown rollup dimension database value {value}")]
+pub struct RollupDimensionDecodeError {
+    pub value: i16,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct PageBounds {
-    pub limit: usize,
-    pub after: Option<PageToken>,
+impl RollupDimension {
+    pub fn to_db_smallint(self) -> i16 {
+        match self {
+            Self::ExecutionStatus => 0,
+            Self::WorkflowType => 1,
+            Self::TaskQueue => 2,
+        }
+    }
 }
 
-pub const MAX_PAGE_SIZE: usize = 1000;
-```
-
-Page tokens are serialized as base64-encoded JSON. The sort tuple is `(close_time DESC NULLS FIRST, start_time DESC, run_key DESC)` for the default sort order.
-
-```rust
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SortOrder {
-    Default,
-    StartTimeAsc,
-    StartTimeDesc,
-    CloseTimeAsc,
-    CloseTimeDesc,
-}
-```
-
-### Rollup Acceleration
-
-```rust
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RollupDimension {
-    ExecutionStatus,
-    WorkflowType,
-    TaskQueue,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct RollupDelta {
-    pub namespace_id: NamespaceId,
-    pub dimension: RollupDimension,
-    pub value: String,
-    pub delta: i64,
+impl TryFrom<i16> for RollupDimension {
+    type Error = RollupDimensionDecodeError;
+    fn try_from(value: i16) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::ExecutionStatus),
+            1 => Ok(Self::WorkflowType),
+            2 => Ok(Self::TaskQueue),
+            value => Err(RollupDimensionDecodeError { value }),
+        }
+    }
 }
 ```
-
-The `RollupPlanner` computes signed deltas during each apply cycle:
-- New row: `+1` for current status, workflow type, task queue.
-- Status change: `-1` for old value, `+1` for new value.
-- The store accumulates deltas into rollup counters.
-
-### VisibilityQueryService
-
-Implements `VisibilityApi` by delegating to the query planner and store.
-
-```rust
-pub struct VisibilityQueryService<S: VisibilityStore> {
-    store: S,
-}
-
-#[async_trait]
-impl<S: VisibilityStore> VisibilityApi
-    for VisibilityQueryService<S>
-{
-    async fn list_workflows(
-        &self,
-        req: ListWorkflowExecutionsRequest,
-    ) -> Result<ListWorkflowExecutionsResponse>;
-
-    async fn count_workflows(
-        &self,
-        req: CountWorkflowExecutionsRequest,
-    ) -> Result<CountWorkflowExecutionsResponse>;
-}
-```
-
-`list_workflows`:
-1. Parse namespace to `NamespaceId`.
-2. Compile filter via `compile_filter`.
-3. Decode page token (if present).
-4. Call `store.list_executions(...)`.
-5. Map `ExecutionRow` → `WorkflowExecutionSummary`.
-6. Encode next page token if more results exist.
-
-`count_workflows`:
-1. Parse namespace and filter.
-2. If filter is empty and group-by targets a rollup dimension, use `store.count_from_rollup`.
-3. Otherwise call `store.count_executions`.
-
-### ProjectionWorker Extensions
-
-The existing `ProjectionWorker` is extended with:
-
-```rust
-impl<L, S> ProjectionWorker<L, S>
-where
-    L: ProjectionLog,
-    S: ProjectionSink,
-{
-    /// Long-running loop with backoff and cancellation.
-    pub async fn run(
-        &self,
-        cancel: CancellationToken,
-    ) -> Result<()>;
-}
-```
-
-The `run` method:
-1. Load checkpoint from store (or start from beginning).
-2. Loop: read batch → apply → save checkpoint → repeat.
-3. On empty batch: exponential backoff (100ms base, 5s cap).
-4. On sink error: log, backoff, retry without advancing checkpoint.
-5. On cancellation: finish current batch, save checkpoint, return.
 
 ## Data Models
 
-### ExecutionRow
+### New Tables
 
-```rust
-#[derive(Clone, Debug, PartialEq)]
-pub struct ExecutionRow {
-    pub run_key: RunKey,
-    pub namespace_id: NamespaceId,
-    pub workflow_id: WorkflowId,
-    pub run_id: RunId,
-    pub workflow_type: WorkflowType,
-    pub task_queue: TaskQueueName,
-    pub status: ExecutionStatus,
-    pub start_time: OffsetDateTime,
-    pub execution_time: Option<OffsetDateTime>,
-    pub close_time: Option<OffsetDateTime>,
-    pub history_length: i64,
-    pub state_transition_count: i64,
-    pub memo: Memo,
-    pub search_attr_version: u64,
-}
+#### `sa_registry` (V029)
+
+```sql
+CREATE TABLE IF NOT EXISTS sa_registry (
+    attr_id       BIGINT      NOT NULL,
+    namespace_id  UUID        NOT NULL,
+    attr_name     TEXT        NOT NULL,
+    attr_type     SMALLINT    NOT NULL,
+    PRIMARY KEY (attr_id)
+);
 ```
 
-### TypedIndex
+#### `sa_registry` unique index (V030)
 
-Seven in-memory index structures, each keyed by `(NamespaceId, AttrId)`:
+```sql
+CREATE UNIQUE INDEX ASYNC idx_sa_registry_ns_name
+ON sa_registry (namespace_id, attr_name);
+```
 
-| Index | Value Type | Lookup |
+#### `sa_current` (V031)
+
+```sql
+CREATE TABLE IF NOT EXISTS sa_current (
+    run_key    UUID    NOT NULL,
+    attr_id    BIGINT  NOT NULL,
+    value_data BYTEA   NOT NULL,
+    PRIMARY KEY (run_key, attr_id)
+);
+```
+
+#### `sa_keyword_idx` (V032)
+
+```sql
+CREATE TABLE IF NOT EXISTS sa_keyword_idx (
+    namespace_id UUID    NOT NULL,
+    attr_id      BIGINT  NOT NULL,
+    value        TEXT    NOT NULL,
+    run_key      UUID    NOT NULL,
+    PRIMARY KEY (namespace_id, attr_id, value, run_key)
+);
+```
+
+#### `sa_keyword_list_idx` (V033)
+
+```sql
+CREATE TABLE IF NOT EXISTS sa_keyword_list_idx (
+    namespace_id UUID    NOT NULL,
+    attr_id      BIGINT  NOT NULL,
+    value        TEXT    NOT NULL,
+    run_key      UUID    NOT NULL,
+    PRIMARY KEY (namespace_id, attr_id, value, run_key)
+);
+```
+
+#### `sa_int_idx` (V034)
+
+```sql
+CREATE TABLE IF NOT EXISTS sa_int_idx (
+    namespace_id UUID    NOT NULL,
+    attr_id      BIGINT  NOT NULL,
+    value        BIGINT  NOT NULL,
+    run_key      UUID    NOT NULL,
+    PRIMARY KEY (namespace_id, attr_id, value, run_key)
+);
+```
+
+#### `sa_bool_idx` (V035)
+
+```sql
+CREATE TABLE IF NOT EXISTS sa_bool_idx (
+    namespace_id UUID    NOT NULL,
+    attr_id      BIGINT  NOT NULL,
+    value        BOOLEAN NOT NULL,
+    run_key      UUID    NOT NULL,
+    PRIMARY KEY (namespace_id, attr_id, value, run_key)
+);
+```
+
+#### `sa_datetime_idx` (V036)
+
+```sql
+CREATE TABLE IF NOT EXISTS sa_datetime_idx (
+    namespace_id UUID        NOT NULL,
+    attr_id      BIGINT      NOT NULL,
+    value        TIMESTAMPTZ NOT NULL,
+    run_key      UUID        NOT NULL,
+    PRIMARY KEY (namespace_id, attr_id, value, run_key)
+);
+```
+
+#### `sa_double_idx` (V037)
+
+```sql
+CREATE TABLE IF NOT EXISTS sa_double_idx (
+    namespace_id UUID             NOT NULL,
+    attr_id      BIGINT           NOT NULL,
+    value        DOUBLE PRECISION NOT NULL,
+    run_key      UUID             NOT NULL,
+    PRIMARY KEY (namespace_id, attr_id, value, run_key)
+);
+```
+
+#### `sa_text_token_idx` (V038)
+
+```sql
+CREATE TABLE IF NOT EXISTS sa_text_token_idx (
+    namespace_id UUID    NOT NULL,
+    attr_id      BIGINT  NOT NULL,
+    value        TEXT    NOT NULL,
+    run_key      UUID    NOT NULL,
+    PRIMARY KEY (namespace_id, attr_id, value, run_key)
+);
+```
+
+#### `vis_rollup` (V039)
+
+```sql
+CREATE TABLE IF NOT EXISTS vis_rollup (
+    namespace_id UUID     NOT NULL,
+    dimension    SMALLINT NOT NULL,
+    value        TEXT     NOT NULL,
+    counter      BIGINT   NOT NULL DEFAULT 0,
+    PRIMARY KEY (namespace_id, dimension, value)
+);
+```
+
+#### Additional `vis_execution` indexes (V040, V041, V042)
+
+```sql
+-- V040: namespace + execution_status for filtered counts
+CREATE INDEX ASYNC idx_vis_execution_ns_status
+ON vis_execution (namespace_id, execution_status);
+
+-- V041: namespace + start_time + run_key for time-ordered keyset pagination
+CREATE INDEX ASYNC idx_vis_execution_ns_start
+ON vis_execution (namespace_id, start_time DESC, run_key DESC);
+
+-- V042: namespace + task_queue for task-queue-filtered queries
+CREATE INDEX ASYNC idx_vis_execution_ns_tq
+ON vis_execution (namespace_id, task_queue);
+```
+
+Note: V017 (`idx_vis_execution_ns_close`) is updated in-place from `NULLS FIRST` to `NULLS LAST` to match the default sort order. V018 (`idx_vis_execution_ns_type`) already exists unchanged.
+
+### Existing Tables (No Changes)
+
+| Table | Used By |
+|---|---|
+| `vis_execution` | `list_executions`, `count_executions`, `get_row` (read); already written by `ProjectionSink::apply` |
+| `projector_checkpoint` | `load_checkpoint`, `save_checkpoint` (already implemented) |
+
+### Type Mappings (New)
+
+| Rust Type | SQL Column | Encoding |
 |---|---|---|
-| `sa_keyword_idx` | `String` | exact, IN, StartsWith |
-| `sa_keyword_list_idx` | `Vec<String>` | exact per element |
-| `sa_int_idx` | `i64` | range, exact |
-| `sa_bool_idx` | `bool` | exact |
-| `sa_double_idx` | `f64` | range, exact |
-| `sa_datetime_idx` | `OffsetDateTime` | range, exact, BETWEEN |
-| `sa_text_token_idx` | `Vec<String>` (tokens) | token match |
+| `AttrId(u64)` | `attr_id BIGINT` | Checked `i64` conversion via `i64_from_u64` |
+| `SearchAttrType` | `attr_type SMALLINT` | `to_db_smallint()` / `TryFrom<i16>` |
+| `RollupDimension` | `dimension SMALLINT` | `to_db_smallint()` / `TryFrom<i16>` |
+| `SearchAttrValue` | `value_data BYTEA` | Postcard `codec::encode` / `codec::decode` |
+| `f64` (Double) | `DOUBLE PRECISION` | Direct sqlx binding |
 
-Each index entry maps `(NamespaceId, AttrId, value) → BTreeSet<RunKey>` for efficient predicate evaluation.
 
-### RollupEntry
+
+### InMemoryVisibilityStore Filter Semantics Fix
+
+The current `InMemoryVisibilityStore` has incorrect filter evaluation for KeywordList and Text attributes. The `search_attr_to_filter` function collapses multi-value attributes into a single `FilterValue::String`:
+
+- **KeywordList**: `v.join(",")` — so `CustomKeywordList = "a"` compares against `"a,b"`, which never matches. Should use element-membership.
+- **Text**: returns the full string — so `CustomText = "hello world"` does exact string equality. Should use token-matching.
+
+The fix replaces the single-dispatch `field_value` → `search_attr_to_filter` → `compare` path with type-aware evaluation in `eval_expr` that handles multi-value attributes directly:
 
 ```rust
-#[derive(Clone, Debug, Default)]
-pub struct RollupCounter {
-    /// dimension_value → accumulated count
-    pub counts: HashMap<String, i64>,
+// For KeywordList: element-membership
+FieldRef::Custom { attr_type: SearchAttrType::KeywordList, attr_id, .. } => {
+    let Some(SearchAttrValue::KeywordList(elements)) = inner.sa_current.get(&(row.run_key, *attr_id)) else {
+        return false;
+    };
+    // For Compare(Eq, "a"): any element == "a"
+    // For In(["a", "b"]): any element in set
+    // For StartsWith("pre"): any element starts with "pre"
+    elements.iter().any(|e| /* match against filter value */)
+}
+
+// For Text: token-matching
+FieldRef::Custom { attr_type: SearchAttrType::Text, attr_id, .. } => {
+    let Some(SearchAttrValue::Text(text)) = inner.sa_current.get(&(row.run_key, *attr_id)) else {
+        return false;
+    };
+    let tokens = InMemoryVisibilityStore::index_text(text);
+    // For Compare(Eq, "word"): any token == "word"
+    // For StartsWith("pre"): any token starts with "pre"
+    tokens.iter().any(|t| /* match against filter value */)
 }
 ```
 
-Stored per `(NamespaceId, RollupDimension)`.
-
-### PageToken (serialized)
-
-```rust
-#[derive(Serialize, Deserialize)]
-struct PageTokenWire {
-    ct: Option<i64>,  // close_time unix millis
-    st: i64,          // start_time unix millis
-    rk: Uuid,         // run_key
-    so: u8,           // sort_order discriminant
-}
-```
-
-Base64-encoded JSON. Compact to keep gRPC response sizes small.
-
-### SearchAttributeRegistry (in-memory)
-
-```rust
-struct RegistryState {
-    /// (namespace_id, attr_name) → descriptor
-    attrs: HashMap<
-        (NamespaceId, String),
-        AttrDescriptor,
-    >,
-    next_attr_id: u64,
-}
-```
-
-### InMemoryVisibilityStore State
-
-```rust
-struct VisibilityState {
-    rows: HashMap<RunKey, ExecutionRow>,
-    // Search attribute current values
-    sa_current: HashMap<
-        (RunKey, AttrId),
-        SearchAttrValue,
-    >,
-    // Typed indexes: (ns, attr_id, value) → run_keys
-    keyword_idx: BTreeMap<
-        (NamespaceId, AttrId, String),
-        BTreeSet<RunKey>,
-    >,
-    keyword_list_idx: BTreeMap<
-        (NamespaceId, AttrId, String),
-        BTreeSet<RunKey>,
-    >,
-    int_idx: BTreeMap<
-        (NamespaceId, AttrId, i64),
-        BTreeSet<RunKey>,
-    >,
-    bool_idx: BTreeMap<
-        (NamespaceId, AttrId, bool),
-        BTreeSet<RunKey>,
-    >,
-    double_idx: BTreeMap<
-        (NamespaceId, AttrId, OrderedFloat<f64>),
-        BTreeSet<RunKey>,
-    >,
-    datetime_idx: BTreeMap<
-        (NamespaceId, AttrId, OffsetDateTime),
-        BTreeSet<RunKey>,
-    >,
-    text_token_idx: BTreeMap<
-        (NamespaceId, AttrId, String),
-        BTreeSet<RunKey>,
-    >,
-    // Rollups
-    rollups: HashMap<
-        (NamespaceId, RollupDimension),
-        RollupCounter,
-    >,
-    // Registry
-    registry: RegistryState,
-    // Checkpoints
-    checkpoints: HashMap<String, ProjectionCursor>,
-}
-```
-
-Wrapped in `Arc<Mutex<VisibilityState>>` following the existing `InMemoryStore` pattern.
+This aligns the in-memory reference with Temporal's documented semantics and with the DSQL index table structure, making behavioral equivalence tests meaningful.
 
 
 ## Correctness Properties
 
 *A property is a characteristic or behavior that should hold true across all valid executions of a system — essentially, a formal statement about what the system should do. Properties serve as the bridge between human-readable specifications and machine-verifiable correctness guarantees.*
 
-### Property 1: Apply Correctness
+The following properties are derived from the acceptance criteria prework analysis. The existing test suite (in `memory.rs`, `rollup.rs`, `visibility_sink.rs`, `filter.rs`, `query_service.rs`) already validates the behavioral correctness of the `VisibilityStore` contract through Properties 1–15 against `InMemoryVisibilityStore`. The DSQL implementation must pass the same behavioral tests via integration tests. The new properties here focus on DSQL-specific concerns: stable numeric encodings, SQL compilation correctness, and serialization round-trips.
 
-*For any* valid `ProjectionRecord` containing one or more `ProjectionOp`s (UpsertExecution and/or CloseExecution), applying the record to the visibility sink SHALL produce an `ExecutionRow` whose status, memo, search attributes, close time, and system fields (namespace, workflow ID, run ID, workflow type, task queue, start time, history length, transition count) correctly reflect the sequential application of all ops in the record.
+### Property 1: SearchAttrType Numeric Round-Trip
 
-**Validates: Requirements 1.1, 1.2, 1.4, 1.5**
+*For any* `SearchAttrType` variant, encoding to `i16` via `to_db_smallint` and then decoding via `TryFrom<i16>` SHALL produce the original variant. Unknown `i16` values SHALL produce `SearchAttrTypeDecodeError`.
 
-### Property 2: Idempotent Apply
+**Validates: Requirements 1.4, 6.3, 6.5, 16.1, 16.2, 16.5**
 
-*For any* valid `ProjectionRecord`, applying it once and applying it twice SHALL produce identical `ExecutionRow` state and identical typed index entries. That is, `apply(apply(state, record), record) == apply(state, record)`.
+### Property 2: RollupDimension Numeric Round-Trip
 
-**Validates: Requirements 1.3**
+*For any* `RollupDimension` variant, encoding to `i16` via `to_db_smallint` and then decoding via `TryFrom<i16>` SHALL produce the original variant. Unknown `i16` values SHALL produce `RollupDimensionDecodeError`.
 
-### Property 3: Search Attribute Indexing
+**Validates: Requirements 4.3, 10.3, 14.3, 17.1, 17.2, 17.5**
 
-*For any* `ProjectionOp::UpsertExecution` with a non-empty search attribute patch where all attribute names are registered and all value types match, applying the op SHALL produce typed index entries that contain the run key under the correct `(namespace, attr_id, value)` key for each of the seven attribute types (Keyword, KeywordList, Int, Bool, Double, Datetime, Text).
+### Property 3: SearchAttrValue Serialization Round-Trip
 
-**Validates: Requirements 2.1, 2.2, 2.6**
-
-### Property 4: Index Update Cleanup
-
-*For any* execution row with an existing indexed search attribute value, when a new value is applied for the same attribute, the old typed index entries SHALL be removed and only the new entries SHALL be present. The run key SHALL NOT appear under the old value in the typed index.
+*For any* valid `SearchAttrValue` instance, serializing via postcard and then deserializing SHALL produce a value equal to the original.
 
 **Validates: Requirements 2.3**
 
-### Property 5: Text Tokenization
+### Property 4: Attribute Registry Register-Then-Resolve Round-Trip
 
-*For any* non-empty text string applied as a `Text` search attribute, the text token index SHALL contain one entry per unique lowercase alphanumeric token extracted from the string, and each token SHALL map to the run key.
+*For any* `(namespace_id, attr_name, attr_type)` tuple, registering the attribute and then resolving it SHALL return an `AttrDescriptor` with the same `attr_type` and a valid `AttrId`. Re-registering the same `(namespace_id, attr_name)` SHALL return the same `AttrId`.
 
-**Validates: Requirements 2.7**
+**Validates: Requirements 6.1, 7.1, 7.2**
 
-### Property 6: Filter Expression Round-Trip
+### Property 5: Filter SQL Compiler Parameterization Safety
 
-*For any* valid `FilterExpr` AST, printing it to a filter string and parsing it back SHALL produce an equivalent AST.
+*For any* `FilterExpr` tree, the compiled SQL fragment SHALL contain only positional parameter placeholders (`$N`) and no interpolated filter values. The number of bind values SHALL equal the number of distinct parameter placeholders in the SQL fragment.
 
-**Validates: Requirements 3.1**
+**Validates: Requirements 11.1, 11.9**
 
-### Property 7: Pagination Completeness
+### Property 6: LIKE Prefix Escaping Correctness
 
-*For any* set of execution rows in a namespace and any page size between 1 and `MAX_PAGE_SIZE`, iterating through all pages using the returned page tokens SHALL yield exactly the same set of rows (in the same order) as a single unbounded query. No rows are duplicated or omitted.
+*For any* string prefix (including strings containing `%`, `_`, and `\` characters), the escaped LIKE pattern produced by the filter SQL compiler SHALL not contain unescaped `%`, `_`, or `\` characters from the original prefix. Backslashes SHALL be escaped before percent and underscore characters, and the pattern SHALL end with exactly one `%` wildcard.
 
-**Validates: Requirements 4.1, 4.2, 4.3**
+**Validates: Requirements 11.8**
 
-### Property 8: Sort Order Correctness
+### Property 7: System Field to Column Name Mapping Completeness
 
-*For any* set of execution rows containing a mix of open (null close time) and closed executions, querying with the default sort order SHALL return open executions before closed executions, with closed executions ordered by close time descending, and ties broken by start time descending then run key descending. For each non-default sort order, rows SHALL be ordered by the specified field and direction.
+*For any* `SystemField` variant, the filter SQL compiler's column mapping SHALL produce a non-empty column name string. The mapping SHALL cover all `SystemField` variants exhaustively (no panics or fallthrough).
 
-**Validates: Requirements 4.4, 4.5**
-
-### Property 9: Count-List Consistency
-
-*For any* namespace, filter expression, and set of execution rows, the count returned by `count_executions` SHALL equal the number of rows returned by `list_executions` with the same filter (ignoring pagination).
-
-**Validates: Requirements 5.1**
-
-### Property 10: Group-By Count Correctness
-
-*For any* namespace, filter, and group-by field (system or custom search attribute), the sum of all per-group counts SHALL equal the total count, and each per-group count SHALL equal the count of rows matching the filter whose group-by field has that value.
-
-**Validates: Requirements 5.2, 5.3**
-
-### Property 11: Rollup Delta Conservation
-
-*For any* sequence of `ProjectionRecord` applications that cause status transitions, the sum of all rollup deltas for each `(namespace, dimension, value)` tuple SHALL equal the net change in the number of execution rows with that dimension value. In particular, for a single status transition from A to B, the deltas SHALL be exactly -1 for A and +1 for B.
-
-**Validates: Requirements 6.1, 6.2**
-
-### Property 12: Rollup Time Bucketing
-
-*For any* timestamp and configurable time window, the rollup bucket assignment SHALL be deterministic and the bucket boundaries SHALL be aligned to the window size. Two timestamps in the same window SHALL map to the same bucket.
-
-**Validates: Requirements 6.3**
-
-### Property 13: Rollup-Accelerated Count Consistency
-
-*For any* namespace and rollup-accelerated dimension (ExecutionStatus, WorkflowType, TaskQueue) with no additional filter predicates, the count returned via rollup aggregates SHALL equal the count returned by a direct scan of execution rows.
-
-**Validates: Requirements 6.4**
-
-### Property 14: ExecutionRow to Summary Mapping
-
-*For any* `ExecutionRow`, the `WorkflowExecutionSummary` produced by the query service SHALL have matching namespace, workflow ID, run ID, workflow type, task queue, execution status, start time, and close time fields.
-
-**Validates: Requirements 7.1, 7.5**
-
-### Property 15: Checkpoint Round-Trip
-
-*For any* valid `ProjectionCursor`, saving it via `save_checkpoint` and loading it via `load_checkpoint` SHALL return an identical cursor.
-
-**Validates: Requirements 9.1, 9.2**
-
-### Property 16: Checkpoint-After-Apply Invariant
-
-*For any* batch of projection records, if the sink apply fails (returns an error), the checkpoint SHALL NOT be advanced past the pre-apply position. The checkpoint is advanced only after successful application.
-
-**Validates: Requirements 9.4**
+**Validates: Requirements 11.7**
 
 ## Error Handling
 
-### Sink Errors
+### OCC Conflicts (SQLSTATE 40001)
 
-| Condition | Behavior |
-|---|---|
-| Unknown search attribute name | Return `anyhow::Error` with message identifying the unknown attribute name and namespace |
-| Search attribute type mismatch | Return `anyhow::Error` with message identifying the attribute, expected type, and actual type |
-| Store write failure | Propagate error to worker; worker retries with backoff without advancing checkpoint |
+All write operations (`accumulate_rollup`, `upsert_search_attr_index`, `remove_search_attr_index`, `register_attr`) surface OCC conflicts as `anyhow::Error`. The caller (typically `VisibilitySink` or `ProjectionWorker`) decides whether and when to retry. Search attribute and rollup writes are idempotent by design — re-applying the same operation produces the same final state.
 
-### Query Errors
+### Connection Acquisition Failures
 
-| Condition | Behavior |
-|---|---|
-| Unparseable filter expression | Return `anyhow::Error` with parse error details and position |
-| Unknown attribute in filter | Return `anyhow::Error` identifying the unknown attribute name |
-| Type mismatch in filter predicate | Return `anyhow::Error` identifying the field, expected type, and literal type |
-| Invalid/corrupted page token | Return `anyhow::Error` indicating malformed token |
-| Page size > MAX_PAGE_SIZE | Silently clamp to `MAX_PAGE_SIZE` |
+If `director.acquire(DbClass::Projection)` fails, the error propagates immediately. The projection worker backs off and retries.
 
-### Worker Errors
+### Unknown Numeric Encodings
 
-| Condition | Behavior |
-|---|---|
-| Sink apply error | Log error at `warn` level, backoff, retry from same checkpoint |
-| Projection log read error | Log error at `warn` level, backoff, retry |
-| Checkpoint save error | Log error at `error` level, continue (next successful batch will re-save) |
-| Cancellation signal | Complete current batch, save checkpoint, return `Ok(())` |
+- `SearchAttrType::try_from(i16)` returns `SearchAttrTypeDecodeError` for values outside 0–6.
+- `RollupDimension::try_from(i16)` returns `RollupDimensionDecodeError` for values outside 0–2.
+- `ExecutionStatus::try_from(i16)` returns `ExecutionStatusDecodeError` for values outside 0–7 (already implemented).
 
-All errors use `anyhow::Result` following the existing codebase pattern. No custom error enums are introduced; error context is added via `anyhow::Context`.
+These errors propagate as `anyhow::Error` through the `?` operator. They indicate data corruption or schema version mismatch.
+
+### Missing `sa_current` Row on Remove
+
+Per Requirement 9.5, if no `sa_current` row exists when `remove_search_attr_index` is called, the method returns `Ok(())` without error. This handles the case where the attribute was never indexed or was already removed.
+
+### Filter Compilation Errors
+
+The filter SQL compiler does not perform I/O — it operates on the already-compiled `FilterExpr` tree. Errors from the compiler (e.g., unsupported field types) propagate as `anyhow::Error` to the caller.
+
+### `get_row` Error Handling
+
+The `get_row` method returns `Option<ExecutionRow>` (not `Result`), so DSQL errors are logged as warnings and mapped to `None`. This matches the existing implementation and the trait signature.
+
+### Attribute Registration Conflicts
+
+Concurrent `register_attr` calls for the same `(namespace_id, attr_name)` are handled by `INSERT ... ON CONFLICT DO NOTHING` followed by a SELECT. The first writer wins; subsequent callers get the existing `attr_id`. No error is returned for conflicts.
 
 ## Testing Strategy
 
 ### Property-Based Tests (proptest)
 
-The codebase uses `proptest` for property-based testing. Each property from the Correctness Properties section maps to one `proptest!` test with a minimum of 100 iterations.
+Property-based tests validate the correctness properties above. Each test runs a minimum of 100 iterations with random inputs. The `proptest` library is already a dev-dependency of `tokeira-projection`.
 
-Tag format: `// Feature: projection-visibility, Property N: <title>`
+| Property | Test Location | Library |
+|----------|--------------|---------|
+| P1: SearchAttrType numeric round-trip | `tokeira-projection/src/types.rs` | `proptest` |
+| P2: RollupDimension numeric round-trip | `tokeira-projection/src/types.rs` | `proptest` |
+| P3: SearchAttrValue serialization round-trip | `tokeira-projection/src/dsql_store.rs` | `proptest` |
+| P4: Attribute registry register-then-resolve | `tokeira-projection/src/memory.rs` | `proptest` |
+| P5: Filter SQL parameterization safety | `tokeira-projection/src/dsql_store.rs` | `proptest` |
+| P6: LIKE prefix escaping correctness | `tokeira-projection/src/dsql_store.rs` | `proptest` |
+| P7: System field column mapping completeness | `tokeira-projection/src/dsql_store.rs` | `proptest` |
 
-Tests run against `InMemoryVisibilityStore` which exercises the full pipeline without external dependencies.
+**Tag format:** `Feature: projection-visibility, Property {N}: {title}`
 
-Key generators needed:
-- `arb_execution_row()` — random `ExecutionRow` with valid field combinations
-- `arb_projection_record()` — random `ProjectionRecord` with valid `ProjectionOp` sequences
-- `arb_search_attr_patch()` — random `SearchAttributes` with registered attribute names and matching types
-- `arb_filter_expr()` — random valid `FilterExpr` AST
-- `arb_page_token()` — random valid `PageToken`
-- `arb_sort_order()` — random `SortOrder` variant
+**P1 (SearchAttrType round-trip):** Uses `prop_oneof!` over all `SearchAttrType` variants. Verifies `TryFrom::<i16>::try_from(x.to_db_smallint()) == Ok(x)`.
+
+**P2 (RollupDimension round-trip):** Uses `prop_oneof!` over all `RollupDimension` variants. Verifies `TryFrom::<i16>::try_from(x.to_db_smallint()) == Ok(x)`.
+
+**P3 (SearchAttrValue round-trip):** Generates random `SearchAttrValue` instances across all variants (Keyword, KeywordList, Int, Bool, Double, Datetime, Text). Verifies `codec::decode(codec::encode(x)) == x`.
+
+**P4 (Attribute registry round-trip):** Generates random `(NamespaceId, String, SearchAttrType)` tuples. Registers via `InMemoryVisibilityStore`, resolves, verifies the descriptor matches. Registers again, verifies same `AttrId`. This tests the behavioral contract that the DSQL implementation must match.
+
+**P5 (Filter SQL parameterization):** Generates random `FilterExpr` trees with system fields and various operators. Compiles to SQL. Verifies: (a) the SQL contains no literal filter values, (b) the number of `$N` placeholders equals the number of bind values, (c) parameter indices are sequential starting from the offset.
+
+**P6 (LIKE escaping):** Generates random strings including `%`, `_`, `\` characters. Passes through the LIKE escape function. Verifies the escaped string does not contain unescaped `%`, `_`, or `\` from the original, backslash is escaped first, and the pattern ends with exactly one `%`.
+
+**P7 (System field mapping):** Uses `prop_oneof!` over all `SystemField` variants. Verifies the column mapping function returns a non-empty string for each variant.
 
 ### Unit Tests
 
-Focused on specific examples and edge cases not covered by property tests:
-- Unknown search attribute name returns descriptive error (Req 2.4)
-- Search attribute type mismatch returns descriptive error (Req 2.5)
-- Unknown attribute in filter returns descriptive error (Req 3.4)
-- Type mismatch in filter returns descriptive error (Req 3.5)
-- Empty filter returns all executions (Req 3.6)
-- Invalid page token returns descriptive error (Req 4.6)
-- Count with no filter returns total (Req 5.4)
-- `get_row(run_key)` backward compatibility (Req 8.6)
-- No persisted cursor starts from beginning (Req 9.3)
-- Worker backoff on empty batch (Req 10.2)
-- Worker graceful shutdown on cancellation (Req 10.3)
-- Worker retry on sink error (Req 10.4)
+Unit tests cover specific examples and edge cases:
 
-### Integration Tests
+- **SearchAttrType stability**: Assert exact numeric values for each variant (prevents accidental reordering).
+- **SearchAttrType unknown value**: Verify `TryFrom<i16>` returns error for values 7, -1, 100.
+- **RollupDimension stability**: Assert exact numeric values for each variant.
+- **RollupDimension unknown value**: Verify `TryFrom<i16>` returns error for values 3, -1, 100.
+- **Filter SQL: system field Compare**: Compile `WorkflowType = "Foo"`, verify SQL contains `workflow_type = $N`.
+- **Filter SQL: system field status Compare**: Compile `ExecutionStatus = Running`, verify SQL uses `execution_status = $N` with `to_db_smallint()` value.
+- **Filter SQL: custom attribute Compare**: Compile a custom Keyword equality, verify SQL contains `run_key IN (SELECT run_key FROM sa_keyword_idx ...)`.
+- **Filter SQL: multi-value Ne**: Compile KeywordList/Text inequality, verify SQL uses `NOT EXISTS` rather than `value <>`.
+- **Filter SQL: And/Or composition**: Compile `A AND B`, verify SQL contains `AND`. Compile `A OR B`, verify SQL contains `OR`.
+- **Filter SQL: In clause**: Compile `WorkflowType IN ("A", "B")`, verify SQL contains `IN ($N, $M)`.
+- **Filter SQL: Between clause**: Compile `StartTime BETWEEN t1 AND t2`, verify SQL contains `BETWEEN $N AND $M`.
+- **Filter SQL: StartsWith**: Compile `WorkflowId STARTS_WITH "prefix"`, verify SQL contains `LIKE $N`.
+- **Filter SQL: StartsWith with special chars**: Compile `WorkflowId STARTS_WITH "a%b_c"`, verify LIKE pattern is `a\%b\_c%`.
+- **Filter SQL: empty filter**: Compile `CompiledFilter { expr: None }`, verify no WHERE clause fragment.
+- **LIKE escape: empty string**: Verify produces `%`.
+- **LIKE escape: no special chars**: Verify `abc` produces `abc%`.
+- **LIKE escape: all special chars**: Verify `%_\` produces `\%\_\\%`.
+- **remove_search_attr_index with no current value**: Verify returns `Ok(())`.
+- **Text tokenization edge cases**: Empty string produces no tokens. All-whitespace produces no tokens. Single word produces one lowercase token.
+- **Attr ID generation**: Verify generated IDs are positive i64 values.
 
-- End-to-end: start workflow → commit transition → projection worker applies → list_workflows returns the execution (Req 7.3)
-- Full pagination walk-through with real filter expressions (Req 7.4)
-- Worker lifecycle: start, process batches, cancel, verify checkpoint (Req 10.1)
+### Existing Property Tests (Already Implemented)
+
+The following property tests already exist in the codebase and validate the `VisibilityStore` behavioral contract. The DSQL implementation must pass these same behavioral tests via integration tests:
+
+| Property | Test File | What It Tests |
+|----------|----------|---------------|
+| P1: Apply Correctness | `visibility_sink.rs` | Sink apply produces correct ExecutionRow fields |
+| P2: Idempotent Apply | `visibility_sink.rs` | Applying same record twice produces identical rows |
+| P3: Search Attribute Indexing | `memory.rs` | Upserted attributes appear in indexes |
+| P4: Index Update Cleanup | `memory.rs` | Old index entries removed on attribute update |
+| P5: Text Tokenization | `memory.rs` | Tokenization matches reference implementation |
+| P6: Filter Expression Round-Trip | `filter.rs` | Compiled filter preserves field, op, value |
+| P7: Pagination Completeness | `memory.rs` | Paginated results equal unpaginated results |
+| P8: Sort Order Correctness | `memory.rs` | Results respect requested sort order |
+| P9: Count-List Consistency | `memory.rs` | Count equals list length for same filter |
+| P10: Group-By Count Correctness | `memory.rs` | Group sums equal total count |
+| P11: Rollup Delta Conservation | `rollup.rs` | Net delta is 0 for transitions, +1 for inserts |
+| P12: Rollup Determinism | `rollup.rs` | Same inputs produce same deltas |
+| P13: Rollup-Accelerated Count Consistency | `memory.rs` | Rollup count matches scan count |
+| P14: ExecutionRow to Summary Mapping | `query_service.rs` | Row fields map correctly to summary |
+| P15: Checkpoint Round-Trip | `memory.rs` | Save then load produces same cursor |
+
+### Integration Tests (gated behind `dsql-integration` feature)
+
+- **list_executions with system field filter**: Insert rows, query with `WorkflowType = "X"`, verify correct subset returned.
+- **list_executions pagination cycle**: Insert multiple rows, paginate through all pages, verify all rows returned in correct order.
+- **list_executions with custom attribute filter**: Register attribute, index values, query with custom attribute filter, verify correct subset.
+- **count_executions with group_by**: Insert rows with different statuses, count with `GROUP BY ExecutionStatus`, verify group counts.
+- **count_from_rollup**: Accumulate rollup deltas, query rollup counts, verify they match.
+- **register_attr idempotence**: Register same attribute twice, verify same AttrId returned.
+- **upsert_search_attr_index then list**: Index a keyword value, list with filter on that keyword, verify the row appears.
+- **remove_search_attr_index then list**: Index a value, remove it, list with filter, verify the row no longer appears.
+- **accumulate_rollup with positive and negative deltas**: Apply +1 and -1 deltas, verify final counter is correct.
+- **Behavioral equivalence**: For a fixed dataset, run the same queries against both `InMemoryVisibilityStore` and `DsqlVisibilityStore`, verify identical results.

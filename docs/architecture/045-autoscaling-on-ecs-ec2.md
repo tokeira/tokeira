@@ -1,6 +1,6 @@
 # 045 Autoscaling on ECS on EC2 (private-only, no CloudWatch)
 
-**Status:** draft for architecture review  
+**Status:** revised draft  
 **Decision direction:** preferred  
 **Related docs:** [035-placement-and-membership](035-placement-and-membership.md), [040-delivery-broker](040-delivery-broker.md), [050-dsql-storage](050-dsql-storage.md), [060-connection-management](060-connection-management.md), [090-failover-and-recovery](090-failover-and-recovery.md)
 
@@ -20,6 +20,18 @@ The target state is:
 This note therefore makes one explicit architectural choice:
 
 > **Tokeira uses a custom `tokeira-autoscaler` service that reads Mimir and writes scaling decisions directly to ECS and EC2 Auto Scaling APIs.**
+
+## Autoscaling invariants
+
+The autoscaler must preserve these invariants:
+
+1. **Scaling decisions are advisory.** DSQL lease fencing remains the authoritative ownership mechanism. A scaling mistake cannot corrupt workflow state.
+2. **Runtime scale-in must be placement-aware and drain-aware.** A runtime node must not be terminated intentionally while it owns bundles, unless the system has declared an emergency forced-failover path.
+3. **Missing metrics must never trigger scale-in.** Absent or stale data is unknown, not zero.
+4. **DSQL connection headroom is a hard scaling envelope.** Runtime scale-out must not proceed if projected connections would exceed the safe connection budget.
+5. **Poll traffic and non-poll API traffic must remain separately scalable.** The edge-api / edge-poll split is a core design principle.
+6. **Projection lag must not affect authoritative workflow correctness.** Projection is outside the correctness path; its scaling is independent.
+7. **Autoscaler unavailability must not affect workflow correctness.** It only pauses automatic capacity changes. Existing runtime owners continue renewing leases, edges continue using cached routing.
 
 ## Why not use native ECS autoscaling?
 
@@ -69,26 +81,87 @@ The autoscaler action is simply:
 - compute `desiredCount`,
 - call `ecs:UpdateService`.
 
-### Loop B: EC2 Auto Scaling group desired capacity
+### Loop B: EC2 Auto Scaling group desired capacity (runtime scale-out)
 
-This loop is for the **runtime fleet**.
+This loop handles **runtime scale-out only**.
 
 AWS documents that `DAEMON` scheduling places exactly one task on each eligible active container instance, and with `DAEMON` there is no desired count and no Service Auto Scaling policy.[^ecs-daemon]
 
-That is exactly what we want for `tokeira-runtime`:
+That is the preferred first production profile for `tokeira-runtime`:
 
 - one runtime task per host,
 - one shard-owning process per host,
 - predictable local CPU and memory envelopes,
 - no multi-runtime colocation on the same instance unless we explicitly choose it later.
 
-So the runtime scaling lever is **not** ECS desired count. It is the backing Auto Scaling group's desired capacity. AWS documents `SetDesiredCapacity` as the API that changes the desired capacity an Auto Scaling group attempts to maintain.[^asg-set-desired]
+The runtime correctness model must not depend on DAEMON scheduling. DAEMON is the initial placement profile because it gives one runtime incarnation per EC2 host and simplifies capacity accounting. The lease and placement model must continue to work if runtime later becomes REPLICA with explicit placement constraints.
 
-The autoscaler action is therefore:
+So the runtime scale-out lever is **not** ECS desired count. It is the backing Auto Scaling group's desired capacity. AWS documents `SetDesiredCapacity` as the API that changes the desired capacity an Auto Scaling group attempts to maintain.[^asg-set-desired]
+
+The autoscaler scale-out action is:
 
 - read runtime pressure from Mimir,
+- verify DSQL connection headroom is sufficient (see [Connection-aware scaling envelope](#connection-aware-scaling-envelope)),
+- verify pressure is broad saturation, not hot-bundle imbalance (see [Runtime scale-out decision](#runtime-scale-out-decision)),
 - compute desired host count,
 - call `autoscaling:SetDesiredCapacity` on the runtime ASG.
+
+New instances launch with **instance scale-in protection enabled by default**. The autoscaler clears protection only after Tokeira has drained the node (see Loop C). AWS documents instance scale-in protection for Auto Scaling groups.[^asg-instance-protection]
+
+ECS managed termination protection is not sufficient for the runtime design because AWS notes that DAEMON tasks are ignored for managed termination protection purposes.[^ecs-daemon] Tokeira must own scale-in protection explicitly through the ASG instance protection API.
+
+### Loop C: runtime retirement (runtime scale-in)
+
+Runtime scale-in is **not** a raw desired-capacity operation. For the runtime plane, scale-out and scale-in are asymmetric:
+
+- **scale-out** increases the runtime ASG desired capacity,
+- **scale-in** retires selected runtime nodes after Tokeira-level drain.
+
+The autoscaler MUST NOT reduce the runtime ASG desired capacity and allow Auto Scaling to choose an arbitrary runtime instance while that instance may own bundles. AWS Auto Scaling termination policies are not Tokeira-aware.[^asg-termination-policies]
+
+The safe scale-in protocol:
+
+1. **Autoscaler decides** the runtime fleet has excess capacity based on fresh Mimir metrics and a fresh controller snapshot.
+2. **Autoscaler asks the controller** for candidate nodes. The controller selects nodes with:
+   - lowest owned-bundle count,
+   - lowest runnable-lane pressure,
+   - no active sweep or repair,
+   - enough remaining AZ capacity after removal.
+3. **Controller marks selected nodes `DRAINING`:**
+   - no new bundle placement,
+   - no new queue-home assignment,
+   - no new actors except takeover/repair.
+4. **Runtime voluntarily releases or transfers work:**
+   - stops acquiring new bundles,
+   - renews current leases only until transfer completes,
+   - moves queue-home broker ownership,
+   - flushes projection/dispatch handoff,
+   - rejects or forwards owner-targeted traffic with stale-owner metadata.
+5. **Autoscaler sets the ECS container instance to `DRAINING`.** AWS documents that when an instance is set to DRAINING, ECS prevents new tasks from being scheduled there.[^ecs-container-instance-draining]
+6. **Wait until the runtime heartbeat reports safe to terminate:**
+   - `bundle_count == 0`,
+   - `active_run_actor_count == 0` (or below a forced threshold),
+   - open internal requests drained.
+7. **Autoscaler clears instance scale-in protection** for the selected EC2 instance.
+8. **Autoscaler terminates the instance** using `TerminateInstanceInAutoScalingGroup` with `ShouldDecrementDesiredCapacity=true`. AWS documents this API and its decrement parameter.[^asg-terminate-instance]
+
+This gives Tokeira control over **which** runtime node leaves, rather than letting Auto Scaling choose arbitrarily.
+
+#### Autoscaler vs controller responsibility split
+
+The autoscaler and controller have complementary but distinct roles:
+
+| Concern | Owner |
+|---|---|
+| Desired capacity envelopes | Autoscaler |
+| AWS API calls (ECS, ASG) | Autoscaler |
+| Cooldowns, min/max, rate limits | Autoscaler |
+| Placement state and node drain state | Controller |
+| Ownership movement decisions | Controller |
+| Routing map publication | Controller |
+| Safe scale-in candidate nomination | Controller |
+
+The autoscaler does not decide which bundle moves. The controller does not change ASG size.
 
 ## Recommended ECS cluster and capacity-provider shape
 
@@ -177,9 +250,9 @@ Responsibilities:
 - publish dispatch and projection mutations,
 - perform local sweep/repair.
 
-Because this service should run exactly once per eligible runtime instance, `DAEMON` is the cleanest ECS fit.[^ecs-daemon]
+Because this service should run exactly once per eligible runtime instance, `DAEMON` is the preferred first production profile.[^ecs-daemon]
 
-Scale this plane by changing the **runtime Auto Scaling group desired capacity**, not by changing ECS desired count.
+Scale this plane by changing the **runtime Auto Scaling group desired capacity** for scale-out, and by using the **runtime retirement protocol** (Loop C) for scale-in.
 
 ### `tokeira-projection`
 
@@ -293,10 +366,13 @@ Provision the DSQL endpoints required by the chosen connectivity pattern before 
 
 Add these only if you use the corresponding AWS features:
 
-- Systems Manager / ECS Exec endpoints,
-- CloudWatch Logs endpoints,
-- STS endpoints for explicit SDK flows that require them,
-- Application Auto Scaling endpoint if you later adopt scheduled actions or native scalable targets.
+- **STS endpoint** (`com.amazonaws.<region>.sts`) — include if using AssumeRole, Pod Identity, or explicit STS calls from tasks.
+- **KMS endpoint** (`com.amazonaws.<region>.kms`) — include if pulling encrypted secrets or decrypting config at runtime.
+- **Secrets Manager endpoint** (`com.amazonaws.<region>.secretsmanager`) — include if task bootstrap reads secrets from Secrets Manager.
+- **SSM endpoint** (`com.amazonaws.<region>.ssm`) — include if using SSM Parameter Store or ECS Exec.
+- **CloudWatch Logs endpoint** (`com.amazonaws.<region>.logs`) — include only if using the `awslogs` log driver; otherwise use Alloy/log shipping path.
+- **EC2 endpoint** (`com.amazonaws.<region>.ec2`) — include if the autoscaler or controller calls `DescribeInstances`, `DescribeNetworkInterfaces`, or related APIs directly.
+- **Application Auto Scaling endpoint** — include if you later adopt scheduled actions or native scalable targets.
 
 ## Service discovery and routing
 
@@ -321,16 +397,18 @@ Tokeira edges often need to talk to the **specific runtime node that owns a shar
 
 That is not a generic load-balanced service lookup problem. It is an **identity-aware endpoint selection** problem.
 
-For `tokeira-runtime`, use **ECS service discovery / Cloud Map** so each runtime task can be associated with a concrete, discoverable endpoint. AWS documents that ECS service discovery uses Cloud Map and that private DNS namespaces are visible only inside a specified VPC.[^ecs-service-discovery][^cloudmap-private-ns]
+Cloud Map is not authoritative for ownership or routing. The controller publishes `node_id → endpoint` as part of the routing snapshot. Cloud Map / ECS metadata may be used to discover or validate the concrete endpoint, but the source of truth for `bundle_id → node_id → endpoint` is the controller's placement state.
+
+For `tokeira-runtime`, use **ECS service discovery / Cloud Map** as discovery plumbing so each runtime task can be associated with a concrete, discoverable endpoint. AWS documents that ECS service discovery uses Cloud Map and that private DNS namespaces are visible only inside a specified VPC.[^ecs-service-discovery][^cloudmap-private-ns]
 
 The recommended pattern is:
 
 - runtime tasks register in a private Cloud Map namespace,
-- the routing/control plane maps `node_id -> endpoint`,
-- the edge routing cache maps `shard_id -> node_id`,
+- the controller publishes the authoritative `node_id → endpoint` mapping as part of the routing snapshot,
+- the edge routing cache maps `shard_id → node_id`,
 - the edge then resolves that node to a concrete private endpoint.
 
-This keeps runtime routing explicit and compatible with shard-owner semantics.
+This keeps runtime routing explicit and compatible with shard-owner semantics, and avoids a subtle future bug where DNS resolution and ownership routing become confused.
 
 ## Edge isolation: how Tokeira avoids poller overload
 
@@ -406,7 +484,67 @@ and configure workers explicitly to use the poll endpoint.
 ### Outputs
 
 - `ecs:UpdateService` for REPLICA services,[^ecs-update-service]
-- `autoscaling:SetDesiredCapacity` for runtime host groups.[^asg-set-desired]
+- `autoscaling:SetDesiredCapacity` for runtime scale-out,[^asg-set-desired]
+- `autoscaling:TerminateInstanceInAutoScalingGroup` for runtime scale-in.[^asg-terminate-instance]
+
+### Metric freshness and degraded autoscaling
+
+The autoscaler treats stale or missing metrics as **unknown**, not as zero.
+
+Rules:
+
+1. **Missing data is not zero.** An absent metric series must never be interpreted as "no load."
+2. **No scale-in from stale metrics.** If the most recent Mimir sample for a scaling input is older than the staleness threshold, scale-in is blocked for that plane.
+3. **Runtime scale-in requires a fresh controller snapshot.** The controller must have reported node placement state within the staleness window.
+4. **Runtime scale-out requires fresh DSQL connection-headroom data** unless an emergency override is active.
+5. **Scale-out may proceed from partial high-confidence overload signals.** If some metrics are missing but available signals clearly indicate overload, scale-out is allowed.
+6. **If Mimir is unavailable, freeze desired capacity** except for explicit operator actions or emergency floor restoration.
+
+| Condition | Scale out | Scale in |
+|---|---|---|
+| Mimir healthy, metrics fresh | allowed | allowed |
+| Mimir unavailable | emergency/manual only | no |
+| Metric series missing | maybe, with fallback | no |
+| Controller snapshot stale | edge/projection only | no runtime scale-in |
+| DSQL headroom unknown | constrained | no runtime scale-out beyond floor |
+| AWS API throttled | backoff | backoff |
+
+### Connection-aware scaling envelope
+
+DSQL connection headroom is a **hard guardrail**, not merely a scaling input. See [060-connection-management](060-connection-management.md).
+
+Runtime scale-out is allowed only if:
+
+- `projected_runtime_connections_after_scale <= safe_connection_budget`
+- `projected_new_connection_rate_after_scale <= safe_connection_rate`
+
+The effective maximum runtime host count is:
+
+```
+effective_max_runtime_hosts = min(
+    configured_max_runtime_hosts,
+    floor(dsql_connection_budget / per_runtime_reserved_connections),
+    floor(dsql_new_connection_rate_budget / per_runtime_startup_connection_rate)
+)
+```
+
+Without this guardrail, the autoscaler can create a death spiral: runtime pressure rises → autoscaler adds hosts → new hosts open DSQL pools → connection pressure rises → commit latency worsens → autoscaler adds more hosts.
+
+### AWS actuator reconciliation
+
+The autoscaler should maintain desired state and reconcile on each loop, not fire-and-forget:
+
+- `service_name → desired_count`
+- `asg_name → desired_capacity`
+- `instance_id → drain/terminate intent`
+
+Reconciliation rules:
+
+- do not issue `UpdateService` if `desiredCount` already matches the target,
+- do not issue `SetDesiredCapacity` repeatedly for the same target,
+- handle eventual consistency from `DescribeServices` / `DescribeAutoScalingGroups`,
+- back off on AWS API throttling,
+- record every scaling decision with input metrics and reason for auditability.
 
 ### Control-loop rules
 
@@ -440,6 +578,20 @@ Recommended signals:
 - pending task-start count,
 - DSQL active-connection headroom,
 - DSQL new-connection-rate headroom.
+
+### Runtime scale-out decision
+
+Runtime scale-out is appropriate only when pressure is **broad enough** that new hosts can help. A single hot bundle or hot queue partition should first be handled by placement rebalance or partition split (see [037-dynamic-placement](037-dynamic-placement.md)).
+
+The autoscaler should classify runtime pressure as:
+
+- **broad saturation** — most nodes are under pressure, adding hosts helps,
+- **hot-node imbalance** — a few nodes are overloaded, rebalance helps,
+- **hot-bundle imbalance** — a few bundles are hot, partition split helps,
+- **DSQL-bound** — connection or commit headroom is the bottleneck, adding hosts makes it worse,
+- **admission-bound** — the system should shed load, not add capacity.
+
+Only broad saturation with sufficient DSQL headroom should directly increase the runtime ASG size.
 
 ### Edge API scaling inputs
 
@@ -478,7 +630,7 @@ Recommended signals:
 |---|---|---|---|
 | `tokeira-edge-api` | `REPLICA` | `ecs:UpdateService` | normal API traffic |
 | `tokeira-edge-poll` | `REPLICA` | `ecs:UpdateService` | long-poll traffic only |
-| `tokeira-runtime` | `DAEMON` | `autoscaling:SetDesiredCapacity` on runtime ASG | one runtime per host |
+| `tokeira-runtime` | `DAEMON` | scale-out: `SetDesiredCapacity`; scale-in: Loop C retirement | one runtime per host |
 | `tokeira-projection` | `REPLICA` | `ecs:UpdateService` | lag-tolerant plane |
 | `tokeira-controller` | `REPLICA` | static or `ecs:UpdateService` | small fleet |
 | `tokeira-autoscaler` | `REPLICA` | static | 2 tasks, one active leader |
@@ -498,33 +650,38 @@ The initial ECS-on-EC2, private-only deployment should look like this:
 - one ECS cluster per environment,
 - private subnets only,
 - capacity providers: `cp-edge-api`, `cp-edge-poll`, `cp-runtime`, `cp-projection`, `cp-control`,
-- internal ingress for Edge,
-- `tokeira-runtime` as a DAEMON service,
+- internal ingress for Edge, with split private DNS names (`edge-api.<private-zone>`, `edge-poll.<private-zone>`),
+- `tokeira-runtime` as a DAEMON service with ASG instance scale-in protection enabled by default,
 - `tokeira-autoscaler` as a small REPLICA service with DSQL leader lease,
 - ECS / ECR / S3 / EC2 Auto Scaling / Cloud Map / DSQL private endpoints provisioned,
 - Service Connect for generic service-to-service communication,
-- Cloud Map / explicit endpoint registry for runtime node discovery,
-- Mimir as the source of scaling truth.
+- controller-published endpoint registry for runtime node discovery (Cloud Map as discovery plumbing, not source of truth),
+- Mimir as the source of scaling truth,
+- direct ECS and EC2 Auto Scaling APIs only (no Application Auto Scaling in the first iteration).
 
 ## Bottom line
 
 The scaling model for Tokeira on ECS on EC2 should be:
 
-> **Custom autoscaler, private-only networking, REPLICA services for edge/projection/control, DAEMON runtime on dedicated hosts, and AWS APIs used only as actuators.**
+> **Custom autoscaler, private-only networking, isolated REPLICA services for edge/projection/control, DAEMON runtime as the first runtime placement profile, Mimir/controller/DSQL signals as scaling inputs, and AWS APIs used only as capacity actuators.**
+
+Runtime scale-out is an ASG desired-capacity action. Runtime scale-in is a Tokeira node-retirement workflow.
 
 That gives us:
 
 - no CloudWatch dependency in the decision loop,
 - no DDB expansion into general control-plane placement,
 - strong isolation between poll and non-poll edge traffic,
+- safe runtime scale-in that respects bundle ownership and drain state,
+- DSQL connection headroom as a hard scaling envelope,
 - a scaling model that matches Tokeira’s actual bottlenecks rather than generic ECS utilization.
 
-## Review questions
+## Resolved review questions
 
-1. Do we want `tokeira-runtime` to start as `DAEMON`, or do we want a REPLICA runtime fleet first for denser packing experiments?
-2. Do we want to preserve a single Temporal-compatible private endpoint immediately, or accept split private DNS names for `edge-api` and `edge-poll` in the first deployment?
-3. Do we want Cloud Map to be the runtime endpoint source of truth, or do we want the controller to publish an explicit endpoint registry derived from ECS task metadata?
-4. Should the autoscaler write directly to ECS and EC2 Auto Scaling only, or do we also want an optional Application Auto Scaling integration for scheduled actions later?
+1. **DAEMON or REPLICA runtime first?** Start with DAEMON for the first ECS-on-EC2 profile. DAEMON is a placement profile, not a correctness dependency. Correctness comes from DSQL leases and epochs. DAEMON gives clean host/process accounting.
+2. **Single Temporal-compatible endpoint immediately?** Start with split private names (`edge-api.<private-zone>`, `edge-poll.<private-zone>`). Move to a single ALB endpoint with gRPC method routing once the internals are stable.
+3. **Cloud Map or controller endpoint registry?** Controller-published registry. Cloud Map is discovery plumbing. The controller publishes `node_id → endpoint` as part of the routing snapshot. Cloud Map / ECS metadata may be used to discover or validate the concrete endpoint.
+4. **Direct ECS/ASG only, or Application Auto Scaling later?** Direct ECS and EC2 Auto Scaling APIs only for the first iteration. Keep Application Auto Scaling as a future optional integration for scheduled floors or non-runtime service envelopes.
 
 ## References
 
@@ -548,3 +705,7 @@ That gives us:
 [^cloudmap-private-ns]: AWS, "CreatePrivateDnsNamespace - AWS Cloud Map" — <https://docs.aws.amazon.com/cloud-map/latest/api/API_CreatePrivateDnsNamespace.html>
 [^alb-grpc-routing]: AWS, "Target groups for your Application Load Balancers" — <https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-target-groups.html>
 [^dsql-privatelink]: AWS, "Managing and connecting to Amazon Aurora DSQL clusters using AWS PrivateLink" — <https://docs.aws.amazon.com/aurora-dsql/latest/userguide/privatelink-managing-clusters.html>
+[^asg-instance-protection]: AWS, "Use instance scale-in protection" — <https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-instance-protection.html>
+[^asg-termination-policies]: AWS, "Configure termination policies for Amazon EC2 Auto Scaling" — <https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-termination-policies.html>
+[^asg-terminate-instance]: AWS, "TerminateInstanceInAutoScalingGroup - Amazon EC2 Auto Scaling" — <https://docs.aws.amazon.com/autoscaling/ec2/APIReference/API_TerminateInstanceInAutoScalingGroup.html>
+[^ecs-container-instance-draining]: AWS, "Drain Amazon ECS container instances" — <https://docs.aws.amazon.com/AmazonECS/latest/developerguide/container-instance-draining.html>

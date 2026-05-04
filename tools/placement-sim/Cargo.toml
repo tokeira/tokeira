@@ -1,0 +1,10 @@
+[package]
+name = "placement-sim"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Discrete-event simulator for Tokeira placement/membership invariants"
+
+[[bin]]
+name = "placement-sim"
+path = "src/main.rs"

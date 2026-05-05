@@ -19,30 +19,34 @@ The implementation is organized into 6 phases:
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │                           ECS Cluster (per environment)                       │
 │                                                                              │
-│  ┌─────────────┐  ┌──────────────┐  ┌────────────┐  ┌────────────┐  ┌─────┐│
-│  │ cp-edge-api  │  │ cp-edge-poll  │  │ cp-runtime  │  │cp-projection│  │cp-  ││
-│  │              │  │              │  │              │  │            │  │ctrl ││
-│  │ edge-api     │  │ edge-poll    │  │ runtime     │  │ projection │  │     ││
-│  │ (REPLICA)    │  │ (REPLICA)    │  │ (DAEMON)    │  │ (REPLICA)  │  │ctrl ││
-│  │ +alloy       │  │ +alloy       │  │ +alloy       │  │ +alloy     │  │auto ││
-│  │              │  │              │  │              │  │            │  │admin││
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └────────────┘  │mimir│
-│         │                 │                 │                           │loki ││
-│  ┌──────┴─────────────────┴──────┐          │                           │graf ││
-│  │      Internal ALB             │          │                           └─────┘│
-│  │  edge-api.<zone>              │          │                                  │
-│  │  edge-poll.<zone>             │          │                                  │
-│  └───────────────────────────────┘          │                                  │
-│                                             │                                  │
-│  ┌──────────────────────────────────────────┴──────────────────────────────┐  │
-│  │                    Service Connect Namespace                             │  │
-│  │  controller  autoscaler  projection  mimir  loki  grafana                │  │
-│  └──────────────────────────────────────────────────────────────────────────┘  │
+│   Application plane                    Observability plane       Control     │
+│  ┌─────────────┐  ┌──────────────┐  ┌────────────┐  ┌────────┐ ┌────────┐   │
+│  │ cp-edge-api │  │ cp-edge-poll │  │ cp-runtime │  │cp-proj │ │cp-ctrl │   │
+│  │   (c8g)     │  │   (r8g)      │  │   (c8g)    │  │ (c8g)  │ │(c8g)   │   │
+│  │ edge-api    │  │ edge-poll    │  │ runtime    │  │ proj   │ │ctrl×2  │   │
+│  │ (REPLICA)   │  │ (REPLICA)    │  │ (DAEMON)   │  │(REPL)  │ │autos×2 │   │
+│  │ +alloy      │  │ +alloy       │  │ +alloy     │  │+alloy  │ │admin×0 │   │
+│  └──────┬──────┘  └──────┬───────┘  └──────┬─────┘  └────────┘ │+alloy  │   │
+│         │                │                 │                   └────────┘   │
+│  ┌──────┴────────────────┴──────┐          │                                │
+│  │   Internal ALB (gRPC HTTP/2) │          │      Observability plane       │
+│  │   edge-api.<zone>            │          │  ┌────────┐ ┌────────┐ ┌─────┐ │
+│  │   edge-poll.<zone>           │          │  │cp-mimir│ │cp-loki │ │cp-  │ │
+│  └──────────────────────────────┘          │  │ (r8g)  │ │ (r8g)  │ │graf │ │
+│                                             │  │ mimir  │ │ loki   │ │(c8g)│ │
+│                                             │  │+alloy  │ │+alloy  │ │graf │ │
+│                                             │  │        │ │        │ │+all │ │
+│                                             │  └────────┘ └────────┘ └─────┘ │
+│                                             │                                │
+│  ┌──────────────────────────────────────────┴───────────────────────────────┐│
+│  │                    Service Connect Namespace                              ││
+│  │  controller  autoscaler  projection  mimir  loki  grafana                 ││
+│  └───────────────────────────────────────────────────────────────────────────┘│
 │                                                                              │
-│  ┌──────────────────────────────────────────────────────────────────────────┐  │
-│  │                    VPC Endpoints (private connectivity)                   │  │
-│  │  ECS(3) ECR(2) S3(gw) AutoScaling CloudMap DSQL(2) [opt: STS,KMS,CWL]  │  │
-│  └──────────────────────────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────────────────────┐│
+│  │                    VPC Endpoints (private connectivity)                   ││
+│  │  ECS(3) ECR(2) S3(gw) AutoScaling CloudMap DSQL(2) SSM(3) [opt: CWL...]  ││
+│  └──────────────────────────────────────────────────────────────────────────┘│
 └──────────────────────────────────────────────────────────────────────────────┘
                                     │
                     ┌───────────────┼───────────────┐
@@ -54,6 +58,8 @@ The implementation is organized into 6 phases:
               └────────────┘  │  logs)     │  └───────────┘
                               └────────────┘
 ```
+
+All EC2 instance types default to Graviton4 (c8g/r8g family) for best price-performance. Graviton4 is based on Neoverse V2 cores and is supported end-to-end by Amazon Linux 2023 on arm64. Regions where c8g/r8g are not yet generally available can override the instance type in config to Graviton3 (c7g/r7g).
 
 **Note on runtime scheduling:** Runtime uses DAEMON scheduling (one task per host) because each runtime process owns bundles and manages shard-local lanes. DAEMON ensures predictable resource envelopes — the entire host's CPU and memory are available to the single runtime task. Scaling the runtime fleet means scaling the ASG (adding/removing hosts), not adjusting a desired count.
 
@@ -76,96 +82,23 @@ remote-state → networking → dsql → cluster → observability → services
 - **remote-state**: S3 state bucket with shared-bucket semantics — snapshot delete prevention policy, versioning enforcement, public access block, adoption of existing buckets, no-op delete. Implemented as a `RemoteStateBucket` resource in `platforms/` (shared across all AWS-backed platforms).
 - **networking**: VPC subnets, security groups, VPC endpoints, internal ALB
 - **dsql**: DSQL cluster, DSQL PrivateLink endpoints, IAM authentication roles
-- **cluster**: ECS cluster, 5 capacity providers, 5 ASGs, launch templates, IAM instance profiles
+- **cluster**: ECS cluster, 8 capacity providers (application plane: edge-api, edge-poll, runtime, projection, control; observability plane: mimir, loki, grafana), 8 ASGs, launch templates, IAM instance profiles, ecs-exec CloudWatch log group
 - **observability**: Mimir, Loki, Grafana ECS services, S3 buckets for metrics/log storage, IAM roles
 - **services**: 7 Tokeira ECS service definitions, 7 task definitions (each with Alloy sidecar), Service Connect config, Cloud Map namespace. Depends on observability because Alloy sidecars need Mimir/Loki endpoints.
 
 ## Components and Interfaces
 
-### 1. CLI Progress Reporting (Prerequisite)
+### 1. Progress Reporting and CLI UX — Consumed from `iac-resource-lifecycle`
 
-Before the ECS platform can provide good operator UX during `infra apply`, the IaC engine and CLI output module need progress callback support. This is a prerequisite for all subsequent phases.
+The `ProvisionContext` progress callbacks (`set_apply_progress`, `set_complete_progress`, `set_failed_progress`, `set_wait_progress`, `set_note_progress`), the `ActionTuiHandle` implementation, the `OutputFormat` / `ProgressEvent` types, the JSON event schema, and the `--json` flag threading are defined by the [`iac-resource-lifecycle`](../iac-resource-lifecycle/design.md) spec. This ECS spec consumes them.
 
-#### IaC Engine Progress Callbacks (`tokeira-iac`)
+Notably:
+- `set_apply_progress` takes three arguments (`action`, `resource_id`, `resource_type`) — not five. `index`/`total` counters belong on the CLI side (`ActionCounters`), not on the engine callback signature.
+- `skipped` is derived from `ChangeKind::NoChange` plan entries, not a callback.
+- `ActionTuiHandle` uses the `ActiveSpinners` map pattern (per-resource `SpinnerEntry` keyed by `ResourceId`), not a single `overall` + `detail` pair.
+- The test-only `with_terminal_detected(format, is_terminal)` constructor is the deterministic injection seam for unit tests.
 
-Add three callback registration methods to `ProvisionContext`:
-
-```rust
-impl ProvisionContext {
-    pub fn set_apply_progress<F>(&mut self, reporter: F)
-    where
-        F: Fn(&str, &ResourceId, &ResourceType, usize, usize) + Send + Sync + 'static;
-
-    pub fn set_wait_progress<F>(&mut self, reporter: F)
-    where
-        F: Fn(&ResourceId, &ResourceType, &str, Duration, Duration) + Send + Sync + 'static;
-
-    pub fn set_note_progress<F>(&mut self, reporter: F)
-    where
-        F: Fn(&ResourceId, &ResourceType, &str) + Send + Sync + 'static;
-
-    pub fn emit_apply_progress(&self, action: &str, rid: &ResourceId, rtype: &ResourceType, current: usize, total: usize);
-    pub fn emit_wait_progress(&self, rid: &ResourceId, rtype: &ResourceType, phase: &str, elapsed: Duration, timeout: Duration);
-    pub fn emit_note_progress(&self, rid: &ResourceId, rtype: &ResourceType, message: &str);
-}
-```
-
-The IaC engine calls `emit_apply_progress` before each resource lifecycle operation and `emit_wait_progress` during polling waits.
-
-#### CLI Output Module (`apps/tkr/src/output.rs`)
-
-Replace the current minimal `OutputFormatter` with a full output module:
-
-```rust
-use console::Style;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutputFormat {
-    Human,
-    Json,
-}
-
-#[derive(Clone)]
-pub struct ActionTuiHandle {
-    overall: ProgressBar,   // [##--] 3/12 creating VpcEndpoint (ecs)
-    detail: ProgressBar,    // spinner for wait phases
-}
-
-impl ActionTuiHandle {
-    pub fn on_action(&self, msg: &str, current: usize, total: usize);
-    pub fn on_wait(&self, msg: &str);
-    pub fn finish(&self);
-}
-
-pub fn start_action_tui(format: OutputFormat) -> Option<ActionTuiHandle>;
-pub fn print_header(format: OutputFormat, title: &str);
-pub fn print_status(format: OutputFormat, label: &str, value: &str);
-pub fn print_progress(format: OutputFormat, msg: &str);
-pub fn print_success(format: OutputFormat, msg: &str);
-pub fn print_warning(format: OutputFormat, msg: &str);
-pub fn print_error(format: OutputFormat, msg: &str);
-pub fn print_changes(format: OutputFormat, changes: &[(String, String, String, Option<String>)]);
-pub fn print_deployment_table(format: OutputFormat, rows: &[(String, u32, u32, u32, bool)]);
-pub fn print_json<T: Serialize>(data: &T);
-```
-
-New dependencies: `console` (ANSI styles, TTY detection), `indicatif` (progress bars, spinners).
-
-#### Wiring in `infra apply`
-
-```rust
-let tui = output::start_action_tui(format);
-let apply_tui = tui.clone();
-engine.context_mut().set_apply_progress(move |action, rid, rtype, current, total| {
-    let msg = format!("{action} {} ({})", rid.0, rtype);
-    if let Some(tui) = &apply_tui {
-        tui.on_action(&msg, current, total);
-    } else {
-        output::print_progress(format, &format!("[{current}/{total}] {msg}"));
-    }
-});
-```
+New IaC resources in this spec call `ctx.emit_apply_progress` at the start of their lifecycle methods, `ctx.emit_wait_progress` during polling waits (for example while waiting for an OpenSearch domain to reach `Active`), and `ctx.emit_note_progress` for informational events (for example "adopting existing DSQL cluster", "ecs-exec log group already exists"). They call `ctx.emit_complete_progress` / `ctx.emit_failed_progress` on return via the engine's generic `apply_changes` / `destroy_changes` machinery — resource implementations do not call these directly.
 
 ### 1a. ECS Platform Configuration (`platforms/ecs/src/config.rs`)
 
@@ -222,12 +155,70 @@ pub struct OptionalEndpoints {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DsqlConfig {
+    /// Lifecycle mode: `Managed` (create and own the cluster) or
+    /// `Preexisting` (adopt a pre-existing cluster, PrivateLink endpoints,
+    /// and IAM roles). Defaults to `Managed`.
+    pub mode: DsqlClusterMode,
     /// DSQL cluster endpoint (e.g., "cluster.dsql.us-east-1.on.aws").
-    pub endpoint: String,
+    ///
+    /// For `Managed`: initially empty or placeholder; populated by post-apply
+    /// writeback with the discovered endpoint.
+    /// For `Preexisting`: required — operator must supply the endpoint.
+    pub endpoint: Option<String>,
+    /// PrivateLink management endpoint ID.
+    /// Required for `Preexisting`; populated by writeback for `Managed`.
+    pub management_endpoint_id: Option<String>,
+    /// PrivateLink connection endpoint ID.
+    /// Required for `Preexisting`; populated by writeback for `Managed`.
+    pub connection_endpoint_id: Option<String>,
     /// IAM role ARN for runtime DSQL access.
+    /// Required for `Preexisting`; populated by writeback for `Managed`.
     pub runtime_role_arn: Option<String>,
     /// IAM role ARN for admin/migration DSQL access.
+    /// Required for `Preexisting`; populated by writeback for `Managed`.
     pub admin_role_arn: Option<String>,
+}
+
+/// DSQL cluster lifecycle mode. Follows the `effective_managed` convention
+/// from the `iac-resource-lifecycle` spec so a cluster originally created
+/// as `Managed` is still deleted on destroy even if config is later
+/// changed to `Preexisting`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DsqlClusterMode {
+    /// Create and own the cluster lifecycle. Endpoint, endpoint IDs, and
+    /// role ARNs are discovered after apply and written back to config.
+    #[default]
+    Managed,
+    /// Adopt an existing cluster. Operator must supply endpoint,
+    /// endpoint IDs, and role ARNs. Module never creates or deletes.
+    Preexisting,
+}
+
+impl DsqlConfig {
+    /// Validate that Preexisting mode has all required fields populated.
+    /// Called during config loading; produces a descriptive error naming
+    /// the first missing field.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.mode == DsqlClusterMode::Preexisting {
+            if self.endpoint.is_none() {
+                return Err(ConfigError::missing("dsql.endpoint"));
+            }
+            if self.management_endpoint_id.is_none() {
+                return Err(ConfigError::missing("dsql.management_endpoint_id"));
+            }
+            if self.connection_endpoint_id.is_none() {
+                return Err(ConfigError::missing("dsql.connection_endpoint_id"));
+            }
+            if self.runtime_role_arn.is_none() {
+                return Err(ConfigError::missing("dsql.runtime_role_arn"));
+            }
+            if self.admin_role_arn.is_none() {
+                return Err(ConfigError::missing("dsql.admin_role_arn"));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,6 +229,9 @@ pub struct CapacityProviderConfigs {
     pub runtime: RuntimeCapacityProviderConfig,
     pub projection: CapacityProviderConfig,
     pub control: CapacityProviderConfig,
+    pub mimir: CapacityProviderConfig,
+    pub loki: CapacityProviderConfig,
+    pub grafana: CapacityProviderConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,6 +327,9 @@ pub struct ObservabilityStackConfig {
     pub alloy_sidecar_memory_mb: u32,
     pub mimir_s3_bucket: String,
     pub loki_s3_bucket: String,
+    /// Retention for both Mimir metrics and Loki logs. Default 30 days.
+    /// Mimir's compactor and Loki's compactor both respect this value.
+    pub retention_days: u32,
 }
 
 impl Default for EcsConfig {
@@ -354,25 +351,39 @@ impl Default for EcsConfig {
             },
             capacity_providers: CapacityProviderConfigs {
                 edge_api: CapacityProviderConfig {
-                    instance_type: "c7g.large".into(),
+                    instance_type: "c8g.large".into(),  // Graviton4, 2 vCPU, 4 GiB
                     min_capacity: 1, max_capacity: 10, desired_capacity: 2,
                 },
                 edge_poll: CapacityProviderConfig {
-                    instance_type: "r7g.large".into(),
+                    instance_type: "r8g.large".into(),  // Graviton4, 2 vCPU, 16 GiB
                     min_capacity: 1, max_capacity: 10, desired_capacity: 2,
                 },
                 runtime: RuntimeCapacityProviderConfig {
-                    instance_type: "c7g.xlarge".into(),
+                    instance_type: "c8g.xlarge".into(), // Graviton4, 4 vCPU, 8 GiB
                     min_capacity: 1, max_capacity: 20, desired_capacity: 2,
                     scale_in_protection: true,
                 },
                 projection: CapacityProviderConfig {
-                    instance_type: "c7g.large".into(),
+                    instance_type: "c8g.large".into(),  // Graviton4, 2 vCPU, 4 GiB
                     min_capacity: 1, max_capacity: 10, desired_capacity: 1,
                 },
                 control: CapacityProviderConfig {
-                    instance_type: "t4g.medium".into(),
+                    instance_type: "c8g.large".into(),  // Graviton4, 2 vCPU, 4 GiB
                     min_capacity: 1, max_capacity: 3, desired_capacity: 1,
+                },
+                // Observability services — each on its own single-host CP.
+                // max=1 so tkr port-forward always targets the unique host.
+                mimir: CapacityProviderConfig {
+                    instance_type: "r8g.large".into(),  // Graviton4, 2 vCPU, 16 GiB
+                    min_capacity: 1, max_capacity: 1, desired_capacity: 1,
+                },
+                loki: CapacityProviderConfig {
+                    instance_type: "r8g.large".into(),  // Graviton4, 2 vCPU, 16 GiB
+                    min_capacity: 1, max_capacity: 1, desired_capacity: 1,
+                },
+                grafana: CapacityProviderConfig {
+                    instance_type: "c8g.large".into(),  // Graviton4, 2 vCPU, 4 GiB
+                    min_capacity: 1, max_capacity: 1, desired_capacity: 1,
                 },
             },
             services: ServiceConfigs { /* defaults per service */ },
@@ -418,7 +429,51 @@ fn resource_tags(config: &EcsConfig, resource_name: &str) -> HashMap<String, Str
 }
 ```
 
-Every `Resource` implementation passes `resource_tags(config, name)` to the AWS SDK create/update calls. This applies to VPC resources, security groups, VPC endpoints, ALB, ECS cluster, capacity providers, ASGs, launch templates, IAM roles, S3 buckets, DSQL cluster, Cloud Map namespace, and ECS services/task definitions.
+Every `Resource` implementation passes `resource_tags(config, name)` to the AWS SDK create/update calls. This applies to VPC resources, security groups, VPC endpoints, ALB, ECS cluster, capacity providers, ASGs, launch templates, IAM roles, S3 buckets, DSQL cluster, Cloud Map namespace, ECS services/task definitions, and CloudWatch log groups (including the ecs-exec audit log group from §3d).
+
+#### ECS Task CPU/Memory Validation
+
+ECS enforces a discrete matrix of valid task-level CPU/memory pairs. Invalid combinations are rejected at `RegisterTaskDefinition` time; we catch them at TOML parse time instead so operators find the problem during `tkr init` / `tkr infra plan`:
+
+```rust
+/// Validate an ECS task's (cpu, memory_mb) pair against the ECS matrix.
+/// Returns Ok if the pair is valid; Err with the nearest valid pairs otherwise.
+pub fn validate_cpu_memory(cpu: u32, memory_mb: u32) -> Result<(), ConfigError> {
+    // ECS task CPU values (CPU units; 1024 = 1 vCPU)
+    // and the inclusive memory ranges + stride they support.
+    const MATRIX: &[(u32, u32, u32, u32)] = &[
+        // (cpu, min_memory_mb, max_memory_mb, stride_mb)
+        (256,    512,   2048, 512),
+        (512,   1024,   4096, 1024),
+        (1024,  2048,   8192, 1024),
+        (2048,  4096,  16384, 1024),
+        (4096,  8192,  30720, 1024),
+        (8192, 16384,  61440, 4096),  // Linux on EC2 only
+        (16384, 32768, 122880, 8192), // Linux on EC2 only
+    ];
+
+    let Some(row) = MATRIX.iter().find(|(c, ..)| *c == cpu) else {
+        return Err(ConfigError::invalid_cpu(cpu, MATRIX));
+    };
+    let (_, min_mem, max_mem, stride) = row;
+    if memory_mb < *min_mem || memory_mb > *max_mem {
+        return Err(ConfigError::memory_out_of_range(cpu, memory_mb, *min_mem, *max_mem));
+    }
+    if (memory_mb - min_mem) % stride != 0 {
+        return Err(ConfigError::memory_not_on_stride(cpu, memory_mb, *stride));
+    }
+    Ok(())
+}
+```
+
+`EcsConfig::validate()` calls `validate_cpu_memory` for every service (`edge_api`, `edge_poll`, `runtime`, `projection`, `controller`, `autoscaler`, `admin`) plus Mimir, Loki, Grafana. Error messages cite the invalid pair and the nearest valid pairs so operators can correct without consulting AWS docs:
+
+```
+ecs service `tokeira-runtime` has invalid cpu/memory pair: cpu=3584, memory=6656
+  cpu=3584 is not a valid ECS CPU value
+  valid CPU values: 256, 512, 1024, 2048, 4096, 8192, 16384
+  nearest valid pairs: (2048, 4096..=16384), (4096, 8192..=30720)
+```
 
 ### 2. IaC Modules (`platforms/ecs/src/modules.rs`)
 
@@ -570,7 +625,7 @@ pub struct ClusterModule {
 
 impl iac::Module for ClusterModule {
     fn name(&self) -> &str { "cluster" }
-    fn dependencies(&self) -> &[&str] { &["networking"] }
+    fn dependencies(&self) -> &[&str] { &["dsql"] }
     fn resources(&self, ctx: &iac::ModuleContext) -> Result<Vec<Box<dyn iac::Resource>>, iac::IacError> {
         let mut resources: Vec<Box<dyn iac::Resource>> = Vec::new();
         // ECS cluster
@@ -625,6 +680,8 @@ pub struct EcsWorkload {
     pub scheduling: EcsScheduling,
     pub capacity_provider: String,
     pub task_definition: TaskDefinitionSpec,
+    pub service_connect: ServiceConnectSpec,
+    pub placement_constraints: Vec<PlacementConstraint>,
 }
 
 #[derive(Debug, Clone)]
@@ -643,6 +700,37 @@ pub struct TaskDefinitionSpec {
     pub environment: Vec<EnvVar>,
     pub log_configuration: LogConfiguration,
     pub health_check: Option<HealthCheck>,
+    pub init_containers: Vec<InitContainerSpec>,
+    pub init_process_enabled: bool, // set true on the primary container for ECS Exec
+}
+
+/// Init container that blocks the primary container's start until a
+/// dependency's Service Connect endpoint accepts a TCP connection.
+#[derive(Debug, Clone)]
+pub struct InitContainerSpec {
+    pub name: String,            // e.g., "wait-for-tokeira-controller"
+    pub image: String,           // "public.ecr.aws/docker/library/busybox:latest"
+    pub command: Vec<String>,    // ["sh", "-c", "until nc -z <dep> <port>; do sleep 2; done"]
+    pub cpu: u32,                // 32
+    pub memory_mb: u32,          // 64
+    pub essential: bool,         // false — init containers must exit to let the task run
+}
+
+/// Service Connect service registrations. Each service registers both its
+/// primary gRPC port (where applicable) and its Prometheus metrics port so
+/// Mimir can use Service Connect DNS to discover scrape targets.
+#[derive(Debug, Clone, Default)]
+pub struct ServiceConnectSpec {
+    pub grpc: Option<ServiceConnectPort>,     // discovery name "<service>"
+    pub metrics: Option<ServiceConnectPort>,  // discovery name "<service>-metrics"
+}
+
+#[derive(Debug, Clone)]
+pub struct ServiceConnectPort {
+    pub port_name: String,       // "grpc" or "metrics"
+    pub container_port: u16,
+    pub discovery_name: String,  // e.g., "tokeira-runtime-metrics"
+    pub dns_name: String,        // e.g., "tokeira-runtime-metrics"
 }
 
 impl deploy_engine::Service for EcsWorkload {
@@ -651,8 +739,12 @@ impl deploy_engine::Service for EcsWorkload {
     fn dependencies(&self) -> &[&str] {
         match self.name.as_str() {
             "tokeira-edge-api" | "tokeira-edge-poll" => &["tokeira-runtime", "tokeira-controller"],
+            "tokeira-runtime" => &["tokeira-controller"],
             "tokeira-projection" => &["tokeira-runtime"],
-            "tokeira-autoscaler" => &["tokeira-controller"],
+            // Autoscaler needs Mimir to query metrics and controller for nominate/drain APIs
+            "tokeira-autoscaler" => &["tokeira-controller", "tokeira-mimir"],
+            // Grafana depends on both data sources
+            "tokeira-grafana" => &["tokeira-mimir", "tokeira-loki"],
             "tokeira-admin" => &[],
             _ => &[],
         }
@@ -665,6 +757,12 @@ impl deploy_engine::Service for EcsWorkload {
 }
 ```
 
+**Wait-for init containers** — `EcsWorkload::build` synthesises one `wait-for-<dep>` init container per upstream dependency from the `dependencies()` list. Each primary container declares a `dependsOn` for its matching init containers. The init image is the public busybox, the command polls the dependency's Service Connect endpoint every 2 seconds until TCP connect succeeds, and CPU/memory reservations (32/64) are deducted from the primary container's budget.
+
+**Service Connect metrics registration** — `ServiceConnectSpec::metrics` registers every service's Prometheus endpoint on Service Connect. This gives Mimir a stable DNS target (for example `tokeira-runtime-metrics.tokeira.local:9090`) and allows it to discover scrape targets via DNS SD instead of via the Docker socket. Alloy sidecars still scrape localhost and forward via remote-write; the Service Connect metrics aliases are a second path for Mimir pull scraping when sidecars are unhealthy or during break-glass debugging.
+
+**ECS Exec readiness** — every `EcsWorkload` sets `enable_execute_command = true` on the service and `linuxParameters.initProcessEnabled = true` on the primary container. See §3d for the cluster-level logging configuration and task role IAM.
+
 Service definition table:
 
 | Service | Scheduling | Capacity Provider | Default Count | Ingress |
@@ -676,19 +774,21 @@ Service definition table:
 | `tokeira-controller` | REPLICA | `cp-control` | 2 | Service Connect |
 | `tokeira-autoscaler` | REPLICA | `cp-control` | 2 | None |
 | `tokeira-admin` | REPLICA | `cp-control` | 0 (on-demand) | None |
-| `tokeira-mimir` | REPLICA | `cp-control` | 1 | Service Connect (`mimir.tokeira.local`) |
-| `tokeira-loki` | REPLICA | `cp-control` | 1 | Service Connect (`loki.tokeira.local`) |
-| `tokeira-grafana` | REPLICA | `cp-control` | 1 | Internal ALB or Service Connect |
+| `tokeira-mimir` | REPLICA | `cp-mimir` | 1 | Service Connect (`mimir.tokeira.local`) |
+| `tokeira-loki` | REPLICA | `cp-loki` | 1 | Service Connect (`loki.tokeira.local`) |
+| `tokeira-grafana` | REPLICA | `cp-grafana` | 1 | `tkr port-forward grafana` (no ALB registration) |
 
 ### 3a. Infrastructure and Service Sizing Rationale
 
 This section documents the reasoning behind instance types, task resource limits, and capacity provider defaults for each service plane. All instance types are Graviton (ARM64) for cost efficiency. Resource limits are set as requests = limits for guaranteed QoS — no overcommit.
 
+All capacity providers default to Graviton4 (c8g/r8g family) instance types. Graviton4 is Neoverse V2-based and is supported end-to-end by Amazon Linux 2023 arm64. Regions without c8g/r8g availability can override to Graviton3 (c7g/r7g) via config.
+
 #### Capacity Provider: `cp-edge-api`
 
 | Setting | Value | Rationale |
 |---|---|---|
-| Instance type | `c7g.large` (2 vCPU, 4 GiB) | Edge-api is CPU-bound: gRPC deserialization, routing lookup, request forwarding. No DSQL connections. Memory demand is low — routing cache is a small `ArcSwap<RoutingSnapshot>`. |
+| Instance type | `c8g.large` (2 vCPU, 4 GiB, Graviton4) | Edge-api is CPU-bound: gRPC deserialization, routing lookup, request forwarding. No DSQL connections. Memory demand is low — routing cache is a small `ArcSwap<RoutingSnapshot>`. |
 | Min/Max/Desired | 1 / 10 / 2 | Two instances for HA. Max 10 handles ~10k concurrent non-poll RPCs. |
 
 | Task resource | Value | Rationale |
@@ -702,7 +802,7 @@ This section documents the reasoning behind instance types, task resource limits
 
 | Setting | Value | Rationale |
 |---|---|---|
-| Instance type | `r7g.large` (2 vCPU, 16 GiB) | Edge-poll is memory-bound: each long-poll holds a gRPC stream and a broker subscription. At 1000 concurrent polls × ~16 KiB per poll context, memory dominates. `r7g` (memory-optimized) is the right family. |
+| Instance type | `r8g.large` (2 vCPU, 16 GiB, Graviton4) | Edge-poll is memory-bound: each long-poll holds a gRPC stream and a broker subscription. At 1000 concurrent polls × ~16 KiB per poll context, memory dominates. `r8g` (memory-optimized Graviton4) is the right family. |
 | Min/Max/Desired | 1 / 10 / 2 | Two instances for HA. Max 10 handles ~10k concurrent long polls. |
 
 | Task resource | Value | Rationale |
@@ -716,15 +816,18 @@ This section documents the reasoning behind instance types, task resource limits
 
 | Setting | Value | Rationale |
 |---|---|---|
-| Instance type | `c7g.xlarge` (4 vCPU, 8 GiB) | Runtime is CPU-bound: kernel transition evaluation, history serialization, DSQL transaction preparation. 4 vCPU supports ~4 lanes of concurrent transition processing. Memory holds the DSQL connection reservoir (50 connections × ~2 MiB each = ~100 MiB), shard owner state, and in-flight actor state. |
+| Instance type | `c8g.xlarge` (4 vCPU, 8 GiB, Graviton4) | Runtime is CPU-bound: kernel transition evaluation, history serialization, DSQL transaction preparation. 4 vCPU supports ~4 lanes of concurrent transition processing. Memory holds the DSQL connection reservoir, shard owner state, and in-flight actor state. |
 | Min/Max/Desired | 1 / 20 / 2 | Two instances for initial bundle distribution. Max 20 supports ~2000 WPS at 100 WPS/node. Scale-in protection enabled. |
 | DAEMON scheduling | One task per host | Runtime owns bundles and manages shard-local lanes. The entire host's resources are dedicated to the single runtime process. Scaling the runtime fleet means scaling the ASG. |
 
 | Task resource | Value | Rationale |
 |---|---|---|
-| CPU | 3584 (3.5 vCPU) | Leaves 0.5 vCPU for Alloy sidecar and ECS agent. DAEMON task gets the full host minus sidecar overhead. |
-| Memory | 6656 MiB (6.5 GiB) | Leaves ~1.5 GiB for Alloy, ECS agent, and OS. Accommodates: DSQL reservoir (~100 MiB), lane actor state (~50 MiB per lane × 4 lanes), history buffers, gRPC server buffers. |
-| Alloy sidecar | 256 CPU / 512 MiB | Runtime generates more metrics (per-shard, per-lane) and more log volume than edge. Larger sidecar allocation. |
+| Task CPU | 4096 (4 vCPU) | Matches `c8g.xlarge`. Valid ECS CPU tier. |
+| Task Memory | 8192 MiB (8 GiB) | Smallest valid memory for `cpu=4096` (range 8192–30720 MiB). The task claims the host; the ECS agent runs outside the task so the full 8 GiB is available. |
+| Primary container CPU | 3712 | 4096 − 256 (Alloy sidecar) − 64 × 2 (two wait-for init containers, which exit before the primary runs but still count at registration). Set as `reservation`; the container may burst up to the task CPU. |
+| Primary container memory | 7424 MiB | 8192 − 512 (Alloy) − 64 × 4 (conservative init allowance). Holds DSQL reservoir, lane actor state, history buffers, gRPC server buffers. |
+| Alloy sidecar | 256 CPU / 512 MiB | Runtime generates more metrics (per-shard, per-lane, per-class) and more log volume than edge. Larger sidecar allocation. |
+| Wait-for init containers | 32 CPU / 64 MiB each | Up to two per task (controller, projection). `essential = false`; exit before primary starts. |
 | Ports | gRPC 7235 (internal), metrics 9090 | Internal-only gRPC for edge→runtime forwarding. No ALB registration. |
 | DSQL connections | 32 per node (see [060-connection-management](../../../docs/architecture/060-connection-management.md#connection-demand-analysis)) | Control: 2–3, Commit: 15, Read: 10, Projection: 3, Maintenance: 2. |
 
@@ -732,13 +835,13 @@ This section documents the reasoning behind instance types, task resource limits
 
 | Setting | Value | Rationale |
 |---|---|---|
-| Instance type | `c7g.large` (2 vCPU, 4 GiB) | Projection workers are CPU-bound: deserializing postcard-encoded projection ops, computing search attribute indexes, writing to DSQL visibility tables. Memory demand is moderate — batch buffers and DSQL connection pool. |
+| Instance type | `c8g.large` (2 vCPU, 4 GiB, Graviton4) | Projection workers are CPU-bound: deserializing postcard-encoded projection ops, computing search attribute indexes, writing to DSQL visibility tables. Memory demand is moderate — batch buffers and DSQL connection pool. |
 | Min/Max/Desired | 1 / 10 / 1 | One instance is sufficient for low-to-moderate WPS. Scales with projection lag. |
 
 | Task resource | Value | Rationale |
 |---|---|---|
 | CPU | 1024 (1 vCPU) | Projection workers process batches sequentially per partition. One vCPU handles the decode→transform→write pipeline. |
-| Memory | 2048 MiB | Batch buffers (~10 MiB), DSQL connection pool (~20 MiB), search attribute index state. |
+| Memory | 2048 MiB | Batch buffers, DSQL connection pool, search attribute index state. |
 | Alloy sidecar | 128 CPU / 256 MiB | Standard sidecar. |
 | Ports | metrics 9090 | No gRPC ingress — projection workers pull from the projection log. |
 | DSQL connections | 5 per task | Projection class only. Reads from projection_log, writes to visibility tables. |
@@ -747,21 +850,61 @@ This section documents the reasoning behind instance types, task resource limits
 
 | Setting | Value | Rationale |
 |---|---|---|
-| Instance type | `t4g.medium` (2 vCPU, 4 GiB) | Control plane services (controller, autoscaler, admin, observability stack) are low-throughput. `t4g` (burstable) is cost-appropriate — these services are mostly idle with periodic bursts (snapshot computation, scaling decisions, dashboard queries). |
-| Min/Max/Desired | 1 / 3 / 1 | One instance hosts all control-plane tasks. Max 3 for HA during rolling updates. |
+| Instance type | `c8g.large` (2 vCPU, 4 GiB, Graviton4) | Control-plane services (controller, autoscaler, admin) are lightweight but not burstable — they run continuous loops (snapshot computation every few seconds, autoscaler loops at 15s cadence). A standard (non-burstable) Graviton4 `c8g.large` avoids CPU credit exhaustion. |
+| Min/Max/Desired | 1 / 3 / 1 | One instance hosts controller×2, autoscaler×2, admin×0. Max 3 for HA and rolling updates. |
 
-Services sharing `cp-control`:
+Services on `cp-control`:
 
 | Service | CPU | Memory | Rationale |
 |---|---|---|---|
 | `tokeira-controller` (×2) | 256 | 512 MiB | Lightweight: reads DSQL leases, computes snapshots, streams to subscribers. Two replicas for HA. |
 | `tokeira-autoscaler` (×2) | 256 | 512 MiB | Lightweight: queries Mimir, computes scaling decisions, calls AWS APIs. Two replicas with leader lease. |
 | `tokeira-admin` (×0) | 256 | 512 MiB | On-demand only. Schema migrations and diagnostics. |
-| `tokeira-mimir` (×1) | 512 | 1024 MiB | Single-binary mode. Ingests metrics from Alloy sidecars, serves PromQL queries. S3 for long-term storage. |
-| `tokeira-loki` (×1) | 256 | 512 MiB | Single-binary mode. Ingests logs from Alloy sidecars. S3 for long-term storage. |
-| `tokeira-grafana` (×1) | 256 | 512 MiB | Dashboard rendering. Reads from Mimir and Loki. Low steady-state load. |
+| Alloy sidecars (×4) | 64 each | 128 MiB each | 1 per live task. |
 
-Total `cp-control` resource demand at default counts: ~2560 CPU units (2.5 vCPU), ~4096 MiB (4 GiB). Fits on one `t4g.medium` with headroom. A second instance is needed during rolling updates or if Mimir ingestion load grows.
+Steady-state demand at default counts: controller×2 + autoscaler×2 + 4 sidecars = 4×256 + 4×64 = 1280 CPU units (1.25 vCPU), 4×512 + 4×128 = 2560 MiB (2.5 GiB). Leaves ~750 CPU units and ~1.5 GiB for the ECS agent, SSM agent, and OS. A second `c8g.large` is used only during rolling updates.
+
+#### Capacity Provider: `cp-mimir` (Observability — dedicated node)
+
+| Setting | Value | Rationale |
+|---|---|---|
+| Instance type | `r8g.large` (2 vCPU, 16 GiB, Graviton4) | Mimir ingests metrics from every Alloy sidecar in the cluster and is both memory-bound (in-memory active series index, WAL, compactor state) and bursty on query. Memory-optimised Graviton4 gives Mimir the headroom to hold active-series indexes without swapping. |
+| Min/Max/Desired | 1 / 2 / 1 | One dedicated host. Max 2 only during rolling replacement. |
+
+| Task resource | Value | Rationale |
+|---|---|---|
+| CPU | 1536 (1.5 vCPU) | Mimir single-binary mode runs distributor, ingester, compactor, store-gateway, ruler, and querier in one process. 1.5 vCPU handles ~10k samples/sec ingest plus concurrent PromQL queries. |
+| Memory | 12 288 MiB (12 GiB) | Active series (~5k series × 3 KiB per series head chunk), WAL write buffers, query working set, compactor block assembly. Leaves ~4 GiB for the host, Alloy sidecar, and ECS agent. |
+| Alloy sidecar | 128 CPU / 256 MiB | Scrapes Mimir's own metrics endpoint. |
+| Ports | HTTP 9009, gRPC 9095 | Standard Mimir ports. Registered in Service Connect as `mimir.tokeira.local:9009`. |
+
+#### Capacity Provider: `cp-loki` (Observability — dedicated node)
+
+| Setting | Value | Rationale |
+|---|---|---|
+| Instance type | `r8g.large` (2 vCPU, 16 GiB, Graviton4) | Loki ingests log streams from every task in the cluster. The TSDB index shipper, in-memory chunk cache, and query frontend are memory-hungry. Memory-optimised Graviton4 matches the workload shape. |
+| Min/Max/Desired | 1 / 2 / 1 | One dedicated host. Max 2 during rolling replacement. |
+
+| Task resource | Value | Rationale |
+|---|---|---|
+| CPU | 1024 (1 vCPU) | Loki ingest is I/O-bound (compressed chunks written to S3). Query path can spike but is rare at this scale. |
+| Memory | 12 288 MiB (12 GiB) | Index cache, chunk cache, WAL buffers, compactor working set. Retention-driven compaction runs hourly and needs headroom. |
+| Alloy sidecar | 128 CPU / 256 MiB | Scrapes Loki's own metrics endpoint. |
+| Ports | HTTP 3100, gRPC 9095 | Standard Loki ports. Registered in Service Connect as `loki.tokeira.local:3100`. |
+
+#### Capacity Provider: `cp-grafana` (Observability — dedicated node)
+
+| Setting | Value | Rationale |
+|---|---|---|
+| Instance type | `c8g.large` (2 vCPU, 4 GiB, Graviton4) | Grafana is CPU-bound on dashboard render and PromQL proxy. Memory demand is modest — dashboard JSON is small and query results stream through. |
+| Min/Max/Desired | 1 / 2 / 1 | One dedicated host. Max 2 during rolling replacement. |
+
+| Task resource | Value | Rationale |
+|---|---|---|
+| CPU | 1024 (1 vCPU) | Handles ~10 concurrent dashboard users comfortably. |
+| Memory | 2048 MiB (2 GiB) | Dashboard cache, query result buffering, provisioning state. |
+| Alloy sidecar | 64 CPU / 128 MiB | Small sidecar — Grafana has few internal metrics. |
+| Ports | HTTP 3000 | Grafana UI. Reached via `tkr port-forward grafana` (SSM Session Manager) — not registered with the ALB. |
 
 #### Alloy Sidecar Sizing
 
@@ -773,13 +916,209 @@ Every task definition includes an Alloy sidecar. The sidecar's resource allocati
 | Runtime | 256 | 512 MiB | High metric cardinality (per-shard, per-lane, per-class), high log volume during transitions. |
 | Projection | 128 | 256 MiB | Low metric cardinality, low log volume. |
 | Control plane | 64 | 128 MiB | Minimal metrics and logs. |
+| Observability (mimir/loki) | 128 | 256 MiB | Standard — monitors the observability service's own metrics. |
+| Observability (grafana) | 64 | 128 MiB | Minimal — Grafana exposes few metrics. |
 
-#### Why Graviton (ARM64)
+#### Why Graviton4 (ARM64)
 
-All instance types use Graviton processors (`c7g`, `r7g`, `t4g`):
-- ~20% better price-performance than equivalent x86 instances
+All instance types default to Graviton4 processors (`c8g`, `r8g`):
+- Neoverse V2 cores; up to 40% better price-performance than Graviton3 on memory-heavy workloads (Mimir, Loki) and ~30% on CPU-heavy workloads (edge, runtime, controller)
+- Supported by Amazon Linux 2023 arm64 end-to-end; the ECS-optimised AMI path is `/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id` (no separate Graviton4 variant — the same AMI runs on all current Graviton generations because AL2023 kernel 6.1 includes Neoverse V2 support)
 - Tokeira is pure Rust compiled for `aarch64-unknown-linux-gnu` — no x86 dependencies
 - Alloy, Mimir, Loki, and Grafana all publish ARM64 container images
+- Regions where c8g/r8g are not yet generally available can override to Graviton3 via config
+
+### 3b. Launch Template AMI Resolution
+
+The `LaunchTemplateResource` does not embed an AMI ID. At apply time it resolves the current Amazon Linux 2023 arm64 ECS-optimised AMI from SSM:
+
+```rust
+async fn resolve_ecs_optimized_ami(
+    ssm: &aws_sdk_ssm::Client,
+    region: &str,
+) -> Result<String, IacError> {
+    let parameter = "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id";
+    let out = ssm.get_parameter().name(parameter).send().await?;
+    out.parameter
+        .and_then(|p| p.value)
+        .ok_or_else(|| IacError::Other(anyhow::anyhow!(
+            "ECS-optimised AMI parameter missing value in region {region}"
+        )))
+}
+```
+
+This lets the launch template pick up AMI refreshes without requiring the operator to update config. The resolved AMI ID is persisted in `ResourceState.properties["ami_id"]` so `diff()` can detect when AWS publishes a new image and present it as an update.
+
+### 3c. Launch Template User Data and Workload Attributes
+
+Each launch template renders a user-data script that tags the instance with a workload attribute. ECS task placement constraints can then filter by workload, which makes the scheduling invariant explicit on the service side rather than relying on the capacity-provider binding alone:
+
+```bash
+#!/bin/bash
+echo "ECS_CLUSTER=${cluster_name}" >> /etc/ecs/ecs.config
+echo "ECS_ENABLE_CONTAINER_METADATA=true" >> /etc/ecs/ecs.config
+echo "ECS_ENABLE_SPOT_INSTANCE_DRAINING=true" >> /etc/ecs/ecs.config
+echo "ECS_IMAGE_PULL_BEHAVIOR=always" >> /etc/ecs/ecs.config
+echo 'ECS_INSTANCE_ATTRIBUTES={"workload": "${plane}"}' >> /etc/ecs/ecs.config
+```
+
+Where `${plane}` is one of `edge-api`, `edge-poll`, `runtime`, `projection`, `control`, `mimir`, `loki`, `grafana`. Each ECS service then declares a matching placement constraint:
+
+```rust
+service.placement_constraints = Some(vec![
+    PlacementConstraint {
+        r#type: "memberOf".into(),
+        expression: Some(format!("attribute:workload == {plane}")),
+    },
+]);
+```
+
+This is belt-and-braces — the capacity provider strategy already binds services to the right ASG — but the attribute makes the binding discoverable at placement time and allows `ecs:RunTask` ad-hoc invocations (for example the admin service) to land on the right plane.
+
+### 3d. ECS Exec (`ecs exec` with central audit)
+
+ECS Exec is configured at four levels, all three of which this design requires:
+
+**1. Cluster level.** The `EcsClusterResource` configures `execute_command_configuration` with `logging = "OVERRIDE"` and a dedicated CloudWatch log group `/ecs/{project}/ecs-exec` for the session audit trail:
+
+```rust
+let cluster = ecs.create_cluster()
+    .cluster_name(&cluster_name)
+    .settings(ClusterSetting::builder()
+        .name("containerInsights")
+        .value("enabled")
+        .build())
+    .configuration(ClusterConfiguration::builder()
+        .execute_command_configuration(
+            ExecuteCommandConfiguration::builder()
+                .logging(ExecuteCommandLogging::Override)
+                .log_configuration(ExecuteCommandLogConfiguration::builder()
+                    .cloud_watch_log_group_name(format!("/ecs/{project}/ecs-exec"))
+                    .build())
+                .build())
+        .build())
+    .service_connect_defaults(ClusterServiceConnectDefaultsRequest::builder()
+        .namespace(namespace_arn)
+        .build())
+    .send()
+    .await?;
+```
+
+**2. Service level.** Every ECS service sets `enable_execute_command = true`. There is no cluster-wide toggle; the per-service flag is mandatory. The design's `EcsWorkload` always sets this to `true`.
+
+**3. Task definition level.** Every primary container declares `linuxParameters.initProcessEnabled = true` so exec sessions can end cleanly without leaving zombie processes:
+
+```rust
+ContainerDefinition {
+    name: primary_container_name.clone(),
+    // ...
+    linux_parameters: Some(LinuxParameters {
+        init_process_enabled: Some(true),
+        ..Default::default()
+    }),
+}
+```
+
+**4. IAM task role level.** The four SSM Messages actions plus the three CloudWatch Logs actions are granted on the task role (not the execution role):
+
+```rust
+let policy = json!({
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "ssmmessages:CreateControlChannel",
+                "ssmmessages:CreateDataChannel",
+                "ssmmessages:OpenControlChannel",
+                "ssmmessages:OpenDataChannel",
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "logs:CreateLogStream",
+                "logs:DescribeLogStreams",
+                "logs:PutLogEvents",
+            ],
+            "Resource": format!(
+                "arn:aws:logs:{region}:{account}:log-group:/ecs/{project}/ecs-exec:*"
+            )
+        }
+    ]
+});
+```
+
+**Operator access — `tkr exec`.** The CLI wraps all of this behind a single command:
+
+```rust
+/// Open an interactive ECS Exec session against a running task.
+/// Discovers a task via ListTasks/DescribeTasks, calls ExecuteCommand,
+/// hands off to session-manager-plugin for the data-plane.
+pub async fn exec_ecs(
+    service: &str,
+    container: Option<&str>,
+    cmd: &[String],
+    config: &EcsConfig,
+    ecs: &aws_sdk_ecs::Client,
+) -> Result<()> {
+    // 1. Resolve the container name. If omitted, default to the primary
+    //    container for this service (e.g. "tokeira-runtime" for runtime,
+    //    "tokeira-mimir" for mimir). Never default to the Alloy sidecar.
+    let container = container.unwrap_or(&primary_container_name_for(service));
+
+    // 2. Find a running task.
+    let tasks = ecs.list_tasks()
+        .cluster(&config.cluster.name)
+        .service_name(&full_service_name(service, config))
+        .desired_status(DesiredStatus::Running)
+        .send()
+        .await?;
+    let task_arn = tasks.task_arns().first()
+        .ok_or_else(|| anyhow::anyhow!(
+            "no running tasks for {service}; run `tkr scale up` or check service status"
+        ))?;
+
+    // 3. Request an exec session. AWS returns a session payload that
+    //    session-manager-plugin consumes.
+    let out = ecs.execute_command()
+        .cluster(&config.cluster.name)
+        .task(task_arn)
+        .container(container)
+        .command(&cmd.join(" "))
+        .interactive(true)
+        .send()
+        .await?;
+    let session = out.session()
+        .ok_or_else(|| anyhow::anyhow!("ExecuteCommand returned no session"))?;
+
+    // 4. Hand off to session-manager-plugin (same as tkr port-forward).
+    // The plugin reads the session JSON on stdin.
+    let mut child = std::process::Command::new("session-manager-plugin")
+        .args([
+            &serde_json::to_string(session)?,
+            &config.region,
+            "StartSession",
+        ])
+        .spawn()?;
+    let status = child.wait()?;
+    if !status.success() {
+        anyhow::bail!("session-manager-plugin exited with status {status}");
+    }
+    Ok(())
+}
+```
+
+The caller typically wraps this as:
+
+```bash
+tkr exec runtime -- sh
+tkr exec runtime --container alloy -- ps aux
+tkr exec grafana -- /bin/bash
+```
+
+**Audit trail.** Every exec session writes to `/ecs/{project}/ecs-exec` with the session ID, the invoking principal's ARN, and the command. Retention follows `observability.retention_days` (default 30 days).
 
 ### 4. Autoscaler Service (`crates/tokeira-autoscaler/`)
 
@@ -983,32 +1322,119 @@ impl DesiredState {
 }
 ```
 
-### 4b. Alloy Sidecar in Task Definitions
+### 4b. Alloy Sidecar in Task Definitions (init-container + SSM Parameter Store pattern)
 
-Every Tokeira task definition includes an Alloy sidecar container alongside the primary application container. The sidecar:
+Every Tokeira task definition includes an Alloy sidecar container plus a small **config init container** that fetches the Alloy config from SSM Parameter Store and writes it into a shared task volume. This decouples Alloy configuration from task definition revisions — operators can update Alloy settings by writing a new SSM parameter value; the next task start picks up the change.
+
+The sidecar:
 
 - Scrapes Prometheus metrics from `localhost:{metrics_port}` on the primary container
-- Forwards metrics to Mimir via remote-write (`http://mimir.tokeira.local:9009/api/v1/push`)
-- Collects container stdout/stderr and ships to Loki (`http://loki.tokeira.local:3100/loki/api/v1/push`)
+- Forwards metrics to Mimir via remote-write (`http://mimir.<namespace>:9009/api/v1/push`)
+- Collects container stdout/stderr and ships to Loki (`http://loki.<namespace>:3100/loki/api/v1/push`)
 - Uses pinned image `grafana/alloy:v1.16.0`
 
 ```rust
-fn alloy_sidecar_container(metrics_port: u16) -> ContainerDefinition {
-    ContainerDefinition {
-        name: "alloy".into(),
-        image: "grafana/alloy:v1.16.0".into(),
-        essential: false,  // sidecar failure should not kill the primary
+/// Pair of container definitions: the init container that stages the Alloy
+/// config, and the Alloy sidecar that consumes it.
+fn alloy_containers(service_name: &str, project: &str, metrics_port: u16)
+    -> (ContainerDefinition, ContainerDefinition)
+{
+    let param_path = format!("/{project}/alloy/sidecar/{service_name}");
+
+    let init = ContainerDefinition {
+        name: "alloy-config-init".into(),
+        image: "public.ecr.aws/aws-cli/aws-cli:latest".into(),
+        essential: false,
         cpu: 64,
         memory_mb: 128,
-        environment: vec![
-            EnvVar { name: "METRICS_SCRAPE_TARGET".into(), value: format!("localhost:{metrics_port}") },
-            EnvVar { name: "MIMIR_REMOTE_WRITE_URL".into(), value: "http://mimir.tokeira.local:9009/api/v1/push".into() },
-            EnvVar { name: "LOKI_WRITE_URL".into(), value: "http://loki.tokeira.local:3100/loki/api/v1/push".into() },
+        mount_points: vec![MountPoint {
+            source_volume: "alloy-config".into(),
+            container_path: "/etc/alloy".into(),
+            read_only: false,
+        }],
+        // Fetch the parameter value and write it to the shared volume.
+        command: vec![
+            "sh".into(), "-c".into(),
+            format!(
+                "aws ssm get-parameter --name {param_path} --with-decryption \
+                 --query 'Parameter.Value' --output text > /etc/alloy/config.alloy"
+            ),
         ],
         ..Default::default()
-    }
+    };
+
+    let sidecar = ContainerDefinition {
+        name: "alloy".into(),
+        image: "grafana/alloy:v1.16.0".into(),
+        essential: false,
+        cpu: 128,
+        memory_mb: 256,
+        depends_on: vec![ContainerDependency {
+            container_name: "alloy-config-init".into(),
+            condition: "SUCCESS".into(),
+        }],
+        mount_points: vec![MountPoint {
+            source_volume: "alloy-config".into(),
+            container_path: "/etc/alloy".into(),
+            read_only: true,
+        }],
+        command: vec![
+            "run".into(), "--server.http.listen-addr=0.0.0.0:12345".into(),
+            "/etc/alloy/config.alloy".into(),
+        ],
+        ..Default::default()
+    };
+
+    (init, sidecar)
 }
 ```
+
+The task definition declares a shared `alloy-config` volume:
+
+```rust
+task_definition.volumes.push(Volume {
+    name: "alloy-config".into(),
+    host: None, // ephemeral scratch volume
+});
+```
+
+**Config content.** The full Alloy HCL config is rendered from an Askama template at `infra apply` time (see §4d) and written to SSM by an IaC resource:
+
+```rust
+#[derive(Debug)]
+pub struct AlloyParameterResource {
+    pub service_name: String,
+    pub project: String,
+    pub config_content: String,  // rendered HCL
+}
+
+impl Resource for AlloyParameterResource {
+    async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, IacError> {
+        let ssm = ctx.extension::<aws_sdk_ssm::Client>().unwrap();
+        ssm.put_parameter()
+            .name(format!("/{}/alloy/sidecar/{}", self.project, self.service_name))
+            .value(&self.config_content)
+            .r#type(ParameterType::String)
+            .overwrite(true)
+            .send()
+            .await?;
+        Ok(state)
+    }
+    // update/delete/describe follow the same pattern
+}
+```
+
+Each service's `AlloyParameterResource` is enumerated by the `observability` module alongside Mimir/Loki/Grafana.
+
+**IAM.**
+- The **execution role** needs `ssm:GetParameter` on `arn:aws:ssm:*:*:parameter/{project}/alloy/sidecar/*` so the init container can fetch the config at task start.
+- The **task role** does NOT need these permissions — only the init container reads SSM.
+- Writing the parameter (at `infra apply` time) is performed by the operator's credentials via the `AlloyParameterResource`, not by any task role.
+
+**Why this pattern.** Two wins over env-var configuration:
+
+1. **Updatable without task definition churn.** Changing scrape intervals, adding labels, or switching remote-write targets becomes `aws ssm put-parameter` + task restart, not a new task definition revision.
+2. **Larger configs fit.** Alloy HCL config with multiple scrape jobs, labels, and log processors is far beyond what's sensible in env vars.
 
 ### 4c. Observability Module (`platforms/ecs/src/modules.rs`)
 
@@ -1145,6 +1571,7 @@ limits:
   max_global_series_per_metric: 50000
   ingestion_rate: 100000
   ingestion_burst_size: 200000
+  compactor_blocks_retention_period: {{ retention_days }}d
 ```
 
 Key design decisions:
@@ -1213,7 +1640,7 @@ ingester:
 
 Key design decisions:
 - **S3 backend with TSDB store** — schema v13 with TSDB is Loki's current recommended storage layout. Index files are shipped to S3 periodically; chunks are written directly to S3.
-- **Configurable retention** — `retention_days` from `EcsConfig` (default: 7 days for dev, 30 for production). Compactor enforces retention by deleting expired chunks from S3.
+- **Configurable retention** — `retention_days` from `EcsConfig.observability` (default: 30 days; can be overridden per deployment). Loki's compactor enforces retention by deleting expired chunks from S3 after a 2h grace period; Mimir's compactor applies the same retention to its blocks backend.
 - **10 MB/s ingestion rate** — sufficient for ~10 services generating structured logs. Tokeira uses `tracing` with JSON output, so log lines are compact.
 - **Snappy chunk encoding** — same rationale as Mimir: reduces S3 cost with minimal CPU.
 - **In-memory ring** — single-replica deployment. No external coordination needed.
@@ -1366,10 +1793,14 @@ impl Ops for EcsDeployment {
     type Config = EcsConfig;
 
     fn valid_services(&self) -> &[&str] {
-        static VALID: [&str; 7] = [
+        static VALID: [&str; 10] = [
             "tokeira-edge-api", "tokeira-edge-poll", "tokeira-runtime",
             "tokeira-projection", "tokeira-controller", "tokeira-autoscaler",
             "tokeira-admin",
+            // Observability services — valid targets for tkr logs/port-forward/exec,
+            // but NOT for tkr scale (their desired_count is managed by the
+            // observability module, not the operator).
+            "tokeira-mimir", "tokeira-loki", "tokeira-grafana",
         ];
         &VALID
     }
@@ -1419,7 +1850,263 @@ pub async fn disable_debug_logs(config: &EcsConfig, actuator: &AwsActuator) -> R
 }
 ```
 
-### 6b. Zero-Replica Staged Deployment
+### 6b. `tkr port-forward` — Operator Access to Private Services
+
+Tokeira deploys into private-only subnets with no internet gateway. Operators reach Grafana, Mimir, Loki, the controller, and the edge services through AWS Systems Manager Session Manager port forwarding — no bastion, no VPN, no public load balancer.
+
+```rust
+/// Discover a running container instance in the target capacity provider
+/// and open an SSM port-forwarding session to the container port.
+pub async fn port_forward_ecs(
+    service: &str,
+    local_port: u16,
+    config: &EcsConfig,
+    ecs: &aws_sdk_ecs::Client,
+) -> Result<()> {
+    // 1. Resolve capacity provider and target port from service name.
+    let (cp_name, remote_port) = service_target(service, config)?;
+
+    // 2. Find a container instance in the capacity provider's ASG.
+    //    The capacity provider is backed by an ASG; container instances
+    //    inherit the `cp` attribute so we can filter.
+    let instances = ecs
+        .list_container_instances()
+        .cluster(&config.cluster.name)
+        .filter(format!("attribute:capacityProvider=={cp_name}"))
+        .send()
+        .await?;
+    let instance_arn = instances.container_instance_arns()
+        .first()
+        .ok_or_else(|| anyhow::anyhow!(
+            "no running container instances in {cp_name}; \
+             run `tkr scale up` or check ASG health"
+        ))?;
+    let described = ecs
+        .describe_container_instances()
+        .cluster(&config.cluster.name)
+        .container_instances(instance_arn)
+        .send()
+        .await?;
+    let ec2_instance_id = described.container_instances()
+        .first()
+        .and_then(|ci| ci.ec2_instance_id())
+        .ok_or_else(|| anyhow::anyhow!("container instance has no EC2 ID"))?;
+
+    // 3. Invoke `aws ssm start-session` as a subprocess.
+    //    session-manager-plugin handles the data-plane protocol.
+    let status = std::process::Command::new("aws")
+        .args([
+            "ssm", "start-session",
+            "--target", ec2_instance_id,
+            "--document-name", "AWS-StartPortForwardingSession",
+            "--parameters",
+            &format!("portNumber={remote_port},localPortNumber={local_port}"),
+        ])
+        .status()?;
+
+    if !status.success() {
+        anyhow::bail!(
+            "ssm start-session exited with status {status}; \
+             ensure session-manager-plugin is installed"
+        );
+    }
+    Ok(())
+}
+
+/// Map service name to (capacity provider, container port).
+fn service_target(service: &str, _config: &EcsConfig) -> Result<(&'static str, u16)> {
+    Ok(match service {
+        "grafana"    => ("cp-grafana",   3000),
+        "mimir"      => ("cp-mimir",     9009),
+        "loki"       => ("cp-loki",      3100),
+        "edge-api"   => ("cp-edge-api",  7233),
+        "edge-poll"  => ("cp-edge-poll", 7234),
+        "controller" => ("cp-control",   7240),
+        other => anyhow::bail!("unknown service for port-forward: {other}"),
+    })
+}
+```
+
+**Why shell out to `aws ssm start-session`?** The SSM Session Manager data-plane protocol is a WebSocket stream with binary framing that requires the native `session-manager-plugin`. Reimplementing it in Rust would add significant complexity for no operator benefit. This matches the approach used by `dsqld` in the deploy-eks project.
+
+**Required IAM.** Each ASG's instance profile carries the `AmazonSSMManagedInstanceCore` managed policy. The operator's credentials need `ssm:StartSession` on the target EC2 instances and `ssm:TerminateSession` / `ssm:ResumeSession` on their own session IDs.
+
+**Required VPC endpoints for Session Manager.** Add `ssm`, `ssmmessages`, and `ec2messages` to the required VPC endpoint set so Session Manager works without internet egress.
+
+### 6c. DSQL Mode: Managed vs Preexisting
+
+The DSQL module follows the `effective_managed` convention from the `iac-resource-lifecycle` spec. Each resource (cluster, management endpoint, connection endpoint, runtime role, admin role) exposes a resource-level mode enum and decides its own create/delete behaviour:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DsqlClusterMode {
+    Managed,
+    Preexisting,
+}
+
+impl DsqlCluster {
+    fn effective_managed(config_mode: DsqlClusterMode, state_mode: &str) -> bool {
+        config_mode == DsqlClusterMode::Managed || state_mode == "managed"
+    }
+}
+
+#[async_trait]
+impl Resource for DsqlCluster {
+    async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, IacError> {
+        match self.config.mode {
+            DsqlClusterMode::Managed => {
+                let arn = dsql_client(ctx).create_cluster().send().await?;
+                Ok(ResourceState {
+                    properties: json!({
+                        "mode": "managed",
+                        "cluster_arn": arn,
+                        "endpoint": discovered_endpoint,
+                    }),
+                    ..
+                })
+            }
+            DsqlClusterMode::Preexisting => {
+                // Adopt — operator already supplied endpoint/ARN in config.
+                Ok(ResourceState {
+                    properties: json!({
+                        "mode": "preexisting",
+                        "cluster_arn": self.config.preexisting_arn,
+                        "endpoint": self.config.endpoint,
+                    }),
+                    ..
+                })
+            }
+        }
+    }
+
+    async fn delete(&self, current: &ResourceState, ctx: &ProvisionContext)
+        -> Result<(), IacError>
+    {
+        let state_mode = current.properties.get("mode")
+            .and_then(|v| v.as_str()).unwrap_or_default();
+        if !Self::effective_managed(self.config.mode, state_mode) {
+            // Preexisting in both config and state — never delete operator's cluster.
+            return Ok(());
+        }
+        dsql_client(ctx).delete_cluster().arn(...).send().await?;
+        Ok(())
+    }
+}
+```
+
+**Writeback on Managed apply.** When `dsql.mode == Managed`, each successful resource create emits a writeback entry that populates the deployment config. The design uses the same hybrid pattern as the EKS deployment: **state hydration for correctness, config writeback for operator readability**.
+
+```rust
+impl Deployment for EcsDeployment {
+    /// Called on every engine construction (infra plan/apply, deploy plan/apply,
+    /// scale up, schema setup). Populates empty DSQL config fields from
+    /// persisted state so downstream code always has the discovered endpoint.
+    /// This is the correctness path — config-file writeback is not.
+    fn hydrate_config(&self, config: &EcsConfig, state: &InfraState) -> EcsConfig {
+        let mut h = config.clone();
+        let rid_cluster = ResourceId("dsql:cluster".into());
+        let rid_conn_endpoint = ResourceId("dsql:connection-endpoint".into());
+        let rid_mgmt_endpoint = ResourceId("dsql:management-endpoint".into());
+        let rid_runtime_role = ResourceId("dsql:runtime-role".into());
+        let rid_admin_role = ResourceId("dsql:admin-role".into());
+
+        if let Some(rs) = state.resources.get(&rid_cluster) {
+            if h.dsql.endpoint.is_none() {
+                h.dsql.endpoint = prop_str(rs, "endpoint");
+            }
+        }
+        if let Some(rs) = state.resources.get(&rid_mgmt_endpoint) {
+            if h.dsql.management_endpoint_id.is_none() {
+                h.dsql.management_endpoint_id = prop_str(rs, "endpoint_id");
+            }
+        }
+        if let Some(rs) = state.resources.get(&rid_conn_endpoint) {
+            if h.dsql.connection_endpoint_id.is_none() {
+                h.dsql.connection_endpoint_id = prop_str(rs, "endpoint_id");
+            }
+        }
+        if let Some(rs) = state.resources.get(&rid_runtime_role) {
+            if h.dsql.runtime_role_arn.is_none() {
+                h.dsql.runtime_role_arn = prop_str(rs, "role_arn");
+            }
+        }
+        if let Some(rs) = state.resources.get(&rid_admin_role) {
+            if h.dsql.admin_role_arn.is_none() {
+                h.dsql.admin_role_arn = prop_str(rs, "role_arn");
+            }
+        }
+        h
+    }
+
+    /// Called after infra apply. Returns (dotted_key, value) pairs the CLI
+    /// persists to deployment.toml via toml_edit. Convenience only — downstream
+    /// commands use hydrate_config as the source of truth.
+    fn collect_writeback(&self, config: &EcsConfig, state: &InfraState) -> Vec<(String, String)> {
+        let mut entries = Vec::new();
+        if config.dsql.mode == DsqlClusterMode::Managed {
+            let hydrated = self.hydrate_config(config, state);
+            // Emit pairs only when the discovered value differs from the
+            // current config (or the current config is empty).
+            if let Some(ep) = hydrated.dsql.endpoint {
+                if config.dsql.endpoint.as_deref() != Some(&ep) {
+                    entries.push(("dsql.endpoint".into(), ep));
+                }
+            }
+            // ... similar for management_endpoint_id, connection_endpoint_id,
+            //     runtime_role_arn, admin_role_arn
+        }
+        entries
+    }
+
+    /// Called after infra destroy. Returns pairs that CLEAR previously-written
+    /// config values when the corresponding Managed resource has been removed
+    /// from state — otherwise a subsequent plan would treat the destroyed
+    /// cluster as Preexisting.
+    fn collect_destroy_writeback(
+        &self,
+        config: &EcsConfig,
+        state: &InfraState,
+        active_modules: &[String],
+    ) -> Vec<(String, String)> {
+        let mut entries = Vec::new();
+        if active_modules.iter().any(|m| m == "dsql") {
+            if !state.resources.contains_key(&ResourceId("dsql:cluster".into()))
+                && config.dsql.endpoint.is_some()
+            {
+                entries.push(("dsql.endpoint".into(), String::new()));
+                entries.push(("dsql.management_endpoint_id".into(), String::new()));
+                entries.push(("dsql.connection_endpoint_id".into(), String::new()));
+                entries.push(("dsql.runtime_role_arn".into(), String::new()));
+                entries.push(("dsql.admin_role_arn".into(), String::new()));
+            }
+        }
+        entries
+    }
+}
+
+fn prop_str(rs: &ResourceState, key: &str) -> Option<String> {
+    rs.properties.get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned())
+}
+```
+
+**Why both paths.** The EKS deployment uses exactly this pattern because writeback can fail in ways that don't corrupt state:
+- Network blip between successful apply and `toml_edit` write → state has the endpoint, config doesn't.
+- Operator re-runs `infra apply` from a fresh checkout (committed config is stale) → state hydration makes `deploy apply` work regardless.
+- Parallel operators on the same deployment → whoever commits config last wins, but hydration keeps both working.
+
+**Idempotency.** `hydrate_config(hydrate_config(c, s), s) == hydrate_config(c, s)` because each field is populated only when empty. Verified by Property 11 (new; see Correctness Properties).
+
+**Deploy-apply guard.** When `dsql.mode == Managed` and hydration cannot fill `endpoint`, `EcsDeployment::services()` returns an error `infra apply has not run successfully; DSQL endpoint is not yet known`. This prevents downstream commands from using placeholder values after a partial or failed infra apply.
+
+After the first `tkr infra apply` in `Managed` mode, operators see their `deployment.toml` updated in-place (via `toml_edit` preserving comments) with the discovered endpoint and ARNs. Subsequent `tkr infra plan` runs are no-ops because the state already matches.
+
+**Preexisting mode requires complete config up front.** The config loader validates that `endpoint`, `management_endpoint_id`, `connection_endpoint_id`, `runtime_role_arn`, and `admin_role_arn` are all set when `mode = "preexisting"`. Missing fields produce a descriptive error naming the first missing path.
+
+
+### 6d. Zero-Replica Staged Deployment
 
 Services deploy at 0 replicas to avoid crash-loops before schema exists:
 
@@ -1428,12 +2115,15 @@ tkr infra apply          # Provision VPC, DSQL, ECS cluster, ASGs
 tkr deploy apply         # Create ECS services at desired_count=0
 tkr schema setup         # Run DSQL migrations
 tkr scale up             # Scale services in startup order:
+                         #   mimir → loki → grafana →
                          #   runtime → controller → edge-api → edge-poll
                          #   → projection → autoscaler
                          # Each service waits for ready state before next
 ```
 
-The `scale up` command reads the configured desired counts from `EcsConfig.services` and applies them in dependency order. Each service is scaled and then polled until ECS reports the desired number of running tasks with passing health checks.
+Observability services (Mimir, Loki, Grafana) scale up first so the autoscaler has a metrics backend the moment it starts. Starting the autoscaler before Mimir would cause it to freeze in degraded mode until Mimir came up — noisy and indistinguishable from a real Mimir outage.
+
+The `scale up` command reads the configured desired counts from `EcsConfig.services` and `EcsConfig.observability` and applies them in dependency order. Each service is scaled and then polled until ECS reports the desired number of running tasks with passing health checks.
 
 ## Data Models
 
@@ -1444,15 +2134,18 @@ The `scale up` command reads the configured desired counts from `EcsConfig.servi
 | `tags` | Operator-defined custom tags | `{}` (empty — auto-generated tags always applied) |
 | `cluster` | `name`, `service_connect_namespace` | `tokeira-dev`, `tokeira.local` |
 | `networking` | `vpc_id`, `private_subnet_ids`, `availability_zones`, `private_dns_zone`, `optional_endpoints` | Must be provided |
-| `dsql` | `endpoint`, `runtime_role_arn`, `admin_role_arn` | Must be provided |
-| `capacity_providers.edge_api` | `instance_type`, `min/max/desired_capacity` | `c7g.large`, 1/10/2 |
-| `capacity_providers.edge_poll` | `instance_type`, `min/max/desired_capacity` | `r7g.large`, 1/10/2 |
-| `capacity_providers.runtime` | `instance_type`, `min/max/desired_capacity`, `scale_in_protection` | `c7g.xlarge`, 1/20/2, true |
-| `capacity_providers.projection` | `instance_type`, `min/max/desired_capacity` | `c7g.large`, 1/10/1 |
-| `capacity_providers.control` | `instance_type`, `min/max/desired_capacity` | `t4g.medium`, 1/3/1 |
+| `dsql` | `mode` (default `Managed`), plus `endpoint`, `management_endpoint_id`, `connection_endpoint_id`, `runtime_role_arn`, `admin_role_arn` (all `Option<String>` — required for Preexisting, populated from state for Managed) | `mode = "managed"`; discovered fields populated via state hydration and config writeback after `infra apply` |
+| `capacity_providers.edge_api` | `instance_type`, `min/max/desired_capacity` | `c8g.large`, 1/10/2 |
+| `capacity_providers.edge_poll` | `instance_type`, `min/max/desired_capacity` | `r8g.large`, 1/10/2 |
+| `capacity_providers.runtime` | `instance_type`, `min/max/desired_capacity`, `scale_in_protection` | `c8g.xlarge`, 1/20/2, true |
+| `capacity_providers.projection` | `instance_type`, `min/max/desired_capacity` | `c8g.large`, 1/10/1 |
+| `capacity_providers.control` | `instance_type`, `min/max/desired_capacity` | `c8g.large`, 1/3/1 (max=3 required for rolling-update headroom per Req 3.2.8) |
+| `capacity_providers.mimir` | `instance_type`, `min/max/desired_capacity` | `r8g.large`, 1/1/1 |
+| `capacity_providers.loki` | `instance_type`, `min/max/desired_capacity` | `r8g.large`, 1/1/1 |
+| `capacity_providers.grafana` | `instance_type`, `min/max/desired_capacity` | `c8g.large`, 1/1/1 |
 | `autoscaler` | `polling_interval_secs`, `scale_out/in_consecutive_samples`, `cooldown_secs`, `mimir_endpoint`, `staleness_threshold_secs`, `dsql_connection_budget`, `per_runtime_reserved_connections` | 15s, 2/8, 120s, 8000, 200 |
-| `alb` | `name`, `health_check_path`, `health_check_interval_secs` | `/health`, 10s |
-| `observability` | `mimir_image`, `loki_image`, `grafana_image`, `alloy_sidecar_image`, S3 buckets | Pinned versions from compose platform |
+| `alb` | `name`, `listener_protocol`, `health_check_path`, `health_check_interval_secs` | `http2`, `/health`, 10s (gRPC target groups) |
+| `observability` | `mimir_image`, `loki_image`, `grafana_image`, `alloy_sidecar_image`, S3 buckets, `retention_days` | Pinned versions from compose platform, 30 days |
 
 ### Autoscaler Scaling Inputs
 
@@ -1536,7 +2229,19 @@ The `scale up` command reads the configured desired counts from `EcsConfig.servi
 
 *For any* string that is not in the valid services list, `Ops` methods SHALL return an error containing the invalid name and listing valid alternatives.
 
-**Validates: Requirements 8.3.3**
+**Validates: Requirements 9.3.3**
+
+### Property 11: DSQL config hydration idempotency
+
+*For any* valid `EcsConfig` and `InfraState`, `hydrate_config(hydrate_config(config, state), state) == hydrate_config(config, state)`. Hydration is idempotent because each empty field is populated exactly once.
+
+**Validates: Requirements 7.5a.6**
+
+### Property 12: Deploy-apply guard on missing DSQL endpoint
+
+*For any* `EcsConfig` with `dsql.mode == Managed` AND `InfraState` where the DSQL cluster resource is absent, `EcsDeployment::services()` SHALL return an error. This prevents downstream commands from consuming placeholder DSQL values after a partial infra apply.
+
+**Validates: Requirements 7.5a.3**
 
 ## Error Handling
 
@@ -1575,6 +2280,8 @@ The `scale up` command reads the configured desired counts from `EcsConfig.servi
 | Property 8: Freshness safety | `crates/tokeira-autoscaler/src/freshness.rs` | Generate tracker states with Mimir unavailable, verify no scale-in allowed. |
 | Property 9: Manifest stability | `platforms/ecs/src/services.rs` | Generate configs, call manifests twice, assert identical output. |
 | Property 10: Invalid service rejection | `platforms/ecs/src/lib.rs` | Generate random strings not in valid set, verify error message. |
+| Property 11: DSQL hydration idempotency | `platforms/ecs/src/lib.rs` | Generate random `EcsConfig` + `InfraState`, apply `hydrate_config` twice, assert equal. |
+| Property 12: Deploy-apply guard | `platforms/ecs/src/lib.rs` | Generate `Managed` configs with DSQL cluster absent from state, assert `services()` returns an error. |
 
 ### Unit Tests
 

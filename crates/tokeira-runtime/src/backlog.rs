@@ -331,6 +331,15 @@ mod tests {
         ) -> Result<CommitResult> {
             Err(anyhow!("unused"))
         }
+        async fn commit_transition_for_bundle(
+            &self,
+            _run_key: RunKey,
+            _execution_home_bundle: ShardId,
+            _transition: Transition,
+            _epoch: ShardEpoch,
+        ) -> Result<CommitResult> {
+            Err(anyhow!("unused"))
+        }
         async fn materialize_reset_successor(
             &self,
             _base_run_key: RunKey,
@@ -692,16 +701,21 @@ mod tests {
                     let queue = activity_queue.clone();
                     tokio::spawn(async move {
                         activity_broker
-                            .poll_activity_task(
-                                &queue,
-                                std::time::Duration::from_millis(50),
-                            )
+                            .poll_activity_task(&queue, std::time::Duration::from_millis(50))
                             .await
                             .unwrap()
                     })
                 };
 
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                while !broker.queues_with_waiters().await.contains(&workflow_queue)
+                    || !activity_broker
+                        .queues_with_waiters()
+                        .await
+                        .contains(&activity_queue)
+                {
+                    tokio::task::yield_now().await;
+                }
+
                 drain_once(
                     &broker,
                     &activity_broker,
@@ -711,8 +725,16 @@ mod tests {
                     &metrics,
                 ).await;
 
-                let workflow = workflow_waiter.await.unwrap().unwrap();
-                let activity = activity_waiter.await.unwrap().unwrap();
+                let workflow = workflow_waiter.await.unwrap();
+                let activity = activity_waiter.await.unwrap();
+                let Some(workflow) = workflow else {
+                    prop_assert!(false, "workflow backlog entry was not delivered");
+                    return Ok::<(), proptest::test_runner::TestCaseError>(());
+                };
+                let Some(activity) = activity else {
+                    prop_assert!(false, "activity backlog entry was not delivered");
+                    return Ok::<(), proptest::test_runner::TestCaseError>(());
+                };
                 prop_assert_eq!(workflow.0.logical_seq, LogicalTaskSeq(logical_seq));
                 prop_assert_eq!(activity.0.activity_id, "activity");
                 prop_assert_eq!(activity.0.attempt, attempt);
@@ -751,40 +773,54 @@ mod tests {
                     .unwrap()
                     .insert(queue.clone(), VecDeque::from(entries));
 
-                let expected = logical_seqs.clone();
                 let broker_clone = broker.clone();
                 let queue_clone = queue.clone();
-                let waiter = tokio::spawn(async move {
-                    let mut seen = Vec::new();
-                    for _ in 0..expected.len() {
-                        let task = broker_clone
-                            .poll_workflow_task(
-                                &queue_clone,
-                                &tokeira_types::WorkerIdentity("worker".into()),
-                                std::time::Duration::from_millis(50),
-                            )
-                            .await
-                            .unwrap()
-                            .unwrap();
-                        seen.push(task.0.logical_seq.0);
-                    }
-                    seen
+                let first_waiter = tokio::spawn(async move {
+                    broker_clone
+                        .poll_workflow_task(
+                            &queue_clone,
+                            &tokeira_types::WorkerIdentity("worker".into()),
+                            std::time::Duration::from_secs(5),
+                        )
+                        .await
+                        .unwrap()
                 });
 
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                for _ in 0..logical_seqs.len() {
-                    drain_once(
-                        &broker,
-                        &activity_broker,
-                        &repo,
-                        &BacklogConfig::default(),
-                        &fairness,
-                        &metrics,
-                    ).await;
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                while !broker.queues_with_waiters().await.contains(&queue) {
+                    tokio::task::yield_now().await;
+                }
+                drain_once(
+                    &broker,
+                    &activity_broker,
+                    &repo,
+                    &BacklogConfig::default(),
+                    &fairness,
+                    &metrics,
+                ).await;
+
+                let mut seen = Vec::new();
+                let Some(task) = first_waiter.await.unwrap() else {
+                    prop_assert!(false, "workflow backlog entry was not delivered");
+                    return Ok::<(), proptest::test_runner::TestCaseError>(());
+                };
+                seen.push(task.0.logical_seq.0);
+
+                for _ in 1..logical_seqs.len() {
+                    let Some(task) = broker
+                        .poll_workflow_task(
+                            &queue,
+                            &tokeira_types::WorkerIdentity("worker".into()),
+                            std::time::Duration::ZERO,
+                        )
+                        .await
+                        .unwrap()
+                    else {
+                        prop_assert!(false, "workflow backlog entry was not delivered");
+                        return Ok::<(), proptest::test_runner::TestCaseError>(());
+                    };
+                    seen.push(task.0.logical_seq.0);
                 }
 
-                let seen = waiter.await.unwrap();
                 prop_assert_eq!(seen, logical_seqs);
                 Ok::<(), proptest::test_runner::TestCaseError>(())
             })?;

@@ -27,14 +27,6 @@ mod manifest_tests {
 mod store_layout_tests {
     use tokeira_state::S3StateStore;
 
-    fn stub_client() -> aws_sdk_s3::Client {
-        let config = aws_sdk_s3::Config::builder()
-            .behavior_version_latest()
-            .region(aws_sdk_s3::config::Region::new("us-east-1"))
-            .build();
-        aws_sdk_s3::Client::from_conf(config)
-    }
-
     /// A minimal document type for testing StateStore layout.
     #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
     struct TestDoc {
@@ -49,37 +41,24 @@ mod store_layout_tests {
 
     #[test]
     fn manifest_key_contains_prefix() {
-        let store = S3StateStore::<TestDoc>::new(
-            stub_client(),
-            "my-bucket".into(),
-            "my-project/infra".into(),
-        );
-        assert!(
-            store
-                .manifest_key()
-                .contains("my-project/infra/manifest.json")
-        );
+        let (_prefix, manifest_key, _snapshot_prefix) =
+            S3StateStore::<TestDoc>::layout_for_prefix("my-project/infra");
+        assert!(manifest_key.contains("my-project/infra/manifest.json"));
     }
 
     #[test]
     fn snapshot_prefix_contains_prefix() {
-        let store = S3StateStore::<TestDoc>::new(
-            stub_client(),
-            "my-bucket".into(),
-            "my-project/runtime".into(),
-        );
-        assert!(
-            store
-                .snapshot_prefix()
-                .contains("my-project/runtime/snapshots")
-        );
+        let (_prefix, _manifest_key, snapshot_prefix) =
+            S3StateStore::<TestDoc>::layout_for_prefix("my-project/runtime");
+        assert!(snapshot_prefix.contains("my-project/runtime/snapshots"));
     }
 
     #[test]
     fn trailing_slash_is_trimmed() {
-        let store =
-            S3StateStore::<TestDoc>::new(stub_client(), "bucket".into(), "prefix/infra/".into());
-        assert_eq!(store.manifest_key(), "prefix/infra/manifest.json");
-        assert_eq!(store.snapshot_prefix(), "prefix/infra/snapshots");
+        let (prefix, manifest_key, snapshot_prefix) =
+            S3StateStore::<TestDoc>::layout_for_prefix("prefix/infra/");
+        assert_eq!(prefix, "prefix/infra");
+        assert_eq!(manifest_key, "prefix/infra/manifest.json");
+        assert_eq!(snapshot_prefix, "prefix/infra/snapshots");
     }
 }

@@ -1,5 +1,5 @@
 use tokeira_proto::conversions::ProtoConversionError;
-use tonic::Status;
+use tonic::{Status, metadata::MetadataValue};
 
 use crate::errors::EdgeError;
 
@@ -46,6 +46,34 @@ impl From<EdgeError> for Status {
             EdgeError::RemoteRouteUnsupported { target } => Status::unavailable(format!(
                 "request routed to remote target `{target}` but forwarding is not wired yet"
             )),
+            EdgeError::NotShardOwner {
+                bundle_id,
+                current_epoch,
+                current_owner_node_id,
+            } => {
+                let mut status = Status::aborted(format!(
+                    "not shard owner for bundle {:?} at epoch {:?}",
+                    bundle_id, current_epoch
+                ));
+                insert_metadata_value(
+                    &mut status,
+                    "tokeira-bundle-id",
+                    bundle_id.0.to_string().as_str(),
+                );
+                insert_metadata_value(
+                    &mut status,
+                    "tokeira-current-epoch",
+                    current_epoch.0.to_string().as_str(),
+                );
+                if let Some(owner) = current_owner_node_id {
+                    insert_metadata_value(
+                        &mut status,
+                        "tokeira-current-owner",
+                        owner.to_string().as_str(),
+                    );
+                }
+                status
+            }
             EdgeError::Internal(message) => Status::internal(message),
         }
     }
@@ -53,6 +81,12 @@ impl From<EdgeError> for Status {
 
 fn err_static(message: &'static str) -> &'static str {
     message
+}
+
+fn insert_metadata_value(status: &mut Status, key: &'static str, value: &str) {
+    if let Ok(value) = MetadataValue::try_from(value) {
+        status.metadata_mut().insert(key, value);
+    }
 }
 
 pub fn proto_conversion_status(err: ProtoConversionError) -> Status {
@@ -117,6 +151,14 @@ mod tests {
                 },
                 Code::Unavailable,
             ),
+            (
+                EdgeError::NotShardOwner {
+                    bundle_id: tokeira_types::ShardId(3),
+                    current_epoch: tokeira_types::ShardEpoch(7),
+                    current_owner_node_id: None,
+                },
+                Code::Aborted,
+            ),
             (EdgeError::Internal("boom".to_string()), Code::Internal),
         ];
 
@@ -124,5 +166,22 @@ mod tests {
             let status: Status = err.into();
             assert_eq!(status.code(), code);
         }
+    }
+
+    #[test]
+    fn not_shard_owner_status_carries_routing_hints() {
+        let status: Status = EdgeError::NotShardOwner {
+            bundle_id: tokeira_types::ShardId(4),
+            current_epoch: tokeira_types::ShardEpoch(11),
+            current_owner_node_id: None,
+        }
+        .into();
+
+        assert_eq!(status.code(), Code::Aborted);
+        assert_eq!(status.metadata().get("tokeira-bundle-id").unwrap(), "4");
+        assert_eq!(
+            status.metadata().get("tokeira-current-epoch").unwrap(),
+            "11"
+        );
     }
 }

@@ -13,6 +13,7 @@ members = [
     "crates/tokeira-orchestrator",
     "crates/tokeira-compose",
     "crates/tokeira-storage",
+    "crates/tokeira-controller",
     "crates/tokeira-runtime",
     "crates/tokeira-projection",
     "crates/tokeira-edge",

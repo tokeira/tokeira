@@ -58,18 +58,25 @@ impl<T: Serialize + DeserializeOwned + Default + Validate> S3StateStore<T> {
 
     /// Construct a new state store rooted at the given key prefix.
     pub fn new(client: aws_sdk_s3::Client, bucket: String, key_prefix: String) -> Self {
-        let trimmed = key_prefix.trim_end_matches('/').to_string();
+        let (trimmed, manifest_key, snapshot_prefix) = Self::layout_for_prefix(&key_prefix);
         let owner_id = format!("pid-{}-{}", process::id(), Uuid::new_v4());
         Self {
             client,
             bucket,
-            manifest_key: format!("{trimmed}/manifest.json"),
-            snapshot_prefix: format!("{trimmed}/snapshots"),
+            manifest_key,
+            snapshot_prefix,
             key_prefix: trimmed,
             kms_key_id: None,
             owner_id,
             _marker: PhantomData,
         }
+    }
+
+    pub fn layout_for_prefix(key_prefix: &str) -> (String, String, String) {
+        let trimmed = key_prefix.trim_end_matches('/').to_string();
+        let manifest_key = format!("{trimmed}/manifest.json");
+        let snapshot_prefix = format!("{trimmed}/snapshots");
+        (trimmed, manifest_key, snapshot_prefix)
     }
 
     /// Load the current state snapshot referenced by the manifest head.

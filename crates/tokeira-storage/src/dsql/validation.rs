@@ -118,9 +118,15 @@ impl DdlValidator {
             }
         }
 
-        if lower.contains("primary key (id)")
-            || lower.contains("primary key(id)")
-            || lower.contains("primary key (insertion_seq)")
+        let singleton_control_table = lower
+            .contains("create table if not exists routing_generation")
+            || lower.contains("create table routing_generation")
+            || lower.contains("create table if not exists budget_allocation")
+            || lower.contains("create table budget_allocation");
+        if !singleton_control_table
+            && (lower.contains("primary key (id)")
+                || lower.contains("primary key(id)")
+                || lower.contains("primary key (insertion_seq)"))
         {
             issues.push(issue(
                 filename,
@@ -218,6 +224,21 @@ mod tests {
             let issues = DdlValidator::validate(sql, "case.sql");
             assert!(issues.iter().any(|issue| issue.kind == kind));
         }
+    }
+
+    #[test]
+    fn allows_singleton_control_table_primary_keys() {
+        let routing = DdlValidator::validate(
+            "CREATE TABLE IF NOT EXISTS routing_generation (id INTEGER PRIMARY KEY, generation BIGINT NOT NULL);",
+            "V043.sql",
+        );
+        let budget = DdlValidator::validate(
+            "CREATE TABLE IF NOT EXISTS budget_allocation (id INTEGER PRIMARY KEY, version BIGINT NOT NULL);",
+            "V045.sql",
+        );
+
+        assert!(routing.is_empty());
+        assert!(budget.is_empty());
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub mod pending_queries;
 pub mod poller_registry;
 pub mod request_id;
 pub mod routing;
+pub mod routing_cache;
 pub mod translate;
 pub mod workflow_service;
 
@@ -39,5 +40,6 @@ pub use pending_queries::*;
 pub use poller_registry::*;
 pub use request_id::*;
 pub use routing::*;
+pub use routing_cache::*;
 pub use translate::*;
 pub use workflow_service::*;

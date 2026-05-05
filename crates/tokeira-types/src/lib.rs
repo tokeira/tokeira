@@ -40,6 +40,8 @@ pub mod payload;
 pub mod request;
 /// Retry policy configuration carried on workflows/activities.
 pub mod retry;
+/// Placement routing snapshots and deterministic home mapping.
+pub mod routing;
 /// Typed search-attribute values for SQL-native visibility.
 pub mod search_attributes;
 /// DSQL-friendly deterministic spread-key helpers.
@@ -57,6 +59,7 @@ pub use observability::*;
 pub use payload::*;
 pub use request::*;
 pub use retry::*;
+pub use routing::*;
 pub use search_attributes::*;
 pub use spread::*;
 pub use task_queue::*;

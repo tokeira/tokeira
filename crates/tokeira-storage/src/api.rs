@@ -18,10 +18,11 @@ use tokeira_kernel::{
     WorkflowState,
 };
 use tokeira_types::{
-    ExecutionRef, ExecutionStatus, NamespaceId, Payloads, ProjectionCursor, QueueKey, RequestId,
-    RunId, RunKey, ShardEpoch, ShardId, TaskQueueName, TransitionSeq, WorkerIdentity, WorkflowId,
-    WorkflowType,
+    ExecutionRef, ExecutionStatus, GenerationCounter, NamespaceId, Payloads, ProjectionCursor,
+    QueueKey, RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskQueueName, TransitionSeq,
+    WorkerIdentity, WorkflowId, WorkflowType,
 };
+use uuid::Uuid;
 
 /// Write result from persisting one authoritative
 /// run transition.
@@ -155,6 +156,21 @@ pub trait RunRepository: Send + Sync {
     async fn commit_transition(
         &self,
         run_key: RunKey,
+        transition: Transition,
+        epoch: ShardEpoch,
+    ) -> Result<CommitResult>;
+
+    /// Atomically persist a transition fenced by the caller-resolved
+    /// execution-home bundle.
+    ///
+    /// This is the placement-aware form used by runtime/edge paths. The legacy
+    /// [`RunRepository::commit_transition`] entry point remains for tests and
+    /// pre-placement callers, but production routing must carry the bundle that
+    /// was resolved from `(namespace_id, workflow_id)`.
+    async fn commit_transition_for_bundle(
+        &self,
+        run_key: RunKey,
+        execution_home_bundle: ShardId,
         transition: Transition,
         epoch: ShardEpoch,
     ) -> Result<CommitResult>;
@@ -525,7 +541,12 @@ pub trait LeaseRepository: Send + Sync {
     /// Returns [`LeaseOutcome::Acquired`] on success,
     /// or [`LeaseOutcome::Rejected`] if another owner
     /// already holds the lease.
-    async fn try_acquire_bundle(&self, bundle: ShardId, owner: String) -> Result<LeaseOutcome>;
+    async fn try_acquire_bundle(
+        &self,
+        bundle: ShardId,
+        owner: String,
+        node_endpoint: String,
+    ) -> Result<LeaseOutcome>;
     /// Renew an existing lease for `bundle` at the
     /// given `epoch`. Fails if the epoch is stale.
     async fn renew_bundle(
@@ -533,10 +554,68 @@ pub trait LeaseRepository: Send + Sync {
         bundle: ShardId,
         owner: String,
         epoch: ShardEpoch,
+        node_endpoint: String,
     ) -> Result<LeaseOutcome>;
 
-    // TODO(storage): support explicit relinquish, generation-aware placement,
-    // and bulk lease observation for the controller.
+    /// List all bundle leases known to the repository.
+    async fn list_bundle_leases(&self) -> Result<Vec<BundleLease>>;
+
+    /// Release ownership with epoch-checked compare-and-swap semantics.
+    async fn relinquish_bundle(
+        &self,
+        bundle: ShardId,
+        owner: String,
+        epoch: ShardEpoch,
+    ) -> Result<LeaseOutcome>;
+}
+
+/// Current persisted bundle lease row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BundleLease {
+    pub bundle_id: ShardId,
+    pub owner_node_id: Option<String>,
+    pub epoch: ShardEpoch,
+    pub lease_until: OffsetDateTime,
+    pub node_endpoint: Option<String>,
+}
+
+/// Repository for controller coordination state.
+#[async_trait]
+pub trait ControlRepository: Send + Sync {
+    /// Advance the singleton routing generation row with CAS protection.
+    async fn advance_generation(
+        &self,
+        expected: GenerationCounter,
+    ) -> Result<GenerationAdvanceResult>;
+
+    /// Read the current routing generation.
+    async fn current_generation(&self) -> Result<GenerationCounter>;
+
+    /// Allocate connection budget with CAS protection.
+    async fn allocate_budget(
+        &self,
+        expected_version: u64,
+        allocator_id: Uuid,
+        rate_budget: f64,
+        capacity_budget: u64,
+    ) -> Result<BudgetAllocationResult>;
+
+    /// Read the current budget allocation version.
+    async fn current_budget_version(&self) -> Result<u64>;
+}
+
+/// Result of a generation-counter CAS attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenerationAdvanceResult {
+    Advanced(GenerationCounter),
+    Conflict(GenerationCounter),
+}
+
+/// Result of a budget-allocation CAS attempt.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BudgetAllocationResult {
+    Allocated { version: u64 },
+    Conflict { current_version: u64 },
 }
 
 /// Outcome of a lease acquire or renew attempt.
@@ -650,6 +729,18 @@ where
         epoch: ShardEpoch,
     ) -> Result<CommitResult> {
         (**self).commit_transition(run_key, transition, epoch).await
+    }
+
+    async fn commit_transition_for_bundle(
+        &self,
+        run_key: RunKey,
+        execution_home_bundle: ShardId,
+        transition: Transition,
+        epoch: ShardEpoch,
+    ) -> Result<CommitResult> {
+        (**self)
+            .commit_transition_for_bundle(run_key, execution_home_bundle, transition, epoch)
+            .await
     }
 
     async fn materialize_reset_successor(
@@ -782,8 +873,15 @@ impl<T> LeaseRepository for std::sync::Arc<T>
 where
     T: LeaseRepository + ?Sized,
 {
-    async fn try_acquire_bundle(&self, bundle: ShardId, owner: String) -> Result<LeaseOutcome> {
-        (**self).try_acquire_bundle(bundle, owner).await
+    async fn try_acquire_bundle(
+        &self,
+        bundle: ShardId,
+        owner: String,
+        node_endpoint: String,
+    ) -> Result<LeaseOutcome> {
+        (**self)
+            .try_acquire_bundle(bundle, owner, node_endpoint)
+            .await
     }
 
     async fn renew_bundle(
@@ -791,8 +889,57 @@ where
         bundle: ShardId,
         owner: String,
         epoch: ShardEpoch,
+        node_endpoint: String,
     ) -> Result<LeaseOutcome> {
-        (**self).renew_bundle(bundle, owner, epoch).await
+        (**self)
+            .renew_bundle(bundle, owner, epoch, node_endpoint)
+            .await
+    }
+
+    async fn list_bundle_leases(&self) -> Result<Vec<BundleLease>> {
+        (**self).list_bundle_leases().await
+    }
+
+    async fn relinquish_bundle(
+        &self,
+        bundle: ShardId,
+        owner: String,
+        epoch: ShardEpoch,
+    ) -> Result<LeaseOutcome> {
+        (**self).relinquish_bundle(bundle, owner, epoch).await
+    }
+}
+
+#[async_trait]
+impl<T> ControlRepository for std::sync::Arc<T>
+where
+    T: ControlRepository + ?Sized,
+{
+    async fn advance_generation(
+        &self,
+        expected: GenerationCounter,
+    ) -> Result<GenerationAdvanceResult> {
+        (**self).advance_generation(expected).await
+    }
+
+    async fn current_generation(&self) -> Result<GenerationCounter> {
+        (**self).current_generation().await
+    }
+
+    async fn allocate_budget(
+        &self,
+        expected_version: u64,
+        allocator_id: Uuid,
+        rate_budget: f64,
+        capacity_budget: u64,
+    ) -> Result<BudgetAllocationResult> {
+        (**self)
+            .allocate_budget(expected_version, allocator_id, rate_budget, capacity_budget)
+            .await
+    }
+
+    async fn current_budget_version(&self) -> Result<u64> {
+        (**self).current_budget_version().await
     }
 }
 

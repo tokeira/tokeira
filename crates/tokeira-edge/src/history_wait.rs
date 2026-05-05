@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use time::OffsetDateTime;
 use tokeira_kernel::{HistoryEvent, LoadedRun, Transition};
 use tokeira_storage::{
-    ActivitySweepEntry, BacklogEntry, CommitResult, DispatchableActivityTask,
+    ActivitySweepEntry, BacklogEntry, BundleLease, CommitResult, DispatchableActivityTask,
     DispatchableWorkflowTask, DueTimer, LeaseOutcome, LeaseRepository, NexusSweepEntry,
     RequestRecord, RunRepository, TransitionAuditRecord, WftTimeoutSweepEntry,
     WorkflowTimeoutSweepEntry,
@@ -128,6 +128,26 @@ where
         let result = self
             .inner
             .commit_transition(run_key, transition, epoch)
+            .await?;
+        if matches!(result, CommitResult::Applied { .. })
+            && let Some(last_event_id) = last_event_id
+        {
+            self.waits.notify(run_key, last_event_id).await;
+        }
+        Ok(result)
+    }
+
+    async fn commit_transition_for_bundle(
+        &self,
+        run_key: RunKey,
+        execution_home_bundle: ShardId,
+        transition: Transition,
+        epoch: ShardEpoch,
+    ) -> Result<CommitResult> {
+        let last_event_id = transition.history_events.last().map(|event| event.event_id);
+        let result = self
+            .inner
+            .commit_transition_for_bundle(run_key, execution_home_bundle, transition, epoch)
             .await?;
         if matches!(result, CommitResult::Applied { .. })
             && let Some(last_event_id) = last_event_id
@@ -267,8 +287,15 @@ impl<R> LeaseRepository for HistoryNotifyingRepository<R>
 where
     R: LeaseRepository + Send + Sync + 'static,
 {
-    async fn try_acquire_bundle(&self, bundle: ShardId, owner: String) -> Result<LeaseOutcome> {
-        self.inner.try_acquire_bundle(bundle, owner).await
+    async fn try_acquire_bundle(
+        &self,
+        bundle: ShardId,
+        owner: String,
+        node_endpoint: String,
+    ) -> Result<LeaseOutcome> {
+        self.inner
+            .try_acquire_bundle(bundle, owner, node_endpoint)
+            .await
     }
 
     async fn renew_bundle(
@@ -276,7 +303,23 @@ where
         bundle: ShardId,
         owner: String,
         epoch: ShardEpoch,
+        node_endpoint: String,
     ) -> Result<LeaseOutcome> {
-        self.inner.renew_bundle(bundle, owner, epoch).await
+        self.inner
+            .renew_bundle(bundle, owner, epoch, node_endpoint)
+            .await
+    }
+
+    async fn list_bundle_leases(&self) -> Result<Vec<BundleLease>> {
+        self.inner.list_bundle_leases().await
+    }
+
+    async fn relinquish_bundle(
+        &self,
+        bundle: ShardId,
+        owner: String,
+        epoch: ShardEpoch,
+    ) -> Result<LeaseOutcome> {
+        self.inner.relinquish_bundle(bundle, owner, epoch).await
     }
 }

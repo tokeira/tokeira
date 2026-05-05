@@ -6,10 +6,54 @@
 //! the public API. `TransitionSeq` and `ShardEpoch` are monotonic fencing
 //! values used for optimistic concurrency control.
 
+use std::{fmt, str::FromStr};
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{WorkflowId, dsql_spread_uuid};
+
+/// Identifies a runtime node incarnation.
+///
+/// This is stable only for the process lifetime. Its UUID text form is the
+/// canonical owner string persisted in bundle/shard lease rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct IncarnationId(pub Uuid);
+
+impl Default for IncarnationId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IncarnationId {
+    /// Generate a fresh random runtime incarnation identifier.
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl fmt::Display for IncarnationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl FromStr for IncarnationId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(value).map(Self)
+    }
+}
+
+impl TryFrom<&str> for IncarnationId {
+    type Error = uuid::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
 
 /// Stable identifier for a namespace.
 ///
@@ -97,7 +141,10 @@ mod tests {
     use proptest::prelude::*;
     use uuid::Uuid;
 
-    use super::{NamespaceId, RunId, RunKey};
+    use super::{
+        GenerationCounter, IncarnationId, NamespaceId, NodeReachability, PlacementConfig,
+        QueuePartition, RunId, RunKey, ShardEpoch, ShardId,
+    };
     use crate::WorkflowId;
 
     #[test]
@@ -122,6 +169,43 @@ mod tests {
             RunKey::derive(namespace_id, &workflow_id, run_id),
             RunKey::derive(namespace_id, &WorkflowId("other".to_owned()), run_id)
         );
+    }
+
+    #[test]
+    fn incarnation_id_new_generates_unique_ids() {
+        assert_ne!(IncarnationId::new(), IncarnationId::new());
+    }
+
+    #[test]
+    fn incarnation_id_display_round_trips() {
+        let node_id = IncarnationId::new();
+        let parsed = node_id.to_string().parse::<IncarnationId>().unwrap();
+        assert_eq!(parsed, node_id);
+    }
+
+    #[test]
+    fn placement_counter_and_partition_types_behave_as_values() {
+        assert_eq!(GenerationCounter::ZERO.next(), GenerationCounter(1));
+        assert_eq!(QueuePartition(7), QueuePartition(7));
+        assert_eq!(ShardId(3), ShardId(3));
+    }
+
+    #[test]
+    fn placement_config_and_reachability_are_plain_value_types() {
+        let config = PlacementConfig {
+            shard_count: 4,
+            bundle_count: 4,
+            partition_count: 16,
+            hash_version: 1,
+        };
+        assert_eq!(config, config);
+        assert_eq!(NodeReachability::Healthy, NodeReachability::Healthy);
+        assert_ne!(NodeReachability::Suspect, NodeReachability::Unavailable);
+    }
+
+    #[test]
+    fn shard_epoch_advances_monotonically() {
+        assert_eq!(ShardEpoch::ZERO.next(), ShardEpoch(1));
     }
 
     proptest! {
@@ -153,6 +237,50 @@ mod tests {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ShardId(pub u32);
 
+/// Bundle identifier used by placement and leasing.
+pub type BundleId = ShardId;
+
+/// Queue partition number within a placement configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct QueuePartition(pub u32);
+
+/// Monotonic generation for routing snapshots and deltas.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct GenerationCounter(pub u64);
+
+impl Default for GenerationCounter {
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
+
+impl GenerationCounter {
+    /// Initial generation before any routing snapshot has been published.
+    pub const ZERO: Self = Self(0);
+
+    /// Return the next generation value.
+    pub fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
+/// Runtime reachability as observed by the placement controller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NodeReachability {
+    Healthy,
+    Suspect,
+    Unavailable,
+}
+
+/// Hash and cardinality configuration published with routing snapshots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PlacementConfig {
+    pub shard_count: u32,
+    pub bundle_count: u32,
+    pub partition_count: u32,
+    pub hash_version: u32,
+}
+
 /// Fence token for a shard or bundle lease.
 ///
 /// The important property is **monotonicity**, not global
@@ -166,6 +294,11 @@ pub struct ShardEpoch(pub u64);
 impl ShardEpoch {
     /// Epoch value used before any lease has been acquired.
     pub const ZERO: Self = Self(0);
+
+    /// Return the next epoch value.
+    pub fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
 }
 
 /// Monotonic sequence number for authoritative run

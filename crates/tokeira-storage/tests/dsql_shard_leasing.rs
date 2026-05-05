@@ -32,7 +32,7 @@ async fn acquire_renew_expire_takeover_cycle() -> Result<()> {
         context
             .store
             .run_repository()
-            .try_acquire_bundle(shard_id, "owner-a".to_owned())
+            .try_acquire_bundle(shard_id, "owner-a".to_owned(), "127.0.0.1:7233".to_owned())
             .await?,
         LeaseOutcome::Acquired {
             epoch: ShardEpoch(1)
@@ -42,7 +42,12 @@ async fn acquire_renew_expire_takeover_cycle() -> Result<()> {
         context
             .store
             .run_repository()
-            .renew_bundle(shard_id, "owner-a".to_owned(), ShardEpoch(1))
+            .renew_bundle(
+                shard_id,
+                "owner-a".to_owned(),
+                ShardEpoch(1),
+                "127.0.0.1:7233".to_owned(),
+            )
             .await?,
         LeaseOutcome::Renewed {
             epoch: ShardEpoch(1)
@@ -55,7 +60,7 @@ async fn acquire_renew_expire_takeover_cycle() -> Result<()> {
         context
             .store
             .run_repository()
-            .try_acquire_bundle(shard_id, "owner-b".to_owned())
+            .try_acquire_bundle(shard_id, "owner-b".to_owned(), "127.0.0.1:7234".to_owned())
             .await?,
         LeaseOutcome::Acquired {
             epoch: ShardEpoch(2)
@@ -110,7 +115,7 @@ async fn stale_epoch_is_fenced_after_expired_takeover() -> Result<()> {
         context
             .store
             .run_repository()
-            .try_acquire_bundle(shard_id, "owner-a".to_owned())
+            .try_acquire_bundle(shard_id, "owner-a".to_owned(), "127.0.0.1:7233".to_owned())
             .await?,
         LeaseOutcome::Acquired {
             epoch: ShardEpoch(1)
@@ -121,7 +126,7 @@ async fn stale_epoch_is_fenced_after_expired_takeover() -> Result<()> {
         context
             .store
             .run_repository()
-            .try_acquire_bundle(shard_id, "owner-b".to_owned())
+            .try_acquire_bundle(shard_id, "owner-b".to_owned(), "127.0.0.1:7234".to_owned())
             .await?,
         LeaseOutcome::Acquired {
             epoch: ShardEpoch(2)
@@ -157,7 +162,7 @@ async fn active_same_owner_reacquire_is_idempotent() -> Result<()> {
         context
             .store
             .run_repository()
-            .try_acquire_bundle(shard_id, "owner-a".to_owned())
+            .try_acquire_bundle(shard_id, "owner-a".to_owned(), "127.0.0.1:7233".to_owned())
             .await?,
         LeaseOutcome::Acquired {
             epoch: ShardEpoch(1)
@@ -167,7 +172,7 @@ async fn active_same_owner_reacquire_is_idempotent() -> Result<()> {
         context
             .store
             .run_repository()
-            .try_acquire_bundle(shard_id, "owner-a".to_owned())
+            .try_acquire_bundle(shard_id, "owner-a".to_owned(), "127.0.0.1:7233".to_owned())
             .await?,
         LeaseOutcome::Acquired {
             epoch: ShardEpoch(1)
@@ -177,7 +182,12 @@ async fn active_same_owner_reacquire_is_idempotent() -> Result<()> {
         context
             .store
             .run_repository()
-            .renew_bundle(shard_id, "owner-a".to_owned(), ShardEpoch(1))
+            .renew_bundle(
+                shard_id,
+                "owner-a".to_owned(),
+                ShardEpoch(1),
+                "127.0.0.1:7233".to_owned(),
+            )
             .await?,
         LeaseOutcome::Renewed {
             epoch: ShardEpoch(1)
@@ -196,7 +206,7 @@ fn spawn_acquire(
         barrier.wait().await;
         store
             .run_repository()
-            .try_acquire_bundle(shard_id, owner.to_owned())
+            .try_acquire_bundle(shard_id, owner.to_owned(), "127.0.0.1:7233".to_owned())
             .await
     })
 }

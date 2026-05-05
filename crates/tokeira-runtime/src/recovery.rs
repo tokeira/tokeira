@@ -163,6 +163,7 @@ pub async fn run_lease_renewer<R>(
     repo: Arc<R>,
     shard_id: ShardId,
     owner: String,
+    node_endpoint: String,
     epoch: ShardEpoch,
     interval: tokio::time::Duration,
     max_retries: u32,
@@ -180,7 +181,10 @@ pub async fn run_lease_renewer<R>(
             _ = tokio::time::sleep(interval) => {}
         }
 
-        match repo.renew_bundle(shard_id, owner.clone(), epoch).await {
+        match repo
+            .renew_bundle(shard_id, owner.clone(), epoch, node_endpoint.clone())
+            .await
+        {
             Ok(LeaseOutcome::Renewed { .. }) => {
                 failures = 0;
             }

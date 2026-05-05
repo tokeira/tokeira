@@ -6,7 +6,10 @@
 //! before making them available again.
 
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration as StdDuration, Instant},
 };
 
@@ -47,6 +50,8 @@ pub struct Reservoir {
     ready: async_channel::Receiver<ReservoirEntry>,
     /// Non-async return path used by `DsqlPermit::drop`.
     return_tx: mpsc::UnboundedSender<ReservoirEntry>,
+    /// Runtime-adjustable ready target used by controller budget directives.
+    target_ready: Arc<AtomicUsize>,
     /// Background task that opens new physical connections.
     refiller_handle: JoinHandle<()>,
     /// Background task that retires near-expired idle connections.
@@ -72,18 +77,26 @@ impl Reservoir {
         let (ready_tx, ready) = async_channel::bounded(config.target_ready);
         let (return_tx, return_rx) = mpsc::unbounded_channel();
         let inflight = Arc::new(Semaphore::new(config.inflight_limit));
+        let target_ready = Arc::new(AtomicUsize::new(config.target_ready));
         let refiller_handle = spawn_refiller(
             config.clone(),
             connector,
             ready_tx.clone(),
             rate_limiter,
             inflight,
+            Arc::clone(&target_ready),
         );
-        let scanner_handle = spawn_scanner(config.clone(), ready_tx.clone(), ready.clone());
+        let scanner_handle = spawn_scanner(
+            config.clone(),
+            ready_tx.clone(),
+            ready.clone(),
+            Arc::clone(&target_ready),
+        );
         let return_processor_handle = spawn_return_processor(config.clone(), ready_tx, return_rx);
         Ok(Self {
             ready,
             return_tx,
+            target_ready,
             refiller_handle,
             scanner_handle,
             return_processor_handle,
@@ -111,6 +124,29 @@ impl Reservoir {
         self.ready.len()
     }
 
+    /// Apply a controller-provided ready-pool cap.
+    pub fn reconfigure_target(&self, new_target: u32) {
+        self.target_ready
+            .store((new_target as usize).max(1), Ordering::Release);
+    }
+
+    /// Retire idle connections above the supplied target.
+    pub fn retire_excess(&self, new_target: u32) -> usize {
+        let target = (new_target as usize).max(1);
+        let mut retired = 0usize;
+        while self.ready.len() > target {
+            match self.ready.try_recv() {
+                Ok(_entry) => {
+                    retired += 1;
+                    metrics::record_dsql_pool_connection_retired("budget_cap");
+                }
+                Err(_) => break,
+            }
+        }
+        metrics::record_dsql_pool_connections_total(self.ready.len());
+        retired
+    }
+
     /// Original reservoir configuration.
     pub fn config(&self) -> &ReservoirConfig {
         &self.config
@@ -133,11 +169,15 @@ fn spawn_refiller(
     ready_tx: async_channel::Sender<ReservoirEntry>,
     rate_limiter: TokenBucketRateLimiter,
     inflight: Arc<Semaphore>,
+    target_ready: Arc<AtomicUsize>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             // Bounded channel provides natural backpressure — send().await
             // blocks when the channel is full, avoiding a busy-loop.
+            while ready_tx.len() >= target_ready.load(Ordering::Acquire) {
+                tokio::time::sleep(StdDuration::from_millis(50)).await;
+            }
             let Ok(_inflight_guard) = inflight.clone().acquire_owned().await else {
                 return;
             };
@@ -170,6 +210,7 @@ fn spawn_scanner(
     config: ReservoirConfig,
     ready_tx: async_channel::Sender<ReservoirEntry>,
     ready_rx: async_channel::Receiver<ReservoirEntry>,
+    target_ready: Arc<AtomicUsize>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -179,7 +220,7 @@ fn spawn_scanner(
             let guard_window = duration_or_default(config.guard_window, StdDuration::from_secs(45));
             // Scan a bounded batch per interval to avoid draining the entire
             // ready channel and starving concurrent checkout() callers.
-            let batch_size = config.target_ready.max(1);
+            let batch_size = target_ready.load(Ordering::Acquire).max(1);
             let mut scanned = 0;
             while scanned < batch_size {
                 match ready_rx.try_recv() {

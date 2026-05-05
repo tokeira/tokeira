@@ -21,18 +21,19 @@ use tokeira_kernel::{
     WorkflowState,
 };
 use tokeira_types::{
-    ExecutionRef, ExecutionStatus, NamespaceId, ProjectionCursor, QueueKey, RequestId, RunId,
-    RunKey, ShardEpoch, ShardId, TaskKind, WorkflowId,
+    ExecutionRef, ExecutionStatus, GenerationCounter, NamespaceId, ProjectionCursor, QueueKey,
+    RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskKind, WorkflowId,
 };
 use tokio::sync::Mutex;
 
 use crate::{
     api::{
-        ActivitySweepEntry, BacklogEntry, CommitResult, ConnectionDirector,
-        CurrentExecutionConflictPolicy, DbClass, DbPermit, DispatchableActivityTask,
-        DispatchableWorkflowTask, DueTimer, LeaseOutcome, LeaseRepository, NexusSweepEntry,
-        ProjectionBatch, ProjectionContext, ProjectionLog, ProjectionRecord, RequestRecord,
-        RunRepository, TransitionAuditRecord, WftTimeoutSweepEntry, WorkflowTimeoutSweepEntry,
+        ActivitySweepEntry, BacklogEntry, BudgetAllocationResult, BundleLease, CommitResult,
+        ConnectionDirector, ControlRepository, CurrentExecutionConflictPolicy, DbClass, DbPermit,
+        DispatchableActivityTask, DispatchableWorkflowTask, DueTimer, GenerationAdvanceResult,
+        LeaseOutcome, LeaseRepository, NexusSweepEntry, ProjectionBatch, ProjectionContext,
+        ProjectionLog, ProjectionRecord, RequestRecord, RunRepository, TransitionAuditRecord,
+        WftTimeoutSweepEntry, WorkflowTimeoutSweepEntry,
     },
     metrics as storage_metrics,
 };
@@ -75,7 +76,11 @@ struct StoreState {
     /// Projection records awaiting projection workers.
     projection_log: Vec<ProjectionRecord>,
     /// Shard lease state keyed by shard id.
-    bundle_leases: HashMap<ShardId, (String, ShardEpoch)>,
+    bundle_leases: HashMap<ShardId, (Option<String>, ShardEpoch, Option<String>)>,
+    /// Controller routing generation singleton.
+    routing_generation: GenerationCounter,
+    /// CAS version for controller connection-budget allocation.
+    budget_version: u64,
     /// Durable dispatch source for activity work.
     ///
     /// Do not infer dispatchability from `activity_state_table`: started,
@@ -266,17 +271,18 @@ impl RunRepository for InMemoryStore {
         epoch: ShardEpoch,
     ) -> Result<CommitResult> {
         let started = Instant::now();
-        let namespace = Some(transition.next_state.namespace_id.0.to_string());
+        let state = transition.next_state.clone();
+        let namespace = Some(state.namespace_id.0.to_string());
         let mut store = self.inner.lock().await;
         if epoch != ShardEpoch::ZERO {
-            let shard_id = store
-                .run_shard_map
-                .get(&run_key)
-                .copied()
-                .unwrap_or_else(|| shard_for_run_key(run_key, Self::effective_shard_count(&store)));
+            let shard_id = tokeira_types::execution_home_bundle(
+                state.namespace_id.0.as_bytes(),
+                state.workflow_id.0.as_bytes(),
+                Self::effective_shard_count(&store),
+            );
             match store.bundle_leases.get(&shard_id) {
-                Some((_owner, current_epoch)) if *current_epoch == epoch => {}
-                Some((_owner, current_epoch)) => {
+                Some((_owner, current_epoch, _endpoint)) if *current_epoch == epoch => {}
+                Some((_owner, current_epoch, _endpoint)) => {
                     storage_metrics::record_commit_transition_duration(
                         namespace.clone(),
                         "conflict",
@@ -341,7 +347,6 @@ impl RunRepository for InMemoryStore {
             });
         }
 
-        let state = transition.next_state.clone();
         let workflow_key = (state.namespace_id, state.workflow_id.0.clone());
 
         for op in &transition.request_dedupe_ops {
@@ -577,6 +582,40 @@ impl RunRepository for InMemoryStore {
         storage_metrics::record_commit_transition_duration(namespace, "applied", started.elapsed());
         storage_metrics::record_storage_operation("commit_transition", "success");
         Ok(CommitResult::Applied { new_state: state })
+    }
+
+    async fn commit_transition_for_bundle(
+        &self,
+        run_key: RunKey,
+        execution_home_bundle: ShardId,
+        transition: Transition,
+        epoch: ShardEpoch,
+    ) -> Result<CommitResult> {
+        if epoch != ShardEpoch::ZERO {
+            let store = self.inner.lock().await;
+            match store.bundle_leases.get(&execution_home_bundle) {
+                Some((_owner, current_epoch, _endpoint)) if *current_epoch == epoch => {}
+                Some((_owner, current_epoch, _endpoint)) => {
+                    return Ok(CommitResult::Conflict {
+                        reason: format!(
+                            "stale shard epoch {:?} for execution-home bundle {:?}; current {:?}",
+                            epoch, execution_home_bundle, current_epoch
+                        ),
+                    });
+                }
+                None => {
+                    return Ok(CommitResult::Conflict {
+                        reason: format!(
+                            "no active lease for execution-home bundle {:?} at epoch {:?}",
+                            execution_home_bundle, epoch
+                        ),
+                    });
+                }
+            }
+        }
+
+        self.commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .await
     }
 
     async fn materialize_reset_successor(
@@ -1043,16 +1082,39 @@ impl ProjectionLog for InMemoryStore {
 
 #[async_trait]
 impl LeaseRepository for InMemoryStore {
-    async fn try_acquire_bundle(&self, bundle: ShardId, owner: String) -> Result<LeaseOutcome> {
+    async fn try_acquire_bundle(
+        &self,
+        bundle: ShardId,
+        owner: String,
+        node_endpoint: String,
+    ) -> Result<LeaseOutcome> {
         let mut store = self.inner.lock().await;
-        match store.bundle_leases.get(&bundle) {
-            Some((current_owner, current_epoch)) => Ok(LeaseOutcome::Rejected {
-                current_owner: current_owner.clone(),
-                current_epoch: *current_epoch,
-            }),
+        match store.bundle_leases.get_mut(&bundle) {
+            Some((current_owner, current_epoch, current_endpoint)) => {
+                if current_owner.as_deref() == Some(owner.as_str()) {
+                    *current_endpoint = Some(node_endpoint);
+                    Ok(LeaseOutcome::Acquired {
+                        epoch: *current_epoch,
+                    })
+                } else if current_owner.is_none() {
+                    *current_epoch = current_epoch.next();
+                    *current_owner = Some(owner);
+                    *current_endpoint = Some(node_endpoint);
+                    Ok(LeaseOutcome::Acquired {
+                        epoch: *current_epoch,
+                    })
+                } else {
+                    Ok(LeaseOutcome::Rejected {
+                        current_owner: current_owner.clone().unwrap_or_default(),
+                        current_epoch: *current_epoch,
+                    })
+                }
+            }
             None => {
                 let epoch = ShardEpoch(1);
-                store.bundle_leases.insert(bundle, (owner, epoch));
+                store
+                    .bundle_leases
+                    .insert(bundle, (Some(owner), epoch, Some(node_endpoint)));
                 Ok(LeaseOutcome::Acquired { epoch })
             }
         }
@@ -1063,23 +1125,115 @@ impl LeaseRepository for InMemoryStore {
         bundle: ShardId,
         owner: String,
         epoch: ShardEpoch,
+        node_endpoint: String,
     ) -> Result<LeaseOutcome> {
         let mut store = self.inner.lock().await;
         match store.bundle_leases.get_mut(&bundle) {
-            Some((current_owner, current_epoch))
-                if *current_owner == owner && *current_epoch == epoch =>
+            Some((current_owner, current_epoch, current_endpoint))
+                if current_owner.as_deref() == Some(owner.as_str()) && *current_epoch == epoch =>
             {
+                *current_endpoint = Some(node_endpoint);
                 Ok(LeaseOutcome::Renewed { epoch })
             }
-            Some((current_owner, current_epoch)) => Ok(LeaseOutcome::Rejected {
-                current_owner: current_owner.clone(),
+            Some((current_owner, current_epoch, _endpoint)) => Ok(LeaseOutcome::Rejected {
+                current_owner: current_owner.clone().unwrap_or_default(),
                 current_epoch: *current_epoch,
             }),
             None => {
-                store.bundle_leases.insert(bundle, (owner, epoch));
+                store
+                    .bundle_leases
+                    .insert(bundle, (Some(owner), epoch, Some(node_endpoint)));
                 Ok(LeaseOutcome::Acquired { epoch })
             }
         }
+    }
+
+    async fn list_bundle_leases(&self) -> Result<Vec<BundleLease>> {
+        let store = self.inner.lock().await;
+        Ok(store
+            .bundle_leases
+            .iter()
+            .map(|(bundle_id, (owner, epoch, endpoint))| BundleLease {
+                bundle_id: *bundle_id,
+                owner_node_id: owner.clone(),
+                epoch: *epoch,
+                lease_until: OffsetDateTime::now_utc(),
+                node_endpoint: endpoint.clone(),
+            })
+            .collect())
+    }
+
+    async fn relinquish_bundle(
+        &self,
+        bundle: ShardId,
+        owner: String,
+        epoch: ShardEpoch,
+    ) -> Result<LeaseOutcome> {
+        let mut store = self.inner.lock().await;
+        match store.bundle_leases.get_mut(&bundle) {
+            Some((current_owner, current_epoch, current_endpoint))
+                if current_owner.as_deref() == Some(owner.as_str()) && *current_epoch == epoch =>
+            {
+                *current_owner = None;
+                *current_epoch = current_epoch.next();
+                *current_endpoint = None;
+                Ok(LeaseOutcome::Acquired {
+                    epoch: *current_epoch,
+                })
+            }
+            Some((current_owner, current_epoch, _endpoint)) => Ok(LeaseOutcome::Rejected {
+                current_owner: current_owner.clone().unwrap_or_default(),
+                current_epoch: *current_epoch,
+            }),
+            None => Ok(LeaseOutcome::Rejected {
+                current_owner: String::new(),
+                current_epoch: ShardEpoch::ZERO,
+            }),
+        }
+    }
+}
+
+#[async_trait]
+impl ControlRepository for InMemoryStore {
+    async fn advance_generation(
+        &self,
+        expected: GenerationCounter,
+    ) -> Result<GenerationAdvanceResult> {
+        let mut store = self.inner.lock().await;
+        if store.routing_generation == expected {
+            store.routing_generation = store.routing_generation.next();
+            Ok(GenerationAdvanceResult::Advanced(store.routing_generation))
+        } else {
+            Ok(GenerationAdvanceResult::Conflict(store.routing_generation))
+        }
+    }
+
+    async fn current_generation(&self) -> Result<GenerationCounter> {
+        Ok(self.inner.lock().await.routing_generation)
+    }
+
+    async fn allocate_budget(
+        &self,
+        expected_version: u64,
+        _allocator_id: uuid::Uuid,
+        _rate_budget: f64,
+        _capacity_budget: u64,
+    ) -> Result<BudgetAllocationResult> {
+        let mut store = self.inner.lock().await;
+        if store.budget_version == expected_version {
+            store.budget_version += 1;
+            Ok(BudgetAllocationResult::Allocated {
+                version: store.budget_version,
+            })
+        } else {
+            Ok(BudgetAllocationResult::Conflict {
+                current_version: store.budget_version,
+            })
+        }
+    }
+
+    async fn current_budget_version(&self) -> Result<u64> {
+        Ok(self.inner.lock().await.budget_version)
     }
 }
 
@@ -1169,6 +1323,144 @@ mod tests {
             deployment: None,
             build_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn lease_repository_lists_relinquishes_and_reacquires_unowned_bundles() {
+        let store = InMemoryStore::default();
+        let first = store
+            .try_acquire_bundle(
+                ShardId(1),
+                "owner-a".to_owned(),
+                "127.0.0.1:7233".to_owned(),
+            )
+            .await
+            .unwrap();
+        let LeaseOutcome::Acquired { epoch } = first else {
+            panic!("expected initial acquire");
+        };
+        store
+            .try_acquire_bundle(
+                ShardId(2),
+                "owner-b".to_owned(),
+                "127.0.0.1:7234".to_owned(),
+            )
+            .await
+            .unwrap();
+
+        let leases = store.list_bundle_leases().await.unwrap();
+        assert_eq!(leases.len(), 2);
+        assert!(leases.iter().any(|lease| {
+            lease.bundle_id == ShardId(1)
+                && lease.owner_node_id.as_deref() == Some("owner-a")
+                && lease.node_endpoint.as_deref() == Some("127.0.0.1:7233")
+        }));
+
+        let relinquished = store
+            .relinquish_bundle(ShardId(1), "owner-a".to_owned(), epoch)
+            .await
+            .unwrap();
+        let LeaseOutcome::Acquired {
+            epoch: relinquished_epoch,
+        } = relinquished
+        else {
+            panic!("expected relinquish to advance epoch");
+        };
+        assert!(relinquished_epoch.0 > epoch.0);
+
+        let leases = store.list_bundle_leases().await.unwrap();
+        let unowned = leases
+            .iter()
+            .find(|lease| lease.bundle_id == ShardId(1))
+            .unwrap();
+        assert_eq!(unowned.owner_node_id, None);
+        assert_eq!(unowned.node_endpoint, None);
+
+        let reacquired = store
+            .try_acquire_bundle(
+                ShardId(1),
+                "owner-c".to_owned(),
+                "127.0.0.1:7235".to_owned(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(reacquired, LeaseOutcome::Acquired { .. }));
+        let leases = store.list_bundle_leases().await.unwrap();
+        assert!(leases.iter().any(|lease| {
+            lease.bundle_id == ShardId(1)
+                && lease.owner_node_id.as_deref() == Some("owner-c")
+                && lease.node_endpoint.as_deref() == Some("127.0.0.1:7235")
+        }));
+    }
+
+    #[tokio::test]
+    async fn relinquish_rejects_stale_epoch_and_renew_updates_endpoint() {
+        let store = InMemoryStore::default();
+        let acquired = store
+            .try_acquire_bundle(ShardId(7), "owner".to_owned(), "127.0.0.1:7233".to_owned())
+            .await
+            .unwrap();
+        let LeaseOutcome::Acquired { epoch } = acquired else {
+            panic!("expected acquire");
+        };
+
+        let stale = store
+            .relinquish_bundle(ShardId(7), "owner".to_owned(), epoch.next())
+            .await
+            .unwrap();
+        assert!(matches!(stale, LeaseOutcome::Rejected { .. }));
+
+        let renewed = store
+            .renew_bundle(
+                ShardId(7),
+                "owner".to_owned(),
+                epoch,
+                "127.0.0.1:9000".to_owned(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(renewed, LeaseOutcome::Renewed { epoch });
+        let leases = store.list_bundle_leases().await.unwrap();
+        assert!(leases.iter().any(|lease| {
+            lease.bundle_id == ShardId(7)
+                && lease.node_endpoint.as_deref() == Some("127.0.0.1:9000")
+        }));
+    }
+
+    #[tokio::test]
+    async fn control_repository_generation_and_budget_are_cas_protected() {
+        let store = InMemoryStore::default();
+
+        assert_eq!(
+            store
+                .advance_generation(GenerationCounter::ZERO)
+                .await
+                .unwrap(),
+            GenerationAdvanceResult::Advanced(GenerationCounter(1))
+        );
+        assert_eq!(
+            store
+                .advance_generation(GenerationCounter::ZERO)
+                .await
+                .unwrap(),
+            GenerationAdvanceResult::Conflict(GenerationCounter(1))
+        );
+
+        let allocator_id = uuid::Uuid::new_v4();
+        assert_eq!(
+            store
+                .allocate_budget(0, allocator_id, 10.0, 100)
+                .await
+                .unwrap(),
+            BudgetAllocationResult::Allocated { version: 1 }
+        );
+        assert_eq!(
+            store
+                .allocate_budget(0, allocator_id, 10.0, 100)
+                .await
+                .unwrap(),
+            BudgetAllocationResult::Conflict { current_version: 1 }
+        );
     }
 
     fn sample_state(run_key: RunKey) -> WorkflowState {
@@ -2629,6 +2921,35 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(100))]
 
         #[test]
+        fn property_bundle_ownership_consistency(
+            bundle_count in 1u32..16,
+            owner_seed in any::<u64>(),
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let store = InMemoryStore::default();
+                let owner = format!("owner-{owner_seed}");
+                let endpoint = "127.0.0.1:7233".to_owned();
+                for bundle in 0..bundle_count {
+                    let outcome = store
+                        .try_acquire_bundle(ShardId(bundle), owner.clone(), endpoint.clone())
+                        .await
+                        .unwrap();
+                    let acquired = matches!(outcome, LeaseOutcome::Acquired { .. });
+                    prop_assert!(acquired);
+                }
+                let leases = store.list_bundle_leases().await.unwrap();
+                prop_assert_eq!(leases.len(), bundle_count as usize);
+                for lease in leases {
+                    prop_assert_eq!(lease.owner_node_id.as_deref(), Some(owner.as_str()));
+                    prop_assert_eq!(lease.node_endpoint.as_deref(), Some(endpoint.as_str()));
+                    prop_assert!(lease.epoch.0 > 0);
+                }
+                Ok(())
+            })?;
+        }
+
+        #[test]
         fn epoch_fencing_rejects_stale_commits(
             stale_epoch in 2u64..100,
         ) {
@@ -2645,6 +2966,7 @@ mod tests {
                     .try_acquire_bundle(
                         shard_id,
                         "owner".into(),
+                        "127.0.0.1:7233".into(),
                     )
                     .await
                     .unwrap();

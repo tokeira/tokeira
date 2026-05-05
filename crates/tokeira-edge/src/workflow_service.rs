@@ -609,7 +609,7 @@ impl WorkflowService {
 
                 ensure_local(
                     self.router
-                        .route_task_queue(&req.namespace, &req.task_queue)
+                        .route_task_queue(&req.namespace, &req.task_queue, TaskKind::Workflow)
                         .await?,
                 )?;
 
@@ -1797,7 +1797,7 @@ impl WorkflowService {
 
                 ensure_local(
                     self.router
-                        .route_task_queue(&req.namespace, &req.task_queue)
+                        .route_task_queue(&req.namespace, &req.task_queue, TaskKind::Workflow)
                         .await?,
                 )?;
 
@@ -2428,7 +2428,7 @@ impl WorkflowService {
 
                 ensure_local(
                     self.router
-                        .route_task_queue(&req.namespace, &req.task_queue)
+                        .route_task_queue(&req.namespace, &req.task_queue, req.task_kind)
                         .await?,
                 )?;
 
@@ -2689,7 +2689,7 @@ impl WorkflowService {
 
                 ensure_local(
                     self.router
-                        .route_task_queue(&req.namespace, &req.task_queue)
+                        .route_task_queue(&req.namespace, &req.task_queue, TaskKind::Activity)
                         .await?,
                 )?;
 
@@ -3421,6 +3421,7 @@ fn grpc_error_code(error: &EdgeError) -> &'static str {
         EdgeError::TooManyLongPolls => "resource_exhausted",
         EdgeError::LongPollAdmissionTimeout => "deadline_exceeded",
         EdgeError::RemoteRouteUnsupported { .. } => "unavailable",
+        EdgeError::NotShardOwner { .. } => "aborted",
         EdgeError::Internal(_) => "internal",
     }
 }

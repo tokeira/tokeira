@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
 
-use crate::NamespaceId;
+use crate::{NamespaceId, QueuePartition};
 
 /// Discriminator for the two fundamental task kinds.
 ///
@@ -124,6 +124,15 @@ pub struct QueueKey {
     pub deployment: Option<DeploymentId>,
     /// Optional build identifier for versioned routing.
     pub build_id: Option<BuildId>,
+}
+
+/// Full key for a queue partition, scoped to a queue family.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct QueuePartitionKey {
+    pub namespace_id: NamespaceId,
+    pub task_queue: TaskQueueName,
+    pub task_kind: TaskKind,
+    pub partition: QueuePartition,
 }
 
 /// Sticky-execution affinity binding a run to a specific

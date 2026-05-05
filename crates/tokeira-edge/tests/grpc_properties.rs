@@ -467,6 +467,7 @@ fn expected_code(err: &EdgeError) -> Code {
         EdgeError::TooManyLongPolls => Code::ResourceExhausted,
         EdgeError::LongPollAdmissionTimeout => Code::DeadlineExceeded,
         EdgeError::RemoteRouteUnsupported { .. } => Code::Unavailable,
+        EdgeError::NotShardOwner { .. } => Code::Aborted,
         EdgeError::Internal(_) => Code::Internal,
     }
 }

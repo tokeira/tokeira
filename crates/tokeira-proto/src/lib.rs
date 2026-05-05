@@ -13,7 +13,7 @@ pub mod conversions;
 pub mod internal;
 pub mod public;
 
-pub use internal::{admin, runtime};
+pub use internal::{admin, controller, runtime};
 pub use public::{
     common, enums, failure, history, operatorservice, taskqueue, workflow, workflowservice,
 };

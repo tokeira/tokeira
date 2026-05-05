@@ -501,8 +501,14 @@ async fn grpc_roundtrip_signal_then_query_returns_latest_buffered_result() -> Re
 async fn grpc_roundtrip_update_completed_through_protocol_messages() -> Result<()> {
     use prost::Message as _;
     use tokeira_proto::public::temporal::api::{
+        command::v1::{
+            Command, ProtocolMessageCommandAttributes, command::Attributes as CommandAttributes,
+        },
         protocol::v1::Message as ProtocolMessage,
-        update::v1::{Outcome as UpdateOutcome, Response as UpdateResponse, outcome},
+        update::v1::{
+            Acceptance as UpdateAcceptance, Outcome as UpdateOutcome, Response as UpdateResponse,
+            outcome,
+        },
     };
 
     let (addr, shutdown_tx, server) = spawn_test_server().await?;
@@ -575,7 +581,7 @@ async fn grpc_roundtrip_update_completed_through_protocol_messages() -> Result<(
                 }),
                 wait_policy: Some(
                     tokeira_proto::public::temporal::api::update::v1::WaitPolicy {
-                        lifecycle_stage: 2,
+                        lifecycle_stage: 3,
                     },
                 ),
                 ..Default::default()
@@ -584,8 +590,6 @@ async fn grpc_roundtrip_update_completed_through_protocol_messages() -> Result<(
             .map(|resp| resp.into_inner())
             .map_err(anyhow::Error::from)
     });
-
-    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
     let poll = loop {
         let poll = workflow
@@ -601,6 +605,9 @@ async fn grpc_roundtrip_update_completed_through_protocol_messages() -> Result<(
             .await?
             .into_inner();
 
+        if poll.task_token.is_empty() {
+            continue;
+        }
         if !poll.messages.is_empty() {
             break poll;
         }
@@ -621,6 +628,24 @@ async fn grpc_roundtrip_update_completed_through_protocol_messages() -> Result<(
     let update_id = poll.messages[0].protocol_instance_id.clone();
     assert_eq!(update_id, "update-1");
 
+    let acceptance = UpdateAcceptance {
+        accepted_request_message_id: poll.messages[0].id.clone(),
+        accepted_request_sequencing_event_id: poll.messages[0]
+            .sequencing_id
+            .as_ref()
+            .and_then(|id| match id {
+                tokeira_proto::public::temporal::api::protocol::v1::message::SequencingId::EventId(event_id) => {
+                    Some(*event_id)
+                }
+                tokeira_proto::public::temporal::api::protocol::v1::message::SequencingId::CommandIndex(_) => None,
+            })
+            .unwrap_or_default(),
+        accepted_request: None,
+    };
+    let acceptance_body = prost_types::Any {
+        type_url: "type.googleapis.com/temporal.api.update.v1.Acceptance".to_string(),
+        value: acceptance.encode_to_vec(),
+    };
     let response = UpdateResponse {
         meta: None,
         outcome: Some(UpdateOutcome {
@@ -636,13 +661,40 @@ async fn grpc_roundtrip_update_completed_through_protocol_messages() -> Result<(
         .respond_workflow_task_completed(RespondWorkflowTaskCompletedRequest {
             task_token: poll.task_token,
             identity: "worker-1".to_string(),
-            commands: Vec::new(),
-            messages: vec![ProtocolMessage {
-                id: format!("{update_id}/response"),
-                protocol_instance_id: update_id,
-                body: Some(body),
-                sequencing_id: None,
-            }],
+            commands: vec![
+                Command {
+                    command_type: tokeira_proto::enums::CommandType::ProtocolMessage as i32,
+                    user_metadata: None,
+                    attributes: Some(CommandAttributes::ProtocolMessageCommandAttributes(
+                        ProtocolMessageCommandAttributes {
+                            message_id: format!("{update_id}/acceptance"),
+                        },
+                    )),
+                },
+                Command {
+                    command_type: tokeira_proto::enums::CommandType::ProtocolMessage as i32,
+                    user_metadata: None,
+                    attributes: Some(CommandAttributes::ProtocolMessageCommandAttributes(
+                        ProtocolMessageCommandAttributes {
+                            message_id: format!("{update_id}/response"),
+                        },
+                    )),
+                },
+            ],
+            messages: vec![
+                ProtocolMessage {
+                    id: format!("{update_id}/acceptance"),
+                    protocol_instance_id: update_id.clone(),
+                    body: Some(acceptance_body),
+                    sequencing_id: None,
+                },
+                ProtocolMessage {
+                    id: format!("{update_id}/response"),
+                    protocol_instance_id: update_id,
+                    body: Some(body),
+                    sequencing_id: None,
+                },
+            ],
             ..Default::default()
         })
         .await?;

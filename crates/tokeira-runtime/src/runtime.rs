@@ -25,9 +25,9 @@ use tokeira_storage::{
     LeaseRepository, RunRepository,
 };
 use tokeira_types::{
-    ActivityTaskToken, BuildId, DeploymentId, ExecutionRef, Headers, NamespaceId, Payload,
-    Payloads, QueueKey, RequestContext, RetryPolicy, RunId, RunKey, ShardEpoch, ShardId, TaskKind,
-    TaskQueueName, WorkerIdentity, WorkflowTaskToken,
+    ActivityTaskToken, BuildId, DeploymentId, ExecutionRef, Headers, IncarnationId, NamespaceId,
+    Payload, Payloads, QueueKey, RequestContext, RetryPolicy, RunId, RunKey, ShardEpoch, ShardId,
+    TaskKind, TaskQueueName, WorkerIdentity, WorkflowTaskToken,
 };
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -40,8 +40,11 @@ use crate::{
     backlog::{BacklogConfig, run_drain_loop, run_grace_scanner},
     broker::{InMemoryActivityBroker, InMemoryBroker},
     buffered_queries::{BufferedQuery, BufferedQueryRegistry},
+    drain::RuntimeDrain,
+    errors::NotShardOwner,
     fairness::{DeliveryMetrics, FairnessState, run_control_loop},
     lane::{LaneConfig, LaneHandle, spawn_lane},
+    membership::{ConnectionBudgetApplier, HeartbeatInputs, MembershipClient, MembershipConfig},
     metrics as runtime_metrics,
     nexus::{
         NexusEndpointRegistry, NexusHttpClient, NexusTaskBroker, NexusTimeoutScannerConfig,
@@ -143,8 +146,12 @@ pub struct TokeiraRuntime<R> {
     control_loop_cancel: CancellationToken,
     /// Runtime-local shard ownership view.
     shard_owner: Arc<RwLock<ShardOwner>>,
+    /// Shared runtime drain state used by membership and admission.
+    runtime_drain: Arc<RuntimeDrain>,
     /// Stable owner identity for lease operations.
     owner_identity: String,
+    /// Endpoint persisted with lease rows for controller-sourced routing.
+    node_endpoint: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -335,7 +342,7 @@ where
             nexus_registry,
             nexus_client,
             1,
-            "local-runtime".to_string(),
+            IncarnationId::new().to_string(),
             true,
             versioning_rule_store,
         )
@@ -379,6 +386,42 @@ where
         seed_default_shard: bool,
         versioning_rule_store: Arc<VersioningRuleStore>,
     ) -> Self {
+        Self::new_with_nexus_and_shards_and_endpoint(
+            repo,
+            lane_count,
+            config,
+            timer_config,
+            workflow_timeout_config,
+            backlog_config,
+            activity_timeout_config,
+            nexus_timeout_config,
+            nexus_registry,
+            nexus_client,
+            shard_count,
+            owner_identity,
+            "127.0.0.1:0".to_owned(),
+            seed_default_shard,
+            versioning_rule_store,
+        )
+    }
+
+    pub fn new_with_nexus_and_shards_and_endpoint(
+        repo: Arc<R>,
+        lane_count: usize,
+        config: LaneConfig,
+        timer_config: TimerScannerConfig,
+        workflow_timeout_config: WorkflowTimeoutScannerConfig,
+        backlog_config: BacklogConfig,
+        activity_timeout_config: ActivityTimeoutScannerConfig,
+        nexus_timeout_config: NexusTimeoutScannerConfig,
+        nexus_registry: NexusEndpointRegistry,
+        nexus_client: Arc<dyn NexusHttpClient>,
+        shard_count: u32,
+        owner_identity: String,
+        node_endpoint: String,
+        seed_default_shard: bool,
+        versioning_rule_store: Arc<VersioningRuleStore>,
+    ) -> Self {
         let broker = InMemoryBroker::default();
         let activity_broker = InMemoryActivityBroker::default();
         let workflow_timeout_tracking = WorkflowTimeoutTrackingState::default();
@@ -391,6 +434,7 @@ where
         let worker_registry = WorkerRegistry::default();
         let delivery_metrics = DeliveryMetrics::new();
         let fairness_state = FairnessState::new();
+        let runtime_drain = Arc::new(RuntimeDrain::default());
         let shard_count = shard_count.max(1);
         let shard_owner = Arc::new(RwLock::new(ShardOwner::new(shard_count)));
         let lane_count = lane_count.max(1);
@@ -536,7 +580,9 @@ where
             control_loop_handle,
             control_loop_cancel,
             shard_owner,
+            runtime_drain,
             owner_identity,
+            node_endpoint,
             versioning_rule_store,
         }
     }
@@ -660,6 +706,28 @@ where
 
     pub fn owner_identity(&self) -> &str {
         &self.owner_identity
+    }
+
+    pub fn node_endpoint(&self) -> &str {
+        &self.node_endpoint
+    }
+
+    pub fn runtime_drain(&self) -> Arc<RuntimeDrain> {
+        self.runtime_drain.clone()
+    }
+
+    pub fn heartbeat_inputs(
+        &self,
+        available_connections: u32,
+        connection_rate_headroom: f32,
+    ) -> HeartbeatInputs {
+        HeartbeatInputs::from_runtime_components(
+            &self.shard_owner.read().unwrap(),
+            self.runtime_drain.state(),
+            &self.lanes,
+            available_connections,
+            connection_rate_headroom,
+        )
     }
 
     /// Dispatch a read-only query to a workflow worker and await the response.
@@ -1530,8 +1598,21 @@ where
 
     pub async fn submit(&self, run_key: RunKey, command: Command) -> Result<CommitResult> {
         let shard_id = self.shard_id_for(run_key).await;
-        if !self.shard_owner.read().unwrap().is_active(shard_id) {
-            return Err(anyhow!("shard not active for run {:?}", run_key));
+        if self.runtime_drain.is_draining() && is_externally_routed_command(&command) {
+            let current_epoch = self
+                .shard_owner
+                .read()
+                .unwrap()
+                .epoch_of(shard_id)
+                .unwrap_or(ShardEpoch::ZERO);
+            return Err(NotShardOwner::local(shard_id, current_epoch).into());
+        }
+        {
+            let owner = self.shard_owner.read().unwrap();
+            if !owner.is_active(shard_id) {
+                let current_epoch = owner.epoch_of(shard_id).unwrap_or(ShardEpoch::ZERO);
+                return Err(NotShardOwner::local(shard_id, current_epoch).into());
+            }
         }
         let lane = self.pick_lane(run_key);
         let lane_id = {
@@ -1552,14 +1633,11 @@ where
         command: Command,
     ) -> Result<CommitResult> {
         let shard_id = self.shard_id_for(run_key).await;
-        if self
-            .shard_owner
-            .read()
-            .unwrap()
-            .epoch_of(shard_id)
-            .is_none()
         {
-            return Err(anyhow!("shard not owned for run {:?}", run_key));
+            let owner = self.shard_owner.read().unwrap();
+            if owner.epoch_of(shard_id).is_none() {
+                return Err(NotShardOwner::local(shard_id, ShardEpoch::ZERO).into());
+            }
         }
         let lane = self.pick_lane(run_key);
         let lane_id = {
@@ -1594,20 +1672,22 @@ where
 
     async fn current_shard_epoch(&self, run_key: RunKey) -> Result<ShardEpoch> {
         let shard_id = self.shard_id_for(run_key).await;
-        self.shard_owner
-            .read()
-            .unwrap()
-            .owns(shard_id)
-            .ok_or_else(|| anyhow!("shard not owned for run {:?}", run_key))
+        let owner = self.shard_owner.read().unwrap();
+        owner.owns(shard_id).ok_or_else(|| {
+            NotShardOwner::local(
+                shard_id,
+                owner.epoch_of(shard_id).unwrap_or(ShardEpoch::ZERO),
+            )
+            .into()
+        })
     }
 
     async fn shard_epoch_for_completion(&self, run_key: RunKey) -> Result<ShardEpoch> {
         let shard_id = self.shard_id_for(run_key).await;
-        self.shard_owner
-            .read()
-            .unwrap()
+        let owner = self.shard_owner.read().unwrap();
+        owner
             .epoch_of(shard_id)
-            .ok_or_else(|| anyhow!("shard not owned for run {:?}", run_key))
+            .ok_or_else(|| NotShardOwner::local(shard_id, ShardEpoch::ZERO).into())
     }
 
     async fn shard_id_for(&self, run_key: RunKey) -> ShardId {
@@ -1618,7 +1698,8 @@ where
     async fn validate_workflow_task_token(&self, token: &WorkflowTaskToken) -> Result<()> {
         let current_epoch = self.shard_epoch_for_completion(token.run_key).await?;
         if token.shard_epoch != current_epoch {
-            return Err(anyhow!("workflow task shard epoch mismatch"));
+            let shard_id = self.shard_id_for(token.run_key).await;
+            return Err(NotShardOwner::local(shard_id, current_epoch).into());
         }
         Ok(())
     }
@@ -1629,7 +1710,11 @@ where
     {
         let outcome = self
             .repo
-            .try_acquire_bundle(shard_id, self.owner_identity.clone())
+            .try_acquire_bundle(
+                shard_id,
+                self.owner_identity.clone(),
+                self.node_endpoint.clone(),
+            )
             .await?;
         let epoch = match outcome {
             LeaseOutcome::Acquired { epoch } => epoch,
@@ -1649,6 +1734,7 @@ where
             self.repo.clone(),
             shard_id,
             self.owner_identity.clone(),
+            self.node_endpoint.clone(),
             epoch,
             tokio::time::Duration::from_secs(1),
             3,
@@ -2086,6 +2172,47 @@ where
     }
 }
 
+impl<R> TokeiraRuntime<R>
+where
+    R: RunRepository + LeaseRepository + 'static,
+{
+    pub fn spawn_membership_client(
+        &self,
+        config: MembershipConfig,
+        budget_applier: Arc<dyn ConnectionBudgetApplier>,
+        shutdown: CancellationToken,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        let client = MembershipClient::new(
+            config,
+            self.repo.clone(),
+            self.shard_owner.clone(),
+            self.runtime_drain.clone(),
+            budget_applier,
+        );
+        tokio::spawn(client.run(shutdown))
+    }
+}
+
+fn is_externally_routed_command(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Start(_)
+            | Command::SignalWithStart(_)
+            | Command::Update(_)
+            | Command::Signal(_)
+            | Command::Cancel(_)
+            | Command::Terminate(_)
+            | Command::Reset(_)
+            | Command::PauseWorkflow(_)
+            | Command::UnpauseWorkflow(_)
+            | Command::UpdateActivityOptions(_)
+            | Command::PauseActivity(_)
+            | Command::UnpauseActivity(_)
+            | Command::ResetActivity(_)
+            | Command::UpdateExecutionOptions(_)
+    )
+}
+
 /// A workflow task that has been polled and started.
 #[derive(Clone, Debug)]
 pub struct StartedWorkflowTask {
@@ -2156,6 +2283,7 @@ mod tests {
     use super::*;
     use crate::{
         broker::InMemoryBroker,
+        drain::RuntimeDrainState,
         lane::DispatchPublisher,
         nexus::{
             EndpointTarget, NexusEndpointConfig, NexusEndpointRegistry, NexusTaskBroker,
@@ -2267,6 +2395,60 @@ mod tests {
 
             assert_eq!(runtime.lane_index(first), runtime.lane_index(second));
         });
+    }
+
+    #[test]
+    fn runtime_constructor_preserves_membership_identity_and_endpoint() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async move {
+            let repo = Arc::new(InMemoryStore::with_shard_count(4));
+            let node_id = IncarnationId::new();
+            let runtime = TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
+                repo,
+                2,
+                LaneConfig::default(),
+                TimerScannerConfig::default(),
+                WorkflowTimeoutScannerConfig::default(),
+                BacklogConfig::default(),
+                ActivityTimeoutScannerConfig::default(),
+                NexusTimeoutScannerConfig::default(),
+                NexusEndpointRegistry::default(),
+                Arc::new(NoopNexusHttpClient),
+                4,
+                node_id.to_string(),
+                "127.0.0.1:7233".to_owned(),
+                true,
+                Arc::new(VersioningRuleStore::default()),
+            );
+
+            assert_eq!(runtime.owner_identity(), node_id.to_string());
+            assert_eq!(runtime.node_endpoint(), "127.0.0.1:7233");
+            assert_eq!(
+                runtime.heartbeat_inputs(5, 0.5).drain_state,
+                RuntimeDrainState::Active
+            );
+        });
+    }
+
+    #[test]
+    fn drain_admission_classification_separates_external_from_inflight_commands() {
+        let start = Command::Start(sample_start_request(None, None));
+        let completion = Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+            token: WorkflowTaskToken {
+                run_key: RunKey::new(),
+                logical_seq: LogicalTaskSeq(1),
+                started_event_id: 1,
+                attempt: 1,
+                shard_epoch: ShardEpoch::ZERO,
+            },
+            identity: WorkerIdentity("worker".to_owned()),
+            commands: Vec::new(),
+            force_new_workflow_task: false,
+            now: OffsetDateTime::now_utc(),
+        });
+
+        assert!(is_externally_routed_command(&start));
+        assert!(!is_externally_routed_command(&completion));
     }
 
     proptest! {
@@ -3497,6 +3679,16 @@ mod tests {
         async fn commit_transition(
             &self,
             _run_key: RunKey,
+            _transition: Transition,
+            _epoch: ShardEpoch,
+        ) -> Result<CommitResult> {
+            panic!("unused in timer scanner tests")
+        }
+
+        async fn commit_transition_for_bundle(
+            &self,
+            _run_key: RunKey,
+            _execution_home_bundle: ShardId,
             _transition: Transition,
             _epoch: ShardEpoch,
         ) -> Result<CommitResult> {

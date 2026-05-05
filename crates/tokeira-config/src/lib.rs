@@ -41,9 +41,38 @@ pub struct InfrastructureConfig {
     #[serde(default)]
     pub dsql: DsqlInfraConfig,
     #[serde(default)]
+    pub placement: PlacementMembershipConfig,
+    #[serde(default)]
     pub network: NetworkConfig,
     #[serde(default)]
     pub observability: ObservabilityConfig,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlacementMembershipConfig {
+    #[serde(default)]
+    pub controller_endpoint: Option<String>,
+    #[serde(default = "default_heartbeat_interval_ms")]
+    pub heartbeat_interval_ms: u64,
+    #[serde(default = "default_reconnect_base_delay_ms")]
+    pub reconnect_base_delay_ms: u64,
+    #[serde(default = "default_reconnect_max_delay_ms")]
+    pub reconnect_max_delay_ms: u64,
+    #[serde(default = "default_node_host")]
+    pub node_host: String,
+    #[serde(default)]
+    pub node_port: Option<u16>,
+    #[serde(default = "default_placement_shard_count")]
+    pub shard_count: u32,
+    #[serde(default = "default_placement_bundle_count")]
+    pub bundle_count: u32,
+    #[serde(default = "default_placement_partition_count")]
+    pub partition_count: u32,
+    #[serde(default = "default_placement_hash_version")]
+    pub hash_version: u32,
+    #[serde(default = "default_routing_max_retries")]
+    pub routing_max_retries: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -197,8 +226,27 @@ impl Default for InfrastructureConfig {
             cluster_name: default_cluster_name(),
             region: default_region(),
             dsql: DsqlInfraConfig::default(),
+            placement: PlacementMembershipConfig::default(),
             network: NetworkConfig::default(),
             observability: ObservabilityConfig::default(),
+        }
+    }
+}
+
+impl Default for PlacementMembershipConfig {
+    fn default() -> Self {
+        Self {
+            controller_endpoint: None,
+            heartbeat_interval_ms: default_heartbeat_interval_ms(),
+            reconnect_base_delay_ms: default_reconnect_base_delay_ms(),
+            reconnect_max_delay_ms: default_reconnect_max_delay_ms(),
+            node_host: default_node_host(),
+            node_port: None,
+            shard_count: default_placement_shard_count(),
+            bundle_count: default_placement_bundle_count(),
+            partition_count: default_placement_partition_count(),
+            hash_version: default_placement_hash_version(),
+            routing_max_retries: default_routing_max_retries(),
         }
     }
 }
@@ -343,6 +391,55 @@ impl TokeiraConfig {
                 ),
             });
         }
+        let placement = &self.infrastructure.placement;
+        if placement.heartbeat_interval_ms == 0 {
+            errors.push(ValidationError::Field {
+                field: "infrastructure.placement.heartbeat_interval_ms".to_string(),
+                message: "must be positive".to_string(),
+            });
+        }
+        if placement.reconnect_base_delay_ms == 0 {
+            errors.push(ValidationError::Field {
+                field: "infrastructure.placement.reconnect_base_delay_ms".to_string(),
+                message: "must be positive".to_string(),
+            });
+        }
+        if placement.reconnect_max_delay_ms < placement.reconnect_base_delay_ms {
+            errors.push(ValidationError::Field {
+                field: "infrastructure.placement.reconnect_max_delay_ms".to_string(),
+                message: "must be greater than or equal to reconnect_base_delay_ms".to_string(),
+            });
+        }
+        if placement.node_host.is_empty() {
+            errors.push(ValidationError::Field {
+                field: "infrastructure.placement.node_host".to_string(),
+                message: "must not be empty".to_string(),
+            });
+        }
+        if placement.shard_count == 0 {
+            errors.push(ValidationError::Field {
+                field: "infrastructure.placement.shard_count".to_string(),
+                message: "must be positive".to_string(),
+            });
+        }
+        if placement.bundle_count == 0 {
+            errors.push(ValidationError::Field {
+                field: "infrastructure.placement.bundle_count".to_string(),
+                message: "must be positive".to_string(),
+            });
+        }
+        if placement.partition_count == 0 {
+            errors.push(ValidationError::Field {
+                field: "infrastructure.placement.partition_count".to_string(),
+                message: "must be positive".to_string(),
+            });
+        }
+        if placement.routing_max_retries == 0 {
+            errors.push(ValidationError::Field {
+                field: "infrastructure.placement.routing_max_retries".to_string(),
+                message: "must be positive".to_string(),
+            });
+        }
 
         if errors.is_empty() {
             Ok(())
@@ -417,8 +514,44 @@ fn default_cluster_name() -> String {
     "tokeira-local".to_string()
 }
 
+fn default_node_host() -> String {
+    "127.0.0.1".to_string()
+}
+
 fn default_region() -> String {
     "us-east-1".to_string()
+}
+
+fn default_heartbeat_interval_ms() -> u64 {
+    5_000
+}
+
+fn default_reconnect_base_delay_ms() -> u64 {
+    1_000
+}
+
+fn default_reconnect_max_delay_ms() -> u64 {
+    30_000
+}
+
+fn default_placement_shard_count() -> u32 {
+    1
+}
+
+fn default_placement_bundle_count() -> u32 {
+    1
+}
+
+fn default_placement_partition_count() -> u32 {
+    16
+}
+
+fn default_placement_hash_version() -> u32 {
+    1
+}
+
+fn default_routing_max_retries() -> usize {
+    3
 }
 
 fn default_grpc_addr() -> String {
@@ -528,12 +661,51 @@ mod tests {
     fn toml_round_trip_preserves_config() {
         let mut config = TokeiraConfig::default();
         config.infrastructure.cluster_name = "prod".to_string();
+        config.infrastructure.placement.controller_endpoint =
+            Some("http://127.0.0.1:7240".to_string());
+        config.infrastructure.placement.bundle_count = 64;
         config.infrastructure.observability.log_format = LogFormatConfig::Json;
         config.emergency.cap_poll_admission = Some(10);
 
         let encoded = config.to_toml().unwrap();
         let decoded: TokeiraConfig = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded, config);
+    }
+
+    #[test]
+    fn placement_config_rejects_invalid_timing_and_counts() {
+        let mut config = TokeiraConfig::default();
+        config.infrastructure.placement.heartbeat_interval_ms = 0;
+        config.infrastructure.placement.reconnect_base_delay_ms = 10;
+        config.infrastructure.placement.reconnect_max_delay_ms = 1;
+        config.infrastructure.placement.bundle_count = 0;
+        config.infrastructure.placement.routing_max_retries = 0;
+
+        match config.validate().unwrap_err() {
+            ConfigError::Validation(errors) => {
+                assert!(
+                    errors
+                        .iter()
+                        .any(|error| { error.to_string().contains("heartbeat_interval_ms") })
+                );
+                assert!(
+                    errors
+                        .iter()
+                        .any(|error| { error.to_string().contains("reconnect_max_delay_ms") })
+                );
+                assert!(
+                    errors
+                        .iter()
+                        .any(|error| error.to_string().contains("bundle_count"))
+                );
+                assert!(
+                    errors
+                        .iter()
+                        .any(|error| { error.to_string().contains("routing_max_retries") })
+                );
+            }
+            other => panic!("expected validation errors, got {other:?}"),
+        }
     }
 
     #[test]
@@ -741,6 +913,7 @@ mod tests {
                         cluster_name,
                         region,
                         dsql: DsqlInfraConfig::default(),
+                        placement: PlacementMembershipConfig::default(),
                         network: NetworkConfig::default(),
                         observability: ObservabilityConfig {
                             metrics_enabled,

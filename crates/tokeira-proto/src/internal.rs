@@ -16,6 +16,12 @@ pub mod tokeira {
             pub mod v1 {}
         }
 
+        pub mod controller {
+            pub mod v1 {
+                tonic::include_proto!("tokeira.internal.controller.v1");
+            }
+        }
+
         pub mod admin {
             pub mod v1 {}
         }
@@ -26,6 +32,10 @@ pub mod tokeira {
 pub const FILE_DESCRIPTOR_SET: &[u8] =
     tonic::include_file_descriptor_set!("tokeira_internal_descriptor");
 
-pub use tokeira::internal::{admin::v1 as admin, runtime::v1 as runtime};
+pub use tokeira::internal::{
+    admin::v1 as admin, controller::v1 as controller, runtime::v1 as runtime,
+};
 
 pub const ADMIN_SERVICE_NAME: &str = "tokeira.internal.admin.v1.AdminService";
+pub const PLACEMENT_CONTROLLER_SERVICE_NAME: &str =
+    "tokeira.internal.controller.v1.PlacementController";

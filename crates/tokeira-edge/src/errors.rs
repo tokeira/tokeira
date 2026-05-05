@@ -8,6 +8,7 @@
 
 use http::StatusCode;
 use thiserror::Error;
+use tokeira_types::{BundleId, IncarnationId, ShardEpoch};
 
 /// Common error surface for edge handlers.
 ///
@@ -65,6 +66,15 @@ pub enum EdgeError {
     #[error("request routed to remote target `{target}` but forwarding is not wired yet")]
     RemoteRouteUnsupported { target: String },
 
+    #[error(
+        "not shard owner for bundle {bundle_id:?}: current_epoch={current_epoch:?}, current_owner={current_owner_node_id:?}"
+    )]
+    NotShardOwner {
+        bundle_id: BundleId,
+        current_epoch: ShardEpoch,
+        current_owner_node_id: Option<IncarnationId>,
+    },
+
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -91,6 +101,7 @@ impl EdgeError {
             EdgeError::TooManyLongPolls => StatusCode::TOO_MANY_REQUESTS,
             EdgeError::LongPollAdmissionTimeout => StatusCode::REQUEST_TIMEOUT,
             EdgeError::RemoteRouteUnsupported { .. } => StatusCode::BAD_GATEWAY,
+            EdgeError::NotShardOwner { .. } => StatusCode::CONFLICT,
             EdgeError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -110,6 +121,7 @@ impl EdgeError {
             EdgeError::TooManyLongPolls => "too_many_long_polls",
             EdgeError::LongPollAdmissionTimeout => "long_poll_admission_timeout",
             EdgeError::RemoteRouteUnsupported { .. } => "remote_route_unsupported",
+            EdgeError::NotShardOwner { .. } => "not_shard_owner",
             EdgeError::Internal(_) => "internal",
         }
     }
@@ -117,6 +129,13 @@ impl EdgeError {
 
 impl From<anyhow::Error> for EdgeError {
     fn from(value: anyhow::Error) -> Self {
-        Self::Internal(value.to_string())
+        match value.downcast::<tokeira_runtime::NotShardOwner>() {
+            Ok(not_owner) => Self::NotShardOwner {
+                bundle_id: not_owner.bundle_id,
+                current_epoch: not_owner.current_epoch,
+                current_owner_node_id: not_owner.current_owner_node_id,
+            },
+            Err(value) => Self::Internal(value.to_string()),
+        }
     }
 }

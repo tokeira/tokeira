@@ -20,14 +20,15 @@ mod observability;
 
 use tokeira_config::{Cli, TokeiraConfig};
 use tokeira_edge::{
-    EdgeInterceptors, HistoryNotifyingRepository, HistoryWaitRegistry, InMemoryNamespaceCache,
-    InMemoryOperatorApi, LocalOnlyRouter, LongPollConfig, LongPollGate, NamespaceCache,
-    OperatorService, PendingQueryStore, PollerRegistry, ResolvedNamespace,
-    WorkflowExecutionDescription, WorkflowService,
+    CacheBackedRouter, EdgeInterceptors, EdgeRoutingConfig, HistoryNotifyingRepository,
+    HistoryWaitRegistry, InMemoryNamespaceCache, InMemoryOperatorApi, LocalOnlyRouter,
+    LongPollConfig, LongPollGate, NamespaceCache, OperatorService, PendingQueryStore,
+    PollerRegistry, ResolvedNamespace, RoutingCache, WorkflowExecutionDescription, WorkflowService,
     grpc::{
         operator_service::OperatorServiceGrpc, runtime_adapter::RuntimeAdapter,
         workflow_service::WorkflowServiceGrpc,
     },
+    run_routing_subscription,
     translate::to_internal::namespace_id_for,
     workflow_service::ExecutionResolver,
 };
@@ -36,11 +37,15 @@ use tokeira_projection::{
     InMemoryVisibilityStore, ProjectionWorker, VisibilityQueryService, VisibilitySink,
 };
 use tokeira_runtime::{
-    EndpointTarget, NexusEndpointConfig, NexusEndpointRegistry, NoopNexusHttpClient, RuntimeConfig,
-    ScheduleEngineConfig, ScheduleStore, TokeiraRuntime, VersioningRuleStore, run_schedule_engine,
+    ConnectionBudgetApplier, EndpointTarget, MembershipConfig, NexusEndpointConfig,
+    NexusEndpointRegistry, NoopNexusHttpClient, RuntimeConfig, ScheduleEngineConfig, ScheduleStore,
+    TokeiraRuntime, VersioningRuleStore, run_schedule_engine,
 };
 use tokeira_storage::{InMemoryStore, RunRepository};
-use tokeira_types::{ExecutionRef, NamespaceId, ProjectionCursor, WorkflowId};
+use tokeira_types::{
+    ExecutionRef, IncarnationId, NamespaceId, NodeEndpoint, PlacementConfig, ProjectionCursor,
+    WorkflowId,
+};
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -82,7 +87,7 @@ async fn main() -> Result<()> {
         log_reload,
     );
 
-    let addr = effective_config
+    let addr: std::net::SocketAddr = effective_config
         .infrastructure
         .network
         .grpc_addr
@@ -97,6 +102,8 @@ async fn main() -> Result<()> {
 
     // Build the authoritative dev store first, then wrap it with the
     // history-notifying repository used by edge long-poll.
+    let node_id = IncarnationId::new();
+    let node_endpoint = configured_node_endpoint(&effective_config, addr);
     let store = InMemoryStore::default();
     let history_waits = HistoryWaitRegistry::default();
     let repo = Arc::new(HistoryNotifyingRepository::new(
@@ -119,13 +126,41 @@ async fn main() -> Result<()> {
     // run-local in-memory coordination such as buffered consistent queries.
     let versioning_rule_store = Arc::new(VersioningRuleStore::default());
     let schedule_store = Arc::new(ScheduleStore::default());
-    let runtime = Arc::new(TokeiraRuntime::new_with_nexus_and_versioning_config(
+    let runtime = Arc::new(TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
         repo.clone(),
-        RuntimeConfig::default(),
+        RuntimeConfig::default().lane_count,
+        RuntimeConfig::default().lane,
+        RuntimeConfig::default().timer_scanner,
+        RuntimeConfig::default().workflow_timeout_scanner,
+        RuntimeConfig::default().backlog,
+        RuntimeConfig::default().activity_timeout_scanner,
+        RuntimeConfig::default().nexus_timeout_scanner,
         nexus_registry,
         Arc::new(NoopNexusHttpClient),
+        effective_config.infrastructure.placement.shard_count,
+        node_id.to_string(),
+        node_endpoint.as_authority(),
+        true,
         versioning_rule_store.clone(),
     ));
+    let membership_cancel = CancellationToken::new();
+    let _membership_client = effective_config
+        .infrastructure
+        .placement
+        .controller_endpoint
+        .clone()
+        .map(|controller_endpoint| {
+            runtime.spawn_membership_client(
+                membership_config(
+                    &effective_config,
+                    node_id,
+                    node_endpoint.clone(),
+                    controller_endpoint,
+                ),
+                Arc::new(NoopConnectionBudgetApplier),
+                membership_cancel.clone(),
+            )
+        });
     let schedule_engine_cancel = CancellationToken::new();
     let _schedule_engine = run_schedule_engine(
         schedule_store.clone(),
@@ -136,7 +171,36 @@ async fn main() -> Result<()> {
     );
 
     let interceptors = Arc::new(EdgeInterceptors::permissive(namespaces.clone()));
-    let router = Arc::new(LocalOnlyRouter);
+    let routing_subscription_cancel = CancellationToken::new();
+    let router: Arc<dyn tokeira_edge::EdgeRouter> = if let Some(controller_endpoint) =
+        effective_config
+            .infrastructure
+            .placement
+            .controller_endpoint
+            .clone()
+    {
+        let routing_cache = Arc::new(RoutingCache::new(placement_config(&effective_config)));
+        let routing_config = EdgeRoutingConfig {
+            controller_endpoint,
+            max_retries: effective_config
+                .infrastructure
+                .placement
+                .routing_max_retries,
+        };
+        let subscription_cache = routing_cache.clone();
+        let subscription_cancel = routing_subscription_cancel.clone();
+        let _routing_subscription = tokio::spawn(async move {
+            if let Err(error) =
+                run_routing_subscription(subscription_cache, routing_config, subscription_cancel)
+                    .await
+            {
+                tracing::warn!(?error, "routing subscription exited");
+            }
+        });
+        Arc::new(CacheBackedRouter::new(routing_cache, node_id))
+    } else {
+        Arc::new(LocalOnlyRouter)
+    };
     let workflow_broker = runtime.broker();
     let buffered_queries = runtime.buffered_queries();
     let worker_registry = runtime.worker_registry();
@@ -259,6 +323,64 @@ async fn build_nexus_endpoint_registry(
         resolved.insert(endpoint_name, NexusEndpointConfig { target });
     }
     Ok(NexusEndpointRegistry::new(resolved))
+}
+
+fn configured_node_endpoint(
+    config: &TokeiraConfig,
+    listen_addr: std::net::SocketAddr,
+) -> NodeEndpoint {
+    NodeEndpoint {
+        host: config.infrastructure.placement.node_host.clone(),
+        port: config
+            .infrastructure
+            .placement
+            .node_port
+            .unwrap_or_else(|| listen_addr.port()),
+    }
+}
+
+fn placement_config(config: &TokeiraConfig) -> PlacementConfig {
+    let placement = &config.infrastructure.placement;
+    PlacementConfig {
+        shard_count: placement.shard_count,
+        bundle_count: placement.bundle_count,
+        partition_count: placement.partition_count,
+        hash_version: placement.hash_version,
+    }
+}
+
+fn membership_config(
+    config: &TokeiraConfig,
+    node_id: IncarnationId,
+    node_endpoint: NodeEndpoint,
+    controller_endpoint: String,
+) -> MembershipConfig {
+    let placement = &config.infrastructure.placement;
+    MembershipConfig {
+        controller_endpoint,
+        heartbeat_interval: std::time::Duration::from_millis(placement.heartbeat_interval_ms),
+        reconnect_base_delay: std::time::Duration::from_millis(placement.reconnect_base_delay_ms),
+        reconnect_max_delay: std::time::Duration::from_millis(placement.reconnect_max_delay_ms),
+        node_id,
+        node_endpoint,
+        zone: None,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        build_id: env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
+#[derive(Debug)]
+struct NoopConnectionBudgetApplier;
+
+impl ConnectionBudgetApplier for NoopConnectionBudgetApplier {
+    fn apply_budget(
+        &self,
+        _rate_per_second: f64,
+        _capacity: u64,
+        _max_reservoir_size: u32,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 struct StoreExecutionResolver<R> {
@@ -450,5 +572,40 @@ mod tests {
         let error = result.err().expect("error");
 
         assert!(error.to_string().contains("namespace `missing` not found"));
+    }
+
+    #[test]
+    fn placement_helpers_build_runtime_and_edge_config_from_server_config() {
+        let mut config = TokeiraConfig::default();
+        config.infrastructure.placement.controller_endpoint =
+            Some("http://127.0.0.1:7240".to_string());
+        config.infrastructure.placement.node_host = "10.0.0.9".to_string();
+        config.infrastructure.placement.node_port = Some(8123);
+        config.infrastructure.placement.shard_count = 8;
+        config.infrastructure.placement.bundle_count = 4;
+        config.infrastructure.placement.partition_count = 64;
+        config.infrastructure.placement.hash_version = 2;
+        let listen_addr = "127.0.0.1:7233".parse().unwrap();
+        let node_id = IncarnationId::new();
+        let endpoint = configured_node_endpoint(&config, listen_addr);
+        let membership = membership_config(
+            &config,
+            node_id,
+            endpoint.clone(),
+            "http://127.0.0.1:7240".into(),
+        );
+
+        assert_eq!(endpoint.as_authority(), "10.0.0.9:8123");
+        assert_eq!(membership.node_id, node_id);
+        assert_eq!(membership.node_endpoint, endpoint);
+        assert_eq!(
+            placement_config(&config),
+            PlacementConfig {
+                shard_count: 8,
+                bundle_count: 4,
+                partition_count: 64,
+                hash_version: 2,
+            }
+        );
     }
 }

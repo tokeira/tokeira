@@ -17,16 +17,17 @@ use tokeira_kernel::{
     TimerOp, Transition, WorkflowState,
 };
 use tokeira_types::{
-    BuildId, DeploymentId, ExecutionRef, ExecutionStatus, NamespaceId, Payloads, QueueKey,
-    RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskKind, TaskQueueName, TransitionSeq,
-    WorkerIdentity, WorkflowId, dsql_spread_uuid,
+    BuildId, DeploymentId, ExecutionRef, ExecutionStatus, GenerationCounter, NamespaceId, Payloads,
+    QueueKey, RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskKind, TaskQueueName,
+    TransitionSeq, WorkerIdentity, WorkflowId, dsql_spread_uuid,
 };
 use tracing::instrument;
 use uuid::Uuid;
 
 use crate::{
-    ActivitySweepEntry, BacklogEntry, CommitResult, CurrentExecutionConflictPolicy, DbClass,
-    DispatchableActivityTask, DispatchableWorkflowTask, DueTimer, LeaseOutcome, LeaseRepository,
+    ActivitySweepEntry, BacklogEntry, BudgetAllocationResult, BundleLease, CommitResult,
+    ControlRepository, CurrentExecutionConflictPolicy, DbClass, DispatchableActivityTask,
+    DispatchableWorkflowTask, DueTimer, GenerationAdvanceResult, LeaseOutcome, LeaseRepository,
     NexusSweepEntry, ProjectionContext, RequestRecord, RunRepository, TransitionAuditRecord,
     WftTimeoutSweepEntry, WorkflowTimeoutSweepEntry,
 };
@@ -122,7 +123,21 @@ impl DsqlRunRepository {
     /// preserves that schema without changing the public `ShardId(pub u32)`
     /// type used throughout runtime ownership code.
     pub(crate) fn shard_id_to_uuid(shard_id: ShardId) -> Uuid {
-        dsql_spread_uuid(&[b"shard", &shard_id.0.to_le_bytes()])
+        let mut bytes = *b"tokeira-shard-id";
+        bytes[12..16].copy_from_slice(&shard_id.0.to_be_bytes());
+        Uuid::from_bytes(bytes)
+    }
+
+    pub(crate) fn shard_id_from_uuid(value: Uuid) -> Result<ShardId> {
+        let bytes = value.into_bytes();
+        if &bytes[0..12] != b"tokeira-sha" {
+            bail!("shard UUID does not use reversible shard-id encoding");
+        }
+        Ok(ShardId(u32::from_be_bytes(
+            bytes[12..16]
+                .try_into()
+                .context("invalid shard UUID length")?,
+        )))
     }
 
     pub(crate) fn current_execution_key(
@@ -386,7 +401,11 @@ impl RunRepository for DsqlRunRepository {
         let mut permit = self.director.acquire(DbClass::Commit).await?;
         let mut tx = permit.connection()?.begin().await?;
         let state = transition.next_state.clone();
-        let shard_id = self.shard_for_run_key(run_key);
+        let shard_id = tokeira_types::execution_home_bundle(
+            state.namespace_id.0.as_bytes(),
+            state.workflow_id.0.as_bytes(),
+            self.shard_count,
+        );
 
         if should_check_epoch(epoch) {
             // Epoch fencing ties a commit to the lane/shard lease that produced
@@ -504,6 +523,48 @@ impl RunRepository for DsqlRunRepository {
             }),
             Err(err) => Err(err.into()),
         }
+    }
+
+    #[instrument(name = "dsql.commit_transition_for_bundle", skip(self, transition), fields(run_key = %run_key.0, bundle = execution_home_bundle.0, expected_seq = transition.expected_seq.0, epoch = epoch.0))]
+    async fn commit_transition_for_bundle(
+        &self,
+        run_key: RunKey,
+        execution_home_bundle: ShardId,
+        transition: Transition,
+        epoch: ShardEpoch,
+    ) -> Result<CommitResult> {
+        if should_check_epoch(epoch) {
+            convert::i64_from_u64(epoch.0, "caller shard epoch")?;
+            let mut permit = self.director.acquire(DbClass::Commit).await?;
+            let mut tx = permit.connection()?.begin().await?;
+            let row =
+                sqlx::query_as::<_, (i64,)>("SELECT epoch FROM shard_lease WHERE shard_id = $1")
+                    .bind(Self::shard_id_to_uuid(execution_home_bundle))
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let Some((durable_epoch,)) = row else {
+                tx.rollback().await?;
+                return Ok(CommitResult::Conflict {
+                    reason: format!(
+                        "no active lease for execution-home bundle {:?} at epoch {:?}",
+                        execution_home_bundle, epoch
+                    ),
+                });
+            };
+            if durable_epoch != convert::i64_from_u64(epoch.0, "caller shard epoch")? {
+                tx.rollback().await?;
+                return Ok(CommitResult::Conflict {
+                    reason: format!(
+                        "stale shard epoch {:?} for execution-home bundle {:?}; current {}",
+                        epoch, execution_home_bundle, durable_epoch
+                    ),
+                });
+            }
+            tx.rollback().await?;
+        }
+
+        self.commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .await
     }
 
     #[instrument(name = "dsql.materialize_reset_successor", skip(self), fields(base_run_key = %base_run_key.0, fork_event_id, successor_run_id = %successor_run_id.0))]
@@ -990,7 +1051,12 @@ impl RunRepository for DsqlRunRepository {
 #[async_trait]
 impl LeaseRepository for DsqlRunRepository {
     #[instrument(name = "dsql.try_acquire_bundle", skip(self), fields(shard_id = bundle.0, owner = %owner))]
-    async fn try_acquire_bundle(&self, bundle: ShardId, owner: String) -> Result<LeaseOutcome> {
+    async fn try_acquire_bundle(
+        &self,
+        bundle: ShardId,
+        owner: String,
+        node_endpoint: String,
+    ) -> Result<LeaseOutcome> {
         let shard_uuid = Self::shard_id_to_uuid(bundle);
         let app_now = OffsetDateTime::now_utc();
         let new_expiry = app_now + self.lease_duration;
@@ -999,13 +1065,14 @@ impl LeaseRepository for DsqlRunRepository {
         let mut tx = permit.connection()?.begin().await?;
 
         let insert_result = sqlx::query(
-            "INSERT INTO shard_lease (shard_id, owner, epoch, lease_expiry)
-             VALUES ($1, $2, 1, $3)
+            "INSERT INTO shard_lease (shard_id, owner, epoch, lease_expiry, node_endpoint)
+             VALUES ($1, $2, 1, $3, $4)
              ON CONFLICT (shard_id) DO NOTHING",
         )
         .bind(shard_uuid)
         .bind(&owner)
         .bind(new_expiry)
+        .bind(&node_endpoint)
         .execute(&mut *tx)
         .await;
 
@@ -1031,14 +1098,16 @@ impl LeaseRepository for DsqlRunRepository {
                          WHEN owner = $2 AND lease_expiry > $4 THEN epoch
                          ELSE epoch + 1
                      END,
-                     lease_expiry = $3
+                     lease_expiry = $3,
+                     node_endpoint = $5
                  WHERE shard_id = $1
-                   AND (owner = $2 OR lease_expiry <= $4)",
+                   AND (owner = $2 OR owner IS NULL OR lease_expiry <= $4)",
             )
             .bind(shard_uuid)
             .bind(&owner)
             .bind(new_expiry)
             .bind(app_now)
+            .bind(&node_endpoint)
             .execute(&mut *tx)
             .await;
 
@@ -1070,14 +1139,20 @@ impl LeaseRepository for DsqlRunRepository {
                 None,
             )?
         } else {
-            let row = sqlx::query_as::<_, (String, i64)>(
+            let row = sqlx::query_as::<_, (Option<String>, i64)>(
                 "SELECT owner, epoch FROM shard_lease WHERE shard_id = $1",
             )
             .bind(shard_uuid)
             .fetch_optional(&mut *tx)
             .await
             .context("failed to read rejected shard lease holder")?;
-            interpret_acquire(insert_rows_affected, update_rows_affected, None, row)?
+            let rejected_row = row.map(|(owner, epoch)| (owner.unwrap_or_default(), epoch));
+            interpret_acquire(
+                insert_rows_affected,
+                update_rows_affected,
+                None,
+                rejected_row,
+            )?
         };
 
         match outcome {
@@ -1105,6 +1180,7 @@ impl LeaseRepository for DsqlRunRepository {
         bundle: ShardId,
         owner: String,
         epoch: ShardEpoch,
+        node_endpoint: String,
     ) -> Result<LeaseOutcome> {
         let caller_epoch = epoch_to_sql(epoch)?;
         let shard_uuid = Self::shard_id_to_uuid(bundle);
@@ -1113,7 +1189,7 @@ impl LeaseRepository for DsqlRunRepository {
         let mut permit = self.director.acquire(DbClass::Control).await?;
         let mut tx = permit.connection()?.begin().await?;
 
-        let row = sqlx::query_as::<_, (String, i64)>(
+        let row = sqlx::query_as::<_, (Option<String>, i64)>(
             "SELECT owner, epoch
              FROM shard_lease
              WHERE shard_id = $1
@@ -1125,7 +1201,8 @@ impl LeaseRepository for DsqlRunRepository {
         .context("failed to read shard lease for renewal")?;
 
         let decision = decide_renew(
-            row.as_ref().map(|(owner, epoch)| (owner.as_str(), *epoch)),
+            row.as_ref()
+                .map(|(owner, epoch)| (owner.as_deref().unwrap_or(""), *epoch)),
             &owner,
             caller_epoch,
         )?;
@@ -1133,11 +1210,13 @@ impl LeaseRepository for DsqlRunRepository {
             RenewDecision::Renew => {
                 let update_result = sqlx::query(
                     "UPDATE shard_lease
-                     SET lease_expiry = $1
+                     SET lease_expiry = $1,
+                         node_endpoint = $3
                      WHERE shard_id = $2",
                 )
                 .bind(new_expiry)
                 .bind(shard_uuid)
+                .bind(&node_endpoint)
                 .execute(&mut *tx)
                 .await;
 
@@ -1170,6 +1249,176 @@ impl LeaseRepository for DsqlRunRepository {
                 })
             }
         }
+    }
+
+    #[instrument(name = "dsql.list_bundle_leases", skip(self))]
+    async fn list_bundle_leases(&self) -> Result<Vec<BundleLease>> {
+        let mut permit = self.director.acquire(DbClass::Control).await?;
+        let rows =
+            sqlx::query_as::<_, (Uuid, Option<String>, i64, OffsetDateTime, Option<String>)>(
+                "SELECT shard_id, owner, epoch, lease_expiry, node_endpoint FROM shard_lease",
+            )
+            .fetch_all(permit.connection()?)
+            .await
+            .context("failed to list shard leases")?;
+
+        rows.into_iter()
+            .map(|(shard_uuid, owner, epoch, lease_until, endpoint)| {
+                Ok(BundleLease {
+                    bundle_id: Self::shard_id_from_uuid(shard_uuid)?,
+                    owner_node_id: owner,
+                    epoch: epoch_from_sql(epoch)?,
+                    lease_until,
+                    node_endpoint: endpoint,
+                })
+            })
+            .collect()
+    }
+
+    #[instrument(name = "dsql.relinquish_bundle", skip(self), fields(shard_id = bundle.0, owner = %owner, epoch = epoch.0))]
+    async fn relinquish_bundle(
+        &self,
+        bundle: ShardId,
+        owner: String,
+        epoch: ShardEpoch,
+    ) -> Result<LeaseOutcome> {
+        let shard_uuid = Self::shard_id_to_uuid(bundle);
+        let caller_epoch = epoch_to_sql(epoch)?;
+        let mut permit = self.director.acquire(DbClass::Control).await?;
+        let mut tx = permit.connection()?.begin().await?;
+        let row = sqlx::query_as::<_, (i64,)>(
+            "UPDATE shard_lease
+             SET owner = NULL,
+                 epoch = epoch + 1,
+                 node_endpoint = NULL
+             WHERE shard_id = $1 AND owner = $2 AND epoch = $3
+             RETURNING epoch",
+        )
+        .bind(shard_uuid)
+        .bind(&owner)
+        .bind(caller_epoch)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("failed to relinquish shard lease")?;
+
+        if let Some((new_epoch,)) = row {
+            tx.commit().await?;
+            return Ok(LeaseOutcome::Acquired {
+                epoch: epoch_from_sql(new_epoch)?,
+            });
+        }
+
+        let current = sqlx::query_as::<_, (Option<String>, i64)>(
+            "SELECT owner, epoch FROM shard_lease WHERE shard_id = $1",
+        )
+        .bind(shard_uuid)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("failed to read rejected shard lease holder after relinquish")?;
+        tx.rollback().await?;
+        let (current_owner, current_epoch) = current.unwrap_or((None, 0));
+        Ok(LeaseOutcome::Rejected {
+            current_owner: current_owner.unwrap_or_default(),
+            current_epoch: epoch_from_sql(current_epoch)?,
+        })
+    }
+}
+
+#[async_trait]
+impl ControlRepository for DsqlRunRepository {
+    #[instrument(name = "dsql.advance_generation", skip(self), fields(expected = expected.0))]
+    async fn advance_generation(
+        &self,
+        expected: GenerationCounter,
+    ) -> Result<GenerationAdvanceResult> {
+        let expected = convert::i64_from_u64(expected.0, "routing_generation.generation")?;
+        let mut permit = self.director.acquire(DbClass::Control).await?;
+        let row = sqlx::query_as::<_, (i64,)>(
+            "UPDATE routing_generation
+             SET generation = generation + 1,
+                 updated_at = now()
+             WHERE id = 1 AND generation = $1
+             RETURNING generation",
+        )
+        .bind(expected)
+        .fetch_optional(permit.connection()?)
+        .await
+        .context("failed to advance routing generation")?;
+
+        match row {
+            Some((generation,)) => Ok(GenerationAdvanceResult::Advanced(GenerationCounter(
+                convert::u64_from_i64(generation, "routing_generation.generation")?,
+            ))),
+            None => Ok(GenerationAdvanceResult::Conflict(
+                self.current_generation().await?,
+            )),
+        }
+    }
+
+    #[instrument(name = "dsql.current_generation", skip(self))]
+    async fn current_generation(&self) -> Result<GenerationCounter> {
+        let mut permit = self.director.acquire(DbClass::Control).await?;
+        let (generation,) =
+            sqlx::query_as::<_, (i64,)>("SELECT generation FROM routing_generation WHERE id = 1")
+                .fetch_one(permit.connection()?)
+                .await
+                .context("failed to read routing generation")?;
+        Ok(GenerationCounter(convert::u64_from_i64(
+            generation,
+            "routing_generation.generation",
+        )?))
+    }
+
+    #[instrument(name = "dsql.allocate_budget", skip(self), fields(expected_version, allocator_id = %allocator_id))]
+    async fn allocate_budget(
+        &self,
+        expected_version: u64,
+        allocator_id: Uuid,
+        rate_budget: f64,
+        capacity_budget: u64,
+    ) -> Result<BudgetAllocationResult> {
+        let expected_version =
+            convert::i64_from_u64(expected_version, "budget_allocation.version")?;
+        let capacity_budget =
+            convert::i64_from_u64(capacity_budget, "budget_allocation.capacity_budget")?;
+        let mut permit = self.director.acquire(DbClass::Control).await?;
+        let row = sqlx::query_as::<_, (i64,)>(
+            "UPDATE budget_allocation
+             SET version = version + 1,
+                 allocator_id = $2,
+                 allocated_at = now(),
+                 rate_budget = $3,
+                 capacity_budget = $4
+             WHERE id = 1 AND version = $1
+             RETURNING version",
+        )
+        .bind(expected_version)
+        .bind(allocator_id)
+        .bind(rate_budget)
+        .bind(capacity_budget)
+        .fetch_optional(permit.connection()?)
+        .await
+        .context("failed to allocate connection budget")?;
+
+        match row {
+            Some((version,)) => Ok(BudgetAllocationResult::Allocated {
+                version: convert::u64_from_i64(version, "budget_allocation.version")?,
+            }),
+            None => Ok(BudgetAllocationResult::Conflict {
+                current_version: self.current_budget_version().await?,
+            }),
+        }
+    }
+
+    #[instrument(name = "dsql.current_budget_version", skip(self))]
+    async fn current_budget_version(&self) -> Result<u64> {
+        let mut permit = self.director.acquire(DbClass::Control).await?;
+        let (version,) =
+            sqlx::query_as::<_, (i64,)>("SELECT version FROM budget_allocation WHERE id = 1")
+                .fetch_one(permit.connection()?)
+                .await
+                .context("failed to read budget allocation version")?;
+        convert::u64_from_i64(version, "budget_allocation.version")
     }
 }
 
@@ -2599,10 +2848,19 @@ mod tests {
         let repo = test_repo(Arc::clone(&recorder));
 
         let _ = repo
-            .try_acquire_bundle(tokeira_types::ShardId(1), "owner".to_owned())
+            .try_acquire_bundle(
+                tokeira_types::ShardId(1),
+                "owner".to_owned(),
+                "127.0.0.1:7233".to_owned(),
+            )
             .await;
         let _ = repo
-            .renew_bundle(tokeira_types::ShardId(1), "owner".to_owned(), ShardEpoch(1))
+            .renew_bundle(
+                tokeira_types::ShardId(1),
+                "owner".to_owned(),
+                ShardEpoch(1),
+                "127.0.0.1:7233".to_owned(),
+            )
             .await;
 
         assert_eq!(recorder.classes(), vec![DbClass::Control, DbClass::Control]);

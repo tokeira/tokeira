@@ -24,7 +24,7 @@ use tokeira_proto::{
     conversions::common::failure_to_payload, public::temporal::api::failure::v1 as failure_proto,
 };
 use tokeira_storage::{CommitResult, RunRepository};
-use tokeira_types::{ExecutionStatus, RunKey, ShardEpoch};
+use tokeira_types::{ExecutionStatus, RunKey, ShardEpoch, execution_home_bundle};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
@@ -101,6 +101,11 @@ impl LaneHandle {
             })
             .await?;
         reply_rx.await?
+    }
+
+    /// Current number of queued lane messages waiting behind the bounded channel.
+    pub fn queued_depth(&self) -> usize {
+        self.tx.max_capacity().saturating_sub(self.tx.capacity())
     }
 }
 
@@ -650,14 +655,21 @@ where
         );
         let _entered = transition_span.enter();
         let loaded = repo.load_run(run_key).await?;
-        let epoch = {
-            let owner = shard_owner.read().unwrap();
-            let shard_id = shard_for(run_key, owner.shard_count());
-            owner.epoch_of(shard_id).unwrap_or(ShardEpoch::ZERO)
-        };
         let transition = kernel
             .apply(loaded, command.clone())
             .map_err(|reject| anyhow!("kernel rejected command: {reject}"))?;
+        let (execution_home_bundle, epoch) = {
+            let owner = shard_owner.read().unwrap();
+            let bundle_id = execution_home_bundle(
+                transition.next_state.namespace_id.0.as_bytes(),
+                transition.next_state.workflow_id.0.as_bytes(),
+                owner.shard_count(),
+            );
+            (
+                bundle_id,
+                owner.epoch_of(bundle_id).unwrap_or(ShardEpoch::ZERO),
+            )
+        };
         transition_span.record(
             "transition_seq",
             transition.next_state.transition_seq.0 as i64,
@@ -665,7 +677,10 @@ where
         let dispatch_ops = transition.dispatch_ops.clone();
         let history_events = transition.history_events.clone();
 
-        match repo.commit_transition(run_key, transition, epoch).await? {
+        match repo
+            .commit_transition_for_bundle(run_key, execution_home_bundle, transition, epoch)
+            .await?
+        {
             CommitResult::Applied { new_state } => {
                 runtime_metrics::record_transition_committed(
                     &new_state.namespace_id.0.to_string(),
@@ -859,7 +874,10 @@ mod tests {
         ShardEpoch, ShardId, TaskKind, TaskQueueName, TransitionSeq as DurableTransitionSeq,
         WorkerIdentity, WorkflowId, WorkflowType,
     };
-    use tokio::{runtime::Runtime, sync::Mutex as AsyncMutex};
+    use tokio::{
+        runtime::Runtime,
+        sync::{Mutex as AsyncMutex, Notify},
+    };
     use tracing_subscriber::layer::SubscriberExt;
 
     use super::*;
@@ -1047,6 +1065,16 @@ mod tests {
             }
         }
 
+        async fn commit_transition_for_bundle(
+            &self,
+            run_key: RunKey,
+            _execution_home_bundle: ShardId,
+            transition: Transition,
+            epoch: ShardEpoch,
+        ) -> Result<CommitResult> {
+            self.commit_transition(run_key, transition, epoch).await
+        }
+
         async fn materialize_reset_successor(
             &self,
             _base_run_key: RunKey,
@@ -1180,6 +1208,7 @@ mod tests {
             &self,
             _bundle: ShardId,
             _owner: String,
+            _node_endpoint: String,
         ) -> Result<LeaseOutcome> {
             Ok(LeaseOutcome::Acquired {
                 epoch: ShardEpoch::ZERO,
@@ -1191,8 +1220,24 @@ mod tests {
             _bundle: ShardId,
             _owner: String,
             _epoch: ShardEpoch,
+            _node_endpoint: String,
         ) -> Result<LeaseOutcome> {
             Ok(LeaseOutcome::Renewed {
+                epoch: ShardEpoch::ZERO,
+            })
+        }
+
+        async fn list_bundle_leases(&self) -> Result<Vec<tokeira_storage::BundleLease>> {
+            Ok(Vec::new())
+        }
+
+        async fn relinquish_bundle(
+            &self,
+            _bundle: ShardId,
+            _owner: String,
+            _epoch: ShardEpoch,
+        ) -> Result<LeaseOutcome> {
+            Ok(LeaseOutcome::Acquired {
                 epoch: ShardEpoch::ZERO,
             })
         }
@@ -1201,6 +1246,7 @@ mod tests {
     #[derive(Clone)]
     struct MockPublisher {
         state: Arc<AsyncMutex<MockPublisherState>>,
+        wake: Arc<Notify>,
     }
 
     #[derive(Default)]
@@ -1215,6 +1261,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 state: Arc::new(AsyncMutex::new(MockPublisherState::default())),
+                wake: Arc::new(Notify::new()),
             }
         }
 
@@ -1235,6 +1282,15 @@ mod tests {
                 submits: state.submits.clone(),
             }
         }
+
+        async fn wait_for_submits(&self, expected: usize) {
+            loop {
+                if self.state.lock().await.submits.len() >= expected {
+                    return;
+                }
+                self.wake.notified().await;
+            }
+        }
     }
 
     #[derive(Debug, PartialEq)]
@@ -1248,6 +1304,9 @@ mod tests {
         async fn publish(&self, run_key: RunKey, ops: &[DispatchOp]) -> Result<()> {
             let mut state = self.state.lock().await;
             state.publishes.push((run_key, ops.to_vec()));
+            drop(state);
+            self.wake.notify_waiters();
+            let state = self.state.lock().await;
             if state.fail {
                 return Err(anyhow!("publisher failed"));
             }
@@ -1257,6 +1316,9 @@ mod tests {
         async fn submit_to_run(&self, run_key: RunKey, command: Command) -> Result<CommitResult> {
             let mut state = self.state.lock().await;
             state.submits.push((run_key, command));
+            drop(state);
+            self.wake.notify_waiters();
+            let state = self.state.lock().await;
             if state.fail {
                 return Err(anyhow!("publisher failed"));
             }
@@ -1510,6 +1572,25 @@ mod tests {
         };
         assert_eq!(config.max_occ_retries, 0);
         assert_eq!(config.max_drain_per_activation, 1);
+    }
+
+    #[test]
+    fn queued_depth_reflects_bounded_channel_occupancy() {
+        let (tx, _rx) = mpsc::channel(4);
+        let handle = LaneHandle { tx };
+        assert_eq!(handle.queued_depth(), 0);
+
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        handle
+            .tx
+            .try_send(LaneMessage {
+                run_key: RunKey::new(),
+                command: sample_command("queued"),
+                reply_tx,
+            })
+            .unwrap();
+
+        assert_eq!(handle.queued_depth(), 1);
     }
 
     proptest! {
@@ -2167,7 +2248,9 @@ mod tests {
                 ).await;
 
                 let _ = first_reply.await.unwrap().unwrap();
-                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                if is_continued_as_new {
+                    publisher.wait_for_submits(1).await;
+                }
                 let snapshot = publisher.snapshot().await;
                 if is_continued_as_new {
                     prop_assert_eq!(snapshot.submits.len(), 1);

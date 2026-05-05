@@ -1,0 +1,169 @@
+syntax = "proto3";
+
+package tokeira.internal.controller.v1;
+
+import "google/protobuf/timestamp.proto";
+
+service PlacementController {
+  rpc RuntimeMembership(stream RuntimeMembershipRequest) returns (stream ControllerDirective);
+  rpc SubscribeRouting(SubscribeRoutingRequest) returns (stream RoutingUpdate);
+  rpc RefreshBundle(RefreshBundleRequest) returns (RefreshBundleResponse);
+  rpc NominateScaleInCandidates(NominateRequest) returns (NominateResponse);
+  rpc MarkNodeDraining(MarkDrainingRequest) returns (MarkDrainingResponse);
+}
+
+message RuntimeMembershipRequest {
+  oneof request {
+    RuntimeRegistration registration = 1;
+    RuntimeHeartbeat heartbeat = 2;
+  }
+}
+
+message RuntimeRegistration {
+  string node_id = 1;
+  string host = 2;
+  uint32 port = 3;
+  string zone = 4;
+  string version = 5;
+  string build_id = 6;
+}
+
+message RuntimeHeartbeat {
+  uint32 owned_bundle_count = 1;
+  repeated uint32 owned_bundles = 2;
+  uint64 runnable_transitions = 3;
+  uint64 active_actor_count = 4;
+  uint64 backlog_depth = 5;
+  uint32 available_connections = 6;
+  float connection_rate_headroom = 7;
+  NodeDrainState drain_state = 8;
+  repeated LanePressure lane_pressures = 9;
+}
+
+message LanePressure {
+  uint32 lane_id = 1;
+  uint64 runnable_depth = 2;
+  uint64 active_actors = 3;
+  float utilization = 4;
+}
+
+enum NodeDrainState {
+  NODE_DRAIN_STATE_UNSPECIFIED = 0;
+  NODE_DRAIN_STATE_ACTIVE = 1;
+  NODE_DRAIN_STATE_DRAINING = 2;
+  NODE_DRAIN_STATE_SAFE_TO_TERMINATE = 3;
+}
+
+message ControllerDirective {
+  oneof directive {
+    DrainDirective drain = 1;
+    RoutingUpdate routing_update = 2;
+    ConnectionBudgetDirective connection_budget = 3;
+    DesiredPlacementDirective desired_placement = 4;
+  }
+}
+
+message DrainDirective {}
+
+message ConnectionBudgetDirective {
+  double rate_per_second = 1;
+  uint64 capacity = 2;
+  uint32 max_reservoir_size = 3;
+  google.protobuf.Timestamp valid_until = 4;
+}
+
+message DesiredPlacementDirective {
+  repeated uint32 acquire_bundles = 1;
+  repeated uint32 relinquish_bundles = 2;
+}
+
+message SubscribeRoutingRequest {}
+
+message RoutingUpdate {
+  oneof update {
+    FullRoutingSnapshot full = 1;
+    RoutingDeltaMessage delta = 2;
+  }
+}
+
+message FullRoutingSnapshot {
+  repeated BundleOwnershipEntry bundles = 1;
+  repeated NodeEndpointEntry nodes = 2;
+  PlacementConfigMessage placement_config = 3;
+  uint64 generation = 4;
+}
+
+message RoutingDeltaMessage {
+  uint64 base_generation = 1;
+  repeated BundleOwnershipEntry bundle_updates = 2;
+  repeated NodeEndpointEntry node_updates = 3;
+  uint64 generation = 4;
+}
+
+message BundleOwnershipEntry {
+  uint32 bundle_id = 1;
+  oneof state {
+    BundleOwnerMessage owner = 2;
+    bool unowned = 3;
+  }
+}
+
+message BundleOwnerMessage {
+  string owner_node_id = 1;
+  uint64 epoch = 2;
+}
+
+message NodeEndpointEntry {
+  string node_id = 1;
+  oneof state {
+    NodeEndpointMessage endpoint = 2;
+    bool removed = 3;
+  }
+}
+
+message NodeEndpointMessage {
+  string host = 1;
+  uint32 port = 2;
+}
+
+message PlacementConfigMessage {
+  uint32 shard_count = 1;
+  uint32 bundle_count = 2;
+  uint32 partition_count = 3;
+  uint32 hash_version = 4;
+}
+
+message RefreshBundleRequest {
+  uint32 bundle_id = 1;
+}
+
+message RefreshBundleResponse {
+  BundleOwnershipEntry bundle = 1;
+  NodeEndpointEntry node = 2;
+}
+
+message NominateRequest {
+  uint32 limit = 1;
+}
+
+message NominateResponse {
+  repeated ScaleInCandidate candidates = 1;
+  uint32 aggregate_available_connections = 2;
+  float aggregate_connection_rate_headroom = 3;
+}
+
+message ScaleInCandidate {
+  string node_id = 1;
+  uint32 owned_bundle_count = 2;
+  uint64 runnable_transitions = 3;
+  uint64 active_actor_count = 4;
+  uint64 backlog_depth = 5;
+}
+
+message MarkDrainingRequest {
+  string node_id = 1;
+}
+
+message MarkDrainingResponse {
+  bool accepted = 1;
+}

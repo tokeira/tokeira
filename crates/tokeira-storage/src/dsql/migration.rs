@@ -2,7 +2,7 @@
 //!
 //! Aurora DSQL has schema-change constraints that matter for correctness and
 //! operational safety: secondary indexes must be asynchronous, migrations are
-//! one DDL statement per file, and version gaps must be rejected so every
+//! one SQL statement per file, and version gaps must be rejected so every
 //! environment converges through the same ordered schema path.
 
 use std::{fs, path::PathBuf};

@@ -83,7 +83,7 @@ These belong to individual resource implementations, which are free to define th
 pub struct DestroyMode;
 ```
 
-The marker is registered by the orchestrator facade (`tokeira-orchestrator::InfraEngine`) before calling `engine.destroy_modules` or `engine.plan_destroy_modules`. The generic engine does not register it.
+The marker is registered by the orchestrator facade (`tokeira-orchestrator::InfraEngine`) before calling `engine.destroy`/`engine.destroy_for_modules` or `engine.plan_destroy`/`engine.plan_destroy_for_modules`. The generic engine does not register it.
 
 ### Orchestrator Destroy Wiring
 
@@ -109,8 +109,10 @@ impl<D: Deployment> InfraEngine<D> {
                         .destroy(composition, &mut self.ctx, Some(&saver))
                         .await
                 }
-                ModuleSelection::Modules(_) => {
-                    // destroy_for_modules reads the active set from composition.active_modules.
+                // Only and Except both produce a filtered active set.
+                // `compose()` resolves the filter to `composition.active_modules`;
+                // `destroy_for_modules` reads that list.
+                ModuleSelection::Only(_) | ModuleSelection::Except(_) => {
                     self.engine
                         .destroy_for_modules(composition, &mut self.ctx, Some(&saver))
                         .await
@@ -137,7 +139,7 @@ impl<D: Deployment> InfraEngine<D> {
             ModuleSelection::All => {
                 self.engine.plan_destroy(composition, &mut self.ctx).await
             }
-            ModuleSelection::Modules(_) => {
+            ModuleSelection::Only(_) | ModuleSelection::Except(_) => {
                 self.engine
                     .plan_destroy_for_modules(composition, &mut self.ctx)
                     .await
@@ -356,9 +358,26 @@ impl ActionTuiHandle {
                     skipped,
                     elapsed_ms: elapsed.as_millis() as u64,
                 };
-                println!("{}", serde_json::to_string(&event).unwrap());
+                emit_json_line(&event);
             }
         }
+    }
+}
+
+/// Serialise a `ProgressEvent` to stdout as one line. Falls back to a
+/// `tracing::warn!` when serialisation fails so the CLI never panics on a
+/// progress event. `ProgressEvent` holds only owned `String`/`usize`/`u64`
+/// fields with no non-UTF-8 content, so `to_string` cannot fail under
+/// normal operation; the warn branch is a belt-and-braces guard against
+/// future `ProgressEvent` variants that might introduce fallible types.
+fn emit_json_line(event: &ProgressEvent) {
+    match serde_json::to_string(event) {
+        Ok(line) => println!("{line}"),
+        Err(err) => tracing::warn!(
+            %err,
+            ?event,
+            "failed to serialise progress event; dropping"
+        ),
     }
 }
 
@@ -555,15 +574,19 @@ This convention is documented in the spec as guidance. Implementations in `tokei
 
 ```
 CLI (tkr infra destroy --yes)
-  → InfraEngine::destroy(composition)
+  → InfraEngine::destroy(composition, selection)
     → ctx.set_extension(DestroyMode)              // register marker
-    → engine.destroy_modules(&composition.known_modules, &active, &mut ctx)
+    → match selection:
+        ModuleSelection::All            → engine.destroy(composition, &mut ctx, Some(&saver))
+        ModuleSelection::Only(_) |
+        ModuleSelection::Except(_)      → engine.destroy_for_modules(composition, &mut ctx, Some(&saver))
       → collect_resources_from(known_modules, ctx)
         → ModuleContext::new(state, ctx.extensions())
         → module.resources(module_ctx)
           → let destroy_mode = module_ctx.extension::<DestroyMode>().is_some();
           → if destroy_mode: enumerate from config AND state
           → if !destroy_mode: enumerate from config only
+    → ctx.remove_extension::<DestroyMode>()       // scope marker to this op
 ```
 
 ### Apply Changes Algorithm (Existing — Unchanged)

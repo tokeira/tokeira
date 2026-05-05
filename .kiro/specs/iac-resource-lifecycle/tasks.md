@@ -42,9 +42,9 @@ Target crates:
     - _Requirements: 1.2, 2.5, 3.1_
 
   - [ ] 2.2 Register `DestroyMode` in the orchestrator and scope it to the operation
-    - In `crates/tokeira-orchestrator/src/lib.rs`, change `InfraEngine::destroy` to accept a `ModuleSelection` parameter. Branch on the selection: `ModuleSelection::All` calls `engine.destroy(composition, &mut ctx, Some(&saver))`; `ModuleSelection::Modules(_)` calls `engine.destroy_for_modules(composition, &mut ctx, Some(&saver))`. Do NOT gate on `composition.active_modules.is_empty()` — `compose()` always populates that list even for `All`
+    - In `crates/tokeira-orchestrator/src/lib.rs`, change `InfraEngine::destroy` to accept a `ModuleSelection` parameter. Branch on the selection: `ModuleSelection::All` calls `engine.destroy(composition, &mut ctx, Some(&saver))`; `ModuleSelection::Only(_) | ModuleSelection::Except(_)` both call `engine.destroy_for_modules(composition, &mut ctx, Some(&saver))`. Both filtered variants resolve to `composition.active_modules` inside `compose()`, so the engine call is the same. Do NOT gate on `composition.active_modules.is_empty()` — `compose()` always populates that list even for `All`
     - Set `DestroyMode` on `self.ctx` before the engine call; call `self.ctx.remove_extension::<DestroyMode>()` after the engine returns (success or error)
-    - Add `InfraEngine::plan_destroy(&mut self, composition, selection)` that loads state, sets `DestroyMode`, dispatches to `engine.plan_destroy` or `engine.plan_destroy_for_modules` based on `selection`, then removes the marker
+    - Add `InfraEngine::plan_destroy(&mut self, composition, selection)` that loads state, sets `DestroyMode`, dispatches to `engine.plan_destroy` for `All` or `engine.plan_destroy_for_modules` for `Only(_)`/`Except(_)`, then removes the marker
     - Do NOT register `DestroyMode` during `plan` or `apply`
     - Import `DestroyMode` and `ModuleSelection` from `tokeira_iac`
     - Update all call sites (e.g., `commands::infra::run`) to pass `ModuleSelection` through to `destroy`/`plan_destroy`
@@ -55,7 +55,7 @@ Target crates:
     - Verify `ctx.extension::<DestroyMode>()` is `None` after both methods return (success path)
     - Verify `ctx.extension::<DestroyMode>()` is `None` after `InfraEngine::apply` or `InfraEngine::plan`
     - Verify that if the engine call returns an error, `DestroyMode` has still been removed
-    - Verify that `ModuleSelection::All` dispatches to `engine.destroy`/`plan_destroy` and `ModuleSelection::Modules` dispatches to `destroy_for_modules`/`plan_destroy_for_modules`
+    - Verify that `ModuleSelection::All` dispatches to `engine.destroy`/`plan_destroy` and both `ModuleSelection::Only(_)` and `ModuleSelection::Except(_)` dispatch to `destroy_for_modules`/`plan_destroy_for_modules`
     - Test location: `crates/tokeira-orchestrator/src/lib.rs` `#[cfg(test)]` module
     - _Requirements: 1.2, 1.5, 1.6_
 
@@ -199,18 +199,19 @@ Target crates:
     - Implement `ActionTuiHandle::new(format)` that detects TTY via `console::Term::stdout().is_term()`
     - Implement `pub(crate) fn with_terminal_detected(format: OutputFormat, is_terminal: bool) -> Self` as a test-only constructor used by unit tests to force terminal vs non-terminal paths without depending on the runner TTY
     - Implement `pub fn record_skipped(&self, n: usize)` that stores `n` into `counters.skipped` — the CLI calls this with the count of `ChangeKind::NoChange` entries from the engine's plan result
+    - Implement a module-private `fn emit_json_line(event: &ProgressEvent)` helper that serialises via `serde_json::to_string(event)`, prints one line on `Ok`, and logs via `tracing::warn!` on `Err`. No `.unwrap()` or `.expect()` in production code
     - Define `ProgressEvent` enum deriving `Serialize, Deserialize, PartialEq, Eq` with `#[serde(tag = "event", rename_all = "snake_case")]` and variants `OperationStart`, `OperationComplete`, `OperationFailed`, `WaitProgress`, `Note`, `Summary`
     - Add `mod tui;` to `apps/tkr/src/main.rs`
     - _Requirements: 5.6, 5.7, 5.11, 5.12, 5.13_
 
   - [ ] 9.3 Implement `ActionTuiHandle::install` wiring all five reporters
     - Clone `format`, `multi`, `counters`, `spinners`, `is_terminal` into each closure (closures are `Fn`, not `FnMut`; use interior mutability)
-    - `set_apply_progress`: insert a new `SpinnerEntry` keyed by `ResourceId` with the current `Instant` and (for `Human`+TTY) a spinner added via `multi.add(ProgressBar::new_spinner())`; for `Human`+non-TTY print an `eprintln!` start line; for `Json` emit `OperationStart`
-    - `set_complete_progress`: look up and remove the entry, finish the spinner with `✓ {rid} ({elapsed})`, increment `counters.completed`; for `Human`+non-TTY print a plain line; for `Json` emit `OperationComplete`
-    - `set_failed_progress`: look up and remove the entry, finish the spinner with `✗ {rid} ({elapsed}): {err}`, increment `counters.failed`; for `Human`+non-TTY print a plain line; for `Json` emit `OperationFailed`
-    - `set_wait_progress`: for `Human` update the spinner's message with elapsed/timeout; for `Json` emit `WaitProgress`
-    - `set_note_progress`: for `Human` print a dim note line under the active spinner; for `Json` emit `Note`
-    - Each JSON event SHALL serialise via `serde_json::to_string` as a single line to stdout without panicking
+    - `set_apply_progress`: insert a new `SpinnerEntry` keyed by `ResourceId` with the current `Instant` and (for `Human`+TTY) a spinner added via `multi.add(ProgressBar::new_spinner())`; for `Human`+non-TTY print an `eprintln!` start line; for `Json` emit `OperationStart` via the `emit_json_line` helper
+    - `set_complete_progress`: look up and remove the entry, finish the spinner with `✓ {rid} ({elapsed})`, increment `counters.completed`; for `Human`+non-TTY print a plain line; for `Json` emit `OperationComplete` via `emit_json_line`
+    - `set_failed_progress`: look up and remove the entry, finish the spinner with `✗ {rid} ({elapsed}): {err}`, increment `counters.failed`; for `Human`+non-TTY print a plain line; for `Json` emit `OperationFailed` via `emit_json_line`
+    - `set_wait_progress`: for `Human` update the spinner's message with elapsed/timeout; for `Json` emit `WaitProgress` via `emit_json_line`
+    - `set_note_progress`: for `Human` print a dim note line under the active spinner; for `Json` emit `Note` via `emit_json_line`
+    - All JSON emission SHALL route through the `emit_json_line(&ProgressEvent)` helper defined in `tui.rs`: it calls `serde_json::to_string(&event)`, writes the line on `Ok`, and logs via `tracing::warn!` on `Err`. NO use of `.unwrap()` or `.expect()` in non-test code per AGENTS.md
     - _Requirements: 5.1, 5.2, 5.3, 5.6, 5.7, 5.8, 5.9, 5.10, 5.11_
 
   - [ ] 9.4 Implement `ActionTuiHandle::print_summary`

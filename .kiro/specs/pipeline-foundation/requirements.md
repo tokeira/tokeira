@@ -9,28 +9,30 @@ This spec generalises the image-lifecycle pattern into a substrate that future p
 1. A convention for **Rust-authored pipelines** driven by the in-repo `dagger-client` — no Dagger Modules, no `dagger.json`, no Dagger CLI module-call surface. Pipelines are library + binary crates under `crates/tokeira-pipeline-{name}/`.
 2. A shared **pipeline runtime crate** (`tokeira-pipeline-runtime`) holding the common Dagger orchestration helpers (workspace mount, Rust toolchain container, `cargo` wrappers, container publish, artifact upload) so individual pipelines do not reinvent them.
 3. A **policy-layer pattern**: wherever a pipeline has to decide what results *mean* (pass/fail, release gate, classification), that logic lives in a dedicated Rust crate on the non-Dagger side of the boundary. Pipelines execute; policy crates classify.
-4. A **trigger layer** on whichever CI substrate is in play — GitHub Actions first, Buildkite second — whose only job is to install the Dagger CLI and invoke `dagger run -- cargo run -p tokeira-pipeline-{name} -- {subcommand}`. The trigger layer contains no business logic.
+4. A **trigger layer** on **Buildkite Personal with Buildkite hosted Linux agents** as the primary substrate from day one. The trigger layer's only job is to install the Dagger CLI (already present on hosted agents) and invoke `dagger run -- cargo run -p tokeira-pipeline-{name} -- {subcommand}`. A parallel GitHub Actions template is retained as a parity exemplar so substrate independence is exercised, not as an active substrate.
 5. An **artifact contract**: every pipeline run that produces operator-visible results writes a versioned JSON artifact to a known S3 location. `tkr` commands consume artifacts, not CI APIs.
 6. A **local-parity rule**: every pipeline binary runs identically on a developer's workstation under `dagger run -- cargo run -p tokeira-pipeline-{name} -- {subcommand}` and on CI. There is no "works only on CI" logic.
+7. A **conformance orchestration model** that stages what runs where: Tier-0 wire checks and `workspace`-pipeline Rust checks plus Tier-3 Tokeira-owned smoke tests run on every PR; Tier-1 `temporalio/features` against tokeirad runs as a **manually-triggered** Buildkite pipeline until the maintainer judges it ready for PR gating; Tier-2 full SDK integration suites are deferred until Tokeira implements enough of the Temporal surface that their result is signal rather than noise.
 
-The spec is substrate-only. It does not define any specific pipeline (no `tokeirad` build pipeline, no conformance pipeline, no release pipeline). Other specs consume this foundation and add their own pipelines.
+The spec is substrate-only for plumbing. It does not define any specific pipeline (no `tokeirad` build pipeline, no conformance pipeline, no release pipeline). It does define **when** each conformance tier is expected to run, because that choice is a substrate concern (PR vs manual vs deferred) rather than a per-pipeline concern. The semantic interpretation of each tier — what "passing T1" means, which scenarios are classified which way — is owned by [`temporal-compatibility`](../temporal-compatibility/requirements.md).
 
 ### What this spec delivers
 
 - A `tokeira-pipeline-runtime` Rust crate at `crates/tokeira-pipeline-runtime/` holding the common Dagger orchestration helpers, including `CiContext` resolution from environment variables with local fallbacks.
 - A `tokeira-ci-policy` Rust crate at `crates/tokeira-ci-policy/` holding the shared artifact envelope, policy exit codes, and artifact reader/writer.
 - A per-pipeline crate template documented in `dev/pipelines/README.md` describing the `crates/tokeira-pipeline-{name}/` layout every pipeline follows.
-- A GitHub Actions workflow template at `.github/workflows/ci.yml` that is substrate-thin: checkout, install Dagger CLI, invoke `dagger run -- cargo ...`.
-- A Buildkite pipeline template at `dev/pipelines/buildkite/pipeline.yml` ready to register when self-hosted agents are stood up. Same shell invocation pattern as GitHub Actions.
+- A **Buildkite pipeline at `.buildkite/pipeline.yml` as the primary, live trigger**. Targets a Buildkite hosted Linux agent queue. Dagger Cloud is off by default; if it is ever enabled it MUST be the free individual tier, not a paid team tier.
+- A **GitHub Actions workflow at `.github/workflows/ci.yml` kept as a parity template**, exercising the same pipelines via `dagger run`. It is either disabled (workflow not registered) or runs in a shadow mode that does not gate merges. Its purpose is to prove substrate independence mechanically, not to act as the day-to-day CI.
 - An `ArtifactBucket` resource in `tokeira-aws` (S3 bucket with the shared-bucket semantics from [`ecs-deployment`](../ecs-deployment/requirements.md) `RemoteStateBucket`) for pipeline outputs.
 - A `tkr pipeline` command group with subcommands `list`, `run`, `artifacts` for local invocation and artifact inspection.
 - The first pipeline to ship under the new substrate: a `workspace` pipeline that runs `cargo fmt --check`, `cargo lint`, `cargo test-lint`, `cargo check --workspace`, `cargo test --workspace`, and `cargo doc --workspace`. This pipeline becomes the canonical reference for "how a pipeline looks" and replaces whatever ad-hoc workspace CI exists today.
+- A **manually-triggered** `tokeira-pipeline-conformance-features` Buildkite pipeline that runs `temporalio/features` against a freshly-built tokeirad. Manual trigger is the starting point; migration to PR gating happens per the criteria in Feature 10.
 
 ### What this spec does NOT cover
 
-- The container build, conformance, or release pipelines themselves. Those are introduced by [`image-lifecycle`](../image-lifecycle/requirements.md), [`temporal-compatibility`](../temporal-compatibility/requirements.md), and a future `release-pipeline` spec respectively. This spec defines the substrate they run on.
-- Hosting Buildkite agents. If we self-host agents on Tokeira's own AWS account, that is a follow-up module in [`ecs-deployment`](../ecs-deployment/requirements.md) or a dedicated `buildkite-agents` spec.
-- Release automation: changelog generation, semver bumps, artifact signing. Out of scope.
+- The container build, conformance tier semantics, or release pipelines themselves. Container builds are introduced by [`image-lifecycle`](../image-lifecycle/requirements.md). The _meaning_ of each conformance tier (what T0/T1/T2/T3 contain, which scenarios are classified which way) is owned by [`temporal-compatibility`](../temporal-compatibility/requirements.md); this spec defines only _when each tier runs_ (Feature 10). Release automation is out of scope.
+- Self-hosted Buildkite agents. The spec intentionally ships with Buildkite hosted Linux agents and defers the Elastic CI Stack for AWS (or any other self-hosted agent story) until hosted-agent minute cost becomes operationally annoying. When that happens, a follow-up `buildkite-agents` spec SHALL handle it.
+- Dagger Cloud paid tiers. Dagger Cloud is disabled by default. The free individual tier MAY be enabled for local developer traces; the paid team tier SHALL NOT be enabled without a spec amendment.
 - Deployment orchestration from CI. `tkr deploy apply` remains operator-initiated; pipelines never call it.
 - Dagger Modules (`dagger.json`, `dagger call`, module composition). Tokeira drives Dagger via the in-repo `dagger-client` GraphQL client. Adopting the Dagger Module system is a future decision, not a requirement here.
 - Caching infrastructure design beyond declaring that the pipeline runtime exposes Dagger cache mounts through the shared helpers. Cache-key schemas per pipeline are that pipeline's concern.
@@ -60,7 +62,11 @@ The spec is substrate-only. It does not define any specific pipeline (no `tokeir
 - **Run_ID**: An opaque string identifying a single pipeline invocation. Set by the CI substrate (GHA run id, Buildkite build number, or `local-{timestamp}-{random}` for local runs).
 - **Local_Engine**: A Dagger engine running on the developer's workstation (via the `dagger` CLI). Every pipeline runs against a local engine with the same code that runs in CI.
 - **Ci_Context**: The runtime context a pipeline sees: git SHA, branch name, CI substrate name, run ID, actor identity, a monotonic run-start instant. Provided as environment variables read by the `Pipeline_Runtime::ci_context()` helper; pipelines do not hard-code runner-specific lookups.
-- **Buildkite_Agent**: A Buildkite worker process running on Tokeira-owned infrastructure (self-hosted pattern) with Docker and the Dagger CLI pre-installed. Registered with a Buildkite queue that pipeline steps target.
+- **Buildkite_Agent**: A Buildkite hosted Linux agent. Managed by Buildkite, ephemeral, destroyed after each job, Docker and common CLIs pre-installed. Self-hosted agents are out of scope for this spec.
+- **Buildkite_Hosted_Queue**: The Buildkite queue that hosted Linux agents pull from. The spec uses a single queue (`hosted-linux-default`) until job volume or cost justifies further segmentation.
+- **Dagger_Cloud**: Dagger's optional remote trace/cache service. Disabled by default in this spec. MAY be enabled at the free individual tier for local traces; SHALL NOT be enabled at any paid team tier without a spec amendment.
+- **Conformance_Tier**: A compatibility-evidence level defined by [`temporal-compatibility`](../temporal-compatibility/requirements.md). The tier numbering (T0/T1/T2/T3) and scenario-classification rules live in that spec; this spec only decides where each tier runs (PR gate, manual trigger, deferred).
+- **Manual_Pipeline**: A Buildkite pipeline configured so that builds are only created on explicit operator action (Buildkite "New Build" button or `buildkite-agent pipeline upload` from another pipeline), not on branch push or PR.
 
 ## Requirements
 
@@ -199,62 +205,60 @@ The spec is substrate-only. It does not define any specific pipeline (no `tokeir
 
 ## Feature 3: CI Substrate Layer
 
-### Requirement 3.1: GitHub Actions trigger workflow
+### Requirement 3.1: Primary substrate — Buildkite Personal with hosted Linux agents
 
-**User Story:** As a Tokeira developer opening a pull request, I want CI to run the standard verification pipelines, so that regressions are caught before merge.
-
-#### Acceptance Criteria
-
-1. THE workspace SHALL include `.github/workflows/ci.yml` that runs on pull requests and pushes to the default branch.
-2. THE workflow SHALL consist of one job per registered pipeline's `check` subcommand, one job per registered pipeline's `test` subcommand, and separate jobs for `build` where applicable.
-3. EACH job SHALL consist of at most these steps: `actions/checkout@v4` (pinned by full SHA), install the Dagger CLI at a pinned version, and `dagger run -- cargo run -p tokeira-pipeline-{name} --release -- {subcommand} --json`.
-4. THE workflow SHALL NOT contain inline bash that reimplements pipeline logic. If a job needs more than the three steps above, the additional logic SHALL move into the Pipeline_Crate.
-5. THE Dagger CLI SHALL be installed via the upstream installer script at a version pinned by SHA256 checksum, not via a third-party action that wraps it. This minimises third-party trust surface.
-6. THE workflow SHALL NOT require repository secrets to run `check`, `test`, or `lint` jobs. Secrets for `build` (for example, ECR push) SHALL be scoped to default-branch runs only.
-7. Cross-substrate portability is a first-class concern: the workflow SHALL NOT use `github-script`, `actions/github-script`, or any action whose output would be specific to GitHub's pipeline model.
-
-### Requirement 3.2: Buildkite trigger pipeline
-
-**User Story:** As a Tokeira operator planning to self-host CI, I want a ready-to-use Buildkite pipeline template, so that moving to Buildkite is a configuration switch, not a re-architecture.
+**User Story:** As a Tokeira developer opening a pull request, I want CI to run the standard verification pipelines on Buildkite's hosted Linux agents, so that regressions are caught before merge without having to manage runner infrastructure.
 
 #### Acceptance Criteria
 
-1. THE workspace SHALL include `dev/pipelines/buildkite/pipeline.yml` as a reference Buildkite pipeline.
-2. THE template SHALL have the same shape as the GitHub Actions workflow: per-pipeline `check`, `test`, `build` steps, each invoking `dagger run -- cargo run -p tokeira-pipeline-{name} --release -- {subcommand} --json` through a shell step.
-3. THE template SHALL target a named agent queue (default: `tokeira-default`) so job routing is explicit. Steps that are expensive (for example, conformance) MAY target a separate queue (`tokeira-heavy`) to isolate long runs from fast feedback.
-4. THE template SHALL document the self-hosted agent requirements:
-   - Docker (rootless or root-privileged, documented per agent pool).
-   - Dagger CLI pre-installed on the agent (via AMI bake or agent start hook).
-   - AWS credentials scoped per queue via IAM role on the agent instance profile.
-5. Documentation at `dev/pipelines/buildkite/README.md` SHALL explain:
-   - How to register the pipeline with a Buildkite organisation (`buildkite-agent pipeline upload`).
-   - How to provision agents (recommended: Buildkite's Elastic CI Stack for AWS, deploying to the same AWS account as the Tokeira deployment).
-   - How artifacts flow: the canonical artifact path is S3; `buildkite-agent artifact upload` MAY be used additionally for a UI link but is not the source of truth.
-   - The migration path from GitHub Actions: run both in parallel; cut over in a single PR once Buildkite signal has been stable for one week.
-6. THE template is a dry template — it does not have to be live-registered in a Buildkite organisation to land with this spec.
+1. THE workspace SHALL include `.buildkite/pipeline.yml` as the primary, live Trigger_Workflow.
+2. THE pipeline SHALL target the **Buildkite hosted Linux agent queue**. The agent targeting line SHALL be `agents: { queue: "hosted-linux-default" }` (or the current Buildkite-hosted Linux queue name at registration time — whichever matches the organisation's hosted-agent configuration).
+3. THE pipeline SHALL be registered under a **Buildkite Personal** organisation. The spec does not mandate Business-tier features.
+4. Self-hosted agents SHALL NOT be used in the initial rollout. The decision to introduce self-hosted agents (Elastic CI Stack for AWS or otherwise) SHALL be driven by one or more of:
+   - Hosted-agent minute consumption exceeding a documented monthly budget.
+   - Sustained queue-wait time above a documented threshold on PR checks.
+   - A new pipeline requiring capabilities unavailable on hosted Linux agents (for example, GPU, macOS, or network-isolated testing).
+   Until that trigger is documented and acknowledged by a maintainer, the spec remains hosted-agents-only. A follow-up `buildkite-agents` spec SHALL handle self-hosted rollout when the trigger fires.
+5. Dagger Cloud SHALL be **disabled** in the pipeline by default. If enabled locally by a developer or later enabled for the Buildkite org, it SHALL be the free individual tier only. The paid Dagger Team tier SHALL NOT be enabled without a spec amendment. The pipeline SHALL NOT set `DAGGER_CLOUD_TOKEN` on the hosted agent by default.
+6. EACH pipeline step SHALL consist of at most: a shell command that invokes the Dagger CLI (pre-installed on Buildkite hosted agents — if not, one `curl | sh` install with a pinned version), and `dagger run -- cargo run -p tokeira-pipeline-{name} --release -- {subcommand} --json`.
+7. THE pipeline SHALL NOT contain inline bash that reimplements pipeline logic. If a step needs more than the two operations above, the additional logic SHALL move into the Pipeline_Crate.
+8. THE pipeline SHALL NOT require repository secrets to run `check`, `test`, `lint`, or T0/T3 steps (see Feature 10). Secrets for `build` (for example, ECR push) SHALL be scoped via Buildkite pipeline-level environment variables, disclosed only on default-branch runs, and delivered into Dagger via `SecretRef`.
+
+### Requirement 3.2: Parity template — GitHub Actions as a substrate-independence exemplar
+
+**User Story:** As a Tokeira maintainer, I want a second substrate implementation maintained alongside the primary one, so that substrate independence is demonstrably real and a cutover is possible without major rework.
+
+#### Acceptance Criteria
+
+1. THE workspace SHALL include `.github/workflows/ci.yml` using the same Pipeline_Crate invocations as the Buildkite pipeline.
+2. THE GHA workflow SHALL either (a) be disabled (committed but not registered as a required check on the repo), or (b) run in shadow mode (registered but non-blocking for PR merge). The spec explicitly does not require GHA to gate PRs; Buildkite is the gate.
+3. EACH job SHALL consist of at most these steps: `actions/checkout@v4` pinned by full SHA, install the Dagger CLI via the upstream installer at a pinned version (not via a third-party action), and `dagger run -- cargo run -p tokeira-pipeline-{name} --release -- {subcommand} --json`.
+4. THE workflow SHALL NOT use `github-script`, `actions/github-script`, or any action whose output is specific to GitHub's pipeline model.
+5. THE workflow SHALL NOT be deleted by this spec — it remains as substrate-independence evidence.
 
 ### Requirement 3.3: Substrate independence
 
-**User Story:** As a Tokeira maintainer, I want Pipeline_Crates to be substrate-agnostic, so that switching from GitHub Actions to Buildkite (or adding a secondary runner) does not require rewriting pipeline code.
+**User Story:** As a Tokeira maintainer, I want Pipeline_Crates to be substrate-agnostic, so that switching from Buildkite to another runner (or adding a secondary runner) does not require rewriting pipeline code.
 
 #### Acceptance Criteria
 
-1. Pipeline_Crate source SHALL NOT contain the substrings `github`, `buildkite`, or any substrate-specific SDK usage.
+1. Pipeline_Crate source SHALL NOT contain the substrings `github`, `buildkite`, `hosted-linux-`, or any substrate-specific SDK usage.
 2. Pipeline_Crates SHALL read Ci_Context only via `Pipeline_Runtime::ci_context()`, not via raw `GITHUB_SHA` or `BUILDKITE_COMMIT`.
 3. Adding a new CI substrate SHALL require only a new Trigger_Workflow template plus optional Ci_Context resolution updates (Req 2.4.1 ordered sources); no changes to pipeline source.
-4. A lint (`cargo lint` with a custom clippy allow-list entry or a `grep` check in `dev/ci/check-substrate-leakage.sh`) SHALL scan `crates/tokeira-pipeline-*/src/` for substrate-name leakage and fail the build on hit.
+4. A `grep` check in `dev/ci/check-substrate-leakage.sh` SHALL scan `crates/tokeira-pipeline-*/src/` for substrate-name leakage and fail the build on hit.
 
-### Requirement 3.4: Buildkite-specific integration notes
+### Requirement 3.4: Buildkite hosted-agent specifics
 
-**User Story:** As a Tokeira maintainer adopting Buildkite, I want the non-obvious Buildkite-specific trade-offs documented in the spec itself, so that the operational decisions are explicit.
+**User Story:** As a Tokeira maintainer running on Buildkite hosted Linux agents, I want the hosted-agent contract and its limits documented in the spec itself, so that operational expectations are explicit.
 
 #### Acceptance Criteria
 
-1. THE spec SHALL note that Dagger does not publish a Buildkite-specific integration plugin; the integration is a shell step invoking `dagger run`.
-2. THE spec SHALL note that Buildkite hosted agents' Docker support (Remote Docker builders with layer caching) is Enterprise-only; cost-conscious deployments SHALL prefer self-hosted agents on the Elastic CI Stack for AWS.
-3. THE spec SHALL note that Buildkite agent caches are per-agent-instance unless remote caching is configured; pipelines SHALL NOT assume warm caches across agents.
-4. THE spec SHALL note that `buildkite-agent artifact upload` is UI convenience only; the canonical artifact surface is S3 per Feature 4.
-5. THE spec SHALL note that a Buildkite agent queue MUST be sized to absorb concurrent PR load; when rolling out Buildkite, the default queue size SHALL be at least three agents to avoid serialising all PRs.
+1. THE spec SHALL note that Buildkite hosted agents are **ephemeral** — destroyed after each job — so caches SHALL NOT be assumed to carry across jobs unless explicitly uploaded to Buildkite cache volumes or stored in S3.
+2. THE spec SHALL note that Buildkite hosted Linux agents have Docker and common CLIs pre-installed. The pipeline SHALL verify the Dagger CLI is present and install it at a pinned version if not.
+3. THE spec SHALL note that `buildkite-agent artifact upload` is UI convenience only; the canonical artifact surface is S3 per Feature 4.
+4. THE spec SHALL note that the hosted Linux queue is shared across Buildkite Personal pipelines; sustained queue-wait time is an input to the Req 3.1.4 trigger for adopting self-hosted agents.
+5. THE spec SHALL note that Buildkite hosted agents do not support privileged Docker or macOS execution; any future pipeline requiring these capabilities triggers the self-hosted-agent decision.
+6. THE spec SHALL note that Dagger's published CI integration pattern (install the Dagger CLI, run `dagger run`) applies to Buildkite identically to every other substrate Dagger documents; there is no Buildkite-specific Dagger plugin and none is needed.
 
 ---
 
@@ -473,8 +477,9 @@ The spec is substrate-only. It does not define any specific pipeline (no `tokeir
 #### Acceptance Criteria
 
 1. THE first Pipeline_Crate to land SHALL be `tokeira-pipeline-workspace` covering `cargo fmt/lint/test-lint/check/test/doc` for the whole workspace.
-2. Existing CI (if any) SHALL run in parallel with the new substrate during migration. Cutover to the new substrate SHALL be a single PR that deletes the old workflow and is reversible.
-3. AFTER migration, only Pipeline_Crates SHALL produce CI signal. Stray workflow files SHALL be deleted as part of the migration PR.
+2. THE Buildkite pipeline SHALL be registered against a **Buildkite Personal** organisation as the primary live substrate. Any existing CI (ad-hoc workflows, legacy scripts) SHALL run in parallel during migration. Cutover SHALL be a single PR that deletes the legacy workflow(s).
+3. THE GitHub Actions workflow SHALL be committed alongside the Buildkite pipeline but remain non-gating (disabled or shadow mode per Req 3.2.2) to exercise substrate independence.
+4. AFTER migration, only Pipeline_Crates triggered via the Buildkite pipeline SHALL produce merge-gating CI signal. Stray workflow files that still gate merges SHALL be deleted as part of the migration PR.
 
 ### Requirement 9.3: Third-party integrations
 
@@ -482,9 +487,11 @@ The spec is substrate-only. It does not define any specific pipeline (no `tokeir
 
 #### Acceptance Criteria
 
-1. THE initial approved third-party CI-adjacent integrations SHALL be: Dagger (pipeline engine, via in-repo `dagger-client`), GitHub Actions (trigger layer), Buildkite (future trigger layer, self-hosted agents on Elastic CI Stack for AWS), AWS S3 (artifact storage), AWS Secrets Manager (secret source).
-2. Adding a new third-party integration SHALL require a spec amendment.
-3. Pipeline_Crates SHALL NOT call third-party services beyond the approved list without an amendment.
+1. THE initial approved third-party CI-adjacent integrations SHALL be: Dagger (pipeline engine, via in-repo `dagger-client`), Buildkite (primary trigger layer, Personal organisation with hosted Linux agents), GitHub Actions (parity template only; non-gating), AWS S3 (artifact storage), AWS Secrets Manager (secret source for the ECS deployment's runtime, not required for PR CI).
+2. Dagger Cloud is an allowed integration **only at the free individual tier**. Enabling the paid team tier requires a spec amendment.
+3. Self-hosted Buildkite agents (Elastic CI Stack for AWS or equivalent) are explicitly NOT yet approved. Their adoption is gated on the Req 3.1.4 cost/queue-wait/capability trigger and a follow-up `buildkite-agents` spec.
+4. Adding a new third-party integration SHALL require a spec amendment.
+5. Pipeline_Crates SHALL NOT call third-party services beyond the approved list without an amendment.
 
 ### Requirement 9.4: Workspace pipeline reference implementation
 
@@ -498,4 +505,71 @@ The spec is substrate-only. It does not define any specific pipeline (no `tokeir
    - `build` — `cargo doc --workspace --no-deps` (so "build" produces inspectable output; this is the pipeline's primary artifact beyond green/red).
    - `artifact` — emits an `ArtifactEnvelope<WorkspaceResults>` summarising the last `check` and `test` runs.
 2. `tokeira-pipeline-workspace` SHALL be documented as the canonical template. New Pipeline_Crates SHALL be created by copying its structure.
-3. `tokeira-pipeline-workspace` SHALL be the first pipeline wired into both the GitHub Actions trigger workflow and the Buildkite trigger template.
+3. `tokeira-pipeline-workspace` SHALL be the first pipeline wired into both the Buildkite pipeline and the GitHub Actions parity workflow.
+
+---
+
+## Feature 10: Conformance Tier Orchestration
+
+This feature defines **where each conformance tier runs**. The tier numbering and the semantic rules for classifying scenarios (what T0/T1/T2/T3 actually mean, which `temporalio/features` directories map to which feature-matrix states) are owned by [`temporal-compatibility`](../temporal-compatibility/requirements.md). This spec owns only the orchestration choices: PR gate, manual trigger, or deferred.
+
+### Requirement 10.1: PR-gating tier set
+
+**User Story:** As a Tokeira developer opening a PR, I want fast compatibility-adjacent feedback before merge, so that regressions in wire compatibility, Rust workspace checks, or Tokeira-owned smoke tests are caught immediately.
+
+#### Acceptance Criteria
+
+1. THE Buildkite pipeline (Req 3.1) SHALL run the following on **every PR and every push to the default branch**, all on the hosted Linux agent queue:
+   - **T0 wire checks** (owned by `temporal-compatibility`): proto/API-descriptor consistency. A dedicated Pipeline_Crate or a subcommand of an existing Pipeline_Crate implements this.
+   - **Rust workspace checks**: `tokeira-pipeline-workspace` subcommands `check` and `test`.
+   - **T3 Tokeira smoke tests** (owned by `temporal-compatibility`): Tokeira-owned black-box scenarios that exercise behaviours not yet covered by upstream suites. Starts with a minimal set (workflow start, signal, query, activity). Expands as `temporal-compatibility` adds scenarios.
+2. Each of the three items above SHALL be its own Buildkite step (parallelism is Buildkite's to schedule; logical grouping is per step for clarity in the UI).
+3. PR-gating SHALL mean: the step blocks PR merge on failure. Branch protection on the default branch SHALL be configured to require these steps to pass.
+4. NO other conformance tier SHALL be PR-gating at the time this spec lands. T1 and T2 are handled by Req 10.2 and Req 10.3 respectively.
+
+### Requirement 10.2: Manually-triggered T1 pipeline
+
+**User Story:** As a Tokeira maintainer, I want to run the `temporalio/features` suite against tokeirad on demand before it's ready to gate PRs, so that I can validate cross-SDK compatibility without every PR paying its cost.
+
+#### Acceptance Criteria
+
+1. THE workspace SHALL include a `.buildkite/pipeline-features.yml` (or an equivalent Manual_Pipeline definition in the primary pipeline gated on a Buildkite metadata flag) that runs the T1 `temporalio/features` suite against a freshly-built tokeirad.
+2. THE T1 pipeline SHALL be configured so that it only runs on **explicit maintainer trigger** (Buildkite "New Build" button with metadata `run_t1=true`, or `buildkite-agent pipeline upload` from another pipeline gated on a maintainer-only label). It SHALL NOT run on PR open, PR update, or push automatically.
+3. THE T1 pipeline SHALL be implemented as `tokeira-pipeline-conformance-features`, a Pipeline_Crate whose `build` subcommand produces an artifact conforming to the envelope in Feature 4 and whose classification is performed by a future `tokeira-conformance` Policy_Crate (owned by `temporal-compatibility`).
+4. THE T1 pipeline SHALL pin `temporalio/features` by immutable git SHA. The pinned SHA SHALL appear in the resulting artifact.
+5. THE initial T1 language scope SHALL be Go only. Adding TypeScript and Python to the T1 pipeline SHALL be a subsequent amendment, not a requirement of this spec.
+6. Promotion of the T1 pipeline from manual to PR-gating SHALL require:
+   - Ten consecutive manual invocations (across a rolling window) passing with zero unexpected failures.
+   - A maintainer amendment to Req 10.1 moving T1 into the PR-gating set.
+   Neither condition is automatic. Both are explicit acts.
+
+### Requirement 10.3: Deferred T2 SDK integration suites
+
+**User Story:** As a Tokeira maintainer, I want to defer expensive SDK integration suites until Tokeira has enough Temporal-compatible behaviour for their result to matter, so that CI-minute and operator-attention cost is not spent on noise.
+
+#### Acceptance Criteria
+
+1. T2 full SDK integration suites (Go, TypeScript, Python SDK canonical test suites against tokeirad) SHALL NOT be run in CI at the time this spec lands. Neither PR-gating nor nightly.
+2. Adoption of T2 SHALL be gated on a documented **readiness criterion** owned by [`temporal-compatibility`](../temporal-compatibility/requirements.md), expressed in terms of the feature matrix: for example, "T2 for language L runs when the feature matrix reports at least N% of L's required-feature scenarios as `Implemented`." The specific threshold is that spec's choice; this spec requires only that the threshold exists.
+3. ONCE T2 is adopted for a given language, it SHALL land first as a Manual_Pipeline per the pattern in Req 10.2. Promotion to nightly (or PR-gating) follows the same two-condition promotion rule as Req 10.2.6, adapted for the target cadence.
+4. THE spec SHALL NOT prescribe a calendar for T2 adoption. "When the feature matrix makes the result signal, not noise" is the trigger.
+
+### Requirement 10.4: Tier-independence from substrate
+
+**User Story:** As a Tokeira maintainer, I want each tier's orchestration (PR vs manual vs deferred) to be a pure Buildkite-configuration concern, so that moving tiers between run cadences does not require Pipeline_Crate code changes.
+
+#### Acceptance Criteria
+
+1. Promoting a tier (for example, moving T1 from manual to PR-gating) SHALL be a pipeline-YAML change only, not a Pipeline_Crate source change.
+2. A tier's Pipeline_Crate SHALL NOT encode its cadence (PR vs manual vs deferred) in its Rust source. The Pipeline_Crate always does the work; Buildkite chooses when to trigger it.
+3. THE artifact emitted by a tier SHALL carry a `ci_context.substrate` field of `buildkite`, `github`, or `local` per Req 4.1.2; it SHALL NOT carry a "this ran as PR gate / as manual" field. That distinction is recoverable from `ci_context.branch` and Buildkite build metadata without being stored in the artifact.
+
+### Requirement 10.5: Tier orchestration documentation
+
+**User Story:** As a Tokeira contributor, I want the tier orchestration model documented clearly, so that I know what runs when without reading multiple specs.
+
+#### Acceptance Criteria
+
+1. THE root `dev/pipelines/README.md` SHALL include a table mapping each conformance tier to its current cadence (PR gate, manual, deferred) with a last-updated date.
+2. THE table SHALL link to [`temporal-compatibility`](../temporal-compatibility/requirements.md) for the tier _semantics_ (what each tier contains and classifies).
+3. Changes to tier cadence SHALL update the table in the same PR as the Buildkite YAML change.

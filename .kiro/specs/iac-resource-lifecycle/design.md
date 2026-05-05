@@ -2,39 +2,44 @@
 
 ## Overview
 
-This design extends `tokeira-iac` with seven capabilities that close lifecycle management gaps leading to orphaned resources, stale state, and poor operator visibility:
+This design extends `tokeira-iac` with six capabilities that close lifecycle management gaps leading to orphaned resources, stale state, and poor operator visibility. It also documents the `effective_managed` convention for resources that need multiple lifecycle modes.
 
-1. **ResourceMode** — a persisted lifecycle classification (`Managed`, `Preexisting`, `Shared`) that controls destroy and diff behavior.
-2. **DestroyMode context propagation** — a marker extension that tells modules to enumerate all managed resources from state, not just current config.
-3. **Incremental StateSaver** — crash-safe state persistence after every mutation (already partially implemented; this formalizes the contract).
-4. **Module-scoped delete suppression** — prevents `--module X` from deleting resources owned by module Y.
-5. **Config writeback** — writes infrastructure outputs back to `tokeirad.toml` preserving TOML formatting.
-6. **CLI progress reporting** — `ActionTuiHandle` using `indicatif` for spinners, progress, and JSON output.
-7. **Describe-before-delete** — verifies resource existence before deletion during destroy (already implemented; this adds mode-awareness).
+Guiding principle: the engine stays generic. Mode-awareness lives in each resource that needs it. The engine never enumerates mode variants, never decides whether to delete based on mode — it just calls `Resource::diff()`, `Resource::delete()`, and records state. Resources that have multiple lifecycle modes define their own enums, persist mode in `ResourceState.properties["mode"]`, and implement mode-aware lifecycle methods following a shared convention.
 
-All changes are additive to the existing `Resource` trait. The `mode()` method is a required trait method — all existing `Resource` implementations must be updated to declare their lifecycle mode explicitly. This ensures no resource silently defaults to a mode the author didn't intend.
+The six engine-level capabilities are:
+
+1. **DestroyMode context propagation** — a marker extension that tells modules to enumerate resources from state in addition to current config during destroy.
+2. **Incremental StateSaver contract** — crash-safe state persistence after every mutation (already partially implemented; this formalises and tests the contract).
+3. **Module-scoped delete suppression** — already implemented; this formalises and tests the filtering invariant.
+4. **Config writeback** — already implemented; this formalises and tests the TOML writeback invariant.
+5. **CLI progress reporting** — new `ActionTuiHandle` using `indicatif` and `console` for spinners, progress, and JSON event output.
+6. **Describe-before-delete** — already implemented; this formalises and tests the safety invariant.
+
+The `effective_managed` convention (Requirement 7) is documented as a reference pattern, not a trait method. Resources that do not need lifecycle variation simply ignore it.
 
 ## Architecture
 
 ```mermaid
 graph TD
-    CLI[tkr CLI] -->|"--module, --yes, --json"| Orchestrator[InfraEngine]
+    CLI[tkr CLI] -->|"--module, --yes, --json"| Orchestrator[InfraEngine facade]
     Orchestrator -->|compose| Engine[tokeira_iac::Engine]
     Engine -->|plan/apply/destroy| Resources[Resource impls]
     Engine -->|after each mutation| StateSaver[StateSaver callback]
     StateSaver --> StateStore[StateStore<InfraState>]
-    
+
     subgraph "Context Flow"
-        DestroyMode[DestroyMode extension] --> ProvisionContext
+        Orchestrator -->|destroy only| DestroyMode[DestroyMode extension]
+        DestroyMode --> ProvisionContext
         ProvisionContext --> ModuleContext
         ModuleContext --> Module[Module::resources]
+        Module -->|inspects state+DestroyMode| ResourceEnumeration[Resource Enumeration]
     end
-    
+
     subgraph "CLI Output"
         ActionTuiHandle --> indicatif[indicatif MultiProgress]
         ActionTuiHandle --> JsonEmitter[JSON event stream]
     end
-    
+
     Engine -->|progress callbacks| ActionTuiHandle
     Orchestrator -->|after apply| Writeback[Config Writeback]
     Writeback --> TOML[toml_edit]
@@ -43,62 +48,24 @@ graph TD
 ### Crate Boundaries
 
 | Change | Crate | Rationale |
-|--------|-------|-----------|
-| `ResourceMode` enum, `Resource::mode()` default method | `tokeira-iac` | Core trait extension |
-| `DestroyMode` marker struct | `tokeira-iac` | Engine-internal context |
-| Mode-aware diff/destroy logic | `tokeira-iac` | Engine algorithm |
-| `ActionTuiHandle`, `OutputFormat` | `apps/tkr` | CLI-only presentation |
-| `console`, `indicatif` dependencies | `apps/tkr/Cargo.toml` | Binary crate only |
-| Config writeback (already exists) | `apps/tkr` | No change needed |
+|---|---|---|
+| `DestroyMode` marker struct | `tokeira-iac` | Engine-level primitive that modules detect via `ModuleContext` |
+| `StateSaver` contract documentation + tests | `tokeira-iac` | Existing behavior, formalised |
+| Module-scoped delete filtering + tests | `tokeira-iac` | Existing behavior, formalised |
+| Describe-before-delete + tests | `tokeira-iac` | Existing behavior, formalised |
+| `ActionTuiHandle`, `OutputFormat`, `ProgressEvent` | `apps/tkr` | CLI-only presentation |
+| `console`, `indicatif` dependencies | `apps/tkr/Cargo.toml` | Binary crate only — no library impact |
+| Config writeback + tests | `apps/tkr` | Existing behavior, formalised |
+
+Notably **not** changed:
+- No `ResourceMode` enum on the engine
+- No `Resource::mode()` trait method
+- No `ResourceState.mode` field
+- No mode-aware logic in `compute_changes`
+
+These belong to individual resource implementations, which are free to define their own mode enums (as `DsqlCluster` does with `DsqlClusterMode`) and follow the `effective_managed` convention.
 
 ## Components and Interfaces
-
-### ResourceMode Enum
-
-```rust
-// crates/tokeira-iac/src/lib.rs
-
-/// Lifecycle classification for a managed resource.
-///
-/// Controls how the engine handles the resource during destroy and diff:
-/// - Managed: engine created it, engine can delete it
-/// - Preexisting: engine adopted it, engine must not delete it
-/// - Shared: engine uses it, another system owns deletion
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ResourceMode {
-    /// Engine created this resource and owns its full lifecycle.
-    #[default]
-    Managed,
-    /// Engine adopted this resource from a preexisting provider object.
-    /// The engine may update tags/associations but will never delete it.
-    Preexisting,
-    /// Engine references this resource but another system owns deletion.
-    /// The engine will not delete it and uses minimal diff comparison.
-    Shared,
-}
-```
-
-### Resource Trait Extension
-
-```rust
-// crates/tokeira-iac/src/lib.rs — added to the Resource trait
-
-#[async_trait::async_trait]
-pub trait Resource: Send + Sync {
-    // ... existing methods unchanged ...
-
-    /// Lifecycle mode for this resource.
-    ///
-    /// Every resource must explicitly declare its mode:
-    /// - `Managed`: engine created it and owns its full lifecycle (create + delete)
-    /// - `Preexisting`: engine adopted it; may update tags but will never delete
-    /// - `Shared`: engine references it; another system owns deletion
-    fn mode(&self) -> ResourceMode;
-}
-```
-
-This is a required method — all existing `Resource` implementations in `platforms/compose/`, `platforms/local/`, and `tokeira-aws` must be updated to return `ResourceMode::Managed` (or the appropriate mode). This is intentional: every resource must explicitly declare its lifecycle contract rather than silently inheriting a default.
 
 ### DestroyMode Marker
 
@@ -108,39 +75,53 @@ This is a required method — all existing `Resource` implementations in `platfo
 /// Marker extension registered in `ProvisionContext` during destroy operations.
 ///
 /// Modules inspect this via `ModuleContext::extension::<DestroyMode>()` to
-/// decide whether to include state-only resources in the known set.
+/// decide whether to enumerate resources from persisted state in addition
+/// to current config. This is how a module includes a resource that was
+/// originally managed but has been removed from current config in the
+/// destroy set.
 #[derive(Debug, Clone, Copy)]
 pub struct DestroyMode;
 ```
 
-### ResourceState Mode Persistence
+The marker is registered by the orchestrator facade (`tokeira-orchestrator::InfraEngine`) before calling `engine.destroy_modules` or `engine.plan_destroy_modules`. The generic engine does not register it.
 
-The `mode` field is stored as a top-level field on `ResourceState` (not inside `properties`):
+### Orchestrator Destroy Wiring
+
+The `InfraEngine` facade in `tokeira-orchestrator` handles the wiring:
 
 ```rust
-// crates/tokeira-iac/src/lib.rs
+// crates/tokeira-orchestrator/src/lib.rs (added to InfraEngine)
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResourceState {
-    pub resource_type: ResourceType,
-    pub physical_id: String,
-    pub properties: serde_json::Value,
-    pub dependencies: Vec<ResourceId>,
-    pub created_at: String,
-    pub updated_at: String,
-    pub module: String,
-    /// Lifecycle mode. Defaults to Managed for backward compatibility
-    /// with state files that predate this field.
-    #[serde(default)]
-    pub mode: ResourceMode,
+impl<D: Deployment> InfraEngine<D> {
+    pub async fn destroy(&mut self, composition: &InfraComposition)
+        -> Result<Vec<Change>>
+    {
+        self.ctx.set_extension(DestroyMode);
+        let active: Vec<&str> = composition.active_modules.iter()
+            .map(|s| s.as_str()).collect();
+        self.engine
+            .destroy_modules(&composition.known_modules, &active, &mut self.ctx)
+            .await
+    }
+
+    pub async fn plan_destroy(&mut self, composition: &InfraComposition)
+        -> Result<Vec<Change>>
+    {
+        self.ctx.set_extension(DestroyMode);
+        let active: Vec<&str> = composition.active_modules.iter()
+            .map(|s| s.as_str()).collect();
+        self.engine
+            .plan_destroy_modules(&composition.known_modules, &active, &mut self.ctx)
+            .await
+    }
 }
 ```
 
-Using `#[serde(default)]` ensures that state files without the `mode` field deserialize with `ResourceMode::Managed` (the `Default` impl).
+Apply and plan (non-destroy) do **not** register the marker.
 
-### InfraComposition (Unchanged)
+### InfraComposition Semantics
 
-The existing `InfraComposition` struct already carries the three module lists needed:
+The existing `InfraComposition` struct carries three module lists:
 
 ```rust
 pub struct InfraComposition {
@@ -150,65 +131,165 @@ pub struct InfraComposition {
 }
 ```
 
-No structural changes needed. The semantic change is that during destroy, `known_modules` is populated from persisted state (via DestroyMode-aware module enumeration) rather than solely from current config.
+The **composition is built by the orchestrator/deployment crate**, not the generic engine. The deployment-specific code decides:
 
-### StateSaver Callback (Existing — Formalized)
+- **For plan/apply**: `desired_modules = known_modules = modules from current config`. `active_modules` is the subset the operator selected (empty = all).
+- **For destroy**: `desired_modules = []` (nothing should exist after destroy). `known_modules = all modules the deployment could have ever created` (read from deployment code, expanded via `DestroyMode` enumeration). `active_modules` is the subset the operator selected.
+
+This is why the `DestroyMode` marker matters: during destroy, modules use it to expand their resource enumeration to include everything they could have managed, not just what current config declares.
+
+### StateSaver Contract (Formalisation)
 
 The `StateSaver` type already exists:
 
 ```rust
 pub type StateSaver = Box<
-    dyn Fn(
-            &crate::document::InfraState,
-        ) -> Pin<Box<dyn Future<Output = Result<(), IacError>> + Send + '_>>
+    dyn Fn(&InfraState)
+        -> Pin<Box<dyn Future<Output = Result<(), IacError>> + Send + '_>>
         + Send
         + Sync,
 >;
 ```
 
-**Contract formalization:**
-- Called exactly once after each successful create, update, or delete operation.
-- Called after pruning stale resources during refresh (when `has_managed_missing` is true).
-- If it returns `Err`, the engine aborts immediately and propagates the error.
-- The engine MUST NOT batch multiple mutations before calling the saver.
+**Contract:**
+1. Called exactly once after each successful create, update, or delete operation.
+2. Called after pruning a stale resource from state during refresh.
+3. If it returns `Err`, the engine aborts immediately and propagates the error.
+4. The engine MUST NOT batch multiple mutations before calling the saver.
+5. The saver sees the full current `InfraState` snapshot, not a delta.
+
+This contract is already implemented in `apply_changes` and `destroy_changes`. The spec adds explicit tests to catch regression.
 
 ### ActionTuiHandle (New — CLI Only)
 
 ```rust
 // apps/tkr/src/tui.rs
 
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
-use console::style;
+use console::{Term, style};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use tokeira_iac::{ResourceId, ResourceType};
+use serde::Serialize;
 
 /// Output format for CLI operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
-    /// Human-readable terminal UI with spinners and colors.
     Human,
-    /// Structured JSON events, one per line.
     Json,
 }
 
-/// Progress reporting handle for infrastructure operations.
+/// Shared counters updated from progress closures.
 ///
-/// Wraps `indicatif::MultiProgress` for human output or emits JSON events
-/// for machine consumption. Installed as progress reporters on
-/// `ProvisionContext` before calling the engine.
-#[derive(Debug)]
+/// Uses atomics because progress callbacks are `Fn` (not `FnMut`) and
+/// multiple reporter closures share the same counters.
+#[derive(Debug, Default)]
+struct ActionCounters {
+    completed: AtomicUsize,
+    failed: AtomicUsize,
+    skipped: AtomicUsize,
+}
+
+/// Progress reporting handle for infrastructure operations.
+#[derive(Debug, Clone)]
 pub struct ActionTuiHandle {
     format: OutputFormat,
     multi: MultiProgress,
     start: Instant,
-    completed: usize,
-    failed: usize,
-    skipped: usize,
+    counters: Arc<ActionCounters>,
+    is_terminal: bool,
+}
+
+impl ActionTuiHandle {
+    pub fn new(format: OutputFormat) -> Self {
+        let is_terminal = Term::stdout().is_term();
+        Self {
+            format,
+            multi: MultiProgress::new(),
+            start: Instant::now(),
+            counters: Arc::new(ActionCounters::default()),
+            is_terminal,
+        }
+    }
+
+    /// Install progress reporters on the provision context.
+    pub fn install(&self, ctx: &mut tokeira_iac::ProvisionContext) {
+        let format = self.format;
+        let multi = self.multi.clone();
+        let counters = Arc::clone(&self.counters);
+        let is_terminal = self.is_terminal;
+
+        ctx.set_apply_progress(move |action, rid, rtype, current, total| {
+            match format {
+                OutputFormat::Human if is_terminal => {
+                    let pb = multi.add(ProgressBar::new_spinner());
+                    pb.set_style(
+                        ProgressStyle::with_template("  {spinner} {msg}")
+                            .unwrap()
+                            .tick_strings(&["-", "\\", "|", "/", "✓"]),
+                    );
+                    pb.set_message(format!(
+                        "[{current}/{total}] {action} {} ({})",
+                        rid.0, rtype.0
+                    ));
+                    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+                    // Caller is responsible for finishing; we detach here.
+                    pb.finish_and_clear();
+                }
+                OutputFormat::Human => {
+                    eprintln!(
+                        "  [{current}/{total}] {action} {} ({})",
+                        rid.0, rtype.0
+                    );
+                }
+                OutputFormat::Json => {
+                    let event = ProgressEvent::OperationStart {
+                        action: action.into(),
+                        resource_id: rid.0.clone(),
+                        resource_type: rtype.0.clone(),
+                        index: current,
+                        total,
+                    };
+                    println!("{}", serde_json::to_string(&event).unwrap());
+                }
+            }
+            counters.completed.fetch_add(1, Ordering::Relaxed);
+        });
+
+        // Similar wiring for set_wait_progress and set_note_progress.
+        // Elided here for brevity; full wiring in tasks.
+    }
+
+    pub fn print_summary(&self) {
+        let completed = self.counters.completed.load(Ordering::Relaxed);
+        let failed = self.counters.failed.load(Ordering::Relaxed);
+        let skipped = self.counters.skipped.load(Ordering::Relaxed);
+        let elapsed = self.start.elapsed();
+
+        match self.format {
+            OutputFormat::Human => {
+                println!(
+                    "\n{} {completed} completed, {failed} failed, {skipped} skipped in {:.1}s",
+                    style("Done:").bold(),
+                    elapsed.as_secs_f64()
+                );
+            }
+            OutputFormat::Json => {
+                let event = ProgressEvent::Summary {
+                    completed,
+                    failed,
+                    skipped,
+                    elapsed_ms: elapsed.as_millis() as u64,
+                };
+                println!("{}", serde_json::to_string(&event).unwrap());
+            }
+        }
+    }
 }
 
 /// A single JSON progress event emitted when `--json` is active.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum ProgressEvent {
     OperationStart {
@@ -217,12 +298,6 @@ pub enum ProgressEvent {
         resource_type: String,
         index: usize,
         total: usize,
-    },
-    OperationComplete {
-        action: String,
-        resource_id: String,
-        resource_type: String,
-        elapsed_ms: u64,
     },
     WaitProgress {
         resource_id: String,
@@ -243,127 +318,139 @@ pub enum ProgressEvent {
         elapsed_ms: u64,
     },
 }
+```
 
-impl ActionTuiHandle {
-    pub fn new(format: OutputFormat) -> Self {
-        Self {
-            format,
-            multi: MultiProgress::new(),
-            start: Instant::now(),
-            completed: 0,
-            failed: 0,
-            skipped: 0,
+The counters are kept in an `Arc<ActionCounters>` with atomic fields so that the three separate reporter closures (apply, wait, note) can share state without a lock.
+
+When stdout is not a terminal, the `Human` path falls back to plain `eprintln!` lines instead of spinners. This preserves readability when output is piped to a log file.
+
+### Config Writeback (Existing — Formalised)
+
+The existing `write_tokeirad_writeback` in `apps/tkr/src/commands/infra.rs` uses `toml_edit::DocumentMut` which preserves comments and formatting. It:
+
+- Creates intermediate tables when paths don't exist
+- Overwrites existing values at dotted key paths
+- Preserves TOML comments and formatting (inherent to `toml_edit::DocumentMut`)
+- Returns an error if the file cannot be written
+
+No code changes needed. The spec adds property tests.
+
+## The `effective_managed` Convention for Mode-Aware Resources
+
+This is a **resource-level convention**, not an engine feature. Resources that need lifecycle variation (e.g., DSQL clusters, shared S3 buckets) follow this pattern. Other resources ignore it.
+
+### Pattern
+
+```rust
+// Example: DsqlClusterMode in a resource crate
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DsqlClusterMode {
+    /// Engine creates and owns the cluster lifecycle.
+    Managed,
+    /// Engine adopts a preexisting cluster; never deletes it.
+    Preexisting,
+}
+
+pub struct DsqlClusterConfig {
+    pub mode: DsqlClusterMode,
+    pub preexisting_endpoint: Option<String>,
+    pub preexisting_arn: Option<String>,
+    // ...
+}
+
+impl Resource for DsqlCluster {
+    async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, IacError> {
+        match self.config.mode {
+            DsqlClusterMode::Managed => {
+                // Call provider create API
+                let id = create_via_api(ctx).await?;
+                Ok(ResourceState {
+                    // ...
+                    properties: serde_json::json!({
+                        "mode": "managed",
+                        "cluster_id": id,
+                    }),
+                    // ...
+                })
+            }
+            DsqlClusterMode::Preexisting => {
+                // Adopt — record endpoint/arn, no provider API call
+                Ok(ResourceState {
+                    // ...
+                    properties: serde_json::json!({
+                        "mode": "preexisting",
+                        "cluster_endpoint": self.config.preexisting_endpoint,
+                    }),
+                    // ...
+                })
+            }
         }
     }
 
-    /// Install progress reporters on the provision context.
-    pub fn install(&self, ctx: &mut tokeira_iac::ProvisionContext) {
-        // Closures capture format and multi-progress handle,
-        // wire into ctx.set_apply_progress / set_wait_progress / set_note_progress
+    async fn delete(&self, current: &ResourceState, ctx: &ProvisionContext)
+        -> Result<(), IacError>
+    {
+        let state_mode = current.properties.get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+
+        // effective_managed ensures a resource originally created as Managed
+        // is still deleted even if current config now declares Preexisting.
+        let effective_managed = self.config.mode == DsqlClusterMode::Managed
+            || state_mode == "managed";
+
+        if !effective_managed {
+            // Preexisting in both config and state — do not delete.
+            return Ok(());
+        }
+
+        // Actually delete via provider API
+        delete_via_api(ctx, current).await
     }
 
-    /// Print the final summary line.
-    pub fn print_summary(&self) {
-        match self.format {
-            OutputFormat::Human => {
-                println!(
-                    "\n{} {} completed, {} failed, {} skipped in {:.1}s",
-                    style("Done:").bold(),
-                    self.completed,
-                    self.failed,
-                    self.skipped,
-                    self.start.elapsed().as_secs_f64()
-                );
+    fn diff(&self, current: &ResourceState, _ctx: &ProvisionContext) -> Change {
+        match self.config.mode {
+            DsqlClusterMode::Managed => {
+                // Full comparison — whatever the resource tracks
+                Change::NoChange { resource_id: self.resource_id() }
             }
-            OutputFormat::Json => {
-                let event = ProgressEvent::Summary {
-                    completed: self.completed,
-                    failed: self.failed,
-                    skipped: self.skipped,
-                    elapsed_ms: self.start.elapsed().as_millis() as u64,
-                };
-                println!("{}", serde_json::to_string(&event).unwrap());
+            DsqlClusterMode::Preexisting => {
+                // Compare only engine-controlled fields (endpoint/arn)
+                // ...
             }
         }
     }
 }
 ```
 
-### Config Writeback (Existing — No Changes)
+### Key properties of the convention
 
-The `write_tokeirad_writeback` function in `apps/tkr/src/commands/infra.rs` already implements dotted-key TOML insertion using `toml_edit`. It:
-- Creates intermediate tables when paths don't exist
-- Overwrites existing values
-- Preserves TOML formatting and comments (via `toml_edit::DocumentMut`)
+1. **No trait pollution.** Resources without lifecycle variation don't implement or inherit any mode concept.
+2. **State persists mode as a string.** Stored under `properties["mode"]`, serialised as JSON. This is an opaque detail to the engine.
+3. **`effective_managed` reconciles config drift.** If config mode is `Managed` OR persisted state mode is `"managed"`, the resource treats itself as managed for destroy purposes. This prevents orphaning when config changes from `Managed` to `Preexisting` after a resource was originally created.
+4. **Resources define their own mode variants.** `DsqlCluster` has `Managed`/`Preexisting`. A hypothetical `RemoteStateBucket` might have `Managed`/`Shared` where `Shared` has distinct snapshot-protection semantics. Each resource names its modes for what it actually needs.
 
-No changes needed. The design formalizes the existing behavior as a requirement.
+This convention is documented in the spec as guidance. Implementations in `tokeira-aws` (DSQL cluster) already demonstrate the pattern.
 
 ## Data Models
 
-### State Machine: Resource Lifecycle
+### DestroyMode Propagation Flow
 
-```mermaid
-stateDiagram-v2
-    [*] --> Absent: initial state
-    Absent --> Managed: Engine.create()
-    Absent --> Preexisting: Engine.adopt() / describe finds existing
-    Absent --> Shared: Module declares shared
-    
-    Managed --> Managed: Engine.update()
-    Managed --> Absent: Engine.delete()
-    
-    Preexisting --> Preexisting: Engine.update() (tags only)
-    Preexisting --> Absent: Manual deletion outside engine
-    
-    Shared --> Shared: Engine.update() (engine-controlled only)
-    Shared --> Absent: External system deletes
-    
-    note right of Managed: Engine owns full lifecycle
-    note right of Preexisting: Engine never calls delete()
-    note right of Shared: Engine never calls delete()
+```
+CLI (tkr infra destroy --yes)
+  → InfraEngine::destroy(composition)
+    → ctx.set_extension(DestroyMode)              // register marker
+    → engine.destroy_modules(&composition.known_modules, &active, &mut ctx)
+      → collect_resources_from(known_modules, ctx)
+        → ModuleContext::new(state, ctx.extensions())
+        → module.resources(module_ctx)
+          → let destroy_mode = module_ctx.extension::<DestroyMode>().is_some();
+          → if destroy_mode: enumerate from config AND state
+          → if !destroy_mode: enumerate from config only
 ```
 
-### Valid State Transitions
-
-| Current Mode | Operation | Result | Condition |
-|---|---|---|---|
-| (absent) | create | Managed | Resource.mode() == Managed |
-| (absent) | adopt | Preexisting | Resource.mode() == Preexisting |
-| (absent) | reference | Shared | Resource.mode() == Shared |
-| Managed | update | Managed | — |
-| Managed | delete | (absent) | destroy or removed from desired |
-| Preexisting | update | Preexisting | tags/associations only |
-| Preexisting | delete | **FORBIDDEN** | invariant violation |
-| Shared | update | Shared | engine-controlled fields only |
-| Shared | delete | **FORBIDDEN** | invariant violation |
-
-### Refresh State Algorithm (Four-Status Model)
-
-The existing `refresh_state` function uses four statuses. The mode-aware extension adds filtering:
-
-```rust
-enum RefreshStatus {
-    DesiredLive,      // Resource wanted and exists → keep in state
-    DesiredMissing,   // Resource wanted but absent → will be created
-    ManagedLive,      // Not desired, exists → candidate for deletion
-    ManagedMissing,   // Not desired, absent → prune from state
-}
-```
-
-**Algorithm (unchanged from current, formalized):**
-
-1. Compute `desired_ids` from the desired resource set.
-2. Topologically sort the known resource set.
-3. For each resource in sorted order:
-   a. Call `describe(ctx)` to get live provider state.
-   b. If `Some(live_state)`: insert into refreshed state, classify as `DesiredLive` or `ManagedLive`.
-   c. If `None`: remove from refreshed state, classify as `DesiredMissing` or `ManagedMissing`.
-4. If any `ManagedMissing` found, set `has_managed_missing = true`.
-5. Return `RefreshReport { state, status_by_id, has_managed_missing }`.
-
-**Mode-aware addition:** After refresh, before computing changes, filter out resources where `mode != Managed` from the delete candidate set.
-
-### Apply Changes Algorithm
+### Apply Changes Algorithm (Existing — Unchanged)
 
 ```
 apply_changes(known, ctx, changes, saver):
@@ -374,28 +461,29 @@ apply_changes(known, ctx, changes, saver):
      for each resource_id in sorted order:
        if change is Create:
          emit_apply_progress("create", ...)
-         state = resource.create(ctx)
-         ctx.state.insert(resource_id, state)  // mode comes from ResourceState
-         saver(&ctx.state)?                    // incremental save
+         state = resource.create(ctx).await?        // resource handles its own mode
+         ctx.state.insert(resource_id, state)
+         saver(&ctx.state).await?                   // INCREMENTAL SAVE
        if change is Update:
          emit_apply_progress("update", ...)
-         state = resource.update(current, ctx)
+         state = resource.update(current, ctx).await?
          ctx.state.insert(resource_id, state)
-         saver(&ctx.state)?
+         saver(&ctx.state).await?                   // INCREMENTAL SAVE
   5. Reverse pass (reverse topological order) — deletes:
      collect delete_ids from changes
      topological_sort_from_state(delete_ids)
      reverse the order
      for each resource_id in reversed order:
-       SKIP if resource.mode() != Managed     // MODE-AWARE ADDITION
        emit_apply_progress("delete", ...)
-       resource.delete(current, ctx)
+       resource.delete(current, ctx).await?         // resource decides if mode skips
        ctx.state.remove(resource_id)
-       saver(&ctx.state)?
+       saver(&ctx.state).await?                     // INCREMENTAL SAVE
   6. Return changes
 ```
 
-### Destroy Changes Algorithm
+Note: the engine does **not** inspect mode. `resource.delete()` is called unconditionally. The resource's own `delete()` implementation may skip the provider call based on `effective_managed`, returning `Ok(())` without side effects.
+
+### Destroy Changes Algorithm (Existing — Formalised)
 
 ```
 destroy_changes(known, ctx, changes, saver):
@@ -403,39 +491,20 @@ destroy_changes(known, ctx, changes, saver):
   2. Collect delete_ids from changes
   3. Topological sort from state, then reverse
   4. For each resource_id in reversed order:
-     if resource.mode() != Managed:           // MODE-AWARE: skip non-managed
-       ctx.state.remove(resource_id)          // remove from state but don't delete
-       saver(&ctx.state)?
-       continue
      describe(ctx) → live_state?
        None → prune from state (already absent)
               ctx.state.remove(resource_id)
-              saver(&ctx.state)?
-       Some(live) → delete(live, ctx)         // use LIVE state, not stale
+              saver(&ctx.state).await?
+       Some(live) → resource.delete(live, ctx).await?    // use LIVE state
                     ctx.state.remove(resource_id)
-                    saver(&ctx.state)?
+                    saver(&ctx.state).await?
        Err(e) → propagate error, abort
   5. Return changes
 ```
 
-### DestroyMode Propagation Flow
+Again: the engine does not inspect mode. `resource.delete()` is called unconditionally with live state. Mode-aware resources check `effective_managed` internally.
 
-```
-CLI (tkr infra destroy --yes)
-  → InfraEngine::destroy(composition)
-    → ctx.set_extension(DestroyMode)          // register marker
-    → engine.destroy(composition, ctx, saver)
-      → collect_resources_from(known_modules, ctx)
-        → ModuleContext::new(state, extensions)  // extensions include DestroyMode
-        → module.resources(module_ctx)
-          → module_ctx.extension::<DestroyMode>()  // module checks this
-          → if Some(_): enumerate from state (all managed resources)
-          → if None: enumerate from config only
-```
-
-### Module-Scoped Delete Filtering
-
-The existing `filter_changes_by_modules` function already implements this correctly:
+### Module-Scoped Delete Filtering (Existing — Formalised)
 
 ```rust
 fn filter_changes_by_modules(
@@ -459,87 +528,79 @@ fn filter_changes_by_modules(
 }
 ```
 
-No changes needed to this function. The design formalizes its behavior as a requirement.
-
-### Config Writeback Algorithm
-
-```
-write_tokeirad_writeback(deployment_path, values):
-  if values.is_empty(): return Ok(())
-  path = deployment_path / "tokeirad.toml"
-  document = parse path as toml_edit::DocumentMut
-  for (dotted_key, value) in values:
-    parts = dotted_key.split('.')
-    navigate/create intermediate tables
-    set leaf value
-  write document back to path (preserves comments, formatting)
-```
-
-This is already implemented in `apps/tkr/src/commands/infra.rs`.
+No code changes needed. The spec adds property tests.
 
 ## Correctness Properties
 
-*A property is a characteristic or behavior that should hold true across all valid executions of a system — essentially, a formal statement about what the system should do. Properties serve as the bridge between human-readable specifications and machine-verifiable correctness guarantees.*
+### Property 1: DestroyMode Visibility
 
-### Property 1: ResourceMode Serialization Round-Trip
+*For any* `ProvisionContext` where `DestroyMode` has been set via `set_extension`, `ModuleContext::extension::<DestroyMode>()` SHALL return `Some`.
 
-*For any* valid `ResourceMode` value, serializing to JSON and deserializing back SHALL produce an equivalent value.
+*For any* `ProvisionContext` where `DestroyMode` has not been set, `ModuleContext::extension::<DestroyMode>()` SHALL return `None`.
 
-**Validates: Requirements 1.6**
+**Validates: Requirements 1.3, 1.4**
 
-### Property 2: ResourceMode Backward Compatibility Default
-
-*For any* valid `ResourceState` JSON that does not contain a `mode` field, deserializing SHALL produce a `ResourceState` with `mode == ResourceMode::Managed`.
-
-**Validates: Requirements 1.5**
-
-### Property 3: Engine Persists Correct Mode After Mutation
-
-*For any* resource with a declared `ResourceMode`, after the engine performs a create or update operation, the resulting `ResourceState` in `ctx.state` SHALL have `mode` equal to the resource's `mode()` return value.
-
-**Validates: Requirements 1.1, 1.2, 1.3, 1.4**
-
-### Property 4: Destroy Excludes Non-Managed Resources
-
-*For any* destroy or plan/apply operation on a set of resources containing resources with mode `Preexisting` or `Shared`, the engine SHALL never call `delete()` on those resources, and the resulting change set SHALL never contain a `Delete` change for those resources.
-
-**Validates: Requirements 2.4, 8.5**
-
-### Property 5: StateSaver Invocation Count Equals Mutation Count
+### Property 2: StateSaver Invocation Count
 
 *For any* sequence of N successful mutating operations (creates + updates + deletes), the `StateSaver` callback SHALL be invoked exactly N times.
 
-**Validates: Requirements 3.1, 3.2, 3.3, 3.6**
+**Validates: Requirements 2.1, 2.2, 2.3, 2.6**
 
-### Property 6: StateSaver Error Aborts Engine
+### Property 3: StateSaver Error Aborts Engine
 
 *For any* sequence of operations where the `StateSaver` returns an error at invocation K, the engine SHALL complete at most K mutating operations and return an error.
 
-**Validates: Requirements 3.4**
+**Validates: Requirements 2.4**
 
-### Property 7: Module-Scoped Delete Filtering
+### Property 4: Module-Scoped Delete Filtering
 
 *For any* set of changes and any active module set, the filtered change set SHALL contain Delete changes only for resources whose persisted module is in the active set, and SHALL preserve all Create, Update, and NoChange entries unchanged.
 
-**Validates: Requirements 4.1, 4.2, 4.3, 4.4, 4.5**
+**Validates: Requirements 3.1, 3.2, 3.3, 3.4, 3.5, 3.6**
 
-### Property 8: TOML Writeback Round-Trip
+### Property 5: TOML Writeback Round-Trip
 
 *For any* set of N dotted-key/value pairs where keys are valid TOML paths and values are non-empty strings, writing them to a TOML document and reading back the values at those paths SHALL produce the original values.
 
-**Validates: Requirements 5.2, 5.3, 5.4, 5.6**
+**Validates: Requirements 4.2, 4.3, 4.4, 4.7**
 
-### Property 9: Describe-Before-Delete Count
+### Property 6: TOML Writeback Preserves Comments
 
-*For any* destroy operation on N resources in state where K resources are absent (describe returns None), the engine SHALL call `delete()` exactly N-K times (on the resources that are present).
+*For any* existing TOML document with comments, after a writeback operation that modifies values, the resulting document SHALL still contain all original comments.
 
-**Validates: Requirements 7.1, 7.2, 7.5**
+**Validates: Requirements 4.5**
 
-### Property 10: Describe-Before-Delete Uses Live State
+### Property 7: Describe-Before-Delete Count
 
-*For any* resource where `describe()` returns `Some(live_state)` during destroy, the engine SHALL pass `live_state` (not the persisted state) to `delete()`.
+*For any* destroy operation on N resources in state where K resources are absent (describe returns None), the engine SHALL call `resource.delete()` at most N-K times.
 
-**Validates: Requirements 7.3**
+**Validates: Requirements 6.1, 6.2, 6.5**
+
+### Property 8: Describe-Before-Delete Uses Live State
+
+*For any* resource where `describe()` returns `Some(live_state)` during destroy, the engine SHALL pass `live_state` (not the persisted state) to `resource.delete()`.
+
+**Validates: Requirements 6.3**
+
+### Property 9: JSON Progress Event Well-Formedness
+
+*For any* progress event emitted when `OutputFormat::Json` is active, the output line SHALL be valid JSON and SHALL parse back into the expected `ProgressEvent` variant.
+
+**Validates: Requirements 5.7**
+
+### Property 10: Progress Counter Accuracy
+
+*For any* sequence of N apply operations in a CLI session, the summary counters SHALL sum to exactly N (completed + failed + skipped == N).
+
+**Validates: Requirements 5.8**
+
+## Resource Mode Convention — Correctness Guidance
+
+The `effective_managed` convention (Requirement 7) is documented guidance, not a property the engine enforces. Resources that follow the convention gain a specific correctness guarantee:
+
+**Convention Property:** *For any* resource with current config mode `Preexisting` whose persisted state mode is `"managed"`, invoking `resource.delete()` during destroy SHALL call the provider delete API. This prevents orphaning resources that were originally created by the engine but whose config later changed to `Preexisting`.
+
+This property must be tested in each resource that implements the convention. The spec lists it as guidance; enforcement is a per-resource test.
 
 ## Error Handling
 
@@ -547,13 +608,13 @@ This is already implemented in `apps/tkr/src/commands/infra.rs`.
 |---|---|---|
 | `StateSaver` returns error | Engine aborts immediately, returns error | Operator re-runs; state reflects last successful save |
 | `describe()` fails during refresh | Engine returns error, no state mutation | Operator fixes provider access, re-runs |
-| `describe()` fails during destroy | Engine aborts destroy for that resource | Operator fixes access or manually deletes |
-| `delete()` fails | Engine returns error, resource remains in state | Operator re-runs destroy (idempotent) |
+| `describe()` fails during destroy | Engine propagates error, aborts destroy for that resource | Operator fixes access or manually removes |
+| `delete()` fails | Engine propagates error, resource remains in state | Operator re-runs destroy (idempotent) |
 | TOML writeback fails | CLI returns error after successful apply | State is saved; operator manually updates config |
 | Module dependency cycle | `IacError::DependencyResolution` before any mutations | Operator fixes module dependencies |
 | Resource dependency cycle | `IacError::DependencyResolution` before any mutations | Operator fixes resource dependencies |
 
-**Error propagation principle:** Errors during mutations are always propagated immediately. The StateSaver ensures that any successfully completed operations are persisted before the error reaches the caller. This means re-running after a failure is always safe — the engine will see the already-created resources via `describe()` and skip or update them.
+**Error propagation principle:** Errors during mutations are always propagated immediately. The StateSaver ensures that any successfully completed operations are persisted before the error reaches the caller. Re-running after a failure is always safe — the engine will see already-created resources via `describe()` and either skip or update them.
 
 ## Testing Strategy
 
@@ -561,44 +622,43 @@ This is already implemented in `apps/tkr/src/commands/infra.rs`.
 
 Each correctness property maps to a `proptest` test with minimum 100 iterations:
 
-| Property | Generator Strategy | Assertion |
+| Property | Test Location | Generator Strategy |
 |---|---|---|
-| 1: Mode round-trip | `prop_oneof![Managed, Preexisting, Shared]` | `deserialize(serialize(mode)) == mode` |
-| 2: Backward compat | Random `ResourceState` JSON without `mode` | `parsed.mode == Managed` |
-| 3: Mode persistence | Random resources with random modes | `ctx.state[rid].mode == resource.mode()` |
-| 4: No delete non-managed | Random resource sets with mixed modes | `deletes.all(\|d\| d.mode == Managed)` |
-| 5: Saver count | Random N operations | `saver_call_count == N` |
-| 6: Saver error aborts | Random K ∈ [1, N] | `completed_ops <= K` |
-| 7: Module filter | Random changes + random active set | `deletes ⊆ active_module_resources` |
-| 8: TOML round-trip | Random dotted keys + values | `read_back(key) == value` |
-| 9: Delete count | Random N resources, K absent | `delete_calls == N - K` |
-| 10: Live state | Random resources with divergent describe | `delete_arg == describe_result` |
+| 1: DestroyMode visibility | `tokeira-iac/src/module.rs` | `ProvisionContext` with/without DestroyMode, assert ModuleContext visibility |
+| 2: StateSaver count | `tokeira-iac/src/engine.rs` | Random N operations, atomic counter in saver, assert counter == N |
+| 3: StateSaver error aborts | `tokeira-iac/src/engine.rs` | Random K ∈ [1, N] where saver fails, assert completed ≤ K |
+| 4: Module filter | `tokeira-iac/src/engine.rs` | Random changes + random active set, assert deletes ⊆ active |
+| 5: TOML round-trip | `tkr/src/commands/infra.rs` | Random dotted keys + non-empty values, read back, assert equal |
+| 6: TOML comments preserved | `tkr/src/commands/infra.rs` | Random TOML with comments + writeback, assert comments remain |
+| 7: Delete count | `tokeira-iac/src/engine.rs` | Random N resources, K absent, assert delete calls ≤ N-K |
+| 8: Live state | `tokeira-iac/src/engine.rs` | Divergent describe vs persisted, assert delete receives live |
+| 9: JSON well-formedness | `tkr/src/tui.rs` | Random ProgressEvent variants, serialize, parse, assert equal |
+| 10: Counter accuracy | `tkr/src/tui.rs` | Random N operations with mixed outcomes, assert sum == N |
 
 **Test configuration:**
 - Library: `proptest` (already in workspace)
 - Minimum iterations: 100 per property
-- Tag format: `// Feature: iac-resource-lifecycle, Property N: <title>`
 
-### Unit Tests (Example-Based)
+### Unit Tests
 
-- DestroyMode extension propagation through ProvisionContext → ModuleContext
-- CLI `ActionTuiHandle` emits correct JSON events
-- `OutputFormat::Json` produces valid JSON for all event types
-- Summary counts match actual operation outcomes
-- Backward compatibility: existing state files without `mode` field load correctly
+- `DestroyMode` extension propagation through `ProvisionContext` → `ModuleContext`
+- `ActionTuiHandle` terminal vs non-terminal fallback behavior
+- `ActionTuiHandle` summary output format for both `Human` and `Json`
+- `write_tokeirad_writeback` creates intermediate tables when paths don't exist
+- `write_tokeirad_writeback` overwrites existing values
 
 ### Integration Tests
 
-- Full plan → apply → destroy cycle with mixed-mode resources
-- Module-scoped apply does not touch other modules' resources
-- Crash recovery: kill mid-apply, verify state is consistent on re-run
-- Config writeback preserves existing TOML comments
+- **Destroy with mode-aware resource:** A resource originally created in `Managed` mode, config changed to `Preexisting`, destroy invoked. The resource's `effective_managed` logic ensures deletion happens. (Lives with the resource's own tests.)
+- **Module-scoped apply safety:** `tkr infra apply --module networking` does not touch resources in other modules.
+- **Crash recovery:** Simulated mid-apply failure; re-run produces consistent state.
+- **Config writeback preserves comments:** Apply writes back values; original comments remain in the file.
 
 ### New Dependencies
 
 | Dependency | Crate | Purpose |
 |---|---|---|
-| `console` | `apps/tkr` | Colored terminal output, style helpers |
+| `console` | `apps/tkr` | ANSI styles, TTY detection |
 | `indicatif` | `apps/tkr` | Multi-progress bars, spinners |
 
-Both are added only to the binary crate (`apps/tkr`), not to library crates.
+Both added only to the binary crate (`apps/tkr`). No library crate gains a terminal UI dependency.

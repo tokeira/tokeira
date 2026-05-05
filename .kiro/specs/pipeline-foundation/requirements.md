@@ -1,0 +1,501 @@
+# Requirements Document: Pipeline Foundation
+
+## Introduction
+
+Tokeira needs a repeatable, portable way to run continuous-integration work across build, lint, test, container publication, infrastructure apply dry-runs, and compatibility conformance. Today that work is scattered: some of it lives in `cargo` aliases, some in shell scripts in `dev/`, and anything that needs a live environment (container build, conformance, integration testing) has no home. The [`image-lifecycle`](../image-lifecycle/requirements.md) spec introduces the first piece of the model: a `dagger-client` Rust crate that drives a Dagger session over GraphQL, plus a `tokeira-build` policy crate that consumes the client to orchestrate image builds. The in-flight [`temporal-compatibility`](../temporal-compatibility/requirements.md) spec will need a conformance runner that looks almost identical in shape.
+
+This spec generalises the image-lifecycle pattern into a substrate that future pipelines build on. It sets up:
+
+1. A convention for **Rust-authored pipelines** driven by the in-repo `dagger-client` — no Dagger Modules, no `dagger.json`, no Dagger CLI module-call surface. Pipelines are library + binary crates under `crates/tokeira-pipeline-{name}/`.
+2. A shared **pipeline runtime crate** (`tokeira-pipeline-runtime`) holding the common Dagger orchestration helpers (workspace mount, Rust toolchain container, `cargo` wrappers, container publish, artifact upload) so individual pipelines do not reinvent them.
+3. A **policy-layer pattern**: wherever a pipeline has to decide what results *mean* (pass/fail, release gate, classification), that logic lives in a dedicated Rust crate on the non-Dagger side of the boundary. Pipelines execute; policy crates classify.
+4. A **trigger layer** on whichever CI substrate is in play — GitHub Actions first, Buildkite second — whose only job is to install the Dagger CLI and invoke `dagger run -- cargo run -p tokeira-pipeline-{name} -- {subcommand}`. The trigger layer contains no business logic.
+5. An **artifact contract**: every pipeline run that produces operator-visible results writes a versioned JSON artifact to a known S3 location. `tkr` commands consume artifacts, not CI APIs.
+6. A **local-parity rule**: every pipeline binary runs identically on a developer's workstation under `dagger run -- cargo run -p tokeira-pipeline-{name} -- {subcommand}` and on CI. There is no "works only on CI" logic.
+
+The spec is substrate-only. It does not define any specific pipeline (no `tokeirad` build pipeline, no conformance pipeline, no release pipeline). Other specs consume this foundation and add their own pipelines.
+
+### What this spec delivers
+
+- A `tokeira-pipeline-runtime` Rust crate at `crates/tokeira-pipeline-runtime/` holding the common Dagger orchestration helpers, including `CiContext` resolution from environment variables with local fallbacks.
+- A `tokeira-ci-policy` Rust crate at `crates/tokeira-ci-policy/` holding the shared artifact envelope, policy exit codes, and artifact reader/writer.
+- A per-pipeline crate template documented in `dev/pipelines/README.md` describing the `crates/tokeira-pipeline-{name}/` layout every pipeline follows.
+- A GitHub Actions workflow template at `.github/workflows/ci.yml` that is substrate-thin: checkout, install Dagger CLI, invoke `dagger run -- cargo ...`.
+- A Buildkite pipeline template at `dev/pipelines/buildkite/pipeline.yml` ready to register when self-hosted agents are stood up. Same shell invocation pattern as GitHub Actions.
+- An `ArtifactBucket` resource in `tokeira-aws` (S3 bucket with the shared-bucket semantics from [`ecs-deployment`](../ecs-deployment/requirements.md) `RemoteStateBucket`) for pipeline outputs.
+- A `tkr pipeline` command group with subcommands `list`, `run`, `artifacts` for local invocation and artifact inspection.
+- The first pipeline to ship under the new substrate: a `workspace` pipeline that runs `cargo fmt --check`, `cargo lint`, `cargo test-lint`, `cargo check --workspace`, `cargo test --workspace`, and `cargo doc --workspace`. This pipeline becomes the canonical reference for "how a pipeline looks" and replaces whatever ad-hoc workspace CI exists today.
+
+### What this spec does NOT cover
+
+- The container build, conformance, or release pipelines themselves. Those are introduced by [`image-lifecycle`](../image-lifecycle/requirements.md), [`temporal-compatibility`](../temporal-compatibility/requirements.md), and a future `release-pipeline` spec respectively. This spec defines the substrate they run on.
+- Hosting Buildkite agents. If we self-host agents on Tokeira's own AWS account, that is a follow-up module in [`ecs-deployment`](../ecs-deployment/requirements.md) or a dedicated `buildkite-agents` spec.
+- Release automation: changelog generation, semver bumps, artifact signing. Out of scope.
+- Deployment orchestration from CI. `tkr deploy apply` remains operator-initiated; pipelines never call it.
+- Dagger Modules (`dagger.json`, `dagger call`, module composition). Tokeira drives Dagger via the in-repo `dagger-client` GraphQL client. Adopting the Dagger Module system is a future decision, not a requirement here.
+- Caching infrastructure design beyond declaring that the pipeline runtime exposes Dagger cache mounts through the shared helpers. Cache-key schemas per pipeline are that pipeline's concern.
+
+### Cross-references
+
+- [`image-lifecycle`](../image-lifecycle/requirements.md): First consumer and source of the `dagger-client` crate. The `tokeira-build` crate becomes the policy crate for a future `tokeira-pipeline-image` following the template in this spec.
+- [`temporal-compatibility`](../temporal-compatibility/requirements.md): Second consumer. Its conformance runner (T0–T3 tiers) will live as `crates/tokeira-pipeline-conformance/` with policy decisions made by a `tokeira-conformance` crate.
+- [`ecs-deployment`](../ecs-deployment/requirements.md): Provides the S3 shared-bucket pattern (via the shared `RemoteStateBucket` resource) that the `ArtifactBucket` in this spec parallels. Also defines the canonical tagging requirement this spec inherits.
+- [`iac-resource-lifecycle`](../iac-resource-lifecycle/requirements.md): The `ArtifactBucket` is an IaC resource and follows the describe-before-delete, progress-callback, and writeback patterns owned there.
+- [`tkr-cli`](../tkr-cli/requirements.md): Adds the `pipeline` command group to the existing command tree.
+
+## Glossary
+
+- **Pipeline**: A named unit of CI work implemented as a Rust library + binary crate at `crates/tokeira-pipeline-{name}/`. Examples: `workspace`, `image`, `conformance`, `release`.
+- **Pipeline_Crate**: The crate at `crates/tokeira-pipeline-{name}/`. Exposes a library for reuse and a binary (`cargo run -p tokeira-pipeline-{name} -- {subcommand}`) for CI invocation.
+- **Subcommand**: A CLI argument on a pipeline binary naming one of the pipeline's entry points. Every Pipeline_Crate binary SHALL accept at minimum `check`, `test`, `build`, `artifact`.
+- **Pipeline_Runtime**: The `tokeira-pipeline-runtime` crate. Exposes shared Dagger orchestration helpers (workspace mount, Rust toolchain container, `cargo` wrappers, container publish, artifact upload) plus Ci_Context resolution. Consumed by every Pipeline_Crate.
+- **Policy_Crate**: A Rust crate that owns the interpretation of a pipeline's outputs. Example: `tokeira-build` (image-lifecycle), `tokeira-conformance` (temporal-compatibility). Small pipelines may roll their policy into the Pipeline_Crate itself. Larger pipelines separate.
+- **Ci_Policy**: The `tokeira-ci-policy` crate. Exposes the shared `CiContext` struct, `ArtifactEnvelope<T>`, `ExitCode` enum, and artifact read/write helpers. Consumed by every Policy_Crate.
+- **Dagger_Client**: The in-repo `dagger-client` crate from [`image-lifecycle`](../image-lifecycle/requirements.md). Wraps a Dagger session's GraphQL interface. Pipelines use it to construct containers, run execs, publish images, and upload artifacts.
+- **CI_Substrate**: The hosted runner that triggers a pipeline. Initially GitHub Actions; designed to be replaceable with Buildkite without changing pipeline source.
+- **Trigger_Workflow**: A thin CI-substrate file (`.github/workflows/ci.yml`, `.buildkite/pipeline.yml`) whose only job is to check out the repo, install the Dagger CLI, and invoke `dagger run -- cargo run -p tokeira-pipeline-{name} -- {subcommand}`. Contains no business logic beyond matrix/parallelism control.
+- **Artifact**: A JSON document produced by a pipeline run and written to the Artifact_Bucket. Every artifact conforms to a versioned schema. Readable by `tkr` commands.
+- **Artifact_Bucket**: An S3 bucket owned by a Tokeira deployment, used to store pipeline artifacts. Keyed by `{project}/pipelines/{pipeline}/{git_sha}/{run_id}.json`.
+- **Artifact_Schema**: The versioned JSON schema for artifacts. Every artifact has a `schema_version: u32` field at the top level; readers refuse to parse unknown major-version artifacts.
+- **Run_ID**: An opaque string identifying a single pipeline invocation. Set by the CI substrate (GHA run id, Buildkite build number, or `local-{timestamp}-{random}` for local runs).
+- **Local_Engine**: A Dagger engine running on the developer's workstation (via the `dagger` CLI). Every pipeline runs against a local engine with the same code that runs in CI.
+- **Ci_Context**: The runtime context a pipeline sees: git SHA, branch name, CI substrate name, run ID, actor identity, a monotonic run-start instant. Provided as environment variables read by the `Pipeline_Runtime::ci_context()` helper; pipelines do not hard-code runner-specific lookups.
+- **Buildkite_Agent**: A Buildkite worker process running on Tokeira-owned infrastructure (self-hosted pattern) with Docker and the Dagger CLI pre-installed. Registered with a Buildkite queue that pipeline steps target.
+
+## Requirements
+
+---
+
+## Feature 1: Pipeline Crate Convention
+
+### Requirement 1.1: Pipeline crate layout
+
+**User Story:** As a Tokeira developer, I want every pipeline to live in a predictable place with a predictable structure, so that adding a new pipeline or understanding an existing one is a one-directory operation.
+
+#### Acceptance Criteria
+
+1. EVERY Pipeline SHALL live at `crates/tokeira-pipeline-{name}/` where `{name}` is lowercase kebab-case matching `[a-z][a-z0-9-]{1,31}`.
+2. EACH Pipeline_Crate SHALL have a `Cargo.toml` declaring both a library (`[lib]`) target and a binary (`[[bin]]`) target with `name = "tokeira-pipeline-{name}"`.
+3. EACH Pipeline_Crate SHALL have a `README.md` documenting the pipeline's subcommands, secrets (per Req 7.1), and expected duration per subcommand.
+4. Pipeline_Crates SHALL depend on `dagger-client`, `tokeira-pipeline-runtime`, and `tokeira-ci-policy` via path dependencies. They MAY depend on a dedicated Policy_Crate.
+5. Pipeline_Crate binaries SHALL NOT depend on `apps/tkr` — the dependency flows the other way. `tkr pipeline run` invokes Pipeline_Crate binaries through `cargo run` or via a compiled-in dispatcher.
+6. THE root `dev/pipelines/README.md` SHALL document the Pipeline_Crate convention, the Subcommand contract, the Artifact_Schema, the local-parity rule, and the Buildkite vs GitHub Actions parity expectation.
+
+### Requirement 1.2: Authored in Rust
+
+**User Story:** As a Tokeira developer, I want pipelines authored in the same language as the rest of the codebase, so that pipeline source is readable by every contributor without learning a second ecosystem.
+
+#### Acceptance Criteria
+
+1. EVERY Pipeline_Crate SHALL be written in Rust.
+2. Pipeline_Crates SHALL drive Dagger via the in-repo `dagger-client` crate. They SHALL NOT use the official Dagger Go, TypeScript, Python, or Rust SDK, SHALL NOT introduce a `dagger.json`, and SHALL NOT be invoked via `dagger call`.
+3. The invocation path from CI is `dagger run -- cargo run -p tokeira-pipeline-{name} --release -- {subcommand} [args]`. `dagger run` establishes the session; the Rust binary connects via `DAGGER_SESSION_PORT` / `DAGGER_SESSION_TOKEN` and drives it via GraphQL.
+4. Non-Rust helper scripts (Python, shell) SHALL NOT be introduced by this foundation. If a future pipeline genuinely needs a non-Rust helper (for example, invoking a Python SDK's own test harness), the helper SHALL be called from inside a Dagger-orchestrated container, not from the host runner.
+
+### Requirement 1.3: Subcommand contract
+
+**User Story:** As a Tokeira developer wiring a new pipeline into CI, I want a guaranteed set of subcommands on every pipeline binary, so that the CI trigger workflow can generically invoke them without per-pipeline customisation.
+
+#### Acceptance Criteria
+
+1. EVERY Pipeline_Crate binary SHALL expose the following subcommands via `clap` (the workspace-standard arg parser):
+   - `check` — fast verification: format, lint, compile. Exits non-zero on any finding.
+   - `test` — run the pipeline's full test suite. Exits non-zero on any failing test.
+   - `build` — produce the pipeline's primary artifact (container image, binary, or JSON document).
+   - `artifact` — emit the pipeline's machine-readable artifact to stdout or to `--output <path>`. MUST conform to Artifact_Schema.
+2. Pipelines MAY expose additional subcommands (for example, `tokeira-pipeline-image push`, `tokeira-pipeline-conformance tier1`). Additional subcommands SHALL be documented in the Pipeline_Crate's `README.md`.
+3. WHEN a subcommand is not applicable to a pipeline (for example, a lint-only pipeline has no `build`), the subcommand SHALL still exist and SHALL return immediately with a no-op message and exit status 0. This keeps the CI trigger workflow uniform.
+4. EVERY subcommand SHALL complete (in local-engine reference conditions) within a documented budget: `check` ≤ 2 minutes, `test` ≤ 10 minutes, `build` ≤ 15 minutes, `artifact` ≤ 30 seconds. Pipelines whose work exceeds a budget SHALL split into additional subcommands.
+5. WHEN a subcommand fails, THE exit status SHALL be non-zero (per `tokeira-ci-policy::ExitCode`) and stderr SHALL include at minimum a one-line reason citing the pipeline name and the subcommand.
+6. Pipeline_Crate binaries SHALL support a global `--json` flag that switches progress output to JSON events consistent with the [`iac-resource-lifecycle`](../iac-resource-lifecycle/requirements.md) JSON event schema.
+
+### Requirement 1.4: Local-parity rule
+
+**User Story:** As a Tokeira developer, I want every pipeline to run identically on my workstation and in CI, so that "works on CI, fails locally" and "works locally, fails on CI" are both impossible by construction.
+
+#### Acceptance Criteria
+
+1. EVERY Pipeline_Crate binary SHALL be runnable via `dagger run -- cargo run -p tokeira-pipeline-{name} -- {subcommand}` against a Local_Engine.
+2. Pipeline_Crates SHALL read environment variables only via `Pipeline_Runtime::ci_context()`. The helper SHALL expose `git_sha`, `branch`, `substrate`, `run_id`, `actor`, and `run_started_at`, each with a documented local fallback.
+3. Pipeline_Crates SHALL NOT invoke runner-specific CLIs (`gh`, `buildkite-agent`) from pipeline source. If an operation needs runner-specific APIs (for example, uploading a GitHub Actions artifact with a UI link), it SHALL be performed by the Trigger_Workflow after the pipeline binary exits, not by the pipeline binary itself.
+4. Pipeline_Crate binaries SHALL NOT require secrets to run `check` or `test`. Secrets MAY be required for `build` (container registry credentials) or operator-facing subcommands (mirror to ECR). Required secrets SHALL be declared in the Pipeline_Crate's `README.md` and SHALL fail fast with a descriptive error if missing when needed.
+
+### Requirement 1.5: `tkr pipeline run` invocation contract
+
+**User Story:** As a Tokeira operator invoking a pipeline locally, I want a predictable invocation pattern, so that I can run anything in CI from my workstation with a single command shape.
+
+#### Acceptance Criteria
+
+1. `tkr pipeline run {name} [subcommand]` SHALL be a thin wrapper that invokes `dagger run -- cargo run -p tokeira-pipeline-{name} --release -- {subcommand}`.
+2. When `subcommand` is omitted, it SHALL default to `check`.
+3. `tkr pipeline run` SHALL forward any trailing `--` arguments to the pipeline binary unchanged.
+4. `tkr pipeline run` SHALL respect the `--json` global flag from `tkr-cli` by passing `--json` to the pipeline binary.
+5. WHEN the `dagger` CLI is not on PATH, `tkr pipeline run` SHALL exit with a descriptive error (from image-lifecycle's existing Dagger-missing handling) and a link to the install documentation.
+
+---
+
+## Feature 2: Pipeline Runtime Crate
+
+### Requirement 2.1: `tokeira-pipeline-runtime` crate
+
+**User Story:** As a Tokeira pipeline author, I want a shared Rust crate of Dagger orchestration helpers, so that I do not reinvent workspace mounting or `cargo fmt` wrapping in every pipeline.
+
+#### Acceptance Criteria
+
+1. THE workspace SHALL include a `crates/tokeira-pipeline-runtime/` library crate depending on `dagger-client` and `tokeira-ci-policy`.
+2. THE crate SHALL expose at minimum the following functions, each taking a `&dyn DaggerClient` (from the image-lifecycle `dagger-client` crate's trait surface):
+   - `fn workspace(dagger: &dyn DaggerClient, workspace_root: &Path) -> Result<Box<dyn DirectoryRef>>` — mounts the workspace root with gitignored paths excluded (`target/`, `node_modules/`, `.git/`, `.kiro/cache/`).
+   - `fn rust_toolchain(dagger: &dyn DaggerClient, workspace_root: &Path) -> Result<Box<dyn ContainerRef>>` — returns a Rust container based on `rust:{toolchain}-alpine` where `{toolchain}` is read from `rust-toolchain.toml`.
+   - `fn cargo_fmt_check(container: &dyn ContainerRef, workspace: &dyn DirectoryRef) -> Result<Box<dyn ContainerRef>>` — wraps `cargo +nightly fmt --all --check`.
+   - `fn cargo_lint(container, workspace) -> Result<Box<dyn ContainerRef>>` — wraps `cargo lint`.
+   - `fn cargo_test_lint(container, workspace) -> Result<Box<dyn ContainerRef>>` — wraps `cargo test-lint`.
+   - `fn cargo_check(container, workspace) -> Result<Box<dyn ContainerRef>>` — wraps `cargo check --workspace --all-targets`.
+   - `fn cargo_test(container, workspace) -> Result<Box<dyn ContainerRef>>` — wraps `cargo test --workspace`.
+   - `fn cargo_doc(container, workspace) -> Result<Box<dyn ContainerRef>>` — wraps `cargo doc --workspace --no-deps` with `RUSTDOCFLAGS="-D warnings"`.
+   - `fn container_build(dagger, workspace, dockerfile) -> Result<Box<dyn ContainerRef>>` — builds from a Dockerfile path within a workspace directory.
+   - `fn container_publish(container, registry, username, password, remote_refs) -> Result<Vec<PublishedReference>>` — publishes to one or more remote refs. Signature matches `tokeira-build::publish_image` (see image-lifecycle design doc).
+   - `fn upload_artifact(s3: &dyn S3Client, bucket: &str, key: &str, artifact: &[u8]) -> Result<String>` — uploads an artifact blob to the Artifact_Bucket, returns the `s3://` URL.
+   - `fn ci_context() -> CiContext` — reads environment variables per Ci_Context glossary entry, with documented local fallbacks.
+3. THE crate SHALL use `thiserror` for its error type and SHALL NOT expose `anyhow::Error` in its public API.
+4. THE crate SHALL use `tracing` for structured logging; SHALL NOT use `println!` or `eprintln!` in library code.
+
+### Requirement 2.2: Rust toolchain container versioning
+
+**User Story:** As a Tokeira developer, I want the Rust build container version to follow `rust-toolchain.toml`, so that bumping the workspace toolchain automatically updates all pipelines.
+
+#### Acceptance Criteria
+
+1. `rust_toolchain()` SHALL read `rust-toolchain.toml` at call time and use the extracted version in the container image tag (for example, `rust:1.95.0-alpine`).
+2. IF `rust-toolchain.toml` is missing or malformed, `rust_toolchain()` SHALL fail with a descriptive error citing the file path.
+3. Pipelines SHALL NOT override the Rust version without an explicit opt-out via an additional overload; the default behaviour is workspace-pinned toolchain.
+
+### Requirement 2.3: Caching
+
+**User Story:** As a Tokeira developer waiting for a pipeline to complete, I want aggressive build caching, so that unchanged code paths are fast to re-verify.
+
+#### Acceptance Criteria
+
+1. `cargo_*` helper functions SHALL mount Dagger cache volumes for `/root/.cargo/registry`, `/root/.cargo/git`, and `target/` scoped to the workspace fingerprint (`Cargo.lock` + `rust-toolchain.toml`).
+2. Cache-volume keying SHALL use only stable inputs. Transient inputs (run ID, timestamps, secrets) SHALL NOT participate in keys.
+3. THE caching strategy SHALL be documented in `tokeira-pipeline-runtime/README.md`.
+
+### Requirement 2.4: Ci_Context resolution
+
+**User Story:** As a Tokeira pipeline author, I want to read the CI context through one helper, so that substrate specifics (GHA vs Buildkite vs local) are invisible to the pipeline code.
+
+#### Acceptance Criteria
+
+1. `ci_context()` SHALL resolve each Ci_Context field from the following ordered sources:
+   - `git_sha`: `GITHUB_SHA`, `BUILDKITE_COMMIT`, `git rev-parse HEAD`, panic on unavailable.
+   - `branch`: `GITHUB_REF_NAME`, `BUILDKITE_BRANCH`, `git rev-parse --abbrev-ref HEAD`, `local`.
+   - `substrate`: `github` if `GITHUB_ACTIONS == "true"`, `buildkite` if `BUILDKITE == "true"`, else `local`.
+   - `run_id`: `GITHUB_RUN_ID`, `BUILDKITE_BUILD_NUMBER`, `local-{iso8601}-{random}`.
+   - `actor`: `GITHUB_ACTOR`, `BUILDKITE_BUILD_CREATOR`, `$USER`, `local`.
+   - `run_started_at`: `GITHUB_RUN_STARTED_AT`, `BUILDKITE_STARTED_AT`, the binary's monotonic start-instant converted to ISO-8601 at call time (with a one-wall-clock-read-per-process exemption — see Req 5.1.4).
+2. `ci_context()` SHALL be pure enough to unit-test without network or subprocess fallbacks (`git rev-parse` fallback gated behind a feature flag or injected via a `ContextSource` trait).
+3. Pipelines SHALL NOT re-read these environment variables directly.
+
+---
+
+## Feature 3: CI Substrate Layer
+
+### Requirement 3.1: GitHub Actions trigger workflow
+
+**User Story:** As a Tokeira developer opening a pull request, I want CI to run the standard verification pipelines, so that regressions are caught before merge.
+
+#### Acceptance Criteria
+
+1. THE workspace SHALL include `.github/workflows/ci.yml` that runs on pull requests and pushes to the default branch.
+2. THE workflow SHALL consist of one job per registered pipeline's `check` subcommand, one job per registered pipeline's `test` subcommand, and separate jobs for `build` where applicable.
+3. EACH job SHALL consist of at most these steps: `actions/checkout@v4` (pinned by full SHA), install the Dagger CLI at a pinned version, and `dagger run -- cargo run -p tokeira-pipeline-{name} --release -- {subcommand} --json`.
+4. THE workflow SHALL NOT contain inline bash that reimplements pipeline logic. If a job needs more than the three steps above, the additional logic SHALL move into the Pipeline_Crate.
+5. THE Dagger CLI SHALL be installed via the upstream installer script at a version pinned by SHA256 checksum, not via a third-party action that wraps it. This minimises third-party trust surface.
+6. THE workflow SHALL NOT require repository secrets to run `check`, `test`, or `lint` jobs. Secrets for `build` (for example, ECR push) SHALL be scoped to default-branch runs only.
+7. Cross-substrate portability is a first-class concern: the workflow SHALL NOT use `github-script`, `actions/github-script`, or any action whose output would be specific to GitHub's pipeline model.
+
+### Requirement 3.2: Buildkite trigger pipeline
+
+**User Story:** As a Tokeira operator planning to self-host CI, I want a ready-to-use Buildkite pipeline template, so that moving to Buildkite is a configuration switch, not a re-architecture.
+
+#### Acceptance Criteria
+
+1. THE workspace SHALL include `dev/pipelines/buildkite/pipeline.yml` as a reference Buildkite pipeline.
+2. THE template SHALL have the same shape as the GitHub Actions workflow: per-pipeline `check`, `test`, `build` steps, each invoking `dagger run -- cargo run -p tokeira-pipeline-{name} --release -- {subcommand} --json` through a shell step.
+3. THE template SHALL target a named agent queue (default: `tokeira-default`) so job routing is explicit. Steps that are expensive (for example, conformance) MAY target a separate queue (`tokeira-heavy`) to isolate long runs from fast feedback.
+4. THE template SHALL document the self-hosted agent requirements:
+   - Docker (rootless or root-privileged, documented per agent pool).
+   - Dagger CLI pre-installed on the agent (via AMI bake or agent start hook).
+   - AWS credentials scoped per queue via IAM role on the agent instance profile.
+5. Documentation at `dev/pipelines/buildkite/README.md` SHALL explain:
+   - How to register the pipeline with a Buildkite organisation (`buildkite-agent pipeline upload`).
+   - How to provision agents (recommended: Buildkite's Elastic CI Stack for AWS, deploying to the same AWS account as the Tokeira deployment).
+   - How artifacts flow: the canonical artifact path is S3; `buildkite-agent artifact upload` MAY be used additionally for a UI link but is not the source of truth.
+   - The migration path from GitHub Actions: run both in parallel; cut over in a single PR once Buildkite signal has been stable for one week.
+6. THE template is a dry template — it does not have to be live-registered in a Buildkite organisation to land with this spec.
+
+### Requirement 3.3: Substrate independence
+
+**User Story:** As a Tokeira maintainer, I want Pipeline_Crates to be substrate-agnostic, so that switching from GitHub Actions to Buildkite (or adding a secondary runner) does not require rewriting pipeline code.
+
+#### Acceptance Criteria
+
+1. Pipeline_Crate source SHALL NOT contain the substrings `github`, `buildkite`, or any substrate-specific SDK usage.
+2. Pipeline_Crates SHALL read Ci_Context only via `Pipeline_Runtime::ci_context()`, not via raw `GITHUB_SHA` or `BUILDKITE_COMMIT`.
+3. Adding a new CI substrate SHALL require only a new Trigger_Workflow template plus optional Ci_Context resolution updates (Req 2.4.1 ordered sources); no changes to pipeline source.
+4. A lint (`cargo lint` with a custom clippy allow-list entry or a `grep` check in `dev/ci/check-substrate-leakage.sh`) SHALL scan `crates/tokeira-pipeline-*/src/` for substrate-name leakage and fail the build on hit.
+
+### Requirement 3.4: Buildkite-specific integration notes
+
+**User Story:** As a Tokeira maintainer adopting Buildkite, I want the non-obvious Buildkite-specific trade-offs documented in the spec itself, so that the operational decisions are explicit.
+
+#### Acceptance Criteria
+
+1. THE spec SHALL note that Dagger does not publish a Buildkite-specific integration plugin; the integration is a shell step invoking `dagger run`.
+2. THE spec SHALL note that Buildkite hosted agents' Docker support (Remote Docker builders with layer caching) is Enterprise-only; cost-conscious deployments SHALL prefer self-hosted agents on the Elastic CI Stack for AWS.
+3. THE spec SHALL note that Buildkite agent caches are per-agent-instance unless remote caching is configured; pipelines SHALL NOT assume warm caches across agents.
+4. THE spec SHALL note that `buildkite-agent artifact upload` is UI convenience only; the canonical artifact surface is S3 per Feature 4.
+5. THE spec SHALL note that a Buildkite agent queue MUST be sized to absorb concurrent PR load; when rolling out Buildkite, the default queue size SHALL be at least three agents to avoid serialising all PRs.
+
+---
+
+## Feature 4: Artifact Contract
+
+### Requirement 4.1: Artifact schema
+
+**User Story:** As a Tokeira developer consuming pipeline outputs, I want a versioned schema for every artifact, so that `tkr` commands can parse artifacts without guessing at the structure.
+
+#### Acceptance Criteria
+
+1. EVERY artifact produced by a pipeline SHALL conform to a JSON schema documented at `dev/pipelines/artifact-schema.json` and mirrored in `tokeira-ci-policy::ArtifactEnvelope<T>`.
+2. EVERY artifact SHALL carry the following top-level fields:
+   - `schema_version: u32` — major version of the artifact schema. Readers refuse parse on unknown major versions.
+   - `pipeline: string` — the pipeline name (kebab-case, matching the Pipeline_Crate).
+   - `generated_at: string` — ISO-8601 UTC timestamp, set from `ci_context.run_started_at`. This is the ONLY wall-clock-sourced field permitted.
+   - `ci_context: object` — the five Ci_Context fields (`git_sha`, `branch`, `substrate`, `run_id`, `actor`).
+   - `results: object` — pipeline-specific payload. Pipelines define the structure within `results`.
+3. Adding a new top-level field SHALL bump the schema minor version. Removing or renaming a field SHALL bump the major version.
+4. Pipelines SHALL NOT include other wall-clock timestamps in `results`. Event timing SHALL be expressed as durations in milliseconds relative to `generated_at`.
+
+### Requirement 4.2: Artifact bucket
+
+**User Story:** As a Tokeira operator, I want pipeline artifacts stored in a known location with retention, so that `tkr` commands can read the latest results and historical runs without probing CI APIs.
+
+#### Acceptance Criteria
+
+1. THE `tokeira-aws` crate SHALL define an `ArtifactBucket` resource following the shared-bucket pattern from `RemoteStateBucket` (adoption, versioning enforcement, public access block, no-op delete when adopted).
+2. THE default bucket name SHALL be `{project_name}-artifacts-{region}`. The bucket SHALL be keyed by `{project_name}/pipelines/{pipeline}/{git_sha}/{run_id}.json`.
+3. THE bucket SHALL have a lifecycle policy that transitions artifacts older than 90 days to STANDARD_IA and expires artifacts older than 365 days.
+4. THE bucket SHALL carry the same auto-generated and operator-defined tags as all other AWS resources per the [`ecs-deployment`](../ecs-deployment/requirements.md) tagging requirement.
+5. THE bucket resource SHALL be provisionable through any platform's IaC modules. The initial integration is via the ECS platform's networking/observability grouping or a sibling `artifacts` module; the `pipeline-foundation` spec does not hard-bind the bucket to one platform.
+
+### Requirement 4.3: Artifact upload
+
+**User Story:** As a Tokeira pipeline author, I want a single shared function for artifact upload, so that every pipeline produces artifacts in the right place without reinventing S3 logic.
+
+#### Acceptance Criteria
+
+1. `Pipeline_Runtime::upload_artifact` SHALL authenticate to the bucket using the CI substrate's ambient AWS credentials (IAM role on the agent, OIDC token exchange on GHA, or `~/.aws` locally).
+2. IF credentials are absent (for example, a PR-triggered GHA run from a fork), the function SHALL skip the upload and emit a `tracing::warn!` — it SHALL NOT fail the pipeline.
+3. ON successful upload, the function SHALL return the `s3://{bucket}/{key}` URL and log it at INFO for the Trigger_Workflow to capture.
+4. LOCAL runs SHALL write the artifact to `./artifacts/{pipeline}/{run_id}.json` and skip the S3 upload unless the operator has explicitly set AWS credentials and passed `--upload` to `tkr pipeline run`.
+
+### Requirement 4.4: Artifact reading from `tkr`
+
+**User Story:** As a Tokeira operator, I want `tkr` commands to read pipeline artifacts from a known location, so that compatibility or build status is available without CI-substrate-specific API knowledge.
+
+#### Acceptance Criteria
+
+1. `tkr pipeline artifacts {name}` SHALL list the most recent 10 artifacts for a named pipeline in the deployment's Artifact_Bucket, sorted newest-first.
+2. `tkr pipeline artifacts {name} --run-id {id}` SHALL print the artifact JSON for a specific run.
+3. `tkr pipeline artifacts {name} --latest --json` SHALL print the most recent artifact as JSON.
+4. Consumer specs (for example, [`temporal-compatibility`](../temporal-compatibility/requirements.md)'s `tkr compat conformance`) SHALL read artifacts via `tokeira-ci-policy::read_artifact`, not via the S3 SDK directly.
+
+---
+
+## Feature 5: Policy-Layer Pattern
+
+### Requirement 5.1: `tokeira-ci-policy` crate
+
+**User Story:** As a Tokeira maintainer, I want a shared Rust crate for cross-pipeline policy types, so that every Pipeline_Crate and Policy_Crate does not redefine `CiContext`, `ArtifactEnvelope`, or exit codes.
+
+#### Acceptance Criteria
+
+1. THE workspace SHALL include a `crates/tokeira-ci-policy/` library crate.
+2. THE crate SHALL expose:
+   - `CiContext` struct with the six fields from the Ci_Context glossary entry, `Serialize + Deserialize`.
+   - `ArtifactEnvelope<T>` generic struct carrying the mandatory top-level fields (`schema_version`, `pipeline`, `generated_at`, `ci_context`, `results: T`).
+   - `ExitCode` enum covering pipeline-result exit codes (`Ok = 0`, `Failed = 1`, `Unclassified = 2`, `StaleMatrix = 3`, `UsageError = 64`).
+   - A `read_artifact<T>(reader) -> Result<ArtifactEnvelope<T>>` helper that validates `schema_version` and refuses unknown major versions.
+   - A `write_artifact<T>(writer, envelope) -> Result<()>` helper that serialises with a canonical field order for byte-deterministic output.
+3. THE crate SHALL have minimal dependencies: `serde`, `serde_json`, `thiserror`, `time` (for ISO-8601 parsing only, not for `now`).
+4. THE crate SHALL NOT call wall-clock functions. `generated_at` is supplied by the caller from `Ci_Context::run_started_at`, which itself records one wall-clock read at pipeline-binary startup (the single permitted wall-clock read per process).
+
+### Requirement 5.2: Per-pipeline policy crates
+
+**User Story:** As a Tokeira pipeline author, I want a documented pattern for declaring pipeline-specific policy crates, so that new pipelines follow the same shape as `tokeira-build` and (future) `tokeira-conformance`.
+
+#### Acceptance Criteria
+
+1. A pipeline with non-trivial result classification SHALL have a dedicated Policy_Crate at `crates/tokeira-{domain}/` implementing the classification logic (for example, `tokeira-build`, `tokeira-conformance`).
+2. A Policy_Crate SHALL depend on `tokeira-ci-policy` for shared types.
+3. A Pipeline_Crate SHALL invoke its Policy_Crate via in-process library calls (not via shelling out to a binary) — both live in the same workspace, so a direct call is cleaner than reinvoking `cargo run`.
+4. Policy_Crates SHALL produce artifacts via `ArtifactEnvelope<T>::write_to`. Pipelines do not construct artifacts by hand.
+5. Policy_Crates SHALL be unit-testable without a Dagger engine, Docker daemon, or network access.
+
+### Requirement 5.3: Policy-execution separation
+
+**User Story:** As a Tokeira maintainer, I want the "what happened" vs "what it means" separation enforced, so that future changes to classification logic don't require changes to Pipeline_Crate source.
+
+#### Acceptance Criteria
+
+1. Pipeline_Crates SHALL NOT classify pipeline results. They collect raw outputs (JUnit XML, test logs, exit codes) and pass them to a Policy_Crate's classifier function.
+2. Policy_Crates SHALL NOT invoke Dagger or `dagger-client`. They are pure input-in, artifact-out Rust libraries.
+3. Policy_Crates SHALL expose both a library API and a small binary entry point (for example, `cargo run -p tokeira-conformance -- classify --input junit.xml`) so that other Rust code (`tkr` commands) can reuse classification logic and so that classification is independently runnable when debugging.
+
+---
+
+## Feature 6: `tkr pipeline` Command Group
+
+### Requirement 6.1: Command surface
+
+**User Story:** As a Tokeira operator, I want a single `tkr` subcommand for pipeline operations, so that local runs, artifact inspection, and CI parity are one consistent surface.
+
+#### Acceptance Criteria
+
+1. THE `tkr` CLI SHALL expose a top-level `pipeline` subcommand with children: `list`, `run`, `artifacts`.
+2. `tkr pipeline list` SHALL enumerate every Pipeline_Crate in the workspace (discovered by scanning `crates/tokeira-pipeline-*`), showing name and subcommands parsed from the binary's clap help.
+3. `tkr pipeline run {name} [{subcommand}]` SHALL invoke `dagger run -- cargo run -p tokeira-pipeline-{name} --release -- {subcommand}` against the Local_Engine. When `subcommand` is omitted, it defaults to `check`.
+4. `tkr pipeline artifacts {name}` SHALL list recent artifacts per Req 4.4.1.
+5. ALL `tkr pipeline` commands SHALL respect the `--json` global flag from [`tkr-cli`](../tkr-cli/requirements.md).
+
+### Requirement 6.2: Prerequisite checks
+
+**User Story:** As a Tokeira operator running a pipeline locally for the first time, I want clear error messages when prerequisites are missing, so that I am not left guessing.
+
+#### Acceptance Criteria
+
+1. WHEN `dagger` is not on PATH, `tkr pipeline run` SHALL exit with the same descriptive error used by [`image-lifecycle`](../image-lifecycle/requirements.md) (pointing at the Dagger install docs).
+2. WHEN Docker (or another Dagger-supported container runtime) is not running, the invocation SHALL surface Dagger's own error message unmodified and exit non-zero.
+3. Prerequisite checks SHALL NOT be performed for `tkr pipeline list` or `tkr pipeline artifacts` — only the `run` subcommand needs Dagger.
+
+---
+
+## Feature 7: Secrets and Credentials
+
+### Requirement 7.1: Secret declaration
+
+**User Story:** As a Tokeira pipeline author, I want secrets declared in one place per pipeline, so that a reader can tell what a pipeline needs without reading Dagger code.
+
+#### Acceptance Criteria
+
+1. EACH Pipeline_Crate's `README.md` SHALL have a "Secrets" section listing every secret the pipeline requires by name, purpose, and default source (GHA secret name, Buildkite agent binding, or `~/.aws` for AWS credentials).
+2. Pipeline_Crates SHALL read secrets only via the `dagger-client` `SecretRef` plumbing (`Client::set_secret`) or, for host-side values, via the `aws-sdk-*` credential provider chain. Raw secret values SHALL NOT appear in pipeline source or in logs.
+3. Pipeline_Runtime helper functions that take credentials (`container_publish`, `upload_artifact`) SHALL accept `SecretRef` or `aws_credential_types::provider::SharedCredentialsProvider` arguments, not plain strings.
+
+### Requirement 7.2: Secret rotation
+
+**User Story:** As a Tokeira operator rotating a CI secret, I want the rotation process documented, so that there is no guessing which pipelines break when a secret changes.
+
+#### Acceptance Criteria
+
+1. THE root `dev/pipelines/README.md` SHALL include a "Secret rotation" section describing the steps for rotating each class of secret (AWS credentials, container registry credentials, third-party API keys).
+2. Rotation instructions SHALL name both the GitHub Actions and Buildkite rotation paths.
+
+---
+
+## Feature 8: Correctness Properties
+
+### Requirement 8.1: Subcommand registration property
+
+**User Story:** As a Tokeira maintainer, I want every Pipeline_Crate binary validated at build time, so that a pipeline accidentally missing `check` or `test` cannot land.
+
+#### Acceptance Criteria
+
+1. A deterministic test in `tokeira-ci-policy` (or a companion crate) SHALL enumerate `crates/tokeira-pipeline-*/` directories, invoke each binary with `--help`, parse the clap-produced usage, and assert every binary exposes `check`, `test`, `build`, and `artifact`.
+2. THE test SHALL be implemented in safe Rust and SHALL run as part of `cargo test`.
+3. THE test SHALL fail with a descriptive message naming the pipeline and the missing subcommand.
+
+### Requirement 8.2: Artifact schema round-trip property
+
+**User Story:** As a Tokeira maintainer, I want the artifact envelope round-trip property-tested, so that schema drift is caught in CI.
+
+#### Acceptance Criteria
+
+1. A property test (via `proptest`) SHALL generate arbitrary `ArtifactEnvelope<serde_json::Value>` values, serialise to JSON, deserialise, and assert structural equality.
+2. THE test SHALL generate at least one `schema_version` above the current maximum and assert that `read_artifact` returns `Err`.
+
+### Requirement 8.3: No wall-clock in policy-crate property
+
+**User Story:** As a Tokeira maintainer, I want a CI check preventing policy crates from embedding wall-clock reads, so that artifact generation stays deterministic.
+
+#### Acceptance Criteria
+
+1. A CI grep check SHALL scan `crates/tokeira-ci-policy/src/`, `crates/tokeira-pipeline-runtime/src/`, and every `crates/tokeira-pipeline-*/src/` directory for `SystemTime::now|Utc::now|Local::now|OffsetDateTime::now_utc` and fail the build on any hit.
+2. THE single permitted wall-clock read (for `run_started_at`) SHALL live in `Pipeline_Runtime::ci_context()` in a clearly-named function `wall_clock_once_at_process_startup` that the grep check whitelists by function name.
+3. THE check SHALL NOT flag `std::time::Instant` usage.
+
+### Requirement 8.4: Substrate-leakage property
+
+**User Story:** As a Tokeira maintainer, I want a CI check preventing substrate-specific strings from leaking into Pipeline_Crate source, so that substrate independence is mechanically enforced.
+
+#### Acceptance Criteria
+
+1. A CI grep check SHALL scan `crates/tokeira-pipeline-*/src/` for the substrings `GITHUB_`, `BUILDKITE_`, `github_script`, `buildkite_agent`, and fail the build on any hit.
+2. THE check SHALL NOT scan `tokeira-pipeline-runtime/src/ci_context.rs` (which is the one place those env-var names are permitted to appear).
+
+### Requirement 8.5: Pipeline binary starts cleanly under `dagger run`
+
+**User Story:** As a Tokeira maintainer, I want a smoke test that every Pipeline_Crate binary connects to its Dagger session cleanly, so that a mis-configured pipeline is caught in PR CI, not in release.
+
+#### Acceptance Criteria
+
+1. A CI integration job SHALL invoke `dagger run -- cargo run -p tokeira-pipeline-{name} -- check` for every Pipeline_Crate on every PR.
+2. Duration budgets apply (Req 1.3.4). Pipelines exceeding their budget in a PR job SHALL surface a warning in the PR comment (automation optional — documented as the intent).
+
+---
+
+## Feature 9: Cross-Cutting Requirements
+
+### Requirement 9.1: Documentation
+
+**User Story:** As a Tokeira developer new to the project, I want the pipeline story documented in `README.md` and `AGENTS.md`, so that I can understand where CI lives without reading this spec.
+
+#### Acceptance Criteria
+
+1. THE root `README.md` SHALL include a "CI and pipelines" section pointing at `crates/tokeira-pipeline-*`, enumerating the registered pipelines, and listing each pipeline's subcommands.
+2. THE root `AGENTS.md` SHALL include an "Adding a new pipeline" section referencing the Pipeline_Crate convention (Req 1.1–1.5) and the policy-layer pattern (Req 5.1–5.3).
+3. EACH Pipeline_Crate SHALL have its own `README.md` meeting the documentation bar in Req 1.1.3 and Req 7.1.1.
+
+### Requirement 9.2: Migration from existing CI
+
+**User Story:** As a Tokeira maintainer, I want a documented migration path from whatever CI currently exists to the new foundation, so that the transition is incremental and reversible.
+
+#### Acceptance Criteria
+
+1. THE first Pipeline_Crate to land SHALL be `tokeira-pipeline-workspace` covering `cargo fmt/lint/test-lint/check/test/doc` for the whole workspace.
+2. Existing CI (if any) SHALL run in parallel with the new substrate during migration. Cutover to the new substrate SHALL be a single PR that deletes the old workflow and is reversible.
+3. AFTER migration, only Pipeline_Crates SHALL produce CI signal. Stray workflow files SHALL be deleted as part of the migration PR.
+
+### Requirement 9.3: Third-party integrations
+
+**User Story:** As a Tokeira maintainer, I want the list of third-party integrations bounded, so that the pipeline substrate does not accrete vendor lock-in.
+
+#### Acceptance Criteria
+
+1. THE initial approved third-party CI-adjacent integrations SHALL be: Dagger (pipeline engine, via in-repo `dagger-client`), GitHub Actions (trigger layer), Buildkite (future trigger layer, self-hosted agents on Elastic CI Stack for AWS), AWS S3 (artifact storage), AWS Secrets Manager (secret source).
+2. Adding a new third-party integration SHALL require a spec amendment.
+3. Pipeline_Crates SHALL NOT call third-party services beyond the approved list without an amendment.
+
+### Requirement 9.4: Workspace pipeline reference implementation
+
+**User Story:** As a Tokeira maintainer, I want the first shipping pipeline to be a minimal but complete reference, so that subsequent pipelines have an unambiguous template.
+
+#### Acceptance Criteria
+
+1. `tokeira-pipeline-workspace` SHALL expose the four required subcommands:
+   - `check` — `cargo fmt --check`, `cargo lint`, `cargo test-lint`, `cargo check --workspace`.
+   - `test` — `cargo test --workspace`.
+   - `build` — `cargo doc --workspace --no-deps` (so "build" produces inspectable output; this is the pipeline's primary artifact beyond green/red).
+   - `artifact` — emits an `ArtifactEnvelope<WorkspaceResults>` summarising the last `check` and `test` runs.
+2. `tokeira-pipeline-workspace` SHALL be documented as the canonical template. New Pipeline_Crates SHALL be created by copying its structure.
+3. `tokeira-pipeline-workspace` SHALL be the first pipeline wired into both the GitHub Actions trigger workflow and the Buildkite trigger template.

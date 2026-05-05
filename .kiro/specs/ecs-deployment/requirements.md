@@ -15,6 +15,11 @@ The authoritative architecture document is [045-autoscaling-on-ecs-ec2](../../..
 5. **Missing metrics never trigger scale-in.** Absent or stale data is unknown, not zero.
 6. **DSQL connection headroom is a hard scaling envelope.** Runtime scale-out must not proceed if projected connections would exceed the safe connection budget.
 7. **Autoscaler unavailability must not affect workflow correctness.** It only pauses automatic capacity changes.
+8. **Zero-replica staged deployment.** Services deploy at 0 replicas to avoid crash-loops before schema exists. Workflow: `infra apply` → `deploy apply` → `schema setup` → `scale up`. Scale-up follows startup order, waiting for each service to reach ready state.
+9. **Cost discipline.** Every AWS resource must justify its existence. No NAT Gateways. S3 for state, metrics, and logs — no managed Prometheus or managed Grafana. DSQL is serverless — no idle cost, but connection management is critical.
+10. **No secrets in config files.** Secrets are sourced from Secrets Manager references. Config files contain only non-sensitive settings.
+11. **Break-glass debug logging.** CloudWatch Logs is available only as an operator-selected action (`tkr debug logs enable`), not as a default log destination. Normal log flow is Alloy → Loki. CloudWatch is the escape hatch when Loki is unavailable.
+12. **Operator empathy in error messages.** Every error surfaces what happened, why, and what to do next. Remediation hints for common failures (VPC endpoint misconfiguration, IAM permission gaps, DSQL connection limits).
 
 ### What already exists
 
@@ -62,6 +67,49 @@ The authoritative architecture document is [045-autoscaling-on-ecs-ec2](../../..
 
 ---
 
+## Feature 0: CLI Progress Reporting (Prerequisite)
+
+### Requirement 0.1: IaC Progress Callbacks
+
+**User Story:** As a Tokeira developer, I want the IaC engine to emit progress callbacks during plan/apply/destroy, so that the CLI can render live progress indicators for long-running infrastructure operations.
+
+#### Acceptance Criteria
+
+1. THE `ProvisionContext` in `tokeira-iac` SHALL support `set_apply_progress`, `set_wait_progress`, and `set_note_progress` callback registration.
+2. THE `set_apply_progress` callback SHALL receive: action name, resource ID, resource type, current index, and total count.
+3. THE `set_wait_progress` callback SHALL receive: resource ID, resource type, phase description, elapsed duration, and timeout duration.
+4. THE `set_note_progress` callback SHALL receive: resource ID, resource type, and informational message.
+5. THE IaC engine SHALL call `emit_apply_progress` before each resource lifecycle operation during apply/destroy.
+6. THE IaC engine SHALL call `emit_wait_progress` during polling waits (e.g., waiting for a resource to become active).
+7. THE IaC engine SHALL call `emit_note_progress` for informational events (e.g., "adopting existing bucket").
+
+### Requirement 0.2: CLI Output Module Upgrade
+
+**User Story:** As a Tokeira operator, I want the `tkr` CLI to show colored progress indicators, status tables, and spinners during infrastructure operations, so that I have clear visibility into what is happening.
+
+#### Acceptance Criteria
+
+1. THE `tkr` CLI output module SHALL support two output modes: `Human` (styled terminal) and `Json` (structured machine-readable).
+2. THE `Human` mode SHALL use ANSI colors via the `console` crate (auto-disabled when stdout is not a TTY).
+3. THE `Human` mode SHALL render an `ActionTuiHandle` with a progress bar and spinner for long-running operations, using the `indicatif` crate.
+4. THE `Human` mode SHALL render change tables with colored action indicators: `+` green (create), `~` yellow (update), `-` red (delete).
+5. THE `Human` mode SHALL render status messages: `✓` green (success), `⚠` yellow (warning), `✗` red (error), `→` dim (progress step).
+6. THE `Json` mode SHALL produce structured JSON for every output that `Human` mode renders as styled text.
+7. THE `ActionTuiHandle` SHALL fall back to plain `print_progress` lines when stdout is not a terminal.
+8. THE CLI SHALL add `console` and `indicatif` as dependencies.
+
+### Requirement 0.3: Confirmation Prompts
+
+**User Story:** As a Tokeira operator, I want mutating commands to require explicit confirmation, so that I cannot accidentally apply or destroy infrastructure.
+
+#### Acceptance Criteria
+
+1. THE `tkr infra apply`, `tkr infra destroy`, `tkr deploy apply`, `tkr scale up`, `tkr scale down`, `tkr debug logs enable`, and `tkr debug logs disable` commands SHALL require interactive confirmation before proceeding.
+2. THE `--yes` flag SHALL bypass the confirmation prompt for automation.
+3. WHEN stdout is not a terminal and `--yes` is not provided, THE CLI SHALL reject the command with an error (preventing silent mutations in non-interactive contexts).
+
+---
+
 ## Feature 1: ECS Platform Crate and Configuration
 
 ### Requirement 1.1: ECS Platform Configuration Model
@@ -71,10 +119,21 @@ The authoritative architecture document is [045-autoscaling-on-ecs-ec2](../../..
 #### Acceptance Criteria
 
 1. THE ECS_Platform SHALL define an `EcsConfig` struct loadable from TOML via `tokeira-config`.
-2. THE `EcsConfig` SHALL include sections for: cluster settings, VPC/networking, capacity providers (one per plane), service definitions (one per Tokeira service), autoscaler settings, and ALB configuration.
+2. THE `EcsConfig` SHALL include sections for: cluster settings, VPC/networking, capacity providers (one per plane), service definitions (one per Tokeira service), autoscaler settings, ALB configuration, and resource tagging.
 3. THE `EcsConfig` SHALL use `serde(deny_unknown_fields)` on all config structs to reject typos at parse time.
 4. THE `EcsConfig` SHALL provide sensible defaults for a single-environment private-only deployment.
 5. IF an `EcsConfig` contains an invalid combination of settings, THEN THE config loader SHALL return a descriptive validation error.
+
+### Requirement 1.1a: AWS Resource Tagging
+
+**User Story:** As a Tokeira operator, I want all AWS resources tagged consistently, so that cost allocation, ownership, and lifecycle management are traceable.
+
+#### Acceptance Criteria
+
+1. ALL AWS resources provisioned by the ECS_Platform SHALL carry auto-generated tags: `Name` (resource-specific), `Project` (from `project_name`), `Environment` (from `environment`), and `ManagedBy` (`tkr-cli`).
+2. THE `EcsConfig` SHALL include a `[tags]` section for operator-defined custom tags that are merged with auto-generated tags on every resource.
+3. WHEN auto-generated and custom tags conflict on the same key, THE custom tag SHALL take precedence.
+4. THE tagging SHALL apply to: VPC resources, security groups, VPC endpoints, ALB, ECS cluster, capacity providers, ASGs, launch templates, IAM roles, S3 buckets, DSQL cluster, Cloud Map namespace, and ECS services/task definitions.
 
 ### Requirement 1.2: ECS Platform Crate Structure
 
@@ -436,7 +495,7 @@ The authoritative architecture document is [045-autoscaling-on-ecs-ec2](../../..
 #### Acceptance Criteria
 
 1. THE ECS_Platform SHALL define a `services` IaC module implementing the `Module` trait.
-2. THE `services` module SHALL depend on the `cluster` module.
+2. THE `services` module SHALL depend on the `observability` module (application services include Alloy sidecars that need Mimir and Loki endpoints to be available).
 3. THE `services` module SHALL enumerate resources for: seven ECS service definitions, seven task definitions, Service Connect configuration, and Cloud Map namespace.
 4. THE `services` module resources SHALL implement the `Resource` trait.
 
@@ -446,9 +505,35 @@ The authoritative architecture document is [045-autoscaling-on-ecs-ec2](../../..
 
 #### Acceptance Criteria
 
-1. THE module dependency graph SHALL be: `remote-state` → `networking` → `cluster` → `services` → `observability`.
+1. THE module dependency graph SHALL be: `remote-state` → `networking` → `dsql` → `cluster` → `observability` → `services`.
 2. THE module dependency graph SHALL be a DAG with no cycles.
 3. THE `infra_modules` method SHALL return modules filtered by `ModuleSelection`.
+
+### Requirement 7.4a: Remote-State Module
+
+**User Story:** As a Tokeira developer, I want the remote-state module to provision a shared S3 bucket with safety guarantees, so that IaC state is durable, protected from accidental deletion, and shareable across environments.
+
+#### Acceptance Criteria
+
+1. THE ECS_Platform SHALL define a `remote-state` IaC module implementing the `Module` trait with no dependencies.
+2. THE `remote-state` module SHALL provision a `RemoteStateBucket` resource from a shared location under `platforms/` (shared across all AWS-backed platforms) with shared-bucket lifecycle semantics.
+3. THE `RemoteStateBucket` SHALL enforce S3 versioning on every create and update.
+4. THE `RemoteStateBucket` SHALL enforce a public access block (all four settings enabled) on create.
+5. THE `RemoteStateBucket` SHALL apply a bucket policy with `Deny` on `s3:DeleteObject` and `s3:DeleteObjectVersion` scoped to `{key_prefix}/snapshots/*` to prevent accidental state snapshot deletion.
+6. IF the bucket already exists (`BucketAlreadyOwnedByYou`), THE `RemoteStateBucket` SHALL adopt it without error and mark `managed_snapshot_policy = false` to avoid overwriting an existing policy.
+7. THE `RemoteStateBucket` `delete()` SHALL be a no-op — the state bucket outlives any single deployment.
+8. THE `RemoteStateBucket` `diff()` SHALL ignore tag drift (shared bucket may be tagged by other projects). Only versioning and snapshot policy drift SHALL trigger updates.
+
+### Requirement 7.5: DSQL Module
+
+**User Story:** As a Tokeira developer, I want a DSQL IaC module that provisions the Aurora DSQL cluster and related resources, so that the persistence layer is managed as infrastructure alongside the compute layer.
+
+#### Acceptance Criteria
+
+1. THE ECS_Platform SHALL define a `dsql` IaC module implementing the `Module` trait.
+2. THE `dsql` module SHALL depend on the `networking` module (DSQL PrivateLink endpoints require VPC resources).
+3. THE `dsql` module SHALL enumerate resources for: DSQL cluster, DSQL PrivateLink endpoints (management and connection), and IAM authentication roles for runtime and admin access.
+4. THE `dsql` module resources SHALL implement the `Resource` trait.
 
 ---
 
@@ -511,7 +596,7 @@ The authoritative architecture document is [045-autoscaling-on-ecs-ec2](../../..
 #### Acceptance Criteria
 
 1. THE ECS_Platform SHALL define an `observability` IaC module implementing the `Module` trait.
-2. THE `observability` module SHALL depend on the `services` module (observability services need the cluster and Service Connect namespace).
+2. THE `observability` module SHALL depend on the `cluster` module (observability services need the ECS cluster and Service Connect namespace to be provisioned first).
 3. THE `observability` module SHALL enumerate resources for: S3 buckets for Mimir and Loki storage, IAM roles for S3 access, Mimir/Loki/Grafana task definitions and ECS services.
 4. THE `observability` module resources SHALL implement the `Resource` trait.
 
@@ -557,5 +642,28 @@ The authoritative architecture document is [045-autoscaling-on-ecs-ec2](../../..
 #### Acceptance Criteria
 
 1. THE `tkr scale up` and `tkr scale down` commands SHALL work with ECS services by calling `ecs:UpdateService`.
-2. THE `tkr logs` command SHALL retrieve logs from ECS tasks.
+2. THE `tkr logs` command SHALL retrieve logs from ECS tasks via Loki query (primary) or ECS task log retrieval (fallback).
 3. THE `tkr` CLI SHALL validate service names against the set of valid ECS services.
+
+### Requirement 9.4: Break-Glass Debug Logging
+
+**User Story:** As a Tokeira operator, I want to enable CloudWatch Logs as a break-glass debug action, so that I can diagnose issues when the Loki pipeline is unavailable.
+
+#### Acceptance Criteria
+
+1. THE `tkr debug logs enable` command SHALL update ECS task definitions to add a CloudWatch Logs log driver alongside the Alloy sidecar, and trigger a rolling deployment.
+2. THE `tkr debug logs disable` command SHALL remove the CloudWatch Logs log driver from task definitions and trigger a rolling deployment.
+3. CloudWatch Logs SHALL NOT be enabled by default — the normal log flow is Alloy → Loki.
+4. BOTH `tkr debug logs enable` and `tkr debug logs disable` SHALL show the operator what will change and require explicit confirmation before mutation.
+5. THE CloudWatch Logs VPC endpoint SHALL be provisioned as an optional endpoint (enabled via `optional_endpoints.cloudwatch_logs` in config) so that debug logging works without internet access.
+
+### Requirement 9.5: Zero-Replica Staged Deployment
+
+**User Story:** As a Tokeira operator, I want services to deploy at zero replicas initially, so that I can run schema setup before scaling up and avoid crash-loops.
+
+#### Acceptance Criteria
+
+1. WHEN `tkr deploy apply` creates ECS services for the first time, THE services SHALL be created with desired count 0.
+2. THE `tkr schema setup` command SHALL run DSQL schema migrations against the provisioned DSQL cluster.
+3. THE `tkr scale up` command SHALL scale services in startup order, waiting for each to reach ready state before proceeding to the next: runtime → controller → edge-api → edge-poll → projection → autoscaler.
+4. THE `tkr scale up` command SHALL show the operator the planned scaling actions and require confirmation.

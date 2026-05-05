@@ -226,6 +226,130 @@ Long polls should never consume DSQL sessions.
 
 Parked workflows should never consume DSQL sessions.
 
+## Connection demand analysis
+
+This section traces every DSQL access path, what triggers it, and how many connections it actually needs. The reference deployment is 10 runtime nodes at 400 WPS aggregate (40 WPS per node) with 64 bundles.
+
+### Control class — shard lease operations
+
+| Operation | Trigger | Frequency per node |
+|---|---|---|
+| `try_acquire_bundle` | Shard acquisition at startup or rebalance | Rare — once per bundle on ownership change |
+| `renew_bundle` | Periodic lease renewal | Every ~10s per owned bundle (30s lease / 3 renewals) |
+| `list_bundle_leases` | Controller reads all leases for snapshot | Every snapshot cycle (~5s), controller only |
+| `advance_generation` | Controller advances routing generation | Per snapshot publish, controller only |
+| `allocate_budget` | Controller distributes connection budget | On membership change, controller only |
+
+With 64 bundles across 10 nodes, each node owns ~6 bundles. That is ~6 renewals every 10 seconds = 0.6 ops/sec per node. These are short single-row reads/updates. One connection handles this comfortably.
+
+**Peak concurrent connections: 1.** Budget: 2–3.
+
+### Commit class — transition commits
+
+| Operation | Trigger | Frequency per node |
+|---|---|---|
+| `commit_transition` | Every workflow state change (WFT completion, activity completion, signal, timer, cancel) | Proportional to WPS |
+| `persist_to_backlog` | Unmatched task dispatch when no worker is polling | Proportional to unmatched tasks |
+| `drain_backlog` | Backlog sweep drains queued tasks | Periodic per queue with pending backlog |
+
+`commit_transition` is the hot path. It is a multi-statement transaction within a single connection: epoch fence check (`SELECT epoch FROM shard_lease`), OCC check (`SELECT transition_seq FROM workflow_hot FOR UPDATE`), dedupe check, optional current_execution conflict check, then the write set (workflow_hot upsert, history_batch insert, activity/timer/dispatch side-table mutations, projection_log insert, request_dedupe insert). One transaction, one connection, held for the full duration.
+
+At 40 WPS per node with ~10ms average DSQL round-trip, that is 0.4 connections in-use concurrently on average. At p99 latency (~50ms), peak concurrent usage is ~2 connections. Burst structure matters: if 10 workflow tasks complete simultaneously on one lane, 10 concurrent commits happen briefly.
+
+**Peak concurrent connections: ~5 (burst).** Budget: 15.
+
+### Read class — load, resolve, history, sweep queries
+
+| Operation | Trigger | Frequency per node |
+|---|---|---|
+| `resolve_execution` | Every incoming Start/Signal/Query from edge | Per API request |
+| `find_latest_run` | Workflow-id conflict check on Start | Per Start |
+| `load_run` | Lane loads run state for processing | Per WFT/activity start |
+| `read_history` | Worker needs history replay (cache miss) | Per WFT with cache miss |
+| `lookup_request_dedupe` | Dedupe check on read path | Per idempotent request |
+| `list_dispatchable_workflow_tasks_for_shard` | Dispatch sweep per shard | ~1/sec per owned shard |
+| `list_dispatchable_activity_tasks_for_shard` | Dispatch sweep per shard | ~1/sec per owned shard |
+| `list_due_timers_for_shard` | Timer scanner | Every 200ms per owned shard |
+| `list_runs_with_workflow_timeouts_for_shard` | Sweep reconstruction after shard acquisition | Once per shard on acquisition |
+| `list_started_workflow_tasks_for_shard` | WFT timeout reconstruction | Once per shard on acquisition |
+| `list_open_activities_for_shard` | Activity timeout reconstruction | Once per shard on acquisition |
+| `list_pending_nexus_operations_for_shard` | Nexus timeout reconstruction | Once per shard on acquisition |
+
+The timer scanner is the most frequent background reader: 200ms interval × 6 owned shards = 30 reads/sec per node. Each is a simple indexed query at ~5ms, so 0.15 connections in-use concurrently.
+
+Dispatch sweeps add ~12 reads/sec per node (workflow + activity, one per shard per second). Load/resolve/history reads scale with WPS — at 40 WPS per node, roughly 80 reads/sec (load + resolve per workflow task). At 5ms each, that is 0.4 connections concurrent.
+
+Sweep reconstruction queries fire once per shard on acquisition (startup or rebalance), not continuously. They are a brief burst of 4–5 queries per shard, then done.
+
+**Peak concurrent connections: ~3.** Budget: 10.
+
+### Projection class — projection log reads
+
+| Operation | Trigger | Frequency per node |
+|---|---|---|
+| `read_from` (ProjectionLog) | Projection worker polling for new records | Continuous, per partition |
+
+Projection workers poll the projection log for new entries to apply to visibility stores. With 1 partition per node (typical), that is one continuous reader at ~100ms poll interval with ~5ms query time.
+
+**Peak concurrent connections: 1.** Budget: 3.
+
+### Maintenance class — background housekeeping
+
+Not yet implemented. Reserved for archival, cleanup, and other background operations.
+
+**Peak concurrent connections: 0.** Budget: 2 (headroom for future use).
+
+### Summary: 10-node reference deployment at 400 WPS
+
+| Class | Peak concurrent (per node) | Recommended budget (per node) | What holds the connection |
+|---|---|---|---|
+| Control | 1 | 2–3 | Lease renewal: single-row `UPDATE shard_lease` |
+| Commit | 5 (burst) | 15 | Transition commit: multi-statement tx (~10–50ms) |
+| Read | 3 | 10 | Timer scans, dispatch sweeps, load/resolve queries |
+| Projection | 1 | 3 | Projection log poll: `SELECT FROM projection_log` |
+| Maintenance | 0 | 2 | Reserved |
+| **Total** | **~10** | **~32** | |
+
+**Cluster-wide totals at 10 nodes:**
+
+- Connections: 320 out of 10,000 DSQL limit (3.2%)
+- Startup fill rate: 320 connections at 100/sec = 3.2 seconds
+- Per-node fill rate with controller fair-share: 32 connections at 10/sec = 3.2 seconds
+- Connection recycling: ~1 connection/min per node (50-min lifetime), 10/min cluster-wide — negligible against 100/sec rate limit
+
+### Where pressure actually comes from
+
+1. **Commit transaction duration, not connection count.** A commit holds a connection for the entire multi-statement transaction. If DSQL latency spikes (OCC retries, cross-region), commit duration grows and connections pile up. Class-based semaphores protect Control from Commit backpressure.
+
+2. **Startup fill rate.** 10 nodes × 32 connections = 320 needed. At 100/sec cluster-wide with controller fair-share (10/sec per node), each node fills in 3.2 seconds. Acceptable.
+
+3. **Rolling restart.** One node restarts, needs 32 new connections at 10/sec (its fair share) = 3.2 seconds. The old node's connections are still alive until they expire (~50 minutes). No pressure on the 10k limit.
+
+4. **Timer scanner frequency.** 200ms interval × 6 shards = 30 reads/sec. This is the most frequent DSQL access. If shard count per node increases (e.g., 64 shards on one node during drain), this grows linearly. At 64 shards per node it would be 320 reads/sec — still manageable but worth monitoring.
+
+### Default allocation ratios
+
+The `default_allocations` function in `connection.rs` uses percentage-based ratios that sum to `target_ready`:
+
+| Class | Ratio | At target_ready=50 | At target_ready=32 |
+|---|---|---|---|
+| Control | 10% | 5 | 3 |
+| Commit | 50% | 25 | 16 |
+| Read | 20% | 10 | 6 |
+| Projection | 10% | 5 | 3 |
+| Maintenance | remainder | 5 | 4 |
+
+The default `target_ready: 50` is generous for 400 WPS / 10 nodes. A `target_ready: 32` would be sufficient with headroom. The 50 default works without tuning up to ~1000 WPS per node before commit concurrency becomes the bottleneck.
+
+### When DynamoDB-backed coordination becomes necessary
+
+At the 10-node / 400 WPS reference deployment, the controller fair-share approach is sufficient. DynamoDB coordination (token bucket rate limiter, slot block manager) becomes valuable at two thresholds:
+
+- **Work-conserving rate sharing** — when heterogeneous nodes (some doing heavy commit work, others mostly idle) need idle nodes' rate budget available to busy ones. Fair-share wastes the idle budget.
+- **Controller-independent operation** — when connection management must survive controller unavailability indefinitely, not just for the `valid_until` directive window.
+
+Neither is a day-one requirement. See the `connection-budget-allocator` deferred spec for the DynamoDB-backed approach.
+
 ## Degraded mode
 
 On connection exhaustion or open-rate exhaustion:

@@ -7,7 +7,7 @@ This design implements the shard placement and membership system for multi-node 
 The critical correctness distinction is between **execution-home** and **queue-home**:
 
 - **Execution-home** is the correctness boundary. Start, Signal, Query, Update, Cancel all route by execution-home derived from the canonical execution key `hash(namespace_id, workflow_id) -> bundle_id`. This ensures all operations on the same workflow identity reach the same bundle owner.
-- **Queue-home** is an optimisation for poll/task locality. Queue partition placement is used only for dispatching workflow tasks and activities after the execution exists.
+- **Queue-home** is an optimisation for poll/task locality. Queue partition placement is used only for dispatching workflow tasks and activities after the execution exists. For this spec (MVP), queue-home always coincides with bundle ownership — `partition → bundle_for_partition → bundle owner`. Independent queue-partition placement (finer-grained than bundles) is deferred to 037-dynamic-placement.
 
 The implementation is organized into 5 phases:
 
@@ -58,7 +58,7 @@ edge ──route──▶ actual owner
 
 | Crate | New Dependencies | Role |
 |---|---|---|
-| `tokeira-types` | `blake3` | `IncarnationId`, `BundleId`, `QueuePartition`, `GenerationCounter`, `NodeReachability`, `PlacementConfig`, `BundleOwner`, `QueuePartitionHome`, `RoutingSnapshot`, mapping functions |
+| `tokeira-types` | `blake3` | `IncarnationId`, `BundleId`, `QueuePartition`, `QueuePartitionKey`, `GenerationCounter`, `NodeReachability`, `PlacementConfig`, `BundleOwner`, `RoutingSnapshot`, mapping functions |
 | `tokeira-storage` | *(none)* | `LeaseRepository` extensions: `list_bundle_leases`, `relinquish_bundle` |
 | `tokeira-controller` | `tonic`, `tokio`, `tracing`, `tokeira-types`, `tokeira-storage`, `tokeira-proto` | New crate: active-active controller service, membership, routing, desired placement |
 | `tokeira-runtime` | `tokeira-proto` (for controller client) | Membership stream client with registration, placement directive handling, two-phase drain protocol |
@@ -118,9 +118,20 @@ impl IncarnationId {
 }
 
 /// Identifies a queue partition — the main unit of dynamic placement.
-/// Finer-grained than bundles.
+/// Finer-grained than bundles. Always scoped to a queue family via QueuePartitionKey.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct QueuePartition(pub u32);
+
+/// Full key for a queue partition, scoping it to a queue family.
+/// Different queue families can hash to the same partition number,
+/// so the bare QueuePartition(u32) is not a unique map key.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct QueuePartitionKey {
+    pub namespace_id: NamespaceId,
+    pub task_queue: TaskQueueName,
+    pub task_kind: TaskKind,
+    pub partition: QueuePartition,
+}
 
 /// Monotonically increasing counter on routing snapshots.
 /// Persisted in DSQL with CAS protection.
@@ -210,7 +221,9 @@ pub struct BundleOwner {
     pub epoch: ShardEpoch,
 }
 
-/// Home assignment for a queue partition.
+/// Home assignment for a queue partition — no longer stored in the snapshot.
+/// Queue-home is derived on demand: partition → bundle_for_partition → bundle owner.
+/// Retained as a convenience type for callers that need both node_id and bundle_id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct QueuePartitionHome {
     pub node_id: IncarnationId,
@@ -230,13 +243,17 @@ pub struct PlacementConfig {
 ///
 /// Edges cache this via ArcSwap for lock-free reads.
 /// Contains ONLY actual (DSQL-confirmed) ownership, never desired placement.
+/// Node endpoints are sourced from the `node_endpoint` column on `shard_lease`
+/// rows in DSQL, not from membership streams.
+///
+/// Queue-home is NOT a pre-materialized map because queue families are unbounded.
+/// Instead, `resolve_queue_home` derives the bundle on demand from the partition.
 #[derive(Clone, Debug)]
 pub struct RoutingSnapshot {
     /// Execution bundle ownership: bundle_id → owner with epoch.
     execution_bundle_owners: HashMap<BundleId, BundleOwner>,
-    /// Queue partition homes: partition → preferred home.
-    queue_partition_homes: HashMap<QueuePartition, QueuePartitionHome>,
     /// Node endpoints: node_id → network address.
+    /// Sourced from shard_lease.node_endpoint in DSQL.
     node_endpoints: HashMap<IncarnationId, NodeEndpoint>,
     /// Hash and mapping configuration.
     placement_config: PlacementConfig,
@@ -248,7 +265,6 @@ impl RoutingSnapshot {
     pub fn new(placement_config: PlacementConfig) -> Self {
         Self {
             execution_bundle_owners: HashMap::new(),
-            queue_partition_homes: HashMap::new(),
             node_endpoints: HashMap::new(),
             placement_config,
             generation: GenerationCounter::ZERO,
@@ -271,8 +287,9 @@ impl RoutingSnapshot {
         self.node_endpoints.get(&node_id)
     }
 
-    pub fn lookup_queue_partition_home(&self, partition: QueuePartition) -> Option<&QueuePartitionHome> {
-        self.queue_partition_homes.get(&partition)
+    pub fn resolve_queue_home(&self, key: &QueuePartitionKey) -> Option<&BundleOwner> {
+        let bundle_id = bundle_for_partition(key.partition, self.placement_config.bundle_count);
+        self.execution_bundle_owners.get(&bundle_id)
     }
 
     /// Apply an incremental delta to update the snapshot.
@@ -288,12 +305,6 @@ impl RoutingSnapshot {
             match owner {
                 Some(bo) => { self.execution_bundle_owners.insert(bundle_id, bo); }
                 None => { self.execution_bundle_owners.remove(&bundle_id); }
-            }
-        }
-        for (partition, home) in delta.queue_partition_updates {
-            match home {
-                Some(h) => { self.queue_partition_homes.insert(partition, h); }
-                None => { self.queue_partition_homes.remove(&partition); }
             }
         }
         for (node_id, endpoint) in delta.node_updates {
@@ -314,8 +325,6 @@ pub struct RoutingDelta {
     pub base_generation: GenerationCounter,
     /// Changed bundle ownership. None value means bundle is unowned.
     pub bundle_updates: Vec<(BundleId, Option<BundleOwner>)>,
-    /// Changed queue partition homes. None value means partition unassigned.
-    pub queue_partition_updates: Vec<(QueuePartition, Option<QueuePartitionHome>)>,
     /// Changed node endpoints. None value means node removed.
     pub node_updates: Vec<(IncarnationId, Option<NodeEndpoint>)>,
     /// New generation after applying this delta.
@@ -336,7 +345,30 @@ pub enum RoutingDeltaError {
 ### 4. LeaseRepository Extensions (`tokeira-storage`)
 
 ```rust
-// Added to the LeaseRepository trait in api.rs:
+// Updated signatures on the existing LeaseRepository trait in api.rs:
+
+/// Attempt to acquire ownership of `bundle`.
+/// The `node_endpoint` is written to the lease row so controllers
+/// can source endpoints from DSQL for active-active snapshot computation.
+/// Treats `owner IS NULL` rows as immediately acquirable (after relinquish).
+async fn try_acquire_bundle(
+    &self,
+    bundle: ShardId,
+    owner: String,
+    node_endpoint: String,
+) -> Result<LeaseOutcome>;
+
+/// Renew an existing lease for `bundle` at the given `epoch`.
+/// Updates `node_endpoint` on each renewal so endpoint changes propagate.
+async fn renew_bundle(
+    &self,
+    bundle: ShardId,
+    owner: String,
+    epoch: ShardEpoch,
+    node_endpoint: String,
+) -> Result<LeaseOutcome>;
+
+// New methods added to the LeaseRepository trait:
 
 /// List all current bundle leases.
 ///
@@ -360,9 +392,13 @@ async fn relinquish_bundle(
 #[derive(Clone, Debug, PartialEq)]
 pub struct BundleLease {
     pub bundle_id: ShardId,
-    pub owner_node_id: String,
+    /// None when the bundle is unowned (after relinquish).
+    pub owner_node_id: Option<String>,
     pub epoch: ShardEpoch,
     pub lease_until: OffsetDateTime,
+    /// Network endpoint written by the runtime when acquiring the lease.
+    /// Sourced from shard_lease.node_endpoint in DSQL.
+    pub node_endpoint: Option<String>,
 }
 ```
 
@@ -421,6 +457,14 @@ message RuntimeHeartbeat {
     uint32 available_connections = 7;
     float connection_rate_headroom = 8;
     NodeDrainState drain_state = 9;
+    repeated LanePressure lane_pressures = 10;
+}
+
+message LanePressure {
+    uint32 lane_id = 1;
+    uint64 runnable_depth = 2;
+    uint64 active_actors = 3;
+    float utilization = 4;
 }
 
 enum NodeDrainState {
@@ -471,18 +515,18 @@ message RoutingUpdate {
 
 message FullRoutingSnapshot {
     repeated BundleOwnershipEntry bundles = 1;
-    repeated QueuePartitionHomeEntry queue_partitions = 2;
-    repeated NodeEndpointEntry nodes = 3;
-    PlacementConfigMessage placement_config = 4;
-    uint64 generation = 5;
+    // Queue-home is derived on demand from partition → bundle mapping.
+    // No QueuePartitionHomeEntry needed — queue families are unbounded.
+    repeated NodeEndpointEntry nodes = 2;
+    PlacementConfigMessage placement_config = 3;
+    uint64 generation = 4;
 }
 
 message RoutingDeltaMessage {
     uint64 base_generation = 1;
     repeated BundleOwnershipEntry bundle_updates = 2;
-    repeated QueuePartitionHomeEntry queue_partition_updates = 3;
-    repeated NodeEndpointEntry node_updates = 4;
-    uint64 generation = 5;
+    repeated NodeEndpointEntry node_updates = 3;
+    uint64 generation = 4;
 }
 
 // Uses oneof for ownership state instead of empty-string sentinels
@@ -495,22 +539,13 @@ message BundleOwnershipEntry {
 }
 
 message BundleOwnerMessage {
-    string owner_node_id = 1;
+    string owner_node_id = 1;  // IncarnationId UUID text
     uint64 epoch = 2;
 }
 
-message QueuePartitionHomeEntry {
-    uint32 partition_id = 1;
-    oneof state {
-        QueuePartitionHomeMessage assigned = 2;
-        bool unassigned = 3;
-    }
-}
-
-message QueuePartitionHomeMessage {
-    string node_id = 1;
-    uint32 bundle_id = 2;
-}
+// QueuePartitionHomeEntry removed — queue-home is derived on demand
+// from partition → bundle_for_partition → bundle owner lookup.
+// Queue families are unbounded so cannot be pre-materialized.
 
 message NodeEndpointEntry {
     string node_id = 1;
@@ -588,26 +623,66 @@ No leader election. All controllers read DSQL lease rows independently. The gene
 
 ```rust
 pub struct GenerationManager {
-    lease_repo: Arc<dyn LeaseRepository>,
+    control_repo: Arc<dyn ControlRepository>,
 }
 
 impl GenerationManager {
     /// Advance the generation counter using CAS.
     /// Returns the new generation on success, or the current generation on CAS failure.
     pub async fn advance_generation(&self, expected: GenerationCounter) -> Result<GenerationAdvanceResult> {
-        // UPDATE routing_generation
-        // SET generation = generation + 1
-        // WHERE generation = $expected_generation
-        // RETURNING generation;
+        self.control_repo.advance_generation(expected).await
     }
 
     /// Read the current generation from DSQL.
-    pub async fn current_generation(&self) -> Result<GenerationCounter> { ... }
+    pub async fn current_generation(&self) -> Result<GenerationCounter> {
+        self.control_repo.current_generation().await
+    }
 }
 
 pub enum GenerationAdvanceResult {
     Advanced(GenerationCounter),
     Conflict(GenerationCounter), // another controller advanced first
+}
+```
+
+#### Control Repository (`tokeira-storage`)
+
+The `ControlRepository` trait provides the storage surface for generation counter and budget allocation — the two CAS-protected DSQL rows that active-active controllers coordinate through:
+
+```rust
+/// Repository for controller coordination state (generation counter, budget allocation).
+///
+/// Separate from LeaseRepository because these operations are controller-only,
+/// not runtime-only. Both traits may be implemented by the same backing store.
+#[async_trait]
+pub trait ControlRepository: Send + Sync {
+    /// Advance the generation counter using CAS.
+    /// UPDATE routing_generation SET generation = generation + 1
+    /// WHERE id = 1 AND generation = $expected RETURNING generation
+    async fn advance_generation(&self, expected: GenerationCounter) -> Result<GenerationAdvanceResult>;
+
+    /// Read the current generation.
+    async fn current_generation(&self) -> Result<GenerationCounter>;
+
+    /// Attempt to allocate connection budget using CAS on the version column.
+    /// UPDATE budget_allocation SET version = version + 1, allocator_id = $id,
+    ///   allocated_at = now(), rate_budget = $rate, capacity_budget = $cap
+    /// WHERE id = 1 AND version = $expected RETURNING version
+    async fn allocate_budget(
+        &self,
+        expected_version: u64,
+        allocator_id: Uuid,
+        rate_budget: f64,
+        capacity_budget: u64,
+    ) -> Result<BudgetAllocationResult>;
+
+    /// Read the current budget allocation version.
+    async fn current_budget_version(&self) -> Result<u64>;
+}
+
+pub enum BudgetAllocationResult {
+    Allocated { version: u64 },
+    Conflict { current_version: u64 },
 }
 ```
 
@@ -623,7 +698,6 @@ pub struct LiveMembership {
 
 pub struct LiveNode {
     pub node_id: IncarnationId,
-    pub endpoint: NodeEndpoint,
     pub registration: RuntimeRegistration,
     pub last_heartbeat: Instant,
     pub heartbeat: RuntimeHeartbeat,
@@ -631,6 +705,9 @@ pub struct LiveNode {
     pub reachability: NodeReachability,
     /// Handle to the stream for sending directives.
     pub directive_tx: mpsc::Sender<ControllerDirective>,
+    // Note: node_endpoint is NOT stored here. Endpoints are sourced from
+    // shard_lease.node_endpoint in DSQL. Membership streams carry pressure
+    // metrics only.
 }
 
 pub enum NodeMembershipState {
@@ -652,9 +729,14 @@ pub fn compute_routing_snapshot(
     placement_config: &PlacementConfig,
     previous_generation: GenerationCounter,
 ) -> (RoutingSnapshot, RoutingDelta) {
-    // 1. Build execution_bundle_owners from lease rows (BundleOwner with epoch)
-    // 2. Build queue_partition_homes from bundle owners + partition mapping
-    // 3. Build node_endpoints from live membership
+    // 1. Build execution_bundle_owners from DSQL lease rows alone (BundleOwner with epoch).
+    //    Include ALL owned bundles regardless of membership state — DSQL is authoritative.
+    //    Membership is NOT consulted for actual ownership; only DSQL leases determine
+    //    what the RoutingSnapshot advertises. This ensures active-active determinism.
+    //    Parse owner string as IncarnationId UUID; skip rows with malformed owner (log warning).
+    // 2. Build node_endpoints from shard_lease.node_endpoint (DSQL), NOT from membership
+    //    Parse node_endpoint string as host:port; skip rows with missing/malformed endpoint.
+    // 3. Queue-home is derived on demand — no pre-materialized map needed.
     // 4. Compute delta from previous snapshot
     // 5. Set base_generation on delta
 }
@@ -715,12 +797,17 @@ impl MembershipClient {
         shard_owner: Arc<RwLock<ShardOwner>>,
         drain_signal: Arc<Notify>,
         rate_limiter: Arc<TokenBucketRateLimiter>,
+        reservoir: Arc<Reservoir>,
     ) -> Result<()> {
         // 1. Connect to controller
         // 2. Send RuntimeRegistration as first message
         // 3. Loop: send heartbeats, receive directives
         // 4. On DesiredPlacementDirective: attempt acquire/relinquish
-        // 5. On ConnectionBudgetDirective: reconfigure rate limiter, check valid_until
+        // 5. On ConnectionBudgetDirective: reconfigure rate limiter via
+        //    TokenBucketRateLimiter::reconfigure(rate_per_second, capacity),
+        //    cap reservoir via Reservoir::reconfigure_target(max_reservoir_size),
+        //    retire excess via Reservoir::retire_excess(max_reservoir_size) if oversized,
+        //    track valid_until
         // 6. On DrainDirective: begin two-phase drain
         // 7. On disconnect: retain budget until valid_until, then degrade to conservative default
     }
@@ -759,14 +846,15 @@ impl RoutingCache {
 
     /// Resolve the runtime endpoint for a queue-home operation.
     /// Used for poll routing and task dispatch.
+    /// Derives the bundle on demand from the partition — no pre-materialized map.
     pub fn resolve_queue_home(
         &self,
-        partition: QueuePartition,
-    ) -> Option<(IncarnationId, NodeEndpoint)> {
+        key: &QueuePartitionKey,
+    ) -> Option<(IncarnationId, NodeEndpoint, ShardEpoch)> {
         let snap = self.snapshot.load();
-        let home = snap.lookup_queue_partition_home(partition)?;
-        let endpoint = snap.lookup_node_endpoint(home.node_id)?;
-        Some((home.node_id, endpoint.clone()))
+        let owner = snap.resolve_queue_home(key)?;
+        let endpoint = snap.lookup_node_endpoint(owner.node_id)?;
+        Some((owner.node_id, endpoint.clone(), owner.epoch))
     }
 
     /// Run the background subscription loop.
@@ -784,6 +872,7 @@ pub async fn route_with_retry<F, R>(
     namespace_id: &[u8],
     workflow_id: &[u8],
     controller_client: &ControllerClient,
+    lease_repo: &dyn LeaseRepository,
     max_retries: u32,
     make_request: F,
 ) -> Result<R>
@@ -802,11 +891,16 @@ where
                 if retries > max_retries {
                     return Err(anyhow!("routing failed after {} retries", max_retries));
                 }
-                // Recovery option 1: use hint
+                // Recovery option 1: use hint — route directly to hinted owner,
+                // bypassing the stale cache entry
                 if let Some(hint_node_id) = nso.current_owner_node_id {
-                    if let Some(endpoint) = cache.lookup_node_endpoint(hint_node_id) {
-                        // Try the hinted owner directly
-                        continue;
+                    if let Some(hinted_endpoint) = cache.lookup_node_endpoint(hint_node_id) {
+                        match make_request(&hinted_endpoint, nso.current_epoch).await {
+                            Ok(result) => return Ok(result),
+                            Err(_) => {
+                                // Hint failed, fall through to controller refresh
+                            }
+                        }
                     }
                 }
                 // Recovery option 2: RefreshBundle from controller
@@ -815,7 +909,21 @@ where
                     continue;
                 }
                 // Recovery option 3: DSQL lease lookup fallback
-                // (implementation deferred to runtime)
+                if let Ok(lease) = lease_repo.list_bundle_leases().await {
+                    if let Some(bl) = lease.iter().find(|l| l.bundle_id == nso.bundle_id) {
+                        if let (Some(owner_str), Some(ep_str)) = (&bl.owner_node_id, &bl.node_endpoint) {
+                            // Parse owner as IncarnationId UUID — skip if malformed
+                            if let (Ok(node_id), Ok(endpoint)) = (
+                                owner_str.parse::<Uuid>().map(IncarnationId),
+                                NodeEndpoint::parse(ep_str),
+                            ) {
+                                let owner = BundleOwner { node_id, epoch: bl.epoch };
+                                cache.apply_dsql_fallback(nso.bundle_id, owner, &endpoint);
+                                continue;
+                            }
+                        }
+                    }
+                }
             }
             Err(e) => return Err(e),
         }
@@ -860,27 +968,63 @@ Edge retry is safe only because `request_dedupe` is persisted atomically with wo
 
 ### DSQL Tables
 
+#### Shard Lease (updated in-place in V002)
+
+The `shard_lease` table is updated in-place (schema version 1 convention) to make `owner` nullable and add `node_endpoint`:
+
+```sql
+CREATE TABLE IF NOT EXISTS shard_lease (
+    shard_id        UUID        NOT NULL,
+    owner           TEXT,
+    epoch           BIGINT      NOT NULL,
+    lease_expiry    TIMESTAMPTZ NOT NULL,
+    node_endpoint   TEXT,
+    PRIMARY KEY (shard_id)
+);
+```
+
+`owner` is nullable so that `relinquish_bundle` can set it to `NULL` to represent an unowned bundle. `node_endpoint` stores the runtime's `host:port` so controllers can source endpoints from DSQL lease rows rather than membership streams.
+
 #### Generation Counter
 
 ```sql
-CREATE TABLE control.routing_generation (
-    id          integer PRIMARY KEY DEFAULT 1,
+-- V043: CREATE TABLE
+CREATE TABLE IF NOT EXISTS routing_generation (
+    id          integer PRIMARY KEY,
     generation  bigint NOT NULL DEFAULT 0,
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
+
+-- V044: Seed singleton row
+INSERT INTO routing_generation (id, generation, updated_at)
+VALUES (1, 0, now())
+ON CONFLICT (id) DO NOTHING;
 ```
+
+The singleton row with `id = 1` must exist for `SELECT ... WHERE id = 1` and CAS updates to work. The seed migration ensures this on a fresh schema.
 
 #### Connection Budget Allocation
 
 ```sql
-CREATE TABLE control.budget_allocation (
-    id              integer PRIMARY KEY DEFAULT 1,
+-- V045: CREATE TABLE
+CREATE TABLE IF NOT EXISTS budget_allocation (
+    id              integer PRIMARY KEY,
+    version         bigint NOT NULL DEFAULT 0,
     allocator_id    uuid,
     allocated_at    timestamptz,
     rate_budget     double precision NOT NULL DEFAULT 100.0,
     capacity_budget bigint NOT NULL DEFAULT 10000
 );
+
+-- V046: Seed singleton row
+INSERT INTO budget_allocation (id, version, rate_budget, capacity_budget)
+VALUES (1, 0, 100.0, 10000)
+ON CONFLICT (id) DO NOTHING;
 ```
+
+The `version` column provides CAS protection: `UPDATE ... WHERE id = 1 AND version = $expected RETURNING version`. Competing active-active controllers race on the version — exactly one succeeds per allocation cycle.
+
+Each table is created by a dedicated migration file, with a separate seed file (one SQL statement per file per DSQL convention — 4 files total).
 
 
 ## Safety Analysis and Known Limitations
@@ -889,7 +1033,7 @@ This section documents the safety properties the design relies on, the failure m
 
 ### Why active-active controllers are safe
 
-All controllers read the same DSQL lease rows and compute routing snapshots deterministically from that state. The only shared mutable state is the generation counter, which is protected by CAS:
+All controllers read the same DSQL lease rows and compute routing snapshots deterministically from that state. Node endpoints are sourced from the `node_endpoint` column on `shard_lease` rows — not from membership streams — so any controller reading the same lease rows produces the same endpoint map. The only shared mutable state is the generation counter, which is protected by CAS:
 
 - **No split-brain risk from dual computation:** Two controllers computing snapshots from the same DSQL state produce identical routing maps. If they read at slightly different times, the CAS on the generation counter ensures only one publishes per increment.
 - **CAS failure is benign:** A controller that loses the CAS race simply re-reads the current generation and retries. No stale snapshot is published because the generation counter is monotonically increasing.
@@ -906,6 +1050,10 @@ Bundle leases in DSQL are the authoritative fence for workflow commits. The safe
 3. If the lease expires and another node acquires with epoch N+1, the old owner's commits fail because `epoch != N+1`.
 
 **This works if and only if** the old owner's in-flight transaction completes (commit or abort) before the new owner's first commit succeeds. DSQL's OCC with Repeatable Read should guarantee this — a transaction that read epoch N will conflict with a concurrent write that changed epoch to N+1. The `SELECT epoch ... FOR UPDATE` in `commit_transition` should ensure this.
+
+**Execution-home bundle in commit fencing:** The edge routes by `execution_home_bundle(namespace_id, workflow_id)` which hashes the canonical execution key. The runtime's `commit_transition` must accept the execution-home `BundleId` from the edge request and fence against that bundle's epoch — not derive the bundle from `run_key` (which includes `run_id` and produces a different hash via `shard_for`). This ensures the commit fence matches the routing path.
+
+**Internal commits (non-edge-routed):** Workflow task completions, activity completions, timer firings, scanner-driven transitions, and recovery replays are not directly edge-routed. For these, the runtime derives the execution-home `BundleId` from the loaded run's `(namespace_id, workflow_id)` using `execution_home_bundle`. The `ShardOwner` validates the derived bundle matches a locally-owned bundle before committing. This is safe because the runtime only processes runs for bundles it owns.
 
 **Epoch in routing entries provides fast-fail:** The edge includes `observed_bundle_epoch` in requests. The runtime checks this against its local epoch before attempting a DSQL transaction. This avoids wasting a DSQL round-trip on requests that are already known to be stale.
 
@@ -965,6 +1113,8 @@ The previous design had a correctness bug: Start routed by queue partition (prod
 | Stale routing is recoverable | NotShardOwner + hint + controller refresh + DSQL fallback | High | Multiple recovery paths; request_dedupe ensures retry safety |
 | Controller unavailability does not affect correctness | DSQL leases + cached routing | High | Only rebalance and budget updates pause |
 | Start and Signal route to same execution-home | Both use hash(namespace_id, workflow_id) | High | Correctness fix from previous design |
+| Commit fencing matches routing path | commit_transition accepts execution-home BundleId from edge | High | Prevents mismatch between routing hash and fencing hash |
+| Node endpoints are deterministic across controllers | Sourced from shard_lease.node_endpoint in DSQL | High | All controllers reading same lease rows produce same endpoint map |
 | Drain does not lose in-flight work | Two-phase: routing moves before ownership relinquished | High | DSQL confirms new owner before routing advertises it |
 
 ### Candidates for TLA+ verification
@@ -1068,7 +1218,7 @@ The previous design had a correctness bug: Start routed by queue partition (prod
 
 - **Active-active coordination:** Verify CAS generation advance succeeds for one controller, fails for concurrent. Verify re-read and retry.
 - **Membership tracking:** Verify node registration, heartbeat update, grace-period transitions, drain state. Verify NodeReachability transitions.
-- **Routing snapshot:** Verify full snapshot construction from leases with epoch. Verify delta application with base_generation validation. Verify generation advancement. Verify queue_partition_homes and execution_bundle_owners are separate maps.
+- **Routing snapshot:** Verify full snapshot construction from leases with epoch. Verify delta application with base_generation validation. Verify generation advancement. Verify on-demand queue-home derivation via `resolve_queue_home`.
 - **Routing cache:** Verify ArcSwap-based lookup returns correct endpoint with epoch. Verify execution-home resolution for Start and Signal produces same result. Verify stale cache still serves.
 - **NotShardOwner retry:** Verify hint-based routing. Verify controller refresh fallback. Verify DSQL fallback. Verify max retries.
 - **Two-phase drain:** Verify routing moves before ownership relinquished. Verify SAFE_TO_TERMINATE conditions. Verify epoch-checked CAS relinquish.

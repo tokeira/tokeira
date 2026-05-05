@@ -92,7 +92,10 @@ impl<T: Serialize + DeserializeOwned + Default + Validate> S3StateStore<T> {
     }
 
     /// Persist a new state snapshot and atomically move the manifest head.
-    pub async fn save(&self, state: &T) -> Result<(), StateError> {
+    ///
+    /// Returns the manifest ETag after the successful commit so callers that
+    /// coordinate multiple writes can carry the latest version forward.
+    pub async fn save(&self, state: &T) -> Result<String, StateError> {
         let bytes = serde_json::to_vec_pretty(state)
             .map_err(|e| StateError::Corrupted(format!("failed to serialize state: {e}")))?;
         let guard = self
@@ -100,7 +103,11 @@ impl<T: Serialize + DeserializeOwned + Default + Validate> S3StateStore<T> {
             .await?;
 
         match self.write_snapshot(&guard, &bytes).await {
-            Ok(_) => Ok(()),
+            Ok(_) => self
+                .get_manifest()
+                .await?
+                .map(|manifest| manifest.etag)
+                .ok_or_else(|| StateError::Corrupted("manifest missing after save".into())),
             Err(err @ StateError::Conflict(_))
             | Err(err @ StateError::LockLost(_))
             | Err(err @ StateError::Locked(_)) => Err(err),

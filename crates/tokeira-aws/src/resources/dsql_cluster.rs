@@ -15,6 +15,11 @@ pub enum DsqlClusterMode {
     Preexisting,
 }
 
+/// Return whether the cluster should be treated as provider-managed for delete.
+pub fn effective_managed(config_mode: DsqlClusterMode, state_mode: &str) -> bool {
+    config_mode == DsqlClusterMode::Managed || state_mode == "managed"
+}
+
 /// Configuration for a single DSQL cluster provider resource.
 #[derive(Debug)]
 pub struct DsqlClusterConfig {
@@ -297,10 +302,7 @@ impl Resource for DsqlCluster {
             .get("mode")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        let effective_managed =
-            self.config.mode == DsqlClusterMode::Managed || state_mode == "managed";
-
-        if !effective_managed {
+        if !effective_managed(self.config.mode, state_mode) {
             tracing::info!(
                 resource = %self.resource_id().0,
                 "preexisting DSQL cluster: skipping delete"
@@ -602,4 +604,20 @@ fn prop_str(rs: &ResourceState, key: &str) -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_managed_matches_config_and_state_modes() {
+        assert!(effective_managed(DsqlClusterMode::Managed, "managed"));
+        assert!(effective_managed(DsqlClusterMode::Managed, "preexisting"));
+        assert!(effective_managed(DsqlClusterMode::Preexisting, "managed"));
+        assert!(!effective_managed(
+            DsqlClusterMode::Preexisting,
+            "preexisting"
+        ));
+    }
 }

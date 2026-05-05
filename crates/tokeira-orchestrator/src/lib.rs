@@ -21,7 +21,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
@@ -248,7 +248,10 @@ impl<D: Deployment> InfraEngine<D> {
             .deployment
             .remote_state_module(&self.config, &self.deployment_dir);
 
-        let infra_modules = self.deployment.infra_modules(&self.config, &selection);
+        let selected_infra_modules = self.deployment.infra_modules(&self.config, &selection);
+        let known_infra_modules = self
+            .deployment
+            .infra_modules(&self.config, &iac::ModuleSelection::All);
 
         // Desired: remote-state + selected infra modules
         let mut desired_modules: Vec<Box<dyn iac::Module>> = Vec::new();
@@ -256,13 +259,13 @@ impl<D: Deployment> InfraEngine<D> {
             self.deployment
                 .remote_state_module(&self.config, &self.deployment_dir),
         );
-        desired_modules.extend(self.deployment.infra_modules(&self.config, &selection));
+        desired_modules.extend(selected_infra_modules);
 
         // Known: remote-state + all infra modules (superset of desired,
         // so removed modules can still be deleted)
         let mut known_modules: Vec<Box<dyn iac::Module>> = Vec::new();
         known_modules.push(remote_state);
-        known_modules.extend(infra_modules);
+        known_modules.extend(known_infra_modules);
 
         // Active: module names in scope for this operation
         let active_modules = desired_modules
@@ -279,22 +282,66 @@ impl<D: Deployment> InfraEngine<D> {
 
     /// Plan infrastructure changes without calling resource lifecycle methods
     /// that mutate provider state.
-    pub async fn plan(&mut self, composition: &iac::InfraComposition) -> Result<Vec<iac::Change>> {
+    pub async fn plan(
+        &mut self,
+        composition: &iac::InfraComposition,
+        selection: iac::ModuleSelection,
+    ) -> Result<Vec<iac::Change>> {
         let (state, _) = self.state_store.load().await?;
         self.ctx.state = state;
-        Ok(self.engine.plan(composition, &mut self.ctx).await?)
+        let changes = match selection {
+            iac::ModuleSelection::All => self.engine.plan(composition, &mut self.ctx).await,
+            iac::ModuleSelection::Only(_) | iac::ModuleSelection::Except(_) => {
+                self.engine
+                    .plan_for_modules(composition, &mut self.ctx)
+                    .await
+            }
+        }?;
+        Ok(changes)
+    }
+
+    /// Plan infrastructure destruction without mutating provider state.
+    pub async fn plan_destroy(
+        &mut self,
+        composition: &iac::InfraComposition,
+        selection: iac::ModuleSelection,
+    ) -> Result<Vec<iac::Change>> {
+        let (state, _) = self.state_store.load().await?;
+        self.ctx.state = state;
+        self.ctx.set_extension(iac::DestroyMode);
+        let result = match selection {
+            iac::ModuleSelection::All => self.engine.plan_destroy(composition, &mut self.ctx).await,
+            iac::ModuleSelection::Only(_) | iac::ModuleSelection::Except(_) => {
+                self.engine
+                    .plan_destroy_for_modules(composition, &mut self.ctx)
+                    .await
+            }
+        };
+        self.ctx.remove_extension::<iac::DestroyMode>();
+        Ok(result?)
     }
 
     /// Apply infrastructure changes and persist the resulting state document.
-    pub async fn apply(&mut self, composition: &iac::InfraComposition) -> Result<Vec<iac::Change>> {
+    pub async fn apply(
+        &mut self,
+        composition: &iac::InfraComposition,
+        selection: iac::ModuleSelection,
+    ) -> Result<Vec<iac::Change>> {
         let (state, version) = self.state_store.load().await?;
         self.ctx.state = state;
-        let saver = self.make_saver(version.clone());
-        let changes = self
-            .engine
-            .apply(composition, &mut self.ctx, Some(&saver))
-            .await?;
-        let _ = self.state_store.save(&self.ctx.state, &version).await?;
+        let saver = self.make_saver(version);
+        let changes = match selection {
+            iac::ModuleSelection::All => {
+                self.engine
+                    .apply(composition, &mut self.ctx, Some(&saver))
+                    .await
+            }
+            iac::ModuleSelection::Only(_) | iac::ModuleSelection::Except(_) => {
+                self.engine
+                    .apply_for_modules(composition, &mut self.ctx, Some(&saver))
+                    .await
+            }
+        }?;
         self.config = self
             .deployment
             .hydrate_config(&self.config, &self.ctx.state);
@@ -305,16 +352,26 @@ impl<D: Deployment> InfraEngine<D> {
     pub async fn destroy(
         &mut self,
         composition: &iac::InfraComposition,
+        selection: iac::ModuleSelection,
     ) -> Result<Vec<iac::Change>> {
         let (state, version) = self.state_store.load().await?;
         self.ctx.state = state;
-        let saver = self.make_saver(version.clone());
-        let changes = self
-            .engine
-            .destroy(composition, &mut self.ctx, Some(&saver))
-            .await?;
-        let _ = self.state_store.save(&self.ctx.state, &version).await?;
-        Ok(changes)
+        self.ctx.set_extension(iac::DestroyMode);
+        let saver = self.make_saver(version);
+        let result = match selection {
+            iac::ModuleSelection::All => {
+                self.engine
+                    .destroy(composition, &mut self.ctx, Some(&saver))
+                    .await
+            }
+            iac::ModuleSelection::Only(_) | iac::ModuleSelection::Except(_) => {
+                self.engine
+                    .destroy_for_modules(composition, &mut self.ctx, Some(&saver))
+                    .await
+            }
+        };
+        self.ctx.remove_extension::<iac::DestroyMode>();
+        Ok(result?)
     }
 
     /// Return writeback values derived from the latest in-memory state.
@@ -323,17 +380,32 @@ impl<D: Deployment> InfraEngine<D> {
             .collect_writeback(&self.config, &self.ctx.state)
     }
 
-    fn make_saver(&self, version: String) -> iac::StateSaver {
+    /// Access the provision context for presentation-layer hooks such as progress reporting.
+    pub fn provision_context_mut(&mut self) -> &mut iac::ProvisionContext {
+        &mut self.ctx
+    }
+
+    fn make_saver(&self, initial_version: String) -> iac::StateSaver {
         let store = Arc::clone(&self.state_store);
+        let version = Arc::new(Mutex::new(initial_version));
         Box::new(move |state: &crate::iac::InfraState| {
             let store = Arc::clone(&store);
-            let version = version.clone();
+            let version = Arc::clone(&version);
             let state = state.clone();
             Box::pin(async move {
-                store
-                    .save(&state, &version)
+                let current = version
+                    .lock()
+                    .map_err(|_| {
+                        iac::IacError::Other(anyhow::anyhow!("state version mutex poisoned"))
+                    })?
+                    .clone();
+                let next = store
+                    .save(&state, &current)
                     .await
                     .map_err(iac::IacError::State)?;
+                *version.lock().map_err(|_| {
+                    iac::IacError::Other(anyhow::anyhow!("state version mutex poisoned"))
+                })? = next;
                 Ok(())
             })
         })
@@ -408,7 +480,8 @@ impl<D: Deployment> DeployEngine<D> {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use tokeira_state::LocalBackend;
+    use std::sync::{Arc, Mutex};
+    use tokeira_state::{LocalBackend, StateError};
 
     #[derive(Clone)]
     struct TestConfig;
@@ -500,6 +573,34 @@ mod tests {
             _ctx: &iac::ModuleContext<'_>,
         ) -> std::result::Result<Vec<Box<dyn iac::Resource>>, iac::IacError> {
             Ok(vec![Box::new(TestResource)])
+        }
+    }
+
+    #[derive(Debug)]
+    struct DestroyModeAssertingModule {
+        name: &'static str,
+        expected: bool,
+    }
+
+    impl iac::Module for DestroyModeAssertingModule {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn dependencies(&self) -> &[&str] {
+            &[]
+        }
+
+        fn resources(
+            &self,
+            ctx: &iac::ModuleContext<'_>,
+        ) -> std::result::Result<Vec<Box<dyn iac::Resource>>, iac::IacError> {
+            assert_eq!(
+                ctx.extension::<iac::DestroyMode>().is_some(),
+                self.expected,
+                "DestroyMode visibility did not match expectation"
+            );
+            Ok(Vec::new())
         }
     }
 
@@ -639,6 +740,253 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct VersionedDeployment {
+        backend: Arc<VersionedBackend>,
+    }
+
+    #[async_trait]
+    impl Deployment for VersionedDeployment {
+        type Config = TestConfig;
+
+        fn remote_state_module(
+            &self,
+            _config: &Self::Config,
+            _deployment_dir: &Path,
+        ) -> Box<dyn iac::Module> {
+            Box::new(TestModule("remote-state"))
+        }
+
+        fn infra_modules(
+            &self,
+            _config: &Self::Config,
+            _selection: &iac::ModuleSelection,
+        ) -> Vec<Box<dyn iac::Module>> {
+            vec![Box::new(ThreeResourceModule)]
+        }
+
+        fn services(&self, _config: &Self::Config) -> Vec<Box<dyn deploy_engine::Service>> {
+            Vec::new()
+        }
+
+        fn images(&self, _config: &Self::Config) -> Vec<Box<dyn deploy_engine::Image>> {
+            Vec::new()
+        }
+
+        fn required_namespaces(&self, _config: &Self::Config) -> Vec<String> {
+            Vec::new()
+        }
+
+        async fn register_infra_extensions(
+            &self,
+            _config: &Self::Config,
+            _ctx: &mut iac::ProvisionContext,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn register_deploy_extensions(
+            &self,
+            _config: &Self::Config,
+            _ctx: &mut deploy_engine::ServiceContext,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn create_infra_store(
+            &self,
+            _config: &Self::Config,
+            _deployment_dir: &Path,
+        ) -> Box<dyn StateBackend> {
+            Box::new(SharedBackend(Arc::clone(&self.backend)))
+        }
+
+        fn create_deploy_store(
+            &self,
+            _config: &Self::Config,
+            _deployment_dir: &Path,
+        ) -> Box<dyn StateBackend> {
+            Box::new(SharedBackend(Arc::clone(&self.backend)))
+        }
+
+        fn hydrate_config(&self, config: &Self::Config, _state: &iac::InfraState) -> Self::Config {
+            config.clone()
+        }
+
+        fn collect_writeback(
+            &self,
+            _config: &Self::Config,
+            _state: &iac::InfraState,
+        ) -> Vec<(String, String)> {
+            Vec::new()
+        }
+    }
+
+    #[derive(Debug)]
+    struct ThreeResourceModule;
+
+    impl iac::Module for ThreeResourceModule {
+        fn name(&self) -> &str {
+            "three"
+        }
+
+        fn dependencies(&self) -> &[&str] {
+            &[]
+        }
+
+        fn resources(
+            &self,
+            _ctx: &iac::ModuleContext<'_>,
+        ) -> std::result::Result<Vec<Box<dyn iac::Resource>>, iac::IacError> {
+            Ok((0..3)
+                .map(|idx| Box::new(NumberedResource(idx)) as Box<dyn iac::Resource>)
+                .collect())
+        }
+    }
+
+    #[derive(Debug)]
+    struct NumberedResource(usize);
+
+    #[async_trait]
+    impl iac::Resource for NumberedResource {
+        fn resource_type(&self) -> iac::ResourceType {
+            iac::ResourceType::new("numbered")
+        }
+
+        fn resource_id(&self) -> iac::ResourceId {
+            iac::ResourceId(format!("numbered-{}", self.0))
+        }
+
+        fn dependencies(&self) -> Vec<iac::ResourceId> {
+            Vec::new()
+        }
+
+        fn module(&self) -> &str {
+            "three"
+        }
+
+        async fn create(
+            &self,
+            _ctx: &iac::ProvisionContext,
+        ) -> std::result::Result<iac::ResourceState, iac::IacError> {
+            Ok(numbered_state(self.0))
+        }
+
+        async fn update(
+            &self,
+            current: &iac::ResourceState,
+            _ctx: &iac::ProvisionContext,
+        ) -> std::result::Result<iac::ResourceState, iac::IacError> {
+            Ok(current.clone())
+        }
+
+        async fn delete(
+            &self,
+            _current: &iac::ResourceState,
+            _ctx: &iac::ProvisionContext,
+        ) -> std::result::Result<(), iac::IacError> {
+            Ok(())
+        }
+
+        async fn describe(
+            &self,
+            _ctx: &iac::ProvisionContext,
+        ) -> std::result::Result<Option<iac::ResourceState>, iac::IacError> {
+            Ok(None)
+        }
+
+        fn diff(
+            &self,
+            _current: &iac::ResourceState,
+            _ctx: &iac::ProvisionContext,
+        ) -> iac::InternalChange {
+            iac::InternalChange::NoChange {
+                resource_id: self.resource_id(),
+            }
+        }
+    }
+
+    fn numbered_state(idx: usize) -> iac::ResourceState {
+        iac::ResourceState {
+            resource_type: iac::ResourceType::new("numbered"),
+            physical_id: format!("phys-{idx}"),
+            properties: serde_json::json!({}),
+            dependencies: Vec::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            module: "three".into(),
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct VersionedBackend {
+        inner: Mutex<VersionedBackendState>,
+    }
+
+    #[derive(Debug, Default)]
+    struct VersionedBackendState {
+        data: Option<Vec<u8>>,
+        version: String,
+        writes: usize,
+        expected_versions: Vec<String>,
+    }
+
+    #[derive(Debug)]
+    struct SharedBackend(Arc<VersionedBackend>);
+
+    #[async_trait]
+    impl StateBackend for SharedBackend {
+        async fn read_manifest(
+            &self,
+            _key: &str,
+        ) -> std::result::Result<Option<(Vec<u8>, String)>, StateError> {
+            let state = self.0.inner.lock().expect("backend mutex");
+            Ok(state
+                .data
+                .as_ref()
+                .map(|data| (data.clone(), state.version.clone())))
+        }
+
+        async fn write_manifest(
+            &self,
+            _key: &str,
+            data: &[u8],
+            expected_version: &str,
+        ) -> std::result::Result<(), StateError> {
+            let mut state = self.0.inner.lock().expect("backend mutex");
+            if state.version != expected_version {
+                return Err(StateError::Conflict(format!(
+                    "expected {}, got {expected_version}",
+                    state.version
+                )));
+            }
+            state.expected_versions.push(expected_version.to_string());
+            state.writes += 1;
+            state.version = format!("v{}", state.writes);
+            state.data = Some(data.to_vec());
+            Ok(())
+        }
+
+        async fn read_snapshot(&self, _key: &str) -> std::result::Result<Vec<u8>, StateError> {
+            Err(StateError::NotFound("unused".into()))
+        }
+
+        async fn write_snapshot(
+            &self,
+            _key: &str,
+            _data: &[u8],
+        ) -> std::result::Result<(), StateError> {
+            Ok(())
+        }
+
+        async fn list_snapshots(
+            &self,
+            _prefix: &str,
+        ) -> std::result::Result<Vec<String>, StateError> {
+            Ok(Vec::new())
+        }
+    }
+
     #[tokio::test]
     async fn infra_engine_prepends_remote_state_module() {
         let temp = tempfile::tempdir().unwrap();
@@ -663,5 +1011,99 @@ mod tests {
             .unwrap();
         let changes = engine.apply(&TestPlatform).await.unwrap();
         assert_eq!(changes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn destroy_mode_is_scoped_to_destroy_operations() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = TestConfig;
+        let mut engine = InfraEngine::new(TestDeployment, &config, temp.path())
+            .await
+            .unwrap();
+
+        let plan_composition = iac::InfraComposition {
+            desired_modules: vec![Box::new(DestroyModeAssertingModule {
+                name: "plan",
+                expected: false,
+            })],
+            known_modules: vec![Box::new(DestroyModeAssertingModule {
+                name: "plan",
+                expected: false,
+            })],
+            active_modules: vec!["plan".to_string()],
+        };
+        engine
+            .plan(&plan_composition, iac::ModuleSelection::All)
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .provision_context_mut()
+                .extension::<iac::DestroyMode>()
+                .is_none()
+        );
+
+        let destroy_composition = iac::InfraComposition {
+            desired_modules: Vec::new(),
+            known_modules: vec![Box::new(DestroyModeAssertingModule {
+                name: "destroy",
+                expected: true,
+            })],
+            active_modules: vec!["destroy".to_string()],
+        };
+        engine
+            .plan_destroy(&destroy_composition, iac::ModuleSelection::All)
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .provision_context_mut()
+                .extension::<iac::DestroyMode>()
+                .is_none()
+        );
+        engine
+            .destroy(&destroy_composition, iac::ModuleSelection::All)
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .provision_context_mut()
+                .extension::<iac::DestroyMode>()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn cas_saver_tracks_latest_version_across_incremental_saves() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = Arc::new(VersionedBackend::default());
+        let config = TestConfig;
+        let deployment = VersionedDeployment {
+            backend: Arc::clone(&backend),
+        };
+        let mut engine = InfraEngine::new(deployment, &config, temp.path())
+            .await
+            .unwrap();
+        let composition = iac::InfraComposition {
+            desired_modules: vec![Box::new(ThreeResourceModule)],
+            known_modules: vec![Box::new(ThreeResourceModule)],
+            active_modules: vec!["three".to_string()],
+        };
+
+        let changes = engine
+            .apply(&composition, iac::ModuleSelection::All)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            changes
+                .iter()
+                .filter(|change| change.kind == iac::ChangeKind::Create)
+                .count(),
+            3
+        );
+        let state = backend.inner.lock().expect("backend mutex");
+        assert_eq!(state.expected_versions, ["", "v1", "v2"]);
+        assert_eq!(state.version, "v3");
     }
 }

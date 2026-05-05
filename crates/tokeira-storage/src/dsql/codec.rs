@@ -130,8 +130,15 @@ pub fn decode_projection_cursor(bytes: &[u8]) -> Result<ProjectionCursor> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use proptest::prelude::*;
-    use tokeira_types::LogicalTaskSeq;
+    use time::OffsetDateTime;
+    use tokeira_types::{
+        ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, ProjectionCursor, RunId,
+        RunKey, SearchAttributes, TaskQueueName, TransitionSeq, WorkflowId, WorkflowType,
+    };
+    use uuid::Uuid;
 
     use super::*;
 
@@ -142,6 +149,45 @@ mod tests {
             let encoded = encode_projection_cursor(&cursor).unwrap();
             let decoded = decode_projection_cursor(&encoded).unwrap();
             prop_assert_eq!(decoded, cursor);
+        }
+
+        #[test]
+        fn projection_cursor_position_round_trips(
+            partition_id in 0u32..64,
+            fanout in 1u16..64,
+            run_key in proptest::option::of(any::<u128>()),
+            transition_seq in proptest::option::of(0u64..10_000),
+        ) {
+            let cursor = ProjectionCursor {
+                partition_id,
+                fanout,
+                last_run_key: run_key.map(|value| RunKey(Uuid::from_u128(value))),
+                last_transition_seq: transition_seq.map(TransitionSeq),
+            };
+            let encoded = encode_projection_cursor(&cursor).unwrap();
+            let decoded = decode_projection_cursor(&encoded).unwrap();
+            prop_assert_eq!(decoded, cursor);
+        }
+
+        #[test]
+        fn projection_context_round_trips(ctx in arb_projection_context()) {
+            let encoded = encode_projection_context(&ctx).unwrap();
+            let decoded = decode_projection_context(&encoded).unwrap();
+            prop_assert_eq!(decoded, ctx);
+        }
+
+        #[test]
+        fn projection_ops_round_trips(ops in proptest::collection::vec(arb_projection_op(), 0..8)) {
+            let encoded = encode_projection_ops(&ops).unwrap();
+            let decoded = decode_projection_ops(&encoded).unwrap();
+            prop_assert_eq!(decoded, ops);
+        }
+
+        #[test]
+        fn memo_round_trips(memo in arb_memo()) {
+            let encoded = encode(&memo).unwrap();
+            let decoded = decode::<Memo>(&encoded).unwrap();
+            prop_assert_eq!(decoded, memo);
         }
 
         #[test]
@@ -160,6 +206,88 @@ mod tests {
             let encoded = encode_payloads(&payloads).unwrap();
             let decoded = decode_payloads(&encoded).unwrap();
             prop_assert_eq!(decoded, payloads);
+        }
+    }
+
+    prop_compose! {
+        fn arb_payload()(bytes in proptest::collection::vec(any::<u8>(), 0..64)) -> Payload {
+            Payload::new(bytes)
+        }
+    }
+
+    prop_compose! {
+        fn arb_memo()(
+            entries in proptest::collection::btree_map("[a-z][a-z0-9_]{0,12}", arb_payload(), 0..8),
+        ) -> Memo {
+            Memo(entries)
+        }
+    }
+
+    fn arb_execution_status() -> impl Strategy<Value = ExecutionStatus> {
+        prop_oneof![
+            Just(ExecutionStatus::Running),
+            Just(ExecutionStatus::Paused),
+            Just(ExecutionStatus::Completed),
+            Just(ExecutionStatus::Failed),
+            Just(ExecutionStatus::Cancelled),
+            Just(ExecutionStatus::Terminated),
+            Just(ExecutionStatus::ContinuedAsNew),
+            Just(ExecutionStatus::TimedOut),
+        ]
+    }
+
+    prop_compose! {
+        fn arb_timestamp()(seconds in -1_000_000i64..1_000_000) -> OffsetDateTime {
+            OffsetDateTime::from_unix_timestamp(seconds).unwrap()
+        }
+    }
+
+    prop_compose! {
+        fn arb_projection_context()(
+            namespace in any::<u128>(),
+            workflow in "[a-z][a-z0-9-]{0,24}",
+            run_id in any::<u128>(),
+            workflow_type in "[a-z][a-z0-9_]{0,24}",
+            task_queue in "[a-z][a-z0-9_]{0,24}",
+            execution_status in arb_execution_status(),
+            start_time in arb_timestamp(),
+            execution_time in proptest::option::of(arb_timestamp()),
+            close_time in proptest::option::of(arb_timestamp()),
+            history_length in 0i64..10_000,
+            state_transition_count in 0i64..10_000,
+        ) -> ProjectionContext {
+            ProjectionContext {
+                namespace_id: NamespaceId(Uuid::from_u128(namespace)),
+                workflow_id: WorkflowId(workflow),
+                run_id: RunId(Uuid::from_u128(run_id)),
+                workflow_type: WorkflowType(workflow_type),
+                task_queue: TaskQueueName(task_queue),
+                execution_status,
+                start_time,
+                execution_time,
+                close_time,
+                history_length,
+                state_transition_count,
+            }
+        }
+    }
+
+    prop_compose! {
+        fn arb_projection_op()(
+            status in arb_execution_status(),
+            memo_patch in arb_memo(),
+            closed_at in arb_timestamp(),
+            close in any::<bool>(),
+        ) -> ProjectionOp {
+            if close {
+                ProjectionOp::CloseExecution { status, closed_at }
+            } else {
+                ProjectionOp::UpsertExecution {
+                    status,
+                    memo_patch,
+                    search_attr_patch: SearchAttributes(BTreeMap::new()),
+                }
+            }
         }
     }
 }

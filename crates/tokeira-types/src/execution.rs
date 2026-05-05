@@ -171,6 +171,8 @@ pub struct ExecutionSummary {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     #[test]
@@ -194,9 +196,33 @@ mod tests {
 
     #[test]
     fn execution_status_rejects_unknown_database_values() {
-        assert_eq!(
-            ExecutionStatus::try_from(42),
-            Err(ExecutionStatusDecodeError { value: 42 })
-        );
+        for value in [8, -1, 42, 100] {
+            assert_eq!(
+                ExecutionStatus::try_from(value),
+                Err(ExecutionStatusDecodeError { value })
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn execution_status_database_encoding_round_trips(status in arb_execution_status()) {
+            prop_assert_eq!(ExecutionStatus::try_from(status.to_db_smallint()), Ok(status));
+        }
+    }
+
+    fn arb_execution_status() -> impl Strategy<Value = ExecutionStatus> {
+        prop_oneof![
+            Just(ExecutionStatus::Running),
+            Just(ExecutionStatus::Paused),
+            Just(ExecutionStatus::Completed),
+            Just(ExecutionStatus::Failed),
+            Just(ExecutionStatus::Cancelled),
+            Just(ExecutionStatus::Terminated),
+            Just(ExecutionStatus::ContinuedAsNew),
+            Just(ExecutionStatus::TimedOut),
+        ]
     }
 }

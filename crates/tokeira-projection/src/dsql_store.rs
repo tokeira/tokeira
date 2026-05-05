@@ -1614,6 +1614,45 @@ fn merge_memo(existing: Option<Memo>, patch: &Memo) -> Memo {
     memo
 }
 
+#[cfg(test)]
+fn resolve_final_vis_state(
+    context: &tokeira_storage::ProjectionContext,
+    run_key: RunKey,
+    ops: &[ProjectionOp],
+) -> ExecutionRow {
+    let mut row = ExecutionRow {
+        run_key,
+        namespace_id: context.namespace_id,
+        workflow_id: context.workflow_id.clone(),
+        run_id: context.run_id,
+        workflow_type: context.workflow_type.clone(),
+        task_queue: context.task_queue.clone(),
+        status: context.execution_status,
+        start_time: context.start_time,
+        execution_time: context.execution_time,
+        close_time: context.close_time,
+        history_length: context.history_length,
+        state_transition_count: context.state_transition_count,
+        memo: Memo::default(),
+        search_attr_version: 0,
+    };
+    for op in ops {
+        match op {
+            ProjectionOp::UpsertExecution {
+                status, memo_patch, ..
+            } => {
+                row.status = *status;
+                row.memo.0.extend(memo_patch.0.clone());
+            }
+            ProjectionOp::CloseExecution { status, closed_at } => {
+                row.status = *status;
+                row.close_time = Some(*closed_at);
+            }
+        }
+    }
+    row
+}
+
 fn i16_from_u16(value: u16, field: &str) -> Result<i16> {
     i16::try_from(value).map_err(|_| anyhow::anyhow!("{field} {value} exceeds i16 range"))
 }
@@ -1632,7 +1671,8 @@ mod tests {
 
     use proptest::prelude::*;
     use time::OffsetDateTime;
-    use tokeira_types::{Payload, SearchAttrValue};
+    use tokeira_storage::ProjectionContext;
+    use tokeira_types::{Payload, RunId, SearchAttrValue, TaskQueueName, WorkflowId, WorkflowType};
 
     use super::*;
 
@@ -1660,6 +1700,66 @@ mod tests {
         let merged = merge_memo(Some(Memo(existing_entries)), &Memo(patch_entries));
 
         assert_eq!(merged.0["key"].data, b"new");
+    }
+
+    #[test]
+    fn empty_memo_patch_preserves_existing_memo() {
+        let mut existing_entries = BTreeMap::new();
+        existing_entries.insert("key".to_owned(), Payload::new(b"value"));
+        let existing = Memo(existing_entries.clone());
+
+        let merged = merge_memo(Some(existing), &Memo::default());
+
+        assert_eq!(merged, Memo(existing_entries));
+    }
+
+    #[test]
+    fn projection_apply_decision_logic_preserves_operation_order() {
+        let context = test_projection_context(ExecutionStatus::Running);
+        let run_key = RunKey(uuid_from_u128(10));
+        let closed_at = OffsetDateTime::from_unix_timestamp(200).unwrap();
+        let ops = vec![
+            ProjectionOp::UpsertExecution {
+                status: ExecutionStatus::Paused,
+                memo_patch: Memo::default(),
+                search_attr_patch: SearchAttributes::default(),
+            },
+            ProjectionOp::CloseExecution {
+                status: ExecutionStatus::Completed,
+                closed_at,
+            },
+        ];
+
+        let row = resolve_final_vis_state(&context, run_key, &ops);
+
+        assert_eq!(row.status, ExecutionStatus::Completed);
+        assert_eq!(row.close_time, Some(closed_at));
+        assert_eq!(
+            row.status.to_db_smallint(),
+            ExecutionStatus::Completed.to_db_smallint()
+        );
+    }
+
+    #[test]
+    fn close_execution_without_prior_upsert_produces_complete_row() {
+        let context = test_projection_context(ExecutionStatus::Running);
+        let run_key = RunKey(uuid_from_u128(11));
+        let closed_at = OffsetDateTime::from_unix_timestamp(300).unwrap();
+        let ops = [ProjectionOp::CloseExecution {
+            status: ExecutionStatus::Failed,
+            closed_at,
+        }];
+
+        let row = resolve_final_vis_state(&context, run_key, &ops);
+
+        assert_eq!(row.run_key, run_key);
+        assert_eq!(row.namespace_id, context.namespace_id);
+        assert_eq!(row.workflow_id, context.workflow_id);
+        assert_eq!(row.run_id, context.run_id);
+        assert_eq!(row.workflow_type, context.workflow_type);
+        assert_eq!(row.task_queue, context.task_queue);
+        assert_eq!(row.status, ExecutionStatus::Failed);
+        assert_eq!(row.close_time, Some(closed_at));
     }
 
     #[test]
@@ -1798,6 +1898,86 @@ mod tests {
                 + prefix.matches('%').count()
                 + prefix.matches('_').count();
             prop_assert_eq!(escaped.matches('\\').count(), expected_backslashes);
+        }
+
+        #[test]
+        fn visibility_operation_ordering_matches_last_semantic_op(
+            ops in arb_projection_ops(),
+            run_key in any::<u128>(),
+        ) {
+            let context = test_projection_context(ExecutionStatus::Running);
+            let row = resolve_final_vis_state(&context, RunKey(uuid_from_u128(run_key)), &ops);
+            let last = ops.last().unwrap();
+
+            match last {
+                ProjectionOp::UpsertExecution { status, .. } => {
+                    prop_assert_eq!(row.status, *status);
+                    prop_assert_eq!(row.close_time, None);
+                }
+                ProjectionOp::CloseExecution { status, closed_at } => {
+                    prop_assert_eq!(row.status, *status);
+                    prop_assert_eq!(row.close_time, Some(*closed_at));
+                }
+            }
+        }
+    }
+
+    fn uuid_from_u128(value: u128) -> uuid::Uuid {
+        uuid::Uuid::from_u128(value)
+    }
+
+    fn test_projection_context(status: ExecutionStatus) -> ProjectionContext {
+        ProjectionContext {
+            namespace_id: NamespaceId(uuid_from_u128(1)),
+            workflow_id: WorkflowId("workflow".to_owned()),
+            run_id: RunId(uuid_from_u128(2)),
+            workflow_type: WorkflowType("workflow_type".to_owned()),
+            task_queue: TaskQueueName("queue".to_owned()),
+            execution_status: status,
+            start_time: OffsetDateTime::from_unix_timestamp(100).unwrap(),
+            execution_time: None,
+            close_time: None,
+            history_length: 1,
+            state_transition_count: 1,
+        }
+    }
+
+    fn arb_execution_status() -> impl Strategy<Value = ExecutionStatus> {
+        prop_oneof![
+            Just(ExecutionStatus::Running),
+            Just(ExecutionStatus::Paused),
+            Just(ExecutionStatus::Completed),
+            Just(ExecutionStatus::Failed),
+            Just(ExecutionStatus::Cancelled),
+            Just(ExecutionStatus::Terminated),
+            Just(ExecutionStatus::ContinuedAsNew),
+            Just(ExecutionStatus::TimedOut),
+        ]
+    }
+
+    prop_compose! {
+        fn arb_closed_at()(seconds in 1_000i64..1_000_000) -> OffsetDateTime {
+            OffsetDateTime::from_unix_timestamp(seconds).unwrap()
+        }
+    }
+
+    prop_compose! {
+        fn arb_projection_ops()(
+            upsert_statuses in proptest::collection::vec(arb_execution_status(), 1..4),
+            terminal in proptest::option::of((arb_execution_status(), arb_closed_at())),
+        ) -> Vec<ProjectionOp> {
+            let mut ops = upsert_statuses
+                .into_iter()
+                .map(|status| ProjectionOp::UpsertExecution {
+                    status,
+                    memo_patch: Memo::default(),
+                    search_attr_patch: SearchAttributes::default(),
+                })
+                .collect::<Vec<_>>();
+            if let Some((status, closed_at)) = terminal {
+                ops.push(ProjectionOp::CloseExecution { status, closed_at });
+            }
+            ops
         }
     }
 }

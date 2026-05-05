@@ -149,8 +149,49 @@ fn decode_projection_rows(
 }
 
 #[cfg(test)]
+fn interpret_read_from(
+    entries: &[(RunKey, TransitionSeq)],
+    cursor: &ProjectionCursor,
+    limit: usize,
+) -> Result<(Vec<(RunKey, TransitionSeq)>, ProjectionCursor)> {
+    validate_cursor_position(cursor)?;
+    if limit == 0 {
+        return Ok((Vec::new(), cursor.clone()));
+    }
+
+    let selected = entries
+        .iter()
+        .copied()
+        .filter(|(run_key, transition_seq)| {
+            match (cursor.last_run_key, cursor.last_transition_seq) {
+                (None, None) => true,
+                (Some(last_run_key), Some(last_transition_seq)) => {
+                    (run_key.0, transition_seq.0) > (last_run_key.0, last_transition_seq.0)
+                }
+                _ => false,
+            }
+        })
+        .take(limit)
+        .collect::<Vec<_>>();
+    let next_cursor = selected
+        .last()
+        .map(|(run_key, transition_seq)| ProjectionCursor {
+            partition_id: cursor.partition_id,
+            fanout: cursor.fanout,
+            last_run_key: Some(*run_key),
+            last_transition_seq: Some(*transition_seq),
+        })
+        .unwrap_or_else(|| cursor.clone());
+    Ok((selected, next_cursor))
+}
+
+#[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use async_trait::async_trait;
+    use proptest::prelude::*;
+    use uuid::Uuid;
 
     use crate::dsql::DsqlPermit;
 
@@ -206,6 +247,98 @@ mod tests {
         assert_eq!(batch.next_cursor, cursor);
     }
 
+    #[tokio::test]
+    async fn read_from_acquires_projection_class() {
+        let acquirer = Arc::new(RecordingAcquirer::default());
+        let log = DsqlProjectionLog::new_with_acquirer(acquirer.clone());
+        let cursor = ProjectionCursor::beginning(0, 1);
+
+        assert!(log.read_from(&cursor, 1).await.is_err());
+        assert_eq!(
+            acquirer.classes.lock().unwrap().as_slice(),
+            &[DbClass::Projection]
+        );
+    }
+
+    #[test]
+    fn beginning_cursor_reads_from_first_entry() {
+        let entries = vec![
+            (RunKey(Uuid::from_u128(1)), TransitionSeq(1)),
+            (RunKey(Uuid::from_u128(2)), TransitionSeq(1)),
+        ];
+        let cursor = ProjectionCursor::beginning(3, 4);
+
+        let (selected, next_cursor) = interpret_read_from(&entries, &cursor, 1).unwrap();
+
+        assert_eq!(selected, vec![entries[0]]);
+        assert_eq!(next_cursor.last_run_key, Some(entries[0].0));
+        assert_eq!(next_cursor.last_transition_seq, Some(entries[0].1));
+    }
+
+    #[test]
+    fn empty_partition_returns_original_cursor() {
+        let cursor = ProjectionCursor {
+            partition_id: 3,
+            fanout: 4,
+            last_run_key: Some(RunKey(Uuid::from_u128(1))),
+            last_transition_seq: Some(TransitionSeq(7)),
+        };
+
+        let (selected, next_cursor) = interpret_read_from(&[], &cursor, 10).unwrap();
+
+        assert!(selected.is_empty());
+        assert_eq!(next_cursor, cursor);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn cursor_based_pagination_is_strictly_after_cursor(
+            mut entries in proptest::collection::vec((any::<u128>(), 0u64..10_000), 0..100),
+            cursor_index in proptest::option::of(0usize..100),
+            limit in 1usize..=50,
+        ) {
+            entries.sort_unstable();
+            entries.dedup();
+            let entries = entries
+                .into_iter()
+                .map(|(run_key, transition_seq)| {
+                    (RunKey(Uuid::from_u128(run_key)), TransitionSeq(transition_seq))
+                })
+                .collect::<Vec<_>>();
+            let cursor = cursor_index
+                .and_then(|index| entries.get(index).copied())
+                .map(|(run_key, transition_seq)| ProjectionCursor {
+                    partition_id: 0,
+                    fanout: 1,
+                    last_run_key: Some(run_key),
+                    last_transition_seq: Some(transition_seq),
+                })
+                .unwrap_or_else(|| ProjectionCursor::beginning(0, 1));
+
+            let (selected, next_cursor) = interpret_read_from(&entries, &cursor, limit).unwrap();
+
+            prop_assert!(selected.len() <= limit);
+            for window in selected.windows(2) {
+                prop_assert!((window[0].0.0, window[0].1.0) < (window[1].0.0, window[1].1.0));
+            }
+            if let (Some(last_run_key), Some(last_transition_seq)) =
+                (cursor.last_run_key, cursor.last_transition_seq)
+            {
+                for (run_key, transition_seq) in &selected {
+                    prop_assert!((run_key.0, transition_seq.0) > (last_run_key.0, last_transition_seq.0));
+                }
+            }
+            if let Some((run_key, transition_seq)) = selected.last() {
+                prop_assert_eq!(next_cursor.last_run_key, Some(*run_key));
+                prop_assert_eq!(next_cursor.last_transition_seq, Some(*transition_seq));
+            } else {
+                prop_assert_eq!(next_cursor, cursor);
+            }
+        }
+    }
+
     #[derive(Debug)]
     struct PanicAcquirer;
 
@@ -213,6 +346,19 @@ mod tests {
     impl DsqlConnectionAcquirer for PanicAcquirer {
         async fn acquire(&self, _class: DbClass) -> Result<DsqlPermit> {
             panic!("zero-limit projection reads must not acquire a DSQL connection")
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingAcquirer {
+        classes: Mutex<Vec<DbClass>>,
+    }
+
+    #[async_trait]
+    impl DsqlConnectionAcquirer for RecordingAcquirer {
+        async fn acquire(&self, class: DbClass) -> Result<DsqlPermit> {
+            self.classes.lock().unwrap().push(class);
+            bail!("recording acquirer intentionally has no SQL connection")
         }
     }
 }

@@ -9,7 +9,9 @@ authors.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+console = "0.15"
 directories = "6"
+indicatif = "0.17"
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -22,8 +24,10 @@ tokeira-local-deployment = { path = "../../platforms/local" }
 tokeira-compose-deployment = { path = "../../platforms/compose" }
 tokeira-orchestrator = { path = "../../crates/tokeira-orchestrator" }
 tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "signal", "time"] }
+tracing.workspace = true
 uuid = { workspace = true, features = ["v4", "serde"] }
 which = "7"
 
 [dev-dependencies]
+proptest = "1"
 tempfile.workspace = true

@@ -8,6 +8,7 @@ mod metadata;
 mod output;
 mod process;
 mod prototypical;
+mod tui;
 
 use cli::{Cli, Command, ConfigAction};
 use deployment_dir::{DeploymentResolver, load_context};
@@ -22,7 +23,12 @@ async fn main() -> Result<()> {
         Command::Deployment { action } => commands::deployment::run(action, &deployments, cli.json),
         Command::Infra { action } => {
             let ctx = load_context(&deployments, cli.deployment.as_deref())?;
-            commands::infra::run(action, &deployments, ctx).await
+            let format = if cli.json {
+                tui::OutputFormat::Json
+            } else {
+                tui::OutputFormat::Human
+            };
+            commands::infra::run(action, &deployments, ctx, format).await
         }
         Command::Deploy { action } => {
             let ctx = load_context(&deployments, cli.deployment.as_deref())?;

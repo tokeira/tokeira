@@ -68,3 +68,25 @@ pub trait Module: Debug + Send + Sync {
     /// lifecycle methods.
     fn resources(&self, ctx: &ModuleContext) -> Result<Vec<Box<dyn Resource>>, IacError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DestroyMode;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn destroy_mode_visibility_matches_registration(registered in any::<bool>()) {
+            let mut extensions: HashMap<TypeId, Box<dyn Any + Send + Sync>> = HashMap::new();
+            if registered {
+                extensions.insert(TypeId::of::<DestroyMode>(), Box::new(DestroyMode));
+            }
+
+            let state = crate::InfraState::default();
+            let ctx = ModuleContext::new(&state, &extensions);
+
+            prop_assert_eq!(ctx.extension::<DestroyMode>().is_some(), registered);
+        }
+    }
+}

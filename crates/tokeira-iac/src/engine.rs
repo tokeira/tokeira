@@ -29,6 +29,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
     pin::Pin,
+    time::Instant,
 };
 
 use tracing::{info, warn};
@@ -61,6 +62,12 @@ pub type StateSaver = Box<
 /// implementation rather than silently dropped from state.
 pub struct Engine;
 
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Engine {
     pub fn new() -> Self {
         Self
@@ -90,7 +97,7 @@ impl Engine {
         known: &[&dyn Resource],
         ctx: &mut ProvisionContext,
     ) -> Result<Vec<Change>, IacError> {
-        let refreshed = refresh_state(known, desired, ctx).await?;
+        let refreshed = refresh_state(known, desired, ctx, None).await?;
         ctx.state = refreshed.state;
         Ok(compute_changes(desired, &ctx.state, ctx))
     }
@@ -105,7 +112,7 @@ impl Engine {
         let known = collect_resources_from(&composition.known_modules, ctx)?;
         let desired_refs: Vec<&dyn Resource> = desired.iter().map(|r| r.as_ref()).collect();
         let known_refs: Vec<&dyn Resource> = known.iter().map(|r| r.as_ref()).collect();
-        let refreshed = refresh_state(&known_refs, &desired_refs, ctx).await?;
+        let refreshed = refresh_state(&known_refs, &desired_refs, ctx, None).await?;
         ctx.state = refreshed.state;
         let changes = compute_changes(&desired_refs, &ctx.state, ctx);
         let active: Vec<&str> = composition
@@ -143,13 +150,7 @@ impl Engine {
         ctx: &mut ProvisionContext,
         saver: Option<&StateSaver>,
     ) -> Result<Vec<Change>, IacError> {
-        let refreshed = refresh_state(known, desired, ctx).await?;
-        if refreshed.has_managed_missing {
-            ctx.state = refreshed.state.clone();
-            if let Some(save) = saver {
-                save(&ctx.state).await?;
-            }
-        }
+        let refreshed = refresh_state(known, desired, ctx, saver).await?;
         ctx.state = refreshed.state;
         let changes = compute_changes(desired, &ctx.state, ctx);
         apply_changes(known, ctx, changes, saver).await
@@ -166,13 +167,7 @@ impl Engine {
         let known = collect_resources_from(&composition.known_modules, ctx)?;
         let desired_refs: Vec<&dyn Resource> = desired.iter().map(|r| r.as_ref()).collect();
         let known_refs: Vec<&dyn Resource> = known.iter().map(|r| r.as_ref()).collect();
-        let refreshed = refresh_state(&known_refs, &desired_refs, ctx).await?;
-        if refreshed.has_managed_missing {
-            ctx.state = refreshed.state.clone();
-            if let Some(save) = saver {
-                save(&ctx.state).await?;
-            }
-        }
+        let refreshed = refresh_state(&known_refs, &desired_refs, ctx, saver).await?;
         ctx.state = refreshed.state;
         let changes = compute_changes(&desired_refs, &ctx.state, ctx);
         let active: Vec<&str> = composition
@@ -196,6 +191,35 @@ impl Engine {
         self.destroy_known(&known_refs, ctx, saver).await
     }
 
+    /// Compute the destroy change set without calling provider delete methods.
+    pub async fn plan_destroy(
+        &self,
+        composition: &InfraComposition,
+        ctx: &mut ProvisionContext,
+    ) -> Result<Vec<Change>, IacError> {
+        let known = collect_resources_from(&composition.known_modules, ctx)?;
+        let known_refs: Vec<&dyn Resource> = known.iter().map(|r| r.as_ref()).collect();
+        let desired: [&dyn Resource; 0] = [];
+        let refreshed = refresh_state(&known_refs, &desired, ctx, None).await?;
+        ctx.state = refreshed.state;
+        Ok(compute_changes(&desired, &ctx.state, ctx))
+    }
+
+    /// Compute the destroy change set restricted to the active modules.
+    pub async fn plan_destroy_for_modules(
+        &self,
+        composition: &InfraComposition,
+        ctx: &mut ProvisionContext,
+    ) -> Result<Vec<Change>, IacError> {
+        let changes = self.plan_destroy(composition, ctx).await?;
+        let active: Vec<&str> = composition
+            .active_modules
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        Ok(filter_changes_by_modules(&changes, &ctx.state, &active))
+    }
+
     /// Destroy using a known-managed resource set.
     pub async fn destroy_known(
         &self,
@@ -204,13 +228,7 @@ impl Engine {
         saver: Option<&StateSaver>,
     ) -> Result<Vec<Change>, IacError> {
         let desired: [&dyn Resource; 0] = [];
-        let refreshed = refresh_state(known, &desired, ctx).await?;
-        if refreshed.has_managed_missing {
-            ctx.state = refreshed.state.clone();
-            if let Some(save) = saver {
-                save(&ctx.state).await?;
-            }
-        }
+        let refreshed = refresh_state(known, &desired, ctx, saver).await?;
         ctx.state = refreshed.state;
         let changes = compute_changes(&desired, &ctx.state, ctx);
         destroy_changes(known, ctx, changes, saver).await
@@ -226,13 +244,7 @@ impl Engine {
         let known = collect_resources_from(&composition.known_modules, ctx)?;
         let known_refs: Vec<&dyn Resource> = known.iter().map(|r| r.as_ref()).collect();
         let desired: [&dyn Resource; 0] = [];
-        let refreshed = refresh_state(&known_refs, &desired, ctx).await?;
-        if refreshed.has_managed_missing {
-            ctx.state = refreshed.state.clone();
-            if let Some(save) = saver {
-                save(&ctx.state).await?;
-            }
-        }
+        let refreshed = refresh_state(&known_refs, &desired, ctx, saver).await?;
         ctx.state = refreshed.state;
         let changes = compute_changes(&desired, &ctx.state, ctx);
         let active: Vec<&str> = composition
@@ -371,6 +383,7 @@ async fn refresh_state(
     known: &[&dyn Resource],
     desired: &[&dyn Resource],
     ctx: &mut ProvisionContext,
+    saver: Option<&StateSaver>,
 ) -> Result<RefreshReport, IacError> {
     let desired_ids: HashSet<ResourceId> = desired.iter().map(|r| r.resource_id()).collect();
     let sorted = topological_sort(known)?;
@@ -420,6 +433,9 @@ async fn refresh_state(
                         ?resource_id,
                         "managed resource absent from provider, pruning from state"
                     );
+                    if let Some(save) = saver {
+                        save(&ctx.state).await?;
+                    }
                     RefreshStatus::ManagedMissing
                 };
                 status_by_id.insert(resource_id, status);
@@ -521,7 +537,28 @@ async fn apply_changes(
                     total_operations,
                 );
                 info!(?rid, "creating resource");
-                let rs = resource.create(ctx).await?;
+                let started = Instant::now();
+                let rs = match resource.create(ctx).await {
+                    Ok(rs) => {
+                        ctx.emit_complete_progress(
+                            "create",
+                            rid,
+                            &resource.resource_type(),
+                            started.elapsed(),
+                        );
+                        rs
+                    }
+                    Err(err) => {
+                        ctx.emit_failed_progress(
+                            "create",
+                            rid,
+                            &resource.resource_type(),
+                            started.elapsed(),
+                            &err,
+                        );
+                        return Err(err);
+                    }
+                };
                 ctx.state.resources.insert(rid.clone(), rs);
                 if let Some(save) = saver {
                     save(&ctx.state).await?;
@@ -547,7 +584,29 @@ async fn apply_changes(
                     total_operations,
                 );
                 info!(?rid, "updating resource");
-                let rs = resource.update(current, ctx).await?;
+                let current = current.clone();
+                let started = Instant::now();
+                let rs = match resource.update(&current, ctx).await {
+                    Ok(rs) => {
+                        ctx.emit_complete_progress(
+                            "update",
+                            rid,
+                            &resource.resource_type(),
+                            started.elapsed(),
+                        );
+                        rs
+                    }
+                    Err(err) => {
+                        ctx.emit_failed_progress(
+                            "update",
+                            rid,
+                            &resource.resource_type(),
+                            started.elapsed(),
+                            &err,
+                        );
+                        return Err(err);
+                    }
+                };
                 ctx.state.resources.insert(rid.clone(), rs);
                 if let Some(save) = saver {
                     save(&ctx.state).await?;
@@ -580,7 +639,23 @@ async fn apply_changes(
                         total_operations,
                     );
                     info!(?rid, "deleting resource");
-                    resource.delete(&current, ctx).await?;
+                    let started = Instant::now();
+                    if let Err(err) = resource.delete(&current, ctx).await {
+                        ctx.emit_failed_progress(
+                            "delete",
+                            rid,
+                            &current.resource_type,
+                            started.elapsed(),
+                            &err,
+                        );
+                        return Err(err);
+                    }
+                    ctx.emit_complete_progress(
+                        "delete",
+                        rid,
+                        &current.resource_type,
+                        started.elapsed(),
+                    );
                 } else {
                     warn!(
                         ?rid,
@@ -621,7 +696,7 @@ async fn destroy_changes(
     let mut operation_index = 0usize;
 
     for rid in &reversed {
-        if let Some(_current) = ctx.state.resources.get(rid).cloned() {
+        if let Some(current) = ctx.state.resources.get(rid).cloned() {
             if let Some(resource) = resource_map.get(rid) {
                 // Re-describe to get live state before deleting
                 match resource.describe(ctx).await.map_err(|err| {
@@ -640,12 +715,33 @@ async fn destroy_changes(
                             total_operations,
                         );
                         info!(?rid, "destroying resource");
-                        resource.delete(&live_state, ctx).await?;
+                        let started = Instant::now();
+                        if let Err(err) = resource.delete(&live_state, ctx).await {
+                            ctx.emit_failed_progress(
+                                "delete",
+                                rid,
+                                &live_state.resource_type,
+                                started.elapsed(),
+                                &err,
+                            );
+                            return Err(err);
+                        }
+                        ctx.emit_complete_progress(
+                            "delete",
+                            rid,
+                            &live_state.resource_type,
+                            started.elapsed(),
+                        );
                     }
                     None => {
                         warn!(
                             ?rid,
                             "resource already absent from provider, pruning from state"
+                        );
+                        ctx.emit_note_progress(
+                            rid,
+                            &current.resource_type,
+                            &format!("pruned absent: {}", rid.0),
                         );
                     }
                 }
@@ -866,6 +962,11 @@ fn internal_change_to_flat(
 mod tests {
     use super::*;
     use crate::{Module, Resource};
+    use proptest::prelude::*;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[derive(Debug)]
     struct StubModule {
@@ -886,6 +987,148 @@ mod tests {
         ) -> Result<Vec<Box<dyn Resource>>, IacError> {
             Ok(Vec::new())
         }
+    }
+
+    #[derive(Debug)]
+    struct StubResource {
+        id: ResourceId,
+        module: &'static str,
+        describe_state: Option<crate::ResourceState>,
+        create_fails: bool,
+        delete_counter: Option<Arc<AtomicUsize>>,
+        delete_capture: Option<Arc<Mutex<Vec<String>>>>,
+    }
+
+    impl StubResource {
+        fn missing(id: &str, module: &'static str) -> Self {
+            Self {
+                id: ResourceId(id.to_string()),
+                module,
+                describe_state: None,
+                create_fails: false,
+                delete_counter: None,
+                delete_capture: None,
+            }
+        }
+
+        fn live(id: &str, module: &'static str) -> Self {
+            Self {
+                id: ResourceId(id.to_string()),
+                module,
+                describe_state: Some(stub_state(id, module)),
+                create_fails: false,
+                delete_counter: None,
+                delete_capture: None,
+            }
+        }
+
+        fn create_fails(id: &str, module: &'static str) -> Self {
+            Self {
+                id: ResourceId(id.to_string()),
+                module,
+                describe_state: None,
+                create_fails: true,
+                delete_counter: None,
+                delete_capture: None,
+            }
+        }
+
+        fn with_delete_counter(mut self, counter: Arc<AtomicUsize>) -> Self {
+            self.delete_counter = Some(counter);
+            self
+        }
+
+        fn with_delete_capture(mut self, capture: Arc<Mutex<Vec<String>>>) -> Self {
+            self.delete_capture = Some(capture);
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Resource for StubResource {
+        fn resource_type(&self) -> crate::ResourceType {
+            crate::ResourceType::new("Stub")
+        }
+
+        fn resource_id(&self) -> ResourceId {
+            self.id.clone()
+        }
+
+        fn dependencies(&self) -> Vec<ResourceId> {
+            Vec::new()
+        }
+
+        fn module(&self) -> &str {
+            self.module
+        }
+
+        async fn create(&self, _ctx: &ProvisionContext) -> Result<crate::ResourceState, IacError> {
+            if self.create_fails {
+                return Err(IacError::Other(anyhow::anyhow!("create failed")));
+            }
+            Ok(stub_state(&self.id.0, self.module))
+        }
+
+        async fn update(
+            &self,
+            _current: &crate::ResourceState,
+            _ctx: &ProvisionContext,
+        ) -> Result<crate::ResourceState, IacError> {
+            Ok(stub_state(&self.id.0, self.module))
+        }
+
+        async fn delete(
+            &self,
+            current: &crate::ResourceState,
+            _ctx: &ProvisionContext,
+        ) -> Result<(), IacError> {
+            if let Some(counter) = &self.delete_counter {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(capture) = &self.delete_capture {
+                capture
+                    .lock()
+                    .expect("delete capture mutex")
+                    .push(current.physical_id.clone());
+            }
+            Ok(())
+        }
+
+        async fn describe(
+            &self,
+            _ctx: &ProvisionContext,
+        ) -> Result<Option<crate::ResourceState>, IacError> {
+            Ok(self.describe_state.clone())
+        }
+
+        fn diff(&self, _current: &crate::ResourceState, _ctx: &ProvisionContext) -> InternalChange {
+            InternalChange::NoChange {
+                resource_id: self.resource_id(),
+            }
+        }
+    }
+
+    fn stub_state(id: &str, module: &str) -> crate::ResourceState {
+        crate::ResourceState {
+            resource_type: crate::ResourceType::new("Stub"),
+            physical_id: id.to_string(),
+            properties: serde_json::json!({}),
+            dependencies: Vec::new(),
+            created_at: "now".to_string(),
+            updated_at: "now".to_string(),
+            module: module.to_string(),
+        }
+    }
+
+    fn boxed_resources(resources: Vec<StubResource>) -> Vec<Box<dyn Resource>> {
+        resources
+            .into_iter()
+            .map(|resource| Box::new(resource) as Box<dyn Resource>)
+            .collect()
+    }
+
+    fn refs(resources: &[Box<dyn Resource>]) -> Vec<&dyn Resource> {
+        resources.iter().map(|resource| resource.as_ref()).collect()
     }
 
     #[test]
@@ -977,5 +1220,307 @@ mod tests {
         let sorted = topological_sort_modules(&modules).unwrap();
         // Independent modules should be in alphabetical order for determinism
         assert_eq!(sorted, vec!["alpha", "middle", "zebra"]);
+    }
+
+    #[tokio::test]
+    async fn refresh_prunes_save_once_per_missing_managed_resource() {
+        let engine = Engine::new();
+        let mut ctx = ProvisionContext::default();
+        let first = ResourceId("first".to_string());
+        let second = ResourceId("second".to_string());
+        ctx.state
+            .resources
+            .insert(first.clone(), stub_state(&first.0, "module"));
+        ctx.state
+            .resources
+            .insert(second.clone(), stub_state(&second.0, "module"));
+
+        let resources: Vec<Box<dyn Resource>> = vec![
+            Box::new(StubResource::missing(&first.0, "module")),
+            Box::new(StubResource::missing(&second.0, "module")),
+        ];
+        let known: Vec<&dyn Resource> =
+            resources.iter().map(|resource| resource.as_ref()).collect();
+        let save_count = Arc::new(AtomicUsize::new(0));
+        let save_count_for_saver = Arc::clone(&save_count);
+        let saver: StateSaver = Box::new(move |_state| {
+            save_count_for_saver.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(()) })
+        });
+
+        let changes = engine
+            .destroy_known(&known, &mut ctx, Some(&saver))
+            .await
+            .unwrap();
+
+        assert!(changes.is_empty());
+        assert_eq!(save_count.load(Ordering::Relaxed), 2);
+        assert!(ctx.state.resources.is_empty());
+    }
+
+    proptest! {
+        #[test]
+        fn state_saver_invocation_count(create_count in 0usize..20, prune_count in 0usize..20) {
+            let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+            runtime.block_on(async move {
+                let engine = Engine::new();
+                let mut ctx = ProvisionContext::default();
+
+                let desired_resources = (0..create_count)
+                    .map(|idx| StubResource::missing(&format!("create-{idx}"), "desired"))
+                    .collect::<Vec<_>>();
+                let prune_resources = (0..prune_count)
+                    .map(|idx| {
+                        let id = ResourceId(format!("prune-{idx}"));
+                        ctx.state.resources.insert(id.clone(), stub_state(&id.0, "stale"));
+                        StubResource::missing(&id.0, "stale")
+                    })
+                    .collect::<Vec<_>>();
+
+                let desired = boxed_resources(desired_resources);
+                let mut known = desired
+                    .iter()
+                    .map(|resource| {
+                        StubResource::missing(&resource.resource_id().0, "desired")
+                    })
+                    .collect::<Vec<_>>();
+                known.extend(prune_resources);
+                let known = boxed_resources(known);
+                let desired_refs = refs(&desired);
+                let known_refs = refs(&known);
+
+                let save_count = Arc::new(AtomicUsize::new(0));
+                let save_count_for_saver = Arc::clone(&save_count);
+                let saver: StateSaver = Box::new(move |_state| {
+                    save_count_for_saver.fetch_add(1, Ordering::Relaxed);
+                    Box::pin(async { Ok(()) })
+                });
+
+                engine
+                    .apply_with_known(&desired_refs, &known_refs, &mut ctx, Some(&saver))
+                    .await
+                    .expect("apply succeeds");
+
+                prop_assert_eq!(
+                    save_count.load(Ordering::Relaxed),
+                    create_count + prune_count
+                );
+                Ok(())
+            })?;
+        }
+
+        #[test]
+        fn state_saver_error_aborts_engine(total in 1usize..20, fail_at in 1usize..20) {
+            let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+            runtime.block_on(async move {
+                let fail_at = fail_at.min(total);
+                let engine = Engine::new();
+                let mut ctx = ProvisionContext::default();
+                let resources = boxed_resources(
+                    (0..total)
+                        .map(|idx| StubResource::missing(&format!("resource-{idx}"), "module"))
+                        .collect()
+                );
+                let resource_refs = refs(&resources);
+                let save_count = Arc::new(AtomicUsize::new(0));
+                let save_count_for_saver = Arc::clone(&save_count);
+                let saver: StateSaver = Box::new(move |_state| {
+                    let invocation = save_count_for_saver.fetch_add(1, Ordering::Relaxed) + 1;
+                    Box::pin(async move {
+                        if invocation == fail_at {
+                            Err(IacError::Other(anyhow::anyhow!("save failed")))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                });
+
+                let result = engine
+                    .apply_with_known(&resource_refs, &resource_refs, &mut ctx, Some(&saver))
+                    .await;
+
+                prop_assert!(result.is_err());
+                prop_assert!(ctx.state.resources.len() <= fail_at);
+                prop_assert_eq!(save_count.load(Ordering::Relaxed), fail_at);
+                Ok(())
+            })?;
+        }
+
+        #[test]
+        fn module_scoped_delete_filtering(
+            active_flags in prop::collection::vec(any::<bool>(), 1..8),
+            delete_flags in prop::collection::vec(any::<bool>(), 1..8)
+        ) {
+            let modules = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"];
+            let len = active_flags.len().min(delete_flags.len());
+            let active = modules
+                .iter()
+                .zip(active_flags.iter())
+                .filter_map(|(module, active)| active.then_some(*module))
+                .collect::<Vec<_>>();
+            let mut state = crate::InfraState::default();
+            let mut changes = Vec::new();
+
+            for idx in 0..len {
+                let id = ResourceId(format!("resource-{idx}"));
+                let module = modules[idx];
+                state.resources.insert(id.clone(), stub_state(&id.0, module));
+                changes.push(Change {
+                    kind: if delete_flags[idx] {
+                        ChangeKind::Delete
+                    } else {
+                        ChangeKind::NoChange
+                    },
+                    resource_type: "Stub".to_string(),
+                    module: module.to_string(),
+                    resource: id.0,
+                    details: Vec::new(),
+                });
+            }
+
+            let filtered = filter_changes_by_modules(&changes, &state, &active);
+
+            for change in &filtered {
+                if change.kind == ChangeKind::Delete {
+                    prop_assert!(active.iter().any(|module| *module == change.module));
+                }
+            }
+            for change in changes.iter().filter(|change| change.kind != ChangeKind::Delete) {
+                prop_assert!(filtered
+                    .iter()
+                    .any(|filtered| filtered.resource == change.resource && filtered.kind == change.kind));
+            }
+        }
+
+        #[test]
+        fn describe_before_delete_count(total in 1usize..20, missing_count in 0usize..20) {
+            let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+            runtime.block_on(async move {
+                let missing_count = missing_count.min(total);
+                let engine = Engine::new();
+                let mut ctx = ProvisionContext::default();
+                let delete_count = Arc::new(AtomicUsize::new(0));
+                let resources = boxed_resources(
+                    (0..total)
+                        .map(|idx| {
+                            let id = format!("resource-{idx}");
+                            ctx.state.resources.insert(ResourceId(id.clone()), stub_state(&id, "module"));
+                            let resource = if idx < missing_count {
+                                StubResource::missing(&id, "module")
+                            } else {
+                                StubResource::live(&id, "module")
+                            };
+                            resource.with_delete_counter(Arc::clone(&delete_count))
+                        })
+                        .collect()
+                );
+                let resource_refs = refs(&resources);
+
+                engine
+                    .destroy_known(&resource_refs, &mut ctx, None)
+                    .await
+                    .expect("destroy succeeds");
+
+                prop_assert_eq!(delete_count.load(Ordering::Relaxed), total - missing_count);
+                Ok(())
+            })?;
+        }
+    }
+
+    #[tokio::test]
+    async fn describe_before_delete_uses_live_state() {
+        let engine = Engine::new();
+        let mut ctx = ProvisionContext::default();
+        let id = ResourceId("resource".to_string());
+        ctx.state
+            .resources
+            .insert(id.clone(), stub_state(&id.0, "module"));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut live_state = stub_state(&id.0, "module");
+        live_state.physical_id = "live-physical".to_string();
+        let resource = StubResource {
+            id: id.clone(),
+            module: "module",
+            describe_state: Some(live_state),
+            create_fails: false,
+            delete_counter: None,
+            delete_capture: None,
+        }
+        .with_delete_capture(Arc::clone(&captured));
+        let resources = boxed_resources(vec![resource]);
+        let resource_refs = refs(&resources);
+
+        engine
+            .destroy_known(&resource_refs, &mut ctx, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            captured.lock().expect("delete capture mutex").as_slice(),
+            ["live-physical"]
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_callbacks_report_success_and_failure() {
+        let engine = Engine::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut success_ctx = ProvisionContext::default();
+        let success_events = Arc::clone(&events);
+        success_ctx.set_apply_progress(move |action, id, _, _, _| {
+            success_events
+                .lock()
+                .expect("event mutex")
+                .push(format!("start:{action}:{}", id.0));
+        });
+        let success_events = Arc::clone(&events);
+        success_ctx.set_complete_progress(move |action, id, _, elapsed| {
+            assert!(elapsed >= std::time::Duration::ZERO);
+            success_events
+                .lock()
+                .expect("event mutex")
+                .push(format!("complete:{action}:{}", id.0));
+        });
+        let resources = boxed_resources(vec![StubResource::missing("resource", "module")]);
+        let resource_refs = refs(&resources);
+
+        engine
+            .apply_with_known(&resource_refs, &resource_refs, &mut success_ctx, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            events.lock().expect("event mutex").as_slice(),
+            ["start:create:resource", "complete:create:resource"]
+        );
+
+        let mut failure_ctx = ProvisionContext::default();
+        let failures = Arc::new(Mutex::new(Vec::new()));
+        let failure_events = Arc::clone(&failures);
+        failure_ctx.set_apply_progress(move |action, id, _, _, _| {
+            failure_events
+                .lock()
+                .expect("failure mutex")
+                .push(format!("start:{action}:{}", id.0));
+        });
+        let failure_events = Arc::clone(&failures);
+        failure_ctx.set_failed_progress(move |action, id, _, elapsed, err| {
+            assert!(elapsed >= std::time::Duration::ZERO);
+            failure_events
+                .lock()
+                .expect("failure mutex")
+                .push(format!("failed:{action}:{}:{err}", id.0));
+        });
+        let failing = boxed_resources(vec![StubResource::create_fails("failing", "module")]);
+        let failing_refs = refs(&failing);
+
+        let result = engine
+            .apply_with_known(&failing_refs, &failing_refs, &mut failure_ctx, None)
+            .await;
+
+        assert!(result.is_err());
+        let failure_log = failures.lock().expect("failure mutex");
+        assert_eq!(failure_log[0], "start:create:failing");
+        assert!(failure_log[1].starts_with("failed:create:failing:"));
     }
 }

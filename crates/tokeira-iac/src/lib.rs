@@ -24,6 +24,7 @@ pub mod document;
 pub mod engine;
 pub mod error;
 pub mod module;
+pub mod resource_modes;
 pub mod types;
 
 pub use document::{
@@ -93,6 +94,14 @@ pub struct ResourceState {
     pub module: String,
 }
 
+/// Marker extension registered in [`ProvisionContext`] during destroy operations.
+///
+/// Modules can inspect this via [`ModuleContext::extension`] to include
+/// resources recoverable from persisted state, not just resources present in
+/// current config.
+#[derive(Debug, Clone, Copy)]
+pub struct DestroyMode;
+
 /// A change detected by the internal diff engine.
 ///
 /// Used by the low-level engine; the orchestrator-facing API uses
@@ -142,12 +151,17 @@ pub struct ProvisionContext {
     pub tags: HashMap<String, String>,
     pub state: document::InfraState,
     apply_progress: Option<Arc<ApplyProgressReporter>>,
+    complete_progress: Option<Arc<CompleteProgressReporter>>,
+    failed_progress: Option<Arc<FailedProgressReporter>>,
     wait_progress: Option<Arc<WaitProgressReporter>>,
     note_progress: Option<Arc<NoteProgressReporter>>,
     extensions: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
 }
 
 type ApplyProgressReporter = dyn Fn(&str, &ResourceId, &ResourceType, usize, usize) + Send + Sync;
+type CompleteProgressReporter = dyn Fn(&str, &ResourceId, &ResourceType, Duration) + Send + Sync;
+type FailedProgressReporter =
+    dyn Fn(&str, &ResourceId, &ResourceType, Duration, &IacError) + Send + Sync;
 type WaitProgressReporter =
     dyn Fn(&ResourceId, &ResourceType, &str, Duration, Duration) + Send + Sync;
 type NoteProgressReporter = dyn Fn(&ResourceId, &ResourceType, &str) + Send + Sync;
@@ -159,6 +173,8 @@ impl ProvisionContext {
             tags,
             state: document::InfraState::default(),
             apply_progress: None,
+            complete_progress: None,
+            failed_progress: None,
             wait_progress: None,
             note_progress: None,
             extensions: HashMap::new(),
@@ -175,6 +191,11 @@ impl ProvisionContext {
     /// Register a typed extension.
     pub fn set_extension<T: 'static + Send + Sync>(&mut self, value: T) {
         self.extensions.insert(TypeId::of::<T>(), Box::new(value));
+    }
+
+    /// Remove a typed extension, returning whether one was present.
+    pub fn remove_extension<T: 'static + Send + Sync>(&mut self) -> bool {
+        self.extensions.remove(&TypeId::of::<T>()).is_some()
     }
 
     /// Access the extensions map (used by `ModuleContext`).
@@ -199,6 +220,45 @@ impl ProvisionContext {
     ) {
         if let Some(reporter) = &self.apply_progress {
             reporter(action, resource_id, resource_type, current, total);
+        }
+    }
+
+    pub fn set_complete_progress<F>(&mut self, reporter: F)
+    where
+        F: Fn(&str, &ResourceId, &ResourceType, Duration) + Send + Sync + 'static,
+    {
+        self.complete_progress = Some(Arc::new(reporter));
+    }
+
+    pub fn emit_complete_progress(
+        &self,
+        action: &str,
+        resource_id: &ResourceId,
+        resource_type: &ResourceType,
+        elapsed: Duration,
+    ) {
+        if let Some(reporter) = &self.complete_progress {
+            reporter(action, resource_id, resource_type, elapsed);
+        }
+    }
+
+    pub fn set_failed_progress<F>(&mut self, reporter: F)
+    where
+        F: Fn(&str, &ResourceId, &ResourceType, Duration, &IacError) + Send + Sync + 'static,
+    {
+        self.failed_progress = Some(Arc::new(reporter));
+    }
+
+    pub fn emit_failed_progress(
+        &self,
+        action: &str,
+        resource_id: &ResourceId,
+        resource_type: &ResourceType,
+        elapsed: Duration,
+        err: &IacError,
+    ) {
+        if let Some(reporter) = &self.failed_progress {
+            reporter(action, resource_id, resource_type, elapsed, err);
         }
     }
 
@@ -309,4 +369,19 @@ pub trait Resource: Send + Sync {
         ctx: &ProvisionContext,
     ) -> Result<Option<ResourceState>, error::IacError>;
     fn diff(&self, current: &ResourceState, ctx: &ProvisionContext) -> InternalChange;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remove_extension_removes_registered_destroy_mode() {
+        let mut ctx = ProvisionContext::default();
+        ctx.set_extension(DestroyMode);
+        assert!(ctx.extension::<DestroyMode>().is_some());
+        assert!(ctx.remove_extension::<DestroyMode>());
+        assert!(ctx.extension::<DestroyMode>().is_none());
+        assert!(!ctx.remove_extension::<DestroyMode>());
+    }
 }

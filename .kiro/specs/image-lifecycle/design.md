@@ -11,10 +11,11 @@ This design turns `requirements.md` into a concrete Rust implementation. The del
    - Two Dagger-backed pipelines: `build_image` (for Build images) and `mirror_image` (for Mirror images), both keyed off `source_type` so adding a new image requires no pipeline changes.
    - A `DaggerClient` trait wrapping the in-repo `dagger-client` crate, so unit tests can substitute a mock.
 2. An in-repo `dagger-client` crate at `crates/dagger-client/` providing a minimal GraphQL wrapper over a Dagger session.
-3. An `EcrRepository` IaC resource in `tokeira-aws` with the canonical "keep last 10 untagged" lifecycle policy and an `EcrClient` trait.
-4. A `tkr image list|build|push|mirror` command group in `apps/tkr` whose handlers iterate the image registry rather than carrying their own knowledge of specific images.
-5. Writeback driven by `image.writeback_targets(ctx)` rather than CLI-side hardcoded field lists.
-6. Platform lifecycle gates in `platforms/ecs` and `platforms/compose` that are pure predicates over the image registry.
+3. An `EcrRepository` IaC resource in `tokeira-aws` with the canonical "keep last 10 untagged" lifecycle policy, an `EcrClient` trait, and an ECS-platform `images` IaC module that wires one `EcrRepository` per entry in `images::all(ctx)` so `tkr infra plan` / `tkr infra destroy` see every project-owned repository.
+4. An ad-hoc `ensure_ecr_repository` helper in `tokeira-aws` used by `tkr image push` / `tkr image mirror` when those commands run before `tkr infra apply`. Produces the same end-state as the IaC resource so the two paths are interchangeable.
+5. A `tkr image list|build|push|mirror` command group in `apps/tkr` whose handlers iterate the image registry rather than carrying their own knowledge of specific images.
+6. Writeback driven by `image.writeback_targets(ctx)` rather than CLI-side hardcoded field lists, calling a new public `tokeira_iac::write_config_values` helper extracted from the current private `tkr infra` writeback code.
+7. Platform lifecycle gates in `platforms/ecs` and `platforms/compose` that are pure predicates over the image registry.
 
 Guiding principles:
 
@@ -22,7 +23,7 @@ Guiding principles:
 2. **Shape stability is part of the design.** The `Image` trait surface, `DesiredImageRef`, `ImageContext`, and `ImageSourceType` are the stable contract that downstream consumers depend on. Adding fields is additive; renaming or removing them is a spec-level concern (Req 10.4).
 3. **Source-type dispatches pipelines.** `build_image` refuses to run on Mirror images; `mirror_image` refuses to run on Build images. The CLI iterates the registry, partitions by `source_type`, and dispatches accordingly.
 4. **Writeback is an image property.** Each image declares which `deployment.toml` dotted keys its remote ref populates. The CLI iterates — it doesn't enumerate.
-5. **Dagger stays internal.** The `DaggerClient` trait is the boundary between the pipelines and Dagger's GraphQL transport. Unit tests substitute a mock; production wires the in-repo `dagger-client`.
+5. **`DaggerClient` is the public testing seam.** The Dagger session-driving types are wrapped behind the `DaggerClient` trait, which is first-class public API on `tokeira-build`. Pipeline functions take `&dyn DaggerClient`; callers (CLI, tests, future consumers) substitute implementations at that boundary. Production callers obtain the default implementation via `dagger_client::Client::from_env()`.
 6. **IaC integration follows the existing pattern.** `EcrRepository` is a `Resource` trait implementation that describes-before-deleting, consistent with every other AWS resource in the workspace.
 
 ## Architecture
@@ -82,17 +83,18 @@ graph TD
 | `Image` trait, `ImageSourceType`, `DesiredImageRef`, `ImageContext` | New `crates/tokeira-build/` | Core abstraction for the image plane. |
 | `images::tokeira` + `images::observability` modules | `crates/tokeira-build/src/images/` | Per-domain image declarations; one struct per image. |
 | `build_image`, `mirror_image`, `publish_image` pipelines | `crates/tokeira-build/` | Pipelines take `&dyn Image` so adding an image never touches them. |
-| `DaggerClient` trait + default implementation | `crates/tokeira-build/` | Boundary over the in-repo `dagger-client`. |
-| `EcrRepository` resource | `tokeira-aws` | Same crate that owns VPC, DSQL, IAM resources. |
-| `EcrClient` trait + default implementation | `tokeira-aws` | Mock-based unit tests, consistent with AWS SDK testing pattern. |
+| `DaggerClient` trait + default implementation | `crates/tokeira-build/` | Public testing seam over the in-repo `dagger-client`. |
+| `EcrRepository` resource + `EcrClient` trait + default implementation + ad-hoc `ensure_ecr_repository{,ies}` helpers + `EcrClientHandle` extension | `tokeira-aws` | Resource lives alongside VPC, DSQL, IAM; helpers and extension wrapper co-located. |
+| `ImagesModule` IaC module registering `EcrRepository` resources from the image registry | `platforms/ecs/src/modules/images.rs` (new) | Gives ECR repositories `tkr infra plan` / `destroy` visibility. ECS-specific. |
 | `tkr image` command group (4 subcommands) | `apps/tkr/src/commands/image.rs` | Follows existing `commands/{group}.rs` pattern. |
 | `aws_cli_image` and `busybox_image` fields on `EcsConfig.observability` | `platforms/ecs` (owned by ecs-deployment spec) | Two new mirror targets; defaults added by this spec. |
-| Writeback call sites | `apps/tkr` | Iterates `image.writeback_targets(ctx)`; delegates to `iac-resource-lifecycle` writer. |
+| `write_config_values` + `WritebackError` (extracted from private helper in `apps/tkr/src/commands/infra.rs`) | `tokeira-iac` | Shared public writeback API used by `tkr infra` and `tkr image`. |
+| Compose `validate_for_deploy_apply` hook + `gates::validate_local_build` | `platforms/compose/src/{lib,gates}.rs` | Docker-image-existence check lives where the bollard client lives. |
 
 Notably **not** changed:
 - No new Dockerfile templater or manifest templating engine.
 - No new CLI-level progress reporting — reuses the [`iac-resource-lifecycle`](../iac-resource-lifecycle/requirements.md) callbacks.
-- No duplicate TOML edit code — reuses the [`iac-resource-lifecycle`](../iac-resource-lifecycle/requirements.md) writer.
+- No new dotted-key TOML edit code — the existing private implementation is extracted to a public API.
 
 ## Components and Interfaces
 
@@ -445,13 +447,15 @@ The default implementation wraps `dagger_client::Client` from the in-repo crate.
 
 pub struct BuildRequest {
     pub arch: Arch,
-    pub tag: String,
+    /// Optional additional tag to export alongside `:latest`. When `None`
+    /// or `Some("latest")`, only `{image.name()}:latest` is exported.
+    pub tag: Option<String>,
     pub workspace_root: PathBuf,
 }
 
 pub struct BuildResult {
     pub image_name: String,
-    pub local_tag: String,   // "tokeirad:local" or "tokeirad:v1.2.3"
+    pub local_tag: String,   // "tokeirad:latest" (always) and optionally "tokeirad:v1.2.3"
     pub arch: Arch,
     pub toolchain_version: String,
 }
@@ -504,9 +508,20 @@ pub fn build_image(
     runtime = runtime.with_user(image.name())?;
     runtime = runtime.with_entrypoint(&[&format!("/usr/local/bin/{}", image.name())])?;
 
-    // Stage 3: export
-    let local_tag = format!("{}:{}", image.name(), request.tag);
-    runtime.export_image(&local_tag)?;
+    // Stage 3: export. Always tag `:latest`; optionally add a second tag
+    // when the request's `tag` field is not "latest".
+    let latest_tag = format!("{}:latest", image.name());
+    runtime.export_image(&latest_tag)?;
+
+    let local_tag = if request.tag.as_deref() != Some("latest") {
+        let extra = format!("{}:{}", image.name(), request.tag.clone().unwrap_or_else(|| "latest".into()));
+        if extra != latest_tag {
+            runtime.export_image(&extra)?;
+        }
+        extra
+    } else {
+        latest_tag.clone()
+    };
 
     Ok(BuildResult {
         image_name: image.name().to_string(),
@@ -623,24 +638,178 @@ pub fn publish_image(
 
 ### 10. `EcrRepository` resource
 
-`EcrRepository { name, tags }` implements the `Resource` trait from `tokeira-iac`. Canonical `ECR_LIFECYCLE_POLICY` constant. `describe()` returns `None` on not-found for idempotent destroy. `diff()` reports policy drift and tag drift as updates.
-
-Consumed by the image CLI via two helpers:
+`EcrRepository` implements the existing `Resource` trait from `tokeira-iac` verbatim — the trait takes only `&ProvisionContext` (plus `&ResourceState` on update/delete). The ECR SDK client is obtained from a `ProvisionContext` extension registered by the orchestrator, mirroring how `DsqlCluster::delete` reads its DSQL client today via the `effective_managed` convention.
 
 ```rust
+// crates/tokeira-aws/src/resources/ecr_repository.rs
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EcrRepository {
+    /// Scoped name like "tokeira-dev/tokeirad".
+    pub name: String,
+    /// Tags applied on create and update.
+    pub tags: BTreeMap<String, String>,
+    /// Module this resource belongs to (for module-scoped plan/destroy filtering).
+    pub module: String,
+}
+
+/// Extension wrapper registered on ProvisionContext by the orchestrator.
+/// Replace with a more general AwsClients bundle when a second resource
+/// needs an AWS SDK client (see the "Future" note below).
+#[derive(Clone)]
+pub struct EcrClientHandle(pub Arc<dyn EcrClient>);
+
+#[async_trait::async_trait]
+impl Resource for EcrRepository {
+    fn resource_type(&self) -> ResourceType { ResourceType::new("EcrRepository") }
+    fn resource_id(&self) -> ResourceId { ResourceId(format!("ecr-{}", self.name)) }
+    fn module(&self) -> &str { &self.module }
+    fn dependencies(&self) -> Vec<ResourceId> { vec![] }
+
+    async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, IacError> {
+        let ecr = &ctx.extension::<EcrClientHandle>()
+            .expect("EcrClientHandle registered on ProvisionContext").0;
+        ecr.create_repository(&self.name, ImageTagMutability::Mutable, &ctx.resource_tags(&self.name)).await?;
+        ecr.put_lifecycle_policy(&self.name, ECR_LIFECYCLE_POLICY).await?;
+        let desc = ecr.describe_repository(&self.name).await?;
+        Ok(state_from_description(&self.name, desc))
+    }
+
+    async fn update(&self, _current: &ResourceState, ctx: &ProvisionContext)
+        -> Result<ResourceState, IacError>
+    {
+        let ecr = &ctx.extension::<EcrClientHandle>()
+            .expect("EcrClientHandle registered on ProvisionContext").0;
+        ecr.put_lifecycle_policy(&self.name, ECR_LIFECYCLE_POLICY).await?;
+        ecr.tag_resource(self.arn_from_state_cache(), &ctx.resource_tags(&self.name)).await?;
+        let desc = ecr.describe_repository(&self.name).await?;
+        Ok(state_from_description(&self.name, desc))
+    }
+
+    async fn delete(&self, _current: &ResourceState, ctx: &ProvisionContext)
+        -> Result<(), IacError>
+    {
+        let ecr = &ctx.extension::<EcrClientHandle>()
+            .expect("EcrClientHandle registered on ProvisionContext").0;
+        // force=true so repositories with images still present get removed on destroy.
+        ecr.delete_repository(&self.name, /* force */ true).await?;
+        Ok(())
+    }
+
+    async fn describe(&self, ctx: &ProvisionContext)
+        -> Result<Option<ResourceState>, IacError>
+    {
+        let ecr = &ctx.extension::<EcrClientHandle>()
+            .expect("EcrClientHandle registered on ProvisionContext").0;
+        match ecr.describe_repository(&self.name).await {
+            Ok(desc) => Ok(Some(state_from_description(&self.name, desc))),
+            Err(EcrError::NotFound(_)) => Ok(None),
+            Err(e) => Err(IacError::from(e)),
+        }
+    }
+
+    fn diff(&self, current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {
+        // Policy drift (JSON-normalized compare) and tag drift trigger updates.
+        // See ECR_LIFECYCLE_POLICY for the canonical form.
+        // ...
+    }
+}
+```
+
+**Canonical lifecycle policy:**
+
+```rust
+pub const ECR_LIFECYCLE_POLICY: &str = r#"{
+  "rules": [
+    {
+      "rulePriority": 1,
+      "description": "Keep last 10 untagged images",
+      "selection": {
+        "tagStatus": "untagged",
+        "countType": "imageCountMoreThan",
+        "countNumber": 10
+      },
+      "action": { "type": "expire" }
+    }
+  ]
+}"#;
+```
+
+**Registering the extension.** The ECS platform's orchestrator construction flow registers the `EcrClientHandle` once when it builds the `ProvisionContext`, before the IaC engine calls any resource lifecycle method. This is the same place that registers (or will register) `DsqlClientHandle` and other AWS-SDK-backed extensions. A future enhancement bundles all AWS clients into a single `AwsClients` struct and registers it as one extension — until then, per-client handles stay small and focused.
+
+### 10a. `images` IaC module
+
+To give `EcrRepository` lifecycle-tracked visibility in `tkr infra plan` / `tkr infra destroy`, an `images` module registers one `EcrRepository` resource per entry in `images::all(ctx)`:
+
+```rust
+// platforms/ecs/src/modules/images.rs
+
+pub struct ImagesModule;
+
+impl Module for ImagesModule {
+    fn name(&self) -> &str { "images" }
+    fn dependencies(&self) -> &'static [&'static str] { &[] }
+
+    fn resources(&self, mctx: &ModuleContext) -> Result<Vec<Box<dyn Resource>>, IacError> {
+        let cfg = mctx.extension::<EcsConfig>()
+            .expect("EcsConfig registered on ModuleContext");
+        let mut image_ctx = ImageContext::new();
+        image_ctx.set_extension((*cfg).clone());
+
+        let images = tokeira_build::images::all(&image_ctx)?;
+        let tags = mctx.default_tags();
+        let out = images.iter()
+            .map(|img| -> Result<Box<dyn Resource>, IacError> {
+                let desired = img.desired_ref(&image_ctx)?;
+                Ok(Box::new(EcrRepository {
+                    name: desired.repository,
+                    tags: tags.clone(),
+                    module: "images".into(),
+                }))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(out)
+    }
+}
+```
+
+The module is registered in the ECS platform's module list (alongside `foundation`, `networking`, etc.) so `tkr infra plan` sees the repositories. The module is ECS-specific; `local` and `compose` platforms don't register it.
+
+### 10b. Ad-hoc ECR-ensure helpers for pre-apply image flows
+
+The image CLI runs before `tkr infra apply` in the canonical workflow (see Req 8.4), so the `EcrRepository` IaC module may not have been applied yet when `tkr image push` or `tkr image mirror` first runs. A parallel ad-hoc path solves this:
+
+```rust
+// crates/tokeira-aws/src/clients/ecr.rs
+
 pub async fn ensure_ecr_repository(
     ecr: &dyn EcrClient,
     name: &str,
     tags: &BTreeMap<String, String>,
-) -> Result<(), EcrError>;
+) -> Result<(), EcrError> {
+    match ecr.describe_repository(name).await {
+        Ok(_) => {}  // already exists — fall through to policy + tags
+        Err(EcrError::NotFound(_)) => {
+            ecr.create_repository(name, ImageTagMutability::Mutable, tags).await?;
+        }
+        Err(e) => return Err(e),
+    }
+    ecr.put_lifecycle_policy(name, ECR_LIFECYCLE_POLICY).await?;
+    Ok(())
+}
 
 pub async fn ensure_ecr_repositories(
     ecr: &dyn EcrClient,
     repos: &[(String, BTreeMap<String, String>)],
-) -> Result<(), EcrError>;
+) -> Result<(), EcrError> {
+    for (name, tags) in repos {
+        ensure_ecr_repository(ecr, name, tags).await?;
+    }
+    Ok(())
+}
 ```
 
-The CLI builds the `repos` list by iterating `images::all(ctx)` and collecting `desired_ref(ctx)?.repository` values — see §12.
+**Consistency contract.** The ad-hoc helpers produce the same end state as `EcrRepository::create` + `put_lifecycle_policy`: `MUTABLE` mutability, identical policy JSON, identical tags. A repository first created by `tkr image push` and later encountered by `tkr infra apply` adopts cleanly — `EcrRepository::describe()` finds it, `diff()` sees no change, and the plan reports `NoChange`. A unit test asserts this round-trip by wiring the ad-hoc helper against a mock `EcrClient`, then invoking `EcrRepository::describe()` against the same mock state and comparing.
 
 ### 11. `EcrClient` trait
 
@@ -662,8 +831,8 @@ pub enum ImageCommand {
     Build {
         #[arg(long, default_value = "arm64")]
         arch: String,
-        #[arg(long, default_value = "local")]
-        tag: String,
+        #[arg(long)]
+        tag: Option<String>,
         #[arg(long)]
         image: Option<String>,  // default: all Build images
     },
@@ -749,7 +918,7 @@ async fn run_build(
     for image in &selected {
         let request = BuildRequest {
             arch: Arch::from_str(&arch)?,
-            tag: tag.clone(),
+            tag: tag.clone(),  // Option<String>
             workspace_root: workspace_root.clone(),
         };
         let result = tokeira_build::build_image(*image, &request, &dagger)?;
@@ -849,7 +1018,42 @@ async fn run_mirror(
 
 ### 13. Writeback
 
-Writeback uses the existing [`iac-resource-lifecycle`](../iac-resource-lifecycle/requirements.md) `write_config_values(deployment_dir, &[(dotted_key, value), ...])` helper:
+Writeback calls a shared public helper that both `tkr infra` and `tkr image` consume. The current tree has a private helper `write_tokeirad_writeback` in `apps/tkr/src/commands/infra.rs` with a private dotted-key `toml_edit` writer beneath it. This spec extracts that into a public API so neither `tkr infra` nor `tkr image` carries its own copy.
+
+**Extraction choice.** The public helper lands in `tokeira-iac` as `pub fn write_config_values(config_dir: &Path, values: &[(&str, &str)]) -> Result<(), WritebackError>`. `tokeira-iac` is the natural home because:
+
+- Writeback is already conceptually owned by `iac-resource-lifecycle`.
+- `tokeira-iac` is a workspace crate, not a binary, so both `apps/tkr` and `crates/tokeira-build` (via the CLI) can depend on it.
+- The existing unit tests in `apps/tkr/src/commands/infra.rs` move to `tokeira-iac/src/writeback.rs` where they exercise the public API.
+
+`WritebackError` is a `thiserror` enum:
+
+```rust
+// crates/tokeira-iac/src/writeback.rs
+
+#[derive(Debug, thiserror::Error)]
+pub enum WritebackError {
+    #[error("failed to read {path}: {source}")]
+    Io { path: PathBuf, #[source] source: std::io::Error },
+    #[error("failed to parse TOML at {path}: {source}")]
+    Parse { path: PathBuf, #[source] source: toml_edit::TomlError },
+    #[error("invalid dotted key '{key}': {reason}")]
+    InvalidKey { key: String, reason: String },
+    #[error("failed to write {path}: {source}")]
+    Write { path: PathBuf, #[source] source: std::io::Error },
+}
+
+pub fn write_config_values(
+    config_dir: &Path,
+    values: &[(&str, &str)],
+) -> Result<(), WritebackError> {
+    // Body lifted from the current apps/tkr/src/commands/infra.rs::write_tokeirad_writeback
+    // plus its private dotted-key toml_edit helper, unchanged in behaviour.
+    // ...
+}
+```
+
+**`tkr image` call site.** The image CLI wraps `write_config_values` in a tiny helper that pairs with the progress output:
 
 ```rust
 fn write_image_writeback(
@@ -859,12 +1063,14 @@ fn write_image_writeback(
 ) -> Result<()> {
     if values.is_empty() { return Ok(()); }
     let borrowed: Vec<(&str, &str)> = values.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    iac_lifecycle::write_config_values(deployment_dir, &borrowed)
+    tokeira_iac::write_config_values(deployment_dir, &borrowed)
         .context("failed to write image references to deployment.toml")?;
     output::print_progress(format, &format!("Wrote {} image reference(s)", borrowed.len()));
     Ok(())
 }
 ```
+
+**`tkr infra` migration.** `apps/tkr/src/commands/infra.rs` replaces its private `write_tokeirad_writeback` with a direct call to `tokeira_iac::write_config_values`. Behaviour is identical; the existing proptest in `infra.rs` (`toml_writeback_round_trips`) moves into `tokeira-iac` with no semantic change.
 
 ### 14. Platform lifecycle gates
 
@@ -908,23 +1114,25 @@ pub fn validate_builds(
 **Compose gate** is a separate concern because it checks local Docker state, not config:
 
 ```rust
-// platforms/compose/src/gates.rs
+// platforms/compose/src/gates.rs  (new file)
 
 pub async fn validate_local_build(
     cfg: &ComposeConfig,
     docker: &bollard::Docker,
 ) -> Result<(), ComposeError> {
-    if cfg.tokeirad.image != "tokeirad:local" { return Ok(()); }
-    match docker.inspect_image("tokeirad:local").await {
+    if cfg.tokeirad.image != "tokeirad:latest" { return Ok(()); }
+    match docker.inspect_image("tokeirad:latest").await {
         Ok(_) => Ok(()),
         Err(bollard::errors::Error::NotFound) => Err(ComposeError::LocalBuildMissing {
-            image: "tokeirad:local".into(),
+            image: "tokeirad:latest".into(),
             remediation: "run `tkr image build`".into(),
         }),
         Err(e) => Err(ComposeError::DockerIo(e)),
     }
 }
 ```
+
+**Wiring into the platform.** The compose platform (`platforms/compose/src/lib.rs`, where the `ComposePlatform` struct owns the `bollard::Docker` client) gains a `validate_for_deploy_apply(&self, config: &ComposeConfig) -> Result<(), ComposeError>` method that calls `gates::validate_local_build(config, self.docker()).await?`. The ECS platform already has a symmetric `validate_for_apply` / `validate_for_deploy_apply` shape; adding one to the compose platform is structural parity. The `tkr deploy apply` command calls this hook before constructing the deploy-engine service list. The check does NOT live in `platforms/compose/src/services.rs` (which only builds deploy-engine service descriptors and has no Docker access).
 
 ## Data Models
 
@@ -959,7 +1167,7 @@ impl Default for ComposeConfig {
     fn default() -> Self {
         Self {
             project_name: "tokeira".into(),
-            tokeirad: TokeiradServiceConfig { image: "tokeirad:local".into(), /* ... */ },
+            tokeirad: TokeiradServiceConfig { image: "tokeirad:latest".into(), /* ... */ },
             observability: ObservabilityConfig {
                 mimir_image: "grafana/mimir:3.0.6".into(),
                 loki_image: "grafana/loki:3.7.1".into(),
@@ -1041,7 +1249,7 @@ Every image-plane error follows the three-line remediation pattern: what happene
 | Writeback I/O error | `failed to write image references to {deployment_toml}: {source}` | 1 |
 | Mirror gate fail | `ECS deployment cannot apply — mirrored images missing: {fields}; remediation: run \`tkr image mirror\`` | 1 |
 | Build gate fail | `ECS deployment cannot apply — built images not pushed: {fields}; remediation: run \`tkr image push --tag <version>\`` | 1 |
-| Compose build gate fail | `compose deployment cannot apply — tokeirad:local is not in the local Docker image store; run \`tkr image build\`` | 1 |
+| Compose build gate fail | `compose deployment cannot apply — tokeirad:latest is not in the local Docker image store; run \`tkr image build\`` | 1 |
 
 All errors are structured via `thiserror` in library crates and `anyhow::Context` in CLI handlers. CLI surfaces the full causal chain in non-JSON output and a flat `{ "error": ..., "context": [...] }` in JSON.
 
@@ -1068,7 +1276,7 @@ Properties 1–8 above. Each mocked at the appropriate trait boundary:
 ### Integration Tests
 
 Gated behind `integration-test` feature flag:
-- End-to-end `tkr image build`: produces `tokeirad:local` and `docker image inspect` confirms.
+- End-to-end `tkr image build`: produces `tokeirad:latest` and `docker image inspect` confirms.
 - End-to-end `tkr image mirror` against LocalStack: six repos exist, each with canonical lifecycle policy, re-run leaves state unchanged.
 
 ### No Network or Docker by Default
@@ -1100,12 +1308,15 @@ This spec introduces new functionality only — no breaking changes to existing 
 5. `images::observability` module with the six Mirror images.
 6. `images::all` with registry validation; property tests for registry / source-type / grammar invariants.
 7. Build pipeline (`build_image`); mirror pipeline (`mirror_image`); publish pipeline (`publish_image`).
-8. `EcrRepository` resource and `EcrClient` trait in `tokeira-aws`.
-9. `tkr image list|build|push|mirror` handlers.
-10. Platform lifecycle gates (`validate_mirrors`, `validate_builds`, `validate_local_build`) driven by the image registry.
-11. Documentation updates in `README.md` and `AGENTS.md`.
+8. `EcrRepository` resource and `EcrClient` trait in `tokeira-aws`, including the `EcrClientHandle` `ProvisionContext` extension wrapper and the ad-hoc `ensure_ecr_repository` / `ensure_ecr_repositories` helpers.
+9. ECS-platform `ImagesModule` registering `EcrRepository` resources from the image registry.
+10. Extract `tokeira_iac::write_config_values` + `WritebackError` from the private `write_tokeirad_writeback` in `apps/tkr/src/commands/infra.rs`. Migrate `tkr infra` call sites to the public helper.
+11. `tkr image list|build|push|mirror` handlers.
+12. Compose platform `validate_for_deploy_apply` hook + `gates::validate_local_build`.
+13. ECS platform `validate_mirrors` / `validate_builds` gates driven by the image registry.
+14. Documentation updates in `README.md` and `AGENTS.md`.
 
-No deprecations. No state migrations. Existing compose deployments continue to work — once the operator runs `tkr image build`, the previously-broken `tokeirad:local` reference resolves.
+No deprecations. No state migrations. Existing compose deployments continue to work — once the operator runs `tkr image build`, the previously-broken `tokeirad:latest` reference resolves.
 
 ## Future Evolution
 

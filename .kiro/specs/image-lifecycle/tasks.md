@@ -172,7 +172,7 @@ Crucially, this plan does **not** introduce a new IaC module for ECR repositorie
     - _Requirements: 3.1, 3.4, 3.5_
 
   - [ ]* 7.3 Write unit test for build invocation sequence
-    - With `MockDaggerClient`, call `build_image(&TokeiradImage, &request, &mock)`; assert the recorded call sequence includes: `container_from("rust:{toolchain}-alpine")`, `rustup target add aarch64-unknown-linux-musl`, `cargo build --release --target aarch64-unknown-linux-musl --bin tokeirad -p tokeirad`, `container_from("alpine:3.23")`, `with_user("tokeirad")`, `with_entrypoint(["/usr/local/bin/tokeirad"])`, `export_image("tokeirad:local")` in order
+    - With `MockDaggerClient`, call `build_image(&TokeiradImage, &request, &mock)`; assert the recorded call sequence includes: `container_from("rust:{toolchain}-alpine")`, `rustup target add aarch64-unknown-linux-musl`, `cargo build --release --target aarch64-unknown-linux-musl --bin tokeirad -p tokeirad`, `container_from("alpine:3.23")`, `with_user("tokeirad")`, `with_entrypoint(["/usr/local/bin/tokeirad"])`, `export_image("tokeirad:latest")` in order. Also assert that when `request.tag == Some("v1.2.3")`, the sequence additionally includes `export_image("tokeirad:v1.2.3")` after the `:latest` export.
     - Also assert source-type-mismatch: `build_image(&MimirImage, ..)` returns `Err(SourceTypeMismatch)`
     - _Requirements: 3.1_
 
@@ -227,7 +227,7 @@ Crucially, this plan does **not** introduce a new IaC module for ECR repositorie
   - [ ] 8.4 Checkpoint — configs align across platforms
     - Run `cargo lint`, `cargo check --workspace`, `cargo test -p tokeira-build -p tokeira-compose` (unit tests only)
 
-- [ ] 9. Implement `EcrRepository` resource and `EcrClient` trait in `tokeira-aws`
+- [ ] 9. Implement `EcrRepository` resource, `EcrClient` trait, ad-hoc helpers, and `ImagesModule` in `tokeira-aws` + `platforms/ecs`
   - [ ] 9.1 Define the `EcrClient` trait
     - In `crates/tokeira-aws/src/clients/ecr.rs`, define the trait with `get_authorization_token`, `describe_repository`, `create_repository`, `delete_repository`, `put_lifecycle_policy`, `get_lifecycle_policy`, `tag_resource`
     - Define `EcrAuthorization`, `RepositoryDescription`, `ImageTagMutability`, `EcrError` with variants including `NotFound` and `InvalidToken`
@@ -245,31 +245,48 @@ Crucially, this plan does **not** introduce a new IaC module for ECR repositorie
     - Each test constructs a canned `(token_b64, proxy_endpoint)` input and asserts the exact error variant on failure or the exact `EcrAuthorization` on success
     - Test location: `crates/tokeira-aws/src/clients/ecr.rs` `#[cfg(test)]` module
 
-  - [ ] 9.4 Implement `EcrRepository` resource
-    - In `crates/tokeira-aws/src/resources/ecr_repository.rs`, define `EcrRepository { name, tags }` with `#[derive(Debug, Clone, Serialize, Deserialize)]`
-    - Define `ECR_LIFECYCLE_POLICY` constant as the canonical JSON from the Design doc
-    - Implement `Resource` trait: `create` (create repo with `MUTABLE` + apply lifecycle policy), `update` (re-apply lifecycle policy + tags), `delete` (force-delete), `describe` (return `None` on `NotFound`), `diff` (policy drift and tag drift signal updates), `dependencies` (empty)
-    - Implement a constructor `EcrRepository::new(name: &str, tags: BTreeMap<String, String>) -> Result<Self, EcrError>` that validates the name against the ECR grammar (2–256 chars, `[a-z0-9._/-]+`, not starting/ending with `/` or `.`)
-    - _Requirements: 5.1, 5.2_
+  - [ ] 9.4 Define `EcrClientHandle` as a `ProvisionContext` extension wrapper
+    - In `crates/tokeira-aws/src/clients/ecr.rs`, define `pub struct EcrClientHandle(pub Arc<dyn EcrClient>)` deriving `Clone`
+    - Document the pattern: the orchestrator constructs the context and calls `ctx.set_extension(EcrClientHandle(ecr_client))` once, before any `Resource` lifecycle method runs. `EcrRepository` methods read it via `ctx.extension::<EcrClientHandle>().expect("EcrClientHandle registered")`
+    - _Requirements: 5.1.2_
 
-  - [ ]* 9.5 Write unit tests for `EcrRepository` resource methods
-    - Construct a `MockEcrClient` that records calls and serves canned responses
+  - [ ] 9.5 Implement `EcrRepository` resource
+    - In `crates/tokeira-aws/src/resources/ecr_repository.rs`, define `EcrRepository { name, tags, module }` with `#[derive(Debug, Clone, Serialize, Deserialize)]`
+    - Define `ECR_LIFECYCLE_POLICY` constant as the canonical JSON from the Design doc
+    - Implement the `Resource` trait exactly matching the existing signature (`async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, IacError>` and siblings). Do NOT add an `ecr` parameter. Inside each method, fetch the client via `ctx.extension::<EcrClientHandle>().expect(...)`
+    - `create`: create repo with `MUTABLE` + apply lifecycle policy + apply tags
+    - `update`: re-apply lifecycle policy + re-apply tags
+    - `delete`: force-delete (`force=true`)
+    - `describe`: return `None` on `EcrError::NotFound`
+    - `diff`: JSON-normalised policy compare and tag compare both signal `Update`
+    - Implement a constructor `EcrRepository::new(name: String, tags: BTreeMap<String, String>, module: String) -> Result<Self, EcrError>` that validates the name against the ECR grammar (2–256 chars, `[a-z0-9._/-]+`, not starting/ending with `/` or `.`)
+    - _Requirements: 5.1, 5.4_
+
+  - [ ]* 9.6 Write unit tests for `EcrRepository` resource methods
+    - Construct a `MockEcrClient` that records calls and serves canned responses. Register it on a `ProvisionContext` via `EcrClientHandle`
     - Unit-test `create`, `update`, `delete`, `describe`, `diff` each with a focused scenario
     - Test location: `crates/tokeira-aws/src/resources/ecr_repository.rs` `#[cfg(test)]` module
 
-  - [ ]* 9.6 Write property test for lifecycle policy JSON round-trip (Property 5)
+  - [ ]* 9.7 Write property test for lifecycle policy JSON round-trip (Property 5)
     - **Property 5: Lifecycle Policy JSON Round-Trip**
     - **Validates: Requirement 9.5**
     - Parse `ECR_LIFECYCLE_POLICY` with `serde_json::from_str::<serde_json::Value>`, serialize with `to_string`, re-parse
     - Assert the two parsed `Value`s are equal
     - Test location: `crates/tokeira-aws/src/resources/ecr_repository.rs` `#[cfg(test)]` module
 
-  - [ ] 9.7 Implement `ensure_ecr_repository` and `ensure_ecr_repositories`
-    - In `crates/tokeira-aws/src/clients/ecr.rs`, add `async fn ensure_ecr_repository(ecr: &dyn EcrClient, name: &str, tags: &BTreeMap<String, String>) -> Result<(), EcrError>` that describes first, creates if absent, then always applies the lifecycle policy
+  - [ ] 9.8 Implement ad-hoc `ensure_ecr_repository` and `ensure_ecr_repositories`
+    - In `crates/tokeira-aws/src/clients/ecr.rs`, add `async fn ensure_ecr_repository(ecr: &dyn EcrClient, name: &str, tags: &BTreeMap<String, String>) -> Result<(), EcrError>` that describes first, creates if absent with `MUTABLE` mutability, then always applies the lifecycle policy
     - Add `async fn ensure_ecr_repositories(ecr: &dyn EcrClient, repos: &[(String, BTreeMap<String, String>)]) -> Result<(), EcrError>` that calls the single-repo helper in sequence
-    - _Requirements: 5.4_
+    - _Requirements: 5.3_
 
-  - [ ]* 9.8 Write property test for repository creation idempotence (Property 4)
+  - [ ]* 9.9 Write ad-hoc / IaC consistency test
+    - Create a repository via `ensure_ecr_repository` against a `MockEcrClient`
+    - Construct a `ProvisionContext` registering the same `MockEcrClient` via `EcrClientHandle`. Call `EcrRepository::describe(&ctx)` and assert the returned `ResourceState` matches what the resource's `create` path would have produced
+    - Then call `EcrRepository::diff(&state, &ctx)` and assert `Change::NoChange` (ad-hoc-created repos are adopted cleanly by IaC)
+    - Test location: `crates/tokeira-aws/src/resources/ecr_repository.rs` `#[cfg(test)]` module
+    - _Requirements: 5.3.3, 5.3.4_
+
+  - [ ]* 9.10 Write property test for repository creation idempotence (Property 4)
     - **Property 4: ECR Repository Creation Idempotence**
     - **Validates: Requirement 9.4**
     - Generate `Vec<(String, BTreeMap<String, String>)>` of length 0..20 with distinct grammar-valid names
@@ -278,8 +295,39 @@ Crucially, this plan does **not** introduce a new IaC module for ECR repositorie
     - Test location: `crates/tokeira-aws/src/clients/ecr.rs` `#[cfg(test)]` module
     - Minimum 64 iterations
 
-  - [ ] 9.9 Checkpoint — `tokeira-aws` compiles with ECR additions
-    - Run `cargo lint`, `cargo check --workspace`, `cargo test -p tokeira-aws`
+  - [ ] 9.11 Implement the ECS `ImagesModule`
+    - In `platforms/ecs/src/modules/images.rs` (new file), define `pub struct ImagesModule` implementing the `tokeira_iac::Module` trait
+    - `name()` returns `"images"`; `dependencies()` returns `&[]` (no cross-module dependencies); `resources(mctx)` iterates `tokeira_build::images::all(image_ctx)` (where `image_ctx` is constructed from `mctx.extension::<EcsConfig>()`), maps each image to an `EcrRepository { name: desired.repository, tags, module: "images" }`, and returns the collected list
+    - Register `ImagesModule` in the ECS platform's module composition (alongside `foundation`, `networking`, etc.)
+    - _Requirements: 5.2_
+
+  - [ ] 9.12 Register `EcrClientHandle` on the orchestrator's `ProvisionContext`
+    - In `platforms/ecs/src/lib.rs` (or wherever the ECS `Deployment::register_infra_extensions` hook lives), add a call to `ctx.set_extension(EcrClientHandle(Arc::new(default_ecr_client().await?)))` so `EcrRepository` resources can fetch it
+    - Mirror the pattern used by any existing DSQL client registration
+    - _Requirements: 5.1.2_
+
+  - [ ]* 9.13 Write integration test for `ImagesModule` composition
+    - With a realistic `EcsConfig`, construct `ImagesModule` via the platform's `infra_modules(&config, &ModuleSelection::All)` helper
+    - Assert the module's resource list contains one `EcrRepository` per image in `tokeira_build::images::all(ctx)`, with repository names matching `desired_ref(ctx)?.repository` exactly
+    - Test location: `platforms/ecs/src/modules/images.rs` `#[cfg(test)]` module
+    - _Requirements: 5.2.1, 5.2.2_
+
+  - [ ] 9.14 Extract shared writeback helper into `tokeira-iac`
+    - Move `write_tokeirad_writeback` (currently in `apps/tkr/src/commands/infra.rs`) and its private dotted-key `toml_edit` writer into `crates/tokeira-iac/src/writeback.rs` as `pub fn write_config_values(config_dir: &Path, values: &[(&str, &str)]) -> Result<(), WritebackError>`
+    - Define `pub enum WritebackError` in the same module as a `thiserror` enum with variants `Io { path, source }`, `Parse { path, source }`, `InvalidKey { key, reason }`, `Write { path, source }`
+    - Re-export from `tokeira_iac::write_config_values` at the crate root
+    - Migrate the proptests `toml_writeback_round_trips` and `toml_writeback_preserves_comments` from `apps/tkr/src/commands/infra.rs` to `crates/tokeira-iac/src/writeback.rs` `#[cfg(test)]` module
+    - Update `apps/tkr/src/commands/infra.rs` to call `tokeira_iac::write_config_values(&ctx.path, &borrowed)` instead of the local helper; delete the local helper and its private dotted-key writer
+    - _Requirements: 7.3_
+
+  - [ ]* 9.15 Write unit test asserting tkr infra parity after extraction
+    - Call `tokeira_iac::write_config_values` with a set of values that exercise: creating a new dotted key, overwriting an existing dotted key, creating intermediate tables, preserving a comment line
+    - Assert the result matches the pre-extraction behaviour documented in the original tests
+    - Test location: `crates/tokeira-iac/src/writeback.rs` `#[cfg(test)]` module (migrated from `infra.rs`)
+    - _Requirements: 7.3.4_
+
+  - [ ] 9.16 Checkpoint — `tokeira-aws`, `platforms/ecs`, `tokeira-iac`, and `tkr` all compile with the changes
+    - Run `cargo lint`, `cargo check --workspace`, `cargo test -p tokeira-aws -p platforms-ecs -p tokeira-iac -p tkr` (unit tests only)
 
 - [ ] 10. Wire the `tkr image` command group
   - [ ] 10.1 Add `ImageCommand` enum to `apps/tkr/src/cli.rs`
@@ -303,14 +351,14 @@ Crucially, this plan does **not** introduce a new IaC module for ECR repositorie
   - [ ] 10.4 Implement the `push` handler
     - For `Push { tag, image, yes }`: confirm per `tkr-cli`, obtain `EcrClient` + credentials, build `ImageContext`, filter `images::all` to Build images
     - For each selected image: resolve `desired_ref`, verify local image exists in Docker, ensure ECR repo, publish two remote refs (`:latest` and `:{tag}`)
-    - After all pushes: iterate each image's `writeback_targets(&ctx)` and call the `iac_lifecycle::write_config_values` helper with the version-tagged ref
+    - After all pushes: iterate each image's `writeback_targets(&ctx)` and call `tokeira_iac::write_config_values(deployment_dir, &borrowed)` with the version-tagged ref (see task 9.5 for the helper's extraction)
     - Emit progress events and `--json` summary
     - _Requirements: 6.4, 6.6_
 
   - [ ] 10.5 Implement the `mirror` handler
     - For `Mirror { image, yes }`: confirm per `tkr-cli`, obtain `EcrClient` + credentials, build `ImageContext`, filter `images::all` to Mirror images
-    - For each selected image: resolve `desired_ref`, ensure ECR repo, call `tokeira_build::mirror_image` (which handles skip-self internally)
-    - After all mirrors: iterate each image's `writeback_targets(&ctx)` and write the destination ref back to `deployment.toml`
+    - For each selected image: resolve `desired_ref`, ensure ECR repo via the ad-hoc helper, call `tokeira_build::mirror_image` (which handles skip-self internally)
+    - After all mirrors: iterate each image's `writeback_targets(&ctx)` and call `tokeira_iac::write_config_values(deployment_dir, &borrowed)` with the destination ref (see task 9.5)
     - Emit progress events and `--json` summary
     - _Requirements: 6.5, 6.6_
 
@@ -321,7 +369,7 @@ Crucially, this plan does **not** introduce a new IaC module for ECR repositorie
 
   - [ ]* 10.7 Write unit tests for CLI parse
     - `tkr image list`: default; `--source-type build`; `--source-type mirror`; `--json`
-    - `tkr image build`: defaults (`arch=arm64`, `tag=local`); `--arch amd64 --tag v1.2.3`; `--image tokeirad`
+    - `tkr image build`: defaults (`arch=arm64`, no `--tag`, so only `:latest` is exported); `--arch amd64 --tag v1.2.3` additionally exports `:v1.2.3`; `--image tokeirad`
     - `tkr image push`: default (`tag=latest`); `--tag v2026-03-21 --yes`; `--image tokeirad`
     - `tkr image mirror`: default; `--image grafana-mimir`; `--yes`
     - Test location: `apps/tkr/src/commands/image.rs` `#[cfg(test)]` module
@@ -365,8 +413,8 @@ Crucially, this plan does **not** introduce a new IaC module for ECR repositorie
     - Minimum 128 iterations
 
   - [ ] 11.5 Implement the compose `validate_local_build` gate
-    - In `platforms/compose/src/gates.rs`, add `pub async fn validate_local_build(cfg: &ComposeConfig, docker: &bollard::Docker) -> Result<(), ComposeError>`
-    - When `cfg.tokeirad.image == "tokeirad:local"`, query bollard for image existence; return an error with the `tkr image build` remediation if absent
+    - In `platforms/compose/src/gates.rs` (new file), add `pub async fn validate_local_build(cfg: &ComposeConfig, docker: &bollard::Docker) -> Result<(), ComposeError>`
+    - When `cfg.tokeirad.image == "tokeirad:latest"`, query bollard for image existence; return an error with the `tkr image build` remediation if absent
     - When `cfg.tokeirad.image` is any other value, skip the check
     - _Requirements: 8.3_
 
@@ -376,14 +424,21 @@ Crucially, this plan does **not** introduce a new IaC module for ECR repositorie
     - With `cfg.tokeirad.image = "my-registry.example/tokeirad:custom"`, assert the gate returns `Ok(())` without querying bollard
     - Test location: `platforms/compose/src/gates.rs` `#[cfg(test)]` module
 
-  - [ ] 11.7 Checkpoint — gates pass property tests
+  - [ ] 11.7 Wire the compose gate into `ComposePlatform::validate_for_deploy_apply`
+    - In `platforms/compose/src/lib.rs`, add `pub async fn validate_for_deploy_apply(&self, config: &ComposeConfig) -> Result<(), ComposeError>` on `ComposePlatform` (mirrors the ECS platform's existing `validate_for_*` shape)
+    - Implementation: `gates::validate_local_build(config, self.docker()).await`
+    - The `tkr deploy apply` command handler SHALL invoke this hook before constructing the deploy-engine service list
+    - The check does NOT live in `platforms/compose/src/services.rs` — that module only builds deploy-engine service descriptors and has no Docker access
+    - _Requirements: 8.3_
+
+  - [ ] 11.8 Checkpoint — gates pass property tests
     - Run `cargo lint`, `cargo check --workspace`, `cargo test -p platforms-ecs -p platforms-compose`
 
 - [ ] 12. Integration and documentation
   - [ ] 12.1 Update `README.md`
     - Add a "Building and publishing images" section covering:
       - `tkr image list` — enumerate every image the deployment knows about
-      - `tkr image build` — default produces `tokeirad:local` for compose; `--arch amd64 --tag v1.2.3` for explicit
+      - `tkr image build` — default produces `tokeirad:latest` for compose; `--arch amd64 --tag v1.2.3` additionally produces the version tag (both pointing at the same digest)
       - `tkr image push --tag <version>` — pushes Build images with latest + version, writes back to `services.*.image`
       - `tkr image mirror` — mirrors every Mirror image into project-owned ECR, writes back to `observability.*_image`
       - Required prerequisites: Dagger >= 0.20 for `build`/`push`/`mirror`; AWS credentials with `ecr:*` permissions for `push` and `mirror`
@@ -407,7 +462,7 @@ Crucially, this plan does **not** introduce a new IaC module for ECR repositorie
 
   - [ ]* 12.4 Integration test: build the tokeirad image end-to-end
     - Gated behind the `integration-test` feature flag
-    - Run `tkr image build` against the workspace, assert `docker image inspect tokeirad:local` succeeds
+    - Run `tkr image build` against the workspace, assert `docker image inspect tokeirad:latest` succeeds
     - Test location: `apps/tkr/tests/image_build.rs`
     - Documented as skipped in the default test suite per AGENTS.md testing guidance
 

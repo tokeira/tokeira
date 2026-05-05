@@ -87,37 +87,58 @@ The marker is registered by the orchestrator facade (`tokeira-orchestrator::Infr
 
 ### Orchestrator Destroy Wiring
 
-The `InfraEngine` facade in `tokeira-orchestrator` handles the wiring:
+The `InfraEngine` facade in `tokeira-orchestrator` handles the wiring. It uses the engine's existing `destroy`/`destroy_for_modules` methods (there is no `plan_destroy_modules` API on the engine — `plan_destroy` is a new method added by this spec):
 
 ```rust
-// crates/tokeira-orchestrator/src/lib.rs (added to InfraEngine)
+// crates/tokeira-orchestrator/src/lib.rs (InfraEngine)
 
 impl<D: Deployment> InfraEngine<D> {
     pub async fn destroy(&mut self, composition: &InfraComposition)
         -> Result<Vec<Change>>
     {
+        let (state, version) = self.state_store.load().await?;
+        self.ctx.state = state;
         self.ctx.set_extension(DestroyMode);
-        let active: Vec<&str> = composition.active_modules.iter()
-            .map(|s| s.as_str()).collect();
-        self.engine
-            .destroy_modules(&composition.known_modules, &active, &mut self.ctx)
-            .await
+        let result = {
+            let saver = self.make_saver(version);
+            let active: Vec<&str> = composition.active_modules.iter()
+                .map(|s| s.as_str()).collect();
+            if active.is_empty() {
+                self.engine.destroy(composition, &mut self.ctx, Some(&saver)).await
+            } else {
+                self.engine
+                    .destroy_for_modules(composition, &active, &mut self.ctx, Some(&saver))
+                    .await
+            }
+        };
+        // Scope DestroyMode to this operation only. Requirement 1.6.
+        self.ctx.remove_extension::<DestroyMode>();
+        result
     }
 
     pub async fn plan_destroy(&mut self, composition: &InfraComposition)
         -> Result<Vec<Change>>
     {
+        let (state, _version) = self.state_store.load().await?;
+        self.ctx.state = state;
         self.ctx.set_extension(DestroyMode);
         let active: Vec<&str> = composition.active_modules.iter()
             .map(|s| s.as_str()).collect();
-        self.engine
-            .plan_destroy_modules(&composition.known_modules, &active, &mut self.ctx)
-            .await
+        // plan_destroy is new; added as part of this spec.
+        let result = self.engine
+            .plan_destroy(composition, &active, &mut self.ctx)
+            .await;
+        self.ctx.remove_extension::<DestroyMode>();
+        result
     }
 }
 ```
 
-Apply and plan (non-destroy) do **not** register the marker.
+Apply and plan (non-destroy) do **not** register the marker and do **not** call `remove_extension`.
+
+This spec adds two new APIs to the generic engine:
+- `Engine::plan_destroy` — computes the Delete change set for the `known_modules` composition without mutating state.
+- `ProvisionContext::remove_extension<T>()` — removes a typed extension if present, returning `true` if it was removed.
 
 ### InfraComposition Semantics
 
@@ -153,25 +174,60 @@ pub type StateSaver = Box<
 
 **Contract:**
 1. Called exactly once after each successful create, update, or delete operation.
-2. Called after pruning a stale resource from state during refresh.
+2. Called once per pruned resource during refresh (not once per refresh cycle).
 3. If it returns `Err`, the engine aborts immediately and propagates the error.
 4. The engine MUST NOT batch multiple mutations before calling the saver.
 5. The saver sees the full current `InfraState` snapshot, not a delta.
 
-This contract is already implemented in `apply_changes` and `destroy_changes`. The spec adds explicit tests to catch regression.
+The contract is partially implemented in `apply_changes` and `destroy_changes`. This spec adds three behaviors the current implementation does not have:
+
+**Refresh prune save** — the current `refresh_state` calls the saver only when `has_managed_missing` is true, which is once per refresh cycle. Requirement 2.5 requires once per pruned resource. Implementation: call the saver inside the loop that removes resources when `describe()` returns `None`.
+
+**CAS version tracking across saves** — the current orchestrator saver captures one `version: String` at load time and reuses it for every incremental save. The first save succeeds and returns a new ETag/version; the second save conflicts with the stale captured version. Implementation:
+
+```rust
+// crates/tokeira-orchestrator/src/lib.rs (revised make_saver)
+
+fn make_saver(&self, initial_version: String) -> iac::StateSaver {
+    let store = Arc::clone(&self.state_store);
+    // Interior mutability — the saver closure is Fn, not FnMut.
+    let version = Arc::new(Mutex::new(initial_version));
+    Box::new(move |state: &iac::InfraState| {
+        let store = Arc::clone(&store);
+        let version = Arc::clone(&version);
+        let state = state.clone();
+        Box::pin(async move {
+            let current = version.lock().await.clone();
+            let new_version = store
+                .save(&state, &current)
+                .await
+                .map_err(iac::IacError::State)?;
+            *version.lock().await = new_version;
+            Ok(())
+        })
+    })
+}
+```
+
+This requires `StateStore::save` to return the new version. The orchestrator must update its signature and propagate the returned version into the tracked mutex.
+
+**No final save after engine return** — the current `apply`/`destroy` methods call `state_store.save(&self.ctx.state, &version)` after the engine returns, using the stale initial version. This call must be removed. All saves flow through the incremental saver.
 
 ### ActionTuiHandle (New — CLI Only)
 
 ```rust
 // apps/tkr/src/tui.rs
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use console::{Term, style};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use tokeira_iac::{ResourceId, ResourceType};
 
 /// Output format for CLI operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,9 +237,6 @@ pub enum OutputFormat {
 }
 
 /// Shared counters updated from progress closures.
-///
-/// Uses atomics because progress callbacks are `Fn` (not `FnMut`) and
-/// multiple reporter closures share the same counters.
 #[derive(Debug, Default)]
 struct ActionCounters {
     completed: AtomicUsize,
@@ -191,74 +244,77 @@ struct ActionCounters {
     skipped: AtomicUsize,
 }
 
-/// Progress reporting handle for infrastructure operations.
+/// Per-resource start timestamps and active spinner handles.
+///
+/// Because `set_apply_progress` and `set_complete_progress` are separate
+/// closures, we need shared state to (a) compute elapsed time on completion
+/// and (b) locate the spinner to finish with a completion/failure indicator.
+#[derive(Debug, Default)]
+struct ActiveSpinners {
+    // Keyed by `ResourceId` so the completion/failure callback can find the
+    // spinner started by the matching apply callback.
+    entries: Mutex<HashMap<ResourceId, SpinnerEntry>>,
+}
+
+struct SpinnerEntry {
+    started_at: Instant,
+    bar: Option<ProgressBar>, // Some for Human+TTY, None for Human+non-TTY or Json
+}
+
+impl std::fmt::Debug for SpinnerEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpinnerEntry")
+            .field("started_at", &self.started_at)
+            .field("bar", &self.bar.is_some())
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ActionTuiHandle {
     format: OutputFormat,
     multi: MultiProgress,
     start: Instant,
     counters: Arc<ActionCounters>,
+    spinners: Arc<ActiveSpinners>,
     is_terminal: bool,
 }
 
 impl ActionTuiHandle {
     pub fn new(format: OutputFormat) -> Self {
-        let is_terminal = Term::stdout().is_term();
         Self {
             format,
             multi: MultiProgress::new(),
             start: Instant::now(),
             counters: Arc::new(ActionCounters::default()),
-            is_terminal,
+            spinners: Arc::new(ActiveSpinners::default()),
+            is_terminal: Term::stdout().is_term(),
         }
     }
 
     /// Install progress reporters on the provision context.
+    ///
+    /// Wires five callback channels:
+    /// - `set_apply_progress`     — operation started
+    /// - `set_complete_progress`  — operation completed successfully
+    /// - `set_failed_progress`    — operation failed with error
+    /// - `set_wait_progress`      — periodic polling update
+    /// - `set_note_progress`      — informational note
     pub fn install(&self, ctx: &mut tokeira_iac::ProvisionContext) {
-        let format = self.format;
-        let multi = self.multi.clone();
-        let counters = Arc::clone(&self.counters);
-        let is_terminal = self.is_terminal;
-
-        ctx.set_apply_progress(move |action, rid, rtype, current, total| {
-            match format {
-                OutputFormat::Human if is_terminal => {
-                    let pb = multi.add(ProgressBar::new_spinner());
-                    pb.set_style(
-                        ProgressStyle::with_template("  {spinner} {msg}")
-                            .unwrap()
-                            .tick_strings(&["-", "\\", "|", "/", "✓"]),
-                    );
-                    pb.set_message(format!(
-                        "[{current}/{total}] {action} {} ({})",
-                        rid.0, rtype.0
-                    ));
-                    pb.enable_steady_tick(std::time::Duration::from_millis(100));
-                    // Caller is responsible for finishing; we detach here.
-                    pb.finish_and_clear();
-                }
-                OutputFormat::Human => {
-                    eprintln!(
-                        "  [{current}/{total}] {action} {} ({})",
-                        rid.0, rtype.0
-                    );
-                }
-                OutputFormat::Json => {
-                    let event = ProgressEvent::OperationStart {
-                        action: action.into(),
-                        resource_id: rid.0.clone(),
-                        resource_type: rtype.0.clone(),
-                        index: current,
-                        total,
-                    };
-                    println!("{}", serde_json::to_string(&event).unwrap());
-                }
-            }
-            counters.completed.fetch_add(1, Ordering::Relaxed);
-        });
-
-        // Similar wiring for set_wait_progress and set_note_progress.
-        // Elided here for brevity; full wiring in tasks.
+        // Each closure captures its own Arc clones. All closures share
+        // `counters` and `spinners` to cooperate between start/complete/failed.
+        // Closures are `Fn` (not `FnMut`); interior mutability via atomics
+        // and `Mutex` is required.
+        //
+        // Implementation notes (full bodies in task 8.3):
+        // - apply_progress creates a SpinnerEntry and stores it keyed by ResourceId
+        // - complete_progress looks up the entry, finishes the spinner with
+        //   "✓ {rid} ({elapsed})", removes the entry, increments `completed`
+        // - failed_progress looks up the entry, finishes with "✗ {rid} ({elapsed}): {err}",
+        //   removes the entry, increments `failed`
+        // - wait_progress updates the spinner message with elapsed/timeout
+        // - note_progress appends a note line under the spinner (Human) or
+        //   emits ProgressEvent::Note (Json)
     }
 
     pub fn print_summary(&self) {
@@ -289,7 +345,10 @@ impl ActionTuiHandle {
 }
 
 /// A single JSON progress event emitted when `--json` is active.
-#[derive(Debug, Serialize)]
+///
+/// Derives `Deserialize` and `PartialEq, Eq` so round-trip property tests
+/// can serialise and parse events back into the expected variant.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum ProgressEvent {
     OperationStart {
@@ -298,6 +357,19 @@ pub enum ProgressEvent {
         resource_type: String,
         index: usize,
         total: usize,
+    },
+    OperationComplete {
+        action: String,
+        resource_id: String,
+        resource_type: String,
+        elapsed_ms: u64,
+    },
+    OperationFailed {
+        action: String,
+        resource_id: String,
+        resource_type: String,
+        elapsed_ms: u64,
+        error: String,
     },
     WaitProgress {
         resource_id: String,
@@ -320,9 +392,17 @@ pub enum ProgressEvent {
 }
 ```
 
-The counters are kept in an `Arc<ActionCounters>` with atomic fields so that the three separate reporter closures (apply, wait, note) can share state without a lock.
+The counters are kept in `Arc<ActionCounters>` with atomic fields. The active spinner registry is `Arc<ActiveSpinners>` with a `Mutex<HashMap>` because closures are `Fn` and the map needs interior mutability to insert/remove entries.
 
-When stdout is not a terminal, the `Human` path falls back to plain `eprintln!` lines instead of spinners. This preserves readability when output is piped to a log file.
+When stdout is not a terminal, the `Human` path stores `SpinnerEntry { bar: None }` and prints plain `eprintln!` lines on start and complete/fail. This preserves readability when output is piped.
+
+**Engine-level additions** — this spec adds three new progress callback methods to `ProvisionContext`:
+
+- `set_complete_progress<F>(reporter: F)` where `F: Fn(&str, &ResourceId, &ResourceType, Duration) + Send + Sync + 'static` — called by the engine with elapsed time after a successful lifecycle method.
+- `set_failed_progress<F>(reporter: F)` where `F: Fn(&str, &ResourceId, &ResourceType, Duration, &IacError) + Send + Sync + 'static` — called by the engine after a failed lifecycle method.
+- Corresponding `emit_complete_progress` and `emit_failed_progress` methods on `ProvisionContext` that the engine calls.
+
+The engine calls these in `apply_changes` and `destroy_changes`: a `let started = Instant::now()` before the lifecycle method, then `emit_complete_progress(..., started.elapsed())` on success or `emit_failed_progress(..., started.elapsed(), &err)` on failure.
 
 ### Config Writeback (Existing — Formalised)
 

@@ -56,8 +56,8 @@ A seventh area documents the convention for resources with multiple lifecycle mo
 2. WHEN the Engine completes a resource update operation, THE Engine SHALL invoke the `StateSaver` callback before proceeding to the next resource.
 3. WHEN the Engine completes a resource delete operation, THE Engine SHALL invoke the `StateSaver` callback before proceeding to the next resource.
 4. IF the `StateSaver` callback returns an error, THEN THE Engine SHALL abort the current operation and return the error to the caller.
-5. WHEN the Engine prunes a stale resource from state during refresh (resource absent in provider), THE Engine SHALL invoke the `StateSaver` callback once per pruned resource — not once per refresh.
-6. FOR ALL sequences of N successful mutating operations (including per-resource refresh prunes), the `StateSaver` SHALL be invoked exactly N times (no batching).
+5. WHEN the Engine prunes a stale resource from state during refresh in an apply or destroy operation (a `StateSaver` is available), THE Engine SHALL invoke the `StateSaver` callback once per pruned resource — not once per refresh. WHEN the Engine prunes during a plan operation (no `StateSaver` is available), THE Engine SHALL mutate `ctx.state` in memory only, without attempting to persist.
+6. FOR ALL apply and destroy operations with N successful mutating operations (including per-resource refresh prunes), the `StateSaver` SHALL be invoked exactly N times (no batching). Plan operations invoke the `StateSaver` zero times.
 
 ### Requirement 2a: CAS Version Tracking Across Incremental Saves
 
@@ -115,7 +115,7 @@ A seventh area documents the convention for resources with multiple lifecycle mo
 9. WHILE a resource is waiting for a provider condition (polling), THE CLI SHALL display elapsed time and timeout remaining.
 10. WHEN a resource operation emits a note via `emit_note_progress`, THE CLI SHALL display the note associated with the resource.
 11. WHEN the `--json` flag is provided, THE CLI SHALL emit structured JSON progress events to stdout (one JSON object per line) instead of terminal UI elements. The JSON schema SHALL include: `OperationStart`, `OperationComplete`, `OperationFailed`, `WaitProgress`, `Note`, and `Summary`.
-12. THE CLI SHALL display a summary line showing total operations completed, failed, and skipped after plan, apply, or destroy finishes.
+12. THE CLI SHALL display a summary line showing total operations completed, failed, and skipped after plan, apply, or destroy finishes. THE `completed` and `failed` counts SHALL be derived from the `emit_complete_progress` and `emit_failed_progress` callbacks. THE `skipped` count SHALL be derived from the number of `ChangeKind::NoChange` entries returned in the plan — the engine does not invoke a lifecycle method for a NoChange entry, so no callback fires.
 13. WHEN stdout is not a terminal (e.g., piped to a file or log), THE CLI SHALL automatically fall back to plain progress lines instead of ANSI spinners.
 14. THE global `--json` flag SHALL be threaded from `Cli::json` through `main` into `commands::infra::run` so that the `infra` command subsystem selects the correct `OutputFormat`.
 

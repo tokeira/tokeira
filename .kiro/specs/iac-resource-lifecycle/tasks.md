@@ -35,17 +35,19 @@ Target crates:
     - _Requirements: 1.6_
 
 - [ ] 2. Add `Engine::plan_destroy` and wire orchestrator destroy paths
-  - [ ] 2.1 Implement `Engine::plan_destroy` in `tokeira-iac`
-    - Add `pub async fn plan_destroy(composition, active_modules, ctx) -> Result<Vec<Change>, IacError>` to `crates/tokeira-iac/src/engine.rs`
-    - Collect `known_modules`, refresh state (save per-prune via the saver when one is supplied in later integration; `plan_destroy` itself does not accept a saver), compute the zero-desired change set, and apply module-scoped filtering from `active_modules`
-    - Do not call any `Resource::create`, `update`, or `delete` — `plan_destroy` is read-only
-    - _Requirements: 1.2, 3.1_
+  - [ ] 2.1 Implement `Engine::plan_destroy` and `Engine::plan_destroy_for_modules` in `tokeira-iac`
+    - Add `pub async fn plan_destroy(&self, composition: &InfraComposition, ctx: &mut ProvisionContext) -> Result<Vec<Change>, IacError>` and `pub async fn plan_destroy_for_modules(&self, composition: &InfraComposition, ctx: &mut ProvisionContext) -> Result<Vec<Change>, IacError>` to `crates/tokeira-iac/src/engine.rs`
+    - Both methods collect `known_modules`, call `refresh_state(&known, &[], ctx)` (no saver — refresh mutates `ctx.state` in memory only), compute the zero-desired change set, and (for `_for_modules`) apply `filter_changes_by_modules` using `composition.active_modules`
+    - Do not call any `Resource::create`, `update`, or `delete` — `plan_destroy` is read-only; the only side effect is updating `ctx.state` in memory
+    - _Requirements: 1.2, 2.5, 3.1_
 
   - [ ] 2.2 Register `DestroyMode` in the orchestrator and scope it to the operation
-    - In `crates/tokeira-orchestrator/src/lib.rs`, update `InfraEngine::destroy` to call `self.ctx.set_extension(DestroyMode)` before the engine call, select between `engine.destroy` and `engine.destroy_for_modules` based on whether `composition.active_modules` is empty, and call `self.ctx.remove_extension::<DestroyMode>()` after the engine returns (success or error)
-    - Add `InfraEngine::plan_destroy(&mut self, composition)` that loads state, sets `DestroyMode`, calls the new `engine.plan_destroy(composition, &active, &mut self.ctx)`, then removes the marker
+    - In `crates/tokeira-orchestrator/src/lib.rs`, change `InfraEngine::destroy` to accept a `ModuleSelection` parameter. Branch on the selection: `ModuleSelection::All` calls `engine.destroy(composition, &mut ctx, Some(&saver))`; `ModuleSelection::Modules(_)` calls `engine.destroy_for_modules(composition, &mut ctx, Some(&saver))`. Do NOT gate on `composition.active_modules.is_empty()` — `compose()` always populates that list even for `All`
+    - Set `DestroyMode` on `self.ctx` before the engine call; call `self.ctx.remove_extension::<DestroyMode>()` after the engine returns (success or error)
+    - Add `InfraEngine::plan_destroy(&mut self, composition, selection)` that loads state, sets `DestroyMode`, dispatches to `engine.plan_destroy` or `engine.plan_destroy_for_modules` based on `selection`, then removes the marker
     - Do NOT register `DestroyMode` during `plan` or `apply`
-    - Import `DestroyMode` from `tokeira_iac`
+    - Import `DestroyMode` and `ModuleSelection` from `tokeira_iac`
+    - Update all call sites (e.g., `commands::infra::run`) to pass `ModuleSelection` through to `destroy`/`plan_destroy`
     - _Requirements: 1.2, 1.5, 1.6_
 
   - [ ]* 2.3 Write unit test for `DestroyMode` registration and scoping
@@ -53,6 +55,7 @@ Target crates:
     - Verify `ctx.extension::<DestroyMode>()` is `None` after both methods return (success path)
     - Verify `ctx.extension::<DestroyMode>()` is `None` after `InfraEngine::apply` or `InfraEngine::plan`
     - Verify that if the engine call returns an error, `DestroyMode` has still been removed
+    - Verify that `ModuleSelection::All` dispatches to `engine.destroy`/`plan_destroy` and `ModuleSelection::Modules` dispatches to `destroy_for_modules`/`plan_destroy_for_modules`
     - Test location: `crates/tokeira-orchestrator/src/lib.rs` `#[cfg(test)]` module
     - _Requirements: 1.2, 1.5, 1.6_
 
@@ -77,10 +80,12 @@ Target crates:
     - All saves now flow through the incremental saver
     - _Requirements: 2a.3_
 
-  - [ ] 4.4 Save per pruned resource during `refresh_state`
+  - [ ] 4.4 Save per pruned resource during `refresh_state` (when a saver is available)
     - In `crates/tokeira-iac/src/engine.rs`, change the `refresh_state` loop that removes stale resources so it invokes the `StateSaver` once per pruned resource rather than once after the loop completes
+    - Gate the save call on `if let Some(save) = saver` so that plan paths — which call `refresh_state` without a saver — mutate `ctx.state` in memory only and do not attempt to persist. Apply and destroy paths always supply a saver, so every prune persists immediately
+    - Thread `saver: Option<&StateSaver>` through `refresh_state`'s signature so the function can branch on its presence
     - Remove the `has_managed_missing` single-save block in `apply_with_known`, `apply_for_modules`, `destroy_known`, and `destroy_for_modules` — the per-prune save subsumes it
-    - _Requirements: 2.5_
+    - _Requirements: 2.5, 2.6_
 
   - [ ] 4.5 Audit `apply_changes` and `destroy_changes` saver invocations
     - Verify `apply_changes` calls the saver exactly once after each successful create, update, and delete (existing behavior — confirm and comment)
@@ -192,9 +197,11 @@ Target crates:
     - Define `ActiveSpinners` struct with `entries: Mutex<HashMap<ResourceId, SpinnerEntry>>`; each `SpinnerEntry` carries `started_at: Instant` and `bar: Option<ProgressBar>`
     - Define `ActionTuiHandle` with fields: `format`, `multi: MultiProgress`, `start: Instant`, `counters: Arc<ActionCounters>`, `spinners: Arc<ActiveSpinners>`, `is_terminal: bool`
     - Implement `ActionTuiHandle::new(format)` that detects TTY via `console::Term::stdout().is_term()`
+    - Implement `pub(crate) fn with_terminal_detected(format: OutputFormat, is_terminal: bool) -> Self` as a test-only constructor used by unit tests to force terminal vs non-terminal paths without depending on the runner TTY
+    - Implement `pub fn record_skipped(&self, n: usize)` that stores `n` into `counters.skipped` — the CLI calls this with the count of `ChangeKind::NoChange` entries from the engine's plan result
     - Define `ProgressEvent` enum deriving `Serialize, Deserialize, PartialEq, Eq` with `#[serde(tag = "event", rename_all = "snake_case")]` and variants `OperationStart`, `OperationComplete`, `OperationFailed`, `WaitProgress`, `Note`, `Summary`
     - Add `mod tui;` to `apps/tkr/src/main.rs`
-    - _Requirements: 5.6, 5.7, 5.11_
+    - _Requirements: 5.6, 5.7, 5.11, 5.12, 5.13_
 
   - [ ] 9.3 Implement `ActionTuiHandle::install` wiring all five reporters
     - Clone `format`, `multi`, `counters`, `spinners`, `is_terminal` into each closure (closures are `Fn`, not `FnMut`; use interior mutability)
@@ -216,7 +223,8 @@ Target crates:
     - In `apps/tkr/src/cli.rs`, if `Cli::json` is not already a global flag, add `#[arg(long, global = true)]` `json: bool`
     - In `apps/tkr/src/main.rs`, update the `Command::Infra { action }` arm to pass `cli.json` (as `OutputFormat`) to `commands::infra::run(action, &deployments, ctx, format)`
     - In `apps/tkr/src/commands/infra.rs`, update `run` to accept `format: OutputFormat`, construct `ActionTuiHandle::new(format)` once, call `tui.install(&mut ctx)` before each engine call, and call `tui.print_summary()` after the engine returns (success or error)
-    - _Requirements: 5.14_
+    - After the engine returns, compute `let skipped = changes.iter().filter(|c| matches!(c.kind, ChangeKind::NoChange)).count();` and call `tui.record_skipped(skipped)` before `print_summary` so the summary reflects unchanged resources
+    - _Requirements: 5.12, 5.14_
 
   - [ ]* 9.6 Write property test for JSON event well-formedness (Property 9)
     - **Property 9: JSON Progress Event Well-Formedness**
@@ -230,14 +238,16 @@ Target crates:
   - [ ]* 9.7 Write property test for progress counter accuracy (Property 10)
     - **Property 10: Progress Counter Accuracy**
     - **Validates: Requirements 5.12**
-    - Simulate N events with a mix of completion, failure, and skip outcomes by invoking the installed closures directly
+    - Generate triples `(completed_events, failed_events, noChange_count)` with N = completed + failed + noChange
+    - For each completed/failed event invoke the matching installed closure (`complete_progress` or `failed_progress`) directly; call `tui.record_skipped(noChange_count)` once
     - After all events, assert `counters.completed.load() + counters.failed.load() + counters.skipped.load() == N`
     - Minimum 100 iterations
     - Test location: `apps/tkr/src/tui.rs` `#[cfg(test)]` module
 
   - [ ]* 9.8 Write unit tests for terminal vs non-terminal fallback
-    - Construct `ActionTuiHandle` with `is_terminal = false` and verify the `Human` path emits plain lines (no ANSI escapes) via a captured writer or a behavioral test
-    - Construct with `is_terminal = true` and verify the spinner path is exercised
+    - Construct `ActionTuiHandle::with_terminal_detected(OutputFormat::Human, false)` and drive a start/complete cycle; verify via a captured writer trait (or behavioral observation such as spinner-handle presence in the `ActiveSpinners` map) that the `Human` path emits plain lines with no spinner attached
+    - Construct `ActionTuiHandle::with_terminal_detected(OutputFormat::Human, true)` and verify the start callback inserts a `SpinnerEntry { bar: Some(_), .. }` into `spinners.entries`
+    - Prefer behavioural assertions (entry presence, counter values) over capturing stdout, because `indicatif` and `console` write through their own layers; if stdout capture is required, wire it via `MultiProgress::with_draw_target(ProgressDrawTarget::hidden())` in tests so output does not reach the runner
     - Test location: `apps/tkr/src/tui.rs` `#[cfg(test)]` module
     - _Requirements: 5.13_
 

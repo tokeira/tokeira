@@ -87,28 +87,34 @@ The marker is registered by the orchestrator facade (`tokeira-orchestrator::Infr
 
 ### Orchestrator Destroy Wiring
 
-The `InfraEngine` facade in `tokeira-orchestrator` handles the wiring. It uses the engine's existing `destroy`/`destroy_for_modules` methods (there is no `plan_destroy_modules` API on the engine — `plan_destroy` is a new method added by this spec):
+The `InfraEngine` facade in `tokeira-orchestrator` handles the wiring. It branches on the operator's `ModuleSelection` rather than on `active_modules.is_empty()`, because `compose()` always populates `active_modules` (even for `ModuleSelection::All`):
 
 ```rust
 // crates/tokeira-orchestrator/src/lib.rs (InfraEngine)
 
 impl<D: Deployment> InfraEngine<D> {
-    pub async fn destroy(&mut self, composition: &InfraComposition)
-        -> Result<Vec<Change>>
-    {
+    pub async fn destroy(
+        &mut self,
+        composition: &InfraComposition,
+        selection: ModuleSelection,
+    ) -> Result<Vec<Change>> {
         let (state, version) = self.state_store.load().await?;
         self.ctx.state = state;
         self.ctx.set_extension(DestroyMode);
         let result = {
             let saver = self.make_saver(version);
-            let active: Vec<&str> = composition.active_modules.iter()
-                .map(|s| s.as_str()).collect();
-            if active.is_empty() {
-                self.engine.destroy(composition, &mut self.ctx, Some(&saver)).await
-            } else {
-                self.engine
-                    .destroy_for_modules(composition, &active, &mut self.ctx, Some(&saver))
-                    .await
+            match selection {
+                ModuleSelection::All => {
+                    self.engine
+                        .destroy(composition, &mut self.ctx, Some(&saver))
+                        .await
+                }
+                ModuleSelection::Modules(_) => {
+                    // destroy_for_modules reads the active set from composition.active_modules.
+                    self.engine
+                        .destroy_for_modules(composition, &mut self.ctx, Some(&saver))
+                        .await
+                }
             }
         };
         // Scope DestroyMode to this operation only. Requirement 1.6.
@@ -116,18 +122,27 @@ impl<D: Deployment> InfraEngine<D> {
         result
     }
 
-    pub async fn plan_destroy(&mut self, composition: &InfraComposition)
-        -> Result<Vec<Change>>
-    {
+    pub async fn plan_destroy(
+        &mut self,
+        composition: &InfraComposition,
+        selection: ModuleSelection,
+    ) -> Result<Vec<Change>> {
         let (state, _version) = self.state_store.load().await?;
         self.ctx.state = state;
         self.ctx.set_extension(DestroyMode);
-        let active: Vec<&str> = composition.active_modules.iter()
-            .map(|s| s.as_str()).collect();
-        // plan_destroy is new; added as part of this spec.
-        let result = self.engine
-            .plan_destroy(composition, &active, &mut self.ctx)
-            .await;
+        // plan_destroy is a new engine method added by this spec. It refreshes
+        // in-memory state (no saver, so no persisted writes) and computes the
+        // zero-desired change set, optionally filtered by active modules.
+        let result = match selection {
+            ModuleSelection::All => {
+                self.engine.plan_destroy(composition, &mut self.ctx).await
+            }
+            ModuleSelection::Modules(_) => {
+                self.engine
+                    .plan_destroy_for_modules(composition, &mut self.ctx)
+                    .await
+            }
+        };
         self.ctx.remove_extension::<DestroyMode>();
         result
     }
@@ -136,9 +151,12 @@ impl<D: Deployment> InfraEngine<D> {
 
 Apply and plan (non-destroy) do **not** register the marker and do **not** call `remove_extension`.
 
-This spec adds two new APIs to the generic engine:
-- `Engine::plan_destroy` — computes the Delete change set for the `known_modules` composition without mutating state.
+This spec adds three new APIs to the generic engine:
+- `Engine::plan_destroy(composition, ctx)` — computes the Delete change set over `known_modules` without mutating state or persisting prunes.
+- `Engine::plan_destroy_for_modules(composition, ctx)` — same as above but filtered by `composition.active_modules`.
 - `ProvisionContext::remove_extension<T>()` — removes a typed extension if present, returning `true` if it was removed.
+
+Neither `plan_destroy` method accepts a `StateSaver`. The contract below governs what refresh may persist during a read-only plan.
 
 ### InfraComposition Semantics
 
@@ -174,14 +192,14 @@ pub type StateSaver = Box<
 
 **Contract:**
 1. Called exactly once after each successful create, update, or delete operation.
-2. Called once per pruned resource during refresh (not once per refresh cycle).
+2. Called once per pruned resource during refresh **when a saver is provided**. `plan` and `plan_destroy` do not pass a saver; their refresh updates `ctx.state` in memory without persisting prunes. Requirement 2.5 applies to apply and destroy, not to read-only plans.
 3. If it returns `Err`, the engine aborts immediately and propagates the error.
 4. The engine MUST NOT batch multiple mutations before calling the saver.
 5. The saver sees the full current `InfraState` snapshot, not a delta.
 
 The contract is partially implemented in `apply_changes` and `destroy_changes`. This spec adds three behaviors the current implementation does not have:
 
-**Refresh prune save** — the current `refresh_state` calls the saver only when `has_managed_missing` is true, which is once per refresh cycle. Requirement 2.5 requires once per pruned resource. Implementation: call the saver inside the loop that removes resources when `describe()` returns `None`.
+**Refresh prune save** — the current `refresh_state` calls the saver only when `has_managed_missing` is true, which is once per refresh cycle. Requirement 2.5 requires once per pruned resource. Implementation: call the saver inside the loop that removes resources when `describe()` returns `None`. Plan paths (`plan`, `plan_for_modules`, `plan_destroy`, `plan_destroy_for_modules`) do not pass a saver, so refresh mutates `ctx.state` in memory only — no persisted writes occur during plan. Apply and destroy always pass a saver; every prune persists immediately.
 
 **CAS version tracking across saves** — the current orchestrator saver captures one `version: String` at load time and reuses it for every incremental save. The first save succeeds and returns a new ETag/version; the second save conflicts with the stale captured version. Implementation:
 
@@ -394,7 +412,25 @@ pub enum ProgressEvent {
 
 The counters are kept in `Arc<ActionCounters>` with atomic fields. The active spinner registry is `Arc<ActiveSpinners>` with a `Mutex<HashMap>` because closures are `Fn` and the map needs interior mutability to insert/remove entries.
 
+**Skipped derivation.** `skipped` counts plan entries that the engine did not act on — `ChangeKind::NoChange` entries surfaced by `compute_changes`. It does not come from a callback, because the engine does not invoke any lifecycle method for a NoChange entry. The CLI derives it from the plan returned by `engine.plan/apply/destroy`:
+
+```rust
+// apps/tkr/src/commands/infra.rs
+
+let changes = engine.apply(&composition).await?;
+let skipped = changes
+    .iter()
+    .filter(|c| matches!(c.kind, ChangeKind::NoChange))
+    .count();
+tui.record_skipped(skipped);
+tui.print_summary();
+```
+
+`ActionTuiHandle::record_skipped(n)` stores `n` in the `skipped` atomic counter. `completed` and `failed` come from the installed callbacks. This keeps the engine-level callback surface minimal and avoids inventing a start/complete event for operations that were never started.
+
 When stdout is not a terminal, the `Human` path stores `SpinnerEntry { bar: None }` and prints plain `eprintln!` lines on start and complete/fail. This preserves readability when output is piped.
+
+**Test-only injection seam.** `ActionTuiHandle::new(format)` reads `Term::stdout().is_term()` directly, which is not deterministic in unit tests. The design exposes an additional `pub(crate) fn with_terminal_detected(format: OutputFormat, is_terminal: bool) -> Self` constructor used by tests to force the terminal and non-terminal paths without relying on the test runner TTY. Production code uses `new(format)` exclusively.
 
 **Engine-level additions** — this spec adds three new progress callback methods to `ProvisionContext`:
 

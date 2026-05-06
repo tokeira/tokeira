@@ -18,8 +18,8 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
 
 ## Tasks
 
-- [ ] 1. Bootstrap `crates/dagger-client/`
-  - [ ] 1.1 Port the reference `dagger-client` implementation into the workspace
+- [x] 1. Bootstrap `crates/dagger-client/`
+  - [x] 1.1 Port the reference `dagger-client` implementation into the workspace
     - THE complete reference implementation is provided in [`reference/`](reference/) alongside a README covering port mechanics and what to change vs. what to leave untouched
     - Create `crates/dagger-client/Cargo.toml`, `crates/dagger-client/src/lib.rs`, and `crates/dagger-client/tests/quote_tests.rs` by copying `reference/Cargo.toml`, `reference/lib.rs`, and `reference/quote_tests.rs` respectively
     - Add `"crates/dagger-client"` to the workspace `[workspace.members]` list in the root `Cargo.toml`
@@ -28,7 +28,7 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Follow [`reference/README.md`](reference/README.md) for the full list of "do not change" items (query strings, `quote` helper, `container_op!` macro, `export_image` docker-load flow, 600s timeout)
     - _Requirements: 4.2_
 
-  - [ ]* 1.2 Write unit test for session env-var detection
+  - [x]* 1.2 Write unit test for session env-var detection
     - Unset `DAGGER_SESSION_PORT` and `DAGGER_SESSION_TOKEN`, assert `Client::from_env()` returns an error
     - Set both to dummy values, assert `Client::from_env()` succeeds (without making a request)
     - Test location: `crates/dagger-client/src/lib.rs` `#[cfg(test)]` module

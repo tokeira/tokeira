@@ -698,7 +698,35 @@ pub trait SecretRef: Send + Sync {}
 
 The default implementation (`DefaultDaggerClient`) wraps `dagger_client::Client`. Tests use `MockDaggerClient` from a `#[cfg(test)]` `testing` module that records call sequences.
 
-#### 4.3 `build_tokeirad_image`
+#### 4.3 Rationale: the 2026 Rust-server container pattern
+
+This section records why each layer of the container recipe was chosen, so future readers can evaluate changes against the original constraints.
+
+**Primary constraint: allocator throughput under contention.** `tokeirad` is a contended multi-threaded workload — per-run lanes, kernel dispatch, and projection workers all allocate heavily under load. Allocator throughput shows up in p99 latency, which is where the correctness story of authoritative transitions lives. glibc's ptmalloc handles concurrent allocation better than mutex-heavy alternatives; mimalloc (Req 3.3a) layered on top of glibc provides another step up for per-request allocation patterns. Image size, cold start, and bytes-on-disk are all secondary concerns.
+
+**Choices by dimension.**
+
+| Dimension | Choice | Why it matters for tokeirad |
+|---|---|---|
+| Allocator | glibc ptmalloc + mimalloc global override (Req 3.3a) | Per-run lane allocations sit on the hot path; allocator throughput drives p99 latency |
+| Build base | `rust:{toolchain}-slim-bookworm` (Debian slim, glibc) | Matches the runtime's glibc ABI; toolchain pinned by the workspace `rust-toolchain.toml` |
+| Runtime base | `cgr.dev/chainguard/glibc-dynamic:latest` | Distroless — no shell, no package manager — ships CA certs + tzdata + a `nonroot` user at UID 65532 |
+| Build cache | cargo-chef 5-stage pipeline | Dependency compile is a separate Docker layer, reused across source-only edits |
+| Release profile | `lto="fat"`, `codegen-units=1`, `strip="symbols"`, `panic="abort"` (Req 3.2.5) | Shrinks the binary, improves instruction-cache locality, removes unwind tables |
+| Binary strip | Explicit `strip` step after `cargo build` | Defence-in-depth for callers that override the release profile |
+| User | `nonroot` at UID 65532 (Req 3.2.9) | No privilege footprint in the runtime container |
+
+**Why not scratch or distroless-static?** Both require a fully static (musl) binary. Static musl uses a mutex-heavy allocator that degrades under contention — the exact failure mode the allocator choice above is designed to avoid. The ~10 MB image-size delta versus `cgr.dev/chainguard/glibc-dynamic` is irrelevant for a long-running service, while the per-request latency delta from the allocator change is measurable. For tokeirad, glibc dynamic is correct.
+
+**Why chainguard's `glibc-dynamic`?** It is distroless (no shell, no package manager) and ships with a `nonroot` user already at UID 65532, which matches the non-root-by-default posture mandated by Req 3.2.9 and avoids a `useradd` step in the runtime stage. The image tracks upstream glibc and tzdata / CA-certificates bundles and is published with signed SBOMs. Alternatives considered — `gcr.io/distroless/cc-debian12` and `debian:bookworm-slim` with a manual `useradd` — were rejected: the former ships with a `root` default and less-ergonomic tagging; the latter carries a full package manager that we do not need at runtime.
+
+**Why cargo-chef?** Warm-cache builds are dominated by dependency compilation. cargo-chef's 5-stage pipeline (chef base → planner → cacher → builder → runtime → export) caches the `cargo build --release --bin tokeirad` of dependencies as a separate Docker layer. Source-only edits reuse that layer, reducing a warm-cache build from the dependency-compile time (minutes) to the `tokeirad`-only compile time (seconds to tens of seconds).
+
+**Where the release profile fits.** The Cargo release profile (`lto = "fat"`, `codegen-units = 1`, `strip = "symbols"`, `panic = "abort"` — Req 3.2.5) and the global allocator registration (`mimalloc` — Req 3.3a) are binary-level concerns, not container-level concerns. They live in `apps/tokeirad/Cargo.toml` and `apps/tokeirad/src/main.rs`. The Dagger pipeline compiles whatever binary the workspace produces; the pipeline's explicit `strip` command after `cargo build` is defence-in-depth for callers that override the release profile.
+
+**Future evolution.** Profile-Guided Optimization (PGO) is deferred. It requires a representative workload to record a profile against, produces a ~10–25% performance lift on hot paths, and is worth revisiting at v0.2+ once a benchmark harness exists. mimalloc could be replaced by `jemalloc` or `tcmalloc`; mimalloc was chosen because it is the current default recommendation for Rust services with per-request allocation patterns and has the smallest integration surface (one line in `main.rs`).
+
+#### 4.4 `build_tokeirad_image`
 
 ```rust
 // crates/tokeira-build/src/pipelines/build.rs
@@ -814,15 +842,9 @@ pub fn build_tokeirad_image(
 }
 ```
 
-**Recipe summary.** Debian slim build base (glibc) → cargo-chef dependency layer → full build → strip → Chainguard glibc-dynamic runtime → export. This is the 2026 Rust-server pattern: glibc dynamic linking for allocator performance, distroless for attack surface, cargo-chef for build cache. If a future Build image has a different recipe, we add a sibling free function `build_<name>_image` with its own hardcoded steps.
+**Recipe summary.** Debian slim build base (glibc) → cargo-chef dependency layer → full build → strip → Chainguard `glibc-dynamic` runtime → export. See §4.3 for the rationale behind each layer. If a future Build image has a different recipe, we add a sibling free function `build_<name>_image` with its own hardcoded steps.
 
-**What the release profile contributes.** `Cargo.toml`'s release profile (specified by Req 3.2.5) layers `lto = "fat"`, `codegen-units = 1`, `strip = "symbols"`, `panic = "abort"` on top of the Dagger pipeline's compile step. Those are build-time instructions to the Rust compiler; the pipeline's explicit `strip` command after `cargo build` is defence-in-depth for binaries compiled elsewhere or with an unusual profile.
-
-**Why not scratch or distroless/static?** Both require a fully static (musl) binary, which reintroduces the musl allocator penalty we just paid to eliminate. The ~10 MB image-size delta between chainguard/glibc-dynamic and scratch is irrelevant for a long-running service; the per-request latency delta from the allocator change is measurable. For tokeirad, glibc dynamic is correct.
-
-**mimalloc.** The `tokeirad` binary registers `mimalloc` as its global allocator (see Req 3.3a). That is a binary-level concern — `apps/tokeirad/Cargo.toml` depends on `mimalloc`; `apps/tokeirad/src/main.rs` has `#[global_allocator] static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;`. The build pipeline here does not set the allocator — it just compiles the binary that does.
-
-#### 4.4 `publish_image`
+#### 4.5 `publish_image`
 
 ```rust
 // crates/tokeira-build/src/pipelines/publish.rs
@@ -888,7 +910,7 @@ pub fn publish_image(
 }
 ```
 
-#### 4.5 `mirror_image`
+#### 4.6 `mirror_image`
 
 ```rust
 // crates/tokeira-build/src/pipelines/mirror.rs

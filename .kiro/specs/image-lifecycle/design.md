@@ -703,6 +703,7 @@ The default implementation (`DefaultDaggerClient`) wraps `dagger_client::Client`
 ```rust
 // crates/tokeira-build/src/pipelines/build.rs
 
+#[derive(Debug, Clone)]
 pub struct TokeiradBuildRequest {
     pub arch: Arch,
     /// Optional additional tag to export alongside `:latest`.
@@ -711,6 +712,7 @@ pub struct TokeiradBuildRequest {
     pub workspace_root: PathBuf,
 }
 
+#[derive(Debug, Clone)]
 pub struct TokeiradBuildResult {
     pub image_name: String,      // always "tokeirad"
     pub tags: Vec<String>,       // ["tokeirad:latest"] or ["tokeirad:latest", "tokeirad:v1.2.3"]
@@ -783,18 +785,41 @@ The recipe (Rust toolchain → musl target → alpine runtime → non-root user 
 ```rust
 // crates/tokeira-build/src/pipelines/publish.rs
 
+/// Registry password. Wrapped in a newtype so `Debug` redacts the secret —
+/// critical because `PublishRequest` and `MirrorRequest` flow through
+/// `tracing` spans that would otherwise leak credentials into logs.
+#[derive(Clone)]
+pub struct RegistryPassword(String);
+
+impl RegistryPassword {
+    pub fn new(password: impl Into<String>) -> Self { Self(password.into()) }
+    pub fn expose(&self) -> &str { &self.0 }
+}
+
+impl std::fmt::Debug for RegistryPassword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the actual value — even at debug level. The only
+        // legitimate caller that needs the raw string is `DaggerClient::set_secret`,
+        // which goes through `expose()` explicitly.
+        f.write_str("RegistryPassword(***)")
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct PublishRequest {
     pub local_image: String,           // e.g. "tokeirad:latest"
     pub remote_refs: Vec<String>,      // ["{reg}/{repo}:latest", "{reg}/{repo}:v1.2.3"]
     pub registry_host: String,
     pub username: String,
-    pub password: String,
+    pub password: RegistryPassword,    // redacted in Debug — see RegistryPassword below
 }
 
+#[derive(Debug, Clone)]
 pub struct PublishResult {
     pub published: Vec<PublishedReference>,
 }
 
+#[derive(Debug, Clone)]
 pub struct PublishedReference {
     pub remote_ref: String,
     pub published_ref: String,  // digest-pinned
@@ -826,14 +851,16 @@ pub fn publish_image(
 ```rust
 // crates/tokeira-build/src/pipelines/mirror.rs
 
+#[derive(Debug, Clone)]
 pub struct MirrorRequest {
     pub source_ref: String,            // upstream ref
     pub remote_ref: String,            // destination ECR ref
     pub registry_host: String,
     pub username: String,
-    pub password: String,
+    pub password: RegistryPassword,    // redacted in Debug — see RegistryPassword below
 }
 
+#[derive(Debug, Clone)]
 pub struct MirroredReference {
     pub source_ref: String,
     pub remote_ref: String,
@@ -889,8 +916,19 @@ pub struct EcrRepository {
 }
 
 /// `ProvisionContext` extension wrapper registered by the orchestrator.
+/// `ProvisionContext` extension wrapper registered by the orchestrator.
+///
+/// Manual `Debug` impl because the inner `Arc<dyn EcrClient>` cannot derive
+/// `Debug` through the trait object. Outputs an opaque handle identifier
+/// rather than attempting to introspect the client.
 #[derive(Clone)]
 pub struct EcrClientHandle(pub Arc<dyn EcrClient>);
+
+impl std::fmt::Debug for EcrClientHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("EcrClientHandle").field(&"<dyn EcrClient>").finish()
+    }
+}
 
 impl EcrRepository {
     pub fn new(name: String, module: String) -> Result<Self, EcrError> {
@@ -1313,32 +1351,39 @@ async fn run_build(cmd: ImageCommand, format: OutputFormat) -> Result<()> {
 
 #### 10.2 `run_list`
 
-Dispatches on `deployment.platform()`:
+Dispatches on `deployment.platform_kind()`. Like every other image-context consumer, `run_list` populates the `ImageContext` through `Deployment::register_image_extensions` — the single canonical wiring path per Req 1.4.6:
 
 ```rust
-async fn run_list(deployment: &Deployment, cmd: ImageCommand, format: OutputFormat) -> Result<()> {
+async fn run_list<D: Deployment>(
+    deployment: &D,
+    config: &D::Config,
+    cmd: ImageCommand,
+    format: OutputFormat,
+) -> Result<()> {
     let ImageCommand::List { source_type } = cmd else { unreachable!() };
+
+    let mut ctx = deploy_engine::ImageContext::default();
+    deployment.register_image_extensions(config, &mut ctx).await?;
+
     let images = match deployment.platform_kind() {
-        PlatformKind::Compose => {
-            let ctx = build_compose_image_context(deployment)?;
-            platforms_compose::images::all(&ctx)?
-        }
-        PlatformKind::Ecs => {
-            let ctx = build_ecs_image_context(deployment)?;
-            platforms_ecs::images::all(&ctx)?
-        }
-        PlatformKind::Local => return Err(anyhow!("local platform has no image set")),
+        PlatformKind::Compose => platforms_compose::images::all(&ctx)?,
+        PlatformKind::Ecs     => platforms_ecs::images::all(&ctx)?,
+        PlatformKind::Local   => return Err(anyhow!("local platform has no image set")),
     };
+
     // Filter by source_type, render table or JSON.
+    // ...
 }
 ```
+
+No handler-local `build_*_image_context` helpers exist. Every path that needs an `ImageContext` calls `register_image_extensions` directly. This keeps `deploy apply` and `tkr image <subcommand>` on identical wiring (Req 1.4.6).
 
 #### 10.3 `run_push`
 
 ECS-only. Preflight-first ordering: verify local images exist before doing any AWS or Dagger work, so an operator who forgot to build pays only a `docker image inspect` round-trip to find out.
 
 1. Resolve the deployment's `EcsConfig`, build `ImageContext` via `register_image_extensions`, and call `platforms_ecs::images::all(ctx)` filtered to Build images (and to `--image` if set).
-2. **Preflight — local image store.** For every selected image, verify its local ref (today: `tokeirad:latest`) exists via `docker image inspect`. On absence, fail with the "run `tkr image build` first" message. Do NOT start Dagger, do NOT call `get_authorization_token`, do NOT call `ensure_ecr_repositories_from_images`. All AWS work is gated behind the preflight passing for every selected image.
+2. **Preflight — local image store.** For every selected image, verify its local ref (today: `tokeirad:latest`) exists via `inspector.image_exists(&ref).await?` where `inspector: &dyn LocalImageInspector` (see §12.2a). The production implementation wraps `docker image inspect`; tests substitute a mock. On absence, fail with the "run `tkr image build` first" message. Do NOT start Dagger, do NOT call `get_authorization_token`, do NOT call `ensure_ecr_repositories_from_images`. All AWS work is gated behind the preflight passing for every selected image.
 3. Re-exec under `dagger run` if needed; construct `DefaultDaggerClient::from_env()` and `DefaultEcrClient`.
 4. Call ECR `GetAuthorizationToken` once; decode the token.
 5. Build a `ProvisionContext` via the ECS platform's `register_infra_extensions` hook so `ctx.tags` is populated, then call `ensure_ecr_repositories_from_images(ecr, &provision_ctx, &selected_images, &image_ctx)` — the canonical helper that uses `ctx.resource_tags(&desired.repository)` per repo. Do NOT call `ensure_ecr_repositories` directly with a handwritten tag map; that would omit the per-resource `Name` tag and break adoption.
@@ -1493,6 +1538,47 @@ impl DockerImageInspector for BollardInspector {
 ```
 
 Unit tests substitute a `MockDockerImageInspector` that returns canned responses. No live Docker daemon required.
+
+#### 12.2a CLI-side local-image seam for `tkr image push`
+
+The push preflight (Req 6.4.3) needs the same "does image X exist locally?" capability the compose gate has, but from the CLI crate. To avoid coupling `apps/tkr` to `platforms/compose`, define a parallel trait in the CLI:
+
+```rust
+// apps/tkr/src/commands/image/local_inspector.rs
+
+#[async_trait::async_trait]
+pub trait LocalImageInspector: Send + Sync {
+    /// Return true if `image_ref` exists in the local Docker image store.
+    ///
+    /// Implementations SHALL return `Ok(false)` for a not-found condition
+    /// rather than an error, so the push handler can produce the
+    /// operator-facing "run `tkr image build` first" message instead of
+    /// an I/O error chain.
+    async fn image_exists(&self, image_ref: &str) -> anyhow::Result<bool>;
+}
+
+/// Production impl: shells out to `docker image inspect <ref>`. Exit code 0
+/// means present; non-zero with `No such image` means absent; other
+/// non-zero exits surface as errors.
+#[derive(Debug)]
+pub struct DockerCliInspector;
+
+#[async_trait::async_trait]
+impl LocalImageInspector for DockerCliInspector {
+    async fn image_exists(&self, image_ref: &str) -> anyhow::Result<bool> {
+        // tokio::process::Command::new("docker")
+        //     .args(["image", "inspect", image_ref])
+        //     .output().await
+        // — exit 0 ⇒ Ok(true); exit 1 with stderr containing "No such image" ⇒ Ok(false);
+        //   anything else ⇒ Err with the stderr content attached.
+        todo!()
+    }
+}
+```
+
+**Why not reuse `DockerImageInspector`?** The compose trait lives in `platforms/compose/src/gates.rs`, returns `ComposeError`, and the production impl wraps `bollard::Docker`. `apps/tkr` does not depend on `platforms/compose` or bollard today, and adding those dependencies for a two-line trait would be gratuitous coupling. Keeping `LocalImageInspector` CLI-local mirrors the existing pattern where each crate owns its testing seams (`DaggerClient`, `EcrClient`, `DockerImageInspector`).
+
+Unit tests substitute a `MockLocalImageInspector` that records calls and returns canned `Ok(bool)` / `Err(...)` responses. The critical test: with a mock returning `Ok(false)` for `tokeirad:latest`, `run_push` MUST return the "run `tkr image build` first" error WITHOUT constructing `DefaultDaggerClient`, calling `DefaultEcrClient::get_authorization_token`, or calling `ensure_ecr_repositories_from_images`. The mock's call log proves the gate short-circuits before any AWS or Dagger work begins.
 
 #### 12.3 Compose platform wiring
 

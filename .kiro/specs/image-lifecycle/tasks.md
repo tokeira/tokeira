@@ -169,6 +169,23 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - With `MockDaggerClient`, call `mirror_image(&request, &mock)`. Assert the recorded sequence: `set_secret`, `container_from(source_ref)`, `with_registry_auth(registry_host, username, _)`, `publish(remote_ref)`
     - With a mock that returns an error on `publish`, assert the returned error is `BuildError::Mirror` with the exact `source_ref` and `remote_ref` fields
 
+  - [ ] 3.13a Audit public API structs for `#[derive(Debug)]`
+    - AGENTS.md requires all public types to derive `Debug`. Sweep every public struct and enum introduced by this phase and confirm each carries `#[derive(Debug, ...)]` (or a manual impl when a field prevents the derive)
+    - Required derives this phase:
+      - `Arch` — `#[derive(Debug, Clone, Copy, PartialEq, Eq)]`
+      - `BuildError` — `#[derive(Debug, thiserror::Error)]`
+      - `TokeiradBuildRequest` — `#[derive(Debug, Clone)]`
+      - `TokeiradBuildResult` — `#[derive(Debug, Clone)]`
+      - `PublishRequest` — `#[derive(Debug, Clone)]` (safe because `password` is `RegistryPassword` with a masked `Debug` impl, not a raw `String`)
+      - `PublishResult` — `#[derive(Debug, Clone)]`
+      - `PublishedReference` — `#[derive(Debug, Clone)]`
+      - `MirrorRequest` — `#[derive(Debug, Clone)]` (same `RegistryPassword` reasoning)
+      - `MirroredReference` — `#[derive(Debug, Clone)]`
+      - `RegistryPassword` — manual `Debug` that prints `"RegistryPassword(***)"`, never the cleartext
+      - `DaggerClient`, `ContainerRef`, `DirectoryRef`, `FileRef`, `SecretRef` — trait objects, not structs; the trait itself adds no `Debug` bound because implementors vary
+    - Secret fields (registry passwords, tokens) MUST go through `RegistryPassword` or an equivalent masking newtype; no struct derives `Debug` while holding a raw `String` password field
+    - _Requirements: AGENTS.md "Rust Standards" §1 (`All public types derive Debug`)_
+
   - [ ] 3.14 Checkpoint — pipelines compile and mock-backed tests pass
     - Run `cargo lint`, `cargo check --workspace`, `cargo test -p tokeira-build`
 
@@ -389,6 +406,14 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Assert the module's resource list contains one `EcrRepository` per image in `platforms_ecs::images::all(ctx)`, with repository names matching `desired_ref(ctx)?.repository` exactly
     - Test location: `platforms/ecs/src/modules/images.rs` `#[cfg(test)]` module
 
+  - [ ] 7.13a Audit `tokeira-aws` public API structs for `#[derive(Debug)]`
+    - Sweep every public struct/enum introduced by this phase and confirm each carries `#[derive(Debug, ...)]` or a manual `Debug` impl:
+      - `EcrRepository` — `#[derive(Debug, Clone, Serialize, Deserialize)]`
+      - `EcrClientHandle` — wraps `Arc<dyn EcrClient>` which cannot derive `Debug` through the trait object. Provide a MANUAL impl: `impl std::fmt::Debug for EcrClientHandle { fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result { f.debug_tuple("EcrClientHandle").field(&"<dyn EcrClient>").finish() } }`
+      - `EcrAuthorization`, `RepositoryDescription`, `ImageTagMutability`, `EcrError` — all derive `Debug`
+      - `EcrClient` trait — no `Debug` bound (implementors vary)
+    - _Requirements: AGENTS.md "Rust Standards" §1 (`All public types derive Debug`)_
+
   - [ ] 7.14 Checkpoint — ECR resource, module, and extensions compile
     - Run `cargo lint`, `cargo check --workspace`, `cargo test -p tokeira-aws -p tokeira-ecs-deployment`
 
@@ -441,11 +466,25 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Local platform: return an error stating local has no image set
     - _Requirements: 6.2, 1.4.6_
 
+  - [ ] 9.2a Implement the `LocalImageInspector` trait and `DockerCliInspector` in `apps/tkr`
+    - Create `apps/tkr/src/commands/image/local_inspector.rs` with `#[async_trait::async_trait] pub trait LocalImageInspector: Send + Sync { async fn image_exists(&self, image_ref: &str) -> anyhow::Result<bool>; }`
+    - Define `#[derive(Debug)] pub struct DockerCliInspector;` implementing the trait by shelling out to `docker image inspect <ref>` via `tokio::process::Command`. Exit 0 ⇒ `Ok(true)`; exit non-zero with `stderr.contains("No such image")` ⇒ `Ok(false)`; anything else ⇒ `Err` with stderr attached via `anyhow::Context`
+    - Provide a `#[cfg(test)] pub struct MockLocalImageInspector` that records calls and returns canned `Ok(bool)` / `Err(...)` responses
+    - Do NOT take a dependency on bollard — shelling out to `docker` keeps `apps/tkr` slim and matches how operators invoke Docker on their workstation
+    - Do NOT reuse `platforms::compose::gates::DockerImageInspector` — that trait returns `ComposeError` and lives in a crate `apps/tkr` does not depend on
+    - _Requirements: 6.4.3_
+
+  - [ ] 9.3a Implement the `--image <name>` validation helper
+    - In `apps/tkr/src/commands/image.rs`, add `fn validate_image_filter(filter: Option<&str>, images: &[Box<dyn Image>], source: ImageSourceType) -> anyhow::Result<Vec<&Box<dyn Image>>>`
+    - When `filter` is `None`, return every image in `images` whose `source_type() == source`
+    - When `filter` is `Some(name)`, search `images` for one with `name()` matching `name` AND `source_type() == source`; if found return a single-element `Vec`; if not found, return `Err(anyhow!("unknown {source:?} image '{name}'; valid {source:?} images are: {}", valid_names.join(", ")))` where `valid_names` is the sorted list of `name()` values for images whose `source_type() == source`
+    - `run_push` and `run_mirror` both call this helper before their preflight / Dagger work
+    - _Requirements: 6.4.8, 6.5.8_
   - [ ] 9.4 Implement `run_push` — ECS-only, preflight-first ordering, uses `register_image_extensions` + `ensure_ecr_repositories_from_images`
     - For `Push { tag, image, yes }`: require `--deployment`, confirm per `tkr-cli` rules, reject non-ECS platforms with a descriptive error
     - Build `ImageContext` via `deployment.register_image_extensions(config, &mut ctx).await?` (NOT a handler-local `build_ecs_image_context`)
-    - Call `tokeira_ecs_deployment::images::all(&image_ctx)`, filter to Build images (and to `--image name` if set)
-    - **Preflight FIRST — local image store check.** For every selected image, verify its local ref (today: `tokeirad:latest`) exists via `docker image inspect`. On absence, fail immediately with the "run `tkr image build` first" message. Do NOT re-exec under `dagger run`, do NOT construct `DefaultDaggerClient`, do NOT construct `DefaultEcrClient`, do NOT call `get_authorization_token`, do NOT call `ensure_ecr_repositories_from_images`. The preflight gate MUST pass for every selected image before any AWS or Dagger work begins — this keeps the cheap-error path cheap when the operator forgot the build step
+    - Call `tokeira_ecs_deployment::images::all(&image_ctx)`, then pass the result through `validate_image_filter(image.as_deref(), &images, ImageSourceType::Build)?` from task 9.3a. This handles both the filter-matches-nothing case (returns an operator-facing `unknown Build image '<name>'` error) and the no-filter case (returns all Build images)
+    - **Preflight FIRST — local image store check.** Construct an `inspector: &dyn LocalImageInspector` (production: `DockerCliInspector`; tests: `MockLocalImageInspector`). For every selected image, call `inspector.image_exists(&ref).await?` and fail with the "run `tkr image build` first" message on `Ok(false)`. Do NOT re-exec under `dagger run`, do NOT construct `DefaultDaggerClient`, do NOT construct `DefaultEcrClient`, do NOT call `get_authorization_token`, do NOT call `ensure_ecr_repositories_from_images`. The preflight gate MUST pass for every selected image before any AWS or Dagger work begins — this keeps the cheap-error path cheap when the operator forgot the build step
     - ONLY after preflight passes: build a `ProvisionContext` via the ECS platform's `register_infra_extensions` hook so its `tags` map is populated (same code path `tkr infra apply` uses)
     - Re-exec under `dagger run` if needed; construct `DefaultDaggerClient::from_env()`, construct `DefaultEcrClient`, call `get_authorization_token` once, decode
     - Ensure repos ONCE for the entire selected image set: `platforms_ecs::images::ensure_ecr_repositories_from_images(&ecr, &provision_ctx, &selected_images, &image_ctx).await?`. Do NOT construct `(repository, tags)` pairs inline — that duplicates logic and risks tag drift
@@ -454,13 +493,13 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Collect writebacks: for each image, for each `WritebackTarget` in `image.writeback_targets(&image_ctx)`, push `(target.field, effective_ref)` where `effective_ref` is the version-tagged `{reg}/{repo}:{tag}` when `tag != "latest"` and the single `{reg}/{repo}:latest` ref otherwise
     - Call `tokeira_iac::write_config_values(&deployment_path.join(DEPLOYMENT_TOML), &borrowed)` once with the full writeback list — the platform config file, NOT `tokeirad.toml`
     - Emit progress events and `--json` summary. The `published` array SHALL have exactly the length of the deduped `remote_refs` list
-    - _Requirements: 6.4, 7.2, 7.3.4, 1.4.6_
+    - _Requirements: 6.4, 7.2, 7.3.4, 1.4.6, 6.4.3, 6.4.8_
 
   - [ ] 9.5 Implement `run_mirror` — ECS-only, uses `register_image_extensions` + `ensure_ecr_repositories_from_images`
     - For `Mirror { image, yes }`: require `--deployment`, confirm per `tkr-cli` rules, reject non-ECS platforms
     - Build `ImageContext` via `deployment.register_image_extensions(config, &mut ctx).await?`
     - Build `ProvisionContext` via the ECS platform's `register_infra_extensions` hook
-    - Call `tokeira_ecs_deployment::images::all(&image_ctx)`, filter to Mirror images (and to `--image name` if set)
+    - Call `tokeira_ecs_deployment::images::all(&image_ctx)`, then pass the result through `validate_image_filter(image.as_deref(), &images, ImageSourceType::Mirror)?` from task 9.3a. The filter-matches-nothing case returns an operator-facing `unknown Mirror image '<name>'` error
     - Re-exec under `dagger run` if needed; construct `DefaultDaggerClient`, `DefaultEcrClient`, get auth token
     - Ensure repos ONCE via `ensure_ecr_repositories_from_images(&ecr, &provision_ctx, &selected_images, &image_ctx).await?` — same canonical helper as push
     - For each selected image: resolve `desired_ref`, compute `destination_ref = format!("{reg}/{repo}:{tag}")`
@@ -469,7 +508,7 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Collect writebacks: for each image (including skipped ones), for each `WritebackTarget`, push `(target.field, destination_ref.clone())`
     - Call `tokeira_iac::write_config_values(&deployment_path.join(DEPLOYMENT_TOML), &borrowed)` once — the platform config file, NOT `tokeirad.toml`
     - Emit progress events and `--json` summary
-    - _Requirements: 6.5, 7.2, 7.3.4, 1.4.6_
+    - _Requirements: 6.5, 7.2, 7.3.4, 1.4.6, 6.5.8_
 
   - [ ] 9.6 Wire the `image` command into `apps/tkr/src/main.rs`
     - Add a `Command::Image(args) => commands::image::run(args.command, deployment_for_subcommand, format).await?` arm
@@ -482,6 +521,21 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - `tkr image push`: default (`tag=latest`); `--tag v2026-03-21 --yes`; `--image tokeirad`; assert `--deployment` IS required
     - `tkr image mirror`: default; `--image grafana-mimir`; `--yes`; assert `--deployment` IS required
     - Test location: `apps/tkr/src/commands/image.rs` `#[cfg(test)]` module
+
+  - [ ]* 9.7a Write unit tests for `--image` filter validation
+    - With a fresh `MockEcrClient` and `MockDaggerClient`, call `run_push` and `run_mirror` with `--image tokierad` (typo). Assert the call returns an error containing `unknown Build image 'tokierad'` (or `Mirror` for mirror) AND the mocks recorded ZERO calls — validation must run before any AWS or Dagger work
+    - Positive case: `--image tokeirad` matches and executes normally
+    - _Requirements: 6.4.8, 6.5.8_
+
+  - [ ]* 9.7b Write unit test for the push preflight short-circuit
+    - Build a `MockLocalImageInspector` that returns `Ok(false)` for `tokeirad:latest`. Wire it into a test harness that substitutes all external clients with mocks
+    - Call `run_push` on a valid ECS deployment with no `--image` filter. Assert:
+      - The returned error contains `tokeirad:latest` and `tkr image build`
+      - The `MockLocalImageInspector` recorded exactly one `image_exists("tokeirad:latest")` call
+      - The `MockDaggerClient` was NEVER constructed (the handler stopped before `DefaultDaggerClient::from_env()`)
+      - The `MockEcrClient` recorded ZERO calls (no `get_authorization_token`, no `ensure_ecr_repository_from_images`, no `publish`)
+    - This test is the regression guard for Req 6.4.3 preflight-first ordering
+    - _Requirements: 6.4.3_
 
   - [ ]* 9.8 Write property test for mirror idempotence (Property 3)
     - **Property 3: Mirror Idempotence**

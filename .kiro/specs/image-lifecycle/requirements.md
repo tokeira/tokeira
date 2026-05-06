@@ -451,6 +451,7 @@ The design follows a clean separation between **image resolution** (what ref doe
    - When `<value> == "latest"` (the default), the version-tagged ref is IDENTICAL to the `:latest` ref. In this case the list SHALL contain exactly ONE entry — no deduplicated-against-itself double push. This mirrors the build pipeline's tag-dedup rule in Req 3.2.8.
 6. THE subcommand SHALL perform Image_Writeback: for each Build image, for each `WritebackTarget` in `image.writeback_targets(ctx)`, write the remote ref into the target's dotted key via `tokeira_iac::write_config_values` (Req 7.3). When `--tag <value>` with `<value> != "latest"` was supplied, the ref written back is `{registry}/{desired.repository}:{value}` (the version-tagged ref). When `<value> == "latest"` (the default), the ref written back is `{registry}/{desired.repository}:latest` (the sole ref that was published).
 7. WHEN the operator passes `--json`, THE subcommand SHALL emit JSON progress events plus a final summary event. The `published` array SHALL contain one entry per distinct ref actually pushed — never two entries for the same ref.
+8. WHEN `--image <name>` is supplied and no Build image in the platform's image set has a `name()` matching `<name>`, THE subcommand SHALL return an operator-facing error listing the valid Build image names: `unknown Build image '<name>'; valid Build images are: <sorted comma-separated list>`. This validation SHALL run AFTER the image-set enumeration in 6.4 but BEFORE the local preflight in 6.4.3 — a typo like `--image tokierad` must not silently match nothing and appear successful.
 
 ### Requirement 6.5: `mirror` subcommand
 
@@ -468,6 +469,7 @@ The design follows a clean separation between **image resolution** (what ref doe
 5. THE subcommand SHALL be idempotent. FOR ALL invocations with the same deployment, calling `tkr image mirror` twice in a row SHALL succeed both times and SHALL leave the same set of config keys populated with the same values after the second invocation.
 6. WHEN a source field in `deployment.toml` already points to the corresponding project-scoped destination, THE subcommand SHALL treat that image as already-mirrored and SHALL skip the pull/push. The skip SHALL be reported in the summary.
 7. WHEN the operator passes `--json`, THE subcommand SHALL emit JSON progress events plus a final summary event.
+8. WHEN `--image <name>` is supplied and no Mirror image in the platform's image set has a `name()` matching `<name>`, THE subcommand SHALL return an operator-facing error listing the valid Mirror image names: `unknown Mirror image '<name>'; valid Mirror images are: <sorted comma-separated list>`. This validation SHALL run AFTER the image-set enumeration but BEFORE any repository-ensure or Dagger work — a typo must not silently match nothing and appear successful.
 
 ### Requirement 6.6: Confirmation prompts
 

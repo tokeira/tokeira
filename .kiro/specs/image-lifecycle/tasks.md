@@ -94,7 +94,7 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
 
   - [ ] 3.2 Define `BuildError` and `Arch`
     - In `crates/tokeira-build/src/error.rs`, define `pub enum BuildError` with variants: `ToolchainFile`, `ToolchainParse`, `UnsupportedArch`, `DaggerMissing`, `Publish`, `Mirror`, `UpstreamAuth`, `Validation`
-    - In `crates/tokeira-build/src/arch.rs`, define `pub enum Arch { Arm64, Amd64 }` with methods `rust_target() -> &'static str` (`aarch64-unknown-linux-musl` / `x86_64-unknown-linux-musl`), `platform() -> &'static str` (`linux/arm64` / `linux/amd64`), and `FromStr` that maps unknown strings to `BuildError::UnsupportedArch`
+    - In `crates/tokeira-build/src/arch.rs`, define `pub enum Arch { Arm64, Amd64 }` with methods `rust_target() -> &'static str` (`aarch64-unknown-linux-gnu` / `x86_64-unknown-linux-gnu` — glibc gnu targets, NOT musl; see Req 3.2.3 for rationale), `platform() -> &'static str` (`linux/arm64` / `linux/amd64`), and `FromStr` that maps unknown strings to `BuildError::UnsupportedArch`
     - All public types derive `Debug`. Serializable types derive `Serialize, Deserialize`
     - _Requirements: 3.1, 3.3_
 
@@ -126,18 +126,55 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Map I/O errors to `BuildError::ToolchainFile`; map parse errors to `BuildError::ToolchainParse`
     - _Requirements: 3.2_
 
-  - [ ] 3.8 Implement `build_tokeirad_image`
+  - [ ] 3.8 Implement `build_tokeirad_image` using the 2026 Rust-server pattern
     - Create `crates/tokeira-build/src/pipelines/build.rs`
-    - Define `pub struct TokeiradBuildRequest { arch: Arch, tag: Option<String>, workspace_root: PathBuf }` and `pub struct TokeiradBuildResult { image_name: String, tags: Vec<String>, arch: Arch, toolchain_version: String }`
+    - Define `pub struct TokeiradBuildRequest { arch: Arch, tag: Option<String>, workspace_root: PathBuf }` deriving `#[derive(Debug, Clone)]`, and `pub struct TokeiradBuildResult { image_name: String, tags: Vec<String>, arch: Arch, toolchain_version: String }` deriving `#[derive(Debug, Clone)]`
     - Define `pub fn build_tokeirad_image(request: &TokeiradBuildRequest, dagger: &dyn DaggerClient) -> Result<TokeiradBuildResult, BuildError>`
-    - Recipe is hardcoded: resolve toolchain from `rust-toolchain.toml`, `container_from("rust:{toolchain}-alpine")`, install musl-dev/openssl-dev/pkgconfig/protobuf-dev/protoc, mount workspace at `/src`, `rustup target add <arch-target>`, `cargo build --release --target <arch-target> --bin tokeirad -p tokeirad`, extract binary, build runtime on `alpine:3.23`, install ca-certificates + tzdata, create uid/gid 1000 `tokeirad` user/group, copy binary to `/usr/local/bin/tokeirad`, `with_user("tokeirad")`, `with_entrypoint(["/usr/local/bin/tokeirad"])`
+    - Recipe is hardcoded. Reference the design.md §4.3 code block for the exact container operations. Summary:
+      - **Chef base** (`rust:{toolchain}-slim-bookworm`): Debian slim with `pkg-config`, `libssl-dev`, `protobuf-compiler`, `ca-certificates` installed via `apt-get`. Then `cargo install cargo-chef --locked`. Then `rustup target add <arch-target>`. glibc gnu target, NOT musl
+      - **Planner stage**: copy workspace, run `cargo chef prepare --recipe-path recipe.json`
+      - **Cacher stage**: copy `recipe.json` onto the chef base, run `cargo chef cook --release --target <arch> --bin tokeirad --recipe-path recipe.json`. This produces the dependency-cache layer
+      - **Builder stage**: copy full workspace on top of the cacher, run `cargo build --release --target <arch> --bin tokeirad -p tokeirad`, then `strip /app/target/<arch>/release/tokeirad`, extract binary
+      - **Runtime** (`cgr.dev/chainguard/glibc-dynamic:latest`): copy binary to `/usr/local/bin/tokeirad`, `with_user("nonroot")` (UID 65532 provided by the base image), `with_entrypoint(["/usr/local/bin/tokeirad"])`. NO user creation, NO apk/apt-get. CA certificates and tzdata are provided by the chainguard base
     - Always export `tokeirad:latest`. When `request.tag` is `Some(t)` with `t != "latest"`, additionally export `tokeirad:{t}` from the same container handle
-    - _Requirements: 3.2_
+    - _Requirements: 3.2, 3.3, 3.3a_
+
+  - [ ] 3.8a Configure the release profile in the root `Cargo.toml`
+    - Add (or update) `[profile.release]` in the root workspace `Cargo.toml`:
+      ```toml
+      [profile.release]
+      lto = "fat"
+      codegen-units = 1
+      strip = "symbols"
+      panic = "abort"
+      ```
+    - Rationale is captured in Req 3.2.5: LTO + single codegen unit for throughput, strip + panic=abort for binary size and cold start. `panic = "abort"` is safe because tokeirad always restarts on panic under compose/ECS
+    - Audit existing tests for any that rely on catching panics via `std::panic::catch_unwind` — `panic = "abort"` makes that non-functional in release builds. If found, either gate the tests behind `cfg(debug_assertions)` or restructure them to use `Result` instead of panics for the error condition
+    - _Requirements: 3.2.5_
+
+  - [ ] 3.8b Register `mimalloc` as the global allocator in the `tokeirad` binary
+    - Add `mimalloc = { version = "...", default-features = false }` to the workspace `[workspace.dependencies]` section. Pin to the latest stable (check https://crates.io/crates/mimalloc at implementation time)
+    - Add `mimalloc.workspace = true` to `apps/tokeirad/Cargo.toml` `[dependencies]`
+    - In `apps/tokeirad/src/main.rs`, at the top of the file (after module-level docs, before `use` statements), add:
+      ```rust
+      #[global_allocator]
+      static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+      ```
+    - `default-features = false` excludes the secure-heap feature, which adds overhead we don't need for a server that runs in a controlled environment
+    - _Requirements: 3.3a_
+
+  - [ ] 3.8c Revise the existing implementation in `crates/tokeira-build/`
+    - The existing implementation (committed at Phase 3 partial) uses the alpine+musl pattern. The updated spec (Req 3.2, 3.3) mandates the 2026 glibc+chainguard+cargo-chef pattern
+    - Update `crates/tokeira-build/src/arch.rs` to return `aarch64-unknown-linux-gnu` / `x86_64-unknown-linux-gnu` from `rust_target()` — NOT the musl variants
+    - Update `crates/tokeira-build/src/pipelines/build.rs` to use the chef-based pipeline from task 3.8. Remove the existing alpine base, apk installations, and manual user creation
+    - The existing proptest for `Arch::from_str` continues to pass (it tests the enum's string mapping, not the target triples returned by `rust_target()`), but add a new assertion that `Arch::Arm64.rust_target() == "aarch64-unknown-linux-gnu"` and the same for amd64
+    - _Requirements: 3.2, 3.3_
 
   - [ ]* 3.9 Write unit test for `build_tokeirad_image` invocation sequence
-    - With `MockDaggerClient`, call `build_tokeirad_image(&request_arm64_no_tag, &mock)`. Assert the recorded call sequence includes, in order: `container_from("rust:{toolchain}-alpine")`, musl/protoc apk install, `rustup target add aarch64-unknown-linux-musl`, `cargo build --release --target aarch64-unknown-linux-musl --bin tokeirad -p tokeirad`, `container_from("alpine:3.23")`, `with_user("tokeirad")`, `with_entrypoint(["/usr/local/bin/tokeirad"])`, `export_image("tokeirad:latest")` — and only that one export
+    - With `MockDaggerClient`, call `build_tokeirad_image(&request_arm64_no_tag, &mock)`. Assert the recorded call sequence includes, in order: `container_from("rust:{toolchain}-slim-bookworm")`, `apt-get install` for `pkg-config libssl-dev protobuf-compiler ca-certificates`, `cargo install cargo-chef --locked`, `rustup target add aarch64-unknown-linux-gnu`, `cargo chef prepare`, `cargo chef cook --release --target aarch64-unknown-linux-gnu --bin tokeirad`, `cargo build --release --target aarch64-unknown-linux-gnu --bin tokeirad -p tokeirad`, `strip /app/target/aarch64-unknown-linux-gnu/release/tokeirad`, `container_from("cgr.dev/chainguard/glibc-dynamic:latest")`, `with_user("nonroot")`, `with_entrypoint(["/usr/local/bin/tokeirad"])`, `export_image("tokeirad:latest")` — and only that one export
     - Second test: with `tag = Some("v1.2.3")`, assert the additional `export_image("tokeirad:v1.2.3")` appears after the `:latest` export
-    - Third test: with `arch = Amd64`, assert target triple is `x86_64-unknown-linux-musl`
+    - Third test: with `arch = Amd64`, assert target triple is `x86_64-unknown-linux-gnu` (gnu, NOT musl)
+    - Fourth test: assert the sequence does NOT include any `apk` command (no alpine), does NOT include any `addgroup`/`adduser` command (nonroot user comes from the chainguard base image), and does NOT include `container_from("alpine:..)`
 
   - [ ] 3.10 Implement `publish_image`
     - Create `crates/tokeira-build/src/pipelines/publish.rs`

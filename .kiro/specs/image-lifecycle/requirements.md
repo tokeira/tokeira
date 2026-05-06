@@ -232,29 +232,48 @@ The design follows a clean separation between **image resolution** (what ref doe
 
 ### Requirement 3.2: Reproducible tokeirad image build
 
-**User Story:** As a Tokeira operator, I want `tokeirad` image builds to be reproducible across hosts and invocations, so that the same source tree produces functionally equivalent images every time.
+**User Story:** As a Tokeira operator, I want `tokeirad` image builds to be reproducible across hosts and invocations, and I want the resulting image to give the runtime the best possible performance envelope (allocator, linker, base-image security), so that the same source tree produces functionally equivalent images every time and the production runtime does not pay a container-tax for our choice of base image.
 
 #### Acceptance Criteria
 
 1. `build_tokeirad_image` SHALL drive the build through a Dagger pipeline rather than invoking `docker build` directly.
 2. THE Dagger pipeline SHALL resolve the Rust toolchain version from `rust-toolchain.toml` at the workspace root and SHALL pin the build container's Rust version to that value.
-3. THE Dagger pipeline SHALL build the `tokeirad` binary with `cargo build --release --bin tokeirad --target <target-triple>` using the Target_Architecture supplied in the build request.
-4. THE resulting container image SHALL contain exactly one application binary (`/usr/local/bin/tokeirad`) and the minimal runtime dependencies required to execute it (CA certificates, timezone data).
-5. THE resulting container image SHALL run as a non-root user (UID/GID 1000) with `tokeirad` as both the username and group name.
-6. THE resulting container image SHALL declare `ENTRYPOINT ["/usr/local/bin/tokeirad"]` and SHALL leave CMD empty by default.
-7. FOR ALL invocations of `build_tokeirad_image` on the same source tree, same `rust-toolchain.toml`, and same Target_Architecture, the produced application binary layer SHALL be bit-identical.
-8. EVERY successful build SHALL export `tokeirad:latest` regardless of the value of `--tag`. When `--tag <value>` is supplied (and `<value> != "latest"`), the pipeline SHALL additionally export `tokeirad:<value>`, pointing at the same digest.
+3. THE Dagger pipeline SHALL use `rust:{toolchain}-slim-bookworm` as the build base image (a glibc-based Debian Bookworm slim variant). Alpine-based build images (musl) SHALL NOT be used — musl's malloc is meaningfully slower than glibc for tokio-heavy Rust services under the allocation patterns tokeirad produces (DSQL connection reservoir churn, workflow state serialization, history batch decoding).
+4. THE Dagger pipeline SHALL build the `tokeirad` binary with `cargo build --release --bin tokeirad --target <target-triple>` using the Target_Architecture supplied in the build request. Target triples are glibc gnu variants, not musl — see Req 3.3.3.
+5. THE `Cargo.toml` release profile used for this build SHALL specify: `lto = "fat"`, `codegen-units = 1`, `strip = "symbols"`, `panic = "abort"`. These are standard release-profile settings for a long-running server: they reduce binary size by ~40% (strip + panic=abort), produce faster code paths (LTO + single codegen unit), and remove unwinding overhead (panic=abort — safe because tokeirad always restarts on panic under compose/ECS).
+6. THE Dagger pipeline SHALL use `cargo-chef` to separate dependency compilation from application compilation. Stage order:
+   - Stage 1: Planner — copies source and produces `recipe.json` via `cargo chef prepare`.
+   - Stage 2: Cacher — copies the recipe, runs `cargo chef cook --release --bin tokeirad --recipe-path recipe.json`. This compiles only the dependency graph and produces a cacheable layer.
+   - Stage 3: Builder — copies the cacher's `target/` and `/usr/local/cargo/registry/`, copies the full source, runs `cargo build --release --bin tokeirad --target <target-triple>`, then strips the resulting binary.
+   This layering SHALL cache the dependency build across commits unless `Cargo.lock` changes, reducing warm-cache CI rebuilds by an order of magnitude.
+7. THE runtime base image SHALL be `cgr.dev/chainguard/glibc-dynamic:latest` — a minimal distroless glibc base with no shell, no package manager, and a pre-configured non-root user (`nonroot` at UID 65532). This gives a 2026-standard attack surface (Chainguard tracks CVEs with a vendor SLA for zero known CVEs at release time) without the allocator penalty of alpine or the bulk of bookworm-slim.
+8. THE runtime image SHALL contain exactly one application binary (`/usr/local/bin/tokeirad`) plus CA certificates and timezone data. Chainguard's `glibc-dynamic` image ships CA certificates and tzdata by default; no additional packages SHALL be installed.
+9. THE runtime image SHALL run as the `nonroot` user (UID 65532, provided by the Chainguard base image). The Dagger pipeline SHALL NOT manually create a `tokeirad` user — reusing the base image's `nonroot` is simpler, more secure, and matches 2026 industry practice for distroless Rust images.
+10. THE runtime image SHALL declare `ENTRYPOINT ["/usr/local/bin/tokeirad"]` and SHALL leave CMD empty by default.
+11. FOR ALL invocations of `build_tokeirad_image` on the same source tree, same `rust-toolchain.toml`, same `Cargo.lock`, and same Target_Architecture, the produced application binary layer SHALL be bit-identical.
+12. EVERY successful build SHALL export `tokeirad:latest` regardless of the value of `--tag`. When `--tag <value>` is supplied (and `<value> != "latest"`), the pipeline SHALL additionally export `tokeirad:<value>`, pointing at the same digest.
 
 ### Requirement 3.3: Target architecture support
 
-**User Story:** As a Tokeira operator, I want to build `arm64` images by default with an opt-in for `amd64`, so that the same workflow serves Graviton4 ECS hosts, Apple Silicon compose users, and x86 Intel hosts.
+**User Story:** As a Tokeira operator, I want to build `arm64` images by default with an opt-in for `amd64`, so that the same workflow serves Graviton4 ECS hosts, Apple Silicon compose users, and x86 Intel hosts — using glibc dynamic linking for both.
 
 #### Acceptance Criteria
 
 1. THE `TokeiradBuildRequest` SHALL include `arch: Arch` where `pub enum Arch { Arm64, Amd64 }`.
 2. `Arch` SHALL implement `FromStr` with an error type of `BuildError::UnsupportedArch { supplied: String }`. Valid strings SHALL be `"arm64"` and `"amd64"`; any other string returns the error.
-3. WHEN `arch = Arm64`, THE Dagger pipeline SHALL use target triple `aarch64-unknown-linux-musl`. WHEN `arch = Amd64`, the pipeline SHALL use `x86_64-unknown-linux-musl`.
-4. THE produced image's manifest SHALL declare the platform (`linux/arm64` or `linux/amd64`) matching the Target_Architecture.
+3. WHEN `arch = Arm64`, THE Dagger pipeline SHALL use target triple `aarch64-unknown-linux-gnu`. WHEN `arch = Amd64`, the pipeline SHALL use `x86_64-unknown-linux-gnu`. Both are glibc gnu targets. The `musl` targets (`*-unknown-linux-musl`) SHALL NOT be used — see Req 3.2.3 for the rationale.
+4. THE `cgr.dev/chainguard/glibc-dynamic:latest` runtime image is multi-arch (provides both `linux/arm64` and `linux/amd64` variants under the same tag). THE produced image's manifest SHALL declare the platform (`linux/arm64` or `linux/amd64`) matching the Target_Architecture.
+
+### Requirement 3.3a: Allocator and runtime-perf tuning
+
+**User Story:** As a Tokeira operator, I want the runtime binary to use a performance-tuned memory allocator, so that tokio-heavy allocation patterns (DSQL connection pool, workflow state churn) do not pay the default glibc `malloc` cost under concurrent load.
+
+#### Acceptance Criteria
+
+1. THE `tokeirad` binary SHALL register `mimalloc` as the global allocator. This SHALL be done in `apps/tokeirad/src/main.rs` via `#[global_allocator] static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;`.
+2. THE `mimalloc` dependency SHALL be added to `apps/tokeirad/Cargo.toml` at a workspace-pinned version, with `default-features = false` to exclude the secure-heap feature (which adds overhead not needed for a server that runs in a controlled environment).
+3. Rationale: on allocation-heavy Rust services (tokio runtimes with heavy channel/task churn + DSQL reservoir creating connection state) mimalloc gives a consistent 10–20% p99 latency reduction vs default glibc malloc. For tokeirad, this is cheap to adopt (one-line change at the binary entry point) and pays back in sustained production load.
+4. Profile-Guided Optimization (PGO) SHALL NOT be required by this spec. PGO is worth revisiting once the hot path stabilises (v0.2+), at which point it can be added as a follow-up optimisation to `build_tokeirad_image`.
 
 ### Requirement 3.4: Publish operation
 

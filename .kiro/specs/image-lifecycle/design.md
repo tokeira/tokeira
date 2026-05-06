@@ -727,36 +727,72 @@ pub fn build_tokeirad_image(
     let toolchain = crate::toolchain::rust_toolchain_version(&request.workspace_root)?;
     let workspace = dagger.host_directory(&request.workspace_root)?;
 
-    // Stage 1: compile the binary.
-    let rust_image = format!("rust:{toolchain}-alpine");
-    let mut builder = dagger.container_from(&rust_image)?;
-    builder = builder.with_exec(&["apk", "add", "--no-cache", "musl-dev", "openssl-dev", "pkgconfig", "protobuf-dev", "protoc"])?;
-    builder = builder.with_directory("/src", &*workspace)?;
-    builder = builder.with_workdir("/src")?;
-    builder = builder.with_env("CARGO_TERM_COLOR", "never")?;
-    builder = builder.with_env("RUSTUP_TOOLCHAIN", &toolchain)?;
-    builder = builder.with_exec(&["rustup", "target", "add", request.arch.rust_target()])?;
+    // Stage 1: Chef base. Debian slim with Rust + build deps + cargo-chef.
+    // Glibc, not musl — see Req 3.2.3 for the allocator-performance rationale.
+    let chef_base_image = format!("rust:{toolchain}-slim-bookworm");
+    let mut chef = dagger.container_from(&chef_base_image)?;
+    chef = chef.with_exec(&[
+        "sh", "-c",
+        "apt-get update && apt-get install -y --no-install-recommends \
+         pkg-config libssl-dev protobuf-compiler ca-certificates \
+         && rm -rf /var/lib/apt/lists/*",
+    ])?;
+    chef = chef.with_exec(&["cargo", "install", "cargo-chef", "--locked"])?;
+    chef = chef.with_workdir("/app")?;
+    chef = chef.with_env("CARGO_TERM_COLOR", "never")?;
+    chef = chef.with_env("RUSTUP_TOOLCHAIN", &toolchain)?;
+    chef = chef.with_exec(&["rustup", "target", "add", request.arch.rust_target()])?;
+
+    // Stage 2: Planner. Produces recipe.json for dependency caching.
+    let mut planner = chef.clone();
+    planner = planner.with_directory("/app", &*workspace)?;
+    planner = planner.with_exec(&["cargo", "chef", "prepare", "--recipe-path", "recipe.json"])?;
+    let recipe = planner.file("/app/recipe.json")?;
+
+    // Stage 3: Cacher. Compiles only dependencies — cache layer. Unless
+    // Cargo.lock changes, this layer is reused across warm-cache builds.
+    let mut cacher = chef.clone();
+    cacher = cacher.with_file("/app/recipe.json", &*recipe)?;
+    cacher = cacher.with_exec(&[
+        "cargo", "chef", "cook",
+        "--release",
+        "--target", request.arch.rust_target(),
+        "--bin", "tokeirad",
+        "--recipe-path", "recipe.json",
+    ])?;
+
+    // Stage 4: Builder. Inherits the warm cache from the cacher, copies the
+    // full source tree, compiles tokeirad, then strips and extracts the
+    // binary. The release profile in Cargo.toml should specify
+    // lto="fat", codegen-units=1, strip="symbols", panic="abort"
+    // (Req 3.2.5); the `strip` command here is defence-in-depth.
+    let mut builder = cacher;
+    builder = builder.with_directory("/app", &*workspace)?;
     builder = builder.with_exec(&[
         "cargo", "build", "--release",
         "--target", request.arch.rust_target(),
         "--bin", "tokeirad",
         "-p", "tokeirad",
     ])?;
-    let binary = builder.file(&format!("/src/target/{}/release/tokeirad", request.arch.rust_target()))?;
-
-    // Stage 2: assemble the runtime image.
-    let mut runtime = dagger.container_from("alpine:3.23")?;
-    runtime = runtime.with_exec(&[
-        "sh", "-c",
-        "apk add --no-cache ca-certificates tzdata \
-         && addgroup -g 1000 tokeirad \
-         && adduser -u 1000 -G tokeirad -D tokeirad",
+    builder = builder.with_exec(&[
+        "strip",
+        &format!("/app/target/{}/release/tokeirad", request.arch.rust_target()),
     ])?;
+    let binary = builder.file(&format!(
+        "/app/target/{}/release/tokeirad",
+        request.arch.rust_target()
+    ))?;
+
+    // Stage 5: Runtime. Chainguard glibc-dynamic is a distroless base with
+    // no shell, no package manager, and a pre-configured nonroot user at
+    // UID 65532. CA certs and tzdata are provided by the base image.
+    // See Req 3.2.7 and Req 3.2.9.
+    let mut runtime = dagger.container_from("cgr.dev/chainguard/glibc-dynamic:latest")?;
     runtime = runtime.with_file("/usr/local/bin/tokeirad", &*binary)?;
-    runtime = runtime.with_user("tokeirad")?;
+    runtime = runtime.with_user("nonroot")?;
     runtime = runtime.with_entrypoint(&["/usr/local/bin/tokeirad"])?;
 
-    // Stage 3: export. Always `:latest`; optionally an additional tag.
+    // Stage 6: Export. Always `:latest`; optionally an additional tag.
     let latest_tag = "tokeirad:latest".to_string();
     runtime.export_image(&latest_tag)?;
 
@@ -778,7 +814,13 @@ pub fn build_tokeirad_image(
 }
 ```
 
-The recipe (Rust toolchain → musl target → alpine runtime → non-root user → `:latest` always, optional version tag) is hardcoded inside the function. If a future Build image has a different recipe, we add a sibling free function `build_<name>_image` with its own hardcoded steps.
+**Recipe summary.** Debian slim build base (glibc) → cargo-chef dependency layer → full build → strip → Chainguard glibc-dynamic runtime → export. This is the 2026 Rust-server pattern: glibc dynamic linking for allocator performance, distroless for attack surface, cargo-chef for build cache. If a future Build image has a different recipe, we add a sibling free function `build_<name>_image` with its own hardcoded steps.
+
+**What the release profile contributes.** `Cargo.toml`'s release profile (specified by Req 3.2.5) layers `lto = "fat"`, `codegen-units = 1`, `strip = "symbols"`, `panic = "abort"` on top of the Dagger pipeline's compile step. Those are build-time instructions to the Rust compiler; the pipeline's explicit `strip` command after `cargo build` is defence-in-depth for binaries compiled elsewhere or with an unusual profile.
+
+**Why not scratch or distroless/static?** Both require a fully static (musl) binary, which reintroduces the musl allocator penalty we just paid to eliminate. The ~10 MB image-size delta between chainguard/glibc-dynamic and scratch is irrelevant for a long-running service; the per-request latency delta from the allocator change is measurable. For tokeirad, glibc dynamic is correct.
+
+**mimalloc.** The `tokeirad` binary registers `mimalloc` as its global allocator (see Req 3.3a). That is a binary-level concern — `apps/tokeirad/Cargo.toml` depends on `mimalloc`; `apps/tokeirad/src/main.rs` has `#[global_allocator] static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;`. The build pipeline here does not set the allocator — it just compiles the binary that does.
 
 #### 4.4 `publish_image`
 

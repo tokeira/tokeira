@@ -71,6 +71,33 @@ After editing, report the snapshot or patch path to the user. If asked to undo, 
 
 If the working tree has uncommitted spec edits and the user gives a broad instruction like "undo your changes", clarify first: "Undo only the hunks I just introduced; do not restore files from git." Do not assume the broad instruction means restore-from-index.
 
+### 7. Commit messages via `-F` file (Kiro-specific)
+
+Kiro's embedded terminal truncates long single-line `git commit -m "..."` invocations. The failure is silent — the terminal delivers a truncated command and the commit either fails parsing or records a short prefix.
+
+Always write commit messages to a file and pass them via `-F`:
+
+```bash
+cat > /tmp/commit-msg.txt <<'EOF'
+<short title line>
+
+<optional wrapped body paragraph>
+
+<optional trailers>
+EOF
+git commit -F /tmp/commit-msg.txt
+rm /tmp/commit-msg.txt
+```
+
+Benefits:
+
+- Supports multi-line messages (title + blank line + body paragraphs + trailers) without shell-quoting gymnastics.
+- Bypasses the terminal's per-line input cap.
+- Bypasses the shell's `argv` size limit (256 KB on macOS default, but the terminal cap bites first).
+- Lets you preview the message by `cat`ing the file before committing.
+
+Heredoc-into-`-F` is the default; `-m "short"` is acceptable only for terse single-line messages (under ~60 characters) where the risk is clearly absent. Never use `-m` with a multi-line message via `\n` escapes — those route through the terminal's input buffer and hit the same truncation.
+
 ---
 
 ## Architecture

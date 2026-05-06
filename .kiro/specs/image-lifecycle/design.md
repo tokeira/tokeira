@@ -1783,7 +1783,7 @@ Generate `EcsConfig` with writeback-target fields chosen from: empty, upstream s
 
 Owned by [`iac-resource-lifecycle`](../iac-resource-lifecycle/requirements.md) and migrated to `tokeira-iac`. For all generated `(dotted_key, value)` pairs, writing via `write_config_values` then reading at the key produces the original value.
 
-### Property 10 — Publish reference count (Req 3.3.3)
+### Property 10 — Publish reference count (Req 3.4.3)
 
 For `publish_image` with N remote refs (N > 0), assert `published.len() == N` and each `published[i].remote_ref == request.remote_refs[i]`.
 

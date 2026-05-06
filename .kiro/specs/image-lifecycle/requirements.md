@@ -2,37 +2,29 @@
 
 ## Introduction
 
-Tokeira ships a single server binary today, `tokeirad`, that runs on three platforms: `local` (bare-process), `compose` (Docker Compose), and `ecs` (AWS ECS on EC2, private-only). Today the workspace has no documented path for producing the `tokeirad` container image that the compose platform defaults to (`tokeirad:latest`), no path for publishing it to ECR, and no path for mirroring the pinned third-party images the ECS platform depends on (`grafana/mimir`, `grafana/loki`, `grafana/grafana-oss`, `grafana/alloy`, `public.ecr.aws/aws-cli/aws-cli`, `public.ecr.aws/docker/library/busybox`). In a private-only VPC with no internet gateway, direct pulls from Docker Hub fail, so every image referenced by an ECS task definition must already live in a project-owned ECR repository before `tkr infra apply` runs.
+Tokeira ships a single server binary today, `tokeirad`, that runs on three platforms: `local` (bare-process), `compose` (Docker Compose), and `ecs` (AWS ECS on EC2, private-only). Today the workspace has no documented path for producing the `tokeirad` container image that the compose platform defaults to (`tokeirad:latest`), no path for publishing it to ECR, and no path for mirroring the pinned third-party images the ECS platform depends on. In a private-only VPC with no internet gateway, direct pulls from Docker Hub fail, so every image referenced by an ECS task definition must already live in a project-owned ECR repository before `tkr infra apply` runs.
 
-This spec owns the image plane of the deployment lifecycle. It strengthens Tokeira's IaC abstractions by introducing a single trait-based image model: every deployable container image — whether we build it from source or pull it from an upstream registry — implements one `Image` trait, and the CLI, Dagger pipelines, writeback machinery, and platform gates iterate that one abstraction.
+This spec owns the image plane of the deployment lifecycle. It strengthens Tokeira's existing IaC abstractions by completing the `Image` trait already declared in `tokeira-deploy-engine::image`, populating it with concrete per-platform image implementations, and introducing a Dagger-backed build/publish/mirror pipeline alongside an ECR repository resource.
 
-The core abstraction is a single `Image` trait that every deployable artifact implements:
+The design follows a clean separation between **image resolution** (what ref does a service deploy against — a `tokeira-deploy-engine` concern) and **image production** (how do we build, push, or mirror a specific image — a `tokeira-build` concern):
 
-- A built image (`tokeirad`, future `tokeira-tool`) implements `Image` with `source_type = Build`.
-- A mirrored image (`grafana-mimir`, `grafana-loki`, etc.) implements `Image` with `source_type = Mirror`.
-- Image sets are grouped into modules: `tokeira::all()`, `observability::all()`, etc.
-- The CLI iterates the composed image set uniformly: build every `Build` image, mirror every `Mirror` image, publish every image whose desired ref differs from its resolved live ref.
-
-What this gives us:
-
-1. A **`tokeira-build` library crate** that owns the `Image` trait, the `ImageSourceType` enum, and the `DesiredImageRef` / `ImageContext` types, plus the Dagger-backed build and mirror pipelines keyed off `source_type`.
-2. **Per-domain image modules** declaring the concrete images the deployment uses. The first-cut set is `tokeira::TokeiradImage` (build) plus `observability::{MimirImage, LokiImage, GrafanaImage, AlloyImage, AwsCliImage, BusyBoxImage}` (all mirror). Adding a new image — whether built or mirrored — is a three-line struct declaration.
-3. A **`tkr image` command group** with four subcommands: `list`, `build`, `push`, `mirror`. The command handlers iterate the image-trait registry, not hardcoded switch statements.
-4. An **`EcrRepository` IaC resource** — project-scoped names, MUTABLE tag mutability, the canonical "keep last 10 untagged" lifecycle policy.
-5. **Config writeback** that populates `EcsConfig.services.*.image` and `EcsConfig.observability.*_image` fields after push and mirror, reusing the `toml_edit` writeback machinery owned by [`iac-resource-lifecycle`](../iac-resource-lifecycle/requirements.md).
-6. **Lifecycle ordering rules** implemented as platform-level validators driven from the image-trait registry, not from hardcoded field lists.
+- `tokeira-deploy-engine::image` owns the `Image` trait, `ImageSourceType`, `DesiredImageRef`, `ImageContext`, and `WritebackTarget`. It is the deployment-resolution abstraction. It has no knowledge of Dagger, Docker, or any build pipeline.
+- `platforms/compose/src/images/` and `platforms/ecs/src/images/` each own concrete `Image` trait implementations for their platform. Each platform's image structs read that platform's own config type directly. Each platform exposes two entry points: `construct()` — context-free enumeration used by `Deployment::images(&self, config)` — and `all(ctx)` — constructs then validates, used by CLI handlers that already have an `ImageContext`. No cross-platform imports; no shared config DTO.
+- `tokeira-build` owns the Dagger-backed build/publish/mirror free functions (`build_tokeirad_image`, `publish_image`, `mirror_image`) and the `DaggerClient` trait. Each build recipe is hardcoded in the corresponding function. `tokeira-build` is not aware of the `Image` trait and does not walk any image registry.
+- `tkr image` dispatches on the active deployment's platform when the subcommand needs config (`list`, `push`, `mirror`) and is config-free for the `build` subcommand (which knows statically which images are buildable).
 
 ### What this spec delivers
 
-- A `tokeira-build` library crate at `crates/tokeira-build/` containing:
-  - The `Image` trait, `ImageSourceType` enum, `DesiredImageRef` struct, `ImageContext` type — the core abstractions for the image plane.
-  - Dagger-backed build pipeline for `tokeirad` (and any future `Build` image).
-  - Dagger-backed mirror pipeline for any `Mirror` image.
-  - The concrete image modules: `images::tokeira`, `images::observability`, and a registry-level `all(context)` assembling them.
-- A `dagger-client` dependency (new in-repo `crates/dagger-client/` crate, per the reference implementation in `.kiro/specs/image-lifecycle/reference/`).
+- Widen `tokeira-deploy-engine::Image::desired_ref` to return `Result<DesiredImageRef, RuntimeError>` and add a default-empty `writeback_targets(ctx) -> Vec<WritebackTarget>` method. Introduce `WritebackTarget { field: &'static str }`.
+- A new `tokeira-build` library crate at `crates/tokeira-build/` exposing three free functions (`build_tokeirad_image`, `publish_image`, `mirror_image`) plus the `DaggerClient` trait as the public testing seam.
+- A new in-repo `dagger-client` crate at `crates/dagger-client/` providing a minimal GraphQL wrapper over a Dagger session.
+- `platforms/compose/src/images/{tokeirad.rs, observability/mod.rs}` concrete `Image` trait implementations reading `ComposeConfig` directly. Each file's `pub fn all() -> Vec<Box<dyn Image>>` enumerates that submodule's images; a root `platforms::compose::images` module exposes `construct()` and `all(ctx)` — the former context-free for `Deployment::images`, the latter validated for CLI callers.
+- `platforms/ecs/src/images/{tokeirad.rs, observability/mod.rs}` concrete `Image` trait implementations reading `EcsConfig` directly. Same `construct()` / `all(ctx)` shape.
+- An `EcrRepository` resource implementation in `tokeira-aws` + an `EcrClient` trait + an `EcrClientHandle` `ProvisionContext` extension + ad-hoc `ensure_ecr_repository` / `ensure_ecr_repositories` helpers.
+- An `ImagesModule` IaC module in `platforms/ecs/src/modules/images.rs` that enumerates `platforms::ecs::images::all(ctx)` (the validated, context-bearing variant) and registers one `EcrRepository` per image, so `tkr infra plan`/`destroy` see every project-owned repository.
 - A `tkr image` command group in `apps/tkr` with four subcommands: `list`, `build`, `push`, `mirror`.
-- An `EcrRepository` resource implementation in `tokeira-aws` with the canonical "keep last 10 untagged" lifecycle policy.
-- Config writeback into `deployment.toml` after push and mirror, reusing `toml_edit` machinery from the iac-resource-lifecycle spec.
+- Writeback driven by `image.writeback_targets(ctx)` rather than CLI-side hardcoded field lists, calling a new public `tokeira_iac::write_config_values` helper extracted from the existing private helper in `apps/tkr/src/commands/infra.rs`.
+- Platform lifecycle gates: ECS `validate_mirrors` / `validate_builds` (pure predicates over a platform's image list + config); compose `validate_local_build` plus a `DockerImageInspector` trait so the gate is mockable without a live Docker daemon.
 
 ### What this spec does NOT cover
 
@@ -40,36 +32,33 @@ What this gives us:
 - Multi-region mirroring — one mirror region per deployment.
 - Image signing, SBOM generation, or vulnerability scanning.
 - Compose-platform image loading (Docker Compose reads the local image cache directly; no additional action is required for `tkr image build` to satisfy `tokeirad:latest`).
-- The ECS platform's `EcsConfig.services.*` field definitions themselves — those are owned by the [`ecs-deployment`](../ecs-deployment/requirements.md) spec. This spec consumes those fields as writeback targets.
+- A cross-platform version-consistency linter (comparing compose and ECS image pins). Each platform owns its own pins; cross-platform comparison, if ever needed, lives in a separate operator-facing tool outside this spec.
 
 ### Cross-references
 
-- [`iac-resource-lifecycle`](../iac-resource-lifecycle/requirements.md): Progress callbacks on `ProvisionContext` and TOML writeback via `toml_edit` are owned there. This spec consumes those surfaces — it does not redefine them.
+- [`iac-resource-lifecycle`](../iac-resource-lifecycle/requirements.md): Progress callbacks on `ProvisionContext` and TOML writeback via `toml_edit` are owned there. The writeback helper extraction (Req 7.3) extends `tokeira-iac` with a public API consumed by `tkr infra` and `tkr image`.
 - [`ecs-deployment`](../ecs-deployment/requirements.md): Requires that ECR repositories exist and that `EcsConfig.services.*.image` and `EcsConfig.observability.*_image` fields be populated before `tkr infra apply` or `tkr deploy apply` can succeed. This spec owns that image plane.
 - [`tkr-cli`](../tkr-cli/requirements.md): Owns the global CLI structure, `--deployment` / `--json` flags, XDG paths, and command-tree conventions. This spec adds a new `image` command group that follows those conventions.
 - [`pipeline-foundation`](../pipeline-foundation/requirements.md): Future image-related pipelines wrap the library surface defined here.
 
 ## Glossary
 
-- **Image_Trait**: The `tokeira_build::Image` trait that every deployable artifact implements. Provides `name()`, `source_type()`, and `desired_ref(ctx)`. The single abstraction through which the CLI, pipelines, writeback, and platform gates interact with images.
-- **Image_Source_Type**: The `ImageSourceType` enum with exactly two variants: `Build` (produced locally via a Dagger build pipeline) and `Mirror` (pulled from an upstream ref and re-pushed to a project-owned destination).
-- **Desired_Image_Ref**: The `DesiredImageRef` struct produced by `Image::desired_ref()`, carrying `repository` (the project-scoped repo name without a registry host prefix), `tag`, and `upstream_ref: Option<String>` (`Some` for Mirror, `None` for Build).
-- **Image_Context**: The `ImageContext` struct passed to `Image::desired_ref()`. Carries the deployment config via a typed extension mechanism so images can read the project name, observability image pins, and any other config fields without coupling.
-- **Image_Registry**: The flat list produced by `tokeira_build::images::all(ctx)` composing every image module's contribution (`tokeira::all()`, `observability::all()`, and future modules). Consumed by the CLI for iteration.
-- **Image_Module**: A Rust module under `crates/tokeira-build/src/images/` containing concrete `Image` trait implementations grouped by domain (`tokeira`, `observability`). Each module exports an `all() -> Vec<Box<dyn Image>>` function enumerating its images.
-- **Tokeirad_Image**: The `TokeiradImage` struct implementing `Image` with `source_type = Build`. Produces `tokeirad` from `apps/tokeirad/` via the Dagger build pipeline. Its local tag is `tokeirad:latest` (always present after any successful build); additional local tags (e.g. `tokeirad:v1.2.3`) may be produced when the operator passes `--tag`. Remote refs are `{registry}/{project}/tokeirad:{tag}`.
-- **Observability_Image**: Any of `MimirImage`, `LokiImage`, `GrafanaImage`, `AlloyImage`, `AwsCliImage`, `BusyBoxImage` — all implementing `Image` with `source_type = Mirror` and reading their `upstream_ref` from `EcsConfig.observability.*_image`.
-- **Build_Crate**: The `tokeira-build` library crate in `crates/tokeira-build/` that owns the `Image` trait and the Dagger-backed pipelines.
-- **Dagger_Client**: The in-repo GraphQL client wrapper at `crates/dagger-client/` that drives a Dagger session from Rust. Introduced by this spec, reference implementation at `.kiro/specs/image-lifecycle/reference/`.
+- **Image_Trait**: The `tokeira_deploy_engine::Image` trait every deployable artifact implements. Provides `name()`, `source_type()`, `desired_ref(ctx)`, and a default-empty `writeback_targets(ctx)`. Already declared in `tokeira-deploy-engine::image`; this spec widens `desired_ref` to return `DesiredImageRef` (currently `String`) and adds `writeback_targets`.
+- **Image_Source_Type**: The `ImageSourceType` enum declared in `tokeira-deploy-engine`. Variants: `Build` (produced locally via a Dagger pipeline), `Mirror` (pulled from an upstream ref and re-pushed to a project-owned destination), `Registry` (pulled from a registry as-is with the configured ref used verbatim — not used by any image declared in this spec but given an unambiguous contract in Req 1.6 for future use).
+- **Desired_Image_Ref**: The `DesiredImageRef` struct declared in `tokeira-deploy-engine`. Fields: `repository` (project-scoped name without registry host prefix), `tag`, and `upstream_ref: Option<String>` (`Some` for Mirror, `None` for Build).
+- **Image_Context**: The `ImageContext` struct declared in `tokeira-deploy-engine`. Carries platform state and typed extensions; platforms register their own config type on it before invoking image trait methods.
+- **Writeback_Target**: The `WritebackTarget { field: &'static str }` struct declared in `tokeira-deploy-engine`. Images return a `Vec<WritebackTarget>` from `writeback_targets(ctx)` describing which dotted `deployment.toml` keys their remote ref populates after push or mirror.
+- **Build_Crate**: The `tokeira-build` library crate at `crates/tokeira-build/`. Owns the Dagger-backed pipelines `build_tokeirad_image`, `publish_image`, `mirror_image` as free functions with hardcoded recipes. Does not implement the `Image` trait and does not enumerate platforms' image registries.
+- **Dagger_Client**: The in-repo GraphQL client wrapper at `crates/dagger-client/` that drives a Dagger session from Rust. Introduced by this spec; reference implementation at `.kiro/specs/image-lifecycle/reference/`.
 - **Image_CLI**: The `tkr image` command group in `apps/tkr`, exposing `list`, `build`, `push`, and `mirror` subcommands.
+- **Platform_Image_Module**: A Rust module under `platforms/{compose,ecs}/src/images/` that declares concrete `Image` trait implementations for that platform. Each module exposes `construct() -> Vec<Box<dyn Image>>` (context-free enumeration) and `all(ctx) -> Result<Vec<Box<dyn Image>>, RuntimeError>` (validated resolution) per Req 2.3.4. Reads the platform's own config type directly — no cross-platform imports.
 - **ECR_Registry**: The Amazon Elastic Container Registry in a specific AWS region and account, identified by its registry host (`{account}.dkr.ecr.{region}.amazonaws.com`).
-- **Project_Repository**: An ECR repository owned by the Tokeira deployment, named `{project_name}/{repo_suffix}` where `repo_suffix` comes from the image's `DesiredImageRef.repository` field.
+- **Project_Repository**: An ECR repository owned by the Tokeira deployment. Its name is the `DesiredImageRef.repository` field verbatim — already project-scoped by the platform's image implementation (for example `"tokeira-dev/tokeirad"` or `"tokeira-dev/grafana-mimir"`). No additional prefixing occurs downstream. `DesiredImageRef.repository` is the full project-scoped repository name without registry host prefix.
 - **Lifecycle_Policy**: The ECR repository lifecycle policy JSON applied by this spec. Canonical policy: keep the last 10 untagged images; tagged images are never expired by lifecycle rules.
 - **Mirror_Operation**: The act of pulling a Mirror image's `upstream_ref` and publishing it to the corresponding Project_Repository.
 - **Push_Operation**: The act of publishing a Build image's locally-produced artifact to a Project_Repository under two tags: `latest` and a version-specific tag supplied by the operator (defaulting to `latest` when no version is supplied).
 - **Registry_Credentials**: The username, password, and registry host obtained by calling ECR `GetAuthorizationToken` and base64-decoding the returned token in `user:password` form.
-- **Image_Writeback**: The act of writing discovered image references (a pushed ref or a mirrored ref) back into `deployment.toml` under specific TOML keys, using `toml_edit` to preserve comments and formatting. Each image declares its own writeback target (see Requirement 2.4).
-- **Config_Writeback_Module**: The `toml_edit`-backed writer owned by the [`iac-resource-lifecycle`](../iac-resource-lifecycle/requirements.md) spec. This spec consumes that module rather than reimplementing dotted-key TOML insertion.
+- **Image_Writeback**: The act of writing discovered image references back into `deployment.toml` under specific TOML keys, using `toml_edit` to preserve comments and formatting. Each image declares its own writeback targets.
 - **Image_Tag_Mutability**: The ECR repository setting that controls whether a tag (e.g., `latest`) may be overwritten. All repositories created by this spec SHALL be set to `MUTABLE` so `latest` can move with each push.
 - **Reproducible_Build**: A build in which the same source tree plus the same pinned toolchain (`rust-toolchain.toml`) produces an image whose application binary layer is bit-identical across invocations on the same host architecture.
 - **Target_Architecture**: The CPU architecture of a Build image: `arm64` (default — Graviton4 on ECS, native on Apple Silicon for compose) or `amd64` (operator override for x86 hosts and Intel-based deployments).
@@ -78,191 +67,216 @@ What this gives us:
 
 ---
 
-## Feature 1: Image Trait and Source-Type Abstraction
+## Feature 1: Image Trait Extensions in `tokeira-deploy-engine`
 
-### Requirement 1.1: `Image` trait surface
+### Requirement 1.1: Widen `desired_ref` return type
 
-**User Story:** As a Tokeira developer, I want a single `Image` trait that every deployable artifact implements, so that the build, push, mirror, and listing flows iterate one abstraction instead of special-casing per image.
-
-#### Acceptance Criteria
-
-1. THE Build_Crate SHALL define a `pub trait Image: std::fmt::Debug + Send + Sync` exposing at minimum:
-   - `fn name(&self) -> &str` — a stable human-readable identifier (for example, `"tokeirad"`, `"grafana-mimir"`).
-   - `fn source_type(&self) -> ImageSourceType` — `Build` or `Mirror`.
-   - `fn desired_ref(&self, ctx: &ImageContext) -> Result<DesiredImageRef, BuildError>` — resolves the desired target repository, tag, and (for Mirror) upstream ref.
-2. THE `Image` trait SHALL be the only abstraction the Image_CLI and the Dagger pipelines consume. Ad-hoc enumeration of per-image functions SHALL NOT appear in `tokeira-build` or `apps/tkr`.
-3. THE trait SHALL be stable enough that adding a new image (built or mirrored) requires writing one struct plus inserting it into one module's `all()` function. No trait changes, no CLI changes, no Dagger-pipeline changes.
-
-### Requirement 1.2: `ImageSourceType` enum
-
-**User Story:** As a Tokeira developer, I want the image source-type dimension encoded as a two-variant enum, so that build and mirror flows can branch on it and the CLI can filter or group images by source type.
+**User Story:** As a Tokeira developer, I want `Image::desired_ref` to return a structured `DesiredImageRef` rather than a plain string, so that downstream consumers (ECR provisioning, writeback, mirror pipeline) can read the repository, tag, and upstream ref as distinct fields without re-parsing.
 
 #### Acceptance Criteria
 
-1. THE Build_Crate SHALL define `pub enum ImageSourceType { Build, Mirror }` with `#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]`.
-2. FOR ALL images the `desired_ref(ctx)` contract SHALL hold: if `source_type() == Build`, then `desired_ref(ctx)?.upstream_ref == None`; if `source_type() == Mirror`, then `desired_ref(ctx)?.upstream_ref == Some(_)`.
-3. A property test SHALL assert this invariant over every image in the Image_Registry.
+1. THE `tokeira_deploy_engine::Image::desired_ref` method signature SHALL be `fn desired_ref(&self, ctx: &ImageContext) -> Result<DesiredImageRef, RuntimeError>`. The existing `Result<String, RuntimeError>` signature SHALL be replaced in this spec's implementation phase; no backwards-compatibility shim is required.
+2. THE `DesiredImageRef` struct SHALL carry `repository: String` (project-scoped name without registry host prefix, e.g. `"tokeira-dev/tokeirad"`), `tag: String`, and `upstream_ref: Option<String>`.
+3. FOR Build images, `desired_ref(ctx)?.upstream_ref` SHALL be `None`. FOR Mirror images, it SHALL be `Some(_)` with a fully-qualified source ref.
+4. THE `repository` field SHALL always begin with the deployment's project name prefix FOR Build and Mirror images. An image of those source types that produces a repository without the project prefix SHALL fail validation at image-module construction time. Registry images (Req 1.6) are exempt from the project-prefix rule.
+5. THE `tag` field SHALL never include `/`, `@`, or `:`. Tag validation SHALL reject any such input.
+6. EXISTING code paths that use the current `Result<String, RuntimeError>` return SHALL migrate to the new shape as part of this spec's implementation. If no such code paths exist at spec-implementation time, this is a no-op.
 
-### Requirement 1.3: `DesiredImageRef` struct
-
-**User Story:** As a Tokeira developer, I want each image to return a uniform reference descriptor, so that downstream code (publish, mirror, writeback, gates) consumes a consistent shape.
-
-#### Acceptance Criteria
-
-1. THE Build_Crate SHALL define:
-   ```rust
-   pub struct DesiredImageRef {
-       pub repository: String,      // project-scoped, without registry host (e.g. "tokeira-dev/tokeirad")
-       pub tag: String,             // e.g. "latest", "v1.2.3", "3.0.6"
-       pub upstream_ref: Option<String>,  // Some for Mirror, None for Build
-   }
-   ```
-2. THE `repository` field SHALL always begin with the project name prefix. Any image that attempts to produce a repository without the project prefix SHALL fail validation at registry-construction time.
-3. THE `tag` field SHALL never include a `/` or `@`. Tag validation SHALL reject any input matching `[:\/@]`.
-4. FOR Mirror images, `upstream_ref` SHALL be a fully-qualified source ref (including upstream registry host when present) matching the value in the deployment's `EcsConfig.observability.*_image` field.
-5. THE struct SHALL derive `Debug, Clone, PartialEq, Eq, Serialize, Deserialize`.
-
-### Requirement 1.4: `ImageContext` and typed extensions
-
-**User Story:** As a Tokeira image author, I want `desired_ref()` to read config via typed extensions rather than via a fixed parameter list, so that adding a new config source (for example, a new config struct) does not force changes to every image's signature.
-
-#### Acceptance Criteria
-
-1. THE Build_Crate SHALL define `pub struct ImageContext` carrying typed extensions:
-   - `pub fn new() -> Self`
-   - `pub fn set_extension<T: 'static + Send + Sync>(&mut self, value: T)`
-   - `pub fn extension<T: 'static + Send + Sync>(&self) -> Option<&T>`
-2. THE production code path SHALL register the deployment's platform config (for example `EcsConfig`) on the `ImageContext` before invoking `desired_ref()` on any image. An image that needs config reads it via `ctx.extension::<EcsConfig>()`.
-3. THE `ImageContext` SHALL NOT reference any specific config type in its public API — extensions are added by the caller at runtime.
-4. A property test SHALL assert that for every registered image, `desired_ref(&ctx)` where `ctx` carries a realistic `EcsConfig` produces a `DesiredImageRef` whose invariants (Req 1.3) hold.
-
----
-
-## Feature 2: Concrete Image Implementations
-
-### Requirement 2.1: `images::tokeira::TokeiradImage`
-
-**User Story:** As a Tokeira developer, I want the `tokeirad` binary modelled as a concrete `Image` implementation, so that the build flow and the listing flow treat it uniformly with every other image.
-
-#### Acceptance Criteria
-
-1. THE Build_Crate SHALL provide `pub mod images::tokeira` containing a `TokeiradImage` struct implementing `Image`.
-2. `TokeiradImage::name()` SHALL return `"tokeirad"`.
-3. `TokeiradImage::source_type()` SHALL return `ImageSourceType::Build`.
-4. `TokeiradImage::desired_ref(ctx)` SHALL read the project name from the `ImageContext` and produce `DesiredImageRef { repository: format!("{project}/tokeirad"), tag: <computed>, upstream_ref: None }`.
-5. THE module SHALL export `pub fn all() -> Vec<Box<dyn Image>>` returning a `vec!` of the `TokeiradImage` and any future Tokeira-owned built images.
-6. A `TokeiraToolImage` (schema migration utility) MAY be added in a follow-up amendment under the same module without changing any other part of this spec.
-
-### Requirement 2.2: `images::observability` set
-
-**User Story:** As a Tokeira developer, I want every observability-stack image modelled as a concrete `Image` struct in a single module, so that a bump to any observability image pin is localised and the mirror flow picks it up without glue changes.
-
-#### Acceptance Criteria
-
-1. THE Build_Crate SHALL provide `pub mod images::observability` containing six concrete `Image` implementations:
-   - `MimirImage` — `name = "grafana-mimir"`, source = Mirror, upstream = `ctx.extension::<EcsConfig>().observability.mimir_image`.
-   - `LokiImage` — `name = "grafana-loki"`, source = Mirror, upstream = `observability.loki_image`.
-   - `GrafanaImage` — `name = "grafana-oss"`, source = Mirror, upstream = `observability.grafana_image`.
-   - `AlloyImage` — `name = "grafana-alloy"`, source = Mirror, upstream = `observability.alloy_image`.
-   - `AwsCliImage` — `name = "aws-cli"`, source = Mirror, upstream = `observability.aws_cli_image`.
-   - `BusyBoxImage` — `name = "busybox"`, source = Mirror, upstream = `observability.busybox_image`.
-2. EACH image's `desired_ref()` SHALL produce `DesiredImageRef { repository: format!("{project}/{repo_suffix}"), tag: image_tag(upstream).unwrap_or("latest").to_string(), upstream_ref: Some(upstream.clone()) }`.
-3. THE module SHALL export `pub fn all() -> Vec<Box<dyn Image>>` returning all six in the canonical order above.
-4. THE observability repo-suffix names (`grafana-mimir`, `grafana-loki`, `grafana-oss`, `grafana-alloy`, `aws-cli`, `busybox`) SHALL reflect the upstream image names each mirrors. The `aws-cli` and `busybox` entries additionally feed the ECS platform's init-container story defined in [`ecs-deployment`](../ecs-deployment/requirements.md).
-
-### Requirement 2.3: Image-registry composition (`images::all`)
-
-**User Story:** As a Tokeira developer, I want a single `all(ctx) -> Vec<Box<dyn Image>>` function that composes every image-module's contribution, so that the CLI has one uniform iteration target and duplicates / orphans are detectable.
-
-#### Acceptance Criteria
-
-1. THE Build_Crate SHALL expose `pub fn images::all(ctx: &ImageContext) -> Vec<Box<dyn Image>>` returning the concatenation of `tokeira::all() + observability::all()` (and any future image-module contributions).
-2. THE function SHALL validate the concatenated registry before returning it:
-   - No duplicate `name()` values.
-   - No duplicate `(source_type, repository)` pairs (after resolving `desired_ref(ctx)`).
-3. Duplicate violations SHALL return `BuildError::RegistryValidation { kind, names }`. Callers SHALL NOT be expected to handle this — a failing `all()` is a programming error, not a runtime condition.
-
-### Requirement 2.4: Image_Writeback targets are image-provided, not caller-hardcoded
+### Requirement 1.2: Add `writeback_targets` default-empty method
 
 **User Story:** As a Tokeira developer adding a new image, I want the image itself to declare which config field the push or mirror flow writes back to, so that adding an image is one change in one place rather than a multi-file coordinated edit.
 
 #### Acceptance Criteria
 
-1. THE `Image` trait SHALL expose `fn writeback_targets(&self, ctx: &ImageContext) -> Vec<WritebackTarget>` where `WritebackTarget { field: &'static str, kind: WritebackKind }` describes the dotted TOML key(s) the push or mirror flow writes the computed remote ref to.
-2. THE `WritebackKind` enum SHALL have variants `Once` (single field; for example a Mirror image writes to its `observability.mimir_image` field) and `Many` (multiple fields; for example the `tokeirad` Build image writes to all seven `services.*.image` fields on ECS).
-3. THE default implementation SHALL return an empty `Vec` — an image with no writeback does nothing on the config side (useful for Build images whose refs are consumed only by operator-facing tooling, not config).
-4. THE `tkr image push` and `tkr image mirror` handlers SHALL iterate `image.writeback_targets(ctx)` rather than carrying their own hardcoded field list. Adding a new service to the ECS platform means updating `TokeiradImage::writeback_targets`, not the CLI.
+1. THE `Image` trait SHALL expose `fn writeback_targets(&self, ctx: &ImageContext) -> Vec<WritebackTarget>` with a default implementation returning an empty `Vec`.
+2. THE `WritebackTarget` struct SHALL contain `field: &'static str` (dotted TOML key path). No `kind` or arity enum — arity is expressed by the length of the returned `Vec`.
+3. THE default empty implementation SHALL satisfy images whose refs are consumed only by operator-facing tooling (not by config). Images whose refs are written back to config SHALL override.
+4. `tkr image push` and `tkr image mirror` SHALL iterate `image.writeback_targets(ctx)` rather than carrying their own hardcoded field list.
+
+### Requirement 1.3: Fallible extension lookup
+
+**User Story:** As a Tokeira maintainer, I want concrete `Image` implementations to return an `IacError`/`RuntimeError` when a required `ImageContext` extension is missing, so that misconfigured platform wiring surfaces as an operator-facing error instead of a panic.
+
+#### Acceptance Criteria
+
+1. CONCRETE `Image` implementations in platform crates SHALL obtain required config via `ctx.extension::<T>().ok_or_else(|| RuntimeError::Image(format!("image context missing extension: {}", std::any::type_name::<T>())))?`.
+2. THE same fallible-lookup pattern SHALL apply to `EcrRepository::create`/`update`/`delete`/`describe` when fetching `EcrClientHandle` from `ProvisionContext`. The error type SHALL be `IacError::Other(anyhow!(...))` with a message naming the missing extension.
+3. NO `Image` implementation SHALL use `.expect()` or `.unwrap()` on a `ctx.extension::<T>()` lookup.
+
+### Requirement 1.4: `ImageContext` population hook on the `Deployment` trait
+
+**User Story:** As a Tokeira maintainer, I want the deploy-engine flow to populate `ImageContext` with the deployment's platform config before calling any `Image` trait method, so that `deploy apply` and any other consumer receives a context carrying the extensions concrete images require.
+
+#### Acceptance Criteria
+
+1. THE `tokeira_orchestrator::Deployment` trait SHALL gain a new method `async fn register_image_extensions(&self, config: &Self::Config, ctx: &mut deploy_engine::ImageContext) -> Result<()>` with a default empty implementation.
+2. `DeployEngine::new` SHALL construct its `ImageContext` by calling `ImageContext::default()` and then `deployment.register_image_extensions(config, &mut image_ctx).await?` before storing it on the facade.
+3. THE compose platform's `ComposeDeployment::register_image_extensions` SHALL register `ComposeConfig` on the supplied context via `ctx.set_extension(config.clone())`.
+4. THE ECS platform's `EcsDeployment::register_image_extensions` SHALL register `EcsConfig` on the supplied context.
+5. THE local platform's `LocalDeployment::register_image_extensions` SHALL remain the default empty implementation (local has no image set).
+6. THE `tkr image list`, `tkr image push`, and `tkr image mirror` handlers SHALL construct their `ImageContext` the same way: construct a default context, then call `deployment.register_image_extensions(config, &mut ctx).await?` before iterating the platform's image set. This keeps `deploy apply` and `tkr image <subcommand>` on one wiring path.
+7. `tkr image build` SHALL NOT construct an `ImageContext` — the build subcommand is deployment-free (Req 6.3).
+
+### Requirement 1.5: Structured desired refs mapped to persisted image state
+
+**User Story:** As a Tokeira maintainer, I want the deploy engine to translate the structured `DesiredImageRef` into the existing `tokeira_iac::ImageState` / `ImageSource` shape, so that widening the trait return type does not break state persistence or require a state-format migration.
+
+#### Acceptance Criteria
+
+1. `ServiceEngine::record_images` SHALL continue to write each resolved image into `state.images` as `ImageState { name, resolved_ref, digest: None, published_at, source }`.
+2. THE `resolved_ref: String` field SHALL be populated by formatting the `DesiredImageRef`: `format!("{}:{}", desired.repository, desired.tag)`. Callers that need a registry-qualified reference (for example the push handler's writeback) compose the registry host themselves; the persisted ref is project-scoped and registry-agnostic.
+3. THE `source: ImageSource` field SHALL be populated from `image.source_type()` and `desired.upstream_ref`:
+   - `ImageSourceType::Build` ⇒ `ImageSource::Built`
+   - `ImageSourceType::Mirror` ⇒ `ImageSource::Mirrored { upstream_ref }` where `upstream_ref` is obtained from `desired.upstream_ref` via a fallible `ok_or_else` that returns `RuntimeError::Image(format!("image '{}' is Mirror but desired_ref.upstream_ref is None", image.name()))`. The implementation MUST NOT use `.expect()` or `.unwrap()` — Property 2 prevents this in practice, but the error path must remain operator-facing per the workspace's no-`unwrap`-outside-tests rule.
+   - `ImageSourceType::Registry` ⇒ `ImageSource::PullThrough { upstream_ref: desired.upstream_ref.unwrap_or_default() }` — the Registry contract (Req 1.6) permits `None`, so this is the single variant where `unwrap_or_default()` is acceptable because the field is informational only.
+4. NO fields SHALL be removed from `ImageState` or `ImageSource`. All additions are strictly additive per the existing state-format compatibility rule.
+5. A unit test in `tokeira-deploy-engine` SHALL assert that `record_images` produces the expected `ImageState` for each of the three `ImageSourceType` variants against a small fixture of fake `Image` impls. A negative test SHALL construct a fake Mirror image that returns `upstream_ref: None` and assert `record_images` returns the exact documented `RuntimeError::Image` rather than panicking.
+
+### Requirement 1.6: `Registry` source-type semantics
+
+**User Story:** As a Tokeira maintainer, I want `ImageSourceType::Registry` defined rather than reserved, so that an image that is pulled from an existing registry (neither built locally nor mirrored into project ECR) has an unambiguous contract — even if no image in the current spec uses this variant.
+
+#### Acceptance Criteria
+
+1. `ImageSourceType::Registry` represents an image whose reference is consumed as-is from an external registry (for example a public ECR image referenced directly by a compose service without mirroring). This variant is not exercised by any image declared in this spec; it is reserved for future use.
+2. FOR Registry images, `DesiredImageRef.repository` SHALL carry the full registry-qualified reference path (not a project-scoped suffix). The project-prefix requirement in Req 1.1.4 applies to Build and Mirror images only.
+3. FOR Registry images, `DesiredImageRef.upstream_ref` MAY be `None` or `Some(_)`. When `Some`, it SHALL equal `repository:tag` — the field is informational only for this variant.
+4. FOR Registry images, `writeback_targets` SHALL default to empty. A Registry image's ref is authored by the operator in config and never discovered by `tkr image` machinery.
+5. THE per-platform property tests (Req 9.1, 9.2, 9.7, 9.8) SHALL either skip Registry images or assert only the Registry-specific invariants above; they SHALL NOT assert the Build-or-Mirror upstream-ref invariant on Registry images.
 
 ---
 
-## Feature 3: Dagger-Backed Build and Mirror Pipelines
+## Feature 2: Per-Platform Image Declarations
 
-### Requirement 3.1: Build pipeline for Build images
+### Requirement 2.1: Compose platform image modules
 
-**User Story:** As a Tokeira operator, I want every `Build` image produced through a reproducible Dagger pipeline keyed off the image's trait data, so that the CLI can build any Build image uniformly without per-image wiring.
-
-#### Acceptance Criteria
-
-1. THE Build_Crate SHALL expose `pub fn build_image(image: &dyn Image, request: &BuildRequest, dagger: &dyn DaggerClient) -> Result<BuildResult, BuildError>` that executes the Dagger pipeline for a single Build image.
-2. `BuildRequest { arch: Arch, tag: String, workspace_root: PathBuf }` SHALL carry the architecture, local tag, and workspace root. The `image` argument supplies name and desired repo via its trait methods.
-3. THE pipeline SHALL drive the build through Dagger rather than invoking `docker build` directly.
-4. THE pipeline SHALL resolve the Rust toolchain version from `rust-toolchain.toml` at the workspace root and SHALL pin the build container's Rust version to that value.
-5. THE pipeline SHALL build the binary with `cargo build --release --bin {image.name()} --target <target-triple>` using the `Target_Architecture` from the request.
-6. THE resulting container image SHALL contain exactly one application binary at `/usr/local/bin/{image.name()}` and the minimal runtime dependencies (CA certificates, timezone data).
-7. THE resulting container image SHALL run as a non-root user (UID/GID 1000) with `{image.name()}` as both the username and group name.
-8. THE resulting container image SHALL declare `ENTRYPOINT ["/usr/local/bin/{image.name()}"]` and SHALL leave CMD empty by default.
-9. FOR ALL invocations with the same source tree, same `rust-toolchain.toml`, same Target_Architecture, and same image, the produced application binary layer SHALL be bit-identical (Reproducible_Build property).
-10. THE pipeline SHALL refuse to run on images whose `source_type() != Build`, returning `BuildError::SourceTypeMismatch`.
-
-### Requirement 3.2: Mirror pipeline for Mirror images
-
-**User Story:** As a Tokeira operator, I want every `Mirror` image pulled and re-pushed through a uniform Dagger flow, so that the CLI handles the six observability images through one code path.
+**User Story:** As a Tokeira developer, I want the compose platform to own its image set so that compose's image needs and config are expressed directly without cross-platform coupling.
 
 #### Acceptance Criteria
 
-1. THE Build_Crate SHALL expose `pub fn mirror_image(image: &dyn Image, ctx: &ImageContext, creds: &RegistryCredentials, dagger: &dyn DaggerClient) -> Result<MirroredReference, BuildError>`.
-2. THE function SHALL call `image.desired_ref(ctx)` to resolve the source and destination, authenticate to the destination registry using `creds`, and publish the pulled image to `{creds.registry_host}/{desired.repository}:{desired.tag}`.
-3. THE function SHALL NOT require a local `docker pull` step — the Dagger pipeline handles source-to-destination transfer in a single session.
-4. FOR ALL invocations with identical `image`, `ctx`, and destination, calling `mirror_image` twice SHALL produce the same destination image (digest-level idempotence: the second call re-pushes the same digest).
-5. IF the upstream source returns an authentication error, THEN THE function SHALL return `BuildError::UpstreamAuth`. The `RegistryCredentials` argument is only for the destination; upstream sources are assumed to be public.
-6. THE pipeline SHALL refuse to run on images whose `source_type() != Mirror`, returning `BuildError::SourceTypeMismatch`.
+1. THE compose platform SHALL include image modules at `platforms/compose/src/images/`:
+   - `tokeirad.rs` — `TokeiradImage` struct implementing `Image` with `source_type = Build`, reading `ComposeConfig` via `ctx.extension::<ComposeConfig>()`
+   - `observability/mod.rs` — six structs (`MimirImage`, `LokiImage`, `GrafanaImage`, `AlloyImage`, `AwsCliImage`, `BusyBoxImage`), all `source_type = Mirror`, all reading their upstream refs from `ComposeConfig.observability`
+   - `mod.rs` — exposing BOTH `pub fn construct() -> Vec<Box<dyn Image>>` (context-free enumeration — concatenates `tokeirad::all() + observability::all()`; used by `ComposeDeployment::images(&self, config)`) AND `pub fn all(ctx: &ImageContext) -> Result<Vec<Box<dyn Image>>, RuntimeError>` (calls `construct()` then `validate_registry`; used by CLI handlers that already have an `ImageContext`). Per Req 2.3.4
+2. `TokeiradImage::desired_ref` on the compose platform SHALL return `DesiredImageRef { repository: format!("{project}/tokeirad"), tag: "latest", upstream_ref: None }` where `project` comes from `ComposeConfig.project_name`.
+3. `TokeiradImage::writeback_targets` on the compose platform SHALL return `vec![WritebackTarget { field: "tokeirad.image" }]` — the single field the compose config reads for the `tokeirad` service image. The `field` SHALL be populated with the `latest` tag, not a version tag.
+4. EACH observability image's `desired_ref` SHALL return `DesiredImageRef { repository: format!("{project}/{repo_suffix}"), tag: image_tag(upstream).unwrap_or("latest"), upstream_ref: Some(upstream.clone()) }` where `upstream` is read from the matching `ComposeConfig.observability.*_image` field.
+5. EACH observability image's `writeback_targets` SHALL return `vec![WritebackTarget { field: "observability.{name}_image" }]` matching the upstream source field.
 
-### Requirement 3.3: Publish pipeline shared by push
+### Requirement 2.2: ECS platform image modules
 
-**User Story:** As a Tokeira operator, I want the `tkr image push` flow to publish a locally-built image to multiple remote refs in a single authenticated Dagger session, so that `:latest` and `:{tag}` get the same digest.
+**User Story:** As a Tokeira developer, I want the ECS platform to own its image set so that ECS's image needs and config are expressed directly without cross-platform coupling.
 
 #### Acceptance Criteria
 
-1. THE Build_Crate SHALL expose `pub fn publish_image(local_image: &str, remote_refs: &[String], creds: &RegistryCredentials, dagger: &dyn DaggerClient) -> Result<PublishResult, BuildError>`.
-2. THE function SHALL authenticate to `creds.registry_host` using `creds.username` and `creds.password` and push `local_image` to every reference in `remote_refs`.
-3. WHEN `remote_refs` is empty, THE function SHALL return `BuildError::Validation { reason: "remote_refs cannot be empty" }`.
-4. THE `PublishResult` SHALL contain one `PublishedReference { remote_ref, published_ref }` entry per successfully pushed reference; `published_ref` carries the digest-pinned reference Dagger returns.
-5. IF any `remote_ref` push fails, THEN THE function SHALL return `BuildError::Publish { remote_ref, source }` naming the failing reference. Prior successful pushes SHALL NOT be undone.
+1. THE ECS platform SHALL include image modules at `platforms/ecs/src/images/`:
+   - `tokeirad.rs` — `TokeiradImage` struct implementing `Image` with `source_type = Build`, reading `EcsConfig` via `ctx.extension::<EcsConfig>()`
+   - `observability/mod.rs` — six structs matching compose's set (`MimirImage`, `LokiImage`, `GrafanaImage`, `AlloyImage`, `AwsCliImage`, `BusyBoxImage`), all `source_type = Mirror`, all reading their upstream refs from `EcsConfig.observability`
+   - `mod.rs` — exposing BOTH `pub fn construct() -> Vec<Box<dyn Image>>` (context-free, used by `EcsDeployment::images(&self, config)`) AND `pub fn all(ctx: &ImageContext) -> Result<Vec<Box<dyn Image>>, RuntimeError>` (validated, used by CLI handlers and `ImagesModule`). Per Req 2.3.4
+2. `TokeiradImage::desired_ref` on the ECS platform SHALL return `DesiredImageRef { repository: format!("{project}/tokeirad"), tag: "latest", upstream_ref: None }` where `project` comes from `EcsConfig.project_name`.
+3. `TokeiradImage::writeback_targets` on the ECS platform SHALL return a `Vec<WritebackTarget>` with one entry per ECS service: `services.edge_api.image`, `services.edge_poll.image`, `services.runtime.image`, `services.projection.image`, `services.controller.image`, `services.autoscaler.image`, `services.admin.image`. The remote ref written back into each service field is determined by `tkr image push` at publish time (Req 6.4.6): when a non-`latest` tag is supplied via `--tag`, the version-tagged ref `{registry}/{project}/tokeirad:{tag}` is written; when the default `--tag latest` is in effect, the single `:latest` ref `{registry}/{project}/tokeirad:latest` is written. The image's `writeback_targets` method itself only declares which dotted keys are targets — the ref value is chosen by the CLI handler.
+4. EACH observability image's `desired_ref` SHALL produce `DesiredImageRef { repository: format!("{project}/{repo_suffix}"), tag: image_tag(upstream).unwrap_or("latest"), upstream_ref: Some(upstream.clone()) }` where `upstream` is read from the matching `EcsConfig.observability.*_image` field.
+5. EACH observability image's `writeback_targets` SHALL return `vec![WritebackTarget { field: "observability.{name}_image" }]` matching the upstream source field.
 
-### Requirement 3.4: Target-architecture support for Build images
+### Requirement 2.3: Per-platform registry validation
+
+**User Story:** As a Tokeira maintainer, I want each platform's `images::all()` to refuse duplicate names or duplicate repositories at construction time, so that a malformed image module cannot ship.
+
+#### Acceptance Criteria
+
+1. EACH platform's `images::all()` SHALL call a shared `validate_registry(images: &[Box<dyn Image>], ctx: &ImageContext) -> Result<(), RuntimeError>` helper (living in `tokeira-deploy-engine::image::validate_registry`) before returning.
+2. `validate_registry` SHALL walk the list and return an error on duplicate `name()` values or duplicate `repository` values (after resolving `desired_ref(ctx)`), regardless of `source_type`. A `Build` image and a `Mirror` image that resolve to the same `repository` SHALL be rejected — the downstream `ImagesModule` would otherwise register duplicate `EcrRepository` resources for the same AWS repository.
+3. Duplicate violations SHALL return `RuntimeError::Image(format!("image registry validation failed: duplicate {kind} = {value}"))`. Callers SHALL NOT be expected to handle this — a failing `all()` is a programming error, not a runtime condition.
+4. EACH platform SHALL split image construction from image validation:
+   - `images::construct() -> Vec<Box<dyn Image>>` — synchronous, context-free, always returns the full image list. Used by `Deployment::images(&self, config)` which receives no context.
+   - `images::all(ctx) -> Result<Vec<Box<dyn Image>>, RuntimeError>` — calls `construct()` then `validate_registry`. Used by CLI handlers that already have an `ImageContext`.
+   The two functions return the same set of images in the same order. `validate_registry` is run at test time via a per-platform property test (Req 9.1), not on every `deploy apply`.
+
+### Requirement 2.4: ECR name grammar enforcement
+
+**User Story:** As a Tokeira maintainer, I want every image's resolved repository name validated against the ECR grammar, so that an image that accidentally declares an invalid repo name cannot ship.
+
+#### Acceptance Criteria
+
+1. A per-platform property test SHALL iterate its own `images::all(ctx)` across realistic `ctx` values and assert that `desired_ref(ctx)?.repository` satisfies the ECR repository name grammar: 2–256 characters, lowercase alphanumerics plus `/`, `-`, `_`, `.`, not starting with `/` or `.`.
+
+### Requirement 2.5: Platform `images()` returns the new registry
+
+**User Story:** As a Tokeira maintainer, I want `ComposeDeployment::images()` and `EcsDeployment::images()` to return the new platform image registry, so that the deploy-engine actually records the Build and Mirror images it provisions rather than the legacy per-service Registry wrappers.
+
+#### Acceptance Criteria
+
+1. THE existing `ComposeImage` struct in `platforms/compose/src/services.rs` and its surrounding `ComposeDeployment::images()` body SHALL be removed as part of this spec's implementation. The adapter becomes obsolete once the platform registry exists.
+2. `ComposeDeployment::images(&self, config)` SHALL return `platforms::compose::images::construct()` — the context-free constructor (Req 2.3.4). The deploy engine runs `register_image_extensions` before `record_images`, so `desired_ref(ctx)` sees `ComposeConfig` registered at call time.
+3. `EcsDeployment::images(&self, config)` SHALL return `platforms::ecs::images::construct()` using the same pattern.
+4. `LocalDeployment::images()` remains an empty `Vec` (local has no image set).
+5. AFTER this change, running `tkr deploy apply` on a compose deployment SHALL result in `ServiceEngine::record_images` persisting one `ImageState` per image in the new platform registry — `tokeirad` as `Built` and each observability image as `Mirrored { upstream_ref }`. No `ImageSource::PullThrough` entries SHALL be written unless a future `RegistryImage` is added to a platform's `images::construct()` (Req 1.6).
+
+---
+
+## Feature 3: Dagger-Backed Build, Publish, and Mirror Pipelines
+
+### Requirement 3.1: Build crate structure
+
+**User Story:** As a Tokeira developer, I want a dedicated library crate for image build/publish/mirror workflows, so that the pipeline orchestration is isolated from both the CLI and the deployment-resolution abstractions.
+
+#### Acceptance Criteria
+
+1. THE Build_Crate SHALL live at `crates/tokeira-build/` and SHALL be a workspace member.
+2. THE Build_Crate SHALL expose public API: `TokeiradBuildRequest`, `TokeiradBuildResult`, `PublishRequest`, `PublishResult`, `PublishedReference`, `MirrorRequest`, `MirroredReference`, `BuildError`, `Arch`, and the `DaggerClient` trait.
+3. THE Build_Crate SHALL expose public functions: `build_tokeirad_image(&TokeiradBuildRequest, &dyn DaggerClient) -> Result<TokeiradBuildResult, BuildError>`, `publish_image(&PublishRequest, &dyn DaggerClient) -> Result<PublishResult, BuildError>`, `mirror_image(&MirrorRequest, &dyn DaggerClient) -> Result<MirroredReference, BuildError>`.
+4. THE Build_Crate SHALL use `thiserror` for its error type and SHALL NOT expose `anyhow::Error` in its public API.
+5. THE Build_Crate SHALL use `tracing` for structured logging. THE Build_Crate SHALL NOT use `println!` or `eprintln!` in library code.
+6. THE Build_Crate SHALL NOT depend on `apps/tkr` or on any platform crate.
+7. THE Build_Crate SHALL NOT implement the `Image` trait and SHALL NOT enumerate platforms' image registries. Each pipeline function hardcodes the image recipe it produces.
+
+### Requirement 3.2: Reproducible tokeirad image build
+
+**User Story:** As a Tokeira operator, I want `tokeirad` image builds to be reproducible across hosts and invocations, so that the same source tree produces functionally equivalent images every time.
+
+#### Acceptance Criteria
+
+1. `build_tokeirad_image` SHALL drive the build through a Dagger pipeline rather than invoking `docker build` directly.
+2. THE Dagger pipeline SHALL resolve the Rust toolchain version from `rust-toolchain.toml` at the workspace root and SHALL pin the build container's Rust version to that value.
+3. THE Dagger pipeline SHALL build the `tokeirad` binary with `cargo build --release --bin tokeirad --target <target-triple>` using the Target_Architecture supplied in the build request.
+4. THE resulting container image SHALL contain exactly one application binary (`/usr/local/bin/tokeirad`) and the minimal runtime dependencies required to execute it (CA certificates, timezone data).
+5. THE resulting container image SHALL run as a non-root user (UID/GID 1000) with `tokeirad` as both the username and group name.
+6. THE resulting container image SHALL declare `ENTRYPOINT ["/usr/local/bin/tokeirad"]` and SHALL leave CMD empty by default.
+7. FOR ALL invocations of `build_tokeirad_image` on the same source tree, same `rust-toolchain.toml`, and same Target_Architecture, the produced application binary layer SHALL be bit-identical.
+8. EVERY successful build SHALL export `tokeirad:latest` regardless of the value of `--tag`. When `--tag <value>` is supplied (and `<value> != "latest"`), the pipeline SHALL additionally export `tokeirad:<value>`, pointing at the same digest.
+
+### Requirement 3.3: Target architecture support
 
 **User Story:** As a Tokeira operator, I want to build `arm64` images by default with an opt-in for `amd64`, so that the same workflow serves Graviton4 ECS hosts, Apple Silicon compose users, and x86 Intel hosts.
 
 #### Acceptance Criteria
 
-1. `BuildRequest` SHALL include an `arch: Arch` field where `pub enum Arch { Arm64, Amd64 }`.
-2. THE Image_CLI SHALL default `arch` to `Arch::Arm64`.
-3. IF an invalid architecture string is supplied on the CLI, THE Image_CLI SHALL return a usage error naming the invalid value and listing the valid values.
-4. WHEN `arch = Arm64`, THE Dagger pipeline SHALL use a Rust build container whose target triple is `aarch64-unknown-linux-musl`.
-5. WHEN `arch = Amd64`, THE Dagger pipeline SHALL use a Rust build container whose target triple is `x86_64-unknown-linux-musl`.
-6. THE produced image's manifest SHALL declare the platform (`linux/arm64` or `linux/amd64`) matching the Target_Architecture.
-7. `Arch` SHALL implement `FromStr` with an error type of `BuildError::UnsupportedArch { supplied }`.
+1. THE `TokeiradBuildRequest` SHALL include `arch: Arch` where `pub enum Arch { Arm64, Amd64 }`.
+2. `Arch` SHALL implement `FromStr` with an error type of `BuildError::UnsupportedArch { supplied: String }`. Valid strings SHALL be `"arm64"` and `"amd64"`; any other string returns the error.
+3. WHEN `arch = Arm64`, THE Dagger pipeline SHALL use target triple `aarch64-unknown-linux-musl`. WHEN `arch = Amd64`, the pipeline SHALL use `x86_64-unknown-linux-musl`.
+4. THE produced image's manifest SHALL declare the platform (`linux/arm64` or `linux/amd64`) matching the Target_Architecture.
 
-### Requirement 3.5: Local image tag for the compose platform
+### Requirement 3.4: Publish operation
 
-**User Story:** As a Tokeira developer, I want `tkr image build` with no flags to produce `tokeirad:latest`, so that the compose platform's default image reference works without any additional configuration and the push flow (which sources from `tokeirad:latest`) always has its input present after any successful build.
+**User Story:** As a Tokeira operator, I want to publish a locally-built image to multiple remote refs in a single authenticated Dagger session, so that `:latest` and `:{tag}` get the same digest.
 
 #### Acceptance Criteria
 
-1. EVERY successful build SHALL export `{image.name()}:latest` regardless of the value of `--tag`. This guarantees the push flow's `tokeirad:latest` source is always present after a build.
-2. WHEN `--tag <value>` is also supplied (where `<value> != "latest"`), THE Build_Crate SHALL additionally export `{image.name()}:<value>`. The two tags reference the same image (same digest).
-3. FOR ALL invocations that succeed, the local Docker image store SHALL contain the exported tag(s) so subsequent `docker compose up` commands resolve the image without a registry pull.
-4. THE `tokeirad:latest` tag SHALL match the compose platform's default `ComposeConfig.tokeirad.image` value defined in `platforms/compose/src/config.rs`.
+1. `publish_image(request, dagger)` SHALL authenticate to `request.registry` using `request.username` and `request.password` and SHALL push `request.local_image` to every entry in `request.remote_refs`.
+2. WHEN `request.remote_refs` is empty, THE function SHALL return `BuildError::Validation { reason: "remote_refs cannot be empty" }`.
+3. THE `PublishResult` SHALL contain one `PublishedReference { remote_ref, published_ref }` entry per successfully pushed reference; `published_ref` carries the digest-pinned reference Dagger returns.
+4. IF any push fails, the function SHALL return `BuildError::Publish { remote_ref, source }` naming the failing ref. Prior successful pushes SHALL NOT be undone.
+
+### Requirement 3.5: Mirror operation
+
+**User Story:** As a Tokeira operator, I want to mirror a remote image from an upstream registry to a destination ECR reference, so that a private-only ECS deployment has every image it needs before `tkr infra apply`.
+
+#### Acceptance Criteria
+
+1. `mirror_image(request, dagger)` SHALL authenticate to `request.registry` using `request.username` and `request.password` and SHALL pull `request.source_ref` then push to `request.remote_ref`.
+2. THE function SHALL NOT require a local `docker pull` step — the Dagger pipeline handles source-to-destination transfer in a single session.
+3. FOR ALL invocations with identical `source_ref` and `remote_ref`, calling `mirror_image` twice SHALL produce the same destination image (digest-level idempotence).
+4. IF the upstream source returns an authentication error, THE function SHALL return `BuildError::UpstreamAuth`. The `RegistryCredentials` in the request are only for the destination.
 
 ---
 
@@ -275,8 +289,8 @@ What this gives us:
 #### Acceptance Criteria
 
 1. WHEN the Image_CLI is invoked without active Dagger session environment variables (`DAGGER_SESSION_PORT` and `DAGGER_SESSION_TOKEN` both unset), THE Image_CLI SHALL re-execute itself under `dagger run` with the same arguments and exit with that process's status.
-2. WHEN both `DAGGER_SESSION_PORT` and `DAGGER_SESSION_TOKEN` are set, THE Image_CLI SHALL NOT re-execute under `dagger run` and SHALL proceed with the Dagger session established by the wrapping process.
-3. IF `dagger` is not on the operator's PATH, THEN THE Image_CLI SHALL return an error stating that the `dagger` CLI (>= 0.20) must be installed, with a link to the Dagger installation documentation.
+2. WHEN both `DAGGER_SESSION_PORT` and `DAGGER_SESSION_TOKEN` are set, THE Image_CLI SHALL NOT re-execute under `dagger run` and SHALL proceed with the existing session.
+3. IF `dagger` is not on the operator's PATH, THE Image_CLI SHALL return an error stating that `dagger` CLI (>= 0.20) must be installed, with a link to the Dagger installation documentation.
 4. THE re-exec flow SHALL forward the `--deployment`, `--json`, and all `image` subcommand arguments unchanged.
 
 ### Requirement 4.2: Dagger client location
@@ -287,7 +301,7 @@ What this gives us:
 
 1. THE Build_Crate SHALL depend on an in-repo `crates/dagger-client/` crate. THE reference implementation at `.kiro/specs/image-lifecycle/reference/` SHALL be ported into the workspace with minor adjustments documented in the reference README.
 2. THE Dagger client interface consumed by the Build_Crate SHALL include at minimum: `host_directory(path)`, `container_from(image)`, `container_build(context, dockerfile)`, `with_exec(args)`, `with_file(path, file)`, `with_entrypoint(args)`, `export_image(tag)`, `publish(remote_ref)`, `with_registry_auth(registry, username, secret)`, `set_secret(name, value)`.
-3. THE Build_Crate SHALL expose a `DaggerClient` trait over the in-repo client as the seam through which pipeline functions accept a client instance. The trait is a first-class part of the Build_Crate's public API — pipeline functions take `&dyn DaggerClient` so callers (CLI, tests, future consumers) can substitute implementations. Production callers use the default `Client::from_env()` via the `dagger-client` crate.
+3. THE Build_Crate SHALL expose a `DaggerClient` trait over the in-repo client as the public testing seam. Pipeline functions take `&dyn DaggerClient`. The trait is first-class public API so tests can substitute a mock; production callers obtain the default via `Client::from_env()` on the `dagger-client` crate.
 
 ---
 
@@ -299,26 +313,30 @@ What this gives us:
 
 #### Acceptance Criteria
 
-1. THE `tokeira-aws` crate SHALL define an `EcrRepository` resource implementing the `Resource` trait from `tokeira-iac`. Trait signature matches the existing trait: `async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, IacError>` and siblings for `update`, `delete`, `describe`, `diff`. The resource SHALL NOT add parameters to the trait methods.
-2. THE `EcrRepository` SHALL obtain its `aws-sdk-ecr` client from a `ProvisionContext` extension (registered once when the orchestrator constructs the context). Modules that include an `EcrRepository` SHALL rely on the platform ensuring the extension is registered, matching how `DsqlCluster` obtains its DSQL client today.
-3. THE `EcrRepository` resource SHALL accept a repository name field. THE resource SHALL require that the name is non-empty and matches the AWS ECR repository name grammar (lowercase alphanumerics, `/`, `-`, `_`, `.`, 2–256 characters).
+1. THE `tokeira-aws` crate SHALL define an `EcrRepository` resource implementing the `Resource` trait from `tokeira-iac`. Trait method signatures SHALL match the existing trait verbatim: `async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, IacError>` and siblings. NO additional parameters.
+2. THE `EcrRepository` SHALL fetch its ECR client via a `ProvisionContext` extension named `EcrClientHandle(Arc<dyn EcrClient>)`. The lookup SHALL be fallible (Req 1.3); missing extension returns `IacError::Other(anyhow!("ProvisionContext missing extension: EcrClientHandle"))`.
+3. THE `EcrRepository` resource SHALL accept `name: String` and `module: String` fields at construction. It SHALL NOT accept `tags` at construction — tags are computed at lifecycle time (see Req 5.1.9). The `name` SHALL be validated against the ECR grammar (Req 2.4) at construction time.
 4. THE `EcrRepository` SHALL set Image_Tag_Mutability to `MUTABLE` on create.
 5. THE `EcrRepository` SHALL apply the canonical Lifecycle_Policy (keep last 10 untagged images) on both create and update.
-6. THE `EcrRepository::describe()` method SHALL return `None` when the repository does not exist in AWS, so destroy operations following the [`iac-resource-lifecycle`](../iac-resource-lifecycle/requirements.md) describe-before-delete rule are idempotent.
-7. THE `EcrRepository::diff()` method SHALL report a lifecycle policy drift as an update when the current policy JSON differs from the canonical Lifecycle_Policy.
-8. THE `EcrRepository` SHALL carry the same auto-generated and operator-defined tags as all other AWS resources per the [`ecs-deployment`](../ecs-deployment/requirements.md) tagging requirement.
+6. THE `EcrRepository::describe()` method SHALL return `None` when the repository does not exist in AWS. When the repository exists, `describe()` SHALL read LIVE state from AWS — calling `list_tags_for_resource(arn)` for tags and `get_lifecycle_policy(name)` for the policy — and populate `ResourceState.properties` with those live values. It SHALL NOT call `ctx.resource_tags()` on the describe path; that would echo desired tags into state and hide external drift.
+7. THE `EcrRepository::diff()` method SHALL compare the LIVE values persisted into `current.properties` by `describe()` against the desired values. Desired tags come from `ctx.resource_tags(&self.name)`; desired policy is the canonical `ECR_LIFECYCLE_POLICY` constant. Lifecycle-policy comparison SHALL be JSON-normalised (key ordering, rule ordering, whitespace all irrelevant). Any mismatch — including drift introduced outside the tool, such as an operator retagging or retrofitting a policy in the AWS console — SHALL signal `Update`.
+8. THE `EcrRepository` SHALL carry the same auto-generated and operator-defined tags as all other AWS resources per the [`ecs-deployment`](../ecs-deployment/requirements.md) tagging requirement. This includes a resource-specific `Name` tag equal to the repository name (for example `Name = "tokeira-dev/tokeirad"`), a `Project` tag equal to the project name, and a `ManagedBy = "tokeira-cli"` tag, merged with any operator-defined tags.
+9. THE desired tag set SHALL be computed AT LIFECYCLE TIME via `ctx.resource_tags(&self.name)` inside `create`/`update`/`diff` — NOT hoisted to a module-level constant or passed through the resource constructor. The `describe` method SHALL NOT use this helper; it reads LIVE tags from AWS (Req 5.1.6). The existing `tokeira_iac::ProvisionContext::resource_tags(resource_name)` helper already returns the correct per-resource merge (operator tags + `Name = resource_name` + `Project` + `ManagedBy`) as a `HashMap<String, String>`. The resource's constructor SHALL NOT accept a tags parameter, and `ImagesModule` SHALL NOT compute tags itself — letting each `EcrRepository` resolve its own `Name`-including tag map at apply time.
 
 ### Requirement 5.2: ECR repositories are wired into an IaC module
 
-**User Story:** As a Tokeira operator, I want every project-owned ECR repository to appear in `tkr infra plan` output and to be cleaned up on `tkr infra destroy`, so that repositories are first-class members of the deployment's state rather than side-effects of running image commands.
+**User Story:** As a Tokeira operator, I want every project-owned ECR repository to appear in `tkr infra plan` output and to be cleaned up on `tkr infra destroy`, so that repositories are first-class members of the deployment's state.
 
 #### Acceptance Criteria
 
-1. THE ECS platform SHALL include an `images` IaC module (or fold the ECR resources into an existing foundational module) that declares one `EcrRepository` resource per entry in `images::all(ctx)`, using `desired_ref(ctx)?.repository` as the repository name.
-2. THE module's resource list SHALL be computed by iterating the image registry so adding a new image automatically adds its repository to `infra plan` / `infra destroy` without additional wiring.
-3. `tkr infra plan` on an ECS deployment SHALL list every project-owned ECR repository under the `images` module.
-4. `tkr infra destroy` on an ECS deployment SHALL delete every project-owned ECR repository (with `force = true` so repositories that still contain images are removed), subject to the describe-before-delete idempotency rule.
-5. THE module is ECS-specific for this spec. Local and compose platforms SHALL NOT register it — they have no ECR to provision.
+1. THE ECS platform SHALL include an `ImagesModule` IaC module at `platforms/ecs/src/modules/images.rs` that declares one `EcrRepository` resource per entry in `platforms::ecs::images::all(ctx)`, using `desired_ref(ctx)?.repository` as the repository name.
+2. `ImagesModule` SHALL follow the in-constructor capture pattern already used by the compose platform's `ComposeModule::runtime(config)`: the module's constructor takes `EcsConfig` by value and stores it as a field. It SHALL NOT capture or pass tags — tags are computed per-resource at lifecycle time by each `EcrRepository::create`/`update` via `ctx.resource_tags(&self.name)` (Req 5.1.9). It SHALL NOT attempt to read `EcsConfig` from `ModuleContext` extensions, because `ModuleContext` in this workspace exposes only `state` and typed extensions — not arbitrary config, not project tags, and not a `default_tags()` helper.
+3. THE `resources(ctx)` body SHALL construct an `ImageContext`, register the captured `EcsConfig` on it via `ctx.set_extension(config.clone())`, call `platforms::ecs::images::all(&image_ctx)?`, and map each resolved image to an `EcrRepository::new(desired.repository, "images".into())?` — with no tags parameter.
+4. THE module's resource list SHALL be computed by iterating the ECS platform's image set so adding a new image automatically adds its repository to `infra plan` / `infra destroy`.
+5. `tkr infra plan` on an ECS deployment SHALL list every project-owned ECR repository under the `images` module. Each repository's per-resource `Name` tag SHALL equal its repository name (for example `Name = "tokeira-dev/tokeirad"`), confirming that `resource_tags(&self.name)` is computed per-repository and not reused across the module.
+6. `tkr infra destroy` on an ECS deployment SHALL delete every project-owned ECR repository (with `force = true`), subject to the describe-before-delete idempotency rule.
+7. THE module is ECS-specific. Local and compose platforms SHALL NOT register it.
+8. THE tags applied to each ECR repository SHALL match the `resource_tags(&name)` computation in `tokeira_iac::ProvisionContext`. The `ecs-deployment` spec defines the project-level tag set (auto-generated `Name`/`Project`/`ManagedBy` plus operator-defined tags) via the `ProvisionContext::tags` map that `ProvisionContext::new` receives. This spec consumes that map through the existing `resource_tags(name)` helper — it does NOT define or compute tags independently.
 
 ### Requirement 5.3: Ad-hoc repository ensure for pre-apply image flows
 
@@ -326,10 +344,32 @@ What this gives us:
 
 #### Acceptance Criteria
 
-1. THE `tokeira-aws` crate SHALL expose `async fn ensure_ecr_repository(ecr: &dyn EcrClient, name: &str, tags: &BTreeMap<String, String>) -> Result<(), EcrError>` that: describes first, creates if absent with `MUTABLE` mutability, and then always applies the Lifecycle_Policy.
-2. THE crate SHALL expose `async fn ensure_ecr_repositories(ecr: &dyn EcrClient, repos: &[(String, BTreeMap<String, String>)]) -> Result<(), EcrError>` that calls the single-repo helper in sequence.
-3. THE ad-hoc helpers SHALL produce the same end state as the `EcrRepository` IaC resource's `create` + `update` path: same mutability, same lifecycle policy JSON, same tags. A repository created ad-hoc SHALL be adopted cleanly by a subsequent `tkr infra apply` without additional changes.
-4. A unit test SHALL construct a repository via the ad-hoc helper, then invoke `EcrRepository::describe()` against the same mocked ECR state and assert the returned `ResourceState` matches what the resource would have produced from its own `create` path.
+1. THE `tokeira-aws` crate SHALL expose `async fn ensure_ecr_repository(ecr: &dyn EcrClient, name: &str, tags: &HashMap<String, String>) -> Result<(), EcrError>` that:
+   a. Describes the repository.
+   b. If absent, creates it with `MUTABLE` mutability and the supplied `tags`.
+   c. Regardless of whether the repository was newly created or already existed, unconditionally re-applies the Lifecycle_Policy via `put_lifecycle_policy`.
+   d. Regardless of existence, unconditionally re-applies the supplied `tags` via `tag_resource`. This is the reconciliation step that lets `EcrRepository::diff` report `NoChange` on a subsequent `tkr infra apply`.
+2. THE crate SHALL expose `async fn ensure_ecr_repositories(ecr: &dyn EcrClient, repos: &[(String, HashMap<String, String>)]) -> Result<(), EcrError>` that calls the single-repo helper in sequence.
+3. THE caller SHALL supply tags that exactly match what `EcrRepository::create`/`update` would apply for the same repository. The canonical way to produce these tags at the CLI call site is: build a `ProvisionContext` via the ECS platform's `register_infra_extensions` hook (same code path `tkr infra apply` uses), then call `ctx.resource_tags(&name)` once per repository. Reusing the project-level `ctx.tags` map WITHOUT calling `resource_tags` would omit the per-resource `Name` tag and cause subsequent `infra apply` to report spurious `Update` changes.
+4. THE ad-hoc helpers SHALL produce the same end state as the `EcrRepository` IaC resource's `create` + `update` path: same mutability, same lifecycle policy JSON, same tags including the correct per-repository `Name`. A repository created ad-hoc SHALL be adopted cleanly by a subsequent `tkr infra apply` without additional changes, AND a repository created with stale tags SHALL be reconciled on the next `ensure_ecr_repository` call.
+5. A unit test SHALL construct a repository via the ad-hoc helper using `ctx.resource_tags(&name)` as the tag source, then invoke `EcrRepository::describe(&ctx)` and `diff()` against the same mocked ECR state and assert `Change::NoChange`. This is the adoption-consistency test.
+6. A unit test SHALL seed the mock with a repository carrying stale tags, call `ensure_ecr_repository` with `ctx.resource_tags(&name)`, and assert `tag_resource` was invoked with the current tags and that `EcrRepository::diff` subsequently reports `NoChange`.
+
+### Requirement 5.3a: Shared `ensure_ecr_repositories_from_images` helper
+
+**User Story:** As a Tokeira maintainer, I want a single helper that `tkr image push` and `tkr image mirror` both call, so that the tag-source pattern stays consistent between the two subcommands and with `ImagesModule`.
+
+#### Acceptance Criteria
+
+1. THE `platforms/ecs` crate SHALL expose `pub async fn ensure_ecr_repositories_from_images(ecr: &dyn EcrClient, ctx: &ProvisionContext, images: &[Box<dyn Image>], image_ctx: &ImageContext) -> Result<(), IacError>` that:
+   a. Iterates the supplied image list.
+   b. For each image, resolves `desired_ref(image_ctx)?.repository`.
+   c. Computes `ctx.resource_tags(&desired.repository)` — the SAME helper `EcrRepository::create` uses.
+   d. Collects `(repository, tags)` pairs.
+   e. Calls `tokeira_aws::ensure_ecr_repositories(ecr, &repos)` once.
+2. `tkr image push` SHALL call this helper (filtered to Build images) rather than computing tags inline.
+3. `tkr image mirror` SHALL call this helper (filtered to Mirror images) rather than computing tags inline.
+4. A property test SHALL assert that for every image in `platforms::ecs::images::all(ctx)`, the tags produced by `ensure_ecr_repositories_from_images` for that image equal the tags that a fresh `EcrRepository { name: desired.repository, module: "images" }` would apply during `create` — ensuring the two paths converge on the same end state.
 
 ### Requirement 5.4: Canonical Lifecycle_Policy
 
@@ -338,28 +378,17 @@ What this gives us:
 #### Acceptance Criteria
 
 1. THE Lifecycle_Policy SHALL be a single rule with `rulePriority = 1`, `tagStatus = "untagged"`, `countType = "imageCountMoreThan"`, `countNumber = 10`, `action.type = "expire"`.
-2. THE Lifecycle_Policy SHALL NOT expire tagged images. Operators pruning tagged images SHALL do so manually or via a future operator-driven command — this spec does not introduce one.
-3. FOR ALL repositories provisioned by this spec, applying the policy twice SHALL be idempotent: the second `PutLifecyclePolicy` call SHALL produce the same policy state as the first.
+2. THE Lifecycle_Policy SHALL NOT expire tagged images.
+3. FOR ALL repositories provisioned by this spec, applying the policy twice SHALL be idempotent.
 
-### Requirement 5.5: Project-scoped repository names derive from `DesiredImageRef.repository`
+### Requirement 5.5: Repository existence handling in the CLI
 
-**User Story:** As a Tokeira operator, I want repository names derived uniformly from the `Image::desired_ref().repository` field, so that the set of repositories the deployment needs is mechanically derivable from the image registry.
-
-#### Acceptance Criteria
-
-1. THE Image_CLI AND the `images` IaC module SHALL derive the set of required repositories by iterating `images::all(ctx)` and collecting `desired_ref(ctx)?.repository` values.
-2. FOR the `TokeiradImage`, `desired_ref(ctx)?.repository` SHALL equal `{project_name}/tokeirad`.
-3. FOR the observability Mirror images, `desired_ref(ctx)?.repository` SHALL equal `{project_name}/{repo_suffix}` where `repo_suffix` matches Req 2.2.1.
-4. WHERE a deployment's `project_name` contains characters outside the ECR repository name grammar, THE Image_CLI SHALL return a validation error naming the invalid character.
-
-### Requirement 5.6: Repository existence handling in the CLI
-
-**User Story:** As a Tokeira operator, I want `tkr image push` and `tkr image mirror` to create repositories on first use and tolerate pre-existing repositories on re-runs, so that the commands are idempotent without requiring a separate provisioning step.
+**User Story:** As a Tokeira operator, I want `tkr image push` and `tkr image mirror` to create repositories on first use and tolerate pre-existing repositories on re-runs, so that the commands are idempotent.
 
 #### Acceptance Criteria
 
-1. WHEN `tkr image push` or `tkr image mirror` runs, THE Image_CLI SHALL ensure each required Project_Repository (from Req 5.5) exists before attempting to push, via the Req 5.3 ad-hoc helpers.
-2. WHEN the repository already exists, THE Image_CLI SHALL NOT return an error. It SHALL proceed to apply the Lifecycle_Policy (which is idempotent) and then to push.
+1. WHEN `tkr image push` or `tkr image mirror` runs, THE Image_CLI SHALL ensure each required Project_Repository exists before attempting to push, via the Req 5.3 ad-hoc helpers.
+2. WHEN the repository already exists, THE Image_CLI SHALL proceed to apply the Lifecycle_Policy (idempotent) and then to push.
 3. WHEN the repository does not exist, THE Image_CLI SHALL create it with Image_Tag_Mutability = `MUTABLE` and THEN apply the Lifecycle_Policy.
 4. FOR ALL invocations with the same project name and image set, calling `tkr image push` or `tkr image mirror` twice in a row SHALL produce the same set of repositories with the same lifecycle policy.
 
@@ -369,80 +398,85 @@ What this gives us:
 
 ### Requirement 6.1: `tkr image` command group
 
-**User Story:** As a Tokeira operator, I want a single `tkr image` command group for all image-plane operations, so that list, build, push, and mirror workflows are discoverable together and do not pollute other command groups.
+**User Story:** As a Tokeira operator, I want a single `tkr image` command group for all image-plane operations, so that list, build, push, and mirror workflows are discoverable together.
 
 #### Acceptance Criteria
 
 1. THE Image_CLI SHALL expose a top-level `image` subcommand under `tkr` with four children: `list`, `build`, `push`, and `mirror`.
 2. THE `tkr image` command group SHALL follow the [`tkr-cli`](../tkr-cli/requirements.md) conventions for global flags (`--deployment`, `--json`) and for help-text formatting.
-3. THE `tkr image` command group SHALL appear between `tkr deployment` and `tkr infra` in `tkr --help` output, reflecting its position in the deployment lifecycle.
+3. THE `tkr image` command group SHALL appear between `tkr deployment` and `tkr infra` in `tkr --help` output.
 4. WHEN `tkr image` is invoked with no subcommand, THE Image_CLI SHALL print a help message listing the four children.
 
 ### Requirement 6.2: `list` subcommand
 
-**User Story:** As a Tokeira operator, I want `tkr image list` to enumerate every image the deployment knows about, so that I can see at a glance what would be built and what would be mirrored.
+**User Story:** As a Tokeira operator, I want `tkr image list` to enumerate every image the active deployment's platform knows about, so that I can see what would be built and what would be mirrored.
 
 #### Acceptance Criteria
 
-1. `tkr image list` SHALL print one row per image in `images::all(ctx)`, with columns: `NAME`, `SOURCE`, `REPOSITORY`, `TAG`, `UPSTREAM` (empty for Build images).
-2. `tkr image list --source-type build` SHALL filter to Build images. `--source-type mirror` SHALL filter to Mirror images.
-3. `tkr image list --json` SHALL emit an array of `{ name, source_type, repository, tag, upstream_ref }` objects, one per image.
-4. THE subcommand SHALL require an active deployment (`--deployment`) because image resolution reads the platform config via `ImageContext`.
+1. `tkr image list` SHALL dispatch on the active deployment's platform and call the context-bearing, validating registry accessor:
+   - Compose: `platforms::compose::images::all(&ctx)`
+   - ECS: `platforms::ecs::images::all(&ctx)`
+   The `ImageContext` SHALL be populated through `Deployment::register_image_extensions` per Req 1.4.6 so image resolution can read each platform's config. Calling `images::construct()` directly from this subcommand is incorrect — `list` needs the resolved `DesiredImageRef` to render the `REPOSITORY`, `TAG`, and `UPSTREAM` columns, and skipping validation would let a malformed registry silently pass through.
+2. THE command SHALL print one row per image with columns: `NAME`, `SOURCE`, `REPOSITORY`, `TAG`, `UPSTREAM` (empty for Build images).
+3. `tkr image list --source-type build` SHALL filter to Build images. `--source-type mirror` SHALL filter to Mirror images.
+4. `tkr image list --json` SHALL emit an array of `{ name, source_type, repository, tag, upstream_ref }` objects.
+5. THE subcommand SHALL require an active deployment (`--deployment`) because image resolution reads the platform config via `ImageContext`.
 
 ### Requirement 6.3: `build` subcommand
 
-**User Story:** As a Tokeira developer, I want `tkr image build` to build every registered Build image (today: `tokeirad`; future: additional built images) with sensible defaults, so that the compose platform works out of the box.
+**User Story:** As a Tokeira developer, I want `tkr image build` to build `tokeirad` with sensible defaults, so that the compose platform works out of the box after a single command.
 
 #### Acceptance Criteria
 
-1. THE `tkr image build` subcommand SHALL accept the following optional flags: `--arch <arm64|amd64>` (default `arm64`), `--tag <value>` (optional; when supplied, an additional tag is exported alongside `latest` — see Req 3.5), `--image <name>` (default: every Build image).
-2. WHEN invoked with no flags, THE `tkr image build` subcommand SHALL build every Build image returned by `images::all(ctx)` for the `arm64` architecture and export each as `{image.name()}:latest`.
-3. WHEN invoked with `--image tokeirad --tag v1.2.3`, THE subcommand SHALL build only `tokeirad` and export it as `tokeirad:v1.2.3`.
-4. THE subcommand SHALL emit progress events via the [`iac-resource-lifecycle`](../iac-resource-lifecycle/requirements.md) progress callback surface for each stage (toolchain resolution, compile, image assembly, export) of each image.
-5. WHEN the operator passes `--json`, THE subcommand SHALL emit JSON progress events plus a final `{ "action": "build", "images": [{ "name": "<n>", "tag": "<t>", "arch": "<a>" }, ...] }` summary.
-6. THE subcommand SHALL NOT require an active deployment (`--deployment`) because the build only uses workspace sources and produces local images.
+1. THE `tkr image build` subcommand SHALL accept the following optional flags: `--arch <arm64|amd64>` (default `arm64`), `--tag <value>` (optional; when supplied, an additional tag is exported alongside `latest` — see Req 3.2.8).
+2. THE subcommand SHALL call `tokeira_build::build_tokeirad_image` directly. No `Image` trait iteration; no platform dispatch; no `ImageContext`.
+3. THE subcommand SHALL NOT require an active deployment (`--deployment`). The build only uses workspace sources and produces local images.
+4. THE subcommand SHALL emit progress events via the [`iac-resource-lifecycle`](../iac-resource-lifecycle/requirements.md) progress callback surface for each build stage.
+5. WHEN the operator passes `--json`, THE subcommand SHALL emit JSON progress events plus a final `{ "action": "build", "image": "tokeirad", "tags": ["latest", "<tag>"], "arch": "<arch>" }` summary.
+6. THE subcommand SHALL NOT prompt for confirmation (build produces only local artifacts).
 
 ### Requirement 6.4: `push` subcommand
 
-**User Story:** As a Tokeira operator, I want `tkr image push` to authenticate with ECR, ensure repositories exist, push every Build image with both `latest` and a version tag, and write back the resulting remote refs, so that the next `tkr infra apply` and `tkr deploy apply` can consume them without manual edits.
+**User Story:** As a Tokeira operator, I want `tkr image push` to authenticate with ECR, ensure repositories exist, push `tokeirad` with both `latest` and a version tag, and write back the resulting remote refs, so that the next `tkr infra apply` and `tkr deploy apply` can consume them.
 
 #### Acceptance Criteria
 
-1. THE `tkr image push` subcommand SHALL accept `--tag <value>` (defaults to `latest` only when explicitly omitted) and `--image <name>` (default: every Build image).
-2. THE subcommand SHALL require an active deployment.
-3. THE subcommand SHALL fail with a clear error message when a required local image (e.g. `tokeirad:latest`) is not present in the Docker image store, instructing the operator to run `tkr image build` first.
-4. THE subcommand SHALL call ECR `GetAuthorizationToken` once per run, decode the base64 `user:password` token, and use the decoded credentials for both repository-ensure and image-publish steps.
-5. FOR EACH selected Build image, THE subcommand SHALL publish two references: `{registry}/{desired.repository}:latest` and `{registry}/{desired.repository}:{tag}`. The `latest` tag SHALL always be pushed regardless of the `--tag` value.
-6. THE subcommand SHALL perform Image_Writeback: for each selected Build image, for each target in `image.writeback_targets(ctx)`, write the version-tagged remote ref into the target's dotted key in `deployment.toml`.
-7. WHEN the operator passes `--json`, THE subcommand SHALL emit JSON progress events plus a final summary event.
+1. THE `tkr image push` subcommand SHALL accept `--tag <value>` (defaults to `latest` when omitted).
+2. THE subcommand SHALL require an active deployment and dispatch on its platform (ECS-only for the initial spec scope; compose and local reject push).
+3. THE subcommand SHALL verify that `tokeirad:latest` is present in the local Docker image store BEFORE any Dagger startup, ECR authentication, repository-ensure call, or other AWS mutation. On absence, the subcommand SHALL fail with a descriptive error instructing the operator to run `tkr image build` first. The intent is cheap-error ordering: an operator who forgot the build step pays no Dagger launch cost, no ECR `GetAuthorizationToken` round-trip, and writes nothing to AWS before seeing the actionable message.
+4. AFTER the local preflight in 6.4.3 passes, THE subcommand SHALL call ECR `GetAuthorizationToken` once per run, decode the token, and use the decoded credentials for both repository-ensure and image-publish steps.
+5. FOR EACH Build image in the platform's image set, THE subcommand SHALL compute the list of remote references to publish as follows:
+   - Always include `{registry}/{desired.repository}:latest`.
+   - When `--tag <value>` was supplied AND `<value> != "latest"`, additionally include `{registry}/{desired.repository}:{value}`.
+   - When `<value> == "latest"` (the default), the version-tagged ref is IDENTICAL to the `:latest` ref. In this case the list SHALL contain exactly ONE entry — no deduplicated-against-itself double push. This mirrors the build pipeline's tag-dedup rule in Req 3.2.8.
+6. THE subcommand SHALL perform Image_Writeback: for each Build image, for each `WritebackTarget` in `image.writeback_targets(ctx)`, write the remote ref into the target's dotted key via `tokeira_iac::write_config_values` (Req 7.3). When `--tag <value>` with `<value> != "latest"` was supplied, the ref written back is `{registry}/{desired.repository}:{value}` (the version-tagged ref). When `<value> == "latest"` (the default), the ref written back is `{registry}/{desired.repository}:latest` (the sole ref that was published).
+7. WHEN the operator passes `--json`, THE subcommand SHALL emit JSON progress events plus a final summary event. The `published` array SHALL contain one entry per distinct ref actually pushed — never two entries for the same ref.
 
 ### Requirement 6.5: `mirror` subcommand
 
-**User Story:** As a Tokeira operator, I want `tkr image mirror` to copy every Mirror image into project-owned ECR repositories and write the mirrored refs back into the deployment config, so that a private-only ECS deployment has every image it needs before `tkr infra apply`.
+**User Story:** As a Tokeira operator, I want `tkr image mirror` to copy every Mirror image into project-owned ECR repositories and write the mirrored refs back, so that a private-only ECS deployment has every image it needs.
 
 #### Acceptance Criteria
 
 1. THE `tkr image mirror` subcommand SHALL accept no positional arguments and MAY accept `--image <name>` (default: every Mirror image).
-2. THE subcommand SHALL require an active deployment.
-3. THE subcommand SHALL iterate every Mirror image returned by `images::all(ctx)` (filtered by `--image` if supplied) and for each:
-   - ensure the destination Project_Repository exists (Req 5.6),
-   - invoke `mirror_image(image, ctx, creds, dagger)`,
-   - collect the result into a writeback list driven by `image.writeback_targets(ctx)`.
-4. THE subcommand SHALL perform Image_Writeback: each mirrored remote ref SHALL be written into its mapped config fields in `deployment.toml`.
-5. THE subcommand SHALL be idempotent. FOR ALL invocations with the same deployment, calling `tkr image mirror` twice in a row SHALL succeed both times and SHALL leave the same set of config keys populated with the same values after the second invocation as after the first.
-6. WHEN a source field in `deployment.toml` already points to the corresponding project-scoped destination (for example, `observability.mimir_image` is already `{registry}/{project}/grafana-mimir:3.0.6`), THE subcommand SHALL treat that image as already-mirrored and SHALL skip the pull/push. The skip SHALL be reported in the summary.
+2. THE subcommand SHALL require an active deployment and dispatch on its platform (ECS-only for the initial spec scope; compose and local reject mirror).
+3. THE subcommand SHALL iterate every Mirror image in the platform's image set (filtered by `--image` if supplied) and for each:
+   - ensure the destination Project_Repository exists via the Req 5.3 ad-hoc helpers
+   - invoke `tokeira_build::mirror_image` with the source ref and the destination remote ref
+   - collect the result into a writeback list driven by `image.writeback_targets(ctx)`
+4. THE subcommand SHALL perform Image_Writeback via `tokeira_iac::write_config_values`.
+5. THE subcommand SHALL be idempotent. FOR ALL invocations with the same deployment, calling `tkr image mirror` twice in a row SHALL succeed both times and SHALL leave the same set of config keys populated with the same values after the second invocation.
+6. WHEN a source field in `deployment.toml` already points to the corresponding project-scoped destination, THE subcommand SHALL treat that image as already-mirrored and SHALL skip the pull/push. The skip SHALL be reported in the summary.
 7. WHEN the operator passes `--json`, THE subcommand SHALL emit JSON progress events plus a final summary event.
 
 ### Requirement 6.6: Confirmation prompts
 
-**User Story:** As a Tokeira operator, I want `tkr image push` and `tkr image mirror` to respect the same confirmation rules as other mutating commands, so that I cannot accidentally overwrite remote state or configs.
+**User Story:** As a Tokeira operator, I want `tkr image push` and `tkr image mirror` to respect the same confirmation rules as other mutating commands, so that I cannot accidentally overwrite remote state.
 
 #### Acceptance Criteria
 
 1. THE `tkr image push` and `tkr image mirror` subcommands SHALL follow the [`tkr-cli`](../tkr-cli/requirements.md) confirmation rules: interactive confirmation by default, `--yes` to bypass, refuse to proceed when stdout is non-TTY and `--yes` is not provided.
 2. THE `tkr image list` and `tkr image build` subcommands SHALL NOT require confirmation: `list` is read-only and `build` produces only local artifacts.
-3. WHEN the operator passes `--yes`, THE subcommand SHALL proceed without prompting.
-4. WHEN stdout is non-TTY and `--yes` is not provided, THE subcommand SHALL return an error instructing the operator to re-run with `--yes` in non-interactive contexts.
 
 ---
 
@@ -450,14 +484,14 @@ What this gives us:
 
 ### Requirement 7.1: Compose platform config alignment
 
-**User Story:** As a Tokeira operator, I want the compose platform's `tokeirad.image` default to remain `tokeirad:latest` and to be produced by `tkr image build`, so that no manual intervention is needed to bring up a compose deployment after a fresh clone.
+**User Story:** As a Tokeira operator, I want the compose platform's `tokeirad.image` default to remain `tokeirad:latest` and to be produced by `tkr image build`, so that no manual intervention is needed to bring up a compose deployment.
 
 #### Acceptance Criteria
 
-1. THE `ComposeConfig::default()` value for `tokeirad.image` SHALL be `"tokeirad:latest"`.
-2. THE `tkr image build` subcommand with default flags SHALL produce an image with the tag `tokeirad:latest` for the `TokeiradImage` (per Req 3.5.1).
-3. THE compose platform SHALL NOT invoke `tkr image build` automatically on `tkr deploy apply`. Operators SHALL run `tkr image build` manually. This spec does not introduce an automatic build step on deploy apply.
-4. IF `tkr deploy apply` is invoked on a compose deployment and the `tokeirad:latest` image is absent from the local Docker image store, THEN THE compose platform SHALL return an error instructing the operator to run `tkr image build` first, including the exact command to run.
+1. THE `ComposeConfig::default()` value for `tokeirad.image` SHALL be `"tokeirad:latest"` (flipped from the current `"tokeirad:local"`).
+2. THE `tkr image build` subcommand with default flags SHALL produce `tokeirad:latest`.
+3. THE compose platform SHALL NOT invoke `tkr image build` automatically on `tkr deploy apply`.
+4. IF `tkr deploy apply` is invoked on a compose deployment and the `tokeirad:latest` image is absent from the local Docker image store, THE compose platform SHALL return an error instructing the operator to run `tkr image build` first, including the exact command.
 
 ### Requirement 7.2: ECS platform config writeback
 
@@ -465,44 +499,48 @@ What this gives us:
 
 #### Acceptance Criteria
 
-1. THE Image_CLI SHALL use a shared public writeback helper. THE helper's signature SHALL be `pub fn write_config_values(config_dir: &Path, values: &[(&str, &str)]) -> Result<(), WritebackError>` living in a crate shared by `tkr infra` and `tkr image` (see Req 7.3). Neither `tkr infra` nor `tkr image` SHALL implement its own dotted-key TOML writer.
+1. THE Image_CLI SHALL use the shared public writeback helper defined in Req 7.3. Neither `tkr infra` nor `tkr image` SHALL implement its own dotted-key TOML writer.
 2. THE Image_Writeback SHALL preserve existing TOML comments and formatting in `deployment.toml`.
 3. THE Image_Writeback SHALL create intermediate TOML tables when the target dotted key does not yet exist.
 4. THE Image_Writeback SHALL overwrite an existing value when the target dotted key is already present.
-5. FOR ALL Image_Writeback operations with N key-value pairs, reading each value at its specified path after write SHALL produce the original value (round-trip property, inherited from iac-resource-lifecycle).
-6. WHEN the writeback fails (permission, I/O error, malformed TOML), THE Image_CLI SHALL return an error describing the failure and SHALL NOT claim the push or mirror succeeded. Images in ECR SHALL remain in place — writeback failure is reported but not rolled back.
+5. FOR ALL Image_Writeback operations with N key-value pairs, reading each value at its specified path after write SHALL produce the original value (round-trip property).
+6. WHEN the writeback fails (permission, I/O error, malformed TOML), THE Image_CLI SHALL return an error describing the failure and SHALL NOT claim the push or mirror succeeded.
 
 ### Requirement 7.3: Shared writeback helper extraction
 
-**User Story:** As a Tokeira maintainer, I want the existing private writeback helper in `apps/tkr/src/commands/infra.rs` extracted into a public API, so that `tkr infra` and `tkr image` call the same code path and neither owns a private copy.
+**User Story:** As a Tokeira maintainer, I want the existing private writeback helper in `apps/tkr/src/commands/infra.rs` extracted into a public API, so that `tkr infra` and `tkr image` call the same code path — while recognising that they target different config files.
 
 #### Acceptance Criteria
 
-1. THE current private helpers in `apps/tkr/src/commands/infra.rs` (`write_tokeirad_writeback` and the dotted-key `toml_edit` writer) SHALL be extracted into a public `write_config_values(config_dir: &Path, values: &[(&str, &str)]) -> Result<(), WritebackError>` function.
-2. THE new public function SHALL live in a workspace crate visible to both `apps/tkr` and any future consumer. THE design phase selects the crate (candidates: `tokeira-config`, `tokeira-iac`, or a new `tokeira-writeback` crate); the choice is documented in the design doc.
-3. `WritebackError` SHALL be a `thiserror` enum with variants covering I/O failure, TOML parse failure, and dotted-key validation failure.
-4. AFTER extraction, `apps/tkr/src/commands/infra.rs` SHALL import and call `write_config_values` instead of holding its own implementation. Behaviour SHALL be unchanged (the existing unit tests in `infra.rs` continue to pass, possibly after being moved to the new crate).
-5. THE `tkr image push` and `tkr image mirror` handlers SHALL call `write_config_values` for all Image_Writeback operations.
+1. THE current private helpers in `apps/tkr/src/commands/infra.rs` (`write_tokeirad_writeback` and its private dotted-key `toml_edit` writer) SHALL be extracted into `tokeira_iac::writeback` as `pub fn write_config_values(path: &Path, values: &[(&str, &str)]) -> Result<(), WritebackError>` — taking the absolute file path explicitly so the helper is file-agnostic.
+2. `WritebackError` SHALL be a `thiserror` enum covering I/O failure, TOML parse failure, and dotted-key validation failure.
+3. AFTER extraction, `apps/tkr/src/commands/infra.rs` SHALL call `tokeira_iac::write_config_values(&deployment_path.join("tokeirad.toml"), &borrowed)` — preserving the existing behaviour of writing IaC outputs to the server config file.
+4. THE `tkr image push` and `tkr image mirror` handlers SHALL call `tokeira_iac::write_config_values(&deployment_path.join("deployment.toml"), &borrowed)` — image refs live in the platform config file, not in `tokeirad.toml`.
+5. THE existing proptests in `apps/tkr/src/commands/infra.rs` SHALL be moved to `crates/tokeira-iac/src/writeback.rs` and continue to pass against the new path-explicit signature.
+6. THE helper SHALL NOT hardcode any file name. Callers decide which file is written.
 
 ### Requirement 7.4: ECS config field declarations
 
-**User Story:** As a Tokeira developer, I want the `EcsConfig.services.*.image` and `EcsConfig.observability.*_image` fields to be explicitly documented as writeback targets populated by `tkr image`, so that operators and downstream specs know where the image reference comes from.
+**User Story:** As a Tokeira developer, I want the `EcsConfig.services.*.image` and `EcsConfig.observability.*_image` fields to be explicitly documented as writeback targets populated by `tkr image`, so that operators know where image references come from.
 
 #### Acceptance Criteria
 
-1. THE `EcsConfig.services.<service>.image` field for each of the seven services (`edge_api`, `edge_poll`, `runtime`, `projection`, `controller`, `autoscaler`, `admin`) SHALL be populated by Image_Writeback from `tkr image push` (via `TokeiradImage::writeback_targets`).
-2. THE `EcsConfig.observability.{mimir_image, loki_image, grafana_image, alloy_image, aws_cli_image, busybox_image}` fields SHALL be populated by Image_Writeback from `tkr image mirror` (via each observability image's `writeback_targets`).
-3. WHEN any of these fields are empty or point to an upstream source at the time `tkr infra apply` or `tkr deploy apply` runs on an ECS deployment, THE ECS platform SHALL return an error instructing the operator to run the corresponding `tkr image` subcommand. This matches the existing error pattern for Managed-mode DSQL hydration defined in [`ecs-deployment`](../ecs-deployment/requirements.md).
+1. THE `EcsConfig.services.<service>.image` field for each of the seven services SHALL be populated by Image_Writeback from `tkr image push` via the ECS `TokeiradImage::writeback_targets` (Req 2.2.3).
+2. THE `EcsConfig.observability.{mimir_image, loki_image, grafana_image, alloy_image, aws_cli_image, busybox_image}` fields SHALL be populated by Image_Writeback from `tkr image mirror` via each ECS observability image's `writeback_targets`.
+3. WHEN any field above is empty or points to an upstream source at the time `tkr infra apply` or `tkr deploy apply` runs, THE ECS platform SHALL return an error instructing the operator to run the corresponding `tkr image` subcommand.
 
-### Requirement 7.5: Version source-of-truth
+### Requirement 7.5: Observability config field additions
 
-**User Story:** As a Tokeira operator, I want the pinned version of each third-party image to match the compose platform exactly, so that local compose deployments and ECS deployments run the same binaries.
+**User Story:** As a Tokeira developer, I want `aws_cli_image` and `busybox_image` fields added to both platforms' observability configs, so that init-container utility images are also mirror targets.
 
 #### Acceptance Criteria
 
-1. THE pinned versions in `ComposeConfig::default()` SHALL match the prototypical defaults generated by `tkr deployment create --platform ecs`.
-2. WHEN a version in `ComposeConfig::default()` is changed, THE prototypical ECS config SHALL be updated in the same change set. A unit test SHALL enforce this equality.
-3. THE `busybox` and `aws-cli` versions SHALL be pinned to stable references; using `:latest` is explicitly documented as acceptable for these two images because they are used only as init-container utility images where tag stability matters less than service-image stability.
+1. `ComposeConfig.observability` SHALL add `aws_cli_image: String` and `busybox_image: String` fields. Each field SHALL use a per-field `#[serde(default = "default_<field_name>")]` attribute pointing at a standalone `fn default_<field_name>() -> String` that returns the upstream ref — NOT the bare `#[serde(default)]` which would deserialize missing fields as `String::default()` (the empty string).
+2. `EcsConfig.observability` SHALL use the same per-field `#[serde(default = "…")]` pattern with identical default functions.
+3. Defaults: `default_aws_cli_image()` returns `"public.ecr.aws/aws-cli/aws-cli:latest"`; `default_busybox_image()` returns `"public.ecr.aws/docker/library/busybox:latest"`.
+4. Each platform's observability `mirror_image!` invocations SHALL rely on these field values being non-empty. The `desired_ref` implementation SHALL return a `RuntimeError::Image(format!("image '<name>' has empty upstream_ref in config"))` when the configured upstream is the empty string, so a malformed config surfaces as an operator-facing error rather than an empty mirror pull.
+5. Each platform's `TokeiradImage::writeback_targets` / observability-images `writeback_targets` SHALL be updated to cover these two new fields on the Mirror side.
+6. A deserialization unit test SHALL feed a `deployment.toml` that omits `aws_cli_image` and `busybox_image` and assert the parsed `ObservabilityConfig` carries the upstream defaults (not empty strings). A separate test SHALL feed a `deployment.toml` that sets either field to an empty string and assert `desired_ref` returns the documented `RuntimeError::Image`.
 
 ---
 
@@ -510,14 +548,14 @@ What this gives us:
 
 ### Requirement 8.1: Mirror before infra apply (ECS platform)
 
-**User Story:** As a Tokeira operator, I want the CLI to refuse `tkr infra apply` on an ECS deployment until `tkr image mirror` has populated the observability image refs, so that I cannot accidentally deploy task definitions that would fail to pull their images.
+**User Story:** As a Tokeira operator, I want the CLI to refuse `tkr infra apply` on an ECS deployment until `tkr image mirror` has populated the observability image refs, so that I cannot deploy task definitions that would fail to pull their images.
 
 #### Acceptance Criteria
 
-1. WHEN the deployment platform is `ecs` AND `tkr infra apply` is invoked, THE ECS platform SHALL iterate `images::all(ctx)` filtered to Mirror images and validate that each image's writeback targets in `EcsConfig` point to a ref whose host matches the expected ECR registry for the deployment's account and region.
-2. IF any such field is empty or points to an upstream source, THEN THE CLI SHALL return an error listing the unpopulated or upstream-pointing fields and instructing the operator to run `tkr image mirror`.
+1. WHEN the deployment platform is `ecs` AND `tkr infra apply` is invoked, THE ECS platform SHALL iterate its own image set filtered to Mirror images and validate that each image's writeback-target fields in `EcsConfig` point to a ref whose host matches the expected ECR registry.
+2. IF any such field is empty or points to an upstream source, THE CLI SHALL return an error listing the unpopulated or upstream-pointing fields and instructing the operator to run `tkr image mirror`.
 3. THE validation SHALL occur during `tkr infra apply` only. `tkr infra plan` SHALL warn but SHALL NOT refuse to produce a plan.
-4. THE validation SHALL occur for the `ecs` platform only. `local` and `compose` platforms SHALL skip this check.
+4. THE validation SHALL occur for the `ecs` platform only.
 
 ### Requirement 8.2: Build and push before deploy apply (ECS platform)
 
@@ -525,20 +563,21 @@ What this gives us:
 
 #### Acceptance Criteria
 
-1. WHEN the deployment platform is `ecs` AND `tkr deploy apply` is invoked, THE ECS platform SHALL iterate `images::all(ctx)` filtered to Build images and validate that each image's writeback targets point to a ref whose host matches the expected ECR registry for the deployment's account and region.
-2. IF any such field is empty or points to an upstream source, THEN THE CLI SHALL return an error listing the unpopulated or upstream-pointing fields and instructing the operator to run `tkr image push --tag <version>`.
-3. THE validation SHALL occur during `tkr deploy apply` only. `tkr deploy plan` SHALL warn but SHALL NOT refuse to produce a plan.
+1. WHEN the deployment platform is `ecs` AND `tkr deploy apply` is invoked, THE ECS platform SHALL iterate its own image set filtered to Build images and validate that each image's writeback-target fields point to a ref whose host matches the expected ECR registry.
+2. IF any such field is empty or points to an upstream source, THE CLI SHALL return an error listing the fields and instructing the operator to run `tkr image push --tag <version>`.
+3. THE validation SHALL occur during `tkr deploy apply` only. `tkr deploy plan` SHALL warn but SHALL NOT refuse.
 4. THE validation SHALL occur for the `ecs` platform only.
 
 ### Requirement 8.3: Build before deploy apply (compose platform)
 
-**User Story:** As a Tokeira developer, I want the CLI to refuse `tkr deploy apply` on a compose deployment until `tokeirad:latest` exists in the local Docker image store, so that `docker compose up` does not fail with a pull error on the default registry.
+**User Story:** As a Tokeira developer, I want the CLI to refuse `tkr deploy apply` on a compose deployment until `tokeirad:latest` exists in the local Docker image store, so that `docker compose up` does not fail with a pull error.
 
 #### Acceptance Criteria
 
-1. WHEN the deployment platform is `compose` AND `tkr deploy apply` is invoked AND `ComposeConfig.tokeirad.image == "tokeirad:latest"`, THE compose platform SHALL query the local Docker image store for the presence of `tokeirad:latest`.
-2. IF `tokeirad:latest` is absent from the local store, THEN THE compose platform SHALL return an error instructing the operator to run `tkr image build`, including the exact command.
+1. WHEN the deployment platform is `compose` AND `tkr deploy apply` is invoked AND `ComposeConfig.tokeirad.image == "tokeirad:latest"`, THE compose platform SHALL query the local Docker image store via a `DockerImageInspector` trait.
+2. IF `tokeirad:latest` is absent, THE compose platform SHALL return an error instructing the operator to run `tkr image build`, including the exact command.
 3. WHEN `ComposeConfig.tokeirad.image` is any value other than `"tokeirad:latest"`, THE compose platform SHALL NOT enforce this check. Operators who point at a remote ref take responsibility for pull authentication and availability.
+4. THE `DockerImageInspector` trait SHALL be defined so that unit tests can substitute a mock implementation without requiring a live Docker daemon.
 
 ### Requirement 8.4: Image commands do not require prior lifecycle stages
 
@@ -548,97 +587,99 @@ What this gives us:
 
 1. THE `tkr image mirror` and `tkr image push` subcommands SHALL NOT require `tkr infra apply` to have run first. They need only an ECR registry reachable from the operator's workstation and valid AWS credentials.
 2. WHEN the deployment's `infra state` is empty, THE Image_CLI SHALL derive the ECR registry host as `{account_id}.dkr.ecr.{region}.amazonaws.com` using the account and region from the deployment's config and the operator's AWS credentials.
-3. THE Image_CLI SHALL NOT create VPC endpoints, IAM roles, or any other AWS resources beyond ECR repositories. All other infrastructure provisioning belongs to the `tkr infra` command group.
+3. THE Image_CLI SHALL NOT create VPC endpoints, IAM roles, or any other AWS resources beyond ECR repositories.
 
 ---
 
 ## Feature 9: Correctness Properties
 
-### Requirement 9.1: Registry validation property
+### Requirement 9.1: Per-platform registry validation property
 
-**User Story:** As a Tokeira maintainer, I want the image registry to refuse duplicates at construction time, so that duplicate names or repositories cannot ship.
+**User Story:** As a Tokeira maintainer, I want each platform's `images::all()` refused at construction time if it has duplicate names or repositories.
 
 #### Acceptance Criteria
 
-1. A property test SHALL generate arbitrary registries composed of variant-selected images and assert that `images::all(ctx)` rejects a registry containing two images with the same `name()` or the same `(source_type, repository)` pair after resolution.
-2. THE property SHALL be tested with at least 64 generated cases via `proptest`.
+1. A property test (per platform) SHALL construct that platform's `images::all(ctx)` across generated config values and assert `validate_registry` accepts the canonical set.
+2. A negative test SHALL inject a duplicate and assert `validate_registry` returns `RuntimeError::Image`.
 
 ### Requirement 9.2: Source-type / upstream invariant
 
-**User Story:** As a Tokeira maintainer, I want the `source_type` and `upstream_ref` fields kept consistent for every image, so that a Build image cannot accidentally declare an upstream or a Mirror image forget its upstream.
+**User Story:** As a Tokeira maintainer, I want each image's `source_type` and `upstream_ref` kept consistent.
 
 #### Acceptance Criteria
 
-1. A property test SHALL iterate every image in `images::all(ctx)` (with multiple realistic `ctx` values) and assert:
+1. A per-platform property test SHALL iterate its own `images::all(ctx)` (with multiple realistic `ctx` values) and assert:
    - `image.source_type() == Build` ⇒ `image.desired_ref(ctx)?.upstream_ref == None`.
    - `image.source_type() == Mirror` ⇒ `image.desired_ref(ctx)?.upstream_ref == Some(_)`.
+   - `image.source_type() == Registry` ⇒ no invariant beyond Req 1.6 — the property SHALL skip Registry images or assert only that `desired_ref` returns `Ok(_)`.
 2. THE property SHALL run as part of the default `cargo test` invocation.
 
 ### Requirement 9.3: Mirror idempotence property
 
-**User Story:** As a Tokeira maintainer, I want mirror idempotence encoded as a testable property, so that regressions that turn mirror into a non-idempotent operation fail CI.
+**User Story:** As a Tokeira maintainer, I want mirror idempotence encoded as a testable property.
 
 #### Acceptance Criteria
 
-1. FOR ALL valid `EcsConfig` values `cfg`, running `tkr image mirror` twice in sequence (with mocked ECR and mocked Dagger) SHALL produce:
-   - the same set of ensured repositories,
-   - the same set of mirrored digests,
-   - the same set of writeback key-value pairs in `deployment.toml`.
+1. FOR the ECS platform, running `tkr image mirror` twice in sequence (with mocked ECR and mocked Dagger) SHALL produce:
+   - the same set of ensured repositories
+   - the same set of mirrored digests
+   - the same set of writeback key-value pairs in `deployment.toml`
 2. THE test SHALL assert equality of the `deployment.toml` contents before the second invocation and after the second invocation.
-3. THE test SHALL mock the Dagger client at the `DaggerClient` trait boundary so no real network calls are made.
+3. THE test SHALL mock the Dagger client at the `DaggerClient` trait boundary and the ECR client at the `EcrClient` trait boundary.
 
 ### Requirement 9.4: Repository creation idempotence property
 
-**User Story:** As a Tokeira maintainer, I want ECR repository creation idempotence encoded as a testable property, so that re-running the repository-ensure step under any ordering produces the same end state.
+**User Story:** As a Tokeira maintainer, I want ECR repository creation idempotence encoded as a testable property.
 
 #### Acceptance Criteria
 
-1. FOR ALL valid `repo_names: Vec<String>` with no duplicates, calling `ensure_ecr_repositories(names)` twice with the same input SHALL leave the AWS-mocked state identical to calling it once.
-2. THE property SHALL be tested with at least 64 generated cases via `proptest`, covering empty lists, single-element lists, and multi-element lists (up to 20 names) with random ASCII-printable names passing the ECR name grammar filter.
+1. FOR ALL valid `repo_names: Vec<String>` with no duplicates, calling `ensure_ecr_repositories(names)` twice with the same input SHALL leave the AWS-mocked state identical.
+2. THE property SHALL be tested with at least 64 generated cases via `proptest`.
 
 ### Requirement 9.5: Lifecycle policy round-trip property
 
-**User Story:** As a Tokeira maintainer, I want the canonical Lifecycle_Policy JSON to round-trip through parse and serialize without loss, so that we can diff stored policies against the canonical form reliably.
+**User Story:** As a Tokeira maintainer, I want the canonical Lifecycle_Policy JSON to round-trip through parse and serialize without loss.
 
 #### Acceptance Criteria
 
-1. Parsing the canonical Lifecycle_Policy string, serializing, and re-parsing SHALL produce the same `serde_json::Value`.
-2. THE test SHALL run as a unit test in `tokeira-aws`.
+1. Parsing `ECR_LIFECYCLE_POLICY`, serializing, and re-parsing SHALL produce the same `serde_json::Value`.
 
 ### Requirement 9.6: Writeback round-trip property
 
-**User Story:** As a Tokeira maintainer, I want Image_Writeback to round-trip through the TOML writer, so that values written back are exactly what `tkr image push` and `tkr image mirror` intended.
+**User Story:** As a Tokeira maintainer, I want Image_Writeback to round-trip through the TOML writer.
 
 #### Acceptance Criteria
 
-1. Covered by [`iac-resource-lifecycle`](../iac-resource-lifecycle/requirements.md); this spec consumes it and does not duplicate it.
+1. FOR ALL generated `(dotted_key, value)` pairs, writing the pair via `tokeira_iac::write_config_values` and then reading at `dotted_key` SHALL produce the original `value`.
+2. THE test SHALL be implemented in `tokeira-iac` (migrated from the existing `apps/tkr/src/commands/infra.rs` tests).
 
-### Requirement 9.7: Mirror mapping stability property
+### Requirement 9.7: Per-platform mirror stability property
 
-**User Story:** As a Tokeira maintainer, I want the observability mirror set to remain in sync with the compose platform's default image pins, so that the local and remote image planes use the same versions.
-
-#### Acceptance Criteria
-
-1. FOR each Mirror image returned by `observability::all()`, the image's `desired_ref(ctx)?.upstream_ref.unwrap()` with a default-constructed `EcsConfig::observability` SHALL equal the corresponding field in `ComposeConfig::default().observability`.
-2. WHEN a default is bumped in either place, this property SHALL fail in CI unless both are bumped together.
-
-### Requirement 9.8: ECR name grammar property
-
-**User Story:** As a Tokeira maintainer, I want every image's resolved repository name validated against the ECR grammar, so that an image that accidentally declares an invalid repo name cannot ship.
+**User Story:** As a Tokeira maintainer, I want each platform's mirror set to stay aligned with its own config defaults.
 
 #### Acceptance Criteria
 
-1. A property test SHALL iterate every image in `images::all(ctx)` across realistic `ctx` values and assert that `desired_ref(ctx)?.repository` satisfies the ECR repository name grammar: 2–256 characters, lowercase alphanumerics, `/`, `-`, `_`, `.`, not starting with `/` or `.`.
+1. FOR each Mirror image returned by the compose platform's `observability::all()`, `desired_ref(ctx).upstream_ref.unwrap()` with `ComposeConfig::default()` registered SHALL equal the matching field in `ComposeConfig::default().observability`.
+2. FOR each Mirror image returned by the ECS platform's `observability::all()`, `desired_ref(ctx).upstream_ref.unwrap()` with `EcsConfig::default()` registered SHALL equal the matching field in `EcsConfig::default().observability`.
+3. Each test lives in the platform it tests — no cross-platform imports.
+
+### Requirement 9.8: ECR name grammar property (per platform)
+
+**User Story:** As a Tokeira maintainer, I want every image's resolved repository name validated against the ECR grammar.
+
+#### Acceptance Criteria
+
+1. Per Req 2.4 — a per-platform property test validates `desired_ref(ctx)?.repository` against the grammar across realistic `ctx` values.
 
 ### Requirement 9.9: Lifecycle gate predicates
 
-**User Story:** As a Tokeira maintainer, I want the platform lifecycle gates validated as pure predicates driven by the image registry, so that the ECS platform cannot drift from what the image plane writes back.
+**User Story:** As a Tokeira maintainer, I want platform lifecycle gates validated as pure predicates driven by the image set, so that the ECS platform cannot drift from what the image plane writes back.
 
 #### Acceptance Criteria
 
-1. `platforms/ecs` SHALL expose a pure predicate `fn validate_mirrors(cfg: &EcsConfig, registry: &str, images: &[Box<dyn Image>]) -> Result<(), EcsError>` that returns `Err` iff any Mirror image's writeback-target fields are empty or don't start with `{registry}/`.
+1. `platforms/ecs` SHALL expose `fn validate_mirrors(cfg: &EcsConfig, registry: &str, images: &[Box<dyn Image>]) -> Result<(), EcsError>` that returns `Err` iff any Mirror image's writeback-target fields are empty or don't start with `{registry}/`.
 2. A symmetric `fn validate_builds(cfg: &EcsConfig, registry: &str, images: &[Box<dyn Image>]) -> Result<(), EcsError>` SHALL cover Build images.
-3. Property tests SHALL drive each predicate across generated configs plus the concrete image registry and assert the predicate returns `Err` iff at least one targeted field is empty or not `{registry}/`-prefixed.
+3. Property tests SHALL drive each predicate across generated configs plus the platform's image set and assert the predicate returns `Err` iff at least one targeted field is empty or not `{registry}/`-prefixed.
 
 ---
 
@@ -646,43 +687,58 @@ What this gives us:
 
 ### Requirement 10.1: Tests without network or Docker
 
-**User Story:** As a Tokeira developer, I want the default test suite to run without Docker, without the Dagger daemon, and without AWS credentials, so that tests run in any contributor environment.
+**User Story:** As a Tokeira developer, I want the default test suite to run without Docker, without the Dagger daemon, and without AWS credentials.
 
 #### Acceptance Criteria
 
-1. THE unit tests for the Build_Crate SHALL NOT require a running Dagger daemon. THE Build_Crate SHALL use dependency inversion (a trait-bounded `DaggerClient`) so tests can supply a mock.
-2. THE unit tests for the ECR repository resource SHALL NOT require AWS credentials. THE resource SHALL use dependency inversion (a trait-bounded `EcrClient`) so tests can supply a mock.
-3. THE integration tests that require Dagger, Docker, or real AWS credentials SHALL be gated behind a feature flag (`integration-test`) or an `#[ignore]` attribute, matching the AGENTS.md testing guidance for this workspace.
+1. THE unit tests for the Build_Crate SHALL NOT require a running Dagger daemon. Tests supply a mock `DaggerClient`.
+2. THE unit tests for the ECR repository resource SHALL NOT require AWS credentials. Tests supply a mock `EcrClient`.
+3. THE unit tests for the compose build gate SHALL NOT require a running Docker daemon. Tests supply a mock `DockerImageInspector`.
+4. THE integration tests that require Dagger, Docker, or real AWS credentials SHALL be gated behind a feature flag (`integration-test`) or an `#[ignore]` attribute.
 
 ### Requirement 10.2: Documentation
 
-**User Story:** As a Tokeira operator new to the project, I want the `tkr image` command group documented in `README.md` and `AGENTS.md`, so that I can find the expected workflow without reading specs.
+**User Story:** As a Tokeira operator new to the project, I want the `tkr image` command group documented in `README.md` and `AGENTS.md`.
 
 #### Acceptance Criteria
 
-1. THE root `README.md` SHALL include a "Building and publishing images" section covering `tkr image list`, `tkr image build`, `tkr image push`, and `tkr image mirror`.
+1. THE root `README.md` SHALL be updated in four specific places:
+   a. **`### Command Tree`** (under `## `tkr` — Operator and Developer CLI`) — the ASCII command tree SHALL include an `image` subtree placed between `deploy` and `schema`:
+      ```
+      ├── image
+      │   ├── list [--source-type <build|mirror>] [--json]
+      │   ├── build [--arch <arm64|amd64>] [--tag <version>]
+      │   ├── push --tag <version> [--image <name>] [--yes]
+      │   └── mirror [--image <name>] [--yes]
+      ```
+   b. **The `### Compose Platform` section** SHALL be rewritten so the walkthrough shows the image-build step explicitly as part of deploying a compose stack. The updated walkthrough SHALL:
+      - Add `tkr image build` between `tkr deployment create` and `tkr infra apply`, making it clear that compose depends on `tokeirad:latest` existing in the local Docker image store before `tkr deploy apply` (Req 8.3)
+      - Add a short prose paragraph immediately after the walkthrough explaining WHY the build step is separate: `tkr deploy apply` does not invoke the builder; it requires the image to already be present locally
+      - Add a paragraph on storage and schema: the default example uses `--storage in-memory` (no schema to set up). For compose deployments with `--storage dsql`, operators must point `tokeirad.toml`'s `infrastructure.dsql.endpoint` at an externally-provisioned DSQL cluster (the compose platform has no DSQL module) and then run `tkr schema setup` before `tkr deploy apply`. State that DSQL schema provisioning for compose is currently deferred to a future spec, and that the in-memory path is the supported compose workflow today
+   c. **A new section `### Image Management`** SHALL be added under `## `tkr` — Operator and Developer CLI`, positioned after the updated `### Compose Platform` section, covering all four subcommands with example invocations, the lifecycle ordering rules (Req 8.1–8.3), and the prerequisites (Dagger ≥ 0.20, AWS credentials with `ecr:*` for push/mirror).
+   d. **The `## Quick Start` section** SHALL be updated if and only if it currently references compose deployment; if so, align the example with the image-build-first ordering in (b).
 2. THE root `AGENTS.md` SHALL reference:
-   - The image lifecycle ordering rules from Feature 8.
-   - The "Adding a new image" checklist: write a struct implementing `Image`, add it to the domain module's `all()`, run the property tests.
+   - The lifecycle ordering rules from Feature 8, added to the "Working Agreements" section.
+   - An "Adding a new image" checklist in the "Working Agreements" section, alongside the existing "Adding a new CLI command" and "Adding a new IaC Module" checklists.
+   - A note in the "Observability Stack (Compose Platform)" section that the six mirror images (`grafana-mimir`, `grafana-loki`, `grafana-oss`, `grafana-alloy`, `aws-cli`, `busybox`) are declared in each platform's `src/images/observability/mod.rs`, so version bumps are one-line changes in the platform's config defaults.
 3. THE `tkr image <subcommand> --help` output SHALL be sufficient to use the subcommand without reading the spec.
 
-### Requirement 10.3: No introduction of tool sprawl
+### Requirement 10.3: No tool sprawl
 
-**User Story:** As a Tokeira maintainer, I want image lifecycle to avoid introducing new build tools beyond Dagger, so that the workspace stays consistent with the "no tool sprawl" principle.
+**User Story:** As a Tokeira maintainer, I want image lifecycle to avoid introducing new build tools beyond Dagger.
 
 #### Acceptance Criteria
 
-1. THE Build_Crate SHALL NOT depend on a Dockerfile templater, Helm-like tool, or any manifest templating engine. The Dagger pipeline is constructed programmatically in Rust.
+1. THE Build_Crate SHALL NOT depend on a Dockerfile templater, Helm-like tool, or any manifest templating engine.
 2. THE Build_Crate SHALL NOT introduce a new image format or registry protocol. Standard OCI images and the ECR Docker Registry V2 API are the only formats used.
-3. THE Build_Crate SHALL NOT introduce any network-facing dependencies that operate outside of Dagger sessions or `aws-sdk-ecr` calls.
 
 ### Requirement 10.4: Trait stability
 
-**User Story:** As a Tokeira maintainer, I want the `Image` trait surface and its associated types to be stable, so that downstream consumers (CLI, platform gates, future image-lifecycle pipelines) can rely on the shape across releases.
+**User Story:** As a Tokeira maintainer, I want the `Image` trait surface stable across releases, so that downstream consumers (platform image modules, CLI, gates) can rely on its shape.
 
 #### Acceptance Criteria
 
-1. Adding fields to `DesiredImageRef`, `ImageContext`, or `WritebackTarget` SHALL be backwards-compatible (new fields are additive, default-constructed at the call sites that do not populate them).
-2. Renaming existing fields on any of these types SHALL require a spec amendment and a deprecation cycle.
-3. Adding a method to the `Image` trait SHALL be done with a default implementation where at all possible, so that existing image structs do not need to change.
-4. Removing a method from the `Image` trait SHALL require a spec amendment and a deprecation cycle.
+1. Adding fields to `DesiredImageRef`, `ImageContext`, or `WritebackTarget` SHALL be backwards-compatible (additive only).
+2. Renaming existing fields on these types SHALL require a spec amendment.
+3. Adding a method to the `Image` trait SHALL be done with a default implementation where possible, so existing image structs do not need to change.
+4. Removing a method from the `Image` trait SHALL require a spec amendment.

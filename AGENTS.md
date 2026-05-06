@@ -17,7 +17,8 @@ This is a product-from-scratch. The architecture is informed by Temporal but the
 - `cargo +nightly fmt` for formatting (some settings require nightly). Just run it — don't check first.
 - Error handling: `thiserror` in library crates, `anyhow` in binary crates. No `.unwrap()` outside tests.
 - All public types derive `Debug`. Serializable types derive `Serialize, Deserialize`.
-- No `unsafe`. No `Box<dyn Any>`. No runtime reflection.
+- No `unsafe`. No runtime reflection (no trait-object downcasting to concrete types driven by runtime values).
+- Typed extension bags (`HashMap<TypeId, Box<dyn Any + Send + Sync>>` keyed by `TypeId::of::<T>()`, accessed via a type-parameterised `extension::<T>()` helper) are the sanctioned exception. They exist in `ProvisionContext`, `ModuleContext`, `ServiceContext`, and `ImageContext` because the library crates holding these types (`tokeira-iac`, `tokeira-deploy-engine`) cannot depend on the platform crates that register handles into them. This keeps the platform boundary clean at the cost of one well-contained `Box<dyn Any>` per context type. New contexts SHALL NOT introduce additional `Box<dyn Any>` usage beyond this bounded set.
 - Prefer `&str` over `String` in function signatures where ownership isn't needed.
 - Use `tracing` for structured logging. No `println!` or `eprintln!` in library code.
 - Comments explain WHY, not WHAT. Do not add comments that restate type signatures or obvious control flow.
@@ -40,6 +41,35 @@ The CLI follows a `plan → confirm → apply` model. Silent mutations are a bug
 - `tkr infra plan` shows what will change before `tkr infra apply` does it.
 - `tkr deploy plan` shows service manifest changes.
 - Destructive operations (`infra destroy`, `deployment destroy`, `scale down`) require `--yes` or interactive confirmation.
+
+### 5. Revert Safety (worktree integrity)
+
+The working tree frequently contains unstaged edits that represent hours of in-flight work. Reverting files from the git index or HEAD destroys that work irreversibly.
+
+- NEVER run `git checkout`, `git checkout-index`, `git restore`, `git reset --hard`, `git clean -f`, or any equivalent command to revert files without explicit user approval of the exact command.
+- When asked to "undo your changes", produce a reverse patch (`git diff | patch -R`) that reverses ONLY the hunks you introduced. Do not restore files from the index.
+- Before any revert operation, run `git status` and `git diff` and explicitly confirm with the user whether the unstaged changes belong to them.
+- If you did not snapshot the pre-edit content yourself, do not attempt an automatic revert. Stop and ask.
+- Treat all unstaged changes as user work unless proven otherwise.
+
+### 6. Spec editing safety
+
+Before editing any file under `.kiro/specs/**`, snapshot the pre-edit state:
+
+```bash
+mkdir -p /tmp/tokeira-spec-snapshots
+cp .kiro/specs/**/*.md /tmp/tokeira-spec-snapshots/$(date +%Y%m%d-%H%M%S)/
+```
+
+or equivalently produce a patch:
+
+```bash
+git diff -- .kiro/specs > /tmp/spec-before-$(date +%Y%m%d-%H%M%S).patch
+```
+
+After editing, report the snapshot or patch path to the user. If asked to undo, apply a reverse patch for only the assistant-authored hunks.
+
+If the working tree has uncommitted spec edits and the user gives a broad instruction like "undo your changes", clarify first: "Undo only the hunks I just introduced; do not restore files from git." Do not assume the broad instruction means restore-from-index.
 
 ---
 

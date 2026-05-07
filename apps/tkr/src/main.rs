@@ -21,6 +21,18 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Dev { action } => commands::dev::run(action),
         Command::Deployment { action } => commands::deployment::run(action, &deployments, cli.json),
+        Command::Image(args) => {
+            let deployment = match args.command {
+                cli::ImageCommand::Build { .. } => None,
+                _ => Some(load_context(&deployments, cli.deployment.as_deref())?),
+            };
+            let format = if cli.json {
+                tui::OutputFormat::Json
+            } else {
+                tui::OutputFormat::Human
+            };
+            commands::image::run(args.command, deployment, format).await
+        }
         Command::Infra { action } => {
             let ctx = load_context(&deployments, cli.deployment.as_deref())?;
             let format = if cli.json {

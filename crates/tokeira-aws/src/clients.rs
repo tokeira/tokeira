@@ -1,5 +1,7 @@
 //! AWS SDK client bundle registered as a `ProvisionContext` extension.
 
+pub mod ecr;
+
 /// All AWS SDK clients needed by resource implementations.
 ///
 /// Constructed once from a shared `SdkConfig` and registered on

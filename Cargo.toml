@@ -19,9 +19,11 @@ members = [
     "crates/tokeira-edge",
     "platforms/local",
     "platforms/compose",
+    "platforms/ecs",
     "apps/tkr",
     "apps/tokeirad",
     "crates/dagger-client",
+    "crates/tokeira-build",
 ]
 exclude = [
     "examples/hello-world",
@@ -53,6 +55,7 @@ libc = "0.2"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 metrics-util = "0.19"
+mimalloc = { version = "0.1.48", default-features = false }
 opentelemetry = "0.31"
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "reqwest-client"] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
@@ -84,9 +87,16 @@ tokeira-deploy-engine = { path = "crates/tokeira-deploy-engine" }
 tokeira-config = { path = "crates/tokeira-config" }
 tokeira-aws = { path = "crates/tokeira-aws" }
 dagger-client = { path = "crates/dagger-client" }
+tokeira-build = { path = "crates/tokeira-build" }
 
 [workspace.lints.rust]
 unreachable_pub = "warn"
 
 [workspace.lints.clippy]
 dbg_macro = "warn"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

@@ -35,27 +35,3 @@ impl deploy_engine::Service for ComposeWorkload {
         Ok(vec![self.service.to_manifest()])
     }
 }
-
-/// Wraps a compose service as a deploy-engine [`Image`](deploy_engine::Image).
-#[derive(Debug)]
-pub struct ComposeImage {
-    pub name: String,
-    pub image: String,
-}
-
-impl deploy_engine::Image for ComposeImage {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn source_type(&self) -> deploy_engine::ImageSourceType {
-        deploy_engine::ImageSourceType::Registry
-    }
-
-    fn desired_ref(
-        &self,
-        _ctx: &deploy_engine::ImageContext,
-    ) -> Result<String, deploy_engine::DeployError> {
-        Ok(self.image.clone())
-    }
-}

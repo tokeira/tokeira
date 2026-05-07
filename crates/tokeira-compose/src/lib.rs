@@ -61,6 +61,10 @@ pub enum ComposeError {
         #[source]
         source: std::io::Error,
     },
+    #[error("docker operation failed: {0}")]
+    DockerIo(#[source] bollard::errors::Error),
+    #[error("local image '{image}' is missing; {remediation}")]
+    LocalBuildMissing { image: String, remediation: String },
 }
 
 impl From<ComposeError> for iac::IacError {
@@ -285,6 +289,10 @@ impl ComposePlatform {
             .map_err(|error| ComposeError::DockerNotAvailable {
                 socket_path: format!("{} ({error})", self.socket_path),
             })
+    }
+
+    pub fn docker_client(&self) -> Docker {
+        self.docker.clone()
     }
 
     /// Reconcile one compose service by updating the compose file and replacing

@@ -26,6 +26,7 @@ pub mod error;
 pub mod module;
 pub mod resource_modes;
 pub mod types;
+pub mod writeback;
 
 pub use document::{
     ImageSource, ImageState, InfraState, InfraStateStore, RuntimeState, RuntimeStateStore,
@@ -35,6 +36,7 @@ pub use engine::{Engine, StateSaver};
 pub use error::IacError;
 pub use module::{Module, ModuleContext};
 pub use types::{Change, ChangeKind, FieldDiff, InfraComposition, ModuleSelection, ResourceDiff};
+pub use writeback::{WritebackError, write_config_values};
 
 use std::{
     any::{Any, TypeId},

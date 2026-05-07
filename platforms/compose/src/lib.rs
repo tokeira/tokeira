@@ -8,6 +8,8 @@
 
 pub mod compose;
 pub mod config;
+pub mod gates;
+pub mod images;
 pub mod modules;
 pub mod services;
 
@@ -28,7 +30,7 @@ pub use config::ComposeConfig;
 
 use compose::compose_services;
 use modules::{ComposeModule, LocalStateModule};
-use services::{ComposeImage, ComposeWorkload};
+use services::ComposeWorkload;
 
 #[derive(Clone, Default)]
 pub struct ComposeDeployment;
@@ -41,7 +43,20 @@ impl ComposeDeployment {
     }
 
     pub fn default_config_toml() -> String {
-        tokeira_config::write_config_toml(&ComposeConfig::default()).expect("serializes")
+        annotate_image_lifecycle_fields(
+            tokeira_config::write_config_toml(&ComposeConfig::default()).expect("serializes"),
+        )
+    }
+
+    pub async fn validate_for_deploy_apply(
+        &self,
+        config: &ComposeConfig,
+        platform: &ComposePlatform,
+    ) -> Result<()> {
+        gates::validate_local_build(config, &gates::BollardInspector(platform.docker_client()))
+            .await
+            .map_err(anyhow::Error::from)
+            .map_err(Into::into)
     }
 
     fn desired_service_replicas(config: &ComposeConfig) -> Vec<ServiceReplicas> {
@@ -68,6 +83,37 @@ impl ComposeDeployment {
             },
         ]
     }
+}
+
+fn annotate_image_lifecycle_fields(toml: String) -> String {
+    toml.replace(
+        "image = \"tokeirad:latest\"",
+        "# run `tkr image build` before `tkr deploy apply`\nimage = \"tokeirad:latest\"",
+    )
+    .replace(
+        "mimir_image = ",
+        "# populated by `tkr image mirror` for ECS deployments\nmimir_image = ",
+    )
+    .replace(
+        "grafana_image = ",
+        "# populated by `tkr image mirror` for ECS deployments\ngrafana_image = ",
+    )
+    .replace(
+        "loki_image = ",
+        "# populated by `tkr image mirror` for ECS deployments\nloki_image = ",
+    )
+    .replace(
+        "alloy_image = ",
+        "# populated by `tkr image mirror` for ECS deployments\nalloy_image = ",
+    )
+    .replace(
+        "aws_cli_image = ",
+        "# populated by `tkr image mirror` for ECS deployments\naws_cli_image = ",
+    )
+    .replace(
+        "busybox_image = ",
+        "# populated by `tkr image mirror` for ECS deployments\nbusybox_image = ",
+    )
 }
 
 impl PlatformConfig for ComposeDeployment {
@@ -122,16 +168,8 @@ impl tokeira_orchestrator::Deployment for ComposeDeployment {
             .collect()
     }
 
-    fn images(&self, config: &Self::Config) -> Vec<Box<dyn deploy_engine::Image>> {
-        compose_services(config)
-            .into_iter()
-            .map(|service| {
-                Box::new(ComposeImage {
-                    name: service.name.clone(),
-                    image: service.image.clone(),
-                }) as Box<dyn deploy_engine::Image>
-            })
-            .collect()
+    fn images(&self, _config: &Self::Config) -> Vec<Box<dyn deploy_engine::Image>> {
+        crate::images::construct()
     }
 
     fn required_namespaces(&self, _config: &Self::Config) -> Vec<String> {
@@ -151,6 +189,15 @@ impl tokeira_orchestrator::Deployment for ComposeDeployment {
         _config: &Self::Config,
         _ctx: &mut deploy_engine::ServiceContext,
     ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn register_image_extensions(
+        &self,
+        config: &Self::Config,
+        ctx: &mut deploy_engine::ImageContext,
+    ) -> Result<()> {
+        ctx.set_extension(config.clone());
         Ok(())
     }
 

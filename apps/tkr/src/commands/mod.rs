@@ -2,6 +2,7 @@ pub mod config;
 pub mod deploy;
 pub mod deployment;
 pub mod dev;
+pub mod image;
 pub mod infra;
 pub mod logs;
 pub mod port_forward;
@@ -13,6 +14,7 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use tokeira_compose_deployment::{ComposeConfig, ComposeDeployment};
+use tokeira_ecs_deployment::{EcsConfig, EcsDeployment};
 use tokeira_local_deployment::{LocalConfig, LocalDeployment};
 use tokeira_orchestrator::Ops;
 
@@ -22,7 +24,8 @@ use crate::deployment_dir::{DeploymentContext, PlatformDeploymentConfig};
 /// for the deployment's platform kind.
 pub enum PlatformOps {
     Local(LocalDeployment, LocalConfig),
-    Compose(ComposeDeployment, ComposeConfig, PathBuf),
+    Compose(ComposeDeployment, Box<ComposeConfig>, PathBuf),
+    Ecs(EcsDeployment, Box<EcsConfig>),
 }
 
 impl PlatformOps {
@@ -36,6 +39,7 @@ impl PlatformOps {
                 config.clone(),
                 ctx.path.clone(),
             )),
+            PlatformDeploymentConfig::Ecs(config) => Ok(Self::Ecs(EcsDeployment, config.clone())),
         }
     }
 
@@ -43,6 +47,7 @@ impl PlatformOps {
         match self {
             Self::Local(d, c) => d.desired_replicas(c),
             Self::Compose(d, c, _) => d.desired_replicas(c),
+            Self::Ecs(d, c) => d.desired_replicas(c),
         }
     }
 
@@ -50,6 +55,7 @@ impl PlatformOps {
         match self {
             Self::Local(d, c) => d.scale_up(service, replicas, c).await,
             Self::Compose(d, c, dir) => d.scale_up_with_dir(service, replicas, c, dir).await,
+            Self::Ecs(d, c) => d.scale_up(service, replicas, c).await,
         }
     }
 
@@ -61,6 +67,7 @@ impl PlatformOps {
         match self {
             Self::Local(d, c) => d.scale_down(service, replicas, c).await,
             Self::Compose(d, c, dir) => d.scale_down_with_dir(service, replicas, c, dir).await,
+            Self::Ecs(d, c) => d.scale_down(service, replicas, c).await,
         }
     }
 
@@ -68,6 +75,7 @@ impl PlatformOps {
         match self {
             Self::Local(d, c) => d.logs(service, c).await,
             Self::Compose(d, c, dir) => d.logs_with_dir(service, c, dir).await,
+            Self::Ecs(d, c) => d.logs(service, c).await,
         }
     }
 
@@ -78,6 +86,7 @@ impl PlatformOps {
         match self {
             Self::Local(d, c) => d.port_mappings(service, c).await,
             Self::Compose(d, c, dir) => d.port_mappings_with_dir(service, c, dir).await,
+            Self::Ecs(d, c) => d.port_mappings(service, c).await,
         }
     }
 }

@@ -10,5 +10,12 @@ mod context;
 mod iam_policy;
 pub mod resources;
 
-pub use clients::AwsClients;
+pub use clients::{
+    AwsClients,
+    ecr::{
+        DefaultEcrClient, EcrAuthorization, EcrClient, EcrClientHandle, EcrError,
+        ImageTagMutability, RepositoryDescription, decode_authorization_data,
+        ensure_ecr_repositories, ensure_ecr_repository,
+    },
+};
 pub use context::ResourceContext;

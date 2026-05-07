@@ -187,7 +187,7 @@ impl Client {
 
 // ── Container ───────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Container<'c> {
     client: &'c Client,
     id: ContainerId,

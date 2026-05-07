@@ -143,14 +143,30 @@ impl ServiceEngine {
     ) -> Result<(), RuntimeError> {
         for image in images {
             let desired = image.desired_ref(ctx)?;
+            let resolved_ref = format!("{}:{}", desired.repository, desired.tag);
+            let source = match image.source_type() {
+                crate::ImageSourceType::Build => tokeira_iac::ImageSource::Built,
+                crate::ImageSourceType::Mirror => {
+                    let upstream_ref = desired.upstream_ref.clone().ok_or_else(|| {
+                        RuntimeError::Image(format!(
+                            "image '{}' is Mirror but desired_ref.upstream_ref is None",
+                            image.name()
+                        ))
+                    })?;
+                    tokeira_iac::ImageSource::Mirrored { upstream_ref }
+                }
+                crate::ImageSourceType::Registry => tokeira_iac::ImageSource::PullThrough {
+                    upstream_ref: desired.upstream_ref.clone().unwrap_or_default(),
+                },
+            };
             state.images.insert(
                 image.name().to_string(),
                 tokeira_iac::ImageState {
                     name: image.name().to_string(),
-                    resolved_ref: desired,
+                    resolved_ref,
                     digest: None,
                     published_at: chrono::Utc::now().to_rfc3339(),
-                    source: tokeira_iac::ImageSource::Built,
+                    source,
                 },
             );
         }
@@ -245,7 +261,31 @@ fn hash_manifests(manifests: &[serde_json::Value]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{RuntimeError, Service, ServiceContext};
+    use crate::{
+        DesiredImageRef, Image, ImageContext, ImageSourceType, RuntimeError, Service,
+        ServiceContext, validate_registry,
+    };
+    use std::{
+        future::Future,
+        sync::Arc,
+        task::{Context, Poll, Wake, Waker},
+    };
+
+    struct NoopWaker;
+
+    impl Wake for NoopWaker {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    fn block_on_ready<F: Future>(future: F) -> F::Output {
+        let waker = Waker::from(Arc::new(NoopWaker));
+        let mut context = Context::from_waker(&waker);
+        let mut future = Box::pin(future);
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("future unexpectedly pending in synchronous test"),
+        }
+    }
 
     #[derive(Debug)]
     struct MockService {
@@ -356,5 +396,169 @@ mod tests {
         let names: Vec<&str> = ordered.iter().map(|service| service.name()).collect();
         // Independent services keep input order (stable sort)
         assert_eq!(names, vec!["zebra", "alpha"]);
+    }
+
+    #[derive(Debug)]
+    struct MockImage {
+        name: &'static str,
+        repository: &'static str,
+        tag: &'static str,
+        source_type: ImageSourceType,
+        upstream_ref: Option<&'static str>,
+    }
+
+    impl Image for MockImage {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn source_type(&self) -> ImageSourceType {
+            self.source_type
+        }
+
+        fn desired_ref(&self, _ctx: &ImageContext) -> Result<DesiredImageRef, RuntimeError> {
+            Ok(DesiredImageRef {
+                repository: self.repository.to_string(),
+                tag: self.tag.to_string(),
+                upstream_ref: self.upstream_ref.map(ToString::to_string),
+            })
+        }
+    }
+
+    #[test]
+    fn validate_registry_rejects_duplicate_names() {
+        let images: Vec<Box<dyn Image>> = vec![
+            Box::new(MockImage {
+                name: "same",
+                repository: "repo-a",
+                tag: "latest",
+                source_type: ImageSourceType::Build,
+                upstream_ref: None,
+            }),
+            Box::new(MockImage {
+                name: "same",
+                repository: "repo-b",
+                tag: "latest",
+                source_type: ImageSourceType::Build,
+                upstream_ref: None,
+            }),
+        ];
+
+        let error =
+            validate_registry(&images, &ImageContext::default()).expect_err("duplicate name fails");
+        assert_eq!(
+            error.to_string(),
+            "Image error: image registry validation failed: duplicate name = same"
+        );
+    }
+
+    #[test]
+    fn validate_registry_rejects_duplicate_repositories() {
+        let images: Vec<Box<dyn Image>> = vec![
+            Box::new(MockImage {
+                name: "build",
+                repository: "same-repo",
+                tag: "latest",
+                source_type: ImageSourceType::Build,
+                upstream_ref: None,
+            }),
+            Box::new(MockImage {
+                name: "mirror",
+                repository: "same-repo",
+                tag: "latest",
+                source_type: ImageSourceType::Mirror,
+                upstream_ref: Some("upstream:latest"),
+            }),
+        ];
+
+        let error = validate_registry(&images, &ImageContext::default())
+            .expect_err("duplicate repository fails");
+        assert_eq!(
+            error.to_string(),
+            "Image error: image registry validation failed: duplicate repository = same-repo"
+        );
+    }
+
+    #[test]
+    fn record_images_maps_structured_refs_to_state() {
+        let engine = ServiceEngine::new();
+        let ctx = ImageContext::default();
+        let mut state = tokeira_iac::RuntimeState::default();
+        let images: Vec<Box<dyn Image>> = vec![
+            Box::new(MockImage {
+                name: "built",
+                repository: "project/built",
+                tag: "latest",
+                source_type: ImageSourceType::Build,
+                upstream_ref: None,
+            }),
+            Box::new(MockImage {
+                name: "mirrored",
+                repository: "project/mirrored",
+                tag: "v1",
+                source_type: ImageSourceType::Mirror,
+                upstream_ref: Some("source/mirrored:v1"),
+            }),
+            Box::new(MockImage {
+                name: "registry",
+                repository: "public.example/registry",
+                tag: "stable",
+                source_type: ImageSourceType::Registry,
+                upstream_ref: Some("public.example/registry:stable"),
+            }),
+        ];
+
+        block_on_ready(engine.record_images(&images, &ctx, &mut state))
+            .expect("image recording succeeds");
+
+        let built = state.images.get("built").expect("built image recorded");
+        assert_eq!(built.resolved_ref, "project/built:latest");
+        assert!(matches!(built.source, tokeira_iac::ImageSource::Built));
+
+        let mirrored = state
+            .images
+            .get("mirrored")
+            .expect("mirrored image recorded");
+        assert_eq!(mirrored.resolved_ref, "project/mirrored:v1");
+        assert!(matches!(
+            &mirrored.source,
+            tokeira_iac::ImageSource::Mirrored {
+                upstream_ref
+            } if upstream_ref == "source/mirrored:v1"
+        ));
+
+        let registry = state
+            .images
+            .get("registry")
+            .expect("registry image recorded");
+        assert_eq!(registry.resolved_ref, "public.example/registry:stable");
+        assert!(matches!(
+            &registry.source,
+            tokeira_iac::ImageSource::PullThrough {
+                upstream_ref
+            } if upstream_ref == "public.example/registry:stable"
+        ));
+    }
+
+    #[test]
+    fn record_images_errors_when_mirror_has_no_upstream() {
+        let engine = ServiceEngine::new();
+        let mut state = tokeira_iac::RuntimeState::default();
+        let images: Vec<Box<dyn Image>> = vec![Box::new(MockImage {
+            name: "bad-mirror",
+            repository: "project/bad-mirror",
+            tag: "latest",
+            source_type: ImageSourceType::Mirror,
+            upstream_ref: None,
+        })];
+
+        let ctx = ImageContext::default();
+        let error = engine.record_images(&images, &ctx, &mut state);
+        let error = block_on_ready(error).expect_err("bad mirror should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "Image error: image 'bad-mirror' is Mirror but desired_ref.upstream_ref is None"
+        );
     }
 }

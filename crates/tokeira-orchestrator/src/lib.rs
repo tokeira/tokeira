@@ -36,6 +36,7 @@ use tokeira_state::{StateBackend, StateError, StateStore};
 pub enum PlatformKind {
     Local,
     Compose,
+    Ecs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +140,18 @@ pub trait Deployment: Send + Sync {
         config: &Self::Config,
         ctx: &mut deploy_engine::ServiceContext,
     ) -> Result<()>;
+
+    /// Register provider-specific image handles and config on the image context.
+    ///
+    /// Images retrieve these values through `ctx.extension::<T>()` while
+    /// resolving desired refs and writeback targets.
+    async fn register_image_extensions(
+        &self,
+        _config: &Self::Config,
+        _ctx: &mut deploy_engine::ImageContext,
+    ) -> Result<()> {
+        Ok(())
+    }
 
     /// Create the backend used for infrastructure state.
     ///
@@ -428,9 +441,12 @@ impl<D: Deployment> DeployEngine<D> {
     /// provider-specific manifest application to the supplied platform.
     pub async fn new(deployment: D, config: &D::Config, deployment_dir: &Path) -> Result<Self> {
         let mut service_ctx = deploy_engine::ServiceContext::default();
-        let image_ctx = deploy_engine::ImageContext::default();
+        let mut image_ctx = deploy_engine::ImageContext::default();
         deployment
             .register_deploy_extensions(config, &mut service_ctx)
+            .await?;
+        deployment
+            .register_image_extensions(config, &mut image_ctx)
             .await?;
         let state_store = StateStore::new(
             deployment.create_deploy_store(config, deployment_dir),
@@ -619,8 +635,13 @@ mod tests {
         fn desired_ref(
             &self,
             _ctx: &deploy_engine::ImageContext,
-        ) -> std::result::Result<String, deploy_engine::DeployError> {
-            Ok("example:latest".into())
+        ) -> std::result::Result<deploy_engine::DesiredImageRef, deploy_engine::DeployError>
+        {
+            Ok(deploy_engine::DesiredImageRef {
+                repository: "example".into(),
+                tag: "latest".into(),
+                upstream_ref: Some("example:latest".into()),
+            })
         }
     }
 

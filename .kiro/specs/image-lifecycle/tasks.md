@@ -35,25 +35,25 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - _Requirements: 4.1_
 
 - [ ] 2. Extend `tokeira_deploy_engine::image` and the deploy-engine wiring
-  - [ ] 2.1 Widen `Image::desired_ref` return type
+  - [x] 2.1 Widen `Image::desired_ref` return type
     - In `crates/tokeira-deploy-engine/src/image.rs`, change the trait method signature from `fn desired_ref(&self, ctx: &ImageContext) -> Result<String, RuntimeError>` to `fn desired_ref(&self, ctx: &ImageContext) -> Result<DesiredImageRef, RuntimeError>`
     - `DesiredImageRef` (already declared with `repository`, `tag`, `upstream_ref`) stays as-is
     - Audit the workspace for call sites of the old signature and migrate them to the new shape. Expected audit scope at this point in the spec: zero external implementors
     - _Requirements: 1.1_
 
-  - [ ] 2.2 Add `writeback_targets` default-empty trait method and `WritebackTarget` type
+  - [x] 2.2 Add `writeback_targets` default-empty trait method and `WritebackTarget` type
     - In `crates/tokeira-deploy-engine/src/image.rs`, define `pub struct WritebackTarget { pub field: &'static str }` deriving `Debug, Clone, PartialEq, Eq`
     - Add a default-empty `fn writeback_targets(&self, _ctx: &ImageContext) -> Vec<WritebackTarget> { Vec::new() }` method on the `Image` trait
     - Re-export `WritebackTarget` from the `image` module
     - _Requirements: 1.2_
 
-  - [ ] 2.3 Add the `validate_registry` helper
+  - [x] 2.3 Add the `validate_registry` helper
     - In `crates/tokeira-deploy-engine/src/image.rs`, add `pub fn validate_registry(images: &[Box<dyn Image>], ctx: &ImageContext) -> Result<(), RuntimeError>`
     - The implementation walks the list, inserts each `name()` into a `HashSet` (returning `RuntimeError::Image(format!("image registry validation failed: duplicate name = {name}"))` on re-insert), then resolves each `desired_ref(ctx)` and inserts `desired.repository` into a second `HashSet` — keyed by repository ALONE, not `(source_type, repository)`. A `Build` image and a `Mirror` image resolving to the same `repository` MUST be rejected (the downstream `ImagesModule` would otherwise create two `EcrRepository` resources pointing at the same AWS repo)
     - Duplicate-repository error: `RuntimeError::Image(format!("image registry validation failed: duplicate repository = {repo}"))`
     - _Requirements: 2.3_
 
-  - [ ] 2.4 Update `ServiceEngine::record_images` to consume the structured `DesiredImageRef`
+  - [x] 2.4 Update `ServiceEngine::record_images` to consume the structured `DesiredImageRef`
     - In `crates/tokeira-deploy-engine/src/engine.rs`, update `record_images` to compute `resolved_ref = format!("{}:{}", desired.repository, desired.tag)` from the widened return
     - Map `ImageSourceType` onto the existing `tokeira_iac::ImageSource` variants:
       - `Build` ⇒ `ImageSource::Built`
@@ -62,7 +62,7 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Do NOT remove any fields from `ImageState` or `ImageSource`. Persisted state format is append-only
     - _Requirements: 1.5, 1.6_
 
-  - [ ] 2.5 Add `register_image_extensions` hook to the `Deployment` trait
+  - [x] 2.5 Add `register_image_extensions` hook to the `Deployment` trait
     - In `crates/tokeira-orchestrator/src/lib.rs`, add `async fn register_image_extensions(&self, _config: &Self::Config, _ctx: &mut deploy_engine::ImageContext) -> Result<()> { Ok(()) }` to the `Deployment` trait (default empty)
     - Update `DeployEngine::new` to construct `image_ctx` via `let mut image_ctx = deploy_engine::ImageContext::default(); deployment.register_image_extensions(config, &mut image_ctx).await?;` — AFTER `register_deploy_extensions` and BEFORE storing the context on the facade
     - Update the existing in-crate test `Deployment` impls in `crates/tokeira-orchestrator/src/lib.rs` `#[cfg(test)] mod tests` if any rely on the old construction order (expected: none — the hook is default-empty)
@@ -72,11 +72,11 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - In `platforms/local/src/lib.rs`, leave the default empty implementation inherited from the trait. The local platform declares no images, so the default is correct. Add a comment referencing Req 1.4.5 so future maintainers know the emptiness is deliberate
     - _Requirements: 1.4.5_
 
-  - [ ] 2.7 Implement `register_image_extensions` on `ComposeDeployment`
+  - [x] 2.7 Implement `register_image_extensions` on `ComposeDeployment`
     - In `platforms/compose/src/lib.rs`, implement `async fn register_image_extensions(&self, config: &Self::Config, ctx: &mut deploy_engine::ImageContext) -> Result<()> { ctx.set_extension(config.clone()); Ok(()) }`
     - _Requirements: 1.4.3_
 
-  - [ ]* 2.8 Write unit test for `ImageContext` extensions, `validate_registry`, and `record_images` mapping
+  - [x]* 2.8 Write unit test for `ImageContext` extensions, `validate_registry`, and `record_images` mapping
     - Register a dummy config type on a fresh context, assert `ctx.extension::<T>()` returns `Some(_)`. With no extension registered, assert it returns `None`
     - Construct two image lists: one with no duplicates (assert `validate_registry` returns `Ok(())`), one with a duplicate name (assert it returns the exact `RuntimeError::Image` variant)
     - Construct three fake `Image` impls — one Build, one Mirror (with an upstream), one Registry (with/without an upstream). Pass them to `record_images`. Assert the resulting `ImageState` entries have the expected `resolved_ref` format (`repository:tag`) and the expected `ImageSource` variant. Assert the Mirror-without-upstream case returns the documented `RuntimeError::Image`
@@ -86,47 +86,47 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Run `cargo lint`, `cargo check --workspace`, `cargo test -p tokeira-deploy-engine -p tokeira-orchestrator -p tokeira-local-deployment -p tokeira-compose-deployment`
 
 - [ ] 3. Scaffold `crates/tokeira-build/` with free-function pipelines
-  - [ ] 3.1 Add the crate to the workspace
+  - [x] 3.1 Add the crate to the workspace
     - Create `crates/tokeira-build/Cargo.toml` with dependencies on `thiserror`, `tracing`, `toml`, `serde`, `serde_json`, `eyre`, and a path-dep on `crates/dagger-client`
     - Do NOT add a dependency on any platform crate. Do NOT add a dependency on `tokeira-deploy-engine`
     - Add `"crates/tokeira-build"` to `[workspace.members]` in the root `Cargo.toml`
     - _Requirements: 3.1_
 
-  - [ ] 3.2 Define `BuildError` and `Arch`
+  - [x] 3.2 Define `BuildError` and `Arch`
     - In `crates/tokeira-build/src/error.rs`, define `pub enum BuildError` with variants: `ToolchainFile`, `ToolchainParse`, `UnsupportedArch`, `DaggerMissing`, `Publish`, `Mirror`, `UpstreamAuth`, `Validation`
     - In `crates/tokeira-build/src/arch.rs`, define `pub enum Arch { Arm64, Amd64 }` with methods `rust_target() -> &'static str` (`aarch64-unknown-linux-gnu` / `x86_64-unknown-linux-gnu` — glibc gnu targets, NOT musl; see Req 3.2.3 for rationale), `platform() -> &'static str` (`linux/arm64` / `linux/amd64`), and `FromStr` that maps unknown strings to `BuildError::UnsupportedArch`
     - All public types derive `Debug`. Serializable types derive `Serialize, Deserialize`
     - _Requirements: 3.1, 3.3_
 
-  - [ ]* 3.3 Write property test for `Arch` parsing
+  - [x]* 3.3 Write property test for `Arch` parsing
     - **Property: Arch Parsing Rejects Unknown Values**
     - **Validates: Requirement 3.3**
     - Generate arbitrary strings via `proptest`. For strings in `{"arm64", "amd64"}`, assert `Arch::from_str(s)` returns `Ok(_)` and round-trips via `as_str()`. For all other strings, assert `Err(BuildError::UnsupportedArch { supplied })` where `supplied == s`
     - Test location: `crates/tokeira-build/src/arch.rs` `#[cfg(test)]` module
     - Minimum 256 iterations
 
-  - [ ] 3.4 Define the `DaggerClient` trait and helper traits
+  - [x] 3.4 Define the `DaggerClient` trait and helper traits
     - Create `crates/tokeira-build/src/dagger.rs` with `DaggerClient`, `ContainerRef`, `DirectoryRef`, `FileRef`, `SecretRef` traits as in the Design doc
     - Use the `Box<Self>` builder pattern on `ContainerRef` methods to match `dagger_client::Container<'_>`'s owned-by-value API
     - _Requirements: 4.2_
 
-  - [ ] 3.5 Implement the default `DaggerClient` over `dagger_client::Client`
+  - [x] 3.5 Implement the default `DaggerClient` over `dagger_client::Client`
     - Create `crates/tokeira-build/src/dagger_default.rs` with `pub struct DefaultDaggerClient { client: dagger_client::Client }`
     - Add `DefaultDaggerClient::from_env()` that calls `dagger_client::Client::from_env()` and wraps the result
     - Implement every trait method by delegating to the corresponding method on the inner client
     - _Requirements: 4.2_
 
-  - [ ] 3.6 Provide `MockDaggerClient` under `#[cfg(test)]`
+  - [x] 3.6 Provide `MockDaggerClient` under `#[cfg(test)]`
     - Create `crates/tokeira-build/src/testing.rs` with a mock that records call sequences and returns canned `Box<dyn ContainerRef>` / `Box<dyn FileRef>` / `Box<dyn SecretRef>` handles
     - Expose `MockDaggerClient::calls() -> Vec<MockCall>` for tests to inspect
 
-  - [ ] 3.7 Implement `rust-toolchain.toml` resolution
+  - [x] 3.7 Implement `rust-toolchain.toml` resolution
     - In `crates/tokeira-build/src/toolchain.rs`, add `pub fn rust_toolchain_version(workspace_root: &Path) -> Result<String, BuildError>`
     - Read the file at `workspace_root/rust-toolchain.toml`, parse via `toml`, extract `[toolchain] channel` (fallback to `version`)
     - Map I/O errors to `BuildError::ToolchainFile`; map parse errors to `BuildError::ToolchainParse`
     - _Requirements: 3.2_
 
-  - [ ] 3.8 Implement `build_tokeirad_image` using the 2026 Rust-server pattern
+  - [x] 3.8 Implement `build_tokeirad_image` using the 2026 Rust-server pattern
     - Create `crates/tokeira-build/src/pipelines/build.rs`
     - Define `pub struct TokeiradBuildRequest { arch: Arch, tag: Option<String>, workspace_root: PathBuf }` deriving `#[derive(Debug, Clone)]`, and `pub struct TokeiradBuildResult { image_name: String, tags: Vec<String>, arch: Arch, toolchain_version: String }` deriving `#[derive(Debug, Clone)]`
     - Define `pub fn build_tokeirad_image(request: &TokeiradBuildRequest, dagger: &dyn DaggerClient) -> Result<TokeiradBuildResult, BuildError>`
@@ -139,7 +139,7 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Always export `tokeirad:latest`. When `request.tag` is `Some(t)` with `t != "latest"`, additionally export `tokeirad:{t}` from the same container handle
     - _Requirements: 3.2, 3.3, 3.3a_
 
-  - [ ] 3.8a Configure the release profile in the root `Cargo.toml`
+  - [x] 3.8a Configure the release profile in the root `Cargo.toml`
     - Add (or update) `[profile.release]` in the root workspace `Cargo.toml`:
       ```toml
       [profile.release]
@@ -152,7 +152,7 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Audit existing tests for any that rely on catching panics via `std::panic::catch_unwind` — `panic = "abort"` makes that non-functional in release builds. If found, either gate the tests behind `cfg(debug_assertions)` or restructure them to use `Result` instead of panics for the error condition
     - _Requirements: 3.2.5_
 
-  - [ ] 3.8b Register `mimalloc` as the global allocator in the `tokeirad` binary
+  - [x] 3.8b Register `mimalloc` as the global allocator in the `tokeirad` binary
     - Add `mimalloc = { version = "...", default-features = false }` to the workspace `[workspace.dependencies]` section. Pin to the latest stable (check https://crates.io/crates/mimalloc at implementation time)
     - Add `mimalloc.workspace = true` to `apps/tokeirad/Cargo.toml` `[dependencies]`
     - In `apps/tokeirad/src/main.rs`, at the top of the file (after module-level docs, before `use` statements), add:
@@ -163,20 +163,20 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - `default-features = false` excludes the secure-heap feature, which adds overhead we don't need for a server that runs in a controlled environment
     - _Requirements: 3.3a_
 
-  - [ ] 3.8c Revise the existing implementation in `crates/tokeira-build/`
+  - [x] 3.8c Revise the existing implementation in `crates/tokeira-build/`
     - The existing implementation (committed at Phase 3 partial) uses the alpine+musl pattern. The updated spec (Req 3.2, 3.3) mandates the 2026 glibc+chainguard+cargo-chef pattern
     - Update `crates/tokeira-build/src/arch.rs` to return `aarch64-unknown-linux-gnu` / `x86_64-unknown-linux-gnu` from `rust_target()` — NOT the musl variants
     - Update `crates/tokeira-build/src/pipelines/build.rs` to use the chef-based pipeline from task 3.8. Remove the existing alpine base, apk installations, and manual user creation
     - The existing proptest for `Arch::from_str` continues to pass (it tests the enum's string mapping, not the target triples returned by `rust_target()`), but add a new assertion that `Arch::Arm64.rust_target() == "aarch64-unknown-linux-gnu"` and the same for amd64
     - _Requirements: 3.2, 3.3_
 
-  - [ ]* 3.9 Write unit test for `build_tokeirad_image` invocation sequence
+  - [x]* 3.9 Write unit test for `build_tokeirad_image` invocation sequence
     - With `MockDaggerClient`, call `build_tokeirad_image(&request_arm64_no_tag, &mock)`. Assert the recorded call sequence includes, in order: `container_from("rust:{toolchain}-slim-bookworm")`, `apt-get install` for `pkg-config libssl-dev protobuf-compiler ca-certificates`, `cargo install cargo-chef --locked`, `rustup target add aarch64-unknown-linux-gnu`, `cargo chef prepare`, `cargo chef cook --release --target aarch64-unknown-linux-gnu --bin tokeirad`, `cargo build --release --target aarch64-unknown-linux-gnu --bin tokeirad -p tokeirad`, `strip /app/target/aarch64-unknown-linux-gnu/release/tokeirad`, `container_from("cgr.dev/chainguard/glibc-dynamic:latest")`, `with_user("nonroot")`, `with_entrypoint(["/usr/local/bin/tokeirad"])`, `export_image("tokeirad:latest")` — and only that one export
     - Second test: with `tag = Some("v1.2.3")`, assert the additional `export_image("tokeirad:v1.2.3")` appears after the `:latest` export
     - Third test: with `arch = Amd64`, assert target triple is `x86_64-unknown-linux-gnu` (gnu, NOT musl)
     - Fourth test: assert the sequence does NOT include any `apk` command (no alpine), does NOT include any `addgroup`/`adduser` command (nonroot user comes from the chainguard base image), and does NOT include `container_from("alpine:..)`
 
-  - [ ] 3.10 Implement `publish_image`
+  - [x] 3.10 Implement `publish_image`
     - Create `crates/tokeira-build/src/pipelines/publish.rs`
     - Define `pub struct PublishRequest { local_image: String, remote_refs: Vec<String>, registry_host: String, username: String, password: String }`, `pub struct PublishResult { published: Vec<PublishedReference> }`, `pub struct PublishedReference { remote_ref: String, published_ref: String }`
     - Define `pub fn publish_image(request: &PublishRequest, dagger: &dyn DaggerClient) -> Result<PublishResult, BuildError>`
@@ -185,7 +185,7 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Map publish failures to `BuildError::Publish { remote_ref, source }` naming the failing ref; prior successful pushes are not rolled back
     - _Requirements: 3.4_
 
-  - [ ]* 3.11 Write property test for publish reference count
+  - [x]* 3.11 Write property test for publish reference count
     - **Property 10: Publish Reference Count**
     - **Validates: Requirement 3.4**
     - Generate `Vec<String>` of length 1..16 of valid-looking remote refs via `proptest`
@@ -193,7 +193,7 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Test location: `crates/tokeira-build/src/pipelines/publish.rs` `#[cfg(test)]` module
     - Minimum 100 iterations
 
-  - [ ] 3.12 Implement `mirror_image`
+  - [x] 3.12 Implement `mirror_image`
     - Create `crates/tokeira-build/src/pipelines/mirror.rs`
     - Define `pub struct MirrorRequest { source_ref: String, remote_ref: String, registry_host: String, username: String, password: String }` and `pub struct MirroredReference { source_ref: String, remote_ref: String, published_ref: String }`
     - Define `pub fn mirror_image(request: &MirrorRequest, dagger: &dyn DaggerClient) -> Result<MirroredReference, BuildError>`
@@ -202,11 +202,11 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - The skip-self check (source already equals destination) is performed by the CLI caller, not by the pipeline
     - _Requirements: 3.5_
 
-  - [ ]* 3.13 Write unit test for `mirror_image` invocation sequence
+  - [x]* 3.13 Write unit test for `mirror_image` invocation sequence
     - With `MockDaggerClient`, call `mirror_image(&request, &mock)`. Assert the recorded sequence: `set_secret`, `container_from(source_ref)`, `with_registry_auth(registry_host, username, _)`, `publish(remote_ref)`
     - With a mock that returns an error on `publish`, assert the returned error is `BuildError::Mirror` with the exact `source_ref` and `remote_ref` fields
 
-  - [ ] 3.13a Audit public API structs for `#[derive(Debug)]`
+  - [x] 3.13a Audit public API structs for `#[derive(Debug)]`
     - AGENTS.md requires all public types to derive `Debug`. Sweep every public struct and enum introduced by this phase and confirm each carries `#[derive(Debug, ...)]` (or a manual impl when a field prevents the derive)
     - Required derives this phase:
       - `Arch` — `#[derive(Debug, Clone, Copy, PartialEq, Eq)]`
@@ -227,19 +227,19 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Run `cargo lint`, `cargo check --workspace`, `cargo test -p tokeira-build`
 
 - [ ] 4. Extend platform configs with new mirror targets and scaffold the ECS platform
-  - [ ] 4.1 Extend `ComposeConfig::observability` with `aws_cli_image` and `busybox_image`
+  - [x] 4.1 Extend `ComposeConfig::observability` with `aws_cli_image` and `busybox_image`
     - In `platforms/compose/src/config.rs`, add `pub aws_cli_image: String` and `pub busybox_image: String` to `ObservabilityConfig`
     - Use per-field default functions, NOT bare `#[serde(default)]`. Add two free functions: `fn default_aws_cli_image() -> String { "public.ecr.aws/aws-cli/aws-cli:latest".into() }` and `fn default_busybox_image() -> String { "public.ecr.aws/docker/library/busybox:latest".into() }`. Annotate each field with `#[serde(default = "default_aws_cli_image")]` / `#[serde(default = "default_busybox_image")]`. This is critical: bare `#[serde(default)]` yields `String::default()` (empty string) for missing fields and would silently produce empty `upstream_ref` on a fresh `deployment.toml`
     - Update `ObservabilityConfig::default()` to call the same `default_aws_cli_image()` / `default_busybox_image()` functions
     - _Requirements: 7.5_
 
-  - [ ] 4.2 Flip `ComposeConfig::default().tokeirad.image` from `"tokeirad:local"` to `"tokeirad:latest"`
+  - [x] 4.2 Flip `ComposeConfig::default().tokeirad.image` from `"tokeirad:local"` to `"tokeirad:latest"`
     - In `platforms/compose/src/config.rs` (or wherever `ComposeConfig::default()` lives), change the default value for `tokeirad.image` to `"tokeirad:latest"`
     - Audit any tests, snapshots, or fixture files that encode `"tokeirad:local"` and update them. Search with `grepSearch` for the literal string `tokeirad:local` across the workspace
     - Update any prototypical-config generation helpers (e.g., `tkr deployment create --platform compose`) to emit `tokeirad:latest`
     - _Requirements: 7.1_
 
-  - [ ] 4.3 Scaffold the ECS platform crate
+  - [x] 4.3 Scaffold the ECS platform crate
     - There is no `platforms/ecs/` crate in the workspace yet. Create `platforms/ecs/Cargo.toml` with `name = "tokeira-ecs-deployment"`, `version.workspace = true`, `edition.workspace = true`, and the same dependency pattern as `platforms/compose/Cargo.toml`: `anyhow`, `async-trait`, `serde`, `serde_json`, `tokeira-aws` (new path-dep), `tokeira-config`, `tokeira-deploy-engine`, `tokeira-iac`, `tokeira-orchestrator`, `tokeira-state`
     - Add `"platforms/ecs"` to `[workspace.members]` in the root `Cargo.toml`
     - Create `platforms/ecs/src/lib.rs` with a placeholder `EcsDeployment` struct implementing the `Deployment` trait with stubbed methods (`infra_modules`, `services`, `images` each return empty `Vec`, `register_infra_extensions` and `register_deploy_extensions` are no-ops). The full implementation is filled in by subsequent phases
@@ -248,7 +248,7 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Create `platforms/ecs/src/images/mod.rs` as a placeholder for the image modules (filled by phase 6)
     - _Requirements: 7.5_
 
-  - [ ] 4.4 Implement `register_image_extensions` on `EcsDeployment`
+  - [x] 4.4 Implement `register_image_extensions` on `EcsDeployment`
     - In `platforms/ecs/src/lib.rs`, implement `async fn register_image_extensions(&self, config: &Self::Config, ctx: &mut deploy_engine::ImageContext) -> Result<()> { ctx.set_extension(config.clone()); Ok(()) }`
     - _Requirements: 1.4.4_
 
@@ -256,7 +256,7 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Run `cargo lint`, `cargo check --workspace`, `cargo test -p tokeira-compose-deployment -p tokeira-ecs-deployment` (unit tests only)
 
 - [ ] 5. Implement compose platform image modules and retire `ComposeImage`
-  - [ ] 5.1 Scaffold `platforms/compose/src/images/{mod, tokeirad, observability/mod}.rs`
+  - [x] 5.1 Scaffold `platforms/compose/src/images/{mod, tokeirad, observability/mod}.rs`
     - Create `platforms/compose/src/images/mod.rs` exposing TWO functions: `pub fn construct() -> Vec<Box<dyn Image>>` (context-free — concatenates `tokeirad::all()` and `observability::all()`) AND `pub fn all(ctx: &ImageContext) -> Result<Vec<Box<dyn Image>>, RuntimeError>` (calls `construct()` then `tokeira_deploy_engine::image::validate_registry`)
     - `construct()` is what `ComposeDeployment::images(&self, config)` calls; `all(ctx)` is what CLI handlers call
     - Create `platforms/compose/src/images/tokeirad.rs` with `TokeiradImage` implementing `Image` for the compose platform: `source_type = Build`, `desired_ref` reads `ComposeConfig` via `ctx.extension::<ComposeConfig>().ok_or_else(|| RuntimeError::Image(format!("image context missing extension: {}", std::any::type_name::<ComposeConfig>())))?`, `writeback_targets` returns the single `{ field: "tokeirad.image" }` target
@@ -264,7 +264,7 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - CRITICAL: the `mirror_image!` macro's `desired_ref` body MUST include an empty-string guard: `if upstream.is_empty() { return Err(RuntimeError::Image(format!("image '{}' has empty upstream_ref in config", $name))); }` placed immediately after cloning the upstream field. This defends against a `deployment.toml` that explicitly sets an observability field to the empty string
     - _Requirements: 2.1, 7.5_
 
-  - [ ] 5.2 Wire `ComposeDeployment::images` to the new registry and remove `ComposeImage`
+  - [x] 5.2 Wire `ComposeDeployment::images` to the new registry and remove `ComposeImage`
     - In `platforms/compose/src/lib.rs`, change `fn images(&self, _config: &Self::Config) -> Vec<Box<dyn deploy_engine::Image>>` to return `crate::images::construct()`
     - Delete the legacy `ComposeImage` struct from `platforms/compose/src/services.rs` and its `impl Image` block
     - Delete the `ComposeImage` re-export from `platforms/compose/src/lib.rs` (currently `use services::{ComposeImage, ComposeWorkload};` — change to `use services::ComposeWorkload;`)
@@ -272,7 +272,7 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Audit callers of `ComposeImage` across the workspace via `grepSearch`. Expected scope: zero external callers; only the local re-export and the adapter path in `images()` need removal
     - _Requirements: 2.5_
 
-  - [ ]* 5.3 Write unit tests for compose image `desired_ref` / `writeback_targets`
+  - [x]* 5.3 Write unit tests for compose image `desired_ref` / `writeback_targets`
     - Register `ComposeConfig::default()` on a fresh `ImageContext`. For `TokeiradImage`, assert `desired_ref` returns `DesiredImageRef { repository: "tokeira/tokeirad", tag: "latest", upstream_ref: None }` and `writeback_targets` returns the single `tokeirad.image` target
     - For each of the six observability images, assert `desired_ref` produces the expected `repository` (`tokeira/<suffix>`), `tag` (extracted from the upstream ref), and `upstream_ref` (the full upstream ref)
     - Edge cases: upstream with digest (`repo@sha256:...`), upstream with no tag (falls back to `"latest"`), upstream with port in registry host
@@ -291,7 +291,7 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Test location: `platforms/compose/src/images/mod.rs` `#[cfg(test)]` module
     - Minimum 128 iterations
 
-  - [ ]* 5.5 Write compose-platform mirror stability property test (Property 6 compose side)
+  - [x]* 5.5 Write compose-platform mirror stability property test (Property 6 compose side)
     - **Property 6 (compose): Mirror Mapping Stability**
     - **Validates: Requirement 9.7.1**
     - No generation — direct assertion
@@ -300,19 +300,19 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Test location: `platforms/compose/src/images/observability/mod.rs` `#[cfg(test)]` module
 
 - [ ] 6. Implement ECS platform image modules and wire `EcsDeployment::images`
-  - [ ] 6.1 Scaffold `platforms/ecs/src/images/{mod, tokeirad, observability/mod}.rs`
+  - [x] 6.1 Scaffold `platforms/ecs/src/images/{mod, tokeirad, observability/mod}.rs`
     - Structure identical to compose (task 5.1): `mod.rs` exposes both `pub fn construct() -> Vec<Box<dyn Image>>` and `pub fn all(ctx: &ImageContext) -> Result<Vec<Box<dyn Image>>, RuntimeError>`
     - The modules read `EcsConfig` instead of `ComposeConfig`
     - `TokeiradImage::writeback_targets` returns the seven `services.<name>.image` targets in canonical order: `edge_api`, `edge_poll`, `runtime`, `projection`, `controller`, `autoscaler`, `admin`
     - The ECS observability module carries its OWN copy of the `mirror_image!` macro reading `EcsConfig` — do NOT import the compose macro. Include the same empty-upstream guard (`if upstream.is_empty() { return Err(...) }`)
     - _Requirements: 2.2, 7.5_
 
-  - [ ] 6.2 Wire `EcsDeployment::images` to the new registry
+  - [x] 6.2 Wire `EcsDeployment::images` to the new registry
     - In `platforms/ecs/src/lib.rs`, replace the `fn images` stub (task 4.3) with `fn images(&self, _config: &Self::Config) -> Vec<Box<dyn deploy_engine::Image>> { crate::images::construct() }`
     - The ECS platform has no pre-existing `ComposeImage`-style adapter to remove — the scaffold from task 4.3 was already a stub
     - _Requirements: 2.5_
 
-  - [ ]* 6.3 Write unit tests for ECS image `desired_ref` / `writeback_targets`
+  - [x]* 6.3 Write unit tests for ECS image `desired_ref` / `writeback_targets`
     - Register `EcsConfig::default()` on a fresh `ImageContext`. For `TokeiradImage`, assert `desired_ref` returns `DesiredImageRef { repository: "<project>/tokeirad", tag: "latest", upstream_ref: None }` and `writeback_targets` returns the seven service targets in the canonical order above
     - For each of the six observability images, assert `desired_ref` produces the expected fields from `EcsConfig::default().observability`
     - Empty-upstream case: as per task 5.3's equivalent test
@@ -323,7 +323,7 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Test location: `platforms/ecs/src/images/mod.rs` `#[cfg(test)]` module
     - Minimum 128 iterations
 
-  - [ ]* 6.5 Write ECS-platform mirror stability property test (Property 6 ECS side)
+  - [x]* 6.5 Write ECS-platform mirror stability property test (Property 6 ECS side)
     - **Property 6 (ecs): Mirror Mapping Stability**
     - **Validates: Requirement 9.7.2**
     - No generation — direct assertion
@@ -335,7 +335,7 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Run `cargo lint`, `cargo check --workspace`, `cargo test -p tokeira-compose-deployment -p tokeira-ecs-deployment`
 
 - [ ] 7. Implement `EcrRepository`, `EcrClient`, `EcrClientHandle`, ensure helpers, and `ImagesModule`
-  - [ ] 7.1 Define the `EcrClient` trait and default impl
+  - [x] 7.1 Define the `EcrClient` trait and default impl
     - In `crates/tokeira-aws/src/clients/ecr.rs`, define the trait with the mutation-path methods (`get_authorization_token`, `create_repository`, `delete_repository`, `put_lifecycle_policy`, `tag_resource`) AND the live-read methods (`describe_repository`, `list_tags_for_resource`, `get_lifecycle_policy`) required by drift detection
     - Method signatures: `describe_repository(name) -> Result<RepositoryDescription, EcrError>` (returns `arn`, `uri`); `create_repository(name, mutability, tags) -> Result<RepositoryDescription, EcrError>` (returns the created repo's description so `create` has the ARN without a round-trip); `list_tags_for_resource(arn) -> Result<HashMap<String, String>, EcrError>`; `get_lifecycle_policy(name) -> Result<Option<String>, EcrError>` that returns `Ok(None)` when the repository has no policy (map ECR's `LifecyclePolicyNotFoundException` to `Ok(None)` at the wrapper layer)
     - Define `EcrAuthorization`, `RepositoryDescription`, `ImageTagMutability`, `EcrError` with variants including `NotFound` and `InvalidToken`
@@ -343,21 +343,21 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Add `aws-sdk-ecr` and `base64` to `crates/tokeira-aws/Cargo.toml`
     - _Requirements: 5.1_
 
-  - [ ] 7.2 Implement the ECR authorization decoder
+  - [x] 7.2 Implement the ECR authorization decoder
     - In `crates/tokeira-aws/src/clients/ecr.rs`, implement `fn decode_authorization_data(token_b64: &str, proxy_endpoint: &str) -> Result<EcrAuthorization, EcrError>`
     - The decoder validates base64 decoding, UTF-8 decoding, presence of a `:` separator, and trims `http(s)://` and any trailing `/` from the proxy endpoint
     - _Requirements: 5.1_
 
-  - [ ]* 7.3 Write unit tests for the authorization decoder
+  - [x]* 7.3 Write unit tests for the authorization decoder
     - Four tests covering the four failure modes: success, invalid base64, invalid UTF-8, missing `:`
     - Each test constructs a canned `(token_b64, proxy_endpoint)` input and asserts the exact error variant on failure or the exact `EcrAuthorization` on success
 
-  - [ ] 7.4 Define `EcrClientHandle` extension wrapper and the `ecr_client` helper
+  - [x] 7.4 Define `EcrClientHandle` extension wrapper and the `ecr_client` helper
     - In `crates/tokeira-aws/src/clients/ecr.rs`, define `pub struct EcrClientHandle(pub Arc<dyn EcrClient>)` deriving `Clone`
     - Add a private `fn ecr_client(ctx: &ProvisionContext) -> Result<Arc<dyn EcrClient>, IacError>` helper that calls `ctx.extension::<EcrClientHandle>().map(|h| h.0.clone()).ok_or_else(|| IacError::Other(anyhow::anyhow!("ProvisionContext missing extension: EcrClientHandle")))`
     - _Requirements: 1.3, 5.1.2_
 
-  - [ ] 7.5 Implement `EcrRepository` resource with per-lifecycle tag computation and live-read describe
+  - [x] 7.5 Implement `EcrRepository` resource with per-lifecycle tag computation and live-read describe
     - In `crates/tokeira-aws/src/resources/ecr_repository.rs`, define `pub struct EcrRepository { name: String, module: String }` with `#[derive(Debug, Clone, Serialize, Deserialize)]`. Do NOT add a `tags` field. Tags are computed at lifecycle time by calling `ctx.resource_tags(&self.name)` inside each lifecycle method
     - Define `pub const ECR_LIFECYCLE_POLICY: &str` with the canonical JSON from the Design doc
     - Add a `fn state_from_live(name, desc, live_tags, live_policy, module) -> ResourceState` helper that builds `ResourceState` from LIVE values read back from ECR — not from what was asked for. The persisted `properties` map includes `repository_name`, `repository_uri`, `lifecycle_policy` (live), `tags` (live). This is what allows `diff()` to detect external drift such as an operator retagging the repo in the AWS console
@@ -383,14 +383,14 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Test `delete`: assert it calls `delete_repository(name, force = true)`
     - Test missing-extension: construct a `ProvisionContext` WITHOUT `EcrClientHandle`; call `create` and assert the returned error is `IacError::Other` with the exact message `"ProvisionContext missing extension: EcrClientHandle"`
 
-  - [ ]* 7.7 Write property test for lifecycle policy JSON round-trip (Property 5)
+  - [x]* 7.7 Write property test for lifecycle policy JSON round-trip (Property 5)
     - **Property 5: Lifecycle Policy JSON Round-Trip**
     - **Validates: Requirement 9.5**
     - Parse `ECR_LIFECYCLE_POLICY` with `serde_json::from_str::<serde_json::Value>`, serialize with `to_string`, re-parse
     - Assert the two parsed `Value`s are equal
     - Test location: `crates/tokeira-aws/src/resources/ecr_repository.rs` `#[cfg(test)]` module
 
-  - [ ] 7.8 Implement ad-hoc `ensure_ecr_repository` and `ensure_ecr_repositories`
+  - [x] 7.8 Implement ad-hoc `ensure_ecr_repository` and `ensure_ecr_repositories`
     - In `crates/tokeira-aws/src/clients/ecr.rs`, add `pub async fn ensure_ecr_repository(ecr: &dyn EcrClient, name: &str, tags: &HashMap<String, String>) -> Result<(), EcrError>`
     - The helper SHALL: (a) describe the repository; (b) if `EcrError::NotFound`, create it with `MUTABLE` mutability and the supplied tags, capturing the ARN from the create response; otherwise capture the ARN from the describe response; (c) unconditionally call `put_lifecycle_policy(name, ECR_LIFECYCLE_POLICY)`; (d) unconditionally call `tag_resource(&arn, tags)`
     - Step (d) is the critical reconciliation step: it ensures that a pre-existing repository with stale tags is brought into agreement with the current tag set. Without it, `EcrRepository::diff` would still report tag drift on the next `tkr infra apply`
@@ -410,7 +410,7 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Assert the mock's repository set after the second call equals the set after the first, same policies, same tags
     - Minimum 64 iterations
 
-  - [ ] 7.11 Implement the ECS `ImagesModule` using the in-constructor capture pattern
+  - [x] 7.11 Implement the ECS `ImagesModule` using the in-constructor capture pattern
     - Create `platforms/ecs/src/modules/images.rs` with `pub struct ImagesModule { config: EcsConfig }` and `pub fn new(config: EcsConfig) -> Self`. Do NOT add a `tags` field and do NOT accept tags in the constructor — tags are computed per-repository at lifecycle time by each `EcrRepository::create`/`update` via `ctx.resource_tags(&self.name)`
     - This mirrors the existing compose `ComposeModule::runtime(config)` idiom — do NOT attempt to read `EcsConfig` from `ModuleContext::extension`, and do NOT call fabricated helpers like `mctx.default_tags()` or `mctx.runtime_state()`. `ModuleContext` in this workspace exposes only `state` and typed extensions
     - `Module::name()` returns `"images"`; `Module::dependencies()` returns `&[]`; `Module::resources(&self, _ctx)` constructs an `ImageContext::default()`, calls `image_ctx.set_extension(self.config.clone())`, iterates `platforms_ecs::images::all(&image_ctx)?`, and for each image constructs `EcrRepository::new(desired.repository, "images".into())?`. Map any `RuntimeError` / `EcrError` to `IacError::Other(anyhow::anyhow!(e))`
@@ -418,7 +418,7 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Register `ImagesModule` in the ECS platform's module composition list alongside `foundation`, `networking`, `dsql`, `cluster`, `observability`, `services`
     - _Requirements: 5.2_
 
-  - [ ] 7.11a Implement `ensure_ecr_repositories_from_images` glue for CLI handlers
+  - [x] 7.11a Implement `ensure_ecr_repositories_from_images` glue for CLI handlers
     - Create `platforms/ecs/src/images/ensure.rs` with `pub async fn ensure_ecr_repositories_from_images(ecr: &dyn EcrClient, ctx: &ProvisionContext, images: &[Box<dyn Image>], image_ctx: &ImageContext) -> Result<(), IacError>`
     - Implementation: iterate `images`; for each, compute `desired = img.desired_ref(image_ctx)?;` and `tags = ctx.resource_tags(&desired.repository);` — the SAME `resource_tags` helper that `EcrRepository::create` uses. Collect `(repository, tags)` pairs and call `tokeira_aws::ensure_ecr_repositories(ecr, &repos).await`
     - Re-export from `platforms/ecs/src/images/mod.rs` so `tkr image push` and `tkr image mirror` both import this single entry point
@@ -438,12 +438,12 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Mirror the pattern used by any existing DSQL client registration
     - _Requirements: 5.1.2_
 
-  - [ ]* 7.13 Write integration test for `ImagesModule` composition
+  - [x]* 7.13 Write integration test for `ImagesModule` composition
     - With a realistic `EcsConfig`, construct `ImagesModule` via the platform's module-selection helper
     - Assert the module's resource list contains one `EcrRepository` per image in `platforms_ecs::images::all(ctx)`, with repository names matching `desired_ref(ctx)?.repository` exactly
     - Test location: `platforms/ecs/src/modules/images.rs` `#[cfg(test)]` module
 
-  - [ ] 7.13a Audit `tokeira-aws` public API structs for `#[derive(Debug)]`
+  - [x] 7.13a Audit `tokeira-aws` public API structs for `#[derive(Debug)]`
     - Sweep every public struct/enum introduced by this phase and confirm each carries `#[derive(Debug, ...)]` or a manual `Debug` impl:
       - `EcrRepository` — `#[derive(Debug, Clone, Serialize, Deserialize)]`
       - `EcrClientHandle` — wraps `Arc<dyn EcrClient>` which cannot derive `Debug` through the trait object. Provide a MANUAL impl: `impl std::fmt::Debug for EcrClientHandle { fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result { f.debug_tuple("EcrClientHandle").field(&"<dyn EcrClient>").finish() } }`
@@ -455,7 +455,7 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Run `cargo lint`, `cargo check --workspace`, `cargo test -p tokeira-aws -p tokeira-ecs-deployment`
 
 - [ ] 8. Extract shared writeback helper into `tokeira-iac`
-  - [ ] 8.1 Move the private helper into `tokeira_iac::writeback` with a file-agnostic signature
+  - [x] 8.1 Move the private helper into `tokeira_iac::writeback` with a file-agnostic signature
     - Move `write_tokeirad_writeback` (currently in `apps/tkr/src/commands/infra.rs`) and its private dotted-key `toml_edit` writer into `crates/tokeira-iac/src/writeback.rs` as `pub fn write_config_values(path: &Path, values: &[(&str, &str)]) -> Result<(), WritebackError>` — taking the absolute file path explicitly, NOT a deployment directory
     - Remove the current hardcoded `deployment_path.join(TOKEIRAD_TOML)` from the body; use the supplied `path` directly
     - Define `pub enum WritebackError` in the same module as a `thiserror` enum with variants `Io { path, source }`, `Parse { path, source }`, `InvalidKey { key, reason }`, `Write { path, source }`
@@ -463,18 +463,18 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Migrate the existing proptests (`toml_writeback_round_trips`, `toml_writeback_preserves_comments`) from `apps/tkr/src/commands/infra.rs` to `crates/tokeira-iac/src/writeback.rs` `#[cfg(test)]` module, adjusting their inputs to supply the full file path
     - _Requirements: 7.3_
 
-  - [ ] 8.2 Migrate `apps/tkr/src/commands/infra.rs` to the public helper — `tokeirad.toml` target
+  - [x] 8.2 Migrate `apps/tkr/src/commands/infra.rs` to the public helper — `tokeirad.toml` target
     - Replace the local `write_tokeirad_writeback` call with `tokeira_iac::write_config_values(&ctx.path.join(TOKEIRAD_TOML), &borrowed)` — preserving the existing behaviour: IaC outputs are written to the server config file
     - Delete the now-unused private helper and the private dotted-key writer
     - Do NOT change which keys are written or which file is written; only the call path moves
     - _Requirements: 7.3.3_
 
-  - [ ] 8.3 `tkr image push` / `tkr image mirror` target `deployment.toml`
+  - [x] 8.3 `tkr image push` / `tkr image mirror` target `deployment.toml`
     - When the image handlers (task 9.4 / 9.5) call the shared helper, they pass `&ctx.path.join(DEPLOYMENT_TOML)` — NOT `TOKEIRAD_TOML`. Image refs (`services.*.image`, `observability.*_image`) live in the platform config file, not the server config file
     - Add a small assertion in the handlers: before calling the helper, verify `deployment.toml` exists and return a descriptive error if not
     - _Requirements: 7.3.4_
 
-  - [ ]* 8.4 Write unit test asserting parity and file-target correctness
+  - [x]* 8.4 Write unit test asserting parity and file-target correctness
     - Call `tokeira_iac::write_config_values(tempdir.path().join("tokeirad.toml"), &...)` with a set of values that exercise: creating a new dotted key, overwriting an existing dotted key, creating intermediate tables, preserving a comment line. Assert the result matches the pre-extraction behaviour
     - Call `tokeira_iac::write_config_values(tempdir.path().join("deployment.toml"), &...)` with an image writeback value and assert the key lands in `deployment.toml`, not `tokeirad.toml` (create both files in the tempdir and read both after the call)
 
@@ -482,7 +482,7 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Run `cargo lint`, `cargo check --workspace`, `cargo test -p tokeira-iac -p tkr`
 
 - [ ] 9. Wire the `tkr image` command group
-  - [ ] 9.1 Add `Image` subcommand to `apps/tkr/src/cli.rs`
+  - [x] 9.1 Add `Image` subcommand to `apps/tkr/src/cli.rs`
     - Add `Image(ImageArgs)` variant to the top-level `Command` enum, positioned between `Deployment` and `Infra`
     - Define `ImageArgs` with a subcommand field bound to `ImageCommand { List { source_type }, Build { arch, tag }, Push { tag, image, yes }, Mirror { image, yes } }`
     - Only `List`, `Push`, and `Mirror` require an active deployment. `Build` does not require `--deployment`
@@ -496,14 +496,14 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Build does NOT prompt for confirmation
     - _Requirements: 6.3_
 
-  - [ ] 9.3 Implement `run_list` — platform-dispatched, uses `register_image_extensions`
+  - [x] 9.3 Implement `run_list` — platform-dispatched, uses `register_image_extensions`
     - For `List { source_type }`: require `--deployment`, construct an `ImageContext` via `let mut ctx = deploy_engine::ImageContext::default(); deployment.register_image_extensions(config, &mut ctx).await?;` (same hook `DeployEngine` uses — see Req 1.4)
     - Dispatch on `deployment.platform_kind()` to `tokeira_compose_deployment::images::all(&ctx)` or `tokeira_ecs_deployment::images::all(&ctx)`, filter by `source_type`
     - Render a table with columns `NAME`, `SOURCE`, `REPOSITORY`, `TAG`, `UPSTREAM` (human) or JSON array with keys `{ name, source_type, repository, tag, upstream_ref }`
     - Local platform: return an error stating local has no image set
     - _Requirements: 6.2, 1.4.6_
 
-  - [ ] 9.2a Implement the `LocalImageInspector` trait and `DockerCliInspector` in `apps/tkr`
+  - [x] 9.2a Implement the `LocalImageInspector` trait and `DockerCliInspector` in `apps/tkr`
     - Create `apps/tkr/src/commands/image/local_inspector.rs` with `#[async_trait::async_trait] pub trait LocalImageInspector: Send + Sync { async fn image_exists(&self, image_ref: &str) -> anyhow::Result<bool>; }`
     - Define `#[derive(Debug)] pub struct DockerCliInspector;` implementing the trait by shelling out to `docker image inspect <ref>` via `tokio::process::Command`. Exit 0 ⇒ `Ok(true)`; exit non-zero with `stderr.contains("No such image")` ⇒ `Ok(false)`; anything else ⇒ `Err` with stderr attached via `anyhow::Context`
     - Provide a `#[cfg(test)] pub struct MockLocalImageInspector` that records calls and returns canned `Ok(bool)` / `Err(...)` responses
@@ -511,13 +511,13 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Do NOT reuse `platforms::compose::gates::DockerImageInspector` — that trait returns `ComposeError` and lives in a crate `apps/tkr` does not depend on
     - _Requirements: 6.4.3_
 
-  - [ ] 9.3a Implement the `--image <name>` validation helper
+  - [x] 9.3a Implement the `--image <name>` validation helper
     - In `apps/tkr/src/commands/image.rs`, add `fn validate_image_filter(filter: Option<&str>, images: &[Box<dyn Image>], source: ImageSourceType) -> anyhow::Result<Vec<&Box<dyn Image>>>`
     - When `filter` is `None`, return every image in `images` whose `source_type() == source`
     - When `filter` is `Some(name)`, search `images` for one with `name()` matching `name` AND `source_type() == source`; if found return a single-element `Vec`; if not found, return `Err(anyhow!("unknown {source:?} image '{name}'; valid {source:?} images are: {}", valid_names.join(", ")))` where `valid_names` is the sorted list of `name()` values for images whose `source_type() == source`
     - `run_push` and `run_mirror` both call this helper before their preflight / Dagger work
     - _Requirements: 6.4.8, 6.5.8_
-  - [ ] 9.4 Implement `run_push` — ECS-only, preflight-first ordering, uses `register_image_extensions` + `ensure_ecr_repositories_from_images`
+  - [x] 9.4 Implement `run_push` — ECS-only, preflight-first ordering, uses `register_image_extensions` + `ensure_ecr_repositories_from_images`
     - For `Push { tag, image, yes }`: require `--deployment`, confirm per `tkr-cli` rules, reject non-ECS platforms with a descriptive error
     - Build `ImageContext` via `deployment.register_image_extensions(config, &mut ctx).await?` (NOT a handler-local `build_ecs_image_context`)
     - Call `tokeira_ecs_deployment::images::all(&image_ctx)`, then pass the result through `validate_image_filter(image.as_deref(), &images, ImageSourceType::Build)?` from task 9.3a. This handles both the filter-matches-nothing case (returns an operator-facing `unknown Build image '<name>'` error) and the no-filter case (returns all Build images)
@@ -532,7 +532,7 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Emit progress events and `--json` summary. The `published` array SHALL have exactly the length of the deduped `remote_refs` list
     - _Requirements: 6.4, 7.2, 7.3.4, 1.4.6, 6.4.3, 6.4.8_
 
-  - [ ] 9.5 Implement `run_mirror` — ECS-only, uses `register_image_extensions` + `ensure_ecr_repositories_from_images`
+  - [x] 9.5 Implement `run_mirror` — ECS-only, uses `register_image_extensions` + `ensure_ecr_repositories_from_images`
     - For `Mirror { image, yes }`: require `--deployment`, confirm per `tkr-cli` rules, reject non-ECS platforms
     - Build `ImageContext` via `deployment.register_image_extensions(config, &mut ctx).await?`
     - Build `ProvisionContext` via the ECS platform's `register_infra_extensions` hook
@@ -547,12 +547,12 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Emit progress events and `--json` summary
     - _Requirements: 6.5, 7.2, 7.3.4, 1.4.6, 6.5.8_
 
-  - [ ] 9.6 Wire the `image` command into `apps/tkr/src/main.rs`
+  - [x] 9.6 Wire the `image` command into `apps/tkr/src/main.rs`
     - Add a `Command::Image(args) => commands::image::run(args.command, deployment_for_subcommand, format).await?` arm
     - `Build` receives `None` for the deployment; `List`, `Push`, `Mirror` require `Some(deployment)`
     - _Requirements: 6.1_
 
-  - [ ]* 9.7 Write unit tests for CLI parse
+  - [x]* 9.7 Write unit tests for CLI parse
     - `tkr image list`: default; `--source-type build`; `--source-type mirror`; `--json`
     - `tkr image build`: defaults (arch=arm64, no tag); `--arch amd64 --tag v1.2.3`; assert NO `--deployment` is required (parse succeeds without it)
     - `tkr image push`: default (`tag=latest`); `--tag v2026-03-21 --yes`; `--image tokeirad`; assert `--deployment` IS required
@@ -587,7 +587,7 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Run `cargo lint`, `cargo check --workspace`, `cargo test -p tkr -p tokeira-build -p tokeira-aws`
 
 - [ ] 10. Add lifecycle gates driven by the image registry
-  - [ ] 10.1 Implement ECS `validate_mirrors`
+  - [x] 10.1 Implement ECS `validate_mirrors`
     - In `platforms/ecs/src/gates.rs`, add `pub fn validate_mirrors(cfg: &EcsConfig, registry: &str, images: &[Box<dyn Image>], ctx: &ImageContext) -> Result<(), EcsError>`
     - Iterate `images` filtered to `ImageSourceType::Mirror`; for each, iterate `writeback_targets(ctx)` and read the dotted key from `cfg`; collect any empty / non-`{registry}/`-prefixed fields
     - Return `EcsError::UnmirroredImages { fields, remediation: "run `tkr image mirror`" }` when any unmirrored field is found
@@ -599,7 +599,7 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Call this validator from `EcsPlatform::validate_for_deploy_apply` (invoked before `tkr deploy apply`)
     - _Requirements: 8.2, 9.9_
 
-  - [ ]* 10.3 Write property test for `validate_mirrors` and `validate_builds` (Property 8)
+  - [x]* 10.3 Write property test for `validate_mirrors` and `validate_builds` (Property 8)
     - **Property 8: Lifecycle Gate Predicates**
     - **Validates: Requirement 9.9**
     - Generate `EcsConfig` values with writeback-target fields chosen from: empty, upstream source, `{registry}/<repo>:<tag>`
@@ -608,24 +608,24 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Test location: `platforms/ecs/src/gates.rs` `#[cfg(test)]` module
     - Minimum 128 iterations
 
-  - [ ] 10.4 Implement the compose `DockerImageInspector` trait
+  - [x] 10.4 Implement the compose `DockerImageInspector` trait
     - In `platforms/compose/src/gates.rs` (new file), define `#[async_trait::async_trait] pub trait DockerImageInspector: Send + Sync { async fn image_exists(&self, image: &str) -> Result<bool, ComposeError>; }`
     - Define `pub struct BollardInspector(pub bollard::Docker)` implementing the trait by calling `self.0.inspect_image(image)` and mapping `bollard::errors::Error::NotFound` to `Ok(false)`, other bollard errors to `ComposeError::DockerIo`
     - _Requirements: 8.3.4_
 
-  - [ ] 10.5 Implement the compose `validate_local_build` gate
+  - [x] 10.5 Implement the compose `validate_local_build` gate
     - Add `pub async fn validate_local_build<I: DockerImageInspector + ?Sized>(cfg: &ComposeConfig, inspector: &I) -> Result<(), ComposeError>`
     - When `cfg.tokeirad.image == "tokeirad:latest"`, call `inspector.image_exists("tokeirad:latest").await?`; return `ComposeError::LocalBuildMissing` with the `tkr image build` remediation if `false`
     - When `cfg.tokeirad.image` is any other value, return `Ok(())` without calling the inspector
     - _Requirements: 8.3_
 
-  - [ ]* 10.6 Write unit tests for the compose build gate
+  - [x]* 10.6 Write unit tests for the compose build gate
     - With a fake `DockerImageInspector` returning `Ok(false)`, assert the gate returns `ComposeError::LocalBuildMissing` with "tkr image build" in the message
     - With a fake returning `Ok(true)`, assert `Ok(())`
     - With `cfg.tokeirad.image = "my-registry.example/tokeirad:custom"`, assert `Ok(())` without invoking the inspector (use a mock that records calls and assert call count is 0)
     - Test location: `platforms/compose/src/gates.rs` `#[cfg(test)]` module
 
-  - [ ] 10.7 Wire the compose gate into `ComposePlatform::validate_for_deploy_apply`
+  - [x] 10.7 Wire the compose gate into `ComposePlatform::validate_for_deploy_apply`
     - In `platforms/compose/src/lib.rs`, add `pub async fn validate_for_deploy_apply(&self, config: &ComposeConfig) -> Result<(), ComposeError>` on `ComposePlatform`
     - Implementation: `gates::validate_local_build(config, &BollardInspector(self.docker.clone())).await`
     - Update the `tkr deploy apply` command handler to invoke this hook before constructing the deploy-engine service list
@@ -636,7 +636,7 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Run `cargo lint`, `cargo check --workspace`, `cargo test -p tokeira-ecs-deployment -p tokeira-compose-deployment`
 
 - [ ] 11. Integration and documentation
-  - [ ] 11.1 Update `README.md` in four specific places
+  - [x] 11.1 Update `README.md` in four specific places
     - **Edit 1 — `### Command Tree` (under `## `tkr` — Operator and Developer CLI`)**: insert the `image` subtree between `deploy` and `schema`, matching the exact shape in Req 10.2.1.a:
       ```
       ├── image
@@ -691,7 +691,7 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - **Edit 4 — Audit `## Quick Start`** for any compose example. If one exists, align it with the image-build-first ordering from Edit 2. If Quick Start currently covers only local (bare-process) deployment, no change is needed here — local has no image step
     - _Requirements: 10.2.1_
 
-  - [ ] 11.2 Update `AGENTS.md` with three specific additions
+  - [x] 11.2 Update `AGENTS.md` with three specific additions
     - **Addition 1** — In `## Working Agreements`, append a new sub-section titled `### Adding a New Image` after the existing `### Adding a New CLI Command`:
       1. Decide which platform(s) need the image (compose, ECS, or both)
       2. In each owning platform's `src/images/` module, declare a struct implementing `tokeira_deploy_engine::image::Image`
@@ -704,19 +704,19 @@ Each platform carries its own copy of the `mirror_image!` macro and its own conc
     - Also add a pinned-versions line for the new aws-cli and busybox images: `public.ecr.aws/aws-cli/aws-cli:latest`, `public.ecr.aws/docker/library/busybox:latest`
     - _Requirements: 10.2.2_
 
-  - [ ] 11.3 Update prototypical configs for `tkr deployment create`
+  - [x] 11.3 Update prototypical configs for `tkr deployment create`
     - For `--platform ecs`: populate `observability.aws_cli_image` and `observability.busybox_image` with their upstream source defaults so `tkr image mirror` has something to mirror on first run
     - For `--platform compose`: same two fields; also ensure `tokeirad.image = "tokeirad:latest"` is emitted (not `"tokeirad:local"`)
     - Ensure the generated `deployment.toml` carries helpful comments (e.g., `# populated by \`tkr image mirror\``)
     - _Requirements: 7.1, 7.5_
 
-  - [ ]* 11.4 Integration test: build the tokeirad image end-to-end
+  - [x]* 11.4 Integration test: build the tokeirad image end-to-end
     - Gated behind the `integration-test` feature flag
     - Run `tkr image build` against the workspace, assert `docker image inspect tokeirad:latest` succeeds
     - Test location: `apps/tkr/tests/image_build.rs`
     - Documented as skipped in the default test suite per AGENTS.md testing guidance
 
-  - [ ]* 11.5 Integration test: mirror canonical images into LocalStack ECR
+  - [x]* 11.5 Integration test: mirror canonical images into LocalStack ECR
     - Gated behind the `integration-test` feature flag
     - Start LocalStack with ECR service enabled
     - Run `tkr image mirror` against a test deployment pointing at LocalStack

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use tokeira_compose_deployment::ComposeDeployment;
 use tokeira_deploy_engine::Platform;
+use tokeira_ecs_deployment::EcsDeployment;
 use tokeira_local_deployment::LocalDeployment;
 use tokeira_orchestrator::{DeployEngine, PlatformKind};
 
@@ -26,6 +27,10 @@ pub async fn run(
                 let mut engine = DeployEngine::new(ComposeDeployment, config, &ctx.path).await?;
                 print_plan(&engine.plan().await?);
             }
+            PlatformDeploymentConfig::Ecs(config) => {
+                let mut engine = DeployEngine::new(EcsDeployment, config, &ctx.path).await?;
+                print_plan(&engine.plan().await?);
+            }
         },
         DeployAction::Apply { yes } => {
             super::require_confirmation(yes, "deploy apply")?;
@@ -37,13 +42,19 @@ pub async fn run(
                     result?;
                 }
                 PlatformDeploymentConfig::Compose(config) => {
-                    let mut engine =
-                        DeployEngine::new(ComposeDeployment, config, &ctx.path).await?;
                     let compose_file = ctx.path.join("docker-compose.yml");
+                    let deployment = ComposeDeployment;
                     let platform =
                         ComposeDeployment::compose_platform(&compose_file, &config.project_name)?;
+                    deployment
+                        .validate_for_deploy_apply(config, &platform)
+                        .await?;
+                    let mut engine = DeployEngine::new(deployment, config, &ctx.path).await?;
                     print_plan(&engine.apply(&platform as &dyn Platform).await?);
                     deployments.update_status(&ctx.name, DeploymentStatus::Running)?;
+                }
+                PlatformDeploymentConfig::Ecs(_) => {
+                    anyhow::bail!("ECS deploy apply is not implemented yet");
                 }
             }
         }

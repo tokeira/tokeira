@@ -6,7 +6,7 @@
 
 use std::{
     any::{Any, TypeId},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::Debug,
 };
 
@@ -28,12 +28,18 @@ pub enum ImageSourceType {
 /// Resolved desired image reference.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesiredImageRef {
-    /// Target repository name.
+    /// Target repository name without registry host prefix.
     pub repository: String,
-    /// Tag or digest to resolve against.
+    /// Tag to resolve against.
     pub tag: String,
     /// Upstream source reference for mirrored images.
     pub upstream_ref: Option<String>,
+}
+
+/// A dotted config key that should receive a published or mirrored image ref.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WritebackTarget {
+    pub field: &'static str,
 }
 
 /// Context passed to [`Image::desired_ref`] for image resolution.
@@ -87,9 +93,38 @@ pub trait Image: Debug + Send + Sync {
     fn source_type(&self) -> ImageSourceType;
 
     /// Compute the desired image reference given current state and context.
-    ///
-    /// The returned string is persisted in runtime state and used by services
-    /// when constructing manifests. Keep it deterministic for the same input
-    /// config unless the image has intentionally been rebuilt or republished.
-    fn desired_ref(&self, ctx: &ImageContext) -> Result<String, RuntimeError>;
+    fn desired_ref(&self, ctx: &ImageContext) -> Result<DesiredImageRef, RuntimeError>;
+
+    /// Return config fields populated when the image is published or mirrored.
+    fn writeback_targets(&self, _ctx: &ImageContext) -> Vec<WritebackTarget> {
+        Vec::new()
+    }
+}
+
+/// Validate image registry uniqueness before callers consume resolved refs.
+pub fn validate_registry(
+    images: &[Box<dyn Image>],
+    ctx: &ImageContext,
+) -> Result<(), RuntimeError> {
+    let mut names = HashSet::with_capacity(images.len());
+    let mut repositories = HashSet::with_capacity(images.len());
+
+    for image in images {
+        let name = image.name();
+        if !names.insert(name.to_string()) {
+            return Err(RuntimeError::Image(format!(
+                "image registry validation failed: duplicate name = {name}"
+            )));
+        }
+
+        let desired = image.desired_ref(ctx)?;
+        if !repositories.insert(desired.repository.clone()) {
+            return Err(RuntimeError::Image(format!(
+                "image registry validation failed: duplicate repository = {}",
+                desired.repository
+            )));
+        }
+    }
+
+    Ok(())
 }

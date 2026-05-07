@@ -252,6 +252,16 @@ Use `cargo lint` to check if everything compiles without running tests. `cargo c
 2. Create handler in `tkr/src/commands/{group}.rs`.
 3. Wire into the command tree in `main.rs`.
 4. Add CLI parse tests.
+5. For multi-file command groups, use `.kiro/specs/image-lifecycle/` as the reference pattern: clap variant, handler module, main wiring, and any command-specific session re-exec helper.
+
+### Adding a New Image
+
+1. Decide which platform(s) need the image (compose, ECS, or both).
+2. In each owning platform's `src/images/` module, declare a struct implementing `tokeira_deploy_engine::image::Image`.
+3. Add the struct to that submodule's `all()` function, such as `images::tokeirad::all()` or `images::observability::all()`.
+4. If the image's remote ref is referenced by config, override `writeback_targets(ctx)` to list the dotted TOML keys.
+5. Add property-test coverage if `desired_ref` or `writeback_targets` logic is non-trivial.
+6. If the image needs a new build recipe, add a free function to `tokeira-build` with its own hardcoded Dagger pipeline.
 
 ---
 
@@ -262,8 +272,12 @@ Pinned versions:
 - Loki: `grafana/loki:3.7.1`
 - Grafana: `grafana/grafana-oss:12.4.3`
 - Alloy: `grafana/alloy:v1.16.0`
+- AWS CLI: `public.ecr.aws/aws-cli/aws-cli:latest`
+- BusyBox: `public.ecr.aws/docker/library/busybox:latest`
 
 Two modules: `runtime` (tokeirad) and `observability` (mimir, loki, grafana, alloy).
+
+The six mirror images (Mimir, Loki, Grafana, Alloy, AWS CLI, BusyBox) are declared in each platform's `src/images/observability/mod.rs` via a platform-local `mirror_image!` macro. Version bumps are a one-line change in the platform's `ObservabilityConfig::default()` defaults or the `default_<field>_image()` helpers for `aws_cli_image` and `busybox_image`.
 
 ---
 

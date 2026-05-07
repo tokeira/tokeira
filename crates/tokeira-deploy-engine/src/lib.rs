@@ -25,7 +25,9 @@ mod service;
 
 pub use engine::{PlannedServiceManifest, ServiceChange, ServiceChangeKind, ServiceEngine};
 pub use error::RuntimeError;
-pub use image::{DesiredImageRef, Image, ImageContext, ImageSourceType};
+pub use image::{
+    DesiredImageRef, Image, ImageContext, ImageSourceType, WritebackTarget, validate_registry,
+};
 pub use platform::Platform;
 pub use service::{Service, ServiceContext};
 

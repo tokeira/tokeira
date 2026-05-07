@@ -5,6 +5,9 @@
 //! can see which pieces are authoritative, which are transport-only, and where
 //! background tasks such as projection and history notification are attached.
 
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Result, anyhow};

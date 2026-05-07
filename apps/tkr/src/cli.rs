@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use tokeira_orchestrator::{PlatformKind, StorageKind};
 
 #[derive(Parser)]
@@ -23,6 +23,7 @@ pub enum Command {
         #[command(subcommand)]
         action: DeploymentAction,
     },
+    Image(ImageArgs),
     Infra {
         #[command(subcommand)]
         action: InfraAction,
@@ -90,6 +91,53 @@ pub enum DeploymentAction {
     },
 }
 
+#[derive(Args)]
+pub struct ImageArgs {
+    #[command(subcommand)]
+    pub command: ImageCommand,
+}
+
+#[derive(Subcommand)]
+pub enum ImageCommand {
+    List {
+        #[arg(long)]
+        source_type: Option<CliImageSourceType>,
+    },
+    Build {
+        #[arg(long, default_value = "arm64")]
+        arch: CliArch,
+        #[arg(long)]
+        tag: Option<String>,
+    },
+    Push {
+        #[arg(long, default_value = "latest")]
+        tag: String,
+        #[arg(long)]
+        image: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+    Mirror {
+        #[arg(long)]
+        image: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CliImageSourceType {
+    Build,
+    Mirror,
+    Registry,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CliArch {
+    Arm64,
+    Amd64,
+}
+
 #[derive(Subcommand)]
 pub enum InfraAction {
     Plan {
@@ -152,6 +200,7 @@ pub enum ConfigAction {
 pub enum CliPlatformKind {
     Local,
     Compose,
+    Ecs,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -166,6 +215,7 @@ impl From<CliPlatformKind> for PlatformKind {
         match value {
             CliPlatformKind::Local => PlatformKind::Local,
             CliPlatformKind::Compose => PlatformKind::Compose,
+            CliPlatformKind::Ecs => PlatformKind::Ecs,
         }
     }
 }
@@ -175,6 +225,25 @@ impl From<CliStorageKind> for StorageKind {
         match value {
             CliStorageKind::InMemory => StorageKind::InMemory,
             CliStorageKind::Dsql => StorageKind::Dsql,
+        }
+    }
+}
+
+impl From<CliImageSourceType> for tokeira_deploy_engine::ImageSourceType {
+    fn from(value: CliImageSourceType) -> Self {
+        match value {
+            CliImageSourceType::Build => Self::Build,
+            CliImageSourceType::Mirror => Self::Mirror,
+            CliImageSourceType::Registry => Self::Registry,
+        }
+    }
+}
+
+impl From<CliArch> for tokeira_build::Arch {
+    fn from(value: CliArch) -> Self {
+        match value {
+            CliArch::Arm64 => Self::Arm64,
+            CliArch::Amd64 => Self::Amd64,
         }
     }
 }

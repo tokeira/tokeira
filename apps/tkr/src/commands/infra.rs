@@ -1,10 +1,13 @@
 use std::{fs, path::Path};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::Result;
+use tokeira_aws::{DefaultEcrClient, EcrClient};
 use tokeira_compose_deployment::ComposeDeployment;
+use tokeira_deploy_engine::ImageContext;
+use tokeira_ecs_deployment::{EcsConfig, EcsDeployment};
 use tokeira_iac::{Change, ChangeKind, ModuleSelection};
 use tokeira_local_deployment::LocalDeployment;
-use tokeira_orchestrator::InfraEngine;
+use tokeira_orchestrator::{Deployment, InfraEngine};
 
 use crate::{
     cli::InfraAction,
@@ -28,7 +31,35 @@ pub async fn run(
         PlatformDeploymentConfig::Compose(config) => {
             run_with_engine(action, deployments, &ctx, ComposeDeployment, config, format).await
         }
+        PlatformDeploymentConfig::Ecs(config) => {
+            if matches!(&action, InfraAction::Apply { .. }) {
+                validate_ecs_mirrors(config).await?;
+            }
+            run_with_engine(action, deployments, &ctx, EcsDeployment, config, format).await
+        }
     }
+}
+
+async fn validate_ecs_mirrors(config: &EcsConfig) -> Result<()> {
+    let deployment = EcsDeployment;
+    let mut image_ctx = ImageContext::default();
+    deployment
+        .register_image_extensions(config, &mut image_ctx)
+        .await?;
+    let images = tokeira_ecs_deployment::images::all(&image_ctx)?;
+    let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_config::Region::new(config.region.clone()))
+        .load()
+        .await;
+    let ecr = DefaultEcrClient::from_aws_config(&aws_config);
+    let auth = ecr.get_authorization_token().await?;
+    tokeira_ecs_deployment::gates::validate_mirrors(
+        config,
+        &auth.registry_host,
+        &images,
+        &image_ctx,
+    )?;
+    Ok(())
 }
 
 async fn run_with_engine<D>(
@@ -130,33 +161,11 @@ pub fn write_tokeirad_writeback(
         return Ok(());
     }
     let path = deployment_path.join(TOKEIRAD_TOML);
-    let mut document = fs::read_to_string(&path)?.parse::<toml_edit::DocumentMut>()?;
-    for (key, value) in values {
-        set_dotted_string(&mut document, &key, &value)?;
-    }
-    fs::write(&path, document.to_string())?;
-    Ok(())
-}
-
-fn set_dotted_string(
-    document: &mut toml_edit::DocumentMut,
-    dotted_key: &str,
-    value: &str,
-) -> Result<()> {
-    let parts = dotted_key.split('.').collect::<Vec<_>>();
-    if parts.is_empty() {
-        bail!("empty writeback key");
-    }
-    let mut item = document.as_item_mut();
-    for part in &parts[..parts.len() - 1] {
-        if item.get(part).is_none() {
-            item[part] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        item = item
-            .get_mut(part)
-            .ok_or_else(|| anyhow!("failed to create TOML table {part}"))?;
-    }
-    item[parts[parts.len() - 1]] = toml_edit::value(value);
+    let borrowed = values
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    tokeira_iac::write_config_values(&path, &borrowed)?;
     Ok(())
 }
 
@@ -178,80 +187,5 @@ fn print_plan(changes: &[Change]) {
                 detail.field, detail.before, detail.after
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use proptest::prelude::*;
-    use std::collections::BTreeMap;
-
-    proptest! {
-        #[test]
-        fn toml_writeback_round_trips(
-            pairs in prop::collection::vec((dotted_key_strategy(), "[a-zA-Z0-9_-]{1,24}"), 1..30)
-        ) {
-            prop_assume!(!has_prefix_conflict(&pairs));
-            let mut document = "".parse::<toml_edit::DocumentMut>()?;
-            let mut expected = BTreeMap::new();
-
-            for (key, value) in pairs {
-                set_dotted_string(&mut document, &key, &value)
-                    .map_err(|err| TestCaseError::fail(err.to_string()))?;
-                expected.insert(key, value);
-            }
-
-            for (key, value) in expected {
-                let actual = read_dotted_string(&document, &key);
-                prop_assert_eq!(actual.as_deref(), Some(value.as_str()));
-            }
-        }
-
-        #[test]
-        fn toml_writeback_preserves_comments(
-            first_comment in "[a-zA-Z0-9 _-]{1,40}",
-            second_comment in "[a-zA-Z0-9 _-]{1,40}",
-            value in "[a-zA-Z0-9_-]{1,24}"
-        ) {
-            let source = format!(
-                "# {first_comment}\n[infrastructure]\n# {second_comment}\ndsql_endpoint = \"old\"\n"
-            );
-            let mut document = source.parse::<toml_edit::DocumentMut>()?;
-
-            set_dotted_string(&mut document, "infrastructure.dsql_endpoint", &value)
-                .map_err(|err| TestCaseError::fail(err.to_string()))?;
-
-            let rendered = document.to_string();
-            let expected_first = format!("# {first_comment}");
-            let expected_second = format!("# {second_comment}");
-            prop_assert!(rendered.contains(&expected_first));
-            prop_assert!(rendered.contains(&expected_second));
-            let actual = read_dotted_string(&document, "infrastructure.dsql_endpoint");
-            prop_assert_eq!(actual.as_deref(), Some(value.as_str()));
-        }
-    }
-
-    fn dotted_key_strategy() -> impl Strategy<Value = String> {
-        prop::collection::vec("[a-zA-Z_][a-zA-Z0-9_]{0,10}", 1..5).prop_map(|parts| parts.join("."))
-    }
-
-    fn has_prefix_conflict(pairs: &[(String, String)]) -> bool {
-        pairs.iter().any(|(left, _)| {
-            pairs.iter().any(|(right, _)| {
-                left != right
-                    && right
-                        .strip_prefix(left)
-                        .is_some_and(|suffix| suffix.starts_with('.'))
-            })
-        })
-    }
-
-    fn read_dotted_string(document: &toml_edit::DocumentMut, dotted_key: &str) -> Option<String> {
-        let mut item = document.as_item();
-        for part in dotted_key.split('.') {
-            item = item.get(part)?;
-        }
-        item.as_str().map(ToOwned::to_owned)
     }
 }

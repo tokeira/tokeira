@@ -6,6 +6,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use directories::ProjectDirs;
 use tokeira_compose_deployment::ComposeConfig;
+use tokeira_ecs_deployment::EcsConfig;
 use tokeira_local_deployment::LocalConfig;
 use tokeira_orchestrator::{PlatformKind, StorageKind};
 use uuid::Uuid;
@@ -191,7 +192,8 @@ impl DeploymentResolver {
 /// local deployments carry only project_name.
 pub enum PlatformDeploymentConfig {
     Local(LocalConfig),
-    Compose(ComposeConfig),
+    Compose(Box<ComposeConfig>),
+    Ecs(Box<EcsConfig>),
 }
 
 pub struct DeploymentContext {
@@ -221,7 +223,12 @@ pub fn load_context(
         PlatformKind::Compose => {
             let config: ComposeConfig = tokeira_config::load_config(&deployment_config_path, None)
                 .with_context(|| format!("failed to load {}", deployment_config_path.display()))?;
-            PlatformDeploymentConfig::Compose(config)
+            PlatformDeploymentConfig::Compose(Box::new(config))
+        }
+        PlatformKind::Ecs => {
+            let config: EcsConfig = tokeira_config::load_config(&deployment_config_path, None)
+                .with_context(|| format!("failed to load {}", deployment_config_path.display()))?;
+            PlatformDeploymentConfig::Ecs(Box::new(config))
         }
     };
     Ok(DeploymentContext {

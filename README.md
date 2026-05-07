@@ -90,7 +90,7 @@ tkr deploy apply --yes
 ```
 tkr
 ├── deployment
-│   ├── create --name <name> --platform <local|compose> --storage <in-memory|dsql>
+│   ├── create --name <name> --platform <local|compose|ecs> --storage <in-memory|dsql>
 │   ├── list
 │   ├── use <name>
 │   └── destroy <name> --yes
@@ -103,6 +103,11 @@ tkr
 │   ├── plan
 │   ├── apply --yes
 │   └── status
+├── image
+│   ├── list [--source-type <build|mirror>] [--json]
+│   ├── build [--arch <arm64|amd64>] [--tag <version>]
+│   ├── push --tag <version> [--image <name>] [--yes]
+│   └── mirror [--image <name>] [--yes]
 ├── schema
 │   ├── setup --yes
 │   └── status
@@ -152,6 +157,9 @@ The compose platform runs a full Docker Compose stack: `tokeirad` plus an observ
 # Create
 tkr deployment create --name dev-compose --platform compose --storage in-memory
 
+# Build the tokeirad image (compose reads it from the local Docker image store)
+tkr image build
+
 # Provision infrastructure (creates containers via bollard)
 tkr infra plan
 tkr infra apply --yes
@@ -178,6 +186,37 @@ The compose platform organizes services into two modules:
 
 - **runtime** — `tokeirad`
 - **observability** — `mimir`, `loki`, `grafana`, `alloy` (pinned to `grafana/mimir:3.0.6`, `grafana/loki:3.7.1`, `grafana/grafana-oss:12.4.3`, `grafana/alloy:v1.16.0`)
+
+**Why the build step is separate.** `tkr deploy apply` does not invoke the image builder — it requires `tokeirad:latest` to already exist in the local Docker image store. This keeps the deploy path deterministic and fast: a repeat deploy does not rebuild. Re-run `tkr image build` whenever you want a fresh `tokeirad` binary in the compose stack.
+
+**Storage and schema.** The example above uses `--storage in-memory`, which needs no schema setup. For compose deployments that target DSQL (`--storage dsql`), operators must currently point `tokeirad.toml`'s `infrastructure.dsql.endpoint` at an externally-provisioned DSQL cluster — the compose platform has no DSQL module. After the endpoint is set, run `tkr schema setup --yes` before `tkr deploy apply`. First-class DSQL provisioning for the compose platform is deferred to a future spec; for now the in-memory path is the supported compose workflow and the DSQL path is an advanced use case.
+
+### Image Management
+
+`tkr image` manages the image plane: building `tokeirad` from source, pushing built images to ECR, and mirroring upstream observability images into project-owned ECR.
+
+```bash
+# Build tokeirad:latest without requiring an active deployment
+tkr image build
+
+# Build an amd64 image and additionally tag it
+tkr image build --arch amd64 --tag v1.2.3
+
+# Enumerate mirror images for the active deployment
+tkr image list --source-type mirror --json
+
+# Mirror every upstream observability image into project-owned ECR (ECS only)
+tkr image mirror --yes
+
+# Push tokeirad to ECR and write back services.*.image fields (ECS only)
+tkr image push --tag v2026-03-21 --yes
+```
+
+Lifecycle ordering is explicit. For ECS, run `tkr image mirror` before `tkr infra apply`, and run `tkr image build` plus `tkr image push --tag <version>` before `tkr deploy apply`. For compose, run `tkr image build` before `tkr deploy apply` so `tokeirad:latest` exists locally.
+
+Image commands that build, push, or mirror use Dagger. Install Dagger 0.20 or newer; the CLI re-executes under `dagger run` when a Dagger session is absent. ECS push and mirror also require AWS credentials with ECR permissions: `ecr:GetAuthorizationToken`, `ecr:BatchCheckLayerAvailability`, `ecr:PutImage`, `ecr:InitiateLayerUpload`, `ecr:UploadLayerPart`, `ecr:CompleteLayerUpload`, `ecr:CreateRepository`, `ecr:DescribeRepositories`, `ecr:PutLifecyclePolicy`, `ecr:TagResource`, `ecr:ListTagsForResource`, and `ecr:GetLifecyclePolicy`.
+
+To add a new image, start in `platforms/{compose,ecs}/src/images/` and implement `tokeira_deploy_engine::image::Image`. Build recipes live as hardcoded free functions in `tokeira-build`.
 
 ## Rust Development
 

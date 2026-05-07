@@ -4,7 +4,7 @@ This document is the intended entry point for machine-assisted
 contributions. It captures what has been built, what remains,
 and where to contribute safely.
 
-Last updated: 2026-05-03
+Last updated: 2026-05-07
 
 ## Codebase snapshot
 
@@ -51,7 +51,7 @@ dedup, history append with pagination, activity/timer/nexus side
 tables, dispatch backlog, projection log, lease management, shard
 mapping, epoch validation.
 
-**DSQL backend (Features 1–4 complete, Features 5–6 in progress):**
+**DSQL backend (complete):**
 
 | Feature | Spec | Status |
 |---------|------|--------|
@@ -61,7 +61,7 @@ mapping, epoch validation.
 | 4. Shard Leasing | `dsql-shard-leasing` | ✅ Complete |
 | 5. Spread Keys | `dsql-spread-keys` | ✅ Complete |
 | 6. Projection Persistence | `dsql-projection-persistence` | ✅ Complete |
-| 7. Projection Visibility | `projection-visibility` | 📋 Spec complete, implementation not started |
+| 7. Projection Visibility | `projection-visibility` | ✅ Complete |
 
 DSQL modules implemented in `tokeira-storage/src/dsql/`:
 - `DsqlStore` — production storage foundation with connection director
@@ -82,9 +82,9 @@ DSQL modules implemented in `tokeira-storage/src/dsql/`:
 - ✅ Checkpoint read/write
 - ✅ Execution upsert/delete
 - ✅ `ProjectionSink::apply` (UpsertExecution, CloseExecution, memo merge)
-- ❌ Query methods (list, count, rollup) — stubbed, `projection-visibility` spec ready
-- ❌ Search attribute registry and indexing — stubbed
-- ❌ Rollup accumulation — stubbed
+- ✅ Query methods (list, count, rollup) — delivered by `projection-visibility`
+- ✅ Search attribute registry and indexing (all seven typed indexes including `KeywordList` element-membership and `Text` token matching)
+- ✅ Rollup accumulation
 
 ### Runtime — complete
 
@@ -101,12 +101,11 @@ routing. 209 tests.
 All WorkflowService gRPC handlers implemented including eager
 dispatch. 146 tests. See AGENTS.md for the full handler list.
 
-### Projection — working, DSQL visibility spec ready
+### Projection — complete
 
 Visibility sink, rollups, filter compilation, query service,
-projection worker — all working against InMemoryVisibilityStore.
-34 tests. `DsqlVisibilityStore` has write path complete, query
-path stubbed pending the `projection-visibility` spec.
+projection worker, and DSQL visibility store (full read and write
+paths, typed search attributes, rollup accumulation). 34 tests.
 
 ### Platform and deployment
 
@@ -168,105 +167,129 @@ timers, schedules — all running against tokeirad.
 | Platform / Ops | ~25% | Local + Compose platforms working. ECS deployment, placement, autoscaling pending. |
 | **Overall** | **~55%** | Core correctness works end-to-end. DSQL visibility + ops are the remaining bulk. |
 
-## What to work on next (priority order)
+## Backlog (priority order)
 
-### P0: DSQL Visibility Queries (`projection-visibility` spec)
+This is the living backlog. Items higher in the list are the next to pick up.
+Items marked **spec complete** already have `requirements.md` (and often `design.md` + `tasks.md`) authored; the implementation is what's outstanding. Items marked **to spec** still need the requirements authored.
 
-The spec is complete (requirements, design, tasks). This is the
-next implementation target. It replaces the stubbed query methods
-in `DsqlVisibilityStore` with real DSQL implementations.
+### P0 — `temporal-api-v1.62-sync`
 
-Scope:
-- 14 new migration files (V029–V042): `sa_registry`, `sa_current`,
-  7 typed index tables, `vis_rollup`, 3 `vis_execution` indexes
-- Search attribute registry (`resolve_attr`, `register_attr`)
-- Search attribute indexing (all 7 types including KeywordList)
-- Rollup accumulation
-- Filter-to-SQL compiler (pure function, parameterized queries)
-- `list_executions` with keyset pagination and 5 sort orders
-- `count_executions` with GROUP BY
-- `count_from_rollup` from pre-aggregated rollup table
-- Fix `InMemoryVisibilityStore` KeywordList/Text filter semantics
-  to match Temporal's element-membership / token-matching contract
-- Update `DsqlVisibilityStore::apply` to write search attrs + rollups
+**Status:** spec in progress (requirements drafted).
 
-**Why P0:** ListWorkflowExecutions and CountWorkflowExecutions
-need durable visibility for production. The spec is ready to implement.
+Resync the vendored Temporal API proto tree from `v1.43.0` to `v1.62.11` via `tools/proto-sync`. Classify every new RPC, field, message, and enum into one of `Ignore`, `No-op stub`, `Capability advertise`, `Wire through`, or `Full implementation (deferred)`. Replace the interim compat shims landed in `214895e`. Delivers `CountSchedules`, `UpdateTaskQueueConfig`, the Nexus v2 wire surface, the `discard_speculative_workflow_task_with_events` client capability, and renames the `*ById` activity RPCs to their v1.62 unsuffixed names.
 
-### P1: Observability Foundation
+Unblocks: every subsequent backlog item that touches a v1.62-era proto surface. Compose-DSQL becomes operationally useful once a v0.4 SDK worker can complete a workflow against `tokeirad` without the shims.
 
-Establish the metrics, tracing, and logging foundation.
+### P1 — `temporal-compatibility`
 
-- Metrics registry (Prometheus-compatible)
-- OpenTelemetry tracing integration
-- Structured logging with correlation IDs
-- Per-crate instrumentation conventions
-- Export pipeline (Prometheus scrape, OTLP export)
+**Status:** spec complete (requirements, design, tasks).
 
-**Why P1:** DSQL features are already instrumented with `tracing::instrument`.
-The foundation work is about the export pipeline and baseline metrics
-for existing subsystems.
+Temporal-server compatibility scope — the behaviours tokeirad must match beyond wire-compat, and the **version metadata tokeirad surfaces** to different consumers. Sits immediately after `temporal-api-v1.62-sync` because the sync establishes the Temporal API version tokeirad speaks (v1.62.11) and the SDK generation it targets (v0.4), and this spec is the one that exposes those facts in a consumable form to operators, SDKs, and downstream tooling (`GetSystemInfo.server_version`, `tkr` CLI reporting, README / CONTRIBUTING statements, operator-facing metrics labels). Details otherwise tracked in the spec itself.
 
-### P2: Shard Placement and Membership (`shard-placement-membership` spec)
+Blocked on: `temporal-api-v1.62-sync` (the API version is the thing this spec surfaces).
 
-Spec complete (requirements, design, tasks). Currently single-node
-with in-memory shard ownership. Production needs distributed shard
-assignment.
+### P2 — `observability-production`
 
-- Controller-managed live membership (gRPC streams, not DynamoDB)
-- Queue-home and execution-home placement
-- Bundle lease management via DSQL
-- Shard rebalancing on node join/leave
-- Edge routing cache with `NotShardOwner` recovery
-- Controller-coordinated DSQL connection budget allocation
-  (controller computes per-node shares from membership count,
-  sends `ConnectionBudgetDirective` via membership stream;
-  `TokenBucketRateLimiter::reconfigure()` hook already implemented;
-  reservoir `target_ready` capped by `max_reservoir_size` to bound
-  cluster-wide open connections)
+**Status:** to spec.
 
-Architecture: see 035-placement-and-membership.md and 037-dynamic-placement.md.
+Production-facing observability: export pipeline (Prometheus scrape, OTLP), OCC-conflict counters and retry histograms, migration events, connection-leak detection, DSQL-specific metrics (reservoir depth, rate-limiter tokens remaining, class-budget saturation), trace attributes surfacing the full gRPC → edge → runtime → kernel → storage path. Builds on top of the completed `observability-foundation` spec (metrics and tracing primitives) and fills in the application-level instrumentation that makes a production deployment legible.
 
-### P2: ECS Deployment (`ecs-deployment` spec)
+The name matches `observability-foundation`'s full-word style, and distinguishes from the more narrowly-scoped `worker-heartbeat-observability` spec that appears lower in the backlog.
 
-Spec complete (requirements, design, tasks). The autoscaling
-architecture doc (045) is revised and ready.
+### P3 — `compose-dsql`
 
-- Custom `tokeira-autoscaler` service reading Mimir
-- REPLICA services for edge/projection/control
-- DAEMON runtime with safe scale-in protocol (Loop C)
-- Private-only networking with VPC endpoints
-- Instance scale-in protection for runtime ASG
-- Observability stack: Alloy sidecars + Mimir + Loki + Grafana ECS services
+**Status:** spec complete (requirements).
 
-### P3: Admission Control
+Adds Aurora DSQL persistence to the compose platform (alongside the existing in-memory option). Covers: `DsqlModule` (managed + preexisting), `ComposeConfig.dsql` fields, endpoint writeback into `tokeirad.toml`, AWS credentials forwarded via the standard provider chain, `tkr schema setup|status|validate` wiring with build.rs-embedded migrations, two-phase infra apply lifecycle, tokeirad storage-backend selection via `infrastructure.storage`, visibility / projection wiring over `DsqlVisibilityStore`, rename of compose's `LocalStateModule` from `"remote-state"` to `"local-state"`.
 
-Architecture doc 055 exists but no spec or implementation.
+Blocked on: `temporal-api-v1.62-sync` for the DSQL server to actually accept SDK traffic.
 
-- Edge `LongPollGate` for poll admission (referenced in 045)
-- Per-namespace, per-task-queue, per-worker-identity limits
-- Overload shedding with retryable semantics
-- Broker budget tuning
+### P4 — `worker-heartbeat-observability`
 
-### P3: Archival to S3
+**Status:** to spec.
 
-Deferred but needed for long-term history retention.
+Absorb `RecordWorkerHeartbeat` from a no-op into durable observability: persist `WorkerHeartbeat` records with TTL, surface `ListWorkers` over the persisted data, expose derived metrics (polls/sec, slot occupancy, worker-fleet health), expire stale heartbeats on a sweep interval. Requires a storage migration (new `worker_heartbeat` table with `ttl_epoch` column for DSQL, in-memory mirror for local).
 
-### P3: Remaining Proto Field Gaps
+Blocked on: `temporal-api-v1.62-sync` (delivers the real `WorkerHeartbeat` proto surface that this spec consumes).
 
-Features 1-4 from the edge-complete-implementation umbrella
-are spec'd but some have remaining implementation work.
+### P5 — `worker-config-management`
 
-## Known deferred items
+**Status:** to spec.
+
+Server-backed worker configuration: `FetchWorkerConfig` and `UpdateWorkerConfig`. Lets operators push configuration changes (poller counts, slot sizes, rate limits) to workers without redeploying. Requires a new worker-config store (DSQL table + in-memory backend), versioning for optimistic concurrency on updates, and client plumbing that matches what the v0.4 SDK expects on startup and reconfig.
+
+Blocked on: `temporal-api-v1.62-sync` (delivers the proto surface).
+
+### P6 — `ecs-deployment`
+
+**Status:** spec complete (requirements, design, tasks). Architecture doc 045 revised and review questions resolved.
+
+Production ECS on EC2 deployment. Covers: custom `tokeira-autoscaler` reading Mimir, REPLICA services for edge / projection / control, DAEMON runtime with safe scale-in protocol (Loop C), private-only networking with VPC endpoints, instance scale-in protection for the runtime ASG, observability stack (Alloy sidecars + Mimir + Loki + Grafana) as ECS services, the controller-coordinated DSQL connection budget allocation via `ConnectionBudgetDirective`.
+
+Blocked on: `observability-production` (needs production-grade metrics to drive the custom autoscaler).
+
+### P7 — `kernel-pause-workflow`
+
+**Status:** to spec.
+
+First-class workflow-execution pause: `PauseWorkflowExecution` and `UnpauseWorkflowExecution`. Distinct from the v1.43-era activity-level pause-by-id surface. Requires a new kernel transition variant for paused state, timer scanner changes to skip paused workflows, dispatch-path routing to withhold tasks for paused executions, projection changes to surface paused state in visibility. Parallel to the existing `kernel-pause-activity-management` spec.
+
+Blocked on: `temporal-api-v1.62-sync` (delivers the proto surface).
+
+### P8 — `activity-executions-first-class`
+
+**Status:** to spec.
+
+Activities as first-class queryable objects, per the v1.52+ Temporal shift. Delivers: `StartActivityExecution`, `DescribeActivityExecution`, `PollActivityExecution`, `ListActivityExecutions`, `CountActivityExecutions`, `RequestCancelActivityExecution`, `TerminateActivityExecution`, `DeleteActivityExecution`. Requires storage for standalone activities, projection/visibility extensions for activity records, runtime routing for activities outside a workflow context, kernel changes to handle activity executions as their own streams.
+
+Blocked on: `temporal-api-v1.62-sync` (delivers the proto surface).
+
+### P9 — `worker-deployments`
+
+**Status:** to spec.
+
+Temporal's newer versioning primitive. Replaces Build ID versioning with named deployments, per-version ramping, task-queue routing by (namespace, task_queue) → version, and inherited-version workflows that keep running against their original version as new ones deploy. Delivers 11 RPCs (`DescribeWorker`, `ListWorkers`, `DescribeWorkerDeployment`, etc.), the full `temporal.api.deployment.v1` message package, new fields on `PollWorkflowTaskQueueResponse` / `RespondWorkflowTaskCompletedRequest` / `StartWorkflowExecutionRequest`, a new runtime broker for deployment/version state, a migration for deployment-metadata storage, and dispatch-path changes to pick a version per task-queue poll.
+
+Blocked on: `worker-heartbeat-observability` (heartbeats carry the version a worker is serving, which feeds into the deployment router).
+
+### P10 — `workflow-rules`
+
+**Status:** to spec.
+
+Server-side declarative policies that trigger actions on matching workflow executions. Delivers 5 RPCs (`CreateWorkflowRule`, `DescribeWorkflowRule`, `DeleteWorkflowRule`, `ListWorkflowRules`, `TriggerWorkflowRule`), the new `temporal.api.rules.v1` message package, a rule-evaluator background task in the runtime, projection integration to query matching workflows, kernel transitions for rule-triggered actions (terminate, reset, signal).
+
+Self-contained feature. No blockers beyond `temporal-api-v1.62-sync`.
+
+### P11 — `pipeline-foundation`
+
+**Status:** spec complete (requirements, design, tasks).
+
+Foundational CI/CD pipeline work. Details tracked in the spec itself.
+
+## Known deferred items (not yet on the backlog)
 
 Items explicitly deferred during implementation that are not yet
-tracked as specs or priority items:
+tracked as specs or backlog items:
 
 ### Infrastructure / operational
 
 - **Runtime auto-tune** — Architecture doc 065 exists (draft). Local
   tuning of broker budgets, delivery fairness, projection pacing,
   commit reserves. No spec.
+- **Archival to S3** — Architecture doc 075 (future). No spec. Needed
+  for long-term history retention.
+- **Admission control** — Architecture doc 055 exists but no spec or
+  implementation. Edge `LongPollGate` for poll admission, per-namespace
+  / per-task-queue / per-worker-identity limits, overload shedding with
+  retryable semantics, broker budget tuning.
+- **Shard placement and membership** — `shard-placement-membership`
+  spec is complete (requirements, design, tasks) but implementation
+  has not started. The work covers controller-managed live membership
+  via gRPC streams, queue-home and execution-home placement, bundle
+  lease management via DSQL, shard rebalancing, edge routing cache
+  with `NotShardOwner` recovery, and controller-coordinated DSQL
+  connection budget allocation. Currently single-node with in-memory
+  shard ownership; production needs distributed shard assignment.
 - **16 architecture docs have unresolved review questions** — Only
   045-autoscaling has resolved its review questions. The others
   represent open design decisions.
@@ -286,18 +309,19 @@ tracked as specs or priority items:
 
 ### Edge
 
-- **26 UNIMPLEMENTED gRPC handlers** — Documented in AGENTS.md.
-  Includes: legacy versioning (2), deployment management (5),
-  legacy listing (4), activity-by-ID (5), namespace mutation (2),
-  ExecuteMultiOperation, GetSearchAttributes, ListTaskQueuePartitions,
-  activity/workflow options (5). Most are intentionally unimplemented
-  (legacy or not-yet-needed), but some may be called by SDKs.
+- **UNIMPLEMENTED gRPC handlers** — A set of handlers intentionally
+  returns `Status::unimplemented(...)` because the underlying feature
+  is on the backlog (worker deployments, workflow rules, activity
+  executions, pause/unpause, worker config). The `temporal-api-v1.62-sync`
+  spec makes this explicit — every unimplemented handler carries a
+  reference to the deferring spec.
 - **History serializer completeness** — Some event attributes use
   `Default::default()` placeholders because the kernel doesn't yet
   carry the full set of proto fields.
 - **Worker-version capabilities in DescribeTaskQueue** — Tokeira
   doesn't yet publish worker-version capabilities or queue-level
-  stats in DescribeTaskQueue responses.
+  stats in DescribeTaskQueue responses. Will be addressed as part of
+  `worker-deployments`.
 
 ### Projection
 

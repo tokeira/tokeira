@@ -231,7 +231,13 @@ There are two distinct DSQL config surfaces in the workspace and this spec delib
    d. Report the `MigrationReport { applied: N }` to the operator: "Applied N migration(s) to {endpoint}".
 3. IF the endpoint is not configured in `tokeirad.toml`, THEN THE CLI SHALL return an error: "dsql endpoint is not configured in {path}; run `tkr infra apply --module dsql` first".
 4. THE `tkr schema setup` command SHALL require `--yes` or interactive confirmation before executing migrations.
-5. THE migration files (V001–V046) SHALL be embedded in the `tkr` binary at compile time (via `include_str!` or a build-time directory embed) so that `tkr schema setup` does not require the source tree to be present at runtime. Alternatively, `MigrationConfig.migrations_dir` can point to a path resolved relative to the workspace root if the operator always runs from a checkout — document which approach is chosen.
+5. THE migration files (V001–V046) SHALL be embedded in the `tkr` binary at compile time via a `build.rs` script in `tokeira-storage/` that:
+   - Discovers every file in `crates/tokeira-storage/migrations/` matching the pattern `V{nnn}__{name}.sql`.
+   - Validates the version sequence has no gaps and no duplicates; the build SHALL fail if V{n+1} is missing when V{n} and V{n+2} exist, or if two files declare the same version.
+   - Computes each file's SHA-256 checksum at build time.
+   - Emits a `&'static [EmbeddedMigration { version: u32, name: &'static str, sql: &'static str, checksum: [u8; 32] }]` array, sorted by version, into `$OUT_DIR/migrations_embedded.rs`.
+   - Emits `cargo:rerun-if-changed=migrations` so the embed regenerates when any migration file changes.
+   The runtime loads this array via `include!(concat!(env!("OUT_DIR"), "/migrations_embedded.rs"))` inside `tokeira_storage::dsql::migration`. `MigrationRunner` consumes the pre-computed checksum array instead of reading files or hashing at runtime. `MigrationConfig.migrations_dir` SHALL be retained for tests that exercise the directory-scan code path but marked `#[deprecated]` for production use.
 
 ### Requirement 5.2: Schema Status Check
 

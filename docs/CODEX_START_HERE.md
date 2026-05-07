@@ -188,7 +188,17 @@ Temporal-server compatibility scope — the behaviours tokeirad must match beyon
 
 Blocked on: `temporal-api-v1.62-sync` (the API version is the thing this spec surfaces).
 
-### P2 — `observability-production`
+### P2 — `edge-history-serializer-completeness`
+
+**Status:** to spec.
+
+Audit every `HistoryEvent.attributes` variant in `tokeira-edge::grpc::translate` where the translator currently falls back to `Default::default()` placeholders because the kernel event does not yet carry the full proto field set. For each placeholder, classify as: (a) kernel-available-but-unplumbed → wire through, (b) kernel-unavailable → surface kernel-side requirement and thread the field through kernel + runtime + edge, or (c) not-meaningful-in-tokeira's-model → document the rationale and mark the field as intentionally defaulted. Drive every placeholder to a decided resolution so SDKs that branch on history-event attributes see complete data.
+
+Sits immediately after `temporal-compatibility` because it is the "tokeirad speaks completely on the wire" follow-on: compatibility surfaces server version, this surfaces history content.
+
+Blocked on: `temporal-api-v1.62-sync` (some v1.62-added event attributes need decoding before the audit is complete).
+
+### P3 — `observability-production`
 
 **Status:** to spec.
 
@@ -196,7 +206,7 @@ Production-facing observability: export pipeline (Prometheus scrape, OTLP), OCC-
 
 The name matches `observability-foundation`'s full-word style, and distinguishes from the more narrowly-scoped `worker-heartbeat-observability` spec that appears lower in the backlog.
 
-### P3 — `compose-dsql`
+### P4 — `compose-dsql`
 
 **Status:** spec complete (requirements).
 
@@ -204,7 +214,17 @@ Adds Aurora DSQL persistence to the compose platform (alongside the existing in-
 
 Blocked on: `temporal-api-v1.62-sync` for the DSQL server to actually accept SDK traffic.
 
-### P4 — `worker-heartbeat-observability`
+### P5 — `projection-batched-apply-and-failure-policies`
+
+**Status:** to spec.
+
+Two paired evolutions of the projection plane's interfaces. First: add `ProjectionSink::apply_batch(records: &[ProjectionRecord])` with a default implementation that calls `apply` N times, and provide a DSQL override using multi-row `VALUES (...)` inserts — the current `TODO(projection)` at `tokeira-projection/src/sink.rs:14`. Second: introduce `ProjectionWorker::FailurePolicy { retry_backoff, max_retries, dead_letter }` as per-sink configuration instead of the current single retry-only policy — the `TODO(projection)` at `tokeira-projection/src/worker.rs:66`.
+
+Sits here because `compose-dsql` (P4) is the spec that first exercises the DSQL projection path at volume; the batched-apply optimisation pays off immediately after that spec lands.
+
+Self-contained — no external blockers beyond `compose-dsql` providing a workload that makes the batching measurable.
+
+### P6 — `worker-heartbeat-observability`
 
 **Status:** to spec.
 
@@ -212,7 +232,7 @@ Absorb `RecordWorkerHeartbeat` from a no-op into durable observability: persist 
 
 Blocked on: `temporal-api-v1.62-sync` (delivers the real `WorkerHeartbeat` proto surface that this spec consumes).
 
-### P5 — `worker-config-management`
+### P7 — `worker-config-management`
 
 **Status:** to spec.
 
@@ -220,7 +240,7 @@ Server-backed worker configuration: `FetchWorkerConfig` and `UpdateWorkerConfig`
 
 Blocked on: `temporal-api-v1.62-sync` (delivers the proto surface).
 
-### P6 — `ecs-deployment`
+### P8 — `ecs-deployment`
 
 **Status:** spec complete (requirements, design, tasks). Architecture doc 045 revised and review questions resolved.
 
@@ -228,7 +248,17 @@ Production ECS on EC2 deployment. Covers: custom `tokeira-autoscaler` reading Mi
 
 Blocked on: `observability-production` (needs production-grade metrics to drive the custom autoscaler).
 
-### P7 — `kernel-pause-workflow`
+### P9 — `runtime-broker-tiered-delivery`
+
+**Status:** to spec.
+
+Split the broker into explicit sticky / live / backlog tiers per the `TODO(perf)` at `tokeira-runtime/src/broker.rs:61`. The current broker uses a single structure; the design calls for explicit tiers so sticky (workflow-task-cached) pollers are served from one ring, live pollers from another, and backlog items drain through the slowest path. Delivers tier-selection logic per delivery, metrics for tier occupancy and transition rates, and preserves the existing `WorkflowTaskBroker` / `ActivityTaskBroker` external interfaces.
+
+Sits after `ecs-deployment` because production deployments under real load are where the tier split pays off.
+
+Self-contained — local to `tokeira-runtime/`, no storage or kernel changes.
+
+### P10 — `kernel-pause-workflow`
 
 **Status:** to spec.
 
@@ -236,7 +266,7 @@ First-class workflow-execution pause: `PauseWorkflowExecution` and `UnpauseWorkf
 
 Blocked on: `temporal-api-v1.62-sync` (delivers the proto surface).
 
-### P8 — `activity-executions-first-class`
+### P11 — `activity-executions-first-class`
 
 **Status:** to spec.
 
@@ -244,15 +274,27 @@ Activities as first-class queryable objects, per the v1.52+ Temporal shift. Deli
 
 Blocked on: `temporal-api-v1.62-sync` (delivers the proto surface).
 
-### P9 — `worker-deployments`
+### P12 — `kernel-snapshot-suffix-recovery`
+
+**Status:** to spec. Architecture doc 090-failover-and-recovery covers the design at high level.
+
+Persist snapshot refs in the `workflow_hot` table so recovery can replay from snapshot + suffix instead of full history prefix. Delivers: new `LoadedRun::SnapshotRestore { snapshot_ref, after_event_id }` kernel variant, storage API additions to read/write snapshots (addresses `TODO(storage)` at `tokeira-storage/src/api.rs:595`), runtime changes so recovery picks snapshot+suffix when the snapshot is fresh enough, and a migration for the new `workflow_hot` columns.
+
+Sits here because it is a performance / cold-start optimisation — nothing is broken without it, and the right time to prioritise is when production workloads are big enough that the recovery cost is measurable.
+
+Self-contained. No external blockers beyond the pre-v0.4 SDK workflows being able to complete end-to-end against tokeirad.
+
+### P13 — `worker-deployments`
 
 **Status:** to spec.
 
 Temporal's newer versioning primitive. Replaces Build ID versioning with named deployments, per-version ramping, task-queue routing by (namespace, task_queue) → version, and inherited-version workflows that keep running against their original version as new ones deploy. Delivers 11 RPCs (`DescribeWorker`, `ListWorkers`, `DescribeWorkerDeployment`, etc.), the full `temporal.api.deployment.v1` message package, new fields on `PollWorkflowTaskQueueResponse` / `RespondWorkflowTaskCompletedRequest` / `StartWorkflowExecutionRequest`, a new runtime broker for deployment/version state, a migration for deployment-metadata storage, and dispatch-path changes to pick a version per task-queue poll.
 
+Also addresses the `DescribeTaskQueue` worker-version capabilities gap that was deferred previously — the version metadata required there flows from the worker-deployment router.
+
 Blocked on: `worker-heartbeat-observability` (heartbeats carry the version a worker is serving, which feeds into the deployment router).
 
-### P10 — `workflow-rules`
+### P14 — `workflow-rules`
 
 **Status:** to spec.
 
@@ -260,7 +302,17 @@ Server-side declarative policies that trigger actions on matching workflow execu
 
 Self-contained feature. No blockers beyond `temporal-api-v1.62-sync`.
 
-### P11 — `pipeline-foundation`
+### P15 — `storage-archival-sweeps`
+
+**Status:** to spec. Architecture doc 075 (future) covers the high-level design.
+
+Two conjoined workstreams that have always been delivered together: (a) sweep-eligibility operations for activity tasks and archival eligibility (addresses `TODO(storage)` at `tokeira-storage/src/api.rs:258`) — defines what becomes eligible for archival vs. deletion; (b) archival to S3 — defines where eligible data goes for long-term history retention. Archive without sweep leaves orphan storage; sweep without archive loses data.
+
+Sits last in the implementation chain because it only becomes relevant once DSQL storage is in production use at a scale where raw retention cost matters.
+
+Blocked on: `compose-dsql` and `ecs-deployment` (archival only matters against a deployed DSQL backend running enough workload).
+
+### P16 — `pipeline-foundation`
 
 **Status:** spec complete (requirements, design, tasks).
 
@@ -276,8 +328,6 @@ tracked as specs or backlog items:
 - **Runtime auto-tune** — Architecture doc 065 exists (draft). Local
   tuning of broker budgets, delivery fairness, projection pacing,
   commit reserves. No spec.
-- **Archival to S3** — Architecture doc 075 (future). No spec. Needed
-  for long-term history retention.
 - **Admission control** — Architecture doc 055 exists but no spec or
   implementation. Edge `LongPollGate` for poll admission, per-namespace
   / per-task-queue / per-worker-identity limits, overload shedding with
@@ -292,44 +342,8 @@ tracked as specs or backlog items:
   shard ownership; production needs distributed shard assignment.
 - **16 architecture docs have unresolved review questions** — Only
   045-autoscaling has resolved its review questions. The others
-  represent open design decisions.
-
-### Kernel / runtime
-
-- **Snapshot + suffix recovery** — Architecture doc 090 describes
-  persisted snapshot refs in `workflow_hot` for replay from snapshot
-  instead of from origin. Currently recovery always replays from the
-  full history prefix. (`TODO(storage)` at api.rs:595)
-- **Broker sticky/live/backlog tier split** — The broker currently
-  uses a single structure; the design calls for explicit tiers for
-  better delivery performance. (`TODO(perf)` at broker.rs:61)
-- **Sweep methods for activity tasks and archival eligibility** —
-  The storage API has placeholder comments for sweep methods that
-  aren't fully defined. (`TODO(storage)` at api.rs:258)
-
-### Edge
-
-- **UNIMPLEMENTED gRPC handlers** — A set of handlers intentionally
-  returns `Status::unimplemented(...)` because the underlying feature
-  is on the backlog (worker deployments, workflow rules, activity
-  executions, pause/unpause, worker config). The `temporal-api-v1.62-sync`
-  spec makes this explicit — every unimplemented handler carries a
-  reference to the deferring spec.
-- **History serializer completeness** — Some event attributes use
-  `Default::default()` placeholders because the kernel doesn't yet
-  carry the full set of proto fields.
-- **Worker-version capabilities in DescribeTaskQueue** — Tokeira
-  doesn't yet publish worker-version capabilities or queue-level
-  stats in DescribeTaskQueue responses. Will be addressed as part of
-  `worker-deployments`.
-
-### Projection
-
-- **Batched apply for SQL sink** — `TODO(projection)` at sink.rs:14.
-  The `ProjectionSink` trait only has single-record `apply()`.
-- **Per-sink failure policies** — `TODO(projection)` at worker.rs:66.
-  The projection worker has basic retry but no configurable per-sink
-  failure policies.
+  represent open design decisions that will be consumed as each spec
+  is authored.
 
 ## Invariants to preserve
 

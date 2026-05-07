@@ -1930,3 +1930,25 @@ message GetDeploymentReachabilityResponse {
     // was actually calculated.
     google.protobuf.Timestamp last_update_time = 3;
 }
+
+// RecordWorkerHeartbeat allows SDK workers to signal liveness. Backported
+// from v1.62 upstream. Tokeirad accepts the call and discards the payload;
+// the `worker_heartbeat` submessage type lives in `temporal.api.worker.v1`
+// which is not vendored in this proto tree, so we accept it as opaque bytes
+// (wire-compatible with the upstream submessage encoding). A full
+// implementation is tracked in a follow-up spec.
+message RecordWorkerHeartbeatRequest {
+    // Namespace this worker belongs to.
+    string namespace = 1;
+    // The identity of the client who initiated this request.
+    string identity = 2;
+    // Opaque wire-format bytes of the SDK's temporal.api.worker.v1.WorkerHeartbeat
+    // messages. Wire type 2 (length-delimited) matches the upstream sub-message
+    // encoding so prost decodes each element into a raw byte blob.
+    repeated bytes worker_heartbeat = 3;
+    // Resource ID for routing. Contains the worker grouping key.
+    string resource_id = 4;
+}
+
+message RecordWorkerHeartbeatResponse {
+}

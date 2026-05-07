@@ -862,6 +862,12 @@ pub fn namespace_to_proto(
                 eager_workflow_start: false,
                 sync_update: true,
                 async_update: true,
+                // Tokeirad accepts RecordWorkerHeartbeat as a no-op today (see
+                // follow-up spec for real implementation). Advertising `true`
+                // here keeps v0.4+ SDK workers running; otherwise the SDK's
+                // SharedNamespaceWorker shuts down immediately on startup and
+                // drags the user worker down with it.
+                worker_heartbeats: true,
             }),
             supports_schedules: false,
         }),

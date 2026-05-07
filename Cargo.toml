@@ -22,6 +22,7 @@ members = [
     "platforms/ecs",
     "apps/tkr",
     "apps/tokeirad",
+    "apps/tokeira-bench",
     "crates/dagger-client",
     "crates/tokeira-build",
 ]

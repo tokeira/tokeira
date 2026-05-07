@@ -1019,5 +1019,14 @@ service WorkflowService {
             }
         };
     }
+
+    // RecordWorkerHeartbeat is used by v0.4+ SDK workers to signal liveness
+    // to the server. Tokeirad advertises support via
+    // `NamespaceInfo.Capabilities.worker_heartbeats` and accepts the call as
+    // a no-op; real implementation tracked in a follow-up spec. This method
+    // is backported from the v1.62 upstream proto so v0.4+ SDK workers
+    // do not receive `Unimplemented` and shut down.
+    rpc RecordWorkerHeartbeat (RecordWorkerHeartbeatRequest) returns (RecordWorkerHeartbeatResponse) {
+    }
 }
 

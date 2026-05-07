@@ -56,6 +56,11 @@ message NamespaceInfo {
         bool sync_update = 2;
         // True if the namespace supports async update
         bool async_update = 3;
+        // True if the namespace accepts worker heartbeats via RecordWorkerHeartbeat.
+        // Tokeirad currently accepts heartbeats as a no-op so v0.4+ SDK workers
+        // run without shutting down their heartbeat channel. A production
+        // implementation is tracked in a follow-up spec.
+        bool worker_heartbeats = 4;
     }
 
     // Whether scheduled workflows are supported on this namespace. This is only needed

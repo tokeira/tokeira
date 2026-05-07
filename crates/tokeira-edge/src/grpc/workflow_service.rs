@@ -618,6 +618,17 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             workflowservice::ResetStickyTaskQueueResponse {},
         ))
     }
+    async fn record_worker_heartbeat(
+        &self,
+        _request: Request<workflowservice::RecordWorkerHeartbeatRequest>,
+    ) -> Result<Response<workflowservice::RecordWorkerHeartbeatResponse>, Status> {
+        // Accept and discard. The SDK calls this periodically; returning
+        // `Ok(())` keeps v0.4+ SDK workers alive. A real implementation (file
+        // heartbeats, expose via metrics, publish to kernel-observed
+        // liveness) is deferred to a follow-up spec.
+        debug!("record_worker_heartbeat");
+        Ok(Response::new(workflowservice::RecordWorkerHeartbeatResponse {}))
+    }
     async fn shutdown_worker(
         &self,
         request: Request<workflowservice::ShutdownWorkerRequest>,

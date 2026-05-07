@@ -49,11 +49,11 @@ pub async fn run(
             run_build(arch.into(), tag, format)
         }
         ImageCommand::List { source_type } => {
-            let ctx = deployment.ok_or_else(|| anyhow!("image list requires --deployment"))?;
+            let ctx = deployment.ok_or_else(|| deployment_required("image list"))?;
             run_list(ctx, source_type.map(Into::into), format).await
         }
         ImageCommand::Push { tag, image, yes } => {
-            let ctx = deployment.ok_or_else(|| anyhow!("image push requires --deployment"))?;
+            let ctx = deployment.ok_or_else(|| deployment_required("image push"))?;
             if should_reexec_under_dagger() {
                 return reexec_under_dagger(
                     &ImageCommand::Push {
@@ -69,7 +69,7 @@ pub async fn run(
             run_push(ctx, tag, image, yes, format, &DockerCliInspector).await
         }
         ImageCommand::Mirror { image, yes } => {
-            let ctx = deployment.ok_or_else(|| anyhow!("image mirror requires --deployment"))?;
+            let ctx = deployment.ok_or_else(|| deployment_required("image mirror"))?;
             if should_reexec_under_dagger() {
                 return reexec_under_dagger(
                     &ImageCommand::Mirror { image, yes },
@@ -128,7 +128,11 @@ async fn run_push(
 ) -> Result<()> {
     require_confirmation(yes, "image push")?;
     let PlatformDeploymentConfig::Ecs(config) = &ctx.platform_config else {
-        bail!("image push is only supported for ECS deployments");
+        bail!(
+            "image push targets ECR and is only supported for ecs deployments. \
+             Deployment '{}' is not an ecs deployment.",
+            ctx.name
+        );
     };
     let deployment = tokeira_ecs_deployment::EcsDeployment;
     let mut image_ctx = ImageContext::default();
@@ -206,7 +210,11 @@ async fn run_mirror(
 ) -> Result<()> {
     require_confirmation(yes, "image mirror")?;
     let PlatformDeploymentConfig::Ecs(config) = &ctx.platform_config else {
-        bail!("image mirror is only supported for ECS deployments");
+        bail!(
+            "image mirror targets ECR and is only supported for ecs deployments. \
+             Deployment '{}' is not an ecs deployment.",
+            ctx.name
+        );
     };
     let deployment = tokeira_ecs_deployment::EcsDeployment;
     let mut image_ctx = ImageContext::default();
@@ -290,7 +298,12 @@ async fn run_list(
 ) -> Result<()> {
     let mut image_ctx = ImageContext::default();
     let images = match &ctx.platform_config {
-        PlatformDeploymentConfig::Local(_) => bail!("local platform has no image set"),
+        PlatformDeploymentConfig::Local(_) => bail!(
+            "deployment '{}' runs on the local platform, which has no container images \
+             (tokeirad runs directly as a host process). Use a compose or ecs deployment:\n\
+             \ttkr --deployment <name> image list",
+            ctx.name
+        ),
         PlatformDeploymentConfig::Compose(config) => {
             let deployment = tokeira_compose_deployment::ComposeDeployment;
             deployment
@@ -377,6 +390,16 @@ pub fn validate_image_filter<'a>(
 fn should_reexec_under_dagger() -> bool {
     std::env::var_os("DAGGER_SESSION_PORT").is_none()
         || std::env::var_os("DAGGER_SESSION_TOKEN").is_none()
+}
+
+/// Shared error constructor for image subcommands that need a deployment
+/// context to resolve platform images. Points the operator at the global
+/// `--deployment` flag so they do not have to grep the help output.
+fn deployment_required(subcommand: &str) -> anyhow::Error {
+    anyhow!(
+        "{subcommand} requires a deployment to resolve its images. \
+         pass `tkr --deployment <name> {subcommand}` or run `tkr deployment list` to see what is available"
+    )
 }
 
 /// Re-execute this binary under `dagger run` so that the child process

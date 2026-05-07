@@ -87,10 +87,30 @@ impl Client {
 
     /// Load a directory from the host filesystem.
     pub fn host_directory(&self, path: &str) -> Result<Directory<'_>> {
-        let q = format!(
-            r#"{{ host {{ directory(path: {path}) {{ id }} }} }}"#,
-            path = quote(path),
-        );
+        self.host_directory_filtered(path, &[], &[])
+    }
+
+    /// Load a directory from the host filesystem with gitignore-style
+    /// exclude and include patterns.
+    ///
+    /// Avoids uploading large directories (Rust `target/`, `.git/`, caches)
+    /// that Dagger would otherwise hash and ship to the engine. Patterns are
+    /// interpreted by the Dagger engine the same way a `.dockerignore` does.
+    /// When both slices are empty, this is equivalent to `host_directory`.
+    pub fn host_directory_filtered(
+        &self,
+        path: &str,
+        exclude: &[&str],
+        include: &[&str],
+    ) -> Result<Directory<'_>> {
+        let mut args = format!("path: {}", quote(path));
+        if !exclude.is_empty() {
+            args.push_str(&format!(", exclude: {}", patterns_to_graphql(exclude)));
+        }
+        if !include.is_empty() {
+            args.push_str(&format!(", include: {}", patterns_to_graphql(include)));
+        }
+        let q = format!(r#"{{ host {{ directory({args}) {{ id }} }} }}"#);
         let id = self.query_path(&q, &["host", "directory", "id"])?;
         Ok(Directory {
             client: self,
@@ -435,6 +455,19 @@ pub fn quote(s: &str) -> String {
     serde_json::to_string(s).expect("string serialization cannot fail")
 }
 
+/// Render a list of pattern strings as a GraphQL list literal. Each pattern
+/// is JSON-quoted the same way `quote` quotes a single string so that
+/// glob metacharacters ride through unescaped by our code and are interpreted
+/// by the Dagger engine.
+fn patterns_to_graphql(patterns: &[&str]) -> String {
+    let items = patterns
+        .iter()
+        .map(|p| quote(p))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{items}]")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,5 +552,19 @@ mod tests {
             "client url should embed the session port, got: {}",
             client.url
         );
+    }
+
+    #[test]
+    fn patterns_to_graphql_emits_a_quoted_list() {
+        // Each pattern must be JSON-quoted, comma-separated, and wrapped in
+        // a GraphQL list literal so the engine receives a `[String!]` value.
+        // Special characters inside patterns are escaped by serde_json.
+        let rendered = patterns_to_graphql(&["target/", ".git/", "a\"b"]);
+        assert_eq!(rendered, r#"["target/", ".git/", "a\"b"]"#);
+    }
+
+    #[test]
+    fn patterns_to_graphql_handles_empty() {
+        assert_eq!(patterns_to_graphql(&[]), "[]");
     }
 }

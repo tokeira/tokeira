@@ -8,6 +8,11 @@ use crate::{BuildError, ContainerRef, DaggerClient, DirectoryRef, FileRef, Secre
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MockCall {
     HostDirectory(String),
+    HostDirectoryFiltered {
+        path: String,
+        exclude: Vec<String>,
+        include: Vec<String>,
+    },
     ContainerFrom(String),
     SetSecret(String),
     WithExec(Vec<String>),
@@ -55,6 +60,22 @@ impl DaggerClient for MockDaggerClient {
         path: &Path,
     ) -> Result<Box<dyn DirectoryRef<'client> + 'client>, BuildError> {
         self.record(MockCall::HostDirectory(path.display().to_string()));
+        Ok(Box::new(MockDirectory {
+            state: Arc::clone(&self.state),
+        }))
+    }
+
+    fn host_directory_filtered<'client>(
+        &'client self,
+        path: &Path,
+        exclude: &[&str],
+        include: &[&str],
+    ) -> Result<Box<dyn DirectoryRef<'client> + 'client>, BuildError> {
+        self.record(MockCall::HostDirectoryFiltered {
+            path: path.display().to_string(),
+            exclude: to_strings(exclude),
+            include: to_strings(include),
+        });
         Ok(Box::new(MockDirectory {
             state: Arc::clone(&self.state),
         }))

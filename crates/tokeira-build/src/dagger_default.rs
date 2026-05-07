@@ -28,6 +28,21 @@ impl DaggerClient for DefaultDaggerClient {
             .map_err(dagger_error)
     }
 
+    fn host_directory_filtered<'client>(
+        &'client self,
+        path: &Path,
+        exclude: &[&str],
+        include: &[&str],
+    ) -> Result<Box<dyn DirectoryRef<'client> + 'client>, BuildError> {
+        let path = path.to_str().ok_or_else(|| {
+            validation_error(format!("path is not valid UTF-8: {}", path.display()))
+        })?;
+        self.client
+            .host_directory_filtered(path, exclude, include)
+            .map(|dir| Box::new(dir) as Box<dyn DirectoryRef<'client> + 'client>)
+            .map_err(dagger_error)
+    }
+
     fn container_from<'client>(
         &'client self,
         image: &str,

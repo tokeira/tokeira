@@ -7,6 +7,25 @@ pub trait DaggerClient: Send + Sync {
         &'client self,
         path: &Path,
     ) -> Result<Box<dyn DirectoryRef<'client> + 'client>, BuildError>;
+
+    /// Load a directory with gitignore-style exclude/include filters.
+    ///
+    /// Pipelines that upload the workspace root MUST use this to exclude
+    /// Rust `target/`, `.git/`, and other large directories the builder
+    /// does not need. Passing empty slices is equivalent to `host_directory`.
+    ///
+    /// The default implementation falls back to unfiltered `host_directory`
+    /// so mocks that don't care about filtering still work. Production
+    /// implementations SHOULD override to honour the patterns.
+    fn host_directory_filtered<'client>(
+        &'client self,
+        path: &Path,
+        _exclude: &[&str],
+        _include: &[&str],
+    ) -> Result<Box<dyn DirectoryRef<'client> + 'client>, BuildError> {
+        self.host_directory(path)
+    }
+
     fn container_from<'client>(
         &'client self,
         image: &str,

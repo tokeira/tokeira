@@ -121,7 +121,7 @@ Target crates and files:
     - (Req 4.8.1, 4.8.2, 4.8.4, 4.8.5)
   - [ ]* 4.8 Write property test P1: translator round-trip fidelity
     - **Property 1: Translator round-trip fidelity**
-    - **Validates: Requirements 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, 4.9**
+    - **Validates: Requirements 2.2.5, 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, and every in-scope row in the Impact Matrix (§6 design.md)**
     - For each DTO type touched in sub-tasks 4.1–4.7 and 4.9, generate arbitrary instances via `proptest` strategies, encode via `*_to_proto`, decode via `*_from_proto`, and assert byte-equivalence on every field the translator preserves.
     - Every `Classification_WireThrough` field listed in the Impact Matrix MUST be included in the preserved-field comparison. The `client_discards_speculative_with_events` DTO field (Req 4.2.1–4.2.4) MUST also be included because Req 4.2 requires the edge to decode and preserve it even though it is classified `Classification_Capability` rather than `Classification_WireThrough`. Only fields with `Classification_Deferred` classification are excluded, and each exclusion cites the Surface_Audit row that justifies it per Req 4.5.2.
     - Test location: `crates/tokeira-edge/src/translate/` submodule test modules; minimum 256 iterations per `proptest::test_runner::Config::default()`.
@@ -279,10 +279,11 @@ Target crates and files:
     - Test location: `crates/tokeira-edge/tests/grpc_deferred_handlers.rs`.
 
 - [ ] 13. Surface_Audit and Impact Matrix structural property tests
-  - [ ]* 13.1 Write property test P2: Surface_Audit wire-through count matches Impact Matrix row count
-    - **Property 2: Surface_Audit wire-through count matches Impact Matrix row count**
+  - [ ]* 13.1 Write property test P2: Surface_Audit wire-through count matches in-scope Impact Matrix row count
+    - **Property 2: Surface_Audit wire-through count matches in-scope Impact Matrix row count**
     - **Validates: Requirements 2.3, 2.3.3, 5.1.1**
-    - Parse the Surface_Audit table in `design.md`. Assert the count of rows with `Classification == "Wire through"` equals the count of rows in the Impact Matrix table plus the count of rows explicitly escalated from `Wire through` to `Deferred` (four rows per the Impact Matrix summary: `StartWorkflowExecutionRequest.versioning_override`, `RespondActivityTaskFailedRequest.is_last_failure`, `RespondNexusTaskFailedRequest.error.retry_behavior`, and enum-variant escalations).
+    - Parse the Surface_Audit table in `design.md`. Assert the count of rows with `Classification == "Wire through"` equals the count of rows in the Impact Matrix table whose Implementation Notes column starts with `In scope` (i.e. was not escalated to `Classification_Deferred` per Req 5.1.3). Impact Matrix rows whose Implementation Notes column starts with `**Classified Deferred**` are excluded from the equivalence because they already appear as `Classification_Deferred` rows in the Surface_Audit — counting them on both sides would double-count.
+    - Complement property: the count of Surface_Audit rows with `Classification == "Deferred"` SHALL be ≥ the count of Impact Matrix `**Classified Deferred**` rows. (The Surface_Audit additionally carries Classification_Deferred RPCs and messages that never reach the Impact Matrix because they have no in-scope Implementation Notes to record.)
     - Test location: `crates/tokeira-edge/tests/surface_audit_structure.rs`.
   - [ ]* 13.2 Write property test P3: every deferred spec name exists as a workspace directory
     - **Property 3: every deferred spec name exists as a workspace directory**

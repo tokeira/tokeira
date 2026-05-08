@@ -114,7 +114,11 @@ The Edge_DTO module at `crates/tokeira-edge/src/translate/mod.rs` grows to cover
 **`SystemCapabilities`** (Req 4.1.1, 4.1.2):
 
 ```rust
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// See §Data Models for the full struct plus its manual `Default` impl.
+/// `Default` is implemented by hand (not derived) so
+/// `SystemCapabilities::default().worker_heartbeats == true`, matching the
+/// v0.4 SDK liveness contract Req 4.1.2 requires.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SystemCapabilities {
     pub signal_and_query_header: bool,
     pub internal_errors_cause_failures: bool,
@@ -135,12 +139,16 @@ pub struct SystemCapabilities {
     /// returns `Ok`. Real observability deferred to `worker-heartbeat-observability`.
     pub worker_heartbeats: bool,
 }
+// impl Default for SystemCapabilities — see §Data Models for the body.
 ```
 
 **`NamespaceDescription` and its `Capabilities` sub-struct** (Req 3.3, 4.1.4, 4.4.1, 4.4.3):
 
 ```rust
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// See §Data Models for the full struct plus its manual `Default` impl;
+/// `NamespaceCapabilities::default().worker_heartbeats == true` matching
+/// `SystemCapabilities`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NamespaceCapabilities {
     /// Advertised as `true`: same semantics as `SystemCapabilities.worker_heartbeats`.
     pub worker_heartbeats: bool,
@@ -148,6 +156,7 @@ pub struct NamespaceCapabilities {
     /// attributes. Flipping to `true` requires a projection migration (deferred).
     pub reported_problems_search_attribute: bool,
 }
+// impl Default for NamespaceCapabilities — see §Data Models for the body.
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NamespaceDescription {
@@ -159,8 +168,10 @@ pub struct NamespaceDescription {
     pub capabilities: NamespaceCapabilities,
     // DTO additions mirroring v1.62 NamespaceInfo / NamespaceConfig additions
     // identified as Classification_WireThrough in the Surface_Audit are
-    // appended here. Additions classified Classification_Deferred are NOT
-    // mirrored on this DTO — they are carried as opaque proto bytes only.
+    // appended here. Additions classified Classification_Deferred are
+    // explicitly dropped at the edge per tightened Req 2.2.6 — NOT mirrored
+    // on this DTO, NOT carried as opaque bytes, and the response path emits
+    // the protobuf default.
 }
 ```
 
@@ -1217,7 +1228,7 @@ Every `Classification_WireThrough` row whose Kernel, Runtime, or Projection impa
 Two invariants govern this table, enforced by property tests in §8:
 
 1. **Every `Classification_WireThrough` row has a corresponding implementation row in §6 (Impact Matrix)** (Req 2.3.3). The row count equivalence is the property the test asserts.
-2. **Every `Classification_Deferred` row names a target spec in the last column** (Req 2.1 and the property in §8). The spec name must exist as a directory under `.kiro/specs/` in the workspace — either because the spec is already drafted or because this spec's implementation creates a placeholder directory for it.
+2. **Every `Classification_Deferred` row names a target spec in the last column** (Req 2.1 and the property in §8). The spec name must exist as a directory under `.kiro/specs/` in the workspace — either because the spec is already drafted or because this spec's implementation creates a placeholder directory for it. Non-deferred rows (Capability, WireThrough, NoOp, Ignore) MAY also name a target spec as a forward pointer to follow-up work that extends the current in-scope implementation (see Req 2.3.1); structural checks that treat the column as deferred-only ownership MUST restrict themselves to `Classification == Deferred` rows.
 
 The table above enumerates the expected surface deltas based on Temporal API release notes and public proto history; the implementation task validates it against `diff -r` of the vendored trees during resync and amends rows where exact versions or exact field layouts diverge.
 
@@ -1297,7 +1308,7 @@ A field is classified `Classification_WireThrough` when it carries workflow-obse
 
 ### Classification_Deferred
 
-An RPC or field is classified `Classification_Deferred` when implementing it would span more than one crate, require a new kernel transition variant, require a migration file against the visibility store, or introduce new runtime state types. The principle: if the work does not fit inside this spec's scope ("wire-compat delta + small additions"), it is deferred with a named target spec. Every `Classification_Deferred` row names the target spec in the Surface_Audit's last column. The placeholder spec names used by this spec are `worker-deployments`, `workflow-rules`, `activity-executions-first-class`, `worker-config-management`, `kernel-pause-workflow`, `worker-heartbeat-observability`, and — when an Impact Matrix escalation happens — `runtime-worker-versioning`, `runtime-activity-timeouts`, and future `nexus-retry-policy`. Every Classification_Deferred RPC gets an `Unimplemented` stub handler with a human-readable message naming the deferring spec (Req 6.1.1). Every Classification_Deferred field is decoded at the edge but not propagated downstream (Req 2.2.6), so the edge preserves the bytes for future telemetry without committing the kernel or runtime to semantics that are not yet designed. The distinction between `Deferred` and `Ignore` is that a deferred item has a known future owner; an ignored item has none.
+An RPC or field is classified `Classification_Deferred` when implementing it would span more than one crate, require a new kernel transition variant, require a migration file against the visibility store, or introduce new runtime state types. The principle: if the work does not fit inside this spec's scope ("wire-compat delta + small additions"), it is deferred with a named target spec. Every `Classification_Deferred` row names the target spec in the Surface_Audit's last column. The placeholder spec names used by this spec are `worker-deployments`, `workflow-rules`, `activity-executions-first-class`, `worker-config-management`, `kernel-pause-workflow`, `worker-heartbeat-observability`, and — when an Impact Matrix escalation happens — `runtime-worker-versioning`, `runtime-activity-timeouts`, and future `nexus-retry-policy`. Every Classification_Deferred RPC gets an `Unimplemented` stub handler with a human-readable message naming the deferring spec (Req 6.1.1). Every Classification_Deferred field is explicitly dropped at the edge per tightened Req 2.2.6 — it is NOT carried on the DTO (neither as a typed field nor as opaque bytes), the response path emits the protobuf default, and a comment at the DTO definition site names every neighbouring Classification_Deferred field together with the spec that owns its eventual implementation. The rationale for drop-over-preserve: carrying bytes for fields that downstream code cannot yet interpret forces every DTO to grow a generic opaque-field bag, which this spec rejects as gratuitous surface; the deferring spec will re-introduce the field with the right typed shape when it lands. The distinction between `Deferred` and `Ignore` is that a deferred item has a known future owner; an ignored item has none.
 
 ### Cross-reference for deferred specs
 
@@ -1509,7 +1520,7 @@ The integration test at `apps/tokeira-bench/tests/v0_4_integration.rs` is descri
 - Completes in ≤120 s on a developer laptop (Req 7.1.7).
 - Asserts the three substantive invariants:
   - `DescribeNamespace` returns `capabilities.worker_heartbeats == true` (Req 7.1.3).
-  - A v0.4 SDK Worker registers, starts, stays alive for ≥60 s (two heartbeat intervals) (Req 7.1.4).
+  - A v0.4 SDK Worker registers, starts, and stays alive until at least one observed `record_worker_heartbeat` call reaches `tokeirad` (Req 7.1.4). The 90-second timeout in Req 7.1.7 gives the 30-second SDK heartbeat interval two chances to fire; multi-heartbeat observability is the `worker-heartbeat-observability` spec's concern.
   - An `EchoWorkflow` execution completes and returns the input payload (Req 7.1.5).
   - Server log output contains at least one `record_worker_heartbeat` debug line (Req 7.1.6).
 

@@ -342,6 +342,14 @@ async fn count_schedules(
 ) -> Result<Response<workflowservice::CountSchedulesResponse>, Status> {
     let req = request.into_inner();
     let dto = translate::to_internal::count_schedules_request(&req);
+    // Req 4.6.1 (via shared handler convention): empty namespace is a
+    // client programming error, mapped to `invalid_argument` before we
+    // touch the namespace registry. This matches `shutdown_worker` and
+    // `update_task_queue_config` and keeps the not-found vs
+    // invalid-argument distinction crisp for SDK error handling.
+    if dto.namespace.is_empty() {
+        return Err(Status::invalid_argument("namespace is required"));
+    }
     let namespace_id = self
         .namespaces
         .resolve(&dto.namespace)
@@ -360,7 +368,7 @@ async fn count_schedules(
 }
 ```
 
-The namespace-not-found case maps to `Status::not_found(...)` per Req 4.6.4, matching `DescribeNamespace`'s convention. Empty namespace strings map to `Status::invalid_argument(...)` via the existing namespace-resolution path.
+The explicit `is_empty()` guard maps empty namespace to `invalid_argument` before resolution — ahead of the `.resolve()` call which would otherwise return `None` and map to `not_found`. Non-existent-but-non-empty namespaces still map to `Status::not_found(...)` per Req 4.6.4, matching `DescribeNamespace`'s convention.
 
 ### 5. `UpdateTaskQueueConfig` implementation (Req 4.7)
 
@@ -487,7 +495,7 @@ async fn list_workers(...) -> Result<..., Status> { ... }
 // ...5 handlers...
 // === End Workflow Rules block ===
 
-// === Activity Executions — deferred to activity-executions spec ===
+// === Activity Executions — deferred to activity-executions-first-class spec ===
 // ...8 handlers...
 // === End Activity Executions block ===
 
@@ -625,9 +633,13 @@ async fn v0_4_sdk_worker_round_trip() -> anyhow::Result<()> {
     let ns = client.describe_namespace("default").await?;
     assert!(ns.capabilities.worker_heartbeats, "worker_heartbeats must be advertised");
 
-    // 4. Register EchoWorkflow, start a v0.4 Worker, keep it alive two heartbeat
-    //    intervals (≈60 s). The worker uses its own tokio::sync::Notify to
-    //    signal completion; no fixed sleeps anywhere.
+    // 4. Register EchoWorkflow, start a v0.4 Worker, and keep it alive
+    //    until at least one observed RecordWorkerHeartbeat call reaches
+    //    tokeirad — proves the SDK-to-server heartbeat path works
+    //    end-to-end. Steady-state heartbeating across multiple intervals
+    //    is the `worker-heartbeat-observability` spec's concern.
+    //    The worker uses tokio::sync::Notify to signal completion; no
+    //    fixed sleeps anywhere.
     let worker_done = Arc::new(tokio::sync::Notify::new());
     let worker_done_clone = worker_done.clone();
     let worker_task = tokio::spawn(async move {
@@ -656,7 +668,7 @@ async fn v0_4_sdk_worker_round_trip() -> anyhow::Result<()> {
 }
 ```
 
-**Timing.** The heartbeat interval is 30 s; the test must see at least one heartbeat and asserts a 90 s upper bound on the wait, giving the full test ≈120 s maximum runtime including workflow execution and teardown (Req 7.1.7).
+**Timing.** The SDK worker heartbeat interval is 30 s; the test waits up to 90 s for the first `RecordWorkerHeartbeat` log line, giving the 30-second interval two chances to fire before the test times out. The full test completes in ≈90 s upper bound including workflow execution and teardown (Req 7.1.7). Steady-state / multi-heartbeat observability is the `worker-heartbeat-observability` spec's concern and is explicitly not asserted here.
 
 **Synchronisation.** All waits use `tokio::sync::Notify` or `tokio::time::timeout` over channels. No `tokio::time::sleep` or `std::thread::sleep` appears anywhere in the test, per `tokeira/AGENTS.md` Rule 1.
 
@@ -677,7 +689,14 @@ This section collects the concrete Rust struct additions introduced by the desig
 /// New v1.62 fields are additive and default to values that keep SDK v0.4
 /// workers healthy: `worker_heartbeats = true` (no-op handler accepts calls),
 /// `server_scaled_deployments = false` (Worker Deployments are stubs).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `Default` is implemented manually rather than derived because the
+/// derived `bool::default()` is `false`, which would silently downgrade
+/// `worker_heartbeats` to `false` anywhere the struct is constructed via
+/// `SystemCapabilities::default()`. Failing the v0.4 liveness contract at
+/// the default construction site is exactly the regression this spec
+/// exists to prevent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SystemCapabilities {
     pub signal_and_query_header: bool,
     pub internal_errors_cause_failures: bool,
@@ -693,6 +712,32 @@ pub struct SystemCapabilities {
     pub server_scaled_deployments: bool,
     pub worker_heartbeats: bool,
 }
+
+impl Default for SystemCapabilities {
+    fn default() -> Self {
+        Self {
+            // v1.43-era capabilities default to the values already advertised
+            // by the existing server; flipping one is a deliberate act at the
+            // construction site.
+            signal_and_query_header: false,
+            internal_errors_cause_failures: false,
+            activity_failure_include_heartbeat: false,
+            supports_schedules: false,
+            encoded_failure_attributes: false,
+            build_id_based_versioning: false,
+            upsert_memo: false,
+            eager_workflow_start: false,
+            sdk_metadata: false,
+            count_group_by_execution_status: false,
+            nexus: false,
+            // Worker Deployments are stubs in this spec; advertise `false`.
+            server_scaled_deployments: false,
+            // No-op `RecordWorkerHeartbeat` handler accepts every call; the
+            // SDK v0.4 worker shuts down immediately if this is `false`.
+            worker_heartbeats: true,
+        }
+    }
+}
 ```
 
 ### `NamespaceCapabilities` — new struct, replaces the ad-hoc capability literal
@@ -700,10 +745,29 @@ pub struct SystemCapabilities {
 ```rust
 // crates/tokeira-edge/src/translate/mod.rs
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// Mirrors `namespace::v1::NamespaceInfo::Capabilities`.
+///
+/// Manual `Default` is used for the same reason as `SystemCapabilities`:
+/// `#[derive(Default)]` on `bool` produces `false`, which would silently
+/// downgrade the advertised capability and fail the SDK v0.4 liveness
+/// contract at every call site that constructed the struct via `::default()`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NamespaceCapabilities {
     pub worker_heartbeats: bool,
     pub reported_problems_search_attribute: bool,
+}
+
+impl Default for NamespaceCapabilities {
+    fn default() -> Self {
+        Self {
+            // No-op `RecordWorkerHeartbeat` handler accepts every call;
+            // advertise `true` so v0.4 workers stay alive.
+            worker_heartbeats: true,
+            // Tokeira does not emit reported-problems search attributes;
+            // advertise `false` so SDKs do not wait for them.
+            reported_problems_search_attribute: false,
+        }
+    }
 }
 ```
 
@@ -996,7 +1060,7 @@ Every `Classification_WireThrough` row whose Kernel, Runtime, or Projection impa
 | Field | `StartWorkflowExecutionRequest.links` | v1.50 | Wire through | Edge DTO gains `links: Vec<Link>`; pass through to kernel start request | — |
 | Field | `StartWorkflowExecutionRequest.priority` | v1.58 | Wire through | Edge DTO gains `priority: Option<Priority>`; stored on start event; not consumed by scheduler today | — |
 | Field | `StartWorkflowExecutionRequest.completion_callbacks` | v1.52 | Wire through | Edge DTO gains `completion_callbacks: Vec<Callback>`; stored for Nexus completion routing | — |
-| Field | `StartWorkflowExecutionRequest.versioning_override` | v1.54 | Wire through | Edge DTO gains `versioning_override: Option<VersioningOverride>`; escalated to Deferred if runtime plumbing needed (see Impact Matrix) | `runtime-worker-versioning` (escalated) |
+| Field | `StartWorkflowExecutionRequest.versioning_override` | v1.54 | Deferred | Explicitly dropped at the edge per tightened Req 2.2.6; kernel/runtime NOT plumbed; response path emits protobuf default | `runtime-worker-versioning` (escalated) |
 
 ### Wire-through field additions on `SignalWithStartWorkflowExecutionRequest`
 
@@ -1044,7 +1108,7 @@ Every `Classification_WireThrough` row whose Kernel, Runtime, or Projection impa
 | Field | `RespondActivityTaskCompletedRequest.worker_version` | v1.46 | Wire through | Edge DTO gains field; carried through to runtime on response path | — |
 | Field | `RespondActivityTaskFailedRequest.worker_version` | v1.46 | Wire through | Edge DTO gains field | — |
 | Field | `RespondActivityTaskCanceledRequest.worker_version` | v1.46 | Wire through | Edge DTO gains field | — |
-| Field | `RespondActivityTaskFailedRequest.is_last_failure` | v1.54 | Wire through | Edge DTO gains `is_last_failure: bool`; escalated to Deferred if runtime retry logic must branch on it (see Impact Matrix) | escalate if non-trivial |
+| Field | `RespondActivityTaskFailedRequest.is_last_failure` | v1.54 | Deferred | Explicitly dropped at the edge per tightened Req 2.2.6; runtime retry logic does NOT branch on it | `runtime-activity-timeouts` (escalated) |
 
 ### Wire-through field additions on `DescribeNamespaceResponse` / `NamespaceConfig`
 
@@ -1062,7 +1126,7 @@ Every `Classification_WireThrough` row whose Kernel, Runtime, or Projection impa
 | Field | `PollNexusTaskQueueResponse.poll_request_id` | v1.53 | Wire through | Edge DTO gains `poll_request_id: String` | — |
 | Field | `RespondNexusTaskCompletedRequest.namespace` | v1.51 present | Wire through | Confirm preserved | — |
 | Field | `RespondNexusTaskCompletedRequest.response` (expanded sub-fields) | v1.55 | Wire through | Edge DTO mirrors new sub-fields; re-emit on completion | — |
-| Field | `RespondNexusTaskFailedRequest.error` (expanded with `retry_behavior`) | v1.56 | Wire through | Edge DTO gains `retry_behavior: NexusRetryBehavior`; escalated if runtime retry branches on it | escalate if non-trivial |
+| Field | `RespondNexusTaskFailedRequest.error` (expanded with `retry_behavior`) | v1.56 | Deferred | Explicitly dropped at the edge per tightened Req 2.2.6; runtime retry does NOT branch on it | future `nexus-retry-policy` (escalated) |
 | Field | `NexusEndpointSpec.description` | v1.52 | Wire through | Edge DTO gains `description: String` on endpoint spec | — |
 | Field | `NexusEndpointSpec.allowed_cluster_ids` | v1.56 | Deferred | Introduces cross-cluster routing semantics; deferred | future `nexus-multi-cluster` |
 | Enum | `NexusEndpointSpec.endpoint_type` new variant (e.g. `WORKER_TARGET`) | v1.55 | Wire through | `NexusEndpointRegistry::resolve` gains a match arm for the new variant; unrouteable today | — |
@@ -1133,10 +1197,10 @@ Every `Classification_WireThrough` row whose Kernel, Runtime, or Projection impa
 
 | Kind | Qualified Name | Added In | Classification | Disposition | Target Spec |
 |---|---|---|---|---|---|
-| Enum | `VersioningBehavior` new variants | v1.54 | Wire through | Edge DTO enum mirrors new variants; escalated to Deferred if runtime scheduler branches on them | `runtime-worker-versioning` |
+| Enum | `VersioningBehavior` new variants | v1.54 | Deferred | Explicitly dropped at the edge; runtime scheduler does NOT branch on these variants in this spec | `runtime-worker-versioning` |
 | Enum | `WorkflowIdConflictPolicy.USE_EXISTING` | v1.47 | Wire through | Already present in some vendors; confirm | — |
-| Enum | `TaskReachability` new variants | v1.46 | Wire through | Edge DTO enum mirrors; Deferred if consumer logic branches | — |
-| Enum | `BuildIdTaskReachability` | v1.54 | Wire through | New enum; Deferred if consumer logic branches | `runtime-worker-versioning` |
+| Enum | `TaskReachability` new variants | v1.46 | Wire through | Edge DTO enum mirrors; no consumer branches on these variants in this spec | — |
+| Enum | `BuildIdTaskReachability` | v1.54 | Wire through | New enum; Edge DTO mirrors; no consumer branches on it in this spec | `runtime-worker-versioning` |
 | Enum | `ApplicationErrorCategory` | v1.58 | Wire through | Edge DTO enum mirrors; carried through on failure objects | — |
 
 ### Deleted / renamed surfaces
@@ -1175,7 +1239,7 @@ One row per `Classification_WireThrough` field from the Surface_Audit. Columns p
 | `StartWorkflowExecutionRequest.links` | DTO gains `links: Vec<Link>` | none | none | existing start-event projection stores on the event | In scope |
 | `StartWorkflowExecutionRequest.priority` | DTO gains `priority: Option<Priority>` | none | none (not consumed by scheduler in this spec) | none | In scope as wire-through only; scheduler priority remains future work |
 | `StartWorkflowExecutionRequest.completion_callbacks` | DTO gains `completion_callbacks: Vec<Callback>` | none | existing Nexus callback registration uses the field (single-file edit) | none | In scope |
-| `StartWorkflowExecutionRequest.versioning_override` | DTO gains `versioning_override: Option<VersioningOverride>` | new transition variant needed if scheduler branches | significant runtime change | none | **ESCALATED to Classification_Deferred**. Edge decodes and stores on DTO; kernel/runtime NOT plumbed. Deferred to `runtime-worker-versioning` (Req 5.1.3) |
+| `StartWorkflowExecutionRequest.versioning_override` | none (explicitly dropped at edge) | none | none | none | **Classified Deferred**. Per tightened Req 2.2.6, the edge explicitly drops the field and the response path emits the protobuf default. Deferred to `runtime-worker-versioning` (Req 5.1.3) |
 | `SignalWithStartWorkflowExecutionRequest.user_metadata` | mirrors StartWorkflow | none | none | existing projection stores | In scope |
 | `SignalWithStartWorkflowExecutionRequest.links` | mirrors StartWorkflow | none | none | existing projection stores | In scope |
 | `SignalWithStartWorkflowExecutionRequest.priority` | mirrors StartWorkflow | none | none | none | In scope |
@@ -1186,13 +1250,13 @@ One row per `Classification_WireThrough` field from the Surface_Audit. Columns p
 | `RespondActivityTaskCompletedRequest.worker_version` | DTO gains `worker_version` | none | none | none | In scope |
 | `RespondActivityTaskFailedRequest.worker_version` | DTO gains `worker_version` | none | none | none | In scope |
 | `RespondActivityTaskCanceledRequest.worker_version` | DTO gains `worker_version` | none | none | none | In scope |
-| `RespondActivityTaskFailedRequest.is_last_failure` | DTO gains `is_last_failure: bool` | potential new transition if runtime branches | retry logic changes | none | **ESCALATED to Classification_Deferred** if runtime branches on it. Edge decodes; retry logic unchanged. Deferred to `runtime-activity-timeouts` (Req 5.1.3) |
+| `RespondActivityTaskFailedRequest.is_last_failure` | none (explicitly dropped at edge) | none | none | none | **Classified Deferred**. Per tightened Req 2.2.6, the edge explicitly drops the field; runtime retry logic does not branch on it. Deferred to `runtime-activity-timeouts` (Req 5.1.3) |
 | `DescribeTaskQueueResponse.task_queue_stats` | DTO gains `TaskQueueStats` | none | runtime broker exposes lane/poll counters (single-file edit in `broker/stats.rs`) | none | In scope |
 | `DescribeTaskQueueResponse.config` | read from `TaskQueueConfigStore` | none | `TaskQueueConfigStore` read path (single-file edit) | none | In scope |
 | `PollNexusTaskQueueResponse.poll_request_id` | DTO gains `poll_request_id: String` | none | `NexusTaskBroker` carries through (single-file edit) | none | In scope |
 | `PollNexusTaskQueueResponse.request` expanded | DTO sub-fields mirror proto | none | `NexusTaskBroker` carries through (single-file edit) | none | In scope |
 | `RespondNexusTaskCompletedRequest.response` expanded | DTO sub-fields mirror proto | none | `NexusTaskBroker` carries through (single-file edit) | none | In scope |
-| `RespondNexusTaskFailedRequest.error.retry_behavior` | DTO gains `retry_behavior: NexusRetryBehavior` | potential new transition if runtime branches on retry policy | significant runtime change | none | **ESCALATED to Classification_Deferred** if runtime branches. Edge decodes; retry unchanged. Deferred to future `nexus-retry-policy` spec (Req 5.1.3) |
+| `RespondNexusTaskFailedRequest.error.retry_behavior` | none (explicitly dropped at edge) | none | none | none | **Classified Deferred**. Per tightened Req 2.2.6, the edge explicitly drops the field; NexusTaskBroker does not branch on it. Deferred to future `nexus-retry-policy` spec (Req 5.1.3) |
 | `NexusEndpointSpec.description` | DTO gains `description: String` | none | `NexusEndpointRegistry` carries through (single-file edit) | none | In scope |
 | `NexusEndpointSpec.endpoint_type` new variant | DTO enum mirrors | none | `NexusEndpointRegistry::resolve` new match arm (single-file edit); unrouteable today | none | In scope |
 | `ScheduleSpec.time_zone_data` | confirm preserved in DTO | none | none | none | In scope (verification only) |

@@ -117,14 +117,28 @@ Target crates and files:
     - (Req 4.3.4, Impact Matrix rows for renamed request DTOs)
   - [ ] 4.7 Extend the Nexus DTO family with v1.62 field additions
     - In `crates/tokeira-edge/src/translate/nexus.rs`, add the wire-through fields enumerated in the Surface_Audit Nexus section: `PollNexusTaskQueueResponse.poll_request_id: String`, expanded `PollNexusTaskQueueResponse.request` sub-fields, expanded `RespondNexusTaskCompletedRequest.response` sub-fields, `NexusEndpointSpec.description: String`, and the new `NexusEndpointSpec.endpoint_type` enum variant.
-    - Fields classified `Classification_Deferred` (notably `NexusEndpointSpec.allowed_cluster_ids` and `RespondNexusTaskFailedRequest.error.retry_behavior` after Impact Matrix escalation) SHALL NOT be mirrored onto DTOs — they are carried as opaque proto bytes only.
+    - Fields classified `Classification_Deferred` (notably `NexusEndpointSpec.allowed_cluster_ids` and `RespondNexusTaskFailedRequest.error.retry_behavior` after Impact Matrix escalation) SHALL be explicitly dropped at the edge per tightened Req 2.2.6 — they are NOT mirrored onto DTOs, NOT carried as opaque bytes, and the response path emits the protobuf default.
     - (Req 4.8.1, 4.8.2, 4.8.4, 4.8.5)
   - [ ]* 4.8 Write property test P1: translator round-trip fidelity
     - **Property 1: Translator round-trip fidelity**
-    - **Validates: Requirements 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 4.8**
-    - For each DTO type touched in sub-tasks 4.1–4.7, generate arbitrary instances via `proptest` strategies, encode via `*_to_proto`, decode via `*_from_proto`, and assert byte-equivalence on every field the translator preserves.
-    - Fields classified `Classification_Deferred` (e.g. `client_discards_speculative_with_events`) are excluded from the comparison with a documented Surface_Audit row reference per Req 4.5.2.
+    - **Validates: Requirements 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, 4.9**
+    - For each DTO type touched in sub-tasks 4.1–4.7 and 4.9, generate arbitrary instances via `proptest` strategies, encode via `*_to_proto`, decode via `*_from_proto`, and assert byte-equivalence on every field the translator preserves.
+    - Every `Classification_WireThrough` field listed in the Impact Matrix MUST be included in the preserved-field comparison. The `client_discards_speculative_with_events` DTO field (Req 4.2.1–4.2.4) MUST also be included because Req 4.2 requires the edge to decode and preserve it even though it is classified `Classification_Capability` rather than `Classification_WireThrough`. Only fields with `Classification_Deferred` classification are excluded, and each exclusion cites the Surface_Audit row that justifies it per Req 4.5.2.
     - Test location: `crates/tokeira-edge/src/translate/` submodule test modules; minimum 256 iterations per `proptest::test_runner::Config::default()`.
+  - [ ] 4.9 Wire-through field additions on StartWorkflow / SignalWithStartWorkflow / Poll / Respond / DescribeTaskQueue / ScheduleSpec / enum families
+    - In `crates/tokeira-edge/src/translate/mod.rs` and the neighbouring translator modules, add every `Classification_WireThrough` field listed in the Impact Matrix that is not already covered by sub-tasks 4.1–4.7:
+      - `StartWorkflowExecutionRequest.user_metadata: Option<UserMetadata>`, `.links: Vec<Link>`, `.priority: Option<Priority>`, `.completion_callbacks: Vec<Callback>`.
+      - `SignalWithStartWorkflowExecutionRequest.user_metadata`, `.links`, `.priority` (mirroring StartWorkflow).
+      - `PollWorkflowTaskQueueResponse.poll_request_id: String`.
+      - `PollActivityTaskQueueResponse.priority: Option<Priority>`, `.poll_request_id: String`.
+      - `RecordActivityTaskHeartbeatRequest.worker_version: Option<WorkerVersionStamp>`.
+      - `RespondActivityTaskCompletedRequest.worker_version`, `RespondActivityTaskFailedRequest.worker_version`, `RespondActivityTaskCanceledRequest.worker_version`.
+      - `DescribeTaskQueueResponse.task_queue_stats: Option<TaskQueueStats>`.
+      - Enum additions: `TaskReachability` new variants, `BuildIdTaskReachability`, `ApplicationErrorCategory`.
+    - For each field, add the DTO field, update `*_from_proto` and `*_to_proto`, and update the construction / consumption call sites identified in the Impact Matrix Implementation Notes column (typically a single-file edit each).
+    - `DescribeTaskQueueResponse.config` is owned by sub-task 7.6; do NOT duplicate it here.
+    - Fields explicitly classified `Classification_Deferred` (e.g. `StartWorkflowExecutionRequest.versioning_override`, `RespondActivityTaskFailedRequest.is_last_failure`) are out of scope for this sub-task and are explicitly dropped per tightened Req 2.2.6.
+    - (Req 2.2.5, Impact Matrix in-scope rows that sub-tasks 4.1–4.7 do not already cover)
 
 - [ ] 5. Capability advertisement in edge translators (§11 Migration Step 2, part 2; §3 Capability advertisement)
   - [ ] 5.1 Update `system_info_to_proto` to emit v1.62 capability flags
@@ -242,7 +256,7 @@ Target crates and files:
     - Implement stubs for `create_workflow_rule`, `describe_workflow_rule`, `delete_workflow_rule`, `list_workflow_rules`, `trigger_workflow_rule`.
     - (Req 6.3.1)
   - [ ] 12.3 Activity Executions stub block (8 RPCs)
-    - Bracket with `// === Activity Executions — deferred to activity-executions spec ===` and `// === End Activity Executions block ===`.
+    - Bracket with `// === Activity Executions — deferred to activity-executions-first-class spec ===` and `// === End Activity Executions block ===`.
     - Implement stubs for `start_activity_execution`, `describe_activity_execution`, `poll_activity_execution`, `list_activity_executions`, `count_activity_executions`, `request_cancel_activity_execution`, `terminate_activity_execution`, `delete_activity_execution`.
     - (Req 6.3.2)
   - [ ] 12.4 Worker Config stub block (2 RPCs)

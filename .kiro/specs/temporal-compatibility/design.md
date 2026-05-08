@@ -11,14 +11,14 @@ This design turns the compatibility contract in `requirements.md` into code. The
 5. A `dispatch_rpc<F: Feature>` helper in the edge that routes every workflow-service and operator-service RPC through a single policy based on its matrix state.
 6. A `cfg_feature!` compile-time macro for the kernel that refuses to compile code gated on a `Stubbed` or `Unsupported` feature.
 7. A `tkr compat show` / `tkr compat diff` command group in `apps/tkr` that renders the matrix, the SDK matrix, and the build-time metadata for the local binary or for a remote deployment.
-8. A CI check that fails the build if wall-clock time primitives leak into the binary layer, plus a proto-version monotonicity check that fails silent downgrades.
+8. A Dagger-backed local CI pipeline in `tokeira-build` that runs the no-wallclock and proto-monotonicity checks, invokable via a new `tkr ci check` command group that re-execs itself under `dagger run` (mirroring `tkr image build`). Remote-trigger wiring is deferred to the `pipeline-foundation` spec.
 
 Guiding principles:
 
 1. **One source of truth.** The feature matrix is declared once, as a `const`, in a single file. Kernel, edge, CLI, and tests all read the same slice. Adding a feature is a one-line change; bumping a state is a one-field change.
 2. **Compile-time wherever possible.** `TOKEIRA_VERSION`, `TEMPORAL_SERVER_COMPAT`, `TEMPORAL_PROTO_VERSION`, `SOURCE_TREE_HASH`, feature-matrix digest, and SDK-matrix digest are all `&'static str` constants. The startup log, the handshake, and `--version` all embed the same compile-time values — no runtime mutation, no runtime computation.
 3. **Build-time I/O stays in `build.rs`.** Reading env vars, parsing `rust-toolchain.toml`, and emitting generated constants happen in `tokeira-build-info/build.rs`. The crate's runtime API has zero I/O and no transitive dependencies beyond `std`.
-4. **No wall-clock embedding.** Neither the `build.rs` nor any code path reachable at build time calls `SystemTime::now`, `Utc::now`, or similar. A grep-style CI check enforces this invariant.
+4. **No wall-clock embedding.** Neither the `build.rs` nor any code path reachable at build time calls `SystemTime::now`, `Utc::now`, or similar. A Dagger-backed local CI check (invoked via `tkr ci check`) enforces this invariant with `ripgrep` inside a deterministic container; remote-trigger wiring is deferred to `pipeline-foundation`.
 5. **The edge owns the handshake; the kernel stays pure.** `GetSystemInfo` lives in `tokeira-edge`. The kernel can reference feature-matrix constants (it's allowed to depend on `tokeira-compatibility`), but only for compile-time gating. No runtime handshake logic in the kernel.
 6. **Dynamic-config reads are explicit.** `Experimental` features take a dynamic-config handle at the dispatch helper, not a global. Tests substitute a fake dynamic-config source at the dispatch boundary.
 
@@ -39,9 +39,11 @@ graph TD
     Edge -->|"GetSystemInfoResponse"| SdkClient["Temporal SDK client"]
     Edge -->|"feature-state label"| Metrics["dispatch_rpc metric"]
 
-    subgraph "CI Checks"
-      GrepCheck["grep: no wall-clock calls"] -->|"fail on SystemTime::now, Utc::now"| BuildRs
-      MonotonicCheck["proto-version monotonicity"] -->|"fail on silent downgrade"| BuildInfo
+    subgraph "Local CI (Dagger)"
+      GrepCheck["no-wallclock check"] -->|"fail on SystemTime::now, Utc::now"| BuildRs
+      MonotonicCheck["proto monotonicity check"] -->|"fail on silent downgrade"| BuildInfo
+      CliCi["tkr ci check"] -->|"re-exec under dagger run; run_ci_checks"| GrepCheck
+      CliCi --> MonotonicCheck
       CompletenessTest["proptest: matrix completeness"] -->|"every RPC -> one feature"| Compat
       HandshakeTest["proptest: capability consistency"] -->|"every capability flag -> one feature"| Compat
     end
@@ -56,8 +58,9 @@ graph TD
 | `GetSystemInfo` handler | `tokeira-edge` | Edge owns public RPC handlers. Consumes `tokeira-compatibility` for matrix walking. |
 | `cfg_feature!` macro | `tokeira-compatibility` (declarative) or `tokeira-compatibility-macros` (procedural) | Design picks declarative `macro_rules!` form; no need for a proc-macro crate until we need `syn`-level parsing. |
 | `tkr compat show` / `diff` | `apps/tkr/src/commands/compat.rs` | Follows existing `commands/{group}.rs` pattern, reuses [`tkr-cli`](../tkr-cli/requirements.md) global flags. |
-| Proto version monotonicity CI check | `.github/workflows/ci.yml` or `dev/ci/` script | One-shot script invoked by CI. Does not live in crate source. |
-| Wall-clock CI check | `.github/workflows/ci.yml` or `dev/ci/` script | `rg -n 'SystemTime::now|Utc::now|Local::now|OffsetDateTime::now_utc' crates/tokeira-build-info/` fails the build on any hit. |
+| Proto version monotonicity check | NEW `crates/tokeira-build/src/pipelines/ci.rs` + `apps/tkr/src/commands/ci/` | Dagger-backed pipeline invoked via `tkr ci check`. Remote-trigger wiring (GitHub Actions, nightly) is deferred to `pipeline-foundation`; `pipeline-foundation` will consume the same `run_ci_checks` function so verdicts do not diverge. |
+| Wall-clock check | NEW `crates/tokeira-build/src/pipelines/ci.rs` + `apps/tkr/src/commands/ci/` | Same Dagger pipeline as the monotonicity check; runs `rg -n 'SystemTime::now\|Utc::now\|Local::now\|OffsetDateTime::now_utc' crates/tokeira-build-info/` inside a deterministic container. Local invocation only in this spec. |
+| `tkr ci check` command group | NEW `apps/tkr/src/commands/ci/` | Follows existing `commands/image/` pattern: re-exec under `dagger run` when session env absent, mirror mode/subcommand dispatch, `--json` output. |
 
 Notably **not** changed:
 
@@ -585,33 +588,133 @@ pub async fn run(cmd: CompatCommand, format: OutputFormat) -> Result<()> {
 
 `build_local_response` constructs a synthetic `GetSystemInfoResponse` from compile-time constants so `tkr compat show` (no `--remote`) produces output structurally identical to the remote form. This is what enables the "local CLI build vs remote server build" consistency property in Req 7.2.
 
-### 7. CI checks
+### 7. Local CI pipeline (Feature 10)
 
-Two one-shot scripts in `dev/ci/`:
+Two checks, one Dagger-backed pipeline module, one `tkr` command group. No remote-trigger wiring (GHA, nightly cron) lands in this spec — that's the `pipeline-foundation` spec's job. The pipeline and the `tkr ci check` command group are shaped so `pipeline-foundation` can invoke `run_ci_checks` directly against a differently-configured Dagger client.
 
-```bash
-# dev/ci/check-no-wallclock.sh
-#!/usr/bin/env bash
-set -euo pipefail
-HITS=$(rg -n \
-  'SystemTime::now|Utc::now|Local::now|OffsetDateTime::now_utc|chrono::Utc::now|chrono::Local::now' \
-  crates/tokeira-build-info/ || true)
-if [[ -n "$HITS" ]]; then
-  echo "ERROR: wall-clock calls in tokeira-build-info (Req 9.1):"
-  echo "$HITS"
-  exit 1
-fi
+**Pipeline module** at `crates/tokeira-build/src/pipelines/ci.rs`:
+
+```rust
+// crates/tokeira-build/src/pipelines/ci.rs
+
+use std::path::PathBuf;
+
+use crate::{BuildError, DaggerClient};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CiCheck {
+    NoWallclock,
+    ProtoMonotonicity,
+}
+
+#[derive(Debug, Clone)]
+pub struct CiCheckRequest {
+    pub workspace_root: PathBuf,
+    /// Empty = run all checks; non-empty = run only the listed checks.
+    pub checks: Vec<CiCheck>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CiCheckReport {
+    pub results: Vec<CiCheckResult>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CiCheckResult {
+    pub check: CiCheck,
+    pub passed: bool,
+    pub summary: String,
+    pub details: Option<String>,
+}
+
+/// Run the compatibility CI checks inside a deterministic Dagger container.
+///
+/// Mounts the workspace with `TOKEIRAD_WORKSPACE_EXCLUDES` so the cold invocation
+/// does not upload the multi-GB `target/` tree — the same invariant the image
+/// build pipeline relies on.
+pub fn run_ci_checks(
+    request: &CiCheckRequest,
+    dagger: &dyn DaggerClient,
+) -> Result<CiCheckReport, BuildError> {
+    let checks = if request.checks.is_empty() {
+        vec![CiCheck::NoWallclock, CiCheck::ProtoMonotonicity]
+    } else {
+        request.checks.clone()
+    };
+
+    let workspace = dagger.host_directory_filtered(
+        &request.workspace_root,
+        crate::pipelines::build::TOKEIRAD_WORKSPACE_EXCLUDES,
+        &[],
+    )?;
+
+    let base = dagger.container_from("debian:bookworm-slim")?;
+    let base = base.with_exec(&[
+        "sh",
+        "-c",
+        "apt-get update && apt-get install -y --no-install-recommends \
+         ripgrep git ca-certificates && rm -rf /var/lib/apt/lists/*",
+    ])?;
+    let base = base.with_workdir("/workspace")?;
+    let base = base.with_directory("/workspace", &*workspace)?;
+
+    let mut results = Vec::with_capacity(checks.len());
+    for check in checks {
+        let result = match check {
+            CiCheck::NoWallclock => run_no_wallclock(&*base)?,
+            CiCheck::ProtoMonotonicity => run_proto_monotonicity(&*base)?,
+        };
+        results.push(result);
+    }
+    Ok(CiCheckReport { results })
+}
 ```
 
-```bash
-# dev/ci/check-proto-monotonicity.sh
-#!/usr/bin/env bash
-# Fetches the last release tag, extracts TEMPORAL_PROTO_VERSION from both,
-# and fails if the new one is a semver downgrade unless the tip commit
-# message contains "Proto-Downgrade: <reason>".
+Each check is a small function that runs `rg` (or `git` + `sort -V`) inside the container and inspects the exit status. The function returns a `CiCheckResult` capturing the check identity, pass/fail, a one-line summary, and optional multi-line details (e.g. the matching lines from `rg`). Implementations live in `ci.rs` alongside `run_ci_checks`.
+
+**CLI command group** at `apps/tkr/src/commands/ci/mod.rs`:
+
+```rust
+// apps/tkr/src/commands/ci/mod.rs (sketch)
+
+pub async fn run(command: CiCommand, format: OutputFormat) -> Result<()> {
+    match command {
+        CiCommand::Check { check, json } => {
+            if should_reexec_under_dagger() {
+                return reexec_under_dagger(&command, format).await;
+            }
+            run_check(check, json, format)
+        }
+    }
+}
+
+fn run_check(check: Option<CliCiCheck>, json: bool, format: OutputFormat) -> Result<()> {
+    let workspace_root = workspace_root_from_current_dir()?;
+    let dagger = DefaultDaggerClient::from_env()?;
+    let request = CiCheckRequest {
+        workspace_root,
+        checks: check.map(|c| vec![c.into()]).unwrap_or_default(),
+    };
+    let report = run_ci_checks(&request, &dagger)?;
+    render(&report, json, format)?;
+    if report.results.iter().any(|r| !r.passed) {
+        std::process::exit(1);
+    }
+    Ok(())
+}
 ```
 
-Both scripts are wired into the default CI workflow so a PR cannot merge without them passing.
+The `should_reexec_under_dagger` + `reexec_under_dagger` helpers are the same ones landed for `tkr image build` (see `apps/tkr/src/commands/image/mod.rs`). The re-exec pattern is extracted into a shared helper so `tkr image` and `tkr ci` both consume it without duplication — see §Refactor below.
+
+**Refactor: shared `dagger_reexec` helper.** The re-exec logic currently lives in `apps/tkr/src/commands/image/mod.rs`. With a second `tkr` subcommand needing the same behaviour, this spec moves the helper into `apps/tkr/src/dagger_reexec.rs` (module-level, not command-specific) and has both `commands/image/mod.rs` and `commands/ci/mod.rs` import from it. The refactor is a move + extract, no behaviour change.
+
+**Why a pipeline rather than shell scripts.** `dev/ci/check-*.sh` would do the same job with less Rust code, but:
+
+1. **Determinism.** The pipeline runs inside a pinned `debian:bookworm-slim` container with `ripgrep` installed from apt at a specific Debian release. A shell script on the operator's laptop depends on `rg` being installed, at whatever version Homebrew or apt happen to ship.
+2. **Re-use by `pipeline-foundation`.** The pipeline exposes `run_ci_checks(request, dagger) -> CiCheckReport` as a pure function. `pipeline-foundation` will call it directly from whatever remote-trigger shell it grows (GHA action, scheduled runner), passing a Dagger client configured for that environment. No shell-to-Rust boundary to debug.
+3. **Structured output.** `CiCheckReport` serialises via serde; `tkr ci check --json` can emit it unmodified for consumption by editor plugins, badge servers, etc. A shell script would have to hand-roll JSON.
+
+**Remote trigger deferred.** This spec does not add any `.github/workflows/*.yml` file, any nightly cron, or any scheduled runner. The portable substrate is the pipeline module; `pipeline-foundation` (backlog P16) owns the remote trigger story.
 
 ## Data Models
 
@@ -708,10 +811,11 @@ The `GetSystemInfoResponse` that tonic generates is extended via an internal one
 - **Property T6 — Feature matrix digest stability:** Compute the digest twice via the exposed `const fn`; assert byte-equal. Permute the matrix order at the test site and assert digest invariance (the digest sorts on `id` before hashing).
 - **Property T7 — Extension field round-trip:** `TokeiraBuildInfoExt` protobuf encode + decode round-trips without loss.
 
-### CI-only checks
+### Local CI checks (not unit tests)
 
-- `check-no-wallclock.sh` — runs in CI; fails the build if any wall-clock call appears in `tokeira-build-info/`.
-- `check-proto-monotonicity.sh` — runs in CI on release PRs; fails on silent proto downgrade.
+- `tkr ci check no-wallclock` — runs the Dagger pipeline's no-wallclock check; fails the check if any wall-clock call appears in `tokeira-build-info/`.
+- `tkr ci check proto-monotonicity` — runs the Dagger pipeline's semver comparison; fails on silent proto downgrade.
+- Both are runnable locally via `tkr ci check` (which runs every check) or `tkr ci check <name>` (for a single check). No GHA workflow wiring in this spec.
 
 ### Tradeoffs
 
@@ -725,13 +829,14 @@ The `GetSystemInfoResponse` that tonic generates is extended via an internal one
 2. **Kernel adoption.** Wrap existing feature-gated modules in `cfg_feature!`. Start with already-implemented features — no behaviour change, just a compile-time assertion. Then add gates to any `Experimental` module so flipping to `Stubbed` in the matrix produces a compile error.
 3. **Edge adoption.** Convert every workflow-service and operator-service handler to start with `dispatch_rpc<SomeFeature>(&ctx)`. For currently-implemented handlers this is a no-op that emits a metric. For currently-unimplemented handlers this is the mechanism by which they start returning the right error code.
 4. **`GetSystemInfo` rollout.** Replace any stub handler with the new matrix-walking version. Verify via integration test that an `sdk-go` client calling `Connect()` receives `capabilities.*` values matching the matrix defaults.
-5. **CI wiring.** Add the two shell checks to the default CI workflow.
-6. **CLI adoption.** Ship `tkr compat show` in the next tkr release. Add `tkr compat diff` in the release after that (it depends on the tonic client being wired into the CLI).
-7. **Documentation.** Update `README.md` with the "Temporal compatibility" section (Req 9.3). Point at `tkr compat show` for full detail.
+5. **Local CI pipeline.** Add `crates/tokeira-build/src/pipelines/ci.rs` with `run_ci_checks` and the two check implementations. Add `apps/tkr/src/commands/ci/` with the `check` subcommand. Extract the shared `dagger_reexec` helper from `commands/image/mod.rs` so both command groups consume it.
+6. **CLI adoption.** Ship `tkr compat show` and `tkr ci check` in the next tkr release. Add `tkr compat diff` in the release after that (it depends on the tonic client being wired into the CLI).
+7. **Remote trigger (out of scope).** `pipeline-foundation` (backlog P16) will invoke `run_ci_checks` from a remote runner. No GHA workflow, nightly cron, or scheduled job is added by this spec.
+8. **Documentation.** Update `README.md` with the "Temporal compatibility" section (Req 9.3). Update `AGENTS.md` with the `tkr ci check` pre-push gate (Req 10.3). Point at `tkr compat show` for full detail.
 
 No existing user-facing API breaks. Step 4 is the only step that changes runtime behaviour — and only by making `GetSystemInfo` responses more accurate.
 
 ## Open Questions
 
-- **Source tree hash computation location.** Req 1.3.2 mandates that `build.rs` does not compute the hash itself. [`image-lifecycle`](../image-lifecycle/requirements.md) is the obvious computation site, but we need a second producer for local builds (outside Dagger). A small `dev/ci/compute-source-tree-hash` helper binary covers the case; it reads `.gitignore` plus the exclusion list in Req 1.3.3. Tasks doc allocates this work.
+- **Source tree hash computation location.** Req 1.3.2 mandates that `build.rs` does not compute the hash itself. [`image-lifecycle`](../image-lifecycle/requirements.md) is the obvious computation site, but we need a second producer for local builds (outside Dagger). The helper lives at `crates/tokeira-build/src/pipelines/ci.rs::compute_source_tree_hash` (or a dedicated `source_tree_hash.rs` sibling) and is re-used by `tkr image build` and the Dagger-backed CI checks; it reads `.gitignore` plus the exclusion list in Req 1.3.3. Tasks doc allocates this work.
 - **Extension-field future-proofing.** If we decide later to wrap `TokeiraBuildInfoExt` in a versioned envelope (`TokeiraExtensionsV1`), we'd want to do that before the first SDK starts reading it. Tasks doc flags this for review in the tkr-compat diff handler.

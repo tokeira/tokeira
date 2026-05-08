@@ -23,6 +23,7 @@ The spec owns the compatibility contract and the build-time metadata. It consume
 - A canonical `SdkMatrix` declaring minimum and maximum tested SDK versions per language.
 - A `GetSystemInfo` RPC implementation in `tokeira-edge` that walks the feature matrix and returns the correct capabilities blob to connecting clients.
 - A `tkr compat show` CLI subcommand that prints build-time metadata, the feature matrix with runtime state, and the SDK matrix — queryable both for local builds and against a running deployment.
+- A Dagger-backed local CI pipeline (Feature 10) invokable via `tkr ci check` that runs the no-wallclock and proto-monotonicity checks against the current workspace. Remote-trigger wiring is deferred to the `pipeline-foundation` spec.
 - Property tests enforcing matrix completeness (every Temporal RPC maps to exactly one state), capability-handshake consistency (every `capabilities.*` flag maps to a feature), and proto version monotonicity (bumps never downgrade).
 
 ### What this spec does NOT cover
@@ -32,13 +33,15 @@ The spec owns the compatibility contract and the build-time metadata. It consume
 - Client-library version negotiation. SDKs negotiate via the capability handshake this spec defines; the SDK-side logic is not our concern.
 - Tokeira internal-state backward compatibility (state schemas, storage migration). Out of scope.
 - ABI or plugin compatibility. Tokeira does not ship plugin interfaces.
+- Remote CI triggers (GitHub Actions, nightly schedules, release pipelines). The Dagger pipeline landed by Feature 10 is the portable local substrate; remote-trigger wiring is owned by the `pipeline-foundation` spec (backlog P16) and will invoke the same `run_ci_checks` function so verdicts do not diverge.
 
 ### Cross-references
 
-- [`image-lifecycle`](../image-lifecycle/requirements.md): The Dagger build pipeline passes git metadata (`TOKEIRA_GIT_SHA`, working-tree clean flag) as environment variables to the tokeirad build; `tokeira-build-info` reads them in its `build.rs`. Image-lifecycle's reproducible-build property depends on this spec excluding wall-clock timestamps from the binary.
+- [`image-lifecycle`](../image-lifecycle/requirements.md): The Dagger build pipeline passes git metadata (`TOKEIRA_GIT_SHA`, working-tree clean flag) as environment variables to the tokeirad build; `tokeira-build-info` reads them in its `build.rs`. Image-lifecycle's reproducible-build property depends on this spec excluding wall-clock timestamps from the binary. This spec reuses image-lifecycle's `DaggerClient` abstraction and `TOKEIRAD_WORKSPACE_EXCLUDES` for Feature 10.
 - [`shard-placement-membership`](../shard-placement-membership/requirements.md): Controller snapshots carry `TOKEIRA_VERSION` per node so the cluster detects mixed-version deployments.
 - [`ecs-deployment`](../ecs-deployment/requirements.md): Operators use `tkr exec` or `tkr compat show` against a live cluster to verify every task is on the same version before a rolling deployment proceeds.
-- [`tkr-cli`](../tkr-cli/requirements.md): Adds the `compat` command group.
+- [`tkr-cli`](../tkr-cli/requirements.md): Adds the `compat` and `ci` command groups.
+- [`pipeline-foundation`](../pipeline-foundation/requirements.md): Will consume Feature 10's `run_ci_checks` function as the single source of truth for compatibility checks, wiring it into remote triggers (GitHub Actions, nightly, release pipelines). Until `pipeline-foundation` lands, `tkr ci check` is the canonical local pre-push gate.
 
 ## Glossary
 
@@ -344,9 +347,10 @@ The spec owns the compatibility contract and the build-time metadata. It consume
 
 #### Acceptance Criteria
 
-1. A CI check SHALL compare the `TEMPORAL_PROTO_VERSION` between the tip commit and the last tagged tokeira release.
-2. IF the new version is older (semver-less), the CI check SHALL fail, requiring an explicit override commit message (`Proto-Downgrade: <reason>`). Downgrades are possible but never accidental.
+1. A Dagger-backed local CI check, invoked via `tkr ci check` per Feature 10, SHALL compare the `TEMPORAL_PROTO_VERSION` between the tip commit and the last tagged tokeira release.
+2. IF the new version is older (semver-less), the check SHALL fail, requiring an explicit override commit message (`Proto-Downgrade: <reason>`). Downgrades are possible but never accidental.
 3. A `TEMPORAL_SERVER_COMPAT` downgrade SHALL similarly require an explicit override (`Server-Compat-Downgrade: <reason>`).
+4. GitHub Actions or other remote CI trigger wiring is OUT OF SCOPE for this spec. The Dagger pipeline underlying `tkr ci check` is the portable substrate; remote-trigger wiring is owned by the `pipeline-foundation` spec (backlog P16). Operators MUST run `tkr ci check` before push until `pipeline-foundation` lands; the pre-push step is documented in `AGENTS.md` per Req 9.3.
 
 ---
 
@@ -445,12 +449,13 @@ The spec owns the compatibility contract and the build-time metadata. It consume
 
 ### Requirement 8.3: Proto version monotonicity property
 
-**User Story:** As a Tokeira maintainer, I want accidental proto version downgrades to be caught in CI, so that production binaries never silently revert wire protocol.
+**User Story:** As a Tokeira maintainer, I want accidental proto version downgrades to be caught locally before push, so that production binaries never silently revert wire protocol.
 
 #### Acceptance Criteria
 
-1. Covered by Req 5.4. A CI check (not a unit test; implementation can be a script invoked by the release pipeline) SHALL compare `TEMPORAL_PROTO_VERSION` across tagged commits and fail on downgrade unless an explicit override commit message is present.
+1. Covered by Req 5.4. A Dagger-backed local check (not a unit test; runs via `tkr ci check` per Feature 10) SHALL compare `TEMPORAL_PROTO_VERSION` across tagged commits and fail on downgrade unless an explicit override commit message is present.
 2. An analogous check SHALL apply to `TEMPORAL_SERVER_COMPAT`.
+3. Remote-trigger wiring (GitHub Actions, nightly scheduled runs, release pipelines) is OUT OF SCOPE for this spec per Req 5.4.4.
 
 ### Requirement 8.4: SDK matrix round-trip property
 
@@ -481,8 +486,9 @@ The spec owns the compatibility contract and the build-time metadata. It consume
 
 #### Acceptance Criteria
 
-1. Covered by Req 1.6. A CI check (grep or more precise static analysis) SHALL scan `tokeira-build-info/build.rs` and the generated `build_info.rs` for references to `SystemTime`, `Utc::now`, `Local::now`, `OffsetDateTime::now_utc`, or other wall-clock calls. Any hit fails the build.
+1. Covered by Req 1.6. A Dagger-backed local check (invoked via `tkr ci check` per Feature 10) SHALL scan `tokeira-build-info/build.rs` and the generated `build_info.rs` for references to `SystemTime`, `Utc::now`, `Local::now`, `OffsetDateTime::now_utc`, or other wall-clock calls. Any hit fails the check.
 2. THE check SHALL NOT flag `std::time::Instant` usage (monotonic, not wall-clock; not embedded anyway).
+3. Remote-trigger wiring (GitHub Actions, nightly scheduled runs) is OUT OF SCOPE for this spec. The Dagger pipeline underlying the check is the portable substrate; remote wiring is owned by the `pipeline-foundation` spec.
 
 ### Requirement 9.2: Zero runtime deps for `tokeira-build-info`
 
@@ -501,5 +507,55 @@ The spec owns the compatibility contract and the build-time metadata. It consume
 #### Acceptance Criteria
 
 1. THE root `README.md` SHALL include a "Temporal compatibility" section citing `TEMPORAL_SERVER_COMPAT`, `TEMPORAL_PROTO_VERSION`, a summary of the feature matrix by state, and a pointer at `tkr compat show` for full detail.
-2. THE root `AGENTS.md` SHALL reference the compatibility ordering rules from Feature 5 (proto bump workflow, server compat independence).
+2. THE root `AGENTS.md` SHALL reference the compatibility ordering rules from Feature 5 (proto bump workflow, server compat independence) and the pre-push `tkr ci check` gate from Feature 10.3.
 3. THE `tkr compat show --help` output SHALL be sufficient to understand the command without reading the spec.
+4. THE `tkr ci check --help` output SHALL be sufficient to understand the command without reading the spec.
+---
+
+## Feature 10: Local CI via Dagger
+
+### Requirement 10.1: Dagger pipeline for compatibility checks
+
+**User Story:** As a Tokeira developer, I want to run every compatibility CI check on my laptop with a single command before I push, so that I get the same verdict a remote CI runner would eventually give — without waiting for a remote job.
+
+#### Acceptance Criteria
+
+1. THE spec SHALL deliver a Dagger-backed local CI pipeline in `crates/tokeira-build/src/pipelines/ci.rs` that runs two checks:
+   - **No-wallclock**: the `rg` invariant in Req 9.1.1 executed inside a deterministic container against the current workspace.
+   - **Proto monotonicity**: the semver comparison in Req 5.4 executed against `crates/tokeira-build-info/src/pinned.rs` versus the last tagged release.
+2. THE pipeline SHALL be invocable from Rust via a public function `pub fn run_ci_checks(request: &CiCheckRequest, dagger: &dyn DaggerClient) -> Result<CiCheckReport, BuildError>` that returns a structured report enumerating each check and its outcome.
+3. THE pipeline SHALL mount the workspace into the Dagger container using the exclude list established by `TOKEIRAD_WORKSPACE_EXCLUDES` (or a CI-specific subset thereof), so cold invocations do NOT upload the multi-GB `target/` tree — the invariant proven by the `tkr image build` work landed in commit `3082176`.
+4. THE pipeline SHALL use a small `debian:bookworm-slim` or equivalent image with `ripgrep` and `git` installed; it SHALL NOT depend on the full `tokeirad` build image.
+5. Individual check selection SHALL be supported via `CiCheckRequest { checks: Vec<CiCheck> }` where `CiCheck { NoWallclock, ProtoMonotonicity }` is an enum; an empty `checks` vector means "run all checks".
+
+### Requirement 10.2: `tkr ci check` command
+
+**User Story:** As a Tokeira developer, I want a `tkr` subcommand that runs the Dagger pipeline with the same re-exec ergonomics as `tkr image build`, so that I don't have to remember `dagger run -- tkr ci check`.
+
+#### Acceptance Criteria
+
+1. THE `tkr` CLI SHALL expose a top-level `ci` command group with children: `check`.
+2. `tkr ci check` SHALL run all checks defined in Req 10.1.1 and print a human-readable summary.
+3. `tkr ci check <check-name>` SHALL run exactly one check and print the same summary format.
+4. `tkr ci check --json` SHALL emit the `CiCheckReport` as a single JSON object on stdout.
+5. WHEN `DAGGER_SESSION_PORT` and `DAGGER_SESSION_TOKEN` are absent from the environment, `tkr ci check` SHALL re-execute itself under `dagger run` using the re-exec pattern established in `apps/tkr/src/commands/image/mod.rs`. The operator does not need to remember `dagger run`.
+6. Exit status SHALL be 0 if all checks pass, 1 if any check fails, 2 on usage error.
+
+### Requirement 10.3: Pre-push operator workflow
+
+**User Story:** As a Tokeira maintainer, I want the spec to document `tkr ci check` as the pre-push gate, so that contributors know the command is the canonical verdict before remote triggers exist.
+
+#### Acceptance Criteria
+
+1. `AGENTS.md` SHALL include `tkr ci check` in the enforced-commands list (alongside `cargo +nightly fmt --all --check`, `cargo lint`, etc.) as the gate for the compatibility invariants in Features 5, 9.
+2. THE spec's `README.md` / tasks doc SHALL document that remote-trigger wiring (e.g. GitHub Actions) is deferred to the `pipeline-foundation` spec (backlog P16) and that `pipeline-foundation` will invoke the same `run_ci_checks` function, so no behavioural divergence between local and remote verdicts is introduced.
+
+### Requirement 10.4: Forward compatibility with `pipeline-foundation`
+
+**User Story:** As a Tokeira maintainer, I want the local CI pipeline shaped so `pipeline-foundation` can re-use it without rewriting, so that we don't ship throwaway code.
+
+#### Acceptance Criteria
+
+1. THE `run_ci_checks` function SHALL take a Dagger client abstraction (the same `DaggerClient` trait as the existing image build/publish/mirror pipelines), so a `pipeline-foundation`-owned remote runner can pass a differently-configured client without changing the check implementations.
+2. THE `CiCheckReport` SHALL be `Serialize + Deserialize` via serde so `pipeline-foundation` can ship the report to an external system (artifact store, badge server) without re-serialising the check logic.
+3. Adding a new check SHALL be a one-function addition to `ci.rs` plus one variant on the `CiCheck` enum; it SHALL NOT require changes outside `crates/tokeira-build/` or `apps/tkr/src/commands/ci/`.

@@ -10,11 +10,11 @@ Target crates:
 - `crates/tokeira-compatibility/` — NEW library crate with `FEATURE_MATRIX`, `SDK_MATRIX`, `dispatch_rpc`, `cfg_feature!`
 - `crates/tokeira-edge/` — extend with `GetSystemInfo` handler that walks the matrix + `dispatch_rpc` adoption across workflow-service and operator-service handlers
 - `crates/tokeira-kernel/` — adopt `cfg_feature!` at existing feature-gated module boundaries
-- `apps/tkr/` — add `compat` command group (`show`, `diff`)
+- `apps/tkr/` — add `compat` and `ci` command groups
 - `proto/tokeira/internal/v1/` — define `system_info_ext.proto` extension carrying tokeira build info
-- `dev/ci/` — shell scripts for wall-clock check and proto monotonicity check
+- `crates/tokeira-build/src/pipelines/ci.rs` — NEW Dagger-backed local CI pipeline (no-wallclock, proto monotonicity, source-tree hash)
 
-Crucially, this plan does **not** introduce dynamic config itself (the dynamic-config reader trait is injected), does not invent a new gRPC, and does not change any existing workflow semantics.
+Crucially, this plan does **not** introduce dynamic config itself (the dynamic-config reader trait is injected), does not invent a new gRPC, does not change any existing workflow semantics, and does not wire any remote CI triggers (GitHub Actions, nightly crons, release pipelines) — those are owned by the `pipeline-foundation` spec (backlog P16).
 
 ## Tasks
 
@@ -309,36 +309,70 @@ Crucially, this plan does **not** introduce dynamic config itself (the dynamic-c
     - Test location: `apps/tkr/tests/compat_local_vs_remote.rs`
     - _Requirements: 7.2_
 
-- [ ] 10. CI checks
-  - [ ] 10.1 Add `dev/ci/check-no-wallclock.sh`
-    - Create the script per the Design doc
-    - Make it executable; wire it into the CI workflow as a required check
-    - _Requirements: 9.1_
+- [ ] 10. Local CI pipeline via Dagger
+  - [ ] 10.1 Extract `dagger_reexec` helper into a shared module
+    - Move the `should_reexec_under_dagger`, `reexec_under_dagger`, and `reexec_args` helpers out of `apps/tkr/src/commands/image/mod.rs` and into a new `apps/tkr/src/dagger_reexec.rs` module. Generalise `reexec_args` to take a `&[String]` of already-formatted argv tail rather than the `ImageCommand` enum, so both `image` and `ci` command groups can share it
+    - Update `apps/tkr/src/commands/image/mod.rs` to import the shared helpers; add a small per-command shim that formats `ImageCommand` into `Vec<String>` before calling the shared `reexec_under_dagger`
+    - _Requirements: 10.2.5, 10.4.3_
 
-  - [ ] 10.2 Add `dev/ci/check-proto-monotonicity.sh`
-    - Create a bash script that: (a) reads the last git tag matching `v*`; (b) extracts `TEMPORAL_PROTO_VERSION` from `crates/tokeira-build-info/src/pinned.rs` at both the tip and the last tag; (c) compares via `sort -V -r | head -1` — if the tip version is less than the tagged version, fail unless the tip commit message contains `Proto-Downgrade:`
-    - Do the same for `TEMPORAL_SERVER_COMPAT` with the override key `Server-Compat-Downgrade:`
-    - Wire both into the CI workflow as required checks on PRs that modify `pinned.rs`
-    - _Requirements: 5.4, 8.3_
+  - [ ] 10.2 Scaffold `crates/tokeira-build/src/pipelines/ci.rs`
+    - Create the module alongside `pipelines/build.rs`, `pipelines/publish.rs`, `pipelines/mirror.rs`
+    - Define the `CiCheck`, `CiCheckRequest`, `CiCheckReport`, `CiCheckResult` types per design.md §7, all deriving `Serialize + Deserialize`
+    - Add `pub fn run_ci_checks(request: &CiCheckRequest, dagger: &dyn DaggerClient) -> Result<CiCheckReport, BuildError>` with the shared container-preamble (apt install `ripgrep` + `git`, workdir `/workspace`, `with_directory` using `TOKEIRAD_WORKSPACE_EXCLUDES`)
+    - Re-export the public surface from `crates/tokeira-build/src/lib.rs`
+    - _Requirements: 10.1, 10.4_
 
-  - [ ]* 10.3 Write a smoke test for the wall-clock check
-    - Add a temporary wall-clock call to `tokeira-build-info/build.rs`; run `check-no-wallclock.sh`; assert it exits non-zero
-    - Remove the temporary call; assert it exits zero
-    - This can be a one-time manual verification rather than a CI test (document in the task checklist)
-    - _Requirements: 9.1_
+  - [ ] 10.3 Implement the no-wallclock check
+    - Inside `ci.rs`, add `fn run_no_wallclock(base: &dyn ContainerRef<'_>) -> Result<CiCheckResult, BuildError>` that invokes `rg -n 'SystemTime::now|Utc::now|Local::now|OffsetDateTime::now_utc|chrono::Utc::now|chrono::Local::now' crates/tokeira-build-info/` inside the container and inspects the exit code
+    - `rg` exit status 0 = hits present = check FAILED; exit status 1 = no hits = check PASSED; any other exit = surface as a `BuildError::Validation`
+    - Capture the matching lines as `details` on the `CiCheckResult`
+    - _Requirements: 9.1.1, 10.1.1_
+
+  - [ ] 10.4 Implement the proto-monotonicity check
+    - Inside `ci.rs`, add `fn run_proto_monotonicity(base: &dyn ContainerRef<'_>) -> Result<CiCheckResult, BuildError>` that (a) resolves the last tag matching `v*` via `git describe --tags --abbrev=0 --match 'v*'`; (b) extracts `TEMPORAL_PROTO_VERSION` from `crates/tokeira-build-info/src/pinned.rs` at the tip and at the tag; (c) compares via semver (workspace-pinned `semver` dep)
+    - Fail the check if the tip version is lower than the tag version AND the tip commit message does NOT contain `Proto-Downgrade:`
+    - Repeat for `TEMPORAL_SERVER_COMPAT` with the override key `Server-Compat-Downgrade:`
+    - Report both sub-checks as separate lines in the `details` field; the top-level `passed` is the AND
+    - _Requirements: 5.4, 10.1.1_
+
+  - [ ]* 10.5 Write a property test for `run_ci_checks` dispatch
+    - **Property P-CI-2: CiCheckRequest selection**
+    - **Validates: Requirement 10.1.5**
+    - Use `MockDaggerClient` (the existing test harness in `crates/tokeira-build/src/testing.rs`). For each `CiCheck` variant and for the all-checks default, assert the expected set of `with_exec` calls is recorded on the mock
+    - Test location: `crates/tokeira-build/src/pipelines/ci.rs` `#[cfg(test)]` module
+    - _Requirements: 10.1.5_
+
+  - [ ] 10.6 Scaffold `apps/tkr/src/commands/ci/`
+    - Create `apps/tkr/src/commands/ci/mod.rs` with a `CiCommand` enum (variant `Check { check: Option<CliCiCheck>, json: bool }`) and a `pub async fn run(command: CiCommand, format: OutputFormat) -> Result<()>` entry point
+    - Define `CliCiCheck { NoWallclock, ProtoMonotonicity }` with `clap::ValueEnum` and `From<CliCiCheck> for CiCheck`
+    - Add `Ci(CiArgs)` variant to `apps/tkr/src/cli.rs::Command`; wire the dispatcher arm in `apps/tkr/src/main.rs`
+    - _Requirements: 10.2_
+
+  - [ ] 10.7 Implement the re-exec path and local invocation
+    - In `apps/tkr/src/commands/ci/mod.rs::run`, check `should_reexec_under_dagger()` at entry; when absent, format the argv tail and call the shared `reexec_under_dagger`
+    - When session env is present, construct a `CiCheckRequest`, call `run_ci_checks`, render output (human table or JSON via `--json`), exit status 0/1/2 per Req 10.2.6
+    - _Requirements: 10.2_
+
+  - [ ]* 10.8 Write integration test for `tkr ci check`
+    - Invoke `tkr ci check` via `std::process::Command` against a clean working tree; assert exit 0 and both checks PASSED in the JSON output
+    - Introduce a temporary `SystemTime::now()` call in `crates/tokeira-build-info/build.rs`; invoke `tkr ci check no-wallclock`; assert exit 1 and the NoWallclock check FAILED
+    - Remove the temporary call; re-run; assert exit 0
+    - Test location: `apps/tkr/tests/ci_check.rs`, gated behind `integration-test` feature per AGENTS.md
+    - _Requirements: 10.2, 10.3_
 
 - [ ] 11. Source tree hash helper
-  - [ ] 11.1 Implement `dev/ci/compute-source-tree-hash`
-    - A small Rust binary (under `dev/ci/` or `tools/source-tree-hash/`) that walks the workspace, applies the exclusion list from Req 1.3.3, sorts paths, and prints a SHA-256 to stdout
-    - Used by the Dagger pipeline (owned by [`image-lifecycle`](../image-lifecycle/requirements.md)) and by local `cargo build --release` workflows where the operator wants reproducible-build provenance
+  - [ ] 11.1 Implement `compute_source_tree_hash` in `tokeira-build`
+    - Add `pub fn compute_source_tree_hash(workspace_root: &Path) -> Result<String, BuildError>` to `crates/tokeira-build/src/pipelines/ci.rs` (or a sibling `source_tree_hash.rs` module if it grows)
+    - The function walks the workspace applying the exclusion list from Req 1.3.3 (reuses `TOKEIRAD_WORKSPACE_EXCLUDES` as the baseline plus the spec-specific extras), sorts paths deterministically, and returns a lowercase SHA-256 hex string
+    - Used by the Dagger build pipeline owned by [`image-lifecycle`](../image-lifecycle/requirements.md) and by `tkr image build` for reproducible-build provenance; operators who want to compute the hash directly can invoke it via a future `tkr provenance source-hash` subcommand (tracked as a non-blocking follow-up)
     - _Requirements: 1.3, 6.1_
 
   - [ ]* 11.2 Write property test for hash determinism
     - **Property P-CI-1: Source Tree Hash Determinism**
     - **Validates: Requirement 1.3.4**
-    - Generate arbitrary file trees via `proptest` (bounded depth, bounded file sizes); hash twice; assert byte-equal
+    - Generate arbitrary file trees via `proptest` (bounded depth, bounded file sizes) in a `tempfile::TempDir`; hash twice; assert byte-equal
     - Shuffle the traversal order in a test-only alternate implementation; assert the sort produces the same hash
-    - Test location: `tools/source-tree-hash/src/lib.rs` `#[cfg(test)]` module
+    - Test location: `crates/tokeira-build/src/pipelines/ci.rs` `#[cfg(test)]` module
     - _Requirements: 1.3.4_
 
 - [ ] 12. Documentation and integration
@@ -350,7 +384,8 @@ Crucially, this plan does **not** introduce dynamic config itself (the dynamic-c
     - Add the proto bump workflow (Req 5.2) to "Working Agreements"
     - Add the server-compat independence rule (Req 5.3) to the same section
     - Add a pointer from any "adding a new feature" checklist to this spec's matrix declaration
-    - _Requirements: 9.3.2_
+    - Add `tkr ci check` to the Enforced Commands list (Req 10.3.1) as the pre-push gate for compatibility invariants. Mention that `pipeline-foundation` (backlog P16) will wire the same checks into remote triggers; until then, `tkr ci check` is the canonical local verdict
+    - _Requirements: 9.3.2, 10.3_
 
   - [ ] 12.3 Add `README.md` to `crates/tokeira-build-info/`
     - Document the env vars a CI or hand-run release build must set (`TOKEIRA_GIT_SHA`, `TOKEIRA_SOURCE_TREE_HASH`, `CI`)
@@ -365,6 +400,5 @@ Crucially, this plan does **not** introduce dynamic config itself (the dynamic-c
     - Run `cargo check --workspace`
     - Run `cargo test --workspace`
     - Run `cargo doc --workspace --no-deps` with `RUSTDOCFLAGS="-D warnings"`
-    - Run `dev/ci/check-no-wallclock.sh`
-    - Run `dev/ci/check-proto-monotonicity.sh` against a clean working tree (expected: no-op)
+    - Run `tkr ci check` against a clean working tree (expected: all checks PASSED, exit 0)
     - All commands must pass with zero warnings

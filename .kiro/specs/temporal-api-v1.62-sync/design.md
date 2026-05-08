@@ -12,7 +12,7 @@ The design is organised around seven principles that follow directly from Tokeir
 - **Absorb only what costs less than deferring.** Three v1.62 surfaces are implemented in this spec rather than deferred: `CountSchedules` (a trivial count over the existing `ScheduleStore`), `UpdateTaskQueueConfig` (a setter over a new in-memory `TaskQueueConfigStore` that mirrors `ScheduleStore`/`VersioningRuleStore`), and Nexus v2 field wire-through on existing Nexus RPCs (decode, carry through `NexusTaskBroker`/`NexusEndpointRegistry`, re-emit). Every other feature area surfaces as an `Unimplemented` stub with a bracketed comment block naming the deferring spec.
 - **RPC renames are live-handler migrations.** The four `*ById` activity RPCs (`UpdateActivityOptionsById`, `PauseActivityById`, `UnpauseActivityById`, `ResetActivityById`) are renamed in-place to their unsuffixed v1.62 forms. Handler bodies are preserved modulo signature drift. These migrations are not stubs — they are live RPCs whose message types and field layouts changed, and they do not belong inside any deferred-block bracketed comment.
 - **Reviewability is a first-class artifact.** The Surface_Audit table is expected to carry 60–100+ rows covering every RPC, field, message, enum, and package change. Classification decisions are reviewable inline alongside the design, not buried in implementation PRs. The Impact Matrix enforces that every `Classification_WireThrough` field that is not `none`/`none`/`none` across all three downstream impact columns is escalated to `Classification_Deferred` if it would require more than a single-file change (Req 5.1.3, 5.1.4, 5.1.5).
-- **v0.4 SDK integration test is the invariant guard.** A single, `#[ignore]`-gated integration test under `apps/tokeira-bench/tests/v0_4_integration.rs` spawns `tokeirad` in-process against an in-memory storage backend, runs a v0.4 SDK worker for two heartbeat intervals, starts a workflow, asserts completion, and greps server logs for at least one `record_worker_heartbeat` debug line. It is the regression guard that catches anyone who later strips the heartbeat handler or the capability advertisement. It uses `tokio::sync::Notify` for synchronisation per `tokeira/AGENTS.md` Rule 1, completes in under 120 s, and is opt-in via `--include-ignored`.
+- **v0.4 SDK integration test is the invariant guard.** A single, `#[ignore]`-gated integration test under `apps/tokeira-bench/tests/v0_4_integration.rs` spawns `tokeirad` in-process against an in-memory storage backend, runs a v0.4 SDK worker until at least one observed `record_worker_heartbeat` call reaches `tokeirad`, starts a workflow, asserts completion, and greps server logs for the matching heartbeat debug line. It is the regression guard that catches anyone who later strips the heartbeat handler or the capability advertisement. The 90-second timeout in Req 7.1.7 gives the 30-second SDK heartbeat interval two chances to fire; multi-heartbeat observability is the `worker-heartbeat-observability` spec's concern. The test uses `tokio::sync::Notify` for synchronisation per `tokeira/AGENTS.md` Rule 1, completes in under 120 s, and is opt-in via `--include-ignored`.
 
 ## Architecture
 
@@ -991,7 +991,7 @@ Every `Classification_WireThrough` row whose Kernel, Runtime, or Projection impa
 
 | Kind | Qualified Name | Added In | Classification | Disposition | Target Spec |
 |---|---|---|---|---|---|
-| Package | `temporal.api.worker.v1` | v1.48 (heartbeat types) | Wire through | Regenerate via resync; `WorkerHeartbeat` used as opaque payload by `RecordWorkerHeartbeat` | — |
+| Package | `temporal.api.worker.v1` | v1.48 (heartbeat types) | No-op/compile-only | Regenerate via resync; types compile in the generated tree. `RecordWorkerHeartbeat` accepts `Vec<WorkerHeartbeat>` on its request and discards the payload — no translator consumes the types, so no Edge DTO is introduced. Row is NOT counted by the wire-through structural property (§8 Property 2) | `worker-heartbeat-observability` |
 | Package | `temporal.api.rules.v1` | v1.57 | Deferred | Regenerate via resync; no handler consumes these types today | `workflow-rules` |
 | Package | `temporal.api.protometa.v1` | v1.55 | Ignore | Informational annotations only; compile cleanly, no code consumes | — |
 
@@ -1193,16 +1193,18 @@ Every `Classification_WireThrough` row whose Kernel, Runtime, or Projection impa
 
 ### Worker messages (in `temporal.api.worker.v1`)
 
+These messages are generated into the vendored proto tree by the resync but are NOT decoded into Edge DTOs — `RecordWorkerHeartbeat` accepts the full `Vec<WorkerHeartbeat>` on its request type and discards the payload on the handler's no-op path. Real observability (decoding the heartbeat sub-structure, persisting it, exposing metrics) is the `worker-heartbeat-observability` spec's concern. The rows below are classified `No-op/compile-only` to make that explicit, and they are NOT counted by the wire-through structural property (§8 Property 2): no translator edit corresponds to a wire-through-field expectation for any of them.
+
 | Kind | Qualified Name | Added In | Classification | Disposition | Target Spec |
 |---|---|---|---|---|---|
-| Message | `WorkerHeartbeat` | v1.48 | Wire through | Carried as opaque payload by `RecordWorkerHeartbeat`; no persistence | `worker-heartbeat-observability` |
-| Message | `WorkerPollerInfo` | v1.48 | Wire through | Sub-field of `WorkerHeartbeat`; same disposition | `worker-heartbeat-observability` |
-| Message | `WorkerSlotsInfo` | v1.48 | Wire through | Sub-field of `WorkerHeartbeat`; same disposition | `worker-heartbeat-observability` |
-| Message | `WorkerHostInfo` | v1.48 | Wire through | Sub-field of `WorkerHeartbeat`; same disposition | `worker-heartbeat-observability` |
+| Message | `WorkerHeartbeat` | v1.48 | No-op/compile-only | Compiles in the generated tree; accepted on `RecordWorkerHeartbeatRequest.worker_heartbeat` and discarded by the handler; no Edge DTO | `worker-heartbeat-observability` |
+| Message | `WorkerPollerInfo` | v1.48 | No-op/compile-only | Sub-field of `WorkerHeartbeat`; discarded with the parent | `worker-heartbeat-observability` |
+| Message | `WorkerSlotsInfo` | v1.48 | No-op/compile-only | Sub-field of `WorkerHeartbeat`; discarded with the parent | `worker-heartbeat-observability` |
+| Message | `WorkerHostInfo` | v1.48 | No-op/compile-only | Sub-field of `WorkerHeartbeat`; discarded with the parent | `worker-heartbeat-observability` |
 | Message | `WorkerInfo` | v1.55 | Deferred | Used by Worker Deployments | `worker-deployments` |
 | Message | `WorkerListInfo` | v1.55 | Deferred | Used by `ListWorkers` | `worker-deployments` |
-| Message | `PluginInfo` | v1.48 | Wire through | Sub-field of `WorkerHeartbeat` | `worker-heartbeat-observability` |
-| Message | `StorageDriverInfo` | v1.48 | Wire through | Sub-field of `WorkerHeartbeat` | `worker-heartbeat-observability` |
+| Message | `PluginInfo` | v1.48 | No-op/compile-only | Sub-field of `WorkerHeartbeat`; discarded with the parent | `worker-heartbeat-observability` |
+| Message | `StorageDriverInfo` | v1.48 | No-op/compile-only | Sub-field of `WorkerHeartbeat`; discarded with the parent | `worker-heartbeat-observability` |
 
 ### Enum additions
 
@@ -1273,14 +1275,14 @@ One row per `Classification_WireThrough` field from the Surface_Audit. Columns p
 | `ScheduleSpec.time_zone_data` | confirm preserved in DTO | none | none | none | In scope (verification only) |
 | `BuildIdTaskReachability` | DTO enum mirrors | none | existing reachability queries unchanged if no branch logic | existing build-id visibility unchanged | In scope as wire-through only |
 | `ApplicationErrorCategory` | DTO enum mirrors | none | failure-object translation (single-file edit) | none | In scope |
-| `VersioningBehavior` new variants | DTO enum mirrors | none | existing scheduler reads but does not branch on new variants | none | In scope as wire-through only; scheduler branching is `runtime-worker-versioning` |
+| `VersioningBehavior` new variants | none (explicitly dropped at edge) | none | none | none | **Classified Deferred**. Per tightened Req 2.2.6, the edge explicitly drops the new variants; runtime scheduler does NOT branch on them in this spec. Deferred to `runtime-worker-versioning` (Req 5.1.3) |
 
-**Impact Matrix summary.** Four rows escalate from `Classification_WireThrough` to `Classification_Deferred` because they would require a kernel-transition change or a multi-file runtime change:
+**Impact Matrix summary.** Four rows are classified `Classification_Deferred` because they would require a kernel-transition change or a multi-file runtime change — their Impact Matrix rows carry `**Classified Deferred**` under Implementation Notes, and their Surface_Audit rows carry `Classification == Deferred`:
 
 1. `StartWorkflowExecutionRequest.versioning_override` → `runtime-worker-versioning`.
-2. `RespondActivityTaskFailedRequest.is_last_failure` → `runtime-activity-timeouts` (if runtime branches).
-3. `RespondNexusTaskFailedRequest.error.retry_behavior` → future `nexus-retry-policy` (if runtime branches).
-4. Any enum variant on `VersioningBehavior` or `NexusEndpointSpec.endpoint_type` whose semantics introduce branching in scheduling or retry is likewise escalated.
+2. `RespondActivityTaskFailedRequest.is_last_failure` → `runtime-activity-timeouts`.
+3. `RespondNexusTaskFailedRequest.error.retry_behavior` → future `nexus-retry-policy`.
+4. `VersioningBehavior` new variants → `runtime-worker-versioning`. `NexusEndpointSpec.endpoint_type` additions follow the same pattern if their semantics introduce runtime branching; today's new variant is wire-through because `NexusEndpointRegistry::resolve` just returns `NexusResolution::Failed` for unroutable types, matching the existing unknown-endpoint path.
 
 Escalation is recorded by updating the Surface_Audit row's Classification column to `Deferred` and moving the row out of the `Wire through` group into the `Deferred` group, with the Target Spec column pointing at the named follow-up spec. In this design doc we enumerate both the originally-wire-through disposition and the escalation note so reviewers see the decision path.
 
@@ -1297,6 +1299,8 @@ An RPC or field is classified `Classification_Ignore` when SDKs never call it in
 ### Classification_NoOp
 
 An RPC is classified `Classification_NoOp` when SDKs call it during worker liveness loops and expect `Ok(_)`, but the RPC's payload carries no workflow-observable semantics that Tokeira must preserve. `RecordWorkerHeartbeat` is the canonical example: the SDK's `SharedNamespaceWorker` emits one heartbeat every 30 s per registered worker; if the server returns `Unimplemented`, the worker treats it as a capability regression and shuts down. Tokeira must return `Ok` to keep the worker alive, but need not persist the heartbeat payload — that persistence is the `worker-heartbeat-observability` spec's job. `Classification_NoOp` is therefore "respond correctly at the wire without committing to the feature's semantics". A no-op handler emits one `debug!` log per call so operators can confirm the RPC is being exercised during regression testing.
+
+A close cousin of `Classification_NoOp` is the label `No-op/compile-only`, applied to messages and sub-messages that appear in the generated proto tree as types reachable from a `Classification_NoOp` RPC's request or response but whose payload is accepted and discarded by the handler. The canonical set is `temporal.api.worker.v1::{WorkerHeartbeat, WorkerPollerInfo, WorkerSlotsInfo, WorkerHostInfo, PluginInfo, StorageDriverInfo}`, all reachable from `RecordWorkerHeartbeatRequest.worker_heartbeat`. These types compile in the generated tree, and `Vec<WorkerHeartbeat>` flows in on the request — but no Edge DTO mirrors them, no translator decodes their fields, and the handler never reads them. The row is classified `No-op/compile-only` rather than `Wire through` precisely because no translator edit is expected for it; structural properties that count wire-through translator work MUST exclude this bucket (see §8 Property 2).
 
 ### Classification_Capability
 
@@ -1336,13 +1340,13 @@ The properties below are quantified explicitly over "for all" / "for any" inputs
 
 ### Property 1: Translator round-trip fidelity
 
-*For any* valid Edge_DTO instance of a type touched by this spec (minimum: `SystemCapabilities`, `NamespaceDescription`, `RespondWorkflowTaskCompletedRequest`, `CountSchedulesRequest`/`Response`, `UpdateTaskQueueConfigRequest`/`Response`, the renamed activity-management request DTOs, and every Nexus DTO whose message gained fields in v1.62), encoding the DTO into its generated proto type via the `*_to_proto` translator and decoding it back through the `*_from_proto` translator SHALL produce a DTO byte-equivalent on every field the translator is responsible for preserving. Fields classified `Classification_Deferred` and stored on the DTO but not re-emitted are explicitly excluded from the comparison with a documented Surface_Audit row reference (Req 4.5.2).
+*For any* valid Edge_DTO instance of a type touched by this spec (minimum: `SystemCapabilities`, `NamespaceDescription`, `RespondWorkflowTaskCompletedRequest`, `CountSchedulesRequest`/`Response`, `UpdateTaskQueueConfigRequest`/`Response`, the renamed activity-management request DTOs, and every Nexus DTO whose message gained fields in v1.62), encoding the DTO into its generated proto type via the `*_to_proto` translator and decoding it back through the `*_from_proto` translator SHALL produce a DTO byte-equivalent on every field the translator is responsible for preserving. Fields classified `Classification_Deferred` are excluded from the comparison because they are explicitly dropped at the edge per tightened Requirement 2.2.6 — they are NOT represented on the DTO in either direction, so the round-trip comparison has no field to validate. Each exclusion cites its Surface_Audit row per Req 4.5.2.
 
 **Validates: Requirements 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 4.8**
 
-### Property 2: Surface_Audit wire-through count matches Impact Matrix row count
+### Property 2: Surface_Audit wire-through count matches in-scope Impact Matrix row count
 
-*For any* valid rendering of the Surface_Audit table in this design document, the count of rows whose Classification column equals `Wire through` SHALL equal the count of rows in the Impact Matrix table plus the count of rows that have been escalated out of `Wire through` into `Deferred` (§6 escalation note). This is the structural contract that makes the Surface_Audit reviewable: every wire-through decision in §5 corresponds to exactly one implementation row in §6 or one explicitly-escalated row.
+*For any* valid rendering of the Surface_Audit table in this design document, the count of rows whose Classification column equals `Wire through` SHALL equal the count of rows in the Impact Matrix whose Implementation Notes column starts with `In scope`. Rows in the Impact Matrix whose Implementation Notes column starts with `**Classified Deferred**` are excluded from the equivalence because they already appear as `Classification_Deferred` rows in the Surface_Audit; counting them on both sides would double-count. Rows classified `No-op/compile-only` (e.g. `temporal.api.worker.v1` and its sub-messages) are also excluded — no translator edit corresponds to them, so they cannot participate in a wire-through structural count. This is the structural contract that makes the Surface_Audit reviewable: every wire-through decision in §5 corresponds to exactly one in-scope implementation row in §6.
 
 **Validates: Requirements 2.3, 2.3.3, 5.1.1**
 
@@ -1469,7 +1473,7 @@ Testing splits across three tiers:
 
 Unit tests live alongside the code they cover:
 
-- `crates/tokeira-edge/src/translate/mod.rs` — per-DTO default-value assertions (e.g. `SystemCapabilities::default().worker_heartbeats == false` — note this is the DTO default; the advertised value is set at the construction site in `workflow_service.rs` per Req 4.1.5).
+- `crates/tokeira-edge/src/translate/mod.rs` — per-DTO default-value assertions: `SystemCapabilities::default().worker_heartbeats == true` and `NamespaceCapabilities::default().worker_heartbeats == true` (the manual `Default` impls in §Data Models guarantee both; Req 4.1.2 and the SDK v0.4 liveness contract depend on this). The advertised value on the wire is set at the construction site in `workflow_service.rs` per Req 4.1.5, but the DTO default is also `true` so intermediate construction sites that call `SystemCapabilities::default()` do not silently regress the advertisement.
 - `crates/tokeira-edge/src/grpc/workflow_service.rs` — per-handler tests for:
   - `record_worker_heartbeat`: empty-namespace case returns `invalid_argument`; non-empty namespace returns `Ok` and emits exactly one debug log (via a test-only tracing subscriber).
   - Each deferred-block handler: returns `Status::unimplemented` with the expected message format.

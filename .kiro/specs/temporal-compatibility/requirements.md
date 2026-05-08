@@ -352,6 +352,31 @@ The spec owns the compatibility contract and the build-time metadata. It consume
 3. A `TEMPORAL_SERVER_COMPAT` downgrade SHALL similarly require an explicit override (`Server-Compat-Downgrade: <reason>`).
 4. GitHub Actions or other remote CI trigger wiring is OUT OF SCOPE for this spec. The Dagger pipeline underlying `tkr ci check` is the portable substrate; remote-trigger wiring is owned by the `pipeline-foundation` spec (backlog P16). Operators MUST run `tkr ci check` before push until `pipeline-foundation` lands; the pre-push step is documented in `AGENTS.md` per Req 9.3.
 
+### Requirement 5.5: Server compat bump protocol
+
+**User Story:** As a Tokeira maintainer, I want a documented, tool-driven protocol for bumping `TEMPORAL_SERVER_COMPAT`, so that the claim stays close to the upstream Temporal tip, matches a written audit trail, survives reviewer turnover, and is never blocked by feature-coverage gaps that the matrix already communicates honestly.
+
+#### Acceptance Criteria
+
+1. THE bump protocol SHALL recognise three bump triggers, any of which is sufficient to initiate a bump:
+   - **Trigger 1**: Upstream adds behaviour tokeira already classifies `Implemented` or `Experimental` in the feature matrix. Typically a low-risk paperwork bump.
+   - **Trigger 2**: A matrix row moved to `Implemented` and doing so unblocks a claim on an upstream release that introduced the feature. The row move lands first, the bump follows (Req 5.5.4).
+   - **Trigger 3**: Calendar drift. Upstream is ≥6 releases ahead of tokeira's current claim for ≥3 months AND the upstream delta is entirely `Stubbed`/`Unsupported` features tokeira's matrix already documents. Trigger 3 is valid AND expected: it keeps the operator-visible claim close to upstream despite partial coverage, because the feature matrix (not `TEMPORAL_SERVER_COMPAT`) is the authoritative source of what tokeira actually does.
+2. BUMPS SHALL be driven exclusively by the `tkr compat bump --to <version>` CLI command per Feature 11. Hand-editing `crates/tokeira-build-info/src/pinned.rs` outside this command is a protocol violation; `tkr ci check` SHALL fail when `pinned.rs` changes in a commit whose message lacks the required `Server-Compat-Bump:` trailer (Req 5.5.5).
+3. A Server Compat Bump PR SHALL modify `crates/tokeira-build-info/src/pinned.rs` and its rationale comment, and no other file. Feature-matrix row changes and server-compat bumps SHALL NOT appear in the same PR.
+4. A Server Compat Bump PR body SHALL include:
+   - The chosen trigger (1, 2, or 3) with a one-sentence justification.
+   - The Upstream Releases table: one row per Temporal release between the old and new claim, with a link to the upstream release notes and a one-line verbatim quote from those notes.
+   - The Disposition Table: every upstream-introduced surface (new RPC, new field, new default, new message, new enum variant) between the old and new claim, each mapped to exactly one tokeira disposition (`Implemented`, `Experimental`, `Stubbed`, `Unsupported`, `Not wire-visible (internal)`) with the matching feature-matrix row where one exists.
+   - The Matrix Delta section: every feature-matrix row whose state changed since the previous `TEMPORAL_SERVER_COMPAT` commit. Trigger 1 bumps typically have an empty delta; trigger 2 bumps name the row that unblocked the bump; trigger 3 bumps typically have an empty delta and the PR body says so explicitly.
+   - The SDK Test-Suite Evidence section. Where `SdkMatrix.test_suite_ref` entries point at real suites that have been run against tokeirad at the new claim, the section SHALL cite the run. Where the suites are not yet running, the section SHALL say so and SHALL link the tracking issue. A bump SHALL NOT be blocked on the suites being absent (Req 5.5.7).
+5. EVERY commit landing a Server Compat Bump SHALL include a trailer line matching the regex `^Server-Compat-Bump: \d+\.\d+\.\d+ -> \d+\.\d+\.\d+, trigger: [123]$`. THE trailer's old version SHALL match `TEMPORAL_SERVER_COMPAT` at the commit's parent; THE trailer's new version SHALL match `TEMPORAL_SERVER_COMPAT` at the commit. `tkr ci check` enforces both invariants mechanically.
+6. A Server Compat Bump PR SHALL be approved by a `CODEOWNERS`-named reviewer before merge. THE `CODEOWNERS` file SHALL name `crates/tokeira-build-info/src/pinned.rs` as requiring an owner-team approval; Feature 10 covers the file's creation and wiring. Until GHA branch protection is wired by `pipeline-foundation`, the `CODEOWNERS` file is an informational record enforced by reviewer discipline and by the PR template's reviewer checklist.
+7. A Server Compat Bump PR SHALL NOT be blocked on 100% feature coverage of the claimed version. THE server-compat claim is deliberately permitted to run ahead of coverage; the authoritative record of what tokeira actually does is the feature matrix plus `tokeira_feature_states` in the capability handshake.
+8. THE `crates/tokeira-build-info/src/pinned.rs` rationale comment SHALL name the latest Server Compat Bump PR number and the trigger. Bump PRs SHALL amend this comment as part of the same commit.
+9. THE initial `TEMPORAL_SERVER_COMPAT = "1.27.0"` value predates this protocol. Landing Req 5.5 SHALL include a retroactive "Bump PR 0" task (tracked in tasks.md) that authors a fully-templated PR body for the current `1.27.0` value, establishing the baseline disposition table so future diffs have a starting point. Bump PR 0 MAY be a committed markdown file under `docs/compat-bumps/0-baseline.md` rather than an actual GitHub PR, because the value already exists in the tree; this exception SHALL be documented in the file itself.
+10. THE `AGENTS.md` "Working Agreements" section SHALL carry a "Server compat bump protocol" subsection summarising the triggers, the `tkr compat bump` command, the `Server-Compat-Bump:` trailer requirement, and the CODEOWNERS gate.
+
 ---
 
 ## Feature 6: Build Provenance
@@ -526,7 +551,7 @@ The spec owns the compatibility contract and the build-time metadata. It consume
 2. THE pipeline SHALL be invocable from Rust via a public function `pub fn run_ci_checks(request: &CiCheckRequest, dagger: &dyn DaggerClient) -> Result<CiCheckReport, BuildError>` that returns a structured report enumerating each check and its outcome.
 3. THE pipeline SHALL mount the workspace into the Dagger container using the exclude list established by `TOKEIRAD_WORKSPACE_EXCLUDES` (or a CI-specific subset thereof), so cold invocations do NOT upload the multi-GB `target/` tree — the invariant proven by the `tkr image build` work landed in commit `3082176`.
 4. THE pipeline SHALL use a small `debian:bookworm-slim` or equivalent image with `ripgrep` and `git` installed; it SHALL NOT depend on the full `tokeirad` build image.
-5. Individual check selection SHALL be supported via `CiCheckRequest { checks: Vec<CiCheck> }` where `CiCheck { NoWallclock, ProtoMonotonicity }` is an enum; an empty `checks` vector means "run all checks".
+5. Individual check selection SHALL be supported via `CiCheckRequest { checks: Vec<CiCheck> }` where `CiCheck { NoWallclock, ProtoMonotonicity, ServerCompatMonotonicity, BumpTrailer }` is an enum; an empty `checks` vector means "run all checks".
 
 ### Requirement 10.2: `tkr ci check` command
 
@@ -559,3 +584,126 @@ The spec owns the compatibility contract and the build-time metadata. It consume
 1. THE `run_ci_checks` function SHALL take a Dagger client abstraction (the same `DaggerClient` trait as the existing image build/publish/mirror pipelines), so a `pipeline-foundation`-owned remote runner can pass a differently-configured client without changing the check implementations.
 2. THE `CiCheckReport` SHALL be `Serialize + Deserialize` via serde so `pipeline-foundation` can ship the report to an external system (artifact store, badge server) without re-serialising the check logic.
 3. Adding a new check SHALL be a one-function addition to `ci.rs` plus one variant on the `CiCheck` enum; it SHALL NOT require changes outside `crates/tokeira-build/` or `apps/tkr/src/commands/ci/`.
+---
+
+## Feature 11: `tkr compat bump` — driven server-compat bumps
+
+This feature operationalises the Req 5.5 bump protocol as a `tkr` CLI subcommand that walks the maintainer through a Server Compat Bump end-to-end: preflight, evidence gathering from the GitHub API, local commit with the required trailer, local `tkr ci check` validation, push, and PR opening.
+
+### Requirement 11.1: Command surface
+
+**User Story:** As a Tokeira maintainer, I want a single CLI command that drives the entire Server Compat Bump process, so that bumps remain protocol-compliant without me remembering every step.
+
+#### Acceptance Criteria
+
+1. THE `tkr` CLI SHALL expose a `compat bump` subcommand under the existing `tkr compat` group with the signature:
+
+   ```
+   tkr compat bump --to <version>
+                   [--trigger 1|2|3]
+                   [--dry-run]
+                   [--derive-surfaces]
+                   [--no-open]
+                   [--resume | --reset]
+                   [--yes]
+                   [--json]
+   ```
+
+2. `<version>` SHALL be a strict semver string (e.g. `1.29.0`, no `v` prefix to match the `TEMPORAL_SERVER_COMPAT` constant shape).
+3. `--trigger` SHALL be required in non-interactive mode (`--yes` or `--json`) and SHALL be interactively prompted otherwise. It SHALL accept only `1`, `2`, or `3`.
+4. `--dry-run` SHALL print the proposed PR body, branch name, commit message, and pinned.rs diff to stdout without performing any git mutations, network writes, or branch creation.
+5. `--derive-surfaces` SHALL enable the optional upstream proto-diff step described in Feature 11.5. When absent, the generated disposition table SHALL contain a single placeholder row the operator fills manually before pushing.
+6. `--no-open` SHALL stop after the local commit + push phases, producing a pushed branch but no GitHub PR. Useful for maintainers who prefer to open the PR via the GitHub web UI.
+7. `--resume` and `--reset` SHALL be mutually exclusive; both govern retry behaviour when a bump branch already exists locally (see Req 11.6).
+8. Exit status: 0 on success (PR opened or `--no-open` reached its natural end), 1 on any enumerated failure mode from §Failure Modes in design.md, 2 on usage error (enforced by clap).
+
+### Requirement 11.2: Phased execution
+
+**User Story:** As a Tokeira maintainer, I want the bump command's phases to be clearly separated between read-only, local-write, and network-write actions, so that interruptions leave the repository in a knowable state.
+
+#### Acceptance Criteria
+
+1. THE command SHALL execute the following phases in order and SHALL NOT advance past a phase boundary unless the prior phase succeeded:
+   - **Phase A — Preflight** (read-only): load `pinned.rs`, validate target version newer via semver, validate working tree clean, validate branch is `main` (or the configured default), validate GitHub credentials via a `GET /user` call.
+   - **Phase B — Evidence** (network reads, no writes): enumerate upstream Temporal releases between old and new via the GitHub REST API, fetch each release body, diff the feature matrix against the commit of the previous `Server-Compat-Bump:` trailer, optionally diff the `temporalio/api` proto tree when `--derive-surfaces` is active.
+   - **Phase C — Local Mutations** (git write, no network): create the bump branch, update `pinned.rs`, commit with the `Server-Compat-Bump:` trailer, run `tkr ci check` on the branch.
+   - **Phase D — Publish** (network writes): push the branch, open the GitHub PR, amend the commit to replace the PR-number placeholder in `pinned.rs` with the real number, force-with-lease re-push.
+2. Phase A failures SHALL produce no git or network side effects.
+3. Phase B failures SHALL produce no git side effects and SHALL leave no orphaned remote resources.
+4. Phase C failures SHALL leave the bump branch in place for debugging but SHALL NOT push it; the operator recovers via `--resume` or `git branch -D`.
+5. Phase D failures SHALL leave the pushed branch in place but SHALL NOT leave an orphaned open PR. If PR opening fails mid-step, the tool SHALL write the rendered PR body to a local file and name it in the error output so the operator can open the PR manually.
+6. Between Phase B and Phase C, IF not in `--yes` or `--json` mode, THE command SHALL present a confirmation prompt summarising the scope of the bump (count of upstream releases in range, count of upstream-introduced surfaces, count of matrix rows moved).
+
+### Requirement 11.3: Trailer and templated content
+
+**User Story:** As a Tokeira reviewer, I want every bump commit and PR body to follow the same machine-verifiable shape, so that review is fast and mechanical checks work.
+
+#### Acceptance Criteria
+
+1. THE commit created in Phase C SHALL carry a trailer line matching the regex in Req 5.5.5 exactly. THE trailer SHALL be appended using `git interpret-trailers` (not string concatenation) to handle existing trailers safely.
+2. THE PR title SHALL follow the pattern `Server compat bump: <old> -> <new> (trigger: <N>)`.
+3. THE PR body SHALL be rendered from a single Markdown template stored at `crates/tokeira-build/src/compat_bump/pr_template.md` (or equivalent workspace-relative path). Every placeholder SHALL be filled; rendering with any placeholder left unbound SHALL be an error.
+4. THE template SHALL carry, at minimum, the sections enumerated in Req 5.5.4: trigger justification, Upstream Releases table, Disposition Table, Matrix Delta, SDK Test-Suite Evidence, pinned.rs diff, and the reviewer checklist.
+5. THE rationale comment in `pinned.rs` SHALL be updated in Phase C with the new claim and a placeholder `PR #?` token; THE placeholder SHALL be replaced with the real PR number in Phase D.
+
+### Requirement 11.4: GitHub API integration
+
+**User Story:** As a Tokeira maintainer, I want the bump tool to handle GitHub authentication, pagination, and rate-limiting predictably, so that transient failures are clearly recoverable.
+
+#### Acceptance Criteria
+
+1. THE command SHALL read GitHub authentication in the following precedence: (a) `GH_TOKEN` environment variable (matches the `gh` CLI convention); (b) `~/.config/tokeira/github-token` file with mode 0600; (c) fail with a diagnostic naming both options and their installation steps.
+2. THE authentication token SHALL be validated in Phase A with a `GET /user` call. THE command SHALL verify the token carries at minimum `public_repo` and `pull_requests: write` scopes; missing scopes SHALL fail with an explicit scope list in the error.
+3. THE command SHALL use the `octocrab` crate for GitHub REST and GraphQL access. Direct `reqwest` calls to `https://api.github.com` are prohibited to keep one auth path and one rate-limit observer.
+4. GITHUB rate-limit responses (HTTP 429 or 403 with `X-RateLimit-Remaining: 0`) SHALL be surfaced with the reset time from `X-RateLimit-Reset` and a suggestion to retry with `--resume` when the window reopens.
+5. RELEASE enumeration SHALL paginate automatically via `octocrab::stream`; THE command SHALL cache release bodies locally under `target/tkr/compat-cache/<tag>` so `--resume` does not re-fetch.
+6. PR CREATION SHALL use `octocrab::issues()` / `octocrab::pulls()` typed methods. Raw JSON POSTs are prohibited.
+
+### Requirement 11.5: `--derive-surfaces` optional evidence
+
+**User Story:** As a Tokeira maintainer, I want an optional evidence step that produces a skeleton disposition table from the upstream proto diff, so that large bumps don't require manually enumerating every new RPC and field.
+
+#### Acceptance Criteria
+
+1. WHEN `--derive-surfaces` is passed, THE command SHALL resolve the `temporalio/api` proto tag pinned by each Temporal server release in range via `GET /repos/temporalio/temporal/contents/go.mod?ref=<tag>`, parsing the `go.mod` for the `go.temporal.io/api` pin.
+2. THE command SHALL shallow-clone `temporalio/api` at the two resolved tags into `target/tkr/compat-cache/api-<tag>/`. Clones SHALL reuse any cached clone and SHALL NOT re-download when the cache is warm.
+3. THE command SHALL diff the two proto trees and classify diff entries into: new RPC declarations (`rpc <Name>(`), new message fields (`= <n>;` numbered additions on existing messages), new messages, new enum variants.
+4. THE skeleton Disposition Table SHALL list every classified diff entry with the `Tokeira disposition` column blank and the `Matrix row` column auto-filled where a feature-matrix entry names the surface. Where no match exists, the `Matrix row` column SHALL read `—`.
+5. `--derive-surfaces` SHALL be best-effort: a clone failure, proto-tree mismatch, or GitHub 404 on the `go.mod` fetch SHALL produce a warning and fall through to the non-derived path, not fail the bump.
+6. `--derive-surfaces` is IMPLEMENTED IN TWO STAGES. Stage 1 (landed with the core Feature 11 work) produces the raw diff as a commented appendix in the PR body so the operator can cut-and-paste classifications. Stage 2 (follow-up task) produces the skeleton table structure described in this requirement. Stage 2 is deferred until the core command lands and is exercised in practice.
+
+### Requirement 11.6: Idempotency and retry
+
+**User Story:** As a Tokeira maintainer, I want `tkr compat bump` to be rerunnable after transient failures without leaving half-complete state, so that network flakes and local mistakes are recoverable without a destructive cleanup.
+
+#### Acceptance Criteria
+
+1. RERUNNING `tkr compat bump --to <version>` when a local branch named `compat/server-compat-bump-<old>-<new>` already exists SHALL fail unless `--resume` or `--reset` is passed.
+2. `--resume` SHALL replay Phases C and D from the current branch tip, reusing the existing commit if its trailer matches the expected shape, and otherwise amending the commit to carry the correct trailer.
+3. `--reset` SHALL delete the local branch, remove any cached evidence from `target/tkr/compat-cache/`, and restart from Phase A.
+4. WHEN an open GitHub PR already exists for the same bump branch, `tkr compat bump` SHALL print the PR URL and exit 0 (no duplicate PR opened). `--reset` overrides this behaviour by closing the existing PR and opening a new one.
+5. THE command SHALL NOT create temporary commits that are later rewritten by a squash. Phase C creates exactly one commit; Phase D amends that same commit to replace the placeholder PR number.
+
+### Requirement 11.7: Acceptance, testing, and failure-mode coverage
+
+**User Story:** As a Tokeira maintainer, I want `tkr compat bump` to ship with tests that cover every failure mode and the happy path, so that a regression in the command does not break the bump protocol silently.
+
+#### Acceptance Criteria
+
+1. A property test SHALL assert: for any valid `BumpContext` (old version, new version, release list, matrix delta, trigger), the rendered PR body contains every placeholder filled and contains the `Server-Compat-Bump:` trailer in the commit message section.
+2. A property test SHALL assert: the generated commit message is exactly byte-equal across repeated renderings with the same inputs (deterministic).
+3. A unit test SHALL assert: the `Server-Compat-Bump:` trailer regex in Req 5.5.5 accepts all well-formed trailers and rejects common malformations (missing trigger, non-semver versions, wrong arrow, wrong trigger digit).
+4. Integration tests against a mocked `octocrab` client SHALL exercise Phase A + Phase B + Phase D (the Phase C local-git mutations are exercised against a `tempfile::TempDir` fixture holding a fresh git repo).
+5. ONE integration test, gated behind the `integration-test` feature flag and the `--ignored` attribute, SHALL open a real PR against a fork of the tokeira repository and then close it. Running this test requires a test-scope `GH_TOKEN`; it is not part of the default `cargo test` set per AGENTS.md.
+6. EVERY failure mode enumerated in the design's §Failure Modes table SHALL have either a unit test (for pure-logic failures) or an integration test (for IO failures via mocked clients).
+
+### Requirement 11.8: Cross-references and forward compatibility
+
+**User Story:** As a Tokeira maintainer, I want `tkr compat bump` to integrate cleanly with the existing `tkr ci check` pipeline and with the forthcoming `pipeline-foundation` remote triggers, so that the bump process does not diverge between local and remote environments.
+
+#### Acceptance Criteria
+
+1. `tkr compat bump` Phase C SHALL invoke `tkr ci check` (the Feature 10 Dagger pipeline) on the bump branch tip before attempting Phase D. IF `tkr ci check` fails, THE bump SHALL abort and the operator SHALL be pointed at the failing check output; Phase D never runs on a red branch.
+2. THE `Server-Compat-Bump:` trailer check SHALL be added to `tkr ci check` as part of the proto-monotonicity / version-pin family (renamed from `run_proto_monotonicity` to `run_version_pin_checks` in the implementation per design). THE check SHALL fire only when `pinned.rs` changed in the tip commit.
+3. `pipeline-foundation` (backlog P16) SHALL re-use the `tkr ci check` version-pin family when wiring remote triggers for bump PRs. No separate CI logic lives in a GHA workflow.
+4. THE `CODEOWNERS` file created per Req 5.5.6 SHALL be honoured by `pipeline-foundation`'s eventual branch-protection rules without re-writing, by naming the `pinned.rs` path and the owner team with a portable syntax GH recognises directly.

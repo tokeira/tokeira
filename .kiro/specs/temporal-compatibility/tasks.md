@@ -10,9 +10,12 @@ Target crates:
 - `crates/tokeira-compatibility/` — NEW library crate with `FEATURE_MATRIX`, `SDK_MATRIX`, `dispatch_rpc`, `cfg_feature!`
 - `crates/tokeira-edge/` — extend with `GetSystemInfo` handler that walks the matrix + `dispatch_rpc` adoption across workflow-service and operator-service handlers
 - `crates/tokeira-kernel/` — adopt `cfg_feature!` at existing feature-gated module boundaries
-- `apps/tkr/` — add `compat` and `ci` command groups
+- `apps/tkr/` — add `compat` and `ci` command groups; `compat` carries `show`, `diff`, and `bump`
 - `proto/tokeira/internal/v1/` — define `system_info_ext.proto` extension carrying tokeira build info
-- `crates/tokeira-build/src/pipelines/ci.rs` — NEW Dagger-backed local CI pipeline (no-wallclock, proto monotonicity, source-tree hash)
+- `crates/tokeira-build/src/pipelines/ci.rs` — NEW Dagger-backed local CI pipeline (no-wallclock, version-pin monotonicity, bump-trailer, source-tree hash)
+- `crates/tokeira-build/src/compat_bump/` — NEW bump engine powering `tkr compat bump` (preflight / evidence / mutate / publish phases; octocrab-backed GitHub API integration)
+- `.github/CODEOWNERS` — NEW file naming `pinned.rs` as compat-owner-gated
+- `docs/compat-bumps/0-baseline.md` — NEW retroactive baseline establishing the starting point for bump PR diffs
 
 Crucially, this plan does **not** introduce dynamic config itself (the dynamic-config reader trait is injected), does not invent a new gRPC, does not change any existing workflow semantics, and does not wire any remote CI triggers (GitHub Actions, nightly crons, release pipelines) — those are owned by the `pipeline-foundation` spec (backlog P16).
 
@@ -328,11 +331,11 @@ Crucially, this plan does **not** introduce dynamic config itself (the dynamic-c
     - Capture the matching lines as `details` on the `CiCheckResult`
     - _Requirements: 9.1.1, 10.1.1_
 
-  - [ ] 10.4 Implement the proto-monotonicity check
-    - Inside `ci.rs`, add `fn run_proto_monotonicity(base: &dyn ContainerRef<'_>) -> Result<CiCheckResult, BuildError>` that (a) resolves the last tag matching `v*` via `git describe --tags --abbrev=0 --match 'v*'`; (b) extracts `TEMPORAL_PROTO_VERSION` from `crates/tokeira-build-info/src/pinned.rs` at the tip and at the tag; (c) compares via semver (workspace-pinned `semver` dep)
-    - Fail the check if the tip version is lower than the tag version AND the tip commit message does NOT contain `Proto-Downgrade:`
-    - Repeat for `TEMPORAL_SERVER_COMPAT` with the override key `Server-Compat-Downgrade:`
-    - Report both sub-checks as separate lines in the `details` field; the top-level `passed` is the AND
+  - [ ] 10.4 Implement the version-pin monotonicity check (proto + server compat)
+    - Inside `ci.rs`, add `fn run_version_pin_monotonicity(base: &dyn ContainerRef<'_>, pin: PinKind) -> Result<CiCheckResult, BuildError>` that (a) resolves the last tag matching `v*` via `git describe --tags --abbrev=0 --match 'v*'`; (b) extracts the named constant (either `TEMPORAL_PROTO_VERSION` or `TEMPORAL_SERVER_COMPAT`) from `crates/tokeira-build-info/src/pinned.rs` at the tip and at the tag; (c) compares via semver (workspace-pinned `semver` dep)
+    - Fail the check if the tip version is lower than the tag version AND the tip commit message does NOT contain the matching downgrade override trailer (`Proto-Downgrade:` for proto, `Server-Compat-Downgrade:` for server compat)
+    - `PinKind::Proto` and `PinKind::ServerCompat` dispatch to the same logic with different constant names and override trailers
+    - THE `CiCheck::BumpTrailer` check is implemented in task 13.18, not here — this task covers only the monotonicity check family
     - _Requirements: 5.4, 10.1.1_
 
   - [ ]* 10.5 Write a property test for `run_ci_checks` dispatch
@@ -344,7 +347,7 @@ Crucially, this plan does **not** introduce dynamic config itself (the dynamic-c
 
   - [ ] 10.6 Scaffold `apps/tkr/src/commands/ci/`
     - Create `apps/tkr/src/commands/ci/mod.rs` with a `CiCommand` enum (variant `Check { check: Option<CliCiCheck>, json: bool }`) and a `pub async fn run(command: CiCommand, format: OutputFormat) -> Result<()>` entry point
-    - Define `CliCiCheck { NoWallclock, ProtoMonotonicity }` with `clap::ValueEnum` and `From<CliCiCheck> for CiCheck`
+    - Define `CliCiCheck { NoWallclock, ProtoMonotonicity, ServerCompatMonotonicity, BumpTrailer }` with `clap::ValueEnum` and `From<CliCiCheck> for CiCheck`
     - Add `Ci(CiArgs)` variant to `apps/tkr/src/cli.rs::Command`; wire the dispatcher arm in `apps/tkr/src/main.rs`
     - _Requirements: 10.2_
 
@@ -375,25 +378,186 @@ Crucially, this plan does **not** introduce dynamic config itself (the dynamic-c
     - Test location: `crates/tokeira-build/src/pipelines/ci.rs` `#[cfg(test)]` module
     - _Requirements: 1.3.4_
 
-- [ ] 12. Documentation and integration
-  - [ ] 12.1 Update `README.md`
+- [ ] 12. CODEOWNERS and Bump PR 0 baseline
+  - [ ] 12.1 Create `.github/CODEOWNERS`
+    - Add a line `crates/tokeira-build-info/src/pinned.rs @iw/tokeira-compat-owners` (team handle placeholder — use the concrete maintainer handle that exists on GitHub today; the team handle convention survives Pipeline Foundation wiring later)
+    - Add `docs/compat-bumps/ @iw/tokeira-compat-owners` so retroactive and future PR-body records are owned by the same group
+    - Document in the file's header comment that this file is informational until `pipeline-foundation` wires branch protection
+    - _Requirements: 5.5.6_
+
+  - [ ] 12.2 Author Bump PR 0 baseline record
+    - Create `docs/compat-bumps/0-baseline.md` capturing the initial `TEMPORAL_SERVER_COMPAT = "1.27.0"` claim with the full PR body shape Req 5.5.4 mandates, but filled in retroactively
+    - Header note: "This is a retroactive baseline per Req 5.5.9. The claim predates the `tkr compat bump` protocol; this document establishes the starting point so future bump PRs have a comparable disposition table to diff against."
+    - Include the Upstream Releases table for Temporal server 1.27.0 itself (the single release), the Disposition Table covering upstream surfaces tokeira encountered up to 1.27.0 based on the feature matrix as of this spec's landing, Matrix Delta marked `(baseline — no delta)`, SDK Test-Suite Evidence marked `(baseline — suites not yet running)`, and the reviewer checklist
+    - _Requirements: 5.5.9_
+
+  - [ ] 12.3 Update `pinned.rs` rationale comment to cite the baseline
+    - The rationale comment above the `TEMPORAL_SERVER_COMPAT` constant MUST point at `docs/compat-bumps/0-baseline.md` with the phrase "Last bump: baseline — see docs/compat-bumps/0-baseline.md"
+    - Future bump PRs will amend this comment per Req 5.5.8
+    - _Requirements: 5.5.8, 5.5.9_
+
+- [ ] 13. `tkr compat bump` command (Feature 11)
+  - [ ] 13.1 Scaffold `crates/tokeira-build/src/compat_bump/`
+    - Create the module tree per design.md §8: `mod.rs`, `phases/{preflight,evidence,surfaces,mutate,publish}.rs`, `github.rs`, `template.rs`, `trailer.rs`, `pr_template.md`
+    - Define the public surface: `BumpRequest`, `BumpTrigger`, `ResumePolicy`, `BumpOutcome`, `BumpError`, `async fn run_bump(request: BumpRequest) -> Result<BumpOutcome, BumpError>`
+    - Re-export the public surface from `crates/tokeira-build/src/lib.rs`
+    - _Requirements: 11.1_
+
+  - [ ] 13.2 Add `octocrab`, `semver`, `tinytemplate`, `git2`, `secrecy`, `dirs` workspace deps
+    - `octocrab` — workspace-pinned at the current stable
+    - `semver` — workspace-pinned; reuse the same version the proto-sync pipeline already uses if applicable
+    - `tinytemplate` — workspace-pinned; alternative: hand-rolled binding if the review prefers zero-dep. Design.md §8 recommends `tinytemplate`; defer to implementer judgement during this task
+    - `git2` — for `pinned.rs` commit trailer extraction and history walks. Branch creation, commit, push remain shell-outs to `git` per design.md §8
+    - `secrecy` + `dirs` — for `SecretString` token handling and config-dir resolution
+    - Confirm none of these leak into `tokeira-build-info` (which must stay `[dependencies]`-free; Req 9.2)
+    - _Requirements: 11.4.3, 9.2_
+
+  - [ ] 13.3 Implement Phase A (preflight)
+    - In `phases/preflight.rs`, implement `async fn execute(ctx: &mut BumpContext) -> Result<(), BumpError>`
+    - Steps: read `pinned.rs` via `tokeira-build-info::pinned_source_path(&ctx.workspace_root)`; parse `TEMPORAL_SERVER_COMPAT` via a single-constant text parse; validate target version strictly greater than current; validate working tree clean via `git status --porcelain`; validate current branch matches `ctx.default_branch` (default `main`) via `git symbolic-ref --short HEAD`; call `ctx.github.get_user()` and assert scopes include `public_repo` + `pull_requests: write`
+    - Emit `BumpError::AlreadyOnVersion` (exit 0), `BumpError::Downgrade` (exit 1), `BumpError::DirtyWorkingTree`, `BumpError::WrongBranch`, `AuthError::NoToken`, `AuthError::InsufficientScopes` as appropriate
+    - _Requirements: 11.2.1 (Phase A), 11.4.1, 11.4.2_
+
+  - [ ]* 13.4 Write unit tests for Phase A
+    - Test each preflight failure: empty token, invalid token (mocked octocrab returning 401), missing scopes (mocked 200 with incomplete `X-OAuth-Scopes` header), dirty working tree (via `tempfile` repo with an uncommitted file), wrong branch (via a repo on a non-default branch), target equal to current, target older than current
+    - Test location: `crates/tokeira-build/src/compat_bump/phases/preflight.rs` `#[cfg(test)]` module
+    - _Requirements: 11.7.6_
+
+  - [ ] 13.5 Implement Phase B (evidence) — release enumeration and matrix delta
+    - In `phases/evidence.rs`, implement release enumeration via `octocrab`'s paginated releases endpoint for `temporalio/temporal`
+    - Filter releases by tag range: `>current && <=target` under semver
+    - For each release in range, fetch the release body; cache under `target/tkr/compat-cache/<tag>`
+    - Compute the matrix delta: find the commit referenced by the previous `Server-Compat-Bump:` trailer via `git log --grep='^Server-Compat-Bump:' -1 --format=%H`; if no match, use the Bump PR 0 baseline commit (the commit that added `docs/compat-bumps/0-baseline.md`); compare `FEATURE_MATRIX` `(id, state)` pairs between the two commits using `git show <commit>:crates/tokeira-compatibility/src/matrix.rs`
+    - Populate `BumpContext::evidence`
+    - _Requirements: 11.2.1 (Phase B), 11.4.4, 11.4.5_
+
+  - [ ]* 13.6 Write unit tests for Phase B evidence gathering
+    - Mock `octocrab` to return a canned release list; assert the command fetches the expected range
+    - Assert cache reuse: set the cache path; rerun; assert `octocrab` was called zero times on the second run
+    - Assert rate-limit handling: mock a 429 response with `X-RateLimit-Reset`; assert the command surfaces `BumpError::RateLimited { reset_at }` with the correct timestamp
+    - Test location: `crates/tokeira-build/src/compat_bump/phases/evidence.rs` `#[cfg(test)]` module
+    - _Requirements: 11.4.4, 11.7.6_
+
+  - [ ] 13.7 Implement Phase C (mutate) — branch, pinned.rs, commit with trailer, local CI check
+    - In `phases/mutate.rs`, create the bump branch via `git switch -c compat/server-compat-bump-<old>-<new>`; honour `ResumePolicy` (`StrictNew` fails if branch exists; `Resume` fast-forwards; `Reset` deletes and recreates)
+    - Update `pinned.rs`: bump the `TEMPORAL_SERVER_COMPAT` constant and the rationale comment (placeholder `PR #?`)
+    - Write the commit message via `render_commit_message(ctx)`
+    - Append the `Server-Compat-Bump:` trailer via `git commit --trailer "..."` (or equivalent through `git interpret-trailers`)
+    - Invoke the Feature 10 CI pipeline: `run_ci_checks(&CiCheckRequest { workspace_root, checks: vec![] }, &default_dagger)?`; assert all results pass; if any check fails, surface `BumpError::CiChecksFailed(report)` and leave the branch for debugging
+    - _Requirements: 11.2.1 (Phase C), 11.3.1, 11.3.5, 11.6.1, 11.6.2, 11.6.3, 11.8.1_
+
+  - [ ]* 13.8 Write unit tests for Phase C
+    - Use `tempfile` to create a tiny git repository with a minimal `pinned.rs` and a matrix stub
+    - Test branch creation, pinned.rs rewriting, commit trailer correctness (`BumpTrailer::parse` round-trips), resume/reset semantics
+    - Mock the `run_ci_checks` call to return a passing report; assert Phase C succeeds; swap to a failing report; assert Phase C surfaces `BumpError::CiChecksFailed` and the branch remains
+    - Test location: `crates/tokeira-build/src/compat_bump/phases/mutate.rs` `#[cfg(test)]` module
+    - _Requirements: 11.6, 11.7.6_
+
+  - [ ] 13.9 Implement Phase D (publish) — push, PR open, amend for PR number
+    - In `phases/publish.rs`, shell out to `git push -u origin <branch>` for the push; handle non-fast-forward as `BumpError::PushRejected { git_output }`
+    - Render PR title and body via `template.rs::render_*`
+    - Open the PR via `octocrab::pulls::PullRequestHandler::create`; on 5xx, retry once with exponential backoff; if retry fails, write the rendered PR body to `target/tkr/compat-cache/<branch>-pr-body.md` and surface `BumpError::PrOpenFailed { body_path }`
+    - On successful PR creation, rewrite the `pinned.rs` rationale comment to replace `PR #?` with the real PR number, `git commit --amend --no-edit`, and `git push --force-with-lease`
+    - If `--no-open` is set, stop after the push and return `BumpOutcome { pr_url: None, ... }`
+    - _Requirements: 11.2.1 (Phase D), 11.3.5, 11.4.6_
+
+  - [ ]* 13.10 Write integration tests for Phase D against mocked octocrab
+    - Use the `wiremock` crate (or `mockito`) to stand up a mock GitHub endpoint returning canned responses
+    - Test: happy path opens a PR and the body matches the rendered template; retry on 5xx; fail after two 5xx with `PrOpenFailed`; rate-limited response surfaces `RateLimited`
+    - Test location: `crates/tokeira-build/src/compat_bump/phases/publish.rs` `#[cfg(test)]` module (or a dedicated `tests/phase_d_integration.rs` file if it grows)
+    - _Requirements: 11.7.4, 11.7.6_
+
+  - [ ] 13.11 Implement `template.rs` with `tinytemplate` binding
+    - Load `pr_template.md` at compile time via `include_str!`
+    - Define `TemplateBindings` struct with every placeholder the template consumes; derive `Serialize`
+    - Implement `render_pr_body(ctx: &BumpContext) -> Result<String, TemplateError>` and `render_pr_title(ctx: &BumpContext) -> String`
+    - _Requirements: 11.3.3, 11.3.4_
+
+  - [ ]* 13.12 Write property test for PR body rendering determinism
+    - **Property P-BUMP-1: PR body rendering determinism**
+    - **Validates: Requirement 11.7.1**
+    - For any valid `BumpContext`, `render_pr_body` twice produces byte-equal output; every placeholder is bound (no `{{ foo }}` leaks); the output contains the `Server-Compat-Bump:` trailer exactly once
+    - Test location: `crates/tokeira-build/src/compat_bump/template.rs` `#[cfg(test)]` module
+    - _Requirements: 11.7.1, 11.7.2_
+
+  - [ ] 13.13 Implement `trailer.rs` parsing and rendering
+    - Define `BumpTrailer { old, new, trigger }` with `parse(&str) -> Result<Self, TrailerError>` and `render(&self) -> String`
+    - The regex: `^Server-Compat-Bump: (\d+\.\d+\.\d+) -> (\d+\.\d+\.\d+), trigger: ([123])$`
+    - Provide `find_in_commit_message(&str) -> Option<BumpTrailer>` that walks the message and picks the last matching trailer (so trailer-appending preserves correctness)
+    - _Requirements: 11.3.1, 5.5.5_
+
+  - [ ]* 13.14 Write property test for trailer round-trip
+    - **Property P-BUMP-2: Trailer round-trip**
+    - **Validates: Requirements 5.5.5, 11.3.1, 11.7.3**
+    - For any `(old, new, trigger)` tuple where old and new are valid semver, `BumpTrailer { ... }.render().parse()` equals the original
+    - Negative cases: missing trigger, non-semver versions, wrong arrow (`->`, `-->`), wrong trigger digit (`0`, `4`, `a`); assert each yields `TrailerError`
+    - Test location: `crates/tokeira-build/src/compat_bump/trailer.rs` `#[cfg(test)]` module
+    - _Requirements: 5.5.5, 11.7.3_
+
+  - [ ] 13.15 Implement `github.rs` — `GithubAuth`, `Octocrab` wrapper, release enumeration, rate-limit handling
+    - `GithubAuth::from_env_or_config()` per design.md §8
+    - `Octocrab` builder with `User-Agent: tokeira-compat-bump/<version>`
+    - Release enumeration: `ctx.github.list_releases_in_range(owner, repo, old, new) -> Result<Vec<ReleaseSummary>, GithubError>`
+    - Rate-limit reader: inspect `X-RateLimit-*` response headers; surface as `BumpError::RateLimited { reset_at }`
+    - _Requirements: 11.4_
+
+  - [ ] 13.16 Implement the `tkr compat bump` CLI wiring
+    - Create `apps/tkr/src/commands/compat/mod.rs` (if not present; otherwise extend) and `apps/tkr/src/commands/compat/bump.rs`
+    - Define `BumpArgs` with clap per design.md §8
+    - Define `CliTrigger` enum and its `From<CliTrigger> for BumpTrigger` impl
+    - `resolve_trigger(arg, yes, json)` prompts interactively when absent and the mode is interactive; fails when absent in `--yes` or `--json`
+    - Wire `Compat(CompatArgs)` into `apps/tkr/src/cli.rs::Command` (if not already split) with `CompatCommand { Show, Diff, Bump }`
+    - In `apps/tkr/src/main.rs`, dispatch to `commands::compat::bump::run(args, format)`
+    - _Requirements: 11.1_
+
+  - [ ]* 13.17 Write CLI parse tests for `tkr compat bump`
+    - Parse `tkr compat bump --to 1.29.0`: assert `to == 1.29.0`, `trigger == None`, `dry_run == false`
+    - Parse `tkr compat bump --to 1.29.0 --trigger 3 --yes`: assert `trigger == Some(Three)`, `yes == true`
+    - Parse `tkr compat bump --to 1.29.0 --resume --reset`: assert clap rejects (conflicts_with)
+    - Parse `tkr compat bump --to not-semver`: assert clap or the semver parse returns a usage error
+    - Test location: `apps/tkr/src/commands/compat/bump.rs` `#[cfg(test)]` module
+    - _Requirements: 11.1, 11.7.3_
+
+  - [ ] 13.18 Wire the `CiCheck::BumpTrailer` check into `run_ci_checks`
+    - In `crates/tokeira-build/src/pipelines/ci.rs`, add the `BumpTrailer` and `ServerCompatMonotonicity` variants to the `CiCheck` enum per design.md §7
+    - Implement `run_bump_trailer_check` inside the Dagger container: `git log -1 --name-only` to detect `pinned.rs` in the diff; if present, `git log -1 --format=%B | git interpret-trailers --parse` to extract the trailer; invoke `BumpTrailer::parse`; if absent or invalid, fail the check
+    - Implement `run_version_pin_monotonicity(PinKind)` that generalises the existing `run_proto_monotonicity` to cover both `TEMPORAL_PROTO_VERSION` and `TEMPORAL_SERVER_COMPAT`
+    - _Requirements: 5.5.5, 11.8.2_
+
+  - [ ]* 13.19 Write integration test for the full bump flow
+    - Gated behind `integration-test` feature and `#[ignore]`
+    - Requires a `GH_TOKEN` with permissions on a fork of the tokeira repository
+    - Runs `tkr compat bump --to <next-patch> --trigger 3 --yes` against the fork; asserts a PR is opened; closes the PR via API
+    - Test location: `apps/tkr/tests/compat_bump_integration.rs`
+    - _Requirements: 11.7.5_
+
+  - [ ] 13.20 Deferred follow-up: `--derive-surfaces` stage 2
+    - Implement the full skeleton-table generation per Req 11.5.3 — proto-tree diff classification into new RPCs / new fields / new messages / new enum variants, each mapped to the matching matrix row where one exists
+    - Stage 1 ships with the core Feature 11 landing: raw diff as an appendix in the PR body
+    - Stage 2 lands after the core is exercised in practice
+    - This sub-task SHALL be split into its own commit landing after 13.1–13.19 are stable
+    - _Requirements: 11.5.6_
+
+- [ ] 14. Documentation and integration
+  - [ ] 14.1 Update `README.md`
     - Add a "Temporal compatibility" section citing `TEMPORAL_SERVER_COMPAT`, `TEMPORAL_PROTO_VERSION`, summarising the feature matrix by state (e.g., "33 implemented, 5 experimental, 2 stubbed, 1 unsupported"), and pointing at `tkr compat show` for detail
     - _Requirements: 9.3.1_
 
-  - [ ] 12.2 Update `AGENTS.md`
+  - [ ] 14.2 Update `AGENTS.md`
     - Add the proto bump workflow (Req 5.2) to "Working Agreements"
     - Add the server-compat independence rule (Req 5.3) to the same section
     - Add a pointer from any "adding a new feature" checklist to this spec's matrix declaration
     - Add `tkr ci check` to the Enforced Commands list (Req 10.3.1) as the pre-push gate for compatibility invariants. Mention that `pipeline-foundation` (backlog P16) will wire the same checks into remote triggers; until then, `tkr ci check` is the canonical local verdict
-    - _Requirements: 9.3.2, 10.3_
+    - Add a "Server compat bump protocol" subsection summarising Req 5.5: the three triggers, the `tkr compat bump` command, the `Server-Compat-Bump:` trailer requirement, and the CODEOWNERS gate
+    - _Requirements: 9.3.2, 10.3, 5.5.10_
 
-  - [ ] 12.3 Add `README.md` to `crates/tokeira-build-info/`
+  - [ ] 14.3 Add `README.md` to `crates/tokeira-build-info/`
     - Document the env vars a CI or hand-run release build must set (`TOKEIRA_GIT_SHA`, `TOKEIRA_SOURCE_TREE_HASH`, `CI`)
     - Document the debug build fallbacks
-    - Document the `pinned.rs` bump workflow
+    - Document the `pinned.rs` bump workflow — now just a pointer at Feature 5.5 and `tkr compat bump`
     - _Requirements: 6.2.3_
 
-  - [ ] 12.4 Final checkpoint — full workspace verification
+  - [ ] 14.4 Final checkpoint — full workspace verification
     - Run `cargo +nightly fmt --all --check`
     - Run `cargo lint`
     - Run `cargo test-lint`

@@ -11,7 +11,8 @@ This design turns the compatibility contract in `requirements.md` into code. The
 5. A `dispatch_rpc<F: Feature>` helper in the edge that routes every workflow-service and operator-service RPC through a single policy based on its matrix state.
 6. A `cfg_feature!` compile-time macro for the kernel that refuses to compile code gated on a `Stubbed` or `Unsupported` feature.
 7. A `tkr compat show` / `tkr compat diff` command group in `apps/tkr` that renders the matrix, the SDK matrix, and the build-time metadata for the local binary or for a remote deployment.
-8. A Dagger-backed local CI pipeline in `tokeira-build` that runs the no-wallclock and proto-monotonicity checks, invokable via a new `tkr ci check` command group that re-execs itself under `dagger run` (mirroring `tkr image build`). Remote-trigger wiring is deferred to the `pipeline-foundation` spec.
+8. A Dagger-backed local CI pipeline in `tokeira-build` that runs the no-wallclock, proto-monotonicity, server-compat-monotonicity, and bump-trailer checks, invokable via a new `tkr ci check` command group that re-execs itself under `dagger run` (mirroring `tkr image build`). Remote-trigger wiring is deferred to the `pipeline-foundation` spec.
+9. A `tkr compat bump --to <version>` command that drives the Req 5.5 Server Compat Bump protocol end-to-end: preflight, evidence gathering from the GitHub API via `octocrab`, local commit with a `Server-Compat-Bump:` trailer, local `tkr ci check` validation, branch push, and PR opening with a templated body.
 
 Guiding principles:
 
@@ -61,6 +62,10 @@ graph TD
 | Proto version monotonicity check | NEW `crates/tokeira-build/src/pipelines/ci.rs` + `apps/tkr/src/commands/ci/` | Dagger-backed pipeline invoked via `tkr ci check`. Remote-trigger wiring (GitHub Actions, nightly) is deferred to `pipeline-foundation`; `pipeline-foundation` will consume the same `run_ci_checks` function so verdicts do not diverge. |
 | Wall-clock check | NEW `crates/tokeira-build/src/pipelines/ci.rs` + `apps/tkr/src/commands/ci/` | Same Dagger pipeline as the monotonicity check; runs `rg -n 'SystemTime::now\|Utc::now\|Local::now\|OffsetDateTime::now_utc' crates/tokeira-build-info/` inside a deterministic container. Local invocation only in this spec. |
 | `tkr ci check` command group | NEW `apps/tkr/src/commands/ci/` | Follows existing `commands/image/` pattern: re-exec under `dagger run` when session env absent, mirror mode/subcommand dispatch, `--json` output. |
+| `tkr compat bump` command | NEW `apps/tkr/src/commands/compat/bump.rs` | CLI wrapper over the engine in `crates/tokeira-build/src/compat_bump/`. Drives Req 5.5 end-to-end: preflight, evidence, mutate, publish. See §8. |
+| Server-compat bump engine | NEW `crates/tokeira-build/src/compat_bump/` | Phased engine (preflight / evidence / mutate / publish), GitHub API integration via `octocrab`, PR template rendering, trailer parsing. Invoked by `tkr compat bump`; re-usable by `pipeline-foundation`. |
+| CODEOWNERS enforcement | NEW `.github/CODEOWNERS` | Names `crates/tokeira-build-info/src/pinned.rs` as requiring the compat-owners team's approval. Informational until branch protection is wired by `pipeline-foundation`; structured so GH honours it without rewriting when that lands. |
+| Bump PR 0 (baseline record) | NEW `docs/compat-bumps/0-baseline.md` | Retroactive baseline capturing the current `"1.27.0"` claim with a full disposition table, so future bump PRs have a starting point to diff against. See Req 5.5.9. |
 
 Notably **not** changed:
 
@@ -605,6 +610,10 @@ use crate::{BuildError, DaggerClient};
 pub enum CiCheck {
     NoWallclock,
     ProtoMonotonicity,
+    ServerCompatMonotonicity,
+    /// Validates the `Server-Compat-Bump:` trailer on any commit that
+    /// modifies `pinned.rs`. See §8 and Req 5.5.5.
+    BumpTrailer,
 }
 
 #[derive(Debug, Clone)]
@@ -637,7 +646,12 @@ pub fn run_ci_checks(
     dagger: &dyn DaggerClient,
 ) -> Result<CiCheckReport, BuildError> {
     let checks = if request.checks.is_empty() {
-        vec![CiCheck::NoWallclock, CiCheck::ProtoMonotonicity]
+        vec![
+            CiCheck::NoWallclock,
+            CiCheck::ProtoMonotonicity,
+            CiCheck::ServerCompatMonotonicity,
+            CiCheck::BumpTrailer,
+        ]
     } else {
         request.checks.clone()
     };
@@ -662,7 +676,9 @@ pub fn run_ci_checks(
     for check in checks {
         let result = match check {
             CiCheck::NoWallclock => run_no_wallclock(&*base)?,
-            CiCheck::ProtoMonotonicity => run_proto_monotonicity(&*base)?,
+            CiCheck::ProtoMonotonicity => run_version_pin_monotonicity(&*base, PinKind::Proto)?,
+            CiCheck::ServerCompatMonotonicity => run_version_pin_monotonicity(&*base, PinKind::ServerCompat)?,
+            CiCheck::BumpTrailer => run_bump_trailer_check(&*base)?,
         };
         results.push(result);
     }
@@ -715,6 +731,328 @@ The `should_reexec_under_dagger` + `reexec_under_dagger` helpers are the same on
 3. **Structured output.** `CiCheckReport` serialises via serde; `tkr ci check --json` can emit it unmodified for consumption by editor plugins, badge servers, etc. A shell script would have to hand-roll JSON.
 
 **Remote trigger deferred.** This spec does not add any `.github/workflows/*.yml` file, any nightly cron, or any scheduled runner. The portable substrate is the pipeline module; `pipeline-foundation` (backlog P16) owns the remote trigger story.
+
+### 8. Server compat bump command (Feature 11)
+
+`tkr compat bump --to <version>` operationalises Req 5.5. The command is a thin CLI wrapper around a bump engine in `crates/tokeira-build/src/compat_bump/` that owns the phased execution, GitHub API integration, and PR body rendering.
+
+**Module layout** under `crates/tokeira-build/src/compat_bump/`:
+
+```
+compat_bump/
+├── mod.rs              // pub surface: BumpContext, BumpRequest, run_bump
+├── phases/
+│   ├── preflight.rs    // Phase A
+│   ├── evidence.rs     // Phase B (release enumeration, matrix delta)
+│   ├── surfaces.rs     // Phase B --derive-surfaces (stage 1: raw diff; stage 2: skeleton table)
+│   ├── mutate.rs       // Phase C (branch, pinned.rs edit, commit with trailer, tkr ci check)
+│   └── publish.rs      // Phase D (push, PR open via octocrab, amend for PR number)
+├── github.rs           // octocrab wrappers, pagination, rate-limit handling
+├── template.rs         // Markdown template binding + rendering
+├── trailer.rs          // Server-Compat-Bump trailer parsing + generation
+└── pr_template.md      // Template file (per Req 11.3.3)
+```
+
+**Public API** (consumed by `apps/tkr/src/commands/compat/bump.rs`):
+
+```rust
+// crates/tokeira-build/src/compat_bump/mod.rs
+
+pub struct BumpRequest {
+    pub workspace_root: PathBuf,
+    pub target: semver::Version,
+    pub trigger: Option<BumpTrigger>,
+    pub dry_run: bool,
+    pub derive_surfaces: bool,
+    pub no_open: bool,
+    pub resume_policy: ResumePolicy,
+    pub github: GithubAuth,
+}
+
+pub enum BumpTrigger { One, Two, Three }
+pub enum ResumePolicy { StrictNew, Resume, Reset }
+
+pub struct BumpOutcome {
+    pub pr_url: Option<String>,
+    pub branch_name: String,
+    pub commit_sha: String,
+    pub phases_completed: Vec<BumpPhase>,
+}
+
+pub async fn run_bump(request: BumpRequest) -> Result<BumpOutcome, BumpError>;
+```
+
+`run_bump` is the single engine entry point. The CLI in `apps/tkr/` performs argument parsing, prompts the operator interactively where applicable, and calls `run_bump`.
+
+**Phase sketches** — each phase is a single module with one public `fn execute(ctx: &mut BumpContext) -> Result<(), BumpError>`; `BumpContext` is an internal struct carrying the progressive state (loaded pins, fetched releases, created branch, etc.). Phases are pure up to their declared side effects, and each validates its preconditions before mutating state.
+
+```rust
+// phases/preflight.rs
+
+pub async fn execute(ctx: &mut BumpContext) -> Result<(), BumpError> {
+    ctx.current = read_pinned_server_compat(&ctx.workspace_root)?;
+    if ctx.current == ctx.target {
+        return Err(BumpError::AlreadyOnVersion(ctx.target.clone()));
+    }
+    if ctx.current > ctx.target {
+        return Err(BumpError::Downgrade {
+            current: ctx.current.clone(),
+            target: ctx.target.clone(),
+        });
+    }
+    ensure_working_tree_clean(&ctx.workspace_root)?;
+    ensure_on_default_branch(&ctx.workspace_root)?;
+    let user = ctx.github.get_user().await?;
+    ensure_scopes(&user, &[Scope::PublicRepo, Scope::PullRequestsWrite])?;
+    ctx.phases_completed.push(BumpPhase::Preflight);
+    Ok(())
+}
+```
+
+```rust
+// phases/evidence.rs
+
+pub async fn execute(ctx: &mut BumpContext) -> Result<(), BumpError> {
+    let releases = ctx.github
+        .list_releases_in_range("temporalio", "temporal", &ctx.current, &ctx.target)
+        .await?;
+    for release in &releases {
+        let body = ctx.github
+            .fetch_release_body(&release.tag)
+            .cached_at(ctx.cache_dir.join(&release.tag))
+            .await?;
+        ctx.evidence.releases.push(ReleaseEvidence {
+            tag: release.tag.clone(),
+            published_at: release.published_at.clone(),
+            body,
+        });
+    }
+    ctx.evidence.matrix_delta = compute_matrix_delta(&ctx.workspace_root)?;
+    if ctx.request.derive_surfaces {
+        ctx.evidence.surfaces = match derive_upstream_surfaces(ctx).await {
+            Ok(surfaces) => surfaces,
+            Err(err) => {
+                tracing::warn!(%err, "--derive-surfaces failed; falling back to manual disposition");
+                DerivedSurfaces::Skipped
+            }
+        };
+    }
+    ctx.phases_completed.push(BumpPhase::Evidence);
+    Ok(())
+}
+```
+
+```rust
+// phases/mutate.rs
+
+pub async fn execute(ctx: &mut BumpContext) -> Result<(), BumpError> {
+    let branch = format!("compat/server-compat-bump-{}-{}", ctx.current, ctx.target);
+    git_create_branch(&ctx.workspace_root, &branch, match_resume_policy(ctx))?;
+    write_pinned_rs(&ctx.workspace_root, &ctx.target, "PR #?")?;
+    let commit_message = render_commit_message(ctx)?;
+    git_commit_with_trailer(&ctx.workspace_root, &commit_message, &commit_trailer(ctx))?;
+    let ci_report = run_ci_checks_on_branch(ctx)?;
+    if ci_report.has_failures() {
+        return Err(BumpError::CiChecksFailed(ci_report));
+    }
+    ctx.branch = Some(branch);
+    ctx.commit_sha = Some(git_head_sha(&ctx.workspace_root)?);
+    ctx.phases_completed.push(BumpPhase::Mutate);
+    Ok(())
+}
+```
+
+```rust
+// phases/publish.rs
+
+pub async fn execute(ctx: &mut BumpContext) -> Result<(), BumpError> {
+    git_push_branch(&ctx.workspace_root, ctx.branch.as_ref().unwrap())?;
+    if ctx.request.no_open {
+        ctx.phases_completed.push(BumpPhase::Publish);
+        return Ok(());
+    }
+    let pr_body = render_pr_body(ctx)?;
+    let pr = ctx.github
+        .create_pull_request(CreatePullRequest {
+            title: render_pr_title(ctx),
+            body: pr_body,
+            head: ctx.branch.as_ref().unwrap().clone(),
+            base: "main".to_string(),
+        })
+        .await?;
+    rewrite_pr_number_in_pinned_rs(&ctx.workspace_root, pr.number)?;
+    git_amend_and_force_with_lease(&ctx.workspace_root, ctx.branch.as_ref().unwrap())?;
+    ctx.pr_url = Some(pr.html_url);
+    ctx.phases_completed.push(BumpPhase::Publish);
+    Ok(())
+}
+```
+
+#### Trailer format and parsing
+
+```rust
+// compat_bump/trailer.rs
+
+pub const TRAILER_KEY: &str = "Server-Compat-Bump";
+
+/// Matches `^Server-Compat-Bump: \d+\.\d+\.\d+ -> \d+\.\d+\.\d+, trigger: [123]$`
+/// per Req 5.5.5.
+pub struct BumpTrailer {
+    pub old: semver::Version,
+    pub new: semver::Version,
+    pub trigger: BumpTrigger,
+}
+
+impl BumpTrailer {
+    pub fn parse(line: &str) -> Result<Self, TrailerError> { /* ... */ }
+    pub fn render(&self) -> String {
+        format!(
+            "{}: {} -> {}, trigger: {}",
+            TRAILER_KEY, self.old, self.new, self.trigger as u8,
+        )
+    }
+}
+```
+
+The `BumpTrailer::parse` function is what `run_bump_trailer_check` in the CI pipeline invokes inside the container: for any commit whose diff touches `pinned.rs`, the pipeline extracts the commit message's last `Server-Compat-Bump:` trailer line via `git interpret-trailers --parse` and validates it against the `pinned.rs` diff. The check fails if the trailer is missing, unparseable, or the versions don't match the observed diff.
+
+#### GitHub API integration
+
+The `github.rs` module wraps `octocrab` with tokeira-specific conveniences:
+
+```rust
+// compat_bump/github.rs
+
+pub struct GithubAuth {
+    token: SecretString,
+    user_agent: String,
+}
+
+impl GithubAuth {
+    pub fn from_env_or_config() -> Result<Self, AuthError> {
+        if let Ok(tok) = std::env::var("GH_TOKEN") {
+            return Self::from_token(tok);
+        }
+        let path = dirs::config_dir()
+            .ok_or(AuthError::NoConfigDir)?
+            .join("tokeira/github-token");
+        let tok = fs::read_to_string(&path)
+            .map_err(|e| AuthError::ConfigFileMissing { path, source: e })?;
+        Self::from_token(tok.trim().to_string())
+    }
+
+    pub async fn octocrab(&self) -> Result<octocrab::Octocrab, AuthError> {
+        octocrab::Octocrab::builder()
+            .personal_token(self.token.expose_secret())
+            .user_agent(&self.user_agent)
+            .build()
+            .map_err(AuthError::from)
+    }
+
+    pub async fn get_user(&self) -> Result<User, AuthError> {
+        self.octocrab().await?.current().user().await.map_err(AuthError::from)
+    }
+}
+```
+
+Release enumeration uses `octocrab::repos::RepoHandler::releases()` with pagination consumed via `stream::all`. The `X-RateLimit-*` headers are read from response extensions on 429 / rate-limited 403 responses and surfaced in the `BumpError::RateLimited { reset_at: DateTime<Utc> }` variant.
+
+#### PR body rendering
+
+`pr_template.md` uses a lightweight placeholder syntax (double-brace `{{ name }}` or `{{#if name}}...{{/if}}` for optional sections). The choice between `tinytemplate`, `handlebars`, or a hand-rolled binding is a design-time call: handlebars is more capable but a 60KB dependency; tinytemplate is minimal; hand-rolled is zero-dep but more surface to review.
+
+Recommendation: **`tinytemplate`** (already workspace-pinned for other uses if applicable; otherwise add it). It covers the conditional-section case without heavy machinery.
+
+Every placeholder the template declares is a field on `BumpContext::render_template_bindings() -> TemplateBindings`. A compile-time check (unit test) iterates the `TemplateBindings` field list and asserts the template's parsed AST references exactly those placeholders — no typos, no stale names.
+
+#### CLI wiring
+
+```rust
+// apps/tkr/src/commands/compat/bump.rs
+
+#[derive(Args)]
+pub struct BumpArgs {
+    #[arg(long)]
+    pub to: String,
+    #[arg(long)]
+    pub trigger: Option<CliTrigger>,
+    #[arg(long)]
+    pub dry_run: bool,
+    #[arg(long)]
+    pub derive_surfaces: bool,
+    #[arg(long)]
+    pub no_open: bool,
+    #[arg(long, conflicts_with = "reset")]
+    pub resume: bool,
+    #[arg(long, conflicts_with = "resume")]
+    pub reset: bool,
+    #[arg(long)]
+    pub yes: bool,
+    #[arg(long)]
+    pub json: bool,
+}
+
+pub async fn run(args: BumpArgs, format: OutputFormat) -> Result<()> {
+    let target = semver::Version::parse(&args.to)?;
+    let trigger = resolve_trigger(args.trigger, args.yes, args.json)?;
+    let request = BumpRequest {
+        workspace_root: workspace_root_from_current_dir()?,
+        target,
+        trigger: Some(trigger),
+        dry_run: args.dry_run,
+        derive_surfaces: args.derive_surfaces,
+        no_open: args.no_open,
+        resume_policy: match (args.resume, args.reset) {
+            (true, _) => ResumePolicy::Resume,
+            (_, true) => ResumePolicy::Reset,
+            _ => ResumePolicy::StrictNew,
+        },
+        github: GithubAuth::from_env_or_config()?,
+    };
+    let outcome = tokeira_build::compat_bump::run_bump(request).await?;
+    render_outcome(&outcome, args.json, format)
+}
+```
+
+The `resolve_trigger` helper prompts interactively when `--trigger` is absent and the mode is interactive; fails when absent in `--yes` or `--json` mode; returns the value otherwise.
+
+#### Failure-mode summary
+
+Numbered to match the table introduced to the operator experience section:
+
+| # | Condition | Phase | Error variant | Side effects |
+|---|---|---|---|---|
+| 1 | `GH_TOKEN` missing and config file missing | A | `AuthError::NoToken` | None |
+| 2 | Token scopes insufficient | A | `AuthError::InsufficientScopes { missing }` | None |
+| 3 | Rate limited | B, D | `BumpError::RateLimited { reset_at }` | Cache preserved for `--resume` |
+| 4 | Target equals current | A | `BumpError::AlreadyOnVersion` (exit 0) | None |
+| 5 | Target is older | A | `BumpError::Downgrade` | None |
+| 6 | Target is not a Temporal release tag | B | `BumpError::UnknownTargetVersion { candidates }` | None |
+| 7 | Working tree dirty | A | `BumpError::DirtyWorkingTree { output }` | None |
+| 8 | Not on `main` | A | `BumpError::WrongBranch { current }` | None |
+| 9 | Bump branch exists without `--resume` / `--reset` | C | `BumpError::BranchExists` | None |
+| 10 | Open PR exists for branch | D | `BumpOutcome { pr_url: Some(existing), phases_completed: [... up to Publish] }` — not an error | None |
+| 11 | `tkr ci check` fails on branch tip | C | `BumpError::CiChecksFailed(report)` | Branch remains for debugging |
+| 12 | Push rejected (non-fast-forward) | D | `BumpError::PushRejected { git_output }` | Branch remains |
+| 13 | PR creation 5xx | D | Retry once, then `BumpError::PrOpenFailed { body_path }` — body written to a local file | Branch pushed; no PR |
+| 14 | Upstream API schema drift | B, D | `BumpError::ApiSchemaDrift { raw_response }` | Cache preserved |
+| 15 | `--derive-surfaces` clone failure | B | Warning log, `DerivedSurfaces::Skipped`, continues | Partial cache possible |
+| 16 | `pinned.rs` missing/malformed | A | `BumpError::PinFileInvalid { path, reason }` | None |
+| 17 | Commit trailer write fails | C | `BumpError::TrailerWriteFailed { git_output }` | Branch cleaned up |
+| 18 | Pre-push hook rejection | D | `BumpError::PushRejected { git_output }` (same as 12) | Branch remains |
+
+Every `BumpError` variant carries the operator-facing diagnostic text. The `Display` impl produces a two-to-four-line message with the remediation hint baked in; no external string table.
+
+#### Why Rust rather than shelling to `gh`
+
+The `gh` CLI already implements most of this. We considered a shell script that wraps `gh pr create`. The Rust route is chosen because:
+
+1. **Template rendering and trailer generation are pure functions** that benefit from compile-time placeholder validation. A shell script would silently emit broken Markdown when a placeholder name changes.
+2. **Phased execution is easier to reason about as a state machine** with typed errors. Shell's error handling is positional and the failure modes are harder to enumerate.
+3. **`octocrab` typed responses** prevent the silent-schema-drift class of bugs that shell pipelines accumulate when GitHub adds new fields or removes old ones.
+4. **Re-use across environments.** `pipeline-foundation` (backlog P16) can invoke `run_bump` from a nightly scheduled runner without re-implementing the flow. A `gh`-based shell script would need to be forked.
+
+The tradeoff is a larger landing. We accept it: the bump process is rare enough that the protocol needs to be *right* each time, and the investment amortises over every future bump.
 
 ## Data Models
 

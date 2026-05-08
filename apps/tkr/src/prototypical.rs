@@ -1,3 +1,13 @@
+//! Template TOML written at `tkr deployment create` time.
+//!
+//! Each platform contributes its own prototypical `deployment.toml` (the
+//! platform-specific config) and `tokeirad.toml` (the server-side
+//! [`tokeira_config::TokeiraConfig`]). The server-config branch also
+//! round-trips the TOML through the parser as a compile-time safety net:
+//! if a platform ships a template that no longer parses, `tkr deployment
+//! create` will fail here with a clear error rather than minutes later
+//! when `tokeirad` tries to start.
+
 use anyhow::Result;
 use tokeira_compose_deployment::ComposeDeployment;
 use tokeira_ecs_deployment::EcsDeployment;

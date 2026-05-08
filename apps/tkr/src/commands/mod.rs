@@ -1,3 +1,19 @@
+//! Command handlers, one module per top-level `tkr` subcommand.
+//!
+//! Each submodule owns its own `run(...)` entry point, called from the
+//! dispatcher in `main.rs`. Handlers receive a `DeploymentContext` (when
+//! applicable) and use [`PlatformOps::from_context`] to get a
+//! platform-agnostic interface to day-2 operations (scale, logs,
+//! port-forward). Subcommand-specific flows (`infra`, `deploy`, `image`,
+//! `schema`) are more bespoke because their engine boundaries differ.
+//!
+//! # Adding a new subcommand
+//!
+//! 1. Add a new module file here.
+//! 2. Add the clap variant in `cli::Command`.
+//! 3. Wire up the dispatch arm in `main::main`.
+//! 4. Re-use `require_confirmation` for any destructive operation.
+
 pub mod config;
 pub mod deploy;
 pub mod deployment;
@@ -20,8 +36,21 @@ use tokeira_orchestrator::Ops;
 
 use crate::deployment_dir::{DeploymentContext, PlatformDeploymentConfig};
 
-/// Dispatch helper: returns a boxed Ops trait object and the matching config
-/// for the deployment's platform kind.
+/// Platform-agnostic facade over the three concrete deployment types.
+///
+/// Each variant carries the platform's `Deployment` implementor together
+/// with the config it needs. The `Deployment` trait is object-unsafe
+/// (it's generic over `Config`), so a plain `Box<dyn Deployment>` won't
+/// work — this enum threads the three platforms explicitly instead.
+///
+/// Day-2 handlers (`scale`, `logs`, `port_forward`) go through this facade
+/// so they stay platform-neutral. Handlers that need to reach into
+/// platform-specific APIs (the engine-based `infra` and `deploy`
+/// handlers, or the ECS-only `image push/mirror`) match on
+/// [`PlatformDeploymentConfig`] directly.
+///
+/// The Compose variant also carries the deployment directory because the
+/// Compose ops need it to locate the generated `docker-compose.yml`.
 pub enum PlatformOps {
     Local(LocalDeployment, LocalConfig),
     Compose(ComposeDeployment, Box<ComposeConfig>, PathBuf),
@@ -91,6 +120,12 @@ impl PlatformOps {
     }
 }
 
+/// Gate a destructive action behind an explicit `--yes` flag.
+///
+/// Every `apply`, `destroy`, or `remove` path routes through this helper
+/// so confirmation behaviour stays consistent across subcommands. The
+/// `action` argument is echoed in the error text so operators know
+/// exactly which invocation was refused.
 pub fn require_confirmation(yes: bool, action: &str) -> Result<()> {
     if yes {
         Ok(())

@@ -1,3 +1,10 @@
+//! `tkr config show` — dump the two TOML files for the selected deployment.
+//!
+//! Intentionally trivial: the output format is the source text itself so
+//! operators see exactly what `tokeirad` and the deployment engine will
+//! load. Useful when chasing "why did my change not take effect" and for
+//! pasting into bug reports.
+
 use std::fs;
 
 use anyhow::Result;

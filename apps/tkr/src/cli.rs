@@ -1,3 +1,24 @@
+//! Clap-based command surface for `tkr`.
+//!
+//! Keep the enums here as the single source of truth for the CLI shape. The
+//! `main.rs` dispatcher maps top-level variants to handler modules in
+//! `commands/`, and the `From` impls at the bottom of this file bridge the
+//! CLI-local enums to the domain enums in `tokeira-orchestrator`,
+//! `tokeira-deploy-engine`, and `tokeira-build`.
+//!
+//! # Conventions for new subcommands
+//!
+//! - Destructive actions (apply/destroy/remove) take `--yes` and route
+//!   through `commands::require_confirmation` before doing anything.
+//! - Global flags live on `Cli` (`--deployment`, `--json`). Prefer extending
+//!   the global flags over adding per-subcommand equivalents.
+//! - Enum variants mirror the dispatcher in `main.rs` one-to-one; add the
+//!   clap variant, the handler module, and wire them together in `main`.
+//!
+//! The CLI-to-domain `From` impls at the bottom keep clap off the library
+//! crates — library crates stay free of a clap dependency even though they
+//! expose equivalent enum shapes.
+
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tokeira_orchestrator::{PlatformKind, StorageKind};
 
@@ -5,8 +26,13 @@ use tokeira_orchestrator::{PlatformKind, StorageKind};
 #[command(name = "tkr")]
 #[command(about = "Tokeira deployment and developer workflow CLI")]
 pub struct Cli {
+    /// Selects which named deployment this invocation operates on.
+    /// When absent, `DeploymentResolver` falls back to the `.latest`
+    /// sentinel written by `tkr deployment use`.
     #[arg(long)]
     pub deployment: Option<String>,
+    /// Switches human output (tabular text, spinners) for newline-delimited
+    /// JSON events. Machine consumers and CI integrations should pass this.
     #[arg(long)]
     pub json: bool,
     #[command(subcommand)]

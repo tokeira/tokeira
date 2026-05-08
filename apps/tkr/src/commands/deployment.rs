@@ -1,3 +1,16 @@
+//! `tkr deployment` — CRUD and selection for named deployments.
+//!
+//! This module owns the operator-facing lifecycle (create / list / use /
+//! destroy). It deliberately does NOT touch infrastructure or services:
+//! `deployment create` writes template configs and records metadata, but
+//! nothing tangible exists in AWS / Compose until `tkr infra apply` and
+//! `tkr deploy apply` run against that deployment.
+//!
+//! The `Destroy` action removes the deployment directory from disk but
+//! does NOT destroy cloud resources. Operators must run `tkr infra
+//! destroy` first; this ordering is deliberate so a misplaced
+//! `deployment destroy` never orphans AWS resources.
+
 use anyhow::Result;
 
 use crate::{

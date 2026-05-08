@@ -1,3 +1,34 @@
+//! Deployment resolution, on-disk layout, and platform-config loading.
+//!
+//! Every `tkr` command that targets a specific deployment ends up here to
+//! turn a `--deployment <name>` flag (or the `.latest` sentinel) into a
+//! fully-loaded [`DeploymentContext`]. The context bundles the deployment's
+//! on-disk path, its metadata, and its parsed platform config so downstream
+//! handlers can dispatch off `metadata.platform` without re-reading TOML.
+//!
+//! # On-disk layout
+//!
+//! A deployment directory looks like:
+//!
+//! ```text
+//! ~/Library/Application Support/tokeira/tkr/<name>/
+//!   deployment.toml   # platform-specific config (LocalConfig | ComposeConfig | EcsConfig)
+//!   tokeirad.toml     # TokeiraConfig consumed by the tokeirad server binary
+//!   metadata.json     # identity + status tracked by the CLI
+//!   state/            # infra + deploy engine state (single-doc CAS files)
+//!   tokeirad.pid      # written while `tkr deploy apply` runs against local platform
+//! ```
+//!
+//! The parent directory also carries a `.latest` sentinel (name of the
+//! deployment most recently targeted or selected via `tkr deployment use`).
+//!
+//! # Naming invariant
+//!
+//! All deployment names are round-tripped through [`normalize_name`] — the
+//! filesystem entry and the in-memory name always match, and user-supplied
+//! names with spaces or uppercase letters are accepted but normalised on
+//! write and on lookup. The property tests in `main.rs` cover this.
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -18,6 +49,13 @@ pub(crate) const TOKEIRAD_TOML: &str = "tokeirad.toml";
 pub(crate) const METADATA_JSON: &str = "metadata.json";
 pub(crate) const LATEST_FILE: &str = ".latest";
 
+/// Resolves deployment names to on-disk paths and mediates the `.latest`
+/// selection sentinel.
+///
+/// In production use [`DeploymentResolver::default`] (which locates the
+/// platform-appropriate state directory); tests use
+/// `DeploymentResolver::with_root` (`#[cfg(test)]`) to sandbox under a
+/// `tempfile::TempDir`.
 pub struct DeploymentResolver {
     root: PathBuf,
 }
@@ -60,6 +98,9 @@ impl DeploymentResolver {
             .filter(|name| !name.is_empty())
     }
 
+    /// Resolves a user-supplied name (or falls back to the `.latest`
+    /// sentinel) and returns the normalised form. The returned name is the
+    /// filesystem entry under [`DeploymentResolver::root`].
     pub fn resolve_name(&self, requested: Option<&str>) -> Result<String> {
         if let Some(name) = requested {
             return Ok(normalize_name(name));
@@ -74,6 +115,11 @@ impl DeploymentResolver {
         Ok(normalize_name(latest.trim()))
     }
 
+    /// Create a fresh deployment: writes the two TOML files, the metadata
+    /// JSON, an empty `state/` subdir, and flips `.latest` to the new name.
+    ///
+    /// Fails fast if a directory with the same normalised name already
+    /// exists so we never silently clobber operator state.
     pub fn create(
         &self,
         name: &str,
@@ -172,6 +218,9 @@ impl DeploymentResolver {
         metadata::write(&path, &metadata)
     }
 
+    /// Build a helpful "deployment not found" error that lists what is
+    /// actually available. Extracted so every command surfaces the same
+    /// guidance when a caller passes an unknown `--deployment`.
     pub fn not_found_message(&self, name: &str) -> Result<String> {
         let available = self.deployment_names()?;
         if available.is_empty() {
@@ -188,14 +237,24 @@ impl DeploymentResolver {
 }
 
 /// Platform-specific config loaded from deployment.toml.
-/// Compose deployments carry the full compose stack config;
-/// local deployments carry only project_name.
+///
+/// Each variant carries the fully parsed config for that platform so
+/// handlers can branch on the deployment's platform kind without
+/// re-reading files from disk. `Compose` and `Ecs` configs are boxed
+/// because they're significantly larger than `LocalConfig` (observability
+/// stacks, ECR mirror lists, etc.).
 pub enum PlatformDeploymentConfig {
     Local(LocalConfig),
     Compose(Box<ComposeConfig>),
     Ecs(Box<EcsConfig>),
 }
 
+/// Fully-loaded view of a deployment, as consumed by command handlers.
+///
+/// A handler that receives a `DeploymentContext` never needs to touch the
+/// filesystem again for config — everything in [`DeploymentContext::path`]
+/// has already been parsed into [`DeploymentContext::metadata`] and
+/// [`DeploymentContext::platform_config`].
 pub struct DeploymentContext {
     pub name: String,
     pub path: PathBuf,
@@ -203,6 +262,11 @@ pub struct DeploymentContext {
     pub platform_config: PlatformDeploymentConfig,
 }
 
+/// Resolve a deployment by name (or fall back to `.latest`) and return a
+/// fully-parsed [`DeploymentContext`].
+///
+/// This is the single entry point every non-`dev` subcommand uses to turn
+/// an optional `--deployment` flag into a runnable context.
 pub fn load_context(
     deployments: &DeploymentResolver,
     requested_name: Option<&str>,
@@ -239,6 +303,12 @@ pub fn load_context(
     })
 }
 
+/// Normalise a user-supplied deployment name to a safe filesystem entry.
+///
+/// Lowercased; trimmed; non-alphanumeric characters (other than `-` / `_`)
+/// collapse to `-`; leading/trailing dashes are stripped. This means two
+/// operators typing the same deployment "My Dev" vs "my-dev" will always
+/// resolve to the same directory.
 pub fn normalize_name(name: &str) -> String {
     name.trim()
         .chars()

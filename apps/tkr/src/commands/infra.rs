@@ -1,3 +1,20 @@
+//! `tkr infra` — declare, diff, and reconcile cloud infrastructure.
+//!
+//! Wraps `tokeira_orchestrator::InfraEngine` with a `plan → confirm →
+//! apply` workflow that:
+//!
+//! 1. Builds the desired composition for the selected platform.
+//! 2. Refreshes state against the provider (so plan reflects reality).
+//! 3. Renders a human-readable diff and/or spinners via [`ActionTuiHandle`].
+//! 4. On `apply`, re-runs the engine, then writes any discovered values
+//!    (DSQL endpoint, OpenSearch URL, etc.) back into the deployment's
+//!    `tokeirad.toml` via [`write_tokeirad_writeback`].
+//!
+//! The ECS path additionally runs a pre-flight mirror validation
+//! ([`validate_ecs_mirrors`]) so `infra apply` fails loud if the operator
+//! forgot to populate the Mimir/Loki/Grafana/Alloy/aws-cli/busybox mirrors
+//! via `tkr image mirror` first.
+
 use std::{fs, path::Path};
 
 use anyhow::Result;
@@ -40,6 +57,16 @@ pub async fn run(
     }
 }
 
+/// Pre-flight check for ECS `infra apply`.
+///
+/// Most observability images (Mimir, Loki, Grafana, Alloy, aws-cli,
+/// busybox) are mirrored into a project-owned ECR repo rather than
+/// pulled directly from Docker Hub — ECR avoids hitting anonymous rate
+/// limits and keeps all image pulls inside the VPC. This function
+/// verifies the operator has populated every mirror before we provision
+/// infrastructure that would otherwise reference missing images.
+///
+/// Failing here saves the operator minutes of rollback work.
 async fn validate_ecs_mirrors(config: &EcsConfig) -> Result<()> {
     let deployment = EcsDeployment;
     let mut image_ctx = ImageContext::default();
@@ -153,6 +180,14 @@ pub fn read_tokeirad_config(path: &Path) -> Result<tokeira_config::TokeiraConfig
     Ok(toml::from_str(&fs::read_to_string(path)?)?)
 }
 
+/// Persist values discovered during `infra apply` back into the
+/// deployment's server config.
+///
+/// The engine collects writeback requests during apply (DSQL endpoint,
+/// OpenSearch URL, ECR registry host, etc.). Rather than making operators
+/// copy-paste these by hand, we patch them into `tokeirad.toml` using the
+/// same dotted-key writer the `image push/mirror` commands use. A later
+/// `tkr deploy apply` picks them up transparently.
 pub fn write_tokeirad_writeback(
     deployment_path: &Path,
     values: Vec<(String, String)>,
@@ -169,6 +204,9 @@ pub fn write_tokeirad_writeback(
     Ok(())
 }
 
+/// Render an IaC changelist using the `+/-/~/=` convention Terraform
+/// operators already recognise. Each diffed field is printed with its
+/// before/after value so the operator can eyeball the change.
 fn print_plan(changes: &[Change]) {
     for change in changes {
         let marker = match change.kind {

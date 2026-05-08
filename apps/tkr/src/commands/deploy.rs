@@ -1,3 +1,22 @@
+//! `tkr deploy` — service lifecycle: plan, apply, report status.
+//!
+//! `deploy apply` behaves differently per platform because the underlying
+//! runtime engine does:
+//!
+//! - **Local**: spawn `tokeirad` as a foreground host process via
+//!   [`crate::process::spawn_tokeirad`]. Status toggles to `Running` at
+//!   spawn and back to `Stopped` when the process exits (normally or via
+//!   ctrl-c).
+//! - **Compose**: run a Compose-specific pre-flight validation, then have
+//!   the [`DeployEngine`] reconcile the compose stack on disk. Status
+//!   flips to `Running` once the stack is up.
+//! - **ECS**: currently a `todo` surface — the runtime engine for ECS
+//!   exists but this CLI path hasn't been wired yet (tracked separately).
+//!
+//! `deploy status` prefers the live [`crate::process::local_process_status`]
+//! for local deployments over the metadata file so a crashed server is
+//! surfaced as `Stopped` even if the metadata still says `Running`.
+
 use anyhow::Result;
 use tokeira_compose_deployment::ComposeDeployment;
 use tokeira_deploy_engine::Platform;

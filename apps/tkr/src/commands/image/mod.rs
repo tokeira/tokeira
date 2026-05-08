@@ -1,3 +1,36 @@
+//! `tkr image` — runtime image build, push, and mirror flows.
+//!
+//! All four subcommands (`build`, `list`, `push`, `mirror`) live here
+//! because they share Dagger plumbing, the ECR auth path, and the
+//! deployment-config writeback pattern.
+//!
+//! # The Dagger re-exec dance
+//!
+//! `build`, `push`, and `mirror` all need a live Dagger session, which
+//! means they need `DAGGER_SESSION_PORT` + `DAGGER_SESSION_TOKEN` in the
+//! environment. Rather than requiring operators to remember `dagger run
+//! tkr image build`, we transparently re-exec this binary under `dagger
+//! run` when those env vars are missing. See [`reexec_under_dagger`].
+//!
+//! `list` does not need Dagger and skips the re-exec path entirely.
+//!
+//! # Image source types
+//!
+//! The deployment-engine layer labels every declared image as either
+//! `Build` (we build it from sources; tokeirad and its variants),
+//! `Mirror` (we copy an upstream image into our own ECR to avoid Docker
+//! Hub rate limits and keep image pulls in-VPC; Grafana, Mimir, Loki,
+//! Alloy, aws-cli, busybox) or `Registry` (pulled direct at deploy
+//! time; nothing uses this today). `push` only operates on `Build`
+//! images, `mirror` only on `Mirror` images.
+//!
+//! # Writeback
+//!
+//! Both `push` and `mirror` rewrite dotted keys in the deployment's
+//! `deployment.toml` to point at the resulting ECR refs. That way a
+//! subsequent `tkr infra apply` / `tkr deploy apply` sees the freshly
+//! pushed image refs without operator intervention.
+
 pub mod local_inspector;
 
 use std::path::PathBuf;

@@ -1,3 +1,18 @@
+//! `tkr scale` — adjust service replica counts.
+//!
+//! Three modes:
+//!
+//! - `scale up|down <service> <replicas>` — explicit per-service targets.
+//! - `scale up|down` (no args) — iterate every service the platform's
+//!   `desired_replicas()` reports and apply the configured value. Used for
+//!   "bring the whole stack up/down".
+//! - `scale status` — print each service and its configured replica count
+//!   (configured, not currently-running; the ops layer doesn't expose live
+//!   counts uniformly across platforms yet).
+//!
+//! The bulk `scale down` with no args flips the deployment's metadata
+//! status to `Stopped` so `tkr deploy status` reflects reality.
+
 use anyhow::Result;
 
 use crate::{

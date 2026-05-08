@@ -1,3 +1,30 @@
+//! Terminal UI for long-running engine operations.
+//!
+//! The IaC and deploy engines are headless: they raise progress events
+//! through callback hooks registered on a [`ProvisionContext`]. This module
+//! installs those hooks to render either spinners + pretty lines (human
+//! mode) or newline-delimited JSON events (`--json` mode), while also
+//! maintaining counters for the final summary line.
+//!
+//! # Two output paths
+//!
+//! - **Human, terminal attached** — each resource gets a live spinner via
+//!   `indicatif`; completion flips the spinner to a green `OK` or red
+//!   `FAIL` line and stops animation.
+//! - **Human, non-terminal** (e.g. piping to a log file) — no spinners,
+//!   lines are written line-by-line to stderr so they interleave
+//!   predictably with captured output.
+//! - **JSON** — every event type in [`ProgressEvent`] is emitted as a
+//!   single JSON object per line on stdout. Stable schema (`#[serde(tag =
+//!   "event", rename_all = "snake_case")]`).
+//!
+//! # Adding a new event
+//!
+//! 1. Add a variant to [`ProgressEvent`].
+//! 2. Register the corresponding hook on [`ActionTuiHandle::install`].
+//! 3. Extend the property test in this module so round-trip coverage keeps
+//!    up with the wire schema.
+
 use std::{
     collections::HashMap,
     sync::{
@@ -12,6 +39,11 @@ use indicatif::{MultiProgress, ProgressBar};
 use serde::{Deserialize, Serialize};
 use tokeira_iac::{ProvisionContext, ResourceId};
 
+/// Selects between pretty human output and newline-delimited JSON events.
+///
+/// Propagated from the global `--json` flag all the way down to each
+/// progress hook so the engine layer doesn't have to know about render
+/// modes at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
     Human,
@@ -44,6 +76,12 @@ impl std::fmt::Debug for SpinnerEntry {
     }
 }
 
+/// Owner of the live progress UI for a single engine operation.
+///
+/// Construct with [`ActionTuiHandle::new`], hand the engine's
+/// `ProvisionContext` to [`ActionTuiHandle::install`], run the engine, then
+/// call [`ActionTuiHandle::print_summary`] once the operation returns to
+/// render the final `Done: x completed, y failed, z skipped` line.
 #[derive(Debug, Clone)]
 pub struct ActionTuiHandle {
     format: OutputFormat,
@@ -267,6 +305,19 @@ impl ActionTuiHandle {
     }
 }
 
+/// Stable wire schema for machine-readable progress.
+///
+/// `#[serde(tag = "event", rename_all = "snake_case")]` means each variant
+/// serialises to a flat JSON object with an `event` discriminator:
+///
+/// ```json
+/// {"event": "operation_start", "action": "create", "resource_id": "vpc", ...}
+/// {"event": "operation_complete", "action": "create", "elapsed_ms": 432, ...}
+/// ```
+///
+/// The property test `progress_event_round_trips` asserts every variant
+/// survives serde round-tripping; add new variants there whenever this enum
+/// grows.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum ProgressEvent {

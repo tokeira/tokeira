@@ -1,3 +1,44 @@
+//! `tkr` — the Tokeira operator CLI.
+//!
+//! `tkr` is a single binary that drives every stage of a Tokeira deployment
+//! against any supported platform (local process, Docker Compose, AWS ECS).
+//! It replaces Terraform, kubectl, and shell scripts with one `plan → confirm
+//! → apply` workflow per concern.
+//!
+//! # Command map
+//!
+//! | Concern           | Command          | What it does                                   |
+//! |-------------------|------------------|------------------------------------------------|
+//! | Workspace dev     | `tkr dev ...`    | Thin shims over `cargo build/test/clippy/fmt`. |
+//! | Deployment CRUD   | `tkr deployment` | Create/list/use/destroy named deployments.     |
+//! | Container images  | `tkr image`      | Build, push, and mirror runtime images.        |
+//! | Cloud infra       | `tkr infra`      | Plan / apply / destroy declared resources.     |
+//! | Service deploy    | `tkr deploy`     | Plan / apply service manifests (0-replica).    |
+//! | DSQL schema       | `tkr schema`     | Schema setup for DSQL-backed deployments.      |
+//! | Scaling + ops     | `tkr scale`, `tkr logs`, `tkr port-forward` | Day-2 operator loops. |
+//! | Inspection        | `tkr config show`, `tkr version`            | Debugging aids.       |
+//!
+//! # Architecture pointers
+//!
+//! - **`cli`** defines the clap surface. Adding a subcommand starts here.
+//! - **`deployment_dir`** owns how deployments are resolved, loaded, and persisted.
+//! - **`commands`** contains one module per top-level subcommand; each module
+//!   receives a `DeploymentContext` (when needed) and dispatches through
+//!   `commands::PlatformOps` for platform-agnostic operations.
+//! - **`tui`** wires engine progress events to spinners (human mode) or JSON
+//!   lines (`--json` mode).
+//! - **`prototypical`** generates the template TOML written when a deployment
+//!   is created.
+//!
+//! # Working assumptions
+//!
+//! - All deployments live under a platform-specific state dir
+//!   (typically `~/Library/Application Support/tokeira/tkr/` on macOS);
+//!   see `DeploymentResolver::default` for the lookup rules.
+//! - The selected deployment is tracked in a `.latest` sentinel file so
+//!   operators can omit `--deployment` for the happy path.
+//! - Destructive operations require `--yes` (see [`commands::require_confirmation`]).
+
 use anyhow::Result;
 use clap::Parser;
 
@@ -18,6 +59,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let deployments = DeploymentResolver::default()?;
 
+    // Each arm resolves the deployment context it needs before dispatching.
+    // `Image` is the odd one out: `image build` works without any deployment
+    // (it operates on the workspace sources directly), while `image
+    // push/mirror/list` need a deployment to look up the platform's image
+    // catalog. The subcommand module handles that split internally; we just
+    // opportunistically load a context when one could apply.
     match cli.command {
         Command::Dev { action } => commands::dev::run(action),
         Command::Deployment { action } => commands::deployment::run(action, &deployments, cli.json),

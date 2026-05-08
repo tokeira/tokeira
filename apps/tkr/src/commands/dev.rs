@@ -1,3 +1,10 @@
+//! `tkr dev` — thin shim over common workspace cargo commands.
+//!
+//! Exists so contributors have a single discoverable verb for the
+//! most common loops (build, test, clippy, fmt, docs) without having
+//! to remember the exact flag combinations agreed upon in AGENTS.md
+//! (workspace-wide, all-targets, nightly fmt, etc.).
+
 use anyhow::{Result, bail};
 
 use crate::cli::DevAction;

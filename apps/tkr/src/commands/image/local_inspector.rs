@@ -1,3 +1,14 @@
+//! Abstraction over "does this image exist in the local Docker daemon?".
+//!
+//! [`tkr image push`][super::run_push] checks for a local copy of the
+//! built image before attempting to push it to ECR — it's a cheap
+//! pre-flight that turns a confusing Dagger failure into a clear
+//! "run `tkr image build` first" error.
+//!
+//! The inspector is a trait so tests can substitute a mock
+//! (`MockLocalImageInspector`, `#[cfg(test)]`) instead of shelling out
+//! to `docker`.
+
 use anyhow::{Context, Result};
 
 #[async_trait::async_trait]
@@ -5,6 +16,12 @@ pub trait LocalImageInspector: Send + Sync {
     async fn image_exists(&self, image_ref: &str) -> Result<bool>;
 }
 
+/// Production implementation that shells out to the `docker` CLI.
+///
+/// Returns `true` when `docker image inspect <ref>` exits successfully,
+/// `false` when docker reports "No such image", and surfaces any other
+/// failure as an error (so operators see a real diagnostic rather than a
+/// silent "image is missing" that in fact means "docker is dead").
 #[derive(Debug)]
 pub struct DockerCliInspector;
 

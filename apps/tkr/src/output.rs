@@ -1,3 +1,10 @@
+//! Simple helper for human vs JSON rendering of a single value or table.
+//!
+//! Used by `commands::deployment` for the `deployment list` table. Other
+//! commands emit bespoke output (image commands use a different
+//! json-or-human helper colocated with their row builders) so this is
+//! deliberately small rather than a workspace-wide formatter.
+
 use anyhow::Result;
 use serde::Serialize;
 use std::fmt::Display;

@@ -1,3 +1,17 @@
+//! Integration test: `tkr image mirror` against LocalStack ECR.
+//!
+//! Creates an ECS deployment in a sandboxed `XDG_STATE_HOME`, runs
+//! `tkr image mirror` twice, and asserts:
+//!
+//! 1. The deployment's `deployment.toml` writeback is idempotent
+//!    (second run produces byte-identical config).
+//! 2. Every mirrored repository ends up in LocalStack ECR with a
+//!    lifecycle policy attached.
+//!
+//! Gated behind the `integration-test` feature so unit-test runs don't
+//! drag in LocalStack / AWS / Dagger. Invoke with:
+//!   cargo test -p tkr --features integration-test -- --ignored mirrors_canonical_images_into_localstack_ecr
+
 #[cfg(feature = "integration-test")]
 mod integration {
     use std::{env, fs, process::Command};

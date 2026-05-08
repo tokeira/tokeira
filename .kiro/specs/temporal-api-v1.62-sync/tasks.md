@@ -13,7 +13,7 @@ The plan follows the six-step rollout in design.md §11 Migration and Rollout:
 5. v0.4 SDK integration test under `apps/tokeira-bench/tests/`.
 6. Documentation updates.
 
-Before the rollout, section 1 creates the placeholder spec directories that rows in the Surface_Audit point at. After the rollout, property tests validate the structural invariants on the Surface_Audit and the Impact Matrix.
+Before the rollout, section 1 creates placeholder spec directories for every Surface_Audit `Target Spec` value that names a spec which does not yet exist under `.kiro/specs/` — this covers both `Classification_Deferred` rows (where the target spec is mandatory per Req 2.3.1) and non-Deferred rows whose `Target Spec` column carries a forward pointer to not-yet-drafted follow-up work (permitted by the same requirement). After the rollout, property tests validate the structural invariants on the Surface_Audit and the Implementation & Escalation Matrix.
 
 Target crates and files:
 
@@ -33,8 +33,8 @@ Target crates and files:
 
 ## Tasks
 
-- [ ] 1. Create placeholder spec directories for every deferred Surface_Audit target spec that does not yet exist
-  - Each placeholder is a `.kiro/specs/<name>/.placeholder.md` file containing a one-paragraph scope statement and a pointer back to `temporal-api-v1.62-sync` as the spec that identified the need. Property 3 in design.md requires every Surface_Audit Target Spec column value to exist as a directory under `.kiro/specs/`; this section satisfies that invariant for the 8 names that are not already present.
+- [ ] 1. Create placeholder spec directories for every Surface_Audit target spec that does not yet exist
+  - Each placeholder is a `.kiro/specs/<name>/.placeholder.md` file containing a one-paragraph scope statement and a pointer back to `temporal-api-v1.62-sync` as the spec that identified the need. Property 3 in design.md requires every Surface_Audit `Target Spec` column value — whether on a `Classification_Deferred` row (where the target is mandatory per Req 2.3.1) or on a non-Deferred row that carries a forward pointer to follow-up work — to exist as a directory under `.kiro/specs/`. This section satisfies that invariant for every placeholder name that is not already present in the workspace.
   - [ ] 1.1 Create `tokeira/.kiro/specs/worker-deployments/.placeholder.md`
     - Scope: the 11 Worker Deployments RPCs enumerated in design.md §5 Surface_Audit and the `temporal.api.deployment.v1` messages consumed by them.
     - Flip target for `SystemCapabilities.server_scaled_deployments` from `false` to `true` when this spec lands.
@@ -55,7 +55,7 @@ Target crates and files:
     - Scope: persistent `WorkerHeartbeat` storage, kernel-observed worker liveness, `ListWorkers` projection, and the promotion of `record_worker_heartbeat` from no-op to real handler.
     - (Req 2.1.3 RecordWorkerHeartbeat row, Req 3.3.3, Req 3.4.4, Property 3)
   - [ ] 1.7 Create `tokeira/.kiro/specs/nexus-retry-policy/.placeholder.md`
-    - Scope: runtime retry branching on `NexusRetryBehavior` when Nexus-specific retry shapes are needed. Referenced by the Impact Matrix escalation for `RespondNexusTaskFailedRequest.error.retry_behavior`.
+    - Scope: runtime retry branching on `NexusRetryBehavior` when Nexus-specific retry shapes are needed. Referenced by the Implementation & Escalation Matrix escalation for `RespondNexusTaskFailedRequest.error.retry_behavior`.
     - (Req 5.1.3 escalation note for `RespondNexusTaskFailedRequest.error.retry_behavior`, Property 3, Property 7)
   - [ ] 1.8 Create `tokeira/.kiro/specs/speculative-wft/.placeholder.md`
     - Scope: speculative workflow tasks as a distinct task kind. Consumer of `RespondWorkflowTaskCompletedRequest.Capabilities.discard_speculative_workflow_task_with_events`.
@@ -112,21 +112,21 @@ Target crates and files:
     - (Req 4.7.1, 4.7.2)
   - [ ] 4.6 Rename the `*ById` activity DTOs to drop the suffix
     - Rename `UpdateActivityOptionsByIdRequest` → `UpdateActivityOptionsRequest`, `PauseActivityByIdRequest` → `PauseActivityRequest`, `UnpauseActivityByIdRequest` → `UnpauseActivityRequest`, `ResetActivityByIdRequest` → `ResetActivityRequest` in the DTO module.
-    - Add the v1.62 wire-through fields identified in the Impact Matrix: `UpdateActivityOptionsRequest.activity_type: Option<ActivityType>`, `PauseActivityRequest.identity: String`, `UnpauseActivityRequest.reset_heartbeat: bool`, `ResetActivityRequest.keep_paused: bool`.
+    - Add the v1.62 wire-through fields identified in the Implementation & Escalation Matrix: `UpdateActivityOptionsRequest.activity_type: Option<ActivityType>`, `PauseActivityRequest.identity: String`, `UnpauseActivityRequest.reset_heartbeat: bool`, `ResetActivityRequest.keep_paused: bool`.
     - Handler and caller renames are owned by section 9; this sub-task covers only the DTO renames and new DTO fields.
-    - (Req 4.3.4, Impact Matrix rows for renamed request DTOs)
+    - (Req 4.3.4, Implementation & Escalation Matrix rows for renamed request DTOs)
   - [ ] 4.7 Extend the Nexus DTO family with v1.62 field additions
     - In `crates/tokeira-edge/src/translate/nexus.rs`, add the wire-through fields enumerated in the Surface_Audit Nexus section: `PollNexusTaskQueueResponse.poll_request_id: String`, expanded `PollNexusTaskQueueResponse.request` sub-fields, expanded `RespondNexusTaskCompletedRequest.response` sub-fields, `NexusEndpointSpec.description: String`, and the new `NexusEndpointSpec.endpoint_type` enum variant.
-    - Fields classified `Classification_Deferred` (notably `NexusEndpointSpec.allowed_cluster_ids` and `RespondNexusTaskFailedRequest.error.retry_behavior` after Impact Matrix escalation) SHALL be explicitly dropped at the edge per tightened Req 2.2.6 — they are NOT mirrored onto DTOs, NOT carried as opaque bytes, and the response path emits the protobuf default.
+    - Fields classified `Classification_Deferred` (notably `NexusEndpointSpec.allowed_cluster_ids` and `RespondNexusTaskFailedRequest.error.retry_behavior` after Implementation & Escalation Matrix escalation) SHALL be explicitly dropped at the edge per tightened Req 2.2.6 — they are NOT mirrored onto DTOs, NOT carried as opaque bytes, and the response path emits the protobuf default.
     - (Req 4.8.1, 4.8.2, 4.8.4, 4.8.5)
   - [ ]* 4.8 Write property test P1: translator round-trip fidelity
     - **Property 1: Translator round-trip fidelity**
-    - **Validates: Requirements 2.2.5, 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, and every in-scope row in the Impact Matrix (§6 design.md)**
+    - **Validates: Requirements 2.2.5, 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, and every in-scope row in the Implementation & Escalation Matrix (§6 design.md)**
     - For each DTO type touched in sub-tasks 4.1–4.7 and 4.9, generate arbitrary instances via `proptest` strategies, encode via `*_to_proto`, decode via `*_from_proto`, and assert byte-equivalence on every field the translator preserves.
-    - Every `Classification_WireThrough` field listed in the Impact Matrix MUST be included in the preserved-field comparison. The `client_discards_speculative_with_events` DTO field (Req 4.2.1–4.2.4) MUST also be included because Req 4.2 requires the edge to decode and preserve it even though it is classified `Classification_Capability` rather than `Classification_WireThrough`. Only fields with `Classification_Deferred` classification are excluded, and each exclusion cites the Surface_Audit row that justifies it per Req 4.5.2.
+    - Every `Classification_WireThrough` field listed in the Implementation & Escalation Matrix MUST be included in the preserved-field comparison. The `client_discards_speculative_with_events` DTO field (Req 4.2.1–4.2.4) MUST also be included because Req 4.2 requires the edge to decode and preserve it even though it is classified `Classification_Capability` rather than `Classification_WireThrough`. Only fields with `Classification_Deferred` classification are excluded, and each exclusion cites the Surface_Audit row that justifies it per Req 4.5.2.
     - Test location: `crates/tokeira-edge/src/translate/` submodule test modules; minimum 256 iterations per `proptest::test_runner::Config::default()`.
   - [ ] 4.9 Wire-through field additions on StartWorkflow / SignalWithStartWorkflow / Poll / Respond / DescribeTaskQueue / ScheduleSpec / enum families
-    - In `crates/tokeira-edge/src/translate/mod.rs` and the neighbouring translator modules, add every `Classification_WireThrough` field listed in the Impact Matrix that is not already covered by sub-tasks 4.1–4.7:
+    - In `crates/tokeira-edge/src/translate/mod.rs` and the neighbouring translator modules, add every `Classification_WireThrough` field listed in the Implementation & Escalation Matrix that is not already covered by sub-tasks 4.1–4.7:
       - `StartWorkflowExecutionRequest.user_metadata: Option<UserMetadata>`, `.links: Vec<Link>`, `.priority: Option<Priority>`, `.completion_callbacks: Vec<Callback>`.
       - `SignalWithStartWorkflowExecutionRequest.user_metadata`, `.links`, `.priority` (mirroring StartWorkflow).
       - `PollWorkflowTaskQueueResponse.poll_request_id: String`.
@@ -135,10 +135,10 @@ Target crates and files:
       - `RespondActivityTaskCompletedRequest.worker_version`, `RespondActivityTaskFailedRequest.worker_version`, `RespondActivityTaskCanceledRequest.worker_version`.
       - `DescribeTaskQueueResponse.task_queue_stats: Option<TaskQueueStats>`.
       - Enum additions: `TaskReachability` new variants, `BuildIdTaskReachability`, `ApplicationErrorCategory`.
-    - For each field, add the DTO field, update `*_from_proto` and `*_to_proto`, and update the construction / consumption call sites identified in the Impact Matrix Implementation Notes column (typically a single-file edit each).
+    - For each field, add the DTO field, update `*_from_proto` and `*_to_proto`, and update the construction / consumption call sites identified in the Implementation & Escalation Matrix Implementation Notes column (typically a single-file edit each).
     - `DescribeTaskQueueResponse.config` is owned by sub-task 7.6; do NOT duplicate it here.
     - Fields explicitly classified `Classification_Deferred` (e.g. `StartWorkflowExecutionRequest.versioning_override`, `RespondActivityTaskFailedRequest.is_last_failure`) are out of scope for this sub-task and are explicitly dropped per tightened Req 2.2.6.
-    - (Req 2.2.5, Impact Matrix in-scope rows that sub-tasks 4.1–4.7 do not already cover)
+    - (Req 2.2.5, Implementation & Escalation Matrix in-scope rows that sub-tasks 4.1–4.7 do not already cover)
 
 - [ ] 5. Capability advertisement in edge translators (§11 Migration Step 2, part 2; §3 Capability advertisement)
   - [ ] 5.1 Update `system_info_to_proto` to emit v1.62 capability flags
@@ -208,7 +208,7 @@ Target crates and files:
 - [ ] 8. Nexus v2 field wire-through (§11 Migration Step 2, part 5; §6 Nexus v2 wire-through)
   - [ ] 8.1 Decode v1.62 Nexus fields in `crates/tokeira-edge/src/translate/nexus.rs`
     - Update `*_from_proto` translators for `PollNexusTaskQueueResponse`, `RespondNexusTaskCompletedRequest`, `RespondNexusTaskFailedRequest`, and the `NexusEndpointSpec` family to copy every new field from the proto into the DTO. Re-emit the same fields on the `*_to_proto` return path.
-    - Skip fields escalated to `Classification_Deferred` in the Impact Matrix (e.g. `RespondNexusTaskFailedRequest.error.retry_behavior`, `NexusEndpointSpec.allowed_cluster_ids`).
+    - Skip fields escalated to `Classification_Deferred` in the Implementation & Escalation Matrix (e.g. `RespondNexusTaskFailedRequest.error.retry_behavior`, `NexusEndpointSpec.allowed_cluster_ids`).
     - (Req 4.8.1, 4.8.2, 4.8.5)
   - [ ] 8.2 Pass the new Nexus fields through `NexusTaskBroker`
     - In `tokeira-runtime`, extend whichever internal state types already carry the affected Nexus message so that each new DTO field is carried through without new behavioural coupling to dispatch or retry.
@@ -223,8 +223,8 @@ Target crates and files:
     - The v1.43 RPC names no longer exist in the generated trait; any orphan methods on the impl block must be removed or renamed in this sub-task to keep the trait satisfied.
     - (Req 4.3.1, 4.3.2)
   - [ ] 9.2 Wire the v1.62 field additions on the renamed request messages
-    - For `UpdateActivityOptionsRequest.activity_type`, `PauseActivityRequest.identity`, `UnpauseActivityRequest.reset_heartbeat`, `ResetActivityRequest.keep_paused` — update the existing runtime-facing handlers to read the new DTO fields and pass them through. Impact Matrix classifies each as a single-file edit; no new runtime state types are introduced.
-    - (Req 4.3.3, Impact Matrix rows for renamed activity request fields)
+    - For `UpdateActivityOptionsRequest.activity_type`, `PauseActivityRequest.identity`, `UnpauseActivityRequest.reset_heartbeat`, `ResetActivityRequest.keep_paused` — update the existing runtime-facing handlers to read the new DTO fields and pass them through. Implementation & Escalation Matrix classifies each as a single-file edit; no new runtime state types are introduced.
+    - (Req 4.3.3, Implementation & Escalation Matrix rows for renamed activity request fields)
   - [ ] 9.3 Update all callers of the renamed DTOs
     - Rename references to `PauseActivityByIdRequest` / etc. across the workspace (tests, helper functions, docs) to their unsuffixed forms.
     - (Req 4.3.4)
@@ -278,22 +278,24 @@ Target crates and files:
     - Assert exactly one `tracing::debug!` line per call via a test-only tracing subscriber; assert zero `warn!` or higher log lines.
     - Test location: `crates/tokeira-edge/tests/grpc_deferred_handlers.rs`.
 
-- [ ] 13. Surface_Audit and Impact Matrix structural property tests
-  - [ ]* 13.1 Write property test P2: Surface_Audit wire-through count matches in-scope Impact Matrix row count
-    - **Property 2: Surface_Audit wire-through count matches in-scope Impact Matrix row count**
+- [ ] 13. Surface_Audit and Implementation & Escalation Matrix structural property tests
+  - [ ]* 13.1 Write property test P2: Surface_Audit rows align with the Implementation & Escalation Matrix
+    - **Property 2: Surface_Audit rows align with the Implementation & Escalation Matrix**
     - **Validates: Requirements 2.3, 2.3.3, 5.1.1**
-    - Parse the Surface_Audit table in `design.md`. Assert the count of rows with `Classification == "Wire through"` equals the count of rows in the Impact Matrix table whose Implementation Notes column starts with `In scope` (i.e. was not escalated to `Classification_Deferred` per Req 5.1.3). Impact Matrix rows whose Implementation Notes column starts with `**Classified Deferred**` are excluded from the equivalence because they already appear as `Classification_Deferred` rows in the Surface_Audit — counting them on both sides would double-count. Rows classified `No-op/compile-only` (e.g. `temporal.api.worker.v1` and its sub-messages) are also excluded from the wire-through count because no translator edit corresponds to them.
-    - Complement property: the count of Surface_Audit rows with `Classification == "Deferred"` SHALL be ≥ the count of Impact Matrix `**Classified Deferred**` rows. (The Surface_Audit additionally carries Classification_Deferred RPCs and messages that never reach the Impact Matrix because they have no in-scope Implementation Notes to record.)
+    - Parse the Surface_Audit table and the Implementation & Escalation Matrix in `design.md`. Assert three count equivalences:
+      - `Classification == "Wire through"` row count equals the count of Matrix rows whose `Implementation Notes` starts with `In scope` and does NOT start with `In scope (no-op handler)`.
+      - `Classification == "Deferred"` row count is ≥ the count of Matrix rows whose `Implementation Notes` starts with `**Classified Deferred**`. The inequality permits pure `Classification_Deferred` RPCs and messages that never reach the Matrix.
+      - `Classification == "No-op"` row count is ≥ the count of Matrix rows whose `Implementation Notes` starts with `In scope (no-op handler)`. Today there is exactly one such Matrix row (`RecordWorkerHeartbeat`). Surface_Audit `No-op` rows whose Disposition carries `compile-only; no DTO/translator work` are excluded from the Matrix on both sides.
     - Test location: `crates/tokeira-edge/tests/surface_audit_structure.rs`.
-  - [ ]* 13.2 Write property test P3: every deferred spec name exists as a workspace directory
-    - **Property 3: every deferred spec name exists as a workspace directory**
-    - **Validates: Requirements 2.1, 2.1.3, 8.1.2, Property 3**
-    - Parse the Surface_Audit table. For every row classified `Classification_Deferred`, assert the Target Spec column value exists as a directory under `.kiro/specs/` in the workspace. The set covered includes `worker-deployments`, `worker-heartbeat-observability`, `workflow-rules`, `activity-executions-first-class`, `worker-config-management`, `kernel-pause-workflow`, `runtime-worker-versioning`, `runtime-activity-timeouts`, `nexus-retry-policy`, `speculative-wft`, and `temporal-compatibility`.
+  - [ ]* 13.2 Write property test P3: every Target Spec name exists as a workspace directory
+    - **Property 3: every Target Spec name exists as a workspace directory**
+    - **Validates: Requirements 2.1, 2.1.3, 2.3.1, 8.1.2**
+    - Parse the Surface_Audit table. For every row whose `Target Spec` column is non-empty and not the placeholder `—`, assert the value exists as a directory under `.kiro/specs/` in the workspace. The property covers both `Classification_Deferred` rows (where the target is mandatory per Req 2.3.1) and non-Deferred rows whose `Target Spec` carries a forward pointer to follow-up work. The set covered includes `worker-deployments`, `worker-heartbeat-observability`, `workflow-rules`, `activity-executions-first-class`, `worker-config-management`, `kernel-pause-workflow`, `runtime-worker-versioning`, `runtime-activity-timeouts`, `nexus-retry-policy`, `speculative-wft`, and `temporal-compatibility`.
     - Test location: `crates/tokeira-edge/tests/surface_audit_structure.rs`.
-  - [ ]* 13.3 Write property test P7: Impact Matrix escalation invariant
-    - **Property 7: Impact Matrix escalation invariant**
+  - [ ]* 13.3 Write property test P7: Implementation & Escalation Matrix escalation invariant
+    - **Property 7: Implementation & Escalation Matrix escalation invariant**
     - **Validates: Requirements 5.1.3, 5.1.4, 5.1.5, 5.2**
-    - For every row in the Impact Matrix: non-`none` Kernel Impact implies escalation to `Classification_Deferred` or the column value is exactly `existing transition field`; non-`none` Runtime Impact exceeding a single-file edit implies escalation; non-`none` Projection Impact requiring a migration file implies escalation.
+    - For every row in the Implementation & Escalation Matrix: non-`none` Kernel Impact implies escalation to `Classification_Deferred` or the column value is exactly `existing transition field`; non-`none` Runtime Impact exceeding a single-file edit implies escalation; non-`none` Projection Impact requiring a migration file implies escalation.
     - Additionally assert `crates/tokeira-kernel/Cargo.toml` gained no new dependency entries from this spec, and `crates/tokeira-kernel/` gained no new `use` statements on `tokio`, `async_trait`, `tonic`, or `prost` — parse the crate's `src/` tree for these imports.
     - Test location: `crates/tokeira-edge/tests/surface_audit_structure.rs`.
 
@@ -353,4 +355,4 @@ Target crates and files:
 - Checkpoints (tasks 3, 11, 14, 18) mark the handoff points between the six rollout steps from design.md §11 Migration and Rollout. Each step leaves `cargo build --workspace` green so intermediate commits are bisectable.
 - Property tests live alongside their implementation parents (P1 under section 4 translator work, P4 under section 6 CountSchedules, P5 under section 7 UpdateTaskQueueConfig, P6 under section 12 deferred-stub blocks) or under section 13 for structural invariants that span multiple parents (P2, P3, P7).
 - The Surface_Audit table in `design.md` §5 is the single source of truth for which RPC / field lands in which bucket. If the resynced proto tree (after task 2.1) reveals a row whose exact `Added In` version or field shape diverges from the audit, amend the table in the same commit as task 2.4 and carry the amendment forward.
-- No task in this plan modifies `crates/tokeira-kernel/`. Any Impact Matrix escalation that would require kernel changes is deferred to the named follow-up spec per Req 5.2.
+- No task in this plan modifies `crates/tokeira-kernel/`. Any Implementation & Escalation Matrix escalation that would require kernel changes is deferred to the named follow-up spec per Req 5.2.

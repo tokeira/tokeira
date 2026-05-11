@@ -7,8 +7,7 @@
 
 use std::time::Duration;
 
-use tokio::net::TcpStream;
-use tokio::sync::Notify;
+use tokio::{net::TcpStream, sync::Notify};
 
 use tokeirad::TokeiradHandle;
 
@@ -24,7 +23,11 @@ async fn start_in_memory_binds_serves_and_shuts_down() {
         .expect("start_in_memory should succeed on an ephemeral port");
 
     let addr = handle.bound_addr();
-    assert_ne!(addr.port(), 0, "bound port should be concrete, not wildcard");
+    assert_ne!(
+        addr.port(),
+        0,
+        "bound port should be concrete, not wildcard"
+    );
 
     // Prove the listener is accepting by completing a TCP handshake.
     // `tokio::time::timeout` bounds the test duration; the handshake itself

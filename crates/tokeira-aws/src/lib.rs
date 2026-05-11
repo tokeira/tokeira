@@ -8,6 +8,8 @@
 mod clients;
 mod context;
 mod iam_policy;
+pub mod remote_workstation;
+pub mod remote_workstation_bootstrap;
 pub mod resources;
 
 pub use clients::{

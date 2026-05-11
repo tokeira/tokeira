@@ -493,8 +493,10 @@ The engine methods sequence the AWS SDK calls described in §3 (for lifecycle) a
          (+ Filter("tag:workstation-id", override) if --workstation set)
      )
 
-2a. Zero matches (and no --workstation) → create fresh:
-       - Generate workstation_id: ULID
+2a. Zero matches → create fresh:
+       - Use --workstation as workstation_id when provided; otherwise generate
+         workstation_id via ULID
+       - Verify no tagged workstation resource already uses the chosen ID
        - Create IAM role "tokeira-workstation-<id>-role"
          - AttachRolePolicy: AmazonSSMManagedInstanceCore
        - Create instance profile "tokeira-workstation-<id>-profile"
@@ -504,11 +506,16 @@ The engine methods sequence the AWS SDK calls described in §3 (for lifecycle) a
          - All egress to 0.0.0.0/0
        - Create Cache_Volume (gp3, encrypted, 30 GiB, tagged)
        - Create Repo_Volume (gp3, encrypted, 40 GiB, tagged)
+       - Render cloud-init with the pre-created Cache_Volume and Repo_Volume
+         IDs. The script waits for the Nitro by-id device symlinks for those
+         volumes instead of calling EC2 from the instance.
        - RunInstances:
          - AMI: resolve latest Ubuntu 24.04 arm64 (or AL2023) via SSM parameter
          - InstanceType: c8gd.8xlarge
          - SubnetId: from profile or discovered public subnet
-         - AssociatePublicIpAddress: true (one-shot; re-associated on start)
+         - AssociatePublicIpAddress: true for default public-subnet mode;
+           false only when the operator explicitly supplies a private subnet
+           with an existing NAT egress path
          - BlockDeviceMappings: root 20 GiB gp3 encrypted
          - IamInstanceProfile: the one created above
          - UserData: rendered cloud-init script (see §5)
@@ -526,7 +533,8 @@ The engine methods sequence the AWS SDK calls described in §3 (for lifecycle) a
        - Compute local Bootstrap_Fingerprint from the current rust-toolchain.toml
        - StartInstances
        - Wait for instance running
-       - AllocateAddress + AssociateAddress (if no public IP re-assigned)
+       - AllocateAddress + AssociateAddress if outbound public IPv4 is needed
+         and no account-owned tagged EIP is available for reuse
        - Read instance fingerprint via ssm.SendCommand
          (cat /etc/tokeira/workstation-fingerprint)
        - If mismatch, call bootstrap() (§3.4)
@@ -542,7 +550,7 @@ The engine methods sequence the AWS SDK calls described in §3 (for lifecycle) a
     resolves to exactly one
 ```
 
-**Subnet discovery.** When `--subnet-id` is omitted, the engine discovers an eligible public subnet in the target region: `ec2.describe_subnets` filtered by `MapPublicIpOnLaunch=false` and `VpcId` of the default VPC. If multiple match, the first one by subnet-ID lexicographic order is chosen (deterministic and documented). If none match, the engine errors with a clear message telling the operator to pass `--subnet-id` explicitly.
+**Subnet discovery.** When `--subnet-id` is omitted, the engine discovers an eligible public subnet in the target region: `ec2.describe_subnets` filtered to the default VPC and a route table with an Internet Gateway route. The subnet-level `MapPublicIpOnLaunch` value is not authoritative because the engine explicitly sets `AssociatePublicIpAddress` on the launch network interface. If multiple public subnets match, the first one by subnet-ID lexicographic order is chosen (deterministic and documented). If none match, the engine errors with a clear message telling the operator to pass `--subnet-id` explicitly.
 
 **AMI resolution.** The cloud-init script is AMI-family-agnostic in its shell-level contents, but the exact AMI ID is resolved via SSM Parameter Store: `/aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id` for Ubuntu 24.04, or `/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64` for AL2023. Canonical maintains these parameters; AWS maintains AL2023's. No AMI ID is hard-coded in Rust.
 
@@ -647,7 +655,7 @@ Using the `aws` CLI subprocess (rather than the SDK) for the interactive path is
        ssm.cancel_command(command_id).
 ```
 
-**Streaming caveat.** The SSM Run Command model is poll-based: `GetCommandInvocation` returns the accumulated output so far. For real-time streaming of `cargo build` output over a 30-second compile, the engine polls at 500-ms intervals and streams the delta. This is "near-real-time": the operator sees lines in batches of up to ~half a second of output. In practice this feels responsive enough for build-style workloads. If it doesn't, a v2 upgrade path is to use `StartSession` with the non-interactive stream-session document, which gives true streaming — but requires the session-manager-plugin on the MacBook and is more complex to wire in Rust. The v1 poll-based implementation suffices for this spec's acceptance gate.
+**Streaming caveat.** The SSM Run Command model is poll-based: `GetCommandInvocation` returns accumulated output when AWS exposes it, not a byte-stream. For build-style workloads the engine polls at 500-ms intervals and streams newly observed deltas promptly. This is "near-real-time" and satisfies the v1 contract; it is not true terminal streaming. If it proves insufficient, a v2 upgrade path is to use `StartSession` with a non-interactive stream-session document, which gives true streaming but requires the session-manager-plugin on the MacBook and a more complex cancellation path.
 
 **Working directory.** The command is wrapped as `bash -lc "cd <cwd> && <cmd>"`. `bash -l` sources `/etc/profile.d/tokeira-workstation.sh` which exports `CARGO_TARGET_DIR`, `RUSTC_WRAPPER`, `SCCACHE_DIR`, and `CARGO_INCREMENTAL` (Req 2.1.5). This means `tkr workstation remote-exec cargo build` sees the correct environment without the MacBook having to forward anything.
 
@@ -662,6 +670,8 @@ pub struct BootstrapContext {
     pub workstation_id: String,
     pub bootstrap_fingerprint: String,
     pub profile: WorkstationProfile,
+    pub cache_volume_id: String,
+    pub repo_volume_id: String,
     pub rust_toolchain_toml_bytes: Vec<u8>,
     pub cargo_tools: Vec<CargoTool>,      // default: nextest, deny, insta, llvm-cov, sccache
     pub apt_packages: Vec<String>,        // default: git, gh, ripgrep, fd-find, jq, mold, lld, protoc
@@ -678,8 +688,11 @@ set -euo pipefail
 #   - Detect the NVMe block device (vendor-specific naming; use
 #     lsblk + grep for "ephemeral" or by size-threshold).
 #   - Format if not already ext4; mount at /work.
-#   - Identify EBS volumes by EC2 metadata tag via IMDSv2 token → DescribeVolumes:
-#       by-tag:workstation-id + by-tag:Name=Cache or by-tag:Name=Repo.
+#   - Wait for the two EBS devices by explicit volume ID supplied in
+#     BootstrapContext:
+#       /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_<cache-volume-id>
+#       /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_<repo-volume-id>
+#     This avoids requiring ec2:DescribeVolumes on the instance role.
 #   - Format if not already ext4 (detect by blkid); mount at /work/cache, /work/repo.
 #   - Bind-mount ~/.cargo, ~/.rustup from /work/cache/{cargo,rustup}.
 #   - Write /etc/fstab entries for persistent mounts (Cache + Repo).
@@ -716,6 +729,10 @@ set -euo pipefail
 
 # PHASE 4: Clone repo if empty (Req 3.3)
 #   - If /work/repo/tokeira/.git does not exist: git clone <repo_url> /work/repo/tokeira.
+#   - If clone fails (for example, private repo with no deploy key yet), write
+#     /etc/tokeira/repo-clone-status with the failure message and continue.
+#     The bootstrap fingerprint is still written so `up` can return and the
+#     operator can run `tkr workstation github-key add`.
 #   - Symlink /work/tokeira → /work/repo/tokeira.
 #   - Configure git user.name and user.email if provided in BootstrapContext.
 
@@ -948,7 +965,7 @@ Req 10.2.3 is non-obvious and worth stating plainly: the `gh api POST repos/.../
 
 #### 8.5 Minimum-credential IAM role (Req 10.5)
 
-The workstation's IAM role attaches exactly one managed policy: `arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore`. No inline policy, no `secretsmanager:*`, no `ssm:GetParameter` (the bootstrap uses IMDS + DescribeVolumes via the tags tag-based path, not Parameter Store). The Rust code that creates the role asserts this at runtime in debug builds:
+The workstation's IAM role attaches exactly one managed policy: `arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore`. No inline policy, no `secretsmanager:*`, no `ssm:GetParameter`, and no `ec2:DescribeVolumes`. The bootstrap receives the EBS volume IDs from user-data and waits for the corresponding Nitro block-device symlinks, so it does not need AWS API permissions beyond what the SSM agent itself uses. The Rust code that creates the role asserts this at runtime in debug builds:
 
 ```rust
 #[cfg(debug_assertions)]
@@ -1102,7 +1119,7 @@ One `#[ignore]`'d end-to-end test at `crates/tokeira-aws/tests/remote_workstatio
 
 ## Tradeoffs
 
-**SSM `SendCommand` polling vs `StartSession` streaming.** `remote-exec` uses `SendCommand` with 500-ms polling, which gives near-real-time output for build-style workloads but not truly streaming low-latency output. True streaming would require the `session-manager-plugin` and a more complex non-interactive session setup. Accepted trade-off for v1; v2 upgrade path is documented in §4.2.
+**SSM `SendCommand` polling vs `StartSession` streaming.** `remote-exec` uses `SendCommand` with 500-ms polling. The accepted v1 contract is bounded, near-real-time output when AWS exposes output chunks through `GetCommandInvocation`, not true terminal streaming. True streaming would require the `session-manager-plugin` and a more complex non-interactive session setup. Accepted trade-off for v1; v2 upgrade path is documented in §4.2.
 
 **Public subnet with transient EIP vs private subnet with NAT Gateway.** NAT Gateway standing cost is ~$36/month. For a solo developer workstation that cost is disproportionate. Public subnet + transient EIP preserves the zero-ingress security posture (security group has no inbound rules) while halving the monthly bill. If the operator's account already runs a NAT Gateway for unrelated workloads, they can pass `--subnet-id <private-subnet>` to route through it.
 

@@ -119,6 +119,7 @@ async fn main() -> Result<()> {
             let ctx = load_context(&deployments, cli.deployment.as_deref())?;
             commands::config::run_show(ctx)
         }
+        Command::Workstation { action } => commands::workstation::run(action, cli.json).await,
         Command::Version => {
             commands::version::run();
             Ok(())

@@ -567,6 +567,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-ssm"
+version = "1.109.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69f4bdbeea2c7d18632093cd158644902f1e91ae025a3f68afaa449f620ae658"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-sso"
 version = "1.98.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2503,6 +2527,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
+name = "humantime"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "135b12329e5e3ce057a9f972339ea52bc954fe1e9358ef27f95e89716fbc5424"
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3899,7 +3929,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
  "heck",
- "itertools 0.12.1",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -3933,7 +3963,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.12.1",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn",
@@ -5577,9 +5607,11 @@ dependencies = [
  "clap",
  "console",
  "directories",
+ "humantime",
  "indicatif",
  "libc",
  "proptest",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",
@@ -5616,6 +5648,7 @@ dependencies = [
  "aws-sdk-iam",
  "aws-sdk-s3",
  "aws-sdk-secretsmanager",
+ "aws-sdk-ssm",
  "aws-sdk-sts",
  "base64 0.22.1",
  "chrono",
@@ -5626,12 +5659,14 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "shlex",
  "thiserror 2.0.18",
  "tokeira-iac",
  "tokio",
  "tracing",
  "urlencoding",
  "uuid",
+ "which",
 ]
 
 [[package]]

@@ -25,6 +25,7 @@ pub mod port_forward;
 pub mod scale;
 pub mod schema;
 pub mod version;
+pub mod workstation;
 
 use std::path::PathBuf;
 

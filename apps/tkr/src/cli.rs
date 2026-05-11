@@ -80,6 +80,10 @@ pub enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    Workstation {
+        #[command(subcommand)]
+        action: WorkstationAction,
+    },
     Version,
 }
 
@@ -220,6 +224,93 @@ pub enum ScaleAction {
 #[derive(Subcommand)]
 pub enum ConfigAction {
     Show,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkstationAction {
+    Up {
+        #[arg(long, default_value = "c8gd-rust")]
+        profile: String,
+        #[arg(long)]
+        workstation: Option<String>,
+        #[arg(long)]
+        cache_volume_gib: Option<u32>,
+        #[arg(long)]
+        repo_volume_gib: Option<u32>,
+        #[arg(long)]
+        root_volume_gib: Option<u32>,
+        #[arg(long)]
+        instance_type: Option<String>,
+        #[arg(long)]
+        region: Option<String>,
+        #[arg(long)]
+        subnet_id: Option<String>,
+    },
+    Stop {
+        #[arg(long)]
+        workstation: Option<String>,
+    },
+    Destroy {
+        #[arg(long)]
+        workstation: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+    Ssh {
+        #[arg(long)]
+        workstation: Option<String>,
+    },
+    RemoteExec {
+        #[arg(long)]
+        workstation: Option<String>,
+        #[arg(long, default_value = "/work/tokeira")]
+        cwd: String,
+        #[arg(long)]
+        yes_secret_in_command: bool,
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+    Status {
+        #[arg(long)]
+        workstation: Option<String>,
+    },
+    List,
+    Bootstrap {
+        #[arg(long)]
+        workstation: Option<String>,
+    },
+    Idle {
+        #[arg(long)]
+        workstation: Option<String>,
+        #[arg(long)]
+        defer: Option<humantime::Duration>,
+    },
+    GithubKey {
+        #[command(subcommand)]
+        action: GithubKeyAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum GithubKeyAction {
+    Add {
+        #[arg(long)]
+        workstation: Option<String>,
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        read_only: bool,
+    },
+    Remove {
+        #[arg(long)]
+        workstation: Option<String>,
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    List {
+        #[arg(long)]
+        workstation: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

@@ -193,8 +193,7 @@ pub async fn run_from_cli(cli: Cli) -> Result<()> {
         println!("{}", effective_config.to_toml()?);
         return Ok(());
     }
-    let observability =
-        observability::ObservabilityConfig::from_tokeira_config(&effective_config)?;
+    let observability = observability::ObservabilityConfig::from_tokeira_config(&effective_config)?;
     let metrics_handle = observability::install_metrics(&observability)?;
     let log_reload = observability::install_tracing(&observability)?;
     for warning in effective_config.emergency_warnings() {

@@ -24,7 +24,7 @@ This spec is **scoped to the workstation itself**. The agent controller (Codex, 
 - **S3-backed shared sccache** — the bootstrap installs `sccache` with the local filesystem backend at `/work/sccache` on the instance's NVMe. A shared S3 backend is a cost/speed optimisation deferred to a future iteration once two or more workstations regularly coexist or the post-stop cold-cache cost becomes operationally annoying.
 - **Remote debugging, LLDB forwarding, interactive IDE sync** — these are fine use cases for the SSM channel but are not requirements of this spec. The operator SSHes (via `tkr workstation ssh`) for ad-hoc interactive work; the programmatic surface is `tkr workstation remote-exec`.
 - **Multi-region support** — every workstation lives in a single operator-configured default region. Multi-region is an explicit non-goal; if it becomes necessary, a future spec reshapes the configuration surface.
-- **Public internet ingress to the instance** — the instance has no public IP and no inbound security-group rules. All access is via SSM Session Manager with IAM-scoped authorisation.
+- **Public internet ingress to the instance** — the instance has no inbound security-group rules and exposes no public service. A transient public IPv4 address is used only for outbound internet egress through the public subnet's Internet Gateway. All operator access is via SSM Session Manager with IAM-scoped authorisation.
 - **Tokeira runtime code on the workstation** — `tokeirad` does not run on the remote workstation under this spec. The workstation exists to compile, test, and lint Tokeira, not to host it.
 
 ### Cross-references
@@ -59,12 +59,13 @@ This spec is **scoped to the workstation itself**. The agent controller (Codex, 
 #### Acceptance Criteria
 
 1. WHEN the operator invokes `tkr workstation up --profile <profile>`, THE CLI SHALL query EC2 for instances in the configured region matching `tag:tokeira-workstation=true` AND owned by the current IAM principal's account.
-2. IF zero matching instances are found, THEN THE CLI SHALL create a fresh Workstation_Instance per the Workstation_Profile — including the two EBS volumes, the security group, the IAM role, and the instance profile — and tag it with a newly-generated Workstation_Id.
-3. IF exactly one matching instance is found and its state is `stopped`, THEN THE CLI SHALL invoke `StartInstances` and wait for the instance to reach `running` before returning. NO new instance SHALL be created in this branch.
-4. IF exactly one matching instance is found and its state is `running`, THEN THE CLI SHALL return successfully without any state change; the command SHALL print the Workstation_Id and the bound SSM session-ready status.
-5. IF two or more matching instances are found, THEN THE CLI SHALL fail with a clear error message enumerating the instance IDs and tags; the operator SHALL select one via `--workstation <workstation-id>` before `up` succeeds. THE CLI SHALL NOT silently pick one.
-6. IF a matching instance is in a transitional state (`pending`, `stopping`, `shutting-down`), THEN THE CLI SHALL wait for the state to settle (bounded by a 5-minute timeout) and then re-evaluate.
-7. WHEN `up` returns successfully, THE CLI SHALL write the Workstation_Id into `~/.tokeira/workstations/.latest` so subsequent commands default to it.
+2. IF zero matching instances are found and `--workstation` is absent, THEN THE CLI SHALL create a fresh Workstation_Instance per the Workstation_Profile — including the two EBS volumes, the security group, the IAM role, and the instance profile — and tag it with a newly-generated Workstation_Id.
+3. IF `--workstation <workstation-id>` is provided and no matching instance with that Workstation_Id exists, THEN THE CLI SHALL create a fresh Workstation_Instance using exactly that Workstation_Id, after first verifying no tagged workstation resource already uses the same ID. This is the explicit multi-workstation creation path.
+4. IF exactly one matching instance is found and its state is `stopped`, THEN THE CLI SHALL invoke `StartInstances` and wait for the instance to reach `running` before returning. NO new instance SHALL be created in this branch.
+5. IF exactly one matching instance is found and its state is `running`, THEN THE CLI SHALL return successfully without any state change; the command SHALL print the Workstation_Id and the bound SSM session-ready status.
+6. IF two or more matching instances are found, THEN THE CLI SHALL fail with a clear error message enumerating the instance IDs and tags; the operator SHALL select one via `--workstation <workstation-id>` before `up` succeeds. THE CLI SHALL NOT silently pick one.
+7. IF a matching instance is in a transitional state (`pending`, `stopping`, `shutting-down`), THEN THE CLI SHALL wait for the state to settle (bounded by a 5-minute timeout) and then re-evaluate.
+8. WHEN `up` returns successfully, THE CLI SHALL write the Workstation_Id into `~/.tokeira/workstations/.latest` so subsequent commands default to it.
 
 ### Requirement 1.2: `tkr workstation stop` preserves EBS and NVMe-less state
 
@@ -84,7 +85,7 @@ This spec is **scoped to the workstation itself**. The agent controller (Codex, 
 #### Acceptance Criteria
 
 1. WHEN the operator invokes `tkr workstation destroy`, THE CLI SHALL require confirmation — either via an interactive prompt or the `--yes` flag per the `tkr` convention documented in `cli.rs`.
-2. WHEN confirmation is received, THE CLI SHALL invoke the `tokeira-iac` destroy path on the `remote-workstation` module, which tears down in reverse dependency order: terminate the instance, delete the EBS volumes, delete the security group, delete the instance profile, delete the IAM role.
+2. WHEN confirmation is received, THE CLI SHALL invoke the direct-SDK `Workstation::destroy` path in `tokeira-aws::remote_workstation`, which tears down in reverse dependency order: best-effort GitHub deploy-key cleanup, terminate the instance, delete the EBS volumes, delete the security group, delete the instance profile, delete the IAM role, and release any workstation-owned Elastic IP.
 3. IF any AWS resource is missing when the destroy sequence reaches it, THE CLI SHALL log a warning and proceed with the next resource. Missing resources SHALL NOT fail the destroy.
 4. WHEN destroy completes, THE CLI SHALL remove the Workstation_State_Dir for the destroyed workstation AND clear `~/.tokeira/workstations/.latest` if the destroyed Workstation_Id was the pointer target.
 
@@ -159,7 +160,7 @@ This spec is **scoped to the workstation itself**. The agent controller (Codex, 
 
 #### Acceptance Criteria
 
-1. THE cloud-init user-data SHALL be a single Rust-rendered script (rendered from a template in `crates/tokeira-aws/src/resources/remote_workstation_bootstrap.rs`) passed to EC2 at `RunInstances` time. The script SHALL be idempotent on re-execution.
+1. THE cloud-init user-data SHALL be a single Rust-rendered script (rendered from a template in `crates/tokeira-aws/src/remote_workstation_bootstrap.rs`) passed to EC2 at `RunInstances` time. The script SHALL be idempotent on re-execution.
 2. THE script SHALL install, at minimum: rustup with stable + nightly toolchains pinned to the versions used by the Tokeira workspace, `cargo-nextest`, `cargo-deny`, `sccache`, `protoc`, `buf`, `uv`, `ripgrep`, `fd-find`, `jq`, `lld`, `mold`, `git`, `gh`.
 3. THE bootstrap SHALL complete within 10 minutes of instance creation on a cold `c8gd.8xlarge`. THE `tkr workstation up` command SHALL poll the instance's bootstrap completion marker (`/etc/tokeira/workstation-fingerprint`) via SSM and return only when the marker is present or the 15-minute overall `up` timeout elapses.
 4. IF the 15-minute timeout elapses, THE CLI SHALL surface a diagnostic pointing at the cloud-init log path on the instance and SHALL leave the instance running so the operator can debug.
@@ -196,8 +197,8 @@ This spec is **scoped to the workstation itself**. The agent controller (Codex, 
 #### Acceptance Criteria
 
 1. THE security group attached to the Workstation_Instance SHALL have ZERO ingress rules. THE egress ruleset SHALL allow all outbound (0.0.0.0/0) so `cargo` can fetch crates and `rustup` can download toolchains.
-2. THE Workstation_Instance SHALL be launched into a PUBLIC subnet with `MapPublicIpOnLaunch = false` at the subnet level, so the instance receives a public IP only when explicitly associated. This keeps egress free (via the subnet's Internet Gateway route) without the $36/month standing charge of a dedicated NAT Gateway. A NAT Gateway is explicitly NOT provisioned by this spec. If the operator's VPC already has a NAT Gateway serving private subnets, the operator MAY override `--subnet-id` to select a private subnet; this is an advanced override, not the default path.
-3. WHEN the instance is started (`tkr workstation up` on a stopped instance OR fresh create), THE CLI SHALL invoke `AssociateAddress` to attach a public IP — either an account-owned Elastic IP (if one exists and is tagged `tokeira-workstation-eip`) or auto-assignment via the subnet's public-IP assignment setting overridden per-request. WHEN the instance is stopped (`tkr workstation stop`), THE CLI SHALL release the public IP to avoid the stopped-EIP charge (~$3.60/month if left attached to a stopped instance).
+2. THE Workstation_Instance SHALL be launched into a PUBLIC subnet with an Internet Gateway route and zero inbound security-group rules. The subnet MAY have `MapPublicIpOnLaunch = false`; the engine SHALL request public IPv4 association explicitly on the primary network interface at fresh `RunInstances` time so bootstrap has outbound internet access without a NAT Gateway. If the operator's VPC already has a NAT Gateway serving private subnets, the operator MAY override `--subnet-id` to select a private subnet; in that case the engine SHALL NOT require a public IPv4 address.
+3. WHEN a stopped workstation is resumed, THE CLI SHALL attach outbound IPv4 connectivity before polling SSM: it SHALL either reuse an account-owned Elastic IP tagged `tokeira-workstation-eip` or allocate and associate a workstation-owned Elastic IP. WHEN the instance is stopped (`tkr workstation stop`), THE CLI SHALL disassociate and release only workstation-owned Elastic IPs to avoid the stopped-EIP charge. The CLI SHALL NOT release an account-owned tagged EIP that it did not allocate.
 4. THE operator SHALL reach the instance exclusively through SSM Session Manager. NO SSH key material SHALL be imported to the instance, and NO EC2 Instance Connect SSH endpoint SHALL be provisioned by this spec. The instance's public IP is used only for outbound connectivity; inbound traffic is blocked by the security group's empty ingress ruleset.
 
 ### Requirement 4.2: IAM role grants SSM agent permissions
@@ -228,7 +229,7 @@ This spec is **scoped to the workstation itself**. The agent controller (Codex, 
 
 1. `tkr workstation remote-exec <shell-command>` SHALL invoke `aws-sdk-ssm`'s `send_command` or `start_session` (choose one consistently; the design.md records the chosen API) to execute `<shell-command>` on the Workstation_Instance under `/bin/bash -lc`.
 2. THE working directory on the instance SHALL default to `/work/tokeira`. Operators MAY override it with `--cwd <path>`.
-3. STDOUT and STDERR from the remote command SHALL be streamed to the operator's terminal in real time as the remote command runs — not buffered to end-of-command. This is a non-negotiable usability requirement: `cargo build` emits progress over 30+ seconds on a warm cache and any noticeable lag defeats the purpose.
+3. STDOUT and STDERR from the remote command SHALL be surfaced while the command runs using the design's SSM Run Command polling contract. The engine SHALL poll at a bounded interval (default 500 ms), write newly observed output deltas immediately, and SHALL NOT wait until command completion before emitting all output. This is near-real-time rather than byte-stream real-time; upgrading to a true `StartSession` stream is deferred until the v1 polling path proves insufficient.
 4. THE exit code of the remote command SHALL be the exit code of `tkr workstation remote-exec`.
 5. WHEN the local operator sends SIGINT (Ctrl-C) to the `tkr` process, THE CLI SHALL cancel the SSM session and terminate the remote command (best-effort: SSM Run Command supports cancellation; Session Manager rides on the shell's own signal handling).
 6. THE `remote-exec` command SHALL NOT require the operator to know the instance ID. It SHALL discover the target instance from the `--workstation` flag or `~/.tokeira/workstations/.latest`.
@@ -281,7 +282,7 @@ This spec is **scoped to the workstation itself**. The agent controller (Codex, 
 #### Acceptance Criteria
 
 1. `apps/tkr/src/cli.rs` SHALL gain a `Workstation { #[command(subcommand)] action: WorkstationAction }` variant on the top-level `Command` enum.
-2. `WorkstationAction` SHALL declare variants: `Up`, `Stop`, `Destroy`, `Ssh`, `RemoteExec`, `Status`, `List`, `Bootstrap`, `Idle`. The `Bootstrap` variant SHALL be an explicit re-run of the bootstrap drift-detection path per Req 1.4; the `Idle` variant implements Req 5.1.5.
+2. `WorkstationAction` SHALL declare variants: `Up`, `Stop`, `Destroy`, `Ssh`, `RemoteExec`, `Status`, `List`, `Bootstrap`, `Idle`, `GithubKey`. The `Bootstrap` variant SHALL be an explicit re-run of the bootstrap drift-detection path per Req 1.4; the `Idle` variant implements Req 5.1.5; the `GithubKey` variant owns the opt-in deploy-key lifecycle in Feature 10.
 3. Every subcommand SHALL accept `--workstation <workstation-id>` and read `~/.tokeira/workstations/.latest` as the default, per Req 1.5.1.
 4. The dispatch in `apps/tkr/src/main.rs` SHALL route each variant to a handler module under `apps/tkr/src/commands/workstation/`.
 
@@ -416,7 +417,7 @@ Feature ordering note: Feature 10 follows the Correctness Properties in this spe
 1. THE bootstrap SHALL NOT install any SSH key, GitHub personal access token, OAuth token, or GitHub App installation token on the instance.
 2. THE `gh` CLI SHALL be installed as part of the standard bootstrap tool set (per Req 3.1.2) but SHALL NOT be pre-authenticated. Running `gh` on the instance with no prior auth SHALL produce the standard unauthenticated error (`error: You are not logged into any GitHub hosts...`).
 3. IF the operator's `repo_url` points at a public repository (HTTPS URL resolvable without authentication), the initial clone in the bootstrap (per Req 3.3.1) SHALL succeed without any credential.
-4. IF the operator's `repo_url` points at a private repository, the initial clone SHALL fail with a clear message that names `tkr workstation github-key add` as the next step. The bootstrap SHALL NOT retry, fall back to a different auth method, or prompt for credentials interactively — fail loudly and cleanly.
+4. IF the operator's `repo_url` points at a private repository, the initial clone SHALL fail as a non-fatal bootstrap sub-step with a clear message that names `tkr workstation github-key add` as the next step. The bootstrap SHALL still complete all non-git setup, write the bootstrap fingerprint marker, and write a repo-clone status file that `tkr workstation up` surfaces as a warning. The bootstrap SHALL NOT retry, fall back to a different auth method, or prompt for credentials interactively.
 5. THE instance's IAM role SHALL NOT include any permissions beyond those required for SSM Session Manager (Req 4.2.1). In particular, it SHALL NOT include `secretsmanager:GetSecretValue`, `ssm:GetParameter` for a GitHub-related parameter, or any AWS permission that would let a compromised instance pivot to operator-owned credentials stored elsewhere in the account.
 
 ### Requirement 10.2: Opt-in workstation-scoped SSH deploy key

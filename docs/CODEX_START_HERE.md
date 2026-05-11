@@ -28,7 +28,7 @@ Platform and tooling crates:
 | `tokeira-deploy-engine` | Service lifecycle engine. |
 | `tokeira-orchestrator` | Deployment orchestration facade. |
 | `tokeira-compose` | Docker Compose provider (bollard). |
-| `tokeira-aws` | AWS resource implementations. |
+| `tokeira-aws` | AWS resource implementations and remote workstation lifecycle. |
 
 Apps: `tokeirad` (server), `tkr` (CLI), `tokeira-admin`, `tokeira-bench`, `tokeira-replay`.
 
@@ -114,6 +114,7 @@ paths, typed search attributes, rollup accumulation). 34 tests.
 - IaC engine with Module trait, dependency resolution, diff/plan/apply/destroy
 - Deploy engine with Service lifecycle and runtime state
 - `tkr` CLI with infra/deploy/dev/build commands
+- `tkr workstation` for AWS-backed remote Rust build workstations
 - Docker Compose provider via bollard
 
 ### Architecture documentation

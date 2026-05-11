@@ -121,6 +121,16 @@ tkr
 ├── port-forward <service>
 ├── config
 │   └── show
+├── workstation
+│   ├── up [--workstation <id>]
+│   ├── remote-exec [--workstation <id>] -- <command...>
+│   ├── ssh [--workstation <id>]
+│   ├── status [--workstation <id>]
+│   ├── stop [--workstation <id>]
+│   ├── destroy [--workstation <id>] --yes
+│   ├── bootstrap [--workstation <id>]
+│   ├── idle [--workstation <id>] [--defer <duration>]
+│   └── github-key <add|remove|list>
 ├── dev
 │   ├── build
 │   ├── test [--crate <name>]
@@ -222,12 +232,93 @@ To add a new image, start in `platforms/{compose,ecs}/src/images/` and implement
 
 ## Rust Development
 
+### Local development
+
 ```bash
 cargo build                              # build all crates
 cargo clippy --workspace --all-targets   # lint
 cargo test                               # unit tests
 cargo +nightly fmt                       # format
+cargo doc --workspace --no-deps          # generate docs
 ```
+
+The workspace has 150+ crates. A cold `cargo build --workspace` takes 10–20 minutes on a MacBook; incremental builds are typically 10–30 seconds. If cold-build time is blocking your iteration loop, use the remote workstation (below).
+
+### Remote workstation for Rust builds
+
+`tkr workstation` provisions a dedicated Graviton4 `c8gd.8xlarge` (32 vCPU, 64 GiB RAM, 1900 GiB NVMe) in `eu-west-2` for fast Rust compilation. Cold workspace builds complete in under 2 minutes. Access is via AWS Systems Manager Session Manager — no SSH keys, no public ingress.
+
+**The 3-command workflow:**
+
+```bash
+tkr workstation up                                        # create or resume
+tkr workstation remote-exec cargo build --workspace       # build on the workstation
+tkr workstation stop                                      # stop (EBS persists, NVMe erased)
+```
+
+**Storage tiering:**
+
+| Tier | Mount | Survives stop? | Contents |
+|------|-------|----------------|----------|
+| Local NVMe | `/work` (root), `/work/target`, `/work/sccache` | No | `CARGO_TARGET_DIR`, sccache cache |
+| Cache EBS (30 GiB) | `/work/cache` → `~/.cargo`, `~/.rustup` | Yes | Crate registry, toolchains |
+| Repo EBS (40 GiB) | `/work/repo` → `/work/tokeira` | Yes | Repository checkouts |
+
+**Common operations:**
+
+```bash
+# Interactive shell (for ad-hoc debugging)
+tkr workstation ssh
+
+# Run tests remotely
+tkr workstation remote-exec cargo test --workspace
+
+# Run lints remotely
+tkr workstation remote-exec cargo clippy --workspace --all-targets
+
+# Check bootstrap drift after toolchain update
+tkr workstation bootstrap
+
+# Defer idle-shutdown during a long unattended build
+tkr workstation idle --defer 2h
+
+# See cost and uptime
+tkr workstation status
+
+# List all workstations
+tkr workstation list
+
+# Destroy (terminates instance, deletes EBS volumes)
+tkr workstation destroy --yes
+```
+
+**Cost model (~$387/month at 20 working days, 10 active hours/day):**
+
+| Component | Active | Stopped | Monthly |
+|-----------|--------|---------|---------|
+| c8gd.8xlarge | $1.88/hr | $0 | ~$376 |
+| EBS (90 GiB) | $0.01/hr | $0.01/hr | ~$7 |
+| Elastic IP (transient) | $0.005/hr | $0 (released) | ~$1 |
+
+The workstation stops automatically after 30 minutes of idle (configurable). A forgotten instance does not silently accumulate cost.
+
+**Prerequisites:**
+- AWS credentials with EC2, IAM, and SSM permissions
+- `session-manager-plugin` installed on the local machine (`brew install session-manager-plugin` on macOS)
+- A VPC with at least one public subnet (the workstation uses a transient public IP for egress; no NAT Gateway required)
+
+**GitHub push from workstation (opt-in):**
+
+By default the workstation carries no GitHub credentials. To push branches or create PRs from the workstation:
+
+```bash
+tkr workstation github-key add --repo <owner>/<name>   # provisions a deploy key
+tkr workstation github-key remove --repo <owner>/<name> # revokes it
+```
+
+The deploy key is workstation-scoped and registered via the operator's MacBook-side `gh` auth. The operator's primary GitHub token never reaches the workstation.
+
+See `.kiro/specs/remote-workstation/` for the full spec (requirements, design, tasks).
 
 ## Architecture Documentation
 

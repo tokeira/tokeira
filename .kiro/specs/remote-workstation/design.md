@@ -164,6 +164,11 @@ pub enum WorkstationAction {
         workstation: Option<String>,
         #[arg(long, default_value = "/work/tokeira")]
         cwd: String,
+        /// Skip the secret-in-command confirmation prompt. The scanner still
+        /// runs and its findings are logged; this flag only bypasses the
+        /// interactive confirmation. See Req 10.3.
+        #[arg(long)]
+        yes_secret_in_command: bool,
         /// The command and its arguments, joined with spaces and executed under
         /// `bash -lc`. Use `--` to separate from flags.
         #[arg(trailing_var_arg = true)]
@@ -190,7 +195,46 @@ pub enum WorkstationAction {
         #[arg(long)]
         defer: Option<humantime::Duration>,
     },
+    /// Manage workstation-scoped GitHub deploy keys (Req 10.2).
+    GithubKey {
+        #[command(subcommand)]
+        action: GithubKeyAction,
+    },
 }
+
+#[derive(Subcommand)]
+pub enum GithubKeyAction {
+    /// Generate an ed25519 deploy key on the workstation and register the
+    /// public key with GitHub via the operator's MacBook-side `gh` auth.
+    Add {
+        #[arg(long)]
+        workstation: Option<String>,
+        /// GitHub repository in `<owner>/<name>` form. Defaults to the
+        /// workstation's configured `repo_url` when omitted.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Register the deploy key with read-only access. When set, the
+        /// local git remote rewrite in Req 10.2.5 is skipped.
+        #[arg(long)]
+        read_only: bool,
+    },
+    /// Remove a deploy key previously added via `github-key add`.
+    /// Reverses the `add` sequence: deletes the GitHub-side key, rewrites
+    /// instance remotes back to HTTPS, removes the keypair from the instance.
+    Remove {
+        #[arg(long)]
+        workstation: Option<String>,
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// List deploy keys this workstation has registered with GitHub.
+    /// Reads from `~/.tokeira/workstations/<id>/deploy-keys.jsonl` and
+    /// cross-checks against the GitHub API (via MacBook-side `gh`) to
+    /// surface keys that exist locally but not on GitHub (or vice versa).
+    List {
+        #[arg(long)]
+        workstation: Option<String>,
+    },
 ```
 
 Dispatch in `apps/tkr/src/main.rs` routes each variant to a handler module under `apps/tkr/src/commands/workstation/`:
@@ -202,11 +246,13 @@ apps/tkr/src/commands/workstation/
 ├── stop.rs         — WorkstationAction::Stop
 ├── destroy.rs      — WorkstationAction::Destroy, with --yes confirmation
 ├── ssh.rs          — WorkstationAction::Ssh
-├── remote_exec.rs  — WorkstationAction::RemoteExec
+├── remote_exec.rs  — WorkstationAction::RemoteExec (invokes secret scanner)
 ├── status.rs       — WorkstationAction::Status
 ├── list.rs         — WorkstationAction::List
 ├── bootstrap.rs    — WorkstationAction::Bootstrap
-└── idle.rs         — WorkstationAction::Idle
+├── idle.rs         — WorkstationAction::Idle
+├── github_key.rs   — WorkstationAction::GithubKey { Add | Remove | List } (Req 10.2)
+└── secret_scan.rs  — shared secret-in-command heuristic scanner (Req 10.3)
 ```
 
 Each handler is a thin wrapper: argument translation, confirmation logic (for `Destroy`), and output formatting (text vs `--json`). All AWS work lives in the engine layer described in §2.
@@ -364,6 +410,39 @@ impl Workstation {
         workstation_id: &str,
         until: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), WorkstationError> { … }
+
+    /// Generate an ed25519 deploy key on the workstation and register it
+    /// with GitHub via the operator's MacBook-side `gh` auth. See Req 10.2.
+    ///
+    /// GitHub authentication is performed by the caller (the CLI handler)
+    /// invoking `gh api` as a subprocess on the MacBook; this engine method
+    /// only drives the on-instance keypair generation, `~/.ssh/config`
+    /// update, and remote-URL rewrite. Keeping the `gh` subprocess in the
+    /// handler layer enforces the "no GitHub credential on the workstation"
+    /// rule (Req 10.1) at an architectural level — no path through the
+    /// engine touches GitHub auth.
+    pub async fn github_key_add(
+        &self,
+        workstation_id: &str,
+        repo: &GithubRepo,
+        public_key: &str,  // read back from the instance after generation
+        read_only: bool,
+    ) -> Result<String, WorkstationError> { … }
+
+    pub async fn github_key_remove(
+        &self,
+        workstation_id: &str,
+        repo: &GithubRepo,
+    ) -> Result<(), WorkstationError> { … }
+}
+
+/// A GitHub repository identifier, always in `owner/name` form. The
+/// parser rejects URLs and enforces the split shape so the engine and
+/// the MacBook-side `gh api` call see exactly the same identifier.
+#[derive(Debug, Clone)]
+pub struct GithubRepo {
+    pub owner: String,
+    pub name: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -384,6 +463,16 @@ pub enum WorkstationError {
     BootstrapRefresh(String),
     #[error("session-manager-plugin not installed on the local machine; install it and retry")]
     SessionManagerPluginMissing,
+    #[error("github cli `gh` not installed on the local machine; install it and retry")]
+    GhCliMissing,
+    #[error("github cli is not authenticated on the local machine; run `gh auth login` and retry")]
+    GhCliUnauthenticated,
+    #[error("invalid github repo identifier `{0}`; expected `owner/name`")]
+    InvalidGithubRepo(String),
+    #[error("github api error: {0}")]
+    GithubApi(String),
+    #[error("command looks like it contains a secret; rerun with --yes-secret-in-command or use `tkr workstation ssh` for interactive entry")]
+    SecretInCommand,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -495,6 +584,8 @@ EBS volumes remain attached across stop. NVMe contents are gone on the next `sta
 
 Destroy is best-effort: individual resource-deletion failures are logged and the sequence continues, per Req 1.3.3.
 
+**Deploy-key cleanup (Req 10.2.8).** Before the AWS-side terminate sequence, destroy reads `~/.tokeira/workstations/<id>/deploy-keys.jsonl` and invokes the MacBook-side `gh api --method DELETE repos/<owner>/<repo>/keys/<key-id>` for each recorded key. Individual failures (e.g. a key the operator has already removed manually) log a warning with the exact GitHub Settings URL the operator can use to verify and continue; they do not block the AWS teardown. The registry file is deleted with the rest of the workstation state directory at the end of destroy.
+
 #### 3.4 `bootstrap` sequence (Req 1.4, 3.1, 7.2)
 
 Bootstrap is idempotent by design. The flow:
@@ -535,13 +626,17 @@ Using the `aws` CLI subprocess (rather than the SDK) for the interactive path is
 // apps/tkr/src/commands/workstation/remote_exec.rs
 
 1. Resolve workstation_id → instance_id.
-2. Build the command string: `cd <cwd> && <command words, shell-escaped>`.
-3. Call ssm.send_command(...).document_name("AWS-RunShellScript")
+2. Run the secret-in-command scanner (see §8.2). If a match is found:
+     - Print the warning to stderr.
+     - Unless --yes-secret-in-command is set, read y/N from stdin.
+     - If N or non-interactive stdin, return WorkstationError::SecretInCommand.
+3. Build the command string: `cd <cwd> && <command words, shell-escaped>`.
+4. Call ssm.send_command(...).document_name("AWS-RunShellScript")
      .parameters(HashMap::from([("commands", vec![command_str])]))
      .instance_ids(vec![instance_id])
      .send().await
-4. Extract the command_id from the response.
-5. Poll ssm.get_command_invocation(command_id, instance_id) in a loop:
+5. Extract the command_id from the response.
+6. Poll ssm.get_command_invocation(command_id, instance_id) in a loop:
      - On Pending / InProgress: fetch standard_output_content and
        standard_error_content deltas (use the inline-chunk fields if
        available; otherwise re-fetch and diff), stream to caller.
@@ -590,12 +685,25 @@ set -euo pipefail
 #   - Write /etc/fstab entries for persistent mounts (Cache + Repo).
 #   - NVMe is re-formatted on every boot per Req 2.1.1 (not in fstab).
 
-# PHASE 2: Install toolchain + tools (Req 3.1, 3.2)
+# PHASE 2: Install toolchain + tools (Req 3.1, 3.2, 10.1.2, 10.4)
 #   - apt-get install -y <apt_packages>
 #   - Install rustup via https://sh.rustup.rs (idempotent; skip if .rustup exists
 #     and rust_toolchain_toml hash matches a stored marker).
 #   - Run rustup show to force toolchain install from rust-toolchain.toml.
 #   - Install cargo tools with `cargo install` (idempotent: cargo short-circuits).
+#   - Install `gh` CLI but do NOT run `gh auth login`. The workstation is
+#     credential-free by default (Req 10.1.2); authentication, if needed, is
+#     managed per-repo via `tkr workstation github-key add` which keeps the
+#     operator's primary `gh` token on the MacBook.
+#   - Write GitHub's pinned SSH host keys to `~/.ssh/known_hosts` (Req 10.4.1)
+#     for both the shell user (ubuntu or ec2-user) and root. Keys are embedded
+#     as a Rust constant GITHUB_SSH_HOST_KEYS in remote_workstation_bootstrap.rs
+#     sourced from https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints.
+#   - Write `~/.ssh/config` with a `Host github.com` stanza setting
+#     `StrictHostKeyChecking yes` and `UserKnownHostsFile ~/.ssh/known_hosts`
+#     (Req 10.4.2). No IdentityFile is configured at bootstrap time;
+#     `tkr workstation github-key add` appends an IdentityFile line when it
+#     provisions a deploy key.
 
 # PHASE 3: Write profile.d env (Req 2.1.5)
 #   - Generate /etc/profile.d/tokeira-workstation.sh with:
@@ -720,6 +828,142 @@ This spec bypasses the `tokeira-iac` `Module`/`Resource` pattern used elsewhere 
 
 **Future migration path.** If a subsequent spec introduces a second, closely-related workstation-like resource (e.g. a CI build agent with shared caching), and the combined topology justifies `tokeira-iac`, migrating is straightforward: the `Workstation::up/stop/destroy` methods become the bodies of corresponding `Resource::create/delete` impls, tags remain the source of truth, and the engine becomes the caller of `Engine::apply`. Nothing locks us out of that move.
 
+### 8. GitHub credential policy (Req 10)
+
+The workstation is a build surface, not a push surface. The default posture carries no GitHub credential on the instance; the opt-in path provisions a workstation-scoped, per-repository SSH deploy key whose public half is uploaded to GitHub from the operator's MacBook using the operator's MacBook-side `gh auth` state. This keeps the operator's primary GitHub token off the instance entirely.
+
+#### 8.1 Deploy-key lifecycle
+
+The add/remove flow is split deliberately across three machines: the MacBook (holds `gh auth`), the workstation (holds the keypair and the `git` remote config), and GitHub itself.
+
+```
+tkr workstation github-key add --repo <owner>/<name>
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │ Step 1 (MacBook) : Validate preconditions.                               │
+  │   - which::which("gh") → else WorkstationError::GhCliMissing.            │
+  │   - `gh auth status` → else WorkstationError::GhCliUnauthenticated.      │
+  │   - Parse --repo (or derive from profile.repo_url). Reject non-          │
+  │     owner/name shapes with InvalidGithubRepo.                            │
+  │                                                                          │
+  │ Step 2 (Workstation) : Generate keypair via ssm.send_command.            │
+  │   ssh-keygen -t ed25519 -f ~/.ssh/tokeira-workstation-<id> \             │
+  │              -N '' -C "tokeira-workstation-<id>"                         │
+  │   cat ~/.ssh/tokeira-workstation-<id>.pub                                │
+  │   ← public key returned in StandardOutputContent.                        │
+  │                                                                          │
+  │ Step 3 (MacBook) : Register with GitHub via `gh api`.                    │
+  │   gh api --method POST repos/<owner>/<name>/keys \                       │
+  │          -f title=tokeira-workstation-<id> \                             │
+  │          -f key="<pubkey>" \                                             │
+  │          -F read_only=<bool>                                             │
+  │   ← key_id in response JSON.                                             │
+  │                                                                          │
+  │ Step 4 (Workstation) : Wire git to use the key.                          │
+  │   Append to ~/.ssh/config:                                               │
+  │     Host github.com-tokeira-<id>                                         │
+  │       HostName github.com                                                │
+  │       User git                                                           │
+  │       IdentityFile ~/.ssh/tokeira-workstation-<id>                       │
+  │       IdentitiesOnly yes                                                 │
+  │   Unless --read-only: rewrite /work/tokeira remotes from                 │
+  │     https://github.com/<owner>/<name>(.git)? to                          │
+  │     git@github.com-tokeira-<id>:<owner>/<name>.git                       │
+  │     (Host alias prevents key collision when multiple deploy keys are     │
+  │     added for different repos on the same workstation.)                  │
+  │                                                                          │
+  │ Step 5 (MacBook) : Record in the local registry.                         │
+  │   Append one line to                                                     │
+  │     ~/.tokeira/workstations/<id>/deploy-keys.jsonl                       │
+  │   containing the repo, key_id, read_only flag, and timestamp.            │
+  └──────────────────────────────────────────────────────────────────────────┘
+```
+
+`github-key remove` reverses the five steps in reverse order: delete the JSONL entry last so that a failure at any earlier step leaves the registry pointing at the orphan for an operator-visible retry.
+
+`github-key list` reads the local JSONL, then calls `gh api repos/<owner>/<name>/keys` per entry to reconcile. Entries present locally but absent on GitHub are marked `orphan-local`; entries present on GitHub but absent locally (matching the `tokeira-workstation-<id>` title prefix) are marked `orphan-remote`. The operator resolves each manually.
+
+#### 8.2 Secret-in-command scanner (Req 10.3)
+
+`apps/tkr/src/commands/workstation/secret_scan.rs` exposes `scan(command: &[String]) -> Option<SecretMatch>`. The scanner runs a fixed regex set against the joined command string before `remote-exec` dispatches; hits surface an interactive y/N prompt (or fail closed if stdin is not a TTY and `--yes-secret-in-command` is absent).
+
+The pattern set is a Rust constant:
+
+```rust
+// apps/tkr/src/commands/workstation/secret_scan.rs
+//
+// The list is intentionally narrow: broad regex catches too many benign
+// commands (e.g. running a test that prints "Bearer" in its fixtures).
+// Every pattern here is an observed credential-entry idiom, not a
+// content-in-arbitrary-data match.
+
+const SECRET_PATTERNS: &[(&str, &str)] = &[
+    // (name for the warning message, regex pattern)
+    ("gh auth with-token",         r"gh\s+auth\s+login\s+--with-token"),
+    ("GITHUB_TOKEN env",           r"\bGITHUB_TOKEN\s*="),
+    ("bearer header",              r#"-H\s+["']?Authorization:\s*Bearer\s"#),
+    ("AWS secret key env",         r"\bAWS_SECRET_ACCESS_KEY\s*="),
+    ("AWS session token env",      r"\bAWS_SESSION_TOKEN\s*="),
+    ("NPM auth token",             r"\b_authToken\s*="),
+    ("git credential helper pipe", r"git\s+credential-store.*store"),
+    ("inline private key marker",  r"-----BEGIN (OPENSSH|RSA|EC) PRIVATE KEY-----"),
+];
+```
+
+Changes to this list are spec-level (a false-negative surfaced by an incident → add a pattern; a false-positive that breaks a legitimate workflow → refine or remove). The list is not pulled from a runtime source; that would make offline operation impossible and introduce a supply-chain risk that itself defeats the point of the scanner.
+
+The warning message reads exactly as specified in Req 10.3.2 — verbatim text is part of the operator's trust model, not a detail to paraphrase.
+
+#### 8.3 GitHub SSH host-key pinning (Req 10.4)
+
+Phase 2 of the bootstrap writes a Rust constant `GITHUB_SSH_HOST_KEYS` into `~/.ssh/known_hosts` for the shell user. The constant holds GitHub's currently-published host keys for RSA, ECDSA, and Ed25519 as `ssh-keyscan`-format lines. Source: `https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints`. The keys rotate infrequently; each rotation is a spec-level edit with a commit linking the GitHub rotation announcement.
+
+```rust
+// crates/tokeira-aws/src/remote_workstation_bootstrap.rs
+//
+// GitHub's published SSH host keys as of 2026-05. Sourced from
+// https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints
+// Update on rotation announcement; the test in
+// crates/tokeira-aws/tests/remote_workstation_host_keys.rs asserts each
+// entry parses as a valid OpenSSH public key (structural, not freshness).
+
+pub const GITHUB_SSH_HOST_KEYS: &[&str] = &[
+    // github.com ssh-ed25519
+    "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl",
+    // github.com ecdsa-sha2-nistp256
+    "github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=",
+    // github.com ssh-rsa
+    "github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=",
+];
+```
+
+The bootstrap appends `StrictHostKeyChecking yes` plus `UserKnownHostsFile ~/.ssh/known_hosts` to `~/.ssh/config` inside a `Host github.com github.com-tokeira-*` stanza. The `-tokeira-*` wildcard matches the host alias used by `github-key add`, so pinning covers both the base hostname and every workstation-scoped alias.
+
+#### 8.4 Why the MacBook uploads the public key, not the workstation
+
+Req 10.2.3 is non-obvious and worth stating plainly: the `gh api POST repos/.../keys` call runs on the operator's MacBook, not inside `ssm.send_command`. Three reasons:
+
+1. **Credential locality.** The operator's GitHub token (managed by `gh auth login`) lives on the MacBook. It never needs to reach the workstation. The workstation only sees its own ed25519 private key, which has a single-repository blast radius.
+2. **CloudTrail hygiene.** SSM Run Command invocations are logged to CloudTrail with the full command text (Req 10.3 exists because of this). Running `gh api` via Run Command would echo the operator's token into CloudTrail. Running it on the MacBook leaves no AWS audit trail and keeps the token in the same trust boundary `gh` already assumes.
+3. **Reversibility.** Key revocation (`github-key remove`) also runs from the MacBook, symmetric with `add`. Any operator who still has `gh auth` can fully recover from a workstation compromise by deleting every deploy key titled `tokeira-workstation-<id>` from GitHub, without touching the workstation at all.
+
+#### 8.5 Minimum-credential IAM role (Req 10.5)
+
+The workstation's IAM role attaches exactly one managed policy: `arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore`. No inline policy, no `secretsmanager:*`, no `ssm:GetParameter` (the bootstrap uses IMDS + DescribeVolumes via the tags tag-based path, not Parameter Store). The Rust code that creates the role asserts this at runtime in debug builds:
+
+```rust
+#[cfg(debug_assertions)]
+fn assert_role_is_minimal(role_policies: &[AttachedPolicy]) {
+    assert_eq!(role_policies.len(), 1, "workstation role must attach exactly one policy");
+    assert_eq!(
+        role_policies[0].policy_arn.as_deref(),
+        Some("arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"),
+        "workstation role must attach only AmazonSSMManagedInstanceCore"
+    );
+}
+```
+
+The debug-only assertion guards against a future code change silently widening the role. Release builds do not pay for the extra `iam.list_attached_role_policies` call.
+
 ## Data Models
 
 ### `WorkstationProfile` — default values
@@ -785,9 +1029,7 @@ pub fn hourly_rate(region: &str, instance_type: &str) -> Option<f64> {
 }
 ```
 
-### Local state file — `~/.tokeira/workstations/<id>/state.json`
-
-```json
+### Local state file — `~/.tokeira/workstations/<id>/state.json````json
 {
   "workstation_id": "ws-01HXYZ...",
   "instance_id": "i-0abcdef0123456789",
@@ -807,6 +1049,18 @@ pub fn hourly_rate(region: &str, instance_type: &str) -> Option<f64> {
   "last_seen_at": "2026-05-11T18:30:00Z"
 }
 ```
+
+### Local registry — `~/.tokeira/workstations/<id>/deploy-keys.jsonl` (Req 10.2)
+
+Append-only; one JSON object per line. Read on `github-key list` / `github-key remove` / `destroy`. The registry is the MacBook's record of which GitHub repositories the workstation has an outstanding deploy key on, so `destroy` can reverse every `add` without reaching back into GitHub.
+
+```jsonl
+{"event":"add","repo":"octocat/hello-world","key_id":12345678,"read_only":false,"fingerprint":"SHA256:…","at":"2026-05-11T09:15:00Z"}
+{"event":"add","repo":"octocat/private-repo","key_id":12345679,"read_only":true, "fingerprint":"SHA256:…","at":"2026-05-11T09:17:00Z"}
+{"event":"remove","repo":"octocat/hello-world","key_id":12345678,"at":"2026-05-11T18:02:00Z"}
+```
+
+A remove-event entry references the matching add-event's `key_id`; a `list` scan treats `add` events whose `key_id` has no subsequent `remove` as "live". JSONL is chosen over JSON-array so concurrent appends from multiple `tkr` invocations don't race; no file-locking is required for correctness because every writer appends exactly one line.
 
 ## Testing Strategy
 
@@ -834,6 +1088,13 @@ The AWS SDK crates all accept mocked clients via their `aws_smithy_mocks` integr
 | `remote_exec` streams stdout/stderr in near-real-time (Req 4.4.3) | `remote_workstation_remote_exec_streaming.rs` |
 | `idle --defer` writes the sentinel correctly (Req 5.1.5) | `remote_workstation_idle_defer.rs` |
 | Cost-rate table returns `None` for unknown region/type (Req 5.2.3) | `remote_workstation_cost_lookup.rs` |
+| Secret-scan catches every pattern in `SECRET_PATTERNS` (Req 10.3.1) | `apps/tkr/tests/workstation_secret_scan.rs` |
+| Secret-scan warning text matches Req 10.3.2 verbatim | `apps/tkr/tests/workstation_secret_scan.rs` |
+| `github-key add` registry round-trips through JSONL (Req 10.2.8) | `apps/tkr/tests/workstation_deploy_keys_registry.rs` |
+| Embedded `GITHUB_SSH_HOST_KEYS` entries parse as OpenSSH keys (Req 10.4.3) | `crates/tokeira-aws/tests/remote_workstation_host_keys.rs` |
+| `bootstrap` writes exactly the pinned host keys to `~/.ssh/known_hosts` (Req 10.4.1) | `remote_workstation_bootstrap_host_keys.rs` |
+| IAM role attaches only `AmazonSSMManagedInstanceCore` (Req 10.5.1) | `remote_workstation_iam_minimal.rs` |
+| `destroy` iterates every live deploy-keys.jsonl entry (Req 10.2.8) | `remote_workstation_destroy_deploy_keys.rs` |
 
 ### Live-AWS acceptance test
 
@@ -854,6 +1115,10 @@ One `#[ignore]`'d end-to-end test at `crates/tokeira-aws/tests/remote_workstatio
 **Eu-west-2 vs us-east-1.** London pays a ~17% premium (~$65/month at the defaults). For a UK-based operator, London's ~20 ms SSM round-trip beats us-east-1's ~80 ms, which matters noticeably on interactive `ssh` sessions. The premium is worth paying for interactive latency. Bulk `remote-exec` operations are less sensitive.
 
 **Toolchain pin from `rust-toolchain.toml` vs hardcoded in cloud-init.** Driving from `rust-toolchain.toml` means toolchain upgrades do not require a spec change — they flow from the workspace root through `Bootstrap_Fingerprint` into the next `up` call, which triggers drift detection and re-bootstraps. The alternative (hardcoding `1.95.0` in the script) would require a spec edit on every MSRV bump. The chosen approach is lower-friction and more correct.
+
+**Secret scanner is narrow, not broad.** The pattern set in §8.2 deliberately matches credential-entry idioms rather than "anything that looks like a secret". A broad regex (e.g. "entropy > N" heuristics, AWS-access-key regex) catches too many benign commands — test fixtures printing `Bearer`, base64 payloads in `jq` pipelines, secrets-management tooling itself. Every false positive trains the operator to instinctively `--yes-secret-in-command`, which erodes the protection. Narrow beats broad here: catch the obvious footguns (`gh auth login --with-token`, `GITHUB_TOKEN=…`, `-H "Authorization: Bearer"`) and trust the operator's `ssh` fallback for anything the scanner doesn't recognise. Adding a pattern is a spec edit, not a code edit — the set is load-bearing enough to earn change control.
+
+**MacBook-side vs workstation-side `gh api`.** §8.4 argues at length; the summary is that running `gh api` on the workstation would either echo the operator's GitHub token into CloudTrail (via Run Command) or require installing `gh auth` credentials on the instance (defeating Req 10.1). Running on the MacBook keeps the operator's token inside its existing trust boundary and keeps the workstation credential-free.
 
 ## Open questions for tasks phase
 

@@ -22,10 +22,12 @@ Target crates and files:
 - `crates/tokeira-aws/src/remote_workstation_bootstrap.rs` — new module (cloud-init renderer).
 - `crates/tokeira-aws/tests/remote_workstation_*.rs` — property + example tests.
 - `apps/tkr/Cargo.toml` — add `humantime`, `which` (already present).
-- `apps/tkr/src/cli.rs` — add `Workstation` variant and `WorkstationAction`.
-- `apps/tkr/src/commands/workstation/` — new directory with 10 handler files.
+- `apps/tkr/src/cli.rs` — add `Workstation` variant, `WorkstationAction`, and `GithubKeyAction`.
+- `apps/tkr/src/commands/workstation/` — new directory with 12 handler files.
 - `apps/tkr/src/main.rs` — dispatch for `Workstation` variant.
 - `apps/tkr/tests/workstation_resolution.rs` — proptest on CLI defaults.
+- `apps/tkr/tests/workstation_secret_scan.rs` — secret scanner coverage.
+- `apps/tkr/tests/workstation_deploy_keys_registry.rs` — JSONL registry round-trip.
 
 ## Tasks
 
@@ -40,19 +42,20 @@ Target crates and files:
     - `WorkstationProfile` with the c8gd-rust defaults (Req 2.2.1, §"Data Models" of design.md).
     - `WorkstationHandle` carrying every AWS ID the engine needs (Req 7.1.2).
     - `InstanceState`, `UpOutcome`, `BootstrapDrift`, `WorkstationStatus`, `WorkstationSummary` enums/structs per design.md §2.
-    - `WorkstationError` `thiserror` enum per design.md §2.
+    - `GithubRepo` struct with owner/name parser (rejects URLs; returns `InvalidGithubRepo` for anything other than `owner/name`).
+    - `WorkstationError` `thiserror` enum per design.md §2, including the Feature 10 variants: `GhCliMissing`, `GhCliUnauthenticated`, `InvalidGithubRepo(String)`, `GithubApi(String)`, `SecretInCommand`.
     - `COST_RATE_TABLE` constant with the eu-west-2 and us-east-1 `c8gd.8xlarge` rates verified against live AWS pricing (eu-west-2: $1.87776, us-east-1: $1.56768 as of 2026-05).
     - `hourly_rate(region, instance_type) -> Option<f64>` helper.
-    - (Req 5.2.2, 5.2.3, 6.2.1)
+    - (Req 5.2.2, 5.2.3, 6.2.1, 10.2.2)
   - [ ] 1.4 Implement `Workstation::new(region) -> Result<Self, WorkstationError>`
     - Loads AWS config via `aws_config::defaults(BehaviorVersion::latest()).region(Region::new(region.into())).load().await`.
     - Builds the three SDK clients: ec2, ssm, iam.
     - Stores the configured region for later tagging and cost lookup.
     - (Req 6.2.1)
   - [ ] 1.5 Stub all lifecycle methods as `unimplemented!()`
-    - Signatures for `up`, `stop`, `destroy`, `status`, `list`, `remote_exec`, `bootstrap`, `idle_defer` per design.md §2.
+    - Signatures for `up`, `stop`, `destroy`, `status`, `list`, `remote_exec`, `bootstrap`, `idle_defer`, `github_key_add`, `github_key_remove` per design.md §2.
     - This locks the surface and lets the CLI layer proceed in parallel if needed.
-    - (Req 6.2.1)
+    - (Req 6.2.1, 10.2)
 
 - [x] 2. Checkpoint — engine surface compiles
   - Ensure `cargo check -p tokeira-aws` is green; the CLI layer can now target the `Workstation` API even before individual methods are implemented.
@@ -116,6 +119,7 @@ Target crates and files:
     - (Req 1.2, 4.1.3)
   - [ ] 3.5 Implement `Workstation::destroy`
     - Discover workstation by ID.
+    - Read `~/.tokeira/workstations/<id>/deploy-keys.jsonl`; for each live entry, invoke `gh api --method DELETE repos/<owner>/<repo>/keys/<key-id>` from the MacBook (best-effort per Req 10.2.8). Log warning with GitHub Settings URL on failure; do not block AWS teardown.
     - `ec2.terminate_instances`. Wait for `Terminated`.
     - `ec2.delete_volume` for Cache_Volume, Repo_Volume (root volume goes with the instance). Individual failures log and continue (Req 1.3.3).
     - `ec2.delete_security_group`. Tolerate `DependencyViolation`.
@@ -124,7 +128,7 @@ Target crates and files:
     - Release any tagged Elastic IP.
     - Remove `~/.tokeira/workstations/<id>/` directory.
     - Clear `~/.tokeira/workstations/.latest` if it pointed at this workstation.
-    - (Req 1.3)
+    - (Req 1.3, 10.2.8)
   - [ ] 3.6 Implement `Workstation::bootstrap` (drift-refresh)
     - Compute local Bootstrap_Fingerprint.
     - Read remote fingerprint via SSM `cat /etc/tokeira/workstation-fingerprint || echo MISSING`.
@@ -146,6 +150,7 @@ Target crates and files:
   - [ ] 5.1 Implement `Workstation::remote_exec`
     - Signature per design.md §2: accepts `workstation_id`, `cwd`, `command: &[String]`, plus `stdout` and `stderr` writers.
     - Resolve instance ID from workstation ID.
+    - NOTE: The secret-in-command scan (Req 10.3) is performed by the CLI handler (`remote_exec.rs`) BEFORE calling this engine method. The engine does not know about the scanner; separation of concerns keeps the engine testable without TTY mocking.
     - Build the shell command: `cd <shell-escape-cwd> && <shell-escape-joined-command>`. Use the `shell-escape` crate (or `shlex`) — do NOT naively interpolate untrusted strings per AGENTS.md safety_guardrails.
     - `ssm.send_command` with document `AWS-RunShellScript`, parameters `{"commands": ["bash -lc <escaped>"]}`, `instance_ids: [instance_id]`.
     - Poll `ssm.get_command_invocation` at 500 ms intervals. On each poll, diff `StandardOutputContent` and `StandardErrorContent` against the last-seen values and write the deltas to the caller's writers.
@@ -165,10 +170,12 @@ Target crates and files:
 - [ ] 6. CLI layer — `tkr workstation` subcommand group
   - [ ] 6.1 Extend `apps/tkr/src/cli.rs`
     - Add `Workstation { #[command(subcommand)] action: WorkstationAction }` to the top-level `Command` enum.
-    - Declare `WorkstationAction` with all 9 variants per design.md §1 (`Up`, `Stop`, `Destroy`, `Ssh`, `RemoteExec`, `Status`, `List`, `Bootstrap`, `Idle`).
+    - Declare `WorkstationAction` with all 10 variants per design.md §1 (`Up`, `Stop`, `Destroy`, `Ssh`, `RemoteExec`, `Status`, `List`, `Bootstrap`, `Idle`, `GithubKey`).
+    - Declare `GithubKeyAction` with `Add`, `Remove`, `List` variants per design.md §1.
     - Use `#[arg(trailing_var_arg = true)]` on `RemoteExec.command`.
+    - Add `--yes-secret-in-command` flag on `RemoteExec` (Req 10.3).
     - Document each subcommand with `#[doc]` strings that surface under `tkr workstation --help`.
-    - (Req 6.1.1, 6.1.2)
+    - (Req 6.1.1, 6.1.2, 10.2, 10.3)
   - [ ] 6.2 Create `apps/tkr/src/commands/workstation/mod.rs`
     - Declare all handler submodules (one per action).
     - Implement `resolve_workstation_id(override: Option<&str>) -> Result<String, anyhow::Error>` used by every handler to read `--workstation` or fall back to `~/.tokeira/workstations/.latest`. Missing-latest + no-override is a descriptive error, not a panic.
@@ -195,9 +202,10 @@ Target crates and files:
   - [ ] 6.7 Implement `remote_exec.rs`
     - `resolve_workstation_id`.
     - Join `args.command` into a single command string. Reject empty command list with a clear error.
+    - Call `secret_scan::scan(&args.command)`. If match found and `!args.yes_secret_in_command`, print warning to stderr and prompt y/N. Abort on N or non-interactive stdin.
     - Call `workstation.remote_exec(id, &args.cwd, &args.command, tokio::io::stdout(), tokio::io::stderr())`.
     - Exit with the returned exit code.
-    - (Req 4.4)
+    - (Req 4.4, 10.3)
   - [ ] 6.8 Implement `status.rs`, `list.rs`, `bootstrap.rs`, `idle.rs`
     - Each is a thin argument-translation + format wrapper over the corresponding `Workstation` engine method.
     - `status.rs` formats the `WorkstationStatus` with the cost rate and uptime; handles the `hourly_cost_usd: None` case by printing "cost rate: unknown".
@@ -207,7 +215,26 @@ Target crates and files:
     - (Req 5.2.1, 5.2.3)
   - [ ] 6.9 Dispatch in `apps/tkr/src/main.rs`
     - Add the `Command::Workstation { action }` match arm, routing each `WorkstationAction` variant to the corresponding handler.
+    - Route `GithubKey { action }` to `github_key.rs` handler.
     - (Req 6.1.4)
+  - [ ] 6.10 Create `apps/tkr/src/commands/workstation/secret_scan.rs`
+    - Implement `scan(command: &[String]) -> Option<SecretMatch>` per design.md §8.2.
+    - `SecretMatch` carries the pattern name (for the warning message) and the matched substring span.
+    - Embed `SECRET_PATTERNS` as a `LazyLock<Vec<(String, Regex)>>` compiled once.
+    - Unit test: each pattern in `SECRET_PATTERNS` has at least one positive and one negative example.
+    - (Req 10.3.1)
+  - [ ] 6.11 Implement `apps/tkr/src/commands/workstation/github_key.rs`
+    - `Add` handler:
+      1. Validate `gh` presence via `which::which("gh")`.
+      2. Validate `gh auth status` exits 0 (else `GhCliUnauthenticated`).
+      3. Parse `--repo` or derive from profile's `repo_url`.
+      4. Call engine `github_key_add` which generates keypair on instance via SSM, returns pubkey.
+      5. Run `gh api --method POST repos/<owner>/<name>/keys ...` on MacBook as subprocess; parse `id` from JSON response.
+      6. Call engine to wire `~/.ssh/config` and rewrite remotes on instance (unless `--read-only`).
+      7. Append entry to `~/.tokeira/workstations/<id>/deploy-keys.jsonl`.
+    - `Remove` handler: reverse of Add — delete GitHub key via `gh api DELETE`, rewrite remotes back to HTTPS, delete keypair, append remove-event to JSONL.
+    - `List` handler: read JSONL, cross-check via `gh api repos/<owner>/<name>/keys`, print table with status (live / orphan-local / orphan-remote).
+    - (Req 10.2.1 through 10.2.8)
 
 - [x] 7. Checkpoint — CLI end-to-end smoke test
   - `tkr workstation up`, `status`, `stop` round-trip against mock AWS (via an in-process smoke test that drives the engine with mocked SDK clients). Interactive `ssh` and `remote-exec` require the live-AWS path from task 9.
@@ -219,13 +246,13 @@ Target crates and files:
     - `fingerprint(context: &BootstrapContext) -> String` returns the SHA-256 hex.
     - Each of the 7 phases is its own Rust function returning `String`, so they compose cleanly.
     - Phase 1 (filesystem): NVMe detect via `lsblk`, format if unformatted, mount at `/work`, `fstab` entries for EBS volumes.
-    - Phase 2 (toolchain): `apt-get install`, rustup install, `rustup show`, cargo tool installation.
+    - Phase 2 (toolchain): `apt-get install`, rustup install, `rustup show`, cargo tool installation. Install `gh` CLI (unauthenticated per Req 10.1.2). Write `GITHUB_SSH_HOST_KEYS` to `~/.ssh/known_hosts` and configure `StrictHostKeyChecking yes` for `github.com` and `github.com-tokeira-*` per Req 10.4.
     - Phase 3 (profile.d env): generate the shell file with the four exports.
     - Phase 4 (repo clone): if `/work/repo/tokeira/.git` missing, clone; symlink `/work/tokeira`.
     - Phase 5 (agentd socket dir): `mkdir /run/tokeira-agentd`, `tmpfiles.d` entry.
     - Phase 6 (idle watchdog): write the service + timer files (see task 8.2 for the service script).
     - Phase 7 (fingerprint): write `/etc/tokeira/workstation-fingerprint`.
-    - (Req 3.1, 3.2, 3.3, 5.1, 8.1)
+    - (Req 3.1, 3.2, 3.3, 5.1, 8.1, 10.1.2, 10.4)
   - [ ] 8.2 Write the idle-shutdown watchdog script
     - 40-line bash script per design.md §6.
     - Embedded as a string literal in `remote_workstation_bootstrap.rs` and written to the instance during Phase 6.
@@ -279,10 +306,34 @@ Target crates and files:
   - Live-AWS acceptance test from task 9 passes: `tkr workstation up && tkr workstation remote-exec "cargo build --workspace" && tkr workstation stop` produces a successful build with no infra orphans after stop.
   - Update `docs/CODEX_START_HERE.md` if present to mention the new workstation surface.
 
+- [ ] 13. Feature 10 — GitHub credential policy tests
+  - [ ]* 13.1 Secret scanner coverage
+    - `apps/tkr/tests/workstation_secret_scan.rs`.
+    - For each entry in `SECRET_PATTERNS`: one positive match, one negative near-miss.
+    - Assert `scan()` returns `Some(SecretMatch)` for positives and `None` for negatives.
+    - Assert the warning text matches Req 10.3.2 verbatim.
+    - (Req 10.3.1, 10.3.2)
+  - [ ]* 13.2 Deploy-key registry round-trip
+    - `apps/tkr/tests/workstation_deploy_keys_registry.rs`.
+    - Write N add-events, then remove-events for a subset. Assert `list` returns only the live entries.
+    - Assert concurrent appends (simulated via two threads) produce valid JSONL (no interleaved lines).
+    - (Req 10.2.8)
+  - [ ]* 13.3 Host-key structural validity
+    - `crates/tokeira-aws/tests/remote_workstation_host_keys.rs`.
+    - Parse each entry in `GITHUB_SSH_HOST_KEYS` as an OpenSSH public key (use `ssh-key` crate or manual base64 + algorithm-prefix check).
+    - Assert exactly 3 entries (ed25519, ecdsa, rsa).
+    - (Req 10.4.3)
+  - [ ]* 13.4 IAM role minimality assertion
+    - `crates/tokeira-aws/tests/remote_workstation_iam_minimal.rs`.
+    - Mock the IAM `create_role` + `attach_role_policy` sequence.
+    - Assert the engine attaches exactly one policy: `AmazonSSMManagedInstanceCore`.
+    - Assert no inline policy is created.
+    - (Req 10.5.1, 10.5.2)
+
 ## Notes
 
-- Tasks marked with `*` are optional and can be skipped for faster MVP. Per the workflow, these include all property test sub-tasks (10.1–10.4). The correctness properties themselves remain invariants the implementation upholds.
-- Each task references specific requirements in parentheses for traceability. Every requirement number from `requirements.md` Features 1–9 appears in at least one task's parenthetical reference.
+- Tasks marked with `*` are optional and can be skipped for faster MVP. Per the workflow, these include all property test sub-tasks (10.1–10.4, 13.1–13.4). The correctness properties themselves remain invariants the implementation upholds.
+- Each task references specific requirements in parentheses for traceability. Every requirement number from `requirements.md` Features 1–10 appears in at least one task's parenthetical reference.
 - Checkpoints (tasks 2, 4, 7, 9, 12) mark integration points where `cargo build --workspace` stays green and the spec remains bisectable. Task 9 is the first checkpoint that requires live AWS credentials; prior checkpoints are fully mocked.
 - The 3-command happy path (`tkr workstation up` → `tkr workstation remote-exec "cargo build --workspace"` → `tkr workstation stop`) is the spec's north-star UX. Every task should be evaluated against "does this improve or complicate the 3-command path?"
 - Follow-up work deferred to `agent-controller`: nothing in this task list installs Codex, binds agentd to `/run/tokeira-agentd/agentd.sock`, or adds `tkr agent *` subcommands. All such work is owned by the `agent-controller` spec, which will consume `tkr workstation up` and `tkr workstation remote-exec` as its foundation.

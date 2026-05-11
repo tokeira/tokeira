@@ -183,7 +183,7 @@ This spec is **scoped to the workstation itself**. The agent controller (Codex, 
 1. WHEN the Repo_Volume is first formatted, THE bootstrap SHALL clone the Tokeira repository to `/work/tokeira` using the repository URL configured in the Workstation_Profile (default: the `origin` URL of the local checkout running `tkr workstation up`).
 2. IF the Repo_Volume already contains a `/work/tokeira` directory, THE bootstrap SHALL NOT overwrite it. Keeping uncommitted work safe is a first-class bootstrap invariant.
 3. THE bootstrap SHALL configure git on the instance with the local git user's name and email (read from `git config` at `tkr workstation up` time) so commits authored on the workstation carry the expected identity.
-4. THE bootstrap SHALL NOT install an SSH deploy key. Code pushes from the workstation SHALL go through `gh auth` (GitHub CLI) using the operator's token forwarded at `tkr workstation bootstrap` time (see Requirement 5.3).
+4. THE bootstrap SHALL NOT install an SSH key, a GitHub personal access token, or any other GitHub credential by default. Push-from-workstation is opt-in via `tkr workstation github-key add` per Feature 10. Read-only clone from public repositories works credential-free; private-repository clone requires the opt-in path.
 
 ---
 
@@ -398,3 +398,68 @@ This spec is **scoped to the workstation itself**. The agent controller (Codex, 
 
 1. GIVEN an arbitrary state of `~/.tokeira/workstations/` (empty, stale, corrupted, missing `.latest`, `.latest` pointing at a nonexistent Workstation_Id), every subcommand SHALL return `Ok(_)` with a cleanly-formatted status output OR `Err(_)` with a message naming the resolution problem. NO subcommand SHALL panic.
 2. THE test SHALL live under `apps/tkr/tests/workstation_resolution.rs`.
+
+---
+
+## Feature 10: GitHub Credential Policy
+
+The workstation is a Rust build surface. It is NOT a git-push surface by default. This feature establishes the credential-free default posture and provides an opt-in path for operators who do need to commit and push from the workstation without exposing their main GitHub credentials.
+
+Feature ordering note: Feature 10 follows the Correctness Properties in this spec's ordering because it was added after the initial feature enumeration was drafted. The in-spec cross-references in design.md and tasks.md (which cite Req 9.x) remain valid because no existing requirement was renumbered.
+
+### Requirement 10.1: No GitHub credentials by default
+
+**User Story:** As a security-aware operator, I want the remote workstation to carry no GitHub credentials by default, so that an instance compromise — whether through a supply-chain attack on a crate, a lateral movement from another AWS resource, or an SSM session hijack — cannot exfiltrate my GitHub access.
+
+#### Acceptance Criteria
+
+1. THE bootstrap SHALL NOT install any SSH key, GitHub personal access token, OAuth token, or GitHub App installation token on the instance.
+2. THE `gh` CLI SHALL be installed as part of the standard bootstrap tool set (per Req 3.1.2) but SHALL NOT be pre-authenticated. Running `gh` on the instance with no prior auth SHALL produce the standard unauthenticated error (`error: You are not logged into any GitHub hosts...`).
+3. IF the operator's `repo_url` points at a public repository (HTTPS URL resolvable without authentication), the initial clone in the bootstrap (per Req 3.3.1) SHALL succeed without any credential.
+4. IF the operator's `repo_url` points at a private repository, the initial clone SHALL fail with a clear message that names `tkr workstation github-key add` as the next step. The bootstrap SHALL NOT retry, fall back to a different auth method, or prompt for credentials interactively — fail loudly and cleanly.
+5. THE instance's IAM role SHALL NOT include any permissions beyond those required for SSM Session Manager (Req 4.2.1). In particular, it SHALL NOT include `secretsmanager:GetSecretValue`, `ssm:GetParameter` for a GitHub-related parameter, or any AWS permission that would let a compromised instance pivot to operator-owned credentials stored elsewhere in the account.
+
+### Requirement 10.2: Opt-in workstation-scoped SSH deploy key
+
+**User Story:** As an operator who genuinely needs to commit and push from the workstation — for example, during an interactive `tkr workstation ssh` session where I'm iterating on a fix and want to cut a PR without round-tripping to my MacBook — I want an explicit command that provisions a per-workstation SSH deploy key, so that push access is available when I need it but OFF by default, and tightly scoped to one repository.
+
+#### Acceptance Criteria
+
+1. `tkr workstation github-key add --repo <owner/name>` SHALL generate an ed25519 keypair on the Workstation_Instance at `~/.ssh/tokeira-workstation-<workstation-id>` (private key) and `~/.ssh/tokeira-workstation-<workstation-id>.pub` (public key). Both files SHALL live on the Cache_Volume (survives instance stop) with mode `0600` / `0644` respectively.
+2. IF `--repo` is omitted, THE CLI SHALL extract the owner and name from the workstation's `repo_url` configured at creation time. IF that URL does not resolve to a single owner/name pair (e.g. a file:// URL), the command SHALL fail with a clear message requesting `--repo` explicitly.
+3. THE public-key upload to GitHub SHALL run from the **operator's MacBook**, using the operator's existing MacBook-side `gh auth` state, NOT from the Workstation_Instance. The command the CLI invokes is `gh api --method POST repos/<owner>/<repo>/keys -f title=tokeira-workstation-<workstation-id> -f key="<pubkey>" -F read_only=false` executed on the MacBook. THE operator's primary GitHub token (laptop-resident) SHALL NOT travel to the workstation at any point.
+4. THE deploy key's title SHALL be `tokeira-workstation-<workstation-id>`, embedding the Workstation_Id so keys are distinguishable in the GitHub UI under Settings → Deploy keys AND so a follow-up `tkr workstation destroy` can locate and remove the correct key.
+5. AFTER the key is accepted by GitHub, `tkr workstation github-key add` SHALL configure `~/.ssh/config` on the instance with a `github.com` stanza routing through the generated key and SHALL rewrite any `https://github.com/<owner>/<repo>(.git)?` remotes in `/work/tokeira` to their `git@github.com:<owner>/<repo>.git` equivalents via `git remote set-url origin`. Subsequent `git push` operations on the instance SHALL succeed using the deploy key.
+6. THE deploy key SHALL be added with `read_only=false`. The operator may explicitly request read-only with `tkr workstation github-key add --read-only`; the CLI SHALL respect the override and skip the remote rewrite in Req 10.2.5 (read-only access works fine with HTTPS clones too).
+7. `tkr workstation github-key remove` (companion command) SHALL reverse the `add` sequence: call `gh api --method DELETE repos/<owner>/<repo>/keys/<key-id>` from the MacBook to remove the deploy key, rewrite the instance remotes back to HTTPS, and delete the keypair files from the instance.
+8. `tkr workstation destroy` SHALL invoke the `github-key remove` path (best-effort, per Req 1.3.3) for every deploy key tagged with the workstation's ID across every repository the key was added to. A local registry at `~/.tokeira/workstations/<id>/deploy-keys.jsonl` records each `add` call so `destroy` knows where to look. Failure to remove a key SHALL log a warning with explicit instructions: "Remove the orphan deploy key manually at https://github.com/<owner>/<repo>/settings/keys — look for one titled `tokeira-workstation-<id>`."
+
+### Requirement 10.3: Secret-in-command warning on `remote-exec`
+
+**User Story:** As a security-aware operator, I want `tkr workstation remote-exec` to warn me if my command string looks like it contains a secret, so that I don't accidentally expose a token by passing it into an SSM Run Command invocation (which is logged to CloudTrail with the command text).
+
+#### Acceptance Criteria
+
+1. WHEN `tkr workstation remote-exec <command>` is invoked, THE CLI SHALL pattern-match the command string against a set of known secret-substring heuristics: `gh auth login --with-token`, `GITHUB_TOKEN=`, `-H "Authorization: Bearer`, `AWS_SECRET_ACCESS_KEY=`, and a small set of similar patterns. The exact list SHALL be embedded as a Rust constant and updated only by a spec-change.
+2. IF a match is found, THE CLI SHALL print a warning to stderr before executing and require either `--yes-secret-in-command` confirmation OR an interactive y/N prompt (default N). The warning SHALL read: "The command looks like it contains a secret. SSM Run Command invocations are logged to CloudTrail with the full command text. Use `tkr workstation ssh` for interactive secret entry instead. Proceed anyway? [y/N]"
+3. WHERE the operator genuinely needs to pass a secret for legitimate reasons (e.g. passing an ad-hoc PAT for a one-time clone), THE documented path in the operator guide SHALL be: `tkr workstation ssh`, then type the secret-bearing command interactively; SSH sessions via Session Manager are not Run Command invocations and do not embed the command text in CloudTrail.
+
+### Requirement 10.4: SSH host-key pinning for GitHub
+
+**User Story:** As a security-aware operator, I want the instance's first connection to `github.com` over SSH to verify against pre-pinned GitHub host keys, so that a man-in-the-middle attack on the NAT path cannot masquerade as GitHub on trust-on-first-use.
+
+#### Acceptance Criteria
+
+1. THE cloud-init bootstrap SHALL write GitHub's published SSH host keys to `~/.ssh/known_hosts` during Phase 2 (tool installation) for the shell user. Keys SHALL be sourced from GitHub's documented fingerprint set (`https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints`) and embedded as a Rust constant in `remote_workstation_bootstrap.rs`. The keys are published under a stable identity and rotate infrequently; a rotation event is a spec-level change.
+2. THE bootstrap SHALL ensure `StrictHostKeyChecking yes` is set for `github.com` in `~/.ssh/config`, so that the first SSH connection from the instance fails hard if the host key does not match the pinned set, rather than prompting the operator with a non-interactive TOFU dialog that SSM-session users cannot answer.
+3. GitHub's published host keys SHALL be updated in `remote_workstation_bootstrap.rs` whenever GitHub publishes a rotation announcement. A test in `crates/tokeira-aws/tests/remote_workstation_host_keys.rs` SHALL assert that the embedded keys parse as valid OpenSSH public keys; the test is structural, not a freshness check.
+
+### Requirement 10.5: No GitHub credential on the instance role
+
+**User Story:** As a security-aware operator, I want the instance's AWS IAM role to have no path to fetch GitHub credentials from AWS, so that even if the instance is compromised, there is no AWS-side credential chain to pivot through.
+
+#### Acceptance Criteria
+
+1. THE workstation's IAM role (per Req 4.2.1) SHALL attach only the AWS-managed policy `AmazonSSMManagedInstanceCore`. No inline policy SHALL be attached.
+2. `Secrets Manager`, `Parameter Store`, `IAM`, and `sts:AssumeRole` permissions SHALL NOT be present on the instance role under this spec. IF a future spec (e.g. `agent-controller`) needs any of these permissions, that spec SHALL add them explicitly with justification in its own requirements.
+3. THE bootstrap SHALL NOT call any AWS service that requires credentials beyond SSM core (e.g. `aws secretsmanager get-secret-value`, `aws ssm get-parameter`) during its execution. The only AWS permissions the bootstrap exercises are the ones SSM Session Manager itself uses.

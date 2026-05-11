@@ -21,7 +21,7 @@ This spec is **scoped to the workstation itself**. The agent controller (Codex, 
 - **agentd daemon on the instance** — no Tokeira-authored process runs on the remote workstation in this spec. Every operator interaction is `tkr` on the MacBook talking to the instance over SSM Session Manager with a shell command. `agentd` is owned by `agent-controller`.
 - **Codex installation or credentials on the instance** — `agent-controller` installs and authenticates Codex on the workstation. This spec's bootstrap is agent-free.
 - **Multi-instance orchestration** — one workstation per `tkr workstation up` invocation. Multiple instances can coexist under distinct `workstation-id` tags; the CLI operates on one at a time selected by `--workstation` or the last-used sentinel. Parallel agent workloads across multiple instances are a concern for `agent-controller`, not this spec.
-- **S3-backed shared sccache** — the bootstrap installs `sccache` with the local filesystem backend pointing at the persistent cache EBS volume. A shared S3 backend is a cost/speed optimisation deferred to a future iteration once two or more workstations regularly coexist.
+- **S3-backed shared sccache** — the bootstrap installs `sccache` with the local filesystem backend at `/work/sccache` on the instance's NVMe. A shared S3 backend is a cost/speed optimisation deferred to a future iteration once two or more workstations regularly coexist or the post-stop cold-cache cost becomes operationally annoying.
 - **Remote debugging, LLDB forwarding, interactive IDE sync** — these are fine use cases for the SSM channel but are not requirements of this spec. The operator SSHes (via `tkr workstation ssh`) for ad-hoc interactive work; the programmatic surface is `tkr workstation remote-exec`.
 - **Multi-region support** — every workstation lives in a single operator-configured default region. Multi-region is an explicit non-goal; if it becomes necessary, a future spec reshapes the configuration surface.
 - **Public internet ingress to the instance** — the instance has no public IP and no inbound security-group rules. All access is via SSM Session Manager with IAM-scoped authorisation.
@@ -38,9 +38,9 @@ This spec is **scoped to the workstation itself**. The agent controller (Codex, 
 
 - **Workstation_Instance**: The single EC2 `c8gd.8xlarge` Graviton4 instance this spec provisions. Tagged `tokeira-workstation=true` plus a `workstation-id` that uniquely identifies it across the operator's AWS account.
 - **Workstation_Id**: A short stable identifier chosen at `tkr workstation up` time (e.g. `ws-01HXYZ...`). Used as the tag value on the instance and its attached EBS volumes, and as the filesystem path under which the local `tkr` CLI caches its view of the remote state.
-- **Cache_Volume**: A persistent EBS gp3 volume attached to the instance at a stable device name, holding `~/.cargo`, `~/.rustup`, and the `sccache` filesystem cache. Survives instance stop; destroyed only by explicit `tkr workstation destroy`.
-- **Repo_Volume**: A persistent EBS gp3 volume holding the Tokeira repository checkout at `/work/tokeira`. Separate from the cache volume so the cache volume can be recycled (for Rust toolchain upgrades that poison incremental state) without losing uncommitted work.
-- **Local_NVMe**: The instance-store NVMe disk native to the `c8gd` family. Ephemeral — erased on instance stop. Used for `CARGO_TARGET_DIR` so cold rebuild artefacts never spill onto the EBS volumes.
+- **Cache_Volume**: A persistent EBS gp3 volume holding `~/.cargo` (crate registry and git sources) plus `~/.rustup` (toolchains). Survives instance stop. 30 GiB default — cargo registry ~5 GiB, rustup ~6 GiB for stable+nightly, headroom for multi-toolchain workflows.
+- **Repo_Volume**: A persistent EBS gp3 volume holding one or more repository checkouts under `/work/`. Primary use is `/work/tokeira`; 40 GiB default allows 3–4 sibling checkouts (`sdk-core`, `temporal`, `temporal-dsql`) without repartitioning. Separate from the Cache_Volume so a toolchain recycle does not risk uncommitted work.
+- **Local_NVMe**: The instance-store NVMe disk native to the `c8gd` family (~1900 GiB on `c8gd.8xlarge`). Ephemeral — erased on instance stop. Used for `CARGO_TARGET_DIR` AND the `sccache` filesystem cache; both are latency-sensitive and recreatable, which matches NVMe's properties exactly. Losing the cache on stop is accepted in exchange for NVMe-speed hits on every build within a session.
 - **SSM_Session**: An AWS Systems Manager Session Manager session. The only authorised inbound channel to the Workstation_Instance. Scoped to the operator's AWS IAM identity via an allow-list of SSM-related permissions.
 - **Workstation_Profile**: A named profile declaring the instance type, AMI family, region, Cache_Volume size, Repo_Volume size, and idle-shutdown window. The default profile (`c8gd-rust`) captures the choices this spec endorses; future profiles are additive.
 - **Idle_Shutdown_Watchdog**: An `systemd`-managed process on the instance that polls CPU load and SSM-session presence. After a configurable idle window elapses with both conditions below a quiescence threshold, it invokes `shutdown -h now` to stop the instance.
@@ -75,7 +75,7 @@ This spec is **scoped to the workstation itself**. The agent controller (Codex, 
 
 1. WHEN the operator invokes `tkr workstation stop`, THE CLI SHALL invoke `StopInstances` on the Workstation_Instance and wait for the instance to reach `stopped`.
 2. THE Cache_Volume and Repo_Volume SHALL remain attached across a stop/start cycle. NO volume detach SHALL occur during `stop`.
-3. THE operator SHALL be warned, in the `stop` command's output, that the Local_NVMe contents (including `CARGO_TARGET_DIR`) will be erased on stop. The warning SHALL name the specific paths affected (`/work/target`, `/work/sccache-tmp`).
+3. THE operator SHALL be warned, in the `stop` command's output, that the Local_NVMe contents will be erased on stop. The warning SHALL name the specific paths affected: `/work/target` (cargo target directory) AND `/work/sccache` (sccache cache).
 4. WHEN the `stop` command completes, `tkr workstation status` SHALL report the instance state as `stopped` and SHALL retain the Workstation_Id mapping in `~/.tokeira/workstations/`.
 
 ### Requirement 1.3: `tkr workstation destroy` removes all resources
@@ -117,26 +117,28 @@ This spec is **scoped to the workstation itself**. The agent controller (Codex, 
 
 ### Requirement 2.1: Three-tier storage with explicit mount points
 
-**User Story:** As an operator, I want the workstation to have a clear storage hierarchy so that I always know what survives a stop and what does not.
+**User Story:** As an operator, I want the workstation to have a clear storage hierarchy so that I always know what survives a stop, what does not, and why the split is drawn that way.
 
 #### Acceptance Criteria
 
 1. THE Workstation_Instance SHALL mount the `c8gd` Local_NVMe at `/work`. THE bootstrap SHALL format the NVMe as ext4 on first boot and re-format on every subsequent boot (since Local_NVMe is erased on stop).
-2. THE Repo_Volume SHALL be mounted at `/work/repo-volume` and the repository checkout SHALL live at `/work/tokeira`, with the checkout directory symlinked or bind-mounted from the Repo_Volume so the repository persists across stop.
-3. THE Cache_Volume SHALL be mounted at `/work/cache-volume` and the following subdirectories SHALL be bind-mounted into the operator's home directory: `/work/cache-volume/cargo` → `~/.cargo`, `/work/cache-volume/rustup` → `~/.rustup`, `/work/cache-volume/sccache` → `~/.cache/sccache`.
-4. `CARGO_TARGET_DIR` SHALL be set to `/work/target` in `/etc/profile.d/tokeira-workstation.sh`. `RUSTC_WRAPPER` SHALL be set to `sccache`. `SCCACHE_DIR` SHALL be set to `~/.cache/sccache`. `CARGO_INCREMENTAL` SHALL be set to `1`.
-5. THE cloud-init SHALL handle every mount-point bootstrap idempotently: re-running bootstrap on an already-configured instance SHALL detect existing mounts and skip their setup.
+2. THE Repo_Volume SHALL be mounted at `/work/repo` (directory path chosen to distinguish the mount point from any single repository clone). THE bootstrap SHALL create `/work/repo/tokeira` as the canonical Tokeira checkout path on first boot. A symlink `/work/tokeira -> /work/repo/tokeira` SHALL be created for ergonomic `cd /work/tokeira` usage.
+3. THE Cache_Volume SHALL be mounted at `/work/cache` and the following subdirectories SHALL be bind-mounted into the operator's home directory: `/work/cache/cargo` → `~/.cargo`, `/work/cache/rustup` → `~/.rustup`.
+4. `~/.cache/sccache` SHALL be a bind-mount to `/work/sccache`, which is a directory on the Local_NVMe (not the Cache_Volume). The rationale is latency: `sccache` hit-path reads hot artefacts on every compile, and the NVMe's native latency advantage over EBS gp3 is exactly the win `sccache` exists to capture. The cost of this choice is that sccache contents are lost on instance stop; the first build after a resume is a cold build. For a daily workflow (stop overnight, resume in the morning) this is acceptable because `cargo`'s on-disk incremental state on the Cache_Volume gives most of the benefit anyway.
+5. `CARGO_TARGET_DIR` SHALL be set to `/work/target` in `/etc/profile.d/tokeira-workstation.sh`. `RUSTC_WRAPPER` SHALL be set to `sccache`. `SCCACHE_DIR` SHALL be set to `/work/sccache`. `CARGO_INCREMENTAL` SHALL be set to `1`.
+6. THE cloud-init SHALL handle every mount-point bootstrap idempotently: re-running bootstrap on an already-configured instance SHALL detect existing mounts and skip their setup. The Local_NVMe is the exception — it is reformatted on every boot per Req 2.1.1.
 
 ### Requirement 2.2: Volume sizing defaults and profile control
 
-**User Story:** As an operator, I want sensible default sizes for the cache and repo volumes with the ability to override per profile, so that small and large workspaces can both be served.
+**User Story:** As an operator, I want sensible default sizes for the cache and repo volumes with the ability to override per profile, so that small and large workspaces can both be served without paying for unused capacity.
 
 #### Acceptance Criteria
 
-1. THE default Workstation_Profile (`c8gd-rust`) SHALL declare: Cache_Volume 100 GiB, Repo_Volume 20 GiB, instance type `c8gd.8xlarge`, region read from `AWS_REGION` environment or the operator's default profile.
-2. Profile fields SHALL be overridable on the `tkr workstation up` command line: `--cache-volume-gib`, `--repo-volume-gib`, `--instance-type`, `--region`.
-3. Profile definitions SHALL live in a Rust constant table in `crates/tokeira-aws/src/resources/remote_workstation.rs` initially; configuration-file profiles are a deliberate non-goal for this spec.
-4. WHERE an operator overrides the instance type to a non-`c8gd*` family, THE CLI SHALL emit a warning naming the deviation from the Tokeira-recommended baseline. The CLI SHALL NOT reject the override.
+1. THE default Workstation_Profile (`c8gd-rust`) SHALL declare: Root_Volume 20 GiB, Cache_Volume 30 GiB, Repo_Volume 40 GiB, instance type `c8gd.8xlarge`, region read from `AWS_REGION` environment or the operator's default AWS profile (typically `eu-west-2`).
+2. Sizing rationale: the Cache_Volume holds `~/.cargo` (~5 GiB for Tokeira workspace after full resolution) plus `~/.rustup` (~6 GiB for stable + nightly with rustfmt, clippy, rust-src) plus installed cargo tools (~500 MiB) with meaningful headroom for multi-toolchain workflows. The Repo_Volume holds the Tokeira checkout (~1.2 GiB including `.git`) plus 3–4 sibling checkouts of related repositories (`sdk-core`, `temporal`, `temporal-dsql`) at ~1–3 GiB each, leaving comfortable headroom. The Root_Volume carries the Ubuntu 24.04 base (~4 GiB) plus installed OS packages and operator dotfiles, with ~12 GiB unused.
+3. Profile fields SHALL be overridable on the `tkr workstation up` command line: `--cache-volume-gib`, `--repo-volume-gib`, `--root-volume-gib`, `--instance-type`, `--region`.
+4. Profile definitions SHALL live in a Rust constant table in `crates/tokeira-aws/src/remote_workstation.rs` (see Req 6.3); configuration-file profiles are a deliberate non-goal for this spec.
+5. WHERE an operator overrides the instance type to a non-`c8gd*` family, THE CLI SHALL emit a warning naming the deviation from the Tokeira-recommended baseline. The CLI SHALL NOT reject the override.
 
 ### Requirement 2.3: EBS volumes are encrypted
 
@@ -188,16 +190,16 @@ This spec is **scoped to the workstation itself**. The agent controller (Codex, 
 
 ## Feature 4: Access via SSM Session Manager
 
-### Requirement 4.1: No inbound ports, no SSH key
+### Requirement 4.1: No public ingress, no SSH key, transient public IP
 
-**User Story:** As a security-aware operator, I want zero public ingress to the workstation and zero SSH keys stored anywhere so that the attack surface is limited to IAM-scoped SSM sessions.
+**User Story:** As a security-aware but cost-aware operator, I want zero inbound ingress and no SSH keys on the workstation, but I also want to avoid the standing cost of a dedicated NAT Gateway for a single-developer use case.
 
 #### Acceptance Criteria
 
-1. THE security group attached to the Workstation_Instance SHALL have zero ingress rules. THE egress ruleset SHALL allow all outbound (0.0.0.0/0) so `cargo` can fetch crates and `rustup` can download toolchains.
-2. THE Workstation_Instance SHALL be launched into an operator-configured subnet. If the subnet is private (no route to an Internet Gateway), THE bootstrap SHALL rely on a NAT Gateway the operator has provisioned elsewhere; this spec does NOT provision the NAT Gateway.
-3. THE Workstation_Instance SHALL have `AssociatePublicIpAddress = false` unless the operator explicitly overrides it via `--public-ip` on `tkr workstation up`. THE default SHALL favour private networking.
-4. THE operator SHALL reach the instance exclusively through SSM Session Manager. NO SSH key material SHALL be imported to the instance, and NO EC2 Instance Connect SSH endpoint SHALL be provisioned by this spec.
+1. THE security group attached to the Workstation_Instance SHALL have ZERO ingress rules. THE egress ruleset SHALL allow all outbound (0.0.0.0/0) so `cargo` can fetch crates and `rustup` can download toolchains.
+2. THE Workstation_Instance SHALL be launched into a PUBLIC subnet with `MapPublicIpOnLaunch = false` at the subnet level, so the instance receives a public IP only when explicitly associated. This keeps egress free (via the subnet's Internet Gateway route) without the $36/month standing charge of a dedicated NAT Gateway. A NAT Gateway is explicitly NOT provisioned by this spec. If the operator's VPC already has a NAT Gateway serving private subnets, the operator MAY override `--subnet-id` to select a private subnet; this is an advanced override, not the default path.
+3. WHEN the instance is started (`tkr workstation up` on a stopped instance OR fresh create), THE CLI SHALL invoke `AssociateAddress` to attach a public IP — either an account-owned Elastic IP (if one exists and is tagged `tokeira-workstation-eip`) or auto-assignment via the subnet's public-IP assignment setting overridden per-request. WHEN the instance is stopped (`tkr workstation stop`), THE CLI SHALL release the public IP to avoid the stopped-EIP charge (~$3.60/month if left attached to a stopped instance).
+4. THE operator SHALL reach the instance exclusively through SSM Session Manager. NO SSH key material SHALL be imported to the instance, and NO EC2 Instance Connect SSH endpoint SHALL be provisioned by this spec. The instance's public IP is used only for outbound connectivity; inbound traffic is blocked by the security group's empty ingress ruleset.
 
 ### Requirement 4.2: IAM role grants SSM agent permissions
 
@@ -292,18 +294,19 @@ This spec is **scoped to the workstation itself**. The agent controller (Codex, 
 
 1. THE `tokeira-aws` crate SHALL gain a `remote_workstation` module exposing: `WorkstationProfile`, `WorkstationHandle`, and async methods `up`, `stop`, `destroy`, `remote_exec`, `status`, `list`, `bootstrap`, `idle_control`.
 2. THE CLI handlers SHALL contain only argument translation, output formatting, and confirmation logic — no direct AWS SDK calls. All SDK work lives inside the engine.
-3. THE engine SHALL use the `tokeira-iac` `Module`/`Resource` pattern for declarative state changes (create, delete), and direct AWS SDK calls for imperative operations (`start`, `stop`, `send_command`, `start_session`).
+3. THE engine SHALL call the AWS SDK directly via `aws-sdk-ec2` and `aws-sdk-ssm`. Lifecycle operations (`up`, `stop`, `destroy`) sequence explicit SDK calls against the AWS control plane; no `tokeira-iac` `Engine::apply` / `Engine::destroy` machinery is involved.
 
-### Requirement 6.3: Follow the `Tokeira-iac` `Module` shape
+### Requirement 6.3: Direct AWS SDK with tag-based state
 
-**User Story:** As a Tokeira maintainer familiar with the `temporal-dsql-deploy-eks` `aws-sdk-implementations` pattern, I want the new resources in `tokeira-aws/src/resources/` to match the existing conventions, so that a reviewer can diff a new resource against an existing one and verify the same boilerplate.
+**User Story:** As a Tokeira maintainer, I want the remote-workstation module to use the AWS SDK directly rather than plumb through the `tokeira-iac` `Module`/`Resource` engine, so that the one-instance-with-two-volumes topology does not carry the weight of multi-resource composition, state-document persistence, or project-wiring overhead that `tokeira-iac` exists to manage for larger deployments.
 
 #### Acceptance Criteria
 
-1. THE new resource files under `crates/tokeira-aws/src/resources/` SHALL declare Rust structs implementing the `tokeira_iac::Resource` trait: `RemoteWorkstationInstance`, `RemoteWorkstationSecurityGroup`, `RemoteWorkstationCacheVolume`, `RemoteWorkstationRepoVolume`, `RemoteWorkstationInstanceProfile`, `RemoteWorkstationIamRole`, `RemoteWorkstationInstanceAttachments` (the composite attachment binding volumes and instance).
-2. Every resource SHALL implement `create`, `update`, `delete`, `describe`, `diff`, `dependencies`.
-3. A new `RemoteWorkstationModule` SHALL implement the `Module` trait, declaring the resources above and their dependency ordering.
-4. THE resources SHALL be addressable by the `tkr workstation` engine via the `tokeira-iac` `Engine::apply` / `Engine::destroy` entry points, consistent with `temporal-dsql-deploy-eks` usage.
+1. THE module SHALL live at `crates/tokeira-aws/src/remote_workstation.rs` (a single file at the crate root, NOT under `crates/tokeira-aws/src/resources/`). The file-location convention matters: `resources/` holds `tokeira_iac::Resource` impls registered with the IaC engine; top-level crate files hold direct-SDK wrappers. The remote workstation is the latter.
+2. THE source of truth for workstation state SHALL be AWS tags on the live EC2 resources. The tag `tokeira-workstation=true` plus `workstation-id=<id>` identifies workstation-owned resources; discovery proceeds via `DescribeInstances` / `DescribeVolumes` / `DescribeSecurityGroups` filtered by those tags.
+3. THE local `~/.tokeira/workstations/<workstation-id>/` directory SHALL be a performance cache only. Any conflict between cache and AWS state SHALL resolve to AWS (Req 7.1.1). NO project-level IaC state document (`InfraState`, `InfraStateStore`, or equivalent) SHALL be introduced by this spec.
+4. THE module SHALL NOT register itself as a `tokeira_iac::Module` or appear in any `InfraComposition`. `tkr workstation` commands SHALL NOT import `tokeira_iac::Engine`.
+5. Reasons for rejecting the `tokeira-iac` pattern are documented inline in the module's crate-level doc comment so future reviewers understand the deviation from the `temporal-dsql-deploy-eks` convention: (a) the topology is one instance + two EBS volumes + one security group + one IAM role + one instance profile, all with fixed wiring; (b) AWS tags already provide authoritative state; (c) `tokeira-iac`'s value (dependency ordering across heterogeneous resource families, cross-module composition, drift detection on complex state) does not apply to a single-shape developer workstation.
 
 ---
 

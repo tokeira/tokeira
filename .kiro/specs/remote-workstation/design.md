@@ -2,13 +2,13 @@
 
 ## Overview
 
-This spec restores Rust build and validation throughput by moving the cargo loop off the MacBook onto a dedicated Graviton4 `c8gd.8xlarge` EC2 instance in the operator's own AWS account. The MacBook keeps the editor, git history, and the `tkr` CLI; the EC2 instance runs `cargo build`, `cargo test`, `cargo lint`, and (via a later `agent-controller` spec) any Codex-driven agent work.
+This spec restores Rust build and validation throughput by moving the cargo loop off the MacBook onto a dedicated Graviton4 `c8gd.8xlarge` EC2 instance in the operator's own AWS account. The MacBook keeps the editor, git history, and the `tkr` CLI; the EC2 instance runs `cargo build`, `cargo test`, `cargo lint`, and (via a later `agent-controller` spec) any agent-driven work.
 
-The design optimises for three simultaneous goals: **throughput** (minute-scale cold builds on 32 Graviton4 vCPUs vs tens of minutes on a MacBook), **cost** (~£15/day active, ~£0.20/day stopped, ~£300/month at ~20 active days/month), and **scope discipline** (no agentd, no Codex, no Tokeira runtime on the workstation — those belong to follow-up specs). The workstation must be usable on its own for at least a week before the agent controller layer begins; this is a non-negotiable ordering constraint.
+The design optimises for three simultaneous goals: **throughput** (minute-scale cold builds on 32 Graviton4 vCPUs vs tens of minutes on a MacBook), **cost** (~$19/day active, ~$0.25/day stopped, ~$390/month at ~20 active days/month in eu-west-2), and **scope discipline** (no agentd, no agent tooling, no Tokeira runtime on the workstation — those belong to follow-up specs). The workstation must be usable on its own for at least a week before the agent-controller layer begins; this is a non-negotiable ordering constraint.
 
 Constraints honoured:
 
-- **No dedicated NAT Gateway.** A NAT Gateway is ~£36/month of standing cost that a solo-developer workstation does not justify. Egress comes from a public subnet with a transient public IP assigned on `up` and released on `stop`.
+- **No dedicated NAT Gateway.** A NAT Gateway is ~$36/month of standing cost that a solo-developer workstation does not justify. Egress comes from a public subnet with a transient public IP assigned on `up` and released on `stop`.
 - **No public ingress.** Security group has zero inbound rules. The only authorised inbound channel is AWS Systems Manager Session Manager, scoped to the operator's IAM identity. SSM Session Manager is free.
 - **No SSH keys.** SSM Session Manager removes the need for any SSH key material on the instance.
 - **Direct AWS SDK, not `tokeira-iac`.** A one-instance-plus-two-EBS-volumes topology does not benefit from the `Module`/`Resource` machinery; AWS tags on live resources are the source of truth for state. Detailed rationale in §7.
@@ -50,8 +50,8 @@ Three levers can cut this further if needed:
 
 This spec is consumed by:
 
-- [`agent-controller`](../agent-controller/requirements.md) — a future spec that will run a Codex-driven agent daemon on this workstation. `agent-controller` depends on `tkr workstation up` / `tkr workstation remote-exec` being operational. This spec pre-declares the Unix-socket path convention (`/run/tokeira-agentd/agentd.sock`) per Req 8.1 so the follow-up spec can bind without reshaping anything here.
-- The [`temporal-api-v1.62-sync`](../temporal-api-v1.62-sync/tasks.md) facade + integration-test tasks (tasks 15 and 16) — those tasks were deferred mid-spec because MacBook-local cold-rebuild cycles exceeded acceptable iteration bounds. They are expected to land on a running workstation instance under a follow-up PR.
+- [`agent-controller`](../agent-controller/requirements.md) — a future spec that will run an agent daemon on this workstation. `agent-controller` depends on `tkr workstation up` / `tkr workstation remote-exec` being operational. This spec pre-declares the Unix-socket path convention (`/run/tokeira-agentd/agentd.sock`) per Req 8.1 so the follow-up spec can bind without reshaping anything here.
+- Future Tokeira implementation work that requires a fast Rust build loop. Any spec whose acceptance gate is "a `cargo test --workspace` round-trip" benefits from running the round-trip on the workstation this spec ships.
 
 This spec is NOT consumed by:
 
@@ -703,7 +703,7 @@ WantedBy=timers.target
 
 ### 7. Direct AWS SDK vs `tokeira-iac` (Req 6.3)
 
-The explicit deviation from the `temporal-dsql-deploy-eks` pattern merits its own section so future readers understand the choice.
+This spec bypasses the `tokeira-iac` `Module`/`Resource` pattern used elsewhere in `tokeira-aws`. The reasoning merits its own section so the choice is discoverable to future readers.
 
 **Why `tokeira-iac` is not the right fit here:**
 
@@ -715,7 +715,7 @@ The explicit deviation from the `temporal-dsql-deploy-eks` pattern merits its ow
 **What we keep from the `tokeira-iac` spirit:**
 
 - The handler-engine-SDK split (Req 6.2). CLI handlers do no SDK work; all of that is in `Workstation`. This mirrors the `Module` pattern's separation of "what to do" (handlers) from "how to do it" (resources).
-- The tag vocabulary (`tokeira-workstation`, `workstation-id`) is consistent with the project-tag convention `tokeira-iac` imposes on resources. A reviewer looking at tags in the AWS console sees the same shape as EKS / DSQL resources.
+- The tag vocabulary (`tokeira-workstation`, `workstation-id`) is consistent with the project-tag convention `tokeira-iac` imposes on resources. A reviewer looking at tags in the AWS console sees the same shape as other Tokeira-managed AWS resources.
 - The error enum pattern (`WorkstationError` with `thiserror` variants for each SDK source) matches `IacError`'s split by source.
 
 **Future migration path.** If a subsequent spec introduces a second, closely-related workstation-like resource (e.g. a CI build agent with shared caching), and the combined topology justifies `tokeira-iac`, migrating is straightforward: the `Workstation::up/stop/destroy` methods become the bodies of corresponding `Resource::create/delete` impls, tags remain the source of truth, and the engine becomes the caller of `Engine::apply`. Nothing locks us out of that move.

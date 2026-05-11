@@ -37,3 +37,13 @@ temporalio-common = "0.4"
 temporalio-macros = "0.4"
 temporalio-sdk = "0.4"
 temporalio-sdk-core = "0.4"
+
+[dev-dependencies]
+# The v0_4_integration test imports TokeiradHandle from the tokeirad library
+# target (apps/tokeirad) so the test exercises the same bootstrap path the
+# production binary does.
+tokeirad = { path = "../tokeirad" }
+# Tonic IntoRequest for direct WorkflowService calls alongside the SDK.
+tonic = { workspace = true }
+# URL parsing for the in-process server target.
+url = "2"

@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "tokeirad"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tokeirad"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
@@ -22,6 +30,7 @@ serde.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
+tokio-stream = { version = "0.1", features = ["net"] }
 tonic.workspace = true
 tonic-reflection.workspace = true
 tonic-web.workspace = true
@@ -45,4 +54,3 @@ metrics-util.workspace = true
 proptest = "1"
 prost = "0.12"
 prost-types = "0.12"
-tokio-stream = { version = "0.1", features = ["net"] }

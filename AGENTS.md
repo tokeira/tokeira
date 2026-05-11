@@ -54,6 +54,8 @@ The working tree frequently contains unstaged edits that represent hours of in-f
 
 ### 6. Spec editing safety
 
+The following requires the explicit instruction from the user. They need to explicitly indicate they want a spec snapshot.
+
 Before editing any file under `.kiro/specs/**`, snapshot the pre-edit state:
 
 ```bash

@@ -408,6 +408,7 @@ pub fn schedule_action_to_proto(action: &domain::ScheduleAction) -> proto_schedu
                 header: None,
                 user_metadata: None,
                 versioning_override: None,
+                priority: None,
             },
         )),
     }

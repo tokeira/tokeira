@@ -9,7 +9,7 @@
 use anyhow::{Result, anyhow};
 use async_recursion::async_recursion;
 use time::OffsetDateTime;
-use tokeira_types::{ExecutionStatus, NamespaceId};
+use tokeira_types::{ExecutionStatus, NamespaceId, SearchAttrValue, SearchAttributes};
 
 use crate::{
     store::VisibilityStore,
@@ -28,6 +28,176 @@ pub async fn compile_filter<S: VisibilityStore + ?Sized>(
     };
     let expr = compile_expr(input, namespace_id, store).await?;
     Ok(CompiledFilter { expr: Some(expr) })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScheduleFilter {
+    expr: ScheduleFilterExpr,
+}
+
+impl ScheduleFilter {
+    pub fn matches(
+        &self,
+        schedule_id: &str,
+        namespace_id: NamespaceId,
+        paused: bool,
+        notes: &str,
+        search_attributes: &SearchAttributes,
+    ) -> bool {
+        self.expr
+            .matches(schedule_id, namespace_id, paused, notes, search_attributes)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ScheduleFilterExpr {
+    Eq {
+        field: ScheduleField,
+        value: ScheduleFilterValue,
+    },
+    In {
+        field: ScheduleField,
+        values: Vec<ScheduleFilterValue>,
+    },
+}
+
+impl ScheduleFilterExpr {
+    fn matches(
+        &self,
+        schedule_id: &str,
+        namespace_id: NamespaceId,
+        paused: bool,
+        notes: &str,
+        search_attributes: &SearchAttributes,
+    ) -> bool {
+        match self {
+            Self::Eq { field, value } => field
+                .value(schedule_id, namespace_id, paused, notes, search_attributes)
+                .is_some_and(|actual| actual == *value),
+            Self::In { field, values } => field
+                .value(schedule_id, namespace_id, paused, notes, search_attributes)
+                .is_some_and(|actual| values.contains(&actual)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ScheduleField {
+    ScheduleId,
+    Namespace,
+    Paused,
+    Notes,
+    SearchAttribute(String),
+}
+
+impl ScheduleField {
+    fn parse(input: &str) -> Self {
+        match input.trim() {
+            "schedule_id" | "ScheduleId" => Self::ScheduleId,
+            "namespace" | "Namespace" => Self::Namespace,
+            "paused" | "Paused" => Self::Paused,
+            "notes" | "Notes" => Self::Notes,
+            other => Self::SearchAttribute(other.to_string()),
+        }
+    }
+
+    fn value(
+        &self,
+        schedule_id: &str,
+        namespace_id: NamespaceId,
+        paused: bool,
+        notes: &str,
+        search_attributes: &SearchAttributes,
+    ) -> Option<ScheduleFilterValue> {
+        match self {
+            Self::ScheduleId => Some(ScheduleFilterValue::String(schedule_id.to_string())),
+            Self::Namespace => Some(ScheduleFilterValue::String(namespace_id.0.to_string())),
+            Self::Paused => Some(ScheduleFilterValue::Bool(paused)),
+            Self::Notes => Some(ScheduleFilterValue::String(notes.to_string())),
+            Self::SearchAttribute(name) => {
+                search_attributes.0.get(name).and_then(search_attr_value)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ScheduleFilterValue {
+    String(String),
+    Bool(bool),
+    Int(i64),
+    Double(f64),
+}
+
+fn search_attr_value(value: &SearchAttrValue) -> Option<ScheduleFilterValue> {
+    match value {
+        SearchAttrValue::Keyword(value) | SearchAttrValue::Text(value) => {
+            Some(ScheduleFilterValue::String(value.clone()))
+        }
+        SearchAttrValue::Int(value) => Some(ScheduleFilterValue::Int(*value)),
+        SearchAttrValue::Double(value) => Some(ScheduleFilterValue::Double(*value)),
+        SearchAttrValue::Bool(value) => Some(ScheduleFilterValue::Bool(*value)),
+        SearchAttrValue::Datetime(value) => Some(ScheduleFilterValue::String(value.to_string())),
+        SearchAttrValue::KeywordList(_) => None,
+    }
+}
+
+pub fn compile_schedule_filter(query: &str) -> Result<ScheduleFilter> {
+    let input = query.trim();
+    if input.is_empty() {
+        return Err(anyhow!("unsupported schedule query"));
+    }
+    if let Some((field, values)) = parse_schedule_in(input) {
+        return Ok(ScheduleFilter {
+            expr: ScheduleFilterExpr::In {
+                field: ScheduleField::parse(field),
+                values: values
+                    .into_iter()
+                    .map(|value| parse_schedule_value(&value))
+                    .collect(),
+            },
+        });
+    }
+    if let Some((field, value)) = input.split_once('=') {
+        if field.contains('!') || value.contains('=') {
+            return Err(anyhow!("unsupported schedule query"));
+        }
+        return Ok(ScheduleFilter {
+            expr: ScheduleFilterExpr::Eq {
+                field: ScheduleField::parse(field),
+                value: parse_schedule_value(value),
+            },
+        });
+    }
+    Err(anyhow!("unsupported schedule query"))
+}
+
+fn parse_schedule_in(input: &str) -> Option<(&str, Vec<String>)> {
+    let (field, rest) = input.split_once(" IN ")?;
+    let body = rest.trim().strip_prefix('(')?.strip_suffix(')')?;
+    Some((
+        field.trim(),
+        body.split(',')
+            .map(|value| value.trim().to_string())
+            .collect(),
+    ))
+}
+
+fn parse_schedule_value(input: &str) -> ScheduleFilterValue {
+    let value = input.trim().trim_matches('"').trim_matches('\'');
+    if value.eq_ignore_ascii_case("true") {
+        return ScheduleFilterValue::Bool(true);
+    }
+    if value.eq_ignore_ascii_case("false") {
+        return ScheduleFilterValue::Bool(false);
+    }
+    if let Ok(parsed) = value.parse::<i64>() {
+        return ScheduleFilterValue::Int(parsed);
+    }
+    if let Ok(parsed) = value.parse::<f64>() {
+        return ScheduleFilterValue::Double(parsed);
+    }
+    ScheduleFilterValue::String(value.to_string())
 }
 
 #[async_recursion]

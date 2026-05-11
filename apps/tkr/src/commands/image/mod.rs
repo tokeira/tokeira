@@ -33,8 +33,7 @@
 
 pub mod local_inspector;
 
-use std::path::PathBuf;
-use std::process::Stdio;
+use std::{path::PathBuf, process::Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
 use local_inspector::{DockerCliInspector, LocalImageInspector};
@@ -89,11 +88,7 @@ pub async fn run(
             let ctx = deployment.ok_or_else(|| deployment_required("image push"))?;
             if should_reexec_under_dagger() {
                 return reexec_under_dagger(
-                    &ImageCommand::Push {
-                        tag,
-                        image,
-                        yes,
-                    },
+                    &ImageCommand::Push { tag, image, yes },
                     Some(&ctx),
                     format,
                 )

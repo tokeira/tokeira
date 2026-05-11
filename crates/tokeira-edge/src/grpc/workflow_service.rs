@@ -15,8 +15,8 @@ use tokeira_proto::workflowservice::{
     workflow_service_server::{WorkflowService as WorkflowServiceGrpcApi, WorkflowServiceServer},
 };
 use tokeira_runtime::{
-    BuildIdReachabilityResult, ScheduleError, TaskQueueReachability, VersioningError,
-    compute_matching_times, compute_next_times, compute_reachability,
+    BuildIdReachabilityResult, ScheduleError, TaskQueueConfigEntry, TaskQueueReachability,
+    VersioningError, compute_matching_times, compute_next_times, compute_reachability,
 };
 use tokeira_types::{BuildId, TaskQueueName, WorkerIdentity};
 
@@ -84,10 +84,49 @@ fn nexus_translate_error_status(error: nexus::NexusTranslateError) -> Status {
     Status::invalid_argument(error.to_string())
 }
 
+fn namespace_resolution_status(error: crate::errors::EdgeError) -> Status {
+    match error {
+        crate::errors::EdgeError::NamespaceNotFound(_) => Status::not_found("namespace not found"),
+        crate::errors::EdgeError::NamespaceDeleted(_) => {
+            Status::failed_precondition("namespace is deleted")
+        }
+        other => Status::from(other),
+    }
+}
+
 fn proto_timestamp_to_time(value: &prost_types::Timestamp) -> Option<OffsetDateTime> {
     OffsetDateTime::from_unix_timestamp(value.seconds)
         .ok()
         .map(|time| time + time::Duration::nanoseconds(i64::from(value.nanos)))
+}
+
+macro_rules! deferred_unary {
+    ($name:ident, $request:ident, $response:ident, $spec:literal) => {
+        fn $name<'life0, 'async_trait>(
+            &'life0 self,
+            _request: Request<workflowservice::$request>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<Response<workflowservice::$response>, Status>,
+                    > + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                debug!(rpc = stringify!($name), spec = $spec, "deferred rpc");
+                Err(Status::unimplemented(format!(
+                    "{} is not implemented; tracked in spec {}",
+                    stringify!($name),
+                    $spec
+                )))
+            })
+        }
+    };
 }
 
 #[tonic::async_trait]
@@ -620,14 +659,21 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     }
     async fn record_worker_heartbeat(
         &self,
-        _request: Request<workflowservice::RecordWorkerHeartbeatRequest>,
+        request: Request<workflowservice::RecordWorkerHeartbeatRequest>,
     ) -> Result<Response<workflowservice::RecordWorkerHeartbeatResponse>, Status> {
-        // Accept and discard. The SDK calls this periodically; returning
-        // `Ok(())` keeps v0.4+ SDK workers alive. A real implementation (file
-        // heartbeats, expose via metrics, publish to kernel-observed
-        // liveness) is deferred to a follow-up spec.
-        debug!("record_worker_heartbeat");
-        Ok(Response::new(workflowservice::RecordWorkerHeartbeatResponse {}))
+        let req = request.into_inner();
+        if req.namespace.is_empty() {
+            return Err(Status::invalid_argument("namespace is required"));
+        }
+        debug!(
+            rpc = "RecordWorkerHeartbeat",
+            namespace = %req.namespace,
+            heartbeat_count = req.worker_heartbeat.len(),
+            "record_worker_heartbeat"
+        );
+        Ok(Response::new(
+            workflowservice::RecordWorkerHeartbeatResponse {},
+        ))
     }
     async fn shutdown_worker(
         &self,
@@ -1168,11 +1214,323 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             workflowservice::RespondNexusTaskFailedResponse::default(),
         ))
     }
-    async fn update_activity_options_by_id(
+    async fn count_schedules(
         &self,
-        _request: Request<workflowservice::UpdateActivityOptionsByIdRequest>,
-    ) -> Result<Response<workflowservice::UpdateActivityOptionsByIdResponse>, Status> {
-        Err(Status::unimplemented("update_activity_options_by_id"))
+        request: Request<workflowservice::CountSchedulesRequest>,
+    ) -> Result<Response<workflowservice::CountSchedulesResponse>, Status> {
+        let req = request.into_inner();
+        if req.namespace.trim().is_empty() {
+            return Err(Status::invalid_argument("namespace is required"));
+        }
+        let namespace_id = self
+            .inner
+            .resolve_namespace_id(&req.namespace)
+            .await
+            .map_err(namespace_resolution_status)?;
+        let query = req.query.trim();
+        let count = self
+            .inner
+            .schedule_store()
+            .count_schedules(&namespace_id, (!query.is_empty()).then_some(query))
+            .map_err(|_| Status::invalid_argument("unsupported schedule query"))?;
+        Ok(Response::new(workflowservice::CountSchedulesResponse {
+            count: count as i64,
+            groups: Vec::new(),
+        }))
+    }
+    // === Worker Deployments — deferred to worker-deployments spec ===
+    deferred_unary!(
+        describe_worker_deployment_version,
+        DescribeWorkerDeploymentVersionRequest,
+        DescribeWorkerDeploymentVersionResponse,
+        "worker-deployments"
+    );
+    deferred_unary!(
+        set_worker_deployment_current_version,
+        SetWorkerDeploymentCurrentVersionRequest,
+        SetWorkerDeploymentCurrentVersionResponse,
+        "worker-deployments"
+    );
+    deferred_unary!(
+        describe_worker_deployment,
+        DescribeWorkerDeploymentRequest,
+        DescribeWorkerDeploymentResponse,
+        "worker-deployments"
+    );
+    deferred_unary!(
+        delete_worker_deployment,
+        DeleteWorkerDeploymentRequest,
+        DeleteWorkerDeploymentResponse,
+        "worker-deployments"
+    );
+    deferred_unary!(
+        delete_worker_deployment_version,
+        DeleteWorkerDeploymentVersionRequest,
+        DeleteWorkerDeploymentVersionResponse,
+        "worker-deployments"
+    );
+    deferred_unary!(
+        set_worker_deployment_ramping_version,
+        SetWorkerDeploymentRampingVersionRequest,
+        SetWorkerDeploymentRampingVersionResponse,
+        "worker-deployments"
+    );
+    deferred_unary!(
+        list_worker_deployments,
+        ListWorkerDeploymentsRequest,
+        ListWorkerDeploymentsResponse,
+        "worker-deployments"
+    );
+    deferred_unary!(
+        create_worker_deployment,
+        CreateWorkerDeploymentRequest,
+        CreateWorkerDeploymentResponse,
+        "worker-deployments"
+    );
+    deferred_unary!(
+        create_worker_deployment_version,
+        CreateWorkerDeploymentVersionRequest,
+        CreateWorkerDeploymentVersionResponse,
+        "worker-deployments"
+    );
+    deferred_unary!(
+        update_worker_deployment_version_compute_config,
+        UpdateWorkerDeploymentVersionComputeConfigRequest,
+        UpdateWorkerDeploymentVersionComputeConfigResponse,
+        "worker-deployments"
+    );
+    deferred_unary!(
+        validate_worker_deployment_version_compute_config,
+        ValidateWorkerDeploymentVersionComputeConfigRequest,
+        ValidateWorkerDeploymentVersionComputeConfigResponse,
+        "worker-deployments"
+    );
+    deferred_unary!(
+        update_worker_deployment_version_metadata,
+        UpdateWorkerDeploymentVersionMetadataRequest,
+        UpdateWorkerDeploymentVersionMetadataResponse,
+        "worker-deployments"
+    );
+    deferred_unary!(
+        set_worker_deployment_manager,
+        SetWorkerDeploymentManagerRequest,
+        SetWorkerDeploymentManagerResponse,
+        "worker-deployments"
+    );
+    deferred_unary!(
+        describe_worker,
+        DescribeWorkerRequest,
+        DescribeWorkerResponse,
+        "worker-deployments"
+    );
+    deferred_unary!(
+        list_workers,
+        ListWorkersRequest,
+        ListWorkersResponse,
+        "worker-deployments"
+    );
+    // === End Worker Deployments block ===
+
+    // === Workflow Rules — deferred to workflow-rules spec ===
+    deferred_unary!(
+        create_workflow_rule,
+        CreateWorkflowRuleRequest,
+        CreateWorkflowRuleResponse,
+        "workflow-rules"
+    );
+    deferred_unary!(
+        describe_workflow_rule,
+        DescribeWorkflowRuleRequest,
+        DescribeWorkflowRuleResponse,
+        "workflow-rules"
+    );
+    deferred_unary!(
+        delete_workflow_rule,
+        DeleteWorkflowRuleRequest,
+        DeleteWorkflowRuleResponse,
+        "workflow-rules"
+    );
+    deferred_unary!(
+        list_workflow_rules,
+        ListWorkflowRulesRequest,
+        ListWorkflowRulesResponse,
+        "workflow-rules"
+    );
+    deferred_unary!(
+        trigger_workflow_rule,
+        TriggerWorkflowRuleRequest,
+        TriggerWorkflowRuleResponse,
+        "workflow-rules"
+    );
+    // === End Workflow Rules block ===
+
+    async fn update_task_queue_config(
+        &self,
+        request: Request<workflowservice::UpdateTaskQueueConfigRequest>,
+    ) -> Result<Response<workflowservice::UpdateTaskQueueConfigResponse>, Status> {
+        let req = request.into_inner();
+        if req.namespace.trim().is_empty() {
+            return Err(Status::invalid_argument("namespace is required"));
+        }
+        if req.task_queue.trim().is_empty() {
+            return Err(Status::invalid_argument("task queue is required"));
+        }
+        let namespace_id = self
+            .inner
+            .resolve_namespace_id(&req.namespace)
+            .await
+            .map_err(namespace_resolution_status)?;
+        let task_queue = TaskQueueName(req.task_queue.clone());
+        let config = translate::task_queue_config_from_update_request(&req);
+        self.inner
+            .task_queue_config_store()
+            .set(TaskQueueConfigEntry {
+                namespace_id,
+                task_queue,
+                queue_rate_limit: config.queue_rate_limit,
+                fairness_key_rate_limit_default: config.fairness_key_rate_limit_default,
+                fairness_weight_overrides: config.fairness_weight_overrides.clone(),
+            });
+        Ok(Response::new(
+            workflowservice::UpdateTaskQueueConfigResponse {
+                config: Some(translate::task_queue_config_to_proto(config)),
+            },
+        ))
+    }
+    // === Worker Config — deferred to worker-config-management spec ===
+    deferred_unary!(
+        fetch_worker_config,
+        FetchWorkerConfigRequest,
+        FetchWorkerConfigResponse,
+        "worker-config-management"
+    );
+    deferred_unary!(
+        update_worker_config,
+        UpdateWorkerConfigRequest,
+        UpdateWorkerConfigResponse,
+        "worker-config-management"
+    );
+    // === End Worker Config block ===
+
+    // === Pause/Unpause Workflow — deferred to kernel-pause-workflow spec ===
+    deferred_unary!(
+        pause_workflow_execution,
+        PauseWorkflowExecutionRequest,
+        PauseWorkflowExecutionResponse,
+        "kernel-pause-workflow"
+    );
+    deferred_unary!(
+        unpause_workflow_execution,
+        UnpauseWorkflowExecutionRequest,
+        UnpauseWorkflowExecutionResponse,
+        "kernel-pause-workflow"
+    );
+    // === End Pause/Unpause Workflow block ===
+
+    // === Activity Executions — deferred to activity-executions-first-class spec ===
+    deferred_unary!(
+        start_activity_execution,
+        StartActivityExecutionRequest,
+        StartActivityExecutionResponse,
+        "activity-executions-first-class"
+    );
+    deferred_unary!(
+        describe_activity_execution,
+        DescribeActivityExecutionRequest,
+        DescribeActivityExecutionResponse,
+        "activity-executions-first-class"
+    );
+    deferred_unary!(
+        poll_activity_execution,
+        PollActivityExecutionRequest,
+        PollActivityExecutionResponse,
+        "activity-executions-first-class"
+    );
+    deferred_unary!(
+        list_activity_executions,
+        ListActivityExecutionsRequest,
+        ListActivityExecutionsResponse,
+        "activity-executions-first-class"
+    );
+    deferred_unary!(
+        count_activity_executions,
+        CountActivityExecutionsRequest,
+        CountActivityExecutionsResponse,
+        "activity-executions-first-class"
+    );
+    deferred_unary!(
+        request_cancel_activity_execution,
+        RequestCancelActivityExecutionRequest,
+        RequestCancelActivityExecutionResponse,
+        "activity-executions-first-class"
+    );
+    deferred_unary!(
+        terminate_activity_execution,
+        TerminateActivityExecutionRequest,
+        TerminateActivityExecutionResponse,
+        "activity-executions-first-class"
+    );
+    deferred_unary!(
+        delete_activity_execution,
+        DeleteActivityExecutionRequest,
+        DeleteActivityExecutionResponse,
+        "activity-executions-first-class"
+    );
+    // === End Activity Executions block ===
+
+    deferred_unary!(
+        start_nexus_operation_execution,
+        StartNexusOperationExecutionRequest,
+        StartNexusOperationExecutionResponse,
+        "edge-nexus-task-transport"
+    );
+    deferred_unary!(
+        describe_nexus_operation_execution,
+        DescribeNexusOperationExecutionRequest,
+        DescribeNexusOperationExecutionResponse,
+        "edge-nexus-task-transport"
+    );
+    deferred_unary!(
+        poll_nexus_operation_execution,
+        PollNexusOperationExecutionRequest,
+        PollNexusOperationExecutionResponse,
+        "edge-nexus-task-transport"
+    );
+    deferred_unary!(
+        list_nexus_operation_executions,
+        ListNexusOperationExecutionsRequest,
+        ListNexusOperationExecutionsResponse,
+        "edge-nexus-task-transport"
+    );
+    deferred_unary!(
+        count_nexus_operation_executions,
+        CountNexusOperationExecutionsRequest,
+        CountNexusOperationExecutionsResponse,
+        "edge-nexus-task-transport"
+    );
+    deferred_unary!(
+        request_cancel_nexus_operation_execution,
+        RequestCancelNexusOperationExecutionRequest,
+        RequestCancelNexusOperationExecutionResponse,
+        "edge-nexus-task-transport"
+    );
+    deferred_unary!(
+        terminate_nexus_operation_execution,
+        TerminateNexusOperationExecutionRequest,
+        TerminateNexusOperationExecutionResponse,
+        "edge-nexus-task-transport"
+    );
+    deferred_unary!(
+        delete_nexus_operation_execution,
+        DeleteNexusOperationExecutionRequest,
+        DeleteNexusOperationExecutionResponse,
+        "edge-nexus-task-transport"
+    );
+    async fn update_activity_options(
+        &self,
+        _request: Request<workflowservice::UpdateActivityOptionsRequest>,
+    ) -> Result<Response<workflowservice::UpdateActivityOptionsResponse>, Status> {
+        Err(Status::unimplemented("update_activity_options"))
     }
     async fn update_workflow_execution_options(
         &self,
@@ -1180,23 +1538,23 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     ) -> Result<Response<workflowservice::UpdateWorkflowExecutionOptionsResponse>, Status> {
         Err(Status::unimplemented("update_workflow_execution_options"))
     }
-    async fn pause_activity_by_id(
+    async fn pause_activity(
         &self,
-        _request: Request<workflowservice::PauseActivityByIdRequest>,
-    ) -> Result<Response<workflowservice::PauseActivityByIdResponse>, Status> {
-        Err(Status::unimplemented("pause_activity_by_id"))
+        _request: Request<workflowservice::PauseActivityRequest>,
+    ) -> Result<Response<workflowservice::PauseActivityResponse>, Status> {
+        Err(Status::unimplemented("pause_activity"))
     }
-    async fn unpause_activity_by_id(
+    async fn unpause_activity(
         &self,
-        _request: Request<workflowservice::UnpauseActivityByIdRequest>,
-    ) -> Result<Response<workflowservice::UnpauseActivityByIdResponse>, Status> {
-        Err(Status::unimplemented("unpause_activity_by_id"))
+        _request: Request<workflowservice::UnpauseActivityRequest>,
+    ) -> Result<Response<workflowservice::UnpauseActivityResponse>, Status> {
+        Err(Status::unimplemented("unpause_activity"))
     }
-    async fn reset_activity_by_id(
+    async fn reset_activity(
         &self,
-        _request: Request<workflowservice::ResetActivityByIdRequest>,
-    ) -> Result<Response<workflowservice::ResetActivityByIdResponse>, Status> {
-        Err(Status::unimplemented("reset_activity_by_id"))
+        _request: Request<workflowservice::ResetActivityRequest>,
+    ) -> Result<Response<workflowservice::ResetActivityResponse>, Status> {
+        Err(Status::unimplemented("reset_activity"))
     }
 }
 
@@ -1831,6 +2189,7 @@ mod tests {
                 store.clone(),
                 worker_registry.clone(),
                 Arc::new(tokeira_runtime::ScheduleStore::default()),
+                Arc::new(tokeira_runtime::InMemoryTaskQueueConfigStore::default()),
                 Arc::new(tokeira_runtime::BatchOperationStore::default()),
             );
         (
@@ -1839,6 +2198,221 @@ mod tests {
             worker_registry,
             broker,
         )
+    }
+
+    macro_rules! assert_deferred_rpc {
+        ($grpc:expr, $method:ident, $request:ident, $spec:literal) => {{
+            let status = $grpc
+                .$method(Request::new(workflowservice::$request::default()))
+                .await
+                .expect_err("deferred rpc should return Unimplemented");
+            assert_eq!(status.code(), tonic::Code::Unimplemented);
+            assert_eq!(
+                status.message(),
+                format!(
+                    "{} is not implemented; tracked in spec {}",
+                    stringify!($method),
+                    $spec
+                )
+            );
+        }};
+    }
+
+    #[tokio::test]
+    async fn deferred_handler_blocks_return_tracked_unimplemented_messages() {
+        let (grpc, _store, _registry, _broker) = versioning_test_service();
+
+        assert_deferred_rpc!(
+            grpc,
+            describe_worker_deployment_version,
+            DescribeWorkerDeploymentVersionRequest,
+            "worker-deployments"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            set_worker_deployment_current_version,
+            SetWorkerDeploymentCurrentVersionRequest,
+            "worker-deployments"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            describe_worker_deployment,
+            DescribeWorkerDeploymentRequest,
+            "worker-deployments"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            delete_worker_deployment,
+            DeleteWorkerDeploymentRequest,
+            "worker-deployments"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            delete_worker_deployment_version,
+            DeleteWorkerDeploymentVersionRequest,
+            "worker-deployments"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            set_worker_deployment_ramping_version,
+            SetWorkerDeploymentRampingVersionRequest,
+            "worker-deployments"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            list_worker_deployments,
+            ListWorkerDeploymentsRequest,
+            "worker-deployments"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            create_worker_deployment,
+            CreateWorkerDeploymentRequest,
+            "worker-deployments"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            create_worker_deployment_version,
+            CreateWorkerDeploymentVersionRequest,
+            "worker-deployments"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            update_worker_deployment_version_compute_config,
+            UpdateWorkerDeploymentVersionComputeConfigRequest,
+            "worker-deployments"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            validate_worker_deployment_version_compute_config,
+            ValidateWorkerDeploymentVersionComputeConfigRequest,
+            "worker-deployments"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            update_worker_deployment_version_metadata,
+            UpdateWorkerDeploymentVersionMetadataRequest,
+            "worker-deployments"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            set_worker_deployment_manager,
+            SetWorkerDeploymentManagerRequest,
+            "worker-deployments"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            describe_worker,
+            DescribeWorkerRequest,
+            "worker-deployments"
+        );
+        assert_deferred_rpc!(grpc, list_workers, ListWorkersRequest, "worker-deployments");
+
+        assert_deferred_rpc!(
+            grpc,
+            create_workflow_rule,
+            CreateWorkflowRuleRequest,
+            "workflow-rules"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            describe_workflow_rule,
+            DescribeWorkflowRuleRequest,
+            "workflow-rules"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            delete_workflow_rule,
+            DeleteWorkflowRuleRequest,
+            "workflow-rules"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            list_workflow_rules,
+            ListWorkflowRulesRequest,
+            "workflow-rules"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            trigger_workflow_rule,
+            TriggerWorkflowRuleRequest,
+            "workflow-rules"
+        );
+
+        assert_deferred_rpc!(
+            grpc,
+            fetch_worker_config,
+            FetchWorkerConfigRequest,
+            "worker-config-management"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            update_worker_config,
+            UpdateWorkerConfigRequest,
+            "worker-config-management"
+        );
+
+        assert_deferred_rpc!(
+            grpc,
+            pause_workflow_execution,
+            PauseWorkflowExecutionRequest,
+            "kernel-pause-workflow"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            unpause_workflow_execution,
+            UnpauseWorkflowExecutionRequest,
+            "kernel-pause-workflow"
+        );
+
+        assert_deferred_rpc!(
+            grpc,
+            start_activity_execution,
+            StartActivityExecutionRequest,
+            "activity-executions-first-class"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            describe_activity_execution,
+            DescribeActivityExecutionRequest,
+            "activity-executions-first-class"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            poll_activity_execution,
+            PollActivityExecutionRequest,
+            "activity-executions-first-class"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            list_activity_executions,
+            ListActivityExecutionsRequest,
+            "activity-executions-first-class"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            count_activity_executions,
+            CountActivityExecutionsRequest,
+            "activity-executions-first-class"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            request_cancel_activity_execution,
+            RequestCancelActivityExecutionRequest,
+            "activity-executions-first-class"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            terminate_activity_execution,
+            TerminateActivityExecutionRequest,
+            "activity-executions-first-class"
+        );
+        assert_deferred_rpc!(
+            grpc,
+            delete_activity_execution,
+            DeleteActivityExecutionRequest,
+            "activity-executions-first-class"
+        );
     }
 
     fn nexus_test_service(
@@ -1868,6 +2442,7 @@ mod tests {
                 Arc::new(VersioningRuleStore::default()),
                 WorkerRegistry::default(),
                 Arc::new(tokeira_runtime::ScheduleStore::default()),
+                Arc::new(tokeira_runtime::InMemoryTaskQueueConfigStore::default()),
                 Arc::new(tokeira_runtime::BatchOperationStore::default()),
             );
         (WorkflowServiceGrpc::new(service), nexus_broker)
@@ -2076,6 +2651,10 @@ mod tests {
                 sticky_task_queue: "sticky-queue".to_string(),
                 identity: "worker-a".to_string(),
                 reason: "test".to_string(),
+                worker_heartbeat: None,
+                worker_instance_key: String::new(),
+                task_queue: "sticky-queue".to_string(),
+                task_queue_types: Vec::new(),
             }))
             .await
             .expect("shutdown should be idempotent");
@@ -2497,6 +3076,9 @@ mod tests {
                     query_result: Some(tokeira_proto::common::Payloads::default()),
                     error_message: String::new(),
                     namespace: "default".to_string(),
+                    failure: None,
+                    cause: 0,
+                    poller_group_id: String::new(),
                 },
             ))
             .await
@@ -2547,6 +3129,9 @@ mod tests {
                 }),
                 error_message: String::new(),
                 namespace: "default".to_string(),
+                failure: None,
+                cause: 0,
+                poller_group_id: String::new(),
             },
         ))
         .await
@@ -3140,6 +3725,7 @@ mod tests {
                     error: Some(nexus_v1::HandlerError {
                         error_type: "Handler".to_string(),
                         failure: None,
+                        retry_behavior: 0,
                     }),
                     ..Default::default()
                 },
@@ -3193,6 +3779,7 @@ mod tests {
                 error: Some(nexus_v1::HandlerError {
                     error_type: "Handler".to_string(),
                     failure: None,
+                    retry_behavior: 0,
                 }),
                 ..Default::default()
             },

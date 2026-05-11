@@ -152,6 +152,25 @@ pub fn start_batch_request_to_edge(
                 "BatchOperationUpdateWorkflowExecutionOptions",
             ));
         }
+        workflowservice::start_batch_operation_request::Operation::UnpauseActivitiesOperation(
+            _,
+        ) => {
+            return Err(BatchTranslateError::Unsupported(
+                "BatchOperationUnpauseActivities",
+            ));
+        }
+        workflowservice::start_batch_operation_request::Operation::ResetActivitiesOperation(_) => {
+            return Err(BatchTranslateError::Unsupported(
+                "BatchOperationResetActivities",
+            ));
+        }
+        workflowservice::start_batch_operation_request::Operation::UpdateActivityOptionsOperation(
+            _,
+        ) => {
+            return Err(BatchTranslateError::Unsupported(
+                "BatchOperationUpdateActivityOptions",
+            ));
+        }
     };
 
     Ok(StartBatchOperationRequest {
@@ -280,6 +299,11 @@ fn batch_info_to_proto(value: BatchOperationInfo) -> proto_batch::BatchOperation
     }
 }
 
+// v1.62-sync: reads deprecated `BatchOperationReset.reset_type` for wire-compat
+// with v0.4-era SDK batch operation clients. v1.62 replaces the flat enum with
+// the nested `options.target` oneof; the code above prefers the new shape and
+// falls back to the deprecated field only when the new shape is absent.
+#[allow(deprecated)]
 fn reset_target_from_proto(
     value: &proto_batch::BatchOperationReset,
 ) -> Result<BatchResetTarget, BatchTranslateError> {

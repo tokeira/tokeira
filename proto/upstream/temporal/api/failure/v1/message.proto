@@ -1,25 +1,3 @@
-// The MIT License
-//
-// Copyright (c) 2020 Temporal Technologies Inc.  All rights reserved.
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in
-// all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-// THE SOFTWARE.
-
 syntax = "proto3";
 
 package temporal.api.failure.v1;
@@ -33,6 +11,8 @@ option csharp_namespace = "Temporalio.Api.Failure.V1";
 
 import "temporal/api/common/v1/message.proto";
 import "temporal/api/enums/v1/workflow.proto";
+import "temporal/api/enums/v1/nexus.proto";
+import "temporal/api/enums/v1/common.proto";
 
 import "google/protobuf/duration.proto";
 
@@ -45,6 +25,7 @@ message ApplicationFailureInfo {
     // still be subject to the maximum retries limit and total time limit
     // defined by the policy.
     google.protobuf.Duration next_retry_delay = 4;
+    temporal.api.enums.v1.ApplicationErrorCategory category = 5;
 }
 
 message TimeoutFailureInfo {
@@ -54,9 +35,13 @@ message TimeoutFailureInfo {
 
 message CanceledFailureInfo {
     temporal.api.common.v1.Payloads details = 1;
+    // The identity of the worker or client that requested the cancellation.
+    string identity = 2;
 }
 
 message TerminatedFailureInfo {
+    // The identity of the worker or client that requested the termination.
+    string identity = 1;
 }
 
 message ServerFailureInfo {
@@ -85,6 +70,7 @@ message ChildWorkflowExecutionFailureInfo {
     temporal.api.enums.v1.RetryState retry_state = 6;
 }
 
+// Representation of the Temporal SDK NexusOperationError object that is returned to workflow callers.
 message NexusOperationFailureInfo {
     // The NexusOperationScheduled event ID.
     int64 scheduled_event_id = 1;
@@ -95,13 +81,19 @@ message NexusOperationFailureInfo {
     // Operation name.
     string operation = 4;
     // Operation ID - may be empty if the operation completed synchronously.
-    string operation_id = 5;
+    //
+    // Deprecated. Renamed to operation_token.
+    string operation_id = 5 [deprecated = true];
+    // Operation token - may be empty if the operation completed synchronously.
+    string operation_token = 6;
 }
 
 message NexusHandlerFailureInfo {
     // The Nexus error type as defined in the spec:
     // https://github.com/nexus-rpc/api/blob/main/SPEC.md#predefined-handler-errors.
     string type = 1;
+    // Retry behavior, defaults to the retry behavior of the error type as defined in the spec.
+    temporal.api.enums.v1.NexusHandlerErrorRetryBehavior retry_behavior = 2;
 }
 
 message Failure {

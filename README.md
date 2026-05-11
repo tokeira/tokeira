@@ -4,6 +4,8 @@ A Temporal-compatible durable execution engine built in Rust and specialized for
 
 Tokeira preserves the public Temporal contract that SDKs, operators, and tooling depend on — WorkflowService, OperatorService, workflow history semantics, replay model, task-start/completion semantics, sticky execution, polling, retries, signals, timers, Continue-As-New, and archival — while changing the internal architecture to collapse correctness around a single authoritative per-run transition log.
 
+Tokeira currently tracks Temporal API `v1.62.11`; the compatibility smoke target is `temporalio-sdk` v0.4 worker liveness against the in-memory server.
+
 This is not a service-by-service port of Temporal's Frontend / History / Matching / Worker layout. Workflow durability comes from event history; queue delivery is an implementation detail with weaker ordering guarantees. Tokeira makes that distinction explicit: per-workflow event history is the only semantic ordering domain, and everything else — internal queue ordering, delivery ordering, visibility update ordering — becomes derived.
 
 ## Design Principles

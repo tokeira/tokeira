@@ -12,16 +12,16 @@ Generated protobuf and gRPC bindings for Tokeira, covering both the public Tempo
 
 | File | Contents |
 |---|---|
-| `public.rs` | All 24 `temporal.api.*` packages, service constants, file descriptor set, convenience re-exports |
+| `public.rs` | All 28 `temporal.api.*` packages, service constants, file descriptor set, convenience re-exports |
 | `internal.rs` | `tokeira.internal.runtime.v1` and `tokeira.internal.admin.v1` (currently empty shells), internal file descriptor set |
 | `conversions/mod.rs` | `ProtoConversionError` enum (InvalidUuid, InvalidTaskToken, InvalidTimestamp, MissingField) |
 | `conversions/common.rs` | Wire ↔ domain helpers for payloads, headers, memo, search attributes, task queues, task tokens, timestamps, durations |
 
 ## Public API Packages
 
-Uses upstream Temporal API protos (v1.43.0) vendored via `tools/proto-sync`. The `public.rs` module exports all 24 packages under `temporal::api::*::v1`:
+Uses upstream Temporal API protos (v1.62.11) vendored via `tools/proto-sync`. The compatibility smoke target is `temporalio-sdk` v0.4. The `public.rs` module exports all 28 packages under `temporal::api::*::v1`:
 
-`activity`, `batch`, `command`, `common`, `deployment`, `enums`, `errordetails`, `export`, `failure`, `filter`, `history`, `namespace`, `nexus`, `operatorservice`, `protocol`, `query`, `replication`, `schedule`, `sdk`, `taskqueue`, `update`, `version`, `workflow`, `workflowservice`
+`activity`, `batch`, `callback`, `command`, `common`, `compute`, `deployment`, `enums`, `errordetails`, `export`, `failure`, `filter`, `history`, `namespace`, `nexus`, `operatorservice`, `protocol`, `protometa`, `query`, `replication`, `rules`, `schedule`, `sdk`, `taskqueue`, `update`, `version`, `worker`, `workflow`, `workflowservice`
 
 Convenience re-exports: `common`, `enums`, `failure`, `history`, `operatorservice`, `taskqueue`, `workflow`, `workflowservice`.
 
@@ -48,4 +48,4 @@ Service constants: `WORKFLOW_SERVICE_NAME`, `OPERATOR_SERVICE_NAME`, `WORKFLOW_H
 
 ## Status
 
-Stable. All 24 upstream Temporal API packages are generated. Conversion helpers cover the types needed by the edge and runtime layers. Dead conversion files (workflow.rs, operator.rs) have been removed.
+Stable. All 28 upstream Temporal API packages are generated. Conversion helpers cover the types needed by the edge and runtime layers. Dead conversion files (workflow.rs, operator.rs) have been removed.

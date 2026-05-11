@@ -176,9 +176,9 @@ Items marked **spec complete** already have `requirements.md` (and often `design
 
 **Status:** spec in progress (requirements drafted).
 
-Resync the vendored Temporal API proto tree from `v1.43.0` to `v1.62.11` via `tools/proto-sync`. Classify every new RPC, field, message, and enum into one of `Ignore`, `No-op stub`, `Capability advertise`, `Wire through`, or `Full implementation (deferred)`. Replace the interim compat shims landed in `214895e`. Delivers `CountSchedules`, `UpdateTaskQueueConfig`, the Nexus v2 wire surface, the `discard_speculative_workflow_task_with_events` client capability, and renames the `*ById` activity RPCs to their v1.62 unsuffixed names.
+Resync the vendored Temporal API proto tree from `v1.43.0` to `v1.62.11` via `tools/proto-sync`. Classify every new RPC, field, message, and enum into one of `Ignore`, `No-op stub`, `Capability advertise`, `Wire through`, or `Full implementation (deferred)`. Delivers `CountSchedules`, `UpdateTaskQueueConfig`, the Nexus v2 wire surface, the `discard_speculative_workflow_task_with_events` client capability, and renames the `*ById` activity RPCs to their v1.62 unsuffixed names.
 
-Unblocks: every subsequent backlog item that touches a v1.62-era proto surface. Compose-DSQL becomes operationally useful once a v0.4 SDK worker can complete a workflow against `tokeirad` without the shims.
+Unblocks: every subsequent backlog item that touches a v1.62-era proto surface. Compose-DSQL becomes operationally useful once a v0.4 SDK worker can complete a workflow against `tokeirad`.
 
 ### P1 — `temporal-compatibility`
 

@@ -82,7 +82,9 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
         .find(|c: char| !c.is_ascii_digit())
         .map(|idx| s.split_at(idx))
         .ok_or_else(|| format!("duration missing unit suffix: `{s}`"))?;
-    let value: u64 = value.parse().map_err(|e| format!("invalid duration number `{value}`: {e}"))?;
+    let value: u64 = value
+        .parse()
+        .map_err(|e| format!("invalid duration number `{value}`: {e}"))?;
     let millis = match unit {
         "ms" => value,
         "s" => value.checked_mul(1_000).ok_or("duration overflow")?,
@@ -247,7 +249,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("succeeded            : {}", summary.succeeded);
     println!("failed               : {}", summary.failed);
     println!("wall clock           : {:.3}s", summary.wall_clock_seconds);
-    println!("throughput           : {:.2} workflows/s", summary.throughput_per_second);
+    println!(
+        "throughput           : {:.2} workflows/s",
+        summary.throughput_per_second
+    );
     println!("latency p50          : {} ms", summary.latency_ms_p50);
     println!("latency p95          : {} ms", summary.latency_ms_p95);
     println!("latency p99          : {} ms", summary.latency_ms_p99);

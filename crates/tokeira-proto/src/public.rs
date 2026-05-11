@@ -16,6 +16,11 @@ pub mod temporal {
                 tonic::include_proto!("temporal.api.batch.v1");
             }
         }
+        pub mod callback {
+            pub mod v1 {
+                tonic::include_proto!("temporal.api.callback.v1");
+            }
+        }
         pub mod command {
             pub mod v1 {
                 tonic::include_proto!("temporal.api.command.v1");
@@ -24,6 +29,11 @@ pub mod temporal {
         pub mod common {
             pub mod v1 {
                 tonic::include_proto!("temporal.api.common.v1");
+            }
+        }
+        pub mod compute {
+            pub mod v1 {
+                tonic::include_proto!("temporal.api.compute.v1");
             }
         }
         pub mod deployment {
@@ -81,6 +91,11 @@ pub mod temporal {
                 tonic::include_proto!("temporal.api.protocol.v1");
             }
         }
+        pub mod protometa {
+            pub mod v1 {
+                tonic::include_proto!("temporal.api.protometa.v1");
+            }
+        }
         pub mod query {
             pub mod v1 {
                 tonic::include_proto!("temporal.api.query.v1");
@@ -89,6 +104,11 @@ pub mod temporal {
         pub mod replication {
             pub mod v1 {
                 tonic::include_proto!("temporal.api.replication.v1");
+            }
+        }
+        pub mod rules {
+            pub mod v1 {
+                tonic::include_proto!("temporal.api.rules.v1");
             }
         }
         pub mod schedule {
@@ -114,6 +134,11 @@ pub mod temporal {
         pub mod version {
             pub mod v1 {
                 tonic::include_proto!("temporal.api.version.v1");
+            }
+        }
+        pub mod worker {
+            pub mod v1 {
+                tonic::include_proto!("temporal.api.worker.v1");
             }
         }
         pub mod workflow {

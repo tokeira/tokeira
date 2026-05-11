@@ -20,6 +20,7 @@ use tokeira_kernel::{
     CancelRequest, LoadedRun, StartRequest, TerminateRequest, WorkflowIdConflictPolicy,
     WorkflowIdReusePolicy,
 };
+use tokeira_projection::filter::compile_schedule_filter;
 use tokeira_storage::RunRepository;
 use tokeira_types::{
     BuildId, ExecutionRef, ExecutionStatus, Memo, NamespaceId, Payloads, RequestContext, RequestId,
@@ -243,6 +244,12 @@ pub struct ScheduleStore {
     schedules: DashMap<(NamespaceId, ScheduleId), ScheduleEntry>,
 }
 
+#[derive(Debug, Error)]
+pub enum ScheduleCountError {
+    #[error("unsupported schedule query")]
+    UnsupportedQuery,
+}
+
 impl ScheduleStore {
     pub fn new() -> Self {
         Self::default()
@@ -324,6 +331,46 @@ impl ScheduleStore {
         let end = (start + limit).min(entries.len());
         let next = (end < entries.len()).then(|| encode_token(end as u64));
         (entries[start..end].to_vec(), next)
+    }
+
+    pub fn count(&self, namespace_id: NamespaceId) -> usize {
+        self.schedules
+            .iter()
+            .filter(|entry| entry.key().0 == namespace_id)
+            .count()
+    }
+
+    pub fn count_schedules(
+        &self,
+        namespace_id: &NamespaceId,
+        query: Option<&str>,
+    ) -> Result<u64, ScheduleCountError> {
+        let filter = query
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .map(compile_schedule_filter)
+            .transpose()
+            .map_err(|_| ScheduleCountError::UnsupportedQuery)?;
+
+        let count = self
+            .schedules
+            .iter()
+            .filter(|entry| entry.key().0 == *namespace_id)
+            .filter(|entry| {
+                filter.as_ref().is_none_or(|filter| {
+                    let schedule = entry.value();
+                    filter.matches(
+                        &schedule.schedule_id.0,
+                        schedule.namespace_id,
+                        schedule.state.paused,
+                        &schedule.state.notes,
+                        &schedule.search_attributes,
+                    )
+                })
+            })
+            .count();
+
+        Ok(count as u64)
     }
 
     pub fn all_active_schedules(&self) -> Vec<ScheduleEntry> {

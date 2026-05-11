@@ -159,6 +159,19 @@ use tokeira_proto::public::temporal::api::{
 };
 
 #[allow(clippy::too_many_lines)]
+// v1.62-sync: writes deprecated history event fields for wire-compat with
+// v0.4-era SDK history readers. Four deprecations land here:
+// - `WorkflowExecutionContinuedAsNewEventAttributes.failure` — v1.62 moves
+//   failure to the wrapper event level; v0.4 readers still expect the inner.
+// - `SignalExternalWorkflowExecutionInitiatedEventAttributes.control` and
+//   `RequestCancelExternalWorkflowExecutionInitiatedEventAttributes.control`
+//   — v1.62 replaces `control` with an `input_payload`-based shape; v0.4
+//   readers still consume `control`.
+// - `NexusOperationStartedEventAttributes.operation_id` — v1.62 renames to
+//   `operation_token`; v0.4 readers still expect `operation_id`.
+// Serialised history is part of the SDK-visible contract and cannot be
+// quietly migrated without a replay-compat spec.
+#[allow(deprecated)]
 fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
     match &event.kind {
         HistoryEventKind::WorkflowExecutionStarted {

@@ -51,3 +51,12 @@ tokeirad.log
 
 # Proptest regressions (generated, not committed)
 **/proptest-regressions/
+
+# Scratch directory for commit messages, patch snapshots, and similar
+# transient files. Nothing in this directory is ever committed.
+/artifacts/
+
+# VS Code multi-root workspace file. Pre-existing commits contain this file;
+# `git rm --cached tokeira.code-workspace` stopped tracking it at commit
+# <SHA after next commit>.
+/tokeira.code-workspace

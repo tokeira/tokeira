@@ -27,6 +27,7 @@ tracing.workspace = true
 tracing-opentelemetry.workspace = true
 uuid.workspace = true
 tokeira-kernel = { path = "../tokeira-kernel" }
+tokeira-projection = { path = "../tokeira-projection" }
 tokeira-proto = { path = "../tokeira-proto" }
 tokeira-storage = { path = "../tokeira-storage" }
 tokeira-types = { path = "../tokeira-types" }

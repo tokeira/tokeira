@@ -66,8 +66,8 @@ use crate::translate::{
     SignalWithStartWorkflowExecutionRequest as EdgeSignalWithStartWorkflowExecutionRequest,
     SignalWithStartWorkflowExecutionResponse as EdgeSignalWithStartWorkflowExecutionResponse,
     SignalWorkflowExecutionRequest, SignalWorkflowExecutionResponse, StartWorkflowExecutionRequest,
-    StartWorkflowExecutionResponse, SystemInfo, VersioningOverride, WorkflowExecutionDescription,
-    WorkflowExecutionSummary, to_internal::namespace_id_for,
+    StartWorkflowExecutionResponse, SystemInfo, TaskQueueConfig, VersioningOverride,
+    WorkflowExecutionDescription, WorkflowExecutionSummary, to_internal::namespace_id_for,
 };
 use tokeira_kernel::state::ParentClosePolicy;
 
@@ -199,6 +199,11 @@ fn migrate_reuse_policy(
     }
 }
 
+// v1.62-sync: reads deprecated `VersioningOverride.behavior` and `.deployment`
+// fields for wire-compat with v0.4-era SDK clients. v1.62 replaces the flat
+// shape with a `override` oneof; migration to the new shape is tracked under
+// `runtime-worker-versioning`.
+#[allow(deprecated)]
 fn versioning_override_to_edge(
     override_: Option<workflow::VersioningOverride>,
 ) -> Result<Option<VersioningOverride>, ProtoConversionError> {
@@ -303,6 +308,10 @@ pub fn signal_request_to_edge(
     })
 }
 
+// v1.62-sync: reads deprecated `PollWorkflowTaskQueueRequest.worker_version_capabilities`
+// for wire-compat with v0.4-era SDK workers. v1.62 replaces it with
+// `deployment_options`; migration is tracked under `runtime-worker-versioning`.
+#[allow(deprecated)]
 pub fn poll_request_to_edge(
     req: workflowservice::PollWorkflowTaskQueueRequest,
 ) -> Result<PollWorkflowTaskQueueRequest, ProtoConversionError> {
@@ -407,6 +416,9 @@ pub fn respond_completed_request_to_edge(
     Ok(RespondWorkflowTaskCompletedRequest {
         task_token: req.task_token,
         identity: req.identity,
+        client_discards_speculative_with_events: req
+            .capabilities
+            .is_some_and(|capabilities| capabilities.discard_speculative_workflow_task_with_events),
         commands,
         force_create_new_workflow_task: req.force_create_new_workflow_task,
         return_new_workflow_task: req.return_new_workflow_task,
@@ -575,7 +587,7 @@ pub fn start_response_to_proto(
 pub fn signal_response_to_proto(
     _resp: SignalWorkflowExecutionResponse,
 ) -> workflowservice::SignalWorkflowExecutionResponse {
-    workflowservice::SignalWorkflowExecutionResponse {}
+    workflowservice::SignalWorkflowExecutionResponse { link: None }
 }
 
 /// Build the proto poll response from the edge DTO.
@@ -819,6 +831,8 @@ pub fn cluster_info_to_proto(
         history_shard_count: resp.shard_count.max(1),
         persistence_store: "in-memory".to_string(),
         visibility_store: "in-memory".to_string(),
+        initial_failover_version: 0,
+        failover_version_increment: 0,
     }
 }
 
@@ -839,6 +853,7 @@ pub fn system_info_to_proto(resp: SystemInfo) -> workflowservice::GetSystemInfoR
             sdk_metadata: resp.capabilities.sdk_metadata,
             count_group_by_execution_status: resp.capabilities.count_group_by_execution_status,
             nexus: resp.capabilities.nexus,
+            server_scaled_deployments: resp.capabilities.server_scaled_deployments,
         }),
     }
 }
@@ -862,13 +877,19 @@ pub fn namespace_to_proto(
                 eager_workflow_start: false,
                 sync_update: true,
                 async_update: true,
-                // Tokeirad accepts RecordWorkerHeartbeat as a no-op today (see
-                // follow-up spec for real implementation). Advertising `true`
-                // here keeps v0.4+ SDK workers running; otherwise the SDK's
-                // SharedNamespaceWorker shuts down immediately on startup and
-                // drags the user worker down with it.
-                worker_heartbeats: true,
+                // temporal-api-v1.62-sync accepts RecordWorkerHeartbeat as a
+                // no-op; worker-heartbeat-observability owns persistence.
+                // Advertising `true` keeps v0.4+ SDK workers running.
+                worker_heartbeats: namespace.capabilities.worker_heartbeats,
+                reported_problems_search_attribute: namespace
+                    .capabilities
+                    .reported_problems_search_attribute,
+                workflow_pause: false,
+                standalone_activities: false,
+                worker_poll_complete_on_shutdown: false,
+                poller_autoscaling: false,
             }),
+            limits: None,
             supports_schedules: false,
         }),
         config: Some(namespace_proto::NamespaceConfig {
@@ -993,6 +1014,10 @@ pub fn get_history_reverse_response_to_proto(
     }
 }
 
+// v1.62-sync: reads deprecated `DescribeTaskQueueRequest.include_task_queue_status`
+// for wire-compat with v0.4-era SDK clients. v1.62 replaces it with explicit
+// stats request fields; v0.4 callers still set the boolean so edge preserves the read.
+#[allow(deprecated)]
 pub fn describe_task_queue_request_to_edge(
     req: workflowservice::DescribeTaskQueueRequest,
 ) -> Result<EdgeDescribeTaskQueueRequest, ProtoConversionError> {
@@ -1016,6 +1041,12 @@ pub fn describe_task_queue_request_to_edge(
     })
 }
 
+// v1.62-sync: writes deprecated `PollerInfo.worker_version_capabilities` and
+// `DescribeTaskQueueResponse.task_queue_status` for wire-compat with v0.4-era
+// SDK readers. v1.62 replaces the former with `deployment_options` and the
+// latter with `stats` on `DescribeTaskQueueResponse`; migration is owned by
+// task 4.9 (wire-through additions) and `runtime-worker-versioning`.
+#[allow(deprecated)]
 pub fn describe_task_queue_response_to_proto(
     resp: EdgeDescribeTaskQueueResponse,
 ) -> workflowservice::DescribeTaskQueueResponse {
@@ -1031,9 +1062,15 @@ pub fn describe_task_queue_response_to_proto(
                     identity: poller.identity,
                     rate_per_second: poller.rate_per_second,
                     worker_version_capabilities: None,
+                    deployment_options: None,
                 },
             )
             .collect(),
+        stats: None,
+        stats_by_priority_key: Default::default(),
+        versioning_info: None,
+        config: Some(task_queue_config_to_proto(resp.config)),
+        effective_rate_limit: None,
         task_queue_status: resp.backlog_count_hint.map(|backlog_count_hint| {
             tokeira_proto::public::temporal::api::taskqueue::v1::TaskQueueStatus {
                 backlog_count_hint,
@@ -1041,6 +1078,43 @@ pub fn describe_task_queue_response_to_proto(
             }
         }),
         versions_info: Default::default(),
+    }
+}
+
+pub fn task_queue_config_from_update_request(
+    req: &workflowservice::UpdateTaskQueueConfigRequest,
+) -> TaskQueueConfig {
+    TaskQueueConfig {
+        queue_rate_limit: req
+            .update_queue_rate_limit
+            .as_ref()
+            .and_then(|update| update.rate_limit.as_ref())
+            .map(|rate_limit| rate_limit.requests_per_second),
+        fairness_key_rate_limit_default: req
+            .update_fairness_key_rate_limit_default
+            .as_ref()
+            .and_then(|update| update.rate_limit.as_ref())
+            .map(|rate_limit| rate_limit.requests_per_second),
+        fairness_weight_overrides: req.set_fairness_weight_overrides.clone(),
+    }
+}
+
+pub fn task_queue_config_to_proto(config: TaskQueueConfig) -> taskqueue_proto::TaskQueueConfig {
+    taskqueue_proto::TaskQueueConfig {
+        queue_rate_limit: config.queue_rate_limit.map(rate_limit_config_to_proto),
+        fairness_keys_rate_limit_default: config
+            .fairness_key_rate_limit_default
+            .map(rate_limit_config_to_proto),
+        fairness_weight_overrides: config.fairness_weight_overrides,
+    }
+}
+
+fn rate_limit_config_to_proto(requests_per_second: f32) -> taskqueue_proto::RateLimitConfig {
+    taskqueue_proto::RateLimitConfig {
+        rate_limit: Some(taskqueue_proto::RateLimit {
+            requests_per_second,
+        }),
+        metadata: None,
     }
 }
 
@@ -1156,6 +1230,7 @@ pub fn signal_with_start_response_to_proto(
     workflowservice::SignalWithStartWorkflowExecutionResponse {
         run_id: resp.run_id.0.to_string(),
         started: resp.started,
+        signal_link: None,
     }
 }
 
@@ -1366,6 +1441,14 @@ fn is_close_event(event_type: i32) -> bool {
     )
 }
 
+// v1.62-sync: reads deprecated `namespace` and `control` fields on
+// `RequestCancelExternalWorkflowExecutionCommandAttributes`,
+// `StartChildWorkflowExecutionCommandAttributes`, and
+// `SignalExternalWorkflowExecutionCommandAttributes`. v1.62 replaces `namespace`
+// with `namespace_id` (equivalent semantics) and moves `control` to a separate
+// `input_payload` shape; edge preserves both reads so v0.4-era SDK completions
+// that still send the old shape continue to dispatch correctly.
+#[allow(deprecated)]
 pub fn proto_command_to_workflow_command(
     cmd: command::Command,
 ) -> Result<WorkflowCommand, ProtoConversionError> {
@@ -1619,6 +1702,16 @@ pub fn proto_command_to_workflow_command(
     }
 }
 
+// v1.62-sync: writes deprecated `namespace` and `control` fields on outbound
+// `StartChildWorkflowExecutionCommandAttributes`,
+// `SignalExternalWorkflowExecutionCommandAttributes`, and
+// `RequestCancelExternalWorkflowExecutionCommandAttributes` for wire-compat
+// with v0.4-era SDK readers. v1.62 introduces `namespace_id` and an
+// `input_payload`-based control shape; the edge will emit both once the
+// follow-up spec lands (see `runtime-worker-versioning` for namespace id
+// unification; `control` retirement has no named follow-up and should track
+// with the next command-attributes cleanup spec).
+#[allow(deprecated)]
 pub fn workflow_command_to_proto(
     cmd: &WorkflowCommand,
 ) -> Result<command::Command, ProtoConversionError> {
@@ -2087,6 +2180,7 @@ pub fn record_heartbeat_to_proto(
     workflowservice::RecordActivityTaskHeartbeatResponse {
         cancel_requested: resp.cancel_requested,
         activity_paused: false,
+        activity_reset: false,
     }
 }
 
@@ -2323,6 +2417,23 @@ mod tests {
     }
 
     #[test]
+    fn respond_completed_request_decodes_speculative_capability() {
+        let edge = respond_completed_request_to_edge(
+            workflowservice::RespondWorkflowTaskCompletedRequest {
+                capabilities: Some(
+                    workflowservice::respond_workflow_task_completed_request::Capabilities {
+                        discard_speculative_workflow_task_with_events: true,
+                    },
+                ),
+                ..Default::default()
+            },
+        )
+        .expect("respond completed request should convert");
+
+        assert!(edge.client_discards_speculative_with_events);
+    }
+
+    #[test]
     fn versioning_rules_proto_emits_redirect_create_time() {
         let create_time = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(42);
         let proto = versioning_rules_to_get_proto(VersioningRules {
@@ -2354,6 +2465,10 @@ mod tests {
             owner_email: String::new(),
             cluster_name: "local".to_string(),
             custom_search_attribute_aliases: std::collections::BTreeMap::new(),
+            capabilities: crate::translate::NamespaceCapabilities {
+                worker_heartbeats: true,
+                reported_problems_search_attribute: false,
+            },
         });
 
         let config = proto.config.expect("config");
@@ -2379,6 +2494,10 @@ mod tests {
             owner_email: String::new(),
             cluster_name: "local".to_string(),
             custom_search_attribute_aliases: std::collections::BTreeMap::new(),
+            capabilities: crate::translate::NamespaceCapabilities {
+                worker_heartbeats: true,
+                reported_problems_search_attribute: false,
+            },
         });
 
         let replication = proto.replication_config.expect("replication");

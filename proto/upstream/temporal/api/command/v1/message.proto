@@ -1,25 +1,3 @@
-// The MIT License
-//
-// Copyright (c) 2020 Temporal Technologies Inc.  All rights reserved.
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in
-// all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-// THE SOFTWARE.
-
 syntax = "proto3";
 
 package temporal.api.command.v1;
@@ -85,6 +63,9 @@ message ScheduleActivityTaskCommandAttributes {
     // If this is set, the activity would be assigned to the Build ID of the workflow. Otherwise,
     // Assignment rules of the activity's Task Queue will be used to determine the Build ID.
     bool use_workflow_build_id = 13;
+    // Priority metadata. If this message is not present, or any fields are not
+    // present, they inherit the values from the workflow.
+    temporal.api.common.v1.Priority priority = 14;
 }
 
 message RequestCancelActivityTaskCommandAttributes {
@@ -121,11 +102,12 @@ message CancelWorkflowExecutionCommandAttributes {
 }
 
 message RequestCancelExternalWorkflowExecutionCommandAttributes {
-    string namespace = 1;
+    // Deprecated. Cross-namespace operations are disabled by default as of server 1.30.1.
+    string namespace = 1 [deprecated = true];
     string workflow_id = 2;
     string run_id = 3;
     // Deprecated.
-    string control = 4;
+    string control = 4 [deprecated = true];
     // Set this to true if the workflow being cancelled is a child of the workflow originating this
     // command. The request will be rejected if it is set to true and the target workflow is *not*
     // a child of the requesting workflow.
@@ -135,14 +117,15 @@ message RequestCancelExternalWorkflowExecutionCommandAttributes {
 }
 
 message SignalExternalWorkflowExecutionCommandAttributes {
-    string namespace = 1;
+    // Deprecated. Cross-namespace operations are disabled by default as of server 1.30.1.
+    string namespace = 1 [deprecated = true];
     temporal.api.common.v1.WorkflowExecution execution = 2;
     // The workflow author-defined name of the signal to send to the workflow.
     string signal_name = 3;
     // Serialized value(s) to provide with the signal.
     temporal.api.common.v1.Payloads input = 4;
     // Deprecated
-    string control = 5;
+    string control = 5 [deprecated = true];
     // Set this to true if the workflow being cancelled is a child of the workflow originating this
     // command. The request will be rejected if it is set to true and the target workflow is *not*
     // a child of the requesting workflow.
@@ -195,13 +178,20 @@ message ContinueAsNewWorkflowExecutionCommandAttributes {
     temporal.api.common.v1.SearchAttributes search_attributes = 14;
     // If this is set, the new execution inherits the Build ID of the current execution. Otherwise,
     // the assignment rules will be used to independently assign a Build ID to the new execution.
-    bool inherit_build_id = 15;
+    // Deprecated. Only considered for versioning v0.2.
+    bool inherit_build_id = 15 [deprecated = true];
+
+    // Experimental. Optionally decide the versioning behavior that the first task of the new run should use.
+    // For example, choose to AutoUpgrade on continue-as-new instead of inheriting the pinned version
+    // of the previous run.
+    temporal.api.enums.v1.ContinueAsNewVersioningBehavior initial_versioning_behavior = 16;
 
     // `workflow_execution_timeout` is omitted as it shouldn't be overridden from within a workflow.
 }
 
 message StartChildWorkflowExecutionCommandAttributes {
-    string namespace = 1;
+    // Deprecated. Cross-namespace operations are disabled by default as of server 1.30.1.
+    string namespace = 1 [deprecated = true];
     string workflow_id = 2;
     temporal.api.common.v1.WorkflowType workflow_type = 3;
     temporal.api.taskqueue.v1.TaskQueue task_queue = 4;
@@ -225,7 +215,11 @@ message StartChildWorkflowExecutionCommandAttributes {
     temporal.api.common.v1.SearchAttributes search_attributes = 16;
     // If this is set, the child workflow inherits the Build ID of the parent. Otherwise, the assignment
     // rules of the child's Task Queue will be used to independently assign a Build ID to it.
-    bool inherit_build_id = 17;
+    // Deprecated. Only considered for versioning v0.2.
+    bool inherit_build_id = 17 [deprecated = true];
+    // Priority metadata. If this message is not present, or any fields are not
+    // present, they inherit the values from the workflow.
+    temporal.api.common.v1.Priority priority = 18;
 }
 
 message ProtocolMessageCommandAttributes {
@@ -258,6 +252,27 @@ message ScheduleNexusOperationCommandAttributes {
     // Note these headers are not the same as Temporal headers on internal activities and child workflows, these are
     // transmitted to Nexus operations that may be external and are not traditional payloads.
     map<string, string> nexus_header = 6;
+
+    // Schedule-to-start timeout for this operation.
+    // Indicates how long the caller is willing to wait for the operation to be started (or completed if synchronous)
+    // by the handler. If the operation is not started within this timeout, it will fail with
+    // TIMEOUT_TYPE_SCHEDULE_TO_START.
+    // If not set or zero, no schedule-to-start timeout is enforced.
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "to" is used to indicate interval. --)
+    // Requires server version 1.31.0 or later.
+    google.protobuf.Duration schedule_to_start_timeout = 7;
+
+    // Start-to-close timeout for this operation.
+    // Indicates how long the caller is willing to wait for an asynchronous operation to complete after it has been
+    // started. If the operation does not complete within this timeout after starting, it will fail with
+    // TIMEOUT_TYPE_START_TO_CLOSE.
+    // Only applies to asynchronous operations. Synchronous operations ignore this timeout.
+    // If not set or zero, no start-to-close timeout is enforced.
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "to" is used to indicate interval. --)
+    // Requires server version 1.31.0 or later.
+    google.protobuf.Duration start_to_close_timeout = 8;
 }
 
 message RequestCancelNexusOperationCommandAttributes {

@@ -5650,9 +5650,12 @@ dependencies = [
  "temporalio-macros",
  "temporalio-sdk",
  "temporalio-sdk-core",
+ "tokeirad",
  "tokio",
+ "tonic 0.11.0",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -5948,6 +5951,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokeira-kernel",
+ "tokeira-projection",
  "tokeira-proto",
  "tokeira-storage",
  "tokeira-types",

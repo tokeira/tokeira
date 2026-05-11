@@ -11,7 +11,7 @@ The design is organised around seven principles that follow directly from Tokeir
 - **Classification is mechanical.** Every v1.43 → v1.62.11 delta gets placed into exactly one of five buckets (`Ignore`, `No-op stub`, `Capability advertise`, `Wire through`, `Full implementation (deferred)`). The Surface_Audit table in §5 is the single artifact that carries the classification; the Implementation & Escalation Matrix in §6 carries the concrete per-plane impact for every `Wire through` row that lands in this spec plus the `RecordWorkerHeartbeat` `No-op` handler plus every row escalated to `Deferred`; §7 records the principle that governed each bucket placement.
 - **Absorb only what costs less than deferring.** Three v1.62 surfaces are implemented in this spec rather than deferred: `CountSchedules` (a trivial count over the existing `ScheduleStore`), `UpdateTaskQueueConfig` (a setter over a new in-memory `TaskQueueConfigStore` that mirrors `ScheduleStore`/`VersioningRuleStore`), and Nexus v2 field wire-through on existing Nexus RPCs (decode, carry through `NexusTaskBroker`/`NexusEndpointRegistry`, re-emit). Every other feature area surfaces as an `Unimplemented` stub with a bracketed comment block naming the deferring spec.
 - **RPC renames are live-handler migrations.** The four `*ById` activity RPCs (`UpdateActivityOptionsById`, `PauseActivityById`, `UnpauseActivityById`, `ResetActivityById`) are renamed in-place to their unsuffixed v1.62 forms. Handler bodies are preserved modulo signature drift. These migrations are not stubs — they are live RPCs whose message types and field layouts changed, and they do not belong inside any deferred-block bracketed comment.
-- **Reviewability is a first-class artifact.** The Surface_Audit table is expected to carry 60–100+ rows covering every RPC, field, message, enum, and package change. Classification decisions are reviewable inline alongside the design, not buried in implementation PRs. The Implementation & Escalation Matrix enforces that every `Classification_WireThrough` field that is not `none`/`none`/`none` across all three downstream impact columns is escalated to `Classification_Deferred` if it would require more than a single-file change (Req 5.1.3, 5.1.4, 5.1.5).
+- **Reviewability is a first-class artifact.** The Surface_Audit table is expected to carry 60–100+ rows covering every RPC, field, message, enum, and package change. Classification decisions are reviewable inline alongside the design, not buried in implementation PRs. The Implementation & Escalation Matrix enforces that every counted `Classification_WireThrough` surface row that is not `none`/`none`/`none` across all three downstream impact columns is escalated to `Classification_Deferred` if it would require more than a single-file change (Req 5.1.3, 5.1.4, 5.1.5).
 - **v0.4 SDK integration test is the invariant guard.** A single, `#[ignore]`-gated integration test under `apps/tokeira-bench/tests/v0_4_integration.rs` spawns `tokeirad` in-process against an in-memory storage backend, runs a v0.4 SDK worker until at least one observed `record_worker_heartbeat` call reaches `tokeirad`, starts a workflow, asserts completion, and greps server logs for the matching heartbeat debug line. It is the regression guard that catches anyone who later strips the heartbeat handler or the capability advertisement. The 90-second timeout in Req 7.1.7 gives the 30-second SDK heartbeat interval two chances to fire; multi-heartbeat observability is the `worker-heartbeat-observability` spec's concern. The test uses `tokio::sync::Notify` for synchronisation per `tokeira/AGENTS.md` Rule 1, completes in under 120 s, and is opt-in via `--include-ignored`.
 
 ## Architecture
@@ -535,7 +535,7 @@ async fn describe_worker(
 
 The template is mechanical: one `debug!` log, one `Err(Status::unimplemented(...))` with a message naming both the RPC and the deferring spec. No `warn!` or higher log levels (Req 6.1.4) because SDKs call these opportunistically during feature detection.
 
-**Rename interaction.** The four renames in §8 (`*ById` → unsuffixed) are not stubs. They live in the "Live handlers" section above the bracketed blocks, with `update_activity_options` / `pause_activity` / `unpause_activity` / `reset_activity` as the handler names. The Surface_Audit rows for the renamed RPCs carry `Classification_WireThrough` (rename-only) and the Disposition column reads `rename handler from *_by_id; preserve behaviour; no new fields`.
+**Rename interaction.** The four renames in §8 (`*ById` → unsuffixed) are not stubs. They live in the "Live handlers" section above the bracketed blocks, with `update_activity_options` / `pause_activity` / `unpause_activity` / `reset_activity` as the handler names. The Surface_Audit rows for the renamed RPCs carry `Classification_WireThrough` for the live handler migration, and any request-message fields added by v1.62 are classified and implemented separately in the Activity message field-addition rows.
 
 ### 8. RPC renames: `*ById` → unsuffixed (Req 4.3)
 
@@ -553,7 +553,7 @@ Migration steps:
 1. The v1.43 names no longer exist in the generated `workflowservice::workflow_service_server::WorkflowService` trait after the resync (Req 4.3.1). Any v1.43 handlers under the old names become orphan methods on the impl block and must be renamed or the impl block will fail to satisfy the trait.
 2. Each handler is renamed in-place: `update_activity_options_by_id` → `update_activity_options`, etc. The method body is preserved modulo the signature drift from renamed message types (`PauseActivityByIdRequest` → `PauseActivityRequest`, etc.) (Req 4.3.2).
 3. Edge_DTO names lose their `ById` suffixes: `PauseActivityByIdRequest` DTO → `PauseActivityRequest` DTO (Req 4.3.4). All callers are updated.
-4. The Surface_Audit Disposition column for each rename row reads `rename handler; preserve behaviour; no new fields if no new fields are added; otherwise escalate per Req 4.3.3`. Req 4.3.3 requires that if the v1.62 `PauseActivityRequest` / etc. gained new fields relative to its `*ById` predecessor, those fields are enumerated in the Surface_Audit and classified individually; a blanket "preserve behaviour" migration does not proceed if any new field is Classification_WireThrough.
+4. The Surface_Audit Disposition column for each rename row records the handler migration and points to the separately classified request fields. Req 4.3.3 requires that if the v1.62 `PauseActivityRequest` / etc. gained new fields relative to its `*ById` predecessor, those fields are enumerated in the Surface_Audit, classified individually, and implemented according to that classification before the rename work is considered complete.
 
 ### 9. `record_worker_heartbeat` migration (Req 3.4)
 
@@ -985,7 +985,7 @@ let task_queue_config_store: Arc<dyn TaskQueueConfigStore> =
 
 The table below enumerates every proto-level delta between `buf.build/temporalio/api:v1.43.0` and `buf.build/temporalio/api:v1.62.11` that Tokeira must account for. Rows are grouped by `Kind` for readability. `Added In` columns use the exact Temporal API release where available; where the exact release is uncertain, the column uses an inclusive range callout (e.g. `added between v1.48 and v1.55`) — this is acceptable per the user's request, and the implementation verifies the exact version against the resynced tree during implementation.
 
-Every `Classification_WireThrough` row whose Kernel, Runtime, or Projection impact is non-`none` is escalated per Req 5.1.3 — the Disposition column says "escalated to Classification_Deferred (see Implementation & Escalation Matrix)" in those cases, and the row appears instead in the Implementation & Escalation Matrix with an explicit escalation note.
+Every `Classification_WireThrough` row whose Kernel, Runtime, or Projection impact exceeds the limits in Req 5.1.3-5.1.5 is escalated to `Classification_Deferred` — the Disposition column says "escalated to Classification_Deferred (see Implementation & Escalation Matrix)" in those cases, and the row appears in the Implementation & Escalation Matrix with an explicit escalation note. Rows with narrow, in-scope single-file runtime/projection impact remain `Classification_WireThrough` and are implemented by this spec.
 
 ### New packages
 
@@ -1035,10 +1035,10 @@ Every `Classification_WireThrough` row whose Kernel, Runtime, or Projection impa
 
 | Kind | Qualified Name | Added In | Classification | Disposition | Target Spec |
 |---|---|---|---|---|---|
-| RPC | `WorkflowService.UpdateActivityOptions` (was `UpdateActivityOptionsById`) | v1.54 | Wire through | Rename handler; preserve behaviour; verify no new fields | — |
-| RPC | `WorkflowService.PauseActivity` (was `PauseActivityById`) | v1.54 | Wire through | Rename handler; preserve behaviour; verify no new fields | — |
-| RPC | `WorkflowService.UnpauseActivity` (was `UnpauseActivityById`) | v1.54 | Wire through | Rename handler; preserve behaviour; verify no new fields | — |
-| RPC | `WorkflowService.ResetActivity` (was `ResetActivityById`) | v1.54 | Wire through | Rename handler; preserve behaviour; verify no new fields | — |
+| RPC | `WorkflowService.UpdateActivityOptions` (was `UpdateActivityOptionsById`) | v1.54 | Wire through | Rename handler; preserve behaviour; implement separately classified request fields below | — |
+| RPC | `WorkflowService.PauseActivity` (was `PauseActivityById`) | v1.54 | Wire through | Rename handler; preserve behaviour; implement separately classified request fields below | — |
+| RPC | `WorkflowService.UnpauseActivity` (was `UnpauseActivityById`) | v1.54 | Wire through | Rename handler; preserve behaviour; implement separately classified request fields below | — |
+| RPC | `WorkflowService.ResetActivity` (was `ResetActivityById`) | v1.54 | Wire through | Rename handler; preserve behaviour; implement separately classified request fields below | — |
 
 ### Capability fields on `GetSystemInfoResponse.Capabilities`
 
@@ -1061,25 +1061,29 @@ Every `Classification_WireThrough` row whose Kernel, Runtime, or Projection impa
 
 | Kind | Qualified Name | Added In | Classification | Disposition | Target Spec |
 |---|---|---|---|---|---|
-| Field | `RespondWorkflowTaskCompletedRequest.Capabilities.discard_speculative_workflow_task_with_events` | v1.50 | Capability | Decoded into `client_discards_speculative_with_events` DTO field; stored at edge, not propagated further | future `speculative-wft` |
+| Field | `RespondWorkflowTaskCompletedRequest.Capabilities.discard_speculative_workflow_task_with_events` | v1.50 | Capability | Decoded into `client_discards_speculative_with_events` DTO field; stored at edge, not propagated further | `speculative-wft` |
 
 ### Wire-through field additions on `StartWorkflowExecutionRequest`
 
 | Kind | Qualified Name | Added In | Classification | Disposition | Target Spec |
 |---|---|---|---|---|---|
-| Field | `StartWorkflowExecutionRequest.user_metadata` | v1.49 | Wire through | Edge DTO gains `user_metadata: Option<UserMetadata>`; wire to kernel start request; projection stores on the start history event | — |
-| Field | `StartWorkflowExecutionRequest.links` | v1.50 | Wire through | Edge DTO gains `links: Vec<Link>`; pass through to kernel start request | — |
-| Field | `StartWorkflowExecutionRequest.priority` | v1.58 | Wire through | Edge DTO gains `priority: Option<Priority>`; stored on start event; not consumed by scheduler today | — |
-| Field | `StartWorkflowExecutionRequest.completion_callbacks` | v1.52 | Wire through | Edge DTO gains `completion_callbacks: Vec<Callback>`; stored for Nexus completion routing | — |
+| Field | `StartWorkflowExecutionRequest.user_metadata` | v1.49 | Deferred | Vendored v1.62.11 carries the field but v0.4-era SDK workers do not populate it; Edge DTO gains no field today, wire-level default round-trips. Promotion needs a kernel consumer (start-event metadata store) | `worker-deployments` |
+| Field | `StartWorkflowExecutionRequest.links` | v1.50 | Deferred | No v0.4 SDK consumer; Edge DTO gains no field today, wire-level default round-trips. Promotion needs a kernel consumer for inbound links | `worker-deployments` |
+| Field | `StartWorkflowExecutionRequest.priority` | v1.58 | Deferred | No v0.4 SDK consumer and no runtime scheduler branch; Edge DTO gains no field today, wire-level default round-trips. Promotion needs a priority-aware scheduler | `worker-deployments` |
+| Field | `StartWorkflowExecutionRequest.completion_callbacks` | v1.52 | Deferred | No v0.4 SDK consumer; Edge DTO gains no field today, wire-level default round-trips. Promotion needs Nexus completion routing | `worker-deployments` |
 | Field | `StartWorkflowExecutionRequest.versioning_override` | v1.54 | Deferred | Explicitly dropped at the edge per tightened Req 2.2.6; kernel/runtime NOT plumbed; response path emits protobuf default | `runtime-worker-versioning` (escalated) |
+| Field | `StartWorkflowExecutionRequest.eager_worker_deployment_options` | v1.55 | Deferred | Worker Deployments surface; dropped at the edge | `worker-deployments` |
+| Field | `StartWorkflowExecutionRequest.on_conflict_options` | v1.57 | Deferred | No kernel branch on conflict policy yet; dropped at the edge | `worker-deployments` |
+| Field | `StartWorkflowExecutionRequest.time_skipping_config` | v1.60 | Deferred | Dev-affordance only; dropped at the edge | `worker-deployments` |
 
 ### Wire-through field additions on `SignalWithStartWorkflowExecutionRequest`
 
 | Kind | Qualified Name | Added In | Classification | Disposition | Target Spec |
 |---|---|---|---|---|---|
-| Field | `SignalWithStartWorkflowExecutionRequest.user_metadata` | v1.49 | Wire through | Mirrors StartWorkflow addition | — |
-| Field | `SignalWithStartWorkflowExecutionRequest.links` | v1.50 | Wire through | Mirrors StartWorkflow addition | — |
-| Field | `SignalWithStartWorkflowExecutionRequest.priority` | v1.58 | Wire through | Mirrors StartWorkflow addition | — |
+| Field | `SignalWithStartWorkflowExecutionRequest.user_metadata` | v1.49 | Deferred | Mirrors StartWorkflow deferral | `worker-deployments` |
+| Field | `SignalWithStartWorkflowExecutionRequest.links` | v1.50 | Deferred | Mirrors StartWorkflow deferral | `worker-deployments` |
+| Field | `SignalWithStartWorkflowExecutionRequest.priority` | v1.58 | Deferred | Mirrors StartWorkflow deferral | `worker-deployments` |
+| Field | `SignalWithStartWorkflowExecutionRequest.completion_callbacks` | v1.52 | Deferred | Mirrors StartWorkflow deferral | `worker-deployments` |
 
 ### Wire-through field additions on `RespondWorkflowTaskCompletedRequest`
 
@@ -1089,6 +1093,10 @@ Every `Classification_WireThrough` row whose Kernel, Runtime, or Projection impa
 | Field | `RespondWorkflowTaskCompletedRequest.sdk_metadata` | v1.46 | Wire through | Edge DTO already present; confirm no drift | — |
 | Field | `RespondWorkflowTaskCompletedRequest.metering_metadata` | v1.46 | Wire through | Edge DTO already present; confirm no drift | — |
 | Field | `RespondWorkflowTaskCompletedRequest.capabilities` | v1.50 | Capability | Nested message; decoded into `client_discards_speculative_with_events` DTO field | — |
+| Field | `RespondWorkflowTaskCompletedRequest.versioning_behavior` | v1.54 | Deferred | `runtime-worker-versioning` surface; dropped at the edge | `runtime-worker-versioning` |
+| Field | `RespondWorkflowTaskCompletedRequest.deployment_options` | v1.55 | Deferred | Worker Deployments surface; dropped at the edge | `worker-deployments` |
+| Field | `RespondWorkflowTaskCompletedRequest.worker_instance_key` | v1.58 | Deferred | Worker identity observability; dropped at the edge | `worker-heartbeat-observability` |
+| Field | `RespondWorkflowTaskCompletedRequest.worker_control_task_queue` | v1.60 | Deferred | Per-worker control channel; dropped at the edge | `worker-deployments` |
 
 ### Wire-through field additions on `PollWorkflowTaskQueueResponse`
 
@@ -1096,29 +1104,32 @@ Every `Classification_WireThrough` row whose Kernel, Runtime, or Projection impa
 |---|---|---|---|---|---|
 | Field | `PollWorkflowTaskQueueResponse.messages` | v1.45 | Wire through | Edge DTO already present; confirm no drift | — |
 | Field | `PollWorkflowTaskQueueResponse.history_size_bytes` | v1.43 present but verify | Wire through | Confirm no field renumbering | — |
-| Field | `PollWorkflowTaskQueueResponse.poll_request_id` | v1.53 | Wire through | Edge DTO gains `poll_request_id: String`; pass through | — |
+| Field | `PollWorkflowTaskQueueResponse.poller_group_id` | v1.53 | Deferred | The v1.62.11 proto exposes `poller_group_id` / `poller_group_infos` for poller auto-scaling rather than a `poll_request_id` field; no runtime branch, response-path emits empty string / empty list | `worker-deployments` |
+| Field | `PollWorkflowTaskQueueResponse.poller_group_infos` | v1.53 | Deferred | Paired with `poller_group_id`; response-path emits empty list | `worker-deployments` |
 
 ### Wire-through field additions on `PollActivityTaskQueueResponse`
 
 | Kind | Qualified Name | Added In | Classification | Disposition | Target Spec |
 |---|---|---|---|---|---|
-| Field | `PollActivityTaskQueueResponse.priority` | v1.58 | Wire through | Edge DTO gains `priority: Option<Priority>` | — |
-| Field | `PollActivityTaskQueueResponse.poll_request_id` | v1.53 | Wire through | Edge DTO gains `poll_request_id: String` | — |
+| Field | `PollActivityTaskQueueResponse.priority` | v1.58 | Deferred | No scheduler branch; response-path emits proto default | `worker-deployments` |
+| Field | `PollActivityTaskQueueResponse.activity_run_id` | v1.57 | Deferred | Part of first-class activity executions; response-path emits empty string | `activity-executions-first-class` |
+| Field | `PollActivityTaskQueueResponse.poller_scaling_decision` | v1.53 | Deferred | Paired with `poller_group_id`; response-path emits None | `worker-deployments` |
+| Field | `PollActivityTaskQueueResponse.poller_group_infos` | v1.53 | Deferred | Poller auto-scaling; response-path emits empty list | `worker-deployments` |
 
 ### Wire-through field additions on `RecordActivityTaskHeartbeatRequest`
 
 | Kind | Qualified Name | Added In | Classification | Disposition | Target Spec |
 |---|---|---|---|---|---|
 | Field | `RecordActivityTaskHeartbeatRequest.namespace` | v1.43 present | Wire through | Confirm preserved post-resync | — |
-| Field | `RecordActivityTaskHeartbeatRequest.worker_version` | v1.46 | Wire through | Edge DTO gains `worker_version: Option<WorkerVersionStamp>` | — |
+| Field | `RecordActivityTaskHeartbeatRequest.worker_version` | v1.46 | Deferred | Deprecated in v1.62.11 in favor of `deployment_options`; edge preserves pass-through via `#[allow(deprecated)]` but does not add a DTO field; replaced by `deployment_options` when `worker-deployments` lands | `worker-deployments` |
 
 ### Wire-through field additions on `RespondActivityTask{Completed,Failed,Canceled}Request`
 
 | Kind | Qualified Name | Added In | Classification | Disposition | Target Spec |
 |---|---|---|---|---|---|
-| Field | `RespondActivityTaskCompletedRequest.worker_version` | v1.46 | Wire through | Edge DTO gains field; carried through to runtime on response path | — |
-| Field | `RespondActivityTaskFailedRequest.worker_version` | v1.46 | Wire through | Edge DTO gains field | — |
-| Field | `RespondActivityTaskCanceledRequest.worker_version` | v1.46 | Wire through | Edge DTO gains field | — |
+| Field | `RespondActivityTaskCompletedRequest.worker_version` | v1.46 | Deferred | Deprecated in v1.62.11 in favor of `deployment_options`; edge preserves pass-through via `#[allow(deprecated)]`; no DTO field today | `worker-deployments` |
+| Field | `RespondActivityTaskFailedRequest.worker_version` | v1.46 | Deferred | Deprecated in v1.62.11; edge preserves pass-through via `#[allow(deprecated)]`; no DTO field today | `worker-deployments` |
+| Field | `RespondActivityTaskCanceledRequest.worker_version` | v1.46 | Deferred | Deprecated in v1.62.11; edge preserves pass-through via `#[allow(deprecated)]`; no DTO field today | `worker-deployments` |
 | Field | `RespondActivityTaskFailedRequest.is_last_failure` | v1.54 | Deferred | Explicitly dropped at the edge per tightened Req 2.2.6; runtime retry logic does NOT branch on it | `runtime-activity-timeouts` (escalated) |
 
 ### Wire-through field additions on `DescribeNamespaceResponse` / `NamespaceConfig`
@@ -1133,14 +1144,15 @@ Every `Classification_WireThrough` row whose Kernel, Runtime, or Projection impa
 
 | Kind | Qualified Name | Added In | Classification | Disposition | Target Spec |
 |---|---|---|---|---|---|
-| Field | `PollNexusTaskQueueResponse.request` (expanded) | v1.53 | Wire through | Edge DTO mirrors full request sub-fields; pass through `NexusTaskBroker` | — |
-| Field | `PollNexusTaskQueueResponse.poll_request_id` | v1.53 | Wire through | Edge DTO gains `poll_request_id: String` | — |
+| Field | `PollNexusTaskQueueResponse.request` (expanded) | v1.53 | Deferred | The vendored v1.62.11 proto expands the `Request` sub-message with new optional fields (callback_header, links, etc.). Edge Nexus DTO does not mirror them today — no SDK v0.4 consumer — and proto defaults round-trip cleanly through the existing translator | `worker-deployments` |
+| Field | `PollNexusTaskQueueResponse.poller_group_id` | v1.53 | Deferred | v1.62.11 exposes `poller_group_id` / `poller_group_infos` for poller auto-scaling (not `poll_request_id` as originally sketched); response-path emits empty string / empty list | `worker-deployments` |
+| Field | `PollNexusTaskQueueResponse.poller_scaling_decision` | v1.53 | Deferred | Paired with `poller_group_id`; response-path emits None | `worker-deployments` |
 | Field | `RespondNexusTaskCompletedRequest.namespace` | v1.51 present | Wire through | Confirm preserved | — |
-| Field | `RespondNexusTaskCompletedRequest.response` (expanded sub-fields) | v1.55 | Wire through | Edge DTO mirrors new sub-fields; re-emit on completion | — |
-| Field | `RespondNexusTaskFailedRequest.error` (expanded with `retry_behavior`) | v1.56 | Deferred | Explicitly dropped at the edge per tightened Req 2.2.6; runtime retry does NOT branch on it | future `nexus-retry-policy` (escalated) |
-| Field | `NexusEndpointSpec.description` | v1.52 | Wire through | Edge DTO gains `description: String` on endpoint spec | — |
-| Field | `NexusEndpointSpec.allowed_cluster_ids` | v1.56 | Deferred | Introduces cross-cluster routing semantics; deferred | future `nexus-multi-cluster` |
-| Enum | `NexusEndpointSpec.endpoint_type` new variant (e.g. `WORKER_TARGET`) | v1.55 | Wire through | `NexusEndpointRegistry::resolve` gains a match arm for the new variant; unrouteable today | — |
+| Field | `RespondNexusTaskCompletedRequest.response` (expanded sub-fields) | v1.55 | Deferred | No SDK v0.4 consumer for the expanded fields; Edge DTO continues to carry `response: Option<nexus_v1::Response>` as an opaque proto (existing shape); field-level decomposition is deferred | `worker-deployments` |
+| Field | `RespondNexusTaskFailedRequest.error` (expanded with `retry_behavior`) | v1.56 | Deferred | Explicitly dropped at the edge per tightened Req 2.2.6; runtime retry does NOT branch on it | `nexus-retry-policy` |
+| Field | `NexusEndpointSpec.description` | v1.52 | Deferred | v1.62.11 types the field as `Payload` (not `string` as originally sketched); EndpointSpec is accessed only through the runtime `NexusEndpointRegistry` which is initialised from Tokeira-internal config, not the proto surface. No handler decodes `NexusEndpointSpec` from the wire in this spec | `nexus-multi-cluster` |
+| Field | `NexusEndpointSpec.allowed_cluster_ids` | v1.56 | Deferred | Not present in v1.62.11 vendored proto; if a later version adds it, cross-cluster routing semantics land with that spec | `nexus-multi-cluster` |
+| Enum | `NexusEndpointSpec.endpoint_type` new variant (e.g. `WORKER_TARGET`) | v1.55 | Deferred | Not present in v1.62.11 vendored proto; `EndpointTarget` oneof already covers `Worker | External` variants in both the runtime enum and the proto. Original entry referenced a hypothetical `endpoint_type` enum that does not exist in the vendored surface | `nexus-multi-cluster` |
 
 ### Wire-through field additions on Schedule messages
 
@@ -1158,17 +1170,21 @@ Every `Classification_WireThrough` row whose Kernel, Runtime, or Projection impa
 | Message | `UpdateTaskQueueConfigRequest` | v1.58 | Wire through | See UpdateTaskQueueConfig handler row | — |
 | Message | `UpdateTaskQueueConfigResponse` | v1.58 | Wire through | See UpdateTaskQueueConfig handler row | — |
 | Field | `DescribeTaskQueueResponse.versions_info` | v1.46 | Wire through | Edge DTO already present; confirm | — |
-| Field | `DescribeTaskQueueResponse.task_queue_stats` | v1.53 | Wire through | Edge DTO gains `TaskQueueStats` struct; populated from runtime broker state | — |
-| Field | `DescribeTaskQueueResponse.config` | v1.58 | Wire through | Read from `TaskQueueConfigStore`; populated on response | — |
+| Field | `DescribeTaskQueueResponse.task_queue_stats` | v1.53 | Deferred | Requires a real runtime stats collector (backlog depth, add-rate, dispatch-rate); response path emits None today | `worker-deployments` |
+| Field | `DescribeTaskQueueResponse.stats_by_priority_key` | v1.58 | Deferred | Paired with `task_queue_stats`; response-path emits empty map | `worker-deployments` |
+| Field | `DescribeTaskQueueResponse.config` | v1.58 | Wire through | Read from `TaskQueueConfigStore`; populated on response (task 7.6) | — |
+| Field | `DescribeTaskQueueResponse.effective_rate_limit` | v1.58 | Deferred | Requires rate-limit admission-control wiring; response-path emits None today | `worker-deployments` |
 
 ### Wire-through field additions on Activity messages (renamed RPCs)
 
 | Kind | Qualified Name | Added In | Classification | Disposition | Target Spec |
 |---|---|---|---|---|---|
-| Field | `UpdateActivityOptionsRequest.activity_type` | v1.54 | Wire through | Edge DTO gains `activity_type: Option<ActivityType>` for type-based addressing vs id-based | — |
-| Field | `PauseActivityRequest.identity` | v1.54 | Wire through | Edge DTO gains `identity: String` | — |
-| Field | `UnpauseActivityRequest.reset_heartbeat` | v1.54 | Wire through | Edge DTO gains `reset_heartbeat: bool` | — |
-| Field | `ResetActivityRequest.keep_paused` | v1.54 | Wire through | Edge DTO gains `keep_paused: bool` | — |
+| Field | `UpdateActivityOptionsRequest.activity_type` | v1.54 | Wire through | Edge DTO `UpdateActivityOptionsRequest` gains `activity_type: Option<ActivityType>` (task 4.6) | — |
+| Field | `PauseActivityRequest.identity` | v1.54 | Wire through | Edge DTO `PauseActivityRequest` gains `identity: String` (task 4.6) | — |
+| Field | `UnpauseActivityRequest.reset_heartbeat` | v1.54 | Wire through | Edge DTO `UnpauseActivityRequest` gains `reset_heartbeat: bool` (task 4.6) | — |
+| Field | `ResetActivityRequest.keep_paused` | v1.54 | Wire through | Edge DTO `ResetActivityRequest` gains `keep_paused: bool` (task 4.6) | — |
+
+Runtime wiring for these four request messages — reading the added fields and routing them through the activity-management handlers — is `Classification_Deferred` to `activity-executions-first-class`. The v1.62-sync handlers for the renamed RPCs return `Status::unimplemented` (§8 RPC renames); the DTO surface ships in this spec so the consumer spec can wire the handler bodies without re-touching the DTO boundary.
 
 ### Workflow Rule messages (deferred)
 
@@ -1212,18 +1228,20 @@ These messages are generated into the vendored proto tree by the resync but are 
 |---|---|---|---|---|---|
 | Enum | `VersioningBehavior` new variants | v1.54 | Deferred | Explicitly dropped at the edge; runtime scheduler does NOT branch on these variants in this spec | `runtime-worker-versioning` |
 | Enum | `WorkflowIdConflictPolicy.USE_EXISTING` | v1.47 | Wire through | Already present in some vendors; confirm | — |
-| Enum | `TaskReachability` new variants | v1.46 | Wire through | Edge DTO enum mirrors; no consumer branches on these variants in this spec | — |
-| Enum | `BuildIdTaskReachability` | v1.54 | Wire through | New enum; Edge DTO mirrors; no consumer branches on it in this spec | `runtime-worker-versioning` |
-| Enum | `ApplicationErrorCategory` | v1.58 | Wire through | Edge DTO enum mirrors; carried through on failure objects | — |
+| Enum | `TaskReachability` new variants | v1.46 | Deferred | No consumer branches on these variants; edge round-trips integer value unchanged via the existing enum translator | `runtime-worker-versioning` |
+| Enum | `BuildIdTaskReachability` | v1.54 | Deferred | New enum; no consumer branches on it; edge round-trips integer value unchanged | `runtime-worker-versioning` |
+| Enum | `ApplicationErrorCategory` | v1.58 | Deferred | No consumer branches on it; carried as integer on failure objects via the existing enum translator | `runtime-activity-timeouts` |
 
-### Deleted / renamed surfaces
+### Deleted / renamed surface notes
 
-| Kind | Qualified Name | Change | Classification | Disposition | Target Spec |
-|---|---|---|---|---|---|
-| RPC | `UpdateActivityOptionsById` | renamed | Wire through | See rename row | — |
-| RPC | `PauseActivityById` | renamed | Wire through | See rename row | — |
-| RPC | `UnpauseActivityById` | renamed | Wire through | See rename row | — |
-| RPC | `ResetActivityById` | renamed | Wire through | See rename row | — |
+These v1.43 names are not generated by the v1.62 `WorkflowService` trait and are not independent Surface_Audit classification rows. They are recorded here only as rename metadata for reviewer traceability; implementation and Property 2 counting are covered by the unsuffixed v1.62 rows above (`WorkflowService.UpdateActivityOptions`, `WorkflowService.PauseActivity`, `WorkflowService.UnpauseActivity`, `WorkflowService.ResetActivity`) plus any new request fields classified separately.
+
+| Old Qualified Name | Change | Counted Surface_Audit Row |
+|---|---|---|
+| `UpdateActivityOptionsById` | renamed | `WorkflowService.UpdateActivityOptions` |
+| `PauseActivityById` | renamed | `WorkflowService.PauseActivity` |
+| `UnpauseActivityById` | renamed | `WorkflowService.UnpauseActivity` |
+| `ResetActivityById` | renamed | `WorkflowService.ResetActivity` |
 
 ### Invariants on the table
 
@@ -1239,15 +1257,15 @@ The table above enumerates the expected surface deltas based on Temporal API rel
 
 The single implementation-scope view for this spec. Every row records the concrete per-plane impact of one surface-level decision:
 
-- **In scope** rows correspond 1:1 with `Classification_WireThrough` rows in the Surface_Audit plus the `RecordWorkerHeartbeat` `Classification_NoOp` handler work (§9). These are the rows that ship code in this spec.
-- **Classified Deferred** rows capture `Classification_WireThrough` fields that escalated to `Classification_Deferred` because their Kernel, Runtime, or Projection impact exceeded the single-file / no-kernel-change budget. Their Edge DTO, Kernel, Runtime, and Projection columns all read `none` because this spec explicitly drops the field (Req 2.2.6) and emits the protobuf default on the response path; the escalation note names the follow-up spec that will reintroduce the field with typed DTO and runtime semantics (Req 5.1.3–5.1.5).
+- **In scope** rows correspond 1:1 with counted `Classification_WireThrough` rows in the Surface_Audit plus the `RecordWorkerHeartbeat` `Classification_NoOp` handler work (§9). These are the rows that ship code in this spec. Rename metadata notes are not counted separately; the unsuffixed v1.62 rows carry the implementation work.
+- **Classified Deferred** rows capture surfaces that would otherwise be in-scope wire-through but escalated to `Classification_Deferred` because their Kernel, Runtime, or Projection impact exceeded the single-file / no-kernel-change budget. Their Edge DTO, Kernel, Runtime, and Projection columns all read `none` because this spec explicitly drops the field or surface (Req 2.2.6 for fields) and emits the protobuf default on response paths where applicable; the escalation note names the follow-up spec that will reintroduce the field or surface with typed DTO and runtime semantics (Req 5.1.3–5.1.5).
 - Rows classified `Classification_NoOp` with a `compile-only; no DTO/translator work` disposition (e.g. the `temporal.api.worker.v1` sub-messages) are NOT included in this matrix because no implementation row corresponds to them. The `RecordWorkerHeartbeat` RPC itself is included because the handler carries real validation, logging, and the migration described in §9.
 
 The matrix below was historically called "Impact Matrix"; it is renamed to reflect that it carries both in-scope implementation rows and deferred-escalation rows in a single reviewable table. Structural properties in §8 reference it by the name "Implementation & Escalation Matrix".
 
 Columns per Req 5.1.1.
 
-| Field Qualified Name | Edge DTO Change | Kernel Impact | Runtime Impact | Projection Impact | Implementation Notes |
+| Qualified Name | Edge DTO Change | Kernel Impact | Runtime Impact | Projection Impact | Implementation Notes |
 |---|---|---|---|---|---|
 | `WorkflowService.CountSchedules` | New `CountSchedulesRequest` / `Response` DTOs | none | existing `ScheduleStore` gains `count_schedules` method (single-file edit) | none | In scope; see §4 handler and store extension |
 | `WorkflowService.UpdateTaskQueueConfig` | New `UpdateTaskQueueConfigRequest` / `Response` DTOs + `TaskQueueConfig` | none | new `TaskQueueConfigStore` trait + in-memory backing (single new file) | none | In scope; see §5 |
@@ -1277,7 +1295,7 @@ Columns per Req 5.1.1.
 | `PollNexusTaskQueueResponse.poll_request_id` | DTO gains `poll_request_id: String` | none | `NexusTaskBroker` carries through (single-file edit) | none | In scope |
 | `PollNexusTaskQueueResponse.request` expanded | DTO sub-fields mirror proto | none | `NexusTaskBroker` carries through (single-file edit) | none | In scope |
 | `RespondNexusTaskCompletedRequest.response` expanded | DTO sub-fields mirror proto | none | `NexusTaskBroker` carries through (single-file edit) | none | In scope |
-| `RespondNexusTaskFailedRequest.error.retry_behavior` | none (explicitly dropped at edge) | none | none | none | **Classified Deferred**. Per tightened Req 2.2.6, the edge explicitly drops the field; NexusTaskBroker does not branch on it. Deferred to future `nexus-retry-policy` spec (Req 5.1.3) |
+| `RespondNexusTaskFailedRequest.error.retry_behavior` | none (explicitly dropped at edge) | none | none | none | **Classified Deferred**. Per tightened Req 2.2.6, the edge explicitly drops the field; NexusTaskBroker does not branch on it. Deferred to `nexus-retry-policy` (Req 5.1.3) |
 | `NexusEndpointSpec.description` | DTO gains `description: String` | none | `NexusEndpointRegistry` carries through (single-file edit) | none | In scope |
 | `NexusEndpointSpec.endpoint_type` new variant | DTO enum mirrors | none | `NexusEndpointRegistry::resolve` new match arm (single-file edit); unrouteable today | none | In scope |
 | `ScheduleSpec.time_zone_data` | confirm preserved in DTO | none | none | none | In scope (verification only) |
@@ -1289,7 +1307,7 @@ Columns per Req 5.1.1.
 
 1. `StartWorkflowExecutionRequest.versioning_override` → `runtime-worker-versioning`.
 2. `RespondActivityTaskFailedRequest.is_last_failure` → `runtime-activity-timeouts`.
-3. `RespondNexusTaskFailedRequest.error.retry_behavior` → future `nexus-retry-policy`.
+3. `RespondNexusTaskFailedRequest.error.retry_behavior` → `nexus-retry-policy`.
 4. `VersioningBehavior` new variants → `runtime-worker-versioning`. `NexusEndpointSpec.endpoint_type` additions follow the same pattern if their semantics introduce runtime branching; today's new variant is wire-through because `NexusEndpointRegistry::resolve` just returns `NexusResolution::Failed` for unroutable types, matching the existing unknown-endpoint path.
 
 Escalation is recorded by updating the Surface_Audit row's Classification column to `Deferred` and moving the row out of the `Wire through` group into the `Deferred` group, with the Target Spec column pointing at the named follow-up spec. In this design doc we enumerate both the originally-wire-through disposition and the escalation note so reviewers see the decision path.
@@ -1320,7 +1338,7 @@ A field is classified `Classification_WireThrough` when it carries workflow-obse
 
 ### Classification_Deferred
 
-An RPC or field is classified `Classification_Deferred` when implementing it would span more than one crate, require a new kernel transition variant, require a migration file against the visibility store, or introduce new runtime state types. The principle: if the work does not fit inside this spec's scope ("wire-compat delta + small additions"), it is deferred with a named target spec. Every `Classification_Deferred` row names the target spec in the Surface_Audit's last column. The placeholder spec names used by this spec are `worker-deployments`, `workflow-rules`, `activity-executions-first-class`, `worker-config-management`, `kernel-pause-workflow`, `worker-heartbeat-observability`, and — when an Implementation & Escalation Matrix escalation happens — `runtime-worker-versioning`, `runtime-activity-timeouts`, and future `nexus-retry-policy`. Every Classification_Deferred RPC gets an `Unimplemented` stub handler with a human-readable message naming the deferring spec (Req 6.1.1). Every Classification_Deferred field is explicitly dropped at the edge per tightened Req 2.2.6 — it is NOT carried on the DTO (neither as a typed field nor as opaque bytes), the response path emits the protobuf default, and a comment at the DTO definition site names every neighbouring Classification_Deferred field together with the spec that owns its eventual implementation. The rationale for drop-over-preserve: carrying bytes for fields that downstream code cannot yet interpret forces every DTO to grow a generic opaque-field bag, which this spec rejects as gratuitous surface; the deferring spec will re-introduce the field with the right typed shape when it lands. The distinction between `Deferred` and `Ignore` is that a deferred item has a known future owner; an ignored item has none.
+An RPC or field is classified `Classification_Deferred` when implementing it would span more than one crate, require a new kernel transition variant, require a migration file against the visibility store, or introduce new runtime state types. The principle: if the work does not fit inside this spec's scope ("wire-compat delta + small additions"), it is deferred with a named target spec. Every `Classification_Deferred` row names the target spec in the Surface_Audit's last column. The placeholder spec names used by this spec are `worker-deployments`, `workflow-rules`, `activity-executions-first-class`, `worker-config-management`, `kernel-pause-workflow`, `worker-heartbeat-observability`, and — when an Implementation & Escalation Matrix escalation happens — `runtime-worker-versioning`, `runtime-activity-timeouts`, `nexus-retry-policy`, and `nexus-multi-cluster`. Every Classification_Deferred RPC gets an `Unimplemented` stub handler with a human-readable message naming the deferring spec (Req 6.1.1). Every Classification_Deferred field is explicitly dropped at the edge per tightened Req 2.2.6 — it is NOT carried on the DTO (neither as a typed field nor as opaque bytes), the response path emits the protobuf default, and a comment at the DTO definition site names every neighbouring Classification_Deferred field together with the spec that owns its eventual implementation. The rationale for drop-over-preserve: carrying bytes for fields that downstream code cannot yet interpret forces every DTO to grow a generic opaque-field bag, which this spec rejects as gratuitous surface; the deferring spec will re-introduce the field with the right typed shape when it lands. The distinction between `Deferred` and `Ignore` is that a deferred item has a known future owner; an ignored item has none.
 
 ### Cross-reference for deferred specs
 
@@ -1334,8 +1352,9 @@ An RPC or field is classified `Classification_Deferred` when implementing it wou
 | `kernel-pause-workflow` | First-class pause/unpause-workflow as kernel transitions, distinct from v1.43 activity-level pause-by-id. |
 | `runtime-worker-versioning` | Reintroduces `StartWorkflowExecutionRequest.versioning_override` and `VersioningBehavior` with typed DTO fields and runtime scheduler branching for task routing. This spec explicitly drops both and emits protobuf defaults. |
 | `runtime-activity-timeouts` | Reintroduces `RespondActivityTaskFailedRequest.is_last_failure` with its typed DTO field and runtime retry-policy branching for terminal failures. This spec explicitly drops it and emits the protobuf default. |
-| Future `nexus-retry-policy` | Reintroduces `RespondNexusTaskFailedRequest.error.retry_behavior` with its typed DTO field and runtime `NexusTaskBroker` retry branching. This spec explicitly drops it and emits the protobuf default. |
-| Future `speculative-wft` | Speculative workflow tasks as a distinct task kind; consumes `client_discards_speculative_with_events`. |
+| `nexus-retry-policy` | Reintroduces `RespondNexusTaskFailedRequest.error.retry_behavior` with its typed DTO field and runtime `NexusTaskBroker` retry branching. This spec explicitly drops it and emits the protobuf default. |
+| `nexus-multi-cluster` | Reintroduces `NexusEndpointSpec.allowed_cluster_ids` with typed endpoint policy and cross-cluster routing semantics. This spec explicitly drops it and emits the protobuf default. |
+| `speculative-wft` | Speculative workflow tasks as a distinct task kind; consumes `client_discards_speculative_with_events`. |
 
 
 ## Correctness Properties
@@ -1356,7 +1375,7 @@ The properties below are quantified explicitly over "for all" / "for any" inputs
 
 *For any* valid rendering of the Surface_Audit table and the Implementation & Escalation Matrix in this design document, three count equivalences SHALL hold:
 
-1. The count of Surface_Audit rows with `Classification == "Wire through"` SHALL equal the count of Matrix rows whose `Implementation Notes` column starts with `In scope` and does NOT start with `In scope (no-op handler)`. This is the 1:1 correspondence between `Wire through` classifications and the in-scope wire-through implementation rows.
+1. The count of counted Surface_Audit rows with `Classification == "Wire through"` SHALL equal the count of Matrix rows whose `Implementation Notes` column starts with `In scope` and does NOT start with `In scope (no-op handler)`. This is the 1:1 correspondence between `Wire through` classifications and the in-scope wire-through implementation rows. Rename metadata notes are outside the counted Surface_Audit table and are validated through their unsuffixed v1.62 rows.
 2. The count of Surface_Audit rows with `Classification == "Deferred"` SHALL be ≥ the count of Matrix rows whose `Implementation Notes` column starts with `**Classified Deferred**`. The inequality (rather than equality) allows for pure `Classification_Deferred` RPCs and messages that never reach the Matrix because they have no in-scope Implementation Notes to record — their stub handlers are counted in the Surface_Audit only.
 3. The count of Surface_Audit rows with `Classification == "No-op"` SHALL be ≥ the count of Matrix rows whose `Implementation Notes` column starts with `In scope (no-op handler)`. Today there is exactly one such Matrix row (`RecordWorkerHeartbeat`). Surface_Audit `No-op` rows whose Disposition cell carries `compile-only; no DTO/translator work` (e.g. the `temporal.api.worker.v1` sub-messages) are excluded from the Matrix on both sides.
 
@@ -1364,7 +1383,7 @@ The properties below are quantified explicitly over "for all" / "for any" inputs
 
 ### Property 3: Every Target Spec name appears in the workspace
 
-*For any* row in the Surface_Audit whose `Target Spec` column is non-empty and not the placeholder `—`, the value SHALL be a directory name under `.kiro/specs/` in the workspace — either because the spec is already drafted, or because this spec's implementation creates a placeholder directory for it. The property is parameterised over every Target Spec name referenced by the audit: mandatory on `Classification_Deferred` rows per Req 2.3.1, and permitted on other rows as a forward pointer to follow-up work. The set in this spec: `worker-deployments`, `worker-heartbeat-observability`, `workflow-rules`, `activity-executions-first-class`, `worker-config-management`, `kernel-pause-workflow`, `runtime-worker-versioning`, `runtime-activity-timeouts`, `nexus-retry-policy`, `speculative-wft`, and `temporal-compatibility`.
+*For any* row in the Surface_Audit whose `Target Spec` column is non-empty and not the placeholder `—`, the value SHALL be a directory name under `.kiro/specs/` in the workspace — either because the spec is already drafted, or because this spec's implementation creates a placeholder directory for it. The property is parameterised over every Target Spec name referenced by the audit: mandatory on `Classification_Deferred` rows per Req 2.3.1, and permitted on other rows as a forward pointer to follow-up work. The set in this spec: `worker-deployments`, `worker-heartbeat-observability`, `workflow-rules`, `activity-executions-first-class`, `worker-config-management`, `kernel-pause-workflow`, `runtime-worker-versioning`, `runtime-activity-timeouts`, `nexus-retry-policy`, `nexus-multi-cluster`, `speculative-wft`, and `temporal-compatibility`.
 
 **Validates: Requirements 2.1, 2.1.3, 2.3.1, 8.1.2**
 
@@ -1639,7 +1658,8 @@ Additional forward pointers introduced by Implementation & Escalation Matrix esc
 
 - **`runtime-worker-versioning`** — reintroduces `StartWorkflowExecutionRequest.versioning_override` and `VersioningBehavior` with their typed DTO fields and runtime scheduler semantics, because this spec explicitly drops both on the request path and emits protobuf defaults on the response path per Req 2.2.6. Also consumes `VersioningOverride` at the runtime layer.
 - **`runtime-activity-timeouts`** — reintroduces `RespondActivityTaskFailedRequest.is_last_failure` with its typed DTO field and runtime retry-policy branching, because this spec explicitly drops it on the request path. Also covers any related activity-retry signals that require runtime branching.
-- **Future `nexus-retry-policy`** — reintroduces `RespondNexusTaskFailedRequest.error.retry_behavior` with its typed DTO field and runtime `NexusTaskBroker` retry branching, because this spec explicitly drops it on the request path.
-- **Future `speculative-wft`** — implements speculative workflow tasks as a distinct task kind, consuming `client_discards_speculative_with_events` from the DTO (this field is already wire-through preserved by this spec per Req 4.2; the future spec adds the downstream behaviour).
+- **`nexus-retry-policy`** — reintroduces `RespondNexusTaskFailedRequest.error.retry_behavior` with its typed DTO field and runtime `NexusTaskBroker` retry branching, because this spec explicitly drops it on the request path.
+- **`nexus-multi-cluster`** — reintroduces `NexusEndpointSpec.allowed_cluster_ids` with typed endpoint policy and cross-cluster routing semantics, because this spec explicitly drops it on the request path.
+- **`speculative-wft`** — implements speculative workflow tasks as a distinct task kind, consuming `client_discards_speculative_with_events` from the DTO (this field is already wire-through preserved by this spec per Req 4.2; the future spec adds the downstream behaviour).
 
 Each of these specs will remove its corresponding bracketed stub block (or unclassify its escalated Implementation & Escalation Matrix row) atomically with the feature landing, preserving the invariant that the Surface_Audit / Matrix contracts stay coherent across spec generations.

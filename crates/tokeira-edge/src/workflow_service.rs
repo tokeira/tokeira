@@ -33,9 +33,10 @@ use tokeira_runtime::{
     BufferedQueryRegistry, InMemoryBroker, NexusTaskBroker, NexusTaskToken, OverlapDecision,
     OverlapPolicy, PendingUpdateTransport, QueryResult, ResetWorkflowResult, ScheduleActionResult,
     SchedulePatch, ScheduleStore, SignalWithStartResult, StartWorkflowResult, StartedActivityTask,
-    StartedWorkflowTask, UpdateOutcome, UpdateTransportResolution, UpdateWaitPolicy,
-    VersioningRuleStore, WorkerRegistry, WorkflowExecution, WorkflowExecutionStatus,
-    compute_matching_times, decide_overlap, schedule_workflow_id,
+    StartedWorkflowTask, TaskQueueConfigEntry, TaskQueueConfigStore, UpdateOutcome,
+    UpdateTransportResolution, UpdateWaitPolicy, VersioningRuleStore, WorkerRegistry,
+    WorkflowExecution, WorkflowExecutionStatus, compute_matching_times, decide_overlap,
+    schedule_workflow_id,
 };
 use tokeira_storage::RunRepository;
 use tokeira_types::{
@@ -61,20 +62,21 @@ use crate::{
         CountWorkflowExecutionsRequest, CountWorkflowExecutionsResponse,
         DeleteWorkflowExecutionRequest, DescribeTaskQueueRequest, DescribeTaskQueueResponse,
         DescribeWorkflowExecutionRequest, ListNamespacesResponse as EdgeListNamespacesResponse,
-        ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, NamespaceDescription,
-        PollActivityTaskQueueRequest, PollActivityTaskQueueResponse, PollWorkflowTaskQueueRequest,
-        PollWorkflowTaskQueueResponse, ProtocolMessageDto, QueryResultDto, QueryWorkflowRequest,
-        QueryWorkflowResponse, RecordActivityTaskHeartbeatRequest,
-        RecordActivityTaskHeartbeatResponse, RegisterNamespaceRequest,
-        RequestCancelWorkflowExecutionRequest, RequestCancelWorkflowExecutionResponse,
-        ResetWorkflowExecutionRequest, ResetWorkflowExecutionResponse,
-        RespondActivityTaskCompletedRequest, RespondActivityTaskCompletedResponse,
-        RespondActivityTaskFailedRequest, RespondActivityTaskFailedResponse,
-        RespondWorkflowTaskCompletedRequest, RespondWorkflowTaskCompletedResponse,
-        SignalWithStartWorkflowExecutionRequest, SignalWithStartWorkflowExecutionResponse,
-        SignalWorkflowExecutionRequest, SignalWorkflowExecutionResponse,
-        StartWorkflowExecutionRequest, StartWorkflowExecutionResponse, SystemCapabilities,
-        SystemInfo, TerminateWorkflowExecutionRequest, TerminateWorkflowExecutionResponse,
+        ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, NamespaceCapabilities,
+        NamespaceDescription, PollActivityTaskQueueRequest, PollActivityTaskQueueResponse,
+        PollWorkflowTaskQueueRequest, PollWorkflowTaskQueueResponse, ProtocolMessageDto,
+        QueryResultDto, QueryWorkflowRequest, QueryWorkflowResponse,
+        RecordActivityTaskHeartbeatRequest, RecordActivityTaskHeartbeatResponse,
+        RegisterNamespaceRequest, RequestCancelWorkflowExecutionRequest,
+        RequestCancelWorkflowExecutionResponse, ResetWorkflowExecutionRequest,
+        ResetWorkflowExecutionResponse, RespondActivityTaskCompletedRequest,
+        RespondActivityTaskCompletedResponse, RespondActivityTaskFailedRequest,
+        RespondActivityTaskFailedResponse, RespondWorkflowTaskCompletedRequest,
+        RespondWorkflowTaskCompletedResponse, SignalWithStartWorkflowExecutionRequest,
+        SignalWithStartWorkflowExecutionResponse, SignalWorkflowExecutionRequest,
+        SignalWorkflowExecutionResponse, StartWorkflowExecutionRequest,
+        StartWorkflowExecutionResponse, SystemCapabilities, SystemInfo, TaskQueueConfig,
+        TerminateWorkflowExecutionRequest, TerminateWorkflowExecutionResponse,
         UpdateWorkflowExecutionRequest, UpdateWorkflowExecutionResponse,
         WorkflowExecutionDescription, WorkflowQueryDto, from_internal, to_internal,
     },
@@ -344,6 +346,7 @@ pub struct WorkflowService {
     versioning_rule_store: Arc<VersioningRuleStore>,
     worker_registry: WorkerRegistry,
     schedule_store: Arc<ScheduleStore>,
+    task_queue_config_store: Arc<dyn TaskQueueConfigStore>,
     batch_store: Arc<BatchOperationStore>,
     eager_dispatch_config: EagerDispatchConfig,
 }
@@ -436,6 +439,7 @@ impl WorkflowService {
             Arc::new(VersioningRuleStore::default()),
             WorkerRegistry::default(),
             Arc::new(ScheduleStore::default()),
+            Arc::new(tokeira_runtime::InMemoryTaskQueueConfigStore::default()),
             Arc::new(BatchOperationStore::default()),
         )
     }
@@ -474,6 +478,7 @@ impl WorkflowService {
             Arc::new(VersioningRuleStore::default()),
             WorkerRegistry::default(),
             Arc::new(ScheduleStore::default()),
+            Arc::new(tokeira_runtime::InMemoryTaskQueueConfigStore::default()),
             Arc::new(BatchOperationStore::default()),
         )
     }
@@ -512,6 +517,7 @@ impl WorkflowService {
             Arc::new(VersioningRuleStore::default()),
             WorkerRegistry::default(),
             Arc::new(ScheduleStore::default()),
+            Arc::new(tokeira_runtime::InMemoryTaskQueueConfigStore::default()),
             Arc::new(BatchOperationStore::default()),
         )
     }
@@ -535,6 +541,7 @@ impl WorkflowService {
         versioning_rule_store: Arc<VersioningRuleStore>,
         worker_registry: WorkerRegistry,
         schedule_store: Arc<ScheduleStore>,
+        task_queue_config_store: Arc<dyn TaskQueueConfigStore>,
         batch_store: Arc<BatchOperationStore>,
     ) -> Self {
         Self {
@@ -556,6 +563,7 @@ impl WorkflowService {
             versioning_rule_store,
             worker_registry,
             schedule_store,
+            task_queue_config_store,
             batch_store,
             eager_dispatch_config: EagerDispatchConfig::default(),
         }
@@ -581,8 +589,30 @@ impl WorkflowService {
         self.schedule_store.clone()
     }
 
+    pub fn task_queue_config_store(&self) -> Arc<dyn TaskQueueConfigStore> {
+        self.task_queue_config_store.clone()
+    }
+
     pub fn batch_store(&self) -> Arc<BatchOperationStore> {
         self.batch_store.clone()
+    }
+
+    pub async fn resolve_namespace_id(
+        &self,
+        namespace: &str,
+    ) -> EdgeResult<tokeira_types::NamespaceId> {
+        match self
+            .namespaces
+            .get(namespace)
+            .await
+            .map_err(EdgeError::from)?
+        {
+            Some(resolved) if !resolved.deleted => {
+                Ok(to_internal::namespace_id_for(&resolved.name))
+            }
+            Some(_) => Err(EdgeError::NamespaceDeleted(namespace.to_string())),
+            None => Err(EdgeError::NamespaceNotFound(namespace.to_string())),
+        }
     }
 
     pub async fn poll_nexus_task_queue(
@@ -1454,6 +1484,7 @@ impl WorkflowService {
             Arc::new(VersioningRuleStore::default()),
             WorkerRegistry::default(),
             Arc::new(ScheduleStore::default()),
+            Arc::new(tokeira_runtime::InMemoryTaskQueueConfigStore::default()),
             Arc::new(BatchOperationStore::default()),
         )
     }
@@ -2296,6 +2327,8 @@ impl WorkflowService {
                     sdk_metadata: false,
                     count_group_by_execution_status: true,
                     nexus: true,
+                    server_scaled_deployments: false,
+                    worker_heartbeats: true,
                 },
             })
         })
@@ -2434,6 +2467,13 @@ impl WorkflowService {
 
                 let queue =
                     queue_key_for_poll(&req.namespace, &req.task_queue, req.task_kind, None, None);
+                let namespace_id = to_internal::namespace_id_for(&req.namespace);
+                let task_queue = TaskQueueName(req.task_queue.clone());
+                let config = self
+                    .task_queue_config_store
+                    .get(&namespace_id, &task_queue)
+                    .map(task_queue_config_to_edge)
+                    .unwrap_or_default();
 
                 Ok(DescribeTaskQueueResponse {
                     pollers: self
@@ -2443,6 +2483,7 @@ impl WorkflowService {
                         .map(active_poller_to_edge)
                         .collect(),
                     backlog_count_hint: req.include_status.then_some(0),
+                    config,
                 })
             },
         )
@@ -3551,6 +3592,10 @@ fn namespace_to_description(namespace: ResolvedNamespace) -> NamespaceDescriptio
         owner_email: String::new(),
         cluster_name: "local".to_string(),
         custom_search_attribute_aliases: std::collections::BTreeMap::new(),
+        capabilities: NamespaceCapabilities {
+            worker_heartbeats: true,
+            reported_problems_search_attribute: false,
+        },
     }
 }
 
@@ -3606,6 +3651,14 @@ fn active_poller_to_edge(poller: ActivePoller) -> crate::translate::PollerInfo {
         identity: poller.identity.0,
         last_access_time: Some(poller.registered_at),
         rate_per_second: 0.0,
+    }
+}
+
+fn task_queue_config_to_edge(entry: TaskQueueConfigEntry) -> TaskQueueConfig {
+    TaskQueueConfig {
+        queue_rate_limit: entry.queue_rate_limit,
+        fairness_key_rate_limit_default: entry.fairness_key_rate_limit_default,
+        fairness_weight_overrides: entry.fairness_weight_overrides,
     }
 }
 

@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokeira_kernel::NexusResolution;
 use tokeira_proto::{
-    conversions::common::{payload_from_domain, payload_to_domain, to_proto_timestamp},
+    conversions::common::{
+        failure_to_payload, payload_from_domain, payload_to_domain, to_proto_timestamp,
+    },
     public::temporal::api::nexus::v1 as nexus_v1,
     workflowservice,
 };
@@ -83,6 +85,9 @@ pub fn poll_response_to_proto(
     Ok(workflowservice::PollNexusTaskQueueResponse {
         task_token: resp.task_token,
         request: Some(nexus_task_to_proto_request(&resp.request)?),
+        poller_group_id: String::new(),
+        poller_group_infos: Vec::new(),
+        poller_scaling_decision: None,
     })
 }
 
@@ -100,6 +105,11 @@ pub fn completed_request_to_edge(
     })
 }
 
+// v1.62-sync: reads deprecated `RespondNexusTaskFailedRequest.error` for
+// wire-compat with v0.4-era SDK Nexus handlers. v1.62 replaces `error` with
+// a structured `handler_error` shape; migration is task 4.7 (Nexus DTO
+// family additions) + task 8.1 (Nexus decode translator).
+#[allow(deprecated)]
 pub fn failed_request_to_edge(
     req: workflowservice::RespondNexusTaskFailedRequest,
 ) -> Result<RespondNexusTaskFailedRequest, NexusTranslateError> {
@@ -114,6 +124,11 @@ pub fn failed_request_to_edge(
     })
 }
 
+// v1.62-sync: writes deprecated `CancelOperationRequest.operation_id` for
+// wire-compat with v0.4-era Nexus clients. v1.62 renames to `operation_token`;
+// the code above populates both fields so new and old readers both work.
+// Migration to `operation_token`-only is task 4.7 / 8.1.
+#[allow(deprecated)]
 pub fn nexus_task_to_proto_request(
     task_request: &NexusTaskRequest,
 ) -> Result<nexus_v1::Request, NexusTranslateError> {
@@ -127,6 +142,10 @@ pub fn nexus_task_to_proto_request(
         } => Ok(nexus_v1::Request {
             header: BTreeMap::new(),
             scheduled_time: scheduled_time.map(|value| to_proto_timestamp(value).into()),
+            capabilities: Some(nexus_v1::request::Capabilities {
+                temporal_failure_responses: true,
+            }),
+            endpoint: String::new(),
             variant: Some(nexus_v1::request::Variant::StartOperation(
                 nexus_v1::StartOperationRequest {
                     service: service.clone(),
@@ -146,11 +165,16 @@ pub fn nexus_task_to_proto_request(
         } => Ok(nexus_v1::Request {
             header: BTreeMap::new(),
             scheduled_time: None,
+            capabilities: Some(nexus_v1::request::Capabilities {
+                temporal_failure_responses: true,
+            }),
+            endpoint: String::new(),
             variant: Some(nexus_v1::request::Variant::CancelOperation(
                 nexus_v1::CancelOperationRequest {
                     service: service.clone(),
                     operation: operation.clone(),
                     operation_id: operation_id.clone(),
+                    operation_token: operation_id.clone(),
                 },
             )),
         }),
@@ -170,6 +194,12 @@ pub fn proto_response_to_resolution(
     }
 }
 
+// v1.62-sync: reads deprecated `start_operation_response::Async::operation_id`
+// for wire-compat with v0.4-era Nexus clients. v1.62 renames to
+// `operation_token`; the mismatch-check above still uses the deprecated
+// field because the expected_operation_id callers supply is the v0.4 shape.
+// Migration to `operation_token` is task 4.7 / 8.1.
+#[allow(deprecated)]
 pub fn proto_start_response_to_resolution(
     response: nexus_v1::StartOperationResponse,
     expected_operation_id: &str,
@@ -196,6 +226,11 @@ pub fn proto_start_response_to_resolution(
                     error.operation_state,
                     error.failure.as_ref(),
                 )?,
+            })
+        }
+        Some(nexus_v1::start_operation_response::Variant::Failure(failure)) => {
+            Ok(NexusResolution::Failed {
+                failure: failure_to_payload(&failure),
             })
         }
         None => Err(NexusTranslateError::MissingField(
@@ -339,7 +374,8 @@ mod tests {
             prop_assert!(proto.scheduled_time.is_none());
             prop_assert_eq!(cancel.service, service);
             prop_assert_eq!(cancel.operation, operation);
-            prop_assert_eq!(cancel.operation_id, operation_id);
+            prop_assert_eq!(cancel.operation_id, operation_id.clone());
+            prop_assert_eq!(cancel.operation_token, operation_id);
         }
     }
 
@@ -360,7 +396,9 @@ mod tests {
                                 payload: Some(ProtoPayload {
                                     metadata: BTreeMap::new(),
                                     data: payload_bytes.clone(),
+                                    external_payloads: Vec::new(),
                                 }),
+                                links: Vec::new(),
                             },
                         )),
                     },
@@ -381,6 +419,7 @@ mod tests {
                             nexus_v1::start_operation_response::Async {
                                 operation_id: operation_id.clone(),
                                 links: Vec::new(),
+                                operation_token: operation_id.clone(),
                             },
                         )),
                     },
@@ -405,9 +444,12 @@ mod tests {
                 error_type: error_type.clone(),
                 failure: Some(nexus_v1::Failure {
                     message: message.clone(),
+                    stack_trace: String::new(),
                     metadata: BTreeMap::new(),
                     details: payload_bytes.clone(),
+                    cause: None,
                 }),
+                retry_behavior: 0,
             };
             match proto_handler_error_to_resolution(handler_error).expect("handler error") {
                 NexusResolution::Failed { failure } => {

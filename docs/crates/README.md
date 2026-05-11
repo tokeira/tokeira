@@ -53,7 +53,7 @@ graph TD
 | Crate | Role | Key Contents |
 |---|---|---|
 | [`tokeira-types`](types.md) | Shared domain types | `RunKey`, `RunId`, `NamespaceId`, `Payload`, `SearchAttributes`, `QueueKey`, task tokens, `RetryPolicy`, `ProjectionCursor` |
-| [`tokeira-proto`](proto.md) | Wire types and gRPC definitions | 24 upstream Temporal API packages (v1.43.0), internal proto shells, wire↔domain conversions, timestamp/duration helpers |
+| [`tokeira-proto`](proto.md) | Wire types and gRPC definitions | 28 upstream Temporal API packages (v1.62.11), internal proto shells, wire↔domain conversions, timestamp/duration helpers |
 | [`tokeira-kernel`](kernel.md) | Pure deterministic state machine | ~27 command variants, 40+ event kinds, `ActivityTaskStarted`, `BasicKernel::apply()`, reset replay |
 | [`tokeira-storage`](storage.md) | Persistence interfaces + in-memory store | `RunRepository`, `ProjectionLog`, `LeaseRepository`, OCC fencing, shard-filtered sweeps, `find_latest_run` |
 | [`tokeira-runtime`](runtime.md) | Execution orchestration | 15 features: lanes, broker, activity pump, timers, children, nexus, updates, queries, sweeper, fairness |

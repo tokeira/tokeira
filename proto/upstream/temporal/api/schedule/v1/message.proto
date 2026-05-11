@@ -1,25 +1,3 @@
-// The MIT License
-//
-// Copyright (c) 2020 Temporal Technologies Inc.  All rights reserved.
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in
-// all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-// THE SOFTWARE.
-
 // (-- api-linter: core::0203::optional=disabled
 //     aip.dev/not-precedent: field_behavior annotation not available in our gogo fork --)
 // (-- api-linter: core::0203::input-only=disabled
@@ -103,8 +81,8 @@ message Range {
 // corresponding fields of the timestamp, except for year: if year is missing,
 // that means all years match. For all fields besides year, at least one Range
 // must be present to match anything.
-// TODO: add relative-to-end-of-month
-// TODO: add nth day-of-week in month
+// Relative expressions such as "last day of the month" or "third Monday" are not currently
+// representable; callers must enumerate the concrete days they require.
 message StructuredCalendarSpec {
     // Match seconds (0-59)
     repeated Range second = 1;
@@ -189,7 +167,8 @@ message ScheduleSpec {
     // Interval-based specifications of times.
     repeated IntervalSpec interval = 2;
     // Any timestamps matching any of exclude_* will be skipped.
-    repeated CalendarSpec exclude_calendar = 3 [deprecated = true]; // use exclude_structured_calendar
+    // Deprecated. Use exclude_structured_calendar.
+    repeated CalendarSpec exclude_calendar = 3 [deprecated = true];
     repeated StructuredCalendarSpec exclude_structured_calendar = 9;
     // If start_time is set, any timestamps before start_time will be skipped.
     // (Together, start_time and end_time make an inclusive interval.)
@@ -299,6 +278,10 @@ message ScheduleState {
 message TriggerImmediatelyRequest {
     // If set, override overlap policy for this one request.
     temporal.api.enums.v1.ScheduleOverlapPolicy overlap_policy = 1;
+    
+    // Timestamp used for the identity of the target workflow.
+    // If not set the default value is the current time.
+    google.protobuf.Timestamp scheduled_time = 2;
 }
 
 message BackfillRequest {
@@ -364,6 +347,7 @@ message ScheduleInfo {
     google.protobuf.Timestamp create_time = 6;
     google.protobuf.Timestamp update_time = 7;
 
+    // Deprecated.
     string invalid_schedule_error = 8 [deprecated = true];
 }
 

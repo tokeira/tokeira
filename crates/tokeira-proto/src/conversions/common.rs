@@ -23,6 +23,7 @@ pub fn payload_from_domain(value: &DomainPayload) -> common::Payload {
             .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
             .collect(),
         data: value.data.clone(),
+        external_payloads: Vec::new(),
     }
 }
 
@@ -131,7 +132,11 @@ fn search_attr_value_to_payload(value: &SearchAttrValue) -> common::Payload {
     let data = serde_json::to_vec(value).unwrap_or_default();
     let mut metadata = std::collections::BTreeMap::new();
     metadata.insert("encoding".to_string(), b"json/plain".to_vec());
-    common::Payload { metadata, data }
+    common::Payload {
+        metadata,
+        data,
+        external_payloads: Vec::new(),
+    }
 }
 
 fn search_attr_payload_to_domain(

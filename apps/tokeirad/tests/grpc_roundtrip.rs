@@ -473,6 +473,7 @@ async fn grpc_roundtrip_signal_then_query_returns_latest_buffered_result() -> Re
             result_type: tokeira_proto::enums::QueryResultType::Answered as i32,
             answer: Some(payloads("5")),
             error_message: String::new(),
+            failure: None,
         },
     );
 
@@ -973,6 +974,7 @@ fn payloads(value: &str) -> Payloads {
         payloads: vec![tokeira_proto::common::Payload {
             data: value.as_bytes().to_vec(),
             metadata: Default::default(),
+            external_payloads: Vec::new(),
         }],
     }
 }

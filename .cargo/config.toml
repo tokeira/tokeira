@@ -13,3 +13,14 @@ test-lint = [
     "--all-targets",
     "--tests",
 ]
+
+[profile.dev]
+# Reduce debug info to line-tables only — still gives backtraces, cuts link time ~40%
+debug = "line-tables-only"
+
+# Parallel codegen (faster compile, slightly slower runtime; fine for dev)
+codegen-units = 256
+
+[target.aarch64-apple-darwin]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]

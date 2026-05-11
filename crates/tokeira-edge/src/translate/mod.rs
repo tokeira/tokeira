@@ -142,6 +142,8 @@ pub struct PollWorkflowTaskQueueResponse {
 pub struct RespondWorkflowTaskCompletedRequest {
     pub task_token: Vec<u8>,
     pub identity: String,
+    /// Decoded at the edge; downstream behaviour belongs to the `speculative-wft` spec.
+    pub client_discards_speculative_with_events: bool,
     pub commands: Vec<WorkflowCommand>,
     pub return_new_workflow_task: bool,
     pub force_create_new_workflow_task: bool,
@@ -253,12 +255,20 @@ pub struct SystemCapabilities {
     pub sdk_metadata: bool,
     pub count_group_by_execution_status: bool,
     pub nexus: bool,
+    pub server_scaled_deployments: bool,
+    pub worker_heartbeats: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SystemInfo {
     pub server_version: String,
     pub capabilities: SystemCapabilities,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamespaceCapabilities {
+    pub worker_heartbeats: bool,
+    pub reported_problems_search_attribute: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -272,6 +282,7 @@ pub struct NamespaceDescription {
     pub owner_email: String,
     pub cluster_name: String,
     pub custom_search_attribute_aliases: BTreeMap<String, String>,
+    pub capabilities: NamespaceCapabilities,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -531,4 +542,168 @@ pub struct PollerInfo {
 pub struct DescribeTaskQueueResponse {
     pub pollers: Vec<PollerInfo>,
     pub backlog_count_hint: Option<i64>,
+    pub config: TaskQueueConfig,
 }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CountSchedulesRequest {
+    pub namespace: String,
+    pub query: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CountSchedulesResponse {
+    pub count: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TaskQueueConfig {
+    pub queue_rate_limit: Option<f32>,
+    pub fairness_key_rate_limit_default: Option<f32>,
+    pub fairness_weight_overrides: BTreeMap<String, f32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateTaskQueueConfigRequest {
+    pub namespace: String,
+    pub task_queue: String,
+    pub config: TaskQueueConfig,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateTaskQueueConfigResponse {
+    pub applied: TaskQueueConfig,
+}
+
+// ── Activity management DTOs (v1.62) ──
+//
+// v1.62 renamed the four activity-management RPCs from `*ById` to the
+// unsuffixed form (`UpdateActivityOptions`, `PauseActivity`,
+// `UnpauseActivity`, `ResetActivity`) and introduced an `activity` oneof
+// selector that admits id-based, type-based, or match-all targeting. The
+// Edge DTOs below mirror the v1.62 request shapes; the handler wiring in
+// `workflow_service.rs` is owned by task 9.2 of `temporal-api-v1.62-sync`.
+
+/// Target selector for the v1.62 activity-management `activity` oneof.
+///
+/// Each request type chooses exactly one variant. `MatchAll` is available
+/// on Update and Reset; `UnpauseAll` is the Unpause-specific equivalent;
+/// Pause does not admit a match-all variant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActivityTarget {
+    /// Target the activity with this exact id.
+    Id(String),
+    /// Target every running activity of this type.
+    Type(String),
+    /// Target every running activity on the workflow execution.
+    ///
+    /// Only valid for Update (`match_all`), Unpause (`unpause_all`), and
+    /// Reset (`match_all`). Rejected for Pause.
+    MatchAll,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateActivityOptionsRequest {
+    pub namespace: String,
+    pub workflow_id: String,
+    pub run_id: Option<String>,
+    pub identity: String,
+    /// Activity options to apply. Partial updates are controlled by
+    /// `update_mask`; absent fields are left unchanged.
+    pub activity_options: Option<ActivityOptions>,
+    /// Field mask selecting which `activity_options` fields to apply.
+    /// Represented as a `Vec<String>` of dotted field paths rather than the
+    /// raw `google.protobuf.FieldMask`; translator normalises on ingress.
+    pub update_mask: Vec<String>,
+    pub target: ActivityTarget,
+    /// If set, activity options are restored to the defaults captured on
+    /// the first SCHEDULE event. Exclusive with every other option; the
+    /// runtime wiring (task 9.2) rejects the request otherwise.
+    pub restore_original: bool,
+    /// v1.62 addition — overrides the activity type if the request is
+    /// targeting an activity that has not yet been started. Absent
+    /// resolves to the type on the SCHEDULE event.
+    pub activity_type: Option<ActivityType>,
+}
+
+/// Edge DTO for `temporal.api.activity.v1.ActivityOptions`.
+///
+/// Mirrors the v1.62 shape field-for-field; the runtime wiring and
+/// translator coverage for every field lands in task 9.2.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ActivityOptions {
+    pub task_queue: Option<String>,
+    pub schedule_to_close_timeout: Option<time::Duration>,
+    pub schedule_to_start_timeout: Option<time::Duration>,
+    pub start_to_close_timeout: Option<time::Duration>,
+    pub heartbeat_timeout: Option<time::Duration>,
+    pub retry_policy: Option<RetryPolicy>,
+}
+
+/// Edge DTO for `temporal.api.common.v1.ActivityType`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ActivityType {
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateActivityOptionsResponse {
+    pub activity_options: Option<ActivityOptions>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PauseActivityRequest {
+    pub namespace: String,
+    pub workflow_id: String,
+    pub run_id: Option<String>,
+    /// v1.62 addition — records the identity of the client issuing the
+    /// pause. Carried through to the runtime pause record for audit.
+    pub identity: String,
+    pub target: ActivityTarget,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PauseActivityResponse;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnpauseActivityRequest {
+    pub namespace: String,
+    pub workflow_id: String,
+    pub run_id: Option<String>,
+    pub identity: String,
+    pub target: ActivityTarget,
+    /// Also resets the number of attempts on resume.
+    pub reset_attempts: bool,
+    /// v1.62 addition — also clears heartbeat details on resume so the
+    /// activity restarts with a fresh heartbeat state.
+    pub reset_heartbeat: bool,
+    /// Schedules the resumed activity within a random offset of this
+    /// duration; absent resolves to "resume immediately".
+    pub jitter: Option<time::Duration>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnpauseActivityResponse;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResetActivityRequest {
+    pub namespace: String,
+    pub workflow_id: String,
+    pub run_id: Option<String>,
+    pub identity: String,
+    pub target: ActivityTarget,
+    pub reset_heartbeat: bool,
+    /// v1.62 addition — if the activity is paused when reset lands, keep
+    /// it paused after the reset. The default (`false`) resumes on reset.
+    pub keep_paused: bool,
+    /// Randomises the resumed activity within this offset; applies only
+    /// when `keep_paused` is false.
+    pub jitter: Option<time::Duration>,
+    /// If set, activity options are restored to the defaults captured on
+    /// the first SCHEDULE event.
+    pub restore_original_options: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResetActivityResponse;

@@ -1,25 +1,3 @@
-// The MIT License
-//
-// Copyright (c) 2020 Temporal Technologies Inc.  All rights reserved.
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in
-// all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-// THE SOFTWARE.
-
 syntax = "proto3";
 
 package temporal.api.workflowservice.v1;
@@ -41,11 +19,14 @@ import "temporal/api/enums/v1/reset.proto";
 import "temporal/api/enums/v1/task_queue.proto";
 import "temporal/api/enums/v1/deployment.proto";
 import "temporal/api/enums/v1/update.proto";
+import "temporal/api/enums/v1/activity.proto";
+import "temporal/api/enums/v1/nexus.proto";
 import "temporal/api/activity/v1/message.proto";
 import "temporal/api/common/v1/message.proto";
 import "temporal/api/history/v1/message.proto";
 import "temporal/api/workflow/v1/message.proto";
 import "temporal/api/command/v1/message.proto";
+import "temporal/api/compute/v1/config.proto";
 import "temporal/api/deployment/v1/message.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/filter/v1/message.proto";
@@ -53,6 +34,8 @@ import "temporal/api/protocol/v1/message.proto";
 import "temporal/api/namespace/v1/message.proto";
 import "temporal/api/query/v1/message.proto";
 import "temporal/api/replication/v1/message.proto";
+import "temporal/api/rules/v1/message.proto";
+import "temporal/api/sdk/v1/worker_config.proto";
 import "temporal/api/schedule/v1/message.proto";
 import "temporal/api/taskqueue/v1/message.proto";
 import "temporal/api/update/v1/message.proto";
@@ -61,6 +44,7 @@ import "temporal/api/batch/v1/message.proto";
 import "temporal/api/sdk/v1/task_complete_metadata.proto";
 import "temporal/api/sdk/v1/user_metadata.proto";
 import "temporal/api/nexus/v1/message.proto";
+import "temporal/api/worker/v1/message.proto";
 
 import "google/protobuf/duration.proto";
 import "google/protobuf/field_mask.proto";
@@ -206,6 +190,17 @@ message StartWorkflowExecutionRequest {
     // If set, takes precedence over the Versioning Behavior sent by the SDK on Workflow Task completion.
     // To unset the override after the workflow is running, use UpdateWorkflowExecutionOptions.
     temporal.api.workflow.v1.VersioningOverride versioning_override = 25;
+    // Defines actions to be done to the existing running workflow when the conflict policy
+    // WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING is used. If not set (ie., nil value) or set to a
+    // empty object (ie., all options with default value), it won't do anything to the existing
+    // running workflow. If set, it will add a history event to the running workflow.
+    temporal.api.workflow.v1.OnConflictOptions on_conflict_options = 26;
+    // Priority metadata
+    temporal.api.common.v1.Priority priority = 27;
+    // Deployment Options of the worker who will process the eager task. Passed when `request_eager_execution=true`.
+    temporal.api.deployment.v1.WorkerDeploymentOptions eager_worker_deployment_options = 28;
+    // Time-skipping configuration. If not set, time skipping is disabled.
+    temporal.api.workflow.v1.TimeSkippingConfig time_skipping_config = 29;
 }
 
 message StartWorkflowExecutionResponse {
@@ -213,10 +208,15 @@ message StartWorkflowExecutionResponse {
     string run_id = 1;
     // If true, a new workflow was started.
     bool started = 3;
+    // Current execution status of the workflow. Typically remains WORKFLOW_EXECUTION_STATUS_RUNNING
+    // unless a de-dupe occurs or in specific scenarios handled within the ExecuteMultiOperation (refer to its docs).
+    temporal.api.enums.v1.WorkflowExecutionStatus status = 5;
     // When `request_eager_execution` is set on the `StartWorkflowExecutionRequest`, the server - if supported - will
     // return the first workflow task to be eagerly executed.
     // The caller is expected to have a worker available to process the task.
     PollWorkflowTaskQueueResponse eager_workflow_task = 2;
+    // Link to the workflow event.
+    temporal.api.common.v1.Link link = 4;
 }
 
 message GetWorkflowExecutionHistoryRequest {
@@ -261,15 +261,35 @@ message GetWorkflowExecutionHistoryReverseResponse {
 message PollWorkflowTaskQueueRequest {
     string namespace = 1;
     temporal.api.taskqueue.v1.TaskQueue task_queue = 2;
+    // Unless this is the first poll, the client must pass one of the poller group IDs received in
+    // `poller_group_infos` of the last the PollWorkflowTaskQueueResponse according to the
+    // instructions. If not set, the poll is routed randomly which can cause it being blocked
+    // without receiving a task while the queue actually has tasks in another server location.
+    string poller_group_id = 10;
     // The identity of the worker/client who is polling this task queue
     string identity = 3;
-    // DEPRECATED since 1.21 - use `worker_version_capabilities` instead.
+    // A unique key for this worker instance, used for tracking worker lifecycle.
+    // This is guaranteed to be unique, whereas identity is not guaranteed to be unique.
+    string worker_instance_key = 8;
+
+    // A dedicated per-worker Nexus task queue on which the server sends control
+    // tasks (e.g. activity cancellation) to this specific worker instance.
+    string worker_control_task_queue = 9;
+
+    // Deprecated. Use deployment_options instead.
     // Each worker process should provide an ID unique to the specific set of code it is running
     // "checksum" in this field name isn't very accurate, it should be though of as an id.
-    string binary_checksum = 4;
+    string binary_checksum = 4 [deprecated = true];
+    // Deprecated. Use deployment_options instead.
     // Information about this worker's build identifier and if it is choosing to use the versioning
     // feature. See the `WorkerVersionCapabilities` docstring for more.
-    temporal.api.common.v1.WorkerVersionCapabilities worker_version_capabilities = 5;
+    temporal.api.common.v1.WorkerVersionCapabilities worker_version_capabilities = 5 [deprecated = true];
+    // Worker deployment options that user has set in the worker.
+    temporal.api.deployment.v1.WorkerDeploymentOptions deployment_options = 6;
+
+    // Removed in 1.55.0; was temporal.api.worker.v1.WorkerHeartbeat worker_heartbeat
+    reserved 7;
+    reserved "worker_heartbeat";
 }
 
 message PollWorkflowTaskQueueResponse {
@@ -322,6 +342,18 @@ message PollWorkflowTaskQueueResponse {
     map<string, temporal.api.query.v1.WorkflowQuery> queries = 14;
     // Protocol messages piggybacking on a WFT as a transport
     repeated temporal.api.protocol.v1.Message messages = 15;
+    // Server-advised information the SDK may use to adjust its poller count.
+    temporal.api.taskqueue.v1.PollerScalingDecision poller_scaling_decision = 16;
+    // This poller group ID identifies the owner of the workflow task awaiting for query response.
+    // Corresponding RespondQueryTaskCompleted should pass this value for proper routing.
+    string poller_group_id = 17;
+    // The weighted list of poller groups IDs that client should use for future polls to this task
+    // queue. Client is expected to:
+    //   1. Maintain minimum number of pollers no less than the number of groups.
+    //   2. Try to assign the next poll to a group without any pending polls,
+    //   3. If every group has some pending polls, assign the next poll to a group randomly
+    //     according to the weights.
+    repeated temporal.api.taskqueue.v1.PollerGroupInfo poller_group_infos = 18;
 }
 
 message RespondWorkflowTaskCompletedRequest {
@@ -342,16 +374,18 @@ message RespondWorkflowTaskCompletedRequest {
     // something useful, but cannot complete it within the workflow task timeout. Local activities
     // which run for longer than the task timeout being the prime example.
     bool force_create_new_workflow_task = 6;
-    // DEPRECATED since 1.21 - use `worker_version_stamp` instead.
+    // Deprecated. Use `deployment_options` instead.
     // Worker process' unique binary id
-    string binary_checksum = 7;
+    string binary_checksum = 7 [deprecated = true];
     // Responses to the `queries` field in the task being responded to
     map<string, temporal.api.query.v1.WorkflowQueryResult> query_results = 8;
     string namespace = 9;
+    // Resource ID for routing. Contains the workflow ID from the original task.
+    string resource_id = 18;
     // Version info of the worker who processed this task. This message's `build_id` field should
     // always be set by SDKs. Workers opting into versioning will also set the `use_versioning`
     // field to true. See message docstrings for more.
-    // Deprecated. Use `deployment` and `versioning_behavior` instead.
+    // Deprecated. Use `deployment_options` and `versioning_behavior` instead.
     temporal.api.common.v1.WorkerVersionStamp worker_version_stamp = 10 [deprecated = true];
     // Protocol messages piggybacking on a WFT as a transport
     repeated temporal.api.protocol.v1.Message messages = 11;
@@ -364,10 +398,21 @@ message RespondWorkflowTaskCompletedRequest {
     Capabilities capabilities = 14;
     // Deployment info of the worker that completed this task. Must be present if user has set
     // `WorkerDeploymentOptions` regardless of versioning being enabled or not.
-    temporal.api.deployment.v1.Deployment deployment = 15;
+    // Deprecated. Replaced with `deployment_options`.
+    temporal.api.deployment.v1.Deployment deployment = 15 [deprecated = true];
     // Versioning behavior of this workflow execution as set on the worker that completed this task.
     // UNSPECIFIED means versioning is not enabled in the worker.
     temporal.api.enums.v1.VersioningBehavior versioning_behavior = 16;
+    // Worker deployment options that user has set in the worker.
+    temporal.api.deployment.v1.WorkerDeploymentOptions deployment_options = 17;
+
+    // A unique key for this worker instance, used for tracking worker lifecycle.
+    // This is guaranteed to be unique, whereas identity is not guaranteed to be unique.
+    string worker_instance_key = 19;
+
+    // A dedicated per-worker Nexus task queue on which the server sends control
+    // tasks (e.g. activity cancellation) to this specific worker instance.
+    string worker_control_task_queue = 20;
 
     // SDK capability details.
     message Capabilities {
@@ -402,20 +447,25 @@ message RespondWorkflowTaskFailedRequest {
     temporal.api.failure.v1.Failure failure = 3;
     // The identity of the worker/client
     string identity = 4;
-    // DEPRECATED since 1.21 - use `worker_version_stamp` instead.
+    // Deprecated. Use `deployment_options` instead.
     // Worker process' unique binary id
-    string binary_checksum = 5;
+    string binary_checksum = 5 [deprecated = true];
     string namespace = 6;
+    // Resource ID for routing. Contains the workflow ID from the original task.
+    string resource_id = 11;
     // Protocol messages piggybacking on a WFT as a transport
     repeated temporal.api.protocol.v1.Message messages = 7;
     // Version info of the worker who processed this task. This message's `build_id` field should
     // always be set by SDKs. Workers opting into versioning will also set the `use_versioning`
     // field to true. See message docstrings for more.
-    // Deprecated. Use `deployment` instead.
+    // Deprecated. Use `deployment_options` instead.
     temporal.api.common.v1.WorkerVersionStamp worker_version = 8 [deprecated = true];
     // Deployment info of the worker that completed this task. Must be present if user has set
     // `WorkerDeploymentOptions` regardless of versioning being enabled or not.
-    temporal.api.deployment.v1.Deployment deployment = 9;
+    // Deprecated. Replaced with `deployment_options`.
+    temporal.api.deployment.v1.Deployment deployment = 9 [deprecated = true];
+    // Worker deployment options that user has set in the worker.
+    temporal.api.deployment.v1.WorkerDeploymentOptions deployment_options = 10;
 }
 
 message RespondWorkflowTaskFailedResponse {
@@ -424,27 +474,50 @@ message RespondWorkflowTaskFailedResponse {
 message PollActivityTaskQueueRequest {
     string namespace = 1;
     temporal.api.taskqueue.v1.TaskQueue task_queue = 2;
+    // Unless this is the first poll, the client must pass one of the poller group IDs received in
+    // `poller_group_infos` of the last the PollActivityTaskQueueResponse according to the
+    // instructions. If not set, the poll is routed randomly which can cause it being blocked
+    // without receiving a task while the queue actually has tasks in another server location.
+    string poller_group_id = 10;
     // The identity of the worker/client
     string identity = 3;
+    // A unique key for this worker instance, used for tracking worker lifecycle.
+    // This is guaranteed to be unique, whereas identity is not guaranteed to be unique.
+    string worker_instance_key = 8;
+
+    // A dedicated per-worker Nexus task queue on which the server sends control
+    // tasks (e.g. activity cancellation) to this specific worker instance.
+    string worker_control_task_queue = 9;
+
     temporal.api.taskqueue.v1.TaskQueueMetadata task_queue_metadata = 4;
     // Information about this worker's build identifier and if it is choosing to use the versioning
     // feature. See the `WorkerVersionCapabilities` docstring for more.
-    temporal.api.common.v1.WorkerVersionCapabilities worker_version_capabilities = 5;
+    // Deprecated. Replaced by deployment_options.
+    temporal.api.common.v1.WorkerVersionCapabilities worker_version_capabilities = 5 [deprecated = true];
+    // Worker deployment options that user has set in the worker.
+    temporal.api.deployment.v1.WorkerDeploymentOptions deployment_options = 6;
+
+    // Removed in 1.55.0; was temporal.api.worker.v1.WorkerHeartbeat worker_heartbeat
+    reserved 7;
+    reserved "worker_heartbeat";
 }
 
 message PollActivityTaskQueueResponse {
     // A unique identifier for this task
     bytes task_token = 1;
-    // The namespace the workflow which requested this activity lives in
+    // The namespace of the activity. If this is a workflow activity then this is the namespace of
+    // the workflow also. If this is a standalone activity then the name of this field is
+    // misleading, but retained for compatibility with workflow activities.
     string workflow_namespace = 2;
-    // Type of the requesting workflow
+    // Type of the requesting workflow (if this is a workflow activity).
     temporal.api.common.v1.WorkflowType workflow_type = 3;
-    // Execution info of the requesting workflow
+    // Execution info of the requesting workflow (if this is a workflow activity)
     temporal.api.common.v1.WorkflowExecution workflow_execution = 4;
     temporal.api.common.v1.ActivityType activity_type = 5;
     // The autogenerated or user specified identifier of this activity. Can be used to complete the
     // activity via `RespondActivityTaskCompletedById`. May be re-used as long as the last usage
     // has resolved, but unique IDs for every activity invocation is a good idea.
+    // Note that only a workflow activity ID may be autogenerated.
     string activity_id = 6;
     // Headers specified by the scheduling workflow. Commonly used to propagate contextual info
     // from the workflow to its activities. For example, tracing contexts.
@@ -478,6 +551,19 @@ message PollActivityTaskQueueResponse {
     // (or not) during activity scheduling. The service can override the provided one if some
     // values are not specified or exceed configured system limits.
     temporal.api.common.v1.RetryPolicy retry_policy = 17;
+    // Server-advised information the SDK may use to adjust its poller count.
+    temporal.api.taskqueue.v1.PollerScalingDecision poller_scaling_decision = 18;
+    // Priority metadata
+    temporal.api.common.v1.Priority priority = 19;
+    // The run ID of the activity execution, only set for standalone activities.
+    string activity_run_id = 20;
+    // The weighted list of poller groups IDs that client should use for future polls to this task
+    // queue. Client is expected to:
+    //   1. Maintain minimum number of pollers no less than the number of groups.
+    //   2. Try to assign the next poll to a group without any pending polls,
+    //   3. If every group has some pending polls, assign the next poll to a group randomly
+    //     according to the weights.
+    repeated temporal.api.taskqueue.v1.PollerGroupInfo poller_group_infos = 21;
 }
 
 message RecordActivityTaskHeartbeatRequest {
@@ -488,6 +574,8 @@ message RecordActivityTaskHeartbeatRequest {
     // The identity of the worker/client
     string identity = 3;
     string namespace = 4;
+    // Resource ID for routing. Contains the workflow ID or activity ID for standalone activities.
+    string resource_id = 5;
 }
 
 message RecordActivityTaskHeartbeatResponse {
@@ -497,14 +585,19 @@ message RecordActivityTaskHeartbeatResponse {
 
     // Will be set to true if the activity is paused.
     bool activity_paused = 2;
+
+    // Will be set to true if the activity was reset.
+    // Applies only to the current run.
+    bool activity_reset = 3;
 }
 
 message RecordActivityTaskHeartbeatByIdRequest {
     // Namespace of the workflow which scheduled this activity
     string namespace = 1;
-    // Id of the workflow which scheduled this activity
+    // Id of the workflow which scheduled this activity, leave empty to target a standalone activity
     string workflow_id = 2;
-    // Run Id of the workflow which scheduled this activity
+    // For a workflow activity - the run ID of the workflow which scheduled this activity.
+    // For a standalone activity - the run ID of the activity.
     string run_id = 3;
     // Id of the activity we're heartbeating
     string activity_id = 4;
@@ -512,12 +605,21 @@ message RecordActivityTaskHeartbeatByIdRequest {
     temporal.api.common.v1.Payloads details = 5;
     // The identity of the worker/client
     string identity = 6;
+    // Resource ID for routing. Contains "workflow:workflow_id" or "activity:activity_id" for standalone activities.
+    string resource_id = 7;
 }
 
 message RecordActivityTaskHeartbeatByIdResponse {
     // Will be set to true if the activity has been asked to cancel itself. The SDK should then
     // notify the activity of cancellation if it is still running.
     bool cancel_requested = 1;
+
+    // Will be set to true if the activity is paused.
+    bool activity_paused = 2;
+
+    // Will be set to true if the activity was reset.
+    // Applies only to the current run.
+    bool activity_reset = 3;
 }
 
 message RespondActivityTaskCompletedRequest {
@@ -528,14 +630,19 @@ message RespondActivityTaskCompletedRequest {
     // The identity of the worker/client
     string identity = 3;
     string namespace = 4;
+    // Resource ID for routing. Contains the workflow ID or activity ID for standalone activities.
+    string resource_id = 8;
     // Version info of the worker who processed this task. This message's `build_id` field should
     // always be set by SDKs. Workers opting into versioning will also set the `use_versioning`
     // field to true. See message docstrings for more.
-    // Deprecated. Use `deployment` instead.
+    // Deprecated. Use `deployment_options` instead.
     temporal.api.common.v1.WorkerVersionStamp worker_version = 5 [deprecated = true];
     // Deployment info of the worker that completed this task. Must be present if user has set
     // `WorkerDeploymentOptions` regardless of versioning being enabled or not.
-    temporal.api.deployment.v1.Deployment deployment = 6;
+    // Deprecated. Replaced with `deployment_options`.
+    temporal.api.deployment.v1.Deployment deployment = 6 [deprecated = true];
+    // Worker deployment options that user has set in the worker.
+    temporal.api.deployment.v1.WorkerDeploymentOptions deployment_options = 7;
 }
 
 message RespondActivityTaskCompletedResponse {
@@ -544,9 +651,10 @@ message RespondActivityTaskCompletedResponse {
 message RespondActivityTaskCompletedByIdRequest {
     // Namespace of the workflow which scheduled this activity
     string namespace = 1;
-    // Id of the workflow which scheduled this activity
+    // Id of the workflow which scheduled this activity, leave empty to target a standalone activity
     string workflow_id = 2;
-    // Run Id of the workflow which scheduled this activity
+    // For a workflow activity - the run ID of the workflow which scheduled this activity.
+    // For a standalone activity - the run ID of the activity.
     string run_id = 3;
     // Id of the activity to complete
     string activity_id = 4;
@@ -554,6 +662,8 @@ message RespondActivityTaskCompletedByIdRequest {
     temporal.api.common.v1.Payloads result = 5;
     // The identity of the worker/client
     string identity = 6;
+    // Resource ID for routing. Contains "workflow:workflow_id" or "activity:activity_id" for standalone activities.
+    string resource_id = 7;
 }
 
 message RespondActivityTaskCompletedByIdResponse {
@@ -567,16 +677,21 @@ message RespondActivityTaskFailedRequest {
     // The identity of the worker/client
     string identity = 3;
     string namespace = 4;
+    // Resource ID for routing. Contains the workflow ID or activity ID for standalone activities.
+    string resource_id = 9;
     // Additional details to be stored as last activity heartbeat
     temporal.api.common.v1.Payloads last_heartbeat_details = 5;
     // Version info of the worker who processed this task. This message's `build_id` field should
     // always be set by SDKs. Workers opting into versioning will also set the `use_versioning`
     // field to true. See message docstrings for more.
-    // Deprecated. Use `deployment` instead.
+    // Deprecated. Use `deployment_options` instead.
     temporal.api.common.v1.WorkerVersionStamp worker_version = 6 [deprecated = true];
     // Deployment info of the worker that completed this task. Must be present if user has set
     // `WorkerDeploymentOptions` regardless of versioning being enabled or not.
-    temporal.api.deployment.v1.Deployment deployment = 7;
+    // Deprecated. Replaced with `deployment_options`.
+    temporal.api.deployment.v1.Deployment deployment = 7 [deprecated = true];
+    // Worker deployment options that user has set in the worker.
+    temporal.api.deployment.v1.WorkerDeploymentOptions deployment_options = 8;
 }
 
 message RespondActivityTaskFailedResponse {
@@ -588,9 +703,10 @@ message RespondActivityTaskFailedResponse {
 message RespondActivityTaskFailedByIdRequest {
     // Namespace of the workflow which scheduled this activity
     string namespace = 1;
-    // Id of the workflow which scheduled this activity
+    // Id of the workflow which scheduled this activity, leave empty to target a standalone activity
     string workflow_id = 2;
-    // Run Id of the workflow which scheduled this activity
+    // For a workflow activity - the run ID of the workflow which scheduled this activity.
+    // For a standalone activity - the run ID of the activity.
     string run_id = 3;
     // Id of the activity to fail
     string activity_id = 4;
@@ -600,6 +716,8 @@ message RespondActivityTaskFailedByIdRequest {
     string identity = 6;
     // Additional details to be stored as last activity heartbeat
     temporal.api.common.v1.Payloads last_heartbeat_details = 7;
+    // Resource ID for routing. Contains "workflow:workflow_id" or "activity:activity_id" for standalone activities.
+    string resource_id = 8;
 }
 
 message RespondActivityTaskFailedByIdResponse {
@@ -616,14 +734,19 @@ message RespondActivityTaskCanceledRequest {
     // The identity of the worker/client
     string identity = 3;
     string namespace = 4;
+    // Resource ID for routing. Contains the workflow ID or activity ID for standalone activities.
+    string resource_id = 8;
     // Version info of the worker who processed this task. This message's `build_id` field should
     // always be set by SDKs. Workers opting into versioning will also set the `use_versioning`
     // field to true. See message docstrings for more.
-    // Deprecated. Use `deployment` instead.
+    // Deprecated. Use `deployment_options` instead.
     temporal.api.common.v1.WorkerVersionStamp worker_version = 5 [deprecated = true];
     // Deployment info of the worker that completed this task. Must be present if user has set
     // `WorkerDeploymentOptions` regardless of versioning being enabled or not.
-    temporal.api.deployment.v1.Deployment deployment = 6;
+    // Deprecated. Replaced with `deployment_options`.
+    temporal.api.deployment.v1.Deployment deployment = 6 [deprecated = true];
+    // Worker deployment options that user has set in the worker.
+    temporal.api.deployment.v1.WorkerDeploymentOptions deployment_options = 7;
 }
 
 message RespondActivityTaskCanceledResponse {
@@ -632,9 +755,10 @@ message RespondActivityTaskCanceledResponse {
 message RespondActivityTaskCanceledByIdRequest {
     // Namespace of the workflow which scheduled this activity
     string namespace = 1;
-    // Id of the workflow which scheduled this activity
+    // Id of the workflow which scheduled this activity, leave empty to target a standalone activity
     string workflow_id = 2;
-    // Run Id of the workflow which scheduled this activity
+    // For a workflow activity - the run ID of the workflow which scheduled this activity.
+    // For a standalone activity - the run ID of the activity.
     string run_id = 3;
     // Id of the activity to confirm is cancelled
     string activity_id = 4;
@@ -642,6 +766,10 @@ message RespondActivityTaskCanceledByIdRequest {
     temporal.api.common.v1.Payloads details = 5;
     // The identity of the worker/client
     string identity = 6;
+    // Worker deployment options that user has set in the worker.
+    temporal.api.deployment.v1.WorkerDeploymentOptions deployment_options = 7;
+    // Resource ID for routing. Contains "workflow:workflow_id" or "activity:activity_id" for standalone activities.
+    string resource_id = 8;
 }
 
 message RespondActivityTaskCanceledByIdResponse {
@@ -667,6 +795,9 @@ message RequestCancelWorkflowExecutionRequest {
 message RequestCancelWorkflowExecutionResponse {
 }
 
+// Keep the parameters in sync with:
+//   - temporal.api.batch.v1.BatchOperationSignal.
+//   - temporal.api.workflow.v1.PostResetOperation.SignalWorkflow.
 message SignalWorkflowExecutionRequest {
     string namespace = 1;
     temporal.api.common.v1.WorkflowExecution workflow_execution = 2;
@@ -678,8 +809,8 @@ message SignalWorkflowExecutionRequest {
     string identity = 5;
     // Used to de-dupe sent signals
     string request_id = 6;
-    // Deprecated
-    string control = 7;
+    // Deprecated.
+    string control = 7 [deprecated = true];
     // Headers that are passed with the signal to the processing workflow.
     // These can include things like auth or tracing tokens.
     temporal.api.common.v1.Header header = 8;
@@ -690,6 +821,10 @@ message SignalWorkflowExecutionRequest {
 }
 
 message SignalWorkflowExecutionResponse {
+    // Link to be associated with the WorkflowExecutionSignaled event.
+    // Added on the response to propagate the backlink.
+    // Available from Temporal server 1.31 and up.
+    temporal.api.common.v1.Link link = 1;
 }
 
 message SignalWithStartWorkflowExecutionRequest {
@@ -725,8 +860,8 @@ message SignalWithStartWorkflowExecutionRequest {
     string signal_name = 12;
     // Serialized value(s) to provide with the signal
     temporal.api.common.v1.Payloads signal_input = 13;
-    // Deprecated
-    string control = 14;
+    // Deprecated.
+    string control = 14 [deprecated = true];
     // Retry policy for the workflow
     temporal.api.common.v1.RetryPolicy retry_policy = 15;
     // See https://docs.temporal.io/docs/content/what-is-a-temporal-cron-job/
@@ -751,6 +886,10 @@ message SignalWithStartWorkflowExecutionRequest {
     // If set, takes precedence over the Versioning Behavior sent by the SDK on Workflow Task completion.
     // To unset the override after the workflow is running, use UpdateWorkflowExecutionOptions.
     temporal.api.workflow.v1.VersioningOverride versioning_override = 25;
+    // Priority metadata
+    temporal.api.common.v1.Priority priority = 26;
+    // Time-skipping configuration. If not set, time skipping is disabled.
+    temporal.api.workflow.v1.TimeSkippingConfig time_skipping_config = 27;
 }
 
 message SignalWithStartWorkflowExecutionResponse {
@@ -758,6 +897,10 @@ message SignalWithStartWorkflowExecutionResponse {
     string run_id = 1;
     // If true, a new workflow was started.
     bool started = 2;
+    // Link to be associated with the WorkflowExecutionSignaled event.
+    // Added on the response to propagate the backlink.
+    // Available from Temporal server 1.31 and up.
+    temporal.api.common.v1.Link signal_link = 3;
 }
 
 message ResetWorkflowExecutionRequest {
@@ -772,11 +915,17 @@ message ResetWorkflowExecutionRequest {
     int64 workflow_task_finish_event_id = 4;
     // Used to de-dupe reset requests
     string request_id = 5;
-    // Event types to be reapplied (deprecated)
+    // Deprecated. Use `options`.
     // Default: RESET_REAPPLY_TYPE_SIGNAL
-    temporal.api.enums.v1.ResetReapplyType reset_reapply_type = 6;
+    temporal.api.enums.v1.ResetReapplyType reset_reapply_type = 6 [deprecated = true];
     // Event types not to be reapplied
     repeated temporal.api.enums.v1.ResetReapplyExcludeType reset_reapply_exclude_types = 7;
+    // Operations to perform after the workflow has been reset. These operations will be applied
+    // to the *new* run of the workflow execution in the order they are provided.
+    // All operations are applied to the workflow before the first new workflow task is generated
+    repeated temporal.api.workflow.v1.PostResetOperation post_reset_operations = 8;
+    // The identity of the worker/client
+    string identity = 9;
 }
 
 message ResetWorkflowExecutionResponse {
@@ -869,6 +1018,7 @@ message ListArchivedWorkflowExecutionsResponse {
     bytes next_page_token = 2;
 }
 
+// Deprecated: Use with `ListWorkflowExecutions`.
 message ScanWorkflowExecutionsRequest {
     string namespace = 1;
     int32 page_size = 2;
@@ -876,6 +1026,7 @@ message ScanWorkflowExecutionsRequest {
     string query = 4;
 }
 
+// Deprecated: Use with `ListWorkflowExecutions`.
 message ScanWorkflowExecutionsResponse {
     repeated temporal.api.workflow.v1.WorkflowExecutionInfo executions = 1;
     bytes next_page_token = 2;
@@ -914,10 +1065,30 @@ message GetSearchAttributesResponse {
 message RespondQueryTaskCompletedRequest {
     bytes task_token = 1;
     temporal.api.enums.v1.QueryResultType completed_type = 2;
+    // The result of the query.
+    // Mutually exclusive with `error_message` and `failure`. Set when the query succeeds.
     temporal.api.common.v1.Payloads query_result = 3;
+    // A plain error message that must be set if completed_type is QUERY_RESULT_TYPE_FAILED.
+    // SDKs should also fill in the more complete `failure` field to provide the full context and
+    // support encryption of failure information.
+    // `error_message` will be duplicated if the `failure` field is present to support callers
+    // that pre-date the addition of that field, regardless of whether or not a custom failure
+    // converter is used.
+    // Mutually exclusive with `query_result`. Set when the query fails.
     string error_message = 4;
     reserved 5;
     string namespace = 6;
+    // The full reason for this query failure. This field is newer than `error_message` and can be
+    // encoded by the SDK's failure converter to support E2E encryption of messages and stack
+    // traces.
+    // Mutually exclusive with `query_result`. Set when the query fails.
+    temporal.api.failure.v1.Failure failure = 7;
+    // Why did the task fail? It's important to note that many of the variants in this enum cannot
+    // apply to worker responses. See the type's doc for more.
+    temporal.api.enums.v1.WorkflowTaskFailedCause cause = 8;
+    // Client must forward the poller_group_id received in PollWorkflowTaskQueueResponse for proper
+    // routing of the response.
+    string poller_group_id = 9;
 }
 
 message RespondQueryTaskCompletedResponse {
@@ -933,9 +1104,24 @@ message ResetStickyTaskQueueResponse {
 
 message ShutdownWorkerRequest {
     string namespace = 1;
+    // sticky_task_queue may not always be populated. We want to ensure all workers
+    // send a shutdown request to update worker state for heartbeating, as well
+    // as cancel pending poll calls early, instead of waiting for timeouts.
     string sticky_task_queue = 2;
     string identity = 3;
     string reason = 4;
+    temporal.api.worker.v1.WorkerHeartbeat worker_heartbeat = 5;
+    // Technically this is also sent in the WorkerHeartbeat, but
+    // since worker heartbeating can be turned off, this needs
+    // to be a separate, top-level field.
+    string worker_instance_key = 6;
+    // Task queue name the worker is polling on. This allows server to cancel
+    // all outstanding poll RPC calls from SDK. This avoids a race condition that
+    // can lead to tasks being lost.
+    string task_queue = 7;
+    // Task queue types that help server cancel outstanding poll RPC
+    // calls from SDK. This avoids a race condition that can lead to tasks being lost.
+    repeated temporal.api.enums.v1.TaskQueueType task_queue_types = 8;
 }
 
 message ShutdownWorkerResponse {
@@ -968,50 +1154,105 @@ message DescribeWorkflowExecutionResponse {
     temporal.api.workflow.v1.PendingWorkflowTaskInfo pending_workflow_task = 5;
     repeated temporal.api.workflow.v1.CallbackInfo callbacks = 6;
     repeated temporal.api.workflow.v1.PendingNexusOperationInfo pending_nexus_operations = 7;
+    temporal.api.workflow.v1.WorkflowExecutionExtendedInfo workflow_extended_info = 8;
 }
 
 // (-- api-linter: core::0203::optional=disabled
 //     aip.dev/not-precedent: field_behavior annotation not available in our gogo fork --)
 message DescribeTaskQueueRequest {
     string namespace = 1;
-    // Sticky queues are not supported in `ENHANCED` mode.
+
+    // Sticky queues are not supported in deprecated ENHANCED mode.
     temporal.api.taskqueue.v1.TaskQueue task_queue = 2;
-    // Deprecated. Use `ENHANCED` mode with `task_queue_types`. Ignored in `ENHANCED` mode.
+
     // If unspecified (TASK_QUEUE_TYPE_UNSPECIFIED), then default value (TASK_QUEUE_TYPE_WORKFLOW) will be used.
+    // Only supported in default mode (use `task_queue_types` in ENHANCED mode instead).
     temporal.api.enums.v1.TaskQueueType task_queue_type = 3;
-    // Deprecated. Ignored in `ENHANCED` mode.
-    bool include_task_queue_status = 4;
 
-    // All options except `task_queue_type` and `include_task_queue_status` are only available in the `ENHANCED` mode.
-    temporal.api.enums.v1.DescribeTaskQueueMode api_mode = 5;
+    // Report stats for the requested task queue type(s).
+    bool report_stats = 8;
 
+    // Report Task Queue Config
+    bool report_config = 11;
+
+    // Deprecated, use `report_stats` instead.
+    // If true, the task queue status will be included in the response.
+    bool include_task_queue_status = 4 [deprecated = true];
+
+    // Deprecated. ENHANCED mode is also being deprecated.
+    // Select the API mode to use for this request: DEFAULT mode (if unset) or ENHANCED mode.
+    // Consult the documentation for each field to understand which mode it is supported in.
+    temporal.api.enums.v1.DescribeTaskQueueMode api_mode = 5 [deprecated = true];
+
+    // Deprecated (as part of the ENHANCED mode deprecation).
     // Optional. If not provided, the result for the default Build ID will be returned. The default Build ID is the one
     // mentioned in the first unconditional Assignment Rule. If there is no default Build ID, the result for the
     // unversioned queue will be returned.
     // (-- api-linter: core::0140::prepositions --)
-    temporal.api.taskqueue.v1.TaskQueueVersionSelection versions = 6;
+    temporal.api.taskqueue.v1.TaskQueueVersionSelection versions = 6 [deprecated = true];
 
+    // Deprecated (as part of the ENHANCED mode deprecation).
     // Task queue types to report info about. If not specified, all types are considered.
-    repeated temporal.api.enums.v1.TaskQueueType task_queue_types = 7;
-    // Report stats for the requested task queue types and versions
-    bool report_stats = 8;
-    // Report list of pollers for requested task queue types and versions
-    bool report_pollers = 9;
+    repeated temporal.api.enums.v1.TaskQueueType task_queue_types = 7 [deprecated = true];
+
+    // Deprecated (as part of the ENHANCED mode deprecation).
+    // Report list of pollers for requested task queue types and versions.
+    bool report_pollers = 9 [deprecated = true];
+
+    // Deprecated (as part of the ENHANCED mode deprecation).
     // Report task reachability for the requested versions and all task types (task reachability is not reported
     // per task type).
-    bool report_task_reachability = 10;
+    bool report_task_reachability = 10 [deprecated = true];
 }
 
 message DescribeTaskQueueResponse {
-    // Deprecated. Use `versions_info.types_info.pollers` with `ENHANCED` mode instead.
-    // Not set in `ENHANCED` mode.
     repeated temporal.api.taskqueue.v1.PollerInfo pollers = 1;
-    // Deprecated. Not set in `ENHANCED` mode.
-    temporal.api.taskqueue.v1.TaskQueueStatus task_queue_status = 2;
 
+    // Statistics for the task queue.
+    // Only set if `report_stats` is set on the request.
+    temporal.api.taskqueue.v1.TaskQueueStats stats = 5;
+
+    // Task queue stats breakdown by priority key. Only contains actively used priority keys.
+    // Only set if `report_stats` is set on the request.
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "by" is used to clarify the keys and values. --)
+    map<int32, temporal.api.taskqueue.v1.TaskQueueStats> stats_by_priority_key = 8;
+
+    // Specifies which Worker Deployment Version(s) Server routes this Task Queue's tasks to.
+    // When not present, it means the tasks are routed to Unversioned workers (workers with
+    // UNVERSIONED or unspecified WorkerVersioningMode.)
+    // Task Queue Versioning info is updated indirectly by calling SetWorkerDeploymentCurrentVersion
+    // and SetWorkerDeploymentRampingVersion on Worker Deployments.
+    // Note: This information is not relevant to Pinned workflow executions and their activities as
+    // they are always routed to their Pinned Deployment Version. However, new workflow executions
+    // are typically not Pinned until they complete their first task (unless they are started with
+    // a Pinned VersioningOverride or are Child Workflows of a Pinned parent).
+    temporal.api.taskqueue.v1.TaskQueueVersioningInfo versioning_info = 4;
+
+    // Only populated if report_task_queue_config is set to true.
+    temporal.api.taskqueue.v1.TaskQueueConfig config  = 6;
+
+    message EffectiveRateLimit {
+        // The effective rate limit for the task queue.
+        float requests_per_second = 1;
+
+        // Source of the RateLimit Configuration,which can be one of the following values:
+        // - SOURCE_API: The rate limit that is set via the TaskQueueConfig api.
+        // - SOURCE_WORKER: The rate limit is the value set using the workerOptions in TaskQueueActivitiesPerSecond.
+        // - SOURCE_SYSTEM: The rate limit is the default value set by the system
+        temporal.api.enums.v1.RateLimitSource rate_limit_source = 2;
+    }
+
+    EffectiveRateLimit effective_rate_limit = 7;
+
+    // Deprecated.
+    // Status of the task queue. Only populated when `include_task_queue_status` is set to true in the request.
+    temporal.api.taskqueue.v1.TaskQueueStatus task_queue_status = 2 [deprecated = true];
+
+    // Deprecated.
+    // Only returned in ENHANCED mode.
     // This map contains Task Queue information for each Build ID. Empty string as key value means unversioned.
-    // Only set in `ENHANCED` mode.
-    map<string, temporal.api.taskqueue.v1.TaskQueueVersionInfo> versions_info = 3;
+    map<string, temporal.api.taskqueue.v1.TaskQueueVersionInfo> versions_info = 3 [deprecated = true];
 }
 
 message GetClusterInfoRequest {
@@ -1029,6 +1270,8 @@ message GetClusterInfoResponse {
     int32 history_shard_count = 6;
     string persistence_store = 7;
     string visibility_store = 8;
+    int64 initial_failover_version = 9;
+    int64 failover_version_increment = 10;
 }
 
 message GetSystemInfoRequest {
@@ -1084,6 +1327,12 @@ message GetSystemInfoResponse {
         // True if the server supports Nexus operations.
         // This flag is dependent both on server version and for Nexus to be enabled via server configuration.
         bool nexus = 11;
+
+        // True if the server supports server-scaled deployments.
+        // This flag is dependent both on server version and for server-scaled deployments
+        // to be enabled via server configuration.
+        bool server_scaled_deployments = 12;
+
     }
 }
 
@@ -1172,6 +1421,10 @@ message UpdateScheduleRequest {
     // Note: you cannot only update the search attributes with `UpdateScheduleRequest`,
     // you must also set the `schedule` field; otherwise, it will unset the schedule.
     temporal.api.common.v1.SearchAttributes search_attributes = 7;
+    // Schedule memo to replace. If set, replaces the entire memo.
+    // Do not set this field if you do not want to update the memo.
+    // A non-null empty object will clear the memo.
+    temporal.api.common.v1.Memo memo = 8;
 }
 
 message UpdateScheduleResponse {
@@ -1234,6 +1487,31 @@ message ListSchedulesResponse {
     bytes next_page_token = 2;
 }
 
+message CountSchedulesRequest {
+    string namespace = 1;
+    // Visibility query, see https://docs.temporal.io/list-filter for the syntax.
+    string query = 2;
+}
+
+message CountSchedulesResponse {
+    // If `query` is not grouping by any field, the count is an approximate number
+    // of schedules that match the query.
+    // If `query` is grouping by a field, the count is simply the sum of the counts
+    // of the groups returned in the response. This number can be smaller than the
+    // total number of schedules matching the query.
+    int64 count = 1;
+
+    // Contains the groups if the request is grouping by a field.
+    // The list might not be complete, and the counts of each group is approximate.
+    repeated AggregationGroup groups = 2;
+
+    message AggregationGroup {
+        repeated temporal.api.common.v1.Payload group_values = 1;
+        int64 count = 2;
+    }
+}
+
+// [cleanup-wv-pre-release]
 message UpdateWorkerBuildIdCompatibilityRequest {
     message AddNewCompatibleVersion {
         // A new id to be added to an existing compatible set.
@@ -1289,11 +1567,13 @@ message UpdateWorkerBuildIdCompatibilityRequest {
         MergeSets merge_sets = 7;
     }
 }
+// [cleanup-wv-pre-release]
 message UpdateWorkerBuildIdCompatibilityResponse {
     reserved 1;
     reserved "version_set_id";
 }
 
+// [cleanup-wv-pre-release]
 message GetWorkerBuildIdCompatibilityRequest {
     string namespace = 1;
     // Must be set, the task queue to interrogate about worker id compatibility.
@@ -1302,6 +1582,7 @@ message GetWorkerBuildIdCompatibilityRequest {
     // default major version set. 0 returns all sets.
     int32 max_sets = 3;
 }
+// [cleanup-wv-pre-release]
 message GetWorkerBuildIdCompatibilityResponse {
     // Major version sets, in order from oldest to newest. The last element of the list will always
     // be the current default major version. IE: New workflows will target the most recent version
@@ -1315,6 +1596,7 @@ message GetWorkerBuildIdCompatibilityResponse {
 //     aip.dev/not-precedent: UpdateNamespace RPC doesn't follow Google API format. --)
 // (-- api-linter: core::0134::request-resource-required=disabled
 //     aip.dev/not-precedent: GetWorkerBuildIdCompatibilityRequest RPC doesn't follow Google API format. --)
+// [cleanup-wv-pre-release]
 message UpdateWorkerVersioningRulesRequest {
     // Inserts the rule to the list of assignment rules for this Task Queue.
     // The rules are evaluated in order, starting from index 0. The first
@@ -1406,6 +1688,7 @@ message UpdateWorkerVersioningRulesRequest {
     }
 }
 
+// [cleanup-wv-pre-release]
 message UpdateWorkerVersioningRulesResponse {
     repeated temporal.api.taskqueue.v1.TimestampedBuildIdAssignmentRule assignment_rules = 1;
     repeated temporal.api.taskqueue.v1.TimestampedCompatibleBuildIdRedirectRule compatible_redirect_rules = 2;
@@ -1416,11 +1699,13 @@ message UpdateWorkerVersioningRulesResponse {
     bytes conflict_token = 3;
 }
 
+// [cleanup-wv-pre-release]
 message GetWorkerVersioningRulesRequest {
     string namespace = 1;
     string task_queue = 2;
 }
 
+// [cleanup-wv-pre-release]
 message GetWorkerVersioningRulesResponse {
     repeated temporal.api.taskqueue.v1.TimestampedBuildIdAssignmentRule assignment_rules = 1;
     repeated temporal.api.taskqueue.v1.TimestampedCompatibleBuildIdRedirectRule compatible_redirect_rules = 2;
@@ -1431,6 +1716,7 @@ message GetWorkerVersioningRulesResponse {
     bytes conflict_token = 3;
 }
 
+// [cleanup-wv-pre-release]
 // Deprecated. Use `DescribeTaskQueue`.
 message GetWorkerTaskReachabilityRequest {
     string namespace = 1;
@@ -1456,6 +1742,7 @@ message GetWorkerTaskReachabilityRequest {
     temporal.api.enums.v1.TaskReachability reachability = 4;
 }
 
+// [cleanup-wv-pre-release]
 // Deprecated. Use `DescribeTaskQueue`.
 message GetWorkerTaskReachabilityResponse {
     // Task reachability, broken down by build id and then task queue.
@@ -1546,6 +1833,9 @@ message StartBatchOperationRequest {
         temporal.api.batch.v1.BatchOperationDeletion deletion_operation = 13;
         temporal.api.batch.v1.BatchOperationReset reset_operation = 14;
         temporal.api.batch.v1.BatchOperationUpdateWorkflowExecutionOptions update_workflow_options_operation = 15;
+        temporal.api.batch.v1.BatchOperationUnpauseActivities unpause_activities_operation = 16;
+        temporal.api.batch.v1.BatchOperationResetActivities reset_activities_operation = 17;
+        temporal.api.batch.v1.BatchOperationUpdateActivityOptions update_activity_options_operation = 18;
     }
 }
 
@@ -1648,12 +1938,26 @@ message PollWorkflowExecutionUpdateResponse {
 
 message PollNexusTaskQueueRequest {
     string namespace = 1;
+    temporal.api.taskqueue.v1.TaskQueue task_queue = 3;
+    // Unless this is the first poll, the client must pass one of the poller group IDs received in
+    // `poller_group_infos` of the last the PollNexusTaskQueueResponse according to the
+    // instructions. If not set, the poll is routed randomly which can cause it being blocked
+    // without receiving a task while the queue actually has tasks in another server location.
+    string poller_group_id = 9;
     // The identity of the client who initiated this request.
     string identity = 2;
-    temporal.api.taskqueue.v1.TaskQueue task_queue = 3;
+    // A unique key for this worker instance, used for tracking worker lifecycle.
+    // This is guaranteed to be unique, whereas identity is not guaranteed to be unique.
+    string worker_instance_key = 8;
     // Information about this worker's build identifier and if it is choosing to use the versioning
     // feature. See the `WorkerVersionCapabilities` docstring for more.
-    temporal.api.common.v1.WorkerVersionCapabilities worker_version_capabilities = 4;
+    // Deprecated. Replaced by deployment_options.
+    temporal.api.common.v1.WorkerVersionCapabilities worker_version_capabilities = 4 [deprecated = true];
+    // Worker deployment options that user has set in the worker.
+    temporal.api.deployment.v1.WorkerDeploymentOptions deployment_options = 6;
+
+    // Worker info to be sent to the server.
+    repeated temporal.api.worker.v1.WorkerHeartbeat worker_heartbeat = 7;
 }
 
 message PollNexusTaskQueueResponse {
@@ -1661,6 +1965,20 @@ message PollNexusTaskQueueResponse {
     bytes task_token = 1;
     // Embedded request as translated from the incoming frontend request.
     temporal.api.nexus.v1.Request request = 2;
+    // Server-advised information the SDK may use to adjust its poller count.
+    temporal.api.taskqueue.v1.PollerScalingDecision poller_scaling_decision = 3;
+    // This poller group ID identifies the owner of the nexus task awaiting for synchronous
+    // response.
+    // Corresponding `RespondNexusTaskCompleted` and `RespondNexusTaskFailed` calls should pass this
+    // value for proper response routing.
+    string poller_group_id = 4;
+    // The weighted list of poller groups IDs that client should use for future polls to this task
+    // queue. Client is expected to:
+    //   1. Maintain minimum number of pollers no less than the number of groups.
+    //   2. Try to assign the next poll to a group without any pending polls,
+    //   3. If every group has some pending polls, assign the next poll to a group randomly
+    //     according to the weights.
+    repeated temporal.api.taskqueue.v1.PollerGroupInfo poller_group_infos = 5;
 }
 
 message RespondNexusTaskCompletedRequest {
@@ -1671,6 +1989,9 @@ message RespondNexusTaskCompletedRequest {
     bytes task_token = 3;
     // Embedded response to be translated into a frontend response.
     temporal.api.nexus.v1.Response response = 4;
+    // Client must forward the poller_group_id received in PollNexusTaskQueueResponse for proper
+    // routing of the response.
+    string poller_group_id = 5;
 }
 
 message RespondNexusTaskCompletedResponse {
@@ -1682,8 +2003,13 @@ message RespondNexusTaskFailedRequest {
     string identity = 2;
     // A unique identifier for this task.
     bytes task_token = 3;
-    // The error the handler failed with.
-    temporal.api.nexus.v1.HandlerError error = 4;
+    // Deprecated. Use the failure field instead.
+    temporal.api.nexus.v1.HandlerError error = 4 [deprecated = true];
+    // The error the handler failed with. Must contain a NexusHandlerFailureInfo object.
+    temporal.api.failure.v1.Failure failure = 5;
+    // Client must forward the poller_group_id received in PollNexusTaskQueueResponse for proper
+    // routing of the response.
+    string poller_group_id = 6;
 }
 
 message RespondNexusTaskFailedResponse {
@@ -1702,6 +2028,9 @@ message ExecuteMultiOperationRequest {
     // Note that additional operation-specific restrictions have to be considered.
     repeated Operation operations = 2;
 
+    // Resource ID for routing. Should match operations[0].start_workflow.workflow_id
+    string resource_id = 3;
+
     message Operation {
         oneof operation {
             // Additional restrictions:
@@ -1718,6 +2047,12 @@ message ExecuteMultiOperationRequest {
     }
 }
 
+// IMPORTANT: For [StartWorkflow, UpdateWorkflow] combination ("Update-with-Start") when both
+//   1. the workflow update for the requested update ID has already completed, and
+//   2. the workflow for the requested workflow ID has already been closed,
+// then you'll receive
+//   - an update response containing the update's outcome, and
+//   - a start response with a `status` field that reflects the workflow's current state.
 message ExecuteMultiOperationResponse {
     repeated Response responses = 1;
 
@@ -1729,125 +2064,146 @@ message ExecuteMultiOperationResponse {
     }
 }
 
-message UpdateActivityOptionsByIdRequest {
+// NOTE: keep in sync with temporal.api.batch.v1.BatchOperationUpdateActivityOptions
+message UpdateActivityOptionsRequest {
     // Namespace of the workflow which scheduled this activity
     string namespace = 1;
-    // ID of the workflow which scheduled this activity
-    string workflow_id = 2;
-    // Run ID of the workflow which scheduled this activity
-    // if empty - latest workflow is used
-    string run_id = 3;
-    // ID of the activity we're updating
-    string activity_id = 4;
+    // Execution info of the workflow which scheduled this activity
+    temporal.api.common.v1.WorkflowExecution execution = 2;
 
     // The identity of the client who initiated this request
-    string identity = 5;
+    string identity = 3;
 
     // Activity options. Partial updates are accepted and controlled by update_mask
-    temporal.api.activity.v1.ActivityOptions activity_options = 6;
+    temporal.api.activity.v1.ActivityOptions activity_options = 4;
 
     // Controls which fields from `activity_options` will be applied
-    google.protobuf.FieldMask update_mask = 7;
+    google.protobuf.FieldMask update_mask = 5;
 
-    // Used to de-dupe requests
-    string request_id = 8;
+    // either activity id, activity type or update_all must be provided
+    oneof activity {
+        // Only activity with this ID will be updated.
+        string id = 6;
+        // Update all running activities of this type.
+        string type = 7;
+        // Update all running activities.
+        bool match_all = 9;
+    }
+
+    // If set, the activity options will be restored to the default.
+    // Default options are then options activity was created with.
+    // They are part of the first SCHEDULE event.
+    // This flag cannot be combined with any other option; if you supply
+    // restore_original together with other options, the request will be rejected.
+    bool restore_original = 8;
 }
 
-message UpdateActivityOptionsByIdResponse {
+message UpdateActivityOptionsResponse {
     // Activity options after an update
     temporal.api.activity.v1.ActivityOptions activity_options = 1;
 }
 
-message PauseActivityByIdRequest {
+message PauseActivityRequest {
     // Namespace of the workflow which scheduled this activity.
     string namespace = 1;
-    // ID of the workflow which scheduled this activity.
-    string workflow_id = 2;
-    // Run ID of the workflow which scheduled this activity.
-    // If empty - latest workflow is used.
-    string run_id = 3;
-    // ID of the activity we're updating.
-    string activity_id = 4;
+    // Execution info of the workflow which scheduled this activity
+    temporal.api.common.v1.WorkflowExecution execution = 2;
 
     // The identity of the client who initiated this request.
-    string identity = 5;
+    string identity = 3;
 
-    // Used to de-dupe requests.
-    string request_id = 6;
-}
-
-message PauseActivityByIdResponse {
-}
-
-message UnpauseActivityByIdRequest {
-    message ResumeOperation {
-        // Indicates that if the activity is waiting to retry, it will  be scheduled immediately.
-        bool no_wait = 1;
+    // either activity id or activity type must be provided
+    oneof activity {
+        // Only the activity with this ID will be paused.
+        string id = 4;
+        // Pause all running activities of this type.
+        // Note: Experimental - the behavior of pause by activity type might change in a future release.
+        string type = 5;
     }
 
-    message ResetOperation {
-        // Indicates that the activity should be scheduled immediately.
-        // Note that this may run simultaneously with any existing executions of the activity.
-        bool no_wait = 1;
-        // If set, the Heartbeat Details will be cleared out to make the Activity start over from the beginning
-        bool reset_heartbeat = 2;
-    }
+    // Reason to pause the activity.
+    string reason = 6;
+}
 
+message PauseActivityResponse {
+}
+
+message UnpauseActivityRequest {
     // Namespace of the workflow which scheduled this activity.
     string namespace = 1;
-    // ID of the workflow which scheduled this activity.
-    string workflow_id = 2;
-    // Run ID of the workflow which scheduled this activity.
-    // If empty - latest workflow is used.
-    string run_id = 3;
-    // ID of the activity we're updating.
-    string activity_id = 4;
+    // Execution info of the workflow which scheduled this activity
+    temporal.api.common.v1.WorkflowExecution execution = 2;
 
     // The identity of the client who initiated this request.
-    string identity = 5;
+    string identity = 3;
 
-    // Used to de-dupe requests.
-    string request_id = 6;
-
-    // There are two options to resume the activity - with 'resume' or with 'reset'.
-    oneof operation{
-        ResumeOperation resume = 7;
-        ResetOperation reset = 8;
+    // either activity id or activity type must be provided
+    oneof activity {
+        // Only the activity with this ID will be unpaused.
+        string id = 4;
+        // Unpause all running activities with of this type.
+        string type = 5;
+        // Unpause all running activities.
+        bool unpause_all = 6;
     }
+
+    // Providing this flag will also reset the number of attempts.
+    bool reset_attempts = 7;
+
+    // Providing this flag will also reset the heartbeat details.
+    bool reset_heartbeat = 8;
+
+    // If set, the activity will start at a random time within the specified jitter duration.
+    google.protobuf.Duration jitter = 9;
 }
 
-message UnpauseActivityByIdResponse {
+message UnpauseActivityResponse {
 }
 
-message ResetActivityByIdRequest {
+// NOTE: keep in sync with temporal.api.batch.v1.BatchOperationResetActivities
+message ResetActivityRequest {
     // Namespace of the workflow which scheduled this activity.
     string namespace = 1;
-    // ID of the workflow which scheduled this activity.
-    string workflow_id = 2;
-    // Run ID of the workflow which scheduled this activity.
-    // If empty - latest workflow is used.
-    string run_id = 3;
-    // ID of the activity we're updating.
-    string activity_id = 4;
+    // Execution info of the workflow which scheduled this activity
+    temporal.api.common.v1.WorkflowExecution execution = 2;
 
     // The identity of the client who initiated this request.
-    string identity = 5;
+    string identity = 3;
 
-    // Used to de-dupe requests.
-    string request_id = 6;
-
-    // Indicates that activity should be scheduled immediately.
-    // If this flag doesn't set, and activity currently running - temporal will wait until activity is completed.
-    bool no_wait = 7;
+    // either activity id, activity type or update_all must be provided
+    oneof activity {
+        // Only activity with this ID will be reset.
+        string id = 4;
+        // Reset all running activities with of this type.
+        string type = 5;
+        // Reset all running activities.
+        bool match_all = 10;
+    }
 
     // Indicates that activity should reset heartbeat details.
     // This flag will be applied only to the new instance of the activity.
-    bool reset_heartbeat = 8;
+    bool reset_heartbeat = 6;
+
+    // If activity is paused, it will remain paused after reset
+    bool keep_paused = 7;
+
+    // If set, and activity is in backoff, the activity will start at a random time within the specified jitter duration.
+    // (unless it is paused and keep_paused is set)
+    google.protobuf.Duration jitter = 8;
+
+    // If set, the activity options will be restored to the defaults.
+    // Default options are then options activity was created with.
+    // They are part of the first SCHEDULE event.
+    bool restore_original_options = 9;
+
 }
 
-message ResetActivityByIdResponse {
+message ResetActivityResponse {
 }
 
+// Keep the parameters in sync with:
+//   - temporal.api.batch.v1.BatchOperationUpdateWorkflowExecutionOptions.
+//   - temporal.api.workflow.v1.PostResetOperation.UpdateWorkflowOptions.
 message UpdateWorkflowExecutionOptionsRequest {
     // The namespace name of the target Workflow.
     string namespace = 1;
@@ -1862,6 +2218,9 @@ message UpdateWorkflowExecutionOptionsRequest {
     // Controls which fields from `workflow_execution_options` will be applied.
     // To unset a field, set it to null and use the update mask to indicate that it should be mutated.
     google.protobuf.FieldMask update_mask = 4;
+
+    // Optional. The identity of the client who initiated this request.
+    string identity = 5;
 }
 
 message UpdateWorkflowExecutionOptionsResponse {
@@ -1869,15 +2228,59 @@ message UpdateWorkflowExecutionOptionsResponse {
     temporal.api.workflow.v1.WorkflowExecutionOptions workflow_execution_options = 1;
 }
 
+// [cleanup-wv-pre-release] Pre-release deployment APIs, clean up later
 message DescribeDeploymentRequest {
     string namespace = 1;
     deployment.v1.Deployment deployment = 2;
 }
-
+// [cleanup-wv-pre-release] Pre-release deployment APIs, clean up later
 message DescribeDeploymentResponse {
     deployment.v1.DeploymentInfo deployment_info = 1;
 }
 
+message DescribeWorkerDeploymentVersionRequest {
+    string namespace = 1;
+    // Deprecated. Use `deployment_version`.
+    string version = 2 [deprecated = true];
+    // Required.
+    temporal.api.deployment.v1.WorkerDeploymentVersion deployment_version = 3;
+    // Report stats for task queues which have been polled by this version.
+    bool report_task_queue_stats = 4;
+}
+
+message DescribeWorkerDeploymentVersionResponse {
+    temporal.api.deployment.v1.WorkerDeploymentVersionInfo worker_deployment_version_info = 1;
+
+    // All the Task Queues that have ever polled from this Deployment version.
+    repeated VersionTaskQueue version_task_queues = 2;
+    // (-- api-linter: core::0123::resource-annotation=disabled --)
+    message VersionTaskQueue {
+        string name = 1;
+        temporal.api.enums.v1.TaskQueueType type = 2;
+        // Only set if `report_task_queue_stats` is set on the request.
+        temporal.api.taskqueue.v1.TaskQueueStats stats = 3;
+        // Task queue stats breakdown by priority key. Only contains actively used priority keys.
+        // Only set if `report_task_queue_stats` is set to true in the request.
+        // (-- api-linter: core::0140::prepositions=disabled
+        //     aip.dev/not-precedent: "by" is used to clarify the key. --)
+        map<int32, temporal.api.taskqueue.v1.TaskQueueStats> stats_by_priority_key = 4;
+    }
+}
+
+message DescribeWorkerDeploymentRequest {
+    string namespace = 1;
+    string deployment_name = 2;
+}
+
+message DescribeWorkerDeploymentResponse {
+    // This value is returned so that it can be optionally passed to APIs
+    // that write to the Worker Deployment state to ensure that the state
+    // did not change between this read and a future write.
+    bytes conflict_token = 1;
+    temporal.api.deployment.v1.WorkerDeploymentInfo worker_deployment_info = 2;
+}
+
+// [cleanup-wv-pre-release] Pre-release deployment APIs, clean up later
 message ListDeploymentsRequest {
     string namespace = 1;
     int32 page_size = 2;
@@ -1886,11 +2289,13 @@ message ListDeploymentsRequest {
     string series_name = 4;
 }
 
+// [cleanup-wv-pre-release] Pre-release deployment APIs, clean up later
 message ListDeploymentsResponse {
     bytes next_page_token = 1;
     repeated temporal.api.deployment.v1.DeploymentListInfo deployments = 2;
 }
 
+// [cleanup-wv-pre-release] Pre-release deployment APIs, clean up later
 message SetCurrentDeploymentRequest {
     string namespace = 1;
     temporal.api.deployment.v1.Deployment deployment = 2;
@@ -1901,28 +2306,357 @@ message SetCurrentDeploymentRequest {
     // links to internal deployment pipelines, etc.
     temporal.api.deployment.v1.UpdateDeploymentMetadata update_metadata = 4;
 }
-
+// [cleanup-wv-pre-release] Pre-release deployment APIs, clean up later
 message SetCurrentDeploymentResponse {
     temporal.api.deployment.v1.DeploymentInfo current_deployment_info = 1;
     // Info of the deployment that was current before executing this operation.
     temporal.api.deployment.v1.DeploymentInfo previous_deployment_info = 2;
 }
 
+// Set/unset the Current Version of a Worker Deployment.
+message SetWorkerDeploymentCurrentVersionRequest {
+    string namespace = 1;
+    string deployment_name = 2;
+    // Deprecated. Use `build_id`.
+    string version = 3 [deprecated = true];
+
+    // The build id of the Version that you want to set as Current.
+    // Pass an empty value to set the Current Version to nil.
+    // A nil Current Version represents all the unversioned workers (those with `UNVERSIONED` (or unspecified) `WorkerVersioningMode`.)
+    string build_id = 7;
+
+    // Optional. This can be the value of conflict_token from a Describe, or another Worker
+    // Deployment API. Passing a non-nil conflict token will cause this request to fail if the
+    // Deployment's configuration has been modified between the API call that generated the
+    // token and this one.
+    bytes conflict_token = 4;
+    // Optional. The identity of the client who initiated this request.
+    string identity = 5;
+    // Optional. By default this request would be rejected if not all the expected Task Queues are
+    // being polled by the new Version, to protect against accidental removal of Task Queues, or
+    // worker health issues. Pass `true` here to bypass this protection.
+    // The set of expected Task Queues is the set of all the Task Queues that were ever poller by
+    // the existing Current Version of the Deployment, with the following exclusions:
+    //   - Task Queues that are not used anymore (inferred by having empty backlog and a task
+    //     add_rate of 0.)
+    //   - Task Queues that are moved to another Worker Deployment (inferred by the Task Queue
+    //     having a different Current Version than the Current Version of this deployment.)
+    // WARNING: Do not set this flag unless you are sure that the missing task queue pollers are not
+    // needed. If the request is unexpectedly rejected due to missing pollers, then that means the
+    // pollers have not reached to the server yet. Only set this if you expect those pollers to
+    // never arrive.
+    bool ignore_missing_task_queues = 6;
+    // Optional. By default this request will be rejected if no pollers have been seen for the proposed
+    // Current Version, in order to protect users from routing tasks to pollers that do not exist, leading
+    // to possible timeouts. Pass `true` here to bypass this protection.
+    bool allow_no_pollers = 9;
+}
+
+message SetWorkerDeploymentCurrentVersionResponse {
+    // This value is returned so that it can be optionally passed to APIs
+    // that write to the Worker Deployment state to ensure that the state
+    // did not change between this API call and a future write.
+    bytes conflict_token = 1;
+    // Deprecated. Use `previous_deployment_version`.
+    string previous_version = 2 [deprecated = true];
+    // The version that was current before executing this operation.
+    // Deprecated in favor of idempotency of the API. Use `DescribeWorkerDeployment` to get the
+    // Current version info before calling this API. By passing the `conflict_token` got from the
+    // `DescribeWorkerDeployment` call to this API you can ensure there is no interfering changes
+    // between the two calls.
+    temporal.api.deployment.v1.WorkerDeploymentVersion previous_deployment_version = 3 [deprecated = true];
+}
+
+// Set/unset the Ramping Version of a Worker Deployment and its ramp percentage.
+message SetWorkerDeploymentRampingVersionRequest {
+    string namespace = 1;
+    string deployment_name = 2;
+    // Deprecated. Use `build_id`.
+    string version = 3 [deprecated = true];
+
+    // The build id of the Version that you want to ramp traffic to.
+    // Pass an empty value to set the Ramping Version to nil.
+    // A nil Ramping Version represents all the unversioned workers (those with `UNVERSIONED` (or unspecified) `WorkerVersioningMode`.)
+    string build_id = 8;
+
+    // Ramp percentage to set. Valid range: [0,100].
+    float percentage = 4;
+
+    // Optional. This can be the value of conflict_token from a Describe, or another Worker
+    // Deployment API. Passing a non-nil conflict token will cause this request to fail if the
+    // Deployment's configuration has been modified between the API call that generated the
+    // token and this one.
+    bytes conflict_token = 5;
+    // Optional. The identity of the client who initiated this request.
+    string identity = 6;
+    // Optional. By default this request would be rejected if not all the expected Task Queues are
+    // being polled by the new Version, to protect against accidental removal of Task Queues, or
+    // worker health issues. Pass `true` here to bypass this protection.
+    // The set of expected Task Queues equals to all the Task Queues ever polled from the existing
+    // Current Version of the Deployment, with the following exclusions:
+    //   - Task Queues that are not used anymore (inferred by having empty backlog and a task
+    //     add_rate of 0.)
+    //   - Task Queues that are moved to another Worker Deployment (inferred by the Task Queue
+    //     having a different Current Version than the Current Version of this deployment.)
+    // WARNING: Do not set this flag unless you are sure that the missing task queue poller are not
+    // needed. If the request is unexpectedly rejected due to missing pollers, then that means the
+    // pollers have not reached to the server yet. Only set this if you expect those pollers to
+    // never arrive.
+    // Note: this check only happens when the ramping version is about to change, not every time
+    // that the percentage changes. Also note that the check is against the deployment's Current
+    // Version, not the previous Ramping Version.
+    bool ignore_missing_task_queues = 7;
+    // Optional. By default this request will be rejected if no pollers have been seen for the proposed
+    // Current Version, in order to protect users from routing tasks to pollers that do not exist, leading
+    // to possible timeouts. Pass `true` here to bypass this protection.
+    bool allow_no_pollers = 10;
+}
+
+message SetWorkerDeploymentRampingVersionResponse {
+    // This value is returned so that it can be optionally passed to APIs
+    // that write to the Worker Deployment state to ensure that the state
+    // did not change between this API call and a future write.
+    bytes conflict_token = 1;
+    // Deprecated. Use `previous_deployment_version`.
+    string previous_version = 2 [deprecated = true];
+    // The version that was ramping before executing this operation.
+    // Deprecated in favor of idempotency of the API. Use `DescribeWorkerDeployment` to get the
+    // Ramping version info before calling this API. By passing the `conflict_token` got from the
+    // `DescribeWorkerDeployment` call to this API you can ensure there is no interfering changes
+    // between the two calls.
+    temporal.api.deployment.v1.WorkerDeploymentVersion previous_deployment_version = 4 [deprecated = true];
+    // The ramping version percentage before executing this operation.
+    // Deprecated in favor of idempotency of the API. Use `DescribeWorkerDeployment` to get the
+    // Ramping version info before calling this API. By passing the `conflict_token` got from the
+    // `DescribeWorkerDeployment` call to this API you can ensure there is no interfering changes
+    // between the two calls.
+    float previous_percentage = 3 [deprecated = true];
+}
+
+// Creates a new WorkerDeployment.
+message CreateWorkerDeploymentRequest {
+    string namespace = 1;
+    // The name of the Worker Deployment to create. If a Worker Deployment with
+    // this name already exists, an error will be returned.
+    string deployment_name = 2;
+
+    // Optional. The identity of the client who initiated this request.
+    string identity = 4;
+    // A unique identifier for this create request for idempotence. Typically UUIDv4.
+    string request_id = 5;
+}
+
+message CreateWorkerDeploymentResponse {
+    // This value is returned so that it can be optionally passed to APIs that
+    // write to the WorkerDeployment state to ensure that the state did not
+    // change between this API call and a future write.
+    bytes conflict_token = 1;
+}
+
+message ListWorkerDeploymentsRequest {
+    string namespace = 1;
+    int32 page_size = 2;
+    bytes next_page_token = 3;
+}
+
+message ListWorkerDeploymentsResponse {
+    bytes next_page_token = 1;
+    // The list of worker deployments.
+    repeated WorkerDeploymentSummary worker_deployments = 2;
+
+    // (-- api-linter: core::0123::resource-annotation=disabled --)
+    // A subset of WorkerDeploymentInfo
+    message WorkerDeploymentSummary {
+        string name = 1;
+        google.protobuf.Timestamp create_time = 2;
+        temporal.api.deployment.v1.RoutingConfig routing_config = 3;
+        // Summary of the version that was added most recently in the Worker Deployment.
+        temporal.api.deployment.v1.WorkerDeploymentInfo.WorkerDeploymentVersionSummary latest_version_summary = 4;
+        // Summary of the current version of the Worker Deployment.
+        temporal.api.deployment.v1.WorkerDeploymentInfo.WorkerDeploymentVersionSummary current_version_summary = 5;
+        // Summary of the ramping version of the Worker Deployment.
+        temporal.api.deployment.v1.WorkerDeploymentInfo.WorkerDeploymentVersionSummary ramping_version_summary = 6;
+    }
+}
+
+// Creates a new WorkerDeploymentVersion.
+message CreateWorkerDeploymentVersionRequest {
+    string namespace = 1;
+    // Required.
+    temporal.api.deployment.v1.WorkerDeploymentVersion deployment_version = 2;
+
+    // Optional. Contains the new worker compute configuration for the Worker
+    // Deployment. Used for worker scale management.
+    temporal.api.compute.v1.ComputeConfig compute_config = 4;
+
+    // Optional. The identity of the client who initiated this request.
+    string identity = 3;
+    
+    // A unique identifier for this create request for idempotence. Typically UUIDv4.
+    // If a second request with the same ID is recieved, it is considered a successful no-op.
+    // Retrying with a different request ID for the same deployment name + build ID is an error.
+    string request_id = 5;
+}
+
+message CreateWorkerDeploymentVersionResponse {
+}
+
+// Used for manual deletion of Versions. User can delete a Version only when all the
+// following conditions are met:
+//  - It is not the Current or Ramping Version of its Deployment.
+//  - It has no active pollers (none of the task queues in the Version have pollers)
+//  - It is not draining (see WorkerDeploymentVersionInfo.drainage_info). This condition
+//    can be skipped by passing `skip-drainage=true`.
+message DeleteWorkerDeploymentVersionRequest {
+    string namespace = 1;
+    // Deprecated. Use `deployment_version`.
+    string version = 2 [deprecated = true];
+    // Required.
+    temporal.api.deployment.v1.WorkerDeploymentVersion deployment_version = 5;
+    // Pass to force deletion even if the Version is draining. In this case the open pinned
+    // workflows will be stuck until manually moved to another version by UpdateWorkflowExecutionOptions.
+    bool skip_drainage = 3;
+    // Optional. The identity of the client who initiated this request.
+    string identity = 4;
+}
+
+message DeleteWorkerDeploymentVersionResponse {
+}
+
+// Deletes records of (an old) Deployment. A deployment can only be deleted if
+// it has no Version in it.
+message DeleteWorkerDeploymentRequest {
+    string namespace = 1;
+    string deployment_name = 2;
+    // Optional. The identity of the client who initiated this request.
+    string identity = 3;
+}
+
+message DeleteWorkerDeploymentResponse {
+}
+
+// Used to update the compute config of a Worker Deployment Version.
+message UpdateWorkerDeploymentVersionComputeConfigRequest {
+    string namespace = 1;
+
+    // Required.
+    temporal.api.deployment.v1.WorkerDeploymentVersion deployment_version = 2;
+
+    // Optional. Contains the compute config scaling groups to add or update for the Worker
+    // Deployment.
+    map<string, temporal.api.compute.v1.ComputeConfigScalingGroupUpdate> compute_config_scaling_groups = 6;
+
+    // Optional. Contains the compute config scaling groups to remove from the Worker Deployment.
+    repeated string remove_compute_config_scaling_groups = 7;
+
+    // Optional. The identity of the client who initiated this request.
+    string identity = 3;
+
+    // A unique identifier for this create request for idempotence. Typically UUIDv4.
+    // If a second request with the same ID is recieved, it is considered a successful no-op.
+    // Retrying with a different request ID for the same deployment name + build ID is an error.
+    string request_id = 4;
+}
+
+message UpdateWorkerDeploymentVersionComputeConfigResponse {
+}
+
+// Used to validate the compute config without attaching it to a Worker Deployment Version.
+message ValidateWorkerDeploymentVersionComputeConfigRequest {
+    string namespace = 1;
+
+    // Required.
+    temporal.api.deployment.v1.WorkerDeploymentVersion deployment_version = 2;
+
+    // Optional. Contains the compute config scaling groups to add or update for the Worker
+    // Deployment.
+    map<string, temporal.api.compute.v1.ComputeConfigScalingGroupUpdate> compute_config_scaling_groups = 6;
+
+    // Optional. Contains the compute config scaling groups to remove from the Worker Deployment.
+    repeated string remove_compute_config_scaling_groups = 7;
+
+    // Optional. The identity of the client who initiated this request.
+    string identity = 3;
+}
+
+message ValidateWorkerDeploymentVersionComputeConfigResponse {
+}
+
+// Used to update the user-defined metadata of a Worker Deployment Version.
+message UpdateWorkerDeploymentVersionMetadataRequest {
+    string namespace = 1;
+    // Deprecated. Use `deployment_version`.
+    string version = 2 [deprecated = true];
+    // Required.
+    temporal.api.deployment.v1.WorkerDeploymentVersion deployment_version = 5;
+    map<string, temporal.api.common.v1.Payload> upsert_entries = 3;
+    // List of keys to remove from the metadata.
+    repeated string remove_entries = 4;
+    // Optional. The identity of the client who initiated this request.
+    string identity = 6;
+}
+
+message UpdateWorkerDeploymentVersionMetadataResponse {
+    // Full metadata after performing the update.
+    temporal.api.deployment.v1.VersionMetadata metadata = 1;
+}
+
+// Update the ManagerIdentity of a Worker Deployment.
+message SetWorkerDeploymentManagerRequest {
+    string namespace = 1;
+    string deployment_name = 2;
+
+    oneof new_manager_identity {
+      // Arbitrary value for `manager_identity`.
+      // Empty will unset the field.
+      string manager_identity = 3;
+
+      // True will set `manager_identity` to `identity`.
+      bool self = 4;
+    }
+
+    // Optional. This can be the value of conflict_token from a Describe, or another Worker
+    // Deployment API. Passing a non-nil conflict token will cause this request to fail if the
+    // Deployment's configuration has been modified between the API call that generated the
+    // token and this one.
+    bytes conflict_token = 5;
+
+    // Required. The identity of the client who initiated this request.
+    string identity = 6;
+}
+
+message SetWorkerDeploymentManagerResponse {
+    // This value is returned so that it can be optionally passed to APIs
+    // that write to the Worker Deployment state to ensure that the state
+    // did not change between this API call and a future write.
+    bytes conflict_token = 1;
+
+    // What the `manager_identity` field was before this change.
+    // Deprecated in favor of idempotency of the API. Use `DescribeWorkerDeployment` to get the
+    // manager identity before calling this API. By passing the `conflict_token` got from the
+    // `DescribeWorkerDeployment` call to this API you can ensure there is no interfering changes
+    // between the two calls.
+    string previous_manager_identity = 2 [deprecated = true];
+}
+
 // Returns the Current Deployment of a deployment series.
+// [cleanup-wv-pre-release] Pre-release deployment APIs, clean up later
 message GetCurrentDeploymentRequest {
     string namespace = 1;
     string series_name = 2;
 }
-
+// [cleanup-wv-pre-release] Pre-release deployment APIs, clean up later
 message GetCurrentDeploymentResponse {
     temporal.api.deployment.v1.DeploymentInfo current_deployment_info = 1;
 }
 
+// [cleanup-wv-pre-release] Pre-release deployment APIs, clean up later
 message GetDeploymentReachabilityRequest {
     string namespace = 1;
     temporal.api.deployment.v1.Deployment deployment = 2;
 }
 
+// [cleanup-wv-pre-release] Pre-release deployment APIs, clean up later
 message GetDeploymentReachabilityResponse {
     temporal.api.deployment.v1.DeploymentInfo deployment_info = 1;
     enums.v1.DeploymentReachability reachability = 2;
@@ -1931,24 +2665,724 @@ message GetDeploymentReachabilityResponse {
     google.protobuf.Timestamp last_update_time = 3;
 }
 
-// RecordWorkerHeartbeat allows SDK workers to signal liveness. Backported
-// from v1.62 upstream. Tokeirad accepts the call and discards the payload;
-// the `worker_heartbeat` submessage type lives in `temporal.api.worker.v1`
-// which is not vendored in this proto tree, so we accept it as opaque bytes
-// (wire-compatible with the upstream submessage encoding). A full
-// implementation is tracked in a follow-up spec.
+message CreateWorkflowRuleRequest {
+    string namespace = 1;
+
+    // The rule specification .
+    temporal.api.rules.v1.WorkflowRuleSpec spec = 2;
+
+    // If true, the rule will be applied to the currently running workflows via batch job.
+    // If not set , the rule will only be applied when triggering condition is satisfied.
+    // visibility_query in the rule will be used to select the workflows to apply the rule to.
+    bool force_scan = 3;
+
+    // Used to de-dupe requests. Typically should be UUID.
+    string request_id = 4;
+
+    // Identity of the actor who created the rule. Will be stored with the rule.
+    string identity = 5;
+
+    // Rule description.Will be stored with the rule.
+    string description = 6;
+}
+
+message CreateWorkflowRuleResponse {
+    // Created rule.
+    temporal.api.rules.v1.WorkflowRule  rule = 1;
+
+    // Batch Job ID if force-scan flag was provided. Otherwise empty.
+    string job_id = 2;
+}
+
+message DescribeWorkflowRuleRequest {
+    string namespace = 1;
+    // User-specified ID of the rule to read. Unique within the namespace.
+    string rule_id = 2;
+}
+
+message DescribeWorkflowRuleResponse {
+    // The rule that was read.
+    temporal.api.rules.v1.WorkflowRule rule = 1;
+}
+
+message DeleteWorkflowRuleRequest {
+    string namespace = 1;
+
+    // ID of the rule to delete. Unique within the namespace.
+    string rule_id = 2;
+}
+
+message DeleteWorkflowRuleResponse {
+}
+
+message ListWorkflowRulesRequest {
+    string namespace = 1;
+    bytes next_page_token = 2;
+}
+
+message ListWorkflowRulesResponse {
+    repeated temporal.api.rules.v1.WorkflowRule rules = 1;
+    bytes next_page_token = 2;
+}
+
+message TriggerWorkflowRuleRequest {
+    string namespace = 1;
+
+    // Execution info of the workflow which scheduled this activity
+    temporal.api.common.v1.WorkflowExecution execution = 2;
+
+    // Either provide id of existing rule, or rule specification
+    oneof rule {
+        string id = 4;
+        // Note: Rule ID and expiration date are not used in the trigger request.
+        temporal.api.rules.v1.WorkflowRuleSpec spec = 5;
+    }
+
+    // The identity of the client who initiated this request
+    string identity = 3;
+}
+
+message TriggerWorkflowRuleResponse {
+    // True is the rule was applied, based on the rule conditions (predicate/visibility_query).
+    bool applied = 1;
+}
 message RecordWorkerHeartbeatRequest {
     // Namespace this worker belongs to.
     string namespace = 1;
+
     // The identity of the client who initiated this request.
     string identity = 2;
-    // Opaque wire-format bytes of the SDK's temporal.api.worker.v1.WorkerHeartbeat
-    // messages. Wire type 2 (length-delimited) matches the upstream sub-message
-    // encoding so prost decodes each element into a raw byte blob.
-    repeated bytes worker_heartbeat = 3;
+
+    repeated temporal.api.worker.v1.WorkerHeartbeat worker_heartbeat = 3;
+
     // Resource ID for routing. Contains the worker grouping key.
     string resource_id = 4;
 }
 
 message RecordWorkerHeartbeatResponse {
+
+}
+
+message ListWorkersRequest {
+    string namespace = 1;
+    int32 page_size = 2;
+    bytes next_page_token = 3;
+
+    // `query` in ListWorkers is used to filter workers based on worker attributes.
+    // Supported attributes:
+    //* WorkerInstanceKey
+    //* WorkerIdentity
+    //* HostName
+    //* TaskQueue
+    //* DeploymentName
+    //* BuildId
+    //* SdkName
+    //* SdkVersion
+    //* StartTime
+    //* Status
+    string query = 4;
+}
+
+message ListWorkersResponse {
+    // Deprecated: Use workers instead. This field returns full WorkerInfo which
+    // includes expensive runtime metrics. We will stop populating this field in the future.
+    repeated temporal.api.worker.v1.WorkerInfo workers_info = 1 [deprecated = true];
+
+    // Limited worker information.
+    repeated temporal.api.worker.v1.WorkerListInfo workers = 3;
+
+    // Next page token
+    bytes next_page_token = 2;
+}
+
+message UpdateTaskQueueConfigRequest {
+    message RateLimitUpdate {
+        // Rate Limit to be updated
+        temporal.api.taskqueue.v1.RateLimit rate_limit = 1;
+        // Reason for why the rate limit was set.
+        string reason = 2;
+    }
+
+    string namespace = 1;
+    string identity = 2;
+    // Selects the task queue to update.
+    string task_queue = 3;
+    temporal.api.enums.v1.TaskQueueType task_queue_type = 4;
+    // Update to queue-wide rate limit.
+    // If not set, this configuration is unchanged.
+    // NOTE: A limit set by the worker is overriden; and restored again when reset.
+    // If the `rate_limit` field in the `RateLimitUpdate` is missing, remove the existing rate limit.
+    RateLimitUpdate update_queue_rate_limit = 5;
+    // Update to the default fairness key rate limit.
+    // If not set, this configuration is unchanged.
+    // If the `rate_limit` field in the `RateLimitUpdate` is missing, remove the existing rate limit.
+    RateLimitUpdate update_fairness_key_rate_limit_default = 6;
+    // If set, overrides the fairness weight for each specified fairness key.
+    // Fairness keys not listed in this map will keep their existing overrides (if any).
+    map<string, float> set_fairness_weight_overrides = 7;
+    // If set, removes any existing fairness weight overrides for each specified fairness key.
+    // Fairness weights for corresponding keys fall back to the values set during task creation (if any),
+    // or to the default weight of 1.0.
+    repeated string unset_fairness_weight_overrides = 8;
+}
+
+message UpdateTaskQueueConfigResponse {
+    temporal.api.taskqueue.v1.TaskQueueConfig config = 1;
+}
+
+message FetchWorkerConfigRequest {
+    // Namespace this worker belongs to.
+    string namespace = 1;
+
+    // The identity of the client who initiated this request.
+    string identity = 2;
+
+    // Reason for sending worker command, can be used for audit purpose.
+    string reason = 3;
+
+    // Defines which workers should receive this command.
+    // only single worker is supported at this time.
+    temporal.api.common.v1.WorkerSelector selector = 6;
+    // Resource ID for routing. Contains the worker grouping key.
+    string resource_id = 7;
+}
+
+message FetchWorkerConfigResponse {
+    // The worker configuration.
+    temporal.api.sdk.v1.WorkerConfig worker_config = 1;
+}
+
+message UpdateWorkerConfigRequest {
+    // Namespace this worker belongs to.
+    string namespace = 1;
+
+    // The identity of the client who initiated this request.
+    string identity = 2;
+
+    // Reason for sending worker command, can be used for audit purpose.
+    string reason = 3;
+
+    // Partial updates are accepted and controlled by update_mask.
+    // The worker configuration to set.
+    temporal.api.sdk.v1.WorkerConfig worker_config = 4;
+
+    // Controls which fields from `worker_config` will be applied
+    google.protobuf.FieldMask update_mask = 5;
+
+    // Defines which workers should receive this command.
+    temporal.api.common.v1.WorkerSelector selector = 6;
+    // Resource ID for routing. Contains the worker grouping key.
+    string resource_id = 7;
+}
+
+message UpdateWorkerConfigResponse {
+    oneof response {
+        // The worker configuration. Will be returned if the command was sent to a single worker.
+        temporal.api.sdk.v1.WorkerConfig worker_config = 1;
+
+        // Once we support sending update to a multiple workers - it will be converted into a batch job, and job id will be returned.
+    }
+}
+
+message DescribeWorkerRequest {
+    // Namespace this worker belongs to.
+    string namespace = 1;
+
+    // Worker instance key to describe.
+    string worker_instance_key = 2;
+}
+
+message DescribeWorkerResponse {
+    temporal.api.worker.v1.WorkerInfo worker_info = 1;
+}
+
+// Request to pause a workflow execution.
+message PauseWorkflowExecutionRequest {
+    // Namespace of the workflow to pause.
+    string namespace = 1;
+    // ID of the workflow execution to be paused. Required.
+    string workflow_id = 2;
+    // Run ID of the workflow execution to be paused. Optional. If not provided, the current run of the workflow will be paused.
+    string run_id = 3;
+    // The identity of the client who initiated this request.
+    string identity = 4;
+    // Reason to pause the workflow execution.
+    string reason = 5;
+    // A unique identifier for this pause request for idempotence. Typically UUIDv4.
+    string request_id = 6;
+}
+
+// Response to a successful PauseWorkflowExecution request.
+message PauseWorkflowExecutionResponse { }
+
+message UnpauseWorkflowExecutionRequest {
+    // Namespace of the workflow to unpause.
+    string namespace = 1;
+    // ID of the workflow execution to be paused. Required.
+    string workflow_id = 2;
+    // Run ID of the workflow execution to be paused. Optional. If not provided, the current run of the workflow will be paused.
+    string run_id = 3;
+    // The identity of the client who initiated this request.
+    string identity = 4;
+    // Reason to unpause the workflow execution.
+    string reason = 5;
+    // A unique identifier for this unpause request for idempotence. Typically UUIDv4.
+    string request_id = 6;
+}
+
+// Response to a successful UnpauseWorkflowExecution request.
+message UnpauseWorkflowExecutionResponse { }
+
+message StartActivityExecutionRequest {
+    string namespace = 1;
+    // The identity of the client who initiated this request
+    string identity = 2;
+    // A unique identifier for this start request. Typically UUIDv4.
+    string request_id = 3;
+
+    // Identifier for this activity. Required. This identifier should be meaningful in the user's
+    // own system. It must be unique among activities in the same namespace, subject to the rules
+    // imposed by id_reuse_policy and id_conflict_policy.
+    string activity_id = 4;
+
+    // The type of the activity, a string that corresponds to a registered activity on a worker.
+    temporal.api.common.v1.ActivityType activity_type = 5;
+
+    // Task queue to schedule this activity on.
+    temporal.api.taskqueue.v1.TaskQueue task_queue = 6;
+    // Indicates how long the caller is willing to wait for an activity completion. Limits how long
+    // retries will be attempted. Either this or `start_to_close_timeout` must be specified.
+    //
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "to" is used to indicate interval. --)
+    google.protobuf.Duration schedule_to_close_timeout = 7;
+    // Limits time an activity task can stay in a task queue before a worker picks it up. This
+    // timeout is always non retryable, as all a retry would achieve is to put it back into the same
+    // queue. Defaults to `schedule_to_close_timeout` if not specified.
+    //
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "to" is used to indicate interval. --)
+    google.protobuf.Duration schedule_to_start_timeout = 8;
+    // Maximum time an activity is allowed to execute after being picked up by a worker. This
+    // timeout is always retryable. Either this or `schedule_to_close_timeout` must be
+    // specified.
+    //
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "to" is used to indicate interval. --)
+    google.protobuf.Duration start_to_close_timeout = 9;
+    // Maximum permitted time between successful worker heartbeats.
+    google.protobuf.Duration heartbeat_timeout = 10;
+    // The retry policy for the activity. Will never exceed `schedule_to_close_timeout`.
+    temporal.api.common.v1.RetryPolicy retry_policy = 11;
+
+    // Serialized arguments to the activity. These are passed as arguments to the activity function.
+    temporal.api.common.v1.Payloads input = 12;
+
+    // Defines whether to allow re-using the activity id from a previously *closed* activity.
+    // The default policy is ACTIVITY_ID_REUSE_POLICY_ALLOW_DUPLICATE.
+    temporal.api.enums.v1.ActivityIdReusePolicy id_reuse_policy = 13;
+    // Defines how to resolve an activity id conflict with a *running* activity.
+    // The default policy is ACTIVITY_ID_CONFLICT_POLICY_FAIL.
+    temporal.api.enums.v1.ActivityIdConflictPolicy id_conflict_policy = 14;
+
+    // Search attributes for indexing.
+    temporal.api.common.v1.SearchAttributes search_attributes = 15;
+    // Header for context propagation and tracing purposes.
+    temporal.api.common.v1.Header header = 16;
+    // Metadata for use by user interfaces to display the fixed as-of-start summary and details of the activity.
+    temporal.api.sdk.v1.UserMetadata user_metadata = 17;
+    // Priority metadata.
+    temporal.api.common.v1.Priority priority = 18;
+    // Callbacks to be called by the server when this activity reaches a terminal state.
+    // Callback addresses must be whitelisted in the server's dynamic configuration.
+    repeated temporal.api.common.v1.Callback completion_callbacks = 19;
+    // Links to be associated with the activity. Callbacks may also have associated links;
+    // links already included with a callback should not be duplicated here.
+    repeated temporal.api.common.v1.Link links = 20;
+    // Options for handling conflicts when using ACTIVITY_ID_CONFLICT_POLICY_USE_EXISTING.
+    temporal.api.common.v1.OnConflictOptions on_conflict_options = 21;
+    // Time to wait before dispatching the first activity task. This delay is not applied to retry attempts.
+    google.protobuf.Duration start_delay = 22;
+}
+
+message StartActivityExecutionResponse {
+    // The run ID of the activity that was started - or used (via ACTIVITY_ID_CONFLICT_POLICY_USE_EXISTING).
+    string run_id = 1;
+    // If true, a new activity was started.
+    bool started = 2;
+    // Link to the started activity.
+    temporal.api.common.v1.Link link = 3;
+}
+
+message DescribeActivityExecutionRequest {
+    string namespace = 1;
+    string activity_id = 2;
+    // Activity run ID. If empty the request targets the latest run.
+    string run_id = 3;
+    // Include the input field in the response.
+    bool include_input = 4;
+    // Include the outcome (result/failure) in the response if the activity has completed.
+    bool include_outcome = 5;
+    // Token from a previous DescribeActivityExecutionResponse. If present, long-poll until activity
+    // state changes from the state encoded in this token. If absent, return current state immediately.
+    // If present, run_id must also be present.
+    // Note that activity state may change multiple times between requests, therefore it is not
+    // guaranteed that a client making a sequence of long-poll requests will see a complete
+    // sequence of state changes.
+    bytes long_poll_token = 6;
+}
+
+message DescribeActivityExecutionResponse {
+    // The run ID of the activity, useful when run_id was not specified in the request.
+    string run_id = 1;
+
+    // Information about the activity execution.
+    temporal.api.activity.v1.ActivityExecutionInfo info = 2;
+
+    // Serialized activity input, passed as arguments to the activity function.
+    // Only set if include_input was true in the request.
+    temporal.api.common.v1.Payloads input = 3;
+
+    // Only set if the activity is completed and include_outcome was true in the request.
+    temporal.api.activity.v1.ActivityExecutionOutcome outcome = 4;
+
+    // Token for follow-on long-poll requests. Absent only if the activity is complete.
+    bytes long_poll_token = 5;
+
+    // Callbacks attached to this activity execution and their current state.
+    repeated temporal.api.activity.v1.CallbackInfo callbacks = 6;
+}
+
+message PollActivityExecutionRequest {
+    string namespace = 1;
+    string activity_id = 2;
+    // Activity run ID. If empty the request targets the latest run.
+    string run_id = 3;
+}
+
+message PollActivityExecutionResponse {
+    // The run ID of the activity, useful when run_id was not specified in the request.
+    string run_id = 1;
+
+    temporal.api.activity.v1.ActivityExecutionOutcome outcome = 2;
+}
+
+message ListActivityExecutionsRequest {
+    string namespace = 1;
+    // Max number of executions to return per page.
+    int32 page_size = 2;
+    // Token returned in ListActivityExecutionsResponse.
+    bytes next_page_token = 3;
+    // Visibility query, see https://docs.temporal.io/list-filter for the syntax.
+    string query = 4;
+}
+
+message ListActivityExecutionsResponse {
+    repeated temporal.api.activity.v1.ActivityExecutionListInfo executions = 1;
+    // Token to use to fetch the next page. If empty, there is no next page.
+    bytes next_page_token = 2;
+}
+
+message StartNexusOperationExecutionRequest {
+    string namespace = 1;
+    // The identity of the client who initiated this request.
+    string identity = 2;
+    // A unique identifier for this caller-side start request. Typically UUIDv4.
+    // StartOperation requests sent to the handler will use a server-generated request ID.
+    string request_id = 3;
+    // Identifier for this operation. This is a caller-side ID, distinct from any internal
+    // operation identifiers generated by the handler. Must be unique among operations in the
+    // same namespace, subject to the rules imposed by id_reuse_policy and id_conflict_policy.
+    string operation_id = 4;
+    // Endpoint name, resolved to a URL via the cluster's endpoint registry.
+    string endpoint = 5;
+    // Service name.
+    string service = 6;
+    // Operation name.
+    string operation = 7;
+
+    // Schedule-to-close timeout for this operation.
+    // Indicates how long the caller is willing to wait for operation completion.
+    // Calls are retried internally by the server.
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "to" is used to indicate interval. --)
+    google.protobuf.Duration schedule_to_close_timeout = 8;
+
+    // Schedule-to-start timeout for this operation.
+    // Indicates how long the caller is willing to wait for the operation to be started (or completed if synchronous)
+    // by the handler.
+    // If not set or zero, no schedule-to-start timeout is enforced.
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "to" is used to indicate interval. --)
+    google.protobuf.Duration schedule_to_start_timeout = 9;
+
+    // Start-to-close timeout for this operation.
+    // Indicates how long the caller is willing to wait for an asynchronous operation to complete after it has been
+    // started. Synchronous operations ignore this timeout.
+    // If not set or zero, no start-to-close timeout is enforced.
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "to" is used to indicate interval. --)
+    google.protobuf.Duration start_to_close_timeout = 10;
+
+    // Serialized input to the operation. Passed as the request payload.
+    temporal.api.common.v1.Payload input = 11;
+
+    // Defines whether to allow re-using the operation id from a previously *closed* operation.
+    // The default policy is NEXUS_OPERATION_ID_REUSE_POLICY_ALLOW_DUPLICATE.
+    temporal.api.enums.v1.NexusOperationIdReusePolicy id_reuse_policy = 12;
+    // Defines how to resolve an operation id conflict with a *running* operation.
+    // The default policy is NEXUS_OPERATION_ID_CONFLICT_POLICY_FAIL.
+    temporal.api.enums.v1.NexusOperationIdConflictPolicy id_conflict_policy = 13;
+
+    // Search attributes for indexing.
+    temporal.api.common.v1.SearchAttributes search_attributes = 14;
+    // Header to attach to the Nexus request.
+    // Users are responsible for encrypting sensitive data in this header as it is stored in workflow history and
+    // transmitted to external services as-is.
+    // This is useful for propagating tracing information.
+    // Note these headers are not the same as Temporal headers on internal activities and child workflows, these are
+    // transmitted to Nexus operations that may be external and are not traditional payloads.
+    map<string, string> nexus_header = 15;
+    // Metadata for use by user interfaces to display the fixed as-of-start summary and details of the operation.
+    temporal.api.sdk.v1.UserMetadata user_metadata = 16;
+}
+
+message StartNexusOperationExecutionResponse {
+    // The run ID of the operation that was started - or used (via NEXUS_OPERATION_ID_CONFLICT_POLICY_USE_EXISTING).
+    string run_id = 1;
+    // If true, a new operation was started.
+    bool started = 2;
+}
+
+message DescribeNexusOperationExecutionRequest {
+    string namespace = 1;
+    string operation_id = 2;
+    // Operation run ID. If empty the request targets the latest run.
+    string run_id = 3;
+    // Include the input field in the response.
+    bool include_input = 4;
+    // Include the outcome (result/failure) in the response if the operation has completed.
+    bool include_outcome = 5;
+    // Token from a previous DescribeNexusOperationExecutionResponse. If present, this RPC will long-poll until operation
+    // state changes from the state encoded in this token. If absent, return current state immediately.
+    // If present, run_id must also be present.
+    // Note that operation state may change multiple times between requests, therefore it is not
+    // guaranteed that a client making a sequence of long-poll requests will see a complete
+    // sequence of state changes.
+    bytes long_poll_token = 6;
+}
+
+message DescribeNexusOperationExecutionResponse {
+    // The run ID of the operation, useful when run_id was not specified in the request.
+    string run_id = 1;
+
+    // Information about the operation.
+    temporal.api.nexus.v1.NexusOperationExecutionInfo info = 2;
+
+    // Serialized operation input, passed as the request payload.
+    // Only set if include_input was true in the request.
+    temporal.api.common.v1.Payload input = 3;
+
+    // Only set if the operation is completed and include_outcome was true in the request.
+    oneof outcome {
+        // The result if the operation completed successfully.
+        temporal.api.common.v1.Payload result = 4;
+        // The failure if the operation completed unsuccessfully.
+        temporal.api.failure.v1.Failure failure = 5;
+    }
+
+    // Token for follow-on long-poll requests. Absent only if the operation is complete.
+    bytes long_poll_token = 6;
+}
+
+message PollNexusOperationExecutionRequest {
+    string namespace = 1;
+    string operation_id = 2;
+    // Operation run ID. If empty the request targets the latest run.
+    string run_id = 3;
+
+    // Stage to wait for. The operation may be in a more advanced stage when the poll is unblocked.
+    temporal.api.enums.v1.NexusOperationWaitStage wait_stage = 4;
+}
+
+message PollNexusOperationExecutionResponse {
+    // The run ID of the operation, useful when run_id was not specified in the request.
+    string run_id = 1;
+
+    // The current stage of the operation. May be more advanced than the stage requested in the poll.
+    temporal.api.enums.v1.NexusOperationWaitStage wait_stage = 2;
+
+    // Operation token. Only populated for asynchronous operations after a successful StartOperation call.
+    string operation_token = 3;
+
+    // The operation outcome, available if the operation is in a closed state.
+    oneof outcome {
+        // The result if the operation completed successfully.
+        temporal.api.common.v1.Payload result = 4;
+        // The failure if the operation completed unsuccessfully.
+        temporal.api.failure.v1.Failure failure = 5;
+    }
+}
+
+message ListNexusOperationExecutionsRequest {
+    string namespace = 1;
+    // Max number of operations to return per page.
+    int32 page_size = 2;
+    // Token returned in ListNexusOperationExecutionsResponse.
+    bytes next_page_token = 3;
+    // Visibility query, see https://docs.temporal.io/list-filter for the syntax.
+    // Search attributes that are avaialble for Nexus operations include:
+    // - OperationId
+    // - RunId
+    // - Endpoint
+    // - Service
+    // - Operation
+    // - RequestId
+    // - StartTime
+    // - ExecutionTime
+    // - CloseTime
+    // - ExecutionStatus
+    // - ExecutionDuration
+    // - StateTransitionCount
+    string query = 4;
+}
+
+message ListNexusOperationExecutionsResponse {
+    repeated temporal.api.nexus.v1.NexusOperationExecutionListInfo operations = 1;
+    // Token to use to fetch the next page. If empty, there is no next page.
+    bytes next_page_token = 2;
+}
+
+message CountActivityExecutionsRequest {
+    string namespace = 1;
+    // Visibility query, see https://docs.temporal.io/list-filter for the syntax.
+    string query = 2;
+}
+
+message CountActivityExecutionsResponse {
+    // If `query` is not grouping by any field, the count is an approximate number
+    // of activities that match the query.
+    // If `query` is grouping by a field, the count is simply the sum of the counts
+    // of the groups returned in the response. This number can be smaller than the
+    // total number of activities matching the query.
+    int64 count = 1;
+
+    // Contains the groups if the request is grouping by a field.
+    // The list might not be complete, and the counts of each group is approximate.
+    repeated AggregationGroup groups = 2;
+
+    message AggregationGroup {
+        repeated temporal.api.common.v1.Payload group_values = 1;
+        int64 count = 2;
+    }
+}
+
+message CountNexusOperationExecutionsRequest {
+    string namespace = 1;
+    // Visibility query, see https://docs.temporal.io/list-filter for the syntax.
+    // See also ListNexusOperationExecutionsRequest for search attributes available for Nexus operations.
+    string query = 2;
+}
+
+message CountNexusOperationExecutionsResponse {
+    // If `query` is not grouping by any field, the count is an approximate number
+    // of operations that match the query.
+    // If `query` is grouping by a field, the count is simply the sum of the counts
+    // of the groups returned in the response. This number can be smaller than the
+    // total number of operations matching the query.
+    int64 count = 1;
+
+    // Contains the groups if the request is grouping by a field.
+    // The list might not be complete, and the counts of each group is approximate.
+    repeated AggregationGroup groups = 2;
+
+    message AggregationGroup {
+        repeated temporal.api.common.v1.Payload group_values = 1;
+        int64 count = 2;
+    }
+}
+
+message RequestCancelActivityExecutionRequest {
+    string namespace = 1;
+    string activity_id = 2;
+    // Activity run ID, targets the latest run if run_id is empty.
+    string run_id = 3;
+    // The identity of the worker/client.
+    string identity = 4;
+    // Used to de-dupe cancellation requests.
+    string request_id = 5;
+    // Reason for requesting the cancellation, recorded and available via the PollActivityExecution API.
+    // Not propagated to a worker if an activity attempt is currently running.
+    string reason = 6;
+}
+
+message RequestCancelActivityExecutionResponse {
+}
+
+message TerminateActivityExecutionRequest {
+    string namespace = 1;
+    string activity_id = 2;
+    // Activity run ID, targets the latest run if run_id is empty.
+    string run_id = 3;
+    // The identity of the worker/client.
+    string identity = 4;
+    // Used to de-dupe termination requests.
+    string request_id = 5;
+    // Reason for requesting the termination, recorded in in the activity's result failure outcome.
+    string reason = 6;
+}
+
+message TerminateActivityExecutionResponse {
+}
+
+message DeleteActivityExecutionRequest {
+    string namespace = 1;
+    string activity_id = 2;
+    // Activity run ID, targets the latest run if run_id is empty.
+    string run_id = 3;
+}
+
+message DeleteActivityExecutionResponse {
+}
+
+message RequestCancelNexusOperationExecutionRequest {
+    string namespace = 1;
+    string operation_id = 2;
+    // Operation run ID, targets the latest run if empty.
+    string run_id = 3;
+    // The identity of the client who initiated this request.
+    string identity = 4;
+    // Used to de-dupe cancellation requests.
+    string request_id = 5;
+    // Reason for requesting the cancellation, recorded and available via the DescribeNexusOperationExecution API.
+    string reason = 6;
+}
+
+message RequestCancelNexusOperationExecutionResponse {
+}
+
+message TerminateNexusOperationExecutionRequest {
+    string namespace = 1;
+    string operation_id = 2;
+    // Operation run ID, targets the latest run if empty.
+    string run_id = 3;
+    // The identity of the client who initiated this request.
+    string identity = 4;
+    // Used to de-dupe termination requests.
+    string request_id = 5;
+    // Reason for requesting the termination, recorded in the operation's result failure outcome.
+    string reason = 6;
+}
+
+message TerminateNexusOperationExecutionResponse {
+}
+
+message DeleteNexusOperationExecutionRequest {
+    string namespace = 1;
+    string operation_id = 2;
+    // Operation run ID, targets the latest run if empty.
+    string run_id = 3;
+}
+
+message DeleteNexusOperationExecutionResponse {
 }

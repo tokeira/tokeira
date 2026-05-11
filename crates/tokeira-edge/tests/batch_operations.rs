@@ -362,6 +362,7 @@ async fn build_service(
         Arc::new(VersioningRuleStore::default()),
         WorkerRegistry::default(),
         Arc::new(ScheduleStore::default()),
+        Arc::new(tokeira_runtime::InMemoryTaskQueueConfigStore::default()),
         Arc::new(BatchOperationStore::default()),
     )
 }

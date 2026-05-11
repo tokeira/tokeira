@@ -1,25 +1,3 @@
-// The MIT License
-//
-// Copyright (c) 2020 Temporal Technologies Inc.  All rights reserved.
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in
-// all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-// THE SOFTWARE.
-
 syntax = "proto3";
 
 package temporal.api.namespace.v1;
@@ -56,11 +34,33 @@ message NamespaceInfo {
         bool sync_update = 2;
         // True if the namespace supports async update
         bool async_update = 3;
-        // True if the namespace accepts worker heartbeats via RecordWorkerHeartbeat.
-        // Tokeirad currently accepts heartbeats as a no-op so v0.4+ SDK workers
-        // run without shutting down their heartbeat channel. A production
-        // implementation is tracked in a follow-up spec.
+        // True if the namespace supports worker heartbeats
         bool worker_heartbeats = 4;
+        // True if the namespace supports reported problems search attribute
+        bool reported_problems_search_attribute = 5;
+        // True if the namespace supports pausing workflows
+        bool workflow_pause = 6;
+        // True if the namespace supports standalone activities
+        bool standalone_activities = 7;
+        // True if the namespace supports server-side completion of outstanding worker polls on shutdown.
+        // When enabled, the server will complete polls for workers that send WorkerInstanceKey in their
+        // poll requests and call ShutdownWorker with the same WorkerInstanceKey. The poll will return
+        // an empty response. When this flag is true, workers should allow polls to return gracefully
+        // rather than terminating any open polls on shutdown.
+        bool worker_poll_complete_on_shutdown = 8;
+        // True if the namespace supports poller autoscaling
+        bool poller_autoscaling = 9;
+    }
+
+    // Namespace configured limits
+    Limits limits = 8;
+    message Limits {
+        // Maximum size in bytes for payload fields in workflow history events
+        // (e.g., workflow/activity inputs and results, failure details, signal payloads).
+        // When exceeded, the server will reject the operation with an error.
+        int64 blob_size_limit_error = 1;
+        // Maximum total memo size in bytes per workflow execution.
+        int64 memo_size_limit_error = 2;
     }
 
     // Whether scheduled workflows are supported on this namespace. This is only needed
@@ -95,8 +95,8 @@ message UpdateNamespaceInfo {
     string description = 1;
     string owner_email = 2;
     // A key-value map for any customized purpose.
-    // If data already exists on the namespace, 
-    // this will merge with the existing key values. 
+    // If data already exists on the namespace,
+    // this will merge with the existing key values.
     map<string, string> data = 3;
     // New namespace state, server will reject if transition is not allowed.
     // Allowed transitions are:

@@ -53,8 +53,14 @@ set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 WORKSTATION_ID={workstation_id:?}
-SHELL_USER="$(id -un 1000 2>/dev/null || echo ubuntu)"
-SHELL_HOME="$(getent passwd "$SHELL_USER" | cut -d: -f6)"
+
+# Create a dedicated 'tokeira' user for all build and repo operations.
+# Idempotent: skips if the user already exists.
+if ! id tokeira >/dev/null 2>&1; then
+  useradd -m -s /bin/bash -d /home/tokeira tokeira
+fi
+SHELL_USER="tokeira"
+SHELL_HOME="/home/tokeira"
 mkdir -p /etc/tokeira /var/lib/tokeira
 "#,
         workstation_id = context.workstation_id
@@ -183,7 +189,7 @@ mkdir -p /run/tokeira-agentd
 chown "$SHELL_USER:$SHELL_USER" /run/tokeira-agentd
 chmod 0750 /run/tokeira-agentd
 cat > /etc/tmpfiles.d/tokeira-agentd.conf <<'TMPFILES'
-d /run/tokeira-agentd 0750 ubuntu ubuntu -
+d /run/tokeira-agentd 0750 tokeira tokeira -
 TMPFILES
 "#
     .to_string()

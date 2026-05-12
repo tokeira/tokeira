@@ -289,6 +289,31 @@ pub enum WorkstationAction {
         #[command(subcommand)]
         action: GithubKeyAction,
     },
+    /// Manage code on the workstation (clone, sync, push).
+    Code {
+        #[command(subcommand)]
+        action: CodeAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CodeAction {
+    /// Clone the repo if missing, or pull latest from origin.
+    Sync {
+        #[arg(long)]
+        workstation: Option<String>,
+        /// Branch to checkout/pull. Defaults to main.
+        #[arg(long)]
+        branch: Option<String>,
+    },
+    /// Push the current branch to origin.
+    Push {
+        #[arg(long)]
+        workstation: Option<String>,
+        /// Branch to push. Defaults to the current branch.
+        #[arg(long)]
+        branch: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

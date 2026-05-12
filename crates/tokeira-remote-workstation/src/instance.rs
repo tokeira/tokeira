@@ -5,7 +5,6 @@
 //! chicken-and-egg problem: user-data needs volume IDs, but volumes are
 //! created by the IaC engine before the instance.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use aws_sdk_ec2::client::Waiters as Ec2Waiters;
@@ -104,55 +103,83 @@ impl Resource for WorkstationInstance {
         let user_data_base64 =
             base64::engine::general_purpose::STANDARD.encode(user_data.as_bytes());
 
-        // Launch instance
-        let run_output = clients
-            .ec2
-            .run_instances()
-            .image_id(&self.config.ami_id)
-            .instance_type(InstanceType::from(self.config.instance_type.as_str()))
-            .min_count(1)
-            .max_count(1)
-            .iam_instance_profile(
-                IamInstanceProfileSpecification::builder()
-                    .name(&self.config.instance_profile_name)
-                    .build(),
-            )
-            .network_interfaces(
-                InstanceNetworkInterfaceSpecification::builder()
-                    .device_index(0)
-                    .subnet_id(&self.config.subnet_id)
-                    .groups(&sg_id)
-                    .associate_public_ip_address(true)
-                    .build(),
-            )
-            .block_device_mappings(
-                BlockDeviceMapping::builder()
-                    .device_name("/dev/sda1")
-                    .ebs(
-                        EbsBlockDevice::builder()
-                            .volume_size(self.config.root_volume_gib as i32)
-                            .volume_type(VolumeType::Gp3)
-                            .encrypted(true)
-                            .delete_on_termination(true)
-                            .build(),
-                    )
-                    .build(),
-            )
-            .tag_specifications(
-                aws_sdk_ec2::types::TagSpecification::builder()
-                    .resource_type(Ec2ResourceType::Instance)
-                    .set_tags(Some(tokeira_aws::resources::ec2_tags(&tags)))
-                    .build(),
-            )
-            .user_data(&user_data_base64)
-            .send()
-            .await
-            .map_err(|e| {
-                IacError::AwsSdk(format!(
-                    "failed to launch instance: {:?}",
-                    e.into_service_error()
-                ))
-            })?;
+        // Launch instance — retry on InvalidParameterValue for the instance
+        // profile name because IAM propagation is eventually consistent and
+        // the profile may not be visible to EC2 immediately after creation.
+        let mut run_output = None;
+        let max_attempts = 10;
+        for attempt in 1..=max_attempts {
+            match clients
+                .ec2
+                .run_instances()
+                .image_id(&self.config.ami_id)
+                .instance_type(InstanceType::from(self.config.instance_type.as_str()))
+                .min_count(1)
+                .max_count(1)
+                .iam_instance_profile(
+                    IamInstanceProfileSpecification::builder()
+                        .name(&self.config.instance_profile_name)
+                        .build(),
+                )
+                .network_interfaces(
+                    InstanceNetworkInterfaceSpecification::builder()
+                        .device_index(0)
+                        .subnet_id(&self.config.subnet_id)
+                        .groups(&sg_id)
+                        .associate_public_ip_address(true)
+                        .build(),
+                )
+                .block_device_mappings(
+                    BlockDeviceMapping::builder()
+                        .device_name("/dev/sda1")
+                        .ebs(
+                            EbsBlockDevice::builder()
+                                .volume_size(self.config.root_volume_gib as i32)
+                                .volume_type(VolumeType::Gp3)
+                                .encrypted(true)
+                                .delete_on_termination(true)
+                                .build(),
+                        )
+                        .build(),
+                )
+                .tag_specifications(
+                    aws_sdk_ec2::types::TagSpecification::builder()
+                        .resource_type(Ec2ResourceType::Instance)
+                        .set_tags(Some(tokeira_aws::resources::ec2_tags(&tags)))
+                        .build(),
+                )
+                .user_data(&user_data_base64)
+                .send()
+                .await
+            {
+                Ok(output) => {
+                    run_output = Some(output);
+                    break;
+                }
+                Err(e) => {
+                    let svc_err = e.into_service_error();
+                    let msg = format!("{svc_err:?}");
+                    if msg.contains("InvalidParameterValue")
+                        && msg.contains("iamInstanceProfile")
+                        && attempt < max_attempts
+                    {
+                        tracing::info!(
+                            attempt,
+                            profile = %self.config.instance_profile_name,
+                            "instance profile not yet visible to EC2, retrying"
+                        );
+                        tokio::time::sleep(Duration::from_secs(2 * attempt as u64)).await;
+                        continue;
+                    }
+                    return Err(IacError::AwsSdk(format!(
+                        "failed to launch instance: {svc_err:?}"
+                    )));
+                }
+            }
+        }
+        let run_output = run_output.ok_or_else(|| {
+            IacError::AwsSdk("exhausted retries waiting for instance profile propagation".to_string())
+        })?;
 
         let instance_id = run_output
             .instances()

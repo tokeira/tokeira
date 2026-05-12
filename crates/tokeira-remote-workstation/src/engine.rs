@@ -282,8 +282,11 @@ fn ssm_err(err: impl std::fmt::Display + std::fmt::Debug) -> WorkstationError {
     let code = extract_between(&debug, "code: Some(\"", "\")");
     let message = extract_between(&debug, "message: Some(\"", "\")");
     match (code, message) {
+        (Some(code), Some(msg)) if code == "InvalidInstanceId" => WorkstationError::Ssm(format!(
+            "{code}: {msg}; the instance may still be booting — wait 30-60s for the SSM agent to register"
+        )),
         (Some(code), Some(msg)) => WorkstationError::Ssm(format!("{code}: {msg}")),
-        _ => WorkstationError::Ssm(format!("{err}")),
+        _ => WorkstationError::Ssm(format!("{err:?}")),
     }
 }
 
@@ -427,7 +430,7 @@ impl Workstation {
     ) -> Result<WorkstationStatus, WorkstationError> {
         let handle = self.resolve_handle(workstation_id).await?;
         let instance = self
-            .find_instance(Some(workstation_id))
+            .describe_instance_by_id(&handle.instance_id)
             .await?
             .ok_or_else(|| WorkstationError::NotFound(workstation_id.to_string()))?;
         let instance_type = instance
@@ -458,7 +461,7 @@ impl Workstation {
     pub async fn list(&self) -> Result<Vec<WorkstationSummary>, WorkstationError> {
         let mut summaries = Vec::new();
         for handle in self.discover(None).await? {
-            if let Some(instance) = self.find_instance(Some(&handle.workstation_id)).await? {
+            if let Some(instance) = self.describe_instance_by_id(&handle.instance_id).await? {
                 let instance_type = instance
                     .instance_type()
                     .map(|value| value.as_str().to_string())
@@ -507,13 +510,23 @@ impl Workstation {
         let mut seen_stderr = 0;
         loop {
             let invocation = tokio::select! {
-                invocation = self
+                result = self
                     .ssm
                     .get_command_invocation()
                     .command_id(&command_id)
                     .instance_id(&handle.instance_id)
                     .send() => {
-                        invocation.map_err(ssm_err)?
+                        match result {
+                            Ok(inv) => inv,
+                            Err(e) => {
+                                let debug = format!("{e:?}");
+                                if debug.contains("InvocationDoesNotExist") {
+                                    sleep(Duration::from_secs(2)).await;
+                                    continue;
+                                }
+                                return Err(ssm_err(e));
+                            }
+                        }
                     }
                 signal = tokio::signal::ctrl_c() => {
                     if let Err(err) = signal {
@@ -638,13 +651,25 @@ impl Workstation {
         })
     }
 
+    /// Run a shell command on the workstation and return its stdout.
+    /// Resolves the workstation ID to an instance ID from persisted state.
+    pub async fn remote_command_text_raw(
+        &self,
+        workstation_id: &str,
+        command: &str,
+    ) -> Result<String, WorkstationError> {
+        let handle = self.resolve_handle(workstation_id).await?;
+        self.remote_command_text(&handle.instance_id, command).await
+    }
+
     pub async fn github_key_generate(
         &self,
         workstation_id: &str,
     ) -> Result<String, WorkstationError> {
         let handle = self.resolve_handle(workstation_id).await?;
+        let key_path = format!("/home/tokeira/.ssh/tokeira-workstation-{workstation_id}");
         let command = format!(
-            "mkdir -p ~/.ssh && ssh-keygen -t ed25519 -N '' -C 'tokeira-workstation-{workstation_id}' -f ~/.ssh/tokeira-workstation-{workstation_id} >/dev/null && cat ~/.ssh/tokeira-workstation-{workstation_id}.pub"
+            r#"mkdir -p /home/tokeira/.ssh && rm -f {key_path} {key_path}.pub && ssh-keygen -t ed25519 -N '' -C 'tokeira-workstation-{workstation_id}' -f {key_path} >/dev/null 2>&1 && chown tokeira:tokeira {key_path} {key_path}.pub && cat {key_path}.pub"#
         );
         self.remote_command_text(&handle.instance_id, &command)
             .await
@@ -665,13 +690,31 @@ impl Workstation {
         repo: &GithubRepo,
     ) -> Result<(), WorkstationError> {
         let handle = self.resolve_handle(workstation_id).await?;
-        let command = format!(
-            "git -C /work/tokeira remote set-url origin git@github.com-tokeira-{id}:{owner}/{name}.git",
-            id = workstation_id,
+        let host_alias = format!("github.com-tokeira-{workstation_id}");
+        let key_path = format!("/home/tokeira/.ssh/tokeira-workstation-{workstation_id}");
+
+        // Add host alias to SSH config so git uses the deploy key
+        let ssh_config_cmd = format!(
+            r#"grep -q 'Host {host_alias}' /home/tokeira/.ssh/config 2>/dev/null || cat >> /home/tokeira/.ssh/config <<'EOF'
+
+Host {host_alias}
+  HostName github.com
+  IdentityFile {key_path}
+  IdentitiesOnly yes
+  User git
+EOF
+chown tokeira:tokeira /home/tokeira/.ssh/config"#
+        );
+        self.remote_command_text(&handle.instance_id, &ssh_config_cmd)
+            .await?;
+
+        // Rewrite git remote to use the host alias (only if repo already cloned)
+        let git_cmd = format!(
+            "if [ -d /work/repo/tokeira/.git ]; then su tokeira -c 'git -C /work/repo/tokeira remote set-url origin git@{host_alias}:{owner}/{name}.git'; fi",
             owner = repo.owner,
             name = repo.name
         );
-        self.remote_command_text(&handle.instance_id, &command)
+        self.remote_command_text(&handle.instance_id, &git_cmd)
             .await?;
         Ok(())
     }
@@ -682,9 +725,9 @@ impl Workstation {
         repo: &GithubRepo,
     ) -> Result<(), WorkstationError> {
         let handle = self.resolve_handle(workstation_id).await?;
+        let key_path = format!("/home/tokeira/.ssh/tokeira-workstation-{workstation_id}");
         let command = format!(
-            "rm -f ~/.ssh/tokeira-workstation-{id} ~/.ssh/tokeira-workstation-{id}.pub; git -C /work/tokeira remote set-url origin https://github.com/{owner}/{name}.git || true",
-            id = workstation_id,
+            "rm -f {key_path} {key_path}.pub; su tokeira -c 'git -C /work/repo/tokeira remote set-url origin https://github.com/{owner}/{name}.git' || true",
             owner = repo.owner,
             name = repo.name
         );
@@ -699,7 +742,7 @@ impl Workstation {
         handle: &WorkstationHandle,
     ) -> Result<UpOutcome, WorkstationError> {
         let instance = self
-            .find_instance(Some(&handle.workstation_id))
+            .describe_instance_by_id(&handle.instance_id)
             .await?
             .ok_or_else(|| WorkstationError::NotFound(handle.workstation_id.clone()))?;
         match instance_state(&instance).as_str() {
@@ -928,14 +971,89 @@ impl Workstation {
         &self,
         workstation_id: &str,
     ) -> Result<WorkstationHandle, WorkstationError> {
-        let matches = self.discover(Some(workstation_id)).await?;
-        match matches.as_slice() {
-            [handle] => Ok(handle.clone()),
-            [] => Err(WorkstationError::NotFound(workstation_id.to_string())),
-            many => Err(WorkstationError::AmbiguousMatch(
-                many.iter().map(|h| h.instance_id.clone()).collect(),
-            )),
-        }
+        let deployment_dir = crate::deployment::deployment_dir_for(workstation_id);
+        let backend = tokeira_state::LocalBackend::new(deployment_dir.join("state/infra"));
+        let store = tokeira_state::CasStore::<tokeira_iac::InfraState>::new(
+            Box::new(backend),
+            "infra".to_string(),
+        );
+        let (state, _version) = store.load().await.map_err(|e| {
+            WorkstationError::Io(format!("failed to load workstation state: {e}"))
+        })?;
+
+        let instance_resource_id =
+            tokeira_iac::ResourceId(format!("ec2-instance-tokeira-ws-{workstation_id}"));
+        let instance_state = state
+            .resources
+            .get(&instance_resource_id)
+            .ok_or_else(|| WorkstationError::NotFound(workstation_id.to_string()))?;
+
+        let props = &instance_state.properties;
+
+        let sg_resource_id = tokeira_iac::ResourceId(format!(
+            "sg-tokeira-workstation-{workstation_id}-sg"
+        ));
+        let security_group_id = state
+            .resources
+            .get(&sg_resource_id)
+            .map(|s| s.physical_id.clone())
+            .unwrap_or_default();
+
+        let cache_vol_resource_id = tokeira_iac::ResourceId(format!(
+            "ebs-volume-tokeira-ws-{workstation_id}-cache"
+        ));
+        let cache_volume_id = state
+            .resources
+            .get(&cache_vol_resource_id)
+            .map(|s| s.physical_id.clone())
+            .unwrap_or_default();
+
+        let repo_vol_resource_id = tokeira_iac::ResourceId(format!(
+            "ebs-volume-tokeira-ws-{workstation_id}-repo"
+        ));
+        let repo_volume_id = state
+            .resources
+            .get(&repo_vol_resource_id)
+            .map(|s| s.physical_id.clone())
+            .unwrap_or_default();
+
+        Ok(WorkstationHandle {
+            workstation_id: workstation_id.to_string(),
+            instance_id: instance_state.physical_id.clone(),
+            cache_volume_id,
+            repo_volume_id,
+            root_volume_id: String::new(),
+            security_group_id,
+            iam_role_name: format!("tokeira-workstation-{workstation_id}-role"),
+            instance_profile_name: format!("tokeira-workstation-{workstation_id}-profile"),
+            region: self.region.clone(),
+            subnet_id: props
+                .get("subnet_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        })
+    }
+
+    /// Look up a live EC2 instance by its instance ID (from persisted state).
+    async fn describe_instance_by_id(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<aws_sdk_ec2::types::Instance>, WorkstationError> {
+        let output = self
+            .ec2
+            .describe_instances()
+            .instance_ids(instance_id)
+            .send()
+            .await
+            .map_err(ec2_err)?;
+        let instance = output
+            .reservations()
+            .iter()
+            .flat_map(|r| r.instances())
+            .next()
+            .cloned();
+        Ok(instance)
     }
 
     async fn find_instance(
@@ -990,33 +1108,55 @@ impl Workstation {
             })?
             .to_string();
         loop {
-            let invocation = self
+            match self
                 .ssm
                 .get_command_invocation()
                 .command_id(&command_id)
                 .instance_id(instance_id)
                 .send()
                 .await
-                .map_err(ssm_err)?;
-            let status = invocation
-                .status()
-                .map(|status| status.as_str())
-                .unwrap_or_default();
-            if matches!(status, "Success" | "Failed" | "Cancelled" | "TimedOut") {
-                if invocation.response_code() == 0 {
-                    return Ok(invocation
-                        .standard_output_content()
-                        .unwrap_or_default()
-                        .to_string());
+            {
+                Err(e) => {
+                    let debug = format!("{e:?}");
+                    if debug.contains("InvocationDoesNotExist") {
+                        // SSM hasn't registered the invocation yet — retry
+                        sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    return Err(ssm_err(e));
                 }
-                return Err(WorkstationError::Command(
-                    invocation
-                        .standard_error_content()
-                        .unwrap_or_default()
-                        .to_string(),
-                ));
+                Ok(invocation) => {
+                    let status = invocation
+                        .status()
+                        .map(|status| status.as_str())
+                        .unwrap_or_default();
+                    if matches!(status, "Success" | "Failed" | "Cancelled" | "TimedOut") {
+                        if invocation.response_code() == 0 {
+                            return Ok(invocation
+                                .standard_output_content()
+                                .unwrap_or_default()
+                                .to_string());
+                        }
+                        let stderr = invocation
+                            .standard_error_content()
+                            .unwrap_or_default()
+                            .to_string();
+                        let stdout = invocation
+                            .standard_output_content()
+                            .unwrap_or_default()
+                            .to_string();
+                        let detail = if !stderr.is_empty() {
+                            stderr
+                        } else if !stdout.is_empty() {
+                            stdout
+                        } else {
+                            format!("command exited with status {}", invocation.response_code())
+                        };
+                        return Err(WorkstationError::Command(detail));
+                    }
+                    sleep(Duration::from_secs(1)).await;
+                }
             }
-            sleep(Duration::from_secs(1)).await;
         }
     }
 
@@ -1711,7 +1851,8 @@ fn shell_command(cwd: &str, command: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ");
-    format!("cd {cwd} && {command}")
+    // Run as the tokeira user with a login shell so PATH and env are set
+    format!("su tokeira -lc 'cd {cwd} && {command}'")
 }
 
 async fn write_delta(

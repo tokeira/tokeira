@@ -9,7 +9,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use base64::Engine as _;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokeira_remote_workstation::engine::{
@@ -17,7 +16,7 @@ use tokeira_remote_workstation::engine::{
 };
 use tokio::process::Command;
 
-use crate::cli::{GithubKeyAction, WorkstationAction};
+use crate::cli::{CodeAction, GithubKeyAction, WorkstationAction};
 
 mod secret_scan;
 
@@ -158,10 +157,11 @@ pub async fn run(action: WorkstationAction, json: bool) -> Result<()> {
         }
         WorkstationAction::Stop { workstation } => {
             let id = resolve_workstation_id(workstation.as_deref())?;
+            println!("stopping workstation {id}...");
             let profile = WorkstationProfile::c8gd_rust();
             let engine = Workstation::new(profile.region).await?;
             engine.stop(&id).await?;
-            println!("stopped workstation {id}; /work/target and /work/sccache were ephemeral");
+            println!("stopped; /work/target and /work/sccache were ephemeral");
             Ok(())
         }
         WorkstationAction::Destroy { workstation, yes } => {
@@ -187,7 +187,6 @@ pub async fn run(action: WorkstationAction, json: bool) -> Result<()> {
                             root_volume_gib: profile.root_volume_gib,
                             cache_volume_gib: profile.cache_volume_gib,
                             repo_volume_gib: profile.repo_volume_gib,
-                            user_data_base64: String::new(),
                             region: profile.region.clone(),
                         },
                     region: profile.region.clone(),
@@ -352,6 +351,7 @@ pub async fn run(action: WorkstationAction, json: bool) -> Result<()> {
             Ok(())
         }
         WorkstationAction::GithubKey { action } => run_github_key(action).await,
+        WorkstationAction::Code { action } => run_code(action, json).await,
     }
 }
 
@@ -437,10 +437,6 @@ fn clear_latest_if_matches(id: &str) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn read_rust_toolchain_toml() -> String {
-    tokeira_remote_workstation::engine::read_rust_toolchain_toml()
 }
 
 fn confirm_secret(found: &secret_scan::SecretMatch, yes: bool) -> Result<()> {
@@ -546,6 +542,65 @@ async fn run_github_key(action: GithubKeyAction) -> Result<()> {
                     println!("{}\t{}\torphan-remote", remote.repo, remote.key_id);
                 }
             }
+            Ok(())
+        }
+    }
+}
+
+async fn run_code(action: CodeAction, _json: bool) -> Result<()> {
+    match action {
+        CodeAction::Sync {
+            workstation,
+            branch,
+        } => {
+            let id = resolve_workstation_id(workstation.as_deref())?;
+            let profile = WorkstationProfile::c8gd_rust();
+            let engine = Workstation::new(profile.region).await?;
+            let branch = branch.as_deref().unwrap_or("main");
+
+            let check = engine
+                .remote_command_text_raw(
+                    &id,
+                    "test -d /work/repo/tokeira/.git && echo exists || echo missing",
+                )
+                .await?;
+            if check.trim() == "missing" {
+                println!("cloning (branch {branch})...");
+                let clone_cmd = format!(
+                    "su tokeira -lc 'git clone --branch {branch} git@github.com-tokeira-{id}:iw/tokeira.git /work/repo/tokeira'"
+                );
+                engine.remote_command_text_raw(&id, &clone_cmd).await?;
+                println!("cloned");
+            } else {
+                println!("syncing branch {branch}...");
+                let sync_cmd = format!(
+                    "su tokeira -lc 'cd /work/repo/tokeira && git fetch origin && git checkout {branch} && git pull origin {branch}'"
+                );
+                engine.remote_command_text_raw(&id, &sync_cmd).await?;
+                println!("synced");
+            }
+            Ok(())
+        }
+        CodeAction::Push {
+            workstation,
+            branch,
+        } => {
+            let id = resolve_workstation_id(workstation.as_deref())?;
+            let profile = WorkstationProfile::c8gd_rust();
+            let engine = Workstation::new(profile.region).await?;
+
+            let push_cmd = if let Some(ref branch) = branch {
+                format!(
+                    "su tokeira -lc 'cd /work/repo/tokeira && git push origin {branch}'"
+                )
+            } else {
+                "su tokeira -lc 'cd /work/repo/tokeira && git push origin HEAD'".to_string()
+            };
+            let output = engine.remote_command_text_raw(&id, &push_cmd).await?;
+            if !output.trim().is_empty() {
+                println!("{}", output.trim());
+            }
+            println!("pushed");
             Ok(())
         }
     }

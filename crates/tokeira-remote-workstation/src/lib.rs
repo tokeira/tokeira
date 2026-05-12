@@ -12,6 +12,6 @@
 //! This crate composes them with workstation-specific configuration.
 
 pub mod bootstrap;
+pub mod deployment;
 pub mod engine;
 pub mod module;
-pub mod provision;

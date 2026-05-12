@@ -9,6 +9,8 @@ description = "Remote workstation lifecycle — module composition, bootstrap, a
 tokeira-iac = { path = "../tokeira-iac" }
 tokeira-aws = { path = "../tokeira-aws" }
 tokeira-state = { path = "../tokeira-state" }
+tokeira-orchestrator = { path = "../tokeira-orchestrator" }
+tokeira-deploy-engine = { path = "../tokeira-deploy-engine" }
 
 # AWS SDK (for operational methods: SSM remote-exec, instance start/stop)
 aws-config = { version = "1", features = ["behavior-version-latest"] }

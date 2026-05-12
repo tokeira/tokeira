@@ -262,7 +262,7 @@ impl Resource for WorkstationSecurityGroup {
             .send()
             .await
             .map_err(|e| {
-                IacError::ProviderError(format!(
+                IacError::AwsSdk(format!(
                     "failed to create security group {}: {}",
                     self.name,
                     e.into_service_error()
@@ -310,7 +310,7 @@ impl Resource for WorkstationSecurityGroup {
             .send()
             .await
             .map_err(|e| {
-                IacError::ProviderError(format!(
+                IacError::AwsSdk(format!(
                     "failed to delete security group {sg_id}: {}",
                     e.into_service_error()
                 ))
@@ -366,7 +366,7 @@ impl Resource for WorkstationSecurityGroup {
                 if msg.contains("InvalidGroup.NotFound") {
                     Ok(None)
                 } else {
-                    Err(IacError::ProviderError(format!(
+                    Err(IacError::AwsSdk(format!(
                         "failed to describe security group {sg_id}: {msg}"
                     )))
                 }

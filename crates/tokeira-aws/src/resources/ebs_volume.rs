@@ -93,7 +93,7 @@ impl Resource for EbsVolume {
             .send()
             .await
             .map_err(|e| {
-                IacError::ProviderError(format!(
+                IacError::AwsSdk(format!(
                     "failed to create EBS volume {}: {}",
                     self.name,
                     e.into_service_error()
@@ -103,7 +103,7 @@ impl Resource for EbsVolume {
         let volume_id = output
             .volume_id()
             .ok_or_else(|| {
-                IacError::ProviderError("CreateVolume did not return volume ID".to_string())
+                IacError::AwsSdk("CreateVolume did not return volume ID".to_string())
             })?
             .to_string();
 
@@ -115,7 +115,7 @@ impl Resource for EbsVolume {
             .wait(Duration::from_secs(120))
             .await
             .map_err(|e| {
-                IacError::ProviderError(format!(
+                IacError::AwsSdk(format!(
                     "volume {volume_id} did not reach available state: {e}"
                 ))
             })?;
@@ -160,7 +160,7 @@ impl Resource for EbsVolume {
             .send()
             .await
             .map_err(|e| {
-                IacError::ProviderError(format!(
+                IacError::AwsSdk(format!(
                     "failed to delete volume {volume_id}: {}",
                     e.into_service_error()
                 ))
@@ -217,7 +217,7 @@ impl Resource for EbsVolume {
                 if msg.contains("InvalidVolume.NotFound") {
                     Ok(None)
                 } else {
-                    Err(IacError::ProviderError(format!(
+                    Err(IacError::AwsSdk(format!(
                         "failed to describe volume {volume_id}: {msg}"
                     )))
                 }

@@ -92,7 +92,7 @@ impl Resource for IamInstanceProfile {
                         "instance profile already exists, adopting"
                     );
                 } else {
-                    return Err(IacError::ProviderError(format!(
+                    return Err(IacError::AwsSdk(format!(
                         "failed to create instance profile {}: {svc_err}",
                         self.profile_name
                     )));
@@ -120,7 +120,7 @@ impl Resource for IamInstanceProfile {
                         "role already in instance profile"
                     );
                 } else {
-                    return Err(IacError::ProviderError(format!(
+                    return Err(IacError::AwsSdk(format!(
                         "failed to add role {} to instance profile {}: {svc_err}",
                         self.config.role_name, self.profile_name
                     )));
@@ -159,7 +159,7 @@ impl Resource for IamInstanceProfile {
             sleep(Duration::from_secs(2)).await;
         }
 
-        Err(IacError::ProviderError(format!(
+        Err(IacError::AwsSdk(format!(
             "instance profile {} did not become available within 60 seconds",
             self.profile_name
         )))
@@ -197,7 +197,7 @@ impl Resource for IamInstanceProfile {
             .send()
             .await
             .map_err(|e| {
-                IacError::ProviderError(format!(
+                IacError::AwsSdk(format!(
                     "failed to delete instance profile {}: {}",
                     self.profile_name,
                     e.into_service_error()
@@ -238,7 +238,7 @@ impl Resource for IamInstanceProfile {
                 if svc_err.is_no_such_entity_exception() {
                     Ok(None)
                 } else {
-                    Err(IacError::ProviderError(format!(
+                    Err(IacError::AwsSdk(format!(
                         "failed to describe instance profile {}: {svc_err}",
                         self.profile_name
                     )))

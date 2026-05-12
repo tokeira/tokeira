@@ -60,16 +60,16 @@ pub async fn run(action: WorkstationAction, json: bool) -> Result<()> {
                 .unwrap_or_else(|| format!("ws-{}", uuid::Uuid::new_v4()));
 
             let state_dir =
-                tokeira_remote_workstation::provision::state_dir_for(&ws_id);
+                tokeira_remote_workstation::deployment::deployment_dir_for(&ws_id);
 
-            if state_dir.join("infra").exists() {
+            if state_dir.join("state").exists() {
                 // Existing workstation — resume via operational engine
                 let engine = Workstation::new(profile.region.clone()).await?;
                 let outcome = engine.up(&profile, Some(&ws_id)).await?;
                 write_latest(outcome_workstation_id(&outcome))?;
                 print_up_outcome(&outcome, json)?;
             } else {
-                // Fresh create — use IaC engine
+                // Fresh create — use IaC engine via InfraEngine
                 println!("creating workstation {ws_id}...");
                 let engine = Workstation::new(profile.region.clone()).await?;
 
@@ -79,10 +79,10 @@ pub async fn run(action: WorkstationAction, json: bool) -> Result<()> {
                 let bootstrap_ctx =
                     tokeira_remote_workstation::bootstrap::BootstrapContext {
                         workstation_id: ws_id.clone(),
-                        bootstrap_fingerprint: String::new(), // computed below
+                        bootstrap_fingerprint: String::new(),
                         profile: profile.clone(),
-                        cache_volume_id: String::new(), // filled by IaC
-                        repo_volume_id: String::new(),  // filled by IaC
+                        cache_volume_id: String::new(),
+                        repo_volume_id: String::new(),
                         rust_toolchain_toml: read_rust_toolchain_toml(),
                     };
                 let fingerprint = tokeira_remote_workstation::bootstrap::fingerprint(
@@ -98,39 +98,45 @@ pub async fn run(action: WorkstationAction, json: bool) -> Result<()> {
                 let user_data_base64 =
                     base64::engine::general_purpose::STANDARD.encode(user_data.as_bytes());
 
-                let module_config =
-                    tokeira_remote_workstation::module::WorkstationModuleConfig {
-                        workstation_id: ws_id.clone(),
-                        instance_type: profile.instance_type.clone(),
-                        ami_id: preflight.ami_id,
-                        subnet_id: preflight.subnet_id,
-                        vpc_id: preflight.vpc_id,
-                        availability_zone: preflight.availability_zone,
-                        root_volume_gib: profile.root_volume_gib,
-                        cache_volume_gib: profile.cache_volume_gib,
-                        repo_volume_gib: profile.repo_volume_gib,
-                        user_data_base64,
+                let ws_config =
+                    tokeira_remote_workstation::deployment::WorkstationConfig {
+                        module_config:
+                            tokeira_remote_workstation::module::WorkstationModuleConfig {
+                                workstation_id: ws_id.clone(),
+                                instance_type: profile.instance_type.clone(),
+                                ami_id: preflight.ami_id,
+                                subnet_id: preflight.subnet_id,
+                                vpc_id: preflight.vpc_id,
+                                availability_zone: preflight.availability_zone,
+                                root_volume_gib: profile.root_volume_gib,
+                                cache_volume_gib: profile.cache_volume_gib,
+                                repo_volume_gib: profile.repo_volume_gib,
+                                user_data_base64,
+                                region: profile.region.clone(),
+                            },
                         region: profile.region.clone(),
                     };
 
-                let aws_config = aws_config::defaults(
-                    aws_config::BehaviorVersion::latest(),
-                )
-                .region(aws_config::Region::new(profile.region.clone()))
-                .load()
-                .await;
-                let aws_clients = tokeira_aws::AwsClients::new(&aws_config);
+                let deployment_dir =
+                    tokeira_remote_workstation::deployment::deployment_dir_for(&ws_id);
 
-                let _state =
-                    tokeira_remote_workstation::provision::provision_workstation(
-                        module_config,
-                        aws_clients,
-                        &state_dir,
-                        |_ctx| {
-                            // TODO: install TUI progress reporters here
-                        },
-                    )
-                    .await?;
+                let deployment =
+                    tokeira_remote_workstation::deployment::WorkstationDeployment;
+
+                use tokeira_orchestrator::InfraEngine;
+                use tokeira_iac::ModuleSelection;
+                use crate::tui::{ActionTuiHandle, OutputFormat};
+
+                let format = if json { OutputFormat::Json } else { OutputFormat::Human };
+                let mut infra_engine =
+                    InfraEngine::new(deployment, &ws_config, &deployment_dir).await?;
+                let selection = ModuleSelection::All;
+                let composition = infra_engine.compose(selection.clone())?;
+                let tui = ActionTuiHandle::new(format);
+                tui.install(infra_engine.provision_context_mut());
+                let result = infra_engine.apply(&composition, selection).await;
+                tui.print_summary();
+                result?;
 
                 write_latest(&ws_id)?;
                 println!("workstation {ws_id} created");
@@ -151,51 +157,54 @@ pub async fn run(action: WorkstationAction, json: bool) -> Result<()> {
 
             let profile = WorkstationProfile::c8gd_rust();
             let state_dir =
-                tokeira_remote_workstation::provision::state_dir_for(&id);
+                tokeira_remote_workstation::deployment::deployment_dir_for(&id);
 
-            if state_dir.join("infra").exists() {
-                // Use IaC engine for clean reverse-order destroy
+            if state_dir.join("state").exists() {
+                // Use IaC engine via InfraEngine for clean reverse-order destroy
                 println!("destroying workstation {id}...");
 
-                // We need the module config to enumerate resources for destroy.
-                // For destroy, the actual values (AMI, subnet, etc.) don't matter
-                // because we're deleting by physical ID from state. But we need
-                // the workstation_id to generate the correct resource names.
-                let module_config =
-                    tokeira_remote_workstation::module::WorkstationModuleConfig {
-                        workstation_id: id.clone(),
-                        instance_type: profile.instance_type.clone(),
-                        ami_id: String::new(),
-                        subnet_id: String::new(),
-                        vpc_id: String::new(),
-                        availability_zone: String::new(),
-                        root_volume_gib: profile.root_volume_gib,
-                        cache_volume_gib: profile.cache_volume_gib,
-                        repo_volume_gib: profile.repo_volume_gib,
-                        user_data_base64: String::new(),
+                let ws_config =
+                    tokeira_remote_workstation::deployment::WorkstationConfig {
+                        module_config:
+                            tokeira_remote_workstation::module::WorkstationModuleConfig {
+                                workstation_id: id.clone(),
+                                instance_type: profile.instance_type.clone(),
+                                ami_id: String::new(),
+                                subnet_id: String::new(),
+                                vpc_id: String::new(),
+                                availability_zone: String::new(),
+                                root_volume_gib: profile.root_volume_gib,
+                                cache_volume_gib: profile.cache_volume_gib,
+                                repo_volume_gib: profile.repo_volume_gib,
+                                user_data_base64: String::new(),
+                                region: profile.region.clone(),
+                            },
                         region: profile.region.clone(),
                     };
 
-                let aws_config = aws_config::defaults(
-                    aws_config::BehaviorVersion::latest(),
-                )
-                .region(aws_config::Region::new(profile.region.clone()))
-                .load()
-                .await;
-                let aws_clients = tokeira_aws::AwsClients::new(&aws_config);
+                let deployment_dir =
+                    tokeira_remote_workstation::deployment::deployment_dir_for(&id);
 
-                tokeira_remote_workstation::provision::destroy_workstation(
-                    module_config,
-                    aws_clients,
-                    &state_dir,
-                    |_ctx| {
-                        // TODO: install TUI progress reporters here
-                    },
-                )
-                .await?;
+                let deployment =
+                    tokeira_remote_workstation::deployment::WorkstationDeployment;
+
+                use tokeira_orchestrator::InfraEngine;
+                use tokeira_iac::ModuleSelection;
+                use crate::tui::{ActionTuiHandle, OutputFormat};
+
+                let format = if json { OutputFormat::Json } else { OutputFormat::Human };
+                let mut infra_engine =
+                    InfraEngine::new(deployment, &ws_config, &deployment_dir).await?;
+                let selection = ModuleSelection::All;
+                let composition = infra_engine.compose(selection.clone())?;
+                let tui = ActionTuiHandle::new(format);
+                tui.install(infra_engine.provision_context_mut());
+                let result = infra_engine.destroy(&composition, selection).await;
+                tui.print_summary();
+                result?;
 
                 // Remove local state directory
-                let _ = fs::remove_dir_all(&state_dir);
+                let _ = fs::remove_dir_all(&deployment_dir);
                 clear_latest_if_matches(&id)?;
                 println!("destroyed workstation {id}");
             } else {

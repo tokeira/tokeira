@@ -100,7 +100,7 @@ impl Resource for Ec2Instance {
             .get_resource_state(&self.config.security_group_resource_id)
             .map(|s| s.physical_id.clone())
             .map_err(|_| {
-                IacError::ProviderError(
+                IacError::AwsSdk(
                     "security group not found in state — was it created?".to_string(),
                 )
             })?;
@@ -148,7 +148,7 @@ impl Resource for Ec2Instance {
             .send()
             .await
             .map_err(|e| {
-                IacError::ProviderError(format!(
+                IacError::AwsSdk(format!(
                     "failed to launch instance: {}",
                     e.into_service_error()
                 ))
@@ -159,7 +159,7 @@ impl Resource for Ec2Instance {
             .first()
             .and_then(|i| i.instance_id())
             .ok_or_else(|| {
-                IacError::ProviderError("RunInstances did not return instance ID".to_string())
+                IacError::AwsSdk("RunInstances did not return instance ID".to_string())
             })?
             .to_string();
 
@@ -171,7 +171,7 @@ impl Resource for Ec2Instance {
             .wait(Duration::from_secs(300))
             .await
             .map_err(|e| {
-                IacError::ProviderError(format!(
+                IacError::AwsSdk(format!(
                     "instance {instance_id} did not reach running: {e}"
                 ))
             })?;
@@ -193,7 +193,7 @@ impl Resource for Ec2Instance {
                     .send()
                     .await
                     .map_err(|e| {
-                        IacError::ProviderError(format!(
+                        IacError::AwsSdk(format!(
                             "failed to attach volume {vol_id} to {instance_id}: {}",
                             e.into_service_error()
                         ))
@@ -241,7 +241,7 @@ impl Resource for Ec2Instance {
             .send()
             .await
             .map_err(|e| {
-                IacError::ProviderError(format!(
+                IacError::AwsSdk(format!(
                     "failed to terminate instance {instance_id}: {}",
                     e.into_service_error()
                 ))
@@ -255,7 +255,7 @@ impl Resource for Ec2Instance {
             .wait(Duration::from_secs(300))
             .await
             .map_err(|e| {
-                IacError::ProviderError(format!(
+                IacError::AwsSdk(format!(
                     "instance {instance_id} did not terminate: {e}"
                 ))
             })?;
@@ -322,7 +322,7 @@ impl Resource for Ec2Instance {
                 if msg.contains("InvalidInstanceID.NotFound") {
                     Ok(None)
                 } else {
-                    Err(IacError::ProviderError(format!(
+                    Err(IacError::AwsSdk(format!(
                         "failed to describe instance {instance_id}: {msg}"
                     )))
                 }

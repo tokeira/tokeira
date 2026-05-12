@@ -10,7 +10,7 @@ use std::{
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_ec2::{
     Client as Ec2Client,
-    client::Waiters as Ec2Waiters,
+    client::Waiters as _,
     types::{
         BlockDeviceMapping, EbsBlockDevice, Filter, IamInstanceProfileSpecification,
         InstanceNetworkInterfaceSpecification, InstanceType, ResourceType, Tag, TagSpecification,

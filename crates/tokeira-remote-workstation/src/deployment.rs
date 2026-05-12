@@ -90,7 +90,7 @@ impl Deployment for WorkstationDeployment {
         &self,
         config: &Self::Config,
         ctx: &mut iac::ProvisionContext,
-    -> tokeira_orchestrator::Result<()> {
+    ) -> tokeira_orchestrator::Result<()> {
         let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .region(aws_config::Region::new(config.region.clone()))
             .load()
@@ -103,7 +103,7 @@ impl Deployment for WorkstationDeployment {
         &self,
         _config: &Self::Config,
         _ctx: &mut tokeira_deploy_engine::ServiceContext,
-    -> tokeira_orchestrator::Result<()> {
+    ) -> tokeira_orchestrator::Result<()> {
         Ok(())
     }
 

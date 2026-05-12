@@ -149,7 +149,7 @@ impl Resource for Ec2Instance {
             .await
             .map_err(|e| {
                 IacError::AwsSdk(format!(
-                    "failed to launch instance: {}",
+                    "failed to launch instance: {:?}",
                     e.into_service_error()
                 ))
             })?;

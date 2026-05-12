@@ -246,13 +246,16 @@ impl Module for ComputeModule {
 
         // Render user-data with actual volume IDs from state
         let user_data_base64 = if !cache_vol_id.is_empty() && !repo_vol_id.is_empty() {
+            let profile = crate::engine::WorkstationProfile::c8gd_rust();
+            let toolchain_toml = crate::engine::read_rust_toolchain_toml();
+            let fingerprint = crate::bootstrap::fingerprint(&profile, &toolchain_toml);
             let user_data = crate::bootstrap::render(&crate::bootstrap::BootstrapContext {
                 workstation_id: ws_id.clone(),
-                bootstrap_fingerprint: self.config.user_data_base64.clone(),
-                profile: crate::engine::WorkstationProfile::c8gd_rust(),
+                bootstrap_fingerprint: fingerprint,
+                profile,
                 cache_volume_id: cache_vol_id,
                 repo_volume_id: repo_vol_id,
-                rust_toolchain_toml: crate::engine::read_rust_toolchain_toml(),
+                rust_toolchain_toml: toolchain_toml,
             });
             base64::engine::general_purpose::STANDARD.encode(user_data.as_bytes())
         } else {

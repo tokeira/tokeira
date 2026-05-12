@@ -7,8 +7,11 @@
 pub mod dsql_cluster;
 pub mod dsql_connection_endpoint;
 pub mod dynamodb_table;
+pub mod ebs_volume;
+pub mod ec2_instance;
 pub mod ecr_repository;
 pub mod eks;
+pub mod iam_instance_profile;
 pub mod iam_role;
 pub mod pod_identity_association;
 pub mod s3_bucket;

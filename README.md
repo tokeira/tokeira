@@ -242,57 +242,107 @@ cargo +nightly fmt                       # format
 cargo doc --workspace --no-deps          # generate docs
 ```
 
-The workspace has 150+ crates. A cold `cargo build --workspace` takes 10–20 minutes on a MacBook; incremental builds are typically 10–30 seconds. If cold-build time is blocking your iteration loop, use the remote workstation (below).
+The workspace has 150+ crates. A cold `cargo build --workspace` takes 10–20 minutes on a laptop; incremental builds are typically 10–30 seconds. If cold-build time is blocking your iteration loop, use the remote workstation (below).
 
 ### Remote workstation for Rust builds
 
 `tkr workstation` provisions a dedicated Graviton4 `c8gd.8xlarge` (32 vCPU, 64 GiB RAM, 1900 GiB NVMe) in `eu-west-2` for fast Rust compilation. Cold workspace builds complete in under 2 minutes. Access is via AWS Systems Manager Session Manager — no SSH keys, no public ingress.
 
-**The 3-command workflow:**
+#### Workstation lifecycle
+
+| Command | What it does |
+|---------|-------------|
+| `tkr workstation up` | Creates a new workstation (first run) or resumes a stopped one. Runs bootstrap, waits for readiness. |
+| `tkr workstation stop` | Stops the instance. EBS volumes persist; NVMe (`/work/target`, `/work/sccache`) is erased. Public IP released. |
+| `tkr workstation destroy --yes` | Terminates the instance, deletes EBS volumes, removes IAM role and security group. Irreversible. |
+| `tkr workstation bootstrap` | Forces a bootstrap refresh (re-installs toolchain, cargo tools) without destroying the instance. Triggered automatically on `up` when drift is detected. |
+| `tkr workstation status` | Shows state, uptime, cost rate, bootstrap fingerprint, volume IDs. |
+| `tkr workstation list` | Enumerates all workstations in the account with state and cost. |
+| `tkr workstation idle --defer 2h` | Extends the idle-shutdown window (prevents auto-stop during long unattended builds). |
+
+The workstation stops automatically after 30 minutes of idle (configurable). A forgotten instance does not silently accumulate cost.
+
+#### Development workflow
+
+A typical day working with the remote workstation:
 
 ```bash
-tkr workstation up                                        # create or resume
-tkr workstation remote-exec cargo build --workspace       # build on the workstation
-tkr workstation stop                                      # stop (EBS persists, NVMe erased)
+# 1. Bring the workstation online (creates on first run, resumes thereafter)
+tkr workstation up
+
+# 2. (First time only) Add a GitHub deploy key so you can push from the workstation
+tkr workstation github-key add --repo <owner>/tokeira
+
+# 3. Sync your local changes to the workstation
+#    Option A: push a branch from your local machine, pull on the workstation
+git push origin feature/my-work
+tkr workstation remote-exec git pull origin feature/my-work
+
+#    Option B: use rsync or git-push-to-remote patterns (advanced)
+
+# 4. Build
+tkr workstation remote-exec cargo build --workspace
+
+# 5. Test
+tkr workstation remote-exec cargo test --workspace
+
+# 6. Lint
+tkr workstation remote-exec cargo clippy --workspace --all-targets
+
+# 7. Format check
+tkr workstation remote-exec cargo +nightly fmt --all --check
+
+# 8. (Optional) Interactive debugging session
+tkr workstation ssh
+# You're now in a shell on the workstation at /work/tokeira
+cargo test -p tokeira-kernel -- --nocapture
+exit
+
+# 9. Push results back (from the workstation, using the deploy key)
+tkr workstation remote-exec git push origin feature/my-work
+
+# 10. Stop when done for the day
+tkr workstation stop
 ```
 
-**Storage tiering:**
+**What happens on first `up`:**
+- Instance created, EBS volumes provisioned and attached
+- Cloud-init bootstrap runs (~5–8 minutes): installs Rust toolchain (stable + nightly from `rust-toolchain.toml`), cargo tools (`nextest`, `deny`, `sccache`, `protoc`, `buf`, `uv`, `ripgrep`, `fd`, `mold`, `lld`, `gh`), mounts NVMe, clones the repository
+- `tkr workstation up` blocks until bootstrap completes (polls via SSM)
+
+**What happens on subsequent `up` (resume):**
+- Instance started (~30 seconds to reach `running`)
+- Bootstrap fingerprint checked — if your `rust-toolchain.toml` changed, a refresh runs automatically
+- NVMe reformatted (target/ and sccache are cold); EBS volumes intact (cargo registry, rustup, repo checkout preserved)
+
+#### Storage tiering
 
 | Tier | Mount | Survives stop? | Contents |
 |------|-------|----------------|----------|
 | Local NVMe | `/work` (root), `/work/target`, `/work/sccache` | No | `CARGO_TARGET_DIR`, sccache cache |
-| Cache EBS (30 GiB) | `/work/cache` → `~/.cargo`, `~/.rustup` | Yes | Crate registry, toolchains |
-| Repo EBS (40 GiB) | `/work/repo` → `/work/tokeira` | Yes | Repository checkouts |
+| Cache EBS (30 GiB) | `/work/cache` → `~/.cargo`, `~/.rustup` | Yes | Crate registry, toolchains, cargo tools |
+| Repo EBS (40 GiB) | `/work/repo` → `/work/tokeira` | Yes | Repository checkouts, uncommitted work |
 
-**Common operations:**
+The first build after a resume is a cold build (NVMe wiped), but cargo's incremental state on the Cache EBS gives most of the benefit. Subsequent builds within a session hit sccache on NVMe for maximum speed.
+
+#### GitHub credentials (opt-in)
+
+By default the workstation carries no GitHub credentials. To push branches or create PRs:
 
 ```bash
-# Interactive shell (for ad-hoc debugging)
-tkr workstation ssh
+# Add a workstation-scoped deploy key (public key uploaded via your local gh auth)
+tkr workstation github-key add --repo <owner>/tokeira
 
-# Run tests remotely
-tkr workstation remote-exec cargo test --workspace
+# List active deploy keys
+tkr workstation github-key list
 
-# Run lints remotely
-tkr workstation remote-exec cargo clippy --workspace --all-targets
-
-# Check bootstrap drift after toolchain update
-tkr workstation bootstrap
-
-# Defer idle-shutdown during a long unattended build
-tkr workstation idle --defer 2h
-
-# See cost and uptime
-tkr workstation status
-
-# List all workstations
-tkr workstation list
-
-# Destroy (terminates instance, deletes EBS volumes)
-tkr workstation destroy --yes
+# Remove when no longer needed (or automatically on destroy)
+tkr workstation github-key remove --repo <owner>/tokeira
 ```
 
-**Cost model (~$387/month at 20 working days, 10 active hours/day):**
+The deploy key is per-workstation, per-repository. Your primary GitHub token never reaches the workstation.
+
+#### Cost model (~$387/month at 20 working days, 10 active hours/day)
 
 | Component | Active | Stopped | Monthly |
 |-----------|--------|---------|---------|
@@ -300,23 +350,11 @@ tkr workstation destroy --yes
 | EBS (90 GiB) | $0.01/hr | $0.01/hr | ~$7 |
 | Elastic IP (transient) | $0.005/hr | $0 (released) | ~$1 |
 
-The workstation stops automatically after 30 minutes of idle (configurable). A forgotten instance does not silently accumulate cost.
+#### Prerequisites
 
-**Prerequisites:**
 - AWS credentials with EC2, IAM, and SSM permissions
-- `session-manager-plugin` installed on the local machine (`brew install session-manager-plugin` on macOS)
+- `session-manager-plugin` installed locally (`brew install session-manager-plugin` on macOS)
 - A VPC with at least one public subnet (the workstation uses a transient public IP for egress; no NAT Gateway required)
-
-**GitHub push from workstation (opt-in):**
-
-By default the workstation carries no GitHub credentials. To push branches or create PRs from the workstation:
-
-```bash
-tkr workstation github-key add --repo <owner>/<name>   # provisions a deploy key
-tkr workstation github-key remove --repo <owner>/<name> # revokes it
-```
-
-The deploy key is workstation-scoped and registered via the operator's MacBook-side `gh` auth. The operator's primary GitHub token never reaches the workstation.
 
 See `.kiro/specs/remote-workstation/` for the full spec (requirements, design, tasks).
 

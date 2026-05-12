@@ -10,6 +10,7 @@ members = [
     "crates/tokeira-deploy-engine",
     "crates/tokeira-config",
     "crates/tokeira-aws",
+    "crates/tokeira-remote-workstation",
     "crates/tokeira-orchestrator",
     "crates/tokeira-compose",
     "crates/tokeira-storage",

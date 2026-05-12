@@ -12,6 +12,7 @@ integration-test = []
 anyhow.workspace = true
 async-trait.workspace = true
 aws-config = { version = "1", features = ["behavior-version-latest"] }
+base64 = "0.22"
 chrono.workspace = true
 clap.workspace = true
 console = "0.15"
@@ -26,6 +27,7 @@ toml.workspace = true
 toml_edit.workspace = true
 tokeira-config.workspace = true
 tokeira-aws.workspace = true
+tokeira-remote-workstation = { path = "../../crates/tokeira-remote-workstation" }
 tokeira-build.workspace = true
 tokeira-deploy-engine = { path = "../../crates/tokeira-deploy-engine" }
 tokeira-iac = { path = "../../crates/tokeira-iac" }

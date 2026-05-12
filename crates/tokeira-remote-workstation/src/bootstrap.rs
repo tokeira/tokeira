@@ -2,7 +2,7 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::remote_workstation::WorkstationProfile;
+use crate::engine::WorkstationProfile;
 
 pub const BOOTSTRAP_SCHEMA: &str = "v1";
 
@@ -64,7 +64,7 @@ mkdir -p /etc/tokeira /var/lib/tokeira
 fn filesystem_phase(context: &BootstrapContext) -> String {
     format!(
         r#"# idempotency: existing ext4 filesystems and mounts are reused; NVMe is always recreatable.
-mkdir -p /work /work/cache /work/repo /work/sccache /work/target
+mkdir -p /work
 nvme_by_id="$(find /dev/disk/by-id -maxdepth 1 -name 'nvme-Amazon_EC2_NVMe_Instance_Storage*' -print -quit 2>/dev/null || true)"
 nvme_device=""
 if [ -n "$nvme_by_id" ]; then
@@ -76,6 +76,10 @@ if [ -n "$nvme_device" ]; then
     mount "$nvme_device" /work || true
   fi
 fi
+
+# Create subdirectories AFTER the NVMe mount so they exist on the NVMe filesystem,
+# not hidden under the mount point on the root volume.
+mkdir -p /work/cache /work/repo /work/sccache /work/target
 
 cache_id={cache_id:?}
 repo_id={repo_id:?}
@@ -111,12 +115,26 @@ fn toolchain_phase(_context: &BootstrapContext) -> String {
     format!(
         r#"# idempotency: apt and rustup installs are safe to repeat.
 apt-get update
-apt-get install -y build-essential curl git jq lld mold protobuf-compiler unzip ripgrep fd-find gh pkg-config libssl-dev
+apt-get install -y build-essential curl git jq lld mold unzip ripgrep fd-find gh pkg-config libssl-dev cmake
+
+# Install protoc from GitHub releases (not available via apt on Ubuntu 24.04 ARM64)
+if ! command -v protoc >/dev/null 2>&1; then
+  curl -sSL https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-aarch_64.zip -o /tmp/protoc.zip
+  unzip -o /tmp/protoc.zip -d /usr/local bin/protoc
+  unzip -o /tmp/protoc.zip -d /usr/local 'include/*'
+  chmod +x /usr/local/bin/protoc
+  rm -f /tmp/protoc.zip
+fi
+
 if ! command -v rustup >/dev/null 2>&1; then
   su "$SHELL_USER" -c 'curl https://sh.rustup.rs -sSf | sh -s -- -y'
 fi
 su "$SHELL_USER" -c '$HOME/.cargo/bin/rustup toolchain install stable nightly --component rustfmt --component clippy'
-su "$SHELL_USER" -c '$HOME/.cargo/bin/cargo install cargo-nextest cargo-deny sccache --locked' || true
+
+# Install cargo tools without RUSTC_WRAPPER to avoid circular sccache dependency
+su "$SHELL_USER" -c 'RUSTC_WRAPPER= CARGO_TARGET_DIR=/tmp/cargo-tools-build $HOME/.cargo/bin/cargo install cargo-nextest cargo-deny sccache --locked' || true
+rm -rf /tmp/cargo-tools-build
+
 mkdir -p "$SHELL_HOME/.ssh"
 cat > "$SHELL_HOME/.ssh/known_hosts" <<'KNOWN_HOSTS'
 {known_hosts}
@@ -140,7 +158,7 @@ cat > /etc/profile.d/tokeira-workstation.sh <<'PROFILE'
 export CARGO_TARGET_DIR=/work/target
 export RUSTC_WRAPPER=sccache
 export SCCACHE_DIR=/work/sccache
-export CARGO_INCREMENTAL=1
+export CARGO_INCREMENTAL=0
 export PATH="$HOME/.cargo/bin:$PATH"
 PROFILE
 chmod 0644 /etc/profile.d/tokeira-workstation.sh
@@ -249,7 +267,7 @@ printf '%s\n' {fingerprint:?} > /etc/tokeira/workstation-fingerprint
 #[cfg(test)]
 mod tests {
     use super::{GITHUB_SSH_HOST_KEYS, fingerprint};
-    use crate::remote_workstation::WorkstationProfile;
+    use crate::engine::WorkstationProfile;
 
     #[test]
     fn fingerprint_is_deterministic_and_input_sensitive() {

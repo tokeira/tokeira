@@ -9,9 +9,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine as _;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tokeira_aws::remote_workstation::{
+use tokeira_remote_workstation::engine::{
     GithubRepo, UpOutcome, Workstation, WorkstationError, WorkstationProfile,
 };
 use tokio::process::Command;
@@ -51,10 +52,89 @@ pub async fn run(action: WorkstationAction, json: bool) -> Result<()> {
                 region,
                 subnet_id,
             );
-            let engine = Workstation::new(profile.region.clone()).await?;
-            let outcome = engine.up(&profile, workstation.as_deref()).await?;
-            write_latest(outcome_workstation_id(&outcome))?;
-            print_up_outcome(&outcome, json)?;
+
+            // Check if we have local state for an existing workstation
+            let ws_id = workstation
+                .clone()
+                .or_else(|| read_latest().ok())
+                .unwrap_or_else(|| format!("ws-{}", uuid::Uuid::new_v4()));
+
+            let state_dir =
+                tokeira_remote_workstation::provision::state_dir_for(&ws_id);
+
+            if state_dir.join("infra").exists() {
+                // Existing workstation — resume via operational engine
+                let engine = Workstation::new(profile.region.clone()).await?;
+                let outcome = engine.up(&profile, Some(&ws_id)).await?;
+                write_latest(outcome_workstation_id(&outcome))?;
+                print_up_outcome(&outcome, json)?;
+            } else {
+                // Fresh create — use IaC engine
+                println!("creating workstation {ws_id}...");
+                let engine = Workstation::new(profile.region.clone()).await?;
+
+                // Pre-flight: discover subnet, VPC, AZ, AMI
+                let preflight = engine.preflight(&profile).await?;
+
+                let bootstrap_ctx =
+                    tokeira_remote_workstation::bootstrap::BootstrapContext {
+                        workstation_id: ws_id.clone(),
+                        bootstrap_fingerprint: String::new(), // computed below
+                        profile: profile.clone(),
+                        cache_volume_id: String::new(), // filled by IaC
+                        repo_volume_id: String::new(),  // filled by IaC
+                        rust_toolchain_toml: read_rust_toolchain_toml(),
+                    };
+                let fingerprint = tokeira_remote_workstation::bootstrap::fingerprint(
+                    &profile,
+                    &bootstrap_ctx.rust_toolchain_toml,
+                );
+                let user_data = tokeira_remote_workstation::bootstrap::render(
+                    &tokeira_remote_workstation::bootstrap::BootstrapContext {
+                        bootstrap_fingerprint: fingerprint.clone(),
+                        ..bootstrap_ctx
+                    },
+                );
+                let user_data_base64 =
+                    base64::engine::general_purpose::STANDARD.encode(user_data.as_bytes());
+
+                let module_config =
+                    tokeira_remote_workstation::module::WorkstationModuleConfig {
+                        workstation_id: ws_id.clone(),
+                        instance_type: profile.instance_type.clone(),
+                        ami_id: preflight.ami_id,
+                        subnet_id: preflight.subnet_id,
+                        vpc_id: preflight.vpc_id,
+                        availability_zone: preflight.availability_zone,
+                        root_volume_gib: profile.root_volume_gib,
+                        cache_volume_gib: profile.cache_volume_gib,
+                        repo_volume_gib: profile.repo_volume_gib,
+                        user_data_base64,
+                        region: profile.region.clone(),
+                    };
+
+                let aws_config = aws_config::defaults(
+                    aws_config::BehaviorVersion::latest(),
+                )
+                .region(aws_config::Region::new(profile.region.clone()))
+                .load()
+                .await;
+                let aws_clients = tokeira_aws::AwsClients::new(&aws_config);
+
+                let _state =
+                    tokeira_remote_workstation::provision::provision_workstation(
+                        module_config,
+                        aws_clients,
+                        &state_dir,
+                        |_ctx| {
+                            // TODO: install TUI progress reporters here
+                        },
+                    )
+                    .await?;
+
+                write_latest(&ws_id)?;
+                println!("workstation {ws_id} created");
+            }
             Ok(())
         }
         WorkstationAction::Stop { workstation } => {
@@ -68,10 +148,63 @@ pub async fn run(action: WorkstationAction, json: bool) -> Result<()> {
         WorkstationAction::Destroy { workstation, yes } => {
             let id = resolve_workstation_id(workstation.as_deref())?;
             confirm_destroy(&id, yes)?;
+
             let profile = WorkstationProfile::c8gd_rust();
-            let engine = Workstation::new(profile.region).await?;
-            engine.destroy(&id).await?;
-            println!("destroyed workstation {id}");
+            let state_dir =
+                tokeira_remote_workstation::provision::state_dir_for(&id);
+
+            if state_dir.join("infra").exists() {
+                // Use IaC engine for clean reverse-order destroy
+                println!("destroying workstation {id}...");
+
+                // We need the module config to enumerate resources for destroy.
+                // For destroy, the actual values (AMI, subnet, etc.) don't matter
+                // because we're deleting by physical ID from state. But we need
+                // the workstation_id to generate the correct resource names.
+                let module_config =
+                    tokeira_remote_workstation::module::WorkstationModuleConfig {
+                        workstation_id: id.clone(),
+                        instance_type: profile.instance_type.clone(),
+                        ami_id: String::new(),
+                        subnet_id: String::new(),
+                        vpc_id: String::new(),
+                        availability_zone: String::new(),
+                        root_volume_gib: profile.root_volume_gib,
+                        cache_volume_gib: profile.cache_volume_gib,
+                        repo_volume_gib: profile.repo_volume_gib,
+                        user_data_base64: String::new(),
+                        region: profile.region.clone(),
+                    };
+
+                let aws_config = aws_config::defaults(
+                    aws_config::BehaviorVersion::latest(),
+                )
+                .region(aws_config::Region::new(profile.region.clone()))
+                .load()
+                .await;
+                let aws_clients = tokeira_aws::AwsClients::new(&aws_config);
+
+                tokeira_remote_workstation::provision::destroy_workstation(
+                    module_config,
+                    aws_clients,
+                    &state_dir,
+                    |_ctx| {
+                        // TODO: install TUI progress reporters here
+                    },
+                )
+                .await?;
+
+                // Remove local state directory
+                let _ = fs::remove_dir_all(&state_dir);
+                clear_latest_if_matches(&id)?;
+                println!("destroyed workstation {id}");
+            } else {
+                // Fallback: use operational engine (for workstations created
+                // before the IaC rewrite)
+                let engine = Workstation::new(profile.region).await?;
+                engine.destroy(&id).await?;
+                println!("destroyed workstation {id}");
+            }
             Ok(())
         }
         WorkstationAction::Ssh { workstation } => {
@@ -275,6 +408,29 @@ fn write_latest(id: &str) -> Result<()> {
     fs::create_dir_all(&root)?;
     fs::write(root.join(".latest"), id)?;
     Ok(())
+}
+
+fn read_latest() -> Result<String> {
+    let path = state_root()?.join(".latest");
+    let value = fs::read_to_string(&path)?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!(".latest is empty");
+    }
+    Ok(trimmed.to_string())
+}
+
+fn clear_latest_if_matches(id: &str) -> Result<()> {
+    if let Ok(current) = read_latest() {
+        if current == id {
+            let _ = fs::remove_file(state_root()?.join(".latest"));
+        }
+    }
+    Ok(())
+}
+
+fn read_rust_toolchain_toml() -> String {
+    tokeira_remote_workstation::engine::read_rust_toolchain_toml()
 }
 
 fn outcome_workstation_id(outcome: &UpOutcome) -> &str {

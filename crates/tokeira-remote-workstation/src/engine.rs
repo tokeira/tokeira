@@ -10,6 +10,7 @@ use std::{
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_ec2::{
     Client as Ec2Client,
+    client::Waiters as Ec2Waiters,
     types::{
         BlockDeviceMapping, EbsBlockDevice, Filter, IamInstanceProfileSpecification,
         InstanceNetworkInterfaceSpecification, InstanceType, ResourceType, Tag, TagSpecification,
@@ -29,7 +30,7 @@ use tokio::{
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::remote_workstation_bootstrap::{self, BootstrapContext};
+use crate::bootstrap::{self, BootstrapContext};
 
 const WORKSTATION_TAG_KEY: &str = "tokeira-workstation";
 const WORKSTATION_TAG_VALUE: &str = "true";
@@ -165,6 +166,16 @@ pub struct GithubRepo {
     pub name: String,
 }
 
+/// Result of pre-flight discovery. Contains the values the IaC module needs
+/// to provision resources in the correct subnet/AZ.
+#[derive(Debug, Clone)]
+pub struct PreflightResult {
+    pub subnet_id: String,
+    pub vpc_id: String,
+    pub availability_zone: String,
+    pub ami_id: String,
+}
+
 impl GithubRepo {
     pub fn parse(value: &str) -> Result<Self, WorkstationError> {
         if value.contains("://") {
@@ -252,6 +263,47 @@ struct VolumeStatus {
     state: Option<String>,
 }
 
+/// Extract a useful error message from an AWS SDK error. Pulls out the service
+/// error code and message for a human-readable diagnostic, falling back to
+/// Display for non-service errors (network, timeout, etc).
+fn ec2_err(err: impl std::fmt::Display + std::fmt::Debug) -> WorkstationError {
+    let debug = format!("{err:?}");
+    // Extract code and message from the Debug output
+    let code = extract_between(&debug, "code: Some(\"", "\")");
+    let message = extract_between(&debug, "message: Some(\"", "\")");
+    match (code, message) {
+        (Some(code), Some(msg)) => WorkstationError::Ec2(format!("{code}: {msg}")),
+        _ => WorkstationError::Ec2(format!("{err}")),
+    }
+}
+
+fn ssm_err(err: impl std::fmt::Display + std::fmt::Debug) -> WorkstationError {
+    let debug = format!("{err:?}");
+    let code = extract_between(&debug, "code: Some(\"", "\")");
+    let message = extract_between(&debug, "message: Some(\"", "\")");
+    match (code, message) {
+        (Some(code), Some(msg)) => WorkstationError::Ssm(format!("{code}: {msg}")),
+        _ => WorkstationError::Ssm(format!("{err}")),
+    }
+}
+
+fn iam_err(err: impl std::fmt::Display + std::fmt::Debug) -> WorkstationError {
+    let debug = format!("{err:?}");
+    let code = extract_between(&debug, "code: Some(\"", "\")");
+    let message = extract_between(&debug, "message: Some(\"", "\")");
+    match (code, message) {
+        (Some(code), Some(msg)) => WorkstationError::Iam(format!("{code}: {msg}")),
+        _ => WorkstationError::Iam(format!("{err}")),
+    }
+}
+
+fn extract_between<'a>(haystack: &'a str, start: &str, end: &str) -> Option<&'a str> {
+    let start_idx = haystack.find(start)? + start.len();
+    let rest = &haystack[start_idx..];
+    let end_idx = rest.find(end)?;
+    Some(&rest[..end_idx])
+}
+
 impl Workstation {
     pub async fn new(region: impl Into<String>) -> Result<Self, WorkstationError> {
         let region = region.into();
@@ -293,7 +345,7 @@ impl Workstation {
             .instance_ids(&handle.instance_id)
             .send()
             .await
-            .map_err(|err| WorkstationError::Ec2(err.to_string()))?;
+            .map_err(ec2_err)?;
         self.wait_for_instance_state(&handle.instance_id, "stopped")
             .await?;
         self.release_owned_eip(workstation_id).await?;
@@ -311,7 +363,7 @@ impl Workstation {
             .instance_ids(&instance_id)
             .send()
             .await
-            .map_err(|err| WorkstationError::Ec2(err.to_string()))?;
+            .map_err(ec2_err)?;
         self.wait_for_instance_state(&instance_id, "terminated")
             .await?;
         self.release_owned_eip(workstation_id).await?;
@@ -442,7 +494,7 @@ impl Workstation {
             .parameters("commands", vec![shell])
             .send()
             .await
-            .map_err(|err| WorkstationError::Ssm(err.to_string()))?;
+            .map_err(ssm_err)?;
         let command_id = response
             .command()
             .and_then(|command| command.command_id())
@@ -461,7 +513,7 @@ impl Workstation {
                     .command_id(&command_id)
                     .instance_id(&handle.instance_id)
                     .send() => {
-                        invocation.map_err(|err| WorkstationError::Ssm(err.to_string()))?
+                        invocation.map_err(ssm_err)?
                     }
                 signal = tokio::signal::ctrl_c() => {
                     if let Err(err) = signal {
@@ -501,7 +553,7 @@ impl Workstation {
     ) -> Result<BootstrapDrift, WorkstationError> {
         let handle = self.resolve_handle(workstation_id).await?;
         let toolchain = read_rust_toolchain_toml();
-        let local = remote_workstation_bootstrap::fingerprint(profile, &toolchain);
+        let local = bootstrap::fingerprint(profile, &toolchain);
         let remote = self
             .remote_command_text(
                 &handle.instance_id,
@@ -511,7 +563,7 @@ impl Workstation {
         if remote.trim() == local {
             return Ok(BootstrapDrift::UpToDate);
         }
-        let script = remote_workstation_bootstrap::render(&BootstrapContext {
+        let script = bootstrap::render(&BootstrapContext {
             workstation_id: workstation_id.to_string(),
             bootstrap_fingerprint: local.clone(),
             profile: profile.clone(),
@@ -567,6 +619,23 @@ impl Workstation {
             .await
             .map_err(|err| WorkstationError::Io(err.to_string()))?;
         Ok(status.code().unwrap_or(1))
+    }
+
+    /// Pre-flight discovery: resolves subnet, VPC, AZ, and AMI for the
+    /// workstation profile. Called before IaC provisioning to gather the
+    /// values that the module needs.
+    pub async fn preflight(
+        &self,
+        profile: &WorkstationProfile,
+    ) -> Result<PreflightResult, WorkstationError> {
+        let subnet = self.resolve_subnet(profile.subnet_id.as_deref()).await?;
+        let ami_id = self.resolve_ami(profile.ami_family).await?;
+        Ok(PreflightResult {
+            subnet_id: subnet.subnet_id,
+            vpc_id: subnet.vpc_id,
+            availability_zone: subnet.availability_zone,
+            ami_id,
+        })
     }
 
     pub async fn github_key_generate(
@@ -640,7 +709,7 @@ impl Workstation {
                     .instance_ids(&handle.instance_id)
                     .send()
                     .await
-                    .map_err(|err| WorkstationError::Ec2(err.to_string()))?;
+                    .map_err(ec2_err)?;
                 self.wait_for_instance_state(&handle.instance_id, "running")
                     .await?;
                 self.ensure_public_ip(&handle.instance_id, &handle.workstation_id)
@@ -698,8 +767,8 @@ impl Workstation {
             )
             .await?;
         let toolchain = read_rust_toolchain_toml();
-        let fingerprint = remote_workstation_bootstrap::fingerprint(profile, &toolchain);
-        let script = remote_workstation_bootstrap::render(&BootstrapContext {
+        let fingerprint = bootstrap::fingerprint(profile, &toolchain);
+        let script = bootstrap::render(&BootstrapContext {
             workstation_id: workstation_id.clone(),
             bootstrap_fingerprint: fingerprint.clone(),
             profile: profile.clone(),
@@ -749,7 +818,7 @@ impl Workstation {
             .user_data(general_purpose::STANDARD.encode(script.as_bytes()))
             .send()
             .await
-            .map_err(|err| WorkstationError::Ec2(err.to_string()))?;
+            .map_err(ec2_err)?;
         let instance_id = run
             .instances()
             .first()
@@ -769,7 +838,7 @@ impl Workstation {
             .device("/dev/sdf")
             .send()
             .await
-            .map_err(|err| WorkstationError::Ec2(err.to_string()))?;
+            .map_err(ec2_err)?;
 
         self.ec2
             .attach_volume()
@@ -778,7 +847,7 @@ impl Workstation {
             .device("/dev/sdg")
             .send()
             .await
-            .map_err(|err| WorkstationError::Ec2(err.to_string()))?;
+            .map_err(ec2_err)?;
         let repo_clone_warning = self
             .wait_for_bootstrap_fingerprint(&instance_id, &fingerprint)
             .await?;
@@ -826,7 +895,7 @@ impl Workstation {
         let output = request
             .send()
             .await
-            .map_err(|err| WorkstationError::Ec2(err.to_string()))?;
+            .map_err(ec2_err)?;
         let mut handles = Vec::new();
         for reservation in output.reservations() {
             for instance in reservation.instances() {
@@ -890,7 +959,7 @@ impl Workstation {
         let output = request
             .send()
             .await
-            .map_err(|err| WorkstationError::Ec2(err.to_string()))?;
+            .map_err(ec2_err)?;
         Ok(output
             .reservations()
             .iter()
@@ -912,7 +981,7 @@ impl Workstation {
             .parameters("commands", vec![command.to_string()])
             .send()
             .await
-            .map_err(|err| WorkstationError::Ssm(err.to_string()))?;
+            .map_err(ssm_err)?;
         let command_id = response
             .command()
             .and_then(|command| command.command_id())
@@ -928,7 +997,7 @@ impl Workstation {
                 .instance_id(instance_id)
                 .send()
                 .await
-                .map_err(|err| WorkstationError::Ssm(err.to_string()))?;
+                .map_err(ssm_err)?;
             let status = invocation
                 .status()
                 .map(|status| status.as_str())
@@ -973,35 +1042,104 @@ impl Workstation {
             }]
         })
         .to_string();
-        let _ = self
+
+        // Create role (ignore AlreadyExists — idempotent on retry)
+        match self
             .iam
             .create_role()
             .role_name(role_name)
             .assume_role_policy_document(trust_policy)
             .send()
             .await
-            .map_err(|err| WorkstationError::Iam(err.to_string()))?;
+        {
+            Ok(_) => info!(role_name, "created IAM role"),
+            Err(err) => {
+                let debug = format!("{err:?}");
+                if debug.contains("EntityAlreadyExists") {
+                    info!(role_name, "IAM role already exists, reusing");
+                } else {
+                    return Err(iam_err(err));
+                }
+            }
+        }
+
+        // Attach policy (idempotent — attaching an already-attached policy is a no-op)
         self.iam
             .attach_role_policy()
             .role_name(role_name)
             .policy_arn("arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore")
             .send()
             .await
-            .map_err(|err| WorkstationError::Iam(err.to_string()))?;
-        self.iam
+            .map_err(iam_err)?;
+
+        // Create instance profile (ignore AlreadyExists)
+        match self
+            .iam
             .create_instance_profile()
             .instance_profile_name(profile_name)
             .send()
             .await
-            .map_err(|err| WorkstationError::Iam(err.to_string()))?;
-        self.iam
+        {
+            Ok(_) => info!(profile_name, "created IAM instance profile"),
+            Err(err) => {
+                let debug = format!("{err:?}");
+                if debug.contains("EntityAlreadyExists") {
+                    info!(profile_name, "IAM instance profile already exists, reusing");
+                } else {
+                    return Err(iam_err(err));
+                }
+            }
+        }
+
+        // Add role to profile (ignore LimitExceeded which means role is already added)
+        match self
+            .iam
             .add_role_to_instance_profile()
             .instance_profile_name(profile_name)
             .role_name(role_name)
             .send()
             .await
-            .map_err(|err| WorkstationError::Iam(err.to_string()))?;
-        Ok(())
+        {
+            Ok(_) => {}
+            Err(err) => {
+                let debug = format!("{err:?}");
+                if debug.contains("LimitExceeded") || debug.contains("EntityAlreadyExists") {
+                    // Role already in profile — fine
+                } else {
+                    return Err(iam_err(err));
+                }
+            }
+        }
+
+        // IAM is eventually consistent. Poll until the instance profile is visible
+        // to GetInstanceProfile before proceeding to RunInstances.
+        info!(profile_name, "waiting for IAM instance profile propagation");
+        for _ in 0..30 {
+            match self
+                .iam
+                .get_instance_profile()
+                .instance_profile_name(profile_name)
+                .send()
+                .await
+            {
+                Ok(output) => {
+                    // Also verify the role is attached (not just the profile existing)
+                    let has_role = output
+                        .instance_profile()
+                        .map(|p| !p.roles().is_empty())
+                        .unwrap_or(false);
+                    if has_role {
+                        info!(profile_name, "IAM instance profile ready");
+                        return Ok(());
+                    }
+                }
+                Err(_) => {}
+            }
+            sleep(Duration::from_secs(2)).await;
+        }
+        Err(WorkstationError::Iam(format!(
+            "instance profile {profile_name} did not become available within 60 seconds"
+        )))
     }
 
     async fn create_security_group(
@@ -1017,7 +1155,7 @@ impl Workstation {
             .vpc_id(vpc_id)
             .send()
             .await
-            .map_err(|err| WorkstationError::Ec2(err.to_string()))?;
+            .map_err(ec2_err)?;
         output.group_id().map(ToOwned::to_owned).ok_or_else(|| {
             WorkstationError::Ec2("CreateSecurityGroup did not return group id".to_string())
         })
@@ -1041,7 +1179,7 @@ impl Workstation {
         let output = request
             .send()
             .await
-            .map_err(|err| WorkstationError::Ec2(err.to_string()))?;
+            .map_err(ec2_err)?;
         let subnet = output
             .subnets()
             .first()
@@ -1067,30 +1205,67 @@ impl Workstation {
         instance_id: &str,
         desired_state: &str,
     ) -> Result<(), WorkstationError> {
-        for _ in 0..60 {
-            let output = self
-                .ec2
-                .describe_instances()
-                .instance_ids(instance_id)
-                .send()
-                .await
-                .map_err(|err| WorkstationError::Ec2(err.to_string()))?;
-            let state = output
-                .reservations()
-                .iter()
-                .flat_map(|reservation| reservation.instances().iter())
-                .next()
-                .map(instance_state)
-                .unwrap_or_default();
-            if state.eq_ignore_ascii_case(desired_state) {
-                return Ok(());
+        let timeout = Duration::from_secs(300);
+        match desired_state {
+            "running" => {
+                self.ec2
+                    .wait_until_instance_running()
+                    .instance_ids(instance_id)
+                    .wait(timeout)
+                    .await
+                    .map_err(|err| WorkstationError::Ec2(format!(
+                        "timed out waiting for instance {instance_id} to reach running: {err}"
+                    )))?;
             }
-            sleep(Duration::from_secs(5)).await;
+            "stopped" => {
+                self.ec2
+                    .wait_until_instance_stopped()
+                    .instance_ids(instance_id)
+                    .wait(timeout)
+                    .await
+                    .map_err(|err| WorkstationError::Ec2(format!(
+                        "timed out waiting for instance {instance_id} to reach stopped: {err}"
+                    )))?;
+            }
+            "terminated" => {
+                self.ec2
+                    .wait_until_instance_terminated()
+                    .instance_ids(instance_id)
+                    .wait(timeout)
+                    .await
+                    .map_err(|err| WorkstationError::Ec2(format!(
+                        "timed out waiting for instance {instance_id} to reach terminated: {err}"
+                    )))?;
+            }
+            _ => {
+                // Fallback to manual polling for unexpected states
+                for _ in 0..60 {
+                    let output = self
+                        .ec2
+                        .describe_instances()
+                        .instance_ids(instance_id)
+                        .send()
+                        .await
+                        .map_err(ec2_err)?;
+                    let state = output
+                        .reservations()
+                        .iter()
+                        .flat_map(|reservation| reservation.instances().iter())
+                        .next()
+                        .map(instance_state)
+                        .unwrap_or_default();
+                    if state.eq_ignore_ascii_case(desired_state) {
+                        return Ok(());
+                    }
+                    sleep(Duration::from_secs(5)).await;
+                }
+                return Err(WorkstationError::UnexpectedState {
+                    workstation_id: instance_id.to_string(),
+                    state: format!("did not reach {desired_state}"),
+                });
+            }
         }
-        Err(WorkstationError::UnexpectedState {
-            workstation_id: instance_id.to_string(),
-            state: format!("did not reach {desired_state}"),
-        })
+        Ok(())
     }
 
     async fn wait_for_bootstrap_fingerprint(
@@ -1133,7 +1308,7 @@ impl Workstation {
                     .allocate_address()
                     .send()
                     .await
-                    .map_err(|err| WorkstationError::Ec2(err.to_string()))?;
+                    .map_err(ec2_err)?;
                 let allocation_id = allocation
                     .allocation_id()
                     .ok_or_else(|| {
@@ -1165,7 +1340,7 @@ impl Workstation {
                     )
                     .send()
                     .await
-                    .map_err(|err| WorkstationError::Ec2(err.to_string()))?;
+                    .map_err(ec2_err)?;
                 allocation_id
             }
         };
@@ -1175,7 +1350,7 @@ impl Workstation {
             .allocation_id(allocation_id)
             .send()
             .await
-            .map_err(|err| WorkstationError::Ec2(err.to_string()))?;
+            .map_err(ec2_err)?;
         Ok(())
     }
 
@@ -1203,7 +1378,7 @@ impl Workstation {
             )
             .send()
             .await
-            .map_err(|err| WorkstationError::Ec2(err.to_string()))?;
+            .map_err(ec2_err)?;
         for address in output.addresses() {
             if let Some(association_id) = address.association_id()
                 && let Err(err) = self
@@ -1256,7 +1431,7 @@ impl Workstation {
             )
             .send()
             .await
-            .map_err(|err| WorkstationError::Ec2(err.to_string()))?;
+            .map_err(ec2_err)?;
         Ok(output
             .addresses()
             .iter()
@@ -1284,21 +1459,40 @@ impl Workstation {
             ))
             .send()
             .await
-            .map_err(|err| WorkstationError::Ec2(err.to_string()))?;
+            .map_err(ec2_err)?;
         let volume_id = output
             .volume_id()
             .ok_or_else(|| {
                 WorkstationError::Ec2("CreateVolume did not return volume id".to_string())
             })?
             .to_string();
+
+        // Wait for volume to reach 'available' state before proceeding
+        self.wait_for_volume_available(&volume_id).await?;
+
         self.ec2
             .create_tags()
             .resources(&volume_id)
             .tags(Tag::builder().key("Name").value(name).build())
             .send()
             .await
-            .map_err(|err| WorkstationError::Ec2(err.to_string()))?;
+            .map_err(ec2_err)?;
         Ok(volume_id)
+    }
+
+    async fn wait_for_volume_available(
+        &self,
+        volume_id: &str,
+    ) -> Result<(), WorkstationError> {
+        self.ec2
+            .wait_until_volume_available()
+            .volume_ids(volume_id)
+            .wait(Duration::from_secs(120))
+            .await
+            .map_err(|err| WorkstationError::Ec2(format!(
+                "timed out waiting for volume {volume_id} to reach available: {err}"
+            )))?;
+        Ok(())
     }
 
     async fn find_volume_id(
@@ -1324,7 +1518,7 @@ impl Workstation {
             .filters(Filter::builder().name("tag:Name").values(name).build())
             .send()
             .await
-            .map_err(|err| WorkstationError::Ec2(err.to_string()))?;
+            .map_err(ec2_err)?;
         Ok(output
             .volumes()
             .iter()
@@ -1344,7 +1538,7 @@ impl Workstation {
             .volume_ids(volume_id)
             .send()
             .await
-            .map_err(|err| WorkstationError::Ec2(err.to_string()))?;
+            .map_err(ec2_err)?;
         Ok(output.volumes().first().map(|volume| VolumeStatus {
             size_gib: volume.size().map(|size| size as u32),
             state: volume.state().map(|state| state.as_str().to_string()),
@@ -1366,7 +1560,7 @@ impl Workstation {
             .name(name)
             .send()
             .await
-            .map_err(|err| WorkstationError::Ssm(err.to_string()))?;
+            .map_err(ssm_err)?;
         output
             .parameter()
             .and_then(|parameter| parameter.value())
@@ -1563,7 +1757,7 @@ fn git_command<const N: usize>(args: [&str; N]) -> Option<String> {
     }
 }
 
-fn read_rust_toolchain_toml() -> String {
+pub fn read_rust_toolchain_toml() -> String {
     fs::read_to_string("rust-toolchain.toml").unwrap_or_default()
 }
 

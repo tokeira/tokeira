@@ -130,7 +130,10 @@ tkr
 │   ├── destroy [--workstation <id>] --yes
 │   ├── bootstrap [--workstation <id>]
 │   ├── idle [--workstation <id>] [--defer <duration>]
-│   └── github-key <add|remove|list>
+│   ├── github-key <add|remove|list>
+│   └── code
+│       ├── sync [--branch <name>]
+│       └── push [--branch <name>]
 ├── dev
 │   ├── build
 │   ├── test [--crate <name>]
@@ -273,12 +276,9 @@ tkr workstation up
 # 2. (First time only) Add a GitHub deploy key so you can push from the workstation
 tkr workstation github-key add --repo <owner>/tokeira
 
-# 3. Sync your local changes to the workstation
-#    Option A: push a branch from your local machine, pull on the workstation
-git push origin feature/my-work
-tkr workstation remote-exec git pull origin feature/my-work
-
-#    Option B: use rsync or git-push-to-remote patterns (advanced)
+# 3. Sync code to the workstation (clones on first run, pulls thereafter)
+tkr workstation code sync
+tkr workstation code sync --branch feature/my-work   # specific branch
 
 # 4. Build
 tkr workstation remote-exec cargo build --workspace
@@ -298,8 +298,9 @@ tkr workstation ssh
 cargo test -p tokeira-kernel -- --nocapture
 exit
 
-# 9. Push results back (from the workstation, using the deploy key)
-tkr workstation remote-exec git push origin feature/my-work
+# 9. Push results back to origin
+tkr workstation code push
+tkr workstation code push --branch feature/my-work   # specific branch
 
 # 10. Stop when done for the day
 tkr workstation stop

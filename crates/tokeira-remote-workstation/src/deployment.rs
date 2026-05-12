@@ -18,7 +18,7 @@ use tokeira_iac::{self as iac, Module, ModuleContext, Resource};
 use tokeira_orchestrator::Deployment;
 use tokeira_state::{LocalBackend, StateBackend};
 
-use crate::module::{WorkstationModule, WorkstationModuleConfig};
+use crate::module::WorkstationModuleConfig;
 
 /// Configuration for a workstation deployment.
 ///
@@ -59,12 +59,42 @@ impl Deployment for WorkstationDeployment {
             region: config.region.clone(),
             tags: workstation_tags(&config.module_config.workstation_id),
         };
-        let module = WorkstationModule::new(config.module_config.clone(), rctx);
-        if selection.includes(module.name()) {
-            vec![Box::new(module)]
-        } else {
-            vec![]
+
+        let identity = crate::module::IdentityModule {
+            workstation_id: config.module_config.workstation_id.clone(),
+            rctx: rctx.clone(),
+        };
+        let network = crate::module::NetworkModule {
+            workstation_id: config.module_config.workstation_id.clone(),
+            vpc_id: config.module_config.vpc_id.clone(),
+            rctx: rctx.clone(),
+        };
+        let storage = crate::module::StorageModule {
+            workstation_id: config.module_config.workstation_id.clone(),
+            cache_volume_gib: config.module_config.cache_volume_gib,
+            repo_volume_gib: config.module_config.repo_volume_gib,
+            availability_zone: config.module_config.availability_zone.clone(),
+            rctx: rctx.clone(),
+        };
+        let compute = crate::module::ComputeModule {
+            config: config.module_config.clone(),
+            rctx,
+        };
+
+        let mut modules: Vec<Box<dyn iac::Module>> = Vec::new();
+        if selection.includes(identity.name()) {
+            modules.push(Box::new(identity));
         }
+        if selection.includes(network.name()) {
+            modules.push(Box::new(network));
+        }
+        if selection.includes(storage.name()) {
+            modules.push(Box::new(storage));
+        }
+        if selection.includes(compute.name()) {
+            modules.push(Box::new(compute));
+        }
+        modules
     }
 
     fn services(

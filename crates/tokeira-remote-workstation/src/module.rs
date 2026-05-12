@@ -1,16 +1,15 @@
-//! Workstation IaC module — composes generic AWS resources into the
-//! workstation topology.
+//! Workstation IaC modules — four modules composing generic AWS resources
+//! into the workstation topology.
 //!
-//! The module enumerates: IAM role, instance profile, security group,
-//! two EBS volumes (cache + repo), and one EC2 instance. Dependencies
-//! are declared so the IaC engine creates them in the correct order and
-//! destroys them in reverse.
+//! Module dependency graph:
+//!   identity (no deps)     → IAM Role + Instance Profile
+//!   network  (no deps)     → Security Group
+//!   storage  (no deps)     → EBS Volume (cache) + EBS Volume (repo)
+//!   compute  (depends on: identity, network, storage) → EC2 Instance
 //!
-//! Note: We use the generic `EbsVolume` and `Ec2Instance` resources from
-//! `tokeira-aws`, but for the security group we use our own implementation
-//! because the generic `SecurityGroup` resolves VPC ID from a VPC resource
-//! dependency — and the workstation uses a pre-existing default VPC
-//! discovered at pre-flight time.
+//! The engine processes modules in dependency order: identity, network, and
+//! storage are created first (in parallel if the engine supports it), then
+//! compute. On destroy, compute is deleted first, then the others.
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -22,10 +21,9 @@ use tokeira_aws::resources::iam_instance_profile::{IamInstanceProfile, IamInstan
 use tokeira_aws::resources::iam_role::{IamRole, IamRoleConfig};
 use tokeira_iac::{Module, ModuleContext, Resource, ResourceId, error::IacError};
 
-const MODULE_NAME: &str = "workstation";
 const MANAGED_POLICY_ARN: &str = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore";
 
-/// Configuration for the workstation module, derived from `WorkstationProfile`
+/// Configuration for the workstation modules, derived from `WorkstationProfile`
 /// plus pre-flight discovery results (subnet, VPC, AZ, AMI).
 #[derive(Debug, Clone)]
 pub struct WorkstationModuleConfig {
@@ -42,22 +40,17 @@ pub struct WorkstationModuleConfig {
     pub region: String,
 }
 
-/// The workstation IaC module.
+// ── Identity Module ──────────────────────────────────────────────────────────
+
 #[derive(Debug)]
-pub struct WorkstationModule {
-    pub config: WorkstationModuleConfig,
+pub struct IdentityModule {
+    pub workstation_id: String,
     pub rctx: ResourceContext,
 }
 
-impl WorkstationModule {
-    pub fn new(config: WorkstationModuleConfig, rctx: ResourceContext) -> Self {
-        Self { config, rctx }
-    }
-}
-
-impl Module for WorkstationModule {
+impl Module for IdentityModule {
     fn name(&self) -> &str {
-        MODULE_NAME
+        "identity"
     }
 
     fn dependencies(&self) -> &[&str] {
@@ -65,13 +58,9 @@ impl Module for WorkstationModule {
     }
 
     fn resources(&self, _ctx: &ModuleContext) -> Result<Vec<Box<dyn Resource>>, IacError> {
-        let ws_id = &self.config.workstation_id;
+        let ws_id = &self.workstation_id;
         let role_name = format!("tokeira-workstation-{ws_id}-role");
         let profile_name = format!("tokeira-workstation-{ws_id}-profile");
-        let sg_name = format!("tokeira-workstation-{ws_id}-sg");
-        let cache_vol_name = format!("tokeira-ws-{ws_id}-cache");
-        let repo_vol_name = format!("tokeira-ws-{ws_id}-repo");
-        let instance_name = format!("tokeira-ws-{ws_id}");
 
         let trust_policy = serde_json::json!({
             "Version": "2012-10-17",
@@ -83,91 +72,194 @@ impl Module for WorkstationModule {
         })
         .to_string();
 
-        // 1. IAM Role
         let role = IamRole::new(
             role_name.clone(),
             IamRoleConfig {
                 trust_policy,
                 inline_policies: HashMap::new(),
                 managed_policy_arns: vec![MANAGED_POLICY_ARN.to_string()],
-                module: MODULE_NAME.to_string(),
+                module: "identity".to_string(),
             },
             &self.rctx,
         );
         let role_resource_id = role.resource_id();
 
-        // 2. IAM Instance Profile
         let instance_profile = IamInstanceProfile::new(
-            profile_name.clone(),
+            profile_name,
             IamInstanceProfileConfig {
-                role_name: role_name.clone(),
-                role_dependency: role_resource_id.clone(),
-                module: MODULE_NAME.to_string(),
+                role_name,
+                role_dependency: role_resource_id,
+                module: "identity".to_string(),
             },
             &self.rctx,
         );
 
-        // 3. Security Group — we use the generic SecurityGroup but need to
-        //    handle the VPC dependency. Since we don't create a VPC resource,
-        //    we'll use a synthetic "no-dependency" approach by creating a
-        //    minimal EbsVolume-style SG resource. For now, use the generic
-        //    SecurityGroup with an empty vpc_dependency and override the VPC
-        //    resolution in a workstation-specific way.
-        //
-        //    Actually: the simplest correct approach is to use our own
-        //    Ec2Instance-style resource that takes vpc_id directly. But we
-        //    already have the generic SecurityGroup. Let's just create a
-        //    synthetic VPC state entry — no, that's fragile.
-        //
-        //    Decision: use the generic SecurityGroup with a dummy dependency
-        //    that we pre-seed. The engine won't try to create it because
-        //    describe() will find it in state.
-        //
-        //    Simplest correct path: the workstation module pre-seeds a VPC
-        //    state entry. But Module::resources() doesn't have write access
-        //    to state.
-        //
-        //    Final decision: we need a workstation-specific SG resource that
-        //    takes vpc_id directly. This is the same pattern as Ec2Instance
-        //    taking subnet_id directly. Let's define it inline here.
+        Ok(vec![Box::new(role), Box::new(instance_profile)])
+    }
+}
+
+// ── Network Module ───────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub struct NetworkModule {
+    pub workstation_id: String,
+    pub vpc_id: String,
+    pub rctx: ResourceContext,
+}
+
+impl Module for NetworkModule {
+    fn name(&self) -> &str {
+        "network"
+    }
+
+    fn dependencies(&self) -> &[&str] {
+        &[]
+    }
+
+    fn resources(&self, _ctx: &ModuleContext) -> Result<Vec<Box<dyn Resource>>, IacError> {
+        let sg_name = format!(
+            "tokeira-workstation-{}-sg",
+            self.workstation_id
+        );
+
         let sg = WorkstationSecurityGroup {
             name: sg_name,
-            vpc_id: self.config.vpc_id.clone(),
-            module: MODULE_NAME.to_string(),
-            rctx: self.rctx.clone(),
+            vpc_id: self.vpc_id.clone(),
+            module: "network".to_string(),
         };
-        let sg_resource_id = sg.resource_id();
 
-        // 4. Cache EBS Volume
+        Ok(vec![Box::new(sg)])
+    }
+}
+
+// ── Storage Module ───────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub struct StorageModule {
+    pub workstation_id: String,
+    pub cache_volume_gib: u32,
+    pub repo_volume_gib: u32,
+    pub availability_zone: String,
+    pub rctx: ResourceContext,
+}
+
+impl StorageModule {
+    pub fn cache_volume_resource_id(&self) -> ResourceId {
+        ResourceId(format!(
+            "ebs-volume-tokeira-ws-{}-cache",
+            self.workstation_id
+        ))
+    }
+
+    pub fn repo_volume_resource_id(&self) -> ResourceId {
+        ResourceId(format!(
+            "ebs-volume-tokeira-ws-{}-repo",
+            self.workstation_id
+        ))
+    }
+}
+
+impl Module for StorageModule {
+    fn name(&self) -> &str {
+        "storage"
+    }
+
+    fn dependencies(&self) -> &[&str] {
+        &[]
+    }
+
+    fn resources(&self, _ctx: &ModuleContext) -> Result<Vec<Box<dyn Resource>>, IacError> {
+        let ws_id = &self.workstation_id;
+
         let cache_vol = EbsVolume::new(
-            cache_vol_name.clone(),
+            format!("tokeira-ws-{ws_id}-cache"),
             EbsVolumeConfig {
-                size_gib: self.config.cache_volume_gib,
-                availability_zone: self.config.availability_zone.clone(),
+                size_gib: self.cache_volume_gib,
+                availability_zone: self.availability_zone.clone(),
                 volume_type: "gp3".to_string(),
                 encrypted: true,
-                module: MODULE_NAME.to_string(),
+                module: "storage".to_string(),
             },
             &self.rctx,
         );
-        let cache_vol_resource_id = cache_vol.resource_id();
 
-        // 5. Repo EBS Volume
         let repo_vol = EbsVolume::new(
-            repo_vol_name.clone(),
+            format!("tokeira-ws-{ws_id}-repo"),
             EbsVolumeConfig {
-                size_gib: self.config.repo_volume_gib,
-                availability_zone: self.config.availability_zone.clone(),
+                size_gib: self.repo_volume_gib,
+                availability_zone: self.availability_zone.clone(),
                 volume_type: "gp3".to_string(),
                 encrypted: true,
-                module: MODULE_NAME.to_string(),
+                module: "storage".to_string(),
             },
             &self.rctx,
         );
-        let repo_vol_resource_id = repo_vol.resource_id();
 
-        // 6. EC2 Instance
-        let instance_profile_resource_id = instance_profile.resource_id();
+        Ok(vec![Box::new(cache_vol), Box::new(repo_vol)])
+    }
+}
+
+// ── Compute Module ───────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub struct ComputeModule {
+    pub config: WorkstationModuleConfig,
+    pub rctx: ResourceContext,
+}
+
+impl Module for ComputeModule {
+    fn name(&self) -> &str {
+        "compute"
+    }
+
+    fn dependencies(&self) -> &[&str] {
+        &["identity", "network", "storage"]
+    }
+
+    fn resources(&self, ctx: &ModuleContext) -> Result<Vec<Box<dyn Resource>>, IacError> {
+        let ws_id = &self.config.workstation_id;
+        let profile_name = format!("tokeira-workstation-{ws_id}-profile");
+        let sg_name = format!("tokeira-workstation-{ws_id}-sg");
+        let instance_name = format!("tokeira-ws-{ws_id}");
+
+        let instance_profile_resource_id =
+            ResourceId(format!("iam-instance-profile-{profile_name}"));
+        let sg_resource_id = ResourceId(format!("sg-{sg_name}"));
+        let cache_vol_resource_id =
+            ResourceId(format!("ebs-volume-tokeira-ws-{ws_id}-cache"));
+        let repo_vol_resource_id =
+            ResourceId(format!("ebs-volume-tokeira-ws-{ws_id}-repo"));
+
+        // Read volume IDs from state (available because storage module runs first)
+        let cache_vol_id = ctx
+            .state
+            .resources
+            .get(&cache_vol_resource_id)
+            .map(|s| s.physical_id.clone())
+            .unwrap_or_default();
+        let repo_vol_id = ctx
+            .state
+            .resources
+            .get(&repo_vol_resource_id)
+            .map(|s| s.physical_id.clone())
+            .unwrap_or_default();
+
+        // Render user-data with actual volume IDs from state
+        let user_data_base64 = if !cache_vol_id.is_empty() && !repo_vol_id.is_empty() {
+            let user_data = crate::bootstrap::render(&crate::bootstrap::BootstrapContext {
+                workstation_id: ws_id.clone(),
+                bootstrap_fingerprint: self.config.user_data_base64.clone(),
+                profile: crate::engine::WorkstationProfile::c8gd_rust(),
+                cache_volume_id: cache_vol_id,
+                repo_volume_id: repo_vol_id,
+                rust_toolchain_toml: crate::engine::read_rust_toolchain_toml(),
+            });
+            base64::engine::general_purpose::STANDARD.encode(user_data.as_bytes())
+        } else {
+            // Fallback: use pre-rendered user-data (volume IDs will be empty)
+            self.config.user_data_base64.clone()
+        };
+
         let instance = Ec2Instance::new(
             instance_name,
             Ec2InstanceConfig {
@@ -178,7 +270,7 @@ impl Module for WorkstationModule {
                 instance_profile_resource_id,
                 instance_profile_name: profile_name,
                 root_volume_gib: self.config.root_volume_gib,
-                user_data_base64: self.config.user_data_base64.clone(),
+                user_data_base64,
                 associate_public_ip: true,
                 volume_attachments: vec![
                     VolumeAttachment {
@@ -190,34 +282,24 @@ impl Module for WorkstationModule {
                         device: "/dev/sdg".to_string(),
                     },
                 ],
-                module: MODULE_NAME.to_string(),
+                module: "compute".to_string(),
             },
             &self.rctx,
         );
 
-        Ok(vec![
-            Box::new(role),
-            Box::new(instance_profile),
-            Box::new(sg),
-            Box::new(cache_vol),
-            Box::new(repo_vol),
-            Box::new(instance),
-        ])
+        Ok(vec![Box::new(instance)])
     }
 }
 
-// ── Workstation-specific security group ──────────────────────────────────────
-//
-// Takes vpc_id directly rather than resolving from a VPC resource dependency.
-// This is necessary because the workstation uses a pre-existing default VPC
-// that is not managed by the IaC engine.
+// ── Workstation Security Group (takes vpc_id directly) ───────────────────────
+
+use base64::Engine as _;
 
 #[derive(Debug)]
 struct WorkstationSecurityGroup {
     name: String,
     vpc_id: String,
     module: String,
-    rctx: ResourceContext,
 }
 
 #[async_trait::async_trait]
@@ -267,7 +349,6 @@ impl Resource for WorkstationSecurityGroup {
                 let svc_err = e.into_service_error();
                 let msg = format!("{svc_err}");
                 if msg.contains("InvalidGroup.Duplicate") {
-                    // SG already exists — look it up by name to get the ID
                     tracing::warn!(sg = %self.name, "security group already exists, adopting");
                     let desc = clients
                         .ec2

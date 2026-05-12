@@ -38,7 +38,7 @@ pub fn render(context: &BootstrapContext) -> String {
         filesystem_phase(context),
         toolchain_phase(context),
         environment_phase(),
-        repo_phase(context),
+        repo_dir_phase(),
         agentd_phase(),
         idle_phase(context),
         fingerprint_phase(context),
@@ -166,21 +166,15 @@ chmod 0644 /etc/profile.d/tokeira-workstation.sh
     .to_string()
 }
 
-fn repo_phase(context: &BootstrapContext) -> String {
-    format!(
-        r#"# idempotency: an existing checkout is never overwritten.
-if [ ! -d /work/repo/tokeira/.git ]; then
-  if ! su "$SHELL_USER" -c {clone_cmd:?}; then
-    printf '%s\n' 'clone failed; run tkr workstation github-key add if this is a private repository' > /etc/tokeira/repo-clone-status
-  else
-    rm -f /etc/tokeira/repo-clone-status
-  fi
-fi
+fn repo_dir_phase() -> String {
+    r#"# Prepare the repo directory structure. Clone is NOT done here — the operator
+# runs `tkr workstation github-key add` then clones manually or via remote-exec.
+mkdir -p /work/repo
+chown "$SHELL_USER:$SHELL_USER" /work/repo
 ln -sfn /work/repo/tokeira /work/tokeira
 chown -h "$SHELL_USER:$SHELL_USER" /work/tokeira
-"#,
-        clone_cmd = format!("git clone {} /work/repo/tokeira", context.profile.repo_url)
-    )
+"#
+    .to_string()
 }
 
 fn agentd_phase() -> String {

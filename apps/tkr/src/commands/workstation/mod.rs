@@ -137,64 +137,52 @@ pub async fn run(action: WorkstationAction, json: bool) -> Result<()> {
             confirm_destroy(&id, yes)?;
 
             let profile = WorkstationProfile::c8gd_rust();
-            let state_dir =
+            let deployment_dir =
                 tokeira_remote_workstation::deployment::deployment_dir_for(&id);
 
-            if state_dir.join("state").exists() {
-                // Use IaC engine via InfraEngine for clean reverse-order destroy
-                println!("destroying workstation {id}...");
+            println!("destroying workstation {id}...");
 
-                let ws_config =
-                    tokeira_remote_workstation::deployment::WorkstationConfig {
-                        module_config:
-                            tokeira_remote_workstation::module::WorkstationModuleConfig {
-                                workstation_id: id.clone(),
-                                instance_type: profile.instance_type.clone(),
-                                ami_id: String::new(),
-                                subnet_id: String::new(),
-                                vpc_id: String::new(),
-                                availability_zone: String::new(),
-                                root_volume_gib: profile.root_volume_gib,
-                                cache_volume_gib: profile.cache_volume_gib,
-                                repo_volume_gib: profile.repo_volume_gib,
-                                user_data_base64: String::new(),
-                                region: profile.region.clone(),
-                            },
-                        region: profile.region.clone(),
-                    };
+            let ws_config =
+                tokeira_remote_workstation::deployment::WorkstationConfig {
+                    module_config:
+                        tokeira_remote_workstation::module::WorkstationModuleConfig {
+                            workstation_id: id.clone(),
+                            instance_type: profile.instance_type.clone(),
+                            ami_id: String::new(),
+                            subnet_id: String::new(),
+                            vpc_id: String::new(),
+                            availability_zone: String::new(),
+                            root_volume_gib: profile.root_volume_gib,
+                            cache_volume_gib: profile.cache_volume_gib,
+                            repo_volume_gib: profile.repo_volume_gib,
+                            user_data_base64: String::new(),
+                            region: profile.region.clone(),
+                        },
+                    region: profile.region.clone(),
+                };
 
-                let deployment_dir =
-                    tokeira_remote_workstation::deployment::deployment_dir_for(&id);
+            let deployment =
+                tokeira_remote_workstation::deployment::WorkstationDeployment;
 
-                let deployment =
-                    tokeira_remote_workstation::deployment::WorkstationDeployment;
+            use tokeira_orchestrator::InfraEngine;
+            use tokeira_iac::ModuleSelection;
+            use crate::tui::{ActionTuiHandle, OutputFormat};
 
-                use tokeira_orchestrator::InfraEngine;
-                use tokeira_iac::ModuleSelection;
-                use crate::tui::{ActionTuiHandle, OutputFormat};
+            let format = if json { OutputFormat::Json } else { OutputFormat::Human };
+            let mut infra_engine =
+                InfraEngine::new(deployment, &ws_config, &deployment_dir).await?;
+            let selection = ModuleSelection::All;
+            let composition = infra_engine.compose(selection.clone())?;
+            let tui = ActionTuiHandle::new(format);
+            tui.install(infra_engine.provision_context_mut());
+            let result = infra_engine.destroy(&composition, selection).await;
+            tui.print_summary();
+            result?;
 
-                let format = if json { OutputFormat::Json } else { OutputFormat::Human };
-                let mut infra_engine =
-                    InfraEngine::new(deployment, &ws_config, &deployment_dir).await?;
-                let selection = ModuleSelection::All;
-                let composition = infra_engine.compose(selection.clone())?;
-                let tui = ActionTuiHandle::new(format);
-                tui.install(infra_engine.provision_context_mut());
-                let result = infra_engine.destroy(&composition, selection).await;
-                tui.print_summary();
-                result?;
-
-                // Remove local state directory
-                let _ = fs::remove_dir_all(&deployment_dir);
-                clear_latest_if_matches(&id)?;
-                println!("destroyed workstation {id}");
-            } else {
-                // Fallback: use operational engine (for workstations created
-                // before the IaC rewrite)
-                let engine = Workstation::new(profile.region).await?;
-                engine.destroy(&id).await?;
-                println!("destroyed workstation {id}");
-            }
+            // Remove local state directory
+            let _ = fs::remove_dir_all(&deployment_dir);
+            clear_latest_if_matches(&id)?;
+            println!("destroyed workstation {id}");
             Ok(())
         }
         WorkstationAction::Ssh { workstation } => {

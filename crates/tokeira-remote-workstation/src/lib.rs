@@ -14,4 +14,5 @@
 pub mod bootstrap;
 pub mod deployment;
 pub mod engine;
+pub mod instance;
 pub mod module;

@@ -16,7 +16,6 @@ use std::fmt::Debug;
 
 use tokeira_aws::ResourceContext;
 use tokeira_aws::resources::ebs_volume::{EbsVolume, EbsVolumeConfig};
-use tokeira_aws::resources::ec2_instance::{Ec2Instance, Ec2InstanceConfig, VolumeAttachment};
 use tokeira_aws::resources::iam_instance_profile::{IamInstanceProfile, IamInstanceProfileConfig};
 use tokeira_aws::resources::iam_role::{IamRole, IamRoleConfig};
 use tokeira_iac::{Module, ModuleContext, Resource, ResourceId, error::IacError};
@@ -216,7 +215,7 @@ impl Module for ComputeModule {
         &["identity", "network", "storage"]
     }
 
-    fn resources(&self, ctx: &ModuleContext) -> Result<Vec<Box<dyn Resource>>, IacError> {
+    fn resources(&self, _ctx: &ModuleContext) -> Result<Vec<Box<dyn Resource>>, IacError> {
         let ws_id = &self.config.workstation_id;
         let profile_name = format!("tokeira-workstation-{ws_id}-profile");
         let sg_name = format!("tokeira-workstation-{ws_id}-sg");
@@ -230,42 +229,10 @@ impl Module for ComputeModule {
         let repo_vol_resource_id =
             ResourceId(format!("ebs-volume-tokeira-ws-{ws_id}-repo"));
 
-        // Read volume IDs from state (available because storage module runs first)
-        let cache_vol_id = ctx
-            .state
-            .resources
-            .get(&cache_vol_resource_id)
-            .map(|s| s.physical_id.clone())
-            .unwrap_or_default();
-        let repo_vol_id = ctx
-            .state
-            .resources
-            .get(&repo_vol_resource_id)
-            .map(|s| s.physical_id.clone())
-            .unwrap_or_default();
-
-        // Render user-data with actual volume IDs from state
-        let user_data_base64 = if !cache_vol_id.is_empty() && !repo_vol_id.is_empty() {
-            let profile = crate::engine::WorkstationProfile::c8gd_rust();
-            let toolchain_toml = crate::engine::read_rust_toolchain_toml();
-            let fingerprint = crate::bootstrap::fingerprint(&profile, &toolchain_toml);
-            let user_data = crate::bootstrap::render(&crate::bootstrap::BootstrapContext {
+        let instance = crate::instance::WorkstationInstance {
+            name: instance_name,
+            config: crate::instance::WorkstationInstanceConfig {
                 workstation_id: ws_id.clone(),
-                bootstrap_fingerprint: fingerprint,
-                profile,
-                cache_volume_id: cache_vol_id,
-                repo_volume_id: repo_vol_id,
-                rust_toolchain_toml: toolchain_toml,
-            });
-            base64::engine::general_purpose::STANDARD.encode(user_data.as_bytes())
-        } else {
-            // Fallback: use pre-rendered user-data (volume IDs will be empty)
-            self.config.user_data_base64.clone()
-        };
-
-        let instance = Ec2Instance::new(
-            instance_name,
-            Ec2InstanceConfig {
                 instance_type: self.config.instance_type.clone(),
                 ami_id: self.config.ami_id.clone(),
                 subnet_id: self.config.subnet_id.clone(),
@@ -273,30 +240,18 @@ impl Module for ComputeModule {
                 instance_profile_resource_id,
                 instance_profile_name: profile_name,
                 root_volume_gib: self.config.root_volume_gib,
-                user_data_base64,
-                associate_public_ip: true,
-                volume_attachments: vec![
-                    VolumeAttachment {
-                        volume_resource_id: cache_vol_resource_id,
-                        device: "/dev/sdf".to_string(),
-                    },
-                    VolumeAttachment {
-                        volume_resource_id: repo_vol_resource_id,
-                        device: "/dev/sdg".to_string(),
-                    },
-                ],
+                cache_volume_resource_id: cache_vol_resource_id,
+                repo_volume_resource_id: repo_vol_resource_id,
                 module: "compute".to_string(),
             },
-            &self.rctx,
-        );
+            rctx: self.rctx.clone(),
+        };
 
         Ok(vec![Box::new(instance)])
     }
 }
 
 // ── Workstation Security Group (takes vpc_id directly) ───────────────────────
-
-use base64::Engine as _;
 
 #[derive(Debug)]
 struct WorkstationSecurityGroup {

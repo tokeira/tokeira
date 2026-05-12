@@ -30,6 +30,15 @@ struct DeployKeyEntry {
     removed_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PreflightConfig {
+    subnet_id: String,
+    vpc_id: String,
+    availability_zone: String,
+    ami_id: String,
+    region: String,
+}
+
 pub async fn run(action: WorkstationAction, json: bool) -> Result<()> {
     match action {
         WorkstationAction::Up {
@@ -61,44 +70,47 @@ pub async fn run(action: WorkstationAction, json: bool) -> Result<()> {
             let deployment_dir =
                 tokeira_remote_workstation::deployment::deployment_dir_for(&ws_id);
 
-            // Always use the IaC engine. It is idempotent:
-            // - describe() finds existing resources by physical ID from state
-            // - create() is only called for resources not yet in state
-            // - On retry after partial failure, existing resources are skipped
             println!("workstation {ws_id}...");
 
-            let engine = Workstation::new(profile.region.clone()).await?;
-            let preflight = engine.preflight(&profile).await?;
-
-            let toolchain_toml = read_rust_toolchain_toml();
-            let fingerprint =
-                tokeira_remote_workstation::bootstrap::fingerprint(&profile, &toolchain_toml);
-            let user_data = tokeira_remote_workstation::bootstrap::render(
-                &tokeira_remote_workstation::bootstrap::BootstrapContext {
-                    workstation_id: ws_id.clone(),
-                    bootstrap_fingerprint: fingerprint.clone(),
-                    profile: profile.clone(),
-                    cache_volume_id: String::new(),
-                    repo_volume_id: String::new(),
-                    rust_toolchain_toml: toolchain_toml,
-                },
-            );
-            let user_data_base64 =
-                base64::engine::general_purpose::STANDARD.encode(user_data.as_bytes());
+            // Load or create pre-flight config. Once written, pre-flight results
+            // are fixed for this workstation — retries use the same AZ/subnet.
+            let config_path = deployment_dir.join("config.json");
+            let preflight_config = if config_path.exists() {
+                let content = fs::read_to_string(&config_path)
+                    .context("failed to read workstation config.json")?;
+                serde_json::from_str::<PreflightConfig>(&content)
+                    .context("failed to parse workstation config.json")?
+            } else {
+                let engine = Workstation::new(profile.region.clone()).await?;
+                let preflight = engine.preflight(&profile).await?;
+                let config = PreflightConfig {
+                    subnet_id: preflight.subnet_id,
+                    vpc_id: preflight.vpc_id,
+                    availability_zone: preflight.availability_zone,
+                    ami_id: preflight.ami_id,
+                    region: profile.region.clone(),
+                };
+                fs::create_dir_all(&deployment_dir)?;
+                fs::write(
+                    &config_path,
+                    serde_json::to_string_pretty(&config)?,
+                )?;
+                config
+            };
 
             let ws_config = tokeira_remote_workstation::deployment::WorkstationConfig {
                 module_config: tokeira_remote_workstation::module::WorkstationModuleConfig {
                     workstation_id: ws_id.clone(),
                     instance_type: profile.instance_type.clone(),
-                    ami_id: preflight.ami_id,
-                    subnet_id: preflight.subnet_id,
-                    vpc_id: preflight.vpc_id,
-                    availability_zone: preflight.availability_zone,
+                    ami_id: preflight_config.ami_id,
+                    subnet_id: preflight_config.subnet_id,
+                    vpc_id: preflight_config.vpc_id,
+                    availability_zone: preflight_config.availability_zone,
                     root_volume_gib: profile.root_volume_gib,
                     cache_volume_gib: profile.cache_volume_gib,
                     repo_volume_gib: profile.repo_volume_gib,
-                    user_data_base64,
-                    region: profile.region.clone(),
+                    user_data_base64: String::new(), // computed by compute module from state
+                    region: preflight_config.region,
                 },
                 region: profile.region.clone(),
             };

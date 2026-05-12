@@ -5985,6 +5985,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "shlex",
+ "thiserror 2.0.18",
  "tokeira-aws",
  "tokeira-deploy-engine",
  "tokeira-iac",

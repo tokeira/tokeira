@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use tokeira_aws::AwsClients;
 use tokeira_iac::{self as iac, Module, ModuleContext, Resource};
-use tokeira_orchestrator::{Deployment, Result};
+use tokeira_orchestrator::Deployment;
 use tokeira_state::{LocalBackend, StateBackend};
 
 use crate::module::{WorkstationModule, WorkstationModuleConfig};
@@ -90,7 +90,7 @@ impl Deployment for WorkstationDeployment {
         &self,
         config: &Self::Config,
         ctx: &mut iac::ProvisionContext,
-    ) -> Result<()> {
+    -> tokeira_orchestrator::Result<()> {
         let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .region(aws_config::Region::new(config.region.clone()))
             .load()
@@ -103,7 +103,7 @@ impl Deployment for WorkstationDeployment {
         &self,
         _config: &Self::Config,
         _ctx: &mut tokeira_deploy_engine::ServiceContext,
-    ) -> Result<()> {
+    -> tokeira_orchestrator::Result<()> {
         Ok(())
     }
 

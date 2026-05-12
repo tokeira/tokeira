@@ -12,11 +12,10 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
 use async_trait::async_trait;
 use tokeira_aws::AwsClients;
 use tokeira_iac::{self as iac, Module, ModuleContext, Resource};
-use tokeira_orchestrator::Deployment;
+use tokeira_orchestrator::{Deployment, Result};
 use tokeira_state::{LocalBackend, StateBackend};
 
 use crate::module::{WorkstationModule, WorkstationModuleConfig};
@@ -218,7 +217,7 @@ impl Resource for LocalStateResource {
         _ctx: &iac::ProvisionContext,
     ) -> Result<iac::ResourceState, iac::IacError> {
         std::fs::create_dir_all(&self.state_dir).map_err(|e| {
-            iac::IacError::ProviderError(format!(
+            iac::IacError::AwsSdk(format!(
                 "failed to create state directory {}: {e}",
                 self.state_dir.display()
             ))

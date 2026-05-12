@@ -63,12 +63,22 @@ pub async fn run(action: WorkstationAction, json: bool) -> Result<()> {
                 tokeira_remote_workstation::deployment::deployment_dir_for(&ws_id);
 
             if state_dir.join("state").exists() {
-                // Existing workstation — resume via operational engine
-                let engine = Workstation::new(profile.region.clone()).await?;
-                let outcome = engine.up(&profile, Some(&ws_id)).await?;
-                write_latest(outcome_workstation_id(&outcome))?;
-                print_up_outcome(&outcome, json)?;
-            } else {
+                // Check if the instance resource exists in state — if so, this is
+                // a resume (start stopped instance). If not, it's a partial create
+                // that needs the IaC engine to finish.
+                let has_instance = std::fs::read_to_string(
+                    state_dir.join("state/infra/infra/manifest.json"),
+                )
+                .map(|content| content.contains("\"Ec2Instance\""))
+                .unwrap_or(false);
+
+                if has_instance {
+                    // Existing workstation with instance — resume via operational engine
+                    let engine = Workstation::new(profile.region.clone()).await?;
+                    let outcome = engine.up(&profile, Some(&ws_id)).await?;
+                    write_latest(outcome_workstation_id(&outcome))?;
+                    print_up_outcome(&outcome, json)?;
+                } else {
                 // Fresh create — use IaC engine via InfraEngine
                 println!("creating workstation {ws_id}...");
                 let engine = Workstation::new(profile.region.clone()).await?;
@@ -140,6 +150,7 @@ pub async fn run(action: WorkstationAction, json: bool) -> Result<()> {
 
                 write_latest(&ws_id)?;
                 println!("workstation {ws_id} created");
+                }
             }
             Ok(())
         }

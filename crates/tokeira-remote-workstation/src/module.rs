@@ -247,7 +247,7 @@ impl Resource for WorkstationSecurityGroup {
             .expect("AwsClients");
         let tags = ctx.resource_tags(&self.name);
 
-        let output = clients
+        let sg_id = match clients
             .ec2
             .create_security_group()
             .group_name(&self.name)
@@ -261,15 +261,40 @@ impl Resource for WorkstationSecurityGroup {
             )
             .send()
             .await
-            .map_err(|e| {
-                IacError::AwsSdk(format!(
-                    "failed to create security group {}: {}",
-                    self.name,
-                    e.into_service_error()
-                ))
-            })?;
-
-        let sg_id = output.group_id().unwrap_or_default().to_string();
+        {
+            Ok(output) => output.group_id().unwrap_or_default().to_string(),
+            Err(e) => {
+                let svc_err = e.into_service_error();
+                let msg = format!("{svc_err}");
+                if msg.contains("InvalidGroup.Duplicate") {
+                    // SG already exists — look it up by name to get the ID
+                    tracing::warn!(sg = %self.name, "security group already exists, adopting");
+                    let desc = clients
+                        .ec2
+                        .describe_security_groups()
+                        .group_names(&self.name)
+                        .send()
+                        .await
+                        .map_err(|e2| {
+                            IacError::AwsSdk(format!(
+                                "failed to describe existing security group {}: {}",
+                                self.name,
+                                e2.into_service_error()
+                            ))
+                        })?;
+                    desc.security_groups()
+                        .first()
+                        .and_then(|sg| sg.group_id())
+                        .unwrap_or_default()
+                        .to_string()
+                } else {
+                    return Err(IacError::AwsSdk(format!(
+                        "failed to create security group {}: {svc_err}",
+                        self.name
+                    )));
+                }
+            }
+        };
 
         Ok(tokeira_iac::ResourceState {
             resource_type: self.resource_type(),

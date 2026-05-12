@@ -53,105 +53,75 @@ pub async fn run(action: WorkstationAction, json: bool) -> Result<()> {
                 subnet_id,
             );
 
-            // Check if we have local state for an existing workstation
             let ws_id = workstation
                 .clone()
                 .or_else(|| read_latest().ok())
                 .unwrap_or_else(|| format!("ws-{}", uuid::Uuid::new_v4()));
 
-            let state_dir =
+            let deployment_dir =
                 tokeira_remote_workstation::deployment::deployment_dir_for(&ws_id);
 
-            if state_dir.join("state").exists() {
-                // Check if the instance resource exists in state — if so, this is
-                // a resume (start stopped instance). If not, it's a partial create
-                // that needs the IaC engine to finish.
-                let has_instance = std::fs::read_to_string(
-                    state_dir.join("state/infra/infra/manifest.json"),
-                )
-                .map(|content| content.contains("\"Ec2Instance\""))
-                .unwrap_or(false);
+            // Always use the IaC engine. It is idempotent:
+            // - describe() finds existing resources by physical ID from state
+            // - create() is only called for resources not yet in state
+            // - On retry after partial failure, existing resources are skipped
+            println!("workstation {ws_id}...");
 
-                if has_instance {
-                    // Existing workstation with instance — resume via operational engine
-                    let engine = Workstation::new(profile.region.clone()).await?;
-                    let outcome = engine.up(&profile, Some(&ws_id)).await?;
-                    write_latest(outcome_workstation_id(&outcome))?;
-                    print_up_outcome(&outcome, json)?;
-                } else {
-                // Fresh create — use IaC engine via InfraEngine
-                println!("creating workstation {ws_id}...");
-                let engine = Workstation::new(profile.region.clone()).await?;
+            let engine = Workstation::new(profile.region.clone()).await?;
+            let preflight = engine.preflight(&profile).await?;
 
-                // Pre-flight: discover subnet, VPC, AZ, AMI
-                let preflight = engine.preflight(&profile).await?;
+            let toolchain_toml = read_rust_toolchain_toml();
+            let fingerprint =
+                tokeira_remote_workstation::bootstrap::fingerprint(&profile, &toolchain_toml);
+            let user_data = tokeira_remote_workstation::bootstrap::render(
+                &tokeira_remote_workstation::bootstrap::BootstrapContext {
+                    workstation_id: ws_id.clone(),
+                    bootstrap_fingerprint: fingerprint.clone(),
+                    profile: profile.clone(),
+                    cache_volume_id: String::new(),
+                    repo_volume_id: String::new(),
+                    rust_toolchain_toml: toolchain_toml,
+                },
+            );
+            let user_data_base64 =
+                base64::engine::general_purpose::STANDARD.encode(user_data.as_bytes());
 
-                let bootstrap_ctx =
-                    tokeira_remote_workstation::bootstrap::BootstrapContext {
-                        workstation_id: ws_id.clone(),
-                        bootstrap_fingerprint: String::new(),
-                        profile: profile.clone(),
-                        cache_volume_id: String::new(),
-                        repo_volume_id: String::new(),
-                        rust_toolchain_toml: read_rust_toolchain_toml(),
-                    };
-                let fingerprint = tokeira_remote_workstation::bootstrap::fingerprint(
-                    &profile,
-                    &bootstrap_ctx.rust_toolchain_toml,
-                );
-                let user_data = tokeira_remote_workstation::bootstrap::render(
-                    &tokeira_remote_workstation::bootstrap::BootstrapContext {
-                        bootstrap_fingerprint: fingerprint.clone(),
-                        ..bootstrap_ctx
-                    },
-                );
-                let user_data_base64 =
-                    base64::engine::general_purpose::STANDARD.encode(user_data.as_bytes());
+            let ws_config = tokeira_remote_workstation::deployment::WorkstationConfig {
+                module_config: tokeira_remote_workstation::module::WorkstationModuleConfig {
+                    workstation_id: ws_id.clone(),
+                    instance_type: profile.instance_type.clone(),
+                    ami_id: preflight.ami_id,
+                    subnet_id: preflight.subnet_id,
+                    vpc_id: preflight.vpc_id,
+                    availability_zone: preflight.availability_zone,
+                    root_volume_gib: profile.root_volume_gib,
+                    cache_volume_gib: profile.cache_volume_gib,
+                    repo_volume_gib: profile.repo_volume_gib,
+                    user_data_base64,
+                    region: profile.region.clone(),
+                },
+                region: profile.region.clone(),
+            };
 
-                let ws_config =
-                    tokeira_remote_workstation::deployment::WorkstationConfig {
-                        module_config:
-                            tokeira_remote_workstation::module::WorkstationModuleConfig {
-                                workstation_id: ws_id.clone(),
-                                instance_type: profile.instance_type.clone(),
-                                ami_id: preflight.ami_id,
-                                subnet_id: preflight.subnet_id,
-                                vpc_id: preflight.vpc_id,
-                                availability_zone: preflight.availability_zone,
-                                root_volume_gib: profile.root_volume_gib,
-                                cache_volume_gib: profile.cache_volume_gib,
-                                repo_volume_gib: profile.repo_volume_gib,
-                                user_data_base64,
-                                region: profile.region.clone(),
-                            },
-                        region: profile.region.clone(),
-                    };
+            let deployment = tokeira_remote_workstation::deployment::WorkstationDeployment;
 
-                let deployment_dir =
-                    tokeira_remote_workstation::deployment::deployment_dir_for(&ws_id);
+            use crate::tui::{ActionTuiHandle, OutputFormat};
+            use tokeira_iac::ModuleSelection;
+            use tokeira_orchestrator::InfraEngine;
 
-                let deployment =
-                    tokeira_remote_workstation::deployment::WorkstationDeployment;
+            let format = if json { OutputFormat::Json } else { OutputFormat::Human };
+            let mut infra_engine =
+                InfraEngine::new(deployment, &ws_config, &deployment_dir).await?;
+            let selection = ModuleSelection::All;
+            let composition = infra_engine.compose(selection.clone())?;
+            let tui = ActionTuiHandle::new(format);
+            tui.install(infra_engine.provision_context_mut());
+            let result = infra_engine.apply(&composition, selection).await;
+            tui.print_summary();
+            result?;
 
-                use tokeira_orchestrator::InfraEngine;
-                use tokeira_iac::ModuleSelection;
-                use crate::tui::{ActionTuiHandle, OutputFormat};
-
-                let format = if json { OutputFormat::Json } else { OutputFormat::Human };
-                let mut infra_engine =
-                    InfraEngine::new(deployment, &ws_config, &deployment_dir).await?;
-                let selection = ModuleSelection::All;
-                let composition = infra_engine.compose(selection.clone())?;
-                let tui = ActionTuiHandle::new(format);
-                tui.install(infra_engine.provision_context_mut());
-                let result = infra_engine.apply(&composition, selection).await;
-                tui.print_summary();
-                result?;
-
-                write_latest(&ws_id)?;
-                println!("workstation {ws_id} created");
-                }
-            }
+            write_latest(&ws_id)?;
+            println!("workstation {ws_id} ready");
             Ok(())
         }
         WorkstationAction::Stop { workstation } => {

@@ -35,7 +35,6 @@ pub struct WorkstationModuleConfig {
     pub root_volume_gib: u32,
     pub cache_volume_gib: u32,
     pub repo_volume_gib: u32,
-    pub user_data_base64: String,
     pub region: String,
 }
 

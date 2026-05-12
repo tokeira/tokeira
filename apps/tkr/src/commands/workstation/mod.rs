@@ -13,7 +13,7 @@ use base64::Engine as _;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokeira_remote_workstation::engine::{
-    GithubRepo, UpOutcome, Workstation, WorkstationError, WorkstationProfile,
+    GithubRepo, Workstation, WorkstationError, WorkstationProfile,
 };
 use tokio::process::Command;
 
@@ -109,7 +109,6 @@ pub async fn run(action: WorkstationAction, json: bool) -> Result<()> {
                     root_volume_gib: profile.root_volume_gib,
                     cache_volume_gib: profile.cache_volume_gib,
                     repo_volume_gib: profile.repo_volume_gib,
-                    user_data_base64: String::new(), // computed by compute module from state
                     region: preflight_config.region,
                 },
                 region: profile.region.clone(),
@@ -122,9 +121,30 @@ pub async fn run(action: WorkstationAction, json: bool) -> Result<()> {
             use tokeira_orchestrator::InfraEngine;
 
             let format = if json { OutputFormat::Json } else { OutputFormat::Human };
+
+            // Apply modules sequentially: identity + network + storage first,
+            // then compute. This guarantees volume IDs are in persisted state
+            // before the compute module's WorkstationInstance::create() reads them.
+            let foundation_modules = vec![
+                "identity".to_string(),
+                "network".to_string(),
+                "storage".to_string(),
+            ];
             let mut infra_engine =
                 InfraEngine::new(deployment, &ws_config, &deployment_dir).await?;
-            let selection = ModuleSelection::All;
+            let selection = ModuleSelection::Only(foundation_modules);
+            let composition = infra_engine.compose(selection.clone())?;
+            let tui = ActionTuiHandle::new(format);
+            tui.install(infra_engine.provision_context_mut());
+            let result = infra_engine.apply(&composition, selection).await;
+            tui.print_summary();
+            result?;
+
+            // Now apply compute (depends on foundation being in state)
+            let deployment = tokeira_remote_workstation::deployment::WorkstationDeployment;
+            let mut infra_engine =
+                InfraEngine::new(deployment, &ws_config, &deployment_dir).await?;
+            let selection = ModuleSelection::Only(vec!["compute".to_string()]);
             let composition = infra_engine.compose(selection.clone())?;
             let tui = ActionTuiHandle::new(format);
             tui.install(infra_engine.provision_context_mut());
@@ -421,52 +441,6 @@ fn clear_latest_if_matches(id: &str) -> Result<()> {
 
 fn read_rust_toolchain_toml() -> String {
     tokeira_remote_workstation::engine::read_rust_toolchain_toml()
-}
-
-fn outcome_workstation_id(outcome: &UpOutcome) -> &str {
-    match outcome {
-        UpOutcome::Created { handle, .. }
-        | UpOutcome::Resumed { handle, .. }
-        | UpOutcome::AlreadyRunning { handle } => &handle.workstation_id,
-    }
-}
-
-fn print_up_outcome(outcome: &UpOutcome, json: bool) -> Result<()> {
-    if json {
-        println!("{}", serde_json::to_string(outcome)?);
-        return Ok(());
-    }
-    match outcome {
-        UpOutcome::Created {
-            handle,
-            repo_clone_warning,
-            ..
-        } => {
-            println!("created workstation {}", handle.workstation_id);
-            if let Some(warning) = repo_clone_warning
-                && !warning.trim().is_empty()
-            {
-                println!("repo clone warning: {}", warning.trim());
-            }
-        }
-        UpOutcome::Resumed {
-            handle,
-            bootstrap_drift,
-            repo_clone_warning,
-        } => {
-            println!("resumed workstation {}", handle.workstation_id);
-            println!("bootstrap: {bootstrap_drift:?}");
-            if let Some(warning) = repo_clone_warning
-                && !warning.trim().is_empty()
-            {
-                println!("repo clone warning: {}", warning.trim());
-            }
-        }
-        UpOutcome::AlreadyRunning { handle } => {
-            println!("workstation {} already running", handle.workstation_id);
-        }
-    }
-    Ok(())
 }
 
 fn confirm_secret(found: &secret_scan::SecretMatch, yes: bool) -> Result<()> {

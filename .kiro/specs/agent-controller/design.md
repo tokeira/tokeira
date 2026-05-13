@@ -41,17 +41,17 @@ graph TD
             AGENTD[agentd daemon<br/>tokio async runtime]
             QUEUE[Task Queue<br/>SQLite-backed FIFO]
             CODEX[codex exec<br/>--sandbox workspace-write<br/>--ask-for-approval never<br/>--json]
-            JSONL_FILE[/work/worktrees/task-id/.agentd/codex-output.jsonl]
+            JSONL_FILE["/work/worktrees/task-id/.agentd/codex-output.jsonl"]
         end
 
         subgraph "Filesystem"
-            SOCK[/run/tokeira-agentd/agentd.sock]
-            TCP[127.0.0.1:18777<br/>TCP listener]
-            MAIN_REPO[/work/tokeira<br/>main checkout]
-            WORKTREES[/work/worktrees/<br/>task-id/]
-            ENV_FILE[/etc/tokeira/agentd-env<br/>mode 0600]
-            CODEX_HOME_DIR[/home/agent/.codex<br/>mode 0700]
-            SQLITE[/var/lib/tokeira-agentd/state.sqlite]
+            SOCK["/run/tokeira-agentd/agentd.sock"]
+            TCP["127.0.0.1:18777<br/>TCP listener"]
+            MAIN_REPO["/work/tokeira<br/>main checkout"]
+            WORKTREES["/work/worktrees/<br/>task-id/"]
+            ENV_FILE["/etc/tokeira/agentd-env<br/>mode 0600"]
+            CODEX_HOME_DIR["/home/agent/.codex<br/>mode 0700"]
+            SQLITE["/var/lib/tokeira-agentd/state.sqlite"]
         end
 
         subgraph "ubuntu user (admin)"

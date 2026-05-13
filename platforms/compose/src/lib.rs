@@ -188,7 +188,6 @@ impl tokeira_orchestrator::Deployment for ComposeDeployment {
         }
         Ok(())
     }
-    }
 
     async fn register_deploy_extensions(
         &self,

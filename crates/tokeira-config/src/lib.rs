@@ -555,7 +555,7 @@ fn default_routing_max_retries() -> usize {
 }
 
 fn default_grpc_addr() -> String {
-    "[::1]:7233".to_string()
+    "0.0.0.0:7233".to_string()
 }
 
 fn default_metrics_addr() -> String {

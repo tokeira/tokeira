@@ -19,12 +19,16 @@ pub const MODULE_OBSERVABILITY: &str = "observability";
 /// Build all compose service descriptors from config.
 pub fn compose_services(config: &ComposeConfig) -> Vec<ComposeService> {
     let tokeirad_metrics = format!("host.docker.internal:{}", config.tokeirad.metrics_port);
+    let state_dir = config.deployment_dir.join(".tokeira-state");
+    let mimir_vol = format!("{}:/data", state_dir.join("mimir").display());
+    let loki_vol = format!("{}:/loki", state_dir.join("loki").display());
+    let grafana_vol = format!("{}:/var/lib/grafana", state_dir.join("grafana").display());
     vec![
         ComposeService {
             name: "mimir".into(),
             image: config.observability.mimir_image.clone(),
             ports: vec!["9009:9009".into()],
-            volumes: vec![".tokeira-state/mimir:/data".into()],
+            volumes: vec![mimir_vol],
             environment: HashMap::new(),
             depends_on: Vec::new(),
             healthcheck: None,
@@ -33,7 +37,7 @@ pub fn compose_services(config: &ComposeConfig) -> Vec<ComposeService> {
             name: "loki".into(),
             image: config.observability.loki_image.clone(),
             ports: vec!["3100:3100".into()],
-            volumes: vec![".tokeira-state/loki:/loki".into()],
+            volumes: vec![loki_vol],
             environment: HashMap::new(),
             depends_on: Vec::new(),
             healthcheck: None,
@@ -63,7 +67,7 @@ pub fn compose_services(config: &ComposeConfig) -> Vec<ComposeService> {
                 "{}:{}",
                 config.observability.grafana_port, config.observability.grafana_port
             )],
-            volumes: vec![".tokeira-state/grafana:/var/lib/grafana".into()],
+            volumes: vec![grafana_vol],
             environment: HashMap::from([
                 ("GF_SECURITY_ADMIN_USER".into(), "admin".into()),
                 ("GF_SECURITY_ADMIN_PASSWORD".into(), "admin".into()),

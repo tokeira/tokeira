@@ -178,10 +178,16 @@ impl tokeira_orchestrator::Deployment for ComposeDeployment {
 
     async fn register_infra_extensions(
         &self,
-        _config: &Self::Config,
-        _ctx: &mut iac::ProvisionContext,
+        config: &Self::Config,
+        ctx: &mut iac::ProvisionContext,
     ) -> Result<()> {
+        let compose_file = config.deployment_dir.join("docker-compose.yml");
+        if compose_file.exists() {
+            let platform = Self::compose_platform(&compose_file, &config.project_name)?;
+            ctx.set_extension(platform);
+        }
         Ok(())
+    }
     }
 
     async fn register_deploy_extensions(

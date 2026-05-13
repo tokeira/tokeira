@@ -285,8 +285,12 @@ pub fn load_context(
             PlatformDeploymentConfig::Local(config)
         }
         PlatformKind::Compose => {
-            let config: ComposeConfig = tokeira_config::load_config(&deployment_config_path, None)
-                .with_context(|| format!("failed to load {}", deployment_config_path.display()))?;
+            let mut config: ComposeConfig =
+                tokeira_config::load_config(&deployment_config_path, None)
+                    .with_context(|| {
+                        format!("failed to load {}", deployment_config_path.display())
+                    })?;
+            config.deployment_dir = path.clone();
             PlatformDeploymentConfig::Compose(Box::new(config))
         }
         PlatformKind::Ecs => {

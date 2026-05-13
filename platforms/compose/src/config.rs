@@ -1,5 +1,7 @@
 //! Compose platform configuration model.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +38,10 @@ pub struct ComposeConfig {
     pub project_name: String,
     pub tokeirad: TokeiradServiceConfig,
     pub observability: ObservabilityConfig,
+    /// Deployment directory path — populated by the CLI after loading.
+    /// Not serialized to TOML.
+    #[serde(skip)]
+    pub deployment_dir: PathBuf,
 }
 
 impl Default for ComposeConfig {
@@ -61,6 +67,7 @@ impl Default for ComposeConfig {
                 busybox_image: default_busybox_image(),
                 grafana_port: 3000,
             },
+            deployment_dir: PathBuf::new(),
         }
     }
 }

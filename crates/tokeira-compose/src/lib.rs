@@ -194,9 +194,9 @@ impl iac::Resource for ComposeService {
         &self,
         ctx: &iac::ProvisionContext,
     ) -> Result<Option<iac::ResourceState>, iac::IacError> {
-        let platform = ctx.extension::<ComposePlatform>().ok_or_else(|| {
-            iac::IacError::Other(anyhow::anyhow!("ComposePlatform not registered"))
-        })?;
+        let Some(platform) = ctx.extension::<ComposePlatform>() else {
+            return Ok(None);
+        };
         match platform.running_service(&self.name).await? {
             Some(service) => Ok(Some(iac::ResourceState {
                 resource_type: iac::ResourceType::new("compose_service"),

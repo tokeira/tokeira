@@ -23,6 +23,76 @@ The system is shaped as a **policy-light, durable executor** with a serial FIFO 
 - Dedicated `agent` user (non-sudo) runs Codex. IMDS blocked for that UID.
 - `CODEX_HOME` at `/home/agent/.codex`, mode 0700, excluded from all exports.
 
+## CLI UX — `tkr agent`
+
+The operator interacts with the agent controller entirely through `tkr agent` subcommands on their MacBook. Communication with `agentd` on the workstation happens transparently via SSM TCP port-forwarding.
+
+### Command tree
+
+```
+tkr agent
+├── install                          # Install agentd on the workstation
+├── uninstall                        # Remove agentd from the workstation
+├── submit <prompt> [--task <id>]    # Submit a task to the queue
+│   [--branch <base>]               #   Base branch (default: main)
+│   [--spec <path>]                  #   Attach spec file as context
+├── status [--task <id>]             # Show queue state and task statuses
+├── logs --task <id> [--follow]      # Stream Codex JSONL output for a task
+├── diff --task <id> [--stat]        # Show git diff for a completed task
+├── review-pack --task <id>          # Bundle diff + test results + event summary
+├── review-spec <spec-path>          # Run Codex to review a spec document
+├── usage                            # Show observed Codex rate-limit state
+├── push --task <id>                 # Push the task branch to origin
+├── pr --task <id> [--title <t>]     # Create a PR from the task branch
+├── commit --task <id> [--amend]     # Commit uncommitted changes in the worktree
+├── validate --task <id>             # Re-run validation on a completed task
+├── doctor                           # Check agentd health, connectivity, Codex auth
+└── codex-login                      # Store Codex API token on the workstation
+```
+
+### Typical workflow
+
+```bash
+# One-time setup
+tkr workstation up
+tkr agent install
+tkr agent codex-login
+
+# Submit work
+tkr agent submit "Implement the retry logic for DSQL connections" --task impl-retry
+
+# Monitor
+tkr agent status
+tkr agent logs --task impl-retry
+
+# Review
+tkr agent diff --task impl-retry
+tkr agent review-pack --task impl-retry
+
+# Integrate
+tkr agent push --task impl-retry
+tkr agent pr --task impl-retry --title "feat: DSQL connection retry"
+```
+
+### Connection model
+
+All `tkr agent` commands establish an SSM TCP port-forward session to `127.0.0.1:18777` on the workstation. The session is created on-demand and reused within a single command invocation. The operator never manages port-forwarding manually.
+
+```
+MacBook                    AWS SSM                    Workstation
+┌──────────┐              ┌─────────┐               ┌──────────────┐
+│ tkr agent│──TCP 18777──▶│ SSM PF  │──TCP 18777──▶│ agentd       │
+│ submit   │              │ session │               │ (listener)   │
+└──────────┘              └─────────┘               └──────────────┘
+```
+
+### Output conventions
+
+- `--json` flag on all commands for machine-readable output.
+- Human output is terse: one line per task in `status`, streaming lines in `logs`.
+- Errors include actionable remediation hints (e.g., "Is the workstation running? Try `tkr workstation up`").
+- Exit codes: 0 = success, 1 = command error, 2 = connectivity error, 3 = task failure.
+
 ## Architecture
 
 ```mermaid

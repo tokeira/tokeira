@@ -1103,36 +1103,6 @@ chown tokeira:tokeira /home/tokeira/.ssh/config"#
         Ok(instance)
     }
 
-    async fn find_instance(
-        &self,
-        workstation_id: Option<&str>,
-    ) -> Result<Option<aws_sdk_ec2::types::Instance>, WorkstationError> {
-        let mut request = self.ec2.describe_instances().filters(
-            Filter::builder()
-                .name(format!("tag:{WORKSTATION_TAG_KEY}"))
-                .values(WORKSTATION_TAG_VALUE)
-                .build(),
-        );
-        if let Some(id) = workstation_id {
-            request = request.filters(
-                Filter::builder()
-                    .name(format!("tag:{WORKSTATION_ID_TAG_KEY}"))
-                    .values(id)
-                    .build(),
-            );
-        }
-        let output = request
-            .send()
-            .await
-            .map_err(ec2_err)?;
-        Ok(output
-            .reservations()
-            .iter()
-            .flat_map(|reservation| reservation.instances().iter())
-            .next()
-            .cloned())
-    }
-
     async fn remote_command_text(
         &self,
         instance_id: &str,

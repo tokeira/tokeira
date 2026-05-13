@@ -338,8 +338,7 @@ impl ComposePlatform {
             None,
         );
         while let Some(result) = pull_stream.next().await {
-            if let Err(e) = result {
-                tracing::warn!(image = %image_ref, error = %e, "image pull failed, attempting create anyway");
+            if result.is_err() {
                 break;
             }
         }

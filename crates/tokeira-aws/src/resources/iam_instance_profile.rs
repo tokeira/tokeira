@@ -4,8 +4,7 @@
 //! eventual consistency before reporting completion. EC2 cannot reference
 //! a newly-created profile for up to 10-15 seconds.
 
-use std::collections::HashMap;
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use tokeira_iac::{
     InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,

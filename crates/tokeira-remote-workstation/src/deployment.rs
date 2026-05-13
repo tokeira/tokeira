@@ -55,7 +55,10 @@ impl Deployment for WorkstationDeployment {
         selection: &iac::ModuleSelection,
     ) -> Vec<Box<dyn iac::Module>> {
         let rctx = tokeira_aws::ResourceContext {
-            project: format!("tokeira-workstation-{}", config.module_config.workstation_id),
+            project: format!(
+                "tokeira-workstation-{}",
+                config.module_config.workstation_id
+            ),
             region: config.region.clone(),
             tags: workstation_tags(&config.module_config.workstation_id),
         };
@@ -97,18 +100,12 @@ impl Deployment for WorkstationDeployment {
         modules
     }
 
-    fn services(
-        &self,
-        _config: &Self::Config,
-    ) -> Vec<Box<dyn tokeira_deploy_engine::Service>> {
+    fn services(&self, _config: &Self::Config) -> Vec<Box<dyn tokeira_deploy_engine::Service>> {
         // Workstation has no runtime services managed by the deploy engine
         vec![]
     }
 
-    fn images(
-        &self,
-        _config: &Self::Config,
-    ) -> Vec<Box<dyn tokeira_deploy_engine::Image>> {
+    fn images(&self, _config: &Self::Config) -> Vec<Box<dyn tokeira_deploy_engine::Image>> {
         vec![]
     }
 
@@ -153,11 +150,7 @@ impl Deployment for WorkstationDeployment {
         Box::new(LocalBackend::new(deployment_dir.join("state/deploy")))
     }
 
-    fn hydrate_config(
-        &self,
-        config: &Self::Config,
-        _state: &iac::InfraState,
-    ) -> Self::Config {
+    fn hydrate_config(&self, config: &Self::Config, _state: &iac::InfraState) -> Self::Config {
         config.clone()
     }
 
@@ -209,10 +202,7 @@ impl iac::Module for LocalStateModule {
         &[]
     }
 
-    fn resources(
-        &self,
-        _ctx: &ModuleContext<'_>,
-    ) -> Result<Vec<Box<dyn Resource>>, iac::IacError> {
+    fn resources(&self, _ctx: &ModuleContext<'_>) -> Result<Vec<Box<dyn Resource>>, iac::IacError> {
         Ok(vec![Box::new(LocalStateResource {
             state_dir: self.state_dir.clone(),
         })])

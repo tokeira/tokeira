@@ -3,8 +3,7 @@
 //! Provisions an encrypted gp3 EBS volume and waits for it to reach the
 //! `available` state using the SDK's built-in waiter.
 
-use std::collections::HashMap;
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use aws_sdk_ec2::client::Waiters as Ec2Waiters;
 use tokeira_iac::{
@@ -102,9 +101,7 @@ impl Resource for EbsVolume {
 
         let volume_id = output
             .volume_id()
-            .ok_or_else(|| {
-                IacError::AwsSdk("CreateVolume did not return volume ID".to_string())
-            })?
+            .ok_or_else(|| IacError::AwsSdk("CreateVolume did not return volume ID".to_string()))?
             .to_string();
 
         // Wait for volume to become available using SDK waiter

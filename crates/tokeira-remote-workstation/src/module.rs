@@ -11,13 +11,16 @@
 //! storage are created first (in parallel if the engine supports it), then
 //! compute. On destroy, compute is deleted first, then the others.
 
-use std::collections::HashMap;
-use std::fmt::Debug;
+use std::{collections::HashMap, fmt::Debug};
 
-use tokeira_aws::ResourceContext;
-use tokeira_aws::resources::ebs_volume::{EbsVolume, EbsVolumeConfig};
-use tokeira_aws::resources::iam_instance_profile::{IamInstanceProfile, IamInstanceProfileConfig};
-use tokeira_aws::resources::iam_role::{IamRole, IamRoleConfig};
+use tokeira_aws::{
+    ResourceContext,
+    resources::{
+        ebs_volume::{EbsVolume, EbsVolumeConfig},
+        iam_instance_profile::{IamInstanceProfile, IamInstanceProfileConfig},
+        iam_role::{IamRole, IamRoleConfig},
+    },
+};
 use tokeira_iac::{Module, ModuleContext, Resource, ResourceId, error::IacError};
 
 const MANAGED_POLICY_ARN: &str = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore";
@@ -115,10 +118,7 @@ impl Module for NetworkModule {
     }
 
     fn resources(&self, _ctx: &ModuleContext) -> Result<Vec<Box<dyn Resource>>, IacError> {
-        let sg_name = format!(
-            "tokeira-workstation-{}-sg",
-            self.workstation_id
-        );
+        let sg_name = format!("tokeira-workstation-{}-sg", self.workstation_id);
 
         let sg = WorkstationSecurityGroup {
             name: sg_name,
@@ -223,10 +223,8 @@ impl Module for ComputeModule {
         let instance_profile_resource_id =
             ResourceId(format!("iam-instance-profile-{profile_name}"));
         let sg_resource_id = ResourceId(format!("sg-{sg_name}"));
-        let cache_vol_resource_id =
-            ResourceId(format!("ebs-volume-tokeira-ws-{ws_id}-cache"));
-        let repo_vol_resource_id =
-            ResourceId(format!("ebs-volume-tokeira-ws-{ws_id}-repo"));
+        let cache_vol_resource_id = ResourceId(format!("ebs-volume-tokeira-ws-{ws_id}-cache"));
+        let repo_vol_resource_id = ResourceId(format!("ebs-volume-tokeira-ws-{ws_id}-repo"));
 
         let instance = crate::instance::WorkstationInstance {
             name: instance_name,

@@ -7,10 +7,13 @@
 
 use std::time::Duration;
 
-use aws_sdk_ec2::client::Waiters as Ec2Waiters;
-use aws_sdk_ec2::types::{
-    BlockDeviceMapping, EbsBlockDevice, IamInstanceProfileSpecification, InstanceType,
-    InstanceNetworkInterfaceSpecification, ResourceType as Ec2ResourceType, VolumeType,
+use aws_sdk_ec2::{
+    client::Waiters as Ec2Waiters,
+    types::{
+        BlockDeviceMapping, EbsBlockDevice, IamInstanceProfileSpecification,
+        InstanceNetworkInterfaceSpecification, InstanceType, ResourceType as Ec2ResourceType,
+        VolumeType,
+    },
 };
 use base64::Engine as _;
 use tokeira_aws::ResourceContext;
@@ -19,8 +22,10 @@ use tokeira_iac::{
     error::IacError,
 };
 
-use crate::bootstrap::{self, BootstrapContext};
-use crate::engine::WorkstationProfile;
+use crate::{
+    bootstrap::{self, BootstrapContext},
+    engine::WorkstationProfile,
+};
 
 /// Configuration for the workstation instance.
 #[derive(Debug)]
@@ -69,7 +74,9 @@ impl Resource for WorkstationInstance {
     }
 
     async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, IacError> {
-        let clients = ctx.extension::<tokeira_aws::AwsClients>().expect("AwsClients");
+        let clients = ctx
+            .extension::<tokeira_aws::AwsClients>()
+            .expect("AwsClients");
         let tags = ctx.resource_tags(&self.name);
 
         // Resolve physical IDs from state (volumes and SG created before us)
@@ -178,16 +185,16 @@ impl Resource for WorkstationInstance {
             }
         }
         let run_output = run_output.ok_or_else(|| {
-            IacError::AwsSdk("exhausted retries waiting for instance profile propagation".to_string())
+            IacError::AwsSdk(
+                "exhausted retries waiting for instance profile propagation".to_string(),
+            )
         })?;
 
         let instance_id = run_output
             .instances()
             .first()
             .and_then(|i| i.instance_id())
-            .ok_or_else(|| {
-                IacError::AwsSdk("RunInstances did not return instance ID".to_string())
-            })?
+            .ok_or_else(|| IacError::AwsSdk("RunInstances did not return instance ID".to_string()))?
             .to_string();
 
         // Wait for running
@@ -198,9 +205,7 @@ impl Resource for WorkstationInstance {
             .wait(Duration::from_secs(300))
             .await
             .map_err(|e| {
-                IacError::AwsSdk(format!(
-                    "instance {instance_id} did not reach running: {e}"
-                ))
+                IacError::AwsSdk(format!("instance {instance_id} did not reach running: {e}"))
             })?;
 
         // Attach volumes
@@ -265,7 +270,9 @@ impl Resource for WorkstationInstance {
         current: &ResourceState,
         ctx: &ProvisionContext,
     ) -> Result<(), IacError> {
-        let clients = ctx.extension::<tokeira_aws::AwsClients>().expect("AwsClients");
+        let clients = ctx
+            .extension::<tokeira_aws::AwsClients>()
+            .expect("AwsClients");
         let instance_id = &current.physical_id;
 
         clients
@@ -288,9 +295,7 @@ impl Resource for WorkstationInstance {
             .wait(Duration::from_secs(300))
             .await
             .map_err(|e| {
-                IacError::AwsSdk(format!(
-                    "instance {instance_id} did not terminate: {e}"
-                ))
+                IacError::AwsSdk(format!("instance {instance_id} did not terminate: {e}"))
             })?;
 
         Ok(())
@@ -306,7 +311,9 @@ impl Resource for WorkstationInstance {
             return Ok(None);
         };
 
-        let clients = ctx.extension::<tokeira_aws::AwsClients>().expect("AwsClients");
+        let clients = ctx
+            .extension::<tokeira_aws::AwsClients>()
+            .expect("AwsClients");
 
         match clients
             .ec2

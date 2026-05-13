@@ -653,10 +653,7 @@ impl Workstation {
 
     /// Ensure the workstation instance is running. If stopped, starts it and
     /// waits for the running state. If already running, returns immediately.
-    pub async fn ensure_running(
-        &self,
-        workstation_id: &str,
-    ) -> Result<(), WorkstationError> {
+    pub async fn ensure_running(&self, workstation_id: &str) -> Result<(), WorkstationError> {
         let handle = self.resolve_handle(workstation_id).await?;
         let instance = self
             .describe_instance_by_id(&handle.instance_id)
@@ -685,9 +682,7 @@ impl Workstation {
                     .wait(Duration::from_secs(120))
                     .await
                     .map_err(|e| {
-                        WorkstationError::Ec2(format!(
-                            "instance did not reach running state: {e}"
-                        ))
+                        WorkstationError::Ec2(format!("instance did not reach running state: {e}"))
                     })?;
                 Ok(())
             }
@@ -982,10 +977,7 @@ chown tokeira:tokeira /home/tokeira/.ssh/config"#
                     .build(),
             );
         }
-        let output = request
-            .send()
-            .await
-            .map_err(ec2_err)?;
+        let output = request.send().await.map_err(ec2_err)?;
         let mut handles = Vec::new();
         for reservation in output.reservations() {
             for instance in reservation.instances() {
@@ -1024,9 +1016,10 @@ chown tokeira:tokeira /home/tokeira/.ssh/config"#
             Box::new(backend),
             "infra".to_string(),
         );
-        let (state, _version) = store.load().await.map_err(|e| {
-            WorkstationError::Io(format!("failed to load workstation state: {e}"))
-        })?;
+        let (state, _version) = store
+            .load()
+            .await
+            .map_err(|e| WorkstationError::Io(format!("failed to load workstation state: {e}")))?;
 
         let instance_resource_id =
             tokeira_iac::ResourceId(format!("ec2-instance-tokeira-ws-{workstation_id}"));
@@ -1037,27 +1030,24 @@ chown tokeira:tokeira /home/tokeira/.ssh/config"#
 
         let props = &instance_state.properties;
 
-        let sg_resource_id = tokeira_iac::ResourceId(format!(
-            "sg-tokeira-workstation-{workstation_id}-sg"
-        ));
+        let sg_resource_id =
+            tokeira_iac::ResourceId(format!("sg-tokeira-workstation-{workstation_id}-sg"));
         let security_group_id = state
             .resources
             .get(&sg_resource_id)
             .map(|s| s.physical_id.clone())
             .unwrap_or_default();
 
-        let cache_vol_resource_id = tokeira_iac::ResourceId(format!(
-            "ebs-volume-tokeira-ws-{workstation_id}-cache"
-        ));
+        let cache_vol_resource_id =
+            tokeira_iac::ResourceId(format!("ebs-volume-tokeira-ws-{workstation_id}-cache"));
         let cache_volume_id = state
             .resources
             .get(&cache_vol_resource_id)
             .map(|s| s.physical_id.clone())
             .unwrap_or_default();
 
-        let repo_vol_resource_id = tokeira_iac::ResourceId(format!(
-            "ebs-volume-tokeira-ws-{workstation_id}-repo"
-        ));
+        let repo_vol_resource_id =
+            tokeira_iac::ResourceId(format!("ebs-volume-tokeira-ws-{workstation_id}-repo"));
         let repo_volume_id = state
             .resources
             .get(&repo_vol_resource_id)
@@ -1333,10 +1323,7 @@ chown tokeira:tokeira /home/tokeira/.ssh/config"#
                     .build(),
             );
         }
-        let output = request
-            .send()
-            .await
-            .map_err(ec2_err)?;
+        let output = request.send().await.map_err(ec2_err)?;
         let subnet = output
             .subnets()
             .first()
@@ -1370,9 +1357,11 @@ chown tokeira:tokeira /home/tokeira/.ssh/config"#
                     .instance_ids(instance_id)
                     .wait(timeout)
                     .await
-                    .map_err(|err| WorkstationError::Ec2(format!(
-                        "timed out waiting for instance {instance_id} to reach running: {err}"
-                    )))?;
+                    .map_err(|err| {
+                        WorkstationError::Ec2(format!(
+                            "timed out waiting for instance {instance_id} to reach running: {err}"
+                        ))
+                    })?;
             }
             "stopped" => {
                 self.ec2
@@ -1380,9 +1369,11 @@ chown tokeira:tokeira /home/tokeira/.ssh/config"#
                     .instance_ids(instance_id)
                     .wait(timeout)
                     .await
-                    .map_err(|err| WorkstationError::Ec2(format!(
-                        "timed out waiting for instance {instance_id} to reach stopped: {err}"
-                    )))?;
+                    .map_err(|err| {
+                        WorkstationError::Ec2(format!(
+                            "timed out waiting for instance {instance_id} to reach stopped: {err}"
+                        ))
+                    })?;
             }
             "terminated" => {
                 self.ec2
@@ -1460,12 +1451,7 @@ chown tokeira:tokeira /home/tokeira/.ssh/config"#
         let allocation_id = match self.find_workstation_eip(workstation_id).await? {
             Some(allocation_id) => allocation_id,
             None => {
-                let allocation = self
-                    .ec2
-                    .allocate_address()
-                    .send()
-                    .await
-                    .map_err(ec2_err)?;
+                let allocation = self.ec2.allocate_address().send().await.map_err(ec2_err)?;
                 let allocation_id = allocation
                     .allocation_id()
                     .ok_or_else(|| {
@@ -1637,18 +1623,17 @@ chown tokeira:tokeira /home/tokeira/.ssh/config"#
         Ok(volume_id)
     }
 
-    async fn wait_for_volume_available(
-        &self,
-        volume_id: &str,
-    ) -> Result<(), WorkstationError> {
+    async fn wait_for_volume_available(&self, volume_id: &str) -> Result<(), WorkstationError> {
         self.ec2
             .wait_until_volume_available()
             .volume_ids(volume_id)
             .wait(Duration::from_secs(120))
             .await
-            .map_err(|err| WorkstationError::Ec2(format!(
-                "timed out waiting for volume {volume_id} to reach available: {err}"
-            )))?;
+            .map_err(|err| {
+                WorkstationError::Ec2(format!(
+                    "timed out waiting for volume {volume_id} to reach available: {err}"
+                ))
+            })?;
         Ok(())
     }
 

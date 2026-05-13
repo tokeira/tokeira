@@ -66,8 +66,7 @@ pub async fn run(action: WorkstationAction, json: bool) -> Result<()> {
                 .or_else(|| read_latest().ok())
                 .unwrap_or_else(|| format!("ws-{}", uuid::Uuid::new_v4()));
 
-            let deployment_dir =
-                tokeira_remote_workstation::deployment::deployment_dir_for(&ws_id);
+            let deployment_dir = tokeira_remote_workstation::deployment::deployment_dir_for(&ws_id);
 
             println!("workstation {ws_id}...");
 
@@ -90,10 +89,7 @@ pub async fn run(action: WorkstationAction, json: bool) -> Result<()> {
                     region: profile.region.clone(),
                 };
                 fs::create_dir_all(&deployment_dir)?;
-                fs::write(
-                    &config_path,
-                    serde_json::to_string_pretty(&config)?,
-                )?;
+                fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
                 config
             };
 
@@ -119,7 +115,11 @@ pub async fn run(action: WorkstationAction, json: bool) -> Result<()> {
             use tokeira_iac::ModuleSelection;
             use tokeira_orchestrator::InfraEngine;
 
-            let format = if json { OutputFormat::Json } else { OutputFormat::Human };
+            let format = if json {
+                OutputFormat::Json
+            } else {
+                OutputFormat::Human
+            };
 
             // Apply modules sequentially: identity + network + storage first,
             // then compute. This guarantees volume IDs are in persisted state
@@ -173,37 +173,37 @@ pub async fn run(action: WorkstationAction, json: bool) -> Result<()> {
             confirm_destroy(&id, yes)?;
 
             let profile = WorkstationProfile::c8gd_rust();
-            let deployment_dir =
-                tokeira_remote_workstation::deployment::deployment_dir_for(&id);
+            let deployment_dir = tokeira_remote_workstation::deployment::deployment_dir_for(&id);
 
             println!("destroying workstation {id}...");
 
-            let ws_config =
-                tokeira_remote_workstation::deployment::WorkstationConfig {
-                    module_config:
-                        tokeira_remote_workstation::module::WorkstationModuleConfig {
-                            workstation_id: id.clone(),
-                            instance_type: profile.instance_type.clone(),
-                            ami_id: String::new(),
-                            subnet_id: String::new(),
-                            vpc_id: String::new(),
-                            availability_zone: String::new(),
-                            root_volume_gib: profile.root_volume_gib,
-                            cache_volume_gib: profile.cache_volume_gib,
-                            repo_volume_gib: profile.repo_volume_gib,
-                            region: profile.region.clone(),
-                        },
+            let ws_config = tokeira_remote_workstation::deployment::WorkstationConfig {
+                module_config: tokeira_remote_workstation::module::WorkstationModuleConfig {
+                    workstation_id: id.clone(),
+                    instance_type: profile.instance_type.clone(),
+                    ami_id: String::new(),
+                    subnet_id: String::new(),
+                    vpc_id: String::new(),
+                    availability_zone: String::new(),
+                    root_volume_gib: profile.root_volume_gib,
+                    cache_volume_gib: profile.cache_volume_gib,
+                    repo_volume_gib: profile.repo_volume_gib,
                     region: profile.region.clone(),
-                };
+                },
+                region: profile.region.clone(),
+            };
 
-            let deployment =
-                tokeira_remote_workstation::deployment::WorkstationDeployment;
+            let deployment = tokeira_remote_workstation::deployment::WorkstationDeployment;
 
-            use tokeira_orchestrator::InfraEngine;
-            use tokeira_iac::ModuleSelection;
             use crate::tui::{ActionTuiHandle, OutputFormat};
+            use tokeira_iac::ModuleSelection;
+            use tokeira_orchestrator::InfraEngine;
 
-            let format = if json { OutputFormat::Json } else { OutputFormat::Human };
+            let format = if json {
+                OutputFormat::Json
+            } else {
+                OutputFormat::Human
+            };
             let mut infra_engine =
                 InfraEngine::new(deployment, &ws_config, &deployment_dir).await?;
             let selection = ModuleSelection::All;
@@ -594,9 +594,7 @@ async fn run_code(action: CodeAction, _json: bool) -> Result<()> {
             let engine = Workstation::new(profile.region).await?;
 
             let push_cmd = if let Some(ref branch) = branch {
-                format!(
-                    "su tokeira -lc 'cd /work/repo/tokeira && git push origin {branch}'"
-                )
+                format!("su tokeira -lc 'cd /work/repo/tokeira && git push origin {branch}'")
             } else {
                 "su tokeira -lc 'cd /work/repo/tokeira && git push origin HEAD'".to_string()
             };

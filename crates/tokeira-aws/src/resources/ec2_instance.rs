@@ -3,13 +3,15 @@
 //! Provisions a single EC2 instance with user-data, waits for it to reach
 //! `running` using the SDK waiter, and optionally attaches EBS volumes.
 
-use std::collections::HashMap;
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
-use aws_sdk_ec2::client::Waiters as Ec2Waiters;
-use aws_sdk_ec2::types::{
-    BlockDeviceMapping, EbsBlockDevice, IamInstanceProfileSpecification, InstanceType,
-    InstanceNetworkInterfaceSpecification, ResourceType as Ec2ResourceType, VolumeType,
+use aws_sdk_ec2::{
+    client::Waiters as Ec2Waiters,
+    types::{
+        BlockDeviceMapping, EbsBlockDevice, IamInstanceProfileSpecification,
+        InstanceNetworkInterfaceSpecification, InstanceType, ResourceType as Ec2ResourceType,
+        VolumeType,
+    },
 };
 use tokeira_iac::{
     InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
@@ -100,9 +102,7 @@ impl Resource for Ec2Instance {
             .get_resource_state(&self.config.security_group_resource_id)
             .map(|s| s.physical_id.clone())
             .map_err(|_| {
-                IacError::AwsSdk(
-                    "security group not found in state — was it created?".to_string(),
-                )
+                IacError::AwsSdk("security group not found in state — was it created?".to_string())
             })?;
 
         let run_output = clients
@@ -158,9 +158,7 @@ impl Resource for Ec2Instance {
             .instances()
             .first()
             .and_then(|i| i.instance_id())
-            .ok_or_else(|| {
-                IacError::AwsSdk("RunInstances did not return instance ID".to_string())
-            })?
+            .ok_or_else(|| IacError::AwsSdk("RunInstances did not return instance ID".to_string()))?
             .to_string();
 
         // Wait for instance to reach running
@@ -171,9 +169,7 @@ impl Resource for Ec2Instance {
             .wait(Duration::from_secs(300))
             .await
             .map_err(|e| {
-                IacError::AwsSdk(format!(
-                    "instance {instance_id} did not reach running: {e}"
-                ))
+                IacError::AwsSdk(format!("instance {instance_id} did not reach running: {e}"))
             })?;
 
         // Attach EBS volumes
@@ -255,9 +251,7 @@ impl Resource for Ec2Instance {
             .wait(Duration::from_secs(300))
             .await
             .map_err(|e| {
-                IacError::AwsSdk(format!(
-                    "instance {instance_id} did not terminate: {e}"
-                ))
+                IacError::AwsSdk(format!("instance {instance_id} did not terminate: {e}"))
             })?;
 
         Ok(())

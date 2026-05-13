@@ -182,10 +182,8 @@ impl tokeira_orchestrator::Deployment for ComposeDeployment {
         ctx: &mut iac::ProvisionContext,
     ) -> Result<()> {
         let compose_file = config.deployment_dir.join("docker-compose.yml");
-        if compose_file.exists() {
-            let platform = Self::compose_platform(&compose_file, &config.project_name)?;
-            ctx.set_extension(platform);
-        }
+        let platform = Self::compose_platform(&compose_file, &config.project_name)?;
+        ctx.set_extension(platform);
         Ok(())
     }
 

@@ -106,6 +106,8 @@ pub struct ComposeService {
     pub depends_on: Vec<String>,
     /// Optional Docker healthcheck definition.
     pub healthcheck: Option<Healthcheck>,
+    /// Command to run in the container (overrides image CMD).
+    pub command: Vec<String>,
 }
 
 impl ComposeService {
@@ -667,6 +669,11 @@ fn container_config(service: &ComposeService, project_name: &str) -> ContainerCo
 
     ContainerConfig {
         image: Some(service.image.clone()),
+        cmd: if service.command.is_empty() {
+            None
+        } else {
+            Some(service.command.clone())
+        },
         env: if service.environment.is_empty() {
             None
         } else {
@@ -767,6 +774,11 @@ fn service_from_inspect(name: &str, inspect: &ContainerInspectResponse) -> Compo
                     retries: hc.retries.map(|r| r as u32),
                 })
             }),
+        command: inspect
+            .config
+            .as_ref()
+            .and_then(|config| config.cmd.clone())
+            .unwrap_or_default(),
     }
 }
 
@@ -810,9 +822,19 @@ mod tests {
                 prop::option::of("[1-9][0-9]{0,2}s"),
                 prop::option::of(0u32..10),
             )),
+            prop::collection::vec(arb_identifier(), 0..3),
         )
             .prop_map(
-                |(name, image_tag, ports, volumes, environment, depends_on, healthcheck)| {
+                |(
+                    name,
+                    image_tag,
+                    ports,
+                    volumes,
+                    environment,
+                    depends_on,
+                    healthcheck,
+                    command,
+                )| {
                     ComposeService {
                         image: format!("example/{name}:{image_tag}"),
                         name: name.clone(),
@@ -834,6 +856,7 @@ mod tests {
                                 retries,
                             }
                         }),
+                        command,
                     }
                 },
             )
@@ -913,6 +936,7 @@ mod tests {
                 timeout: Some("3s".into()),
                 retries: Some(3),
             }),
+            command: vec!["run".into(), "--config".into()],
         };
         let yaml = compose_yaml_fragment(&service).unwrap();
         assert!(yaml.contains("grafana/grafana-oss:12.4.3"));

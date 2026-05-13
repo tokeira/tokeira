@@ -13,6 +13,7 @@ use tokeira_iac as iac;
 use crate::{
     compose::{MODULE_OBSERVABILITY, MODULE_RUNTIME, compose_services, module_for_service},
     config::ComposeConfig,
+    observability_config::{ObservabilityConfigFilesResource, ObservabilityParams},
 };
 
 // ── Local state module (remote-state bootstrap) ───────────────────
@@ -137,6 +138,7 @@ impl iac::Resource for LocalStateResource {
 #[derive(Debug)]
 pub struct ComposeModule {
     module_name: String,
+    config_files: Option<ObservabilityConfigFilesResource>,
     services: Vec<ComposeService>,
 }
 
@@ -149,6 +151,7 @@ impl ComposeModule {
             .collect();
         Self {
             module_name: MODULE_RUNTIME.into(),
+            config_files: None,
             services,
         }
     }
@@ -161,6 +164,10 @@ impl ComposeModule {
             .collect();
         Self {
             module_name: MODULE_OBSERVABILITY.into(),
+            config_files: Some(ObservabilityConfigFilesResource::new(
+                config.deployment_dir.clone(),
+                ObservabilityParams::from_config(config),
+            )),
             services,
         }
     }
@@ -183,16 +190,27 @@ impl iac::Module for ComposeModule {
         &self,
         _ctx: &iac::ModuleContext<'_>,
     ) -> Result<Vec<Box<dyn iac::Resource>>, iac::IacError> {
-        Ok(self
-            .services
-            .iter()
-            .map(|service| {
-                Box::new(OwnedComposeResource {
-                    service: service.clone(),
-                    module_name: self.module_name.clone(),
-                }) as Box<dyn iac::Resource>
-            })
-            .collect())
+        let mut resources: Vec<Box<dyn iac::Resource>> = Vec::new();
+        let config_resource_id = self
+            .config_files
+            .as_ref()
+            .map(|_| ObservabilityConfigFilesResource::resource_id_value());
+        if let Some(config_files) = &self.config_files {
+            resources.push(Box::new(config_files.clone()));
+        }
+        resources.extend(self.services.iter().map(|service| {
+            let config_resource_id = if module_for_service(&service.name) == MODULE_OBSERVABILITY {
+                config_resource_id.clone()
+            } else {
+                None
+            };
+            Box::new(OwnedComposeResource {
+                service: service.clone(),
+                module_name: self.module_name.clone(),
+                config_resource_id,
+            }) as Box<dyn iac::Resource>
+        }));
+        Ok(resources)
     }
 }
 
@@ -201,6 +219,7 @@ impl iac::Module for ComposeModule {
 struct OwnedComposeResource {
     service: ComposeService,
     module_name: String,
+    config_resource_id: Option<iac::ResourceId>,
 }
 
 #[async_trait]
@@ -214,7 +233,11 @@ impl iac::Resource for OwnedComposeResource {
     }
 
     fn dependencies(&self) -> Vec<iac::ResourceId> {
-        self.service.dependencies()
+        let mut dependencies = self.service.dependencies();
+        if let Some(config_resource_id) = &self.config_resource_id {
+            dependencies.push(config_resource_id.clone());
+        }
+        dependencies
     }
 
     fn module(&self) -> &str {
@@ -227,6 +250,7 @@ impl iac::Resource for OwnedComposeResource {
     ) -> Result<iac::ResourceState, iac::IacError> {
         let mut state = self.service.create(ctx).await?;
         state.module = self.module_name.clone();
+        state.dependencies = self.dependencies();
         Ok(state)
     }
 
@@ -237,6 +261,7 @@ impl iac::Resource for OwnedComposeResource {
     ) -> Result<iac::ResourceState, iac::IacError> {
         let mut state = self.service.update(current, ctx).await?;
         state.module = self.module_name.clone();
+        state.dependencies = self.dependencies();
         Ok(state)
     }
 
@@ -255,6 +280,7 @@ impl iac::Resource for OwnedComposeResource {
         match self.service.describe(ctx).await? {
             Some(mut state) => {
                 state.module = self.module_name.clone();
+                state.dependencies = self.dependencies();
                 Ok(Some(state))
             }
             None => Ok(None),

@@ -1,0 +1,77 @@
+{
+  "uid": "tokeira-broker-runtime-health",
+  "title": "Tokeira Broker / Runtime Health",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "tags": ["tokeira", "runtime", "broker"],
+  "timezone": "browser",
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Build Info",
+      "datasource": { "type": "prometheus", "uid": "mimir" },
+      "targets": [
+        { "expr": "tokeira_build_info", "legendFormat": "{{version}} {{commit}}" }
+      ],
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Broker Publish Rate",
+      "datasource": { "type": "prometheus", "uid": "mimir" },
+      "targets": [
+        { "expr": "sum by (queue) (rate(tokeira_runtime_broker_publish_total[5m]))", "legendFormat": "{{queue}}" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Match Rates",
+      "datasource": { "type": "prometheus", "uid": "mimir" },
+      "targets": [
+        { "expr": "sum by (queue) (rate(tokeira_runtime_broker_sync_match_total[5m]))", "legendFormat": "sync {{queue}}" },
+        { "expr": "sum by (queue) (rate(tokeira_runtime_broker_non_sync_match_total[5m]))", "legendFormat": "non-sync {{queue}}" },
+        { "expr": "sum by (queue) (rate(tokeira_runtime_broker_poll_timeout_total[5m]))", "legendFormat": "timeout {{queue}}" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Queue Depth",
+      "datasource": { "type": "prometheus", "uid": "mimir" },
+      "targets": [
+        { "expr": "sum by (queue, kind) (tokeira_runtime_broker_queue_depth)", "legendFormat": "{{queue}} {{kind}}" }
+      ],
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 12 }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Lane Submit Latency",
+      "datasource": { "type": "prometheus", "uid": "mimir" },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(tokeira_runtime_lane_submit_duration_seconds_bucket[5m])))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(tokeira_runtime_lane_submit_duration_seconds_bucket[5m])))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(tokeira_runtime_lane_submit_duration_seconds_bucket[5m])))", "legendFormat": "p99" }
+      ],
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 12 }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Scanners and OCC",
+      "datasource": { "type": "prometheus", "uid": "mimir" },
+      "targets": [
+        { "expr": "sum by (scanner) (rate(tokeira_runtime_scanner_tick_total[5m]))", "legendFormat": "tick {{scanner}}" },
+        { "expr": "sum by (scanner) (rate(tokeira_runtime_scanner_dispatched_total[5m]))", "legendFormat": "dispatched {{scanner}}" },
+        { "expr": "sum by (result) (rate(tokeira_runtime_occ_retry_total[5m]))", "legendFormat": "occ {{result}}" }
+      ],
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 12 }
+    }
+  ]
+}

@@ -18,29 +18,51 @@ pub const MODULE_OBSERVABILITY: &str = "observability";
 
 /// Build all compose service descriptors from config.
 pub fn compose_services(config: &ComposeConfig) -> Vec<ComposeService> {
-    let tokeirad_metrics = format!("host.docker.internal:{}", config.tokeirad.metrics_port);
     let state_dir = config.deployment_dir.join(".tokeira-state");
+    let config_dir = config.deployment_dir.join("config");
     let mimir_vol = format!("{}:/data", state_dir.join("mimir").display());
     let loki_vol = format!("{}:/loki", state_dir.join("loki").display());
     let grafana_vol = format!("{}:/var/lib/grafana", state_dir.join("grafana").display());
+    let mimir_config_vol = format!(
+        "{}:/etc/mimir/mimir.yaml",
+        config_dir.join("mimir.yaml").display()
+    );
+    let loki_config_vol = format!(
+        "{}:/etc/loki/loki.yaml",
+        config_dir.join("loki.yaml").display()
+    );
+    let alloy_config_vol = format!(
+        "{}:/etc/alloy/config.alloy",
+        config_dir.join("alloy.alloy").display()
+    );
+    let grafana_provisioning_vol = format!(
+        "{}:/etc/grafana/provisioning/",
+        config_dir.join("grafana/provisioning").display()
+    );
+    let grafana_dashboards_vol = format!(
+        "{}:/var/lib/grafana/dashboards/",
+        config_dir.join("grafana/dashboards").display()
+    );
     vec![
         ComposeService {
             name: "mimir".into(),
             image: config.observability.mimir_image.clone(),
             ports: vec!["9009:9009".into()],
-            volumes: vec![mimir_vol],
+            volumes: vec![mimir_vol, mimir_config_vol],
             environment: HashMap::new(),
             depends_on: Vec::new(),
             healthcheck: None,
+            command: vec!["--config.file=/etc/mimir/mimir.yaml".into()],
         },
         ComposeService {
             name: "loki".into(),
             image: config.observability.loki_image.clone(),
             ports: vec!["3100:3100".into()],
-            volumes: vec![loki_vol],
+            volumes: vec![loki_vol, loki_config_vol],
             environment: HashMap::new(),
             depends_on: Vec::new(),
             healthcheck: None,
+            command: vec!["--config.file=/etc/loki/loki.yaml".into()],
         },
         ComposeService {
             name: "tokeirad".into(),
@@ -59,6 +81,7 @@ pub fn compose_services(config: &ComposeConfig) -> Vec<ComposeService> {
             environment: HashMap::new(),
             depends_on: Vec::new(),
             healthcheck: None,
+            command: Vec::new(),
         },
         ComposeService {
             name: "grafana".into(),
@@ -67,32 +90,31 @@ pub fn compose_services(config: &ComposeConfig) -> Vec<ComposeService> {
                 "{}:{}",
                 config.observability.grafana_port, config.observability.grafana_port
             )],
-            volumes: vec![grafana_vol],
+            volumes: vec![
+                grafana_vol,
+                grafana_provisioning_vol,
+                grafana_dashboards_vol,
+            ],
             environment: HashMap::from([
                 ("GF_SECURITY_ADMIN_USER".into(), "admin".into()),
                 ("GF_SECURITY_ADMIN_PASSWORD".into(), "admin".into()),
             ]),
             depends_on: vec!["mimir".into(), "loki".into()],
             healthcheck: None,
+            command: Vec::new(),
         },
         ComposeService {
             name: "alloy".into(),
             image: config.observability.alloy_image.clone(),
             ports: vec!["4317:4317".into(), "4318:4318".into()],
-            volumes: vec!["/var/run/docker.sock:/var/run/docker.sock".into()],
-            environment: HashMap::from([
-                ("TOKEIRAD_METRICS_TARGET".into(), tokeirad_metrics),
-                (
-                    "MIMIR_REMOTE_WRITE_URL".into(),
-                    "http://mimir:9009/api/v1/push".into(),
-                ),
-                (
-                    "LOKI_WRITE_URL".into(),
-                    "http://loki:3100/loki/api/v1/push".into(),
-                ),
-            ]),
+            volumes: vec![
+                "/var/run/docker.sock:/var/run/docker.sock".into(),
+                alloy_config_vol,
+            ],
+            environment: HashMap::new(),
             depends_on: vec!["tokeirad".into(), "mimir".into(), "loki".into()],
             healthcheck: None,
+            command: vec!["run".into(), "/etc/alloy/config.alloy".into()],
         },
     ]
 }

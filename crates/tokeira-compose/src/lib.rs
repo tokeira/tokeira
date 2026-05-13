@@ -36,8 +36,10 @@ use bollard::{
         Config as ContainerConfig, CreateContainerOptions, ListContainersOptions, LogsOptions,
         RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
     },
+    image::CreateImageOptions,
     models::{ContainerInspectResponse, HostConfig, PortBinding},
 };
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokeira_deploy_engine as deploy_engine;
@@ -320,6 +322,28 @@ impl ComposePlatform {
             .await;
 
         let config = container_config(service, &self.project_name);
+
+        // Pull the image if not present locally
+        let image_ref = &service.image;
+        let (image_name, image_tag) = image_ref
+            .rsplit_once(':')
+            .unwrap_or((image_ref.as_str(), "latest"));
+        let mut pull_stream = self.docker.create_image(
+            Some(CreateImageOptions {
+                from_image: image_name.to_string(),
+                tag: image_tag.to_string(),
+                ..Default::default()
+            }),
+            None,
+            None,
+        );
+        while let Some(result) = pull_stream.next().await {
+            if let Err(e) = result {
+                tracing::warn!(image = %image_ref, error = %e, "image pull failed, attempting create anyway");
+                break;
+            }
+        }
+
         self.docker
             .create_container(
                 Some(CreateContainerOptions {

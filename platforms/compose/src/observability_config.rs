@@ -299,10 +299,10 @@ impl ObservabilityConfigFilesResource {
 
     fn state_from_files(&self, files: &[RenderedConfigFile]) -> iac::ResourceState {
         iac::ResourceState {
-            resource_type: self.resource_type(),
+            resource_type: iac::ResourceType::new(CONFIG_RESOURCE_TYPE),
             physical_id: self.deployment_dir.join(CONFIG_DIR).display().to_string(),
             properties: properties_for_checksums(self.checksums_for_rendered(files), Vec::new()),
-            dependencies: self.dependencies(),
+            dependencies: Vec::new(),
             created_at: String::new(),
             updated_at: String::new(),
             module: MODULE_OBSERVABILITY.into(),

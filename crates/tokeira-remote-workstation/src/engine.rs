@@ -651,6 +651,53 @@ impl Workstation {
         })
     }
 
+    /// Ensure the workstation instance is running. If stopped, starts it and
+    /// waits for the running state. If already running, returns immediately.
+    pub async fn ensure_running(
+        &self,
+        workstation_id: &str,
+    ) -> Result<(), WorkstationError> {
+        let handle = self.resolve_handle(workstation_id).await?;
+        let instance = self
+            .describe_instance_by_id(&handle.instance_id)
+            .await?
+            .ok_or_else(|| WorkstationError::NotFound(workstation_id.to_string()))?;
+
+        let state = instance
+            .state()
+            .and_then(|s| s.name())
+            .map(|n| n.as_str().to_string())
+            .unwrap_or_default();
+
+        match state.as_str() {
+            "running" => Ok(()),
+            "stopped" => {
+                println!("starting instance...");
+                self.ec2
+                    .start_instances()
+                    .instance_ids(&handle.instance_id)
+                    .send()
+                    .await
+                    .map_err(ec2_err)?;
+                self.ec2
+                    .wait_until_instance_running()
+                    .instance_ids(&handle.instance_id)
+                    .wait(Duration::from_secs(120))
+                    .await
+                    .map_err(|e| {
+                        WorkstationError::Ec2(format!(
+                            "instance did not reach running state: {e}"
+                        ))
+                    })?;
+                Ok(())
+            }
+            other => Err(WorkstationError::UnexpectedState {
+                workstation_id: workstation_id.to_string(),
+                state: other.to_string(),
+            }),
+        }
+    }
+
     /// Run a shell command on the workstation and return its stdout.
     /// Resolves the workstation ID to an instance ID from persisted state.
     pub async fn remote_command_text_raw(

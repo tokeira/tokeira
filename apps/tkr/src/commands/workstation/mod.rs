@@ -151,6 +151,10 @@ pub async fn run(action: WorkstationAction, json: bool) -> Result<()> {
             tui.print_summary();
             result?;
 
+            // Ensure the instance is running (handles resume after stop)
+            let engine = Workstation::new(profile.region.clone()).await?;
+            engine.ensure_running(&ws_id).await?;
+
             write_latest(&ws_id)?;
             println!("workstation {ws_id} ready");
             Ok(())

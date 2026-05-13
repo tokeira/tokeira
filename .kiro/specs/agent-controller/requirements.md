@@ -171,8 +171,9 @@ Tokeira orchestrating its own development is the "eating your own dogfood" momen
 
 1. `tkr agent logs --task <id>` SHALL request the JSONL stream from Agentd and print it to stdout.
 2. WHERE the task is still running, THE command SHALL stream new events as they arrive (tail -f behaviour) until the operator sends SIGINT.
-3. WHERE the task is completed or failed, THE command SHALL print the full stored JSONL file and exit.
-4. THE `--follow` flag SHALL be implicit for running tasks and a no-op for completed tasks.
+3. WHEN the operator sends SIGINT while a task is still running, THE command SHALL stop streaming immediately (the task itself continues running on the workstation).
+4. WHERE the task is completed or failed, THE command SHALL print the full stored JSONL file and exit.
+5. THE `--follow` flag SHALL be implicit for running tasks and a no-op for completed tasks.
 
 ### Requirement 3.3: `tkr agent diff` shows the branch diff
 
@@ -246,7 +247,7 @@ Tokeira orchestrating its own development is the "eating your own dogfood" momen
 
 1. `tkr agent usage` SHALL query Agentd for the last-known rate-limit state and display: tasks completed in the current 5-hour window, tasks completed in the current weekly window, last rate-limit event timestamp, and queue state.
 2. THE usage information SHALL be derived from Agentd's internal tracking of Codex JSONL events (specifically, completion events and rate-limit events). Agentd SHALL NOT call any external API to check quota.
-3. WHERE no rate-limit event has ever been observed, THE command SHALL display "no rate-limit events observed" and the task counts.
+3. WHERE no rate-limit event has ever been observed, THE command SHALL display "no rate-limit events observed" independently of task counts. WHERE task counts are displayed without rate-limit event correlation, THE command SHALL include a warning that counts may be incomplete.
 4. NOTE: This command reports observed usage from agentd's perspective. It cannot know true remaining quota if the operator also uses Codex elsewhere.
 
 ### Requirement 5.3: Kiro budget guardrail
@@ -411,7 +412,7 @@ Tokeira orchestrating its own development is the "eating your own dogfood" momen
 #### Acceptance Criteria
 
 1. THE test SHALL simulate daemon restart by persisting state to SQLite, re-loading, and verifying that tasks in `running` state transition to `interrupted` and tasks in `queued` state remain queued.
-2. THE test SHALL use `proptest` to generate arbitrary queue states and verify recovery invariants.
+2. THE test SHALL use `proptest` specifically to generate arbitrary queue states and verify recovery invariants. THE test SHALL NOT use alternative property testing frameworks or manual test cases as a substitute for proptest-generated states.
 3. THE test SHALL live under the agentd crate's test directory.
 
 ### Requirement 9.6: Task ID sanitization

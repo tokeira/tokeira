@@ -70,6 +70,7 @@ mkdir -p /etc/tokeira /var/lib/tokeira
 fn filesystem_phase(context: &BootstrapContext) -> String {
     format!(
         r#"# idempotency: existing ext4 filesystems and mounts are reused; NVMe is always recreatable.
+# This logic also runs on every boot via a systemd unit installed below.
 mkdir -p /work
 nvme_by_id="$(find /dev/disk/by-id -maxdepth 1 -name 'nvme-Amazon_EC2_NVMe_Instance_Storage*' -print -quit 2>/dev/null || true)"
 nvme_device=""
@@ -107,10 +108,72 @@ if [ -e "$repo_dev" ]; then
   mountpoint -q /work/repo || mount "$repo_dev" /work/repo
 fi
 
-mkdir -p /work/cache/cargo /work/cache/rustup "$SHELL_HOME/.cargo" "$SHELL_HOME/.rustup" "$SHELL_HOME/.cache/sccache"
-chown -R "$SHELL_USER:$SHELL_USER" /work/cache /work/repo /work/sccache /work/target
-mountpoint -q "$SHELL_HOME/.cargo" || mount --bind /work/cache/cargo "$SHELL_HOME/.cargo" || true
-mountpoint -q "$SHELL_HOME/.rustup" || mount --bind /work/cache/rustup "$SHELL_HOME/.rustup" || true
+mkdir -p /work/cache/cargo /work/cache/rustup /home/tokeira/.cargo /home/tokeira/.rustup /home/tokeira/.cache/sccache
+chown -R tokeira:tokeira /work/cache /work/repo /work/sccache /work/target
+mountpoint -q /home/tokeira/.cargo || mount --bind /work/cache/cargo /home/tokeira/.cargo || true
+mountpoint -q /home/tokeira/.rustup || mount --bind /work/cache/rustup /home/tokeira/.rustup || true
+
+# Install a systemd unit that re-runs the mount logic on every boot (after stop/start).
+cat > /usr/local/bin/tokeira-workstation-mounts <<'MOUNT_SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p /work
+nvme_by_id="$(find /dev/disk/by-id -maxdepth 1 -name 'nvme-Amazon_EC2_NVMe_Instance_Storage*' -print -quit 2>/dev/null || true)"
+nvme_device=""
+if [ -n "$nvme_by_id" ]; then
+  nvme_device="$(readlink -f "$nvme_by_id")"
+fi
+if [ -n "$nvme_device" ]; then
+  if ! mountpoint -q /work; then
+    mkfs.ext4 -F "$nvme_device" || true
+    mount "$nvme_device" /work || true
+  fi
+fi
+mkdir -p /work/cache /work/repo /work/sccache /work/target
+MOUNT_SCRIPT
+# Append the EBS mount commands with the baked volume IDs
+cat >> /usr/local/bin/tokeira-workstation-mounts <<MOUNT_EBS
+cache_dev="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${{cache_id//-/}}"
+repo_dev="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${{repo_id//-/}}"
+for dev in "\$cache_dev" "\$repo_dev"; do
+  for _ in \$(seq 1 120); do
+    [ -e "\$dev" ] && break
+    sleep 2
+  done
+done
+if [ -e "\$cache_dev" ]; then
+  blkid "\$cache_dev" >/dev/null 2>&1 || mkfs.ext4 -F "\$cache_dev"
+  mountpoint -q /work/cache || mount "\$cache_dev" /work/cache
+fi
+if [ -e "\$repo_dev" ]; then
+  blkid "\$repo_dev" >/dev/null 2>&1 || mkfs.ext4 -F "\$repo_dev"
+  mountpoint -q /work/repo || mount "\$repo_dev" /work/repo
+fi
+MOUNT_EBS
+cat >> /usr/local/bin/tokeira-workstation-mounts <<'MOUNT_BIND'
+mkdir -p /work/cache/cargo /work/cache/rustup /home/tokeira/.cargo /home/tokeira/.rustup /home/tokeira/.cache/sccache
+chown -R tokeira:tokeira /work/cache /work/repo /work/sccache /work/target
+mountpoint -q /home/tokeira/.cargo || mount --bind /work/cache/cargo /home/tokeira/.cargo || true
+mountpoint -q /home/tokeira/.rustup || mount --bind /work/cache/rustup /home/tokeira/.rustup || true
+MOUNT_BIND
+chmod 0755 /usr/local/bin/tokeira-workstation-mounts
+
+cat > /etc/systemd/system/tokeira-workstation-mounts.service <<'MOUNT_UNIT'
+[Unit]
+Description=Tokeira workstation NVMe and EBS mounts
+After=local-fs.target
+Before=ssm-agent.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/tokeira-workstation-mounts
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+MOUNT_UNIT
+systemctl daemon-reload
+systemctl enable tokeira-workstation-mounts.service
 "#,
         cache_id = context.cache_volume_id,
         repo_id = context.repo_volume_id

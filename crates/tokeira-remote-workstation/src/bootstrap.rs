@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 
 use crate::engine::WorkstationProfile;
 
-pub const BOOTSTRAP_SCHEMA: &str = "v1";
+pub const BOOTSTRAP_SCHEMA: &str = "v2";
 
 pub const GITHUB_SSH_HOST_KEYS: &[&str] = &[
     "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl",

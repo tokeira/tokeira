@@ -11,6 +11,7 @@ pub mod config;
 pub mod gates;
 pub mod images;
 pub mod modules;
+pub mod observability_config;
 pub mod services;
 
 use std::path::{Path, PathBuf};
@@ -437,6 +438,7 @@ mod tests {
             .iter()
             .map(|r| r.resource_id().0.clone())
             .collect();
+        assert_eq!(names[0], "compose/observability-config-files");
         assert!(names.iter().any(|n| n.contains("mimir")));
         assert!(names.iter().any(|n| n.contains("grafana")));
         assert!(names.iter().any(|n| n.contains("loki")));
@@ -444,6 +446,17 @@ mod tests {
         // All resources report the observability module
         for r in &resources {
             assert_eq!(r.module(), "observability");
+        }
+        for resource in resources.iter().skip(1) {
+            let deps: Vec<String> = resource
+                .dependencies()
+                .into_iter()
+                .map(|dep| dep.0)
+                .collect();
+            assert!(
+                deps.iter()
+                    .any(|dep| dep == "compose/observability-config-files")
+            );
         }
     }
 
@@ -458,6 +471,16 @@ mod tests {
         assert_eq!(resources.len(), 1);
         assert!(resources[0].resource_id().0.contains("tokeirad"));
         assert_eq!(resources[0].module(), "runtime");
+        let deps: Vec<String> = resources[0]
+            .dependencies()
+            .into_iter()
+            .map(|dep| dep.0)
+            .collect();
+        assert!(
+            !deps
+                .iter()
+                .any(|dep| dep == "compose/observability-config-files")
+        );
     }
 
     #[tokio::test]

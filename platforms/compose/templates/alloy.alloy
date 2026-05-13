@@ -1,0 +1,44 @@
+prometheus.scrape "tokeirad" {
+  targets         = [{ __address__ = "{{ metrics_target_host }}:{{ metrics_target_port }}" }]
+  forward_to      = [prometheus.remote_write.mimir.receiver]
+  scrape_interval = "15s"
+  job_name        = "tokeirad"
+  metrics_path    = "/metrics"
+}
+
+prometheus.remote_write "mimir" {
+  endpoint {
+    url = "{{ mimir_remote_write_url }}"
+  }
+}
+
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+discovery.relabel "docker_logs" {
+  targets = discovery.docker.containers.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+}
+
+loki.source.docker "containers" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.docker_logs.output
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "{{ loki_push_url }}"
+  }
+}

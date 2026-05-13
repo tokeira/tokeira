@@ -1,0 +1,73 @@
+{
+  "uid": "tokeira-grpc-edge-health",
+  "title": "Tokeira gRPC / Edge Health",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "tags": ["tokeira", "edge", "grpc"],
+  "timezone": "browser",
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Build Info",
+      "datasource": { "type": "prometheus", "uid": "mimir" },
+      "targets": [
+        { "expr": "tokeira_build_info", "legendFormat": "{{version}} {{commit}}" }
+      ],
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Request Rate",
+      "datasource": { "type": "prometheus", "uid": "mimir" },
+      "targets": [
+        { "expr": "sum by (method, namespace) (rate(tokeira_edge_grpc_request_total[5m]))", "legendFormat": "{{method}} {{namespace}}" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Error Rate",
+      "datasource": { "type": "prometheus", "uid": "mimir" },
+      "targets": [
+        { "expr": "sum by (method, namespace) (rate(tokeira_edge_grpc_error_total[5m]))", "legendFormat": "{{method}} {{namespace}}" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Error Ratio",
+      "datasource": { "type": "prometheus", "uid": "mimir" },
+      "targets": [
+        { "expr": "sum(rate(tokeira_edge_grpc_error_total[5m])) / sum(rate(tokeira_edge_grpc_request_total[5m]))", "legendFormat": "error ratio" }
+      ],
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 12 }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Request Latency",
+      "datasource": { "type": "prometheus", "uid": "mimir" },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(tokeira_edge_grpc_request_duration_seconds_bucket[5m])))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(tokeira_edge_grpc_request_duration_seconds_bucket[5m])))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(tokeira_edge_grpc_request_duration_seconds_bucket[5m])))", "legendFormat": "p99" }
+      ],
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 12 }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Active Requests",
+      "datasource": { "type": "prometheus", "uid": "mimir" },
+      "targets": [
+        { "expr": "sum(tokeira_edge_grpc_active_requests)", "legendFormat": "active" }
+      ],
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 12 }
+    }
+  ]
+}

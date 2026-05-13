@@ -128,15 +128,11 @@ impl From<ConfigGenError> for iac::IacError {
 }
 
 #[derive(Debug, Clone)]
-pub struct ConfigGenerator {
-    deployment_dir: PathBuf,
-}
+pub struct ConfigGenerator;
 
 impl ConfigGenerator {
-    pub fn new(deployment_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            deployment_dir: deployment_dir.into(),
-        }
+    pub fn new(_deployment_dir: impl Into<PathBuf>) -> Self {
+        Self
     }
 
     pub fn render_all(
@@ -627,15 +623,19 @@ mod tests {
             let mimir = contents_for(&files, MIMIR_CONFIG);
             let loki = contents_for(&files, LOKI_CONFIG);
             let datasources = contents_for(&files, GRAFANA_DATASOURCES);
+            let metrics_target = format!("{host}:{metrics_port}");
+            let mimir_port_line = format!("http_listen_port: {mimir_port}");
+            let loki_port_line = format!("http_listen_port: {loki_port}");
+            let loki_retention_line = format!("retention_period: {retention_hours}h");
 
-            prop_assert!(alloy.contains(&format!("{host}:{metrics_port}")));
-            prop_assert!(alloy.contains(&params.mimir_remote_write_url));
-            prop_assert!(alloy.contains(&params.loki_push_url));
-            prop_assert!(mimir.contains(&format!("http_listen_port: {mimir_port}")));
-            prop_assert!(loki.contains(&format!("http_listen_port: {loki_port}")));
-            prop_assert!(loki.contains(&format!("retention_period: {retention_hours}h")));
-            prop_assert!(datasources.contains("http://mimir:9009/prometheus"));
-            prop_assert!(datasources.contains("http://loki:3100"));
+            prop_assert!(alloy.contains(&metrics_target), "alloy target missing");
+            prop_assert!(alloy.contains(&params.mimir_remote_write_url), "mimir write URL missing");
+            prop_assert!(alloy.contains(&params.loki_push_url), "loki push URL missing");
+            prop_assert!(mimir.contains(&mimir_port_line), "mimir port missing");
+            prop_assert!(loki.contains(&loki_port_line), "loki port missing");
+            prop_assert!(loki.contains(&loki_retention_line), "loki retention missing");
+            prop_assert!(datasources.contains("http://mimir:9009/prometheus"), "mimir datasource URL missing");
+            prop_assert!(datasources.contains("http://loki:3100"), "loki datasource URL missing");
         }
 
         #[test]
@@ -650,10 +650,11 @@ mod tests {
                 _ => params.loki_http_port = 0,
             }
             let generator = ConfigGenerator::new(PathBuf::new());
-            prop_assert!(matches!(
+            let rejected = matches!(
                 generator.render_all(&params),
                 Err(ConfigGenError::InvalidParameter { .. })
-            ));
+            );
+            prop_assert!(rejected, "invalid parameters should be rejected");
         }
     }
 

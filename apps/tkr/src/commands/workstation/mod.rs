@@ -578,7 +578,7 @@ async fn run_code(action: CodeAction, _json: bool) -> Result<()> {
             } else {
                 println!("syncing branch {branch}...");
                 let sync_cmd = format!(
-                    "su tokeira -lc 'cd /work/repo/tokeira && git fetch origin && git checkout {branch} && git pull origin {branch}'"
+                    "su tokeira -lc 'cd /work/repo/tokeira && git reset --hard HEAD && git fetch origin && git checkout {branch} && git pull origin {branch}'"
                 );
                 engine.remote_command_text_raw(&id, &sync_cmd).await?;
                 println!("synced");

@@ -263,7 +263,7 @@ pub enum WorkstationAction {
     RemoteExec {
         #[arg(long)]
         workstation: Option<String>,
-        #[arg(long, default_value = "/work/tokeira")]
+        #[arg(long, default_value = "/work/repo/tokeira")]
         cwd: String,
         #[arg(long)]
         yes_secret_in_command: bool,

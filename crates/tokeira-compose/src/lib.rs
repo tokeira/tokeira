@@ -299,6 +299,40 @@ impl ComposePlatform {
         self.docker.clone()
     }
 
+    /// The project-scoped Docker network name. All services in this project
+    /// are attached to this network so they can resolve each other by name.
+    fn network_name(&self) -> String {
+        format!("{}_default", self.project_name)
+    }
+
+    /// Ensure the project network exists, creating it if necessary.
+    async fn ensure_network(&self) -> Result<(), ComposeError> {
+        use bollard::network::{CreateNetworkOptions, InspectNetworkOptions};
+
+        let name = self.network_name();
+        match self
+            .docker
+            .inspect_network(&name, None::<InspectNetworkOptions<String>>)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(_) => {
+                self.docker
+                    .create_network(CreateNetworkOptions {
+                        name: name.clone(),
+                        driver: "bridge".into(),
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(|error| ComposeError::ContainerFailed {
+                        container: name,
+                        source: anyhow::anyhow!(error),
+                    })?;
+                Ok(())
+            }
+        }
+    }
+
     /// Reconcile one compose service by updating the compose file and replacing
     /// the corresponding local container.
     pub async fn reconcile_service(&self, service: &ComposeService) -> Result<(), ComposeError> {
@@ -306,6 +340,9 @@ impl ComposePlatform {
         let mut state = self.load_compose_state()?;
         state.services.insert(service.name.clone(), service.clone());
         self.save_compose_state(&state)?;
+
+        // Ensure the project network exists so containers can resolve each other by name
+        self.ensure_network().await?;
 
         let container_name = service.container_name(&self.project_name);
         let _ = self
@@ -358,6 +395,25 @@ impl ComposePlatform {
                 container: container_name.clone(),
                 source: anyhow::anyhow!(error),
             })?;
+
+        // Connect the container to the project network before starting
+        self.docker
+            .connect_network(
+                &self.network_name(),
+                bollard::network::ConnectNetworkOptions {
+                    container: container_name.clone(),
+                    endpoint_config: bollard::models::EndpointSettings {
+                        aliases: Some(vec![service.name.clone()]),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await
+            .map_err(|error| ComposeError::ContainerFailed {
+                container: container_name.clone(),
+                source: anyhow::anyhow!(error),
+            })?;
+
         self.docker
             .start_container(&container_name, None::<StartContainerOptions<String>>)
             .await

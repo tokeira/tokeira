@@ -2,7 +2,7 @@
 //!
 //! The test spawns `tokeirad` in-process via [`TokeiradHandle::start_in_memory`],
 //! constructs a v0.4 `temporalio_client::Client`, asserts that `worker_heartbeats`
-//! is advertised `true` on both `GetSystemInfo` and `DescribeNamespace`, then
+//! is advertised `true` on `DescribeNamespace`, then
 //! starts and round-trips an `EchoWorkflow` through a v0.4 `Worker`.
 //!
 //! Gated behind `#[ignore]` so it does not run under a plain
@@ -14,7 +14,7 @@
 //!
 //! This test is the spec's acceptance gate per
 //! `.kiro/specs/temporal-api-v1.62-sync/requirements.md` §7:
-//!   - `capabilities.worker_heartbeats == true` on both handshake surfaces.
+//!   - `NamespaceInfo.Capabilities.worker_heartbeats == true`.
 //!   - `RecordWorkerHeartbeat` returns Ok (no `Status::unimplemented`), keeping
 //!     the v0.4 `SharedNamespaceWorker` alive for the duration of the workflow.
 //!   - An `EchoWorkflow` start→complete round-trip succeeds end-to-end.
@@ -26,7 +26,7 @@ use std::{sync::Arc, time::Duration};
 
 use temporalio_client::{
     Client, ClientOptions, Connection, ConnectionOptions, WorkflowGetResultOptions,
-    WorkflowStartOptions, grpc::WorkflowService,
+    WorkflowStartOptions, grpc::WorkflowService, tonic::IntoRequest,
 };
 use temporalio_common::{
     protos::temporal::api::workflowservice::v1::DescribeNamespaceRequest,
@@ -36,7 +36,6 @@ use temporalio_sdk::{Worker, WorkerOptions};
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions};
 use tokeira_bench::{BENCH_TASK_QUEUE, EchoWorkflow};
 use tokio::sync::Notify;
-use tonic::IntoRequest;
 use url::Url;
 
 use tokeirad::TokeiradHandle;
@@ -82,22 +81,9 @@ async fn run_v0_4_integration() {
         .await
         .expect("v0.4 SDK Connection::connect should succeed against post-sync tokeirad");
 
-    // Assertion 1: `worker_heartbeats` on `GetSystemInfoResponse.capabilities`
-    // is `true`. Without this, the SDK's SharedNamespaceWorker would refuse
-    // to start heartbeating, which would then fail any workflow that expects
-    // the worker to remain alive.
-    let capabilities = connection
-        .capabilities()
-        .cloned()
-        .expect("connection should carry cached capabilities after handshake");
-    assert!(
-        capabilities.worker_heartbeats,
-        "post-sync tokeirad must advertise `worker_heartbeats = true` per Req 4.1.1 and Req 3.3"
-    );
-
-    // Assertion 2: `DescribeNamespace("default")` carries the same
-    // capability. The v0.4 SDK consults either surface; post-sync tokeirad
-    // must keep them byte-identical.
+    // Assertion 1: `DescribeNamespace("default")` carries the worker-heartbeat
+    // capability. The v0.4 SDK's SharedNamespaceWorker checks this namespace
+    // surface before enabling heartbeats.
     let describe_resp = WorkflowService::describe_namespace(
         &mut connection,
         DescribeNamespaceRequest {

@@ -100,6 +100,15 @@ impl DsqlStore {
         self.director.as_ref()
     }
 
+    /// Clone the shared connection director handle.
+    ///
+    /// Tokeirad startup needs owned handles for runtime, projection, visibility,
+    /// and schema surfaces that outlive the facade value. Cloning the `Arc`
+    /// preserves one coordinated reservoir and rate-limiter state.
+    pub fn connection_director_arc(&self) -> Arc<connection::DsqlConnectionDirector> {
+        Arc::clone(&self.director)
+    }
+
     /// Access the DSQL-backed run repository.
     pub fn run_repository(&self) -> &run_repository::DsqlRunRepository {
         &self.run_repository
@@ -108,6 +117,27 @@ impl DsqlStore {
     /// Access the DSQL-backed projection log reader.
     pub fn projection_log(&self) -> &projection_log::DsqlProjectionLog {
         &self.projection_log
+    }
+
+    /// Decompose the facade into owned backend components.
+    ///
+    /// This is the production bootstrap escape hatch: each subsystem takes
+    /// ownership of the handle it needs while all DSQL paths continue sharing
+    /// the same connection director.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Arc<connection::DsqlConnectionDirector>,
+        run_repository::DsqlRunRepository,
+        projection_log::DsqlProjectionLog,
+        migration::MigrationRunner,
+    ) {
+        (
+            self.director,
+            self.run_repository,
+            self.projection_log,
+            self.migration_runner,
+        )
     }
 }
 

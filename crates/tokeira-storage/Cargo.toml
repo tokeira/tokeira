@@ -34,6 +34,9 @@ dsql = [
 ]
 dsql-integration = ["dsql"]
 
+[build-dependencies]
+sha2.workspace = true
+
 [dev-dependencies]
 metrics-util.workspace = true
 proptest = "1"

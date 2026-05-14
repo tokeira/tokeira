@@ -7,7 +7,7 @@ This plan integrates Aurora DSQL as a storage backend for the compose platform b
 ## Tasks
 
 - [ ] 1. Rename state module and update ComposeConfig model
-  - [ ] 1.1 Rename `LocalStateModule` logical name from `"remote-state"` to `"local-state"`
+  - [x] 1.1 Rename `LocalStateModule` logical name from `"remote-state"` to `"local-state"`
     - In `platforms/compose/src/modules.rs`, change `LocalStateModule::name()` to return `"local-state"`
     - Update `LocalStateResource::module()` to return `"local-state"`
     - Update `ResourceState.module` in `create()` and `describe()` to `"local-state"`
@@ -15,7 +15,7 @@ This plan integrates Aurora DSQL as a storage backend for the compose platform b
     - Update all tests that assert on the module name
     - _Requirements: 9.1.1, 9.1.2, 9.1.3, 9.1.5, 9.1.7_
 
-  - [ ] 1.2 Add `ComposeDsqlConfig`, `DsqlMode`, and `StorageKind` fields to `ComposeConfig`
+  - [x] 1.2 Add `ComposeDsqlConfig`, `DsqlMode`, and `StorageKind` fields to `ComposeConfig`
     - Add `ComposeDsqlConfig` struct with `#[derive(Default)]` and `#[serde(deny_unknown_fields)]` and fields: `mode: DsqlMode`, `endpoint: Option<String>`, `arn: Option<String>`, `region: String` (default `"us-east-1"` via `#[serde(default = "default_region")]`; the `Default` impl uses the same value)
     - Add `DsqlMode` enum with `Managed` (default) and `Preexisting` variants, `#[serde(rename_all = "lowercase")]`
     - Add `storage: StorageKind` field to `ComposeConfig` with `#[serde(default = "default_storage_kind")]` and a helper `fn default_storage_kind() -> StorageKind { StorageKind::InMemory }` (because `StorageKind` does not derive `Default`)
@@ -31,13 +31,13 @@ This plan integrates Aurora DSQL as a storage backend for the compose platform b
     - **Validates: Requirements 2.1.4**
 
 - [ ] 2. Implement DsqlModule and storage-aware module dependencies
-  - [ ] 2.1 Add AWS and IaC dependencies to `platforms/compose/Cargo.toml`
+  - [x] 2.1 Add AWS and IaC dependencies to `platforms/compose/Cargo.toml`
     - Add `tokeira-aws` dependency (for `DsqlCluster`, `AwsClients`)
     - Add `aws-config` and `aws-sdk-sts` dependencies (for SDK config loading and credential validation)
     - These are required by `DsqlModule::resources()` and `register_infra_extensions()`
     - _Requirements: 1.2.1, 7.1.1_
 
-  - [ ] 2.2 Implement `DsqlModule` struct with `Module` trait
+  - [x] 2.2 Implement `DsqlModule` struct with `Module` trait
     - Create `DsqlModule` in `platforms/compose/src/modules.rs` with fields: `config: ComposeDsqlConfig`, `project_name: String`
     - Implement `name() -> "dsql"`, `dependencies() -> &["local-state"]`
     - Implement `resources()` to:
@@ -47,14 +47,14 @@ This plan integrates Aurora DSQL as a storage backend for the compose platform b
     - Add doc comments on `DsqlModule` explaining it provisions or adopts a DSQL cluster for compose deployments
     - _Requirements: 1.1.1, 1.1.2, 1.1.3, 1.2.1, 1.3.1, 1.3.4, 1.4.1_
 
-  - [ ] 2.3 Make `ComposeModule::dependencies()` storage-kind-aware
+  - [x] 2.3 Make `ComposeModule::dependencies()` storage-kind-aware
     - Add a `storage: StorageKind` field to `ComposeModule`
     - Update `ComposeModule::runtime()` and `ComposeModule::observability()` constructors to accept storage kind
     - Implement conditional dependency logic per the design: DSQL mode reverses runtime/observability ordering
     - Add inline comments explaining WHY the ordering reverses for DSQL (endpoint must be written back before services start)
     - _Requirements: 6.2.1, 6.2.2, 6.2.3, 6.2.4, 6.2.5_
 
-  - [ ] 2.4 Register `DsqlModule` in `ComposeDeployment::infra_modules()` conditionally
+  - [x] 2.4 Register `DsqlModule` in `ComposeDeployment::infra_modules()` conditionally
     - When `config.storage == StorageKind::Dsql`, include `DsqlModule` in the returned modules
     - When `config.storage == StorageKind::InMemory`, exclude `DsqlModule`
     - Pass storage kind to `ComposeModule::runtime()` and `ComposeModule::observability()`
@@ -82,14 +82,14 @@ This plan integrates Aurora DSQL as a storage backend for the compose platform b
   - Ensure all tests pass, ask the user if questions arise.
 
 - [ ] 4. Implement writeback and AWS credential mounting
-  - [ ] 4.1 Implement `ComposeDeployment::collect_writeback()` for DSQL
+  - [x] 4.1 Implement `ComposeDeployment::collect_writeback()` for DSQL
     - When `config.storage == Dsql`, read DSQL resource state from `InfraState` and return writeback pairs: `infrastructure.storage`, `infrastructure.dsql.endpoint`, and `infrastructure.dsql.region`
     - Region writeback: always write `infrastructure.dsql.region` from `ComposeConfig.dsql.region` (which is set at `tkr deployment create --region <region>` time). There is NO region discovery from the DSQL endpoint hostname — region is always explicit in config.
     - When `config.storage == InMemory`, return empty vector (existing behaviour)
     - Add doc comment explaining the writeback atomicity guarantee (all keys written in one `write_config_values` call) and that region is always explicit (no endpoint-based inference)
     - _Requirements: 3.1.1, 3.1.2, 3.1.3, 3.1.4, 3.2.1, 3.2.2, 3.2.3_
 
-  - [ ] 4.2 Add AWS credential mounting to `tokeirad` compose service descriptor
+  - [x] 4.2 Add AWS credential mounting to `tokeirad` compose service descriptor
     - In `platforms/compose/src/compose.rs`, when `storage == StorageKind::Dsql`:
       - Add `~/.aws:/home/nonroot/.aws:ro` volume mount
       - Set `HOME=/home/nonroot` environment variable
@@ -120,7 +120,7 @@ This plan integrates Aurora DSQL as a storage backend for the compose platform b
     - **Validates: Requirements 4.2.1, 4.2.2**
 
 - [ ] 5. Implement ProvisionContext extension registration
-  - [ ] 5.1 Register `AwsClients` in `register_infra_extensions()` for DSQL
+  - [x] 5.1 Register `AwsClients` in `register_infra_extensions()` for DSQL
     - When `config.storage == StorageKind::Dsql`, load AWS SDK config using the region from `ComposeDsqlConfig.region` (always explicit, defaults to `us-east-1`). Use `aws_config::defaults(BehaviorVersion::latest()).region(Region::new(config_region)).load().await`
     - Construct `AwsClients::new(&sdk_config)` and register via `ctx.set_extension()`
     - After constructing `AwsClients`, call STS `GetCallerIdentity` to eagerly validate credentials. If this fails, return a descriptive error: "AWS credentials required for DSQL storage; check `aws configure` or environment variables"
@@ -131,27 +131,27 @@ This plan integrates Aurora DSQL as a storage backend for the compose platform b
   - Ensure all tests pass, ask the user if questions arise.
 
 - [ ] 7. Implement ConfigStorageKind and tokeirad startup branching
-  - [ ] 7.1 Add `ConfigStorageKind` enum to `tokeira-config`
+  - [x] 7.1 Add `ConfigStorageKind` enum to `tokeira-config`
     - Add `ConfigStorageKind` with `InMemory` (default) and `Dsql` variants, `#[serde(rename_all = "kebab-case")]`
     - Add `storage: ConfigStorageKind` field with `#[serde(default)]` to `InfrastructureConfig`
     - Add validation rule: reject `Dsql` + missing/empty endpoint with `ValidationError::Field`
     - Add doc comment on `ConfigStorageKind` explaining it is the server-config-level storage selector, distinct from `tokeira_orchestrator::StorageKind`
     - _Requirements: 8.1.1, 8.1.2, 8.1.3, 8.1.4, 8.1.5_
 
-  - [ ] 7.2 Add `Arc`-returning accessors to `DsqlStore` facade
+  - [x] 7.2 Add `Arc`-returning accessors to `DsqlStore` facade
     - Add `pub fn connection_director_arc(&self) -> Arc<DsqlConnectionDirector>` that clones the internal `Arc`
     - Add `pub fn into_parts(self) -> (Arc<DsqlConnectionDirector>, DsqlRunRepository, DsqlProjectionLog, MigrationRunner)` that decomposes the store into owned components
     - This resolves the ownership boundary: `HistoryNotifyingRepository::new` needs `Arc<R>` and `DsqlVisibilityStore::new` needs `Arc<DsqlConnectionDirector>` — the current facade only exposes borrowed references
     - Add doc comment explaining WHY `into_parts` exists (tokeirad needs to distribute owned handles to runtime, edge, and projection subsystems that outlive the `DsqlStore` value)
     - _Requirements: 8.2.2, 8.4.5_
 
-  - [ ] 7.3 Make `MigrationRunner::status` handle missing `schema_version` table
+  - [x] 7.3 Make `MigrationRunner::status` handle missing `schema_version` table
     - In `crates/tokeira-storage/src/dsql/migration.rs`, update `status()` to catch the "relation does not exist" error from `SELECT max(version) FROM schema_version`
     - When the table is absent, return `SchemaStatus { current_version: None, checked_at }` instead of propagating the error
     - Add doc comment explaining WHY this is handled gracefully (fresh databases have no schema_version table until the first migration runs)
     - _Requirements: 5.2.1, 5.2.2_
 
-  - [ ] 7.4 Implement DSQL startup branch in `tokeirad`
+  - [x] 7.4 Implement DSQL startup branch in `tokeirad`
     - In `apps/tokeirad/src/main.rs` (or `lib.rs`), branch on `infrastructure.storage`:
       - `InMemory` → existing `InMemoryStore::default()` path
       - `Dsql` → construct `DsqlAuthConfig` from config, call `DsqlStore::connect(auth, DsqlPoolConfig::default()).await`, call `into_parts()` to get owned components
@@ -163,7 +163,7 @@ This plan integrates Aurora DSQL as a storage backend for the compose platform b
     - Add doc comments explaining the storage selection flow and WHY pool config uses defaults (storage-layer config boundary)
     - _Requirements: 8.2.1, 8.2.2, 8.2.3, 8.2.4, 8.2.5, 8.2.6, 8.4.1, 8.4.2, 8.4.3, 8.4.4, 8.4.5, 8.4.6_
 
-  - [ ] 7.5 Add storage backend startup log message
+  - [x] 7.5 Add storage backend startup log message
     - Log `INFO` message before gRPC bind: `"storage backend: in-memory"` or `"storage backend: dsql"` with endpoint field
     - Ensure no role ARNs or credentials appear in the log
     - _Requirements: 8.3.1, 8.3.2, 8.3.3_
@@ -190,32 +190,32 @@ This plan integrates Aurora DSQL as a storage backend for the compose platform b
   - Ensure all tests pass, ask the user if questions arise.
 
 - [ ] 9. Implement schema setup CLI wiring
-  - [ ] 9.1 Add schema CLI dependencies to `apps/tkr/Cargo.toml`
+  - [x] 9.1 Add schema CLI dependencies to `apps/tkr/Cargo.toml`
     - Add `tokeira-storage` dependency with `dsql` feature enabled (for `MigrationRunner`, `DsqlAuthConfig`, `DsqlPoolConfig`)
     - Add `sqlx` with `runtime-tokio`, `tls-rustls`, `postgres` features
     - Add `aurora-dsql-sqlx-connector` for IAM-authenticated PgPool construction
     - _Requirements: 5.1.2_
 
-  - [ ] 9.2 Implement `tkr schema setup` command handler
+  - [x] 9.2 Implement `tkr schema setup` command handler
     - Add `schema` subcommand group to `apps/tkr/src/cli.rs` with `setup`, `status`, and `validate` subcommands
     - Implement `setup` handler: load `tokeirad.toml`, read endpoint and region from `infrastructure.dsql` (region is always explicit after writeback), construct `PgPool` with IAM auth, construct `MigrationRunner`, call `apply(&pool).await`, report applied count
     - Require `--yes` or interactive confirmation before executing
     - Return error if endpoint not configured: "dsql endpoint is not configured in {path}; run `tkr infra apply --module dsql` first"
     - _Requirements: 5.1.1, 5.1.2, 5.1.3, 5.1.4_
 
-  - [ ] 9.3 Implement `tkr schema status` command handler
+  - [x] 9.3 Implement `tkr schema status` command handler
     - Connect to DSQL endpoint (same path as setup)
     - Call `runner.status(&pool).await`
     - Report schema version or "not initialized" message
     - _Requirements: 5.2.1, 5.2.2, 5.2.3_
 
-  - [ ] 9.4 Implement `tkr schema validate` command handler
+  - [x] 9.4 Implement `tkr schema validate` command handler
     - Call `runner.validate()` (no pool required)
     - Report validation issues or "All migrations valid"
     - Exit 0 on success, exit 1 on issues
     - _Requirements: 5.3.1, 5.3.2, 5.3.3, 5.3.4_
 
-  - [ ] 9.5 Implement migration embedding via `build.rs` in `tokeira-storage`
+  - [x] 9.5 Implement migration embedding via `build.rs` in `tokeira-storage`
     - Add `sha2` to `[build-dependencies]` in `crates/tokeira-storage/Cargo.toml` (build scripts cannot use normal crate dependencies)
     - Add `build.rs` that discovers `migrations/V{nnn}__{name}.sql` files
     - Validate version sequence (no gaps, no duplicates); fail build on violations
@@ -228,14 +228,14 @@ This plan integrates Aurora DSQL as a storage backend for the compose platform b
     - _Requirements: 5.1.5_
 
 - [ ] 10. Implement prototypical config generation for compose+dsql
-  - [ ] 10.1 Add `--region` argument to `tkr deployment create`
+  - [x] 10.1 Add `--region` argument to `tkr deployment create`
     - Add `--region <region>` optional argument to `DeploymentAction::Create` in `apps/tkr/src/cli.rs`
     - The `PlatformConfig::prototypical_config(storage)` trait method signature is NOT changed — it remains platform-agnostic with only `StorageKind` as input
     - Instead, after generating the base config via `prototypical_config(storage)`, the CLI handler patches the TOML string to set `region = "<value>"` in the `[dsql]` section when `--region` is provided. Use `toml_edit` (already in the workspace) to parse, set the field, and re-serialize.
     - When `--region` is not provided, the generated `[dsql]` section keeps the default `region = "us-east-1"` from `ComposeDsqlConfig::default()`
     - _Requirements: 2.1.1, 2.2.2_
 
-  - [ ] 10.2 Update `PlatformConfig::prototypical_config()` for DSQL storage
+  - [x] 10.2 Update `PlatformConfig::prototypical_config()` for DSQL storage
     - When `storage == StorageKind::Dsql`, generate `deployment.toml` with `storage = "dsql"` and `[dsql]` section containing `mode = "managed"`, empty endpoint/arn fields, and `region = "us-east-1"` (the default — non-default region is patched by the CLI in task 10.1)
     - When `storage == StorageKind::InMemory`, omit `[dsql]` section
     - Update `prototypical_server_config()` to include `infrastructure.storage = "dsql"` and `[infrastructure.dsql]` section when DSQL

@@ -18,7 +18,7 @@ use crate::{
     dsql::{DsqlConnectionAcquirer, DsqlConnectionDirector, codec, convert},
 };
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct DsqlProjectionLog {
     director: Arc<dyn DsqlConnectionAcquirer>,
 }

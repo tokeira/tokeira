@@ -37,7 +37,7 @@ use crate::{
     },
 };
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct DsqlVisibilityStore {
     director: Arc<DsqlConnectionDirector>,
 }

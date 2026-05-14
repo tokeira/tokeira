@@ -131,6 +131,10 @@ impl iac::Resource for LocalStateResource {
 
 // ── Compose service modules ───────────────────────────────────────
 
+/// Compose IaC module that provisions or adopts Aurora DSQL storage.
+///
+/// It depends on local state so cluster identity and resource state can be
+/// recorded before observability/runtime modules need the endpoint writeback.
 #[derive(Debug)]
 pub struct DsqlModule {
     config: ComposeDsqlConfig,

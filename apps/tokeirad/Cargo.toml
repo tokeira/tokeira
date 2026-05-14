@@ -43,10 +43,10 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tokeira-edge = { path = "../../crates/tokeira-edge" }
 tokeira-kernel = { path = "../../crates/tokeira-kernel" }
 tokeira-proto = { path = "../../crates/tokeira-proto" }
-tokeira-projection = { path = "../../crates/tokeira-projection" }
+tokeira-projection = { path = "../../crates/tokeira-projection", features = ["dsql"] }
 tokeira-runtime = { path = "../../crates/tokeira-runtime" }
 tokeira-config.workspace = true
-tokeira-storage = { path = "../../crates/tokeira-storage" }
+tokeira-storage = { path = "../../crates/tokeira-storage", features = ["dsql"] }
 tokeira-types = { path = "../../crates/tokeira-types" }
 
 [dev-dependencies]

@@ -19,7 +19,7 @@ use super::{MigrationConfig, validation::DdlValidator};
 pub struct MigrationRunner {
     /// Source of migration files. The runner is intentionally stateless; the
     /// authoritative applied state lives in the database `schema_version` table.
-    config: MigrationConfig,
+    source: MigrationSource,
 }
 
 /// Summary returned after applying pending migrations.
@@ -61,9 +61,39 @@ struct MigrationFile {
     checksum: String,
 }
 
+#[derive(Clone, Debug)]
+enum MigrationSource {
+    Directory(MigrationConfig),
+    Embedded(&'static [EmbeddedMigration]),
+}
+
+/// Compile-time embedded migration statement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmbeddedMigration {
+    pub version: u32,
+    pub name: &'static str,
+    pub path: &'static str,
+    pub checksum: &'static str,
+    pub sql: &'static str,
+}
+
+include!(concat!(env!("OUT_DIR"), "/migrations_embedded.rs"));
+
 impl MigrationRunner {
     pub fn new(config: MigrationConfig) -> Self {
-        Self { config }
+        Self {
+            source: MigrationSource::Directory(config),
+        }
+    }
+
+    /// Construct a runner over migrations embedded at compile time.
+    ///
+    /// Production CLI/server paths use this to avoid depending on the process
+    /// working directory or re-hashing migration files at runtime.
+    pub fn embedded() -> Self {
+        Self {
+            source: MigrationSource::Embedded(EMBEDDED_MIGRATIONS),
+        }
     }
 
     /// Apply every unapplied migration in strict version order.
@@ -146,13 +176,16 @@ impl MigrationRunner {
 
     /// Read the highest applied schema version from the target database.
     pub async fn status(&self, pool: &PgPool) -> Result<SchemaStatus> {
-        let current_version =
-            sqlx::query_scalar::<_, Option<i32>>("SELECT max(version) FROM schema_version")
-                .fetch_optional(pool)
-                .await?
-                .flatten()
-                .map(u32::try_from)
-                .transpose()?;
+        let current_version = match sqlx::query_scalar::<_, Option<i32>>(
+            "SELECT max(version) FROM schema_version",
+        )
+        .fetch_optional(pool)
+        .await
+        {
+            Ok(version) => version.flatten().map(u32::try_from).transpose()?,
+            Err(error) if is_missing_schema_version(&error) => None,
+            Err(error) => return Err(error.into()),
+        };
         Ok(SchemaStatus {
             current_version,
             checked_at: OffsetDateTime::now_utc(),
@@ -161,47 +194,19 @@ impl MigrationRunner {
 
     /// Discover and validate migration filenames, ordering, and contiguity.
     fn discover(&self) -> Result<Vec<MigrationFile>> {
-        let mut migrations = Vec::new();
-        for entry in fs::read_dir(&self.config.migrations_dir).with_context(|| {
-            format!(
-                "failed to read migration directory {}",
-                self.config.migrations_dir.display()
-            )
-        })? {
-            let path = entry?.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("sql") {
-                continue;
-            }
-            let filename = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| anyhow!("invalid migration filename {}", path.display()))?;
-            let (version, name) = parse_migration_filename(filename)?;
-            let sql = fs::read_to_string(&path)
-                .with_context(|| format!("failed to read migration {}", path.display()))?;
-            let checksum = checksum(&sql);
-            migrations.push(MigrationFile {
-                version,
-                name,
-                path,
-                sql,
-                checksum,
-            });
+        match &self.source {
+            MigrationSource::Directory(config) => discover_directory_migrations(config),
+            MigrationSource::Embedded(migrations) => Ok(migrations
+                .iter()
+                .map(|migration| MigrationFile {
+                    version: migration.version,
+                    name: migration.name.to_owned(),
+                    path: PathBuf::from(migration.path),
+                    sql: migration.sql.to_owned(),
+                    checksum: migration.checksum.to_owned(),
+                })
+                .collect()),
         }
-        migrations.sort_by_key(|migration| migration.version);
-        for pair in migrations.windows(2) {
-            if pair[0].version == pair[1].version {
-                bail!("duplicate migration version {}", pair[0].version);
-            }
-            if pair[0].version + 1 != pair[1].version {
-                bail!(
-                    "migration version gap between {} and {}",
-                    pair[0].version,
-                    pair[1].version
-                );
-            }
-        }
-        Ok(migrations)
     }
 
     /// Bootstrap the migration metadata table.
@@ -239,11 +244,63 @@ impl MigrationRunner {
     }
 }
 
+fn discover_directory_migrations(config: &MigrationConfig) -> Result<Vec<MigrationFile>> {
+    let mut migrations = Vec::new();
+    for entry in fs::read_dir(&config.migrations_dir).with_context(|| {
+        format!(
+            "failed to read migration directory {}",
+            config.migrations_dir.display()
+        )
+    })? {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("sql") {
+            continue;
+        }
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("invalid migration filename {}", path.display()))?;
+        let (version, name) = parse_migration_filename(filename)?;
+        let sql = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read migration {}", path.display()))?;
+        let checksum = checksum(&sql);
+        migrations.push(MigrationFile {
+            version,
+            name,
+            path,
+            sql,
+            checksum,
+        });
+    }
+    migrations.sort_by_key(|migration| migration.version);
+    for pair in migrations.windows(2) {
+        if pair[0].version == pair[1].version {
+            bail!("duplicate migration version {}", pair[0].version);
+        }
+        if pair[0].version + 1 != pair[1].version {
+            bail!(
+                "migration version gap between {} and {}",
+                pair[0].version,
+                pair[1].version
+            );
+        }
+    }
+    Ok(migrations)
+}
+
 fn verify_checksum(version: u32, stored: &str, file: &str) -> Result<bool> {
     if stored == file {
         return Ok(true);
     }
     bail!("checksum mismatch for migration {version}: stored={stored}, file={file}")
+}
+
+fn is_missing_schema_version(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::Database(database_error)
+            if database_error.code().as_deref() == Some("42P01")
+    )
 }
 
 /// Parse `VNNN__snake_case_name.sql`.

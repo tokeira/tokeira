@@ -77,11 +77,17 @@ pub struct PlacementMembershipConfig {
     pub routing_max_retries: usize,
 }
 
+/// Server-side storage backend selector.
+///
+/// This lives in `tokeirad.toml` and is distinct from the deployment-layer
+/// `tokeira_orchestrator::StorageKind` used by `tkr deployment create`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ConfigStorageKind {
+    /// Use the process-local in-memory repository and visibility store.
     #[default]
     InMemory,
+    /// Use Aurora DSQL for run history, projection log, and visibility.
     Dsql,
 }
 

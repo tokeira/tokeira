@@ -1,44 +1,99 @@
 //! `tkr schema` — DSQL schema lifecycle.
 //!
-//! Only meaningful for deployments configured with DSQL storage; bails
-//! cleanly otherwise so in-memory deployments don't need to pretend.
-//!
-//! The DSQL endpoint is discovered during `tkr infra apply` and written
-//! back into `tokeirad.toml` by [`crate::commands::infra::write_tokeirad_writeback`];
-//! this handler reads it from there rather than re-querying AWS.
-//!
-//! Today the `Setup` action only prints the endpoint it would target.
-//! Actual schema migration goes through `temporal-dsql-tool` and is
-//! tracked as dedicated work.
+//! Schema commands operate from the selected deployment's `tokeirad.toml`
+//! because infra writeback is the authoritative source of the DSQL endpoint
+//! that the server will use at runtime.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use tokeira_orchestrator::StorageKind;
+use tokeira_storage::dsql::{
+    DsqlAuthConfig, DsqlConnector, DsqlPoolConfig, DsqlRole, MigrationRunner,
+};
 
 use crate::{
     cli::SchemaAction,
     deployment_dir::{DeploymentContext, TOKEIRAD_TOML},
 };
 
-pub fn run(action: SchemaAction, ctx: DeploymentContext) -> Result<()> {
+pub async fn run(action: SchemaAction, ctx: DeploymentContext) -> Result<()> {
     if ctx.metadata.storage != StorageKind::Dsql {
         bail!("schema commands require dsql storage");
     }
     let server_config_path = ctx.path.join(TOKEIRAD_TOML);
-    let server_config = crate::commands::infra::read_tokeirad_config(&server_config_path)?;
-    let Some(endpoint) = server_config.infrastructure.dsql.endpoint else {
-        bail!(
-            "dsql endpoint is not configured in {}",
-            server_config_path.display()
-        );
-    };
     match action {
         SchemaAction::Setup { yes } => {
             super::require_confirmation(yes, "schema setup")?;
-            println!("schema setup requested for DSQL endpoint {endpoint}");
+            let server_config = crate::commands::infra::read_tokeirad_config(&server_config_path)?;
+            let auth = dsql_auth_config(&server_config_path, &server_config)?;
+            let connector = connect_admin(&auth).await?;
+            let report = migration_runner().apply(connector.pool()).await?;
+            println!("Applied {} DSQL schema migration(s)", report.applied);
         }
         SchemaAction::Status => {
-            println!("DSQL endpoint configured: {endpoint}");
+            let server_config = crate::commands::infra::read_tokeirad_config(&server_config_path)?;
+            let auth = dsql_auth_config(&server_config_path, &server_config)?;
+            let connector = connect_admin(&auth).await?;
+            let status = migration_runner().status(connector.pool()).await?;
+            match status.current_version {
+                Some(version) => {
+                    println!(
+                        "Schema version: V{version:03} (checked at {})",
+                        status.checked_at
+                    );
+                }
+                None => {
+                    println!("Schema not initialized (no schema_version table)");
+                }
+            }
+        }
+        SchemaAction::Validate => {
+            let issues = migration_runner().validate()?;
+            if issues.is_empty() {
+                println!("All migrations valid");
+            } else {
+                for issue in issues {
+                    println!(
+                        "{}:{}: {:?}: {}",
+                        issue.file, issue.line, issue.kind, issue.message
+                    );
+                }
+                bail!("schema validation found issues");
+            }
         }
     }
     Ok(())
+}
+
+fn dsql_auth_config(
+    server_config_path: &std::path::Path,
+    server_config: &tokeira_config::TokeiraConfig,
+) -> Result<DsqlAuthConfig> {
+    let dsql = &server_config.infrastructure.dsql;
+    let endpoint = dsql
+        .endpoint
+        .clone()
+        .filter(|endpoint| !endpoint.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "dsql endpoint is not configured in {}; run `tkr infra apply --module dsql` first",
+                server_config_path.display()
+            )
+        })?;
+    Ok(DsqlAuthConfig {
+        endpoint,
+        region: dsql.region.clone(),
+        admin_role_arn: dsql.admin_role_arn.clone(),
+        runtime_role_arn: dsql.runtime_role_arn.clone(),
+        readonly_role_arn: dsql.readonly_role_arn.clone(),
+    })
+}
+
+async fn connect_admin(auth: &DsqlAuthConfig) -> Result<DsqlConnector> {
+    DsqlConnector::connect(auth, &DsqlPoolConfig::default(), DsqlRole::Admin)
+        .await
+        .context("failed to connect to DSQL for schema command")
+}
+
+fn migration_runner() -> MigrationRunner {
+    MigrationRunner::embedded()
 }

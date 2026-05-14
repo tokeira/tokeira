@@ -35,7 +35,7 @@ use tracing::info;
 pub mod correlation_format;
 pub mod observability;
 
-use tokeira_config::{Cli, TokeiraConfig};
+use tokeira_config::{Cli, ConfigStorageKind, TokeiraConfig};
 use tokeira_edge::{
     CacheBackedRouter, EdgeInterceptors, EdgeRoutingConfig, HistoryNotifyingRepository,
     HistoryWaitRegistry, InMemoryNamespaceCache, InMemoryOperatorApi, LocalOnlyRouter,
@@ -51,14 +51,18 @@ use tokeira_edge::{
 };
 use tokeira_kernel::LoadedRun;
 use tokeira_projection::{
-    InMemoryVisibilityStore, ProjectionWorker, VisibilityQueryService, VisibilitySink,
+    DsqlVisibilityStore, InMemoryVisibilityStore, ProjectionSink, ProjectionWorker,
+    VisibilityQueryService, VisibilitySink, VisibilityStore,
 };
 use tokeira_runtime::{
     ConnectionBudgetApplier, EndpointTarget, InMemoryTaskQueueConfigStore, MembershipConfig,
     NexusEndpointConfig, NexusEndpointRegistry, NoopNexusHttpClient, RuntimeConfig,
     ScheduleEngineConfig, ScheduleStore, TokeiraRuntime, VersioningRuleStore, run_schedule_engine,
 };
-use tokeira_storage::{InMemoryStore, RunRepository};
+use tokeira_storage::{
+    DsqlAuthConfig, DsqlPoolConfig, DsqlStore, InMemoryStore, LeaseRepository, ProjectionLog,
+    RunRepository,
+};
 use tokeira_types::{
     ExecutionRef, IncarnationId, NamespaceId, NodeEndpoint, PlacementConfig, ProjectionCursor,
     WorkflowId,
@@ -182,6 +186,26 @@ impl Drop for TokeiradHandle {
     }
 }
 
+fn dsql_auth_config(config: &TokeiraConfig) -> Result<DsqlAuthConfig> {
+    let dsql = &config.infrastructure.dsql;
+    let endpoint = dsql
+        .endpoint
+        .clone()
+        .filter(|endpoint| !endpoint.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "infrastructure.dsql.endpoint must be set when infrastructure.storage is dsql"
+            )
+        })?;
+    Ok(DsqlAuthConfig {
+        endpoint,
+        region: dsql.region.clone(),
+        admin_role_arn: dsql.admin_role_arn.clone(),
+        runtime_role_arn: dsql.runtime_role_arn.clone(),
+        readonly_role_arn: dsql.readonly_role_arn.clone(),
+    })
+}
+
 /// Entrypoint the CLI delegates to.
 ///
 /// Parses `TokeiraConfig` from the CLI arguments, handles `--dump-config`, and
@@ -248,14 +272,79 @@ async fn build_and_serve(
     CancellationToken,
     broadcast::Sender<LogEvent>,
 )> {
-    // Build the authoritative dev store first, then wrap it with the
+    match effective_config.infrastructure.storage {
+        ConfigStorageKind::InMemory => {
+            let store = InMemoryStore::default();
+            let visibility_store = InMemoryVisibilityStore::default();
+            build_and_serve_with_storage(
+                addr,
+                effective_config,
+                Arc::new(store.clone()),
+                store,
+                visibility_store.clone(),
+                {
+                    let visibility_store = visibility_store.clone();
+                    move |sink_id| VisibilitySink::new(visibility_store.clone(), sink_id)
+                },
+                None,
+            )
+            .await
+        }
+        ConfigStorageKind::Dsql => {
+            let auth = dsql_auth_config(&effective_config)?;
+            let endpoint = auth.endpoint.clone();
+            let dsql_store = DsqlStore::connect(auth, DsqlPoolConfig::default())
+                .await
+                .context("failed to connect DSQL storage backend")?;
+            let (director, run_repository, projection_log, _migration_runner) =
+                dsql_store.into_parts();
+            let visibility_store = DsqlVisibilityStore::new(director);
+            build_and_serve_with_storage(
+                addr,
+                effective_config,
+                Arc::new(run_repository),
+                projection_log,
+                visibility_store.clone(),
+                {
+                    let visibility_store = visibility_store.clone();
+                    move |_sink_id| visibility_store.clone()
+                },
+                Some(endpoint),
+            )
+            .await
+        }
+    }
+}
+
+async fn build_and_serve_with_storage<R, L, S, V, F>(
+    addr: SocketAddr,
+    effective_config: Arc<TokeiraConfig>,
+    run_repository: Arc<R>,
+    projection_log: L,
+    visibility_query_store: V,
+    projection_sink: F,
+    dsql_endpoint: Option<String>,
+) -> Result<(
+    JoinHandle<Result<()>>,
+    SocketAddr,
+    oneshot::Sender<()>,
+    CancellationToken,
+    broadcast::Sender<LogEvent>,
+)>
+where
+    R: LeaseRepository + RunRepository + 'static,
+    L: ProjectionLog + Clone + 'static,
+    S: ProjectionSink + VisibilityStore + 'static,
+    V: VisibilityStore + 'static,
+    F: Fn(String) -> S + Clone + Send + Sync + 'static,
+{
+    // Build the authoritative store first, then wrap it with the
     // history-notifying repository used by edge long-poll.
     let node_id = IncarnationId::new();
     let node_endpoint = configured_node_endpoint(&effective_config, addr);
-    let store = InMemoryStore::default();
     let history_waits = HistoryWaitRegistry::default();
     let repo = Arc::new(HistoryNotifyingRepository::new(
-        Arc::new(store.clone()),
+        run_repository,
         history_waits.clone(),
     ));
     let default_namespace = ResolvedNamespace::active("default");
@@ -359,18 +448,14 @@ async fn build_and_serve(
         repo.clone(),
         default_namespace_id,
     ));
-    let visibility_store = InMemoryVisibilityStore::default();
-    let visibility = Arc::new(VisibilityQueryService::new(visibility_store.clone()));
+    let visibility = Arc::new(VisibilityQueryService::new(visibility_query_store));
     let long_polls = LongPollGate::new(LongPollConfig::default());
     let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
 
     for partition_id in 0..16 {
         let projection_worker = ProjectionWorker {
-            log: store.clone(),
-            sink: VisibilitySink::new(
-                visibility_store.clone(),
-                format!("visibility-{partition_id}"),
-            ),
+            log: projection_log.clone(),
+            sink: projection_sink(format!("visibility-{partition_id}")),
             batch_size: 256,
         };
         let projection_cancel = background_cancel.clone();
@@ -420,6 +505,11 @@ async fn build_and_serve(
         .register_encoded_file_descriptor_set(tokeira_proto::public::FILE_DESCRIPTOR_SET)
         .build()
         .context("failed to build gRPC reflection service")?;
+
+    match dsql_endpoint {
+        Some(endpoint) => info!(%endpoint, "storage backend: dsql"),
+        None => info!("storage backend: in-memory"),
+    }
 
     let listener = TcpListener::bind(addr)
         .await

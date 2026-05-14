@@ -95,7 +95,7 @@ async fn main() -> Result<()> {
         }
         Command::Schema { action } => {
             let ctx = load_context(&deployments, cli.deployment.as_deref())?;
-            commands::schema::run(action, ctx)
+            commands::schema::run(action, ctx).await
         }
         Command::Scale { action } => {
             let ctx = load_context(&deployments, cli.deployment.as_deref())?;

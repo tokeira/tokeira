@@ -208,6 +208,7 @@ pub enum SchemaAction {
         yes: bool,
     },
     Status,
+    Validate,
 }
 
 #[derive(Subcommand)]

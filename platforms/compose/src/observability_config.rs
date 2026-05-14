@@ -588,6 +588,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use proptest::prelude::*;
+    use serde_json::Value;
     use tempfile::TempDir;
     use tokeira_iac::Resource;
 
@@ -733,6 +734,45 @@ mod tests {
             assert!(!temp.path().join(relative_path).exists());
         }
         assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn storage_projection_dashboard_uses_supported_prometheus_queries() {
+        let dashboard: Value =
+            serde_json::from_str(include_str!("../dashboards/storage-projection-health.json"))
+                .unwrap();
+        for panel in dashboard["panels"].as_array().unwrap() {
+            for target in panel["targets"].as_array().into_iter().flatten() {
+                let expr = target["expr"].as_str().unwrap_or_default();
+                assert!(!expr.contains("histogram_quantile("));
+                assert!(!expr.contains("_bucket"));
+            }
+        }
+    }
+
+    #[test]
+    fn storage_projection_dashboard_uses_consistent_timeseries_style() {
+        let dashboard: Value =
+            serde_json::from_str(include_str!("../dashboards/storage-projection-health.json"))
+                .unwrap();
+        for panel in dashboard["panels"].as_array().unwrap() {
+            if panel["type"].as_str() == Some("row") {
+                continue;
+            }
+            assert_eq!(panel["datasource"]["uid"].as_str(), Some("mimir"));
+            if panel["type"].as_str() != Some("timeseries") {
+                continue;
+            }
+            assert!(!panel["description"].as_str().unwrap_or_default().is_empty());
+            let custom = &panel["fieldConfig"]["defaults"]["custom"];
+            assert_eq!(custom["lineInterpolation"].as_str(), Some("smooth"));
+            assert_eq!(custom["showPoints"].as_str(), Some("never"));
+            assert_eq!(custom["pointSize"].as_i64(), Some(0));
+            let legend = &panel["options"]["legend"];
+            assert_eq!(legend["displayMode"].as_str(), Some("table"));
+            assert_eq!(legend["placement"].as_str(), Some("bottom"));
+            assert_eq!(legend["calcs"], json!(["lastNotNull", "mean", "max"]));
+        }
     }
 
     fn contents_for<'a>(files: &'a [RenderedConfigFile], path: &str) -> &'a str {

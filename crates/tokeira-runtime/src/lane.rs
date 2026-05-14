@@ -23,7 +23,7 @@ use tokeira_kernel::{
 use tokeira_proto::{
     conversions::common::failure_to_payload, public::temporal::api::failure::v1 as failure_proto,
 };
-use tokeira_storage::{CommitResult, RunRepository};
+use tokeira_storage::{CommitResult, RunRepository, metrics as storage_metrics};
 use tokeira_types::{ExecutionStatus, RunKey, ShardEpoch, execution_home_bundle};
 use tokio::sync::{mpsc, oneshot};
 
@@ -682,6 +682,9 @@ where
             .await?
         {
             CommitResult::Applied { new_state } => {
+                if attempts > 0 {
+                    storage_metrics::record_dsql_retry("commit_transition_for_bundle", "success");
+                }
                 runtime_metrics::record_transition_committed(
                     &new_state.namespace_id.0.to_string(),
                     command_type_name(&command),
@@ -703,6 +706,10 @@ where
                 runtime_metrics::record_occ_retry("retry");
                 if attempts >= max_retries {
                     runtime_metrics::record_occ_retry("exhausted");
+                    storage_metrics::record_dsql_retry(
+                        "commit_transition_for_bundle",
+                        "exhausted",
+                    );
                     return Err(anyhow!(
                         "lane OCC retry exhausted after {} conflicts for {:?}: {}",
                         attempts + 1,

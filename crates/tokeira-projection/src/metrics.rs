@@ -114,6 +114,9 @@ mod tests {
             set_projection_lag(2, 17);
             record_sink_write_duration(2, std::time::Duration::from_millis(14));
             record_sink_error(2);
+            record_visibility_query_duration("list", std::time::Duration::from_millis(6));
+            record_sa_index_scan_duration("sa_keyword_idx", std::time::Duration::from_millis(4));
+            record_checkpoint_write_duration(2, std::time::Duration::from_millis(3));
         });
 
         let snapshot = snapshot_map(&recorder);
@@ -139,5 +142,26 @@ mod tests {
         let (labels, value) = snapshot.get(SINK_ERROR_TOTAL).unwrap();
         assert_eq!(labels.get("partition_id"), Some(&"2".to_string()));
         assert_eq!(value, &DebugValue::Counter(1));
+
+        let (labels, value) = snapshot.get(VISIBILITY_QUERY_DURATION_SECONDS).unwrap();
+        assert_eq!(labels.get("query_type"), Some(&"list".to_string()));
+        match value {
+            DebugValue::Histogram(values) => assert_eq!(values[0].into_inner(), 0.006f64),
+            other => panic!("expected histogram, got {other:?}"),
+        }
+
+        let (labels, value) = snapshot.get(SA_INDEX_SCAN_DURATION_SECONDS).unwrap();
+        assert_eq!(labels.get("index_table"), Some(&"sa_keyword_idx".to_string()));
+        match value {
+            DebugValue::Histogram(values) => assert_eq!(values[0].into_inner(), 0.004f64),
+            other => panic!("expected histogram, got {other:?}"),
+        }
+
+        let (labels, value) = snapshot.get(CHECKPOINT_WRITE_DURATION_SECONDS).unwrap();
+        assert_eq!(labels.get("partition_id"), Some(&"2".to_string()));
+        match value {
+            DebugValue::Histogram(values) => assert_eq!(values[0].into_inner(), 0.003f64),
+            other => panic!("expected histogram, got {other:?}"),
+        }
     }
 }

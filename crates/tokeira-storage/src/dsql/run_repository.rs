@@ -52,6 +52,15 @@ macro_rules! record_dsql_operation {
     }};
 }
 
+macro_rules! record_dsql_commit_operation {
+    ($repo:expr, $operation:expr, $shard_id:expr, $body:block) => {{
+        let started = Instant::now();
+        let result = (async $body).await;
+        $repo.record_commit_operation_result($operation, $shard_id, started.elapsed(), &result);
+        result
+    }};
+}
+
 /// Production `RunRepository` backed by Aurora DSQL.
 #[derive(Debug)]
 pub struct DsqlRunRepository {
@@ -232,6 +241,42 @@ impl DsqlRunRepository {
             if outcome == "conflict" {
                 metrics::record_dsql_occ_conflict(operation);
             }
+            if let Some(sqlstate) = extract_sqlstate(error) {
+                metrics::record_dsql_error_code(&sqlstate);
+            }
+            if let Some(kind) = classify_connection_error(error) {
+                metrics::record_dsql_connection_error(kind);
+            }
+        }
+    }
+
+    fn record_commit_operation_result(
+        &self,
+        operation: &'static str,
+        shard_id: Option<ShardId>,
+        duration: std::time::Duration,
+        result: &Result<CommitResult>,
+    ) {
+        let outcome = match result {
+            Ok(CommitResult::Conflict { .. }) => "conflict",
+            Ok(_) => "success",
+            Err(error) if is_serialization_failure_error(error) => "conflict",
+            Err(_) => "error",
+        };
+        metrics::record_dsql_operation_duration(operation, outcome, duration);
+        metrics::record_dsql_query_duration(operation, outcome, duration);
+        metrics::record_dsql_operation_total(operation, outcome);
+        if let Some(shard_id) = shard_id {
+            metrics::record_dsql_shard_operation(shard_id.0, operation);
+            metrics::record_dsql_shard_duration(shard_id.0, duration);
+            if outcome == "conflict" {
+                metrics::record_dsql_shard_conflict(shard_id.0);
+            }
+        }
+        if outcome == "conflict" {
+            metrics::record_dsql_occ_conflict(operation);
+        }
+        if let Err(error) = result {
             if let Some(sqlstate) = extract_sqlstate(error) {
                 metrics::record_dsql_error_code(&sqlstate);
             }
@@ -482,7 +527,7 @@ impl RunRepository for DsqlRunRepository {
         transition: Transition,
         epoch: ShardEpoch,
     ) -> Result<CommitResult> {
-        record_dsql_operation!(self, "commit_transition", Some(self.shard_for_run_key(run_key)), {
+        record_dsql_commit_operation!(self, "commit_transition", Some(self.shard_for_run_key(run_key)), {
         // Validate i64 conversions before acquiring a connection or starting a
         // transaction. This prevents mid-transaction failures from overflow on
         // values that are structurally u64 but stored as BIGINT (i64) in DSQL.
@@ -630,7 +675,7 @@ impl RunRepository for DsqlRunRepository {
         transition: Transition,
         epoch: ShardEpoch,
     ) -> Result<CommitResult> {
-        record_dsql_operation!(self, "commit_transition_for_bundle", Some(execution_home_bundle), {
+        record_dsql_commit_operation!(self, "commit_transition_for_bundle", Some(execution_home_bundle), {
         if should_check_epoch(epoch) {
             convert::i64_from_u64(epoch.0, "caller shard epoch")?;
             let mut permit = self.director.acquire(DbClass::Commit).await?;
@@ -2352,7 +2397,7 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use anyhow::{Result, bail};
+    use anyhow::{Result, anyhow, bail};
     use async_trait::async_trait;
     use proptest::prelude::*;
     use time::{Duration, OffsetDateTime};
@@ -2370,8 +2415,9 @@ mod tests {
         ActivityDispatchRow, DsqlConnectionAcquirer, DsqlRunRepository, RenewDecision,
         activity_dispatch_from_row, collect_activity_sweep_entries,
         collect_dispatchable_workflow_tasks, collect_nexus_sweep_entries,
-        collect_started_workflow_task_entries, collect_workflow_timeout_entries, decide_renew,
-        epoch_from_sql, epoch_to_sql, interpret_acquire, should_check_epoch, sticky_fields,
+        classify_connection_error, classify_outcome, collect_started_workflow_task_entries,
+        collect_workflow_timeout_entries, decide_renew, epoch_from_sql, epoch_to_sql,
+        extract_sqlstate, interpret_acquire, should_check_epoch, sticky_fields,
     };
     use crate::{
         CurrentExecutionConflictPolicy, DbClass, LeaseOutcome, LeaseRepository, ProjectionContext,
@@ -2745,6 +2791,46 @@ mod tests {
 
         assert!(DsqlRunRepository::is_serialization_failure(&retryable));
         assert!(!DsqlRunRepository::is_serialization_failure(&other));
+    }
+
+    #[test]
+    fn outcome_and_error_classification_helpers_match_contract() {
+        let ok: Result<()> = Ok(());
+        let generic_error: Result<()> = Err(anyhow!("boom"));
+        let serialization_error: Result<()> = Err(sqlx::Error::Database(Box::new(
+            TestDatabaseError {
+                code: Some("40001"),
+            },
+        ))
+        .into());
+
+        assert_eq!(classify_outcome(&ok), "success");
+        assert_eq!(classify_outcome(&generic_error), "error");
+        assert_eq!(classify_outcome(&serialization_error), "conflict");
+    }
+
+    #[test]
+    fn sqlstate_extraction_returns_database_error_code() {
+        let error = anyhow!(sqlx::Error::Database(Box::new(TestDatabaseError {
+            code: Some("23505"),
+        })));
+
+        assert_eq!(extract_sqlstate(&error), Some("23505".to_owned()));
+    }
+
+    #[test]
+    fn connection_error_classification_maps_io_kinds() {
+        let timeout = anyhow!(sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timeout",
+        )));
+        let refused = anyhow!(sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "refused",
+        )));
+
+        assert_eq!(classify_connection_error(&timeout), Some("timeout"));
+        assert_eq!(classify_connection_error(&refused), Some("refused"));
     }
 
     #[test]

@@ -314,8 +314,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use metrics::with_local_recorder;
+    use metrics::{counter, with_local_recorder};
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use proptest::prelude::*;
 
     fn snapshot_map(
         recorder: &DebuggingRecorder,
@@ -411,5 +412,137 @@ mod tests {
         assert!(snapshot.contains_key(DSQL_POOL_CLASS_BUDGET_TOTAL));
         assert!(snapshot.contains_key(DSQL_POOL_CLASS_IN_USE));
         assert!(snapshot.contains_key(DSQL_POOL_CLASS_WAITERS));
+    }
+
+    #[test]
+    fn dsql_deep_helpers_emit_expected_metrics_and_labels() {
+        let recorder = DebuggingRecorder::new();
+
+        with_local_recorder(&recorder, || {
+            record_dsql_operation_duration(
+                "load_run",
+                "success",
+                std::time::Duration::from_millis(12),
+            );
+            record_dsql_occ_conflict("commit_transition");
+            record_dsql_retry("commit_transition_for_bundle", "success");
+            record_dsql_operation_total("load_run", "success");
+            set_dsql_reservoir_in_flight(3);
+            record_dsql_projection_read_duration(7, std::time::Duration::from_millis(21));
+            record_dsql_projection_batch_size(7, 42);
+            record_dsql_reservoir_connection_create_duration(std::time::Duration::from_millis(31));
+            record_dsql_reservoir_connection_validate_duration(std::time::Duration::from_millis(4));
+            record_dsql_reservoir_connection_age("expired", std::time::Duration::from_secs(120));
+            set_dsql_rate_limiter_tokens_remaining(5.5);
+            record_dsql_rate_limiter_throttled();
+            record_dsql_rate_limiter_throttle_duration(std::time::Duration::from_millis(8));
+            record_dsql_query_duration("load_run", "success", std::time::Duration::from_millis(10));
+            record_dsql_rows_read("read_history", 9);
+            record_dsql_rows_written("persist_to_backlog", 2);
+            record_dsql_commit_retries(1);
+            set_dsql_reservoir_utilization_ratio(2, 6);
+            record_dsql_shard_operation(4, "load_run");
+            record_dsql_shard_conflict(4);
+            record_dsql_shard_duration(4, std::time::Duration::from_millis(16));
+            record_dsql_connection_error("timeout");
+            record_dsql_error_code("40001");
+        });
+
+        let snapshot = snapshot_map(&recorder);
+        assert!(snapshot.contains_key(DSQL_OPERATION_DURATION_SECONDS));
+        assert!(snapshot.contains_key(DSQL_OCC_CONFLICT_TOTAL));
+        assert!(snapshot.contains_key(DSQL_RETRY_TOTAL));
+        assert!(snapshot.contains_key(DSQL_OPERATION_TOTAL));
+        assert!(snapshot.contains_key(DSQL_RESERVOIR_IN_FLIGHT));
+        assert!(snapshot.contains_key(DSQL_PROJECTION_READ_DURATION_SECONDS));
+        assert!(snapshot.contains_key(DSQL_PROJECTION_BATCH_SIZE));
+        assert!(snapshot.contains_key(DSQL_RESERVOIR_CONNECTION_CREATE_DURATION_SECONDS));
+        assert!(snapshot.contains_key(DSQL_RESERVOIR_CONNECTION_VALIDATE_DURATION_SECONDS));
+        assert!(snapshot.contains_key(DSQL_RESERVOIR_CONNECTION_AGE_SECONDS));
+        assert!(snapshot.contains_key(DSQL_RATE_LIMITER_TOKENS_REMAINING));
+        assert!(snapshot.contains_key(DSQL_RATE_LIMITER_THROTTLED_TOTAL));
+        assert!(snapshot.contains_key(DSQL_RATE_LIMITER_THROTTLE_DURATION_SECONDS));
+        assert!(snapshot.contains_key(DSQL_QUERY_DURATION_SECONDS));
+        assert!(snapshot.contains_key(DSQL_ROWS_READ));
+        assert!(snapshot.contains_key(DSQL_ROWS_WRITTEN));
+        assert!(snapshot.contains_key(DSQL_COMMIT_RETRIES));
+        assert!(snapshot.contains_key(DSQL_RESERVOIR_UTILIZATION_RATIO));
+        assert!(snapshot.contains_key(DSQL_SHARD_OPERATION_TOTAL));
+        assert!(snapshot.contains_key(DSQL_SHARD_CONFLICT_TOTAL));
+        assert!(snapshot.contains_key(DSQL_SHARD_DURATION_SECONDS));
+        assert!(snapshot.contains_key(DSQL_CONNECTION_ERROR_TOTAL));
+        assert!(snapshot.contains_key(DSQL_ERROR_CODE_TOTAL));
+
+        let (labels, value) = snapshot.get(DSQL_RETRY_TOTAL).unwrap();
+        assert_eq!(
+            labels.get("operation"),
+            Some(&"commit_transition_for_bundle".to_string())
+        );
+        assert_eq!(labels.get("outcome"), Some(&"success".to_string()));
+        assert_eq!(value, &DebugValue::Counter(1));
+
+        let (_, value) = snapshot.get(DSQL_RESERVOIR_UTILIZATION_RATIO).unwrap();
+        assert_eq!(value, &DebugValue::Gauge(0.25.into()));
+    }
+
+    proptest! {
+        #[test]
+        fn counter_helpers_accumulate(count in 0u64..10_000) {
+            let recorder = DebuggingRecorder::new();
+            with_local_recorder(&recorder, || {
+                counter!(DSQL_RETRY_TOTAL, "operation" => "commit_transition", "outcome" => "success").increment(count);
+            });
+            let snapshot = snapshot_map(&recorder);
+            let (_, value) = snapshot.get(DSQL_RETRY_TOTAL).unwrap();
+            prop_assert_eq!(value, &DebugValue::Counter(count));
+        }
+
+        #[test]
+        fn histogram_helpers_record_each_observation(values in prop::collection::vec(0u64..10_000, 1..32)) {
+            let recorder = DebuggingRecorder::new();
+            with_local_recorder(&recorder, || {
+                for value in &values {
+                    record_dsql_rows_read("read_history", *value as usize);
+                }
+            });
+            let snapshot = snapshot_map(&recorder);
+            let (_, value) = snapshot.get(DSQL_ROWS_READ).unwrap();
+            match value {
+                DebugValue::Histogram(observations) => {
+                    prop_assert_eq!(observations.len(), values.len());
+                }
+                _ => prop_assert!(false, "expected histogram"),
+            }
+        }
+
+        #[test]
+        fn gauge_helpers_are_last_write_wins(values in prop::collection::vec(0usize..10_000, 1..32)) {
+            let recorder = DebuggingRecorder::new();
+            with_local_recorder(&recorder, || {
+                for value in &values {
+                    set_dsql_reservoir_in_flight(*value);
+                }
+            });
+            let snapshot = snapshot_map(&recorder);
+            let (_, value) = snapshot.get(DSQL_RESERVOIR_IN_FLIGHT).unwrap();
+            prop_assert_eq!(value, &DebugValue::Gauge((*values.last().unwrap() as f64).into()));
+        }
+
+        #[test]
+        fn utilization_ratio_matches_inputs(in_flight in 0usize..10_000, ready in 0usize..10_000) {
+            let recorder = DebuggingRecorder::new();
+            with_local_recorder(&recorder, || {
+                set_dsql_reservoir_utilization_ratio(in_flight, ready);
+            });
+            let snapshot = snapshot_map(&recorder);
+            let (_, value) = snapshot.get(DSQL_RESERVOIR_UTILIZATION_RATIO).unwrap();
+            let total = in_flight + ready;
+            let expected = if total == 0 {
+                0.0
+            } else {
+                in_flight as f64 / total as f64
+            };
+            prop_assert_eq!(value, &DebugValue::Gauge(expected.into()));
+        }
     }
 }

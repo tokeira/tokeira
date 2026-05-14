@@ -13,7 +13,7 @@ use std::{
     time::{Duration as StdDuration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 use rand::Rng;
 use sqlx::{Connection, Postgres, pool::PoolConnection};
 use tokio::{
@@ -136,8 +136,12 @@ impl Reservoir {
         let mut retired = 0usize;
         while self.ready.len() > target {
             match self.ready.try_recv() {
-                Ok(_entry) => {
+                Ok(entry) => {
                     retired += 1;
+                    metrics::record_dsql_reservoir_connection_age(
+                        "budget_cap",
+                        entry.created_at.elapsed(),
+                    );
                     metrics::record_dsql_pool_connection_retired("budget_cap");
                 }
                 Err(_) => break,
@@ -182,8 +186,12 @@ fn spawn_refiller(
                 return;
             };
             rate_limiter.acquire().await;
+            let create_started = Instant::now();
             match connector.acquire().await {
                 Ok(connection) => {
+                    metrics::record_dsql_reservoir_connection_create_duration(
+                        create_started.elapsed(),
+                    );
                     metrics::record_dsql_pool_connection_created();
                     let entry = ReservoirEntry {
                         connection,
@@ -197,6 +205,10 @@ fn spawn_refiller(
                     metrics::record_dsql_pool_connections_total(ready_tx.len());
                 }
                 Err(error) => {
+                    metrics::record_dsql_reservoir_connection_create_duration(
+                        create_started.elapsed(),
+                    );
+                    metrics::record_dsql_connection_error(classify_anyhow_connection_error(&error));
                     tracing::warn!(error = %error, "failed to create DSQL connection");
                     // Back off on creation failure to avoid hammering a broken endpoint.
                     tokio::time::sleep(StdDuration::from_secs(1)).await;
@@ -227,6 +239,10 @@ fn spawn_scanner(
                     Ok(entry) => {
                         scanned += 1;
                         if entry.should_retire(guard_window) {
+                            metrics::record_dsql_reservoir_connection_age(
+                                "guard_window",
+                                entry.created_at.elapsed(),
+                            );
                             metrics::record_dsql_pool_connection_retired("guard_window");
                         } else if ready_tx.try_send(entry).is_err() {
                             // Channel full — stop scanning this interval.
@@ -250,13 +266,27 @@ fn spawn_return_processor(
         let guard_window = duration_or_default(config.guard_window, StdDuration::from_secs(45));
         while let Some(mut entry) = return_rx.recv().await {
             if entry.should_retire(guard_window) {
+                metrics::record_dsql_reservoir_connection_age(
+                    "expired",
+                    entry.created_at.elapsed(),
+                );
                 metrics::record_dsql_pool_connection_retired("expired");
                 continue;
             }
-            if entry.connection.ping().await.is_err() {
+            let validate_started = Instant::now();
+            if let Err(error) = entry.connection.ping().await {
+                metrics::record_dsql_reservoir_connection_validate_duration(
+                    validate_started.elapsed(),
+                );
+                metrics::record_dsql_reservoir_connection_age(
+                    "unhealthy",
+                    entry.created_at.elapsed(),
+                );
+                metrics::record_dsql_connection_error(classify_sqlx_connection_error(&error));
                 metrics::record_dsql_pool_connection_retired("unhealthy");
                 continue;
             }
+            metrics::record_dsql_reservoir_connection_validate_duration(validate_started.elapsed());
             metrics::record_dsql_pool_connection_returned();
             if ready_tx.send(entry).await.is_err() {
                 return;
@@ -264,6 +294,27 @@ fn spawn_return_processor(
             metrics::record_dsql_pool_connections_total(ready_tx.len());
         }
     })
+}
+
+fn classify_anyhow_connection_error(error: &Error) -> &'static str {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<sqlx::Error>())
+        .map(classify_sqlx_connection_error)
+        .unwrap_or("reset")
+}
+
+fn classify_sqlx_connection_error(error: &sqlx::Error) -> &'static str {
+    match error {
+        sqlx::Error::Io(io_error) => match io_error.kind() {
+            std::io::ErrorKind::ConnectionReset => "reset",
+            std::io::ErrorKind::TimedOut => "timeout",
+            std::io::ErrorKind::ConnectionRefused => "refused",
+            _ => "reset",
+        },
+        sqlx::Error::Tls(_) => "tls",
+        _ => "reset",
+    }
 }
 
 pub(crate) fn assign_lifetime(config: &ReservoirConfig) -> StdDuration {

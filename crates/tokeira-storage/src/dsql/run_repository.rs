@@ -6,7 +6,7 @@
 //! tables combine into workflow semantics; callers continue to use the storage
 //! trait in terms of runs, history, leases, dispatch, and sweep entries.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -28,6 +28,7 @@ use crate::{
     ActivitySweepEntry, BacklogEntry, BudgetAllocationResult, BundleLease, CommitResult,
     ControlRepository, CurrentExecutionConflictPolicy, DbClass, DispatchableActivityTask,
     DispatchableWorkflowTask, DueTimer, GenerationAdvanceResult, LeaseOutcome, LeaseRepository,
+    metrics,
     NexusSweepEntry, ProjectionContext, RequestRecord, RunRepository, TransitionAuditRecord,
     WftTimeoutSweepEntry, WorkflowTimeoutSweepEntry,
 };
@@ -41,6 +42,15 @@ use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, codec, convert};
 const PROJECTION_FANOUT: i16 = 1;
 /// Number of projection partitions used to distribute projection log reads.
 const PROJECTION_PARTITION_COUNT: u32 = 16;
+
+macro_rules! record_dsql_operation {
+    ($repo:expr, $operation:expr, $shard_id:expr, $body:block) => {{
+        let started = Instant::now();
+        let result = (async $body).await;
+        $repo.record_operation_result($operation, $shard_id, started.elapsed(), &result);
+        result
+    }};
+}
 
 /// Production `RunRepository` backed by Aurora DSQL.
 #[derive(Debug)]
@@ -199,12 +209,81 @@ impl DsqlRunRepository {
     pub(crate) fn is_serialization_failure(err: &sqlx::Error) -> bool {
         matches!(err, sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("40001"))
     }
+
+    fn record_operation_result<T>(
+        &self,
+        operation: &'static str,
+        shard_id: Option<ShardId>,
+        duration: std::time::Duration,
+        result: &Result<T>,
+    ) {
+        let outcome = classify_outcome(result);
+        metrics::record_dsql_operation_duration(operation, outcome, duration);
+        metrics::record_dsql_query_duration(operation, outcome, duration);
+        metrics::record_dsql_operation_total(operation, outcome);
+        if let Some(shard_id) = shard_id {
+            metrics::record_dsql_shard_operation(shard_id.0, operation);
+            metrics::record_dsql_shard_duration(shard_id.0, duration);
+            if outcome == "conflict" {
+                metrics::record_dsql_shard_conflict(shard_id.0);
+            }
+        }
+        if let Err(error) = result {
+            if outcome == "conflict" {
+                metrics::record_dsql_occ_conflict(operation);
+            }
+            if let Some(sqlstate) = extract_sqlstate(error) {
+                metrics::record_dsql_error_code(&sqlstate);
+            }
+            if let Some(kind) = classify_connection_error(error) {
+                metrics::record_dsql_connection_error(kind);
+            }
+        }
+    }
+}
+
+fn classify_outcome<T>(result: &Result<T>) -> &'static str {
+    match result {
+        Ok(_) => "success",
+        Err(error) if is_serialization_failure_error(error) => "conflict",
+        Err(_) => "error",
+    }
+}
+
+fn is_serialization_failure_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<sqlx::Error>())
+        .is_some_and(DsqlRunRepository::is_serialization_failure)
+}
+
+fn extract_sqlstate(error: &anyhow::Error) -> Option<String> {
+    error.chain().find_map(|cause| match cause.downcast_ref::<sqlx::Error>() {
+        Some(sqlx::Error::Database(database_error)) => {
+            database_error.code().map(|code| code.into_owned())
+        }
+        _ => None,
+    })
+}
+
+fn classify_connection_error(error: &anyhow::Error) -> Option<&'static str> {
+    error.chain().find_map(|cause| match cause.downcast_ref::<sqlx::Error>() {
+        Some(sqlx::Error::Io(io_error)) => Some(match io_error.kind() {
+            std::io::ErrorKind::ConnectionReset => "reset",
+            std::io::ErrorKind::TimedOut => "timeout",
+            std::io::ErrorKind::ConnectionRefused => "refused",
+            _ => "reset",
+        }),
+        Some(sqlx::Error::Tls(_)) => Some("tls"),
+        _ => None,
+    })
 }
 
 #[async_trait]
 impl RunRepository for DsqlRunRepository {
     #[instrument(name = "dsql.resolve_execution", skip(self), fields(namespace_id = %execution.namespace_id.0, workflow_id = %execution.workflow_id.0))]
     async fn resolve_execution(&self, execution: &ExecutionRef) -> Result<Option<RunKey>> {
+        record_dsql_operation!(self, "resolve_execution", None, {
         let mut permit = self.director.acquire(DbClass::Read).await?;
         if let Some(requested_run_id) = execution.run_id {
             // Explicit run IDs do not use `current_execution`; that row is
@@ -230,6 +309,7 @@ impl RunRepository for DsqlRunRepository {
         .fetch_optional(permit.connection()?)
         .await?;
         Ok(row.map(|(run_key,)| RunKey(run_key)))
+        })
     }
 
     #[instrument(name = "dsql.find_latest_run", skip(self), fields(namespace_id = %namespace_id.0, workflow_id = %workflow_id.0))]
@@ -238,6 +318,7 @@ impl RunRepository for DsqlRunRepository {
         namespace_id: NamespaceId,
         workflow_id: &WorkflowId,
     ) -> Result<Option<RunKey>> {
+        record_dsql_operation!(self, "find_latest_run", None, {
         let mut permit = self.director.acquire(DbClass::Read).await?;
         let key = Self::current_execution_key(namespace_id, workflow_id);
         // `current_execution` is the latest-run pointer even after the run is
@@ -250,10 +331,12 @@ impl RunRepository for DsqlRunRepository {
         .fetch_optional(permit.connection()?)
         .await?;
         Ok(row.map(|(run_key,)| RunKey(run_key)))
+        })
     }
 
     #[instrument(name = "dsql.load_run", skip(self), fields(run_key = %run_key.0))]
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun> {
+        record_dsql_operation!(self, "load_run", Some(self.shard_for_run_key(run_key)), {
         let mut permit = self.director.acquire(DbClass::Read).await?;
         let row = sqlx::query_as::<_, (Vec<u8>,)>(
             "SELECT state_data FROM workflow_hot WHERE run_key = $1",
@@ -267,6 +350,7 @@ impl RunRepository for DsqlRunRepository {
             )?)),
             None => Ok(LoadedRun::Absent),
         }
+        })
     }
 
     #[instrument(name = "dsql.read_history", skip(self), fields(run_key = %run_key.0, after_event_id, limit))]
@@ -276,7 +360,9 @@ impl RunRepository for DsqlRunRepository {
         after_event_id: i64,
         limit: usize,
     ) -> Result<Vec<HistoryEvent>> {
+        record_dsql_operation!(self, "read_history", Some(self.shard_for_run_key(run_key)), {
         if limit == 0 {
+            metrics::record_dsql_rows_read("read_history", 0);
             return Ok(Vec::new());
         }
 
@@ -293,6 +379,7 @@ impl RunRepository for DsqlRunRepository {
         .bind(after_event_id)
         .fetch_all(permit.connection()?)
         .await?;
+        metrics::record_dsql_rows_read("read_history", rows.len());
 
         let mut events = Vec::new();
         for (_first_event_id, _last_event_id, events_data) in rows {
@@ -307,6 +394,7 @@ impl RunRepository for DsqlRunRepository {
             }
         }
         Ok(events)
+        })
     }
 
     #[instrument(name = "dsql.lookup_request_dedupe", skip(self), fields(namespace_id = %execution.namespace_id.0, workflow_id = %execution.workflow_id.0, request_id = %request_id.0))]
@@ -315,6 +403,7 @@ impl RunRepository for DsqlRunRepository {
         execution: &ExecutionRef,
         request_id: &RequestId,
     ) -> Result<Option<RequestRecord>> {
+        record_dsql_operation!(self, "lookup_request_dedupe", None, {
         let mut permit = self.director.acquire(DbClass::Read).await?;
         let key =
             Self::request_dedupe_key(execution.namespace_id, &execution.workflow_id, request_id);
@@ -352,10 +441,12 @@ impl RunRepository for DsqlRunRepository {
                 "request_dedupe.first_seen_transition_seq",
             )?),
         }))
+        })
     }
 
     #[instrument(name = "dsql.read_transition_audit", skip(self), fields(run_key = %run_key.0))]
     async fn read_transition_audit(&self, run_key: RunKey) -> Result<Vec<TransitionAuditRecord>> {
+        record_dsql_operation!(self, "read_transition_audit", Some(self.shard_for_run_key(run_key)), {
         let mut permit = self.director.acquire(DbClass::Read).await?;
         let rows = sqlx::query_as::<_, (i64, Vec<u8>)>(
             "SELECT transition_seq, events_data FROM history_batch
@@ -381,6 +472,7 @@ impl RunRepository for DsqlRunRepository {
                 })
             })
             .collect()
+        })
     }
 
     #[instrument(name = "dsql.commit_transition", skip(self, transition), fields(run_key = %run_key.0, expected_seq = transition.expected_seq.0, epoch = epoch.0))]
@@ -390,6 +482,7 @@ impl RunRepository for DsqlRunRepository {
         transition: Transition,
         epoch: ShardEpoch,
     ) -> Result<CommitResult> {
+        record_dsql_operation!(self, "commit_transition", Some(self.shard_for_run_key(run_key)), {
         // Validate i64 conversions before acquiring a connection or starting a
         // transaction. This prevents mid-transaction failures from overflow on
         // values that are structurally u64 but stored as BIGINT (i64) in DSQL.
@@ -514,7 +607,10 @@ impl RunRepository for DsqlRunRepository {
 
         write_transition(&mut tx, run_key, shard_id, &transition, &state).await?;
         match tx.commit().await {
-            Ok(()) => Ok(CommitResult::Applied { new_state: state }),
+            Ok(()) => {
+                metrics::record_dsql_commit_retries(0);
+                Ok(CommitResult::Applied { new_state: state })
+            }
             // Aurora DSQL can reject a transaction at commit because another
             // transaction won serialization. The runtime already knows how to
             // reload and retry `Conflict`, so normalize SQLSTATE 40001 here.
@@ -523,6 +619,7 @@ impl RunRepository for DsqlRunRepository {
             }),
             Err(err) => Err(err.into()),
         }
+        })
     }
 
     #[instrument(name = "dsql.commit_transition_for_bundle", skip(self, transition), fields(run_key = %run_key.0, bundle = execution_home_bundle.0, expected_seq = transition.expected_seq.0, epoch = epoch.0))]
@@ -533,6 +630,7 @@ impl RunRepository for DsqlRunRepository {
         transition: Transition,
         epoch: ShardEpoch,
     ) -> Result<CommitResult> {
+        record_dsql_operation!(self, "commit_transition_for_bundle", Some(execution_home_bundle), {
         if should_check_epoch(epoch) {
             convert::i64_from_u64(epoch.0, "caller shard epoch")?;
             let mut permit = self.director.acquire(DbClass::Commit).await?;
@@ -565,6 +663,7 @@ impl RunRepository for DsqlRunRepository {
 
         self.commit_transition(run_key, transition, ShardEpoch::ZERO)
             .await
+        })
     }
 
     #[instrument(name = "dsql.materialize_reset_successor", skip(self), fields(base_run_key = %base_run_key.0, fork_event_id, successor_run_id = %successor_run_id.0))]
@@ -574,6 +673,7 @@ impl RunRepository for DsqlRunRepository {
         fork_event_id: i64,
         successor_run_id: RunId,
     ) -> Result<()> {
+        record_dsql_operation!(self, "materialize_reset_successor", Some(self.shard_for_run_key(base_run_key)), {
         let mut permit = self.director.acquire(DbClass::Commit).await?;
         let mut tx = permit.connection()?.begin().await?;
 
@@ -673,6 +773,7 @@ impl RunRepository for DsqlRunRepository {
         }
         tx.commit().await?;
         Ok(())
+        })
     }
 
     #[instrument(name = "dsql.list_dispatchable_workflow_tasks", skip(self), fields(namespace_id = %queue.namespace_id.0, task_queue = %queue.task_queue.0, limit))]
@@ -681,7 +782,9 @@ impl RunRepository for DsqlRunRepository {
         queue: &QueueKey,
         limit: usize,
     ) -> Result<Vec<DispatchableWorkflowTask>> {
+        record_dsql_operation!(self, "list_dispatchable_workflow_tasks", None, {
         if limit == 0 {
+            metrics::record_dsql_rows_read("list_dispatchable_workflow_tasks", 0);
             return Ok(Vec::new());
         }
 
@@ -694,8 +797,10 @@ impl RunRepository for DsqlRunRepository {
         .bind(queue.namespace_id.0)
         .fetch_all(permit.connection()?)
         .await?;
+        metrics::record_dsql_rows_read("list_dispatchable_workflow_tasks", rows.len());
 
         collect_dispatchable_workflow_tasks(rows, Some(queue), limit)
+        })
     }
 
     #[instrument(name = "dsql.list_dispatchable_activity_tasks", skip(self), fields(namespace_id = %queue.namespace_id.0, task_queue = %queue.task_queue.0, limit))]
@@ -704,7 +809,9 @@ impl RunRepository for DsqlRunRepository {
         queue: &QueueKey,
         limit: usize,
     ) -> Result<Vec<DispatchableActivityTask>> {
+        record_dsql_operation!(self, "list_dispatchable_activity_tasks", None, {
         if limit == 0 {
+            metrics::record_dsql_rows_read("list_dispatchable_activity_tasks", 0);
             return Ok(Vec::new());
         }
 
@@ -731,15 +838,20 @@ impl RunRepository for DsqlRunRepository {
         .bind(i64::try_from(limit)?)
         .fetch_all(permit.connection()?)
         .await?;
+        metrics::record_dsql_rows_read("list_dispatchable_activity_tasks", rows.len());
 
         rows.into_iter().map(activity_dispatch_from_row).collect()
+        })
     }
 
     async fn persist_to_backlog(&self, entries: Vec<BacklogEntry>) -> Result<()> {
+        record_dsql_operation!(self, "persist_to_backlog", None, {
         if entries.is_empty() {
+            metrics::record_dsql_rows_written("persist_to_backlog", 0);
             return Ok(());
         }
 
+        let row_count = entries.len() as u64;
         let mut permit = self.director.acquire(DbClass::Commit).await?;
         let mut tx = permit.connection()?.begin().await?;
         for entry in entries {
@@ -779,11 +891,16 @@ impl RunRepository for DsqlRunRepository {
             .await?;
         }
         tx.commit().await?;
+        metrics::record_dsql_rows_written("persist_to_backlog", row_count);
         Ok(())
+        })
     }
 
     async fn drain_backlog(&self, queue: &QueueKey, limit: usize) -> Result<Vec<BacklogEntry>> {
+        record_dsql_operation!(self, "drain_backlog", None, {
         if limit == 0 {
+            metrics::record_dsql_rows_read("drain_backlog", 0);
+            metrics::record_dsql_rows_written("drain_backlog", 0);
             return Ok(Vec::new());
         }
 
@@ -810,6 +927,7 @@ impl RunRepository for DsqlRunRepository {
         .bind(i64::try_from(limit)?)
         .fetch_all(&mut *tx)
         .await?;
+        metrics::record_dsql_rows_read("drain_backlog", rows.len());
 
         let mut drained = Vec::with_capacity(rows.len());
         for (
@@ -845,12 +963,16 @@ impl RunRepository for DsqlRunRepository {
             });
         }
         tx.commit().await?;
+        metrics::record_dsql_rows_written("drain_backlog", drained.len() as u64);
         Ok(drained)
+        })
     }
 
     #[instrument(name = "dsql.list_due_timers", skip(self), fields(limit))]
     async fn list_due_timers(&self, now: OffsetDateTime, limit: usize) -> Result<Vec<DueTimer>> {
+        record_dsql_operation!(self, "list_due_timers", None, {
         if limit == 0 {
+            metrics::record_dsql_rows_read("list_due_timers", 0);
             return Ok(Vec::new());
         }
 
@@ -866,7 +988,9 @@ impl RunRepository for DsqlRunRepository {
             );
         }
         due.truncate(limit);
+        metrics::record_dsql_rows_read("list_due_timers", due.len());
         Ok(due)
+        })
     }
 
     #[instrument(name = "dsql.list_dispatchable_workflow_tasks_for_shard", skip(self), fields(shard_id = shard_id.0, limit))]
@@ -875,7 +999,9 @@ impl RunRepository for DsqlRunRepository {
         shard_id: ShardId,
         limit: usize,
     ) -> Result<Vec<DispatchableWorkflowTask>> {
+        record_dsql_operation!(self, "list_dispatchable_workflow_tasks_for_shard", Some(shard_id), {
         if limit == 0 {
+            metrics::record_dsql_rows_read("list_dispatchable_workflow_tasks_for_shard", 0);
             return Ok(Vec::new());
         }
 
@@ -888,8 +1014,10 @@ impl RunRepository for DsqlRunRepository {
         .bind(Self::shard_id_to_uuid(shard_id))
         .fetch_all(permit.connection()?)
         .await?;
+        metrics::record_dsql_rows_read("list_dispatchable_workflow_tasks_for_shard", rows.len());
 
         collect_dispatchable_workflow_tasks(rows, None, limit)
+        })
     }
 
     #[instrument(name = "dsql.list_dispatchable_activity_tasks_for_shard", skip(self), fields(shard_id = shard_id.0, limit))]
@@ -898,7 +1026,9 @@ impl RunRepository for DsqlRunRepository {
         shard_id: ShardId,
         limit: usize,
     ) -> Result<Vec<DispatchableActivityTask>> {
+        record_dsql_operation!(self, "list_dispatchable_activity_tasks_for_shard", Some(shard_id), {
         if limit == 0 {
+            metrics::record_dsql_rows_read("list_dispatchable_activity_tasks_for_shard", 0);
             return Ok(Vec::new());
         }
 
@@ -915,8 +1045,10 @@ impl RunRepository for DsqlRunRepository {
         .bind(i64::try_from(limit)?)
         .fetch_all(permit.connection()?)
         .await?;
+        metrics::record_dsql_rows_read("list_dispatchable_activity_tasks_for_shard", rows.len());
 
         rows.into_iter().map(activity_dispatch_from_row).collect()
+        })
     }
 
     #[instrument(name = "dsql.list_due_timers_for_shard", skip(self), fields(shard_id = shard_id.0, limit))]
@@ -926,7 +1058,9 @@ impl RunRepository for DsqlRunRepository {
         now: OffsetDateTime,
         limit: usize,
     ) -> Result<Vec<DueTimer>> {
+        record_dsql_operation!(self, "list_due_timers_for_shard", Some(shard_id), {
         if limit == 0 {
+            metrics::record_dsql_rows_read("list_due_timers_for_shard", 0);
             return Ok(Vec::new());
         }
 
@@ -943,6 +1077,7 @@ impl RunRepository for DsqlRunRepository {
         .bind(i64::try_from(limit)?)
         .fetch_all(permit.connection()?)
         .await?;
+        metrics::record_dsql_rows_read("list_due_timers_for_shard", rows.len());
 
         Ok(rows
             .into_iter()
@@ -951,6 +1086,7 @@ impl RunRepository for DsqlRunRepository {
                 timer_id,
             })
             .collect())
+        })
     }
 
     #[instrument(name = "dsql.list_runs_with_workflow_timeouts_for_shard", skip(self), fields(shard_id = shard_id.0, limit))]
@@ -959,7 +1095,9 @@ impl RunRepository for DsqlRunRepository {
         shard_id: ShardId,
         limit: usize,
     ) -> Result<Vec<WorkflowTimeoutSweepEntry>> {
+        record_dsql_operation!(self, "list_runs_with_workflow_timeouts_for_shard", Some(shard_id), {
         if limit == 0 {
+            metrics::record_dsql_rows_read("list_runs_with_workflow_timeouts_for_shard", 0);
             return Ok(Vec::new());
         }
 
@@ -972,8 +1110,10 @@ impl RunRepository for DsqlRunRepository {
         .bind(Self::shard_id_to_uuid(shard_id))
         .fetch_all(permit.connection()?)
         .await?;
+        metrics::record_dsql_rows_read("list_runs_with_workflow_timeouts_for_shard", rows.len());
 
         collect_workflow_timeout_entries(rows, limit)
+        })
     }
 
     #[instrument(name = "dsql.list_started_workflow_tasks_for_shard", skip(self), fields(shard_id = shard_id.0, limit))]
@@ -982,7 +1122,9 @@ impl RunRepository for DsqlRunRepository {
         shard_id: ShardId,
         limit: usize,
     ) -> Result<Vec<WftTimeoutSweepEntry>> {
+        record_dsql_operation!(self, "list_started_workflow_tasks_for_shard", Some(shard_id), {
         if limit == 0 {
+            metrics::record_dsql_rows_read("list_started_workflow_tasks_for_shard", 0);
             return Ok(Vec::new());
         }
 
@@ -995,8 +1137,10 @@ impl RunRepository for DsqlRunRepository {
         .bind(Self::shard_id_to_uuid(shard_id))
         .fetch_all(permit.connection()?)
         .await?;
+        metrics::record_dsql_rows_read("list_started_workflow_tasks_for_shard", rows.len());
 
         collect_started_workflow_task_entries(rows, limit)
+        })
     }
 
     #[instrument(name = "dsql.list_open_activities_for_shard", skip(self), fields(shard_id = shard_id.0, limit))]
@@ -1005,7 +1149,9 @@ impl RunRepository for DsqlRunRepository {
         shard_id: ShardId,
         limit: usize,
     ) -> Result<Vec<ActivitySweepEntry>> {
+        record_dsql_operation!(self, "list_open_activities_for_shard", Some(shard_id), {
         if limit == 0 {
+            metrics::record_dsql_rows_read("list_open_activities_for_shard", 0);
             return Ok(Vec::new());
         }
 
@@ -1020,8 +1166,10 @@ impl RunRepository for DsqlRunRepository {
         .bind(i64::try_from(limit)?)
         .fetch_all(permit.connection()?)
         .await?;
+        metrics::record_dsql_rows_read("list_open_activities_for_shard", rows.len());
 
         collect_activity_sweep_entries(rows)
+        })
     }
 
     #[instrument(name = "dsql.list_pending_nexus_operations_for_shard", skip(self), fields(shard_id = shard_id.0, limit))]
@@ -1030,7 +1178,9 @@ impl RunRepository for DsqlRunRepository {
         shard_id: ShardId,
         limit: usize,
     ) -> Result<Vec<NexusSweepEntry>> {
+        record_dsql_operation!(self, "list_pending_nexus_operations_for_shard", Some(shard_id), {
         if limit == 0 {
+            metrics::record_dsql_rows_read("list_pending_nexus_operations_for_shard", 0);
             return Ok(Vec::new());
         }
 
@@ -1043,8 +1193,10 @@ impl RunRepository for DsqlRunRepository {
         .bind(Self::shard_id_to_uuid(shard_id))
         .fetch_all(permit.connection()?)
         .await?;
+        metrics::record_dsql_rows_read("list_pending_nexus_operations_for_shard", rows.len());
 
         collect_nexus_sweep_entries(rows, limit)
+        })
     }
 }
 
@@ -1057,6 +1209,7 @@ impl LeaseRepository for DsqlRunRepository {
         owner: String,
         node_endpoint: String,
     ) -> Result<LeaseOutcome> {
+        record_dsql_operation!(self, "try_acquire_bundle", Some(bundle), {
         let shard_uuid = Self::shard_id_to_uuid(bundle);
         let app_now = OffsetDateTime::now_utc();
         let new_expiry = app_now + self.lease_duration;
@@ -1172,6 +1325,7 @@ impl LeaseRepository for DsqlRunRepository {
                 bail!("acquire interpretation unexpectedly returned renewed outcome");
             }
         }
+        })
     }
 
     #[instrument(name = "dsql.renew_bundle", skip(self), fields(shard_id = bundle.0, owner = %owner, epoch = epoch.0))]
@@ -1182,6 +1336,7 @@ impl LeaseRepository for DsqlRunRepository {
         epoch: ShardEpoch,
         node_endpoint: String,
     ) -> Result<LeaseOutcome> {
+        record_dsql_operation!(self, "renew_bundle", Some(bundle), {
         let caller_epoch = epoch_to_sql(epoch)?;
         let shard_uuid = Self::shard_id_to_uuid(bundle);
         let new_expiry = OffsetDateTime::now_utc() + self.lease_duration;
@@ -1249,10 +1404,12 @@ impl LeaseRepository for DsqlRunRepository {
                 })
             }
         }
+        })
     }
 
     #[instrument(name = "dsql.list_bundle_leases", skip(self))]
     async fn list_bundle_leases(&self) -> Result<Vec<BundleLease>> {
+        record_dsql_operation!(self, "list_bundle_leases", None, {
         let mut permit = self.director.acquire(DbClass::Control).await?;
         let rows =
             sqlx::query_as::<_, (Uuid, Option<String>, i64, OffsetDateTime, Option<String>)>(
@@ -1273,6 +1430,7 @@ impl LeaseRepository for DsqlRunRepository {
                 })
             })
             .collect()
+        })
     }
 
     #[instrument(name = "dsql.relinquish_bundle", skip(self), fields(shard_id = bundle.0, owner = %owner, epoch = epoch.0))]
@@ -1282,6 +1440,7 @@ impl LeaseRepository for DsqlRunRepository {
         owner: String,
         epoch: ShardEpoch,
     ) -> Result<LeaseOutcome> {
+        record_dsql_operation!(self, "relinquish_bundle", Some(bundle), {
         let shard_uuid = Self::shard_id_to_uuid(bundle);
         let caller_epoch = epoch_to_sql(epoch)?;
         let mut permit = self.director.acquire(DbClass::Control).await?;
@@ -1321,6 +1480,7 @@ impl LeaseRepository for DsqlRunRepository {
             current_owner: current_owner.unwrap_or_default(),
             current_epoch: epoch_from_sql(current_epoch)?,
         })
+        })
     }
 }
 
@@ -1331,6 +1491,7 @@ impl ControlRepository for DsqlRunRepository {
         &self,
         expected: GenerationCounter,
     ) -> Result<GenerationAdvanceResult> {
+        record_dsql_operation!(self, "advance_generation", None, {
         let expected = convert::i64_from_u64(expected.0, "routing_generation.generation")?;
         let mut permit = self.director.acquire(DbClass::Control).await?;
         let row = sqlx::query_as::<_, (i64,)>(
@@ -1353,10 +1514,12 @@ impl ControlRepository for DsqlRunRepository {
                 self.current_generation().await?,
             )),
         }
+        })
     }
 
     #[instrument(name = "dsql.current_generation", skip(self))]
     async fn current_generation(&self) -> Result<GenerationCounter> {
+        record_dsql_operation!(self, "current_generation", None, {
         let mut permit = self.director.acquire(DbClass::Control).await?;
         let (generation,) =
             sqlx::query_as::<_, (i64,)>("SELECT generation FROM routing_generation WHERE id = 1")
@@ -1367,6 +1530,7 @@ impl ControlRepository for DsqlRunRepository {
             generation,
             "routing_generation.generation",
         )?))
+        })
     }
 
     #[instrument(name = "dsql.allocate_budget", skip(self), fields(expected_version, allocator_id = %allocator_id))]
@@ -1377,6 +1541,7 @@ impl ControlRepository for DsqlRunRepository {
         rate_budget: f64,
         capacity_budget: u64,
     ) -> Result<BudgetAllocationResult> {
+        record_dsql_operation!(self, "allocate_budget", None, {
         let expected_version =
             convert::i64_from_u64(expected_version, "budget_allocation.version")?;
         let capacity_budget =
@@ -1408,10 +1573,12 @@ impl ControlRepository for DsqlRunRepository {
                 current_version: self.current_budget_version().await?,
             }),
         }
+        })
     }
 
     #[instrument(name = "dsql.current_budget_version", skip(self))]
     async fn current_budget_version(&self) -> Result<u64> {
+        record_dsql_operation!(self, "current_budget_version", None, {
         let mut permit = self.director.acquire(DbClass::Control).await?;
         let (version,) =
             sqlx::query_as::<_, (i64,)>("SELECT version FROM budget_allocation WHERE id = 1")
@@ -1419,6 +1586,7 @@ impl ControlRepository for DsqlRunRepository {
                 .await
                 .context("failed to read budget allocation version")?;
         convert::u64_from_i64(version, "budget_allocation.version")
+        })
     }
 }
 

@@ -19,7 +19,10 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use aurora_dsql_sqlx_connector::DsqlConnectOptions;
 use sqlx::{PgConnection, PgPool, Pool, Postgres, pool::PoolConnection};
-use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::{
+    sync::{OwnedSemaphorePermit, RwLock, Semaphore},
+    task::JoinHandle,
+};
 
 use crate::{ConnectionDirector, DbClass, metrics};
 
@@ -155,9 +158,13 @@ impl ClassBudgets {
 #[derive(Debug)]
 pub struct DsqlConnectionDirector {
     /// Warm physical connections managed independently of operation class.
-    reservoir: Reservoir,
+    reservoir: Arc<Reservoir>,
     /// Logical admission limits layered on top of the reservoir.
-    class_budgets: ClassBudgets,
+    class_budgets: Arc<ClassBudgets>,
+    /// Number of permits currently holding a physical connection.
+    in_flight: Arc<AtomicUsize>,
+    /// Periodic reporter for class budget and reservoir snapshots.
+    reporter_handle: JoinHandle<()>,
 }
 
 impl DsqlConnectionDirector {
@@ -165,11 +172,21 @@ impl DsqlConnectionDirector {
     pub async fn start(config: DsqlPoolConfig, connector: DsqlConnector) -> Result<Self> {
         let rate_limiter =
             TokenBucketRateLimiter::new(config.connection_rate_per_second, config.burst_capacity);
-        let reservoir = Reservoir::start(config.reservoir.clone(), connector, rate_limiter).await?;
-        let class_budgets = ClassBudgets::new(&default_allocations(&config.reservoir))?;
+        let reservoir = Arc::new(
+            Reservoir::start(config.reservoir.clone(), connector, rate_limiter).await?,
+        );
+        let class_budgets = Arc::new(ClassBudgets::new(&default_allocations(&config.reservoir))?);
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let reporter_handle = spawn_periodic_reporter(
+            Arc::clone(&class_budgets),
+            Arc::clone(&reservoir),
+            Arc::clone(&in_flight),
+        );
         Ok(Self {
             reservoir,
             class_budgets,
+            in_flight,
+            reporter_handle,
         })
     }
 
@@ -189,13 +206,23 @@ impl ConnectionDirector for DsqlConnectionDirector {
         let started = Instant::now();
         let class_guard = self.class_budgets.acquire(class).await?;
         let entry = self.reservoir.checkout().await?;
+        let in_flight = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
         metrics::record_dsql_pool_checkout_duration(db_class_label(class), started.elapsed());
+        metrics::set_dsql_reservoir_in_flight(in_flight);
+        metrics::set_dsql_reservoir_utilization_ratio(in_flight, self.reservoir.ready_count());
         Ok(DsqlPermit::new(
             class,
             entry,
             class_guard,
             self.reservoir.return_sender(),
+            Arc::clone(&self.in_flight),
         ))
+    }
+}
+
+impl Drop for DsqlConnectionDirector {
+    fn drop(&mut self) {
+        self.reporter_handle.abort();
     }
 }
 
@@ -229,6 +256,8 @@ pub struct DsqlPermit {
     _class_guard: OwnedSemaphorePermit,
     /// Synchronous return path into the reservoir return processor.
     reservoir_return: tokio::sync::mpsc::UnboundedSender<ReservoirEntry>,
+    /// Shared in-flight counter owned by the director.
+    director_in_flight: Arc<AtomicUsize>,
 }
 
 impl DsqlPermit {
@@ -237,6 +266,7 @@ impl DsqlPermit {
         entry: ReservoirEntry,
         class_guard: OwnedSemaphorePermit,
         reservoir_return: tokio::sync::mpsc::UnboundedSender<ReservoirEntry>,
+        director_in_flight: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             class,
@@ -245,6 +275,7 @@ impl DsqlPermit {
             max_lifetime: entry.max_lifetime,
             _class_guard: class_guard,
             reservoir_return,
+            director_in_flight,
         }
     }
 
@@ -258,6 +289,8 @@ impl DsqlPermit {
 
 impl Drop for DsqlPermit {
     fn drop(&mut self) {
+        let previous = self.director_in_flight.fetch_sub(1, Ordering::AcqRel);
+        metrics::set_dsql_reservoir_in_flight(previous.saturating_sub(1));
         // Dropping the permit is the storage-layer "return connection" API.
         // Expired connections are intentionally discarded here because handing
         // them back to the ready pool would create rare mid-transaction expiry
@@ -270,10 +303,30 @@ impl Drop for DsqlPermit {
                     max_lifetime: self.max_lifetime,
                 });
             } else {
+                metrics::record_dsql_reservoir_connection_age("expired", self.created_at.elapsed());
                 metrics::record_dsql_pool_connection_retired("expired");
             }
         }
     }
+}
+
+fn spawn_periodic_reporter(
+    class_budgets: Arc<ClassBudgets>,
+    reservoir: Arc<Reservoir>,
+    in_flight: Arc<AtomicUsize>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            class_budgets.record_metrics().await;
+            let ready = reservoir.ready_count();
+            let in_flight = in_flight.load(Ordering::Acquire);
+            metrics::record_dsql_pool_connections_total(ready);
+            metrics::set_dsql_reservoir_in_flight(in_flight);
+            metrics::set_dsql_reservoir_utilization_ratio(in_flight, ready);
+        }
+    })
 }
 
 fn validate_allocations(allocations: &HashMap<DbClass, usize>) -> Result<usize> {

@@ -5,7 +5,7 @@
 //! DSQL connection foundation and codecs; projection owns how semantic projection
 //! ops become visibility rows.
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc, time::Instant};
 
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
@@ -27,7 +27,7 @@ use tracing::{instrument, warn};
 use uuid::Uuid;
 
 use crate::{
-    ProjectionSink, VisibilityStore,
+    ProjectionSink, VisibilityStore, metrics as projection_metrics,
     rollup::compute_rollup_deltas,
     types::{
         AttrDescriptor, AttrId, CompareOp, CompiledFilter, CountResult, ExecutionRow, FieldRef,
@@ -157,7 +157,15 @@ impl VisibilityStore for DsqlVisibilityStore {
         query = bind_sql_values(query, &values);
         query = query.bind(i64::try_from(limit + 1)?);
         let mut permit = self.director.acquire(DbClass::Projection).await?;
-        let rows = query.fetch_all(permit.connection()?).await?;
+        let referenced_tables = referenced_search_attr_index_tables(filter, None)?;
+        let started = Instant::now();
+        let rows = query.fetch_all(permit.connection()?).await;
+        let duration = started.elapsed();
+        projection_metrics::record_visibility_query_duration("list", duration);
+        for table in referenced_tables {
+            projection_metrics::record_sa_index_scan_duration(table, duration);
+        }
+        let rows = rows?;
         let mut executions = rows
             .into_iter()
             .map(row_to_execution)
@@ -186,7 +194,13 @@ impl VisibilityStore for DsqlVisibilityStore {
         filter: &CompiledFilter,
         group_by: Option<GroupByField>,
     ) -> Result<CountResult> {
-        match group_by {
+        let group_attr_type = match group_by.as_ref() {
+            Some(GroupByField::Custom { attr_type, .. }) => Some(*attr_type),
+            _ => None,
+        };
+        let referenced_tables = referenced_search_attr_index_tables(filter, group_attr_type)?;
+        let started = Instant::now();
+        let result = match group_by {
             Some(GroupByField::Custom {
                 attr_id, attr_type, ..
             }) => {
@@ -203,7 +217,13 @@ impl VisibilityStore for DsqlVisibilityStore {
                 count_system_group(self.director.as_ref(), namespace_id, filter, field).await
             }
             None => count_without_group(self.director.as_ref(), namespace_id, filter).await,
+        };
+        let duration = started.elapsed();
+        projection_metrics::record_visibility_query_duration("count", duration);
+        for table in referenced_tables {
+            projection_metrics::record_sa_index_scan_duration(table, duration);
         }
+        result
     }
 
     async fn count_from_rollup(
@@ -258,7 +278,8 @@ impl VisibilityStore for DsqlVisibilityStore {
         let fanout = i16_from_u16(cursor.fanout, "projection cursor fanout")?;
         let data = codec::encode_projection_cursor(cursor)?;
         let mut permit = self.director.acquire(DbClass::Projection).await?;
-        sqlx::query(
+        let started = Instant::now();
+        let result = sqlx::query(
             r#"
             INSERT INTO projector_checkpoint (
                 sink_id,
@@ -278,7 +299,12 @@ impl VisibilityStore for DsqlVisibilityStore {
         .bind(fanout)
         .bind(data)
         .execute(permit.connection()?)
-        .await?;
+        .await;
+        projection_metrics::record_checkpoint_write_duration(
+            cursor.partition_id,
+            started.elapsed(),
+        );
+        result?;
         Ok(())
     }
 
@@ -874,6 +900,41 @@ fn compile_filter(
     let mut compiler = SqlCompiler::new(param_offset);
     let sql = compile_expr(expr, &mut compiler)?;
     Ok((format!("AND {sql}"), compiler.values, compiler.next_param))
+}
+
+fn referenced_search_attr_index_tables(
+    filter: &CompiledFilter,
+    group_attr_type: Option<SearchAttrType>,
+) -> Result<Vec<&'static str>> {
+    let mut tables = BTreeSet::new();
+    if let Some(expr) = &filter.expr {
+        collect_referenced_tables(expr, &mut tables)?;
+    }
+    if let Some(attr_type) = group_attr_type {
+        tables.insert(index_table(attr_type)?);
+    }
+    Ok(tables.into_iter().collect())
+}
+
+fn collect_referenced_tables(
+    expr: &FilterExpr,
+    tables: &mut BTreeSet<&'static str>,
+) -> Result<()> {
+    match expr {
+        FilterExpr::And(lhs, rhs) | FilterExpr::Or(lhs, rhs) => {
+            collect_referenced_tables(lhs, tables)?;
+            collect_referenced_tables(rhs, tables)?;
+        }
+        FilterExpr::Compare { field, .. }
+        | FilterExpr::In { field, .. }
+        | FilterExpr::Between { field, .. }
+        | FilterExpr::StartsWith { field, .. } => {
+            if let FieldRef::Custom { attr_type, .. } = field {
+                tables.insert(index_table(*attr_type)?);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn compile_expr(expr: &FilterExpr, compiler: &mut SqlCompiler) -> Result<String> {

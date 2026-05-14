@@ -50,9 +50,17 @@ impl TokenBucketRateLimiter {
     /// The short async delay avoids a CPU spin while keeping connection
     /// creation responsive under startup pressure.
     pub async fn acquire(&self) {
+        let mut throttle_start = None;
         loop {
             if self.try_acquire() {
+                if let Some(started) = throttle_start {
+                    metrics::record_dsql_rate_limiter_throttle_duration(started.elapsed());
+                }
                 return;
+            }
+            if throttle_start.is_none() {
+                metrics::record_dsql_rate_limiter_throttled();
+                throttle_start = Some(Instant::now());
             }
             tokio::time::sleep(StdDuration::from_millis(5)).await;
         }
@@ -65,6 +73,7 @@ impl TokenBucketRateLimiter {
         loop {
             let current = self.tokens.load(Ordering::Acquire);
             if current < one {
+                metrics::set_dsql_rate_limiter_tokens_remaining(current as f64 / SCALE as f64);
                 return false;
             }
             if self
@@ -76,6 +85,7 @@ impl TokenBucketRateLimiter {
                     self.available_tokens(),
                     self.rate_per_second(),
                 );
+                metrics::set_dsql_rate_limiter_tokens_remaining(self.available_tokens());
                 return true;
             }
         }
@@ -96,6 +106,7 @@ impl TokenBucketRateLimiter {
             self.tokens.store(capacity_fixed, Ordering::Release);
         }
         metrics::record_dsql_pool_rate_limiter(self.available_tokens(), rate_per_second);
+        metrics::set_dsql_rate_limiter_tokens_remaining(self.available_tokens());
     }
 
     /// Current token count in human-readable whole-token units.
@@ -135,6 +146,7 @@ impl TokenBucketRateLimiter {
                 .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
+                metrics::set_dsql_rate_limiter_tokens_remaining(next as f64 / SCALE as f64);
                 return;
             }
         }

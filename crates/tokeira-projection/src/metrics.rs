@@ -9,12 +9,27 @@ pub const RECORDS_PROCESSED_TOTAL: &str = "tokeira_projection_records_processed_
 pub const LAG_RECORDS: &str = "tokeira_projection_worker_lag_records";
 pub const SINK_WRITE_DURATION_SECONDS: &str = "tokeira_projection_sink_write_duration_seconds";
 pub const SINK_ERROR_TOTAL: &str = "tokeira_projection_sink_error_total";
+pub const VISIBILITY_QUERY_DURATION_SECONDS: &str =
+    "tokeira_projection_visibility_query_duration_seconds";
+pub const SA_INDEX_SCAN_DURATION_SECONDS: &str =
+    "tokeira_projection_sa_index_scan_duration_seconds";
+pub const CHECKPOINT_WRITE_DURATION_SECONDS: &str =
+    "tokeira_projection_checkpoint_write_duration_seconds";
 
 pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (RECORDS_PROCESSED_TOTAL, MetricType::Counter),
     (LAG_RECORDS, MetricType::Gauge),
     (SINK_WRITE_DURATION_SECONDS, MetricType::DurationHistogram),
     (SINK_ERROR_TOTAL, MetricType::Counter),
+    (
+        VISIBILITY_QUERY_DURATION_SECONDS,
+        MetricType::DurationHistogram,
+    ),
+    (SA_INDEX_SCAN_DURATION_SECONDS, MetricType::DurationHistogram),
+    (
+        CHECKPOINT_WRITE_DURATION_SECONDS,
+        MetricType::DurationHistogram,
+    ),
 ];
 
 pub fn record_records_processed(partition_id: u32, count: usize) {
@@ -36,6 +51,24 @@ pub fn record_sink_write_duration(partition_id: u32, duration: std::time::Durati
 
 pub fn record_sink_error(partition_id: u32) {
     counter!(SINK_ERROR_TOTAL, "partition_id" => partition_id.to_string()).increment(1);
+}
+
+pub fn record_visibility_query_duration(query_type: &'static str, duration: std::time::Duration) {
+    histogram!(VISIBILITY_QUERY_DURATION_SECONDS, "query_type" => query_type)
+        .record(duration.as_secs_f64());
+}
+
+pub fn record_sa_index_scan_duration(index_table: &'static str, duration: std::time::Duration) {
+    histogram!(SA_INDEX_SCAN_DURATION_SECONDS, "index_table" => index_table)
+        .record(duration.as_secs_f64());
+}
+
+pub fn record_checkpoint_write_duration(partition_id: u32, duration: std::time::Duration) {
+    histogram!(
+        CHECKPOINT_WRITE_DURATION_SECONDS,
+        "partition_id" => partition_id.to_string(),
+    )
+    .record(duration.as_secs_f64());
 }
 
 #[cfg(test)]

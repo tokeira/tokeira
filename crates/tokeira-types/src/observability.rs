@@ -28,6 +28,7 @@ pub const LABEL_STATUS: &str = "status";
 pub enum MetricType {
     Counter,
     Gauge,
+    Histogram,
     DurationHistogram,
     SizeHistogram,
 }
@@ -150,6 +151,7 @@ mod tests {
             metric_type in prop_oneof![
                 Just(MetricType::Counter),
                 Just(MetricType::Gauge),
+                Just(MetricType::Histogram),
                 Just(MetricType::DurationHistogram),
                 Just(MetricType::SizeHistogram),
             ],
@@ -159,6 +161,7 @@ mod tests {
             let suffix = match metric_type {
                 MetricType::Counter => "total".to_string(),
                 MetricType::Gauge => unit,
+                MetricType::Histogram => unit,
                 MetricType::DurationHistogram => "seconds".to_string(),
                 MetricType::SizeHistogram => "bytes".to_string(),
             };

@@ -5,7 +5,7 @@
 //! This module deliberately owns only the read side; checkpointing belongs to the
 //! projection sink because that is the surface the live worker already calls.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::{
     DbClass, ProjectionBatch, ProjectionContext, ProjectionLog, ProjectionRecord,
     dsql::{DsqlConnectionAcquirer, DsqlConnectionDirector, codec, convert},
+    metrics,
 };
 
 #[derive(Clone, Debug)]
@@ -42,12 +43,14 @@ impl ProjectionLog for DsqlProjectionLog {
     async fn read_from(&self, cursor: &ProjectionCursor, limit: usize) -> Result<ProjectionBatch> {
         validate_cursor_position(cursor)?;
         if limit == 0 {
+            metrics::record_dsql_projection_batch_size(cursor.partition_id, 0);
             return Ok(ProjectionBatch {
                 records: Vec::new(),
                 next_cursor: cursor.clone(),
             });
         }
 
+        let started = Instant::now();
         let partition_id =
             convert::i32_from_u32(cursor.partition_id, "projection cursor partition_id")?;
         let fanout = convert::i16_from_u16(cursor.fanout, "projection cursor fanout")?;
@@ -96,6 +99,8 @@ impl ProjectionLog for DsqlProjectionLog {
             }
             _ => unreachable!("cursor position is validated before query construction"),
         };
+        metrics::record_dsql_projection_read_duration(cursor.partition_id, started.elapsed());
+        metrics::record_dsql_projection_batch_size(cursor.partition_id, rows.len());
 
         let records = decode_projection_rows(cursor.partition_id, cursor.fanout, rows)?;
         let next_cursor = records

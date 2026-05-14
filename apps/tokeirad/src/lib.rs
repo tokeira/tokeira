@@ -60,8 +60,8 @@ use tokeira_runtime::{
     ScheduleEngineConfig, ScheduleStore, TokeiraRuntime, VersioningRuleStore, run_schedule_engine,
 };
 use tokeira_storage::{
-    DsqlAuthConfig, DsqlPoolConfig, DsqlStore, InMemoryStore, LeaseRepository, ProjectionLog,
-    RunRepository,
+    InMemoryStore, LeaseRepository, ProjectionLog, RunRepository,
+    dsql::{DsqlAuthConfig, DsqlPoolConfig, DsqlStore},
 };
 use tokeira_types::{
     ExecutionRef, IncarnationId, NamespaceId, NodeEndpoint, PlacementConfig, ProjectionCursor,

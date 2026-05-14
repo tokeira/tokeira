@@ -319,7 +319,7 @@ Add comprehensive metrics instrumentation to the DSQL storage and projection lay
     - Assert legend consistency (bottom-placed table, lastNotNull/mean/max calcs)
     - _Requirements: 12.1, 12.2, 16.1, 16.2, 16.3, 16.4, 16.5_
 
-- [ ] 17. Final checkpoint — Ensure all tests pass
+- [x] 17. Final checkpoint — Ensure all tests pass
   - Ensure all tests pass (`cargo test --workspace`), ask the user if questions arise.
 
 ## Notes

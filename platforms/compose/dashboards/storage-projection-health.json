@@ -2,77 +2,587 @@
   "uid": "tokeira-storage-projection-health",
   "title": "Tokeira Storage / Projection Health",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "refresh": "15s",
-  "tags": ["tokeira", "storage", "projection"],
+  "tags": [
+    "tokeira",
+    "storage",
+    "projection",
+    "dsql"
+  ],
   "timezone": "browser",
   "panels": [
     {
       "id": 1,
-      "type": "stat",
-      "title": "Build Info",
-      "datasource": { "type": "prometheus", "uid": "mimir" },
-      "targets": [
-        { "expr": "tokeira_build_info", "legendFormat": "{{version}} {{commit}}" }
-      ],
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 }
+      "type": "row",
+      "title": "Repository Operations",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      }
     },
     {
       "id": 2,
-      "type": "timeseries",
-      "title": "Storage Latency",
-      "datasource": { "type": "prometheus", "uid": "mimir" },
+      "type": "stat",
+      "title": "Commit p95",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
       "targets": [
-        { "expr": "histogram_quantile(0.95, sum by (le) (rate(tokeira_storage_commit_transition_duration_seconds_bucket[5m])))", "legendFormat": "commit p95" },
-        { "expr": "histogram_quantile(0.95, sum by (le) (rate(tokeira_storage_load_run_duration_seconds_bucket[5m])))", "legendFormat": "load run p95" },
-        { "expr": "histogram_quantile(0.95, sum by (le) (rate(tokeira_storage_read_history_duration_seconds_bucket[5m])))", "legendFormat": "read history p95" },
-        { "expr": "histogram_quantile(0.50, sum by (le) (rate(tokeira_storage_commit_transition_duration_seconds_bucket[5m])))", "legendFormat": "commit p50" },
-        { "expr": "histogram_quantile(0.99, sum by (le) (rate(tokeira_storage_commit_transition_duration_seconds_bucket[5m])))", "legendFormat": "commit p99" }
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(tokeira_storage_commit_transition_duration_seconds_bucket[5m])))",
+          "legendFormat": "commit p95"
+        }
       ],
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 }
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 1
+      },
+      "description": "p95 durable commit latency for workflow transitions. This is the main write-path health signal.",
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
     },
     {
       "id": 3,
-      "type": "timeseries",
-      "title": "Storage Operations",
-      "datasource": { "type": "prometheus", "uid": "mimir" },
+      "type": "stat",
+      "title": "Storage Error Rate",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
       "targets": [
-        { "expr": "sum by (operation, result) (rate(tokeira_storage_repository_operation_total[5m]))", "legendFormat": "{{operation}} {{result}}" }
+        {
+          "expr": "100 * sum(rate(tokeira_storage_repository_operation_total{outcome=\"error\"}[5m])) / clamp_min(sum(rate(tokeira_storage_repository_operation_total[5m])), 1)",
+          "legendFormat": "errors %"
+        }
       ],
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 }
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 1
+      },
+      "description": "Repository operation errors as a percentage of all repository operations.",
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
     },
     {
       "id": 4,
-      "type": "timeseries",
-      "title": "Projection Throughput",
-      "datasource": { "type": "prometheus", "uid": "mimir" },
+      "type": "stat",
+      "title": "Projection Lag",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
       "targets": [
-        { "expr": "sum by (partition) (rate(tokeira_projection_records_processed_total[5m]))", "legendFormat": "partition {{partition}}" }
+        {
+          "expr": "sum(tokeira_projection_worker_lag_records)",
+          "legendFormat": "records"
+        }
       ],
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 12 }
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 1
+      },
+      "description": "Current projection lag in records across all projection partitions.",
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
     },
     {
       "id": 5,
-      "type": "timeseries",
-      "title": "Projection Lag",
-      "datasource": { "type": "prometheus", "uid": "mimir" },
+      "type": "stat",
+      "title": "DSQL Connections",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
       "targets": [
-        { "expr": "sum by (partition) (tokeira_projection_worker_lag_records)", "legendFormat": "partition {{partition}}" }
+        {
+          "expr": "sum(tokeira_dsql_pool_connections_total)",
+          "legendFormat": "connections"
+        }
       ],
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 12 }
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 1
+      },
+      "description": "Current warmed/managed DSQL connections in the reservoir.",
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
     },
     {
       "id": 6,
       "type": "timeseries",
-      "title": "Sink Health",
-      "datasource": { "type": "prometheus", "uid": "mimir" },
+      "title": "Repository Operation Rate",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
       "targets": [
-        { "expr": "histogram_quantile(0.95, sum by (le) (rate(tokeira_projection_sink_write_duration_seconds_bucket[5m])))", "legendFormat": "write p95" },
-        { "expr": "histogram_quantile(0.50, sum by (le) (rate(tokeira_projection_sink_write_duration_seconds_bucket[5m])))", "legendFormat": "write p50" },
-        { "expr": "histogram_quantile(0.99, sum by (le) (rate(tokeira_projection_sink_write_duration_seconds_bucket[5m])))", "legendFormat": "write p99" },
-        { "expr": "sum(rate(tokeira_projection_sink_error_total[5m]))", "legendFormat": "errors" }
+        {
+          "expr": "sum by (operation, outcome) (rate(tokeira_storage_repository_operation_total[5m]))",
+          "legendFormat": "{{operation}} / {{outcome}}"
+        }
       ],
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 12 }
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 0,
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      },
+      "description": "Repository operation rate split by operation and outcome.",
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Repository Latency",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(tokeira_storage_commit_transition_duration_seconds_bucket[5m])))",
+          "legendFormat": "commit p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(tokeira_storage_commit_transition_duration_seconds_bucket[5m])))",
+          "legendFormat": "commit p95"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(tokeira_storage_load_run_duration_seconds_bucket[5m])))",
+          "legendFormat": "load p95"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(tokeira_storage_read_history_duration_seconds_bucket[5m])))",
+          "legendFormat": "history p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 0,
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      },
+      "description": "Durable storage latency quantiles for commit, load, and history-read paths.",
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "row",
+      "title": "DSQL Pool",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 13
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "DSQL Pool Lifecycle",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(tokeira_dsql_pool_connections_created_total[5m]))",
+          "legendFormat": "created/s"
+        },
+        {
+          "expr": "sum(rate(tokeira_dsql_pool_connections_retired_total[5m]))",
+          "legendFormat": "retired/s"
+        },
+        {
+          "expr": "sum(rate(tokeira_dsql_pool_connections_returned_total[5m]))",
+          "legendFormat": "returned/s"
+        },
+        {
+          "expr": "sum(rate(tokeira_dsql_pool_empty_reservoir_total[5m]))",
+          "legendFormat": "empty/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 0,
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 14
+      },
+      "description": "DSQL reservoir churn and empty-reservoir events per second. Empty events indicate checkout pressure or slow connection creation.",
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "DSQL Class Budgets",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "targets": [
+        {
+          "expr": "sum by (class) (tokeira_dsql_pool_class_budget_total)",
+          "legendFormat": "budget {{class}}"
+        },
+        {
+          "expr": "sum by (class) (tokeira_dsql_pool_class_in_use)",
+          "legendFormat": "in use {{class}}"
+        },
+        {
+          "expr": "sum by (class) (tokeira_dsql_pool_class_waiters)",
+          "legendFormat": "waiters {{class}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 0,
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 14
+      },
+      "description": "Per-class DSQL logical admission budgets, in-use counts, and waiters. Waiters indicate class-level saturation.",
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "row",
+      "title": "Projection",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 22
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Projection Throughput and Lag",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "targets": [
+        {
+          "expr": "sum by (partition) (rate(tokeira_projection_records_processed_total[5m]))",
+          "legendFormat": "processed {{partition}}"
+        },
+        {
+          "expr": "sum by (partition) (tokeira_projection_worker_lag_records)",
+          "legendFormat": "lag {{partition}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 0,
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 23
+      },
+      "description": "Records processed per second and current per-partition lag. Lag should converge to zero after bursts.",
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Projection Sink",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(tokeira_projection_sink_write_duration_seconds_bucket[5m])))",
+          "legendFormat": "write p95"
+        },
+        {
+          "expr": "sum(rate(tokeira_projection_sink_error_total[5m]))",
+          "legendFormat": "errors/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 0,
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 23
+      },
+      "description": "Projection sink write latency and error rate. Errors here affect visibility freshness, not history correctness.",
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
     }
-  ]
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  }
 }

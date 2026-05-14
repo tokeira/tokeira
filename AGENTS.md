@@ -138,7 +138,7 @@ tokeira/
 │   └── tokeira-aws/              # AWS resource implementations
 ├── platforms/
 │   ├── local/                    # Bare-process local platform
-│   └── compose/                  # Docker Compose platform with observability
+│   └── compose/                  # Docker Compose platform with observability + DSQL module
 ├── docs/
 │   └── architecture/             # Design documents (000–110)
 └── .kiro/specs/                  # Feature specs (requirements, design, tasks)
@@ -174,7 +174,8 @@ The engine distinguishes **desired** resources (what should exist) from **known*
 ## Configuration
 
 - Server config: `tokeirad.toml` — `TokeiraConfig` with four sections: infrastructure, policy, capacity, emergency.
-- Platform config: `deployment.toml` — platform-specific (`LocalConfig` or `ComposeConfig`).
+- Platform config: `deployment.toml` — platform-specific (`LocalConfig` or `ComposeConfig`). Compose DSQL deployments carry `storage = "dsql"` plus `[dsql]` mode/endpoint/arn/region fields.
+- Compose DSQL writeback updates `tokeirad.toml` with `infrastructure.storage = "dsql"` plus `infrastructure.dsql.endpoint` and `infrastructure.dsql.region`.
 - `serde(deny_unknown_fields)` on all config structs — typos are caught at parse time.
 - `RuntimeConfig` is always `Default` — not configurable from TOML. Mechanical settings are auto-tuned.
 - No env vars on invocation. Defaults characterized by expected performance, not deployment environment.
@@ -247,6 +248,7 @@ Use `cargo lint` to check if everything compiles without running tests. `cargo c
 2. Implement `Module` trait with `name()`, `dependencies()`, `resources()`.
 3. Register it in the platform's `infra_modules()` method.
 4. Add tests for resource enumeration and dependency ordering.
+5. For compose storage modules, use `DsqlModule` as the reference pattern: module-owned config, explicit dependencies, and provider handles registered through `register_infra_extensions()`.
 
 ### Adding a New CLI Command
 
@@ -277,7 +279,13 @@ Pinned versions:
 - AWS CLI: `public.ecr.aws/aws-cli/aws-cli:latest`
 - BusyBox: `public.ecr.aws/docker/library/busybox:latest`
 
-Two modules: `runtime` (tokeirad) and `observability` (mimir, loki, grafana, alloy).
+Three compose IaC modules are relevant in DSQL mode: `local-state`, `dsql`, `observability`, then `runtime` by dependency order. In-memory compose deployments omit `dsql`.
+
+Provisioned Grafana dashboards:
+- `broker-runtime-health.json`
+- `grpc-edge-health.json`
+- `storage-projection-health.json`
+- `log-exploration.json`
 
 The six mirror images (Mimir, Loki, Grafana, Alloy, AWS CLI, BusyBox) are declared in each platform's `src/images/observability/mod.rs` via a platform-local `mirror_image!` macro. Version bumps are a one-line change in the platform's `ObservabilityConfig::default()` defaults or the `default_<field>_image()` helpers for `aws_cli_image` and `busybox_image`.
 

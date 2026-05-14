@@ -27,6 +27,7 @@ const GRPC_EDGE_DASHBOARD: &str = "config/grafana/dashboards/grpc-edge-health.js
 const BROKER_RUNTIME_DASHBOARD: &str = "config/grafana/dashboards/broker-runtime-health.json";
 const STORAGE_PROJECTION_DASHBOARD: &str =
     "config/grafana/dashboards/storage-projection-health.json";
+const LOG_EXPLORATION_DASHBOARD: &str = "config/grafana/dashboards/log-exploration.json";
 
 const MANAGED_DIRECTORIES: &[&str] = &[
     "config/grafana/provisioning/datasources",
@@ -149,6 +150,7 @@ impl ConfigGenerator {
             self.grpc_edge_dashboard(),
             self.broker_runtime_dashboard(),
             self.storage_projection_dashboard(),
+            self.log_exploration_dashboard(),
         ])
     }
 
@@ -229,6 +231,13 @@ impl ConfigGenerator {
         RenderedConfigFile {
             relative_path: PathBuf::from(STORAGE_PROJECTION_DASHBOARD),
             contents: include_str!("../dashboards/storage-projection-health.json").to_string(),
+        }
+    }
+
+    fn log_exploration_dashboard(&self) -> RenderedConfigFile {
+        RenderedConfigFile {
+            relative_path: PathBuf::from(LOG_EXPLORATION_DASHBOARD),
+            contents: include_str!("../dashboards/log-exploration.json").to_string(),
         }
     }
 }
@@ -513,6 +522,7 @@ fn managed_relative_paths() -> &'static [&'static str] {
         GRPC_EDGE_DASHBOARD,
         BROKER_RUNTIME_DASHBOARD,
         STORAGE_PROJECTION_DASHBOARD,
+        LOG_EXPLORATION_DASHBOARD,
     ]
 }
 

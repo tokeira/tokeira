@@ -6,7 +6,7 @@ This plan integrates Aurora DSQL as a storage backend for the compose platform b
 
 ## Tasks
 
-- [ ] 1. Rename state module and update ComposeConfig model
+- [x] 1. Rename state module and update ComposeConfig model
   - [x] 1.1 Rename `LocalStateModule` logical name from `"remote-state"` to `"local-state"`
     - In `platforms/compose/src/modules.rs`, change `LocalStateModule::name()` to return `"local-state"`
     - Update `LocalStateResource::module()` to return `"local-state"`
@@ -30,7 +30,7 @@ This plan integrates Aurora DSQL as a storage backend for the compose platform b
     - Assert serialize-then-deserialize produces equivalent config
     - **Validates: Requirements 2.1.4**
 
-- [ ] 2. Implement DsqlModule and storage-aware module dependencies
+- [x] 2. Implement DsqlModule and storage-aware module dependencies
   - [x] 2.1 Add AWS and IaC dependencies to `platforms/compose/Cargo.toml`
     - Add `tokeira-aws` dependency (for `DsqlCluster`, `AwsClients`)
     - Add `aws-config` and `aws-sdk-sts` dependencies (for SDK config loading and credential validation)
@@ -81,7 +81,7 @@ This plan integrates Aurora DSQL as a storage backend for the compose platform b
 - [ ] 3. Checkpoint — Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 4. Implement writeback and AWS credential mounting
+- [x] 4. Implement writeback and AWS credential mounting
   - [x] 4.1 Implement `ComposeDeployment::collect_writeback()` for DSQL
     - When `config.storage == Dsql`, read DSQL resource state from `InfraState` and return writeback pairs: `infrastructure.storage`, `infrastructure.dsql.endpoint`, and `infrastructure.dsql.region`
     - Region writeback: always write `infrastructure.dsql.region` from `ComposeConfig.dsql.region` (which is set at `tkr deployment create --region <region>` time). There is NO region discovery from the DSQL endpoint hostname — region is always explicit in config.
@@ -119,7 +119,7 @@ This plan integrates Aurora DSQL as a storage backend for the compose platform b
     - Assert DSQL configs always set `AWS_REGION` to `config.dsql.region`; InMemory configs do not set `AWS_REGION`
     - **Validates: Requirements 4.2.1, 4.2.2**
 
-- [ ] 5. Implement ProvisionContext extension registration
+- [x] 5. Implement ProvisionContext extension registration
   - [x] 5.1 Register `AwsClients` in `register_infra_extensions()` for DSQL
     - When `config.storage == StorageKind::Dsql`, load AWS SDK config using the region from `ComposeDsqlConfig.region` (always explicit, defaults to `us-east-1`). Use `aws_config::defaults(BehaviorVersion::latest()).region(Region::new(config_region)).load().await`
     - Construct `AwsClients::new(&sdk_config)` and register via `ctx.set_extension()`
@@ -130,7 +130,7 @@ This plan integrates Aurora DSQL as a storage backend for the compose platform b
 - [ ] 6. Checkpoint — Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 7. Implement ConfigStorageKind and tokeirad startup branching
+- [x] 7. Implement ConfigStorageKind and tokeirad startup branching
   - [x] 7.1 Add `ConfigStorageKind` enum to `tokeira-config`
     - Add `ConfigStorageKind` with `InMemory` (default) and `Dsql` variants, `#[serde(rename_all = "kebab-case")]`
     - Add `storage: ConfigStorageKind` field with `#[serde(default)]` to `InfrastructureConfig`
@@ -189,7 +189,7 @@ This plan integrates Aurora DSQL as a storage backend for the compose platform b
 - [ ] 8. Checkpoint — Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 9. Implement schema setup CLI wiring
+- [x] 9. Implement schema setup CLI wiring
   - [x] 9.1 Add schema CLI dependencies to `apps/tkr/Cargo.toml`
     - Add `tokeira-storage` dependency with `dsql` feature enabled (for `MigrationRunner`, `DsqlAuthConfig`, `DsqlPoolConfig`)
     - Add `sqlx` with `runtime-tokio`, `tls-rustls`, `postgres` features
@@ -227,7 +227,7 @@ This plan integrates Aurora DSQL as a storage backend for the compose platform b
     - Add doc comment on the embedding mechanism explaining WHY checksums are pre-computed (avoids runtime hashing and filesystem access)
     - _Requirements: 5.1.5_
 
-- [ ] 10. Implement prototypical config generation for compose+dsql
+- [x] 10. Implement prototypical config generation for compose+dsql
   - [x] 10.1 Add `--region` argument to `tkr deployment create`
     - Add `--region <region>` optional argument to `DeploymentAction::Create` in `apps/tkr/src/cli.rs`
     - The `PlatformConfig::prototypical_config(storage)` trait method signature is NOT changed — it remains platform-agnostic with only `StorageKind` as input
@@ -244,8 +244,8 @@ This plan integrates Aurora DSQL as a storage backend for the compose platform b
 - [ ] 11. Checkpoint — Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 12. Improve observability dashboards
-  - [ ] 12.1 Refactor existing dashboards with better panel layouts
+- [x] 12. Improve observability dashboards
+  - [x] 12.1 Refactor existing dashboards with better panel layouts
     - Reorganize `platforms/compose/dashboards/broker-runtime-health.json` with proper row grouping and consistent panel sizing
     - Reorganize `platforms/compose/dashboards/grpc-edge-health.json` with proper row grouping
     - Reorganize `platforms/compose/dashboards/storage-projection-health.json` with proper row grouping
@@ -254,30 +254,30 @@ This plan integrates Aurora DSQL as a storage backend for the compose platform b
     - Reference EKS project's `server.json` for panel layout patterns (row grouping, stat+timeseries pairs)
     - _Requirements: (additional task — dashboard polish)_
 
-  - [ ] 12.2 Create a Loki log exploration dashboard
+  - [x] 12.2 Create a Loki log exploration dashboard
     - Create `platforms/compose/dashboards/log-exploration.json`
     - Include panels: log volume by service (bar chart), error/warn rate over time, log explorer panel with label filters
     - Use datasource UID `loki` (matching provisioned datasource)
     - Reference EKS project's `operator-console.json` for log panel patterns
     - _Requirements: (additional task — dashboard polish)_
 
-- [ ] 13. Update documentation
-  - [ ] 13.1 Update README.md with compose+DSQL deployment lifecycle
+- [x] 13. Update documentation
+  - [x] 13.1 Update README.md with compose+DSQL deployment lifecycle
     - Add a "Compose + DSQL" section documenting both the two-phase and one-shot workflows from Req 6.1
     - Update the architecture section to mention DSQL as a storage option alongside in-memory
     - Add prerequisites section mentioning AWS credentials for DSQL mode
     - Update the existing "Storage and schema" paragraph to reflect first-class DSQL support
     - _Requirements: 6.1.7, (additional task — README updates)_
 
-  - [ ] 13.2 Update AGENTS.md with DSQL-related changes
+  - [x] 13.2 Update AGENTS.md with DSQL-related changes
     - Update "Workspace Structure" section to reflect the DSQL module in compose platform
     - Update "Configuration" section to mention `deployment.toml` DSQL fields and `tokeirad.toml` writeback
     - Update "Observability Stack" section to mention the improved dashboards and Loki log exploration
     - Add note about `DsqlModule` in the "Adding a New IaC Module" working agreement
     - _Requirements: (additional task — AGENTS.md updates)_
 
-- [ ] 14. Add code documentation
-  - [ ] 14.1 Add doc comments to all new public types and functions
+- [x] 14. Add code documentation
+  - [x] 14.1 Add doc comments to all new public types and functions
     - `DsqlModule` — explain it provisions or adopts a DSQL cluster for compose deployments
     - `ComposeDsqlConfig` — explain the managed/preexisting distinction and field semantics
     - `DsqlMode` — explain each variant's lifecycle implications

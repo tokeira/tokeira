@@ -254,14 +254,15 @@ pub async fn run_from_cli(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-/// Build the full in-memory server stack and start serving on the given
-/// address. Returns the server's join handle, the address it bound to, a
-/// shutdown sender, a cancellation token for background workers, and the
-/// log-event broadcast used by test harnesses.
+/// Build the full server stack and start serving on the given address.
+///
+/// Storage selection is driven only by `infrastructure.storage`: endpoint
+/// presence alone is not treated as intent. This keeps failed DSQL writeback
+/// and explicit in-memory deployments from being conflated.
 ///
 /// Factored out so both the CLI entrypoint and the in-memory facade share one
 /// bootstrap path. Deliberately long and sequential: each block mirrors the
-/// ordering `main.rs` had before the lib/bin split.
+/// startup dependency order.
 async fn build_and_serve(
     addr: SocketAddr,
     effective_config: Arc<TokeiraConfig>,
@@ -293,6 +294,8 @@ async fn build_and_serve(
         ConfigStorageKind::Dsql => {
             let auth = dsql_auth_config(&effective_config)?;
             let endpoint = auth.endpoint.clone();
+            // Pool sizing remains storage-internal for now; the server config
+            // exposes only the high-level endpoint/role boundary.
             let dsql_store = DsqlStore::connect(auth, DsqlPoolConfig::default())
                 .await
                 .context("failed to connect DSQL storage backend")?;

@@ -43,10 +43,10 @@ All other dependencies are code that already exists in the workspace — see "Wh
 ### What this spec does NOT cover
 
 - IAM token refresh for DSQL runtime connections — already implemented by the connection-reservoir layer in `tokeira-storage::dsql::connection` + `tokeira_storage::dsql::reservoir`. This spec only wires it into the tokeirad startup path (Feature 8).
-- Schema migration tooling internals — already implemented in `tokeira_storage::dsql::migration`.
+- General schema migration tooling internals are already implemented in `tokeira_storage::dsql::migration`. This spec only adds the small integration changes needed by the compose CLI path: missing-table status handling and an embedded-migration production constructor.
 - The writeback machinery itself — already implemented as `tokeira_iac::write_config_values` and `Deployment::collect_writeback`.
 - DSQL connection pool management — already implemented in `tokeira_storage::dsql::connection`.
-- Migration SQL files V001–V046 — already present under `crates/tokeira-storage/migrations/` (covers run-repository, projection log, visibility, search-attribute indexes, routing generation, and budget allocation).
+- Migration SQL file contents V001–V046 — already present under `crates/tokeira-storage/migrations/` (covers run-repository, projection log, visibility, search-attribute indexes, routing generation, and budget allocation).
 - Operator-facing performance tuning of `DsqlPoolConfig` / `ReservoirConfig` / `MigrationConfig` (see "Storage-layer config boundary" below).
 - The `[capacity.dsql]` section of `tokeirad.toml` (`max_connections`, `connection_rate_per_second`, `burst_capacity` on `tokeira_config::DsqlCapacityConfig`). This section already exists in the server config model with its own defaults and is operator-tunable; this spec does not wire it through to the storage layer and does not define any writeback into it.
 
@@ -105,7 +105,7 @@ There are two distinct DSQL config surfaces in the workspace and this spec delib
 1. WHEN `ComposeConfig.dsql.mode` is `managed` (or defaulted because no preexisting endpoint is provided), THE `DsqlModule` SHALL include a `DsqlCluster` resource with `DsqlClusterMode::Managed`.
 2. WHEN the `DsqlCluster` resource is created in managed mode, THE resource SHALL provision a new Aurora DSQL cluster via the AWS DSQL API.
 3. WHEN the managed cluster is provisioned, THE resource state SHALL contain the `cluster_endpoint`, `cluster_arn`, and `cluster_id` properties.
-4. THE `DsqlModule` SHALL register `AwsClients` in `ProvisionContext` extensions before resource operations execute.
+4. THE `ComposeDeployment::register_infra_extensions()` hook (Requirement 7.1) SHALL register `AwsClients` in `ProvisionContext` before the IaC engine calls `DsqlModule::resources()`. The module itself does not register extensions — it relies on the deployment hook having already done so.
 
 ### Requirement 1.3: Preexisting Mode Adoption
 
@@ -142,9 +142,9 @@ There are two distinct DSQL config surfaces in the workspace and this spec delib
    - `mode: DsqlMode` (enum with variants `Managed` and `Preexisting`, default `Managed`)
    - `endpoint: Option<String>` (default `None`)
    - `arn: Option<String>` (default `None`)
-   - `region: Option<String>` (default `None` — there is NO built-in default; region resolution at runtime follows the standard AWS provider chain per Req 4.2 and Req 7.1.2, and `us-east-1` is only the last-resort fallback at the `AwsClients` level during cluster provisioning)
+   - `region: String` (default `"us-east-1"`) — region is always explicit. Set at `tkr deployment create --region <region>` time. There is no provider-chain inference or endpoint-based discovery for region.
 2. THE `ComposeConfig` SHALL use `serde(deny_unknown_fields)` on the DSQL config section to reject typos at parse time.
-3. WHEN `ComposeConfig.dsql` is `None` (section absent) AND storage is `StorageKind::Dsql`, THE Compose_Platform SHALL treat this as managed mode with defaults.
+3. WHEN `ComposeConfig.dsql` is `None` (section absent) AND storage is `StorageKind::Dsql`, THE Compose_Platform SHALL treat this as managed mode with defaults (region defaults to `"us-east-1"`).
 4. FOR ALL valid `ComposeConfig` values with DSQL fields, serializing to TOML and deserializing back SHALL produce an equivalent `ComposeConfig` (round-trip property).
 
 ### Requirement 2.2: Storage Kind Awareness
@@ -154,7 +154,7 @@ There are two distinct DSQL config surfaces in the workspace and this spec delib
 #### Acceptance Criteria
 
 1. THE `ComposeConfig` SHALL include a `storage` field of type `StorageKind` (default `InMemory`).
-2. WHEN `tkr deployment create --platform compose --storage dsql` is run, THE generated `deployment.toml` SHALL include `storage = "dsql"` and a `[dsql]` section with `mode = "managed"` and empty `endpoint` / `arn` fields (placeholders for operator override or writeback). The `region` field SHALL NOT be included — region resolution follows the standard AWS provider chain (Req 4.2). If the operator wants to override the region, they add `region = "eu-west-1"` manually.
+2. WHEN `tkr deployment create --platform compose --storage dsql` is run, THE generated `deployment.toml` SHALL include `storage = "dsql"` and a `[dsql]` section with `mode = "managed"`, empty `endpoint` / `arn` fields, and `region = "us-east-1"` (or the value from `--region <region>` if provided). Region is always explicit in the generated config.
 3. WHEN `tkr deployment create --platform compose --storage in-memory` is run, THE generated `deployment.toml` SHALL NOT include a `[dsql]` section.
 
 ---
@@ -170,7 +170,7 @@ There are two distinct DSQL config surfaces in the workspace and this spec delib
 1. WHEN `tkr infra apply` completes successfully with a DSQL module, THE `ComposeDeployment::collect_writeback()` SHALL return:
    - `("infrastructure.storage", "dsql")` — the authoritative storage-kind signal tokeirad reads on startup (see Feature 8).
    - `("infrastructure.dsql.endpoint", <endpoint_value>)` — the resolved DSQL cluster endpoint.
-   - `("infrastructure.dsql.region", <region_value>)` — only when the DSQL cluster state contains a `region` property or the config specifies a region.
+   - `("infrastructure.dsql.region", <region_value>)` — always written from `ComposeConfig.dsql.region` (which is always explicit, defaults to `"us-east-1"`). There is no region inference from the endpoint hostname.
 2. WHEN the DSQL cluster state contains a `cluster_endpoint` property, THE writeback SHALL use that value for `infrastructure.dsql.endpoint`.
 3. THE writeback SHALL set `infrastructure.storage = "dsql"` whenever it writes `infrastructure.dsql.endpoint`. The two values are written atomically via a single `write_config_values(path, values)` call so tokeirad cannot observe an intermediate state where the endpoint is set but the storage kind is not.
 4. WHEN the DSQL module is not present in state (in-memory storage), THE `collect_writeback()` SHALL return an empty vector (existing behaviour). It SHALL NOT write `infrastructure.storage = "in-memory"` — the field's default in the TOML model is `InMemory`, so absence is equivalent and writeback stays no-op for in-memory deployments.
@@ -196,22 +196,22 @@ There are two distinct DSQL config surfaces in the workspace and this spec delib
 #### Acceptance Criteria
 
 1. WHEN storage is `StorageKind::Dsql`, THE compose service descriptor for `tokeirad` SHALL mount the host's AWS configuration into the container so that the standard AWS credential provider chain works correctly inside the container. This means:
-   - Mount `~/.aws` (host) to the container's expected AWS config directory as read-only.
-   - If `AWS_SHARED_CREDENTIALS_FILE` or `AWS_CONFIG_FILE` environment variables are set on the host, mount those specific paths instead of `~/.aws`.
-   - Forward the following environment variables from the host into the container when set: `AWS_PROFILE`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_ROLE_ARN`, `AWS_WEB_IDENTITY_TOKEN_FILE`, `AWS_SHARED_CREDENTIALS_FILE`, `AWS_CONFIG_FILE`. This ensures SSO sessions, assumed roles, and environment-variable credentials all work.
-2. THE mount target inside the container SHALL match the user the `tokeirad` image runs as. The current `tokeirad` image uses the Chainguard `glibc-dynamic` base and runs as `nonroot` at UID 65532, so the mount target SHALL be `/home/nonroot/.aws`. If a future image change moves the container to a different user, the mount target SHALL follow. The `HOME` environment variable inside the container SHALL be set consistently with the mount target.
+   - Mount `~/.aws` (host) to `/home/nonroot/.aws` (container) as read-only.
+   - Forward the following environment variables from the host into the container when set: `AWS_PROFILE`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_ROLE_ARN`. This ensures SSO sessions, assumed roles, and environment-variable credentials all work.
+   - Do NOT forward `AWS_SHARED_CREDENTIALS_FILE`, `AWS_CONFIG_FILE`, or `AWS_WEB_IDENTITY_TOKEN_FILE` — these contain host-specific absolute paths that do not resolve inside the container. The `~/.aws` mount provides the standard credential and config files at the expected container path (`/home/nonroot/.aws/credentials` and `/home/nonroot/.aws/config`).
+2. THE mount target inside the container SHALL match the user the `tokeirad` image runs as. The current `tokeirad` image uses the Chainguard `glibc-dynamic` base and runs as `nonroot` at UID 65532, so the mount target SHALL be `/home/nonroot/.aws`. If a future image change moves the container to a different user, the mount target SHALL follow. The `HOME` environment variable inside the container SHALL be set to `/home/nonroot`.
 3. WHEN storage is `StorageKind::InMemory`, THE compose service descriptor for `tokeirad` SHALL NOT include any AWS credential mounts or environment variable forwarding.
 4. THE credential mounting SHALL NOT copy or persist credentials into the container image or any writable layer — read-only bind mount only.
 
 ### Requirement 4.2: AWS Region Resolution
 
-**User Story:** As a Tokeira operator, I want the AWS region resolved from my credentials/config (the same way the AWS CLI resolves it), so that I don't have to specify it separately unless I want to override.
+**User Story:** As a Tokeira operator, I want the AWS region carried explicitly in deployment config, so that DSQL provisioning and the tokeirad container use the same predictable region without provider-chain inference.
 
 #### Acceptance Criteria
 
-1. WHEN storage is `StorageKind::Dsql` AND `ComposeConfig.dsql.region` is explicitly set, THE compose service descriptor for `tokeirad` SHALL include an `AWS_REGION` environment variable set to that configured value.
-2. WHEN `ComposeConfig.dsql.region` is NOT set, THE compose service descriptor SHALL NOT set `AWS_REGION` explicitly — allowing the standard provider chain inside the container to resolve the region from `~/.aws/config` (the `[profile ...]` region setting) or from `AWS_DEFAULT_REGION` forwarded from the host.
-3. WHEN neither the config nor the provider chain yields a region, THE `DsqlModule` SHALL default to `us-east-1` during cluster provisioning (this is the `tkr infra apply` path, not the container runtime path — the container relies on the provider chain or the explicit config override).
+1. WHEN storage is `StorageKind::Dsql`, THE compose service descriptor for `tokeirad` SHALL include an `AWS_REGION` environment variable set to `ComposeConfig.dsql.region` (always present, defaults to `"us-east-1"`).
+2. THE compose service descriptor SHALL always set `AWS_REGION` for DSQL deployments — region is never inferred from the provider chain inside the container.
+3. THE `DsqlModule` SHALL use `ComposeConfig.dsql.region` directly during cluster provisioning. There is no separate fallback chain — the config value is authoritative.
 
 ---
 
@@ -225,8 +225,8 @@ There are two distinct DSQL config surfaces in the workspace and this spec delib
 
 1. WHEN `tkr schema setup` is run for a compose+dsql deployment, THE CLI SHALL read the DSQL endpoint from `tokeirad.toml` at `infrastructure.dsql.endpoint`.
 2. WHEN the endpoint is configured, THE CLI SHALL:
-   a. Construct a `PgPool` connection to the endpoint using `aurora-dsql-sqlx-connector` for IAM authentication. Region is resolved from the endpoint hostname via `tokeira_storage::dsql::config::detect_region_from_endpoint` (matches `*.dsql.{region}.on.aws`) or from the config's `infrastructure.dsql.region` field when the hostname pattern does not yield a region.
-   b. Construct a `tokeira_storage::dsql::MigrationRunner::new(MigrationConfig { migrations_dir })` where `migrations_dir` points to the embedded migration files from `crates/tokeira-storage/migrations/` (V001–V046).
+   a. Construct a `PgPool` connection to the endpoint using `aurora-dsql-sqlx-connector` for IAM authentication. Region is read from `tokeirad.toml` at `infrastructure.dsql.region` (always present after writeback).
+   b. Construct a `tokeira_storage::dsql::MigrationRunner::embedded()` which loads the compile-time-embedded migration array (see Req 5.1.5). The `MigrationRunner::new(MigrationConfig { migrations_dir })` constructor is retained only for tests that exercise the directory-scan code path.
    c. Call `runner.apply(&pool).await?` which applies all unapplied migrations in strict version order, one DDL statement per transaction, with checksum verification.
    d. Report the `MigrationReport { applied: N }` to the operator: "Applied N migration(s) to {endpoint}".
 3. IF the endpoint is not configured in `tokeirad.toml`, THEN THE CLI SHALL return an error: "dsql endpoint is not configured in {path}; run `tkr infra apply --module dsql` first".
@@ -314,9 +314,9 @@ There are two distinct DSQL config surfaces in the workspace and this spec delib
 #### Acceptance Criteria
 
 1. WHEN storage is `StorageKind::Dsql`, THE `ComposeDeployment::register_infra_extensions()` SHALL construct an `AwsClients` instance and register it in `ProvisionContext` via `set_extension()`.
-2. THE `AwsClients` instance SHALL resolve its region using the standard AWS provider chain: first `ComposeConfig.dsql.region` (explicit override), then the environment (`AWS_REGION` / `AWS_DEFAULT_REGION`), then `~/.aws/config` profile region, then fall back to `us-east-1` as the last resort. This matches how the AWS SDK resolves region by default — the implementation should use `aws_config::load_defaults(BehaviorVersion::latest()).await` with an optional region override from config.
+2. THE `AwsClients` instance SHALL use the region from `ComposeConfig.dsql.region` directly (always explicit, defaults to `"us-east-1"`). The implementation SHALL use `aws_config::defaults(BehaviorVersion::latest()).region(Region::new(config_region)).load().await`. There is no provider-chain region inference — region is always taken from config.
 3. WHEN storage is `StorageKind::InMemory`, THE `register_infra_extensions()` SHALL NOT register `AwsClients` (existing no-op behavior).
-4. IF AWS credential resolution fails during extension registration, THEN THE method SHALL return a descriptive error indicating that AWS credentials are required for DSQL storage and suggesting the operator check `aws configure` or their environment variables.
+4. AFTER constructing `AwsClients`, THE method SHALL call STS `GetCallerIdentity` to eagerly validate credentials. AWS credential resolution is lazy in the SDK — without this validation call, credential failures would not surface until the first DSQL API call during plan/apply. IF this validation fails, THE method SHALL return a descriptive error indicating that AWS credentials are required for DSQL storage and suggesting the operator check `aws configure` or their environment variables.
 
 ---
 
@@ -342,12 +342,13 @@ There are two distinct DSQL config surfaces in the workspace and this spec delib
 #### Acceptance Criteria
 
 1. WHEN `tokeirad` starts AND `TokeiraConfig.infrastructure.storage == ConfigStorageKind::Dsql`, THE startup path in `apps/tokeirad/src/main.rs` SHALL construct a DSQL-backed `RunRepository` instead of the `InMemoryStore` currently hard-coded there.
-2. THE DSQL-backed storage SHALL be assembled by calling the existing public facade `tokeira_storage::dsql::DsqlStore::connect(auth, config)` in `crates/tokeira-storage/src/dsql/mod.rs`, which already wires a shared `Arc<DsqlConnectionDirector>`, a `DsqlRunRepository`, a `DsqlProjectionLog`, and a `MigrationRunner` over one coordinated reservoir:
+2. THE DSQL-backed storage SHALL be assembled by calling the existing public facade `tokeira_storage::dsql::DsqlStore::connect(auth, config)` in `crates/tokeira-storage/src/dsql/mod.rs`, then decomposing it via `DsqlStore::into_parts()` to obtain owned components:
    - A `DsqlAuthConfig` built by copying `endpoint`, `region`, `admin_role_arn`, `runtime_role_arn`, and `readonly_role_arn` from `TokeiraConfig.infrastructure.dsql`.
    - A `DsqlPoolConfig::default()` (per the "Storage-layer config boundary" note; pool tuning is not operator-facing).
-   - The `DsqlStore::run_repository()` accessor returns the `&DsqlRunRepository` that tokeirad wraps in `HistoryNotifyingRepository`.
-   - The `DsqlStore::projection_log()` accessor returns the `&DsqlProjectionLog` that each `ProjectionWorker` reads from.
-   - The same `Arc<DsqlConnectionDirector>` (exposed via `DsqlStore::connection_director()`) SHALL be cloned into the `DsqlVisibilityStore` constructed under Req 8.4 so the visibility sink, repository writes, and projection-log reads share one reservoir and class-budget state.
+   - `DsqlStore::into_parts(self)` returns `(Arc<DsqlConnectionDirector>, DsqlRunRepository, DsqlProjectionLog, MigrationRunner)` — owned values that tokeirad distributes to its subsystems.
+   - The `DsqlRunRepository` is wrapped in `Arc` and passed to `HistoryNotifyingRepository::new(Arc<DsqlRunRepository>, waits)`.
+   - The `DsqlProjectionLog` is wrapped in `Arc` and cloned into each `ProjectionWorker`. `DsqlProjectionLog` SHALL derive `Clone` (it holds only an `Arc<DsqlConnectionDirector>` internally), OR `ProjectionLog` SHALL be implemented for `Arc<DsqlProjectionLog>`.
+   - The `Arc<DsqlConnectionDirector>` is cloned into `DsqlVisibilityStore::new(Arc<DsqlConnectionDirector>)` so the visibility sink, repository writes, and projection-log reads share one reservoir and class-budget state.
 3. WHEN `TokeiraConfig.infrastructure.storage == ConfigStorageKind::InMemory`, THE startup path SHALL continue to use `InMemoryStore::default()` (existing behaviour).
 4. WHEN the DSQL-backed storage fails to connect at startup (invalid endpoint, IAM auth failure, DNS failure, schema tables missing), THE process SHALL exit with a non-zero status and log the error via the existing `tracing` infrastructure. It SHALL NOT silently fall back to `InMemoryStore`. This failure is distinct from Req 8.1.4: Req 8.1.4 fires at config-load time before any network I/O; Req 8.2.4 fires during connection establishment.
 5. THE DSQL-backed run repository SHALL be wrapped by `HistoryNotifyingRepository` the same way `InMemoryStore` is wrapped today — only the inner `Arc<dyn RunRepository>` differs.
@@ -369,11 +370,11 @@ There are two distinct DSQL config surfaces in the workspace and this spec delib
 
 #### Acceptance Criteria
 
-1. WHEN `infrastructure.storage == ConfigStorageKind::Dsql`, THE startup path SHALL construct a `tokeira_projection::dsql_store::DsqlVisibilityStore::new(director)` using the same `Arc<DsqlConnectionDirector>` obtained from `DsqlStore::connection_director()`. The `DsqlVisibilityStore` already exists in `crates/tokeira-projection/src/dsql_store.rs` (gated by the `dsql` feature on `tokeira-projection`) and implements both `VisibilityStore` (for query reads) and `ProjectionSink` (for projection-log consumption).
+1. WHEN `infrastructure.storage == ConfigStorageKind::Dsql`, THE startup path SHALL construct a `tokeira_projection::dsql_store::DsqlVisibilityStore::new(director)` using the `Arc<DsqlConnectionDirector>` obtained from `DsqlStore::into_parts()`. The `DsqlVisibilityStore` already exists in `crates/tokeira-projection/src/dsql_store.rs` (gated by the `dsql` feature on `tokeira-projection`) and implements both `VisibilityStore` (for query reads) and `ProjectionSink` (for projection-log consumption).
 2. THE `tokeira-projection` crate dependency in `apps/tokeirad/Cargo.toml` SHALL enable the `dsql` feature so that `DsqlVisibilityStore` is accessible. The dependency SHALL be written as `tokeira-projection = { path = "...", features = ["dsql"] }`.
 3. THE `VisibilityQueryService` SHALL be constructed over the `DsqlVisibilityStore` (replacing today's unconditional `VisibilityQueryService::new(InMemoryVisibilityStore::default())` at `apps/tokeirad/src/main.rs` line 216–217).
-4. THE projection workers spawned in `apps/tokeirad/src/main.rs` SHALL read from `DsqlStore::projection_log()` (a `&DsqlProjectionLog` — implements the `ProjectionLog` trait from `tokeira-storage`) and write to `DsqlVisibilityStore` (via its `ProjectionSink` impl) instead of the current `InMemoryStore` / `VisibilitySink<InMemoryVisibilityStore>` pair. Partition count, batch size, and cursor-from-beginning semantics SHALL be preserved.
-5. THE `DsqlVisibilityStore` and `DsqlProjectionLog` SHALL share the single `Arc<DsqlConnectionDirector>` held by `DsqlStore` — tokeirad SHALL NOT construct a second director. Sharing the director is the mechanism that keeps reservoir capacity, class budgets, and rate limits globally coordinated across repository writes, projection-log reads, and visibility sink writes.
+4. THE projection workers spawned in `apps/tokeirad/src/main.rs` SHALL read from the `DsqlProjectionLog` obtained via `DsqlStore::into_parts()`. `DsqlProjectionLog` SHALL be made shareable across workers by either deriving `Clone` (it holds only `Arc<DsqlConnectionDirector>` internally) or by implementing `ProjectionLog` for `Arc<DsqlProjectionLog>`. Each worker gets a clone. Workers write to `DsqlVisibilityStore` (via its `ProjectionSink` impl) instead of the current `InMemoryStore` / `VisibilitySink<InMemoryVisibilityStore>` pair. `DsqlVisibilityStore` SHALL also be made shareable: either derive `Clone` (it holds only `Arc<DsqlConnectionDirector>`) or implement `VisibilityStore` + `ProjectionSink` for `Arc<DsqlVisibilityStore>`. The `VisibilityQueryService` and all projection workers share one `DsqlVisibilityStore` instance (or clones of it). Partition count, batch size, and cursor-from-beginning semantics SHALL be preserved.
+5. THE `DsqlVisibilityStore` and `DsqlProjectionLog` SHALL share the single `Arc<DsqlConnectionDirector>` returned by `into_parts()` — tokeirad SHALL NOT construct a second director. Sharing the director is the mechanism that keeps reservoir capacity, class budgets, and rate limits globally coordinated across repository writes, projection-log reads, and visibility sink writes.
 6. WHEN `infrastructure.storage == ConfigStorageKind::InMemory`, the visibility and projection wiring SHALL remain unchanged: `VisibilityQueryService::new(InMemoryVisibilityStore::default())` with `ProjectionWorker { log: InMemoryStore, sink: VisibilitySink<InMemoryVisibilityStore> }` per partition (existing behaviour).
 7. THE schema migrations required by `DsqlVisibilityStore` (tables `vis_execution`, `vis_rollup`, `sa_registry`, `sa_current`, and the six `sa_*_idx` indexes covered by migration files V012, V017, V029–V042) SHALL be applied by the same `tkr schema setup` step that Feature 5 defines. No separate visibility-only schema-setup command is needed because `MigrationRunner::apply` runs all unapplied migrations in strict version order.
 

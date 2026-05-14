@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 use tokeira_compose::ComposeService;
+use tokeira_orchestrator::StorageKind;
 
 use crate::config::ComposeConfig;
 
@@ -43,6 +44,26 @@ pub fn compose_services(config: &ComposeConfig) -> Vec<ComposeService> {
         "{}:/var/lib/grafana/dashboards/",
         config_dir.join("grafana/dashboards").display()
     );
+    let mut tokeirad_volumes = Vec::new();
+    let mut tokeirad_environment = HashMap::new();
+    if config.storage == StorageKind::Dsql {
+        tokeirad_volumes.push("~/.aws:/home/nonroot/.aws:ro".into());
+        tokeirad_environment.insert("HOME".into(), "/home/nonroot".into());
+        let dsql = config.dsql.clone().unwrap_or_default();
+        tokeirad_environment.insert("AWS_REGION".into(), dsql.region);
+        for key in [
+            "AWS_PROFILE",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_ROLE_ARN",
+        ] {
+            if let Ok(value) = std::env::var(key) {
+                tokeirad_environment.insert(key.to_string(), value);
+            }
+        }
+    }
+
     vec![
         ComposeService {
             name: "mimir".into(),
@@ -77,8 +98,8 @@ pub fn compose_services(config: &ComposeConfig) -> Vec<ComposeService> {
                     config.tokeirad.metrics_port, config.tokeirad.metrics_port
                 ),
             ],
-            volumes: Vec::new(),
-            environment: HashMap::new(),
+            volumes: tokeirad_volumes,
+            environment: tokeirad_environment,
             depends_on: Vec::new(),
             healthcheck: None,
             command: Vec::new(),

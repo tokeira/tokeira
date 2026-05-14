@@ -125,6 +125,7 @@ impl DeploymentResolver {
         name: &str,
         platform: PlatformKind,
         storage: StorageKind,
+        region: Option<String>,
     ) -> Result<DeploymentMetadata> {
         let name = normalize_name(name);
         let path = self.path(&name);
@@ -134,7 +135,7 @@ impl DeploymentResolver {
         fs::create_dir_all(path.join("state"))?;
         fs::write(
             path.join(DEPLOYMENT_TOML),
-            crate::prototypical::deployment_config(platform, storage)?,
+            crate::prototypical::deployment_config(platform, storage, region.as_deref())?,
         )?;
         fs::write(
             path.join(TOKEIRAD_TOML),

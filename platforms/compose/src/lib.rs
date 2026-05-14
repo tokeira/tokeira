@@ -16,9 +16,11 @@ pub mod services;
 
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use async_trait::async_trait;
+use tokeira_aws::AwsClients;
 use tokeira_compose::ComposePlatform;
-use tokeira_config::TokeiraConfig;
+use tokeira_config::{ConfigStorageKind, TokeiraConfig};
 use tokeira_deploy_engine as deploy_engine;
 use tokeira_iac as iac;
 use tokeira_iac::Module;
@@ -30,7 +32,8 @@ use tokeira_state::{LocalBackend, StateBackend};
 pub use config::ComposeConfig;
 
 use compose::compose_services;
-use modules::{ComposeModule, LocalStateModule};
+use config::ComposeDsqlConfig;
+use modules::{ComposeModule, DsqlModule, LocalStateModule, dsql_resource_id};
 use services::ComposeWorkload;
 
 #[derive(Clone, Default)]
@@ -44,8 +47,19 @@ impl ComposeDeployment {
     }
 
     pub fn default_config_toml() -> String {
+        Self::config_toml_for_storage(StorageKind::InMemory)
+    }
+
+    fn config_toml_for_storage(storage: StorageKind) -> String {
+        let mut config = ComposeConfig {
+            storage,
+            ..ComposeConfig::default()
+        };
+        if storage == StorageKind::Dsql {
+            config.dsql = Some(ComposeDsqlConfig::default());
+        }
         annotate_image_lifecycle_fields(
-            tokeira_config::write_config_toml(&ComposeConfig::default()).expect("serializes"),
+            tokeira_config::write_config_toml(&config).expect("serializes"),
         )
     }
 
@@ -118,14 +132,16 @@ fn annotate_image_lifecycle_fields(toml: String) -> String {
 }
 
 impl PlatformConfig for ComposeDeployment {
-    fn prototypical_config(_storage: StorageKind) -> String {
-        Self::default_config_toml()
+    fn prototypical_config(storage: StorageKind) -> String {
+        Self::config_toml_for_storage(storage)
     }
 
     fn prototypical_server_config(storage: StorageKind) -> String {
         let mut config = TokeiraConfig::default();
         if storage == StorageKind::Dsql {
+            config.infrastructure.storage = ConfigStorageKind::Dsql;
             config.infrastructure.dsql.endpoint = Some("replace-with-dsql-endpoint".to_string());
+            config.infrastructure.dsql.region = Some("us-east-1".to_string());
         }
         config.to_toml().expect("server config serializes")
     }
@@ -153,6 +169,13 @@ impl tokeira_orchestrator::Deployment for ComposeDeployment {
         let mut modules: Vec<Box<dyn iac::Module>> = Vec::new();
         let runtime = ComposeModule::runtime(config);
         let observability = ComposeModule::observability(config);
+        if config.storage == StorageKind::Dsql && selection.includes("dsql") {
+            let dsql_config = config.dsql.clone().unwrap_or_default();
+            modules.push(Box::new(DsqlModule::new(
+                dsql_config,
+                config.project_name.clone(),
+            )));
+        }
         if selection.includes(runtime.name()) {
             modules.push(Box::new(runtime));
         }
@@ -185,6 +208,21 @@ impl tokeira_orchestrator::Deployment for ComposeDeployment {
         let compose_file = config.deployment_dir.join("docker-compose.yml");
         let platform = Self::compose_platform(&compose_file, &config.project_name)?;
         ctx.set_extension(platform);
+        if config.storage == StorageKind::Dsql {
+            let dsql_config = config.dsql.clone().unwrap_or_default();
+            let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .region(aws_config::Region::new(dsql_config.region))
+                .load()
+                .await;
+            let clients = AwsClients::new(&aws_config);
+            clients
+                .sts
+                .get_caller_identity()
+                .send()
+                .await
+                .context("AWS credentials required for DSQL storage; check `aws configure` or environment variables")?;
+            ctx.set_extension(clients);
+        }
         Ok(())
     }
 
@@ -227,10 +265,30 @@ impl tokeira_orchestrator::Deployment for ComposeDeployment {
 
     fn collect_writeback(
         &self,
-        _config: &Self::Config,
-        _state: &iac::InfraState,
+        config: &Self::Config,
+        state: &iac::InfraState,
     ) -> Vec<(String, String)> {
-        Vec::new()
+        if config.storage != StorageKind::Dsql {
+            return Vec::new();
+        }
+        let Some(resource_state) = state.resources.get(&dsql_resource_id(&config.project_name))
+        else {
+            return Vec::new();
+        };
+        let Some(endpoint) = resource_state
+            .properties
+            .get("cluster_endpoint")
+            .and_then(|value| value.as_str())
+            .filter(|endpoint| !endpoint.is_empty())
+        else {
+            return Vec::new();
+        };
+        let dsql = config.dsql.clone().unwrap_or_default();
+        vec![
+            ("infrastructure.storage".into(), "dsql".into()),
+            ("infrastructure.dsql.endpoint".into(), endpoint.into()),
+            ("infrastructure.dsql.region".into(), dsql.region),
+        ]
     }
 }
 

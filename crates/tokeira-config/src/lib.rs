@@ -39,6 +39,8 @@ pub struct InfrastructureConfig {
     #[serde(default = "default_region")]
     pub region: String,
     #[serde(default)]
+    pub storage: ConfigStorageKind,
+    #[serde(default)]
     pub dsql: DsqlInfraConfig,
     #[serde(default)]
     pub placement: PlacementMembershipConfig,
@@ -73,6 +75,14 @@ pub struct PlacementMembershipConfig {
     pub hash_version: u32,
     #[serde(default = "default_routing_max_retries")]
     pub routing_max_retries: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConfigStorageKind {
+    #[default]
+    InMemory,
+    Dsql,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -225,6 +235,7 @@ impl Default for InfrastructureConfig {
         Self {
             cluster_name: default_cluster_name(),
             region: default_region(),
+            storage: ConfigStorageKind::InMemory,
             dsql: DsqlInfraConfig::default(),
             placement: PlacementMembershipConfig::default(),
             network: NetworkConfig::default(),
@@ -359,6 +370,20 @@ impl TokeiraConfig {
             errors.push(ValidationError::Field {
                 field: "infrastructure.observability.trace_sample_rate".to_string(),
                 message: format!("must be between 0.0 and 1.0, got {sample_rate}"),
+            });
+        }
+        if self.infrastructure.storage == ConfigStorageKind::Dsql
+            && self
+                .infrastructure
+                .dsql
+                .endpoint
+                .as_deref()
+                .unwrap_or("")
+                .is_empty()
+        {
+            errors.push(ValidationError::Field {
+                field: "infrastructure.dsql.endpoint".to_string(),
+                message: "must be set when infrastructure.storage is dsql; run `tkr infra apply --module dsql` first".to_string(),
             });
         }
         if self

@@ -4,19 +4,20 @@
 //! - `runtime` — the tokeirad service
 //! - `observability` — mimir, loki, grafana, alloy
 
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 use async_trait::async_trait;
 use tokeira_compose::ComposeService;
 use tokeira_iac as iac;
+use tokeira_orchestrator::StorageKind;
 
 use crate::{
     compose::{MODULE_OBSERVABILITY, MODULE_RUNTIME, compose_services, module_for_service},
-    config::ComposeConfig,
+    config::{ComposeConfig, ComposeDsqlConfig, DsqlMode},
     observability_config::{ObservabilityConfigFilesResource, ObservabilityParams},
 };
 
-// ── Local state module (remote-state bootstrap) ───────────────────
+// ── Local state module ────────────────────────────────────────────
 
 #[derive(Debug)]
 pub struct LocalStateModule {
@@ -25,7 +26,7 @@ pub struct LocalStateModule {
 
 impl iac::Module for LocalStateModule {
     fn name(&self) -> &str {
-        "remote-state"
+        "local-state"
     }
 
     fn dependencies(&self) -> &[&str] {
@@ -62,7 +63,7 @@ impl iac::Resource for LocalStateResource {
     }
 
     fn module(&self) -> &str {
-        "remote-state"
+        "local-state"
     }
 
     async fn create(
@@ -78,7 +79,7 @@ impl iac::Resource for LocalStateResource {
             dependencies: Vec::new(),
             created_at: String::new(),
             updated_at: String::new(),
-            module: "remote-state".into(),
+            module: "local-state".into(),
         })
     }
 
@@ -110,7 +111,7 @@ impl iac::Resource for LocalStateResource {
                 dependencies: Vec::new(),
                 created_at: String::new(),
                 updated_at: String::new(),
-                module: "remote-state".into(),
+                module: "local-state".into(),
             }))
         } else {
             Ok(None)
@@ -130,6 +131,81 @@ impl iac::Resource for LocalStateResource {
 
 // ── Compose service modules ───────────────────────────────────────
 
+#[derive(Debug)]
+pub struct DsqlModule {
+    config: ComposeDsqlConfig,
+    project_name: String,
+}
+
+impl DsqlModule {
+    pub fn new(config: ComposeDsqlConfig, project_name: impl Into<String>) -> Self {
+        Self {
+            config,
+            project_name: project_name.into(),
+        }
+    }
+}
+
+impl iac::Module for DsqlModule {
+    fn name(&self) -> &str {
+        "dsql"
+    }
+
+    fn dependencies(&self) -> &[&str] {
+        &["local-state"]
+    }
+
+    fn resources(
+        &self,
+        _ctx: &iac::ModuleContext<'_>,
+    ) -> Result<Vec<Box<dyn iac::Resource>>, iac::IacError> {
+        if self.config.mode == DsqlMode::Preexisting
+            && self.config.endpoint.as_deref().unwrap_or("").is_empty()
+        {
+            return Err(iac::IacError::Other(anyhow::anyhow!(
+                "preexisting DSQL mode requires dsql.endpoint"
+            )));
+        }
+
+        let cluster_identity = dsql_cluster_identity(&self.project_name);
+        let rctx = tokeira_aws::ResourceContext {
+            project: self.project_name.clone(),
+            region: self.config.region.clone(),
+            tags: HashMap::from([("ManagedBy".into(), "tkr".into())]),
+        };
+        let mode = match self.config.mode {
+            DsqlMode::Managed => {
+                tokeira_aws::resources::dsql_cluster::DsqlClusterMode::Managed
+            }
+            DsqlMode::Preexisting => {
+                tokeira_aws::resources::dsql_cluster::DsqlClusterMode::Preexisting
+            }
+        };
+        let config = tokeira_aws::resources::dsql_cluster::DsqlClusterConfig {
+            mode,
+            preexisting_endpoint: self.config.endpoint.clone(),
+            preexisting_arn: self.config.arn.clone(),
+            fallback_identifier: None,
+            module: self.name().to_owned(),
+        };
+        Ok(vec![Box::new(
+            tokeira_aws::resources::dsql_cluster::DsqlCluster::new(
+                cluster_identity,
+                config,
+                &rctx,
+            ),
+        )])
+    }
+}
+
+pub fn dsql_cluster_identity(project_name: &str) -> String {
+    format!("{project_name}-compose")
+}
+
+pub fn dsql_resource_id(project_name: &str) -> iac::ResourceId {
+    iac::ResourceId(format!("dsql-{}", dsql_cluster_identity(project_name)))
+}
+
 /// Groups compose services under a logical module name.
 ///
 /// Each compose service resource reports its owning module via
@@ -138,6 +214,7 @@ impl iac::Resource for LocalStateResource {
 #[derive(Debug)]
 pub struct ComposeModule {
     module_name: String,
+    storage: StorageKind,
     config_files: Option<ObservabilityConfigFilesResource>,
     services: Vec<ComposeService>,
 }
@@ -151,6 +228,7 @@ impl ComposeModule {
             .collect();
         Self {
             module_name: MODULE_RUNTIME.into(),
+            storage: config.storage,
             config_files: None,
             services,
         }
@@ -164,6 +242,7 @@ impl ComposeModule {
             .collect();
         Self {
             module_name: MODULE_OBSERVABILITY.into(),
+            storage: config.storage,
             config_files: Some(ObservabilityConfigFilesResource::new(
                 config.deployment_dir.clone(),
                 ObservabilityParams::from_config(config),
@@ -179,9 +258,11 @@ impl iac::Module for ComposeModule {
     }
 
     fn dependencies(&self) -> &[&str] {
-        match self.module_name.as_str() {
-            MODULE_RUNTIME => &["remote-state"],
-            MODULE_OBSERVABILITY => &["remote-state", "runtime"],
+        match (self.module_name.as_str(), self.storage) {
+            (MODULE_RUNTIME, StorageKind::Dsql) => &["observability"],
+            (MODULE_RUNTIME, StorageKind::InMemory) => &["local-state"],
+            (MODULE_OBSERVABILITY, StorageKind::Dsql) => &["local-state", "dsql"],
+            (MODULE_OBSERVABILITY, StorageKind::InMemory) => &["local-state", "runtime"],
             _ => &[],
         }
     }

@@ -109,6 +109,8 @@ pub enum DeploymentAction {
         platform: CliPlatformKind,
         #[arg(long)]
         storage: CliStorageKind,
+        #[arg(long)]
+        region: Option<String>,
     },
     List,
     Use {

@@ -3,6 +3,47 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use tokeira_orchestrator::StorageKind;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ComposeDsqlConfig {
+    #[serde(default)]
+    pub mode: DsqlMode,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub arn: Option<String>,
+    #[serde(default = "default_dsql_region")]
+    pub region: String,
+}
+
+impl Default for ComposeDsqlConfig {
+    fn default() -> Self {
+        Self {
+            mode: DsqlMode::Managed,
+            endpoint: None,
+            arn: None,
+            region: default_dsql_region(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DsqlMode {
+    #[default]
+    Managed,
+    Preexisting,
+}
+
+fn default_dsql_region() -> String {
+    "us-east-1".into()
+}
+
+fn default_storage_kind() -> StorageKind {
+    StorageKind::InMemory
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokeiradServiceConfig {
@@ -36,6 +77,10 @@ pub struct ObservabilityConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComposeConfig {
     pub project_name: String,
+    #[serde(default = "default_storage_kind")]
+    pub storage: StorageKind,
+    #[serde(default)]
+    pub dsql: Option<ComposeDsqlConfig>,
     pub tokeirad: TokeiradServiceConfig,
     pub observability: ObservabilityConfig,
     /// Deployment directory path — populated by the CLI after loading.
@@ -48,6 +93,8 @@ impl Default for ComposeConfig {
     fn default() -> Self {
         Self {
             project_name: "tokeira".into(),
+            storage: StorageKind::InMemory,
+            dsql: None,
             tokeirad: TokeiradServiceConfig {
                 image: "tokeirad:latest".into(),
                 grpc_port: 7233,

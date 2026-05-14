@@ -26,9 +26,11 @@ pub fn run(action: DeploymentAction, deployments: &DeploymentResolver, json: boo
             name,
             platform,
             storage,
+            region,
         } => {
             let resolved_name = name.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            let metadata = deployments.create(&resolved_name, platform.into(), storage.into())?;
+            let metadata =
+                deployments.create(&resolved_name, platform.into(), storage.into(), region)?;
             print_metadata(&metadata, json)?;
         }
         DeploymentAction::List => {

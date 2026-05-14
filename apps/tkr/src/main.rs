@@ -368,7 +368,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
         deployments
-            .create("dev", PlatformKind::Local, StorageKind::InMemory)
+            .create("dev", PlatformKind::Local, StorageKind::InMemory, None)
             .unwrap();
         let deployment_path = deployments.path("dev");
         let _: LocalConfig =
@@ -383,7 +383,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
         deployments
-            .create("My Dev", PlatformKind::Local, StorageKind::InMemory)
+            .create("My Dev", PlatformKind::Local, StorageKind::InMemory, None)
             .unwrap();
         let deployment_path = deployments.path("my-dev");
         assert!(deployment_path.join(DEPLOYMENT_TOML).exists());
@@ -410,10 +410,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
         deployments
-            .create("dev", PlatformKind::Local, StorageKind::InMemory)
+            .create("dev", PlatformKind::Local, StorageKind::InMemory, None)
             .unwrap();
         let err = deployments
-            .create("DEV", PlatformKind::Local, StorageKind::InMemory)
+            .create("DEV", PlatformKind::Local, StorageKind::InMemory, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("already exists"));
@@ -424,7 +424,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
         deployments
-            .create("dev", PlatformKind::Local, StorageKind::InMemory)
+            .create("dev", PlatformKind::Local, StorageKind::InMemory, None)
             .unwrap();
         let path = deployments.path("dev");
         assert!(path.exists());
@@ -438,10 +438,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
         deployments
-            .create("alpha", PlatformKind::Local, StorageKind::InMemory)
+            .create("alpha", PlatformKind::Local, StorageKind::InMemory, None)
             .unwrap();
         deployments
-            .create("beta", PlatformKind::Local, StorageKind::InMemory)
+            .create("beta", PlatformKind::Local, StorageKind::InMemory, None)
             .unwrap();
         let error = deployments.not_found_message("gamma").unwrap();
         assert!(error.contains("alpha"));
@@ -456,16 +456,21 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
         deployments
-            .create("local-mem", PlatformKind::Local, StorageKind::InMemory)
+            .create("local-mem", PlatformKind::Local, StorageKind::InMemory, None)
             .unwrap();
         deployments
-            .create("local-dsql", PlatformKind::Local, StorageKind::Dsql)
+            .create("local-dsql", PlatformKind::Local, StorageKind::Dsql, None)
             .unwrap();
         deployments
-            .create("compose-mem", PlatformKind::Compose, StorageKind::InMemory)
+            .create(
+                "compose-mem",
+                PlatformKind::Compose,
+                StorageKind::InMemory,
+                None,
+            )
             .unwrap();
         deployments
-            .create("compose-dsql", PlatformKind::Compose, StorageKind::Dsql)
+            .create("compose-dsql", PlatformKind::Compose, StorageKind::Dsql, None)
             .unwrap();
     }
 
@@ -539,7 +544,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
         deployments
-            .create("test-local", PlatformKind::Local, StorageKind::InMemory)
+            .create("test-local", PlatformKind::Local, StorageKind::InMemory, None)
             .unwrap();
         let toml_content =
             fs::read_to_string(deployments.path("test-local").join(DEPLOYMENT_TOML)).unwrap();
@@ -556,7 +561,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
         deployments
-            .create("test-compose", PlatformKind::Compose, StorageKind::InMemory)
+            .create(
+                "test-compose",
+                PlatformKind::Compose,
+                StorageKind::InMemory,
+                None,
+            )
             .unwrap();
         let toml_content =
             fs::read_to_string(deployments.path("test-compose").join(DEPLOYMENT_TOML)).unwrap();

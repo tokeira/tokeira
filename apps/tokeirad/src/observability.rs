@@ -395,6 +395,7 @@ mod tests {
         let (layer, reload) = tracing_subscriber::reload::Layer::new(EnvFilter::new("info"));
         let _layer = layer;
         let mut config = TokeiraConfig::default();
+        let grpc_addr = config.infrastructure.network.grpc_addr.clone();
         config.infrastructure.dsql.endpoint = Some("secret.example".to_string());
         config.emergency.freeze_projection = true;
         let state = ObservabilityServerState {
@@ -422,7 +423,7 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["infrastructure"]["dsql"]["endpoint"], "[redacted]");
-        assert_eq!(json["infrastructure"]["network"]["grpc_addr"], "[::1]:7233");
+        assert_eq!(json["infrastructure"]["network"]["grpc_addr"], grpc_addr);
         assert_eq!(json["_warnings"].as_array().unwrap().len(), 1);
     }
 }

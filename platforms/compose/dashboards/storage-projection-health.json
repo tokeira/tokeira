@@ -34,7 +34,7 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(tokeira_storage_commit_transition_duration_seconds_bucket[5m])))",
+          "expr": "tokeira_storage_commit_transition_duration_seconds{quantile=\"0.95\"}",
           "legendFormat": "commit p95"
         }
       ],
@@ -254,19 +254,19 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(tokeira_storage_commit_transition_duration_seconds_bucket[5m])))",
+          "expr": "tokeira_storage_commit_transition_duration_seconds{quantile=\"0.5\"}",
           "legendFormat": "commit p50"
         },
         {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(tokeira_storage_commit_transition_duration_seconds_bucket[5m])))",
+          "expr": "tokeira_storage_commit_transition_duration_seconds{quantile=\"0.95\"}",
           "legendFormat": "commit p95"
         },
         {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(tokeira_storage_load_run_duration_seconds_bucket[5m])))",
+          "expr": "tokeira_storage_load_run_duration_seconds{quantile=\"0.95\"}",
           "legendFormat": "load p95"
         },
         {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(tokeira_storage_read_history_duration_seconds_bucket[5m])))",
+          "expr": "tokeira_storage_read_history_duration_seconds{quantile=\"0.95\"}",
           "legendFormat": "history p95"
         }
       ],
@@ -522,7 +522,7 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(tokeira_projection_sink_write_duration_seconds_bucket[5m])))",
+          "expr": "tokeira_projection_sink_write_duration_seconds{quantile=\"0.95\"}",
           "legendFormat": "write p95"
         },
         {

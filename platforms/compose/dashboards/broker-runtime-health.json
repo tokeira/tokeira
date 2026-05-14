@@ -317,15 +317,15 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(tokeira_runtime_lane_submit_duration_seconds_bucket[5m])))",
+          "expr": "tokeira_runtime_lane_submit_duration_seconds{quantile=\"0.5\"}",
           "legendFormat": "p50"
         },
         {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(tokeira_runtime_lane_submit_duration_seconds_bucket[5m])))",
+          "expr": "tokeira_runtime_lane_submit_duration_seconds{quantile=\"0.95\"}",
           "legendFormat": "p95"
         },
         {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(tokeira_runtime_lane_submit_duration_seconds_bucket[5m])))",
+          "expr": "tokeira_runtime_lane_submit_duration_seconds{quantile=\"0.99\"}",
           "legendFormat": "p99"
         }
       ],

@@ -46,8 +46,26 @@ pub fn compose_services(config: &ComposeConfig) -> Vec<ComposeService> {
     );
     let mut tokeirad_volumes = Vec::new();
     let mut tokeirad_environment = HashMap::new();
+
+    // Always mount tokeirad.toml so the container reads the operator's server config
+    // (including storage kind and DSQL endpoint after writeback)
+    let tokeirad_toml = config.deployment_dir.join("tokeirad.toml");
+    if tokeirad_toml.exists() {
+        tokeirad_volumes.push(format!(
+            "{}:/etc/tokeira/tokeirad.toml:ro",
+            tokeirad_toml.display()
+        ));
+        tokeirad_environment.insert(
+            "TOKEIRA_CONFIG".into(),
+            "/etc/tokeira/tokeirad.toml".into(),
+        );
+    }
+
     if config.storage == StorageKind::Dsql {
-        tokeirad_volumes.push("~/.aws:/home/nonroot/.aws:ro".into());
+        // Docker requires absolute paths for bind mounts — expand ~ to the user's home directory
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        let aws_dir = format!("{home}/.aws");
+        tokeirad_volumes.push(format!("{aws_dir}:/home/nonroot/.aws:ro"));
         tokeirad_environment.insert("HOME".into(), "/home/nonroot".into());
         let dsql = config.dsql.clone().unwrap_or_default();
         tokeirad_environment.insert("AWS_REGION".into(), dsql.region);

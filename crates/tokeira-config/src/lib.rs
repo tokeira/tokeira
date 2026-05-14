@@ -935,6 +935,7 @@ mod tests {
                     target_p99_wft_latency_ms,
                 )| TokeiraConfig {
                     infrastructure: InfrastructureConfig {
+                        storage: ConfigStorageKind::InMemory,
                         cluster_name,
                         region,
                         dsql: DsqlInfraConfig::default(),

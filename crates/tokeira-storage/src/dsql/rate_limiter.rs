@@ -50,7 +50,7 @@ impl TokenBucketRateLimiter {
     /// The short async delay avoids a CPU spin while keeping connection
     /// creation responsive under startup pressure.
     pub async fn acquire(&self) {
-        let mut throttle_start = None;
+        let mut throttle_start: Option<Instant> = None;
         loop {
             if self.try_acquire() {
                 if let Some(started) = throttle_start {

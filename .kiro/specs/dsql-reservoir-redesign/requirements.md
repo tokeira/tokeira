@@ -99,40 +99,30 @@ All connection management parameters are internal constants derived from DSQL's 
 4. IF the ping succeeds, THEN THE Return_Processor SHALL place the connection back in the Ready_Channel.
 5. IF the ping fails, THEN THE Return_Processor SHALL discard the connection and emit a metric indicating the failure reason.
 
-### Requirement 7: Local Token Bucket Rate Limiter
+### Requirement 7: Distributed Token Bucket as Sole Rate Limiter
 
-**User Story:** As a tokeira developer, I want connection creation to be rate-limited per node, so that a single node cannot exceed DSQL's cluster-wide connection creation rate.
-
-#### Acceptance Criteria
-
-1. THE Token_Bucket SHALL enforce a sustained rate of 100 connections per second with a burst capacity of 1,000 connections for single-node deployments.
-2. WHEN the Token_Bucket is integrated into the Refiller, THE Token_Bucket SHALL be the sole throttle on connection creation rate.
-3. THE Token_Bucket SHALL refill tokens based on monotonic elapsed time.
-4. FOR ALL sequences of `try_acquire` calls, the Token_Bucket SHALL never allow more than `burst_capacity` tokens to be consumed without refill time elapsing.
-5. WHEN the Token_Bucket is reconfigured for multi-node operation, THE Token_Bucket SHALL accept a partitioned rate (cluster rate divided by node count) without restarting the Refiller.
-
-### Requirement 8: Distributed Token Bucket
-
-**User Story:** As a tokeira operator running multiple nodes, I want the cluster-wide 100/sec connection creation rate to be coordinated across all nodes, so that no combination of nodes exceeds DSQL's rate limit.
+**User Story:** As a tokeira developer, I want the DynamoDB-backed distributed token bucket to be the sole rate limiter for connection creation, so that there is one authoritative coordination point for the cluster-wide 100/sec DSQL rate limit.
 
 #### Acceptance Criteria
 
-1. THE Distributed_Token_Bucket SHALL use a DynamoDB table to coordinate the cluster-wide 100 connections/second rate limit across all nodes.
-2. WHEN the DynamoDB coordination table exists at startup, THE Reservoir SHALL use the Distributed_Token_Bucket instead of the local-only Token_Bucket for rate limiting.
-3. WHEN the DynamoDB coordination table does not exist at startup, THE Reservoir SHALL fall back to the local-only Token_Bucket without error.
-4. THE Distributed_Token_Bucket SHALL use TTL-based cleanup of expired rate limit entries to prevent unbounded table growth.
-5. IF the Distributed_Token_Bucket fails to communicate with DynamoDB, THEN THE Reservoir SHALL fall back to local-only rate limiting and emit a warning metric.
+1. THE Distributed_Token_Bucket SHALL be the only rate limiter in the connection creation path. There SHALL NOT be a separate local token bucket.
+2. THE Refiller SHALL acquire a token from the Distributed_Token_Bucket before each connection creation attempt.
+3. THE Distributed_Token_Bucket SHALL enforce DSQL's cluster-wide sustained rate of 100 connections per second with a burst capacity of 1,000 connections.
+4. THE Distributed_Token_Bucket SHALL use a DynamoDB table with a single item per DSQL endpoint, tracking token count and last refill timestamp.
+5. THE Distributed_Token_Bucket SHALL use atomic conditional updates (DynamoDB condition expressions) to prevent race conditions between nodes.
 
-### Requirement 9: Distributed Slot Block Manager
+### Requirement 8: Distributed Slot Block Manager
 
-**User Story:** As a tokeira operator running multiple nodes, I want the 10,000 connection limit to be partitioned across nodes, so that no single node can consume the entire cluster's connection budget.
+**User Story:** As a tokeira developer, I want the 10,000 connection limit to be partitioned across nodes using block-based allocation, so that no single node can consume the entire cluster's connection budget.
 
 #### Acceptance Criteria
 
 1. THE Slot_Block_Manager SHALL use a DynamoDB table to allocate blocks of connection slots (100 slots per block) to individual nodes.
 2. WHEN a node acquires a slot block, THE Slot_Block_Manager SHALL record the allocation with a TTL for crash recovery.
 3. THE Refiller SHALL only create connections within the node's allocated slot budget (number of acquired blocks × block size).
-4. WHEN the DynamoDB slot block table exists at startup, THE Reservoir SHALL use block-based allocation to limit its connection count.
+4. THE Slot_Block_Manager SHALL periodically renew its block leases to prevent expiry during normal operation.
+5. IF a node crashes, THEN THE Slot_Block_Manager SHALL release the node's blocks via TTL expiry, making them available to other nodes.
+6. THE Slot_Block_Manager SHALL use the same DynamoDB table as the Distributed_Token_Bucket (separate partition key prefix) to minimize infrastructure.
 5. WHEN the DynamoDB slot block table does not exist at startup, THE Reservoir SHALL operate without a distributed connection count limit and fall back to local-only operation.
 6. THE Slot_Block_Manager SHALL periodically renew its block leases to prevent expiry during normal operation.
 7. IF a node crashes, THEN THE Slot_Block_Manager SHALL release the node's blocks via TTL expiry, making them available to other nodes.

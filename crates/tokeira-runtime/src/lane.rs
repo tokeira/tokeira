@@ -210,6 +210,7 @@ where
             shard_owner,
             message.run_key,
             message.command,
+            config,
             config.max_occ_retries,
         )
         .await;
@@ -642,6 +643,7 @@ async fn handle_message<K, R>(
     shard_owner: &Arc<RwLock<ShardOwner>>,
     run_key: RunKey,
     command: Command,
+    config: &LaneConfig,
     max_retries: u32,
 ) -> Result<(
     CommitResult,
@@ -1635,7 +1637,7 @@ mod tests {
                 let kernel = MockKernel::new(sample_dispatch_ops(state.namespace_id));
                 let shard_owner = test_shard_owner();
 
-                let (result, _, _) = handle_message(&kernel, &repo, &shard_owner, run_key, sample_command("a"), 8).await.unwrap();
+                let (result, _, _) = handle_message(&kernel, &repo, &shard_owner, run_key, sample_command("a"), &LaneConfig::default(), 8).await.unwrap();
                 let (load_calls, commit_calls, _) = repo.snapshot().await;
                 let (commands, loaded_runs) = kernel.snapshot();
                 (result, load_calls, commit_calls, commands.len(), loaded_runs.len())
@@ -1665,7 +1667,7 @@ mod tests {
                 let command = sample_command("stable");
                 let shard_owner = test_shard_owner();
 
-                let _ = handle_message(&kernel, &repo, &shard_owner, run_key, command.clone(), 8).await.unwrap();
+                let _ = handle_message(&kernel, &repo, &shard_owner, run_key, command.clone(), &LaneConfig::default(), 8).await.unwrap();
                 kernel.snapshot().0
             });
             prop_assert!(!commands.is_empty());
@@ -1690,7 +1692,7 @@ mod tests {
                 let kernel = MockKernel::new(sample_dispatch_ops(state.namespace_id));
                 let shard_owner = test_shard_owner();
 
-                let error = handle_message(&kernel, &repo, &shard_owner, run_key, sample_command("bound"), max_retries)
+                let error = handle_message(&kernel, &repo, &shard_owner, run_key, sample_command("bound"), &LaneConfig::default(), max_retries)
                     .await
                     .expect_err("retry exhaustion should surface as an error");
                 let (load_calls, commit_calls, _) = repo.snapshot().await;
@@ -1720,6 +1722,7 @@ mod tests {
                     &shard_owner,
                     run_key,
                     sample_command(&format!("dup-{seed}")),
+                    &LaneConfig::default(),
                     5,
                 )
                 .await
@@ -2350,6 +2353,7 @@ mod tests {
             &shard_owner,
             run_key,
             sample_command("reject"),
+            &LaneConfig::default(),
             5,
         )
         .await
@@ -2382,6 +2386,7 @@ mod tests {
             &shard_owner,
             run_key,
             sample_command("span"),
+            &LaneConfig::default(),
             0,
         )
         .await

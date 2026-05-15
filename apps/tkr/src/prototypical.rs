@@ -32,29 +32,47 @@ pub fn deployment_config(
     }
 }
 
-pub fn server_config(platform: PlatformKind, storage: StorageKind) -> Result<String> {
-    match platform {
+pub fn server_config(
+    platform: PlatformKind,
+    storage: StorageKind,
+    region: Option<&str>,
+) -> Result<String> {
+    let toml = match platform {
         PlatformKind::Local => {
             let toml = LocalDeployment::prototypical_server_config(storage);
             let _: tokeira_config::TokeiraConfig = toml::from_str(&toml)?;
-            Ok(toml)
+            toml
         }
         PlatformKind::Compose => {
             let toml = ComposeDeployment::prototypical_server_config(storage);
             let _: tokeira_config::TokeiraConfig = toml::from_str(&toml)?;
-            Ok(toml)
+            toml
         }
         PlatformKind::Ecs => {
             let toml = EcsDeployment::prototypical_server_config(storage);
             let _: tokeira_config::TokeiraConfig = toml::from_str(&toml)?;
-            Ok(toml)
+            toml
         }
+    };
+    if storage == StorageKind::Dsql {
+        patch_server_dsql_region(toml, region.unwrap_or("us-east-1"))
+    } else {
+        Ok(toml)
     }
 }
 
 fn patch_dsql_region(toml: String, region: &str) -> Result<String> {
     let mut document = toml.parse::<DocumentMut>()?;
     document["dsql"]["region"] = value(region);
+    Ok(document.to_string())
+}
+
+fn patch_server_dsql_region(toml: String, region: &str) -> Result<String> {
+    let mut document = toml.parse::<DocumentMut>()?;
+    document["infrastructure"]["region"] = value(region);
+    if let Some(dsql) = document.get_mut("infrastructure").and_then(|i| i.get_mut("dsql")) {
+        dsql["region"] = value(region);
+    }
     Ok(document.to_string())
 }
 

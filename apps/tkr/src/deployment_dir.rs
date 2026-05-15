@@ -139,7 +139,7 @@ impl DeploymentResolver {
         )?;
         fs::write(
             path.join(TOKEIRAD_TOML),
-            crate::prototypical::server_config(platform, storage)?,
+            crate::prototypical::server_config(platform, storage, region.as_deref())?,
         )?;
         let now = timestamp();
         let metadata = DeploymentMetadata {

@@ -28,7 +28,7 @@ pub const DSQL_POOL_CLASS_IN_USE: &str = "tokeira_dsql_pool_class_in_use";
 pub const DSQL_POOL_CLASS_WAITERS: &str = "tokeira_dsql_pool_class_waiters";
 pub const DSQL_CLASS_PERMIT_WAIT_DURATION_SECONDS: &str =
     "tokeira_dsql_class_permit_wait_duration_seconds";
-pub const DSQL_POOL_WAITING: &str = "tokeira_dsql_pool_waiting";
+pub const DSQL_POOL_WAITING: &str = "tokeira_dsql_pool_waiting_requests";
 pub const DSQL_OPERATION_DURATION_SECONDS: &str = "tokeira_storage_dsql_operation_duration_seconds";
 pub const DSQL_STATEMENT_DURATION_SECONDS: &str = "tokeira_storage_dsql_statement_duration_seconds";
 pub const DSQL_OCC_CONFLICT_TOTAL: &str = "tokeira_storage_dsql_occ_conflict_total";

@@ -234,3 +234,58 @@ Expected throughput: **1,000–3,000 wf/s** (with multi-node, multi-bundle distr
 3. **Fix 2** (vis_rollup redesign) — eliminates the OCC hotspot permanently
 4. **Fix 3** (self-assign bundles) — enables multi-bundle compose for higher throughput
 5. **Fix 4** (pool/budget tuning) — fine-tuning after the structural fixes land
+
+## Dashboard and Metrics Gaps
+
+### Metric Emission Split
+
+The in-memory and DSQL storage paths emit different metric names:
+
+| Backend | Metric | Emitted? |
+|---------|--------|----------|
+| InMemory | `tokeira_storage_repository_operation_total` | ✓ |
+| InMemory | `tokeira_storage_commit_transition_duration_seconds` | ✓ |
+| InMemory | `tokeira_storage_load_run_duration_seconds` | ✓ |
+| InMemory | `tokeira_storage_read_history_duration_seconds` | ✓ |
+| DSQL | `tokeira_storage_dsql_operation_total` | ✓ |
+| DSQL | `tokeira_storage_dsql_operation_duration_seconds` | ✓ |
+| DSQL | `tokeira_storage_dsql_query_duration_seconds` | ✓ |
+| DSQL | `tokeira_storage_dsql_shard_operation_total` | ✓ |
+| DSQL | `tokeira_storage_dsql_shard_duration_seconds` | ✓ |
+| DSQL | `tokeira_storage_repository_operation_total` | ✗ (not wired) |
+| DSQL | `tokeira_storage_dsql_occ_conflict_total` | ✗ (not wired or no conflicts) |
+| DSQL | `tokeira_storage_dsql_retry_total` | ✗ (not wired or no retries) |
+
+The generic `tokeira_storage_repository_*` metrics from the Phase 2 observability foundation were wired into `InMemoryStore` but never into `DsqlRunRepository`. The DSQL path has its own metrics (`tokeira_storage_dsql_*`) but the dashboard's "Repository Operations" row queries the generic names — resulting in "No data" on DSQL deployments.
+
+### Missing OCC/Retry Metrics
+
+The `tokeira_storage_dsql_occ_conflict_total` and `tokeira_storage_dsql_retry_total` counters are either:
+1. Not wired into the DSQL code paths (the recording calls exist in the lane retry loop but may not cover all conflict sources), or
+2. No conflicts occurred during the bench run (unlikely given the projection OCC logs observed earlier)
+
+Investigation needed: verify the recording call placement covers both the lane-level retry path and the projection sink conflict path.
+
+### Recommended Dashboard Structure
+
+The current single `storage-projection-health.json` dashboard tries to serve both backends but fails because the metric names diverge. Recommended split:
+
+| Dashboard | Purpose | Metrics |
+|-----------|---------|---------|
+| `tokeira-server-health.json` | Always works regardless of backend | gRPC, broker, runtime, kernel metrics |
+| `tokeira-dsql-storage.json` | DSQL-specific storage health | `tokeira_storage_dsql_*`, `tokeira_dsql_pool_*`, `tokeira_dsql_reservoir_*` |
+| `tokeira-projection.json` | Projection pipeline health | `tokeira_projection_*` (same names for both backends) |
+
+The "Repository Operations" row (generic metrics) should be removed from the DSQL dashboard. The DSQL dashboard should only reference `tokeira_storage_dsql_*` and `tokeira_dsql_pool_*` metrics.
+
+### Fix 6: Unify or Split Storage Metrics (Priority: Medium)
+
+**Option A — Emit generic metrics from DSQL path too:**
+
+Wire `record_storage_operation`, `record_commit_transition_duration`, etc. into `DsqlRunRepository` alongside the DSQL-specific metrics. Both metric families are emitted. The generic dashboard works for both backends; the DSQL dashboard adds DSQL-specific detail.
+
+**Option B — Separate dashboards per backend:**
+
+Split into `tokeira-dsql-storage.json` and `tokeira-inmemory-storage.json`. Each queries only the metrics its backend emits. The compose platform generates the appropriate dashboard based on `StorageKind`.
+
+**Recommendation:** Option A (emit both) — simpler for operators who switch between backends. The generic metrics provide a consistent baseline; DSQL metrics add depth. The cost is ~10 additional counter/histogram calls per operation, which is negligible.

@@ -632,6 +632,22 @@ async fn self_assign_dsql_shards<R>(
 where
     R: LeaseRepository + RunRepository + 'static,
 {
+    // In single-node compose mode (no controller), any existing leases are stale
+    // by definition — there is no other node. Relinquish all existing leases first
+    // so try_acquire_bundle succeeds regardless of prior owner or expiry.
+    let existing_leases = lease_repository.list_bundle_leases().await?;
+    for lease in &existing_leases {
+        if let Some(owner) = &lease.owner_node_id {
+            let _ = lease_repository
+                .relinquish_bundle(
+                    lease.bundle_id,
+                    owner.clone(),
+                    lease.epoch,
+                )
+                .await;
+        }
+    }
+
     let mut acquired = 0u32;
     for shard_index in 0..shard_count {
         let shard_id = ShardId(shard_index);

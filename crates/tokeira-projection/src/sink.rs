@@ -9,7 +9,7 @@ use tokeira_storage::ProjectionRecord;
 /// stream, but operational reality means restarts and retries still happen.
 #[async_trait]
 pub trait ProjectionSink: Send + Sync {
-    async fn apply(&self, record: &ProjectionRecord) -> Result<()>;
+    async fn apply(&self, record: &ProjectionRecord, partition_id: u32) -> Result<()>;
 
     // TODO(projection): add batched apply once the SQL sink exists.
     // TODO(projection): add checkpoint persistence hooks for sinks that want to

@@ -775,6 +775,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn storage_projection_dashboard_uses_operator_style_contract() {
+        let dashboard: Value =
+            serde_json::from_str(include_str!("../dashboards/storage-projection-health.json"))
+                .unwrap();
+        for panel in dashboard["panels"].as_array().unwrap() {
+            let grid = &panel["gridPos"];
+            let x = grid["x"].as_i64().unwrap();
+            let w = grid["w"].as_i64().unwrap();
+            assert!(x >= 0);
+            assert!(w > 0);
+            assert!(x + w <= 24);
+            assert!(grid["h"].as_i64().unwrap() > 0);
+
+            if panel["type"].as_str() == Some("row") {
+                continue;
+            }
+            assert!(!panel["description"].as_str().unwrap_or_default().is_empty());
+
+            let title = panel["title"].as_str().unwrap_or_default();
+            let is_rate_panel = title.contains("Rate") || title.contains("/s");
+            if is_rate_panel {
+                let targets = panel["targets"].as_array().unwrap();
+                assert!(targets.iter().all(|target| {
+                    target["expr"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("rate(")
+                }));
+                assert_eq!(
+                    panel["fieldConfig"]["defaults"]["unit"].as_str(),
+                    Some("ops")
+                );
+            }
+        }
+    }
+
     fn contents_for<'a>(files: &'a [RenderedConfigFile], path: &str) -> &'a str {
         files
             .iter()

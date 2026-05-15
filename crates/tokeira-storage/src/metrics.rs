@@ -26,8 +26,11 @@ pub const DSQL_POOL_RATE_LIMITER_RATE: &str = "tokeira_dsql_pool_rate_limiter_ra
 pub const DSQL_POOL_CLASS_BUDGET_TOTAL: &str = "tokeira_dsql_pool_class_budget_total";
 pub const DSQL_POOL_CLASS_IN_USE: &str = "tokeira_dsql_pool_class_in_use";
 pub const DSQL_POOL_CLASS_WAITERS: &str = "tokeira_dsql_pool_class_waiters";
-pub const DSQL_OPERATION_DURATION_SECONDS: &str =
-    "tokeira_storage_dsql_operation_duration_seconds";
+pub const DSQL_CLASS_PERMIT_WAIT_DURATION_SECONDS: &str =
+    "tokeira_dsql_class_permit_wait_duration_seconds";
+pub const DSQL_POOL_WAITING: &str = "tokeira_dsql_pool_waiting";
+pub const DSQL_OPERATION_DURATION_SECONDS: &str = "tokeira_storage_dsql_operation_duration_seconds";
+pub const DSQL_STATEMENT_DURATION_SECONDS: &str = "tokeira_storage_dsql_statement_duration_seconds";
 pub const DSQL_OCC_CONFLICT_TOTAL: &str = "tokeira_storage_dsql_occ_conflict_total";
 pub const DSQL_RETRY_TOTAL: &str = "tokeira_storage_dsql_retry_total";
 pub const DSQL_OPERATION_TOTAL: &str = "tokeira_storage_dsql_operation_total";
@@ -41,8 +44,7 @@ pub const DSQL_RESERVOIR_CONNECTION_VALIDATE_DURATION_SECONDS: &str =
     "tokeira_dsql_reservoir_connection_validate_duration_seconds";
 pub const DSQL_RESERVOIR_CONNECTION_AGE_SECONDS: &str =
     "tokeira_dsql_reservoir_connection_age_seconds";
-pub const DSQL_RATE_LIMITER_TOKENS_REMAINING: &str =
-    "tokeira_dsql_rate_limiter_tokens_remaining";
+pub const DSQL_RATE_LIMITER_TOKENS_REMAINING: &str = "tokeira_dsql_rate_limiter_tokens_remaining";
 pub const DSQL_RATE_LIMITER_THROTTLED_TOTAL: &str = "tokeira_dsql_rate_limiter_throttled_total";
 pub const DSQL_RATE_LIMITER_THROTTLE_DURATION_SECONDS: &str =
     "tokeira_dsql_rate_limiter_throttle_duration_seconds";
@@ -80,7 +82,16 @@ pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (DSQL_POOL_CLASS_IN_USE, MetricType::Gauge),
     (DSQL_POOL_CLASS_WAITERS, MetricType::Gauge),
     (
+        DSQL_CLASS_PERMIT_WAIT_DURATION_SECONDS,
+        MetricType::DurationHistogram,
+    ),
+    (DSQL_POOL_WAITING, MetricType::Gauge),
+    (
         DSQL_OPERATION_DURATION_SECONDS,
+        MetricType::DurationHistogram,
+    ),
+    (
+        DSQL_STATEMENT_DURATION_SECONDS,
         MetricType::DurationHistogram,
     ),
     (DSQL_OCC_CONFLICT_TOTAL, MetricType::Counter),
@@ -193,12 +204,34 @@ pub fn record_dsql_pool_class_budget(
     gauge!(DSQL_POOL_CLASS_WAITERS, "class" => class).set(waiters as f64);
 }
 
+pub fn increment_dsql_pool_waiting(class: &'static str) {
+    gauge!(DSQL_POOL_WAITING, "class" => class).increment(1.0);
+}
+
+pub fn decrement_dsql_pool_waiting(class: &'static str) {
+    gauge!(DSQL_POOL_WAITING, "class" => class).decrement(1.0);
+}
+
+pub fn record_dsql_class_permit_wait_duration(class: &'static str, duration: std::time::Duration) {
+    histogram!(DSQL_CLASS_PERMIT_WAIT_DURATION_SECONDS, "class" => class)
+        .record(duration.as_secs_f64());
+}
+
 pub fn record_dsql_operation_duration(
     operation: &'static str,
     outcome: &'static str,
     duration: std::time::Duration,
 ) {
     histogram!(DSQL_OPERATION_DURATION_SECONDS, "operation" => operation, "outcome" => outcome)
+        .record(duration.as_secs_f64());
+}
+
+pub fn record_dsql_statement_duration(
+    operation: &'static str,
+    statement: &'static str,
+    duration: std::time::Duration,
+) {
+    histogram!(DSQL_STATEMENT_DURATION_SECONDS, "operation" => operation, "statement" => statement)
         .record(duration.as_secs_f64());
 }
 
@@ -236,10 +269,7 @@ pub fn record_dsql_reservoir_connection_validate_duration(duration: std::time::D
     histogram!(DSQL_RESERVOIR_CONNECTION_VALIDATE_DURATION_SECONDS).record(duration.as_secs_f64());
 }
 
-pub fn record_dsql_reservoir_connection_age(
-    reason: &'static str,
-    age: std::time::Duration,
-) {
+pub fn record_dsql_reservoir_connection_age(reason: &'static str, age: std::time::Duration) {
     histogram!(DSQL_RESERVOIR_CONNECTION_AGE_SECONDS, "retirement_reason" => reason)
         .record(age.as_secs_f64());
 }
@@ -365,6 +395,9 @@ mod tests {
             record_dsql_pool_connection_returned();
             record_dsql_pool_rate_limiter(4.0, 100.0);
             record_dsql_pool_class_budget("commit", 5, 1, 0);
+            increment_dsql_pool_waiting("commit");
+            decrement_dsql_pool_waiting("commit");
+            record_dsql_class_permit_wait_duration("commit", std::time::Duration::from_millis(3));
         });
 
         let snapshot = snapshot_map(&recorder);
@@ -412,6 +445,8 @@ mod tests {
         assert!(snapshot.contains_key(DSQL_POOL_CLASS_BUDGET_TOTAL));
         assert!(snapshot.contains_key(DSQL_POOL_CLASS_IN_USE));
         assert!(snapshot.contains_key(DSQL_POOL_CLASS_WAITERS));
+        assert!(snapshot.contains_key(DSQL_POOL_WAITING));
+        assert!(snapshot.contains_key(DSQL_CLASS_PERMIT_WAIT_DURATION_SECONDS));
     }
 
     #[test]
@@ -423,6 +458,11 @@ mod tests {
                 "load_run",
                 "success",
                 std::time::Duration::from_millis(12),
+            );
+            record_dsql_statement_duration(
+                "commit_transition",
+                "load_hot",
+                std::time::Duration::from_millis(5),
             );
             record_dsql_occ_conflict("commit_transition");
             record_dsql_retry("commit_transition_for_bundle", "success");
@@ -450,6 +490,7 @@ mod tests {
 
         let snapshot = snapshot_map(&recorder);
         assert!(snapshot.contains_key(DSQL_OPERATION_DURATION_SECONDS));
+        assert!(snapshot.contains_key(DSQL_STATEMENT_DURATION_SECONDS));
         assert!(snapshot.contains_key(DSQL_OCC_CONFLICT_TOTAL));
         assert!(snapshot.contains_key(DSQL_RETRY_TOTAL));
         assert!(snapshot.contains_key(DSQL_OPERATION_TOTAL));

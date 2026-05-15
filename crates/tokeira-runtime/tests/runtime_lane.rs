@@ -91,6 +91,7 @@ async fn occ_conflicts_are_retried_for_signals() -> Result<()> {
         LaneConfig {
             max_occ_retries: 5,
             max_drain_per_activation: 16,
+            ..LaneConfig::default()
         },
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),

@@ -178,9 +178,7 @@ impl iac::Module for DsqlModule {
             tags: HashMap::from([("ManagedBy".into(), "tkr".into())]),
         };
         let mode = match self.config.mode {
-            DsqlMode::Managed => {
-                tokeira_aws::resources::dsql_cluster::DsqlClusterMode::Managed
-            }
+            DsqlMode::Managed => tokeira_aws::resources::dsql_cluster::DsqlClusterMode::Managed,
             DsqlMode::Preexisting => {
                 tokeira_aws::resources::dsql_cluster::DsqlClusterMode::Preexisting
             }
@@ -193,11 +191,7 @@ impl iac::Module for DsqlModule {
             module: self.name().to_owned(),
         };
         Ok(vec![Box::new(
-            tokeira_aws::resources::dsql_cluster::DsqlCluster::new(
-                cluster_identity,
-                config,
-                &rctx,
-            ),
+            tokeira_aws::resources::dsql_cluster::DsqlCluster::new(cluster_identity, config, &rctx),
         )])
     }
 }

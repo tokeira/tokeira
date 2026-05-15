@@ -55,10 +55,7 @@ pub fn compose_services(config: &ComposeConfig) -> Vec<ComposeService> {
             "{}:/etc/tokeira/tokeirad.toml:ro",
             tokeirad_toml.display()
         ));
-        tokeirad_environment.insert(
-            "TOKEIRA_CONFIG".into(),
-            "/etc/tokeira/tokeirad.toml".into(),
-        );
+        tokeirad_environment.insert("TOKEIRA_CONFIG".into(), "/etc/tokeira/tokeirad.toml".into());
     }
 
     if config.storage == StorageKind::Dsql {

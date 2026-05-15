@@ -10,7 +10,7 @@ use std::{collections::BTreeSet, sync::Arc, time::Instant};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use sqlx::{
-    PgConnection, Postgres, Row,
+    Connection, PgConnection, Postgres, Row,
     postgres::{PgArguments, PgRow},
     query::Query,
 };
@@ -18,6 +18,7 @@ use tokeira_kernel::ProjectionOp;
 use tokeira_storage::{
     ConnectionDirector, DbClass, ProjectionRecord,
     dsql::{DsqlConnectionDirector, codec},
+    metrics as storage_metrics,
 };
 use tokeira_types::{
     ExecutionStatus, Memo, NamespaceId, ProjectionCursor, RunKey, SearchAttrValue,
@@ -45,6 +46,81 @@ pub struct DsqlVisibilityStore {
 impl DsqlVisibilityStore {
     pub fn new(director: Arc<DsqlConnectionDirector>) -> Self {
         Self { director }
+    }
+
+    fn is_occ_conflict(error: &anyhow::Error) -> bool {
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<sqlx::Error>())
+            .is_some_and(|error| {
+                matches!(
+                    error,
+                    sqlx::Error::Database(database_error)
+                        if matches!(database_error.code().as_deref(), Some("OC000" | "40001"))
+                )
+            })
+    }
+
+    fn retry_delay(attempt: u32) -> tokio::time::Duration {
+        let jitter = u64::from(attempt.wrapping_mul(17) % 50);
+        tokio::time::Duration::from_millis(10 * u64::from(attempt) + jitter)
+    }
+
+    async fn accumulate_rollup_partitioned(
+        &self,
+        partition_id: u32,
+        entries: &[RollupDelta],
+    ) -> Result<()> {
+        for entry in entries {
+            let mut attempts = 0u32;
+            loop {
+                let mut permit = self.director.acquire(DbClass::Projection).await?;
+                let started = Instant::now();
+                let result = sqlx::query(
+                    r#"
+                    INSERT INTO vis_rollup (namespace_id, dimension, value, partition_id, counter)
+                    VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (namespace_id, dimension, value, partition_id) DO UPDATE
+                    SET counter = vis_rollup.counter + EXCLUDED.counter
+                    "#,
+                )
+                .bind(entry.namespace_id.0)
+                .bind(entry.dimension.to_db_smallint())
+                .bind(&entry.value)
+                .bind(i32_from_u32(partition_id, "vis_rollup.partition_id")?)
+                .bind(entry.delta)
+                .execute(permit.connection()?)
+                .await
+                .map(|_| ())
+                .map_err(anyhow::Error::from);
+                storage_metrics::record_dsql_statement_duration(
+                    "projection_apply",
+                    "upsert_rollup",
+                    started.elapsed(),
+                );
+                drop(permit);
+
+                match result {
+                    Ok(()) => {
+                        if attempts > 0 {
+                            storage_metrics::record_dsql_retry("accumulate_rollup", "success");
+                        }
+                        break;
+                    }
+                    Err(error) if Self::is_occ_conflict(&error) && attempts < 5 => {
+                        attempts += 1;
+                        storage_metrics::record_dsql_occ_conflict("accumulate_rollup");
+                        tokio::time::sleep(Self::retry_delay(attempts)).await;
+                    }
+                    Err(error) if Self::is_occ_conflict(&error) => {
+                        storage_metrics::record_dsql_retry("accumulate_rollup", "exhausted");
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -94,25 +170,7 @@ impl VisibilityStore for DsqlVisibilityStore {
     }
 
     async fn accumulate_rollup(&self, entries: &[RollupDelta]) -> Result<()> {
-        let mut permit = self.director.acquire(DbClass::Projection).await?;
-        let connection = permit.connection()?;
-        for entry in entries {
-            sqlx::query(
-                r#"
-                INSERT INTO vis_rollup (namespace_id, dimension, value, counter)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (namespace_id, dimension, value) DO UPDATE
-                SET counter = vis_rollup.counter + EXCLUDED.counter
-                "#,
-            )
-            .bind(entry.namespace_id.0)
-            .bind(entry.dimension.to_db_smallint())
-            .bind(&entry.value)
-            .bind(entry.delta)
-            .execute(&mut *connection)
-            .await?;
-        }
-        Ok(())
+        self.accumulate_rollup_partitioned(0, entries).await
     }
 
     async fn list_executions(
@@ -234,9 +292,10 @@ impl VisibilityStore for DsqlVisibilityStore {
         let mut permit = self.director.acquire(DbClass::Projection).await?;
         let rows = sqlx::query(
             r#"
-            SELECT value, counter
+            SELECT value, SUM(counter) AS counter
             FROM vis_rollup
             WHERE namespace_id = $1 AND dimension = $2
+            GROUP BY value
             "#,
         )
         .bind(namespace_id.0)
@@ -410,7 +469,7 @@ impl VisibilityStore for DsqlVisibilityStore {
 #[async_trait]
 impl ProjectionSink for DsqlVisibilityStore {
     #[instrument(skip_all, fields(run_key = %record.run_key.0, transition_seq = record.transition_seq.0))]
-    async fn apply(&self, record: &ProjectionRecord) -> Result<()> {
+    async fn apply(&self, record: &ProjectionRecord, partition_id: u32) -> Result<()> {
         let previous = self.get_row(record.run_key).await;
         let mut row = previous.clone().unwrap_or_else(|| ExecutionRow {
             run_key: record.run_key,
@@ -458,7 +517,7 @@ impl ProjectionSink for DsqlVisibilityStore {
             }
         }
 
-        self.upsert_execution(&row).await?;
+        let mut resolved_search_attrs = Vec::new();
         for (name, value) in &search_patch.0 {
             let Some(attr) = self.resolve_attr(record.context.namespace_id, name).await? else {
                 bail!("unknown search attribute: {name}");
@@ -471,26 +530,78 @@ impl ProjectionSink for DsqlVisibilityStore {
                     actual
                 );
             }
-            self.remove_search_attr_index(
-                record.run_key,
-                record.context.namespace_id,
-                attr.attr_id,
-                attr.attr_type,
-            )
-            .await?;
-            self.upsert_search_attr_index(
-                record.run_key,
-                record.context.namespace_id,
-                attr.attr_id,
-                attr.attr_type,
-                value,
-            )
-            .await?;
+            resolved_search_attrs.push((attr, value));
             row.search_attr_version += 1;
         }
-        self.upsert_execution(&row).await?;
+
+        let memo = codec::encode(&row.memo)?;
+        let mut attempts = 0u32;
+        loop {
+            let mut permit = self.director.acquire(DbClass::Projection).await?;
+            let result = async {
+                let mut tx = permit.connection()?.begin().await?;
+
+                let started = Instant::now();
+                upsert_execution_row(&mut **tx, &row, Some(memo.clone())).await?;
+                storage_metrics::record_dsql_statement_duration(
+                    "projection_apply",
+                    "upsert_execution",
+                    started.elapsed(),
+                );
+
+                for (attr, value) in &resolved_search_attrs {
+                    remove_search_attr_index_row(
+                        &mut **tx,
+                        record.run_key,
+                        record.context.namespace_id,
+                        attr.attr_id,
+                        attr.attr_type,
+                    )
+                    .await?;
+                    let started = Instant::now();
+                    upsert_search_attr_index_row(
+                        &mut **tx,
+                        record.run_key,
+                        record.context.namespace_id,
+                        attr.attr_id,
+                        attr.attr_type,
+                        value,
+                    )
+                    .await?;
+                    storage_metrics::record_dsql_statement_duration(
+                        "projection_apply",
+                        "upsert_search_attr",
+                        started.elapsed(),
+                    );
+                }
+
+                tx.commit().await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            drop(permit);
+
+            match result {
+                Ok(()) => break,
+                Err(error) if Self::is_occ_conflict(&error) && attempts < 5 => {
+                    attempts += 1;
+                    storage_metrics::record_dsql_occ_conflict("projection_apply_tx");
+                    tokio::time::sleep(Self::retry_delay(attempts)).await;
+                }
+                Err(error) if Self::is_occ_conflict(&error) => {
+                    storage_metrics::record_dsql_retry("projection_apply_tx", "exhausted");
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if attempts > 0 {
+            storage_metrics::record_dsql_retry("projection_apply_tx", "success");
+        }
+
         let deltas = compute_rollup_deltas(previous.as_ref(), &row);
-        self.accumulate_rollup(&deltas).await?;
+        self.accumulate_rollup_partitioned(partition_id, &deltas)
+            .await?;
         Ok(())
     }
 }
@@ -916,10 +1027,7 @@ fn referenced_search_attr_index_tables(
     Ok(tables.into_iter().collect())
 }
 
-fn collect_referenced_tables(
-    expr: &FilterExpr,
-    tables: &mut BTreeSet<&'static str>,
-) -> Result<()> {
+fn collect_referenced_tables(expr: &FilterExpr, tables: &mut BTreeSet<&'static str>) -> Result<()> {
     match expr {
         FilterExpr::And(lhs, rhs) | FilterExpr::Or(lhs, rhs) => {
             collect_referenced_tables(lhs, tables)?;

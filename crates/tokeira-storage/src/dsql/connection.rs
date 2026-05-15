@@ -105,15 +105,24 @@ impl ClassBudgets {
     }
 
     pub async fn acquire(&self, class: DbClass) -> Result<OwnedSemaphorePermit> {
+        let label = db_class_label(class);
+        metrics::increment_dsql_pool_waiting(label);
+        let started = Instant::now();
         let semaphore = {
             let budgets = self.budgets.read().await;
             let Some(semaphore) = budgets.get(&class) else {
+                metrics::decrement_dsql_pool_waiting(label);
                 bail!("missing budget for class {class:?}");
             };
             semaphore.clone()
         };
         self.record_class_metric(class, &semaphore).await;
-        semaphore.acquire_owned().await.map_err(Into::into)
+        let result = semaphore.acquire_owned().await.map_err(Into::into);
+        metrics::decrement_dsql_pool_waiting(label);
+        if result.is_ok() {
+            metrics::record_dsql_class_permit_wait_duration(label, started.elapsed());
+        }
+        result
     }
 
     pub async fn reconfigure(&self, allocations: &HashMap<DbClass, usize>) -> Result<()> {
@@ -172,9 +181,8 @@ impl DsqlConnectionDirector {
     pub async fn start(config: DsqlPoolConfig, connector: DsqlConnector) -> Result<Self> {
         let rate_limiter =
             TokenBucketRateLimiter::new(config.connection_rate_per_second, config.burst_capacity);
-        let reservoir = Arc::new(
-            Reservoir::start(config.reservoir.clone(), connector, rate_limiter).await?,
-        );
+        let reservoir =
+            Arc::new(Reservoir::start(config.reservoir.clone(), connector, rate_limiter).await?);
         let class_budgets = Arc::new(ClassBudgets::new(&default_allocations(&config.reservoir))?);
         let in_flight = Arc::new(AtomicUsize::new(0));
         let reporter_handle = spawn_periodic_reporter(

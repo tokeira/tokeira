@@ -456,7 +456,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
         deployments
-            .create("local-mem", PlatformKind::Local, StorageKind::InMemory, None)
+            .create(
+                "local-mem",
+                PlatformKind::Local,
+                StorageKind::InMemory,
+                None,
+            )
             .unwrap();
         deployments
             .create("local-dsql", PlatformKind::Local, StorageKind::Dsql, None)
@@ -470,7 +475,12 @@ mod tests {
             )
             .unwrap();
         deployments
-            .create("compose-dsql", PlatformKind::Compose, StorageKind::Dsql, None)
+            .create(
+                "compose-dsql",
+                PlatformKind::Compose,
+                StorageKind::Dsql,
+                None,
+            )
             .unwrap();
     }
 
@@ -544,7 +554,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
         deployments
-            .create("test-local", PlatformKind::Local, StorageKind::InMemory, None)
+            .create(
+                "test-local",
+                PlatformKind::Local,
+                StorageKind::InMemory,
+                None,
+            )
             .unwrap();
         let toml_content =
             fs::read_to_string(deployments.path("test-local").join(DEPLOYMENT_TOML)).unwrap();

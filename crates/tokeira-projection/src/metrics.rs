@@ -25,7 +25,10 @@ pub const METRIC_NAMES: &[(&str, MetricType)] = &[
         VISIBILITY_QUERY_DURATION_SECONDS,
         MetricType::DurationHistogram,
     ),
-    (SA_INDEX_SCAN_DURATION_SECONDS, MetricType::DurationHistogram),
+    (
+        SA_INDEX_SCAN_DURATION_SECONDS,
+        MetricType::DurationHistogram,
+    ),
     (
         CHECKPOINT_WRITE_DURATION_SECONDS,
         MetricType::DurationHistogram,
@@ -151,7 +154,10 @@ mod tests {
         }
 
         let (labels, value) = snapshot.get(SA_INDEX_SCAN_DURATION_SECONDS).unwrap();
-        assert_eq!(labels.get("index_table"), Some(&"sa_keyword_idx".to_string()));
+        assert_eq!(
+            labels.get("index_table"),
+            Some(&"sa_keyword_idx".to_string())
+        );
         match value {
             DebugValue::Histogram(values) => assert_eq!(values[0].into_inner(), 0.004f64),
             other => panic!("expected histogram, got {other:?}"),

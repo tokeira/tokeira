@@ -45,6 +45,12 @@ pub struct LaneConfig {
     /// Maximum commands drained from the channel for the
     /// same run in a single activation before yielding.
     pub max_drain_per_activation: u32,
+    /// Whether durable placement-controller takeover fencing is enabled.
+    ///
+    /// No-controller single-node deployments can pass `ShardEpoch::ZERO` to
+    /// storage after local ownership validation. Controller-managed deployments
+    /// must pass the real local epoch so storage keeps its durable lease read.
+    pub controller_managed_placement: bool,
 }
 
 impl Default for LaneConfig {
@@ -52,6 +58,7 @@ impl Default for LaneConfig {
         Self {
             max_occ_retries: 5,
             max_drain_per_activation: 16,
+            controller_managed_placement: false,
         }
     }
 }
@@ -665,10 +672,21 @@ where
                 transition.next_state.workflow_id.0.as_bytes(),
                 owner.shard_count(),
             );
-            (
-                bundle_id,
-                owner.epoch_of(bundle_id).unwrap_or(ShardEpoch::ZERO),
-            )
+            let Some(local_epoch) = owner.epoch_of(bundle_id) else {
+                return Ok((
+                    CommitResult::Conflict {
+                        reason: format!("not owner of execution-home shard {bundle_id:?}"),
+                    },
+                    SmallVec::new(),
+                    SmallVec::new(),
+                ));
+            };
+            let commit_epoch = if config.controller_managed_placement {
+                local_epoch
+            } else {
+                ShardEpoch::ZERO
+            };
+            (bundle_id, commit_epoch)
         };
         transition_span.record(
             "transition_seq",
@@ -706,10 +724,7 @@ where
                 runtime_metrics::record_occ_retry("retry");
                 if attempts >= max_retries {
                     runtime_metrics::record_occ_retry("exhausted");
-                    storage_metrics::record_dsql_retry(
-                        "commit_transition_for_bundle",
-                        "exhausted",
-                    );
+                    storage_metrics::record_dsql_retry("commit_transition_for_bundle", "exhausted");
                     return Err(anyhow!(
                         "lane OCC retry exhausted after {} conflicts for {:?}: {}",
                         attempts + 1,
@@ -1569,6 +1584,7 @@ mod tests {
         let config = LaneConfig::default();
         assert_eq!(config.max_occ_retries, 5);
         assert_eq!(config.max_drain_per_activation, 16);
+        assert!(!config.controller_managed_placement);
     }
 
     #[test]
@@ -1576,9 +1592,11 @@ mod tests {
         let config = LaneConfig {
             max_occ_retries: 0,
             max_drain_per_activation: 1,
+            controller_managed_placement: true,
         };
         assert_eq!(config.max_occ_retries, 0);
         assert_eq!(config.max_drain_per_activation, 1);
+        assert!(config.controller_managed_placement);
     }
 
     #[test]
@@ -1756,6 +1774,7 @@ mod tests {
             &LaneConfig {
                 max_occ_retries: 5,
                 max_drain_per_activation: 4,
+                ..LaneConfig::default()
             },
         )
         .await;
@@ -1830,6 +1849,7 @@ mod tests {
             &LaneConfig {
                 max_occ_retries: 5,
                 max_drain_per_activation: 2,
+                ..LaneConfig::default()
             },
         )
         .await;
@@ -1979,6 +1999,7 @@ mod tests {
             &LaneConfig {
                 max_occ_retries: 0,
                 max_drain_per_activation: 16,
+                ..LaneConfig::default()
             },
         )
         .await;

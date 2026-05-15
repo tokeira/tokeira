@@ -176,16 +176,15 @@ impl MigrationRunner {
 
     /// Read the highest applied schema version from the target database.
     pub async fn status(&self, pool: &PgPool) -> Result<SchemaStatus> {
-        let current_version = match sqlx::query_scalar::<_, Option<i32>>(
-            "SELECT max(version) FROM schema_version",
-        )
-        .fetch_optional(pool)
-        .await
-        {
-            Ok(version) => version.flatten().map(u32::try_from).transpose()?,
-            Err(error) if is_missing_schema_version(&error) => None,
-            Err(error) => return Err(error.into()),
-        };
+        let current_version =
+            match sqlx::query_scalar::<_, Option<i32>>("SELECT max(version) FROM schema_version")
+                .fetch_optional(pool)
+                .await
+            {
+                Ok(version) => version.flatten().map(u32::try_from).transpose()?,
+                Err(error) if is_missing_schema_version(&error) => None,
+                Err(error) => return Err(error.into()),
+            };
         Ok(SchemaStatus {
             current_version,
             checked_at: OffsetDateTime::now_utc(),

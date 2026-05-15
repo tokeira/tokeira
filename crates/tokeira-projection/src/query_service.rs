@@ -251,22 +251,28 @@ mod tests {
             .await
             .unwrap();
         let sink = VisibilitySink::new(store.clone(), "sink");
-        sink.apply(&projection_record(
-            namespace_id,
-            RunKey(Uuid::from_u128(1)),
-            "wf-a",
-            "queue-a",
-            None,
-        ))
+        sink.apply(
+            &projection_record(
+                namespace_id,
+                RunKey(Uuid::from_u128(1)),
+                "wf-a",
+                "queue-a",
+                None,
+            ),
+            0,
+        )
         .await
         .unwrap();
-        sink.apply(&projection_record(
-            namespace_id,
-            RunKey(Uuid::from_u128(2)),
-            "wf-b",
-            "queue-b",
-            Some(OffsetDateTime::from_unix_timestamp(200).unwrap()),
-        ))
+        sink.apply(
+            &projection_record(
+                namespace_id,
+                RunKey(Uuid::from_u128(2)),
+                "wf-b",
+                "queue-b",
+                Some(OffsetDateTime::from_unix_timestamp(200).unwrap()),
+            ),
+            0,
+        )
         .await
         .unwrap();
         (namespace_id, VisibilityQueryService::new(store))

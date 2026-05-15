@@ -78,6 +78,7 @@ impl DsqlStore {
         let run_repository = run_repository::DsqlRunRepository::new(
             Arc::clone(&director),
             config.shard_count,
+            config.projection_partition_count,
             config.conflict_policy,
             config.lease_duration,
         )?;

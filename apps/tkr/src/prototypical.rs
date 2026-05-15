@@ -70,7 +70,10 @@ fn patch_dsql_region(toml: String, region: &str) -> Result<String> {
 fn patch_server_dsql_region(toml: String, region: &str) -> Result<String> {
     let mut document = toml.parse::<DocumentMut>()?;
     document["infrastructure"]["region"] = value(region);
-    if let Some(dsql) = document.get_mut("infrastructure").and_then(|i| i.get_mut("dsql")) {
+    if let Some(dsql) = document
+        .get_mut("infrastructure")
+        .and_then(|i| i.get_mut("dsql"))
+    {
         dsql["region"] = value(region);
     }
     Ok(document.to_string())

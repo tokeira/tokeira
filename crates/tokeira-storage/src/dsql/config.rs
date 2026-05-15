@@ -57,6 +57,10 @@ fn default_shard_count() -> u32 {
     64
 }
 
+fn default_projection_partition_count() -> u32 {
+    16
+}
+
 fn default_lease_duration() -> Duration {
     Duration::seconds(30)
 }
@@ -272,6 +276,9 @@ pub struct DsqlPoolConfig {
     /// Runtime shard count used for deterministic run-key ownership.
     #[serde(default = "default_shard_count")]
     pub shard_count: u32,
+    /// Projection partition count used when writing projection-log records.
+    #[serde(default = "default_projection_partition_count")]
+    pub projection_partition_count: u32,
     /// Workflow-id conflict behavior used by repository start commits.
     #[serde(default)]
     pub conflict_policy: CurrentExecutionConflictPolicy,
@@ -288,6 +295,7 @@ impl Default for DsqlPoolConfig {
             connection_rate_per_second: default_rate_per_second(),
             burst_capacity: default_burst_capacity(),
             shard_count: default_shard_count(),
+            projection_partition_count: default_projection_partition_count(),
             conflict_policy: CurrentExecutionConflictPolicy::default(),
             lease_duration: default_lease_duration(),
         }
@@ -307,6 +315,9 @@ impl DsqlPoolConfig {
         }
         if self.shard_count == 0 {
             bail!("shard_count must be greater than zero");
+        }
+        if self.projection_partition_count == 0 {
+            bail!("projection_partition_count must be greater than zero");
         }
         if self.lease_duration <= Duration::ZERO {
             bail!("lease_duration must be positive");
@@ -338,6 +349,18 @@ mod tests {
         assert!(config.validate().is_err());
 
         config.lease_duration = Duration::seconds(1);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn validates_projection_partition_count() {
+        let mut config = DsqlPoolConfig {
+            projection_partition_count: 0,
+            ..DsqlPoolConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        config.projection_partition_count = 4;
         config.validate().unwrap();
     }
 

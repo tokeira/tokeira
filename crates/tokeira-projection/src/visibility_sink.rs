@@ -150,7 +150,7 @@ impl<S> ProjectionSink for VisibilitySink<S>
 where
     S: VisibilityStore,
 {
-    async fn apply(&self, record: &ProjectionRecord) -> Result<()> {
+    async fn apply(&self, record: &ProjectionRecord, _partition_id: u32) -> Result<()> {
         let started = std::time::Instant::now();
         let mut row = self
             .store
@@ -390,7 +390,7 @@ mod tests {
                     InMemoryVisibilityStore::default();
                 let sink =
                     VisibilitySink::new(store.clone(), "s");
-                sink.apply(&record).await.unwrap();
+                sink.apply(&record, 0).await.unwrap();
                 let row =
                     store.get_row(record.run_key).await.unwrap();
                 prop_assert_eq!(
@@ -459,10 +459,10 @@ mod tests {
                     InMemoryVisibilityStore::default();
                 let sink =
                     VisibilitySink::new(store.clone(), "s");
-                sink.apply(&record).await.unwrap();
+                sink.apply(&record, 0).await.unwrap();
                 let row1 =
                     store.get_row(record.run_key).await.unwrap();
-                sink.apply(&record).await.unwrap();
+                sink.apply(&record, 0).await.unwrap();
                 let row2 =
                     store.get_row(record.run_key).await.unwrap();
                 // Core fields must be identical
@@ -559,7 +559,7 @@ mod tests {
         let record =
             record_with_search_attr(namespace_id, SearchAttrValue::Keyword("blue".to_string()));
 
-        sink.apply(&record).await.unwrap();
+        sink.apply(&record, 0).await.unwrap();
 
         let row = store.get_row(record.run_key).await.unwrap();
         assert_eq!(row.workflow_id.0, "wf-1");

@@ -60,12 +60,12 @@ use tokeira_runtime::{
     ScheduleEngineConfig, ScheduleStore, TokeiraRuntime, VersioningRuleStore, run_schedule_engine,
 };
 use tokeira_storage::{
-    InMemoryStore, LeaseRepository, ProjectionLog, RunRepository,
+    InMemoryStore, LeaseOutcome, LeaseRepository, ProjectionLog, RunRepository,
     dsql::{DsqlAuthConfig, DsqlPoolConfig, DsqlStore},
 };
 use tokeira_types::{
     ExecutionRef, IncarnationId, NamespaceId, NodeEndpoint, PlacementConfig, ProjectionCursor,
-    WorkflowId,
+    ShardId, WorkflowId,
 };
 
 /// Nexus-endpoint bootstrap target used by the dev startup path. Kept in the
@@ -193,9 +193,7 @@ fn dsql_auth_config(config: &TokeiraConfig) -> Result<DsqlAuthConfig> {
         .clone()
         .filter(|endpoint| !endpoint.trim().is_empty())
         .ok_or_else(|| {
-            anyhow!(
-                "infrastructure.dsql.endpoint must be set when infrastructure.storage is dsql"
-            )
+            anyhow!("infrastructure.dsql.endpoint must be set when infrastructure.storage is dsql")
         })?;
     Ok(DsqlAuthConfig {
         endpoint,
@@ -204,6 +202,14 @@ fn dsql_auth_config(config: &TokeiraConfig) -> Result<DsqlAuthConfig> {
         runtime_role_arn: dsql.runtime_role_arn.clone(),
         readonly_role_arn: dsql.readonly_role_arn.clone(),
     })
+}
+
+fn dsql_pool_config(config: &TokeiraConfig) -> DsqlPoolConfig {
+    DsqlPoolConfig {
+        shard_count: config.infrastructure.placement.shard_count,
+        projection_partition_count: config.infrastructure.placement.partition_count,
+        ..DsqlPoolConfig::default()
+    }
 }
 
 /// Entrypoint the CLI delegates to.
@@ -294,9 +300,8 @@ async fn build_and_serve(
         ConfigStorageKind::Dsql => {
             let auth = dsql_auth_config(&effective_config)?;
             let endpoint = auth.endpoint.clone();
-            // Pool sizing remains storage-internal for now; the server config
-            // exposes only the high-level endpoint/role boundary.
-            let dsql_store = DsqlStore::connect(auth, DsqlPoolConfig::default())
+            let pool_config = dsql_pool_config(&effective_config);
+            let dsql_store = DsqlStore::connect(auth, pool_config)
                 .await
                 .context("failed to connect DSQL storage backend")?;
             let (director, run_repository, projection_log, _migration_runner) =
@@ -367,23 +372,52 @@ where
     let versioning_rule_store = Arc::new(VersioningRuleStore::default());
     let schedule_store = Arc::new(ScheduleStore::default());
     let task_queue_config_store = Arc::new(InMemoryTaskQueueConfigStore::default());
+    let mut runtime_config = RuntimeConfig::default();
+    runtime_config.lane.controller_managed_placement = effective_config
+        .infrastructure
+        .placement
+        .controller_endpoint
+        .is_some();
+    let seed_default_shard = dsql_endpoint.is_none()
+        && effective_config
+            .infrastructure
+            .placement
+            .controller_endpoint
+            .is_none();
     let runtime = Arc::new(TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
         repo.clone(),
-        RuntimeConfig::default().lane_count,
-        RuntimeConfig::default().lane,
-        RuntimeConfig::default().timer_scanner,
-        RuntimeConfig::default().workflow_timeout_scanner,
-        RuntimeConfig::default().backlog,
-        RuntimeConfig::default().activity_timeout_scanner,
-        RuntimeConfig::default().nexus_timeout_scanner,
+        runtime_config.lane_count,
+        runtime_config.lane,
+        runtime_config.timer_scanner,
+        runtime_config.workflow_timeout_scanner,
+        runtime_config.backlog,
+        runtime_config.activity_timeout_scanner,
+        runtime_config.nexus_timeout_scanner,
         nexus_registry,
         Arc::new(NoopNexusHttpClient),
         effective_config.infrastructure.placement.shard_count,
         node_id.to_string(),
         node_endpoint.as_authority(),
-        true,
+        seed_default_shard,
         versioning_rule_store.clone(),
     ));
+
+    if dsql_endpoint.is_some()
+        && effective_config
+            .infrastructure
+            .placement
+            .controller_endpoint
+            .is_none()
+    {
+        self_assign_dsql_shards(
+            runtime.as_ref(),
+            repo.as_ref(),
+            effective_config.infrastructure.placement.shard_count,
+            &node_id,
+            &node_endpoint,
+        )
+        .await?;
+    }
 
     let background_cancel = CancellationToken::new();
 
@@ -455,7 +489,7 @@ where
     let long_polls = LongPollGate::new(LongPollConfig::default());
     let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
 
-    for partition_id in 0..16 {
+    for partition_id in 0..effective_config.infrastructure.placement.partition_count {
         let projection_worker = ProjectionWorker {
             log: projection_log.clone(),
             sink: projection_sink(format!("visibility-{partition_id}")),
@@ -586,6 +620,50 @@ async fn build_nexus_endpoint_registry(
         resolved.insert(endpoint_name, NexusEndpointConfig { target });
     }
     Ok(NexusEndpointRegistry::new(resolved))
+}
+
+async fn self_assign_dsql_shards<R>(
+    runtime: &TokeiraRuntime<R>,
+    lease_repository: &R,
+    shard_count: u32,
+    node_id: &IncarnationId,
+    node_endpoint: &NodeEndpoint,
+) -> Result<()>
+where
+    R: LeaseRepository + RunRepository + 'static,
+{
+    let mut acquired = 0u32;
+    for shard_index in 0..shard_count {
+        let shard_id = ShardId(shard_index);
+        match lease_repository
+            .try_acquire_bundle(shard_id, node_id.to_string(), node_endpoint.as_authority())
+            .await
+        {
+            Ok(LeaseOutcome::Acquired { epoch } | LeaseOutcome::Renewed { epoch }) => {
+                runtime.record_self_assigned_shard(shard_id, epoch);
+                acquired += 1;
+            }
+            Ok(LeaseOutcome::Rejected {
+                current_owner,
+                current_epoch,
+            }) => {
+                tracing::warn!(
+                    shard_index,
+                    %current_owner,
+                    current_epoch = current_epoch.0,
+                    "failed to self-assign shard: lease is held by another owner"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(shard_index, ?error, "failed to self-assign shard");
+            }
+        }
+    }
+    info!(
+        acquired,
+        shard_count, "self-assigned DSQL shards (no controller)"
+    );
+    Ok(())
 }
 
 fn configured_node_endpoint(config: &TokeiraConfig, listen_addr: SocketAddr) -> NodeEndpoint {
@@ -867,5 +945,17 @@ mod tests {
                 hash_version: 2,
             }
         );
+    }
+
+    #[test]
+    fn dsql_pool_config_uses_effective_placement_values() {
+        let mut config = TokeiraConfig::default();
+        config.infrastructure.placement.shard_count = 32;
+        config.infrastructure.placement.partition_count = 4;
+
+        let pool_config = dsql_pool_config(&config);
+
+        assert_eq!(pool_config.shard_count, 32);
+        assert_eq!(pool_config.projection_partition_count, 4);
     }
 }

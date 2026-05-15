@@ -716,6 +716,12 @@ where
         self.runtime_drain.clone()
     }
 
+    pub fn record_self_assigned_shard(&self, shard_id: ShardId, epoch: ShardEpoch) {
+        let mut owner = self.shard_owner.write().unwrap();
+        let _ = owner.record_acquired(shard_id, epoch);
+        owner.mark_active(shard_id);
+    }
+
     pub fn heartbeat_inputs(
         &self,
         available_connections: u32,

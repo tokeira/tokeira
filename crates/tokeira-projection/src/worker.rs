@@ -49,7 +49,7 @@ where
         projection_metrics::set_projection_lag(cursor.partition_id, batch.records.len());
 
         for record in &batch.records {
-            self.sink.apply(record).await?;
+            self.sink.apply(record, cursor.partition_id).await?;
         }
         projection_metrics::record_records_processed(cursor.partition_id, batch.records.len());
         projection_metrics::set_projection_lag(cursor.partition_id, 0);
@@ -112,7 +112,7 @@ where
 
             let mut failed = false;
             for record in &batch.records {
-                if let Err(error) = self.sink.apply(record).await {
+                if let Err(error) = self.sink.apply(record, cursor.partition_id).await {
                     tracing::warn!(?error, "projection sink apply failed");
                     failed = true;
                     break;
@@ -287,7 +287,7 @@ mod tests {
 
     #[async_trait]
     impl crate::sink::ProjectionSink for FailingSink {
-        async fn apply(&self, record: &ProjectionRecord) -> Result<()> {
+        async fn apply(&self, record: &ProjectionRecord, _partition_id: u32) -> Result<()> {
             let mut failures_left = self.failures_left.lock().await;
             if *failures_left > 0 {
                 *failures_left -= 1;

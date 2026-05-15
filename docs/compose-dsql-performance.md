@@ -16,8 +16,8 @@ A compose+DSQL deployment running tokeirad on a developer laptop against Aurora 
 | DSQL region | eu-west-2 |
 | Client location | Developer laptop (UK) |
 | Pool size | 50 connections (default) |
-| Bundle count | 1 (default) |
 | Shard count | 1 (default) |
+| Projection partition count | 16 (legacy default) |
 
 ## Root Causes
 
@@ -48,11 +48,11 @@ With 16 projection workers all incrementing the same `(namespace_id, dimension, 
 
 **Cascade effect:** Pool exhaustion from projection retries starves `commit_transition` of connections, dropping throughput from the theoretical 128 wf/s to 5 wf/s.
 
-### 3. Single-Bundle Serialization (bundle_count = 1)
+### 3. Single-Shard Serialization (shard_count = 1)
 
-The `execution_home_bundle()` function hashes `(namespace_id, workflow_id) % bundle_count`. With `bundle_count = 1`, every workflow maps to bundle 0. The `commit_transition_for_bundle` path reads `shard_lease WHERE shard_id = <bundle_0_uuid>` for epoch fencing — all commits serialize on this single row.
+The runtime execution-home routing hashes `(namespace_id, workflow_id) % shard_count`. With `shard_count = 1`, every workflow maps to shard 0. The `commit_transition_for_bundle` path reads `shard_lease WHERE shard_id = <shard_0_uuid>` for epoch fencing — all commits serialize on this single row.
 
-Additionally, when `bundle_count > 1` is configured without a placement controller, the node never acquires leases for bundles 1–63, causing "not shard owner" rejections.
+Additionally, when `shard_count > 1` is configured without a placement controller, the node must self-assign those shards before admitting work. Without that startup self-assignment, commits for shards above zero are rejected as "not shard owner".
 
 ## Theoretical Maximum Throughput
 
@@ -143,24 +143,28 @@ Delete `vis_rollup` entirely. `CountWorkflowExecutions` queries scan `vis_execut
 
 **Recommendation:** Option A (per-partition sharding) — preserves fast reads, eliminates conflicts, minimal schema change.
 
-### Fix 3: Self-Assign Bundles in Single-Node Mode (Priority: High)
+### Fix 3: Self-Assign Shards in Single-Node Mode (Priority: High)
 
-**Problem:** Without a placement controller, the node never acquires leases for bundles > 0. With `bundle_count = 1`, all commits serialize on one shard_lease row.
+**Problem:** Without a placement controller, the node never acquires leases for shards > 0. With `shard_count = 1`, all commits serialize on one shard_lease row.
 
-**Fix:** On startup, when `controller_endpoint` is not configured, the node should self-assign all bundles by inserting/updating `shard_lease` rows:
+**Fix:** On startup, when `controller_endpoint` is not configured, the node should self-assign all shards by inserting/updating `shard_lease` rows and recording the returned lease epoch in runtime-owned `ShardOwner` state:
 
 ```rust
 // In tokeirad startup, after runtime construction:
 if config.infrastructure.placement.controller_endpoint.is_none() {
-    let bundle_count = config.infrastructure.placement.bundle_count;
-    for bundle_id in 0..bundle_count {
-        repo.try_acquire_bundle(ShardId(bundle_id), node_id, Duration::from_secs(3600)).await?;
-        runtime.shard_owner().record_acquired(ShardId(bundle_id), ShardEpoch(1));
+    let shard_count = config.infrastructure.placement.shard_count;
+    for shard_id in 0..shard_count {
+        let outcome = repo
+            .try_acquire_bundle(ShardId(shard_id), node_id.to_string(), node_endpoint)
+            .await?;
+        if let LeaseOutcome::Acquired { epoch } | LeaseOutcome::Renewed { epoch } = outcome {
+            runtime.record_self_assigned_shard(ShardId(shard_id), epoch);
+        }
     }
 }
 ```
 
-**Impact:** Enables `bundle_count > 1` for compose deployments. Distributes epoch-fence reads across multiple `shard_lease` rows, eliminating the single-row serialization point.
+**Impact:** Enables `shard_count > 1` for compose deployments. In single-node no-controller mode, the lane validates local ownership and passes `ShardEpoch::ZERO` to storage, so DSQL skips the per-transition lease-row read. Controller-managed deployments still pass the real epoch and keep the durable takeover fence.
 
 ### Fix 4: Increase Default Pool Size for DSQL (Priority: Medium)
 
@@ -209,30 +213,30 @@ async fn apply(&self, record: &ProjectionRecord) -> Result<()> {
 
 ```toml
 [infrastructure.placement]
-shard_count = 1
-bundle_count = 1
+shard_count = 32
 partition_count = 4   # Reduce from 16 to limit projection concurrency
 ```
 
-Expected throughput: **50–128 wf/s** (after Fix 1, limited by network RTT).
+Tokeira promotes legacy DSQL defaults by value: `shard_count = 1` becomes `32`, and `partition_count = 16` becomes `4`. Existing explicit non-legacy values are preserved.
+
+Expected throughput: **50–128 wf/s** after the structural fixes, limited primarily by network RTT from a developer machine.
 
 ### For ECS+DSQL (co-located in same region):
 
 ```toml
 [infrastructure.placement]
 shard_count = 64
-bundle_count = 64
 partition_count = 16
 ```
 
-Expected throughput: **1,000–3,000 wf/s** (with multi-node, multi-bundle distribution).
+Expected throughput: **1,000–3,000 wf/s** (with multi-node, multi-shard distribution).
 
 ## Priority Order
 
 1. **Fix 1** (projection OCC retry) — unblocks compose+DSQL immediately
 2. **Fix 5** (single-transaction apply) — reduces pool pressure, makes apply atomic
 3. **Fix 2** (vis_rollup redesign) — eliminates the OCC hotspot permanently
-4. **Fix 3** (self-assign bundles) — enables multi-bundle compose for higher throughput
+4. **Fix 3** (self-assign shards) — enables multi-shard compose for higher throughput
 5. **Fix 4** (pool/budget tuning) — fine-tuning after the structural fixes land
 
 ## Dashboard and Metrics Gaps
@@ -289,3 +293,25 @@ Wire `record_storage_operation`, `record_commit_transition_duration`, etc. into 
 Split into `tokeira-dsql-storage.json` and `tokeira-inmemory-storage.json`. Each queries only the metrics its backend emits. The compose platform generates the appropriate dashboard based on `StorageKind`.
 
 **Recommendation:** Option A (emit both) — simpler for operators who switch between backends. The generic metrics provide a consistent baseline; DSQL metrics add depth. The cost is ~10 additional counter/histogram calls per operation, which is negligible.
+
+## Schema Reset Requirement
+
+The per-partition rollup fix changes the fresh `vis_rollup` schema by adding `partition_id` to the primary key. This is intentionally not a forward `ALTER TABLE` migration for already-applied DSQL databases. Existing compose+DSQL databases that have recorded the old `V039__vis_rollup.sql` migration must be reset before running this spec's code.
+
+For development deployments, destroy and recreate the DSQL-backed schema before validation. Do not expect old rollup rows to coexist with the new partitioned key shape.
+
+## Validation Benchmark
+
+Run the validation benchmark after the self-assignment, projection retry, single-transaction projection apply, rollup partitioning, and DSQL defaulting fixes are applied:
+
+```bash
+cargo run -p tokeira-bench -- --workflows 2000 --concurrency 20
+```
+
+Prerequisites:
+
+- Compose deployment uses DSQL storage with a freshly initialized schema.
+- Effective placement has `shard_count = 32` and `partition_count = 4`.
+- The benchmark process is pointed at the compose `tokeirad` endpoint.
+
+Success criteria: sustained throughput should be at least **50 wf/s** from a developer machine. The expected ceiling for the original laptop-to-eu-west-2 setup remains roughly **128 wf/s** at concurrency 20 because each workflow still needs three sequential network-bound commits.

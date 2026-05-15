@@ -332,7 +332,8 @@ impl Default for DsqlCapacityConfig {
 impl TokeiraConfig {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path)?;
-        let config: TokeiraConfig = toml::from_str(&content)?;
+        let mut config: TokeiraConfig = toml::from_str(&content)?;
+        config.apply_storage_defaults();
         config.validate()?;
         Ok(config)
     }
@@ -344,9 +345,22 @@ impl TokeiraConfig {
         if let Ok(env_path) = std::env::var("TOKEIRA_CONFIG") {
             return Ok((Self::load(Path::new(&env_path))?, "TOKEIRA_CONFIG env"));
         }
-        let config = Self::default();
+        let mut config = Self::default();
+        config.apply_storage_defaults();
         config.validate()?;
         Ok((config, "defaults"))
+    }
+
+    pub fn apply_storage_defaults(&mut self) {
+        if self.infrastructure.storage == ConfigStorageKind::Dsql {
+            if self.infrastructure.placement.shard_count == default_placement_shard_count() {
+                self.infrastructure.placement.shard_count = 32;
+            }
+            if self.infrastructure.placement.partition_count == default_placement_partition_count()
+            {
+                self.infrastructure.placement.partition_count = 4;
+            }
+        }
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -665,6 +679,30 @@ mod tests {
     }
 
     #[test]
+    fn dsql_storage_defaults_promote_legacy_values() {
+        let mut config = TokeiraConfig::default();
+        config.infrastructure.storage = ConfigStorageKind::Dsql;
+
+        config.apply_storage_defaults();
+
+        assert_eq!(config.infrastructure.placement.shard_count, 32);
+        assert_eq!(config.infrastructure.placement.partition_count, 4);
+    }
+
+    #[test]
+    fn dsql_storage_defaults_preserve_non_legacy_values() {
+        let mut config = TokeiraConfig::default();
+        config.infrastructure.storage = ConfigStorageKind::Dsql;
+        config.infrastructure.placement.shard_count = 2;
+        config.infrastructure.placement.partition_count = 8;
+
+        config.apply_storage_defaults();
+
+        assert_eq!(config.infrastructure.placement.shard_count, 2);
+        assert_eq!(config.infrastructure.placement.partition_count, 8);
+    }
+
+    #[test]
     fn rejects_unknown_fields() {
         let error = toml::from_str::<TokeiraConfig>("[infrastructure]\nunknown = true\n")
             .unwrap_err()
@@ -911,6 +949,24 @@ mod tests {
             let has_override = disable_stickiness || freeze_projection || cap_poll_admission.is_some();
 
             prop_assert_eq!(json.get("_warnings").is_some(), has_override);
+        }
+
+        #[test]
+        fn property_dsql_promotes_legacy_defaults_by_value(
+            shard_count in 1u32..128,
+            partition_count in 1u32..128,
+        ) {
+            let mut config = TokeiraConfig::default();
+            config.infrastructure.storage = ConfigStorageKind::Dsql;
+            config.infrastructure.placement.shard_count = shard_count;
+            config.infrastructure.placement.partition_count = partition_count;
+
+            config.apply_storage_defaults();
+
+            let expected_shard_count = if shard_count == 1 { 32 } else { shard_count };
+            let expected_partition_count = if partition_count == 16 { 4 } else { partition_count };
+            prop_assert_eq!(config.infrastructure.placement.shard_count, expected_shard_count);
+            prop_assert_eq!(config.infrastructure.placement.partition_count, expected_partition_count);
         }
     }
 

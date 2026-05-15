@@ -36,7 +36,9 @@ fn discover_migrations(dir: &Path) -> Result<Vec<Migration>, Box<dyn std::error:
         let filename = path
             .file_name()
             .and_then(|name| name.to_str())
-            .ok_or_else(|| invalid_data(format!("invalid migration filename {}", path.display())))?;
+            .ok_or_else(|| {
+                invalid_data(format!("invalid migration filename {}", path.display()))
+            })?;
         let (version, name) = parse_migration_filename(filename)?;
         let sql = fs::read_to_string(&path)?;
         let checksum = checksum(&sql);
@@ -92,14 +94,15 @@ fn checksum(sql: &str) -> String {
 }
 
 fn render(migrations: &[Migration]) -> String {
-    let mut output = String::from(
-        "static EMBEDDED_MIGRATIONS: &[EmbeddedMigration] = &[\n",
-    );
+    let mut output = String::from("static EMBEDDED_MIGRATIONS: &[EmbeddedMigration] = &[\n");
     for migration in migrations {
         output.push_str("    EmbeddedMigration {\n");
         output.push_str(&format!("        version: {},\n", migration.version));
         output.push_str(&format!("        name: {:?},\n", migration.name));
-        output.push_str(&format!("        path: {:?},\n", migration.path.display().to_string()));
+        output.push_str(&format!(
+            "        path: {:?},\n",
+            migration.path.display().to_string()
+        ));
         output.push_str(&format!("        checksum: {:?},\n", migration.checksum));
         output.push_str(&format!("        sql: {:?},\n", migration.sql));
         output.push_str("    },\n");

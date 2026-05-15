@@ -695,7 +695,7 @@ Any dashboard updates made for this spec must follow the compose observability d
 | Error | Handling |
 |-------|----------|
 | `try_acquire_bundle` failure | Log warning, continue to next shard |
-| All bundles fail | Log info with `acquired=0`, server starts but cannot commit (operator must investigate) |
+| All shards fail | Log info with `acquired=0`, server starts but cannot commit (operator must investigate) |
 
 ### Metric Recording Errors
 

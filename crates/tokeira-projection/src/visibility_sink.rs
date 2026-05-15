@@ -508,10 +508,13 @@ mod tests {
         let sink = VisibilitySink::new(store, "sink");
 
         let error = sink
-            .apply(&record_with_search_attr(
-                namespace_id,
-                SearchAttrValue::Keyword("blue".to_string()),
-            ))
+            .apply(
+                &record_with_search_attr(
+                    namespace_id,
+                    SearchAttrValue::Keyword("blue".to_string()),
+                ),
+                0,
+            )
             .await
             .unwrap_err();
 
@@ -533,10 +536,13 @@ mod tests {
         let sink = VisibilitySink::new(store, "sink");
 
         let error = sink
-            .apply(&record_with_search_attr(
-                namespace_id,
-                SearchAttrValue::Keyword("blue".to_string()),
-            ))
+            .apply(
+                &record_with_search_attr(
+                    namespace_id,
+                    SearchAttrValue::Keyword("blue".to_string()),
+                ),
+                0,
+            )
             .await
             .unwrap_err();
 

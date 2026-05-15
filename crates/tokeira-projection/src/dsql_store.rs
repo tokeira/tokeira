@@ -542,7 +542,7 @@ impl ProjectionSink for DsqlVisibilityStore {
                 let mut tx = permit.connection()?.begin().await?;
 
                 let started = Instant::now();
-                upsert_execution_row(&mut **tx, &row, Some(memo.clone())).await?;
+                upsert_execution_row(&mut *tx, &row, Some(memo.clone())).await?;
                 storage_metrics::record_dsql_statement_duration(
                     "projection_apply",
                     "upsert_execution",
@@ -551,7 +551,7 @@ impl ProjectionSink for DsqlVisibilityStore {
 
                 for (attr, value) in &resolved_search_attrs {
                     remove_search_attr_index_row(
-                        &mut **tx,
+                        &mut *tx,
                         record.run_key,
                         record.context.namespace_id,
                         attr.attr_id,
@@ -560,7 +560,7 @@ impl ProjectionSink for DsqlVisibilityStore {
                     .await?;
                     let started = Instant::now();
                     upsert_search_attr_index_row(
-                        &mut **tx,
+                        &mut *tx,
                         record.run_key,
                         record.context.namespace_id,
                         attr.attr_id,

@@ -271,21 +271,145 @@ while let Some(returned) = return_rx.recv().await {
 
 | Attribute | Type | Key | Description |
 |-----------|------|-----|-------------|
-| `pk` | String | PK | `dsql_connect_bucket#{endpoint}#{unix_second}` |
+| `pk` | String | PK | `dsql_connect_bucket#{endpoint}` |
 | `tokens_milli` | Number | — | Current tokens × 1000 (avoids floats) |
 | `last_refill_ms` | Number | — | Unix millis of last refill |
 | `rate_milli` | Number | — | 100,000 (= 100 tokens/sec × 1000) |
 | `capacity_milli` | Number | — | 1,000,000 (= 1000 tokens × 1000) |
 | `ttl_epoch` | Number | TTL | Unix seconds + 180 (3 min auto-cleanup) |
 
-**Wait protocol:**
-1. GetItem — read current bucket state (or create at full capacity if missing).
-2. Compute refill: `elapsed_ms × rate_milli / 1000`, cap at `capacity_milli`.
-3. If `tokens_milli >= 1000`: conditional UpdateItem to deduct 1000.
-4. If condition fails (another node raced): retry with jittered backoff (1–10ms).
-5. If `tokens_milli < 1000` after refill: sleep until next refill, retry.
+**Wait protocol (Rust pseudocode):**
 
-**Atomicity:** The condition expression `last_refill_ms = :expected` ensures only one node succeeds per token. Losers retry with fresh state.
+```rust
+/// Blocks until one token is acquired from the distributed bucket.
+/// Uses optimistic read-modify-write with DynamoDB conditional updates.
+///
+/// IMPORTANT: The AWS SDK (`aws-sdk-dynamodb`) has built-in retry with
+/// exponential backoff for DynamoDB throttling (ThrottlingException).
+/// Do NOT add redundant retry logic for throttling — only handle
+/// ConditionalCheckFailedException (race condition) explicitly.
+pub async fn wait(&self, ctx: &Context) -> Result<(), TokenBucketError> {
+    let deadline = Instant::now() + MAX_WAIT; // 30 seconds
+    let mut attempts = 0u32;
+
+    loop {
+        attempts += 1;
+        let (acquired, retry_after_ms) = self.try_acquire().await?;
+
+        if acquired { return Ok(()); }
+
+        if Instant::now() >= deadline {
+            return Err(TokenBucketError::Timeout { attempts });
+        }
+
+        // Backoff: use retry_after_ms hint (10ms per token at 100/sec) + jitter
+        let backoff = if retry_after_ms > 0 {
+            Duration::from_millis(retry_after_ms as u64)
+        } else {
+            BACKOFF_BASE // 50ms — used when ConditionalCheckFailed (immediate retry)
+        };
+        let jitter = rand::gen_range(0..=backoff.as_millis() / 2) as u64;
+        let sleep_for = Duration::from_millis(backoff.as_millis() as u64 + jitter)
+            .min(deadline.duration_since(Instant::now()));
+
+        tokio::time::sleep(sleep_for).await;
+    }
+}
+
+/// Single attempt to acquire one token.
+/// Returns (true, 0) on success.
+/// Returns (false, retry_after_ms) if bucket empty.
+/// Returns Err on DynamoDB error (NOT ConditionalCheckFailed — that returns (false, 0)).
+async fn try_acquire(&self) -> Result<(bool, i64), TokenBucketError> {
+    let pk = format!("dsql_connect_bucket#{}", self.endpoint);
+    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).as_millis() as i64;
+
+    // Milli-token constants (integer math, no floats)
+    let rate_milli: i64 = self.rate * 1000;         // 100_000
+    let capacity_milli: i64 = self.capacity * 1000; // 1_000_000
+    let one_token_milli: i64 = 1000;
+
+    // Step 1: Read current bucket state (ConsistentRead)
+    let get_result = self.ddb.get_item()
+        .table_name(&self.table_name)
+        .key("pk", AttributeValue::S(pk.clone()))
+        .consistent_read(true)
+        .send().await?;
+
+    // Step 2: Compute new state
+    let (current_tokens_milli, last_refill_ms, is_new_bucket) = match get_result.item {
+        None => (capacity_milli, now_ms, true),  // New bucket: start at full capacity
+        Some(item) => {
+            let tokens = parse_number(&item, "tokens_milli");
+            let refill = parse_number(&item, "last_refill_ms");
+            (tokens, refill, false)
+        }
+    };
+
+    // Compute refill: tokens += (elapsed_ms × rate_milli) / 1000
+    let elapsed_ms = (now_ms - last_refill_ms).max(0);
+    let refill_milli = (elapsed_ms * rate_milli) / 1000;
+    let tokens_after_refill = (current_tokens_milli + refill_milli).min(capacity_milli);
+
+    // Check if we have at least 1 token
+    if tokens_after_refill < one_token_milli {
+        // Bucket empty — hint: one token refills every 10ms at 100/sec
+        let ms_per_token = 1000 / self.rate;
+        return Ok((false, ms_per_token));
+    }
+
+    // Deduct 1 token
+    let new_tokens_milli = tokens_after_refill - one_token_milli;
+    let ttl_epoch = (now_ms / 1000) + 3600; // 1 hour TTL
+
+    // Step 3: Conditional write
+    let result = if is_new_bucket {
+        // New bucket: condition on attribute_not_exists(pk)
+        self.ddb.update_item()
+            .table_name(&self.table_name)
+            .key("pk", AttributeValue::S(pk))
+            .update_expression("SET tokens_milli = :tokens, last_refill_ms = :now, rate_milli = :rate, capacity_milli = :cap, ttl_epoch = :ttl")
+            .condition_expression("attribute_not_exists(pk)")
+            .expression_attribute_values(":tokens", AttributeValue::N(new_tokens_milli.to_string()))
+            .expression_attribute_values(":now", AttributeValue::N(now_ms.to_string()))
+            .expression_attribute_values(":rate", AttributeValue::N(rate_milli.to_string()))
+            .expression_attribute_values(":cap", AttributeValue::N(capacity_milli.to_string()))
+            .expression_attribute_values(":ttl", AttributeValue::N(ttl_epoch.to_string()))
+            .send().await
+    } else {
+        // Existing bucket: condition on last_refill_ms matching what we read
+        self.ddb.update_item()
+            .table_name(&self.table_name)
+            .key("pk", AttributeValue::S(pk))
+            .update_expression("SET tokens_milli = :tokens, last_refill_ms = :now, ttl_epoch = :ttl")
+            .condition_expression("last_refill_ms = :expected_refill")
+            .expression_attribute_values(":tokens", AttributeValue::N(new_tokens_milli.to_string()))
+            .expression_attribute_values(":now", AttributeValue::N(now_ms.to_string()))
+            .expression_attribute_values(":ttl", AttributeValue::N(ttl_epoch.to_string()))
+            .expression_attribute_values(":expected_refill", AttributeValue::N(last_refill_ms.to_string()))
+            .send().await
+    };
+
+    match result {
+        Ok(_) => Ok((true, 0)),
+        Err(e) if is_conditional_check_failed(&e) => {
+            // Another node raced us — retry immediately (return 0 for retry_after)
+            Ok((false, 0))
+        }
+        Err(e) => Err(TokenBucketError::DynamoDb(e.into())),
+    }
+}
+```
+
+**Key implementation notes:**
+- `ConsistentRead: true` on GetItem ensures we see the latest state.
+- Milli-token math (×1000) avoids floating-point precision issues in DynamoDB Number attributes.
+- `ConditionalCheckFailedException` is a normal race condition (another node consumed the token first) — retry immediately with 0 backoff.
+- The AWS SDK's built-in retry handles `ThrottlingException` transparently — do NOT add redundant retry for throttling.
+- `MAX_WAIT = 30 seconds` caps total acquisition time. If the bucket stays empty for 30s, the refiller's connection creation attempt fails (and the refiller backs off 250ms before trying again).
+- `BACKOFF_BASE = 50ms` is used when `ConditionalCheckFailed` returns `retry_after_ms = 0`.
+
+**Atomicity:** The condition expression `last_refill_ms = :expected_refill` ensures only one node succeeds per read-modify-write cycle. Losers see `ConditionalCheckFailedException` and retry with fresh state.
 
 ### 8. Slot Block Manager
 
@@ -295,20 +419,194 @@ while let Some(returned) = return_rx.recv().await {
 
 | Attribute | Type | Key | Description |
 |-----------|------|-----|-------------|
-| `pk` | String | PK | `dsql_slot_block#{endpoint}#{block_id}` |
-| `owner` | String | — | Node ID that owns this block |
-| `acquired_at` | Number | — | Unix millis when acquired |
+| `pk` | String | PK | `connslots#{endpoint}#block-{block_id}` |
+| `owner_id` | String | — | Node ID (hex-encoded 16 random bytes), empty string if unowned |
 | `ttl_epoch` | Number | TTL | Unix seconds + 180 (crash recovery) |
-| `block_size` | Number | — | 100 (slots per block) |
+| `slots` | Number | — | 100 (slots per block) |
+| `service_name` | String | — | For debugging (e.g., "tokeirad") |
+| `acquired_at_ms` | Number | — | Unix millis when acquired |
 
-**Protocol:**
-1. On startup: acquire `ceil(TARGET_READY / BLOCK_SIZE)` blocks (= 1 block for 50 connections).
-2. Acquire = conditional PutItem where `attribute_not_exists(pk) OR ttl_epoch < :now`.
-3. Every 60 seconds: renew owned blocks (update `ttl_epoch`).
-4. On shutdown: release blocks (conditional DeleteItem where `owner = :my_node`).
-5. Refiller checks `has_budget()`: `connections_created < owned_blocks × BLOCK_SIZE`.
+**Rust struct:**
 
-**Crash recovery:** If a node crashes, its blocks' `ttl_epoch` expires after 3 minutes. Other nodes can then claim them.
+```rust
+pub struct SlotBlockManager {
+    ddb: aws_sdk_dynamodb::Client,
+    table: String,
+    endpoint: String,
+    owner_id: String,  // hex-encoded 16 random bytes, generated at startup
+    
+    // Internal constants
+    block_size: u32,   // 100
+    block_count: u32,  // 100 (total capacity: 10,000 connections)
+    ttl: Duration,     // 3 minutes
+    renew_period: Duration, // 1 minute
+    
+    // State
+    owned_blocks: RwLock<HashSet<u32>>,  // block indices we own
+    total_slots: AtomicU32,              // sum of owned blocks × block_size
+    used_slots: AtomicI64,               // currently in use (atomic for fast-path check)
+    renewer_handle: JoinHandle<()>,
+}
+```
+
+**Acquire slots on startup (Rust pseudocode):**
+
+```rust
+/// Acquire enough blocks to have at least target_slots available.
+/// Called once during startup before the refiller begins.
+///
+/// CRITICAL: Randomize starting block index to avoid thundering herd.
+/// Without this, all nodes starting simultaneously would race for blocks 0, 1, 2...
+pub async fn acquire_slots(&self, target_slots: u32) -> Result<u32> {
+    let blocks_needed = (target_slots + self.block_size - 1) / self.block_size; // ceil division
+    let mut blocks_acquired = 0u32;
+    
+    // Randomize start to reduce contention on simultaneous startup
+    let start_idx = rand::gen_range(0..self.block_count);
+    
+    for i in 0..self.block_count {
+        if blocks_acquired >= blocks_needed { break; }
+        let block_idx = (start_idx + i) % self.block_count;
+        
+        if self.owned_blocks.read().await.contains(&block_idx) { continue; }
+        
+        match self.try_acquire_block(block_idx).await {
+            Ok(true) => {
+                self.owned_blocks.write().await.insert(block_idx);
+                self.total_slots.fetch_add(self.block_size, Ordering::Release);
+                blocks_acquired += 1;
+            }
+            Ok(false) => continue,  // Owned by another node
+            Err(e) => { tracing::debug!(block_idx, ?e, "failed to acquire block"); continue; }
+        }
+    }
+    
+    if blocks_acquired > 0 { self.start_renewer(); }
+    Ok(self.total_slots.load(Ordering::Acquire))
+}
+
+/// Attempt to acquire a single block via conditional PutItem.
+/// Returns Ok(true) if acquired, Ok(false) if owned by another, Err on DynamoDB error.
+async fn try_acquire_block(&self, block_idx: u32) -> Result<bool> {
+    let pk = format!("connslots#{}#block-{}", self.endpoint, block_idx);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).as_millis() as i64;
+    let ttl_epoch = (now / 1000) + self.ttl.as_secs() as i64;
+    
+    let result = self.ddb.put_item()
+        .table_name(&self.table)
+        .item("pk", AttributeValue::S(pk))
+        .item("owner_id", AttributeValue::S(self.owner_id.clone()))
+        .item("ttl_epoch", AttributeValue::N(ttl_epoch.to_string()))
+        .item("slots", AttributeValue::N(self.block_size.to_string()))
+        .item("service_name", AttributeValue::S("tokeirad".into()))
+        .item("acquired_at_ms", AttributeValue::N(now.to_string()))
+        // Acquire if: not exists OR owner_id is empty OR TTL expired (crash recovery)
+        .condition_expression("attribute_not_exists(pk) OR owner_id = :empty OR ttl_epoch < :now")
+        .expression_attribute_values(":empty", AttributeValue::S(String::new()))
+        .expression_attribute_values(":now", AttributeValue::N((now / 1000).to_string()))
+        .send().await;
+    
+    match result {
+        Ok(_) => Ok(true),
+        Err(e) if is_conditional_check_failed(&e) => Ok(false), // Owned by another
+        Err(e) => Err(e.into()),
+    }
+}
+```
+
+**Fast-path budget check (called by refiller before each connection creation):**
+
+```rust
+/// Check if we have available slots. O(1), no DynamoDB call.
+/// The refiller calls this before each connection creation attempt.
+pub fn has_budget(&self) -> bool {
+    let total = self.total_slots.load(Ordering::Acquire) as i64;
+    let used = self.used_slots.load(Ordering::Acquire);
+    used < total
+}
+
+/// Acquire one slot (called by refiller after creating a connection).
+/// Returns Err if all slots are in use.
+pub fn acquire_slot(&self) -> Result<(), SlotBudgetExhausted> {
+    let total = self.total_slots.load(Ordering::Acquire) as i64;
+    let new_used = self.used_slots.fetch_add(1, Ordering::AcqRel) + 1;
+    if new_used > total {
+        self.used_slots.fetch_sub(1, Ordering::AcqRel); // Roll back
+        return Err(SlotBudgetExhausted);
+    }
+    Ok(())
+}
+
+/// Release one slot (called when a connection is retired/discarded).
+pub fn release_slot(&self) {
+    self.used_slots.fetch_sub(1, Ordering::AcqRel);
+}
+```
+
+**Renewal loop (background task):**
+
+```rust
+async fn renew_loop(&self) {
+    let mut interval = tokio::time::interval(self.renew_period); // 1 minute
+    loop {
+        interval.tick().await;
+        let blocks: Vec<u32> = self.owned_blocks.read().await.iter().copied().collect();
+        for block_idx in blocks {
+            if let Err(e) = self.renew_block(block_idx).await {
+                tracing::warn!(block_idx, ?e, "failed to renew slot block");
+            }
+        }
+    }
+}
+
+async fn renew_block(&self, block_idx: u32) -> Result<()> {
+    let pk = format!("connslots#{}#block-{}", self.endpoint, block_idx);
+    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).as_millis() as i64;
+    let ttl_epoch = (now_ms / 1000) + self.ttl.as_secs() as i64;
+    
+    self.ddb.update_item()
+        .table_name(&self.table)
+        .key("pk", AttributeValue::S(pk))
+        .update_expression("SET ttl_epoch = :ttl, renewed_at_ms = :now")
+        .condition_expression("owner_id = :owner")  // Only renew if we still own it
+        .expression_attribute_values(":ttl", AttributeValue::N(ttl_epoch.to_string()))
+        .expression_attribute_values(":now", AttributeValue::N(now_ms.to_string()))
+        .expression_attribute_values(":owner", AttributeValue::S(self.owner_id.clone()))
+        .send().await?;
+    Ok(())
+}
+```
+
+**Graceful shutdown (release = clear owner_id, NOT delete):**
+
+```rust
+pub async fn release_all(&self) {
+    let blocks: Vec<u32> = self.owned_blocks.write().await.drain().collect();
+    for block_idx in blocks {
+        let pk = format!("connslots#{}#block-{}", self.endpoint, block_idx);
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).as_millis() as i64;
+        // Clear owner_id to release (don't delete — keep for visibility/debugging)
+        let _ = self.ddb.update_item()
+            .table_name(&self.table)
+            .key("pk", AttributeValue::S(pk))
+            .update_expression("SET owner_id = :empty, released_at_ms = :now")
+            .condition_expression("owner_id = :owner")
+            .expression_attribute_values(":empty", AttributeValue::S(String::new()))
+            .expression_attribute_values(":now", AttributeValue::N(now_ms.to_string()))
+            .expression_attribute_values(":owner", AttributeValue::S(self.owner_id.clone()))
+            .send().await;
+    }
+    self.total_slots.store(0, Ordering::Release);
+}
+```
+
+**Key implementation notes:**
+- `owner_id` is 16 random bytes hex-encoded at startup — unique per process incarnation.
+- Release clears `owner_id` to empty string (NOT delete) — keeps the item for debugging visibility.
+- Renewal condition `owner_id = :owner` ensures only the owner can renew — if another node stole the block (after TTL expiry), renewal fails silently.
+- `has_budget()` and `acquire_slot()` are O(1) atomic operations — no DynamoDB call on the hot path.
+- The refiller calls `slot_manager.acquire_slot()` AFTER successfully creating a connection, and `slot_manager.release_slot()` when a connection is retired (in the expiry scanner or return processor discard path).
+- Crash recovery: if a node crashes, its blocks' `ttl_epoch` expires after 3 minutes. The `attribute_not_exists(pk) OR owner_id = :empty OR ttl_epoch < :now` condition allows other nodes to claim expired blocks.
 
 ### 9. Class-Based Admission Control
 
@@ -428,7 +726,7 @@ Both tables: on-demand billing, TTL enabled on `ttl_epoch`, same region as DSQL,
 
 | Attribute | Type | Key | Description |
 |-----------|------|-----|-------------|
-| `pk` | String | PK | `dsql_connect_bucket#{endpoint}#{unix_second}` |
+| `pk` | String | PK | `dsql_connect_bucket#{endpoint}` |
 | `tokens_milli` | Number | — | Current tokens × 1000 |
 | `last_refill_ms` | Number | — | Unix millis of last refill |
 | `rate_milli` | Number | — | 100,000 (100 tokens/sec × 1000) |
@@ -439,7 +737,7 @@ Both tables: on-demand billing, TTL enabled on `ttl_epoch`, same region as DSQL,
 
 | Attribute | Type | Key | Description |
 |-----------|------|-----|-------------|
-| `pk` | String | PK | `dsql_slot_block#{endpoint}#{block_id}` |
+| `pk` | String | PK | `connslots#{endpoint}#block-{block_id}` |
 | `owner` | String | — | Node ID |
 | `acquired_at` | Number | — | Unix millis |
 | `ttl_epoch` | Number | TTL | Unix seconds + 180 |

@@ -17,8 +17,7 @@ use std::{
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
-use aurora_dsql_sqlx_connector::DsqlConnectOptions;
-use sqlx::{PgConnection, PgPool, Pool, Postgres, pool::PoolConnection};
+use sqlx::PgConnection;
 use tokio::{
     sync::{OwnedSemaphorePermit, RwLock, Semaphore},
     task::JoinHandle,
@@ -27,55 +26,8 @@ use tokio::{
 use crate::{ConnectionDirector, DbClass, metrics};
 
 use super::{
-    DsqlAuthConfig, DsqlPoolConfig, Reservoir, ReservoirEntry, TokenBucketRateLimiter,
-    config::ReservoirConfig,
+    DsqlPoolConfig, Reservoir, ReservoirEntry, ReturnedConnection, config::ReservoirConfig,
 };
-
-#[derive(Clone, Debug)]
-pub struct DsqlConnector {
-    pool: PgPool,
-}
-
-impl DsqlConnector {
-    /// Wrap an existing SQLx pool.
-    ///
-    /// Tests and embedding applications can use this to provide their own pool
-    /// policy while still exercising Tokeira's reservoir and class budgets.
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
-    }
-
-    /// Build a DSQL-aware SQLx pool from IAM auth settings.
-    ///
-    /// The current connector uses the same PostgreSQL username for all roles;
-    /// the role distinction is captured in the auth config and left available
-    /// for future assume-role plumbing.
-    pub async fn connect(
-        auth: &DsqlAuthConfig,
-        config: &DsqlPoolConfig,
-        role: super::DsqlRole,
-    ) -> Result<Self> {
-        let user = match role {
-            super::DsqlRole::Admin => "admin",
-            super::DsqlRole::Runtime => "admin", // same user, different IAM role via assume-role
-            super::DsqlRole::Readonly => "admin",
-        };
-        let connection_string = auth.connection_string(user, "postgres")?;
-        let options = DsqlConnectOptions::from_connection_string(&connection_string)?;
-        let pool =
-            aurora_dsql_sqlx_connector::pool::connect_with(&options, auth.pool_options(config))
-                .await?;
-        Ok(Self { pool })
-    }
-
-    pub async fn acquire(&self) -> Result<PoolConnection<Postgres>> {
-        self.pool.acquire().await.map_err(Into::into)
-    }
-
-    pub fn pool(&self) -> &Pool<Postgres> {
-        &self.pool
-    }
-}
 
 #[derive(Debug)]
 pub struct ClassBudgets {
@@ -178,11 +130,8 @@ pub struct DsqlConnectionDirector {
 
 impl DsqlConnectionDirector {
     /// Start the background connection reservoir and class-budget controller.
-    pub async fn start(config: DsqlPoolConfig, connector: DsqlConnector) -> Result<Self> {
-        let rate_limiter =
-            TokenBucketRateLimiter::new(config.connection_rate_per_second, config.burst_capacity);
-        let reservoir =
-            Arc::new(Reservoir::start(config.reservoir.clone(), connector, rate_limiter).await?);
+    pub fn start(config: DsqlPoolConfig, reservoir: Reservoir) -> Result<Self> {
+        let reservoir = Arc::new(reservoir);
         let class_budgets = Arc::new(ClassBudgets::new(&default_allocations(&config.reservoir))?);
         let in_flight = Arc::new(AtomicUsize::new(0));
         let reporter_handle = spawn_periodic_reporter(
@@ -213,7 +162,7 @@ impl ConnectionDirector for DsqlConnectionDirector {
     async fn acquire(&self, class: DbClass) -> Result<DsqlPermit> {
         let started = Instant::now();
         let class_guard = self.class_budgets.acquire(class).await?;
-        let entry = self.reservoir.checkout().await?;
+        let entry = self.reservoir.checkout()?;
         let in_flight = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
         metrics::record_dsql_pool_checkout_duration(db_class_label(class), started.elapsed());
         metrics::set_dsql_reservoir_in_flight(in_flight);
@@ -223,6 +172,7 @@ impl ConnectionDirector for DsqlConnectionDirector {
             entry,
             class_guard,
             self.reservoir.return_sender(),
+            self.reservoir.slot_manager(),
             Arc::clone(&self.in_flight),
         ))
     }
@@ -255,7 +205,7 @@ pub struct DsqlPermit {
     /// The `Option` is required because `Drop` only receives `&mut self`; taking
     /// the connection allows the permit to return ownership to the reservoir
     /// without unsafe code or an explicit close API.
-    connection: Option<PoolConnection<Postgres>>,
+    connection: Option<PgConnection>,
     /// Creation timestamp of the physical connection, not the checkout time.
     created_at: std::time::Instant,
     /// Maximum lifetime assigned when the connection was created.
@@ -263,9 +213,13 @@ pub struct DsqlPermit {
     /// Semaphore permit enforcing operation-class admission.
     _class_guard: OwnedSemaphorePermit,
     /// Synchronous return path into the reservoir return processor.
-    reservoir_return: tokio::sync::mpsc::UnboundedSender<ReservoirEntry>,
+    reservoir_return: tokio::sync::mpsc::UnboundedSender<ReturnedConnection>,
+    /// Slot accounting owner for discard paths that bypass the return processor.
+    slot_manager: Arc<super::SlotBlockManager>,
     /// Shared in-flight counter owned by the director.
     director_in_flight: Arc<AtomicUsize>,
+    /// Caller-set flag that causes return processing to discard the connection.
+    marked_bad: bool,
 }
 
 impl DsqlPermit {
@@ -273,7 +227,8 @@ impl DsqlPermit {
         class: DbClass,
         entry: ReservoirEntry,
         class_guard: OwnedSemaphorePermit,
-        reservoir_return: tokio::sync::mpsc::UnboundedSender<ReservoirEntry>,
+        reservoir_return: tokio::sync::mpsc::UnboundedSender<ReturnedConnection>,
+        slot_manager: Arc<super::SlotBlockManager>,
         director_in_flight: Arc<AtomicUsize>,
     ) -> Self {
         Self {
@@ -283,7 +238,9 @@ impl DsqlPermit {
             max_lifetime: entry.max_lifetime,
             _class_guard: class_guard,
             reservoir_return,
+            slot_manager,
             director_in_flight,
+            marked_bad: false,
         }
     }
 
@@ -292,6 +249,10 @@ impl DsqlPermit {
             bail!("DSQL permit connection already returned");
         };
         Ok(&mut *connection)
+    }
+
+    pub fn mark_bad(&mut self) {
+        self.marked_bad = true;
     }
 }
 
@@ -305,14 +266,25 @@ impl Drop for DsqlPermit {
         // failures that are hard to diagnose.
         if let Some(connection) = self.connection.take() {
             if self.created_at.elapsed() <= self.max_lifetime {
-                let _ = self.reservoir_return.send(ReservoirEntry {
-                    connection,
-                    created_at: self.created_at,
-                    max_lifetime: self.max_lifetime,
-                });
+                if self
+                    .reservoir_return
+                    .send(ReturnedConnection {
+                        entry: ReservoirEntry {
+                            connection,
+                            created_at: self.created_at,
+                            max_lifetime: self.max_lifetime,
+                        },
+                        marked_bad: self.marked_bad,
+                    })
+                    .is_err()
+                {
+                    self.slot_manager.release_slot();
+                    metrics::record_dsql_pool_connection_retired("return_channel_closed");
+                }
             } else {
                 metrics::record_dsql_reservoir_connection_age("expired", self.created_at.elapsed());
                 metrics::record_dsql_pool_connection_retired("expired");
+                self.slot_manager.release_slot();
             }
         }
     }

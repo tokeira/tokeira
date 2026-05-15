@@ -1,7 +1,5 @@
 #![cfg(feature = "dsql-integration")]
 
-use std::sync::Arc;
-
 use anyhow::Result;
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use time::OffsetDateTime;
@@ -9,7 +7,7 @@ use tokeira_kernel::ProjectionOp;
 use tokeira_projection::{DsqlVisibilityStore, ProjectionSink, VisibilityStore};
 use tokeira_storage::{
     ProjectionContext, ProjectionLog, ProjectionRecord,
-    dsql::{DsqlConnectionDirector, DsqlConnector, DsqlPoolConfig, DsqlStore, codec},
+    dsql::{DsqlPoolConfig, DsqlStore, codec},
 };
 use tokeira_types::{
     ExecutionStatus, Memo, NamespaceId, Payload, ProjectionCursor, RunId, RunKey, SearchAttributes,
@@ -239,16 +237,23 @@ impl TestContext {
             .max_connections(8)
             .connect(&url)
             .await?;
-        let config = DsqlPoolConfig::default();
-        let store = DsqlStore::from_pool(pool.clone(), config).await?;
+        let config = DsqlPoolConfig {
+            reservoir: tokeira_storage::dsql::ReservoirConfig {
+                target_ready: 4,
+                inflight_limit: 2,
+                ..tokeira_storage::dsql::ReservoirConfig::default()
+            },
+            ..DsqlPoolConfig::default()
+        };
+        let store = DsqlStore::from_database_url_for_tests(url.clone(), config).await?;
         store.migration_runner().apply(&pool).await?;
         Ok(Some(Self { pool, store }))
     }
 
     async fn visibility_store(&self) -> Result<DsqlVisibilityStore> {
-        let connector = DsqlConnector::new(self.pool.clone());
-        let director = DsqlConnectionDirector::start(DsqlPoolConfig::default(), connector).await?;
-        Ok(DsqlVisibilityStore::new(Arc::new(director)))
+        Ok(DsqlVisibilityStore::new(
+            self.store.connection_director_arc(),
+        ))
     }
 
     async fn clear_projection_rows(&self, run_keys: &[RunKey]) -> Result<()> {

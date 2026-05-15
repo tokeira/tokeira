@@ -5,10 +5,9 @@
 //! that the server will use at runtime.
 
 use anyhow::{Context, Result, bail};
+use sqlx::PgConnection;
 use tokeira_orchestrator::StorageKind;
-use tokeira_storage::dsql::{
-    DsqlAuthConfig, DsqlConnector, DsqlPoolConfig, DsqlRole, MigrationRunner,
-};
+use tokeira_storage::dsql::{ConnectionFactory, DsqlAuthConfig, MigrationRunner};
 
 use crate::{
     cli::SchemaAction,
@@ -25,15 +24,17 @@ pub async fn run(action: SchemaAction, ctx: DeploymentContext) -> Result<()> {
             super::require_confirmation(yes, "schema setup")?;
             let server_config = crate::commands::infra::read_tokeirad_config(&server_config_path)?;
             let auth = dsql_auth_config(&server_config_path, &server_config)?;
-            let connector = connect_admin(&auth).await?;
-            let report = migration_runner().apply(connector.pool()).await?;
+            let mut connection = connect_admin(&auth).await?;
+            let report = migration_runner().apply_connection(&mut connection).await?;
             println!("Applied {} DSQL schema migration(s)", report.applied);
         }
         SchemaAction::Status => {
             let server_config = crate::commands::infra::read_tokeirad_config(&server_config_path)?;
             let auth = dsql_auth_config(&server_config_path, &server_config)?;
-            let connector = connect_admin(&auth).await?;
-            let status = migration_runner().status(connector.pool()).await?;
+            let mut connection = connect_admin(&auth).await?;
+            let status = migration_runner()
+                .status_connection(&mut connection)
+                .await?;
             match status.current_version {
                 Some(version) => {
                     println!(
@@ -88,8 +89,12 @@ fn dsql_auth_config(
     })
 }
 
-async fn connect_admin(auth: &DsqlAuthConfig) -> Result<DsqlConnector> {
-    DsqlConnector::connect(auth, &DsqlPoolConfig::default(), DsqlRole::Admin)
+async fn connect_admin(auth: &DsqlAuthConfig) -> Result<PgConnection> {
+    let region = auth.resolved_region().ok_or_else(|| {
+        anyhow::anyhow!("dsql region must be configured or derivable from endpoint")
+    })?;
+    ConnectionFactory::new(&auth.endpoint, &region)?
+        .create_connection()
         .await
         .context("failed to connect to DSQL for schema command")
 }

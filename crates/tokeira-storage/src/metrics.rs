@@ -58,6 +58,8 @@ pub const DSQL_SHARD_CONFLICT_TOTAL: &str = "tokeira_storage_dsql_shard_conflict
 pub const DSQL_SHARD_DURATION_SECONDS: &str = "tokeira_storage_dsql_shard_duration_seconds";
 pub const DSQL_CONNECTION_ERROR_TOTAL: &str = "tokeira_dsql_connection_error_total";
 pub const DSQL_ERROR_CODE_TOTAL: &str = "tokeira_dsql_error_code_total";
+pub const DSQL_SLOT_BLOCKS_OWNED: &str = "tokeira_dsql_slot_blocks_owned";
+pub const DSQL_SLOT_BLOCK_LOST_TOTAL: &str = "tokeira_dsql_slot_block_lost_total";
 
 pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (
@@ -131,6 +133,8 @@ pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (DSQL_SHARD_DURATION_SECONDS, MetricType::DurationHistogram),
     (DSQL_CONNECTION_ERROR_TOTAL, MetricType::Counter),
     (DSQL_ERROR_CODE_TOTAL, MetricType::Counter),
+    (DSQL_SLOT_BLOCKS_OWNED, MetricType::Gauge),
+    (DSQL_SLOT_BLOCK_LOST_TOTAL, MetricType::Counter),
 ];
 
 pub fn record_commit_transition_duration(
@@ -339,6 +343,14 @@ pub fn record_dsql_error_code(sqlstate: &str) {
     counter!(DSQL_ERROR_CODE_TOTAL, "sqlstate" => sqlstate.to_owned()).increment(1);
 }
 
+pub fn set_dsql_slot_blocks_owned(count: usize) {
+    gauge!(DSQL_SLOT_BLOCKS_OWNED).set(count as f64);
+}
+
+pub fn record_dsql_slot_block_lost() {
+    counter!(DSQL_SLOT_BLOCK_LOST_TOTAL).increment(1);
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -486,6 +498,8 @@ mod tests {
             record_dsql_shard_duration(4, std::time::Duration::from_millis(16));
             record_dsql_connection_error("timeout");
             record_dsql_error_code("40001");
+            set_dsql_slot_blocks_owned(1);
+            record_dsql_slot_block_lost();
         });
 
         let snapshot = snapshot_map(&recorder);
@@ -513,6 +527,8 @@ mod tests {
         assert!(snapshot.contains_key(DSQL_SHARD_DURATION_SECONDS));
         assert!(snapshot.contains_key(DSQL_CONNECTION_ERROR_TOTAL));
         assert!(snapshot.contains_key(DSQL_ERROR_CODE_TOTAL));
+        assert!(snapshot.contains_key(DSQL_SLOT_BLOCKS_OWNED));
+        assert!(snapshot.contains_key(DSQL_SLOT_BLOCK_LOST_TOTAL));
 
         let (labels, value) = snapshot.get(DSQL_RETRY_TOTAL).unwrap();
         assert_eq!(

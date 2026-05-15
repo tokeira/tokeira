@@ -9,7 +9,7 @@ use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{Connection, PgConnection, PgPool};
 use time::OffsetDateTime;
 
 use super::{MigrationConfig, validation::DdlValidator};
@@ -133,6 +133,38 @@ impl MigrationRunner {
         Ok(MigrationReport { applied })
     }
 
+    pub async fn apply_connection(&self, connection: &mut PgConnection) -> Result<MigrationReport> {
+        self.ensure_schema_version_connection(connection).await?;
+        let mut applied = 0;
+        for migration in self.discover()? {
+            if self.is_applied_connection(connection, &migration).await? {
+                continue;
+            }
+            let mut tx = connection.begin().await?;
+            sqlx::query(&migration.sql)
+                .execute(&mut *tx)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to apply migration V{:03}__{}",
+                        migration.version, migration.name
+                    )
+                })?;
+            tx.commit().await?;
+
+            sqlx::query(
+                "INSERT INTO schema_version (version, name, checksum, applied_at) VALUES ($1, $2, $3, now())",
+            )
+            .bind(i32::try_from(migration.version)?)
+            .bind(&migration.name)
+            .bind(&migration.checksum)
+            .execute(&mut *connection)
+            .await?;
+            applied += 1;
+        }
+        Ok(MigrationReport { applied })
+    }
+
     /// Return the ordered migration plan without touching the database.
     ///
     /// The pool parameter is retained so callers can share command signatures
@@ -191,6 +223,22 @@ impl MigrationRunner {
         })
     }
 
+    pub async fn status_connection(&self, connection: &mut PgConnection) -> Result<SchemaStatus> {
+        let current_version =
+            match sqlx::query_scalar::<_, Option<i32>>("SELECT max(version) FROM schema_version")
+                .fetch_optional(&mut *connection)
+                .await
+            {
+                Ok(version) => version.flatten().map(u32::try_from).transpose()?,
+                Err(error) if is_missing_schema_version(&error) => None,
+                Err(error) => return Err(error.into()),
+            };
+        Ok(SchemaStatus {
+            current_version,
+            checked_at: OffsetDateTime::now_utc(),
+        })
+    }
+
     /// Discover and validate migration filenames, ordering, and contiguity.
     fn discover(&self) -> Result<Vec<MigrationFile>> {
         match &self.source {
@@ -227,6 +275,21 @@ impl MigrationRunner {
         Ok(())
     }
 
+    async fn ensure_schema_version_connection(&self, connection: &mut PgConnection) -> Result<()> {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                checksum TEXT NOT NULL,
+                applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (version)
+            )",
+        )
+        .execute(connection)
+        .await?;
+        Ok(())
+    }
+
     /// Check whether one migration has already been applied and still matches
     /// its recorded checksum.
     async fn is_applied(&self, pool: &PgPool, migration: &MigrationFile) -> Result<bool> {
@@ -235,6 +298,23 @@ impl MigrationRunner {
         )
         .bind(i32::try_from(migration.version)?)
         .fetch_optional(pool)
+        .await?;
+        match row {
+            Some((stored,)) => verify_checksum(migration.version, &stored, &migration.checksum),
+            None => Ok(false),
+        }
+    }
+
+    async fn is_applied_connection(
+        &self,
+        connection: &mut PgConnection,
+        migration: &MigrationFile,
+    ) -> Result<bool> {
+        let row = sqlx::query_as::<_, (String,)>(
+            "SELECT checksum FROM schema_version WHERE version = $1",
+        )
+        .bind(i32::try_from(migration.version)?)
+        .fetch_optional(connection)
         .await?;
         match row {
             Some((stored,)) => verify_checksum(migration.version, &stored, &migration.checksum),

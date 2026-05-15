@@ -4,12 +4,12 @@
 
 This design eliminates the sqlx `PgPool` from the DSQL connection path entirely. The current implementation wraps a sqlx PgPool inside the reservoir: the refiller calls `pool.acquire()` to create connections, but the pool's `max_connections` equals `target_ready`, so when the reservoir holds all connections in its ready channel, the pool has nothing left for the refiller — causing `pool timed out` errors under load.
 
-The redesign makes the reservoir the **sole connection owner**. Physical connections are created directly via IAM-authenticated TCP/TLS using `aurora_dsql_sqlx_connector::DsqlConnectOptions` and `sqlx::PgConnection::connect_with()`, bypassing the sqlx pool entirely. The reservoir IS the pool.
+The redesign makes the reservoir the **sole connection owner**. Physical connections are created directly via IAM-authenticated TCP/TLS using `aurora_dsql_sqlx_connector::DsqlConnectOptions` and `aurora_dsql_sqlx_connector::connection::connect_with()`, bypassing the sqlx pool entirely. The reservoir IS the pool.
 
 Three background tokio tasks manage the connection lifecycle:
 1. **Refiller** — continuously creates connections to maintain the ready channel at `target_ready`.
 2. **Expiry Scanner** — periodically retires connections approaching their IAM token expiry.
-3. **Return Processor** — validates returned connections (lifetime check only, no ping) before reuse.
+3. **Return Processor** — validates returned connections (lifetime and bad-flag checks only, no ping) before reuse.
 
 For multi-node coordination, DynamoDB-backed components distribute the rate budget and connection count:
 - **Distributed Token Bucket** — enforces the cluster-wide 100/sec DSQL connection creation rate.
@@ -37,7 +37,7 @@ graph TD
     subgraph "Background Tasks"
         REFILLER[Refiller Loop]
         SCANNER[Expiry Scanner<br/>interval 1s]
-        RETURN_PROC[Return Processor<br/>no ping - lifetime check only]
+        RETURN_PROC[Return Processor<br/>no ping - lifetime and bad-flag checks only]
     end
 
     subgraph "Rate Coordination - DynamoDB"
@@ -47,7 +47,7 @@ graph TD
 
     subgraph "Connection Factory"
         IAM[IAM Token Provider<br/>fresh token per connection]
-        FACTORY[ConnectionFactory<br/>DsqlConnectOptions + PgConnection connect_with]
+        FACTORY[ConnectionFactory<br/>DsqlConnectOptions + connector connect_with]
     end
 
     subgraph "Admission Control"
@@ -77,6 +77,7 @@ graph TD
 5. **Class budgets guarantee isolation.** Projection cannot consume commit-class permits — separate semaphore instances.
 6. **DynamoDB coordination is mandatory for DSQL.** No local-only fallback. Unreachable DynamoDB = startup failure.
 7. **No ping on return.** Lifetime check and bad-flag check only.
+8. **Every reserved slot is released exactly once.** Any path that drops a physical connection created after `acquire_slot()` must call `release_slot()` before the connection leaves the reservoir lifecycle.
 
 
 ## Components and Interfaces
@@ -126,9 +127,9 @@ impl ConnectionFactory {
         let conn_str = format!("postgres://admin@{}:5432/postgres?region={}", self.endpoint, self.region);
         let options = DsqlConnectOptions::from_connection_string(&conn_str)
             .map_err(|e| ConnectionFactoryError::Iam(e.into()))?;
-        sqlx::PgConnection::connect_with(&options.into())
+        aurora_dsql_sqlx_connector::connection::connect_with(&options)
             .await
-            .map_err(ConnectionFactoryError::from_sqlx)
+            .map_err(ConnectionFactoryError::from_dsql_error)
     }
 }
 
@@ -147,8 +148,75 @@ impl ConnectionFactoryError {
                      Self::Timeout(_) => "timeout", Self::Refused(_) => "refused",
                      Self::Other(_) => "other" }
     }
+
+    pub fn from_dsql_error(error: aurora_dsql_sqlx_connector::DsqlError) -> Self {
+        match error {
+            aurora_dsql_sqlx_connector::DsqlError::TokenError(err) => Self::Iam(err.into()),
+            aurora_dsql_sqlx_connector::DsqlError::ConnectionError(err) => classify_sqlx_connection_error(err),
+            other => Self::Other(other.into()),
+        }
+    }
 }
 ```
+
+### 2.5 DSQL Coordination Config
+
+**Location:** `crates/tokeira-storage/src/dsql/config.rs`
+
+The DynamoDB coordination table names and client are runtime wiring, not
+operator-tunable TOML. `apps/tokeirad` constructs this config from the effective
+server config before calling `DsqlStore::connect(auth, pool_config)`.
+
+```rust
+#[derive(Clone, Debug)]
+pub struct DsqlCoordinationConfig {
+    pub rate_limiter_table: String,
+    pub conn_lease_table: String,
+    pub ddb_client: aws_sdk_dynamodb::Client,
+}
+
+#[derive(Clone, Debug)]
+pub struct DsqlPoolConfig {
+    pub reservoir: ReservoirConfig,
+    pub migration: MigrationConfig,
+    pub coordination: DsqlCoordinationConfig,
+    // existing DSQL mechanical fields...
+}
+```
+
+`DsqlPoolConfig` is constructed programmatically by the DSQL startup path. If
+the existing serde derives conflict with the non-serializable DynamoDB client,
+remove those derives from `DsqlPoolConfig` or move serde coverage to the
+serializable sub-configs that still need it.
+
+`apps/tokeirad/src/lib.rs` derives table names from the effective project
+identifier:
+
+```rust
+let project = &effective_config.infrastructure.cluster_name;
+let rate_limiter_table = format!("{project}-dsql-rate-limiter");
+let conn_lease_table = format!("{project}-dsql-conn-lease");
+let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+    .region(aws_config::Region::new(auth.resolved_region().context("missing DSQL region")?))
+    .load()
+    .await;
+let ddb_client = aws_sdk_dynamodb::Client::new(&sdk_config);
+
+let pool_config = DsqlPoolConfig {
+    coordination: DsqlCoordinationConfig {
+        rate_limiter_table,
+        conn_lease_table,
+        ddb_client,
+    },
+    ..dsql_pool_config(&effective_config)
+};
+let dsql_store = DsqlStore::connect(auth, pool_config).await?;
+```
+
+`DsqlStore::connect` remains the single external entry point and uses
+`config.coordination` internally to validate DynamoDB reachability, construct
+the Distributed_Token_Bucket and Slot_Block_Manager, start the reservoir, warm
+it, and build the `DsqlConnectionDirector`.
 
 ### 3. Reservoir
 
@@ -164,6 +232,7 @@ impl ConnectionFactoryError {
 | `GUARD_WINDOW` | 45 sec | Safety margin before token expiry |
 | `INFLIGHT_LIMIT` | 8 | Max concurrent TCP/TLS handshakes |
 | `SCAN_INTERVAL` | 1 sec | Expiry scanner frequency |
+| `SCAN_BUDGET` | `TARGET_READY / 2` | Max ready entries examined per scan |
 | `WARMUP_TIMEOUT` | 30 sec | Max time to wait for initial fill |
 | `REFILLER_IDLE_INTERVAL` | 100ms | Check interval when full |
 | `REFILLER_ERROR_BACKOFF` | 250ms | Initial backoff on failure |
@@ -209,14 +278,29 @@ loop {
     if ready_tx.len() >= TARGET_READY { sleep(100ms); continue; }
     if !slot_manager.has_budget() { sleep(100ms); continue; }
     let _permit = inflight_sem.acquire().await;  // max 8 concurrent
-    distributed_bucket.wait().await;              // DynamoDB round-trip
+    match slot_manager.acquire_slot() {
+        Ok(()) => {}
+        Err(_) => { sleep(100ms); continue; }
+    }
+    if let Err(e) = distributed_bucket.wait().await {  // DynamoDB round-trip
+        slot_manager.release_slot();
+        log_warn(e);
+        sleep(250ms);
+        continue;
+    }
     match factory.create_connection().await {
         Ok(conn) => {
             let lifetime = assign_jittered_lifetime(); // [8min, 12min]
-            ready_tx.send(PhysicalConn { connection: conn, created_at: now(), lifetime }).await;
-            slot_manager.record_connection_created();
+            if let Err(err) = ready_tx.send(PhysicalConn { connection: conn, created_at: now(), lifetime }).await {
+                slot_manager.release_slot();
+                drop(err.into_inner());
+            }
         }
-        Err(e) => { log_warn(e); sleep(250ms); }
+        Err(e) => {
+            slot_manager.release_slot();
+            log_warn(e);
+            sleep(250ms);
+        }
     }
 }
 
@@ -228,16 +312,25 @@ fn assign_jittered_lifetime() -> Duration {
 
 ### 5. Expiry Scanner
 
+The scanner receives an `Arc<SlotBlockManager>` so every discarded physical
+connection releases the slot reserved when it was created.
+
 ```rust
 loop {
     sleep(SCAN_INTERVAL); // 1 second
-    for _ in 0..TARGET_READY {  // bounded: max 50 entries per pass
+    for _ in 0..SCAN_BUDGET {  // bounded: max 25 entries per pass
         match ready_rx.try_recv() {
             Ok(conn) if conn.within_guard_window(GUARD_WINDOW) => {
                 metrics::record_retirement("guard_window", conn.created_at.elapsed());
+                slot_manager.release_slot();
                 drop(conn);
             }
-            Ok(conn) => { ready_tx.try_send(conn).ok(); }
+            Ok(conn) => {
+                if let Err(err) = ready_tx.try_send(conn) {
+                    slot_manager.release_slot();
+                    drop(err.into_inner());
+                }
+            }
             Err(_) => break,
         }
     }
@@ -246,20 +339,29 @@ loop {
 
 ### 6. Return Processor
 
+The return processor receives the same `Arc<SlotBlockManager>` and releases a
+slot whenever it discards a returned connection instead of putting it back into
+the ready channel.
+
 ```rust
 while let Some(returned) = return_rx.recv().await {
     if returned.marked_bad {
         metrics::record_retirement("unhealthy", returned.created_at.elapsed());
+        slot_manager.release_slot();
         continue; // discard
     }
     let conn = PhysicalConn { connection: returned.connection, created_at: returned.created_at,
                               lifetime: returned.lifetime };
     if conn.within_guard_window(GUARD_WINDOW) {
         metrics::record_retirement("guard_window", conn.created_at.elapsed());
+        slot_manager.release_slot();
         continue; // discard
     }
     // Put back — NO PING, no network I/O.
-    ready_tx.send(conn).await.ok();
+    if let Err(err) = ready_tx.send(conn).await {
+        slot_manager.release_slot();
+        drop(err.into_inner());
+    }
 }
 ```
 
@@ -436,14 +538,14 @@ pub struct SlotBlockManager {
     owner_id: String,  // hex-encoded 16 random bytes, generated at startup
     
     // Internal constants
-    block_size: u32,   // 100
+    slots_per_block: u32,   // 100
     block_count: u32,  // 100 (total capacity: 10,000 connections)
     ttl: Duration,     // 3 minutes
     renew_period: Duration, // 1 minute
     
     // State
     owned_blocks: RwLock<HashSet<u32>>,  // block indices we own
-    total_slots: AtomicU32,              // sum of owned blocks × block_size
+    total_slots: AtomicU32,              // sum of owned blocks × slots_per_block
     used_slots: AtomicI64,               // currently in use (atomic for fast-path check)
     renewer_handle: JoinHandle<()>,
 }
@@ -458,7 +560,7 @@ pub struct SlotBlockManager {
 /// CRITICAL: Randomize starting block index to avoid thundering herd.
 /// Without this, all nodes starting simultaneously would race for blocks 0, 1, 2...
 pub async fn acquire_slots(&self, target_slots: u32) -> Result<u32> {
-    let blocks_needed = (target_slots + self.block_size - 1) / self.block_size; // ceil division
+    let blocks_needed = (target_slots + self.slots_per_block - 1) / self.slots_per_block; // ceil division
     let mut blocks_acquired = 0u32;
     
     // Randomize start to reduce contention on simultaneous startup
@@ -473,7 +575,7 @@ pub async fn acquire_slots(&self, target_slots: u32) -> Result<u32> {
         match self.try_acquire_block(block_idx).await {
             Ok(true) => {
                 self.owned_blocks.write().await.insert(block_idx);
-                self.total_slots.fetch_add(self.block_size, Ordering::Release);
+                self.total_slots.fetch_add(self.slots_per_block, Ordering::Release);
                 blocks_acquired += 1;
             }
             Ok(false) => continue,  // Owned by another node
@@ -497,7 +599,7 @@ async fn try_acquire_block(&self, block_idx: u32) -> Result<bool> {
         .item("pk", AttributeValue::S(pk))
         .item("owner_id", AttributeValue::S(self.owner_id.clone()))
         .item("ttl_epoch", AttributeValue::N(ttl_epoch.to_string()))
-        .item("slots", AttributeValue::N(self.block_size.to_string()))
+        .item("slots", AttributeValue::N(self.slots_per_block.to_string()))
         .item("service_name", AttributeValue::S("tokeirad".into()))
         .item("acquired_at_ms", AttributeValue::N(now.to_string()))
         // Acquire if: not exists OR owner_id is empty OR TTL expired (crash recovery)
@@ -525,7 +627,7 @@ pub fn has_budget(&self) -> bool {
     used < total
 }
 
-/// Acquire one slot (called by refiller after creating a connection).
+/// Acquire one slot (called by refiller before creating a connection).
 /// Returns Err if all slots are in use.
 pub fn acquire_slot(&self) -> Result<(), SlotBudgetExhausted> {
     let total = self.total_slots.load(Ordering::Acquire) as i64;
@@ -552,8 +654,12 @@ async fn renew_loop(&self) {
         interval.tick().await;
         let blocks: Vec<u32> = self.owned_blocks.read().await.iter().copied().collect();
         for block_idx in blocks {
-            if let Err(e) = self.renew_block(block_idx).await {
-                tracing::warn!(block_idx, ?e, "failed to renew slot block");
+            match self.renew_block(block_idx).await {
+                Ok(()) => {}
+                Err(e) if is_conditional_check_failed(&e) => {
+                    self.handle_lost_block(block_idx).await;
+                }
+                Err(e) => tracing::warn!(block_idx, ?e, "failed to renew slot block"),
             }
         }
     }
@@ -574,6 +680,14 @@ async fn renew_block(&self, block_idx: u32) -> Result<()> {
         .expression_attribute_values(":owner", AttributeValue::S(self.owner_id.clone()))
         .send().await?;
     Ok(())
+}
+
+async fn handle_lost_block(&self, block_idx: u32) {
+    if self.owned_blocks.write().await.remove(&block_idx) {
+        self.total_slots.fetch_sub(self.slots_per_block, Ordering::AcqRel);
+        metrics::record_dsql_slot_block_lost();
+        tracing::warn!(block_idx, "lost DSQL slot block ownership");
+    }
 }
 ```
 
@@ -605,7 +719,8 @@ pub async fn release_all(&self) {
 - Release clears `owner_id` to empty string (NOT delete) — keeps the item for debugging visibility.
 - Renewal condition `owner_id = :owner` ensures only the owner can renew — if another node stole the block (after TTL expiry), renewal fails silently.
 - `has_budget()` and `acquire_slot()` are O(1) atomic operations — no DynamoDB call on the hot path.
-- The refiller calls `slot_manager.acquire_slot()` AFTER successfully creating a connection, and `slot_manager.release_slot()` when a connection is retired (in the expiry scanner or return processor discard path).
+- The refiller calls `slot_manager.acquire_slot()` BEFORE creating a connection and calls `slot_manager.release_slot()` if creation fails or when a connection is retired (in the expiry scanner or return processor discard path).
+- If a renewal receives `ConditionalCheckFailedException`, the node removes that block from `owned_blocks`, subtracts `SLOT_BLOCK_SIZE` from `total_slots`, emits `tokeira_dsql_slot_block_lost_total`, and continues running with reduced capacity. If `used_slots > total_slots`, `has_budget()` returns false until enough existing connections are returned/retired or a later refiller cycle acquires replacement capacity.
 - Crash recovery: if a node crashes, its blocks' `ttl_epoch` expires after 3 minutes. The `attribute_not_exists(pk) OR owner_id = :empty OR ttl_epoch < :now` condition allows other nodes to claim expired blocks.
 
 ### 9. Class-Based Admission Control
@@ -618,7 +733,7 @@ impl ConnectionDirector for DsqlConnectionDirector {
         let started = Instant::now();
         let class_guard = self.class_budgets.acquire(class).await?;  // may block
         match self.reservoir.checkout() {                              // non-blocking
-            Ok(conn) => { /* build permit */ }
+            Ok(conn) => { /* build permit with Arc<SlotBlockManager> clone */ }
             Err(ReservoirError::Empty) => {
                 drop(class_guard);  // release permit on backpressure
                 Err(anyhow!("reservoir empty: backpressure"))
@@ -640,6 +755,10 @@ impl ConnectionDirector for DsqlConnectionDirector {
 
 ### 10. DsqlPermit
 
+Each permit stores an `Arc<SlotBlockManager>` so the synchronous drop path can
+release the reserved slot if it closes an expired connection or cannot hand the
+connection to the return processor during shutdown.
+
 ```rust
 pub struct DsqlPermit {
     pub class: DbClass,
@@ -649,6 +768,7 @@ pub struct DsqlPermit {
     marked_bad: bool,
     _class_guard: OwnedSemaphorePermit,
     reservoir_return: mpsc::UnboundedSender<ReturnedConn>,
+    slot_manager: Arc<SlotBlockManager>,
     director_in_flight: Arc<AtomicUsize>,
 }
 
@@ -661,10 +781,19 @@ impl Drop for DsqlPermit {
     fn drop(&mut self) {
         self.director_in_flight.fetch_sub(1, Ordering::AcqRel);
         if let Some(conn) = self.connection.take() {
-            let _ = self.reservoir_return.send(ReturnedConn {
+            if self.created_at.elapsed() >= self.lifetime {
+                metrics::record_retirement("expired", self.created_at.elapsed());
+                self.slot_manager.release_slot();
+                drop(conn);
+                return;
+            }
+            if let Err(err) = self.reservoir_return.send(ReturnedConn {
                 connection: conn, created_at: self.created_at,
                 lifetime: self.lifetime, marked_bad: self.marked_bad,
-            });
+            }) {
+                self.slot_manager.release_slot();
+                drop(err.0);
+            }
         }
     }
 }
@@ -673,16 +802,17 @@ impl Drop for DsqlPermit {
 ### 11. Pool Warmup and Startup Sequence
 
 ```
-1. Validate DynamoDB tables reachable (fail hard if not).
-2. Start SlotBlockManager (acquire initial blocks).
-3. Start DistributedTokenBucket.
-4. Start Reservoir (spawns refiller, scanner, return processor).
-5. Warmup: poll until ready_count >= TARGET_READY (timeout: 30s).
-6. Build DsqlConnectionDirector with class budgets.
-7. Accept gRPC traffic.
+1. Read `DsqlPoolConfig.coordination` for DynamoDB table names and client.
+2. Validate DynamoDB tables reachable (fail hard if not).
+3. Start SlotBlockManager (acquire initial blocks).
+4. Start DistributedTokenBucket.
+5. Start Reservoir (spawns refiller, scanner, return processor).
+6. Warmup: poll until ready_count >= TARGET_READY (timeout: 30s).
+7. Build DsqlConnectionDirector with class budgets.
+8. Accept gRPC traffic.
 ```
 
-If DynamoDB unreachable at step 1:
+If DynamoDB is unreachable during validation:
 ```
 Error: DynamoDB table '{project}-dsql-rate-limiter' is unreachable.
 DSQL deployments require DynamoDB coordination tables.
@@ -722,6 +852,14 @@ Both tables: on-demand billing, TTL enabled on `ttl_epoch`, same region as DSQL,
 | `lifetime` | `Duration` | Original assigned lifetime |
 | `marked_bad` | `bool` | Caller signals connection-level error |
 
+### DsqlCoordinationConfig
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `rate_limiter_table` | `String` | DynamoDB table used by Distributed_Token_Bucket |
+| `conn_lease_table` | `String` | DynamoDB table used by Slot_Block_Manager |
+| `ddb_client` | `aws_sdk_dynamodb::Client` | Runtime DynamoDB client constructed from the effective DSQL region and AWS credentials |
+
 ### DynamoDB: Rate Limiter (`{project}-dsql-rate-limiter`)
 
 | Attribute | Type | Key | Description |
@@ -738,26 +876,29 @@ Both tables: on-demand billing, TTL enabled on `ttl_epoch`, same region as DSQL,
 | Attribute | Type | Key | Description |
 |-----------|------|-----|-------------|
 | `pk` | String | PK | `connslots#{endpoint}#block-{block_id}` |
-| `owner` | String | — | Node ID |
-| `acquired_at` | Number | — | Unix millis |
+| `owner_id` | String | — | Node ID |
+| `acquired_at_ms` | Number | — | Unix millis |
 | `ttl_epoch` | Number | TTL | Unix seconds + 180 |
-| `block_size` | Number | — | 100 |
+| `slots` | Number | — | 100 |
 
 ### Metrics
 
 | Metric Name | Type | Labels |
 |-------------|------|--------|
-| `tokeira_dsql_reservoir_ready_connections` | Gauge | — |
-| `tokeira_dsql_reservoir_checkout_duration_seconds` | Histogram | `class` |
-| `tokeira_dsql_reservoir_empty_total` | Counter | — |
+| `tokeira_dsql_pool_connections_total` | Gauge | — |
+| `tokeira_dsql_pool_checkout_duration_seconds` | Histogram | `class` |
+| `tokeira_dsql_pool_empty_reservoir_total` | Counter | — |
 | `tokeira_dsql_reservoir_connection_create_duration_seconds` | Histogram | — |
 | `tokeira_dsql_reservoir_connection_age_seconds` | Histogram | `retirement_reason` |
 | `tokeira_dsql_reservoir_in_flight` | Gauge | — |
-| `tokeira_dsql_rate_limiter_tokens_remaining` | Gauge | — |
+| `tokeira_dsql_pool_rate_limiter_tokens` | Gauge | — |
+| `tokeira_dsql_pool_rate_limiter_rate` | Gauge | — |
 | `tokeira_dsql_slot_blocks_owned` | Gauge | — |
 | `tokeira_dsql_pool_class_budget_total` | Gauge | `class` |
 | `tokeira_dsql_pool_class_in_use` | Gauge | `class` |
 | `tokeira_dsql_pool_class_waiters` | Gauge | `class` |
+| `tokeira_dsql_class_permit_wait_duration_seconds` | Histogram | `class` |
+| `tokeira_dsql_slot_block_lost_total` | Counter | — |
 | `tokeira_dsql_pool_connections_created_total` | Counter | — |
 | `tokeira_dsql_pool_connections_retired_total` | Counter | `reason` |
 | `tokeira_dsql_pool_connections_returned_total` | Counter | — |
@@ -773,47 +914,47 @@ All metrics emitted unconditionally via the `metrics` crate. No configuration op
 
 *For any* connection created by the refiller, its assigned lifetime SHALL be within `[BASE_LIFETIME - LIFETIME_JITTER, BASE_LIFETIME + LIFETIME_JITTER]` (8 to 12 minutes inclusive).
 
-**Validates: Requirements 4.6, 12.3**
+**Validates: Requirements 4.6, 11.3**
 
 ### Property 2: Lifetime Safety Against Token TTL
 
 *For any* valid reservoir configuration, `BASE_LIFETIME + LIFETIME_JITTER + GUARD_WINDOW` SHALL be strictly less than 15 minutes (the DSQL IAM token TTL). With specified constants: 12 min + 45 sec = 12:45 < 15:00.
 
-**Validates: Requirements 12.4**
+**Validates: Requirements 11.4**
 
 ### Property 3: Guard Window Enforcement
 
 *For any* connection where `remaining_lifetime() <= GUARD_WINDOW`, both the expiry scanner and the return processor SHALL discard it. No such connection SHALL be placed back in the ready channel or handed to a caller.
 
-**Validates: Requirements 5.2, 6.2, 17.1, 17.2**
+**Validates: Requirements 5.2, 5.5, 6.2, 6.6, 16.1, 16.2, 16.6**
 
 ### Property 4: Bad Connection Discard
 
 *For any* connection returned with `marked_bad = true`, the return processor SHALL discard it regardless of remaining lifetime.
 
-**Validates: Requirements 17.3**
+**Validates: Requirements 16.3, 16.6**
 
 ### Property 5: No-Network Return Path
 
 *For any* connection returned outside the guard window and not marked bad, the return processor SHALL place it back in the ready channel without executing any network I/O.
 
-**Validates: Requirements 17.4, 17.5**
+**Validates: Requirements 16.4, 16.5**
 
 ### Property 6: Class Budget Sum Invariant
 
 *For any* `target_ready` ≥ 5, the sum of all class allocations SHALL equal `target_ready`, and each class SHALL have at least 1 permit.
 
-**Validates: Requirements 10.1**
+**Validates: Requirements 9.1**
 
 ### Property 7: Class Isolation
 
 *For any* valid system state, exhausting all permits in one class SHALL NOT reduce available permits in any other class.
 
-**Validates: Requirements 10.4**
+**Validates: Requirements 9.4**
 
 ### Property 8: Bounded Scan Per Pass
 
-*For any* expiry scanner pass, the scanner SHALL examine at most `TARGET_READY` entries from the ready channel.
+*For any* expiry scanner pass, the scanner SHALL examine at most `SCAN_BUDGET` (`TARGET_READY / 2`) entries from the ready channel.
 
 **Validates: Requirements 5.4**
 
@@ -821,7 +962,7 @@ All metrics emitted unconditionally via the `metrics` crate. No configuration op
 
 *For any* node with N owned slot blocks, the refiller SHALL NOT create more than `N × SLOT_BLOCK_SIZE` connections.
 
-**Validates: Requirements 9.3**
+**Validates: Requirements 8.3**
 
 ### Property 10: Distributed Rate Burst Limit
 
@@ -863,7 +1004,8 @@ The refiller never propagates errors to checkout callers. It logs, backs off, an
 | Cannot acquire any slot blocks | **Fail hard** — process exits |
 | Condition check failed (race) | Normal — retry with jitter |
 | Transient error during operation | Log error, retry with backoff |
-| Slot block renewal fails | Log warning, retry next interval |
+| Slot block renewal transient failure | Log warning, retry next interval |
+| Slot block renewal conditional check failure | Remove block locally, reduce total slots, emit `tokeira_dsql_slot_block_lost_total`, continue with reduced capacity |
 | Slot block TTL expires (crash) | Blocks become available to other nodes |
 
 ### Checkout Failures
@@ -904,7 +1046,7 @@ Each correctness property maps to a property-based test with minimum 100 iterati
 | 5: No-Network Return | Mock-based, verify no I/O calls on healthy return |
 | 6: Class Budget Sum | `target_ready in 5..500`, verify sum invariant |
 | 7: Class Isolation | Exhaust one class, verify others unchanged |
-| 8: Bounded Scan | `channel_size in 1..200`, verify ≤ TARGET_READY examined |
+| 8: Bounded Scan | `channel_size in 1..200`, verify ≤ SCAN_BUDGET examined |
 | 9: Slot Budget | `blocks in 0..10, connections in 0..1000`, verify budget check |
 | 10: Rate Burst | `acquisitions in 1..2000`, verify burst limit |
 | 11: Non-Blocking Checkout | Various channel states, verify O(1) return |

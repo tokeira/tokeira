@@ -13,7 +13,7 @@ All connection management parameters are internal constants derived from DSQL's 
 - **Reservoir**: The channel-based connection buffer that holds pre-created physical DSQL connections ready for immediate checkout.
 - **Refiller**: A background tokio task that continuously creates new physical connections to maintain the reservoir at its target level.
 - **Expiry_Scanner**: A background tokio task that periodically inspects the ready channel and retires connections approaching their IAM token expiry.
-- **Return_Processor**: A background tokio task that validates returned connections (via ping) before placing them back in the ready channel.
+- **Return_Processor**: A background tokio task that validates returned connections via lifetime and bad-flag checks before placing them back in the ready channel.
 - **Connection_Factory**: The component that creates raw `PgConnection` instances via IAM-authenticated TCP/TLS without using a sqlx pool.
 - **Token_Bucket**: A rate limiter that enforces DSQL's cluster-wide connection creation rate (100/sec sustained, 1000 burst).
 - **Distributed_Token_Bucket**: A DynamoDB-backed token bucket that coordinates the cluster-wide connection creation rate across multiple nodes.
@@ -70,11 +70,12 @@ All connection management parameters are internal constants derived from DSQL's 
 
 1. THE Refiller SHALL run as a dedicated tokio task that continuously creates connections to maintain the Ready_Channel at `target_ready` (50) connections.
 2. WHILE the Ready_Channel contains fewer connections than `target_ready`, THE Refiller SHALL attempt to create new connections.
-3. WHEN the Refiller creates a connection, THE Refiller SHALL first acquire a token from the Token_Bucket rate limiter.
-4. WHEN the Refiller creates a connection, THE Refiller SHALL first acquire a permit from the In_Flight_Semaphore.
+3. WHEN the Refiller creates a connection, THE Refiller SHALL acquire resources in this order: `In_Flight_Semaphore`, `Slot_Block_Manager.acquire_slot()`, `Distributed_Token_Bucket.wait()`, then `Connection_Factory.create_connection()`.
+4. IF rate limiting or connection creation fails after a slot is reserved, THEN THE Refiller SHALL call `Slot_Block_Manager.release_slot()` before backing off.
 5. IF the Connection_Factory returns an error, THEN THE Refiller SHALL back off with exponential delay before retrying.
 6. THE Refiller SHALL assign each new connection a jittered lifetime of `base_lifetime` ± `lifetime_jitter`.
 7. THE Refiller SHALL record the creation timestamp on each connection for lifetime enforcement.
+8. IF the Refiller creates a connection but cannot place it into the Ready_Channel, THEN THE Refiller SHALL call `Slot_Block_Manager.release_slot()` exactly once for that physical connection before dropping it.
 
 ### Requirement 5: Expiry Scanner
 
@@ -86,6 +87,8 @@ All connection management parameters are internal constants derived from DSQL's 
 2. WHEN the Expiry_Scanner finds a connection whose elapsed age plus `guard_window` (45 seconds) exceeds its assigned lifetime, THE Expiry_Scanner SHALL retire that connection by dropping it.
 3. THE Expiry_Scanner SHALL emit a metric for each connection retired due to guard window proximity.
 4. THE Expiry_Scanner SHALL not drain the entire Ready_Channel in a single scan pass; scanning SHALL be bounded to prevent starvation of concurrent checkout callers.
+5. WHEN the Expiry_Scanner retires a connection, THE Expiry_Scanner SHALL call `Slot_Block_Manager.release_slot()` for that physical connection.
+6. IF the Expiry_Scanner cannot place a still-healthy scanned connection back into the Ready_Channel, THEN THE Expiry_Scanner SHALL call `Slot_Block_Manager.release_slot()` exactly once before dropping that physical connection.
 
 ### Requirement 6: Return Processor
 
@@ -95,9 +98,11 @@ All connection management parameters are internal constants derived from DSQL's 
 
 1. THE Return_Processor SHALL run as a dedicated tokio task that receives connections from the return channel.
 2. WHEN the Return_Processor receives a connection, THE Return_Processor SHALL check whether the connection is within the guard window; connections within the guard window SHALL be discarded.
-3. WHEN the Return_Processor receives a connection outside the guard window, THE Return_Processor SHALL validate the connection with a lightweight ping.
-4. IF the ping succeeds, THEN THE Return_Processor SHALL place the connection back in the Ready_Channel.
-5. IF the ping fails, THEN THE Return_Processor SHALL discard the connection and emit a metric indicating the failure reason.
+3. WHEN the Return_Processor receives a connection, THE Return_Processor SHALL validate it using only the lifetime check and caller-provided bad-flag.
+4. IF the connection is outside the guard window and is not marked bad, THEN THE Return_Processor SHALL place the connection back in the Ready_Channel.
+5. IF the connection is marked bad, THEN THE Return_Processor SHALL discard the connection and emit a metric indicating the failure reason.
+6. IF the Return_Processor discards a returned connection, THEN THE Return_Processor SHALL call `Slot_Block_Manager.release_slot()` for that physical connection.
+7. IF the Return_Processor cannot place a reusable returned connection back into the Ready_Channel, THEN THE Return_Processor SHALL call `Slot_Block_Manager.release_slot()` exactly once before dropping that physical connection.
 
 ### Requirement 7: Distributed Token Bucket as Sole Rate Limiter
 
@@ -122,12 +127,11 @@ All connection management parameters are internal constants derived from DSQL's 
 3. THE Refiller SHALL only create connections within the node's allocated slot budget (number of acquired blocks × block size).
 4. THE Slot_Block_Manager SHALL periodically renew its block leases to prevent expiry during normal operation.
 5. IF a node crashes, THEN THE Slot_Block_Manager SHALL release the node's blocks via TTL expiry, making them available to other nodes.
-6. THE Slot_Block_Manager SHALL use the same DynamoDB table as the Distributed_Token_Bucket (separate partition key prefix) to minimize infrastructure.
-5. WHEN the DynamoDB slot block table does not exist at startup, THE Reservoir SHALL operate without a distributed connection count limit and fall back to local-only operation.
-6. THE Slot_Block_Manager SHALL periodically renew its block leases to prevent expiry during normal operation.
-7. IF a node crashes, THEN THE Slot_Block_Manager SHALL release the node's blocks via TTL expiry, making them available to other nodes.
+6. THE Slot_Block_Manager SHALL use a separate DynamoDB table from the Distributed_Token_Bucket, with the slot table dedicated to connection slot allocation.
+7. WHEN the DynamoDB slot block table does not exist or is unreachable at startup, THE Reservoir SHALL fail fast with a clear error.
+8. WHEN slot block renewal fails because ownership was lost, THE Slot_Block_Manager SHALL remove the block locally, reduce total slot capacity by one block, emit `tokeira_dsql_slot_block_lost_total`, and continue operating with reduced capacity.
 
-### Requirement 10: Class-Based Admission Control
+### Requirement 9: Class-Based Admission Control
 
 **User Story:** As a tokeira developer, I want operation classes to have reserved connection budgets, so that projection bursts cannot starve commit operations.
 
@@ -139,7 +143,7 @@ All connection management parameters are internal constants derived from DSQL's 
 4. FOR ALL valid system states, the projection class SHALL NOT be able to acquire permits reserved for the commit class (class isolation invariant).
 5. THE Class_Budget SHALL emit metrics for each class: total permits, in-use permits, and wait duration.
 
-### Requirement 11: IAM Token Provider
+### Requirement 10: IAM Token Provider
 
 **User Story:** As a tokeira developer, I want fresh IAM tokens generated for each new connection, so that connections authenticate correctly without sharing expired tokens.
 
@@ -150,7 +154,7 @@ All connection management parameters are internal constants derived from DSQL's 
 3. THE IAM_Token_Provider SHALL use the DSQL endpoint and region from operator-provided configuration to generate tokens.
 4. IF the IAM_Token_Provider fails to generate a token, THEN THE Connection_Factory SHALL propagate the error to the Refiller as a connection creation failure.
 
-### Requirement 12: Connection Lifecycle Constants
+### Requirement 11: Connection Lifecycle Constants
 
 **User Story:** As a tokeira operator, I want all connection lifecycle parameters to be derived from DSQL's known constraints, so that I do not need to configure or tune connection management.
 
@@ -161,29 +165,30 @@ All connection management parameters are internal constants derived from DSQL's 
 3. FOR ALL connections created by the Refiller, the assigned lifetime SHALL be within the range `[base_lifetime - lifetime_jitter, base_lifetime + lifetime_jitter]` (8 to 12 minutes).
 4. FOR ALL connections created by the Refiller, the assigned lifetime plus guard_window SHALL NOT exceed the DSQL IAM token TTL of 15 minutes.
 
-### Requirement 13: Graceful Degradation
+### Requirement 12: Graceful Degradation
 
 **User Story:** As a tokeira operator, I want the system to degrade gracefully when the reservoir is empty and connections cannot be created, so that operations queue predictably rather than failing catastrophically.
 
 #### Acceptance Criteria
 
-1. WHEN the Reservoir is empty and the Refiller cannot create connections (rate limited or DSQL unavailable), THE system SHALL queue operations at the Class_Budget semaphore rather than at the connection layer.
-2. WHILE the Reservoir is in a degraded state, THE Reservoir SHALL emit metrics exposing the backpressure: empty reservoir events, refiller in-flight count, and rate limiter tokens remaining.
-3. WHEN the Refiller encounters repeated connection creation failures, THE Refiller SHALL apply exponential backoff up to a maximum delay without stopping the refill loop.
-4. WHEN DSQL becomes available again after an outage, THE Refiller SHALL resume filling the reservoir without operator intervention.
+1. THE system SHALL queue operations at the Class_Budget semaphore for admission before reservoir checkout.
+2. WHEN the Reservoir is empty after class admission, THE caller SHALL release the class permit and signal backpressure immediately with `ReservoirError::Empty`.
+3. WHILE the Reservoir is in a degraded state, THE Reservoir SHALL emit metrics exposing the backpressure: empty reservoir events, refiller in-flight count, and rate limiter tokens remaining.
+4. WHEN the Refiller encounters repeated connection creation failures, THE Refiller SHALL apply exponential backoff up to a maximum delay without stopping the refill loop.
+5. WHEN DSQL becomes available again after an outage, THE Refiller SHALL resume filling the reservoir without operator intervention.
 
-### Requirement 14: Observability
+### Requirement 13: Observability
 
 **User Story:** As a tokeira operator, I want comprehensive metrics for the reservoir and its subsystems, so that I can monitor connection health and diagnose performance issues.
 
 #### Acceptance Criteria
 
-1. THE Reservoir SHALL emit the following metrics via the `metrics` crate: reservoir size (gauge), checkout latency (histogram), empty reservoir events (counter), refiller in-flight count (gauge), connection age at retirement (histogram), rate limiter tokens remaining (gauge), class budget utilization per class (gauge).
+1. THE Reservoir SHALL emit the following metrics via the `metrics` crate: reservoir size (gauge), checkout latency (histogram), empty reservoir events (counter), refiller in-flight count (gauge), connection age at retirement (histogram), rate limiter tokens remaining (gauge), class budget utilization per class (gauge), and class permit wait duration (histogram).
 2. THE Reservoir SHALL NOT expose metrics configuration as operator-configurable settings.
 3. WHEN a connection is retired, THE Reservoir SHALL record the retirement reason (expired, guard_window, unhealthy, budget_cap) as a metric label.
 4. THE Reservoir SHALL emit a metric for connection creation duration (histogram) to track IAM auth and TCP/TLS handshake latency.
 
-### Requirement 15: DynamoDB Coordination for All DSQL Deployments
+### Requirement 14: DynamoDB Coordination for All DSQL Deployments
 
 **User Story:** As a tokeira developer, I want the full DynamoDB-backed coordination (distributed token bucket and slot block manager) active for ALL DSQL deployments including compose, so that developers exercise the production coordination path locally and catch coordination bugs before they reach multi-node deployments.
 
@@ -194,8 +199,10 @@ All connection management parameters are internal constants derived from DSQL's 
 3. THE Reservoir SHALL NOT have a "local-only" fallback mode for DSQL deployments. If the DynamoDB tables are unreachable, the Reservoir SHALL fail with a clear error rather than silently degrading to uncoordinated operation.
 4. THE DynamoDB tables SHALL be provisioned with on-demand billing (pay-per-request) so they cost nothing when idle.
 5. THE compose platform SHALL provision the DynamoDB tables in the same region as the DSQL cluster, using the same AWS credentials.
+6. WHEN `tokeirad` starts with DSQL storage, THE DSQL startup path SHALL populate `DsqlCoordinationConfig` with a DynamoDB client plus table names derived from the effective project identifier: `{project}-dsql-rate-limiter` and `{project}-dsql-conn-lease`.
+7. THE `DsqlStore::connect(auth, config)` startup path SHALL use `config.coordination.rate_limiter_table`, `config.coordination.conn_lease_table`, and `config.coordination.ddb_client` to construct the Distributed_Token_Bucket and Slot_Block_Manager.
 
-### Requirement 16: Pool Warmup
+### Requirement 15: Pool Warmup
 
 **User Story:** As a tokeira operator, I want the reservoir to be fully warmed before the server accepts traffic, so that the first requests do not experience cold-start latency.
 
@@ -206,7 +213,7 @@ All connection management parameters are internal constants derived from DSQL's 
 3. THE warmup phase SHALL complete within a bounded time derived from `target_ready` and the rate limit (50 connections at 100/sec = 500ms minimum).
 4. IF warmup cannot complete (DSQL unavailable), THEN THE Reservoir SHALL log a warning and allow the server to start with a partially filled reservoir rather than blocking indefinitely.
 
-### Requirement 17: Connection Return with Lifetime Check
+### Requirement 16: Connection Return with Lifetime Check
 
 **User Story:** As a tokeira developer, I want returned connections to be checked for remaining lifetime before reuse, so that near-expired connections are discarded without adding per-return network overhead.
 
@@ -217,18 +224,20 @@ All connection management parameters are internal constants derived from DSQL's 
 3. IF the connection was marked as bad by the caller (e.g., received a connection-level error during use), THEN THE Return_Processor SHALL discard the connection.
 4. IF the connection is outside the guard window and not marked bad, THEN THE Return_Processor SHALL place the connection back in the Ready_Channel immediately without a network round-trip.
 5. THE Return_Processor SHALL NOT execute a ping or any network operation on returned connections.
+6. IF a permit drop path discards an expired connection before it reaches the Return_Processor, THEN the permit SHALL call `Slot_Block_Manager.release_slot()` for that physical connection.
+7. IF a permit drop path cannot send a live connection to the Return_Processor, THEN the permit SHALL call `Slot_Block_Manager.release_slot()` exactly once before dropping that physical connection.
 
-### Requirement 18: Metrics Are Internal
+### Requirement 17: Metrics Are Internal
 
 **User Story:** As a tokeira developer, I want all reservoir metrics to be emitted automatically without operator configuration, so that observability is always available without tuning.
 
 #### Acceptance Criteria
 
-1. THE Reservoir SHALL emit all metrics (Requirement 14) unconditionally via the `metrics` crate.
+1. THE Reservoir SHALL emit all metrics (Requirement 13) unconditionally via the `metrics` crate.
 2. THE Reservoir SHALL NOT provide configuration options to enable, disable, or filter metric emission.
 3. THE metric names and labels SHALL follow the existing `tokeira_dsql_reservoir_*` and `tokeira_dsql_pool_*` naming conventions established in the codebase.
 
-### Requirement 19: Architecture Documentation
+### Requirement 18: Architecture Documentation
 
 **User Story:** As a tokeira developer, I want comprehensive documentation of the connection management architecture, so that contributors understand the design rationale, invariants, and operational behaviour without reading the implementation.
 
@@ -242,7 +251,7 @@ All connection management parameters are internal constants derived from DSQL's 
 6. THE documentation SHALL explain the DynamoDB coordination tables (schema, TTL behaviour, cost model) and why they are provisioned for all DSQL deployments including compose.
 7. THE documentation SHALL NOT include operator-tunable configuration guidance — all parameters are internal constants.
 
-### Requirement 20: Compose IaC DynamoDB Table Provisioning
+### Requirement 19: Compose IaC DynamoDB Table Provisioning
 
 **User Story:** As a tokeira operator using compose+DSQL, I want the DynamoDB coordination tables provisioned automatically by `tkr infra apply`, so that the full coordination path works without manual AWS console work.
 

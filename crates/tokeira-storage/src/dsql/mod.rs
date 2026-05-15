@@ -3,28 +3,34 @@
 //! This module contains the schema/migration and connection-management
 //! primitives used by the production DSQL backend. The public entry point is
 //! [`DsqlStore`], which wires a connection director, migration runner, and
-//! DSQL `RunRepository` over the same physical pool/reservoir foundation.
+//! DSQL `RunRepository` over the same raw-connection reservoir foundation.
 
 use std::sync::Arc;
 
 pub mod codec;
 pub mod config;
 pub mod connection;
+pub mod connection_factory;
 pub(crate) mod convert;
+pub mod distributed_bucket;
 pub mod migration;
 pub mod projection_log;
 pub mod rate_limiter;
 pub mod reservoir;
 pub mod run_repository;
+pub mod slot_block_manager;
 pub mod validation;
 
 pub use config::*;
 pub use connection::*;
+pub use connection_factory::*;
+pub use distributed_bucket::*;
 pub use migration::*;
 pub use projection_log::*;
 pub use rate_limiter::*;
 pub use reservoir::*;
 pub use run_repository::*;
+pub use slot_block_manager::*;
 pub use validation::*;
 
 /// Production DSQL storage foundation.
@@ -43,36 +49,76 @@ pub struct DsqlStore {
 impl DsqlStore {
     /// Construct the foundational DSQL components from IAM auth settings.
     ///
-    /// Uses `DsqlRole::Runtime` for the connection pool. Migration connections
-    /// should use a separate `DsqlConnector` with `DsqlRole::Admin`.
+    /// The full startup sequence is internal: DynamoDB coordination validation,
+    /// slot-block ownership, distributed rate limiting, and reservoir warmup.
     pub async fn connect(
         auth: config::DsqlAuthConfig,
         config: config::DsqlPoolConfig,
     ) -> anyhow::Result<Self> {
         config.validate()?;
         auth.validate()?;
-        let connector =
-            connection::DsqlConnector::connect(&auth, &config, config::DsqlRole::Runtime).await?;
-        Self::from_connector(connector, config).await
+        let region = auth.resolved_region().ok_or_else(|| {
+            anyhow::anyhow!("dsql region must be configured or derivable from endpoint")
+        })?;
+        let factory = Arc::new(connection_factory::ConnectionFactory::new(
+            &auth.endpoint,
+            &region,
+        )?);
+        let bucket = Arc::new(distributed_bucket::DistributedTokenBucket::new(
+            config.coordination.ddb_client.clone(),
+            config.coordination.rate_limiter_table.clone(),
+            auth.endpoint.clone(),
+            config.connection_rate_per_second,
+            config.burst_capacity,
+        ));
+        bucket.validate_table().await?;
+        let slot_manager = slot_block_manager::SlotBlockManager::start(
+            config.coordination.ddb_client.clone(),
+            config.coordination.conn_lease_table.clone(),
+            auth.endpoint.clone(),
+        )
+        .await?;
+        let reservoir = reservoir::Reservoir::start(
+            config.reservoir.clone(),
+            factory,
+            bucket,
+            Arc::clone(&slot_manager),
+        )
+        .await?;
+        Self::from_reservoir(reservoir, config).await
     }
 
-    /// Construct the foundational DSQL components from an existing SQLx pool.
-    pub async fn from_pool(
-        pool: sqlx::PgPool,
+    /// Construct the foundational DSQL components from a database URL for tests.
+    #[cfg(any(test, feature = "dsql-integration"))]
+    pub async fn from_database_url_for_tests(
+        url: impl Into<String>,
         config: config::DsqlPoolConfig,
     ) -> anyhow::Result<Self> {
         config.validate()?;
-        let connector = connection::DsqlConnector::new(pool);
-        Self::from_connector(connector, config).await
+        let factory = Arc::new(connection_factory::DatabaseUrlConnectionFactory::new(url));
+        let bucket = Arc::new(distributed_bucket::DistributedTokenBucket::local_for_tests(
+            config.connection_rate_per_second,
+            config.burst_capacity,
+        ));
+        let slot_manager =
+            slot_block_manager::SlotBlockManager::local_for_tests(config.reservoir.target_ready);
+        let reservoir = reservoir::Reservoir::start(
+            config.reservoir.clone(),
+            factory,
+            bucket,
+            Arc::clone(&slot_manager),
+        )
+        .await?;
+        Self::from_reservoir(reservoir, config).await
     }
 
-    async fn from_connector(
-        connector: connection::DsqlConnector,
+    async fn from_reservoir(
+        reservoir: reservoir::Reservoir,
         config: config::DsqlPoolConfig,
     ) -> anyhow::Result<Self> {
         // One `Arc<DsqlConnectionDirector>` is shared by all DSQL surfaces so
         // class budgets and reservoir state remain globally coordinated.
-        let director = connection::DsqlConnectionDirector::start(config.clone(), connector).await?;
+        let director = connection::DsqlConnectionDirector::start(config.clone(), reservoir)?;
         let director = Arc::new(director);
         let migration_runner = migration::MigrationRunner::new(config.migration);
         let run_repository = run_repository::DsqlRunRepository::new(

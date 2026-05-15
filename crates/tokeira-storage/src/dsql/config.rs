@@ -10,7 +10,6 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgPoolOptions;
 use time::Duration;
 
 use crate::CurrentExecutionConflictPolicy;
@@ -19,7 +18,7 @@ use crate::CurrentExecutionConflictPolicy;
 ///
 /// The reservoir retires connections before the hard cutoff so callers do not
 /// receive a connection that will expire mid-transaction.
-const DSQL_HARD_CUTOFF: Duration = Duration::minutes(60);
+const DSQL_HARD_CUTOFF: Duration = Duration::minutes(15);
 
 fn default_target_ready() -> usize {
     50
@@ -30,11 +29,11 @@ fn default_inflight_limit() -> usize {
 }
 
 fn default_base_lifetime() -> Duration {
-    Duration::minutes(50)
+    Duration::minutes(10)
 }
 
 fn default_lifetime_jitter() -> Duration {
-    Duration::minutes(5)
+    Duration::minutes(2)
 }
 
 fn default_guard_window() -> Duration {
@@ -42,7 +41,7 @@ fn default_guard_window() -> Duration {
 }
 
 fn default_scan_interval() -> Duration {
-    Duration::seconds(10)
+    Duration::seconds(1)
 }
 
 fn default_rate_per_second() -> f64 {
@@ -238,10 +237,6 @@ impl DsqlAuthConfig {
         }
         Ok(connection)
     }
-
-    pub fn pool_options(&self, config: &DsqlPoolConfig) -> PgPoolOptions {
-        PgPoolOptions::new().max_connections(config.reservoir.target_ready as u32)
-    }
 }
 
 /// Extract `{region}` from the canonical DSQL endpoint format.
@@ -255,35 +250,50 @@ pub fn detect_region_from_endpoint(endpoint: &str) -> Option<String> {
     (!region.is_empty()).then(|| region.to_owned())
 }
 
+/// DynamoDB coordination resources used by the DSQL connection reservoir.
+#[derive(Clone, Debug)]
+pub struct DsqlCoordinationConfig {
+    pub rate_limiter_table: String,
+    pub conn_lease_table: String,
+    pub ddb_client: aws_sdk_dynamodb::Client,
+}
+
+impl Default for DsqlCoordinationConfig {
+    fn default() -> Self {
+        let config = aws_sdk_dynamodb::Config::builder()
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .region(aws_sdk_dynamodb::config::Region::new("us-east-1"))
+            .build();
+        Self {
+            rate_limiter_table: "tokeira-dsql-rate-limiter".to_owned(),
+            conn_lease_table: "tokeira-dsql-conn-lease".to_owned(),
+            ddb_client: aws_sdk_dynamodb::Client::from_conf(config),
+        }
+    }
+}
+
 /// DSQL pool foundation configuration.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub struct DsqlPoolConfig {
     /// Warm-connection reservoir behavior.
-    #[serde(default)]
     pub reservoir: ReservoirConfig,
     /// Migration discovery settings.
-    #[serde(default)]
     pub migration: MigrationConfig,
+    /// DynamoDB coordination resources for global rate and slot accounting.
+    pub coordination: DsqlCoordinationConfig,
     /// Node-local connection creation rate.
     ///
     /// This caps new physical connections, not logical operation throughput.
-    #[serde(default = "default_rate_per_second")]
     pub connection_rate_per_second: f64,
     /// Burst capacity for the node-local connection creation limiter.
-    #[serde(default = "default_burst_capacity")]
     pub burst_capacity: u64,
     /// Runtime shard count used for deterministic run-key ownership.
-    #[serde(default = "default_shard_count")]
     pub shard_count: u32,
     /// Projection partition count used when writing projection-log records.
-    #[serde(default = "default_projection_partition_count")]
     pub projection_partition_count: u32,
     /// Workflow-id conflict behavior used by repository start commits.
-    #[serde(default)]
     pub conflict_policy: CurrentExecutionConflictPolicy,
     /// Duration added to the repository's application clock for shard leases.
-    #[serde(default = "default_lease_duration")]
     pub lease_duration: Duration,
 }
 
@@ -292,6 +302,7 @@ impl Default for DsqlPoolConfig {
         Self {
             reservoir: ReservoirConfig::default(),
             migration: MigrationConfig::default(),
+            coordination: DsqlCoordinationConfig::default(),
             connection_rate_per_second: default_rate_per_second(),
             burst_capacity: default_burst_capacity(),
             shard_count: default_shard_count(),
@@ -312,6 +323,12 @@ impl DsqlPoolConfig {
         }
         if self.burst_capacity == 0 {
             bail!("burst_capacity must be greater than zero");
+        }
+        if self.coordination.rate_limiter_table.trim().is_empty() {
+            bail!("rate_limiter_table must not be empty");
+        }
+        if self.coordination.conn_lease_table.trim().is_empty() {
+            bail!("conn_lease_table must not be empty");
         }
         if self.shard_count == 0 {
             bail!("shard_count must be greater than zero");
@@ -365,19 +382,6 @@ mod tests {
     }
 
     #[test]
-    fn serde_round_trip_preserves_lease_duration() {
-        let config = DsqlPoolConfig {
-            lease_duration: Duration::seconds(17),
-            ..DsqlPoolConfig::default()
-        };
-
-        let encoded = toml::to_string(&config).unwrap();
-        let decoded: DsqlPoolConfig = toml::from_str(&encoded).unwrap();
-
-        assert_eq!(decoded.lease_duration, Duration::seconds(17));
-    }
-
-    #[test]
     fn rejects_invalid_reservoir_values() {
         let mut config = ReservoirConfig {
             target_ready: 0,
@@ -418,11 +422,6 @@ mod tests {
 
     #[test]
     fn config_structs_round_trip_through_serde() {
-        let config = DsqlPoolConfig::default();
-        let encoded = postcard::to_allocvec(&config).unwrap();
-        let decoded: DsqlPoolConfig = postcard::from_bytes(&encoded).unwrap();
-        assert_eq!(decoded, config);
-
         let auth = DsqlAuthConfig {
             endpoint: "cluster.dsql.eu-west-1.on.aws".to_owned(),
             region: Some("eu-west-1".to_owned()),

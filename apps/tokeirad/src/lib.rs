@@ -61,7 +61,7 @@ use tokeira_runtime::{
 };
 use tokeira_storage::{
     InMemoryStore, LeaseOutcome, LeaseRepository, ProjectionLog, RunRepository,
-    dsql::{DsqlAuthConfig, DsqlPoolConfig, DsqlStore},
+    dsql::{DsqlAuthConfig, DsqlCoordinationConfig, DsqlPoolConfig, DsqlStore},
 };
 use tokeira_types::{
     ExecutionRef, IncarnationId, NamespaceId, NodeEndpoint, PlacementConfig, ProjectionCursor,
@@ -204,12 +204,43 @@ fn dsql_auth_config(config: &TokeiraConfig) -> Result<DsqlAuthConfig> {
     })
 }
 
-fn dsql_pool_config(config: &TokeiraConfig) -> DsqlPoolConfig {
+fn dsql_pool_config_with_client(
+    config: &TokeiraConfig,
+    ddb_client: aws_sdk_dynamodb::Client,
+) -> DsqlPoolConfig {
+    let (rate_limiter_table, conn_lease_table) =
+        dsql_coordination_table_names(&config.infrastructure.cluster_name);
     DsqlPoolConfig {
+        coordination: DsqlCoordinationConfig {
+            rate_limiter_table,
+            conn_lease_table,
+            ddb_client,
+        },
         shard_count: config.infrastructure.placement.shard_count,
         projection_partition_count: config.infrastructure.placement.partition_count,
         ..DsqlPoolConfig::default()
     }
+}
+
+async fn dsql_pool_config(config: &TokeiraConfig, auth: &DsqlAuthConfig) -> Result<DsqlPoolConfig> {
+    let region = auth
+        .resolved_region()
+        .ok_or_else(|| anyhow!("dsql region must be configured or derivable from endpoint"))?;
+    let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_config::Region::new(region))
+        .load()
+        .await;
+    Ok(dsql_pool_config_with_client(
+        config,
+        aws_sdk_dynamodb::Client::new(&sdk_config),
+    ))
+}
+
+fn dsql_coordination_table_names(project_name: &str) -> (String, String) {
+    (
+        format!("{project_name}-dsql-rate-limiter"),
+        format!("{project_name}-dsql-conn-lease"),
+    )
 }
 
 /// Entrypoint the CLI delegates to.
@@ -300,7 +331,7 @@ async fn build_and_serve(
         ConfigStorageKind::Dsql => {
             let auth = dsql_auth_config(&effective_config)?;
             let endpoint = auth.endpoint.clone();
-            let pool_config = dsql_pool_config(&effective_config);
+            let pool_config = dsql_pool_config(&effective_config, &auth).await?;
             let dsql_store = DsqlStore::connect(auth, pool_config)
                 .await
                 .context("failed to connect DSQL storage backend")?;
@@ -639,11 +670,7 @@ where
     for lease in &existing_leases {
         if let Some(owner) = &lease.owner_node_id {
             let _ = lease_repository
-                .relinquish_bundle(
-                    lease.bundle_id,
-                    owner.clone(),
-                    lease.epoch,
-                )
+                .relinquish_bundle(lease.bundle_id, owner.clone(), lease.epoch)
                 .await;
         }
     }
@@ -969,7 +996,8 @@ mod tests {
         config.infrastructure.placement.shard_count = 32;
         config.infrastructure.placement.partition_count = 4;
 
-        let pool_config = dsql_pool_config(&config);
+        let pool_config =
+            dsql_pool_config_with_client(&config, DsqlCoordinationConfig::default().ddb_client);
 
         assert_eq!(pool_config.shard_count, 32);
         assert_eq!(pool_config.projection_partition_count, 4);

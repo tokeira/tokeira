@@ -234,11 +234,16 @@ impl TestContext {
             .connect(&url)
             .await?;
         let config = DsqlPoolConfig {
+            reservoir: tokeira_storage::dsql::ReservoirConfig {
+                target_ready: 4,
+                inflight_limit: 2,
+                ..tokeira_storage::dsql::ReservoirConfig::default()
+            },
             shard_count,
             conflict_policy: CurrentExecutionConflictPolicy::Reject,
             ..DsqlPoolConfig::default()
         };
-        let store = DsqlStore::from_pool(pool.clone(), config).await?;
+        let store = DsqlStore::from_database_url_for_tests(url.clone(), config).await?;
         store.migration_runner().apply(&pool).await?;
         Ok(Some(Self {
             pool,

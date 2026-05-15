@@ -23,6 +23,7 @@ humantime = "2"
 regex = "1"
 serde.workspace = true
 serde_json.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }
 toml.workspace = true
 toml_edit.workspace = true
 tokeira-config.workspace = true

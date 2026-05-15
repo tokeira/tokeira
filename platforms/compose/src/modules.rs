@@ -190,10 +190,47 @@ impl iac::Module for DsqlModule {
             fallback_identifier: None,
             module: self.name().to_owned(),
         };
-        Ok(vec![Box::new(
-            tokeira_aws::resources::dsql_cluster::DsqlCluster::new(cluster_identity, config, &rctx),
-        )])
+        let mut resources: Vec<Box<dyn iac::Resource>> = vec![
+            Box::new(tokeira_aws::resources::dsql_cluster::DsqlCluster::new(
+                cluster_identity,
+                config,
+                &rctx,
+            )),
+            Box::new(dsql_coordination_table(
+                format!("{}-dsql-rate-limiter", self.project_name),
+                self.name(),
+                &rctx,
+            )),
+            Box::new(dsql_coordination_table(
+                format!("{}-dsql-conn-lease", self.project_name),
+                self.name(),
+                &rctx,
+            )),
+        ];
+        resources.shrink_to_fit();
+        Ok(resources)
     }
+}
+
+fn dsql_coordination_table(
+    table_name: String,
+    module: &str,
+    rctx: &tokeira_aws::ResourceContext,
+) -> tokeira_aws::resources::dynamodb_table::DynamoDbTable {
+    tokeira_aws::resources::dynamodb_table::DynamoDbTable::new(
+        table_name,
+        tokeira_aws::resources::dynamodb_table::DynamoDbTableConfig {
+            key_schema: vec![tokeira_aws::resources::dynamodb_table::KeyAttribute {
+                name: "pk".to_owned(),
+                key_type: tokeira_aws::resources::dynamodb_table::KeyType::Hash,
+                attribute_type: tokeira_aws::resources::dynamodb_table::AttributeType::String,
+            }],
+            billing_mode: tokeira_aws::resources::dynamodb_table::BillingMode::OnDemand,
+            ttl_attribute: Some("ttl_epoch".to_owned()),
+            module: module.to_owned(),
+        },
+        rctx,
+    )
 }
 
 pub fn dsql_cluster_identity(project_name: &str) -> String {

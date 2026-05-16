@@ -6,7 +6,7 @@ use tokeira_kernel::{
 use tokeira_runtime::VersioningRuleStore;
 use tokeira_types::{
     BuildId, DeploymentId, NamespaceId, QueueKey, RequestContext, RequestId as CoreRequestId,
-    RunId, RunKey, ShardEpoch, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId,
+    RunId, RunKey, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId,
     WorkflowTaskToken, WorkflowType,
 };
 use uuid::Uuid;
@@ -229,10 +229,7 @@ pub fn workflow_task_completed_request(
 ) -> Result<WorkflowTaskCompletedRequest> {
     let token: WorkflowTaskToken = serde_json::from_slice(&req.task_token)?;
     Ok(WorkflowTaskCompletedRequest {
-        token: WorkflowTaskToken {
-            shard_epoch: ShardEpoch::ZERO,
-            ..token
-        },
+        token,
         identity: WorkerIdentity(req.identity),
         commands: req.commands,
         force_new_workflow_task: req.force_create_new_workflow_task,

@@ -188,7 +188,7 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            lane_count: 4,
+            lane_count: 32,
             lane: LaneConfig::default(),
             timer_scanner: TimerScannerConfig::default(),
             workflow_timeout_scanner: WorkflowTimeoutScannerConfig::default(),

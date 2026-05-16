@@ -2602,7 +2602,8 @@ fn wft_timed_out_with_started_wft() {
         )
         .unwrap();
 
-    assert_eq!(transition.history_events.len(), 1);
+    // After timeout: WorkflowTaskTimedOut + fresh WorkflowTaskScheduled
+    assert_eq!(transition.history_events.len(), 2);
     assert!(matches!(
         &transition.history_events[0].kind,
         HistoryEventKind::WorkflowTaskTimedOut {
@@ -2616,9 +2617,13 @@ fn wft_timed_out_with_started_wft() {
             && *started_event_id == 9
             && *timeout_type == WorkflowTaskTimeoutType::StartToClose
     ));
+    assert!(matches!(
+        &transition.history_events[1].kind,
+        HistoryEventKind::WorkflowTaskScheduled { logical_seq, .. }
+        if *logical_seq == LogicalTaskSeq(4)
+    ));
     let pending = transition.next_state.pending_workflow_task.unwrap();
-    assert_eq!(pending.logical_seq, LogicalTaskSeq(3));
-    assert_eq!(pending.scheduled_event_id, 8);
+    assert_eq!(pending.logical_seq, LogicalTaskSeq(4));
     assert_eq!(pending.started_event_id, None);
     assert!(transition.next_state.sticky.is_none());
     assert_eq!(transition.dispatch_ops.len(), 1);
@@ -2628,7 +2633,7 @@ fn wft_timed_out_with_started_wft() {
             logical_seq,
             sticky_preferred,
             ..
-        } if *logical_seq == LogicalTaskSeq(3) && sticky_preferred.is_none()
+        } if *logical_seq == LogicalTaskSeq(4) && sticky_preferred.is_none()
     ));
     assert!(transition.request_dedupe_ops.is_empty());
     assert!(transition.activity_ops.is_empty());

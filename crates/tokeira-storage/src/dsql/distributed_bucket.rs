@@ -1,4 +1,9 @@
 //! DynamoDB-backed global connection creation token bucket.
+//!
+//! Every refiller in the deployment shares one DynamoDB row. The row is updated
+//! with a conditional write so concurrent nodes naturally serialize token
+//! consumption without holding a long-lived lock. This protects the DSQL
+//! endpoint and IAM token path from coordinated cold-start bursts.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -8,7 +13,12 @@ use aws_sdk_dynamodb::{Client, types::AttributeValue};
 use crate::metrics;
 
 const BUCKET_KEY: &str = "bucket#global";
+/// Upper bound for one wait call. A caller that cannot obtain a token inside
+/// this window should surface backpressure instead of hiding an unhealthy
+/// coordination table behind an indefinitely pending checkout.
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const DISTRIBUTED_BURST: u64 = 1_000;
 
 #[derive(Clone, Debug)]
 pub struct DistributedTokenBucket {
@@ -27,6 +37,10 @@ struct BucketState {
 }
 
 impl DistributedTokenBucket {
+    /// Construct the production distributed bucket.
+    ///
+    /// The `owner_id` is informational for diagnostics; correctness is provided
+    /// by the conditional write on `updated_at_ms`.
     pub fn new(
         client: Client,
         table_name: impl Into<String>,
@@ -102,12 +116,19 @@ impl DistributedTokenBucket {
         let current = self.read_state().await?;
         let now_ms = unix_millis();
         let elapsed_seconds = now_ms.saturating_sub(current.updated_at_ms) as f64 / 1000.0;
-        let replenished =
-            (current.tokens + elapsed_seconds * self.rate_per_second).min(self.burst_capacity);
+        let replenished = replenished_tokens(
+            current.tokens,
+            elapsed_seconds,
+            self.rate_per_second,
+            self.burst_capacity,
+        );
         metrics::record_dsql_pool_rate_limiter(replenished, self.rate_per_second);
         metrics::set_dsql_rate_limiter_tokens_remaining(replenished);
 
         if replenished < 1.0 {
+            // Return a caller-side sleep instead of sleeping under any DynamoDB
+            // request context. That keeps the conditional write path short and
+            // lets competing refillers make progress while this one waits.
             let deficit = 1.0 - replenished;
             let seconds = deficit / self.rate_per_second.max(f64::EPSILON);
             return Ok(Duration::from_secs_f64(seconds.max(0.01)));
@@ -119,6 +140,9 @@ impl DistributedTokenBucket {
             .await
         {
             Ok(()) => Ok(Duration::ZERO),
+            // Another node consumed the bucket state first. A short randomized
+            // backoff would also work; the fixed delay is sufficient because
+            // the token bucket itself controls global refill rate.
             Err(error) if is_conditional_check(&error) => Ok(Duration::from_millis(25)),
             Err(error) => Err(error),
         }
@@ -140,6 +164,9 @@ impl DistributedTokenBucket {
                 )
             })?;
         let Some(item) = output.item() else {
+            // First writer initializes from a full bucket. The following
+            // conditional put prevents multiple cold-start nodes from all
+            // successfully consuming that same initial capacity.
             return Ok(BucketState {
                 tokens: self.burst_capacity,
                 updated_at_ms: 0,
@@ -152,6 +179,9 @@ impl DistributedTokenBucket {
     }
 
     async fn write_state(&self, expected_updated_at: u64, now_ms: u64, tokens: f64) -> Result<()> {
+        // TTL is hygiene for abandoned bucket rows, not part of the rate-limit
+        // correctness model. The conditional expression is the correctness
+        // boundary.
         let ttl_epoch = unix_seconds().saturating_add(300);
         self.client
             .put_item()
@@ -206,4 +236,27 @@ fn is_conditional_check(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.to_string().contains("ConditionalCheckFailed"))
+}
+
+fn replenished_tokens(current_tokens: f64, elapsed_seconds: f64, rate: f64, capacity: f64) -> f64 {
+    (current_tokens + elapsed_seconds * rate).min(capacity)
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    proptest! {
+        #[test]
+        fn distributed_rate_burst_limit(
+            current in 0.0f64..2_000.0,
+            elapsed in 0.0f64..60.0,
+            rate in 1.0f64..500.0,
+        ) {
+            let tokens = replenished_tokens(current, elapsed, rate, DISTRIBUTED_BURST as f64);
+            prop_assert!(tokens <= DISTRIBUTED_BURST as f64);
+        }
+    }
 }

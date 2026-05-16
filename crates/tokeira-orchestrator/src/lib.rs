@@ -490,6 +490,15 @@ impl<D: Deployment> DeployEngine<D> {
         let _ = self.state_store.save(&state, &version).await?;
         Ok(changes)
     }
+
+    /// Clear persisted service state so the next apply treats all services as
+    /// new. Use after rebuilding a local image behind the same tag.
+    pub async fn clear_service_state(&mut self) -> Result<()> {
+        let (mut state, version) = self.state_store.load().await?;
+        state.services.clear();
+        let _ = self.state_store.save(&state, &version).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

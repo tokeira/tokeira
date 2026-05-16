@@ -1917,10 +1917,11 @@ proptest! {
                 now,
             }),
         ).unwrap();
-        prop_assert_eq!(timed_out_transition.history_events.len(), 1);
+        prop_assert_eq!(timed_out_transition.history_events.len(), 2);
         prop_assert_eq!(timed_out_transition.dispatch_ops.len(), 1);
         prop_assert_eq!(matches!(timed_out_transition.history_events[0].kind, HistoryEventKind::WorkflowTaskTimedOut { .. }), true);
-        prop_assert_eq!(matches!(timed_out_transition.dispatch_ops[0], DispatchOp::EnqueueWorkflowTask { logical_seq: LogicalTaskSeq(81), .. }), true);
+        prop_assert_eq!(matches!(timed_out_transition.history_events[1].kind, HistoryEventKind::WorkflowTaskScheduled { .. }), true);
+        prop_assert_eq!(matches!(timed_out_transition.dispatch_ops[0], DispatchOp::EnqueueWorkflowTask { logical_seq: LogicalTaskSeq(82), .. }), true);
         prop_assert!(timed_out_transition.request_dedupe_ops.is_empty());
         prop_assert!(timed_out_transition.activity_ops.is_empty());
         prop_assert!(timed_out_transition.timer_ops.is_empty());

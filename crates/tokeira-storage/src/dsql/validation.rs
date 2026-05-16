@@ -123,6 +123,9 @@ impl DdlValidator {
             || lower.contains("create table routing_generation")
             || lower.contains("create table if not exists budget_allocation")
             || lower.contains("create table budget_allocation");
+        // The singleton control tables are intentionally tiny, fixed-key rows.
+        // All high-volume tables still need spread-key primary keys so DSQL
+        // does not concentrate writes on one key range.
         if !singleton_control_table
             && (lower.contains("primary key (id)")
                 || lower.contains("primary key(id)")

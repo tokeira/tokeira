@@ -43,6 +43,9 @@ impl ProjectionLog for DsqlProjectionLog {
     async fn read_from(&self, cursor: &ProjectionCursor, limit: usize) -> Result<ProjectionBatch> {
         validate_cursor_position(cursor)?;
         if limit == 0 {
+            // A zero-limit poll is a bookkeeping operation. Avoiding a
+            // connection checkout keeps idle projection loops from consuming
+            // class budget.
             metrics::record_dsql_projection_batch_size(cursor.partition_id, 0);
             return Ok(ProjectionBatch {
                 records: Vec::new(),
@@ -78,6 +81,9 @@ impl ProjectionLog for DsqlProjectionLog {
                     transition_seq.0,
                     "projection cursor last_transition_seq",
                 )?;
+                // Tuple comparison gives a stable strict-after cursor over the
+                // same ordering used by the SELECT. This avoids duplicate
+                // delivery without requiring wall-clock timestamps.
                 sqlx::query_as::<_, (Uuid, i64, Vec<u8>, Vec<u8>)>(
                     r#"
                     SELECT run_key, transition_seq, context_data, ops_data
@@ -121,6 +127,9 @@ impl ProjectionLog for DsqlProjectionLog {
 }
 
 fn validate_cursor_position(cursor: &ProjectionCursor) -> Result<()> {
+    // The SQL cursor is a composite `(run_key, transition_seq)`. Accepting only
+    // both-or-neither prevents ambiguous "start after run but no sequence"
+    // semantics.
     match (cursor.last_run_key, cursor.last_transition_seq) {
         (None, None) | (Some(_), Some(_)) => Ok(()),
         _ => bail!(

@@ -8,15 +8,15 @@ Implementation follows the natural dependency order: foundational components fir
 
 ## Tasks
 
-- [ ] 0. Prepare DSQL coordination configuration and dependencies
-  - [ ] 0.1 Add AWS SDK dependencies for DSQL coordination
+- [x] 0. Prepare DSQL coordination configuration and dependencies
+  - [x] 0.1 Add AWS SDK dependencies for DSQL coordination
     - Add `aws-sdk-dynamodb` to `crates/tokeira-storage/Cargo.toml` as an optional dependency behind the `dsql` feature.
     - Add `aws-config` where the DynamoDB client is constructed; if `apps/tokeirad` constructs the client, add it to `apps/tokeirad/Cargo.toml`.
     - Add `aws-sdk-dynamodb` to `apps/tokeirad/Cargo.toml` if `apps/tokeirad` constructs `aws_sdk_dynamodb::Client` directly for `DsqlCoordinationConfig`.
     - Ensure `cargo check --workspace` can compile `crates/tokeira-storage/src/dsql/distributed_bucket.rs` and `slot_block_manager.rs` without hidden dependency assumptions.
     - _Requirements: 7.4, 8.1, 14.2, 14.7_
 
-  - [ ] 0.2 Add `DsqlCoordinationConfig` to the DSQL startup config
+  - [x] 0.2 Add `DsqlCoordinationConfig` to the DSQL startup config
     - Define `DsqlCoordinationConfig` in `crates/tokeira-storage/src/dsql/config.rs` with `rate_limiter_table: String`, `conn_lease_table: String`, and `ddb_client: aws_sdk_dynamodb::Client`.
     - Add `coordination: DsqlCoordinationConfig` to `DsqlPoolConfig`.
     - Adjust `DsqlPoolConfig` derives/manual impls as needed because `aws_sdk_dynamodb::Client` is runtime state and is not TOML-serializable.
@@ -24,15 +24,15 @@ Implementation follows the natural dependency order: foundational components fir
     - Construct an AWS SDK config/client using the effective DSQL region and populate `DsqlPoolConfig.coordination` before calling `DsqlStore::connect(auth, pool_config)`.
     - _Requirements: 14.2, 14.6, 14.7, 19.5_
 
-  - [ ] 0.3 Generalize `MigrationRunner` to support raw DSQL connections
+  - [x] 0.3 Generalize `MigrationRunner` to support raw DSQL connections
     - Change `MigrationRunner::{apply,status,dry_run}` signatures from `&PgPool` to `impl sqlx::Executor<'_, Database = Postgres>` where the method touches the database.
     - Preserve compatibility for existing `&PgPool` callers while allowing `&mut PgConnection` callers.
     - Update `apps/tkr/src/commands/schema.rs` to create one raw `PgConnection` through `ConnectionFactory` and pass it directly to the migration runner for schema setup/status.
     - Keep schema commands outside the reservoir; schema operations do not need warm pooled connections.
     - _Requirements: 1.1, 2.5_
 
-- [ ] 1. Implement Connection Factory
-  - [ ] 1.1 Create `crates/tokeira-storage/src/dsql/connection_factory.rs`
+- [x] 1. Implement Connection Factory
+  - [x] 1.1 Create `crates/tokeira-storage/src/dsql/connection_factory.rs`
     - Define `ConnectionFactory` struct with `endpoint: String` and `region: String`
     - Implement `create_connection(&self) -> Result<PgConnection, ConnectionFactoryError>` using `DsqlConnectOptions` and `aurora_dsql_sqlx_connector::connection::connect_with(&options)`
     - Define `ConnectionFactoryError` enum with variants: `Iam`, `Tls`, `Timeout`, `Refused`, `Other`
@@ -41,20 +41,20 @@ Implementation follows the natural dependency order: foundational components fir
     - Register module in `crates/tokeira-storage/src/dsql/mod.rs`
     - _Requirements: 1.1, 1.2, 1.3, 1.4, 10.1, 10.2, 10.3, 10.4_
 
-  - [ ]* 1.2 Write unit tests for Connection Factory error classification
+  - [x]* 1.2 Write unit tests for Connection Factory error classification
     - Test that relevant `DsqlError` variants map to the correct `ConnectionFactoryError` variant, including embedded `sqlx::Error` classification for `ConnectionError`
     - Test `category()` returns expected string for each variant
     - _Requirements: 1.4_
 
-  - [ ] 1.3 Migrate DSQL entry points away from PgPool
+  - [x] 1.3 Migrate DSQL entry points away from PgPool
     - Remove `DsqlConnector::new(pool: PgPool)` and replace production construction with `ConnectionFactory::new(endpoint, region)`
     - Remove `DsqlStore::from_pool(pool, config)` and replace it with a test-only constructor that accepts a pre-built reservoir or mock connection source
     - Update `DsqlStore::connect(auth, config)` to use the new reservoir startup path instead of creating a `DsqlConnector` with a pool
     - Update DSQL integration tests that use `DsqlStore::from_pool` to use the test factory or the new `ConnectionFactory` directly
     - _Requirements: 1.1, 2.4, 2.5_
 
-- [ ] 2. Implement Distributed Token Bucket
-  - [ ] 2.1 Create `crates/tokeira-storage/src/dsql/distributed_bucket.rs`
+- [x] 2. Implement Distributed Token Bucket
+  - [x] 2.1 Create `crates/tokeira-storage/src/dsql/distributed_bucket.rs`
     - Define `DistributedTokenBucket` struct with DynamoDB client, table name, endpoint, rate, capacity
     - Implement `wait(&self) -> Result<(), TokenBucketError>` with optimistic read-modify-write loop
     - Implement `try_acquire(&self) -> Result<(bool, i64), TokenBucketError>` with milli-token math
@@ -67,13 +67,13 @@ Implementation follows the natural dependency order: foundational components fir
     - Register module in `crates/tokeira-storage/src/dsql/mod.rs`
     - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5_
 
-  - [ ]* 2.2 Write property test for distributed rate burst limit
+  - [x]* 2.2 Write property test for distributed rate burst limit
     - **Property 10: Distributed Rate Burst Limit**
     - Verify bucket cannot dispense more than `DISTRIBUTED_BURST` (1000) tokens without refill time
     - **Validates: Requirements 7.3**
 
-- [ ] 3. Implement Slot Block Manager
-  - [ ] 3.1 Create `crates/tokeira-storage/src/dsql/slot_block_manager.rs`
+- [x] 3. Implement Slot Block Manager
+  - [x] 3.1 Create `crates/tokeira-storage/src/dsql/slot_block_manager.rs`
     - Define `SlotBlockManager` struct with DynamoDB client, table, endpoint, owner_id, slots_per_block, block_count, ttl, renew_period
     - Generate `owner_id` as hex-encoded 16 random bytes at construction
     - Implement `acquire_slots(&self, target_slots: u32) -> Result<u32>` with randomized start index
@@ -89,16 +89,16 @@ Implementation follows the natural dependency order: foundational components fir
     - Register module in `crates/tokeira-storage/src/dsql/mod.rs`
     - _Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7_
 
-  - [ ]* 3.2 Write property test for slot budget enforcement
+  - [x]* 3.2 Write property test for slot budget enforcement
     - **Property 9: Slot Budget Enforcement**
     - For random `blocks in 0..10` and `connections in 0..1000`, verify `has_budget()` and `acquire_slot()` enforce `N × SLOT_BLOCK_SIZE` limit
     - **Validates: Requirements 8.3**
 
-- [ ] 4. Checkpoint — Connection Factory and DynamoDB coordination compile
+- [x] 4. Checkpoint — Connection Factory and DynamoDB coordination compile
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 5. Restructure Reservoir
-  - [ ] 5.1 Rewrite `crates/tokeira-storage/src/dsql/reservoir.rs`
+- [x] 5. Restructure Reservoir
+  - [x] 5.1 Rewrite `crates/tokeira-storage/src/dsql/reservoir.rs`
     - Define `PhysicalConn` struct: `connection: PgConnection`, `created_at: Instant`, `lifetime: Duration`
     - Implement `remaining_lifetime()` and `within_guard_window(guard_window)` methods
     - Define `ReturnedConn` struct: `connection: PgConnection`, `created_at: Instant`, `lifetime: Duration`, `marked_bad: bool`
@@ -111,7 +111,7 @@ Implementation follows the natural dependency order: foundational components fir
     - Remove all sqlx `PgPool` usage from the module
     - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 3.1, 3.2, 3.3, 11.1, 11.2, 15.1, 15.4_
 
-  - [ ] 5.2 Implement refiller loop
+  - [x] 5.2 Implement refiller loop
     - Spawn as dedicated tokio task
     - Loop: check `ready_tx.len() >= TARGET_READY` → idle sleep; check `slot_manager.has_budget()` → idle sleep
     - Acquire inflight semaphore permit (max 8 concurrent)
@@ -123,7 +123,7 @@ Implementation follows the natural dependency order: foundational components fir
     - Implement `assign_jittered_lifetime()` using `rand::gen_range`
     - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 12.3, 12.4_
 
-  - [ ] 5.3 Implement expiry scanner
+  - [x] 5.3 Implement expiry scanner
     - Spawn as dedicated tokio task with `SCAN_INTERVAL` (1s) interval
     - Each pass: drain up to `SCAN_BUDGET` (`TARGET_READY / 2`, 25 entries) from ready channel
     - For each: if `within_guard_window(GUARD_WINDOW)` → call `slot_manager.release_slot()`, drop, and emit metric; else → put back
@@ -132,7 +132,7 @@ Implementation follows the natural dependency order: foundational components fir
     - Bounded scan prevents starvation of concurrent checkout callers
     - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5_
 
-  - [ ] 5.4 Implement return processor
+  - [x] 5.4 Implement return processor
     - Spawn as dedicated tokio task receiving from `return_rx`
     - If `marked_bad` → call `slot_manager.release_slot()`, discard, and emit metric
     - If `within_guard_window(GUARD_WINDOW)` → call `slot_manager.release_slot()`, discard, and emit metric
@@ -141,7 +141,7 @@ Implementation follows the natural dependency order: foundational components fir
     - Thread `Arc<SlotBlockManager>` into the return processor task
     - _Requirements: 6.1, 6.2, 6.6, 16.1, 16.2, 16.3, 16.4, 16.5_
 
-  - [ ]* 5.5 Write property tests for reservoir invariants
+  - [x]* 5.5 Write property tests for reservoir invariants
     - **Property 1: Lifetime Jitter Bounds** — verify `assign_jittered_lifetime()` output in [8min, 12min]
     - **Property 2: Lifetime Safety Against Token TTL** — verify `BASE_LIFETIME + LIFETIME_JITTER + GUARD_WINDOW < 15min`
     - **Property 3: Guard Window Enforcement** — random (age, lifetime) pairs, verify retirement decision
@@ -150,11 +150,11 @@ Implementation follows the natural dependency order: foundational components fir
     - **Property 12: Inflight Concurrency Limit** — verify semaphore enforcement at `INFLIGHT_LIMIT`
     - **Validates: Requirements 4.6, 5.2, 5.4, 11.3, 11.4, 3.1, 3.2, 4.4**
 
-- [ ] 6. Checkpoint — Reservoir restructure compiles and property tests pass
+- [x] 6. Checkpoint — Reservoir restructure compiles and property tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 7. Implement Class Budgets and DsqlPermit
-  - [ ] 7.1 Modify `crates/tokeira-storage/src/dsql/connection.rs` for class-based admission
+- [x] 7. Implement Class Budgets and DsqlPermit
+  - [x] 7.1 Modify `crates/tokeira-storage/src/dsql/connection.rs` for class-based admission
     - Define `ClassBudgets` struct with per-class `Arc<Semaphore>` instances
     - Implement allocation from `TARGET_READY`: commit 50%, read 20%, projection 10%, control 10%, maintenance 10%
     - Implement `acquire(class: DbClass) -> Result<OwnedSemaphorePermit>` that blocks until permit available
@@ -164,7 +164,7 @@ Implementation follows the natural dependency order: foundational components fir
     - Record `tokeira_dsql_class_permit_wait_duration_seconds` from before `semaphore.acquire_owned()` to after acquisition
     - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.5_
 
-  - [ ] 7.2 Rewrite `DsqlPermit` in `crates/tokeira-storage/src/dsql/connection.rs`
+  - [x] 7.2 Rewrite `DsqlPermit` in `crates/tokeira-storage/src/dsql/connection.rs`
     - Define `DsqlPermit` struct: `class`, `connection: Option<PgConnection>`, `created_at`, `lifetime`, `marked_bad`, `_class_guard: OwnedSemaphorePermit`, `reservoir_return: mpsc::UnboundedSender<ReturnedConn>`, `slot_manager: Arc<SlotBlockManager>`, `director_in_flight: Arc<AtomicUsize>`
     - Implement `connection(&mut self) -> Result<&mut PgConnection>`
     - Implement `mark_bad(&mut self)` setting the flag
@@ -172,27 +172,27 @@ Implementation follows the natural dependency order: foundational components fir
     - Remove all sqlx `PoolConnection<Postgres>` usage
     - _Requirements: 2.3, 16.3, 16.6_
 
-  - [ ]* 7.3 Write property tests for class budget invariants
+  - [x]* 7.3 Write property tests for class budget invariants
     - **Property 6: Class Budget Sum Invariant** — for `target_ready in 5..500`, verify sum equals target and each class ≥ 1
     - **Property 7: Class Isolation** — exhaust one class, verify others unchanged
     - **Validates: Requirements 9.1, 9.4**
 
-  - [ ]* 7.4 Write unit tests for DsqlPermit lifecycle
+  - [x]* 7.4 Write unit tests for DsqlPermit lifecycle
     - Test `Drop` sends `ReturnedConn` to return channel
     - Test `mark_bad()` propagates to `ReturnedConn.marked_bad`
     - Test `connection()` returns mutable reference
     - _Requirements: 16.3_
 
-  - [ ]* 7.5 Write property test for bad connection discard and no-network return
+  - [x]* 7.5 Write property test for bad connection discard and no-network return
     - **Property 4: Bad Connection Discard** — random lifetimes with `marked_bad=true`, verify always discarded
     - **Property 5: No-Network Return Path** — verify no I/O calls on healthy return outside guard window
     - **Validates: Requirements 6.6, 16.3, 16.4, 16.5, 16.6**
 
-- [ ] 8. Checkpoint — Class budgets and DsqlPermit compile, all property tests pass
+- [x] 8. Checkpoint — Class budgets and DsqlPermit compile, all property tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 9. Warmup and Startup Integration
-  - [ ] 9.1 Implement startup sequence in `apps/tokeirad/src/lib.rs`
+- [x] 9. Warmup and Startup Integration
+  - [x] 9.1 Implement startup sequence in `apps/tokeirad/src/lib.rs`
     - Keep the existing `build_and_serve` DSQL branch calling `DsqlStore::connect(auth, config)`
     - Derive `DsqlCoordinationConfig` table names from `effective_config.infrastructure.cluster_name`: `{project}-dsql-rate-limiter` and `{project}-dsql-conn-lease`
     - Construct `aws_sdk_dynamodb::Client` from the effective DSQL region and place it in `DsqlPoolConfig.coordination`
@@ -207,7 +207,7 @@ Implementation follows the natural dependency order: foundational components fir
     - Do not create a separate bootstrap flow and do not replace the external `DsqlStore::connect` API at the call site
     - _Requirements: 14.2, 14.3, 14.6, 14.7, 15.1, 15.2, 15.3, 15.4_
 
-  - [ ] 9.2 Implement graceful shutdown for reservoir components
+  - [x] 9.2 Implement graceful shutdown for reservoir components
     - Abort refiller, scanner, return processor tasks
     - Close ready and return channels
     - Call `SlotBlockManager::release_all()`
@@ -215,25 +215,25 @@ Implementation follows the natural dependency order: foundational components fir
     - Wire into existing `tokeirad` shutdown sequence
     - _Requirements: 8.5_
 
-  - [ ] 9.3 Add observability metrics emission
+  - [x] 9.3 Add observability metrics emission
     - Emit all metrics from design: reservoir size gauge, checkout histogram, empty counter, in-flight gauge, connection age histogram, rate limiter tokens gauge, class budget gauges, class permit wait histogram, connection create duration histogram, error counter with `error_kind` label, retirement counter with `reason` label
     - Follow existing `tokeira_dsql_reservoir_*` and `tokeira_dsql_pool_*` naming conventions
     - Emit unconditionally via `metrics` crate — no configuration options
     - _Requirements: 13.1, 13.2, 13.3, 13.4, 17.1, 17.2, 17.3_
 
-- [ ] 10. Checkpoint — Full startup sequence works end-to-end
+- [x] 10. Checkpoint — Full startup sequence works end-to-end
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 11. Compose IaC DynamoDB Provisioning
-  - [ ] 11.1 Extend `platforms/compose/src/modules.rs` DSQL module for DynamoDB tables
+- [x] 11. Compose IaC DynamoDB Provisioning
+  - [x] 11.1 Extend `platforms/compose/src/modules.rs` DSQL module for DynamoDB tables
     - Add DynamoDB table resource for `{project}-dsql-rate-limiter`: on-demand billing, TTL on `ttl_epoch`, partition key `pk` (String)
     - Add DynamoDB table resource for `{project}-dsql-conn-lease`: on-demand billing, TTL on `ttl_epoch`, partition key `pk` (String)
     - Provision in same region as DSQL cluster
     - Tables created by `tkr infra apply`, destroyed by `tkr infra destroy`
     - _Requirements: 14.1, 14.4, 14.5, 19.1, 19.2, 19.3, 19.4, 19.5, 19.6, 19.7_
 
-- [ ] 12. Architecture Documentation
-  - [ ] 12.1 Create `docs/architecture/060-connection-management.md`
+- [x] 12. Architecture Documentation
+  - [x] 12.1 Create `docs/architecture/060-connection-management.md`
     - Document reservoir as sole connection owner (no sqlx PgPool)
     - Document refiller's rate-limited creation loop with DynamoDB token bucket
     - Document expiry scanner's proactive retirement with guard window
@@ -248,14 +248,14 @@ Implementation follows the natural dependency order: foundational components fir
     - No operator-tunable configuration guidance — all parameters are internal constants
     - _Requirements: 18.1, 18.2, 18.3, 18.4, 18.5, 18.6, 18.7_
 
-- [ ] 13. Remove legacy rate limiter
-  - [ ] 13.1 Remove `crates/tokeira-storage/src/dsql/rate_limiter.rs`
+- [x] 13. Remove legacy rate limiter
+  - [x] 13.1 Remove `crates/tokeira-storage/src/dsql/rate_limiter.rs`
     - Delete the file (replaced by distributed_bucket.rs)
     - Remove module declaration from `mod.rs`
     - Update any imports that referenced the old rate limiter
     - _Requirements: 7.1_
 
-- [ ] 14. Final checkpoint — Full compilation, all tests pass
+- [x] 14. Final checkpoint — Full compilation, all tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
 ## Notes

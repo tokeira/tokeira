@@ -104,6 +104,14 @@ pub struct DsqlInfraConfig {
     pub runtime_role_arn: Option<String>,
     #[serde(default)]
     pub readonly_role_arn: Option<String>,
+    /// DynamoDB table name for distributed rate limiting.
+    /// Written back by `tkr infra apply --module dsql`.
+    #[serde(default)]
+    pub rate_limiter_table: Option<String>,
+    /// DynamoDB table name for distributed connection slot leasing.
+    /// Written back by `tkr infra apply --module dsql`.
+    #[serde(default)]
+    pub conn_lease_table: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

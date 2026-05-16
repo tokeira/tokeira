@@ -69,6 +69,9 @@ impl ClassBudgets {
             semaphore.clone()
         };
         self.record_class_metric(class, &semaphore).await;
+        // Wait time is measured around only the class semaphore. Reservoir
+        // empty backpressure is intentionally a separate signal emitted after
+        // admission.
         let result = semaphore.acquire_owned().await.map_err(Into::into);
         metrics::decrement_dsql_pool_waiting(label);
         if result.is_ok() {
@@ -153,6 +156,11 @@ impl DsqlConnectionDirector {
     ) -> Result<()> {
         self.class_budgets.reconfigure(allocations).await
     }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        self.reporter_handle.abort();
+        self.reservoir.shutdown().await
+    }
 }
 
 #[async_trait]
@@ -163,6 +171,8 @@ impl ConnectionDirector for DsqlConnectionDirector {
         let started = Instant::now();
         let class_guard = self.class_budgets.acquire(class).await?;
         let entry = self.reservoir.checkout()?;
+        // From this point until `DsqlPermit::drop`, the connection is out of
+        // the ready reservoir but still owns exactly one slot reservation.
         let in_flight = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
         metrics::record_dsql_pool_checkout_duration(db_class_label(class), started.elapsed());
         metrics::set_dsql_reservoir_in_flight(in_flight);
@@ -252,6 +262,9 @@ impl DsqlPermit {
     }
 
     pub fn mark_bad(&mut self) {
+        // Consumers call this when SQL usage indicates the connection should
+        // not be reused. The actual discard happens in `Drop`/return
+        // processing so callers keep a simple RAII API.
         self.marked_bad = true;
     }
 }
@@ -335,21 +348,16 @@ fn build_budget_map(allocations: &HashMap<DbClass, usize>) -> HashMap<DbClass, A
 /// Maintenance gets the remainder. Each class gets at least 1 permit.
 fn default_allocations(config: &ReservoirConfig) -> HashMap<DbClass, usize> {
     let total = config.target_ready.max(5);
-    let control = (total / 10).max(1);
-    let commit = (total / 2).max(1);
-    let read = (total / 5).max(1);
-    let projection = (total / 10).max(1);
+    // Allocate one permit to every class first, then distribute the remaining
+    // capacity by priority. This preserves liveness for maintenance/control
+    // while biasing the pool toward commit throughput.
+    let remaining = total - 5;
+    let control = 1 + remaining / 10;
+    let commit = 1 + remaining / 2;
+    let read = 1 + remaining / 5;
+    let projection = 1 + remaining / 10;
     let allocated = control + commit + read + projection;
-    // Maintenance absorbs the remainder so the sum equals total.
-    // If the fixed allocations already exceed total (small target_ready),
-    // maintenance gets 1 and the total is allowed to exceed target_ready
-    // by a small amount — the reservoir will simply have more permits
-    // than ready connections, causing natural backpressure.
-    let maintenance = if allocated >= total {
-        1
-    } else {
-        total - allocated
-    };
+    let maintenance = total - allocated;
 
     let mut allocations = HashMap::new();
     allocations.insert(DbClass::Control, control);
@@ -414,6 +422,42 @@ mod tests {
         assert_eq!(budgets.class_available(DbClass::Commit).await, Some(3));
     }
 
+    #[tokio::test]
+    async fn class_budget_exhaustion_is_class_local() {
+        let budgets = ClassBudgets::new(&test_allocations(1)).unwrap();
+        let _commit = budgets.acquire(DbClass::Commit).await.unwrap();
+
+        assert_eq!(budgets.class_available(DbClass::Commit).await, Some(0));
+        assert_eq!(budgets.class_available(DbClass::Read).await, Some(1));
+        let _read = budgets.acquire(DbClass::Read).await.unwrap();
+        assert_eq!(budgets.class_available(DbClass::Read).await, Some(0));
+    }
+
+    #[tokio::test]
+    async fn dsql_permit_mark_bad_and_connection_error_paths_are_stable() {
+        let budgets = ClassBudgets::new(&test_allocations(1)).unwrap();
+        let class_guard = budgets.acquire(DbClass::Commit).await.unwrap();
+        let (return_tx, _return_rx) = tokio::sync::mpsc::unbounded_channel();
+        let in_flight = Arc::new(AtomicUsize::new(1));
+        let mut permit = DsqlPermit {
+            class: DbClass::Commit,
+            connection: None,
+            created_at: std::time::Instant::now(),
+            max_lifetime: std::time::Duration::from_secs(60),
+            _class_guard: class_guard,
+            reservoir_return: return_tx,
+            slot_manager: crate::dsql::SlotBlockManager::local_for_tests(1),
+            director_in_flight: Arc::clone(&in_flight),
+            marked_bad: false,
+        };
+
+        assert!(permit.connection().is_err());
+        permit.mark_bad();
+        assert!(permit.marked_bad);
+        drop(permit);
+        assert_eq!(in_flight.load(Ordering::Acquire), 0);
+    }
+
     proptest! {
         #[test]
         fn class_budget_sum_invariant(commit in 1usize..128) {
@@ -421,6 +465,17 @@ mod tests {
             let expected: usize = allocations.values().sum();
             let budgets = ClassBudgets::new(&allocations).unwrap();
             prop_assert_eq!(budgets.total_budget(), expected);
+        }
+
+        #[test]
+        fn default_class_budget_sum_invariant(target_ready in 5usize..500) {
+            let config = ReservoirConfig {
+                target_ready,
+                ..ReservoirConfig::default()
+            };
+            let allocations = default_allocations(&config);
+            prop_assert_eq!(allocations.values().sum::<usize>(), target_ready);
+            prop_assert!(allocations.values().all(|permits| *permits >= 1));
         }
     }
 }

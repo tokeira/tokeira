@@ -1,4 +1,8 @@
 //! Raw DSQL connection creation.
+//!
+//! The rest of the storage layer deals only in `PgConnection`s. This module is
+//! the single place that knows about `aurora_dsql_sqlx_connector`, which keeps
+//! IAM-token generation and connector error taxonomy out of repository code.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -12,6 +16,10 @@ pub struct ConnectionFactory {
 }
 
 impl ConnectionFactory {
+    /// Build connector options for the DSQL admin database.
+    ///
+    /// Aurora DSQL uses IAM authentication through the connector, not a stored
+    /// password in the URL. The URL therefore carries endpoint and region only.
     pub fn new(endpoint: &str, region: &str) -> Result<Self> {
         let connection_string = format!(
             "postgres://admin@{}:5432/postgres?region={}",
@@ -22,6 +30,8 @@ impl ConnectionFactory {
     }
 
     pub async fn create_connection(&self) -> Result<PgConnection, ConnectionFactoryError> {
+        // Use the connector entry point directly. `sqlx::PgConnection` cannot
+        // mint DSQL IAM tokens on its own.
         aurora_dsql_sqlx_connector::connection::connect_with(&self.options)
             .await
             .map_err(ConnectionFactoryError::from_dsql_error)
@@ -43,6 +53,10 @@ pub enum ConnectionFactoryError {
 }
 
 impl ConnectionFactoryError {
+    /// Preserve the connector's failure classes for metrics and operator
+    /// messages. Flattening everything into `sqlx::Error` would hide whether
+    /// the failure came from local configuration, IAM token generation, TCP/TLS,
+    /// or the database handshake.
     pub fn from_dsql_error(error: DsqlError) -> Self {
         let message = error.to_string();
         match error {
@@ -98,5 +112,46 @@ impl PhysicalConnectionFactory for DatabaseUrlConnectionFactory {
         <PgConnection as sqlx::Connection>::connect(&self.url)
             .await
             .map_err(|error| ConnectionFactoryError::Connection(error.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use aurora_dsql_sqlx_connector::DsqlError;
+
+    use super::ConnectionFactoryError;
+
+    #[test]
+    fn dsql_error_classification_returns_stable_categories() {
+        let cases = [
+            (
+                DsqlError::ConfigError(Box::new(io::Error::other("bad config"))),
+                "config",
+            ),
+            (
+                DsqlError::TokenError(Box::new(io::Error::other("bad token"))),
+                "token",
+            ),
+            (
+                DsqlError::ConnectionError(sqlx::Error::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timeout",
+                ))),
+                "connection",
+            ),
+            (
+                DsqlError::DatabaseError(sqlx::Error::Protocol("db".to_owned())),
+                "database",
+            ),
+        ];
+
+        for (error, category) in cases {
+            assert_eq!(
+                ConnectionFactoryError::from_dsql_error(error).kind(),
+                category
+            );
+        }
     }
 }

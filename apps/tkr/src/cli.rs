@@ -197,6 +197,10 @@ pub enum DeployAction {
     Apply {
         #[arg(long)]
         yes: bool,
+        /// Force recreation of all services regardless of manifest hash.
+        /// Use after rebuilding a local image behind the same tag.
+        #[arg(long)]
+        force: bool,
     },
     Status,
 }

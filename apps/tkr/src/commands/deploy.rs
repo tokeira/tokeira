@@ -51,7 +51,7 @@ pub async fn run(
                 print_plan(&engine.plan().await?);
             }
         },
-        DeployAction::Apply { yes } => {
+        DeployAction::Apply { yes, force } => {
             super::require_confirmation(yes, "deploy apply")?;
             match &ctx.platform_config {
                 PlatformDeploymentConfig::Local(_) => {
@@ -69,6 +69,9 @@ pub async fn run(
                         .validate_for_deploy_apply(config, &platform)
                         .await?;
                     let mut engine = DeployEngine::new(deployment, config, &ctx.path).await?;
+                    if force {
+                        engine.clear_service_state().await?;
+                    }
                     print_plan(&engine.apply(&platform as &dyn Platform).await?);
                     deployments.update_status(&ctx.name, DeploymentStatus::Running)?;
                 }

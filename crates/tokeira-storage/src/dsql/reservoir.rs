@@ -1,4 +1,9 @@
 //! Warm raw DSQL connection reservoir.
+//!
+//! The reservoir owns physical `PgConnection`s. Callers do not wait here: they
+//! first obtain an operation-class permit, then checkout either returns a warm
+//! connection immediately or reports `Empty` so the caller can shed/backpressure
+//! work. Background tasks refill, scan, and process returns independently.
 
 use std::{
     error::Error as StdError,
@@ -22,22 +27,48 @@ use crate::metrics;
 
 use super::{DistributedTokenBucket, PhysicalConnectionFactory, ReservoirConfig, SlotBlockManager};
 
+/// Default warm connection target for one node.
+pub(crate) const TARGET_READY: usize = 50;
+/// Maximum entries inspected by one scanner pass.
+///
+/// The scanner only inspects half of the target pool so a scan cannot drain the
+/// channel and starve concurrent checkouts.
+pub(crate) const SCAN_BUDGET: usize = TARGET_READY / 2;
+/// Base age before a connection becomes eligible for retirement.
+pub(crate) const BASE_LIFETIME: StdDuration = StdDuration::from_secs(10 * 60);
+/// Positive jitter applied to spread retirements across time.
+pub(crate) const LIFETIME_JITTER: StdDuration = StdDuration::from_secs(2 * 60);
+/// Safety margin before the DSQL IAM token hard cutoff.
+pub(crate) const GUARD_WINDOW: StdDuration = StdDuration::from_secs(45);
+/// Maximum concurrent physical connection creation attempts.
+pub(crate) const INFLIGHT_LIMIT: usize = 8;
+pub(crate) const SCAN_INTERVAL: StdDuration = StdDuration::from_secs(1);
+pub(crate) const WARMUP_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+pub(crate) const REFILLER_IDLE_INTERVAL: StdDuration = StdDuration::from_millis(100);
+pub(crate) const REFILLER_ERROR_BACKOFF: StdDuration = StdDuration::from_millis(250);
+
 #[derive(Debug)]
 pub struct ReservoirEntry {
+    /// The physical connection whose DSQL slot is currently reserved.
     pub(crate) connection: PgConnection,
+    /// Creation time, used for lifetime retirement rather than checkout age.
     pub(crate) created_at: Instant,
+    /// Per-connection lifetime after jitter was assigned at creation.
     pub(crate) max_lifetime: StdDuration,
 }
 
 impl ReservoirEntry {
     fn should_retire(&self, guard_window: StdDuration) -> bool {
-        self.created_at.elapsed().saturating_add(guard_window) >= self.max_lifetime
+        within_guard_window(self.created_at, self.max_lifetime, guard_window)
     }
 }
 
 #[derive(Debug)]
 pub struct ReturnedConnection {
+    /// Connection returned by a completed storage operation.
     pub(crate) entry: ReservoirEntry,
+    /// Caller-set health flag. The return processor does not ping; bad-flagged
+    /// connections are retired immediately.
     pub(crate) marked_bad: bool,
 }
 
@@ -71,6 +102,12 @@ pub struct Reservoir {
 }
 
 impl Reservoir {
+    /// Start the reservoir background tasks and block until warmup completes.
+    ///
+    /// Refiller ordering is correctness-sensitive: local in-flight permit,
+    /// global slot reservation, distributed rate token, then physical
+    /// connection creation. Any failure after slot reservation must release the
+    /// slot exactly once.
     pub async fn start(
         config: ReservoirConfig,
         factory: Arc<dyn PhysicalConnectionFactory>,
@@ -121,7 +158,7 @@ impl Reservoir {
     pub async fn warmup(&self) -> Result<()> {
         let started = Instant::now();
         while self.ready.len() < self.config.target_ready {
-            if started.elapsed() > StdDuration::from_secs(30) {
+            if started.elapsed() > WARMUP_TIMEOUT {
                 anyhow::bail!("timed out warming DSQL connection reservoir");
             }
             tokio::task::yield_now().await;
@@ -131,6 +168,9 @@ impl Reservoir {
     }
 
     pub fn checkout(&self) -> Result<ReservoirEntry, ReservoirError> {
+        // Non-blocking by design. Queueing is handled by class budgets before
+        // checkout; an empty reservoir is immediate backpressure, not another
+        // hidden wait queue.
         match self.ready.try_recv() {
             Ok(entry) => {
                 metrics::record_dsql_pool_connections_total(self.ready.len());
@@ -180,6 +220,16 @@ impl Reservoir {
     pub fn config(&self) -> &ReservoirConfig {
         &self.config
     }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        // Abort background producers before releasing slot blocks. Otherwise a
+        // refiller could acquire a fresh slot while shutdown is trying to
+        // relinquish capacity.
+        self.refiller_handle.abort();
+        self.scanner_handle.abort();
+        self.return_processor_handle.abort();
+        self.slot_manager.release_all().await
+    }
 }
 
 impl Drop for Reservoir {
@@ -202,7 +252,7 @@ fn spawn_refiller(
     tokio::spawn(async move {
         loop {
             while ready_tx.len() >= target_ready.load(Ordering::Acquire) {
-                tokio::time::sleep(StdDuration::from_millis(50)).await;
+                tokio::time::sleep(REFILLER_IDLE_INTERVAL).await;
             }
             let Ok(_inflight_guard) = inflight.clone().acquire_owned().await else {
                 return;
@@ -212,9 +262,12 @@ fn spawn_refiller(
                 continue;
             };
             if let Err(error) = distributed_bucket.wait().await {
+                // A slot is reserved before the global rate token so local
+                // refillers cannot collectively overshoot capacity while
+                // waiting for token-bucket admission.
                 slot_manager.release_slot();
                 tracing::warn!(error = %error, "failed to acquire DSQL distributed rate token");
-                tokio::time::sleep(StdDuration::from_secs(1)).await;
+                tokio::time::sleep(REFILLER_ERROR_BACKOFF).await;
                 continue;
             }
             let create_started = Instant::now();
@@ -230,6 +283,9 @@ fn spawn_refiller(
                         max_lifetime: assign_lifetime(&config),
                     };
                     if ready_tx.send(entry).await.is_err() {
+                        // Channel closure means shutdown won the race after the
+                        // physical connection was created. Dropping the
+                        // connection must also release its reserved slot.
                         slot_manager.release_slot();
                         return;
                     }
@@ -242,7 +298,7 @@ fn spawn_refiller(
                     );
                     metrics::record_dsql_connection_error(error.kind());
                     tracing::warn!(error = %error, "failed to create DSQL connection");
-                    tokio::time::sleep(StdDuration::from_secs(1)).await;
+                    tokio::time::sleep(REFILLER_ERROR_BACKOFF).await;
                 }
             }
         }
@@ -258,11 +314,11 @@ fn spawn_scanner(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let sleep_for = duration_or_default(config.scan_interval, StdDuration::from_secs(1));
+            let sleep_for = duration_or_default(config.scan_interval, SCAN_INTERVAL);
             tokio::time::sleep(sleep_for).await;
 
-            let guard_window = duration_or_default(config.guard_window, StdDuration::from_secs(45));
-            let batch_size = (target_ready.load(Ordering::Acquire) / 2).max(1);
+            let guard_window = duration_or_default(config.guard_window, GUARD_WINDOW);
+            let batch_size = scan_budget(target_ready.load(Ordering::Acquire));
             let mut scanned = 0;
             while scanned < batch_size {
                 match ready_rx.try_recv() {
@@ -275,6 +331,9 @@ fn spawn_scanner(
                                 entry.created_at.elapsed(),
                             );
                         } else if ready_tx.try_send(entry).is_err() {
+                            // The scanner took a healthy connection out of the
+                            // ready queue. If it cannot put it back, it becomes
+                            // the owner of the discard and must release the slot.
                             slot_manager.release_slot();
                             metrics::record_dsql_pool_connection_retired("ready_channel_full");
                             break;
@@ -295,7 +354,7 @@ fn spawn_return_processor(
     slot_manager: Arc<SlotBlockManager>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let guard_window = duration_or_default(config.guard_window, StdDuration::from_secs(45));
+        let guard_window = duration_or_default(config.guard_window, GUARD_WINDOW);
         while let Some(returned) = return_rx.recv().await {
             let validate_started = Instant::now();
             let entry = returned.entry;
@@ -316,6 +375,8 @@ fn spawn_return_processor(
             metrics::record_dsql_reservoir_connection_validate_duration(validate_started.elapsed());
             metrics::record_dsql_pool_connection_returned();
             if ready_tx.send(entry).await.is_err() {
+                // The return processor is the last owner when the ready channel
+                // is closed. Retire the connection instead of leaking capacity.
                 slot_manager.release_slot();
                 metrics::record_dsql_pool_connection_retired("return_channel_closed");
                 return;
@@ -332,13 +393,27 @@ fn record_retirement(slot_manager: &SlotBlockManager, reason: &'static str, age:
 }
 
 pub(crate) fn assign_lifetime(config: &ReservoirConfig) -> StdDuration {
-    let base = duration_or_default(config.base_lifetime, StdDuration::from_secs(10 * 60));
-    let jitter_max = duration_or_default(config.lifetime_jitter, StdDuration::from_secs(2 * 60));
+    let base = duration_or_default(config.base_lifetime, BASE_LIFETIME);
+    let jitter_max = duration_or_default(config.lifetime_jitter, LIFETIME_JITTER);
     if jitter_max.is_zero() {
         return base;
     }
     let jitter = rand::thread_rng().gen_range(0..=jitter_max.as_secs());
     base + StdDuration::from_secs(jitter)
+}
+
+pub(crate) fn within_guard_window(
+    created_at: Instant,
+    max_lifetime: StdDuration,
+    guard_window: StdDuration,
+) -> bool {
+    // Saturating arithmetic treats already-expired connections as definitely
+    // inside the guard window without panicking on clock skew or long pauses.
+    created_at.elapsed().saturating_add(guard_window) >= max_lifetime
+}
+
+pub(crate) fn scan_budget(target_ready: usize) -> usize {
+    (target_ready / 2).max(1)
 }
 
 fn duration_or_default(value: time::Duration, fallback: StdDuration) -> StdDuration {
@@ -373,5 +448,55 @@ mod tests {
             prop_assert!(lifetime >= StdDuration::from_secs(base_secs));
             prop_assert!(lifetime <= StdDuration::from_secs(base_secs + jitter_secs));
         }
+
+        #[test]
+        fn lifetime_safety_against_token_ttl(
+            base_secs in 1u64..600,
+            jitter_secs in 0u64..120,
+            guard_secs in 1u64..120,
+        ) {
+            let config = ReservoirConfig {
+                target_ready: 1,
+                inflight_limit: 1,
+                base_lifetime: Duration::seconds(i64::try_from(base_secs).unwrap()),
+                lifetime_jitter: Duration::seconds(i64::try_from(jitter_secs).unwrap()),
+                guard_window: Duration::seconds(i64::try_from(guard_secs).unwrap()),
+                scan_interval: Duration::seconds(1),
+            };
+            if config.validate().is_ok() {
+                prop_assert!(base_secs + jitter_secs + guard_secs <= 15 * 60);
+            }
+        }
+
+        #[test]
+        fn scan_budget_is_bounded_by_half_target(target_ready in 1usize..500) {
+            let budget = scan_budget(target_ready);
+            prop_assert!(budget <= target_ready.max(2) / 2);
+            prop_assert!(budget >= 1);
+        }
+    }
+
+    #[test]
+    fn default_internal_constants_match_dsql_token_safety() {
+        assert_eq!(TARGET_READY, 50);
+        assert_eq!(SCAN_BUDGET, 25);
+        assert_eq!(INFLIGHT_LIMIT, 8);
+        assert_eq!(SCAN_INTERVAL, StdDuration::from_secs(1));
+        assert!(BASE_LIFETIME + LIFETIME_JITTER + GUARD_WINDOW < StdDuration::from_secs(15 * 60));
+    }
+
+    #[test]
+    fn guard_window_enforces_retirement_boundary() {
+        let created_at = Instant::now() - StdDuration::from_secs(100);
+        assert!(within_guard_window(
+            created_at,
+            StdDuration::from_secs(120),
+            StdDuration::from_secs(25)
+        ));
+        assert!(!within_guard_window(
+            created_at,
+            StdDuration::from_secs(140),
+            StdDuration::from_secs(25)
+        ));
     }
 }

@@ -134,6 +134,8 @@ impl MigrationRunner {
     }
 
     pub async fn apply_connection(&self, connection: &mut PgConnection) -> Result<MigrationReport> {
+        // Schema CLI paths use one raw connection so migrations do not require
+        // the runtime reservoir or DynamoDB coordination to be online.
         self.ensure_schema_version_connection(connection).await?;
         let mut applied = 0;
         for migration in self.discover()? {
@@ -166,10 +168,7 @@ impl MigrationRunner {
     }
 
     /// Return the ordered migration plan without touching the database.
-    ///
-    /// The pool parameter is retained so callers can share command signatures
-    /// between dry-run and apply flows without a separate orchestration branch.
-    pub async fn dry_run(&self, _pool: &PgPool) -> Result<Vec<MigrationPlan>> {
+    pub fn dry_run(&self) -> Result<Vec<MigrationPlan>> {
         self.discover()?
             .into_iter()
             .map(|migration| {
@@ -224,6 +223,8 @@ impl MigrationRunner {
     }
 
     pub async fn status_connection(&self, connection: &mut PgConnection) -> Result<SchemaStatus> {
+        // Mirrors `status(&PgPool)` for administrative commands that open a
+        // single raw DSQL connection through the IAM connector.
         let current_version =
             match sqlx::query_scalar::<_, Option<i32>>("SELECT max(version) FROM schema_version")
                 .fetch_optional(&mut *connection)
@@ -276,6 +277,8 @@ impl MigrationRunner {
     }
 
     async fn ensure_schema_version_connection(&self, connection: &mut PgConnection) -> Result<()> {
+        // Keep this SQL byte-for-byte aligned with the pool variant. The two
+        // entry points differ only by executor shape.
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS schema_version (
                 version INTEGER NOT NULL,
@@ -352,6 +355,9 @@ fn discover_directory_migrations(config: &MigrationConfig) -> Result<Vec<Migrati
         });
     }
     migrations.sort_by_key(|migration| migration.version);
+    // Gaps are rejected even when missing migrations would not be immediately
+    // needed. A gap means two environments could reach different schemas while
+    // claiming the same highest version.
     for pair in migrations.windows(2) {
         if pair[0].version == pair[1].version {
             bail!("duplicate migration version {}", pair[0].version);
@@ -468,7 +474,7 @@ mod tests {
         let runner = MigrationRunner::new(MigrationConfig {
             migrations_dir: dir.clone(),
         });
-        let plans = runner.dry_run(&unreachable_pool()).await.unwrap();
+        let plans = runner.dry_run().unwrap();
 
         assert_eq!(plans[0].version, 1);
         assert_eq!(plans[1].version, 2);
@@ -541,9 +547,5 @@ mod tests {
 
     fn write_migration(dir: &Path, filename: &str, sql: &str) {
         fs::write(dir.join(filename), sql).unwrap();
-    }
-
-    fn unreachable_pool() -> sqlx::PgPool {
-        sqlx::PgPool::connect_lazy("postgres://localhost/unreachable").unwrap()
     }
 }

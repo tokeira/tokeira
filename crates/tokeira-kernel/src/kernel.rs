@@ -1664,28 +1664,24 @@ impl BasicKernel {
             started_event_id,
             timeout_type: req.timeout_type,
         });
-        let current = builder
-            .state
-            .pending_workflow_task
-            .as_mut()
-            .expect("validated pending workflow task must still exist");
-        current.started_event_id = None;
-        current.started_at = None;
         builder.state.workflow_task_attempt += 1;
-        current.attempt = builder.state.workflow_task_attempt;
         builder.state.sticky = None;
-        if builder.state.status != ExecutionStatus::Paused {
-            builder.dispatch_ops.push(DispatchOp::EnqueueWorkflowTask {
-                queue: QueueKey {
-                    namespace_id: builder.state.namespace_id,
-                    task_queue: builder.state.task_queue.clone(),
-                    task_kind: tokeira_types::TaskKind::Workflow,
-                    deployment: builder.state.deployment.clone(),
-                    build_id: builder.state.build_id.clone(),
-                },
-                logical_seq: pending.logical_seq,
-                sticky_preferred: None,
-            });
+        if builder.state.status == ExecutionStatus::Paused {
+            // Paused workflows retain the pending task (cleared of started
+            // state) so it can be re-dispatched when the workflow resumes.
+            let current = builder
+                .state
+                .pending_workflow_task
+                .as_mut()
+                .expect("validated pending workflow task must still exist");
+            current.started_event_id = None;
+            current.started_at = None;
+            current.attempt = builder.state.workflow_task_attempt;
+        } else {
+            // Active workflows get a fresh WorkflowTaskScheduled event so the
+            // SDK state machine sees the correct Scheduled→Started sequence.
+            builder.state.pending_workflow_task = None;
+            builder.schedule_workflow_task();
         }
         Ok(builder.finish())
     }

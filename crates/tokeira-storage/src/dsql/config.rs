@@ -251,10 +251,23 @@ pub fn detect_region_from_endpoint(endpoint: &str) -> Option<String> {
 }
 
 /// DynamoDB coordination resources used by the DSQL connection reservoir.
+///
+/// The two table names are intentionally separate. The rate-limiter table has
+/// one global token-bucket row, while the connection-lease table contains slot
+/// block rows that represent cluster-wide connection capacity. Keeping them
+/// separate lets each table use a narrow key shape and independent IAM/TTL
+/// policies.
 #[derive(Clone, Debug)]
 pub struct DsqlCoordinationConfig {
+    /// DynamoDB table containing the distributed connection-creation bucket.
     pub rate_limiter_table: String,
+    /// DynamoDB table containing connection slot block leases.
     pub conn_lease_table: String,
+    /// AWS SDK client constructed from the effective server deployment config.
+    ///
+    /// Tests may use a dummy client only through explicitly test-only local
+    /// constructors. Production startup validates table reachability before the
+    /// reservoir is allowed to warm.
     pub ddb_client: aws_sdk_dynamodb::Client,
 }
 
@@ -273,6 +286,11 @@ impl Default for DsqlCoordinationConfig {
 }
 
 /// DSQL pool foundation configuration.
+///
+/// This is a storage-internal configuration object rather than the public
+/// `tokeirad.toml` schema. Tokeirad builds it from effective infrastructure and
+/// placement settings so repository routing, projection partitioning, and the
+/// reservoir all observe one consistent set of counts.
 #[derive(Clone, Debug)]
 pub struct DsqlPoolConfig {
     /// Warm-connection reservoir behavior.
@@ -290,6 +308,9 @@ pub struct DsqlPoolConfig {
     /// Runtime shard count used for deterministic run-key ownership.
     pub shard_count: u32,
     /// Projection partition count used when writing projection-log records.
+    ///
+    /// Writers and projection workers must use the same value; otherwise a
+    /// worker fanout can miss records written into partitions it never scans.
     pub projection_partition_count: u32,
     /// Workflow-id conflict behavior used by repository start commits.
     pub conflict_policy: CurrentExecutionConflictPolicy,

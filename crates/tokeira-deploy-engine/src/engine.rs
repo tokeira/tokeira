@@ -99,11 +99,19 @@ impl ServiceEngine {
         for service in ordered {
             let manifests = service.manifests(ctx)?;
             let hash = hash_manifests(&manifests);
-            let kind = match state.services.get(service.name()) {
+            let mut kind = match state.services.get(service.name()) {
                 Some(existing) if existing.desired_hash == hash => ServiceChangeKind::NoChange,
                 Some(_) => ServiceChangeKind::Update,
                 None => ServiceChangeKind::Create,
             };
+
+            // Even when the manifest hash matches, check if the running state
+            // has drifted (e.g., image rebuilt behind the same tag).
+            if kind == ServiceChangeKind::NoChange
+                && !platform.is_service_current(service.name(), &manifests).await
+            {
+                kind = ServiceChangeKind::Update;
+            }
 
             if kind != ServiceChangeKind::NoChange {
                 platform.apply_manifests(&manifests).await?;

@@ -202,15 +202,26 @@ impl iac::Resource for ComposeService {
             return Ok(None);
         };
         match platform.running_service(&self.name).await? {
-            Some(service) => Ok(Some(iac::ResourceState {
-                resource_type: iac::ResourceType::new("compose_service"),
-                physical_id: service.name.clone(),
-                properties: service.to_manifest(),
-                dependencies: Vec::new(),
-                created_at: String::new(),
-                updated_at: String::new(),
-                module: self.name.clone(),
-            })),
+            Some(mut service) => {
+                // Detect image rebuild: if the container's image digest differs
+                // from the local image's current digest for the same tag, report
+                // the running image as the full digest so diff() sees a change.
+                if let Some(stale_digest) = platform
+                    .container_image_stale(&self.name, &service.image)
+                    .await
+                {
+                    service.image = stale_digest;
+                }
+                Ok(Some(iac::ResourceState {
+                    resource_type: iac::ResourceType::new("compose_service"),
+                    physical_id: service.name.clone(),
+                    properties: service.to_manifest(),
+                    dependencies: Vec::new(),
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                    module: self.name.clone(),
+                }))
+            }
             None => Ok(None),
         }
     }
@@ -330,6 +341,44 @@ impl ComposePlatform {
                     })?;
                 Ok(())
             }
+        }
+    }
+
+    /// Returns the container's image digest if it differs from the local image's
+    /// current digest for the same tag. This detects rebuilt images behind the
+    /// same tag (e.g., `tokeirad:latest` rebuilt locally).
+    ///
+    /// Returns `None` if the image is current, or if either lookup fails (in
+    /// which case we fall back to tag-only comparison).
+    pub async fn container_image_stale(
+        &self,
+        service_name: &str,
+        image_tag: &str,
+    ) -> Option<String> {
+        let container_name = format!("{}_{}", self.project_name, service_name);
+        let inspect = self
+            .docker
+            .inspect_container(&container_name, None::<bollard::container::InspectContainerOptions>)
+            .await
+            .ok()?;
+        // The container's `image` field is the sha256 digest of the image it
+        // was created from.
+        let container_image_id = inspect.image.as_deref()?;
+
+        // Resolve the current local image ID for the same tag.
+        let local_image = self
+            .docker
+            .inspect_image(image_tag)
+            .await
+            .ok()?;
+        let local_image_id = local_image.id.as_deref()?;
+
+        if container_image_id != local_image_id {
+            // Return the stale digest so diff() sees a mismatch against the
+            // desired tag-only image field.
+            Some(format!("{image_tag}@stale:{}", &container_image_id[..19.min(container_image_id.len())]))
+        } else {
+            None
         }
     }
 
@@ -665,6 +714,39 @@ impl deploy_engine::Platform for ComposePlatform {
         }
         self.save_compose_state(&state)?;
         Ok(count)
+    }
+
+    async fn is_service_current(&self, service_name: &str, manifests: &[serde_json::Value]) -> bool {
+        let Some(manifest) = manifests.first() else {
+            return true;
+        };
+        let image_tag = manifest
+            .get("image")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if image_tag.is_empty() {
+            return true;
+        }
+        let container_name = format!("{}_{}", self.project_name, service_name);
+        let Ok(inspect) = self
+            .docker
+            .inspect_container(&container_name, None::<bollard::container::InspectContainerOptions>)
+            .await
+        else {
+            // Container doesn't exist — not current.
+            return false;
+        };
+        let Some(container_image_id) = inspect.image.as_deref() else {
+            return false;
+        };
+        let Ok(local_image) = self.docker.inspect_image(image_tag).await else {
+            // Can't resolve local image — assume current to avoid false positives.
+            return true;
+        };
+        let Some(local_image_id) = local_image.id.as_deref() else {
+            return true;
+        };
+        container_image_id == local_image_id
     }
 }
 

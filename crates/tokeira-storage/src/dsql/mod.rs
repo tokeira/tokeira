@@ -4,6 +4,12 @@
 //! primitives used by the production DSQL backend. The public entry point is
 //! [`DsqlStore`], which wires a connection director, migration runner, and
 //! DSQL `RunRepository` over the same raw-connection reservoir foundation.
+//!
+//! Two external systems are involved before any SQL work can run:
+//! DynamoDB coordinates cluster-wide connection creation and slot ownership,
+//! while Aurora DSQL owns the workflow data itself. Startup intentionally
+//! validates both DynamoDB coordination tables before warming connections so a
+//! misprovisioned deployment fails before serving traffic.
 
 use std::sync::Arc;
 
@@ -15,7 +21,6 @@ pub(crate) mod convert;
 pub mod distributed_bucket;
 pub mod migration;
 pub mod projection_log;
-pub mod rate_limiter;
 pub mod reservoir;
 pub mod run_repository;
 pub mod slot_block_manager;
@@ -27,7 +32,6 @@ pub use connection_factory::*;
 pub use distributed_bucket::*;
 pub use migration::*;
 pub use projection_log::*;
-pub use rate_limiter::*;
 pub use reservoir::*;
 pub use run_repository::*;
 pub use slot_block_manager::*;
@@ -60,10 +64,16 @@ impl DsqlStore {
         let region = auth.resolved_region().ok_or_else(|| {
             anyhow::anyhow!("dsql region must be configured or derivable from endpoint")
         })?;
+        // The Aurora connector owns IAM token generation. Tokeira keeps the
+        // boundary at "raw PgConnection factory" so token caching/refresh
+        // details never leak into repository code.
         let factory = Arc::new(connection_factory::ConnectionFactory::new(
             &auth.endpoint,
             &region,
         )?);
+        // DynamoDB coordination is mandatory in production DSQL mode. There is
+        // no local fallback here because uncoordinated refillers can overshoot
+        // DSQL connection limits when more than one node starts.
         let bucket = Arc::new(distributed_bucket::DistributedTokenBucket::new(
             config.coordination.ddb_client.clone(),
             config.coordination.rate_limiter_table.clone(),
@@ -89,6 +99,10 @@ impl DsqlStore {
     }
 
     /// Construct the foundational DSQL components from a database URL for tests.
+    ///
+    /// This path deliberately bypasses IAM and DynamoDB so unit/integration
+    /// tests can exercise repository behavior against a local PostgreSQL-like
+    /// endpoint without requiring AWS credentials.
     #[cfg(any(test, feature = "dsql-integration"))]
     pub async fn from_database_url_for_tests(
         url: impl Into<String>,
@@ -185,6 +199,10 @@ impl DsqlStore {
             self.projection_log,
             self.migration_runner,
         )
+    }
+
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
+        self.director.shutdown().await
     }
 }
 

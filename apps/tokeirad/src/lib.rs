@@ -209,7 +209,7 @@ fn dsql_pool_config_with_client(
     ddb_client: aws_sdk_dynamodb::Client,
 ) -> DsqlPoolConfig {
     let (rate_limiter_table, conn_lease_table) =
-        dsql_coordination_table_names(&config.infrastructure.cluster_name);
+        dsql_coordination_table_names(config);
     DsqlPoolConfig {
         coordination: DsqlCoordinationConfig {
             rate_limiter_table,
@@ -236,11 +236,17 @@ async fn dsql_pool_config(config: &TokeiraConfig, auth: &DsqlAuthConfig) -> Resu
     ))
 }
 
-fn dsql_coordination_table_names(project_name: &str) -> (String, String) {
-    (
-        format!("{project_name}-dsql-rate-limiter"),
-        format!("{project_name}-dsql-conn-lease"),
-    )
+fn dsql_coordination_table_names(config: &TokeiraConfig) -> (String, String) {
+    let dsql = &config.infrastructure.dsql;
+    let rate_limiter = dsql
+        .rate_limiter_table
+        .clone()
+        .unwrap_or_else(|| format!("{}-dsql-rate-limiter", config.infrastructure.cluster_name));
+    let conn_lease = dsql
+        .conn_lease_table
+        .clone()
+        .unwrap_or_else(|| format!("{}-dsql-conn-lease", config.infrastructure.cluster_name));
+    (rate_limiter, conn_lease)
 }
 
 /// Entrypoint the CLI delegates to.

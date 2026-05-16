@@ -43,6 +43,9 @@ macro_rules! record_dsql_operation {
     ($repo:expr, $operation:expr, $shard_id:expr, $body:block) => {{
         let started = Instant::now();
         let result = (async $body).await;
+        // Instrument at the repository boundary so helper functions can stay
+        // focused on persistence semantics and every public operation gets the
+        // same outcome/error classification.
         $repo.record_operation_result($operation, $shard_id, started.elapsed(), &result);
         result
     }};
@@ -141,6 +144,9 @@ impl DsqlRunRepository {
 
     pub(crate) fn shard_for_run_key(&self, run_key: RunKey) -> ShardId {
         debug_assert!(self.shard_count > 0);
+        // The run key is already a spread UUID. Taking its low bits is stable
+        // and cheap, and keeps routing aligned with rows written by this
+        // repository.
         ShardId((run_key.0.as_u128() as u32) % self.shard_count)
     }
 
@@ -157,7 +163,7 @@ impl DsqlRunRepository {
 
     pub(crate) fn shard_id_from_uuid(value: Uuid) -> Result<ShardId> {
         let bytes = value.into_bytes();
-        if &bytes[0..12] != b"tokeira-sha" {
+        if &bytes[0..12] != b"tokeira-shar" {
             bail!("shard UUID does not use reversible shard-id encoding");
         }
         Ok(ShardId(u32::from_be_bytes(
@@ -171,6 +177,8 @@ impl DsqlRunRepository {
         namespace_id: NamespaceId,
         workflow_id: &WorkflowId,
     ) -> Uuid {
+        // Workflow-id uniqueness is a workflow-level invariant, so this key
+        // deliberately excludes run_id.
         dsql_spread_uuid(&[
             b"current-execution",
             namespace_id.0.as_bytes(),
@@ -183,6 +191,8 @@ impl DsqlRunRepository {
         workflow_id: &WorkflowId,
         request_id: &RequestId,
     ) -> Uuid {
+        // Request dedupe is workflow-scoped for start/signal/update style
+        // operations. Explicit run filtering is applied when the row is read.
         dsql_spread_uuid(&[
             b"request-dedupe",
             namespace_id.0.as_bytes(),
@@ -200,6 +210,8 @@ impl DsqlRunRepository {
         build_id: Option<&str>,
         insertion_seq: u64,
     ) -> Uuid {
+        // Include optional deployment/build identity in the key input so
+        // versioned and unversioned queue entries cannot collide.
         let deployment = option_key_part(deployment);
         let build_id = option_key_part(build_id);
         let task_kind = (task_kind.to_db_smallint() as u16).to_le_bytes();
@@ -324,6 +336,8 @@ fn is_serialization_failure_error(error: &anyhow::Error) -> bool {
 }
 
 fn extract_sqlstate(error: &anyhow::Error) -> Option<String> {
+    // SQLSTATE values are the most stable way to alert on DSQL/PostgreSQL
+    // classes across connector versions.
     error
         .chain()
         .find_map(|cause| match cause.downcast_ref::<sqlx::Error>() {
@@ -335,6 +349,9 @@ fn extract_sqlstate(error: &anyhow::Error) -> Option<String> {
 }
 
 fn classify_connection_error(error: &anyhow::Error) -> Option<&'static str> {
+    // Keep this intentionally coarse. Operators need to distinguish transport,
+    // timeout, refusal, and TLS classes; SQL semantics are reported separately
+    // through SQLSTATE.
     error
         .chain()
         .find_map(|cause| match cause.downcast_ref::<sqlx::Error>() {
@@ -587,6 +604,9 @@ impl RunRepository for DsqlRunRepository {
                     state.workflow_id.0.as_bytes(),
                     self.shard_count,
                 );
+                // Commit routing is derived from the same shard_count used by the
+                // runtime ShardOwner. A mismatch here would make leases and rows
+                // disagree about execution-home ownership.
 
                 if should_check_epoch(epoch) {
                     // Epoch fencing ties a commit to the lane/shard lease that produced
@@ -757,6 +777,10 @@ impl RunRepository for DsqlRunRepository {
             Some(execution_home_bundle),
             {
                 if should_check_epoch(epoch) {
+                    // Multi-node/controller-managed deployments keep the
+                    // durable shard_lease fence. Single-node compose passes
+                    // ShardEpoch::ZERO and skips this read because there is no
+                    // takeover actor that can advance the epoch.
                     convert::i64_from_u64(epoch.0, "caller shard epoch")?;
                     let mut permit = self.director.acquire(DbClass::Commit).await?;
                     let mut tx = permit.connection()?.begin().await?;
@@ -1589,17 +1613,30 @@ impl LeaseRepository for DsqlRunRepository {
                 .await
                 .context("failed to list shard leases")?;
 
-            rows.into_iter()
-                .map(|(shard_uuid, owner, epoch, lease_until, endpoint)| {
-                    Ok(BundleLease {
-                        bundle_id: Self::shard_id_from_uuid(shard_uuid)?,
-                        owner_node_id: owner,
-                        epoch: epoch_from_sql(epoch)?,
-                        lease_until,
-                        node_endpoint: endpoint,
-                    })
-                })
-                .collect()
+            let mut leases = Vec::with_capacity(rows.len());
+            for (shard_uuid, owner, epoch, lease_until, endpoint) in rows {
+                let bundle_id = match Self::shard_id_from_uuid(shard_uuid) {
+                    Ok(id) => id,
+                    Err(_) => {
+                        // Row written by a previous code version with a different
+                        // UUID encoding. Skip it — try_acquire_bundle will overwrite
+                        // it via the ON CONFLICT + expiry-based UPDATE path.
+                        tracing::debug!(
+                            %shard_uuid,
+                            "skipping shard_lease row with unrecognized UUID encoding"
+                        );
+                        continue;
+                    }
+                };
+                leases.push(BundleLease {
+                    bundle_id,
+                    owner_node_id: owner,
+                    epoch: epoch_from_sql(epoch)?,
+                    lease_until,
+                    node_endpoint: endpoint,
+                });
+            }
+            Ok(leases)
         })
     }
 
@@ -1785,6 +1822,9 @@ fn collect_dispatchable_workflow_tasks(
     let now = OffsetDateTime::now_utc();
     let mut tasks = Vec::new();
     for (run_key, state_data) in rows {
+        // Workflow task dispatch is derived from the hot state snapshot. There
+        // is no separate workflow-task queue table to repair; replaying history
+        // can rebuild this materialization.
         let state = codec::decode_workflow_state(&state_data)?;
         if state.status != ExecutionStatus::Running {
             continue;
@@ -1874,6 +1914,8 @@ fn collect_workflow_timeout_entries(
     }
     let mut entries = Vec::new();
     for (run_key, state_data) in rows {
+        // Timeout scanners need enough state to evaluate both execution and
+        // run timeout policies in runtime without reopening history.
         let state = codec::decode_workflow_state(&state_data)?;
         if !state.status.is_open()
             || (state.workflow_execution_timeout.is_none() && state.workflow_run_timeout.is_none())
@@ -1955,6 +1997,8 @@ fn collect_nexus_sweep_entries(
     }
     let mut entries = Vec::new();
     for (run_key, state_data) in rows {
+        // Nexus timeout tracking currently lives in the workflow snapshot so
+        // this scan filters in Rust after shard-local row selection.
         let state = codec::decode_workflow_state(&state_data)?;
         if !state.status.is_open() {
             continue;
@@ -2456,10 +2500,13 @@ fn option_key_part(value: Option<&str>) -> Vec<u8> {
 }
 
 fn epoch_to_sql(epoch: ShardEpoch) -> Result<i64> {
+    // DSQL stores epochs in BIGINT. Rejecting overflow here is preferable to a
+    // connector/database error after a transaction has started.
     convert::i64_from_u64(epoch.0, "shard_lease.epoch")
 }
 
 fn epoch_from_sql(value: i64) -> Result<ShardEpoch> {
+    // Negative epochs indicate corrupt storage or an incompatible manual edit.
     Ok(ShardEpoch(convert::u64_from_i64(
         value,
         "shard_lease.epoch",
@@ -2481,6 +2528,9 @@ fn interpret_acquire(
     acquired_epoch: Option<i64>,
     rejected_row: Option<(String, i64)>,
 ) -> Result<LeaseOutcome> {
+    // The lease acquire SQL is split into INSERT and UPDATE for portability.
+    // These row-count combinations are the contract that maps SQL effects back
+    // into the storage trait's semantic outcome.
     match (insert_rows_affected, update_rows_affected) {
         (1, 0) => {
             let epoch = acquired_epoch
@@ -2518,6 +2568,8 @@ fn decide_renew(
     caller_owner: &str,
     caller_epoch: i64,
 ) -> Result<RenewDecision> {
+    // Renewal is stricter than acquire: only the current owner at the exact
+    // epoch can extend a lease. Expired-takeover behavior belongs to acquire.
     let Some((current_owner, current_epoch)) = row else {
         return Ok(RenewDecision::Reject {
             current_owner: String::new(),

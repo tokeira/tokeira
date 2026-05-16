@@ -284,11 +284,42 @@ impl tokeira_orchestrator::Deployment for ComposeDeployment {
             return Vec::new();
         };
         let dsql = config.dsql.clone().unwrap_or_default();
-        vec![
+        let mut entries = vec![
             ("infrastructure.storage".into(), "dsql".into()),
             ("infrastructure.dsql.endpoint".into(), endpoint.into()),
             ("infrastructure.dsql.region".into(), dsql.region),
-        ]
+        ];
+
+        // Write back DynamoDB coordination table names so tokeirad uses the
+        // actual provisioned names rather than deriving from cluster_name.
+        let rate_limiter_id =
+            iac::ResourceId(format!("dynamodb-{}-dsql-rate-limiter", config.project_name));
+        if let Some(table_name) = state
+            .resources
+            .get(&rate_limiter_id)
+            .and_then(|rs| rs.properties.get("table_name"))
+            .and_then(|v| v.as_str())
+        {
+            entries.push((
+                "infrastructure.dsql.rate_limiter_table".into(),
+                table_name.into(),
+            ));
+        }
+        let conn_lease_id =
+            iac::ResourceId(format!("dynamodb-{}-dsql-conn-lease", config.project_name));
+        if let Some(table_name) = state
+            .resources
+            .get(&conn_lease_id)
+            .and_then(|rs| rs.properties.get("table_name"))
+            .and_then(|v| v.as_str())
+        {
+            entries.push((
+                "infrastructure.dsql.conn_lease_table".into(),
+                table_name.into(),
+            ));
+        }
+
+        entries
     }
 }
 

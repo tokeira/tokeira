@@ -105,6 +105,7 @@ impl LaneHandle {
                 run_key,
                 command,
                 reply_tx,
+                enqueued_at: std::time::Instant::now(),
             })
             .await?;
         reply_rx.await?
@@ -120,6 +121,7 @@ struct LaneMessage {
     run_key: RunKey,
     command: Command,
     reply_tx: oneshot::Sender<Result<CommitResult>>,
+    enqueued_at: std::time::Instant,
 }
 
 /// Spawn a new lane executor as a background Tokio task.
@@ -204,6 +206,9 @@ where
 
     while let Some(message) = current.take() {
         let committed_command = message.command.clone();
+        let command_type = command_type_name(&message.command);
+        runtime_metrics::record_lane_queue_wait(message.enqueued_at.elapsed());
+        let processing_start = std::time::Instant::now();
         let result = handle_message(
             kernel,
             repo,
@@ -614,6 +619,7 @@ where
             }
             Err(error) => Err(error),
         };
+        runtime_metrics::record_lane_processing_duration(command_type, processing_start.elapsed());
         let _ = message.reply_tx.send(reply);
         drained += 1;
 
@@ -1566,6 +1572,7 @@ mod tests {
                 run_key,
                 command: sample_command(label),
                 reply_tx,
+                enqueued_at: std::time::Instant::now(),
             },
             reply_rx,
         )
@@ -1614,6 +1621,7 @@ mod tests {
                 run_key: RunKey::new(),
                 command: sample_command("queued"),
                 reply_tx,
+                enqueued_at: std::time::Instant::now(),
             })
             .unwrap();
 

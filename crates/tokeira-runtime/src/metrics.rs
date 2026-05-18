@@ -11,6 +11,8 @@ pub const BROKER_NON_SYNC_MATCH_TOTAL: &str = "tokeira_runtime_broker_non_sync_m
 pub const BROKER_POLL_TIMEOUT_TOTAL: &str = "tokeira_runtime_broker_poll_timeout_total";
 pub const BROKER_QUEUE_DEPTH: &str = "tokeira_runtime_broker_queue_depth";
 pub const LANE_SUBMIT_DURATION_SECONDS: &str = "tokeira_runtime_lane_submit_duration_seconds";
+pub const LANE_QUEUE_WAIT_SECONDS: &str = "tokeira_runtime_lane_queue_wait_seconds";
+pub const LANE_PROCESSING_DURATION_SECONDS: &str = "tokeira_runtime_lane_processing_duration_seconds";
 pub const SCANNER_TICK_TOTAL: &str = "tokeira_runtime_scanner_tick_total";
 pub const SCANNER_DISPATCHED_TOTAL: &str = "tokeira_runtime_scanner_dispatched_total";
 pub const OCC_RETRY_TOTAL: &str = "tokeira_runtime_occ_retry_total";
@@ -25,6 +27,8 @@ pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (BROKER_POLL_TIMEOUT_TOTAL, MetricType::Counter),
     (BROKER_QUEUE_DEPTH, MetricType::Gauge),
     (LANE_SUBMIT_DURATION_SECONDS, MetricType::DurationHistogram),
+    (LANE_QUEUE_WAIT_SECONDS, MetricType::DurationHistogram),
+    (LANE_PROCESSING_DURATION_SECONDS, MetricType::DurationHistogram),
     (SCANNER_TICK_TOTAL, MetricType::Counter),
     (SCANNER_DISPATCHED_TOTAL, MetricType::Counter),
     (OCC_RETRY_TOTAL, MetricType::Counter),
@@ -99,6 +103,17 @@ pub fn set_queue_depth(queue: &QueueKey, tier: &'static str, depth: usize) {
 /// Record how long a lane submission took end-to-end.
 pub fn record_lane_submit_duration(lane_id: usize, duration: std::time::Duration) {
     histogram!(LANE_SUBMIT_DURATION_SECONDS, "lane_id" => lane_id.to_string())
+        .record(duration.as_secs_f64());
+}
+
+/// Record how long a message waited in the lane channel before processing began.
+pub fn record_lane_queue_wait(duration: std::time::Duration) {
+    histogram!(LANE_QUEUE_WAIT_SECONDS).record(duration.as_secs_f64());
+}
+
+/// Record how long the lane spent processing a single command (load + kernel + commit).
+pub fn record_lane_processing_duration(command_type: &'static str, duration: std::time::Duration) {
+    histogram!(LANE_PROCESSING_DURATION_SECONDS, "command_type" => command_type)
         .record(duration.as_secs_f64());
 }
 

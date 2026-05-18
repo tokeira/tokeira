@@ -28,11 +28,15 @@ use crate::metrics;
 use super::{DistributedTokenBucket, PhysicalConnectionFactory, ReservoirConfig, SlotBlockManager};
 
 /// Default warm connection target for one node.
+// Pinned here for reservoir startup wiring and tested as part of the DSQL token-safety contract.
+#[allow(dead_code)]
 pub(crate) const TARGET_READY: usize = 50;
 /// Maximum entries inspected by one scanner pass.
 ///
 /// The scanner only inspects half of the target pool so a scan cannot drain the
 /// channel and starve concurrent checkouts.
+// Pinned here for reservoir startup wiring and tested as part of the DSQL token-safety contract.
+#[allow(dead_code)]
 pub(crate) const SCAN_BUDGET: usize = TARGET_READY / 2;
 /// Base age before a connection becomes eligible for retirement.
 pub(crate) const BASE_LIFETIME: StdDuration = StdDuration::from_secs(10 * 60);
@@ -41,6 +45,8 @@ pub(crate) const LIFETIME_JITTER: StdDuration = StdDuration::from_secs(2 * 60);
 /// Safety margin before the DSQL IAM token hard cutoff.
 pub(crate) const GUARD_WINDOW: StdDuration = StdDuration::from_secs(45);
 /// Maximum concurrent physical connection creation attempts.
+// Pinned here for reservoir startup wiring and tested as part of the DSQL token-safety contract.
+#[allow(dead_code)]
 pub(crate) const INFLIGHT_LIMIT: usize = 8;
 pub(crate) const SCAN_INTERVAL: StdDuration = StdDuration::from_secs(1);
 pub(crate) const WARMUP_TIMEOUT: StdDuration = StdDuration::from_secs(30);

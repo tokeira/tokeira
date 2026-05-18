@@ -15,7 +15,9 @@ use tokeira_kernel::{Command, RetryState, WorkflowExecutionTimedOutRequest, Work
 use tokeira_types::{RunKey, ShardId};
 use tokio_util::sync::CancellationToken;
 
-use crate::{lane::LaneHandle, metrics as runtime_metrics, scanner::pick_lane, shard::ShardOwner};
+use crate::{
+    lane::LaneHandle, metrics as runtime_metrics, scanner::pick_lane_for_run_key, shard::ShardOwner,
+};
 
 /// Runtime-local timeout tracking entry for one open run.
 #[derive(Clone, Debug, PartialEq)]
@@ -187,7 +189,7 @@ pub(crate) async fn run_workflow_timeout_scanner(
                 &config,
                 |entry, violation, now| {
                     runtime_metrics::record_scanner_dispatched("workflow_timeout", shard_id.0);
-                    let lane = pick_lane(&lanes, lane_count, entry.shard_id).clone();
+                    let lane = pick_lane_for_run_key(&lanes, lane_count, entry.run_key).clone();
                     async move {
                         lane.submit(
                             entry.run_key,

@@ -587,7 +587,7 @@ mod tests {
                     .await
                     .unwrap();
 
-                prop_assert_eq!(delivered.map(|entry| entry.0), Some(task));
+                prop_assert_eq!(delivered.and_then(|entry| entry.into_queued().map(|queued| queued.0)), Some(task));
                 Ok::<(), proptest::test_runner::TestCaseError>(())
             })?;
         }
@@ -633,7 +633,7 @@ mod tests {
                     .await
                     .unwrap();
 
-                prop_assert_eq!(delivered.map(|entry| entry.0), Some(task));
+                prop_assert_eq!(delivered.and_then(|entry| entry.into_queued().map(|queued| queued.0)), Some(task));
                 prop_assert!(repo.persisted.lock().unwrap().is_empty());
                 Ok::<(), proptest::test_runner::TestCaseError>(())
             })?;
@@ -735,7 +735,11 @@ mod tests {
                     prop_assert!(false, "activity backlog entry was not delivered");
                     return Ok::<(), proptest::test_runner::TestCaseError>(());
                 };
-                prop_assert_eq!(workflow.0.logical_seq, LogicalTaskSeq(logical_seq));
+                let Some((workflow, _)) = workflow.into_queued() else {
+                    prop_assert!(false, "expected queued workflow task");
+                    return Ok::<(), proptest::test_runner::TestCaseError>(());
+                };
+                prop_assert_eq!(workflow.logical_seq, LogicalTaskSeq(logical_seq));
                 prop_assert_eq!(activity.0.activity_id, "activity");
                 prop_assert_eq!(activity.0.attempt, attempt);
                 Ok::<(), proptest::test_runner::TestCaseError>(())
@@ -803,7 +807,11 @@ mod tests {
                     prop_assert!(false, "workflow backlog entry was not delivered");
                     return Ok::<(), proptest::test_runner::TestCaseError>(());
                 };
-                seen.push(task.0.logical_seq.0);
+                let Some((task, _)) = task.into_queued() else {
+                    prop_assert!(false, "expected queued workflow task");
+                    return Ok::<(), proptest::test_runner::TestCaseError>(());
+                };
+                seen.push(task.logical_seq.0);
 
                 for _ in 1..logical_seqs.len() {
                     let Some(task) = broker
@@ -818,7 +826,11 @@ mod tests {
                         prop_assert!(false, "workflow backlog entry was not delivered");
                         return Ok::<(), proptest::test_runner::TestCaseError>(());
                     };
-                    seen.push(task.0.logical_seq.0);
+                    let Some((task, _)) = task.into_queued() else {
+                        prop_assert!(false, "expected queued workflow task");
+                        return Ok::<(), proptest::test_runner::TestCaseError>(());
+                    };
+                    seen.push(task.logical_seq.0);
                 }
 
                 prop_assert_eq!(seen, logical_seqs);
@@ -892,7 +904,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            delivered_b.as_ref().map(|t| t.0.run_key),
+            delivered_b
+                .as_ref()
+                .and_then(|task| task.queued_task())
+                .map(|task| task.run_key),
             Some(task_b.run_key)
         );
 
@@ -905,7 +920,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            delivered_c.as_ref().map(|t| t.0.run_key),
+            delivered_c
+                .as_ref()
+                .and_then(|task| task.queued_task())
+                .map(|task| task.run_key),
             Some(task_c.run_key)
         );
 

@@ -39,6 +39,16 @@ use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, codec, convert};
 /// The schema supports partitioned projection scans; the MVP uses one logical
 /// fanout value while still assigning deterministic partitions.
 const PROJECTION_FANOUT: i16 = 1;
+const DEFAULT_HISTORY_PAGE_SIZE: usize = 1000;
+
+fn effective_history_limit(limit: usize) -> usize {
+    if limit == usize::MAX {
+        DEFAULT_HISTORY_PAGE_SIZE
+    } else {
+        limit
+    }
+}
+
 macro_rules! record_dsql_operation {
     ($repo:expr, $operation:expr, $shard_id:expr, $body:block) => {{
         let started = Instant::now();
@@ -448,12 +458,13 @@ impl RunRepository for DsqlRunRepository {
         after_event_id: i64,
         limit: usize,
     ) -> Result<Vec<HistoryEvent>> {
-        record_dsql_operation!(
+        let result = record_dsql_operation!(
             self,
             "read_history",
             Some(self.shard_for_run_key(run_key)),
             {
-                if limit == 0 {
+                let effective_limit = effective_history_limit(limit);
+                if effective_limit == 0 {
                     metrics::record_dsql_rows_read("read_history", 0);
                     return Ok(Vec::new());
                 }
@@ -480,14 +491,18 @@ impl RunRepository for DsqlRunRepository {
                             continue;
                         }
                         events.push(event);
-                        if events.len() == limit {
+                        if events.len() == effective_limit {
                             return Ok(events);
                         }
                     }
                 }
                 Ok(events)
             }
-        )
+        );
+        if let Ok(events) = &result {
+            metrics::record_read_history_events(events.len());
+        }
+        result
     }
 
     #[instrument(name = "dsql.lookup_request_dedupe", skip(self), fields(namespace_id = %execution.namespace_id.0, workflow_id = %execution.workflow_id.0, request_id = %request_id.0))]
@@ -811,8 +826,12 @@ impl RunRepository for DsqlRunRepository {
                     tx.rollback().await?;
                 }
 
-                self.commit_transition(run_key, transition, ShardEpoch::ZERO)
-                    .await
+                metrics::increment_dsql_commits_in_flight();
+                let result = self
+                    .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                    .await;
+                metrics::decrement_dsql_commits_in_flight();
+                result
             }
         )
     }
@@ -2615,12 +2634,13 @@ mod tests {
     };
 
     use super::{
-        ActivityDispatchRow, DsqlConnectionAcquirer, DsqlRunRepository, RenewDecision,
-        activity_dispatch_from_row, classify_connection_error, classify_outcome,
+        ActivityDispatchRow, DEFAULT_HISTORY_PAGE_SIZE, DsqlConnectionAcquirer, DsqlRunRepository,
+        RenewDecision, activity_dispatch_from_row, classify_connection_error, classify_outcome,
         collect_activity_sweep_entries, collect_dispatchable_workflow_tasks,
         collect_nexus_sweep_entries, collect_started_workflow_task_entries,
-        collect_workflow_timeout_entries, decide_renew, epoch_from_sql, epoch_to_sql,
-        extract_sqlstate, interpret_acquire, partition_for, should_check_epoch, sticky_fields,
+        collect_workflow_timeout_entries, decide_renew, effective_history_limit, epoch_from_sql,
+        epoch_to_sql, extract_sqlstate, interpret_acquire, partition_for, should_check_epoch,
+        sticky_fields,
     };
     use crate::{
         CurrentExecutionConflictPolicy, DbClass, LeaseOutcome, LeaseRepository, ProjectionContext,
@@ -2647,6 +2667,16 @@ mod tests {
             let partition_id = partition_for(run_key, partition_count);
 
             prop_assert!(partition_id < partition_count);
+        }
+
+        #[test]
+        fn read_history_effective_limit_preserves_finite_limits(limit in 0usize..10_000) {
+            prop_assert_eq!(effective_history_limit(limit), limit);
+        }
+
+        #[test]
+        fn read_history_legacy_unbounded_limit_uses_default_page_size(_seed in any::<u64>()) {
+            prop_assert_eq!(effective_history_limit(usize::MAX), DEFAULT_HISTORY_PAGE_SIZE);
         }
 
         #[test]

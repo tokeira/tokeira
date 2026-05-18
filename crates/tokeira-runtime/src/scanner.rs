@@ -10,7 +10,7 @@ use anyhow::Result;
 use time::OffsetDateTime;
 use tokeira_kernel::{Command, TimerDueRequest};
 use tokeira_storage::{DueTimer, RunRepository};
-use tokeira_types::ShardId;
+use tokeira_types::{RunKey, ShardId, dsql_spread_uuid};
 use tokio_util::sync::CancellationToken;
 
 use crate::{lane::LaneHandle, metrics as runtime_metrics, shard::ShardOwner};
@@ -33,14 +33,26 @@ impl Default for TimerScannerConfig {
     }
 }
 
+// Shard-scoped routing is retained for sweep enumeration and regression tests;
+// all command submission paths route by RunKey through `lane_index_for_run_key`.
+#[allow(dead_code)]
 pub(crate) fn lane_index_for(shard_id: ShardId, lane_count: usize) -> usize {
     (shard_id.0 as usize) % lane_count.max(1)
 }
 
-pub(crate) fn pick_lane(lanes: &[LaneHandle], lane_count: usize, shard_id: ShardId) -> &LaneHandle {
+pub(crate) fn lane_index_for_run_key(run_key: RunKey, lane_count: usize) -> usize {
+    let lane_key = dsql_spread_uuid(&[b"lane", run_key.0.as_bytes()]);
+    (lane_key.as_u128() as usize) % lane_count.max(1)
+}
+
+pub(crate) fn pick_lane_for_run_key(
+    lanes: &[LaneHandle],
+    lane_count: usize,
+    run_key: RunKey,
+) -> &LaneHandle {
     debug_assert!(!lanes.is_empty());
     debug_assert_eq!(lanes.len(), lane_count.max(1));
-    &lanes[lane_index_for(shard_id, lane_count.max(1)) % lanes.len()]
+    &lanes[lane_index_for_run_key(run_key, lane_count.max(1)) % lanes.len()]
 }
 
 #[allow(dead_code)]
@@ -158,7 +170,7 @@ pub(crate) async fn run_timer_scanner<R>(
             runtime_metrics::record_scanner_tick("timer", shard_id.0);
             scan_due_timers_once_for_shard(&*repo, shard_id, &config, |due, fired_at| {
                 runtime_metrics::record_scanner_dispatched("timer", shard_id.0);
-                let lane = pick_lane(&lanes, lane_count, shard_id).clone();
+                let lane = pick_lane_for_run_key(&lanes, lane_count, due.run_key).clone();
                 async move {
                     lane.submit(
                         due.run_key,
@@ -178,6 +190,8 @@ pub(crate) async fn run_timer_scanner<R>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use proptest::prelude::*;
     use tokeira_types::RunKey;
@@ -212,6 +226,16 @@ mod tests {
     #[test]
     fn test_lane_count_one_always_zero() {
         assert_eq!(lane_index_for(ShardId(u32::MAX), 1), 0);
+    }
+
+    #[test]
+    fn run_key_routing_reaches_all_lanes_for_fixed_sample() {
+        let lane_count = 64;
+        let lanes = (0..10_000u128)
+            .map(|value| lane_index_for_run_key(RunKey(Uuid::from_u128(value)), lane_count))
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(lanes.len(), lane_count);
     }
 
     proptest! {

@@ -424,6 +424,7 @@ async fn seed_workflow(
             },
             now,
             cron_schedule: None,
+            reserved_poller_identity: None,
         })
         .await
         .expect("seed workflow");

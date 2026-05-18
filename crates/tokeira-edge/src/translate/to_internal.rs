@@ -6,8 +6,8 @@ use tokeira_kernel::{
 use tokeira_runtime::VersioningRuleStore;
 use tokeira_types::{
     BuildId, DeploymentId, NamespaceId, QueueKey, RequestContext, RequestId as CoreRequestId,
-    RunId, RunKey, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId,
-    WorkflowTaskToken, WorkflowType,
+    RunId, RunKey, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowTaskToken,
+    WorkflowType,
 };
 use uuid::Uuid;
 
@@ -100,6 +100,7 @@ pub fn start_request(
         },
         now,
         cron_schedule: None,
+        reserved_poller_identity: None,
     }
 }
 
@@ -293,7 +294,9 @@ mod tests {
     use time::OffsetDateTime;
     use tokeira_kernel::{WorkflowIdConflictPolicy, WorkflowIdReusePolicy};
     use tokeira_runtime::{AssignmentRule, VersioningMutation, VersioningRuleStore};
-    use tokeira_types::{BuildId, DeploymentId, Memo, Payloads, SearchAttributes};
+    use tokeira_types::{
+        BuildId, DeploymentId, LogicalTaskSeq, Memo, Payloads, SearchAttributes, ShardEpoch,
+    };
 
     use super::*;
 
@@ -369,6 +372,32 @@ mod tests {
             )
             .unwrap();
         store
+    }
+
+    #[test]
+    fn workflow_task_completed_preserves_shard_epoch_from_token() {
+        let token = WorkflowTaskToken {
+            run_key: RunKey::new(),
+            logical_seq: LogicalTaskSeq(7),
+            started_event_id: 11,
+            attempt: 3,
+            shard_epoch: ShardEpoch(42),
+        };
+        let req = RespondWorkflowTaskCompletedRequest {
+            task_token: serde_json::to_vec(&token).unwrap(),
+            identity: "worker-a".to_string(),
+            client_discards_speculative_with_events: false,
+            commands: Vec::new(),
+            return_new_workflow_task: false,
+            force_create_new_workflow_task: false,
+            query_results: std::collections::HashMap::new(),
+            messages: Vec::new(),
+        };
+
+        let internal = workflow_task_completed_request(req).unwrap();
+
+        assert_eq!(internal.token.shard_epoch, token.shard_epoch);
+        assert_eq!(internal.token, token);
     }
 
     #[test]

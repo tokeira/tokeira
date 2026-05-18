@@ -1052,6 +1052,7 @@ mod tests {
                 request: req_ctx(&format!("start-{wf_id}")),
                 now: OffsetDateTime::now_utc(),
                 cron_schedule: None,
+                reserved_poller_identity: None,
             })
             .await
             .unwrap();

@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 380" font-family="Inter, -apple-system, sans-serif" font-size="11">
+  <defs>
+    <marker id="ap" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="#555"/>
+    </marker>
+  </defs>
+
+  <rect width="800" height="380" fill="#fafafa" rx="8"/>
+  <text x="400" y="25" text-anchor="middle" font-size="14" font-weight="bold" fill="#1a1a1a">Plane 3 — Projection (Implementation View)</text>
+
+  <!-- Input from Runtime -->
+  <rect x="30" y="50" width="200" height="35" rx="5" fill="#e8f5e9" stroke="#388e3c"/>
+  <text x="130" y="72" text-anchor="middle" font-size="10" fill="#1b5e20">Runtime commit → projection_ops</text>
+
+  <!-- tokeira-projection boundary -->
+  <rect x="20" y="100" width="760" height="240" rx="8" fill="#f3e5f5" stroke="#7b1fa2" stroke-width="1.5" stroke-dasharray="4,2"/>
+  <text x="40" y="120" font-size="12" font-weight="bold" fill="#4a148c">tokeira-projection</text>
+
+  <!-- Projection Log (DSQL) -->
+  <rect x="40" y="135" width="200" height="60" rx="5" fill="#fff" stroke="#7b1fa2"/>
+  <text x="140" y="155" text-anchor="middle" font-size="10" font-weight="bold" fill="#4a148c">DsqlProjectionLog</text>
+  <text x="50" y="172" font-size="9" fill="#555">• Partitioned (partition_count=4)</text>
+  <text x="50" y="185" font-size="9" fill="#555">• read_batch(partition, after_seq, limit)</text>
+
+  <!-- Projection Workers -->
+  <rect x="280" y="135" width="220" height="80" rx="5" fill="#fff" stroke="#7b1fa2"/>
+  <text x="390" y="155" text-anchor="middle" font-size="10" font-weight="bold" fill="#4a148c">ProjectionWorker (×4)</text>
+  <text x="290" y="172" font-size="9" fill="#555">• Reads from projection_log partition</text>
+  <text x="290" y="185" font-size="9" fill="#555">• Applies to sink (VisibilitySink)</text>
+  <text x="290" y="198" font-size="9" fill="#555">• Advances projector_checkpoint</text>
+  <text x="290" y="211" font-size="9" fill="#555">• batch_size: 256</text>
+
+  <!-- Sinks -->
+  <rect x="540" y="135" width="220" height="80" rx="5" fill="#fff" stroke="#7b1fa2"/>
+  <text x="650" y="155" text-anchor="middle" font-size="10" font-weight="bold" fill="#4a148c">Sinks</text>
+  <rect x="555" y="165" width="90" height="20" rx="3" fill="#e1bee7" stroke="#7b1fa2"/>
+  <text x="600" y="179" text-anchor="middle" font-size="8" fill="#4a148c">VisibilitySink</text>
+  <rect x="655" y="165" width="90" height="20" rx="3" fill="#e1bee7" stroke="#7b1fa2"/>
+  <text x="700" y="179" text-anchor="middle" font-size="8" fill="#4a148c">DsqlVisibility</text>
+  <text x="555" y="200" font-size="9" fill="#555">• vis_execution table</text>
+  <text x="555" y="213" font-size="9" fill="#555">• vis_rollup (sharded)</text>
+
+  <!-- Visibility Store -->
+  <rect x="40" y="230" width="200" height="55" rx="5" fill="#fff" stroke="#7b1fa2"/>
+  <text x="140" y="250" text-anchor="middle" font-size="10" font-weight="bold" fill="#4a148c">VisibilityQueryService</text>
+  <text x="50" y="267" font-size="9" fill="#555">• list_workflow_executions()</text>
+  <text x="50" y="280" font-size="9" fill="#555">• count_workflow_executions()</text>
+
+  <!-- Search Attributes -->
+  <rect x="280" y="230" width="220" height="55" rx="5" fill="#fff" stroke="#7b1fa2"/>
+  <text x="390" y="250" text-anchor="middle" font-size="10" font-weight="bold" fill="#4a148c">Search Attribute Indexes</text>
+  <text x="290" y="267" font-size="9" fill="#555">• sa_keyword_idx, sa_int_idx, sa_double_idx</text>
+  <text x="290" y="280" font-size="9" fill="#555">• sa_datetime_idx, sa_bool_idx, sa_text_token</text>
+
+  <!-- Rollup -->
+  <rect x="540" y="230" width="220" height="55" rx="5" fill="#fff" stroke="#7b1fa2"/>
+  <text x="650" y="250" text-anchor="middle" font-size="10" font-weight="bold" fill="#4a148c">Rollup</text>
+  <text x="555" y="267" font-size="9" fill="#555">• vis_rollup (namespace × dimension)</text>
+  <text x="555" y="280" font-size="9" fill="#555">• Sharded to avoid OCC conflicts</text>
+
+  <!-- Filter -->
+  <rect x="40" y="300" width="200" height="30" rx="4" fill="#fff" stroke="#7b1fa2"/>
+  <text x="140" y="319" text-anchor="middle" font-size="9" fill="#333">Filter (List Filter parsing)</text>
+
+  <!-- Checkpoint -->
+  <rect x="280" y="300" width="220" height="30" rx="4" fill="#fff" stroke="#7b1fa2"/>
+  <text x="390" y="319" text-anchor="middle" font-size="9" fill="#333">projector_checkpoint (per sink × partition)</text>
+
+  <!-- Arrows -->
+  <line x1="130" y1="85" x2="130" y2="135" stroke="#7b1fa2" stroke-width="1.2" marker-end="url(#ap)"/>
+  <line x1="240" y1="165" x2="280" y2="165" stroke="#555" stroke-width="1" marker-end="url(#ap)"/>
+  <line x1="500" y1="175" x2="540" y2="175" stroke="#555" stroke-width="1" marker-end="url(#ap)"/>
+
+  <!-- Output to Edge -->
+  <rect x="550" y="345" width="200" height="25" rx="4" fill="#fff3e0" stroke="#f57c00"/>
+  <text x="650" y="362" text-anchor="middle" font-size="9" fill="#e65100">← Edge queries visibility</text>
+
+  <line x1="140" y1="285" x2="550" y2="352" stroke="#f57c00" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#ap)"/>
+
+  <!-- Legend -->
+  <text x="40" y="370" font-size="9" fill="#555">Projection is outside the correctness path. A lagging projector is a quality problem, not a correctness failure. Workers are independently restartable.</text>
+</svg>

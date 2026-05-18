@@ -43,11 +43,11 @@ use time::OffsetDateTime;
 use tokeira_storage::{DispatchableActivityTask, DispatchableWorkflowTask};
 use tokeira_types::{LogicalTaskSeq, NamespaceId, QueueKey, RunKey, TaskQueueName, WorkerIdentity};
 use tokio::{
-    sync::{Mutex, Notify},
+    sync::{Mutex, Notify, oneshot},
     time::{Duration, Instant, timeout},
 };
 
-use crate::{DeliveryMetrics, QueryTask, metrics as runtime_metrics};
+use crate::{DeliveryMetrics, QueryTask, StartedWorkflowTask, metrics as runtime_metrics};
 
 /// Lightweight in-memory workflow-task broker.
 ///
@@ -91,9 +91,57 @@ struct BrokerState {
     general_ready: HashMap<QueueKey, VecDeque<TimestampedWorkflowTask>>,
     enqueued: HashSet<(RunKey, LogicalTaskSeq)>,
     waiter_counts: HashMap<QueueKey, usize>,
+    workflow_waiters: HashMap<QueueKey, VecDeque<WorkflowWaiter>>,
+    next_workflow_waiter_id: u64,
     query_ready: HashMap<QueueKey, VecDeque<QueryTask>>,
     query_waiter_counts: HashMap<QueueKey, usize>,
     denied_workers: HashSet<(NamespaceId, TaskQueueName, WorkerIdentity)>,
+}
+
+#[derive(Debug)]
+struct WorkflowWaiter {
+    id: u64,
+    worker: WorkerIdentity,
+    response_tx: oneshot::Sender<Result<Option<StartedWorkflowTask>>>,
+}
+
+#[derive(Debug)]
+pub struct ReservedPoller {
+    queue: QueueKey,
+    worker_identity: WorkerIdentity,
+    response_tx: oneshot::Sender<Result<Option<StartedWorkflowTask>>>,
+}
+
+impl ReservedPoller {
+    pub fn worker_identity(&self) -> &WorkerIdentity {
+        &self.worker_identity
+    }
+
+    pub fn deliver(self, task: StartedWorkflowTask) -> bool {
+        self.response_tx.send(Ok(Some(task))).is_ok()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum WorkflowPollResult {
+    Queued(DispatchableWorkflowTask, Instant),
+    Started(StartedWorkflowTask),
+}
+
+impl WorkflowPollResult {
+    pub fn into_queued(self) -> Option<(DispatchableWorkflowTask, Instant)> {
+        match self {
+            Self::Queued(task, entered_at) => Some((task, entered_at)),
+            Self::Started(_) => None,
+        }
+    }
+
+    pub fn queued_task(&self) -> Option<&DispatchableWorkflowTask> {
+        match self {
+            Self::Queued(task, _) => Some(task),
+            Self::Started(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -259,15 +307,18 @@ impl InMemoryBroker {
         queue: &QueueKey,
         worker: &WorkerIdentity,
         wait_for: Duration,
-    ) -> Result<Option<(DispatchableWorkflowTask, Instant)>> {
+    ) -> Result<Option<WorkflowPollResult>> {
         if self.is_denied(queue, worker).await {
             return Ok(None);
         }
         if let Some(task) = self.try_take(queue, worker).await? {
-            return Ok(Some(task));
+            return Ok(Some(WorkflowPollResult::Queued(task.0, task.1)));
         }
 
-        self.increment_waiter(queue).await;
+        let (response_tx, response_rx) = oneshot::channel();
+        let waiter_id = self
+            .insert_workflow_waiter(queue, worker.clone(), response_tx)
+            .await;
 
         // Create the notified future first, then re-check. This
         // closes the race between try_take and notify_waiters:
@@ -275,17 +326,77 @@ impl InMemoryBroker {
         // registering the waiter, we catch it here.
         let notified = self.wake.notified();
         if let Some(task) = self.try_take(queue, worker).await? {
-            self.decrement_waiter(queue).await;
-            return Ok(Some(task));
+            self.remove_workflow_waiter(queue, waiter_id).await;
+            return Ok(Some(WorkflowPollResult::Queued(task.0, task.1)));
         }
 
-        let _ = timeout(wait_for, notified).await;
-        self.decrement_waiter(queue).await;
+        tokio::select! {
+            response = response_rx => {
+                self.remove_workflow_waiter(queue, waiter_id).await;
+                return match response {
+                    Ok(result) => result.map(|task| task.map(WorkflowPollResult::Started)),
+                    Err(_) => Ok(None),
+                };
+            }
+            _ = notified => {}
+            _ = tokio::time::sleep(wait_for) => {
+                self.remove_workflow_waiter(queue, waiter_id).await;
+                return Ok(None);
+            }
+        }
+
+        self.remove_workflow_waiter(queue, waiter_id).await;
 
         if self.is_denied(queue, worker).await {
             return Ok(None);
         }
-        self.try_take(queue, worker).await
+        Ok(self
+            .try_take(queue, worker)
+            .await?
+            .map(|(task, entered_at)| WorkflowPollResult::Queued(task, entered_at)))
+    }
+
+    pub async fn try_reserve_poller(&self, queue: &QueueKey) -> Option<ReservedPoller> {
+        let mut inner = self.inner.lock().await;
+        loop {
+            let waiter = inner
+                .workflow_waiters
+                .get_mut(queue)
+                .and_then(|waiters| waiters.pop_front())?;
+            Self::decrement_waiter_count(&mut inner, queue);
+            if waiter.response_tx.is_closed() {
+                continue;
+            }
+            return Some(ReservedPoller {
+                queue: queue.clone(),
+                worker_identity: waiter.worker,
+                response_tx: waiter.response_tx,
+            });
+        }
+    }
+
+    pub async fn return_reserved_poller(&self, reserved: ReservedPoller) {
+        if reserved.response_tx.is_closed() {
+            return;
+        }
+        let mut inner = self.inner.lock().await;
+        let id = inner.next_workflow_waiter_id;
+        inner.next_workflow_waiter_id = inner.next_workflow_waiter_id.wrapping_add(1);
+        inner
+            .workflow_waiters
+            .entry(reserved.queue.clone())
+            .or_default()
+            .push_front(WorkflowWaiter {
+                id,
+                worker: reserved.worker_identity,
+                response_tx: reserved.response_tx,
+            });
+        *inner
+            .waiter_counts
+            .entry(reserved.queue.clone())
+            .or_default() += 1;
+        drop(inner);
+        self.wake.notify_waiters();
     }
 
     pub async fn queues_with_waiters(&self) -> HashSet<QueueKey> {
@@ -436,13 +547,45 @@ impl InMemoryBroker {
         ))
     }
 
-    async fn increment_waiter(&self, queue: &QueueKey) {
+    async fn insert_workflow_waiter(
+        &self,
+        queue: &QueueKey,
+        worker: WorkerIdentity,
+        response_tx: oneshot::Sender<Result<Option<StartedWorkflowTask>>>,
+    ) -> u64 {
         let mut inner = self.inner.lock().await;
+        let id = inner.next_workflow_waiter_id;
+        inner.next_workflow_waiter_id = inner.next_workflow_waiter_id.wrapping_add(1);
+        inner
+            .workflow_waiters
+            .entry(queue.clone())
+            .or_default()
+            .push_back(WorkflowWaiter {
+                id,
+                worker,
+                response_tx,
+            });
         *inner.waiter_counts.entry(queue.clone()).or_default() += 1;
+        id
     }
 
-    async fn decrement_waiter(&self, queue: &QueueKey) {
+    async fn remove_workflow_waiter(&self, queue: &QueueKey, waiter_id: u64) -> bool {
         let mut inner = self.inner.lock().await;
+        let removed = inner
+            .workflow_waiters
+            .get_mut(queue)
+            .and_then(|waiters| {
+                let index = waiters.iter().position(|waiter| waiter.id == waiter_id)?;
+                waiters.remove(index)
+            })
+            .is_some();
+        if removed {
+            Self::decrement_waiter_count(&mut inner, queue);
+        }
+        removed
+    }
+
+    fn decrement_waiter_count(inner: &mut BrokerState, queue: &QueueKey) {
         if let Some(count) = inner.waiter_counts.get_mut(queue) {
             *count -= 1;
             if *count == 0 {
@@ -843,7 +986,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(wrong, None);
-        assert_eq!(right.map(|entry| entry.0), Some(task));
+        assert_eq!(
+            right.and_then(|entry| entry.into_queued().map(|queued| queued.0)),
+            Some(task)
+        );
     }
 
     #[tokio::test]
@@ -1125,7 +1271,7 @@ mod tests {
                     )
                     .await
                     .unwrap()
-                    .map(|entry| entry.0);
+                    .and_then(|entry| entry.into_queued().map(|queued| queued.0));
 
                 prop_assert_eq!(claimed.map(|entry| entry.0), Some(target));
                 prop_assert_eq!(remaining, Some(other));
@@ -1320,7 +1466,10 @@ mod tests {
                     .await
                     .unwrap();
 
-                prop_assert_eq!(first.map(|entry| entry.0), Some(task));
+                prop_assert_eq!(
+                    first.and_then(|entry| entry.into_queued().map(|queued| queued.0)),
+                    Some(task)
+                );
                 prop_assert_eq!(second, None);
                 Ok::<(), proptest::test_runner::TestCaseError>(())
             })?;

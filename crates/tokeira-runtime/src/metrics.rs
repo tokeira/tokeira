@@ -12,7 +12,8 @@ pub const BROKER_POLL_TIMEOUT_TOTAL: &str = "tokeira_runtime_broker_poll_timeout
 pub const BROKER_QUEUE_DEPTH: &str = "tokeira_runtime_broker_queue_depth";
 pub const LANE_SUBMIT_DURATION_SECONDS: &str = "tokeira_runtime_lane_submit_duration_seconds";
 pub const LANE_QUEUE_WAIT_SECONDS: &str = "tokeira_runtime_lane_queue_wait_seconds";
-pub const LANE_PROCESSING_DURATION_SECONDS: &str = "tokeira_runtime_lane_processing_duration_seconds";
+pub const LANE_PROCESSING_DURATION_SECONDS: &str =
+    "tokeira_runtime_lane_processing_duration_seconds";
 pub const SCANNER_TICK_TOTAL: &str = "tokeira_runtime_scanner_tick_total";
 pub const SCANNER_DISPATCHED_TOTAL: &str = "tokeira_runtime_scanner_dispatched_total";
 pub const OCC_RETRY_TOTAL: &str = "tokeira_runtime_occ_retry_total";
@@ -28,7 +29,10 @@ pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (BROKER_QUEUE_DEPTH, MetricType::Gauge),
     (LANE_SUBMIT_DURATION_SECONDS, MetricType::DurationHistogram),
     (LANE_QUEUE_WAIT_SECONDS, MetricType::DurationHistogram),
-    (LANE_PROCESSING_DURATION_SECONDS, MetricType::DurationHistogram),
+    (
+        LANE_PROCESSING_DURATION_SECONDS,
+        MetricType::DurationHistogram,
+    ),
     (SCANNER_TICK_TOTAL, MetricType::Counter),
     (SCANNER_DISPATCHED_TOTAL, MetricType::Counter),
     (OCC_RETRY_TOTAL, MetricType::Counter),

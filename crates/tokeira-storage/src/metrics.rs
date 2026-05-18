@@ -13,7 +13,9 @@ pub const COMMIT_TRANSITION_DURATION_SECONDS: &str =
     "tokeira_storage_commit_transition_duration_seconds";
 pub const LOAD_RUN_DURATION_SECONDS: &str = "tokeira_storage_load_run_duration_seconds";
 pub const READ_HISTORY_DURATION_SECONDS: &str = "tokeira_storage_read_history_duration_seconds";
+pub const READ_HISTORY_EVENTS: &str = "tokeira_storage_read_history_events";
 pub const OPERATION_TOTAL: &str = "tokeira_storage_repository_operation_total";
+pub const DSQL_COMMITS_IN_FLIGHT: &str = "tokeira_dsql_commits_in_flight";
 pub const DSQL_POOL_CONNECTIONS_TOTAL: &str = "tokeira_dsql_pool_connections_total";
 pub const DSQL_POOL_CHECKOUT_DURATION_SECONDS: &str = "tokeira_dsql_pool_checkout_duration_seconds";
 pub const DSQL_POOL_EMPTY_RESERVOIR_TOTAL: &str = "tokeira_dsql_pool_empty_reservoir_total";
@@ -68,7 +70,9 @@ pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     ),
     (LOAD_RUN_DURATION_SECONDS, MetricType::DurationHistogram),
     (READ_HISTORY_DURATION_SECONDS, MetricType::DurationHistogram),
+    (READ_HISTORY_EVENTS, MetricType::Histogram),
     (OPERATION_TOTAL, MetricType::Counter),
+    (DSQL_COMMITS_IN_FLIGHT, MetricType::Gauge),
     (DSQL_POOL_CONNECTIONS_TOTAL, MetricType::Gauge),
     (
         DSQL_POOL_CHECKOUT_DURATION_SECONDS,
@@ -161,8 +165,20 @@ pub fn record_read_history_duration(duration: std::time::Duration) {
     histogram!(READ_HISTORY_DURATION_SECONDS).record(duration.as_secs_f64());
 }
 
+pub fn record_read_history_events(count: usize) {
+    histogram!(READ_HISTORY_EVENTS).record(count as f64);
+}
+
 pub fn record_storage_operation(operation: &'static str, outcome: &'static str) {
     counter!(OPERATION_TOTAL, "operation" => operation, "outcome" => outcome).increment(1);
+}
+
+pub fn increment_dsql_commits_in_flight() {
+    gauge!(DSQL_COMMITS_IN_FLIGHT).increment(1.0);
+}
+
+pub fn decrement_dsql_commits_in_flight() {
+    gauge!(DSQL_COMMITS_IN_FLIGHT).decrement(1.0);
 }
 
 pub fn record_dsql_pool_connections_total(count: usize) {
@@ -573,6 +589,27 @@ mod tests {
         }
 
         #[test]
+        fn read_history_event_histogram_records_each_observation(values in prop::collection::vec(0usize..10_000, 1..32)) {
+            let recorder = DebuggingRecorder::new();
+            with_local_recorder(&recorder, || {
+                for value in &values {
+                    record_read_history_events(*value);
+                }
+            });
+            let snapshot = snapshot_map(&recorder);
+            let (_, value) = snapshot.get(READ_HISTORY_EVENTS).unwrap();
+            match value {
+                DebugValue::Histogram(observations) => {
+                    prop_assert_eq!(observations.len(), values.len());
+                    for (observation, expected) in observations.iter().zip(values.iter()) {
+                        prop_assert_eq!(observation.into_inner(), *expected as f64);
+                    }
+                }
+                _ => prop_assert!(false, "expected histogram"),
+            }
+        }
+
+        #[test]
         fn gauge_helpers_are_last_write_wins(values in prop::collection::vec(0usize..10_000, 1..32)) {
             let recorder = DebuggingRecorder::new();
             with_local_recorder(&recorder, || {
@@ -583,6 +620,29 @@ mod tests {
             let snapshot = snapshot_map(&recorder);
             let (_, value) = snapshot.get(DSQL_RESERVOIR_IN_FLIGHT).unwrap();
             prop_assert_eq!(value, &DebugValue::Gauge((*values.last().unwrap() as f64).into()));
+        }
+
+        #[test]
+        fn dsql_commit_in_flight_gauge_balances_increments_and_decrements(
+            increments in 1usize..128,
+            decrements in 0usize..128,
+        ) {
+            let decrements = decrements.min(increments);
+            let recorder = DebuggingRecorder::new();
+            with_local_recorder(&recorder, || {
+                for _ in 0..increments {
+                    increment_dsql_commits_in_flight();
+                }
+                for _ in 0..decrements {
+                    decrement_dsql_commits_in_flight();
+                }
+            });
+            let snapshot = snapshot_map(&recorder);
+            let (_, value) = snapshot.get(DSQL_COMMITS_IN_FLIGHT).unwrap();
+            prop_assert_eq!(
+                value,
+                &DebugValue::Gauge(((increments - decrements) as f64).into()),
+            );
         }
 
         #[test]

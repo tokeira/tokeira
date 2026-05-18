@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 450" font-family="Inter, -apple-system, sans-serif" font-size="11">
+  <defs>
+    <marker id="ae" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="#555"/>
+    </marker>
+  </defs>
+
+  <rect width="900" height="450" fill="#fafafa" rx="8"/>
+  <text x="450" y="25" text-anchor="middle" font-size="14" font-weight="bold" fill="#1a1a1a">Plane 1 — Compatibility Edge (Implementation View)</text>
+
+  <!-- External clients -->
+  <rect x="30" y="45" width="100" height="30" rx="4" fill="#e8f4fd" stroke="#4a9eda"/>
+  <text x="80" y="64" text-anchor="middle" font-size="9" fill="#2c6faa">SDK Workers</text>
+  <rect x="150" y="45" width="100" height="30" rx="4" fill="#e8f4fd" stroke="#4a9eda"/>
+  <text x="200" y="64" text-anchor="middle" font-size="9" fill="#2c6faa">SDK Clients</text>
+  <rect x="270" y="45" width="100" height="30" rx="4" fill="#e8f4fd" stroke="#4a9eda"/>
+  <text x="320" y="64" text-anchor="middle" font-size="9" fill="#2c6faa">Temporal UI</text>
+
+  <!-- tokeira-edge boundary -->
+  <rect x="20" y="90" width="860" height="310" rx="8" fill="#fff3e0" stroke="#f57c00" stroke-width="1.5" stroke-dasharray="4,2"/>
+  <text x="40" y="110" font-size="12" font-weight="bold" fill="#e65100">tokeira-edge</text>
+
+  <!-- gRPC layer -->
+  <rect x="40" y="120" width="820" height="55" rx="5" fill="#ffe0b2" stroke="#f57c00"/>
+  <text x="450" y="138" text-anchor="middle" font-size="10" font-weight="bold" fill="#e65100">gRPC Transport (tonic + tonic-web + CORS)</text>
+  <rect x="60" y="148" width="120" height="20" rx="3" fill="#fff" stroke="#f57c00"/>
+  <text x="120" y="162" text-anchor="middle" font-size="8" fill="#333">WorkflowServiceGrpc</text>
+  <rect x="200" y="148" width="120" height="20" rx="3" fill="#fff" stroke="#f57c00"/>
+  <text x="260" y="162" text-anchor="middle" font-size="8" fill="#333">OperatorServiceGrpc</text>
+  <rect x="340" y="148" width="100" height="20" rx="3" fill="#fff" stroke="#f57c00"/>
+  <text x="390" y="162" text-anchor="middle" font-size="8" fill="#333">Reflection</text>
+  <rect x="460" y="148" width="100" height="20" rx="3" fill="#fff" stroke="#f57c00"/>
+  <text x="510" y="162" text-anchor="middle" font-size="8" fill="#333">HealthService</text>
+  <rect x="580" y="148" width="100" height="20" rx="3" fill="#fff" stroke="#f57c00"/>
+  <text x="630" y="162" text-anchor="middle" font-size="8" fill="#333">HttpProxy</text>
+
+  <!-- Interceptors -->
+  <rect x="40" y="185" width="250" height="50" rx="5" fill="#fff" stroke="#f57c00"/>
+  <text x="165" y="203" text-anchor="middle" font-size="10" font-weight="bold" fill="#333">EdgeInterceptors</text>
+  <text x="55" y="220" font-size="9" fill="#555">• Namespace resolution</text>
+  <text x="55" y="232" font-size="9" fill="#555">• Action authorization</text>
+
+  <!-- Namespace Cache -->
+  <rect x="310" y="185" width="170" height="50" rx="5" fill="#fff" stroke="#f57c00"/>
+  <text x="395" y="203" text-anchor="middle" font-size="10" font-weight="bold" fill="#333">InMemoryNamespaceCache</text>
+  <text x="320" y="220" font-size="9" fill="#555">• get(name) → ResolvedNamespace</text>
+  <text x="320" y="232" font-size="9" fill="#555">• insert(), list()</text>
+
+  <!-- Router -->
+  <rect x="500" y="185" width="180" height="50" rx="5" fill="#fff" stroke="#f57c00"/>
+  <text x="590" y="203" text-anchor="middle" font-size="10" font-weight="bold" fill="#333">EdgeRouter</text>
+  <text x="510" y="220" font-size="9" fill="#555">• LocalOnlyRouter (compose)</text>
+  <text x="510" y="232" font-size="9" fill="#555">• CacheBackedRouter (multi-node)</text>
+
+  <!-- Long Poll Gate -->
+  <rect x="700" y="185" width="150" height="50" rx="5" fill="#fff" stroke="#f57c00"/>
+  <text x="775" y="203" text-anchor="middle" font-size="10" font-weight="bold" fill="#333">LongPollGate</text>
+  <text x="710" y="220" font-size="9" fill="#555">• Admission control</text>
+  <text x="710" y="232" font-size="9" fill="#555">• Timeout management</text>
+
+  <!-- WorkflowService -->
+  <rect x="40" y="250" width="400" height="70" rx="5" fill="#fff" stroke="#f57c00" stroke-width="1.5"/>
+  <text x="240" y="268" text-anchor="middle" font-size="10" font-weight="bold" fill="#e65100">WorkflowService</text>
+  <text x="55" y="285" font-size="9" fill="#555">• start_workflow_execution, signal, cancel, terminate, reset</text>
+  <text x="55" y="298" font-size="9" fill="#555">• poll_workflow_task_queue, respond_workflow_task_completed</text>
+  <text x="55" y="311" font-size="9" fill="#555">• poll_activity_task_queue, respond_activity_task_completed</text>
+
+  <!-- OperatorService -->
+  <rect x="460" y="250" width="200" height="50" rx="5" fill="#fff" stroke="#f57c00"/>
+  <text x="560" y="268" text-anchor="middle" font-size="10" font-weight="bold" fill="#e65100">OperatorService</text>
+  <text x="470" y="285" font-size="9" fill="#555">• describe_namespace</text>
+  <text x="470" y="298" font-size="9" fill="#555">• get_cluster_info</text>
+
+  <!-- Translate -->
+  <rect x="680" y="250" width="170" height="50" rx="5" fill="#fff" stroke="#f57c00"/>
+  <text x="765" y="268" text-anchor="middle" font-size="10" font-weight="bold" fill="#e65100">translate/</text>
+  <text x="690" y="285" font-size="9" fill="#555">• to_internal (proto → domain)</text>
+  <text x="690" y="298" font-size="9" fill="#555">• from_internal (domain → proto)</text>
+
+  <!-- Supporting modules -->
+  <rect x="40" y="335" width="130" height="35" rx="4" fill="#fff" stroke="#f57c00"/>
+  <text x="105" y="357" text-anchor="middle" font-size="9" fill="#333">PollerRegistry</text>
+
+  <rect x="185" y="335" width="130" height="35" rx="4" fill="#fff" stroke="#f57c00"/>
+  <text x="250" y="357" text-anchor="middle" font-size="9" fill="#333">PendingQueryStore</text>
+
+  <rect x="330" y="335" width="130" height="35" rx="4" fill="#fff" stroke="#f57c00"/>
+  <text x="395" y="357" text-anchor="middle" font-size="9" fill="#333">HistoryWaitRegistry</text>
+
+  <rect x="475" y="335" width="130" height="35" rx="4" fill="#fff" stroke="#f57c00"/>
+  <text x="540" y="357" text-anchor="middle" font-size="9" fill="#333">RoutingCache</text>
+
+  <rect x="620" y="335" width="130" height="35" rx="4" fill="#fff" stroke="#f57c00"/>
+  <text x="685" y="357" text-anchor="middle" font-size="9" fill="#333">BatchEngine</text>
+
+  <!-- Output to Runtime -->
+  <rect x="350" y="400" width="200" height="30" rx="5" fill="#e8f5e9" stroke="#388e3c"/>
+  <text x="450" y="419" text-anchor="middle" font-size="10" fill="#1b5e20">→ tokeira-runtime</text>
+
+  <!-- Arrows -->
+  <line x1="200" y1="75" x2="200" y2="120" stroke="#555" stroke-width="1" marker-end="url(#ae)"/>
+  <line x1="240" y1="320" x2="350" y2="400" stroke="#388e3c" stroke-width="1.2" marker-end="url(#ae)"/>
+
+  <!-- Legend -->
+  <text x="40" y="440" font-size="9" fill="#555">Edge is intentionally thin: translate gRPC → internal commands, gate long-polls, resolve namespaces, route to runtime. No workflow semantics here.</text>
+</svg>

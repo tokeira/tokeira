@@ -427,6 +427,7 @@ async fn start_workflow(
             request: request_context("start-1"),
             now: OffsetDateTime::now_utc(),
             cron_schedule: None,
+            reserved_poller_identity: None,
         })
         .await?;
     Ok(match result {

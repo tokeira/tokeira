@@ -1396,6 +1396,7 @@ impl WorkflowService {
             request: schedule_request_context(actual_time),
             now: actual_time,
             cron_schedule: Some(schedule_id.0.clone()),
+            reserved_poller_identity: None,
         };
         let outcome = self
             .runtime
@@ -1403,7 +1404,9 @@ impl WorkflowService {
             .await
             .map_err(EdgeError::from)?;
         let result = match outcome {
-            StartWorkflowResult::Started { run_key, run_id } => ScheduleActionResult {
+            StartWorkflowResult::Started {
+                run_key, run_id, ..
+            } => ScheduleActionResult {
                 schedule_time: nominal_time,
                 actual_time,
                 start_workflow_result: Some(WorkflowExecution {
@@ -1674,27 +1677,21 @@ impl WorkflowService {
                     .await
                     .map_err(EdgeError::from)?;
                 match outcome {
-                    StartWorkflowResult::Started { .. } => {
-                        let loaded = self
-                            .repo
-                            .load_run(internal.run_key)
-                            .await
-                            .map_err(EdgeError::from)?;
-                        let tokeira_kernel::LoadedRun::Existing(state) = loaded else {
-                            return Err(EdgeError::Internal(format!(
-                                "started run {:?} not found after commit",
-                                internal.run_key
-                            )));
-                        };
-                        self.notify_history_run_key(internal.run_key, state.last_event_id)
-                            .await;
+                    StartWorkflowResult::Started {
+                        mutation_metadata, ..
+                    } => {
+                        self.notify_history_run_key(
+                            internal.run_key,
+                            mutation_metadata.last_event_id,
+                        )
+                        .await;
                         let mut response = from_internal::start_response(
                             &internal,
                             WorkflowMutationOutcome {
-                                transition_seq: state.transition_seq.0,
-                                last_event_id: state.last_event_id,
+                                transition_seq: mutation_metadata.transition_seq.0,
+                                last_event_id: mutation_metadata.last_event_id,
                                 was_duplicate: false,
-                                execution_status: state.status,
+                                execution_status: mutation_metadata.execution_status,
                                 new_run_id: None,
                             },
                         );
@@ -3237,7 +3234,7 @@ impl WorkflowService {
                 loop {
                     let history = self
                         .repo
-                        .read_history(run_key, caller_last_event_id, usize::MAX)
+                        .read_history(run_key, caller_last_event_id, limit)
                         .await
                         .map_err(EdgeError::from)?;
                     let current_last_event_id = history

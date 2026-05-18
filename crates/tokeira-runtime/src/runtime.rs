@@ -18,16 +18,17 @@ use tokeira_kernel::{
     ActivityOp, ActivityResolution, ActivityResolvedRequest, BasicKernel, Command, DispatchOp,
     HistoryEvent, HistoryEventKind, LoadedRun, SignalRequest, SignalWithStartRequest, StartRequest,
     StartWorkflowTaskRequest, TerminateRequest, Transition, UpdateRequest,
-    WorkflowIdConflictPolicy, WorkflowIdReusePolicy, WorkflowTaskCompletedRequest,
+    WorkflowIdConflictPolicy, WorkflowIdReusePolicy, WorkflowState, WorkflowTaskCompletedRequest,
 };
 use tokeira_storage::{
     CommitResult, DispatchableActivityTask, DispatchableWorkflowTask, LeaseOutcome,
     LeaseRepository, RunRepository,
 };
 use tokeira_types::{
-    ActivityTaskToken, BuildId, DeploymentId, ExecutionRef, Headers, IncarnationId, NamespaceId,
-    Payload, Payloads, QueueKey, RequestContext, RetryPolicy, RunId, RunKey, ShardEpoch, ShardId,
-    TaskKind, TaskQueueName, WorkerIdentity, WorkflowTaskToken,
+    ActivityTaskToken, BuildId, DeploymentId, ExecutionRef, ExecutionStatus, Headers,
+    IncarnationId, NamespaceId, Payload, Payloads, QueueKey, RequestContext, RetryPolicy, RunId,
+    RunKey, ShardEpoch, ShardId, TaskKind, TaskQueueName, TransitionSeq, WorkerIdentity,
+    WorkflowTaskToken,
 };
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -38,7 +39,7 @@ use crate::{
         ActivityTimeoutScannerConfig, ActivityTrackingState, run_activity_timeout_scanner,
     },
     backlog::{BacklogConfig, run_drain_loop, run_grace_scanner},
-    broker::{InMemoryActivityBroker, InMemoryBroker},
+    broker::{InMemoryActivityBroker, InMemoryBroker, ReservedPoller, WorkflowPollResult},
     buffered_queries::{BufferedQuery, BufferedQueryRegistry},
     drain::RuntimeDrain,
     errors::NotShardOwner,
@@ -54,7 +55,9 @@ use crate::{
     query::{QueryResult, QueryTask},
     recovery::{lease_rejected_error, run_lease_renewer, sweep_shard},
     retry::{RetryDecision, evaluate_activity_retry},
-    scanner::{TimerScannerConfig, lane_index_for, pick_lane, run_timer_scanner},
+    scanner::{
+        TimerScannerConfig, lane_index_for_run_key, pick_lane_for_run_key, run_timer_scanner,
+    },
     shard::{ShardOwner, shard_for},
     timeout::{
         WorkflowTimeoutEntry, WorkflowTimeoutScannerConfig, WorkflowTimeoutTrackingState,
@@ -161,10 +164,27 @@ pub struct ResetWorkflowResult {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct MutationMetadata {
+    pub transition_seq: TransitionSeq,
+    pub last_event_id: i64,
+    pub execution_status: ExecutionStatus,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum StartWorkflowResult {
-    Started { run_key: RunKey, run_id: RunId },
-    UsedExisting { run_key: RunKey, run_id: RunId },
-    Rejected { run_key: RunKey, run_id: RunId },
+    Started {
+        run_key: RunKey,
+        run_id: RunId,
+        mutation_metadata: MutationMetadata,
+    },
+    UsedExisting {
+        run_key: RunKey,
+        run_id: RunId,
+    },
+    Rejected {
+        run_key: RunKey,
+        run_id: RunId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -943,10 +963,34 @@ where
     }
 
     /// Start a new workflow execution.
-    pub async fn start_workflow(&self, request: StartRequest) -> Result<CommitResult> {
-        let result = self
+    pub async fn start_workflow(&self, mut request: StartRequest) -> Result<CommitResult> {
+        let reserved_poller = self.try_reserve_start_poller(&request).await;
+        if let Some(reserved) = &reserved_poller {
+            request.reserved_poller_identity = Some(reserved.worker_identity().clone());
+        }
+
+        let result = match self
             .submit(request.run_key, Command::Start(request.clone()))
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(reserved) = reserved_poller {
+                    self.broker.return_reserved_poller(reserved).await;
+                }
+                return Err(error);
+            }
+        };
+        match (&result, reserved_poller) {
+            (CommitResult::Applied { new_state }, Some(reserved)) => {
+                self.deliver_reserved_start_workflow_task(new_state, reserved)
+                    .await?;
+            }
+            (_, Some(reserved)) => {
+                self.broker.return_reserved_poller(reserved).await;
+            }
+            (_, None) => {}
+        }
         if matches!(result, CommitResult::Applied { .. })
             && (request.workflow_execution_timeout.is_some()
                 || request.workflow_run_timeout.is_some())
@@ -965,6 +1009,34 @@ where
         Ok(result)
     }
 
+    async fn try_reserve_start_poller(&self, request: &StartRequest) -> Option<ReservedPoller> {
+        let queue = QueueKey {
+            namespace_id: request.namespace_id,
+            task_queue: request.task_queue.clone(),
+            task_kind: TaskKind::Workflow,
+            deployment: request.deployment.clone(),
+            build_id: request.build_id.clone(),
+        };
+        self.broker.try_reserve_poller(&queue).await
+    }
+
+    async fn deliver_reserved_start_workflow_task(
+        &self,
+        new_state: &WorkflowState,
+        reserved: ReservedPoller,
+    ) -> Result<()> {
+        let task = self
+            .started_workflow_task_from_state(new_state, true)
+            .await?;
+        if !reserved.deliver(task) {
+            tracing::warn!(
+                run_key = %new_state.run_key.0,
+                "reserved workflow task poller disappeared after durable start commit; timeout scanner will recover"
+            );
+        }
+        Ok(())
+    }
+
     pub async fn start_workflow_with_policy(
         &self,
         request: StartRequest,
@@ -980,9 +1052,10 @@ where
         match resolution {
             ConflictResolution::Absent | ConflictResolution::ClosedAllowReuse => {
                 match self.start_workflow(request.clone()).await? {
-                    CommitResult::Applied { .. } => Ok(StartWorkflowResult::Started {
+                    CommitResult::Applied { new_state } => Ok(StartWorkflowResult::Started {
                         run_key: request.run_key,
                         run_id: request.run_id,
+                        mutation_metadata: mutation_metadata(&new_state),
                     }),
                     CommitResult::Duplicate => Err(anyhow!(
                         "unexpected duplicate start commit for {:?}",
@@ -1003,9 +1076,10 @@ where
                 )
                 .await?;
                 match self.start_workflow(request.clone()).await? {
-                    CommitResult::Applied { .. } => Ok(StartWorkflowResult::Started {
+                    CommitResult::Applied { new_state } => Ok(StartWorkflowResult::Started {
                         run_key: request.run_key,
                         run_id: request.run_id,
+                        mutation_metadata: mutation_metadata(&new_state),
                     }),
                     CommitResult::Duplicate => Err(anyhow!(
                         "unexpected duplicate start commit for {:?}",
@@ -1308,14 +1382,14 @@ where
         worker_identity: WorkerIdentity,
         timeout_after: tokio::time::Duration,
     ) -> Result<Option<StartedWorkflowTask>> {
-        let offered = match self
+        let polled = match self
             .broker
             .poll_workflow_task(&queue, &worker_identity, timeout_after)
             .await?
         {
-            Some(offered) => {
+            Some(polled) => {
                 self.delivery_metrics.record_poll_success(&queue);
-                offered
+                polled
             }
             None => {
                 self.delivery_metrics.record_poll_timeout(&queue);
@@ -1323,10 +1397,15 @@ where
             }
         };
 
-        let started = self
-            .start_polled_workflow_task(offered.0, offered.1, worker_identity)
-            .await?;
-        Ok(Some(started))
+        match polled {
+            WorkflowPollResult::Queued(offered, entered_at) => {
+                let started = self
+                    .start_polled_workflow_task(offered, entered_at, worker_identity)
+                    .await?;
+                Ok(Some(started))
+            }
+            WorkflowPollResult::Started(started) => Ok(Some(started)),
+        }
     }
 
     pub async fn try_claim_workflow_task(
@@ -1596,8 +1675,52 @@ where
             workflow_id: new_state.workflow_id,
             task_queue: new_state.task_queue,
             previous_started_event_id: new_state.previous_started_event_id,
+            is_sticky_match: offered.sticky_preferred.as_ref() == Some(&worker_identity),
             scheduled_time: pending.scheduled_at,
             started_time: pending.started_at.unwrap_or(now),
+            token,
+        })
+    }
+
+    async fn started_workflow_task_from_state(
+        &self,
+        state: &WorkflowState,
+        is_sticky_match: bool,
+    ) -> Result<StartedWorkflowTask> {
+        let pending = state
+            .pending_workflow_task
+            .clone()
+            .ok_or_else(|| anyhow!("workflow task missing after reserved start"))?;
+        let started_event_id = pending
+            .started_event_id
+            .ok_or_else(|| anyhow!("reserved workflow task missing started_event_id"))?;
+        let started_at = pending
+            .started_at
+            .ok_or_else(|| anyhow!("reserved workflow task missing started_at"))?;
+        let token = WorkflowTaskToken {
+            run_key: state.run_key,
+            logical_seq: pending.logical_seq,
+            started_event_id,
+            attempt: pending.attempt,
+            shard_epoch: self.current_shard_epoch(state.run_key).await?,
+        };
+        let shard_id = self.shard_id_for(state.run_key).await;
+        self.wft_timeout_tracking.insert(WftTimeoutEntry {
+            run_key: state.run_key,
+            shard_id,
+            logical_seq: pending.logical_seq,
+            started_event_id,
+            started_at,
+            workflow_task_timeout: state.workflow_task_timeout,
+        });
+        Ok(StartedWorkflowTask {
+            run_key: state.run_key,
+            workflow_id: state.workflow_id.clone(),
+            task_queue: state.task_queue.clone(),
+            previous_started_event_id: state.previous_started_event_id,
+            is_sticky_match,
+            scheduled_time: pending.scheduled_at,
+            started_time: started_at,
             token,
         })
     }
@@ -1621,11 +1744,7 @@ where
             }
         }
         let lane = self.pick_lane(run_key);
-        let lane_id = {
-            let shard_count = self.shard_owner.read().unwrap().shard_count();
-            let shard_id = shard_for(run_key, shard_count);
-            lane_index_for(shard_id, self.lanes.len())
-        };
+        let lane_id = lane_index_for_run_key(run_key, self.lanes.len());
         let started = std::time::Instant::now();
         let result = lane.submit(run_key, command).await?;
         runtime_metrics::record_lane_submit_duration(lane_id, started.elapsed());
@@ -1646,11 +1765,7 @@ where
             }
         }
         let lane = self.pick_lane(run_key);
-        let lane_id = {
-            let shard_count = self.shard_owner.read().unwrap().shard_count();
-            let shard_id = shard_for(run_key, shard_count);
-            lane_index_for(shard_id, self.lanes.len())
-        };
+        let lane_id = lane_index_for_run_key(run_key, self.lanes.len());
         let started = std::time::Instant::now();
         let result = lane.submit(run_key, command).await?;
         runtime_metrics::record_lane_submit_duration(lane_id, started.elapsed());
@@ -1795,16 +1910,12 @@ where
     }
 
     fn pick_lane(&self, run_key: RunKey) -> &LaneHandle {
-        let shard_count = self.shard_owner.read().unwrap().shard_count();
-        let shard_id = shard_for(run_key, shard_count);
-        pick_lane(&self.lanes, self.lanes.len(), shard_id)
+        pick_lane_for_run_key(&self.lanes, self.lanes.len(), run_key)
     }
 
     #[cfg(test)]
     fn lane_index(&self, run_key: RunKey) -> usize {
-        let shard_count = self.shard_owner.read().unwrap().shard_count();
-        let shard_id = shard_for(run_key, shard_count);
-        crate::scanner::lane_index_for(shard_id, self.lanes.len())
+        crate::scanner::lane_index_for_run_key(run_key, self.lanes.len())
     }
 
     /// Cancel the background timer scanner and wait for
@@ -2219,8 +2330,16 @@ fn is_externally_routed_command(command: &Command) -> bool {
     )
 }
 
+fn mutation_metadata(state: &WorkflowState) -> MutationMetadata {
+    MutationMetadata {
+        transition_seq: state.transition_seq,
+        last_event_id: state.last_event_id,
+        execution_status: state.status,
+    }
+}
+
 /// A workflow task that has been polled and started.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StartedWorkflowTask {
     /// Unique key for the workflow run.
     pub run_key: RunKey,
@@ -2231,6 +2350,8 @@ pub struct StartedWorkflowTask {
     /// started_event_id of the most recently completed
     /// workflow task.
     pub previous_started_event_id: i64,
+    /// Whether this task was delivered to the worker that owns sticky cache.
+    pub is_sticky_match: bool,
     /// Timestamp of the scheduling event for this task.
     pub scheduled_time: OffsetDateTime,
     /// Timestamp of the start event for this task.
@@ -2298,7 +2419,7 @@ mod tests {
         },
         publisher::RuntimeDispatchPublisher,
         retry::{RetryDecision, compute_retry_backoff, evaluate_activity_retry},
-        scanner::{TimerScannerConfig, lane_index_for, pick_lane, scan_due_timers_once},
+        scanner::{TimerScannerConfig, lane_index_for_run_key, scan_due_timers_once},
         timeout::{
             WorkflowTimeoutEntry, WorkflowTimeoutScannerConfig, WorkflowTimeoutTrackingState,
             WorkflowTimeoutViolation, evaluate_workflow_timeout, scan_workflow_timeouts_once,
@@ -2339,8 +2460,77 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn reserved_start_direct_delivery_suppresses_broker_dispatch_and_tracks_timeout() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = Arc::new(TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        ));
+        let request = sample_start_request(None, None);
+        let queue = QueueKey {
+            namespace_id: request.namespace_id,
+            task_queue: request.task_queue.clone(),
+            task_kind: TaskKind::Workflow,
+            deployment: None,
+            build_id: None,
+        };
+        let worker = WorkerIdentity("reserved-worker".to_string());
+        let poll_runtime = runtime.clone();
+        let poll_queue = queue.clone();
+        let poll_worker = worker.clone();
+        let poller = tokio::spawn(async move {
+            poll_runtime
+                .poll_workflow_task(poll_queue, poll_worker, tokio::time::Duration::from_secs(5))
+                .await
+                .unwrap()
+                .expect("reserved poller should receive the started WFT")
+        });
+
+        while !runtime.broker.queues_with_waiters().await.contains(&queue) {
+            tokio::task::yield_now().await;
+        }
+
+        let run_key = request.run_key;
+        let result = runtime.start_workflow(request).await.unwrap();
+        assert!(matches!(result, CommitResult::Applied { .. }));
+        let started = poller.await.unwrap();
+        assert_eq!(started.run_key, run_key);
+        assert_eq!(started.token.started_event_id, 3);
+
+        let leftover = runtime
+            .broker
+            .poll_workflow_task(
+                &queue,
+                &WorkerIdentity("other-worker".to_string()),
+                tokio::time::Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        assert_eq!(leftover, None);
+
+        let tracked = runtime.wft_timeout_tracking.snapshot();
+        assert_eq!(tracked.len(), 1);
+        assert_eq!(tracked[0].run_key, run_key);
+        assert_eq!(tracked[0].started_event_id, started.token.started_event_id);
+
+        let history = repo.read_history(run_key, 0, 16).await.unwrap();
+        assert!(matches!(
+            history.get(1).map(|event| &event.kind),
+            Some(HistoryEventKind::WorkflowTaskScheduled { .. })
+        ));
+        assert!(matches!(
+            history.get(2).map(|event| &event.kind),
+            Some(HistoryEventKind::WorkflowTaskStarted { identity, .. }) if identity == &worker
+        ));
+    }
+
     #[test]
-    fn test_pick_lane_returns_correct_handle() {
+    fn test_pick_lane_returns_run_key_routed_handle() {
         let rt = Runtime::new().unwrap();
         rt.block_on(async move {
             let repo = Arc::new(InMemoryStore::with_shard_count(8));
@@ -2360,17 +2550,17 @@ mod tests {
                 true,
                 Arc::new(VersioningRuleStore::default()),
             );
-            let shard_id = ShardId(7);
-            let lane_ptr =
-                pick_lane(&runtime.lanes, runtime.lanes.len(), shard_id) as *const LaneHandle;
-            let expected_ptr = &runtime.lanes[3] as *const LaneHandle;
+            let run_key = RunKey(Uuid::from_u128(7));
+            let lane_index = lane_index_for_run_key(run_key, runtime.lanes.len());
+            let lane_ptr = runtime.pick_lane(run_key) as *const LaneHandle;
+            let expected_ptr = &runtime.lanes[lane_index] as *const LaneHandle;
 
             assert_eq!(lane_ptr, expected_ptr);
         });
     }
 
     #[test]
-    fn test_runtime_pick_lane_uses_shard() {
+    fn same_shard_run_keys_can_route_to_different_lanes() {
         let rt = Runtime::new().unwrap();
         rt.block_on(async move {
             let shard_count = 8;
@@ -2392,14 +2582,18 @@ mod tests {
                 Arc::new(VersioningRuleStore::default()),
             );
             let first = RunKey(Uuid::from_u128(3));
-            let second = (4u128..10_000)
+            let first_shard = shard_for(first, shard_count);
+            let first_lane = runtime.lane_index(first);
+            let second = (4u128..100_000)
                 .map(|value| RunKey(Uuid::from_u128(value)))
                 .find(|candidate| {
-                    shard_for(*candidate, shard_count) == shard_for(first, shard_count)
+                    shard_for(*candidate, shard_count) == first_shard
+                        && runtime.lane_index(*candidate) != first_lane
                 })
-                .expect("same-shard run key");
+                .expect("same-shard run key on a different lane");
 
-            assert_eq!(runtime.lane_index(first), runtime.lane_index(second));
+            assert_eq!(shard_for(second, shard_count), first_shard);
+            assert_ne!(runtime.lane_index(first), runtime.lane_index(second));
         });
     }
 
@@ -2670,8 +2864,9 @@ mod tests {
             .await
             .unwrap()
             .expect("redirected workflow task should deliver");
-        assert_eq!(task.0.run_key, run_key);
-        assert_eq!(task.0.queue.build_id, Some(BuildId("new".to_string())));
+        let (task, _) = task.into_queued().expect("queued workflow task");
+        assert_eq!(task.run_key, run_key);
+        assert_eq!(task.queue.build_id, Some(BuildId("new".to_string())));
     }
 
     #[tokio::test]
@@ -3104,8 +3299,7 @@ mod tests {
                     BacklogConfig::default(),
                 );
                 let run_key = RunKey(Uuid::from_u128(run));
-                let shard_id = shard_for(run_key, runtime.shard_owner.read().unwrap().shard_count());
-                let lane_ptr = pick_lane(&runtime.lanes, lane_count, shard_id) as *const LaneHandle as usize;
+                let lane_ptr = runtime.pick_lane(run_key) as *const LaneHandle as usize;
                 let expected_ptr = &runtime.lanes[runtime.lane_index(run_key)] as *const LaneHandle as usize;
                 (lane_ptr, expected_ptr)
             });
@@ -3119,7 +3313,6 @@ mod tests {
             runs in proptest::collection::vec(any::<u128>(), 0..20),
             timer_ids in proptest::collection::vec("[a-z0-9]{1,8}", 0..20),
             lane_count in 1usize..16usize,
-            shard_count in 1u32..16u32,
         ) {
             let rt = Runtime::new().unwrap();
             rt.block_on(async move {
@@ -3145,7 +3338,7 @@ mod tests {
                         captured.lock().unwrap().push((
                             due.run_key,
                             due.timer_id,
-                            lane_index_for(shard_for(due.run_key, shard_count), lane_count),
+                            lane_index_for_run_key(due.run_key, lane_count),
                             fired_at,
                         ));
                         Ok(())
@@ -3160,7 +3353,7 @@ mod tests {
                     prop_assert_eq!(timer_id, &due.timer_id);
                     prop_assert_eq!(
                         *lane_index,
-                        lane_index_for(shard_for(due.run_key, shard_count), lane_count)
+                        lane_index_for_run_key(due.run_key, lane_count)
                     );
                 }
                 Ok::<(), proptest::test_runner::TestCaseError>(())
@@ -3610,6 +3803,7 @@ mod tests {
             },
             now: OffsetDateTime::now_utc(),
             cron_schedule: None,
+            reserved_poller_identity: None,
         }
     }
 

@@ -3226,6 +3226,7 @@ mod tests {
             },
             now: OffsetDateTime::now_utc(),
             cron_schedule: None,
+            reserved_poller_identity: None,
         };
 
         let transition = BasicKernel::default()

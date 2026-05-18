@@ -292,8 +292,10 @@ impl tokeira_orchestrator::Deployment for ComposeDeployment {
 
         // Write back DynamoDB coordination table names so tokeirad uses the
         // actual provisioned names rather than deriving from cluster_name.
-        let rate_limiter_id =
-            iac::ResourceId(format!("dynamodb-{}-dsql-rate-limiter", config.project_name));
+        let rate_limiter_id = iac::ResourceId(format!(
+            "dynamodb-{}-dsql-rate-limiter",
+            config.project_name
+        ));
         if let Some(table_name) = state
             .resources
             .get(&rate_limiter_id)

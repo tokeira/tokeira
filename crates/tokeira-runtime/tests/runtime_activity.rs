@@ -430,6 +430,7 @@ fn start_request(
         },
         now: OffsetDateTime::now_utc(),
         cron_schedule: None,
+        reserved_poller_identity: None,
     }
 }
 

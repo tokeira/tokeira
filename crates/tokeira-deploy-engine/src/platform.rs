@@ -28,7 +28,11 @@ pub trait Platform: Send + Sync {
     ///
     /// Default implementation returns `true` (assume current) for platforms
     /// that don't support live drift detection.
-    async fn is_service_current(&self, _service_name: &str, _manifests: &[serde_json::Value]) -> bool {
+    async fn is_service_current(
+        &self,
+        _service_name: &str,
+        _manifests: &[serde_json::Value],
+    ) -> bool {
         true
     }
 }

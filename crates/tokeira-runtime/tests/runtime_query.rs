@@ -216,6 +216,7 @@ async fn start_workflow(
             },
             now: OffsetDateTime::now_utc(),
             cron_schedule: None,
+            reserved_poller_identity: None,
         })
         .await?;
     Ok(match result {

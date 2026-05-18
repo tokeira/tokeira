@@ -13,7 +13,9 @@ use tokeira_storage::RunRepository;
 use tokeira_types::{RunKey, ShardId};
 use tokio_util::sync::CancellationToken;
 
-use crate::{lane::LaneHandle, metrics as runtime_metrics, scanner::pick_lane, shard::ShardOwner};
+use crate::{
+    lane::LaneHandle, metrics as runtime_metrics, scanner::pick_lane_for_run_key, shard::ShardOwner,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActivityTrackingEntry {
@@ -255,7 +257,7 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
             continue;
         };
 
-        let lane = pick_lane(lanes, lane_count, entry.shard_id).clone();
+        let lane = pick_lane_for_run_key(lanes, lane_count, entry.run_key).clone();
         let result = lane
             .submit(
                 entry.run_key,

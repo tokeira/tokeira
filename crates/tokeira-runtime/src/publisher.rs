@@ -41,7 +41,7 @@ use crate::{
         NexusTaskBroker, NexusTaskRequest, NexusTaskToken, NexusTimeoutEntry,
         NexusTimeoutTrackingState,
     },
-    scanner::pick_lane,
+    scanner::pick_lane_for_run_key,
     shard::shard_for,
     versioning::VersioningRuleStore,
 };
@@ -123,9 +123,8 @@ where
     }
 
     fn pick_lane(&self, run_key: RunKey) -> LaneHandle {
-        let shard_id = shard_for(run_key, self.shard_count);
         let lanes = self.lanes.lock().unwrap();
-        pick_lane(&lanes, self.lane_count, shard_id).clone()
+        pick_lane_for_run_key(&lanes, self.lane_count, run_key).clone()
     }
 
     fn nexus_trace_headers(&self) -> Vec<KeyValue> {
@@ -245,6 +244,7 @@ where
             },
             now: OffsetDateTime::now_utc(),
             cron_schedule: None,
+            reserved_poller_identity: None,
         };
 
         let result = self

@@ -358,7 +358,10 @@ impl ComposePlatform {
         let container_name = format!("{}_{}", self.project_name, service_name);
         let inspect = self
             .docker
-            .inspect_container(&container_name, None::<bollard::container::InspectContainerOptions>)
+            .inspect_container(
+                &container_name,
+                None::<bollard::container::InspectContainerOptions>,
+            )
             .await
             .ok()?;
         // The container's `image` field is the sha256 digest of the image it
@@ -366,17 +369,16 @@ impl ComposePlatform {
         let container_image_id = inspect.image.as_deref()?;
 
         // Resolve the current local image ID for the same tag.
-        let local_image = self
-            .docker
-            .inspect_image(image_tag)
-            .await
-            .ok()?;
+        let local_image = self.docker.inspect_image(image_tag).await.ok()?;
         let local_image_id = local_image.id.as_deref()?;
 
         if container_image_id != local_image_id {
             // Return the stale digest so diff() sees a mismatch against the
             // desired tag-only image field.
-            Some(format!("{image_tag}@stale:{}", &container_image_id[..19.min(container_image_id.len())]))
+            Some(format!(
+                "{image_tag}@stale:{}",
+                &container_image_id[..19.min(container_image_id.len())]
+            ))
         } else {
             None
         }
@@ -716,21 +718,25 @@ impl deploy_engine::Platform for ComposePlatform {
         Ok(count)
     }
 
-    async fn is_service_current(&self, service_name: &str, manifests: &[serde_json::Value]) -> bool {
+    async fn is_service_current(
+        &self,
+        service_name: &str,
+        manifests: &[serde_json::Value],
+    ) -> bool {
         let Some(manifest) = manifests.first() else {
             return true;
         };
-        let image_tag = manifest
-            .get("image")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let image_tag = manifest.get("image").and_then(|v| v.as_str()).unwrap_or("");
         if image_tag.is_empty() {
             return true;
         }
         let container_name = format!("{}_{}", self.project_name, service_name);
         let Ok(inspect) = self
             .docker
-            .inspect_container(&container_name, None::<bollard::container::InspectContainerOptions>)
+            .inspect_container(
+                &container_name,
+                None::<bollard::container::InspectContainerOptions>,
+            )
             .await
         else {
             // Container doesn't exist — not current.

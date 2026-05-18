@@ -11,7 +11,10 @@
 //! `first_run_started_at`) so the server can enforce execution-level timeouts
 //! across the entire chain, not just the current run.
 
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{Arc, RwLock},
+};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -51,6 +54,10 @@ pub struct LaneConfig {
     /// storage after local ownership validation. Controller-managed deployments
     /// must pass the real local epoch so storage keeps its durable lease read.
     pub controller_managed_placement: bool,
+    /// Maximum loaded runs retained by a lane between activations.
+    pub cache_max_entries: usize,
+    /// Maximum idle age for a cached run before the lane reloads it.
+    pub cache_idle_timeout: std::time::Duration,
 }
 
 impl Default for LaneConfig {
@@ -59,6 +66,8 @@ impl Default for LaneConfig {
             max_occ_retries: 5,
             max_drain_per_activation: 16,
             controller_managed_placement: false,
+            cache_max_entries: 4096,
+            cache_idle_timeout: std::time::Duration::from_secs(60),
         }
     }
 }
@@ -124,6 +133,72 @@ struct LaneMessage {
     enqueued_at: std::time::Instant,
 }
 
+struct LaneCache {
+    max_entries: usize,
+    idle_timeout: std::time::Duration,
+    entries: HashMap<RunKey, CachedRun>,
+    order: VecDeque<RunKey>,
+}
+
+#[derive(Clone)]
+struct CachedRun {
+    loaded: LoadedRun,
+    last_accessed: std::time::Instant,
+}
+
+impl LaneCache {
+    fn new(config: &LaneConfig) -> Self {
+        Self {
+            max_entries: config.cache_max_entries,
+            idle_timeout: config.cache_idle_timeout,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, run_key: RunKey) -> Option<LoadedRun> {
+        let now = std::time::Instant::now();
+        let entry = self.entries.get_mut(&run_key)?;
+        if now.duration_since(entry.last_accessed) > self.idle_timeout {
+            self.entries.remove(&run_key);
+            return None;
+        }
+        entry.last_accessed = now;
+        Some(entry.loaded.clone())
+    }
+
+    fn insert(&mut self, run_key: RunKey, loaded: LoadedRun) {
+        if self.max_entries == 0 {
+            return;
+        }
+        let now = std::time::Instant::now();
+        self.order.retain(|key| *key != run_key);
+        self.order.push_back(run_key);
+        self.entries.insert(
+            run_key,
+            CachedRun {
+                loaded,
+                last_accessed: now,
+            },
+        );
+        self.evict_over_capacity();
+    }
+
+    fn evict(&mut self, run_key: RunKey) {
+        self.entries.remove(&run_key);
+        self.order.retain(|key| *key != run_key);
+    }
+
+    fn evict_over_capacity(&mut self) {
+        while self.entries.len() > self.max_entries {
+            let Some(run_key) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&run_key);
+        }
+    }
+}
+
 /// Spawn a new lane executor as a background Tokio task.
 ///
 /// Each lane owns a bounded channel and processes commands
@@ -153,8 +228,9 @@ where
     let (tx, mut rx) = mpsc::channel::<LaneMessage>(1024);
     let requeue_tx = tx.clone();
     tokio::spawn(async move {
+        let mut cache = LaneCache::new(&config);
         while let Some(message) = rx.recv().await {
-            let buffered = run_activation(
+            let buffered = run_activation_with_cache(
                 &kernel,
                 &repo,
                 &publisher,
@@ -167,6 +243,7 @@ where
                 &mut rx,
                 message,
                 &config,
+                &mut cache,
             )
             .await;
             for message in buffered {
@@ -179,6 +256,7 @@ where
     LaneHandle { tx }
 }
 
+#[cfg(test)]
 async fn run_activation<K, R, P>(
     kernel: &K,
     repo: &R,
@@ -198,6 +276,45 @@ where
     R: RunRepository + 'static,
     P: DispatchPublisher + Clone + 'static,
 {
+    let mut cache = LaneCache::new(config);
+    run_activation_with_cache(
+        kernel,
+        repo,
+        publisher,
+        shard_owner,
+        activity_tracking,
+        workflow_timeout_tracking,
+        wft_timeout_tracking,
+        nexus_timeout_tracking,
+        update_registry,
+        rx,
+        first_message,
+        config,
+        &mut cache,
+    )
+    .await
+}
+
+async fn run_activation_with_cache<K, R, P>(
+    kernel: &K,
+    repo: &R,
+    publisher: &P,
+    shard_owner: &Arc<RwLock<ShardOwner>>,
+    activity_tracking: &crate::activity_timeout::ActivityTrackingState,
+    workflow_timeout_tracking: &crate::timeout::WorkflowTimeoutTrackingState,
+    wft_timeout_tracking: &crate::wft_timeout::WftTimeoutTrackingState,
+    nexus_timeout_tracking: &crate::nexus::NexusTimeoutTrackingState,
+    update_registry: &UpdateRegistry,
+    rx: &mut mpsc::Receiver<LaneMessage>,
+    first_message: LaneMessage,
+    config: &LaneConfig,
+    cache: &mut LaneCache,
+) -> Vec<LaneMessage>
+where
+    K: Kernel + Send + Sync + 'static,
+    R: RunRepository + 'static,
+    P: DispatchPublisher + Clone + 'static,
+{
     let active_run_key = first_message.run_key;
     let mut current = Some(first_message);
     let mut buffered = Vec::new();
@@ -209,7 +326,7 @@ where
         let command_type = command_type_name(&message.command);
         runtime_metrics::record_lane_queue_wait(message.enqueued_at.elapsed());
         let processing_start = std::time::Instant::now();
-        let result = handle_message(
+        let result = handle_message_with_cache(
             kernel,
             repo,
             shard_owner,
@@ -217,12 +334,13 @@ where
             message.command,
             config,
             config.max_occ_retries,
+            cache,
         )
         .await;
 
         let stop_draining = result.is_err();
         let reply = match result {
-            Ok((commit_result, dispatch_ops, history_events)) => {
+            Ok((commit_result, mut dispatch_ops, history_events)) => {
                 let mut reset_materialization_error = None;
                 if let CommitResult::Applied { new_state } = &commit_result {
                     for event in &history_events {
@@ -349,6 +467,9 @@ where
                             }
                         }
                     }
+                }
+                if reserved_start_has_direct_delivery(&committed_command) {
+                    dispatch_ops.retain(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. }));
                 }
                 if !dispatch_ops.is_empty()
                     && let Err(error) = publisher.publish(message.run_key, &dispatch_ops).await
@@ -542,6 +663,7 @@ where
                                         },
                                         now: OffsetDateTime::now_utc(),
                                         cron_schedule: None,
+                                        reserved_poller_identity: None,
                                     };
                                     let publisher = publisher.clone();
                                     let workflow_timeout_tracking =
@@ -643,6 +765,7 @@ where
     buffered
 }
 
+#[cfg(test)]
 async fn handle_message<K, R>(
     kernel: &K,
     repo: &R,
@@ -651,6 +774,38 @@ async fn handle_message<K, R>(
     command: Command,
     config: &LaneConfig,
     max_retries: u32,
+) -> Result<(
+    CommitResult,
+    SmallVec<[DispatchOp; 4]>,
+    SmallVec<[HistoryEvent; 8]>,
+)>
+where
+    K: Kernel + Send + Sync + 'static,
+    R: RunRepository + 'static,
+{
+    let mut cache = LaneCache::new(config);
+    handle_message_with_cache(
+        kernel,
+        repo,
+        shard_owner,
+        run_key,
+        command,
+        config,
+        max_retries,
+        &mut cache,
+    )
+    .await
+}
+
+async fn handle_message_with_cache<K, R>(
+    kernel: &K,
+    repo: &R,
+    shard_owner: &Arc<RwLock<ShardOwner>>,
+    run_key: RunKey,
+    command: Command,
+    config: &LaneConfig,
+    max_retries: u32,
+    cache: &mut LaneCache,
 ) -> Result<(
     CommitResult,
     SmallVec<[DispatchOp; 4]>,
@@ -669,7 +824,14 @@ where
             transition_seq = tracing::field::Empty,
         );
         let _entered = transition_span.enter();
-        let loaded = repo.load_run(run_key).await?;
+        let loaded = match cache.get(run_key) {
+            Some(loaded) => loaded,
+            None => {
+                let loaded = repo.load_run(run_key).await?;
+                cache.insert(run_key, loaded.clone());
+                loaded
+            }
+        };
         let transition = kernel
             .apply(loaded, command.clone())
             .map_err(|reject| anyhow!("kernel rejected command: {reject}"))?;
@@ -708,6 +870,7 @@ where
             .await?
         {
             CommitResult::Applied { new_state } => {
+                cache.insert(run_key, LoadedRun::Existing(new_state.clone()));
                 if attempts > 0 {
                     storage_metrics::record_dsql_retry("commit_transition_for_bundle", "success");
                 }
@@ -729,6 +892,7 @@ where
                 return Ok((CommitResult::Duplicate, SmallVec::new(), SmallVec::new()));
             }
             CommitResult::Conflict { reason } => {
+                cache.evict(run_key);
                 runtime_metrics::record_occ_retry("retry");
                 if attempts >= max_retries {
                     runtime_metrics::record_occ_retry("exhausted");
@@ -776,6 +940,16 @@ fn command_type_name(command: &Command) -> &'static str {
         Command::TimerDue(_) => "TimerDue",
         Command::ScheduleQueryTask(_) => "ScheduleQueryTask",
     }
+}
+
+fn reserved_start_has_direct_delivery(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Start(StartRequest {
+            reserved_poller_identity: Some(_),
+            ..
+        })
+    )
 }
 
 fn history_event_type_name(event: &HistoryEvent) -> &'static str {
@@ -884,6 +1058,7 @@ mod tests {
     use std::{
         collections::{BTreeMap, VecDeque},
         sync::{Arc, Mutex},
+        time::{Duration as StdDuration, Instant},
     };
 
     use proptest::prelude::*;
@@ -1594,6 +1769,7 @@ mod tests {
         assert_eq!(config.max_occ_retries, 5);
         assert_eq!(config.max_drain_per_activation, 16);
         assert!(!config.controller_managed_placement);
+        assert_eq!(config.cache_max_entries, 4096);
     }
 
     #[test]
@@ -1602,10 +1778,124 @@ mod tests {
             max_occ_retries: 0,
             max_drain_per_activation: 1,
             controller_managed_placement: true,
+            cache_max_entries: 0,
+            cache_idle_timeout: std::time::Duration::ZERO,
         };
         assert_eq!(config.max_occ_retries, 0);
         assert_eq!(config.max_drain_per_activation, 1);
         assert!(config.controller_managed_placement);
+    }
+
+    #[tokio::test]
+    async fn lane_cache_reuses_loaded_state_between_commands() {
+        let run_key = RunKey::new();
+        let state = sample_state(run_key);
+        let repo = MockRepo::new(
+            LoadedRun::Existing(state.clone()),
+            vec![CommitBehavior::Applied, CommitBehavior::Applied],
+        );
+        let kernel = MockKernel::new(SmallVec::new());
+        let shard_owner = test_shard_owner();
+        let config = LaneConfig::default();
+        let mut cache = LaneCache::new(&config);
+
+        let first = handle_message_with_cache(
+            &kernel,
+            &repo,
+            &shard_owner,
+            run_key,
+            sample_command("first"),
+            &config,
+            config.max_occ_retries,
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(first.0, CommitResult::Applied { .. }));
+
+        let second = handle_message_with_cache(
+            &kernel,
+            &repo,
+            &shard_owner,
+            run_key,
+            sample_command("second"),
+            &config,
+            config.max_occ_retries,
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(second.0, CommitResult::Applied { .. }));
+
+        let (load_calls, commit_calls, _) = repo.snapshot().await;
+        assert_eq!(load_calls, 1);
+        assert_eq!(commit_calls, 2);
+    }
+
+    #[tokio::test]
+    async fn lane_cache_evicts_on_occ_conflict_before_retry() {
+        let run_key = RunKey::new();
+        let state = sample_state(run_key);
+        let repo = MockRepo::new(
+            LoadedRun::Existing(state.clone()),
+            vec![CommitBehavior::Conflict, CommitBehavior::Applied],
+        );
+        let kernel = MockKernel::new(SmallVec::new());
+        let shard_owner = test_shard_owner();
+        let config = LaneConfig::default();
+        let mut cache = LaneCache::new(&config);
+
+        let result = handle_message_with_cache(
+            &kernel,
+            &repo,
+            &shard_owner,
+            run_key,
+            sample_command("conflict"),
+            &config,
+            config.max_occ_retries,
+            &mut cache,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result.0, CommitResult::Applied { .. }));
+        let (load_calls, commit_calls, _) = repo.snapshot().await;
+        assert_eq!(load_calls, 2);
+        assert_eq!(commit_calls, 2);
+    }
+
+    #[test]
+    fn lane_cache_idle_timeout_evicts_stale_entries_without_sleeping() {
+        let run_key = RunKey::new();
+        let config = LaneConfig {
+            cache_idle_timeout: StdDuration::from_secs(1),
+            ..LaneConfig::default()
+        };
+        let mut cache = LaneCache::new(&config);
+        cache.insert(run_key, LoadedRun::Existing(sample_state(run_key)));
+        cache.entries.get_mut(&run_key).unwrap().last_accessed = Instant::now()
+            .checked_sub(StdDuration::from_secs(2))
+            .unwrap();
+
+        assert!(cache.get(run_key).is_none());
+        assert!(!cache.entries.contains_key(&run_key));
+    }
+
+    proptest! {
+        #[test]
+        fn lane_cache_never_exceeds_configured_capacity(max_entries in 1usize..32, count in 1usize..128) {
+            let config = LaneConfig {
+                cache_max_entries: max_entries,
+                ..LaneConfig::default()
+            };
+            let mut cache = LaneCache::new(&config);
+
+            for index in 0..count {
+                let run_key = RunKey(uuid::Uuid::from_u128(index as u128));
+                cache.insert(run_key, LoadedRun::Existing(sample_state(run_key)));
+                prop_assert!(cache.entries.len() <= max_entries);
+            }
+        }
     }
 
     #[test]

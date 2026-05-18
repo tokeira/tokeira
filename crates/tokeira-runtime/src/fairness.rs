@@ -647,8 +647,10 @@ mod tests {
                         .await
                         .unwrap();
 
-                    let (task, _entered) =
-                        result.expect("should get a task");
+                    let (task, _entered) = result
+                        .expect("should get a task")
+                        .into_queued()
+                        .expect("queued workflow task");
 
                     if has_sticky {
                         prop_assert_eq!(

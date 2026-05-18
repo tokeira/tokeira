@@ -139,6 +139,7 @@ fn with_pending_wft(
         started_at: started_event_id.map(|_| state.started_at + Duration::seconds(1)),
         attempt,
     });
+    state.next_workflow_task_seq = LogicalTaskSeq(logical_seq).next();
     state
 }
 
@@ -671,6 +672,7 @@ fn arb_start_request() -> impl Strategy<Value = StartRequest> {
                     request: request_context("prop-start", now),
                     now,
                     cron_schedule: None,
+                    reserved_poller_identity: None,
                 }
             },
         )
@@ -1412,6 +1414,9 @@ proptest! {
         prop_assert_eq!(transition.next_state.attempt, req.attempt);
         prop_assert_eq!(transition.next_state.first_execution_run_id, req.first_execution_run_id);
         prop_assert_eq!(transition.next_state.first_run_started_at, req.first_run_started_at);
+        prop_assert_eq!(transition.next_state.status, ExecutionStatus::Running);
+        prop_assert_eq!(transition.next_state.last_event_id, transition.history_events.last().unwrap().event_id);
+        prop_assert_eq!(transition.next_state.transition_seq, transition.expected_seq.next());
         prop_assert!(transition.next_state.pending_updates.is_empty());
         prop_assert!(transition.next_state.pending_nexus_operations.is_empty());
         prop_assert_eq!(transition.next_state.versioning_override, None);
@@ -1423,6 +1428,56 @@ proptest! {
         prop_assert_eq!(started.4, transition.next_state.workflow_execution_timeout);
         prop_assert_eq!(started.5, transition.next_state.workflow_run_timeout);
         prop_assert_eq!(started.6, transition.next_state.workflow_task_timeout);
+    }
+
+    #[test]
+    fn reserved_start_combines_schedule_and_started_events(mut req in arb_start_request(), worker in "\\PC{1,64}") {
+        req.reserved_poller_identity = Some(WorkerIdentity(worker.clone()));
+
+        let transition = kernel().apply(LoadedRun::Absent, Command::Start(req)).unwrap();
+        let event_kinds = transition
+            .history_events
+            .iter()
+            .map(|event| &event.kind)
+            .collect::<Vec<_>>();
+
+        prop_assert_eq!(matches!(event_kinds[0], HistoryEventKind::WorkflowExecutionStarted { .. }), true);
+        prop_assert_eq!(matches!(event_kinds[1], HistoryEventKind::WorkflowTaskScheduled { .. }), true);
+        prop_assert_eq!(
+            matches!(
+                event_kinds[2],
+                HistoryEventKind::WorkflowTaskStarted {
+                    identity,
+                    ..
+                } if identity == &WorkerIdentity(worker)
+            ),
+            true,
+        );
+        prop_assert_eq!(transition
+            .dispatch_ops
+            .iter()
+            .any(|op| matches!(op, DispatchOp::EnqueueWorkflowTask { .. })), true);
+        let pending = transition.next_state.pending_workflow_task.as_ref().unwrap();
+        prop_assert_eq!(pending.scheduled_event_id, 2);
+        prop_assert_eq!(pending.started_event_id, Some(3));
+        prop_assert_eq!(transition.next_state.previous_started_event_id, 0);
+    }
+
+    #[test]
+    fn start_without_reserved_poller_never_emits_workflow_task_started(req in arb_start_request()) {
+        prop_assume!(req.reserved_poller_identity.is_none());
+
+        let transition = kernel().apply(LoadedRun::Absent, Command::Start(req)).unwrap();
+
+        prop_assert_eq!(transition.history_events.iter().any(|event| {
+            matches!(event.kind, HistoryEventKind::WorkflowTaskScheduled { .. })
+        }), true);
+        prop_assert_eq!(transition.history_events.iter().all(|event| {
+            !matches!(event.kind, HistoryEventKind::WorkflowTaskStarted { .. })
+        }), true);
+        let pending = transition.next_state.pending_workflow_task.as_ref().unwrap();
+        prop_assert_eq!(pending.started_event_id, None);
+        prop_assert_eq!(transition.next_state.previous_started_event_id, 0);
     }
 
     #[test]
@@ -1872,8 +1927,8 @@ proptest! {
             }),
         ).unwrap();
         let timed_out_pending = timed_out_transition.next_state.pending_workflow_task.unwrap();
-        prop_assert_eq!(timed_out_pending.logical_seq, LogicalTaskSeq(61));
-        prop_assert_eq!(timed_out_pending.scheduled_event_id, 13);
+        prop_assert_eq!(timed_out_pending.logical_seq, LogicalTaskSeq(62));
+        prop_assert_eq!(timed_out_pending.scheduled_event_id, 16);
         prop_assert_eq!(timed_out_pending.started_event_id, None);
     }
 

@@ -103,6 +103,7 @@ fn make_start_request() -> StartRequest {
         request: request_context("start-req"),
         now: now(),
         cron_schedule: None,
+        reserved_poller_identity: None,
     }
 }
 

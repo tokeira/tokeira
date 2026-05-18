@@ -309,6 +309,9 @@ impl BasicKernel {
             search_attr_patch: req.search_attributes,
         });
         builder.schedule_workflow_task();
+        if let Some(identity) = req.reserved_poller_identity {
+            builder.start_pending_workflow_task(identity);
+        }
         Ok(builder.finish())
     }
 
@@ -2787,6 +2790,33 @@ impl TransitionBuilder {
                 .as_ref()
                 .map(|s| s.worker_identity.clone()),
         });
+    }
+
+    /// Start the just-scheduled WFT in the same transition for runtime-owned
+    /// sync-match. The runtime strips the enqueue op and delivers directly to
+    /// the reserved poller after the commit succeeds.
+    fn start_pending_workflow_task(&mut self, identity: WorkerIdentity) {
+        let Some(pending) = self.state.pending_workflow_task.clone() else {
+            return;
+        };
+        if pending.started_event_id.is_some() {
+            return;
+        }
+        let attempt = pending.attempt.max(1);
+        let started_event_id = self.emit(HistoryEventKind::WorkflowTaskStarted {
+            logical_seq: pending.logical_seq,
+            scheduled_event_id: pending.scheduled_event_id,
+            attempt,
+            identity,
+        });
+        let current = self
+            .state
+            .pending_workflow_task
+            .as_mut()
+            .expect("pending workflow task was just observed");
+        current.started_event_id = Some(started_event_id);
+        current.started_at = Some(self.now);
+        current.attempt = attempt;
     }
 
     /// Transition the run to a terminal status.

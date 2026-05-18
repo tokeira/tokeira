@@ -208,8 +208,7 @@ fn dsql_pool_config_with_client(
     config: &TokeiraConfig,
     ddb_client: aws_sdk_dynamodb::Client,
 ) -> DsqlPoolConfig {
-    let (rate_limiter_table, conn_lease_table) =
-        dsql_coordination_table_names(config);
+    let (rate_limiter_table, conn_lease_table) = dsql_coordination_table_names(config);
     DsqlPoolConfig {
         coordination: DsqlCoordinationConfig {
             rate_limiter_table,

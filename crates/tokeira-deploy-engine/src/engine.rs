@@ -108,7 +108,9 @@ impl ServiceEngine {
             // Even when the manifest hash matches, check if the running state
             // has drifted (e.g., image rebuilt behind the same tag).
             if kind == ServiceChangeKind::NoChange
-                && !platform.is_service_current(service.name(), &manifests).await
+                && !platform
+                    .is_service_current(service.name(), &manifests)
+                    .await
             {
                 kind = ServiceChangeKind::Update;
             }

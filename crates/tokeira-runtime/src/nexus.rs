@@ -19,7 +19,9 @@ use tokeira_types::{NamespaceId, Payload, Payloads, RunKey, ShardId, TaskQueueNa
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 
-use crate::{lane::LaneHandle, metrics as runtime_metrics, scanner::pick_lane, shard::ShardOwner};
+use crate::{
+    lane::LaneHandle, metrics as runtime_metrics, scanner::pick_lane_for_run_key, shard::ShardOwner,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum NexusStartResult {
@@ -364,7 +366,7 @@ pub(crate) async fn run_nexus_timeout_scanner(
             runtime_metrics::record_scanner_tick("nexus_timeout", shard_id.0);
             scan_nexus_timeouts_once(&tracking, Some(shard_id), &config, |entry, now| {
                 runtime_metrics::record_scanner_dispatched("nexus_timeout", shard_id.0);
-                let lane = pick_lane(&lanes, lane_count, entry.shard_id).clone();
+                let lane = pick_lane_for_run_key(&lanes, lane_count, entry.run_key).clone();
                 async move {
                     lane.submit(
                         entry.run_key,

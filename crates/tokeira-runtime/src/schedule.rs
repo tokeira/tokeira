@@ -884,11 +884,14 @@ where
         },
         now: actual_time,
         cron_schedule: Some(schedule_id.0.clone()),
+        reserved_poller_identity: None,
     };
 
     let outcome = runtime.start_workflow_with_policy(request).await;
     let result = match outcome {
-        Ok(StartWorkflowResult::Started { run_key, run_id }) => {
+        Ok(StartWorkflowResult::Started {
+            run_key, run_id, ..
+        }) => {
             let workflow = WorkflowExecution {
                 namespace_id,
                 workflow_id,

@@ -1,0 +1,226 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 750" font-family="Inter, -apple-system, sans-serif" font-size="11">
+  <defs>
+    <marker id="a2" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="#555"/>
+    </marker>
+    <marker id="a2b" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="#1565c0"/>
+    </marker>
+    <marker id="a2g" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="#388e3c"/>
+    </marker>
+    <marker id="a2p" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="#7b1fa2"/>
+    </marker>
+  </defs>
+
+  <rect width="1000" height="750" fill="#fafafa" rx="8"/>
+  <text x="500" y="28" text-anchor="middle" font-size="15" font-weight="bold" fill="#1a1a1a">Plane 2 — Authoritative Runtime &amp; Storage (Implementation View)</text>
+
+  <!-- ═══ INCOMING FROM EDGE ═══ -->
+  <rect x="20" y="45" width="130" height="35" rx="5" fill="#fff3e0" stroke="#f57c00"/>
+  <text x="85" y="67" text-anchor="middle" font-size="10" fill="#e65100">Edge (commands)</text>
+
+  <rect x="170" y="45" width="130" height="35" rx="5" fill="#fff3e0" stroke="#f57c00"/>
+  <text x="235" y="67" text-anchor="middle" font-size="10" fill="#e65100">Edge (polls)</text>
+
+  <!-- ═══ TOKEIRA-RUNTIME ═══ -->
+  <rect x="20" y="95" width="680" height="540" rx="8" fill="#e8f5e9" stroke="#388e3c" stroke-width="1.5" stroke-dasharray="4,2"/>
+  <text x="40" y="115" font-size="12" font-weight="bold" fill="#1b5e20">tokeira-runtime</text>
+
+  <!-- TokeiraRuntime struct -->
+  <rect x="40" y="125" width="250" height="80" rx="5" fill="#fff" stroke="#388e3c" stroke-width="1.5"/>
+  <text x="165" y="143" text-anchor="middle" font-size="10" font-weight="bold" fill="#1b5e20">TokeiraRuntime&lt;R&gt;</text>
+  <text x="55" y="160" font-size="9" fill="#555">• shard_owner: Arc&lt;RwLock&lt;ShardOwner&gt;&gt;</text>
+  <text x="55" y="173" font-size="9" fill="#555">• lanes: Vec&lt;LaneHandle&gt; (32)</text>
+  <text x="55" y="186" font-size="9" fill="#555">• broker: Arc&lt;InMemoryBroker&gt;</text>
+  <text x="55" y="199" font-size="9" fill="#555">• wft_timeout_tracking, worker_registry</text>
+
+  <!-- ShardOwner -->
+  <rect x="310" y="125" width="180" height="60" rx="5" fill="#c8e6c9" stroke="#388e3c"/>
+  <text x="400" y="143" text-anchor="middle" font-size="10" font-weight="bold" fill="#1b5e20">ShardOwner</text>
+  <text x="320" y="160" font-size="9" fill="#555">• shards: HashMap&lt;ShardId, OwnedShard&gt;</text>
+  <text x="320" y="173" font-size="9" fill="#555">• is_active(), epoch_of(), owns()</text>
+
+  <!-- Broker -->
+  <rect x="510" y="125" width="170" height="100" rx="5" fill="#c8e6c9" stroke="#388e3c"/>
+  <text x="595" y="143" text-anchor="middle" font-size="10" font-weight="bold" fill="#1b5e20">InMemoryBroker</text>
+  <text x="520" y="160" font-size="9" fill="#555">• publish_workflow_task()</text>
+  <text x="520" y="173" font-size="9" fill="#555">• poll_workflow_task()</text>
+  <text x="520" y="186" font-size="9" fill="#555">• try_reserve_poller()</text>
+  <text x="520" y="199" font-size="9" fill="#555">• queues_with_waiters()</text>
+  <text x="520" y="212" font-size="9" fill="#555">• live-ready + sticky tiers</text>
+
+  <!-- Lanes -->
+  <rect x="40" y="230" width="350" height="160" rx="6" fill="#f1f8e9" stroke="#66bb6a"/>
+  <text x="60" y="248" font-size="10" font-weight="bold" fill="#2e7d32">Lanes (32 × LaneHandle)</text>
+
+  <rect x="55" y="260" width="150" height="55" rx="4" fill="#fff" stroke="#66bb6a"/>
+  <text x="130" y="278" text-anchor="middle" font-size="9" font-weight="bold" fill="#333">Lane N</text>
+  <text x="65" y="293" font-size="8" fill="#555">mpsc channel (1024)</text>
+  <text x="65" y="305" font-size="8" fill="#555">handle_message loop</text>
+
+  <rect x="220" y="260" width="155" height="55" rx="4" fill="#fff" stroke="#66bb6a"/>
+  <text x="297" y="278" text-anchor="middle" font-size="9" font-weight="bold" fill="#333">handle_message()</text>
+  <text x="230" y="293" font-size="8" fill="#555">load_run → kernel.apply</text>
+  <text x="230" y="305" font-size="8" fill="#555">→ commit → publish</text>
+
+  <rect x="55" y="325" width="320" height="55" rx="4" fill="#fff" stroke="#66bb6a"/>
+  <text x="215" y="343" text-anchor="middle" font-size="9" font-weight="bold" fill="#333">run_activation (coalescing)</text>
+  <text x="65" y="358" font-size="8" fill="#555">Drains multiple messages for same RunKey before yielding lane</text>
+  <text x="65" y="370" font-size="8" fill="#555">Requeues first different-run message to back of channel</text>
+
+  <!-- Publisher -->
+  <rect x="410" y="250" width="270" height="80" rx="5" fill="#c8e6c9" stroke="#388e3c"/>
+  <text x="545" y="268" text-anchor="middle" font-size="10" font-weight="bold" fill="#1b5e20">RuntimeDispatchPublisher</text>
+  <text x="420" y="285" font-size="9" fill="#555">• publish(run_key, dispatch_ops)</text>
+  <text x="420" y="298" font-size="9" fill="#555">• EnqueueWorkflowTask → broker.publish</text>
+  <text x="420" y="311" font-size="9" fill="#555">• StartChildWorkflow → lane.submit</text>
+  <text x="420" y="324" font-size="9" fill="#555">• ScheduleNexusOp, SignalExternal, etc.</text>
+
+  <!-- Scanners -->
+  <rect x="40" y="400" width="350" height="80" rx="5" fill="#c8e6c9" stroke="#388e3c"/>
+  <text x="215" y="418" text-anchor="middle" font-size="10" font-weight="bold" fill="#1b5e20">Background Scanners</text>
+  <rect x="55" y="428" width="95" height="22" rx="3" fill="#fff" stroke="#81c784"/>
+  <text x="102" y="443" text-anchor="middle" font-size="8" fill="#333">Timer Scanner</text>
+  <rect x="160" y="428" width="95" height="22" rx="3" fill="#fff" stroke="#81c784"/>
+  <text x="207" y="443" text-anchor="middle" font-size="8" fill="#333">WFT Timeout</text>
+  <rect x="265" y="428" width="110" height="22" rx="3" fill="#fff" stroke="#81c784"/>
+  <text x="320" y="443" text-anchor="middle" font-size="8" fill="#333">Activity Timeout</text>
+  <rect x="55" y="455" width="95" height="22" rx="3" fill="#fff" stroke="#81c784"/>
+  <text x="102" y="470" text-anchor="middle" font-size="8" fill="#333">Nexus Timeout</text>
+  <rect x="160" y="455" width="95" height="22" rx="3" fill="#fff" stroke="#81c784"/>
+  <text x="207" y="470" text-anchor="middle" font-size="8" fill="#333">Wf Timeout</text>
+  <rect x="265" y="455" width="110" height="22" rx="3" fill="#fff" stroke="#81c784"/>
+  <text x="320" y="470" text-anchor="middle" font-size="8" fill="#333">Backlog Drain</text>
+
+  <!-- Membership -->
+  <rect x="410" y="350" width="270" height="50" rx="5" fill="#c8e6c9" stroke="#388e3c"/>
+  <text x="545" y="370" text-anchor="middle" font-size="10" font-weight="bold" fill="#1b5e20">Membership Client</text>
+  <text x="420" y="387" font-size="9" fill="#555">Heartbeat → Controller → shard assignment</text>
+
+  <!-- Schedule Engine -->
+  <rect x="410" y="415" width="270" height="40" rx="5" fill="#c8e6c9" stroke="#388e3c"/>
+  <text x="545" y="435" text-anchor="middle" font-size="10" font-weight="bold" fill="#1b5e20">Schedule Engine</text>
+  <text x="420" y="448" font-size="9" fill="#555">Cron/schedule → StartWorkflow at due time</text>
+
+  <!-- Fairness -->
+  <rect x="40" y="495" width="200" height="35" rx="4" fill="#fff" stroke="#388e3c"/>
+  <text x="140" y="517" text-anchor="middle" font-size="9" fill="#333">Fairness Control Loop</text>
+
+  <!-- Worker Registry -->
+  <rect x="260" y="495" width="200" height="35" rx="4" fill="#fff" stroke="#388e3c"/>
+  <text x="360" y="517" text-anchor="middle" font-size="9" fill="#333">Worker Registry + Versioning</text>
+
+  <!-- Buffered Queries -->
+  <rect x="480" y="475" width="200" height="35" rx="4" fill="#fff" stroke="#388e3c"/>
+  <text x="580" y="497" text-anchor="middle" font-size="9" fill="#333">Buffered Queries + Updates</text>
+
+  <!-- ═══ TOKEIRA-KERNEL ═══ -->
+  <rect x="40" y="545" width="250" height="75" rx="6" fill="#fff" stroke="#2e7d32" stroke-width="2"/>
+  <text x="165" y="565" text-anchor="middle" font-size="10" font-weight="bold" fill="#1b5e20">tokeira-kernel (PURE)</text>
+  <text x="55" y="583" font-size="9" fill="#555">kernel.apply(LoadedRun, Command)</text>
+  <text x="55" y="596" font-size="9" fill="#555">→ Transition { next_state, history_events,</text>
+  <text x="55" y="609" font-size="9" fill="#555">   dispatch_ops, timer_ops, projection_ops }</text>
+
+  <!-- ═══ TOKEIRA-STORAGE ═══ -->
+  <rect x="720" y="95" width="260" height="540" rx="8" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5" stroke-dasharray="4,2"/>
+  <text x="740" y="115" font-size="12" font-weight="bold" fill="#0d47a1">tokeira-storage</text>
+
+  <!-- DsqlStore -->
+  <rect x="735" y="125" width="230" height="55" rx="5" fill="#fff" stroke="#1565c0"/>
+  <text x="850" y="143" text-anchor="middle" font-size="10" font-weight="bold" fill="#0d47a1">DsqlStore</text>
+  <text x="745" y="160" font-size="9" fill="#555">connect(auth, pool_config) → Self</text>
+  <text x="745" y="173" font-size="9" fill="#555">into_parts() → (director, repo, proj, migr)</text>
+
+  <!-- ConnectionDirector -->
+  <rect x="735" y="195" width="230" height="70" rx="5" fill="#bbdefb" stroke="#1565c0"/>
+  <text x="850" y="213" text-anchor="middle" font-size="10" font-weight="bold" fill="#0d47a1">DsqlConnectionDirector</text>
+  <text x="745" y="230" font-size="9" fill="#555">• acquire(DbClass) → ConnectionPermit</text>
+  <text x="745" y="243" font-size="9" fill="#555">• Classes: Commit, Read, Projection,</text>
+  <text x="745" y="256" font-size="9" fill="#555">  Control, Maintenance</text>
+
+  <!-- Reservoir -->
+  <rect x="735" y="280" width="230" height="60" rx="5" fill="#bbdefb" stroke="#1565c0"/>
+  <text x="850" y="298" text-anchor="middle" font-size="10" font-weight="bold" fill="#0d47a1">Reservoir</text>
+  <text x="745" y="315" font-size="9" fill="#555">• ready_channel (50 PhysicalConns)</text>
+  <text x="745" y="328" font-size="9" fill="#555">• refiller, scanner, return_processor</text>
+
+  <!-- Token Bucket -->
+  <rect x="735" y="355" width="110" height="40" rx="4" fill="#fff8e1" stroke="#f9a825"/>
+  <text x="790" y="372" text-anchor="middle" font-size="9" fill="#795548">Token Bucket</text>
+  <text x="790" y="385" text-anchor="middle" font-size="8" fill="#555">100/sec DDB</text>
+
+  <!-- Slot Block -->
+  <rect x="855" y="355" width="110" height="40" rx="4" fill="#fff8e1" stroke="#f9a825"/>
+  <text x="910" y="372" text-anchor="middle" font-size="9" fill="#795548">Slot Blocks</text>
+  <text x="910" y="385" text-anchor="middle" font-size="8" fill="#555">10k limit DDB</text>
+
+  <!-- DsqlRunRepository -->
+  <rect x="735" y="410" width="230" height="90" rx="5" fill="#fff" stroke="#1565c0"/>
+  <text x="850" y="428" text-anchor="middle" font-size="10" font-weight="bold" fill="#0d47a1">DsqlRunRepository</text>
+  <text x="745" y="445" font-size="9" fill="#555">• load_run(RunKey)</text>
+  <text x="745" y="458" font-size="9" fill="#555">• commit_transition_for_bundle()</text>
+  <text x="745" y="471" font-size="9" fill="#555">• read_history(run_key, after, limit)</text>
+  <text x="745" y="484" font-size="9" fill="#555">• try_acquire_bundle(), list_bundle_leases()</text>
+  <text x="745" y="497" font-size="9" fill="#555">• resolve_execution(), find_latest_run()</text>
+
+  <!-- DsqlProjectionLog -->
+  <rect x="735" y="515" width="230" height="45" rx="5" fill="#fff" stroke="#1565c0"/>
+  <text x="850" y="533" text-anchor="middle" font-size="10" font-weight="bold" fill="#0d47a1">DsqlProjectionLog</text>
+  <text x="745" y="550" font-size="9" fill="#555">• read_batch(partition, after_seq, limit)</text>
+
+  <!-- MigrationRunner -->
+  <rect x="735" y="575" width="230" height="40" rx="5" fill="#fff" stroke="#1565c0"/>
+  <text x="850" y="593" text-anchor="middle" font-size="10" font-weight="bold" fill="#0d47a1">MigrationRunner</text>
+  <text x="745" y="608" font-size="9" fill="#555">• apply(), status(), dry_run()</text>
+
+  <!-- ═══ DSQL CLUSTER ═══ -->
+  <rect x="730" y="640" width="130" height="45" rx="5" fill="#c5cae9" stroke="#3f51b5" stroke-width="1.5"/>
+  <text x="795" y="660" text-anchor="middle" font-size="10" font-weight="bold" fill="#283593">Aurora DSQL</text>
+  <text x="795" y="675" text-anchor="middle" font-size="8" fill="#555">eu-west-2</text>
+
+  <!-- DynamoDB -->
+  <rect x="880" y="640" width="100" height="45" rx="5" fill="#fff8e1" stroke="#f9a825" stroke-width="1.5"/>
+  <text x="930" y="660" text-anchor="middle" font-size="10" font-weight="bold" fill="#795548">DynamoDB</text>
+  <text x="930" y="675" text-anchor="middle" font-size="8" fill="#555">coordination</text>
+
+  <!-- ═══ PROJECTION (output) ═══ -->
+  <rect x="310" y="645" width="200" height="40" rx="5" fill="#f3e5f5" stroke="#7b1fa2"/>
+  <text x="410" y="662" text-anchor="middle" font-size="10" fill="#7b1fa2">→ Projection Log</text>
+  <text x="410" y="676" text-anchor="middle" font-size="9" fill="#555">tokeira-projection workers</text>
+
+  <!-- ═══ KEY ARROWS ═══ -->
+  <!-- Edge commands → Runtime -->
+  <line x1="85" y1="80" x2="85" y2="125" stroke="#555" stroke-width="1.2" marker-end="url(#a2)"/>
+  <!-- Edge polls → Broker -->
+  <line x1="235" y1="80" x2="540" y2="125" stroke="#555" stroke-width="1.2" marker-end="url(#a2)"/>
+
+  <!-- Runtime → Kernel -->
+  <path d="M 165 205 L 165 545" fill="none" stroke="#2e7d32" stroke-width="1.2" marker-end="url(#a2g)"/>
+  <text x="175" y="380" font-size="8" fill="#2e7d32" transform="rotate(-90 175 380)">kernel.apply()</text>
+
+  <!-- Lane → Storage (load_run + commit) -->
+  <path d="M 375 290 L 735 450" fill="none" stroke="#1565c0" stroke-width="1.2" marker-end="url(#a2b)"/>
+  <text x="550" y="360" font-size="8" fill="#1565c0">load_run / commit</text>
+
+  <!-- Publisher → Broker -->
+  <line x1="545" y1="250" x2="595" y2="225" stroke="#388e3c" stroke-width="1" marker-end="url(#a2g)"/>
+
+  <!-- Scanners → Lanes -->
+  <line x1="215" y1="400" x2="215" y2="390" stroke="#555" stroke-width="1" marker-end="url(#a2)"/>
+  <text x="225" y="395" font-size="8" fill="#555">submit(TimerDue, WftTimeout, ...)</text>
+
+  <!-- Storage → DSQL -->
+  <line x1="850" y1="615" x2="795" y2="640" stroke="#3f51b5" stroke-width="1.2" marker-end="url(#a2)"/>
+  <!-- Storage → DynamoDB -->
+  <line x1="910" y1="395" x2="930" y2="640" stroke="#f9a825" stroke-width="1" marker-end="url(#a2)"/>
+
+  <!-- Commit → Projection -->
+  <path d="M 390 530 L 390 645" fill="none" stroke="#7b1fa2" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#a2p)"/>
+  <text x="400" y="590" font-size="8" fill="#7b1fa2">projection_ops</text>
+
+  <!-- Legend -->
+  <rect x="20" y="710" width="960" height="30" rx="4" fill="#f5f5f5"/>
+  <text x="40" y="729" font-size="9" fill="#555">Data flow: Edge → Runtime.submit() → Lane.handle_message() → Kernel.apply() → Storage.commit() → Publisher.publish(dispatch_ops) → Broker / Lanes</text>
+</svg>

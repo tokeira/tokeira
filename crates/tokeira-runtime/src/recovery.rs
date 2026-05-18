@@ -15,7 +15,7 @@ use crate::{
     broker::{InMemoryActivityBroker, InMemoryBroker},
     lane::LaneHandle,
     nexus::{NexusTimeoutEntry, NexusTimeoutTrackingState},
-    scanner::pick_lane,
+    scanner::pick_lane_for_run_key,
     timeout::{WorkflowTimeoutEntry, WorkflowTimeoutTrackingState},
     wft_timeout::{WftTimeoutEntry, WftTimeoutTrackingState},
 };
@@ -80,7 +80,7 @@ where
         .list_due_timers_for_shard(shard_id, now, usize::MAX)
         .await?
     {
-        let lane = pick_lane(lanes, lane_count, shard_id).clone();
+        let lane = pick_lane_for_run_key(lanes, lane_count, due.run_key).clone();
         lane.submit(
             due.run_key,
             Command::TimerDue(tokeira_kernel::TimerDueRequest {
@@ -518,7 +518,10 @@ mod tests {
                         .await
                         .unwrap()
                     {
-                        Some((task, _)) => {
+                        Some(polled_task) => {
+                            let Some((task, _)) = polled_task.into_queued() else {
+                                continue;
+                            };
                             polled.push(task.run_key)
                         }
                         None => break,
@@ -871,7 +874,10 @@ mod tests {
                     .await
                     .unwrap();
                 prop_assert!(polled.is_some());
-                let (task, _) = polled.unwrap();
+                let (task, _) = polled
+                    .unwrap()
+                    .into_queued()
+                    .expect("queued workflow task");
                 prop_assert_eq!(
                     task.sticky_preferred,
                     None,

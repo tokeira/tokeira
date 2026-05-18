@@ -264,6 +264,8 @@ pub struct StartRequest {
     /// Schedule ID that triggered this start, if any. This is serialized as
     /// Temporal's legacy `cron_schedule` marker for schedule-originated runs.
     pub cron_schedule: Option<String>,
+    /// Worker identity reserved by the runtime for synchronous first-WFT delivery.
+    pub reserved_poller_identity: Option<WorkerIdentity>,
 }
 
 /// Request to create a brand-new workflow and immediately deliver a signal.

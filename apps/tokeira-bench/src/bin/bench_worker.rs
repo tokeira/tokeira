@@ -11,7 +11,7 @@ use temporalio_client::{
 };
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk::{Worker, WorkerOptions};
-use temporalio_sdk_core::{CoreRuntime, RuntimeOptions};
+use temporalio_sdk_core::{CoreRuntime, PollerBehavior, RuntimeOptions};
 use tokeira_bench::{BENCH_TASK_QUEUE, EchoWorkflow};
 
 #[derive(Parser)]
@@ -56,6 +56,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let worker_options = WorkerOptions::new(&args.task_queue)
         .register_workflow::<EchoWorkflow>()
+        .max_cached_workflows(2000)
+        .workflow_task_poller_behavior(PollerBehavior::SimpleMaximum(50))
+        .nonsticky_to_sticky_poll_ratio(0.1)
         .build();
 
     let mut worker = Worker::new(&runtime, client, worker_options)?;

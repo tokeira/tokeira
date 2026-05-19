@@ -11,11 +11,15 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+time.workspace = true
 tokeira-autoscaler = { path = "../../crates/tokeira-autoscaler" }
 tokeira-config.workspace = true
+tokeira-storage = { path = "../../crates/tokeira-storage" }
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid = { version = "1", features = ["v4"] }
 
 [lints]
 workspace = true

@@ -144,6 +144,8 @@ pub struct RespondWorkflowTaskCompletedRequest {
     pub identity: String,
     /// Decoded at the edge; downstream behaviour belongs to the `speculative-wft` spec.
     pub client_discards_speculative_with_events: bool,
+    pub sdk_metadata: Option<Vec<u8>>,
+    pub worker_version: Option<String>,
     pub commands: Vec<WorkflowCommand>,
     pub return_new_workflow_task: bool,
     pub force_create_new_workflow_task: bool,

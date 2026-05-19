@@ -1,0 +1,234 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="1600" viewBox="0 0 2400 1600">
+<defs>
+  <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M40 0 L0 0 0 40" fill="none" stroke="#e8eef7" stroke-width="1" opacity=".65"/></pattern>
+  <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%"><feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#0f172a" flood-opacity=".08"/></filter>
+  <filter id="smallShadow" x="-20%" y="-20%" width="140%" height="160%"><feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#0f172a" flood-opacity=".14"/></filter>
+  <linearGradient id="band" x1="0" x2="1" y1="0" y2="0"><stop offset="0" stop-color="#f8fafc"/><stop offset="1" stop-color="#eef2ff"/></linearGradient>
+  <linearGradient id="greenband" x1="0" x2="1" y1="0" y2="0"><stop offset="0" stop-color="#f0fdf4"/><stop offset="1" stop-color="#ecfeff"/></linearGradient>
+  <linearGradient id="blueband" x1="0" x2="1" y1="0" y2="0"><stop offset="0" stop-color="#eff6ff"/><stop offset="1" stop-color="#f8fafc"/></linearGradient>
+  <marker id="arr_orange" markerWidth="13" markerHeight="13" refX="11" refY="6.5" orient="auto"><path d="M2,2 L11,6.5 L2,11 Z" fill="#ea580c"/></marker>
+  <marker id="arr_purple" markerWidth="13" markerHeight="13" refX="11" refY="6.5" orient="auto"><path d="M2,2 L11,6.5 L2,11 Z" fill="#7c3aed"/></marker>
+  <marker id="arr_blue" markerWidth="13" markerHeight="13" refX="11" refY="6.5" orient="auto"><path d="M2,2 L11,6.5 L2,11 Z" fill="#2563eb"/></marker>
+  <marker id="arr_cyan" markerWidth="13" markerHeight="13" refX="11" refY="6.5" orient="auto"><path d="M2,2 L11,6.5 L2,11 Z" fill="#0284c7"/></marker>
+  <marker id="arr_green" markerWidth="13" markerHeight="13" refX="11" refY="6.5" orient="auto"><path d="M2,2 L11,6.5 L2,11 Z" fill="#16a34a"/></marker>
+  <marker id="arr_red" markerWidth="13" markerHeight="13" refX="11" refY="6.5" orient="auto"><path d="M2,2 L11,6.5 L2,11 Z" fill="#dc2626"/></marker>
+  <marker id="arr_slate" markerWidth="13" markerHeight="13" refX="11" refY="6.5" orient="auto"><path d="M2,2 L11,6.5 L2,11 Z" fill="#475569"/></marker>
+  <marker id="arr_yellow" markerWidth="13" markerHeight="13" refX="11" refY="6.5" orient="auto"><path d="M2,2 L11,6.5 L2,11 Z" fill="#ca8a04"/></marker>
+  <style>
+    .title { font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 40px; font-weight: 800; fill:#111827; letter-spacing:-.5px; }
+    .subtitle { font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 20px; font-weight: 500; fill:#5b667a; }
+    .section { font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 16px; font-weight: 900; fill:#5b667a; letter-spacing:2.2px; text-transform:uppercase; }
+    .boxtitle { font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 22px; font-weight: 850; fill:#111827; }
+    .subhead { font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 15px; font-weight: 800; fill:#334155; }
+    .body { font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 16px; font-weight: 500; fill:#475569; }
+    .small { font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; font-weight: 500; fill:#475569; }
+    .tiny { font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 12.5px; font-weight: 600; fill:#64748b; }
+    .code { font-family: 'SF Mono', Menlo, Consolas, monospace; font-size: 14px; font-weight: 650; fill:#334155; }
+    .num { font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 15px; font-weight: 900; fill:white; }
+  </style>
+</defs>
+<rect width="100%" height="100%" fill="#f7f9fc"/><rect width="100%" height="100%" fill="url(#grid)" opacity=".55"/>
+<text x="76" y="62" class="title">Tokeira Plane 4 — Performance Critical Path</text>
+<text x="76" y="96" class="subtitle">The critical-path map for explaining throughput: what is synchronous, what is async, where DSQL latency matters, and which levers increase parallelism</text>
+<text x="76" y="124" class="subtitle">without violating workflow ordering.</text>
+<rect x="1970" y="30" width="350" height="76" rx="18" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5" opacity="1"/>
+<text x="1996" y="62" class="tiny">
+<tspan x="1996" dy="0">TOKEIRA</tspan>
+<tspan x="1996" dy="18">Temporal-compatible runtime</tspan>
+<tspan x="1996" dy="18">AWS-first / DSQL authority</tspan>
+</text>
+<text x="76" y="160" class="section">SYNCHRONOUS MUTATION CRITICAL PATH</text>
+<rect x="76" y="180" width="2248" height="455" rx="22" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.4" filter="url(#shadow)" opacity="1"/>
+<rect x="120" y="245" width="280" height="220" rx="14" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.4" opacity="1"/>
+<text x="140" y="277" class="subhead" fill="#ea580c">1 Edge admission</text>
+<text x="140" y="305" class="small">
+<tspan x="140" dy="0">route lookup</tspan>
+<tspan x="140" dy="20">request dedupe</tspan>
+<tspan x="140" dy="20">NotShardOwner retry</tspan>
+</text>
+<path d="M400 355 H453" fill="none" stroke="#ea580c" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_orange)" opacity="0.86"/>
+<rect x="453" y="245" width="280" height="220" rx="14" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.4" opacity="1"/>
+<text x="473" y="277" class="subhead" fill="#16a34a">2 Runtime submit</text>
+<text x="473" y="305" class="small">
+<tspan x="473" dy="0">active bundle?</tspan>
+<tspan x="473" dy="20">choose lane</tspan>
+<tspan x="473" dy="20">bounded queue</tspan>
+</text>
+<path d="M733 355 H786" fill="none" stroke="#16a34a" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_green)" opacity="0.86"/>
+<rect x="786" y="245" width="280" height="220" rx="14" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.4" opacity="1"/>
+<text x="806" y="277" class="subhead" fill="#16a34a">3 Lane executor</text>
+<text x="806" y="305" class="small">
+<tspan x="806" dy="0">per-run serialization</tspan>
+<tspan x="806" dy="20">OCC retry budget</tspan>
+<tspan x="806" dy="20">backpressure point</tspan>
+</text>
+<path d="M1066 355 H1119" fill="none" stroke="#16a34a" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_green)" opacity="0.86"/>
+<rect x="1119" y="245" width="280" height="220" rx="14" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.4" opacity="1"/>
+<text x="1139" y="277" class="subhead" fill="#0284c7">4 Load state</text>
+<text x="1139" y="305" class="small">
+<tspan x="1139" dy="0">workflow_hot</tspan>
+<tspan x="1139" dy="20">needed history</tspan>
+<tspan x="1139" dy="20">request_dedupe</tspan>
+</text>
+<path d="M1399 355 H1452" fill="none" stroke="#0284c7" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_cyan)" opacity="0.86"/>
+<rect x="1452" y="245" width="280" height="220" rx="14" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.4" opacity="1"/>
+<text x="1472" y="277" class="subhead" fill="#16a34a">5 Pure kernel</text>
+<text x="1472" y="305" class="small">
+<tspan x="1472" dy="0">no I/O</tspan>
+<tspan x="1472" dy="20">deterministic transition</tspan>
+<tspan x="1472" dy="20">side-effect intents</tspan>
+</text>
+<path d="M1732 355 H1785" fill="none" stroke="#16a34a" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_green)" opacity="0.86"/>
+<rect x="1785" y="245" width="280" height="220" rx="14" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.4" opacity="1"/>
+<text x="1805" y="277" class="subhead" fill="#2563eb">6 Commit transition</text>
+<text x="1805" y="305" class="small">
+<tspan x="1805" dy="0">history_batch + hot state</tspan>
+<tspan x="1805" dy="20">CAS/fenced epoch</tspan>
+<tspan x="1805" dy="20">commit latency dominates</tspan>
+</text>
+<path d="M2065 355 H2118" fill="none" stroke="#2563eb" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_blue)" opacity="0.86"/>
+<rect x="2118" y="245" width="280" height="220" rx="14" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.4" opacity="1"/>
+<text x="2138" y="277" class="subhead" fill="#7c3aed">7 Reply / publish</text>
+<text x="2138" y="305" class="small">
+<tspan x="2138" dy="0">reply after durable commit</tspan>
+<tspan x="2138" dy="20">broker dispatch</tspan>
+<tspan x="2138" dy="20">projection append</tspan>
+</text>
+<rect x="120" y="505" width="2100" height="74" rx="18" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1.2" opacity="1"/>
+<rect x="150" y="540" width="300" height="18" rx="9" fill="#f97316" opacity=".86"/>
+<text x="160" y="530" class="tiny">edge + lane</text>
+<rect x="450" y="540" width="300" height="18" rx="9" fill="#06b6d4" opacity=".86"/>
+<text x="460" y="530" class="tiny">load_run</text>
+<rect x="750" y="540" width="760" height="18" rx="9" fill="#2563eb" opacity=".86"/>
+<text x="760" y="530" class="tiny">commit_transition</text>
+<rect x="1510" y="540" width="300" height="18" rx="9" fill="#7c3aed" opacity=".86"/>
+<text x="1520" y="530" class="tiny">post-commit publish</text>
+<rect x="1810" y="540" width="360" height="18" rx="9" fill="#64748b" opacity=".86"/>
+<text x="1820" y="530" class="tiny">queue / scheduler overhead</text>
+<text x="120" y="600" class="small">
+<tspan x="120" dy="0">Read this bar as conceptual, not measured: DSQL commit latency is the big synchronous segment; projection and visibility should remain outside this path.</tspan>
+</text>
+<text x="76" y="690" class="section">PARALLELISM LEVERS</text>
+<rect x="76" y="710" width="1070" height="430" rx="22" fill="#f0fdf4" stroke="#86efac" stroke-width="1.5" filter="url(#shadow)" opacity="1"/>
+<rect x="120" y="760" width="300" height="120" rx="18" fill="#ffffff" stroke="#86efac" stroke-width="1.8" filter="url(#shadow)" opacity="1"/>
+<rect x="120" y="760" width="8" height="120" rx="4" fill="#16a34a"/>
+<text x="148" y="802" class="boxtitle" fill="#111827">bundle_count</text>
+<text x="148" y="836" class="body">
+<tspan x="148" dy="0">More independent ownership cells.</tspan>
+<tspan x="148" dy="23">Higher concurrency across runtimes.</tspan>
+<tspan x="148" dy="23">Avoid one lease row serializing the system.</tspan>
+</text>
+<rect x="470" y="760" width="300" height="120" rx="18" fill="#ffffff" stroke="#86efac" stroke-width="1.8" filter="url(#shadow)" opacity="1"/>
+<rect x="470" y="760" width="8" height="120" rx="4" fill="#16a34a"/>
+<text x="498" y="802" class="boxtitle" fill="#111827">lane_count</text>
+<text x="498" y="836" class="body">
+<tspan x="498" dy="0">More local executors per runtime.</tspan>
+<tspan x="498" dy="23">Still preserves per-run order.</tspan>
+<tspan x="498" dy="23">Too high can amplify DB contention.</tspan>
+</text>
+<rect x="820" y="760" width="280" height="120" rx="18" fill="#ffffff" stroke="#86efac" stroke-width="1.8" filter="url(#shadow)" opacity="1"/>
+<rect x="820" y="760" width="8" height="120" rx="4" fill="#16a34a"/>
+<text x="848" y="802" class="boxtitle" fill="#111827">id distribution</text>
+<text x="848" y="836" class="body">
+<tspan x="848" dy="0">Deterministic wide UUIDs.</tspan>
+<tspan x="848" dy="23">Avoid hot shard/bundle paths.</tspan>
+<tspan x="848" dy="23">Spread workflow starts.</tspan>
+</text>
+<rect x="120" y="950" width="300" height="120" rx="18" fill="#faf5ff" stroke="#c4b5fd" stroke-width="1.8" filter="url(#shadow)" opacity="1"/>
+<rect x="120" y="950" width="8" height="120" rx="4" fill="#7c3aed"/>
+<text x="148" y="992" class="boxtitle" fill="#111827">broker sync-match</text>
+<text x="148" y="1026" class="body">
+<tspan x="148" dy="0">Poller present → avoid backlog write.</tspan>
+<tspan x="148" dy="23">Long-poll admission protects edge.</tspan>
+</text>
+<rect x="470" y="950" width="300" height="120" rx="18" fill="#eff6ff" stroke="#93c5fd" stroke-width="1.8" filter="url(#shadow)" opacity="1"/>
+<rect x="470" y="950" width="8" height="120" rx="4" fill="#2563eb"/>
+<text x="498" y="992" class="boxtitle" fill="#111827">commit batching</text>
+<text x="498" y="1026" class="body">
+<tspan x="498" dy="0">Append history batches atomically.</tspan>
+<tspan x="498" dy="23">Batch where semantics allow.</tspan>
+<tspan x="498" dy="23">Never reorder a run.</tspan>
+</text>
+<rect x="820" y="950" width="280" height="120" rx="18" fill="#faf5ff" stroke="#c4b5fd" stroke-width="1.8" filter="url(#shadow)" opacity="1"/>
+<rect x="820" y="950" width="8" height="120" rx="4" fill="#7c3aed"/>
+<text x="848" y="992" class="boxtitle" fill="#111827">projection isolation</text>
+<text x="848" y="1026" class="body">
+<tspan x="848" dy="0">Visibility lag is acceptable.</tspan>
+<tspan x="848" dy="23">Projection retries cannot block WFT completion.</tspan>
+</text>
+<text x="1240" y="690" class="section">CONNECTION BUDGETING</text>
+<rect x="1240" y="710" width="1084" height="430" rx="22" fill="#eff6ff" stroke="#93c5fd" stroke-width="1.5" filter="url(#shadow)" opacity="1"/>
+<rect x="1285" y="760" width="310" height="120" rx="18" fill="#ffffff" stroke="#93c5fd" stroke-width="1.8" filter="url(#shadow)" opacity="1"/>
+<rect x="1285" y="760" width="8" height="120" rx="4" fill="#0284c7"/>
+<text x="1313" y="802" class="boxtitle" fill="#111827">Class-aware semaphores</text>
+<text x="1313" y="836" class="body">
+<tspan x="1313" dy="0">Commit, read, projection, control, maintenance are isolated.</tspan>
+</text>
+<rect x="1645" y="760" width="280" height="120" rx="18" fill="#ffffff" stroke="#93c5fd" stroke-width="1.8" filter="url(#shadow)" opacity="1"/>
+<rect x="1645" y="760" width="8" height="120" rx="4" fill="#0284c7"/>
+<text x="1673" y="802" class="boxtitle" fill="#111827">Reservoir</text>
+<text x="1673" y="836" class="body">
+<tspan x="1673" dy="0">Create slowly; reuse aggressively; retire safely.</tspan>
+</text>
+<rect x="1975" y="760" width="300" height="120" rx="18" fill="#fffbeb" stroke="#fde68a" stroke-width="1.8" filter="url(#shadow)" opacity="1"/>
+<rect x="1975" y="760" width="8" height="120" rx="4" fill="#ca8a04"/>
+<text x="2003" y="802" class="boxtitle" fill="#111827">Cluster budget</text>
+<text x="2003" y="836" class="body">
+<tspan x="2003" dy="0">DDB token bucket / slots prevent account-wide DSQL storms.</tspan>
+</text>
+<path d="M1595 820 H1645" fill="none" stroke="#0284c7" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_cyan)" opacity="0.86"/>
+<path d="M1925 820 H1975" fill="none" stroke="#ca8a04" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_yellow)" opacity="0.86"/>
+<rect x="1285" y="950" width="990" height="120" rx="18" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.8" filter="url(#shadow)" opacity="1"/>
+<rect x="1285" y="950" width="8" height="120" rx="4" fill="#475569"/>
+<text x="1313" y="992" class="boxtitle" fill="#111827">Operational goal</text>
+<text x="1313" y="1026" class="body">
+<tspan x="1313" dy="0">The runtime should saturate useful workflow concurrency before saturating connection creation, DSQL sessions, or projection retries. A slow projection plane should degrade query/list freshness, not workflow correctness.</tspan>
+</text>
+<text x="76" y="1192" class="section">ASYNC / OFF-CRITICAL-PATH WORK</text>
+<rect x="76" y="1212" width="2248" height="220" rx="22" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.4" filter="url(#shadow)" opacity="1"/>
+<rect x="130" y="1268" width="500" height="92" rx="14" fill="#faf5ff" stroke="#ddd6fe" stroke-width="1.4" opacity="1"/>
+<text x="150" y="1300" class="subhead" fill="#7c3aed">projection_log → visibility</text>
+<text x="150" y="1328" class="small">
+<tspan x="150" dy="0">projection workers update SQL visibility and rollups; lag is observable</tspan>
+</text>
+<rect x="670" y="1268" width="500" height="92" rx="14" fill="#faf5ff" stroke="#ddd6fe" stroke-width="1.4" opacity="1"/>
+<text x="690" y="1300" class="subhead" fill="#7c3aed">timer_bucket scanner</text>
+<text x="690" y="1328" class="small">
+<tspan x="690" dy="0">scanner submits commands back into lanes; it does not mutate workflow state directly</tspan>
+</text>
+<rect x="1210" y="1268" width="500" height="92" rx="14" fill="#faf5ff" stroke="#ddd6fe" stroke-width="1.4" opacity="1"/>
+<text x="1230" y="1300" class="subhead" fill="#7c3aed">dispatch_backlog</text>
+<text x="1230" y="1328" class="small">
+<tspan x="1230" dy="0">durable fallback for tasks when no poller is available</tspan>
+</text>
+<rect x="1750" y="1268" width="500" height="92" rx="14" fill="#faf5ff" stroke="#ddd6fe" stroke-width="1.4" opacity="1"/>
+<text x="1770" y="1300" class="subhead" fill="#7c3aed">observability</text>
+<text x="1770" y="1328" class="small">
+<tspan x="1770" dy="0">traces, metrics and structured logs should describe bottleneck shape</tspan>
+</text>
+<path d="M2030 465 C2040 850 350 1190 350 1268" fill="none" stroke="#7c3aed" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arr_purple)" stroke-dasharray="10 8" opacity="0.86"/>
+<circle cx="1982" cy="510" r="17" fill="#7c3aed" stroke="white" stroke-width="4" filter="url(#smallShadow)"/>
+<text x="1982" y="516" text-anchor="middle" class="num">A</text>
+<rect x="76" y="1470" width="2248" height="92" rx="18" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.4" opacity="1"/>
+<rect x="110" y="1498" width="210" height="38" rx="19" fill="#ffffff" stroke="#475569" stroke-width="1.2" opacity="1"/>
+<circle cx="132" cy="1517" r="6" fill="#475569"/>
+<text x="150" y="1522" class="small">commit_transition latency + OCC conflict rate</text>
+<rect x="420" y="1498" width="210" height="38" rx="19" fill="#ffffff" stroke="#475569" stroke-width="1.2" opacity="1"/>
+<circle cx="442" cy="1517" r="6" fill="#475569"/>
+<text x="460" y="1522" class="small">load_run latency</text>
+<rect x="730" y="1498" width="210" height="38" rx="19" fill="#ffffff" stroke="#475569" stroke-width="1.2" opacity="1"/>
+<circle cx="752" cy="1517" r="6" fill="#475569"/>
+<text x="770" y="1522" class="small">lane queue depth / enqueue wait</text>
+<rect x="1040" y="1498" width="210" height="38" rx="19" fill="#ffffff" stroke="#475569" stroke-width="1.2" opacity="1"/>
+<circle cx="1062" cy="1517" r="6" fill="#475569"/>
+<text x="1080" y="1522" class="small">broker sync-match ratio</text>
+<rect x="1350" y="1498" width="210" height="38" rx="19" fill="#ffffff" stroke="#475569" stroke-width="1.2" opacity="1"/>
+<circle cx="1372" cy="1517" r="6" fill="#475569"/>
+<text x="1390" y="1522" class="small">connection permit wait by class</text>
+<rect x="1660" y="1498" width="210" height="38" rx="19" fill="#ffffff" stroke="#475569" stroke-width="1.2" opacity="1"/>
+<circle cx="1682" cy="1517" r="6" fill="#475569"/>
+<text x="1700" y="1522" class="small">projection lag + retry rate</text>
+<rect x="1970" y="1498" width="210" height="38" rx="19" fill="#ffffff" stroke="#475569" stroke-width="1.2" opacity="1"/>
+<circle cx="1992" cy="1517" r="6" fill="#475569"/>
+<text x="2010" y="1522" class="small">NotShardOwner retries</text>
+</svg>

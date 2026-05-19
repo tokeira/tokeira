@@ -66,6 +66,7 @@ pub fn start_request(
         workflow_type: WorkflowType(req.workflow_type),
         task_queue,
         input: req.input,
+        header: req.header,
         memo: req.memo,
         search_attributes: req.search_attributes,
         workflow_execution_timeout: req.workflow_execution_timeout,
@@ -232,6 +233,8 @@ pub fn workflow_task_completed_request(
     Ok(WorkflowTaskCompletedRequest {
         token,
         identity: WorkerIdentity(req.identity),
+        sdk_metadata: req.sdk_metadata,
+        worker_version: req.worker_version,
         commands: req.commands,
         force_new_workflow_task: req.force_create_new_workflow_task,
         now: OffsetDateTime::now_utc(),
@@ -386,6 +389,8 @@ mod tests {
         let req = RespondWorkflowTaskCompletedRequest {
             task_token: serde_json::to_vec(&token).unwrap(),
             identity: "worker-a".to_string(),
+            sdk_metadata: None,
+            worker_version: None,
             client_discards_speculative_with_events: false,
             commands: Vec::new(),
             return_new_workflow_task: false,

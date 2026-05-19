@@ -357,6 +357,7 @@ mod tests {
             build_id: None,
             input: Payloads::default(),
             header: None,
+            last_failure: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: None,

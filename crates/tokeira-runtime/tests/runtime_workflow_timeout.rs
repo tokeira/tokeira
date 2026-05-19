@@ -257,6 +257,7 @@ fn start_request(
         workflow_type: WorkflowType("example".to_string()),
         task_queue: TaskQueueName("workflow-q".to_string()),
         input: Payloads::default(),
+        header: None,
         memo: Memo::default(),
         search_attributes: SearchAttributes::default(),
         workflow_execution_timeout,

@@ -211,6 +211,9 @@ pub struct ActivityState {
     /// Event ID of the `ActivityTaskStarted` event, if the
     /// activity has been started.
     pub started_event_id: Option<i64>,
+    /// Failure from the previous attempt, surfaced on the next
+    /// `ActivityTaskStarted` event when the activity retries.
+    pub last_failure: Option<Payload>,
     /// Pause metadata when the activity is individually
     /// paused.
     pub pause_info: Option<ActivityPauseInfo>,
@@ -262,6 +265,10 @@ pub struct ChildWorkflowState {
     pub child_workflow_id: WorkflowId,
     /// Namespace that owns the child workflow.
     pub namespace_id: NamespaceId,
+    /// Human-readable namespace name, if the edge supplied one.
+    pub namespace: Option<String>,
+    /// Workflow type of the child, retained for terminal events.
+    pub workflow_type: WorkflowType,
     /// Run ID assigned to the child, once started.
     pub child_run_id: Option<RunId>,
     /// Event ID of the initiation event in the parent's
@@ -290,6 +297,10 @@ pub enum ParentClosePolicy {
 pub struct PendingExternalSignal {
     /// Event ID of the initiation event (used as map key).
     pub initiated_event_id: i64,
+    /// Namespace ID of the signal target.
+    pub target_namespace_id: NamespaceId,
+    /// Human-readable namespace name of the target, if supplied.
+    pub target_namespace: Option<String>,
     /// Workflow ID of the signal target.
     pub target_workflow_id: WorkflowId,
     /// Optional run ID of the signal target.
@@ -304,6 +315,10 @@ pub struct PendingExternalSignal {
 pub struct PendingExternalCancel {
     /// Event ID of the initiation event (used as map key).
     pub initiated_event_id: i64,
+    /// Namespace ID of the cancel target.
+    pub target_namespace_id: NamespaceId,
+    /// Human-readable namespace name of the target, if supplied.
+    pub target_namespace: Option<String>,
     /// Workflow ID of the cancel target.
     pub target_workflow_id: WorkflowId,
     /// Optional run ID of the cancel target.

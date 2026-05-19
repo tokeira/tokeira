@@ -345,10 +345,10 @@ where
                 if let CommitResult::Applied { new_state } = &commit_result {
                     for event in &history_events {
                         match &event.kind {
-                            HistoryEventKind::ActivityTaskCancelRequested { activity_id } => {
-                                activity_tracking
-                                    .mark_cancel_requested(message.run_key, activity_id)
-                            }
+                            HistoryEventKind::ActivityTaskCancelRequested {
+                                activity_id, ..
+                            } => activity_tracking
+                                .mark_cancel_requested(message.run_key, activity_id),
                             HistoryEventKind::ActivityTaskCompleted { activity_id, .. }
                             | HistoryEventKind::ActivityTaskFailed { activity_id, .. }
                             | HistoryEventKind::ActivityTaskTimedOut { activity_id, .. }
@@ -358,6 +358,7 @@ where
                             HistoryEventKind::WorkflowExecutionUpdateCompleted {
                                 update_id,
                                 result,
+                                ..
                             } => {
                                 update_registry.notify(
                                     message.run_key,
@@ -370,6 +371,7 @@ where
                             HistoryEventKind::WorkflowExecutionUpdateRejected {
                                 update_id,
                                 failure,
+                                ..
                             } => {
                                 update_registry.notify(
                                     message.run_key,
@@ -627,6 +629,7 @@ where
                                         deployment: new_state.deployment.clone(),
                                         build_id: new_state.build_id.clone(),
                                         input,
+                                        header: None,
                                         memo,
                                         search_attributes,
                                         workflow_execution_timeout,
@@ -823,7 +826,6 @@ where
             run_key = %run_key.0,
             transition_seq = tracing::field::Empty,
         );
-        let _entered = transition_span.enter();
         let loaded = match cache.get(run_key) {
             Some(loaded) => loaded,
             None => {
@@ -832,9 +834,11 @@ where
                 loaded
             }
         };
-        let transition = kernel
-            .apply(loaded, command.clone())
-            .map_err(|reject| anyhow!("kernel rejected command: {reject}"))?;
+        let transition = transition_span.in_scope(|| {
+            kernel
+                .apply(loaded, command.clone())
+                .map_err(|reject| anyhow!("kernel rejected command: {reject}"))
+        })?;
         let (execution_home_bundle, epoch) = {
             let owner = shard_owner.read().unwrap();
             let bundle_id = execution_home_bundle(
@@ -1037,7 +1041,7 @@ fn history_event_type_name(event: &HistoryEvent) -> &'static str {
         HistoryEventKind::WorkflowExecutionContinuedAsNew { .. } => {
             "WorkflowExecutionContinuedAsNew"
         }
-        HistoryEventKind::WorkflowExecutionCanceled => "WorkflowExecutionCanceled",
+        HistoryEventKind::WorkflowExecutionCanceled { .. } => "WorkflowExecutionCanceled",
     }
 }
 
@@ -1148,6 +1152,7 @@ mod tests {
                     kind: tokeira_kernel::HistoryEventKind::WorkflowExecutionSignaled {
                         signal_name: "test".to_string(),
                         input: Payloads::default(),
+                        header: None,
                         request_id: "req".to_string(),
                         identity: None,
                     },
@@ -1590,6 +1595,7 @@ mod tests {
                         initiator: tokeira_kernel::ContinueAsNewInitiator::Workflow,
                         failure: None,
                         last_completion_result: None,
+                        workflow_task_completed_event_id: 0,
                     },
                 }]
             } else {
@@ -1598,6 +1604,7 @@ mod tests {
                     happened_at: OffsetDateTime::now_utc(),
                     kind: tokeira_kernel::HistoryEventKind::WorkflowExecutionCompleted {
                         result: Payloads::default(),
+                        workflow_task_completed_event_id: 0,
                     },
                 }]
             };

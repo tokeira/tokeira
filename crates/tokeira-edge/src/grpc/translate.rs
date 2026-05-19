@@ -416,6 +416,8 @@ pub fn respond_completed_request_to_edge(
     Ok(RespondWorkflowTaskCompletedRequest {
         task_token: req.task_token,
         identity: req.identity,
+        sdk_metadata: req.sdk_metadata.map(|metadata| metadata.encode_to_vec()),
+        worker_version: req.worker_version_stamp.map(|stamp| stamp.build_id),
         client_discards_speculative_with_events: req
             .capabilities
             .is_some_and(|capabilities| capabilities.discard_speculative_workflow_task_with_events),
@@ -1554,6 +1556,7 @@ pub fn proto_command_to_workflow_command(
         Some(Attributes::RequestCancelExternalWorkflowExecutionCommandAttributes(attrs)) => {
             Ok(WorkflowCommand::RequestCancelExternalWorkflowExecution {
                 target_namespace_id: namespace_name_to_domain(&attrs.namespace),
+                target_namespace: non_empty(attrs.namespace),
                 target_workflow_id: WorkflowId(attrs.workflow_id),
                 target_run_id: non_empty(attrs.run_id)
                     .map(|run_id| parse_run_id(&run_id))
@@ -1624,6 +1627,7 @@ pub fn proto_command_to_workflow_command(
             Ok(WorkflowCommand::StartChildWorkflow {
                 child_workflow_id: WorkflowId(attrs.workflow_id),
                 namespace_id: namespace_name_to_domain(&attrs.namespace),
+                namespace: non_empty(attrs.namespace),
                 workflow_type: WorkflowType(
                     attrs
                         .workflow_type
@@ -1637,6 +1641,22 @@ pub fn proto_command_to_workflow_command(
                     .as_ref()
                     .map(payloads_to_domain)
                     .unwrap_or_default(),
+                header: attrs.header.as_ref().map(headers_to_domain),
+                memo: attrs.memo.as_ref().map(memo_to_domain).unwrap_or_default(),
+                search_attributes: attrs
+                    .search_attributes
+                    .as_ref()
+                    .map(search_attributes_to_domain)
+                    .transpose()?
+                    .unwrap_or_default(),
+                workflow_execution_timeout: proto_duration_to_time(
+                    attrs.workflow_execution_timeout.as_ref(),
+                ),
+                workflow_run_timeout: proto_duration_to_time(attrs.workflow_run_timeout.as_ref()),
+                workflow_task_timeout: proto_duration_to_time(attrs.workflow_task_timeout.as_ref())
+                    .unwrap_or(time::Duration::seconds(10)),
+                retry_policy: attrs.retry_policy.as_ref().map(retry_policy_to_domain),
+                cron_schedule: non_empty(attrs.cron_schedule),
                 parent_close_policy: parent_close_policy_to_domain(attrs.parent_close_policy),
             })
         }
@@ -1649,6 +1669,7 @@ pub fn proto_command_to_workflow_command(
                 ))?;
             Ok(WorkflowCommand::SignalExternalWorkflowExecution {
                 target_namespace_id: namespace_name_to_domain(&attrs.namespace),
+                target_namespace: non_empty(attrs.namespace),
                 target_workflow_id: WorkflowId(execution.workflow_id.clone()),
                 target_run_id: non_empty(execution.run_id.clone())
                     .map(|run_id| parse_run_id(&run_id))
@@ -1659,6 +1680,7 @@ pub fn proto_command_to_workflow_command(
                     .as_ref()
                     .map(payloads_to_domain)
                     .unwrap_or_default(),
+                header: attrs.header.as_ref().map(headers_to_domain),
                 control: attrs.control,
             })
         }
@@ -1858,13 +1880,24 @@ pub fn workflow_command_to_proto(
         WorkflowCommand::StartChildWorkflow {
             child_workflow_id,
             namespace_id,
+            namespace,
             workflow_type,
             task_queue,
             input,
+            header,
+            memo,
+            search_attributes,
+            workflow_execution_timeout,
+            workflow_run_timeout,
+            workflow_task_timeout,
+            retry_policy,
+            cron_schedule,
             parent_close_policy,
         } => Some(Attributes::StartChildWorkflowExecutionCommandAttributes(
             command::StartChildWorkflowExecutionCommandAttributes {
-                namespace: namespace_id.0.to_string(),
+                namespace: namespace
+                    .clone()
+                    .unwrap_or_else(|| namespace_id.0.to_string()),
                 workflow_id: child_workflow_id.0.clone(),
                 workflow_type: Some(tokeira_proto::common::WorkflowType {
                     name: workflow_type.0.clone(),
@@ -1873,27 +1906,40 @@ pub fn workflow_command_to_proto(
                     task_queue,
                 )),
                 input: Some(payloads_from_domain(input)),
+                header: header.as_ref().map(headers_from_domain),
+                memo: Some(memo_from_domain(memo)),
+                search_attributes: Some(search_attributes_from_domain(search_attributes)),
+                workflow_execution_timeout: workflow_execution_timeout.map(to_proto_duration),
+                workflow_run_timeout: workflow_run_timeout.map(to_proto_duration),
+                workflow_task_timeout: Some(to_proto_duration(*workflow_task_timeout)),
+                retry_policy: retry_policy.as_ref().map(retry_policy_from_domain),
+                cron_schedule: cron_schedule.clone().unwrap_or_default(),
                 parent_close_policy: parent_close_policy_from_domain(*parent_close_policy),
                 ..Default::default()
             },
         )),
         WorkflowCommand::SignalExternalWorkflowExecution {
             target_namespace_id,
+            target_namespace,
             target_workflow_id,
             target_run_id,
             signal_name,
             input,
+            header,
             control,
         } => Some(
             Attributes::SignalExternalWorkflowExecutionCommandAttributes(
                 command::SignalExternalWorkflowExecutionCommandAttributes {
-                    namespace: target_namespace_id.0.to_string(),
+                    namespace: target_namespace
+                        .clone()
+                        .unwrap_or_else(|| target_namespace_id.0.to_string()),
                     execution: Some(workflow_execution_from_ids(
                         target_workflow_id,
                         target_run_id.unwrap_or(RunId(Uuid::nil())),
                     )),
                     signal_name: signal_name.clone(),
                     input: Some(payloads_from_domain(input)),
+                    header: header.as_ref().map(headers_from_domain),
                     control: control.clone(),
                     ..Default::default()
                 },
@@ -1901,13 +1947,16 @@ pub fn workflow_command_to_proto(
         ),
         WorkflowCommand::RequestCancelExternalWorkflowExecution {
             target_namespace_id,
+            target_namespace,
             target_workflow_id,
             target_run_id,
             control,
         } => Some(
             Attributes::RequestCancelExternalWorkflowExecutionCommandAttributes(
                 command::RequestCancelExternalWorkflowExecutionCommandAttributes {
-                    namespace: target_namespace_id.0.to_string(),
+                    namespace: target_namespace
+                        .clone()
+                        .unwrap_or_else(|| target_namespace_id.0.to_string()),
                     workflow_id: target_workflow_id.0.clone(),
                     run_id: target_run_id
                         .map(|run_id| run_id.0.to_string())

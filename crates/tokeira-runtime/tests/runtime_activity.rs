@@ -49,7 +49,7 @@ async fn schedule_poll_complete_activity_produces_completed_history() -> Result<
     assert_eq!(started.activity_id, "activity-1");
 
     let _ = runtime
-        .complete_activity_task(started.token, payloads("done"))
+        .complete_activity_task(started.token, payloads("done"), None)
         .await?;
 
     let history = store.read_history(run_key, 0, 64).await?;
@@ -105,6 +105,7 @@ async fn retryable_activity_failure_redispatches_next_attempt() -> Result<()> {
             Payload::new(b"boom".to_vec()),
             Some("retryable".to_string()),
             false,
+            None,
         )
         .await?;
 
@@ -185,6 +186,7 @@ async fn retryable_activity_failure_preserves_versioned_queue() -> Result<()> {
             Payload::new(b"boom".to_vec()),
             Some("retryable".to_string()),
             false,
+            None,
         )
         .await?;
 
@@ -253,6 +255,7 @@ async fn non_retryable_activity_failure_submits_failed_resolution() -> Result<()
             Payload::new(b"boom".to_vec()),
             Some("fatal".to_string()),
             false,
+            None,
         )
         .await?;
 
@@ -364,6 +367,8 @@ async fn start_and_schedule_activity_with_version(
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: workflow_task.token,
             identity: WorkerIdentity("worker-a".to_string()),
+            sdk_metadata: None,
+            worker_version: None,
             commands: vec![WorkflowCommand::ScheduleActivity {
                 activity_id: activity_id.to_string(),
                 activity_type: "activity-type".to_string(),
@@ -401,6 +406,7 @@ fn start_request(
         workflow_type: WorkflowType("example".to_string()),
         task_queue: TaskQueueName("workflow-q".to_string()),
         input: Payloads::default(),
+        header: None,
         memo: Memo::default(),
         search_attributes: SearchAttributes::default(),
         workflow_execution_timeout: None,

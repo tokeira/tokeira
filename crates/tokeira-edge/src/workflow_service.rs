@@ -174,6 +174,7 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         &self,
         token: ActivityTaskToken,
         result: Payloads,
+        worker_identity: Option<tokeira_types::WorkerIdentity>,
     ) -> Result<WorkflowMutationOutcome>;
 
     async fn fail_activity_task(
@@ -182,6 +183,7 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         failure: Payload,
         failure_error_type: Option<String>,
         is_non_retryable: bool,
+        worker_identity: Option<tokeira_types::WorkerIdentity>,
     ) -> Result<()>;
 
     async fn record_activity_heartbeat(&self, token: ActivityTaskToken) -> Result<bool>;
@@ -1367,6 +1369,7 @@ impl WorkflowService {
             workflow_type: entry.action.start_workflow.workflow_type.clone(),
             task_queue: entry.action.start_workflow.task_queue.clone(),
             input: entry.action.start_workflow.input.clone(),
+            header: None,
             memo: entry.action.start_workflow.memo.clone(),
             search_attributes: entry.action.start_workflow.search_attributes.clone(),
             workflow_execution_timeout: entry.action.start_workflow.workflow_execution_timeout,
@@ -2779,7 +2782,11 @@ impl WorkflowService {
                 let token = req.token;
                 let _outcome = self
                     .runtime
-                    .complete_activity_task(token.clone(), req.result)
+                    .complete_activity_task(
+                        token.clone(),
+                        req.result,
+                        Some(tokeira_types::WorkerIdentity(req.identity)),
+                    )
                     .await
                     .map_err(EdgeError::from)?;
                 self.notify_history_run_key(
@@ -2817,6 +2824,7 @@ impl WorkflowService {
                         req.failure,
                         req.failure_error_type,
                         req.is_non_retryable,
+                        Some(tokeira_types::WorkerIdentity(req.identity)),
                     )
                     .await
                     .map_err(EdgeError::from)?;
@@ -3141,6 +3149,7 @@ impl WorkflowService {
                             HistoryEventKind::WorkflowExecutionUpdateCompleted {
                                 update_id: uid,
                                 result,
+                                ..
                             } if uid == &update_id => {
                                 return Ok(Some((
                                     UpdateOutcome::Completed {
@@ -3153,6 +3162,7 @@ impl WorkflowService {
                             HistoryEventKind::WorkflowExecutionUpdateRejected {
                                 update_id: uid,
                                 failure,
+                                ..
                             } if uid == &update_id => {
                                 return Ok(Some((
                                     UpdateOutcome::Rejected {
@@ -3513,7 +3523,7 @@ fn is_close_history_event(kind: &HistoryEventKind) -> bool {
         HistoryEventKind::WorkflowExecutionCompleted { .. }
             | HistoryEventKind::WorkflowExecutionFailed { .. }
             | HistoryEventKind::WorkflowExecutionTimedOut { .. }
-            | HistoryEventKind::WorkflowExecutionCanceled
+            | HistoryEventKind::WorkflowExecutionCanceled { .. }
             | HistoryEventKind::WorkflowExecutionTerminated { .. }
             | HistoryEventKind::WorkflowExecutionContinuedAsNew { .. }
     )

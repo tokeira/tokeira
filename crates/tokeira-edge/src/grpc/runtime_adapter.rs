@@ -115,8 +115,12 @@ where
         &self,
         token: ActivityTaskToken,
         result: Payloads,
+        worker_identity: Option<tokeira_types::WorkerIdentity>,
     ) -> Result<WorkflowMutationOutcome> {
-        let commit = self.runtime.complete_activity_task(token, result).await?;
+        let commit = self
+            .runtime
+            .complete_activity_task(token, result, worker_identity)
+            .await?;
         commit_result_to_outcome(commit)
     }
 
@@ -126,9 +130,16 @@ where
         failure: Payload,
         failure_error_type: Option<String>,
         is_non_retryable: bool,
+        worker_identity: Option<tokeira_types::WorkerIdentity>,
     ) -> Result<()> {
         self.runtime
-            .fail_activity_task(token, failure, failure_error_type, is_non_retryable)
+            .fail_activity_task(
+                token,
+                failure,
+                failure_error_type,
+                is_non_retryable,
+                worker_identity,
+            )
             .await
     }
 

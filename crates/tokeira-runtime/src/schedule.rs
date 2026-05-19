@@ -851,6 +851,7 @@ where
         workflow_type: entry.action.start_workflow.workflow_type.clone(),
         task_queue: entry.action.start_workflow.task_queue.clone(),
         input: entry.action.start_workflow.input.clone(),
+        header: None,
         memo: entry.action.start_workflow.memo.clone(),
         search_attributes: entry.action.start_workflow.search_attributes.clone(),
         workflow_execution_timeout: entry.action.start_workflow.workflow_execution_timeout,

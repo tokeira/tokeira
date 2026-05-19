@@ -189,6 +189,7 @@ async fn start_workflow(
             deployment: None,
             build_id: None,
             input: Payloads::default(),
+            header: None,
             memo: Memo::default(),
             search_attributes: SearchAttributes::default(),
             workflow_execution_timeout: None,
@@ -241,6 +242,8 @@ async fn quiesce_workflow(
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: started.token,
             identity: WorkerIdentity("worker-a".into()),
+            sdk_metadata: None,
+            worker_version: None,
             commands: Vec::new(),
             force_new_workflow_task: false,
             now: OffsetDateTime::now_utc(),

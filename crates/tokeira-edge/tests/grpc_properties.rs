@@ -1028,28 +1028,43 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
             arb_payloads(),
         )
             .prop_map(|(child_workflow_id, workflow_type, task_queue, input)| {
+                let namespace_id = tokeira_types::NamespaceId::new();
                 WorkflowCommand::StartChildWorkflow {
                     child_workflow_id: tokeira_types::WorkflowId(child_workflow_id),
-                    namespace_id: tokeira_types::NamespaceId::new(),
+                    namespace: Some(namespace_id.0.to_string()),
+                    namespace_id,
                     workflow_type: tokeira_types::WorkflowType(workflow_type),
                     task_queue: tokeira_types::TaskQueueName(task_queue),
                     input,
+                    header: None,
+                    memo: tokeira_types::Memo::default(),
+                    search_attributes: tokeira_types::SearchAttributes::default(),
+                    workflow_execution_timeout: None,
+                    workflow_run_timeout: None,
+                    workflow_task_timeout: time::Duration::seconds(10),
+                    retry_policy: None,
+                    cron_schedule: None,
                     parent_close_policy: tokeira_kernel::ParentClosePolicy::Terminate,
                 }
             }),
         (arb_small_string(), arb_payloads(),).prop_map(|(target_workflow_id, input)| {
+            let target_namespace_id = tokeira_types::NamespaceId::new();
             WorkflowCommand::SignalExternalWorkflowExecution {
-                target_namespace_id: tokeira_types::NamespaceId::new(),
+                target_namespace: Some(target_namespace_id.0.to_string()),
+                target_namespace_id,
                 target_workflow_id: tokeira_types::WorkflowId(target_workflow_id),
                 target_run_id: Some(tokeira_types::RunId::new()),
                 signal_name: "sig".into(),
                 input,
+                header: None,
                 control: "ctl".into(),
             }
         }),
         arb_small_string().prop_map(|target_workflow_id| {
+            let target_namespace_id = tokeira_types::NamespaceId::new();
             WorkflowCommand::RequestCancelExternalWorkflowExecution {
-                target_namespace_id: tokeira_types::NamespaceId::new(),
+                target_namespace: Some(target_namespace_id.0.to_string()),
+                target_namespace_id,
                 target_workflow_id: tokeira_types::WorkflowId(target_workflow_id),
                 target_run_id: Some(tokeira_types::RunId::new()),
                 control: "ctl".into(),

@@ -154,6 +154,7 @@ impl WorkflowRuntimeApi for RecordingRuntime {
         &self,
         _token: ActivityTaskToken,
         _result: Payloads,
+        _worker_identity: Option<WorkerIdentity>,
     ) -> Result<WorkflowMutationOutcome> {
         unreachable!()
     }
@@ -164,6 +165,7 @@ impl WorkflowRuntimeApi for RecordingRuntime {
         _failure: Payload,
         _failure_error_type: Option<String>,
         _is_non_retryable: bool,
+        _worker_identity: Option<WorkerIdentity>,
     ) -> Result<()> {
         unreachable!()
     }
@@ -395,6 +397,7 @@ async fn seed_workflow(
             workflow_type: WorkflowType("test".to_string()),
             task_queue: queue.clone(),
             input: Payloads::default(),
+            header: None,
             memo: Memo::default(),
             search_attributes: SearchAttributes::default(),
             workflow_execution_timeout: None,

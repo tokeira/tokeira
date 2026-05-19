@@ -45,7 +45,7 @@ Blocked on: `temporal-api-v1.62-sync` for v1.62-specific proto fields. The audit
 
 1.11 WHEN a `WorkflowTaskFailed` event is serialized THEN the system produces a proto event with `binary_checksum` and `worker_version` fields defaulted to zero/empty
 
-1.12 WHEN an `ActivityTaskScheduled` event is serialized THEN the system produces a proto event with `workflow_task_completed_event_id`, `namespace`, and `use_workflow_build_id` fields defaulted to zero/empty
+1.12 WHEN an `ActivityTaskScheduled` event is serialized THEN the system produces a proto event with `workflow_task_completed_event_id` defaulted to zero. `namespace` is also empty today, but that is not a bug for same-namespace activities because the namespace is implicit from the workflow execution context.
 
 1.13 WHEN an `ActivityTaskStarted` event is serialized THEN the system produces a proto event with `request_id`, `last_failure`, and `worker_version` fields defaulted to zero/empty
 
@@ -67,7 +67,7 @@ Blocked on: `temporal-api-v1.62-sync` for v1.62-specific proto fields. The audit
 
 1.22 WHEN a `StartChildWorkflowExecutionInitiated` event is serialized THEN the system produces a proto event with `workflow_task_completed_event_id`, `namespace` (human-readable), `header`, `memo`, `search_attributes`, `workflow_execution_timeout`, `workflow_run_timeout`, `workflow_task_timeout`, `retry_policy`, and `cron_schedule` fields defaulted to zero/empty
 
-1.23 WHEN a `ChildWorkflowExecutionStarted` event is serialized THEN the system produces a proto event with `header` defaulted to empty
+1.23 WHEN a `ChildWorkflowExecutionStarted` event is serialized THEN the system produces a proto event with `header` defaulted to empty. This is intentionally defaulted in this spec because the parent-side child-start confirmation path has no authoritative child-started header source.
 
 1.24 WHEN a `StartChildWorkflowExecutionFailed` event is serialized THEN the system produces a proto event with `initiated_event_id`, `namespace`, and `workflow_type` fields defaulted to zero/empty
 
@@ -95,7 +95,7 @@ Blocked on: `temporal-api-v1.62-sync` for v1.62-specific proto fields. The audit
 
 1.36 WHEN a `NexusOperationScheduled` event is serialized THEN the system produces a proto event with `workflow_task_completed_event_id`, `nexus_header`, and `endpoint_id` fields defaulted to zero/empty
 
-1.37 WHEN a `NexusOperationStarted` event is serialized THEN the system produces a proto event with `operation_token` (v1.62 rename of `operation_id`) defaulted to empty
+1.37 WHEN a `NexusOperationStarted` event is serialized THEN the current checked-in proto surface still uses `operation_id`; the v1.62 `operation_token` rename is tracked as deferred until `tokeira_proto` is regenerated
 
 1.38 WHEN a `NexusOperationCompleted`, `NexusOperationFailed`, `NexusOperationCanceled`, or `NexusOperationTimedOut` event is serialized THEN the system produces a proto event with `operation_id` defaulted to empty (the kernel carries it but the serializer ignores it via `operation_id: _`)
 
@@ -127,13 +127,13 @@ Blocked on: `temporal-api-v1.62-sync` for v1.62-specific proto fields. The audit
 
 2.8 WHEN a `WorkflowExecutionSignaled` event is serialized THEN the system SHALL populate `header` when the signal carries headers (requires kernel addition for signal headers)
 
-2.9 WHEN a `WorkflowTaskStarted` event is serialized THEN the system SHALL populate `request_id` from the task start metadata and `history_size_bytes` from the run's history size (requires runtime addition)
+2.9 WHEN a `WorkflowTaskStarted` event is serialized THEN the system SHALL populate `request_id` from the task start command, `history_size_bytes` from the run's history size, and `suggest_continue_as_new` from the runtime's history-size policy. The runtime SHALL generate the request ID when it submits `StartWorkflowTaskRequest`; the kernel stamps the request fields onto the event.
 
-2.10 WHEN a `WorkflowTaskCompleted` event is serialized THEN the system SHALL populate `sdk_metadata` and `worker_version` from the completion response (requires kernel addition to carry SDK metadata through)
+2.10 WHEN a `WorkflowTaskCompleted` event is serialized THEN the system SHALL populate `sdk_metadata` and `worker_version` from the completion response after the gRPC request translation, internal DTO, `WorkflowTaskCompletedRequest`, and kernel event all preserve those values.
 
-2.11 WHEN a `WorkflowTaskFailed` event is serialized THEN the system SHALL populate `worker_version` from the failure response metadata (requires kernel addition)
+2.11 WHEN a `WorkflowTaskFailed` event is serialized THEN the system SHALL leave `worker_version` default in this spec. The current `respond_workflow_task_failed` handler does not submit a kernel command with worker version metadata; WFT failure is processed server-side by runtime paths such as SDK failure handling or timeout scanning. Populate this field when the `worker-deployments` spec adds worker version reporting to WFT failure responses.
 
-2.12 WHEN an `ActivityTaskScheduled` event is serialized THEN the system SHALL populate `workflow_task_completed_event_id` from the WFT that produced the schedule command and `namespace` from the target namespace (requires kernel additions)
+2.12 WHEN an `ActivityTaskScheduled` event is serialized THEN the system SHALL populate `workflow_task_completed_event_id` from the WFT that produced the schedule command. `ActivityTaskScheduled.namespace` SHALL remain empty for same-namespace activities because the namespace is implicit from the workflow execution context; it SHALL be populated only when a future cross-namespace activity feature adds an authoritative target namespace name to the command/event model.
 
 2.13 WHEN an `ActivityTaskStarted` event is serialized THEN the system SHALL populate `request_id` from the activity start metadata and `last_failure` from the previous attempt's failure when retrying (requires kernel addition)
 
@@ -155,13 +155,15 @@ Blocked on: `temporal-api-v1.62-sync` for v1.62-specific proto fields. The audit
 
 2.22 WHEN a `StartChildWorkflowExecutionInitiated` event is serialized THEN the system SHALL populate `workflow_task_completed_event_id`, human-readable `namespace`, header, memo, search attributes, workflow execution/run/task timeout fields, retry policy, and cron schedule only after adding those values to the child-start command/event model. The current event already carries only child workflow ID, workflow type, task queue, input, namespace ID, and parent close policy; all other fields are kernel event enrichment, not serializer-only.
 
-2.23 WHEN a `ChildWorkflowExecutionStarted` event is serialized THEN the system SHALL populate `header` only if the child-started event is enriched with an authored header or explicit runtime/history context provides one. If no authoritative header exists for the child-started path, the proto header field SHALL remain default.
+2.23 WHEN a `ChildWorkflowExecutionStarted` event is serialized THEN the system SHALL leave `header` default in this spec. The parent-side child-start confirmation path currently receives only child run identity and does not receive the child's authored start header; populating this field requires a future `runtime-child-workflows` enhancement that echoes authored child-start metadata back to the parent.
 
 2.24 WHEN child workflow terminal events are serialized THEN the system SHALL populate `namespace`, `workflow_type`, and child `run_id` only after those values are made available to serialization. The preferred fix is kernel event enrichment: include namespace, workflow type, and child run ID on `ChildWorkflowExecutionCompleted`, `ChildWorkflowExecutionFailed`, `ChildWorkflowExecutionCanceled`, `ChildWorkflowExecutionTerminated`, and `ChildWorkflowExecutionTimedOut` when known. An alternative implementation may pass explicit history context into the serializer, but the serializer MUST NOT attempt an implicit storage lookup or synthesize missing child metadata.
 
 2.25 WHEN external signal/cancel events are serialized THEN the system SHALL populate `namespace` and target `run_id` only after those values are preserved on the initiated and result events, or after an explicit history-context enrichment layer is added. The current success/failure events only carry `initiated_event_id` and `target_workflow_id`, so the serializer cannot recover `target_run_id` or namespace by itself.
 
-2.26 WHEN Nexus operation events are serialized THEN the system SHALL wire through `operation_id` on terminal events (the kernel already carries it but the serializer discards it via `_` bindings)
+Namespace source contract: WHEN any event requires a human-readable Temporal `namespace` string THEN the system SHALL use an explicitly threaded namespace name from edge/runtime request context. If only `NamespaceId` is available, the serializer SHALL continue populating `namespace_id` fields where the proto supports them and SHALL leave human-readable `namespace` empty rather than serializing a UUID as a namespace name. The kernel and serializer MUST NOT perform implicit namespace lookup.
+
+2.26 WHEN Nexus operation events are serialized THEN the system SHALL wire through `operation_id` on terminal events (the kernel already carries it but the serializer discards it via `_` bindings). The `NexusOperationStarted.operation_token` rename is deferred until `tokeira_proto` is regenerated with that field; until then the serializer continues populating the existing `operation_id` field, which is already correct.
 
 2.27 WHEN update events are serialized THEN the system SHALL populate sequencing event IDs and request metadata from the kernel's update tracking data
 
@@ -197,8 +199,8 @@ Blocked on: `temporal-api-v1.62-sync` for v1.62-specific proto fields. The audit
 
 4.1 Serializer-only fixes include fields already present on `HistoryEventKind`, such as `NexusOperationCompleted.operation_id`, `NexusOperationFailed.operation_id`, `NexusOperationCanceled.operation_id`, and `NexusOperationTimedOut.operation_id`, plus any currently ignored fields explicitly carried by the event.
 
-4.2 Kernel event enrichment fixes include start identity/header, producing `workflow_task_completed_event_id` fields, timeout retry `new_execution_run_id`, activity completion/failure/cancel worker identity and retry state, timer/marker producing event IDs, child-start optional attributes, child-started header when authored, child terminal metadata, external signal/cancel target namespace/run ID, continued-as-new header/inherit-build-id when authored, and update sequencing/request metadata not currently carried on update events.
+4.2 Kernel event enrichment fixes include start identity/header, producing `workflow_task_completed_event_id` fields, timeout retry `new_execution_run_id`, activity completion/failure/cancel worker identity and retry state, timer/marker producing event IDs, child-start optional attributes, child terminal metadata, external signal/cancel target namespace/run ID, and update sequencing/request metadata not currently carried on update events. Child-started header and continued-as-new header/inherit-build-id remain intentionally defaulted until their command/runtime contracts are enriched.
 
 4.3 Runtime/history-context enrichment fixes include values derived from history size, task-start request IDs, or relationships to earlier events if the team chooses not to duplicate them into each kernel event. This context must be passed explicitly to the serializer or applied before serialization; `history_serializer.rs` remains a pure event-to-proto projector.
 
-4.4 Deferred proto-sync fixes include v1.62-only fields such as renamed Nexus `operation_token` and any fields not exposed by the currently generated `tokeira_proto` surface. These SHALL be tracked but not implemented until `temporal-api-v1.62-sync`.
+4.4 Deferred proto-sync fixes include fields not exposed by the currently generated `tokeira_proto` surface or fields owned by a separate feature spec. `NexusOperationStarted.operation_token` remains deferred until the generated proto exposes the v1.62 field; the current serializer should keep writing `operation_id`.

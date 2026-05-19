@@ -217,6 +217,7 @@ where
             deployment: None,
             build_id: None,
             input,
+            header: None,
             memo: Memo::default(),
             search_attributes: SearchAttributes::default(),
             workflow_execution_timeout: None,

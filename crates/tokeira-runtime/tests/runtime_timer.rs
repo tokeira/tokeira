@@ -190,6 +190,8 @@ async fn complete_with_commands(
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: workflow_task.token,
             identity: WorkerIdentity("worker-a".to_string()),
+            sdk_metadata: None,
+            worker_version: None,
             commands,
             force_new_workflow_task: false,
             now: OffsetDateTime::now_utc(),
@@ -231,6 +233,7 @@ fn start_request(
         workflow_type: WorkflowType("example".to_string()),
         task_queue: TaskQueueName("workflow-q".to_string()),
         input: Payloads::default(),
+        header: None,
         memo: Memo::default(),
         search_attributes: SearchAttributes::default(),
         workflow_execution_timeout: None,

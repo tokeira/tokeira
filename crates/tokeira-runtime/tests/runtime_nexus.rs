@@ -136,6 +136,8 @@ async fn nexus_schedule_sync_complete_delivers_completed_resolution() -> Result<
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: task.token,
             identity: WorkerIdentity("worker".to_string()),
+            sdk_metadata: None,
+            worker_version: None,
             commands: vec![WorkflowCommand::ScheduleNexusOperation {
                 operation_id: "op-1".to_string(),
                 endpoint: "payments".to_string(),
@@ -186,6 +188,8 @@ async fn nexus_async_started_times_out_via_scanner() -> Result<()> {
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: task.token,
             identity: WorkerIdentity("worker".to_string()),
+            sdk_metadata: None,
+            worker_version: None,
             commands: vec![WorkflowCommand::ScheduleNexusOperation {
                 operation_id: "op-1".to_string(),
                 endpoint: "payments".to_string(),
@@ -248,6 +252,8 @@ async fn nexus_cancel_success_delivers_canceled_resolution() -> Result<()> {
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: task.token,
             identity: WorkerIdentity("worker".to_string()),
+            sdk_metadata: None,
+            worker_version: None,
             commands: vec![WorkflowCommand::ScheduleNexusOperation {
                 operation_id: "op-1".to_string(),
                 endpoint: "payments".to_string(),
@@ -311,6 +317,8 @@ async fn nexus_cancel_success_delivers_canceled_resolution() -> Result<()> {
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: cancel_task.token,
             identity: WorkerIdentity("worker".to_string()),
+            sdk_metadata: None,
+            worker_version: None,
             commands: vec![WorkflowCommand::CancelNexusOperation { scheduled_event_id }],
             force_new_workflow_task: false,
             now: OffsetDateTime::now_utc(),
@@ -403,6 +411,8 @@ async fn worker_targeted_nexus_schedule_publishes_to_broker() -> Result<()> {
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: task.token,
             identity: WorkerIdentity("worker".to_string()),
+            sdk_metadata: None,
+            worker_version: None,
             commands: vec![WorkflowCommand::ScheduleNexusOperation {
                 operation_id: "op-1".to_string(),
                 endpoint: "payments".to_string(),
@@ -482,6 +492,8 @@ async fn worker_targeted_nexus_cancel_publishes_to_broker() -> Result<()> {
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: task.token,
             identity: WorkerIdentity("worker".to_string()),
+            sdk_metadata: None,
+            worker_version: None,
             commands: vec![WorkflowCommand::ScheduleNexusOperation {
                 operation_id: "op-1".to_string(),
                 endpoint: "payments".to_string(),
@@ -542,6 +554,8 @@ async fn worker_targeted_nexus_cancel_publishes_to_broker() -> Result<()> {
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: cancel_task.token,
             identity: WorkerIdentity("worker".to_string()),
+            sdk_metadata: None,
+            worker_version: None,
             commands: vec![WorkflowCommand::CancelNexusOperation { scheduled_event_id }],
             force_new_workflow_task: false,
             now: OffsetDateTime::now_utc(),
@@ -623,6 +637,8 @@ proptest! {
                 .complete_workflow_task(WorkflowTaskCompletedRequest {
                     token: task.token,
                     identity: WorkerIdentity("worker".to_string()),
+                    sdk_metadata: None,
+                    worker_version: None,
                     commands: vec![WorkflowCommand::ScheduleNexusOperation {
                         operation_id: operation_id.clone(),
                         endpoint: "payments".to_string(),
@@ -707,6 +723,8 @@ proptest! {
                 .complete_workflow_task(WorkflowTaskCompletedRequest {
                     token: cancel_task.token,
                     identity: WorkerIdentity("worker".to_string()),
+                    sdk_metadata: None,
+                    worker_version: None,
                     commands: vec![WorkflowCommand::CancelNexusOperation { scheduled_event_id }],
                     force_new_workflow_task: false,
                     now: OffsetDateTime::now_utc(),
@@ -775,6 +793,8 @@ async fn nexus_unknown_endpoint_delivers_failed_resolution() -> Result<()> {
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: task.token,
             identity: WorkerIdentity("worker".to_string()),
+            sdk_metadata: None,
+            worker_version: None,
             commands: vec![WorkflowCommand::ScheduleNexusOperation {
                 operation_id: "op-1".to_string(),
                 endpoint: "missing".to_string(),
@@ -865,6 +885,7 @@ fn start_request(
         workflow_type: WorkflowType("example".to_string()),
         task_queue: TaskQueueName("workflow-q".to_string()),
         input: Payloads::default(),
+        header: None,
         memo: Memo::default(),
         search_attributes: SearchAttributes::default(),
         workflow_execution_timeout: None,

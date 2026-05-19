@@ -37,6 +37,7 @@ fn sample_start_request(
         deployment: None,
         build_id: None,
         attempt: 1,
+        header: None,
         continued_execution_run_id: None,
         first_execution_run_id: None,
         parent_run_key: None,

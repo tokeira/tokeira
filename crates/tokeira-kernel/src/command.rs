@@ -208,6 +208,8 @@ pub struct StartRequest {
     pub task_queue: TaskQueueName,
     /// Arguments passed to the workflow function.
     pub input: Payloads,
+    /// Headers supplied on the start request and recorded in the first event.
+    pub header: Option<Headers>,
     /// Unindexed key-value metadata attached to the execution.
     pub memo: Memo,
     /// Indexed attributes for visibility queries.
@@ -516,6 +518,12 @@ pub struct StartWorkflowTaskRequest {
     pub logical_seq: tokeira_types::LogicalTaskSeq,
     /// Identity of the worker that started the task.
     pub worker_identity: WorkerIdentity,
+    /// Runtime-generated idempotency key for this task start.
+    pub request_id: String,
+    /// Approximate persisted history size at task start time.
+    pub history_size_bytes: i64,
+    /// Whether the runtime suggests continue-as-new soon.
+    pub suggest_continue_as_new: bool,
     /// If set, the worker requests sticky execution affinity
     /// for this duration.
     pub sticky_ttl: Option<Duration>,
@@ -531,6 +539,10 @@ pub struct WorkflowTaskCompletedRequest {
     pub token: WorkflowTaskToken,
     /// Identity of the completing worker.
     pub identity: WorkerIdentity,
+    /// Raw encoded Temporal SDK metadata from the completion request.
+    pub sdk_metadata: Option<Vec<u8>>,
+    /// Build ID from the worker version stamp, when reported by the SDK.
+    pub worker_version: Option<String>,
     /// Ordered list of workflow commands produced by the
     /// worker's replay/execution.
     pub commands: Vec<WorkflowCommand>,
@@ -835,23 +847,35 @@ pub enum WorkflowCommand {
     StartChildWorkflow {
         child_workflow_id: WorkflowId,
         namespace_id: NamespaceId,
+        namespace: Option<String>,
         workflow_type: WorkflowType,
         task_queue: TaskQueueName,
         input: Payloads,
+        header: Option<Headers>,
+        memo: Memo,
+        search_attributes: SearchAttributes,
+        workflow_execution_timeout: Option<Duration>,
+        workflow_run_timeout: Option<Duration>,
+        workflow_task_timeout: Duration,
+        retry_policy: Option<RetryPolicy>,
+        cron_schedule: Option<String>,
         parent_close_policy: ParentClosePolicy,
     },
     /// Send a signal to an external workflow.
     SignalExternalWorkflowExecution {
         target_namespace_id: NamespaceId,
+        target_namespace: Option<String>,
         target_workflow_id: WorkflowId,
         target_run_id: Option<RunId>,
         signal_name: String,
         input: Payloads,
+        header: Option<Headers>,
         control: String,
     },
     /// Request cancellation of an external workflow.
     RequestCancelExternalWorkflowExecution {
         target_namespace_id: NamespaceId,
+        target_namespace: Option<String>,
         target_workflow_id: WorkflowId,
         target_run_id: Option<RunId>,
         control: String,

@@ -208,7 +208,7 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            lane_count: 64,
+            lane_count: 32,
             lane: LaneConfig::default(),
             timer_scanner: TimerScannerConfig::default(),
             workflow_timeout_scanner: WorkflowTimeoutScannerConfig::default(),
@@ -1500,6 +1500,7 @@ where
         &self,
         token: ActivityTaskToken,
         result: Payloads,
+        worker_identity: Option<WorkerIdentity>,
     ) -> Result<CommitResult> {
         let activity_id = token.activity_id.clone();
         self.validate_activity_token(&token).await?;
@@ -1509,7 +1510,7 @@ where
                 Command::ActivityResolved(ActivityResolvedRequest {
                     activity_id,
                     resolution: ActivityResolution::Completed { result },
-                    worker_identity: None,
+                    worker_identity,
                     now: OffsetDateTime::now_utc(),
                 }),
             )
@@ -1533,6 +1534,7 @@ where
         failure: Payload,
         failure_error_type: Option<String>,
         is_non_retryable: bool,
+        worker_identity: Option<WorkerIdentity>,
     ) -> Result<()> {
         let (activity, workflow_retry_policy) = self.validate_activity_token(&token).await?;
         let activity_id = token.activity_id.clone();
@@ -1561,7 +1563,7 @@ where
                 Command::ActivityResolved(ActivityResolvedRequest {
                     activity_id,
                     resolution: ActivityResolution::Failed { failure },
-                    worker_identity: None,
+                    worker_identity,
                     now: OffsetDateTime::now_utc(),
                 }),
             )
@@ -1624,6 +1626,9 @@ where
         let request = StartWorkflowTaskRequest {
             logical_seq: offered.logical_seq,
             worker_identity: worker_identity.clone(),
+            request_id: uuid::Uuid::new_v4().to_string(),
+            history_size_bytes: 0,
+            suggest_continue_as_new: false,
             sticky_ttl: Some(Duration::seconds(30)),
             now,
         };
@@ -2094,6 +2099,8 @@ where
                     scheduled_event_id: current.schedule_event_id,
                     attempt: current.attempt,
                     identity: _worker_identity.clone(),
+                    request_id: format!("activity-start-{}-{}", task.activity_id, current.attempt),
+                    last_failure: current.last_failure.clone(),
                 },
             };
 
@@ -2642,6 +2649,8 @@ mod tests {
                 shard_epoch: ShardEpoch::ZERO,
             },
             identity: WorkerIdentity("worker".to_owned()),
+            sdk_metadata: None,
+            worker_version: None,
             commands: Vec::new(),
             force_new_workflow_task: false,
             now: OffsetDateTime::now_utc(),
@@ -3776,6 +3785,7 @@ mod tests {
             deployment: None,
             build_id: None,
             input: Payloads::default(),
+            header: None,
             memo: Memo::default(),
             search_attributes: SearchAttributes::default(),
             workflow_execution_timeout,

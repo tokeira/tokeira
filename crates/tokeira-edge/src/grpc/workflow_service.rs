@@ -1683,6 +1683,7 @@ mod tests {
             &self,
             _token: tokeira_types::ActivityTaskToken,
             _result: tokeira_types::Payloads,
+            _worker_identity: Option<tokeira_types::WorkerIdentity>,
         ) -> Result<WorkflowMutationOutcome> {
             unreachable!()
         }
@@ -1693,6 +1694,7 @@ mod tests {
             _failure: tokeira_types::Payload,
             _failure_error_type: Option<String>,
             _is_non_retryable: bool,
+            _worker_identity: Option<tokeira_types::WorkerIdentity>,
         ) -> Result<()> {
             unreachable!()
         }
@@ -1847,6 +1849,7 @@ mod tests {
             &self,
             _token: tokeira_types::ActivityTaskToken,
             _result: tokeira_types::Payloads,
+            _worker_identity: Option<tokeira_types::WorkerIdentity>,
         ) -> Result<WorkflowMutationOutcome> {
             unreachable!()
         }
@@ -1857,6 +1860,7 @@ mod tests {
             _failure: tokeira_types::Payload,
             _failure_error_type: Option<String>,
             _is_non_retryable: bool,
+            _worker_identity: Option<tokeira_types::WorkerIdentity>,
         ) -> Result<()> {
             unreachable!()
         }
@@ -2009,6 +2013,7 @@ mod tests {
             &self,
             _token: tokeira_types::ActivityTaskToken,
             _result: tokeira_types::Payloads,
+            _worker_identity: Option<tokeira_types::WorkerIdentity>,
         ) -> Result<WorkflowMutationOutcome> {
             unreachable!()
         }
@@ -2019,6 +2024,7 @@ mod tests {
             _failure: tokeira_types::Payload,
             _failure_error_type: Option<String>,
             _is_non_retryable: bool,
+            _worker_identity: Option<tokeira_types::WorkerIdentity>,
         ) -> Result<()> {
             unreachable!()
         }
@@ -3199,6 +3205,7 @@ mod tests {
             deployment: None,
             build_id: None,
             input: Payloads::default(),
+            header: None,
             memo: Memo::default(),
             search_attributes: SearchAttributes::default(),
             workflow_execution_timeout: None,

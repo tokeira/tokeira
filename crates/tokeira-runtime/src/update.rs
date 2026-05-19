@@ -1029,6 +1029,7 @@ mod tests {
                 deployment: None,
                 build_id: None,
                 input: Payloads::default(),
+                header: None,
                 memo: Memo::default(),
                 search_attributes: SearchAttributes::default(),
                 workflow_execution_timeout: None,

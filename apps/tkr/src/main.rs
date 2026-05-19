@@ -290,7 +290,7 @@ mod tests {
                 .unwrap()
                 .command,
             Command::Deploy {
-                action: DeployAction::Apply { yes: true }
+                action: DeployAction::Apply { yes: true, .. }
             }
         ));
         assert!(matches!(

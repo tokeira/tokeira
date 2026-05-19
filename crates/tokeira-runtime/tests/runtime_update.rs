@@ -49,6 +49,8 @@ async fn update_completed_notifies_waiting_caller() -> Result<()> {
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: task.token,
             identity: WorkerIdentity("worker-a".into()),
+            sdk_metadata: None,
+            worker_version: None,
             commands: vec![
                 WorkflowCommand::ProtocolMessage {
                     message_id: "msg-accept-update-1".into(),
@@ -113,6 +115,8 @@ async fn update_rejected_notifies_waiting_caller() -> Result<()> {
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: task.token,
             identity: WorkerIdentity("worker-a".into()),
+            sdk_metadata: None,
+            worker_version: None,
             commands: vec![
                 WorkflowCommand::ProtocolMessage {
                     message_id: "msg-accept-update-1".into(),
@@ -175,6 +179,8 @@ async fn update_timeout_does_not_block_late_completion_commit() -> Result<()> {
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: task.token,
             identity: WorkerIdentity("worker-a".into()),
+            sdk_metadata: None,
+            worker_version: None,
             commands: vec![
                 WorkflowCommand::ProtocolMessage {
                     message_id: "msg-accept-update-1".into(),
@@ -200,7 +206,8 @@ async fn update_timeout_does_not_block_late_completion_commit() -> Result<()> {
                 &event.kind,
                 tokeira_kernel::HistoryEventKind::WorkflowExecutionUpdateCompleted {
                     update_id,
-                    result
+                    result,
+                    ..
                 } if update_id == "update-1" && result == &payloads("late")
             )
         })
@@ -243,6 +250,8 @@ async fn run_close_notifies_waiting_update_callers() -> Result<()> {
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: task.token,
             identity: WorkerIdentity("worker-a".into()),
+            sdk_metadata: None,
+            worker_version: None,
             commands: vec![WorkflowCommand::CompleteWorkflow {
                 result: payloads("closed"),
             }],
@@ -318,6 +327,8 @@ async fn multiple_updates_resolved_in_single_wft() -> Result<()> {
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: task.token,
             identity: WorkerIdentity("worker-a".into()),
+            sdk_metadata: None,
+            worker_version: None,
             commands: vec![
                 WorkflowCommand::ProtocolMessage {
                     message_id: "msg-accept-update-1".into(),
@@ -404,6 +415,7 @@ async fn start_workflow(
             deployment: None,
             build_id: None,
             input: Payloads::default(),
+            header: None,
             memo: Memo::default(),
             search_attributes: SearchAttributes::default(),
             workflow_execution_timeout: None,

@@ -284,9 +284,11 @@ impl BasicKernel {
             workflow_type: req.workflow_type,
             task_queue: req.task_queue,
             input: req.input,
+            header: req.header,
             memo: req.memo.clone(),
             search_attributes: req.search_attributes.clone(),
             request_id: req.request.request_id.0,
+            identity: req.request.caller_identity.unwrap_or_default(),
             continued_execution_run_id: req.continued_execution_run_id,
             first_execution_run_id: req.first_execution_run_id,
             retry_policy: req.retry_policy,
@@ -385,9 +387,11 @@ impl BasicKernel {
             workflow_type: req.workflow_type,
             task_queue: req.task_queue,
             input: req.input,
+            header: None,
             memo: req.memo.clone(),
             search_attributes: req.search_attributes.clone(),
             request_id: req.request.request_id.0.clone(),
+            identity: req.request.caller_identity.clone().unwrap_or_default(),
             continued_execution_run_id: req.continued_execution_run_id,
             first_execution_run_id: req.first_execution_run_id,
             retry_policy: req.retry_policy,
@@ -407,6 +411,7 @@ impl BasicKernel {
         builder.emit(HistoryEventKind::WorkflowExecutionSignaled {
             signal_name: req.signal_name,
             input: req.signal_input,
+            header: None,
             request_id: req.request.request_id.0,
             identity: req.request.caller_identity,
         });
@@ -432,6 +437,7 @@ impl BasicKernel {
         builder.emit(HistoryEventKind::WorkflowExecutionSignaled {
             signal_name: req.signal_name,
             input: req.input,
+            header: None,
             request_id: req.request.request_id.0,
             identity: req.request.caller_identity,
         });
@@ -491,6 +497,8 @@ impl BasicKernel {
         builder.emit(HistoryEventKind::WorkflowExecutionCancelRequested {
             reason: req.reason,
             external_workflow_execution: req.external_initiator,
+            external_initiated_event_id: 0,
+            identity: req.request.caller_identity.clone().unwrap_or_default(),
             request_id: req.request.request_id.0,
         });
 
@@ -981,6 +989,7 @@ impl BasicKernel {
         builder.emit(HistoryEventKind::WorkflowExecutionTimedOut {
             timeout_type: req.timeout_type,
             retry_state: req.retry_state,
+            new_execution_run_id: None,
         });
         builder.close(ExecutionStatus::TimedOut);
 
@@ -1033,6 +1042,9 @@ impl BasicKernel {
             scheduled_event_id: pending.scheduled_event_id,
             attempt,
             identity: req.worker_identity.clone(),
+            request_id: req.request_id,
+            history_size_bytes: req.history_size_bytes,
+            suggest_continue_as_new: req.suggest_continue_as_new,
         });
 
         let current = builder
@@ -1110,11 +1122,13 @@ impl BasicKernel {
         // the WFT was in progress (e.g., signals) and need a fresh WFT.
         let pre_completion_last_event_id = builder.state.last_event_id;
 
-        builder.emit(HistoryEventKind::WorkflowTaskCompleted {
+        let wft_completed_event_id = builder.emit(HistoryEventKind::WorkflowTaskCompleted {
             logical_seq: req.token.logical_seq,
             scheduled_event_id: pending.scheduled_event_id,
             started_event_id: req.token.started_event_id,
             identity: req.identity,
+            sdk_metadata: req.sdk_metadata,
+            worker_version: req.worker_version,
         });
         builder.state.previous_started_event_id = req.token.started_event_id;
         builder.state.workflow_task_attempt = 1;
@@ -1125,7 +1139,7 @@ impl BasicKernel {
             if closed {
                 return Err(Reject::CommandsAfterClose { index });
             }
-            closed = apply_workflow_command(&mut builder, command)?;
+            closed = apply_workflow_command(&mut builder, command, wft_completed_event_id)?;
         }
 
         // Schedule a new WFT when the worker explicitly requests one
@@ -1176,6 +1190,8 @@ impl BasicKernel {
             scheduled_event_id: activity.schedule_event_id,
             attempt: activity.attempt,
             identity,
+            request_id: format!("activity-start-{}-{}", activity_id, activity.attempt),
+            last_failure: activity.last_failure.clone(),
         });
 
         if let Some(act) = builder.state.activities.get_mut(activity_id) {
@@ -1207,6 +1223,7 @@ impl BasicKernel {
                     activity_id: activity.activity_id.clone(),
                     scheduled_event_id: activity.schedule_event_id,
                     started_event_id: activity.started_event_id.unwrap_or(0),
+                    identity: req.worker_identity.clone(),
                     result,
                 });
             }
@@ -1215,6 +1232,8 @@ impl BasicKernel {
                     activity_id: activity.activity_id.clone(),
                     scheduled_event_id: activity.schedule_event_id,
                     started_event_id: activity.started_event_id.unwrap_or(0),
+                    identity: req.worker_identity.clone(),
+                    retry_state: RetryState::RetryPolicyNotSet,
                     failure,
                 });
             }
@@ -1224,6 +1243,7 @@ impl BasicKernel {
                     scheduled_event_id: activity.schedule_event_id,
                     started_event_id: activity.started_event_id.unwrap_or(0),
                     timeout_type,
+                    retry_state: RetryState::Timeout,
                 });
             }
             ActivityResolution::Canceled { details } => {
@@ -1231,6 +1251,7 @@ impl BasicKernel {
                     activity_id: activity.activity_id.clone(),
                     scheduled_event_id: activity.schedule_event_id,
                     started_event_id: activity.started_event_id.unwrap_or(0),
+                    identity: req.worker_identity.clone(),
                     details,
                 });
             }
@@ -1275,14 +1296,14 @@ impl BasicKernel {
         match req.result {
             ChildStartResult::Started {
                 child_run_id,
-                workflow_type,
+                workflow_type: _,
             } => {
                 let child_run_id_for_state = child_run_id;
                 let started_event_id =
                     builder.emit(HistoryEventKind::ChildWorkflowExecutionStarted {
                         child_workflow_id: child.child_workflow_id.clone(),
                         child_run_id,
-                        workflow_type,
+                        workflow_type: child.workflow_type.clone(),
                         initiated_event_id: child.initiated_event_id,
                     });
                 if let Some(current) = builder.state.children.get_mut(&child.child_workflow_id) {
@@ -1293,6 +1314,10 @@ impl BasicKernel {
             ChildStartResult::Failed { cause } => {
                 builder.emit(HistoryEventKind::StartChildWorkflowExecutionFailed {
                     child_workflow_id: child.child_workflow_id.clone(),
+                    initiated_event_id: child.initiated_event_id,
+                    namespace_id: child.namespace_id,
+                    namespace: child.namespace.clone(),
+                    workflow_type: child.workflow_type.clone(),
                     cause,
                 });
                 builder.state.children.remove(&child.child_workflow_id);
@@ -1326,6 +1351,10 @@ impl BasicKernel {
             ChildResolution::Completed { result } => {
                 builder.emit(HistoryEventKind::ChildWorkflowExecutionCompleted {
                     child_workflow_id: child.child_workflow_id.clone(),
+                    namespace_id: child.namespace_id,
+                    namespace: child.namespace.clone(),
+                    child_run_id: child.child_run_id,
+                    workflow_type: child.workflow_type.clone(),
                     result,
                     initiated_event_id: child.initiated_event_id,
                     started_event_id: child.started_event_id.unwrap_or(0),
@@ -1334,6 +1363,11 @@ impl BasicKernel {
             ChildResolution::Failed { failure } => {
                 builder.emit(HistoryEventKind::ChildWorkflowExecutionFailed {
                     child_workflow_id: child.child_workflow_id.clone(),
+                    namespace_id: child.namespace_id,
+                    namespace: child.namespace.clone(),
+                    child_run_id: child.child_run_id,
+                    workflow_type: child.workflow_type.clone(),
+                    retry_state: RetryState::RetryPolicyNotSet,
                     failure,
                     initiated_event_id: child.initiated_event_id,
                     started_event_id: child.started_event_id.unwrap_or(0),
@@ -1342,6 +1376,11 @@ impl BasicKernel {
             ChildResolution::Canceled => {
                 builder.emit(HistoryEventKind::ChildWorkflowExecutionCanceled {
                     child_workflow_id: child.child_workflow_id.clone(),
+                    namespace_id: child.namespace_id,
+                    namespace: child.namespace.clone(),
+                    child_run_id: child.child_run_id,
+                    workflow_type: child.workflow_type.clone(),
+                    details: None,
                     initiated_event_id: child.initiated_event_id,
                     started_event_id: child.started_event_id.unwrap_or(0),
                 });
@@ -1349,6 +1388,9 @@ impl BasicKernel {
             ChildResolution::Terminated => {
                 builder.emit(HistoryEventKind::ChildWorkflowExecutionTerminated {
                     child_workflow_id: child.child_workflow_id.clone(),
+                    namespace_id: child.namespace_id,
+                    namespace: child.namespace.clone(),
+                    workflow_type: child.workflow_type.clone(),
                     initiated_event_id: child.initiated_event_id,
                     started_event_id: child.started_event_id.unwrap_or(0),
                 });
@@ -1356,6 +1398,10 @@ impl BasicKernel {
             ChildResolution::TimedOut => {
                 builder.emit(HistoryEventKind::ChildWorkflowExecutionTimedOut {
                     child_workflow_id: child.child_workflow_id.clone(),
+                    namespace_id: child.namespace_id,
+                    namespace: child.namespace.clone(),
+                    workflow_type: child.workflow_type.clone(),
+                    retry_state: RetryState::Timeout,
                     initiated_event_id: child.initiated_event_id,
                     started_event_id: child.started_event_id.unwrap_or(0),
                 });
@@ -1390,13 +1436,19 @@ impl BasicKernel {
             ExternalSignalResult::Signaled => {
                 builder.emit(HistoryEventKind::ExternalWorkflowExecutionSignaled {
                     initiated_event_id: pending.initiated_event_id,
+                    namespace_id: pending.target_namespace_id,
+                    namespace: pending.target_namespace.clone(),
                     target_workflow_id: pending.target_workflow_id,
+                    target_run_id: pending.target_run_id,
                 });
             }
             ExternalSignalResult::Failed { cause } => {
                 builder.emit(HistoryEventKind::SignalExternalWorkflowExecutionFailed {
                     initiated_event_id: pending.initiated_event_id,
+                    namespace_id: pending.target_namespace_id,
+                    namespace: pending.target_namespace.clone(),
                     target_workflow_id: pending.target_workflow_id,
+                    target_run_id: pending.target_run_id,
                     cause,
                 });
             }
@@ -1433,14 +1485,20 @@ impl BasicKernel {
             ExternalCancelResult::CancelRequested => {
                 builder.emit(HistoryEventKind::ExternalWorkflowExecutionCancelRequested {
                     initiated_event_id: pending.initiated_event_id,
+                    namespace_id: pending.target_namespace_id,
+                    namespace: pending.target_namespace.clone(),
                     target_workflow_id: pending.target_workflow_id,
+                    target_run_id: pending.target_run_id,
                 });
             }
             ExternalCancelResult::Failed { cause } => {
                 builder.emit(
                     HistoryEventKind::RequestCancelExternalWorkflowExecutionFailed {
                         initiated_event_id: pending.initiated_event_id,
+                        namespace_id: pending.target_namespace_id,
+                        namespace: pending.target_namespace.clone(),
                         target_workflow_id: pending.target_workflow_id,
+                        target_run_id: pending.target_run_id,
                         cause,
                     },
                 );
@@ -1888,6 +1946,7 @@ impl BasicKernel {
                 schedule_to_start_timeout,
                 start_to_close_timeout,
                 heartbeat_timeout,
+                ..
             } => {
                 state.activities.insert(
                     activity_id.clone(),
@@ -1909,6 +1968,7 @@ impl BasicKernel {
                         scheduled_at: event.happened_at,
                         started_at: None,
                         started_event_id: None,
+                        last_failure: None,
                         pause_info: None,
                         stamp: 0,
                     },
@@ -1932,7 +1992,9 @@ impl BasicKernel {
                 state.activities.remove(activity_id);
             }
             HistoryEventKind::ActivityTaskCancelRequested { .. } => {}
-            HistoryEventKind::TimerStarted { timer_id, fire_at } => {
+            HistoryEventKind::TimerStarted {
+                timer_id, fire_at, ..
+            } => {
                 state.timers.insert(
                     timer_id.clone(),
                     TimerState {
@@ -1943,13 +2005,15 @@ impl BasicKernel {
                 );
             }
             HistoryEventKind::MarkerRecorded { .. } => {}
-            HistoryEventKind::TimerCanceled { timer_id }
+            HistoryEventKind::TimerCanceled { timer_id, .. }
             | HistoryEventKind::TimerFired { timer_id, .. } => {
                 state.timers.remove(timer_id);
             }
             HistoryEventKind::StartChildWorkflowExecutionInitiated {
                 child_workflow_id,
                 namespace_id,
+                namespace,
+                workflow_type,
                 parent_close_policy,
                 ..
             } => {
@@ -1958,6 +2022,8 @@ impl BasicKernel {
                     ChildWorkflowState {
                         child_workflow_id: child_workflow_id.clone(),
                         namespace_id: *namespace_id,
+                        namespace: namespace.clone(),
+                        workflow_type: workflow_type.clone(),
                         child_run_id: None,
                         initiated_event_id: event.event_id,
                         started_event_id: None,
@@ -1999,12 +2065,16 @@ impl BasicKernel {
                 target_workflow_id,
                 target_run_id,
                 signal_name,
+                namespace_id,
+                namespace,
                 ..
             } => {
                 state.pending_external_signals.insert(
                     event.event_id,
                     PendingExternalSignal {
                         initiated_event_id: event.event_id,
+                        target_namespace_id: *namespace_id,
+                        target_namespace: namespace.clone(),
                         target_workflow_id: target_workflow_id.clone(),
                         target_run_id: *target_run_id,
                         signal_name: signal_name.clone(),
@@ -2022,12 +2092,16 @@ impl BasicKernel {
             HistoryEventKind::RequestCancelExternalWorkflowExecutionInitiated {
                 target_workflow_id,
                 target_run_id,
+                namespace_id,
+                namespace,
                 ..
             } => {
                 state.pending_external_cancels.insert(
                     event.event_id,
                     PendingExternalCancel {
                         initiated_event_id: event.event_id,
+                        target_namespace_id: *namespace_id,
+                        target_namespace: namespace.clone(),
                         target_workflow_id: target_workflow_id.clone(),
                         target_run_id: *target_run_id,
                     },
@@ -2119,7 +2193,7 @@ impl BasicKernel {
                     FieldChange::Unchanged => {}
                 }
             }
-            HistoryEventKind::WorkflowExecutionCompleted { result } => {
+            HistoryEventKind::WorkflowExecutionCompleted { result, .. } => {
                 close_replayed_run(state, ExecutionStatus::Completed, event.happened_at);
                 state.close_result = Some(result.clone());
             }
@@ -2130,7 +2204,7 @@ impl BasicKernel {
             HistoryEventKind::WorkflowExecutionContinuedAsNew { .. } => {
                 close_replayed_run(state, ExecutionStatus::ContinuedAsNew, event.happened_at);
             }
-            HistoryEventKind::WorkflowExecutionCanceled => {
+            HistoryEventKind::WorkflowExecutionCanceled { .. } => {
                 close_replayed_run(state, ExecutionStatus::Cancelled, event.happened_at);
             }
         }
@@ -2179,6 +2253,7 @@ fn expect_open(loaded: LoadedRun) -> Result<WorkflowState, Reject> {
 fn apply_workflow_command(
     builder: &mut TransitionBuilder,
     command: WorkflowCommand,
+    workflow_task_completed_event_id: i64,
 ) -> Result<bool, Reject> {
     match command {
         WorkflowCommand::ScheduleActivity {
@@ -2201,6 +2276,7 @@ fn apply_workflow_command(
             }
 
             let schedule_event_id = builder.emit(HistoryEventKind::ActivityTaskScheduled {
+                workflow_task_completed_event_id,
                 activity_id: activity_id.clone(),
                 activity_type: activity_type.clone(),
                 task_queue: task_queue.clone(),
@@ -2233,6 +2309,7 @@ fn apply_workflow_command(
                 scheduled_at: builder.now,
                 started_at: None,
                 started_event_id: None,
+                last_failure: None,
                 pause_info: None,
                 stamp: 0,
             };
@@ -2267,6 +2344,7 @@ fn apply_workflow_command(
                 return Err(Reject::DuplicateTimerId(timer_id));
             }
             let started_event_id = builder.emit(HistoryEventKind::TimerStarted {
+                workflow_task_completed_event_id,
                 timer_id: timer_id.clone(),
                 fire_at,
             });
@@ -2304,6 +2382,7 @@ fn apply_workflow_command(
             header,
         } => {
             builder.emit(HistoryEventKind::MarkerRecorded {
+                workflow_task_completed_event_id,
                 marker_name,
                 details,
                 failure,
@@ -2313,7 +2392,10 @@ fn apply_workflow_command(
         }
         WorkflowCommand::CompleteWorkflow { result } => {
             builder.state.close_result = Some(result.clone());
-            builder.emit(HistoryEventKind::WorkflowExecutionCompleted { result });
+            builder.emit(HistoryEventKind::WorkflowExecutionCompleted {
+                workflow_task_completed_event_id,
+                result,
+            });
             builder.close(ExecutionStatus::Completed);
             builder.apply_parent_close_policy();
             Ok(true)
@@ -2327,6 +2409,7 @@ fn apply_workflow_command(
             };
             let attempt = builder.state.attempt;
             builder.emit(HistoryEventKind::WorkflowExecutionFailed {
+                workflow_task_completed_event_id,
                 failure,
                 retry_state,
                 attempt,
@@ -2348,6 +2431,7 @@ fn apply_workflow_command(
             retry_policy,
         } => {
             builder.emit(HistoryEventKind::WorkflowExecutionContinuedAsNew {
+                workflow_task_completed_event_id,
                 new_run_id,
                 workflow_type,
                 task_queue,
@@ -2369,7 +2453,10 @@ fn apply_workflow_command(
             Ok(true)
         }
         WorkflowCommand::CancelWorkflow => {
-            builder.emit(HistoryEventKind::WorkflowExecutionCanceled);
+            builder.emit(HistoryEventKind::WorkflowExecutionCanceled {
+                workflow_task_completed_event_id,
+                details: None,
+            });
             builder.close(ExecutionStatus::Cancelled);
             builder.apply_parent_close_policy();
             Ok(true)
@@ -2378,15 +2465,33 @@ fn apply_workflow_command(
             if !builder.state.activities.contains_key(&activity_id) {
                 return Err(Reject::UnknownActivity(activity_id));
             }
-            builder.emit(HistoryEventKind::ActivityTaskCancelRequested { activity_id });
+            let scheduled_event_id = builder
+                .state
+                .activities
+                .get(&activity_id)
+                .map(|activity| activity.schedule_event_id)
+                .unwrap_or(0);
+            builder.emit(HistoryEventKind::ActivityTaskCancelRequested {
+                workflow_task_completed_event_id,
+                activity_id,
+                scheduled_event_id,
+            });
             Ok(false)
         }
         WorkflowCommand::CancelTimer { timer_id } => {
             if !builder.state.timers.contains_key(&timer_id) {
                 return Err(Reject::UnknownTimer(timer_id));
             }
+            let started_event_id = builder
+                .state
+                .timers
+                .get(&timer_id)
+                .map(|timer| timer.started_event_id)
+                .unwrap_or(0);
             builder.emit(HistoryEventKind::TimerCanceled {
+                workflow_task_completed_event_id,
                 timer_id: timer_id.clone(),
+                started_event_id,
             });
             builder.state.timers.remove(&timer_id);
             builder.timer_ops.push(TimerOp::Delete { timer_id });
@@ -2401,9 +2506,18 @@ fn apply_workflow_command(
         WorkflowCommand::StartChildWorkflow {
             child_workflow_id,
             namespace_id,
+            namespace,
             workflow_type,
             task_queue,
             input,
+            header,
+            memo,
+            search_attributes,
+            workflow_execution_timeout,
+            workflow_run_timeout,
+            workflow_task_timeout,
+            retry_policy,
+            cron_schedule,
             parent_close_policy,
         } => {
             if builder.state.children.contains_key(&child_workflow_id) {
@@ -2425,11 +2539,21 @@ fn apply_workflow_command(
             };
             let initiated_event_id =
                 builder.emit(HistoryEventKind::StartChildWorkflowExecutionInitiated {
+                    workflow_task_completed_event_id,
                     child_workflow_id: child_workflow_id.clone(),
                     workflow_type: workflow_type.clone(),
                     task_queue: task_queue.clone(),
                     input: input.clone(),
                     namespace_id,
+                    namespace: namespace.clone(),
+                    header,
+                    memo,
+                    search_attributes,
+                    workflow_execution_timeout,
+                    workflow_run_timeout,
+                    workflow_task_timeout,
+                    retry_policy,
+                    cron_schedule,
                     parent_close_policy,
                 });
             builder.state.children.insert(
@@ -2437,6 +2561,8 @@ fn apply_workflow_command(
                 ChildWorkflowState {
                     child_workflow_id: child_workflow_id.clone(),
                     namespace_id,
+                    namespace,
+                    workflow_type: workflow_type.clone(),
                     child_run_id: None,
                     initiated_event_id,
                     started_event_id: None,
@@ -2459,24 +2585,32 @@ fn apply_workflow_command(
         }
         WorkflowCommand::SignalExternalWorkflowExecution {
             target_namespace_id,
+            target_namespace,
             target_workflow_id,
             target_run_id,
             signal_name,
             input,
+            header,
             control,
         } => {
             let initiated_event_id =
                 builder.emit(HistoryEventKind::SignalExternalWorkflowExecutionInitiated {
+                    workflow_task_completed_event_id,
+                    namespace_id: target_namespace_id,
+                    namespace: target_namespace.clone(),
                     target_workflow_id: target_workflow_id.clone(),
                     target_run_id,
                     signal_name: signal_name.clone(),
                     input: input.clone(),
+                    header,
                     control: control.clone(),
                 });
             builder.state.pending_external_signals.insert(
                 initiated_event_id,
                 PendingExternalSignal {
                     initiated_event_id,
+                    target_namespace_id,
+                    target_namespace,
                     target_workflow_id: target_workflow_id.clone(),
                     target_run_id,
                     signal_name: signal_name.clone(),
@@ -2497,12 +2631,16 @@ fn apply_workflow_command(
         }
         WorkflowCommand::RequestCancelExternalWorkflowExecution {
             target_namespace_id,
+            target_namespace,
             target_workflow_id,
             target_run_id,
             control,
         } => {
             let initiated_event_id = builder.emit(
                 HistoryEventKind::RequestCancelExternalWorkflowExecutionInitiated {
+                    workflow_task_completed_event_id,
+                    namespace_id: target_namespace_id,
+                    namespace: target_namespace.clone(),
                     target_workflow_id: target_workflow_id.clone(),
                     target_run_id,
                     control: control.clone(),
@@ -2512,6 +2650,8 @@ fn apply_workflow_command(
                 initiated_event_id,
                 PendingExternalCancel {
                     initiated_event_id,
+                    target_namespace_id,
+                    target_namespace,
                     target_workflow_id: target_workflow_id.clone(),
                     target_run_id,
                 },
@@ -2550,11 +2690,14 @@ fn apply_workflow_command(
                 return Err(Reject::DuplicateNexusOperationId(operation_id));
             }
             let scheduled_event_id = builder.emit(HistoryEventKind::NexusOperationScheduled {
+                workflow_task_completed_event_id,
                 operation_id: operation_id.clone(),
                 endpoint: endpoint.clone(),
+                endpoint_id: endpoint.clone(),
                 service: service.clone(),
                 operation: operation.clone(),
                 input: input.clone(),
+                nexus_header: BTreeMap::new(),
                 schedule_to_close_timeout,
             });
             builder.state.pending_nexus_operations.insert(
@@ -2611,9 +2754,16 @@ fn apply_workflow_command(
             if !builder.state.pending_updates.contains_key(&update_id) {
                 return Err(Reject::UnknownUpdate(update_id));
             }
+            let accepted_event_id = builder
+                .state
+                .pending_updates
+                .get(&update_id)
+                .map(|update| update.accepted_event_id)
+                .unwrap_or(0);
             builder.emit(HistoryEventKind::WorkflowExecutionUpdateCompleted {
                 update_id: update_id.clone(),
                 result,
+                accepted_event_id,
             });
             builder.state.pending_updates.remove(&update_id);
             Ok(false)
@@ -2625,6 +2775,8 @@ fn apply_workflow_command(
             builder.emit(HistoryEventKind::WorkflowExecutionUpdateRejected {
                 update_id: update_id.clone(),
                 failure,
+                rejected_request_message_id: update_id.clone(),
+                rejected_request_sequencing_event_id: 0,
             });
             builder.state.pending_updates.remove(&update_id);
             Ok(false)
@@ -2649,6 +2801,7 @@ fn apply_workflow_command(
                             update_id: update_id.clone(),
                             update_name: update_name.clone(),
                             input,
+                            accepted_request_sequencing_event_id: 0,
                         });
                     builder.state.pending_updates.insert(
                         update_id.clone(),
@@ -2666,6 +2819,12 @@ fn apply_workflow_command(
                     builder.emit(HistoryEventKind::WorkflowExecutionUpdateCompleted {
                         update_id: update_id.clone(),
                         result,
+                        accepted_event_id: builder
+                            .state
+                            .pending_updates
+                            .get(&update_id)
+                            .map(|update| update.accepted_event_id)
+                            .unwrap_or(0),
                     });
                     builder.state.pending_updates.remove(&update_id);
                 }
@@ -2680,6 +2839,8 @@ fn apply_workflow_command(
                     builder.emit(HistoryEventKind::WorkflowExecutionUpdateRejected {
                         update_id: update_id.clone(),
                         failure,
+                        rejected_request_message_id: update_id.clone(),
+                        rejected_request_sequencing_event_id: 0,
                     });
                     builder.state.pending_updates.remove(&update_id);
                 }
@@ -2808,6 +2969,9 @@ impl TransitionBuilder {
             scheduled_event_id: pending.scheduled_event_id,
             attempt,
             identity,
+            request_id: format!("sync-match-{}", pending.logical_seq.0),
+            history_size_bytes: self.state.last_event_id,
+            suggest_continue_as_new: false,
         });
         let current = self
             .state

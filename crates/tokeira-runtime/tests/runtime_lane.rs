@@ -51,6 +51,8 @@ async fn start_and_signal_publish_workflow_tasks() -> Result<()> {
         .complete_workflow_task(WorkflowTaskCompletedRequest {
             token: first_task.token,
             identity: WorkerIdentity("worker-a".to_string()),
+            sdk_metadata: None,
+            worker_version: None,
             commands: Vec::new(),
             force_new_workflow_task: false,
             now: OffsetDateTime::now_utc(),
@@ -219,6 +221,7 @@ fn start_request(
         workflow_type: WorkflowType("example".to_string()),
         task_queue: TaskQueueName("queue-a".to_string()),
         input: Payloads::default(),
+        header: None,
         memo: Memo::default(),
         search_attributes: SearchAttributes::default(),
         workflow_execution_timeout: None,

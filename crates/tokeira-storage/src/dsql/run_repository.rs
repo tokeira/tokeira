@@ -3586,6 +3586,7 @@ mod tests {
             kind: HistoryEventKind::WorkflowExecutionSignaled {
                 signal_name: format!("signal-{event_id}"),
                 input: Payloads::default(),
+                header: None,
                 request_id: format!("request-{event_id}"),
                 identity: Some("tester".to_owned()),
             },
@@ -3602,6 +3603,7 @@ mod tests {
             build_id: None,
             input: Payloads::default(),
             header: None,
+            last_failure: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::seconds(30)),

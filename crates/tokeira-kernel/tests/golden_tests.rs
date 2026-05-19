@@ -80,6 +80,7 @@ fn make_start_request() -> StartRequest {
         deployment: None,
         build_id: None,
         input: payloads("start-input"),
+        header: None,
         memo: memo(),
         search_attributes: search_attributes(),
         workflow_execution_timeout: Some(Duration::minutes(10)),
@@ -243,6 +244,8 @@ fn replay_history_reconstructs_workflow_task_lifecycle() {
                 memo: start.memo.clone(),
                 search_attributes: start.search_attributes.clone(),
                 request_id: start.request.request_id.0.clone(),
+                header: start.header.clone(),
+                identity: start.request.caller_identity.clone().unwrap_or_default(),
                 continued_execution_run_id: start.continued_execution_run_id,
                 first_execution_run_id: start.first_execution_run_id,
                 retry_policy: start.retry_policy.clone(),
@@ -278,6 +281,9 @@ fn replay_history_reconstructs_workflow_task_lifecycle() {
                 scheduled_event_id: 2,
                 attempt: 1,
                 identity: worker.clone(),
+                request_id: "wft-start".into(),
+                history_size_bytes: 0,
+                suggest_continue_as_new: false,
             },
         ),
         history_event(
@@ -288,6 +294,8 @@ fn replay_history_reconstructs_workflow_task_lifecycle() {
                 scheduled_event_id: 2,
                 started_event_id: 3,
                 identity: worker,
+                sdk_metadata: None,
+                worker_version: None,
             },
         ),
     ];
@@ -318,6 +326,8 @@ fn replay_history_reconstructs_activity_and_timer_state() {
                 memo: start.memo.clone(),
                 search_attributes: start.search_attributes.clone(),
                 request_id: start.request.request_id.0.clone(),
+                header: start.header.clone(),
+                identity: start.request.caller_identity.clone().unwrap_or_default(),
                 continued_execution_run_id: start.continued_execution_run_id,
                 first_execution_run_id: start.first_execution_run_id,
                 retry_policy: start.retry_policy.clone(),
@@ -344,6 +354,7 @@ fn replay_history_reconstructs_activity_and_timer_state() {
                 task_queue: TaskQueueName("activity-q".into()),
                 input: payloads("activity-input"),
                 header: None,
+                workflow_task_completed_event_id: 4,
                 retry_policy: Some(retry_policy()),
                 schedule_to_close_timeout: Some(Duration::minutes(2)),
                 schedule_to_start_timeout: Some(Duration::seconds(30)),
@@ -359,6 +370,8 @@ fn replay_history_reconstructs_activity_and_timer_state() {
                 scheduled_event_id: 2,
                 attempt: 1,
                 identity: WorkerIdentity("activity-worker".into()),
+                request_id: "activity-start".into(),
+                last_failure: None,
             },
         ),
         history_event(
@@ -367,6 +380,7 @@ fn replay_history_reconstructs_activity_and_timer_state() {
             HistoryEventKind::TimerStarted {
                 timer_id: "t1".into(),
                 fire_at: t0 + Duration::minutes(1),
+                workflow_task_completed_event_id: 4,
             },
         ),
     ];
@@ -397,6 +411,8 @@ fn replay_history_reconstructs_historical_execution_options_and_pause() {
                 memo: start.memo.clone(),
                 search_attributes: start.search_attributes.clone(),
                 request_id: start.request.request_id.0.clone(),
+                header: start.header.clone(),
+                identity: start.request.caller_identity.clone().unwrap_or_default(),
                 continued_execution_run_id: start.continued_execution_run_id,
                 first_execution_run_id: start.first_execution_run_id,
                 retry_policy: start.retry_policy.clone(),
@@ -530,6 +546,7 @@ fn make_paused_state_with_activity(id: &str) -> WorkflowState {
             build_id: None,
             input: Payloads::default(),
             header: None,
+            last_failure: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
@@ -559,6 +576,7 @@ fn make_open_state_with_activity(id: &str) -> WorkflowState {
             build_id: None,
             input: Payloads::default(),
             header: None,
+            last_failure: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
@@ -919,6 +937,7 @@ fn cancel_with_no_pending_wft() {
             reason,
             external_workflow_execution,
             request_id,
+            ..
         } if reason == &req.reason
             && external_workflow_execution == &None
             && request_id == "cancel-req"
@@ -1026,6 +1045,7 @@ fn terminate_with_activities_and_timers() {
             build_id: None,
             input: Payloads::default(),
             header: None,
+            last_failure: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
@@ -1191,6 +1211,7 @@ fn reset_cleans_up_activities_and_timers() {
             build_id: None,
             input: Payloads::default(),
             header: None,
+            last_failure: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
@@ -1345,6 +1366,7 @@ fn pause_workflow_happy_path() {
             build_id: None,
             input: Payloads::default(),
             header: None,
+            last_failure: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
@@ -1470,6 +1492,7 @@ fn unpause_workflow_happy_path() {
             build_id: None,
             input: Payloads::default(),
             header: None,
+            last_failure: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
@@ -1733,6 +1756,8 @@ fn wft_completed_paused_workflow_no_force_wft() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![],
                 force_new_workflow_task: true,
                 now: now(),
@@ -1760,6 +1785,8 @@ fn wft_completion_tracks_previous_started_event_id() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![],
                 force_new_workflow_task: false,
                 now: now(),
@@ -1916,6 +1943,9 @@ fn workflow_task_started_with_sticky() {
             Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
                 logical_seq: LogicalTaskSeq(3),
                 worker_identity: WorkerIdentity("worker-a".into()),
+                request_id: "start-wft".into(),
+                history_size_bytes: 0,
+                suggest_continue_as_new: false,
                 sticky_ttl: Some(Duration::seconds(30)),
                 now: now(),
             }),
@@ -1949,6 +1979,8 @@ fn workflow_task_completed_with_activity_and_timer() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![
                     WorkflowCommand::ScheduleActivity {
                         activity_id: "activity-1".into(),
@@ -2030,6 +2062,8 @@ fn workflow_task_completed_with_complete_workflow() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::CompleteWorkflow {
                     result: payloads("done"),
                 }],
@@ -2071,6 +2105,8 @@ fn workflow_task_completed_with_fail_workflow() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::FailWorkflow {
                     failure: payload("nope"),
                 }],
@@ -2152,6 +2188,8 @@ fn continue_as_new_closes_run() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![command.clone()],
                 force_new_workflow_task: false,
                 now: now(),
@@ -2207,6 +2245,8 @@ fn continue_as_new_then_another_command() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![
                     make_continue_as_new_command(),
                     WorkflowCommand::RequestNewWorkflowTask,
@@ -2240,7 +2280,8 @@ fn workflow_execution_timed_out_no_entities() {
         transition.history_events[0].kind,
         HistoryEventKind::WorkflowExecutionTimedOut {
             timeout_type: WorkflowTimeoutType::RunTimeout,
-            retry_state: RetryState::Timeout
+            retry_state: RetryState::Timeout,
+            ..
         }
     ));
 }
@@ -2259,6 +2300,7 @@ fn workflow_execution_timed_out_with_entities() {
             build_id: None,
             input: Payloads::default(),
             header: None,
+            last_failure: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
@@ -2349,6 +2391,8 @@ fn fail_workflow_with_retry_policy() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::FailWorkflow {
                     failure: payload("nope"),
                 }],
@@ -2384,6 +2428,8 @@ fn fail_workflow_without_retry_policy() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::FailWorkflow {
                     failure: payload("nope"),
                 }],
@@ -2786,6 +2832,9 @@ fn reject_wft_started_no_pending() {
             Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
                 logical_seq: LogicalTaskSeq(3),
                 worker_identity: WorkerIdentity("worker".into()),
+                request_id: "start-wft".into(),
+                history_size_bytes: 0,
+                suggest_continue_as_new: false,
                 sticky_ttl: None,
                 now: now(),
             })
@@ -2802,6 +2851,9 @@ fn reject_wft_started_seq_mismatch() {
             Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
                 logical_seq: LogicalTaskSeq(4),
                 worker_identity: WorkerIdentity("worker".into()),
+                request_id: "start-wft".into(),
+                history_size_bytes: 0,
+                suggest_continue_as_new: false,
                 sticky_ttl: None,
                 now: now(),
             })
@@ -2827,6 +2879,9 @@ fn reject_wft_started_already_started() {
             Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
                 logical_seq: LogicalTaskSeq(3),
                 worker_identity: WorkerIdentity("worker".into()),
+                request_id: "start-wft".into(),
+                history_size_bytes: 0,
+                suggest_continue_as_new: false,
                 sticky_ttl: None,
                 now: now(),
             })
@@ -2849,6 +2904,8 @@ fn reject_wft_completed_no_pending() {
                     shard_epoch: ShardEpoch::ZERO
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![],
                 force_new_workflow_task: false,
                 now: now(),
@@ -2872,6 +2929,8 @@ fn reject_wft_completed_not_started() {
                     shard_epoch: ShardEpoch::ZERO
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![],
                 force_new_workflow_task: false,
                 now: now(),
@@ -2896,6 +2955,8 @@ fn reject_wft_completed_seq_mismatch() {
                     shard_epoch: ShardEpoch::ZERO
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![],
                 force_new_workflow_task: false,
                 now: now(),
@@ -2923,6 +2984,8 @@ fn reject_wft_completed_token_mismatch() {
                     shard_epoch: ShardEpoch::ZERO
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![],
                 force_new_workflow_task: false,
                 now: now(),
@@ -2947,6 +3010,7 @@ fn reject_duplicate_activity_id() {
             build_id: None,
             input: Payloads::default(),
             header: None,
+            last_failure: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: None,
@@ -2972,6 +3036,8 @@ fn reject_duplicate_activity_id() {
                     shard_epoch: ShardEpoch::ZERO
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::ScheduleActivity {
                     activity_id: "dup".into(),
                     activity_type: "activity-type".into(),
@@ -3019,6 +3085,8 @@ fn reject_duplicate_timer_id() {
                     shard_epoch: ShardEpoch::ZERO
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::StartTimer {
                     timer_id: "dup".into(),
                     fire_at: now()
@@ -3288,6 +3356,8 @@ fn reject_commands_after_close() {
                     shard_epoch: ShardEpoch::ZERO
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![
                     WorkflowCommand::CompleteWorkflow {
                         result: payloads("done")
@@ -3317,6 +3387,8 @@ fn cancel_workflow_command() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::CancelWorkflow],
                 force_new_workflow_task: false,
                 now: now(),
@@ -3330,7 +3402,7 @@ fn cancel_workflow_command() {
     ));
     assert!(matches!(
         transition.history_events[1].kind,
-        HistoryEventKind::WorkflowExecutionCanceled
+        HistoryEventKind::WorkflowExecutionCanceled { .. }
     ));
     assert_eq!(transition.next_state.status, ExecutionStatus::Cancelled);
     assert!(transition.next_state.closed_at.is_some());
@@ -3363,6 +3435,8 @@ fn cancel_workflow_then_another_command() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![
                     WorkflowCommand::CancelWorkflow,
                     WorkflowCommand::RequestNewWorkflowTask,
@@ -3390,6 +3464,8 @@ fn request_cancel_activity() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::RequestCancelActivity {
                     activity_id: "activity-1".into(),
                 }],
@@ -3401,7 +3477,7 @@ fn request_cancel_activity() {
 
     assert!(transition.history_events.iter().any(|event| matches!(
         &event.kind,
-        HistoryEventKind::ActivityTaskCancelRequested { activity_id } if activity_id == "activity-1"
+        HistoryEventKind::ActivityTaskCancelRequested { activity_id, .. } if activity_id == "activity-1"
     )));
     assert!(transition.next_state.activities.contains_key("activity-1"));
     assert!(transition.activity_ops.is_empty());
@@ -3422,6 +3498,8 @@ fn request_cancel_activity_unknown() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::RequestCancelActivity {
                     activity_id: "missing".into(),
                 }],
@@ -3448,6 +3526,8 @@ fn cancel_timer() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::CancelTimer {
                     timer_id: "timer-1".into(),
                 }],
@@ -3459,7 +3539,7 @@ fn cancel_timer() {
 
     assert!(transition.history_events.iter().any(|event| matches!(
         &event.kind,
-        HistoryEventKind::TimerCanceled { timer_id } if timer_id == "timer-1"
+        HistoryEventKind::TimerCanceled { timer_id, .. } if timer_id == "timer-1"
     )));
     assert!(!transition.next_state.timers.contains_key("timer-1"));
     assert!(matches!(
@@ -3483,6 +3563,8 @@ fn cancel_timer_unknown() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::CancelTimer {
                     timer_id: "missing".into(),
                 }],
@@ -3509,6 +3591,8 @@ fn request_cancel_activity_then_resolved_canceled() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::RequestCancelActivity {
                     activity_id: "activity-1".into(),
                 }],
@@ -3563,6 +3647,9 @@ fn cancel_then_cancel_workflow_e2e() {
             Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
                 logical_seq: cancel.next_state.pending_workflow_task.unwrap().logical_seq,
                 worker_identity: WorkerIdentity("worker".into()),
+                request_id: "start-wft".into(),
+                history_size_bytes: 0,
+                suggest_continue_as_new: false,
                 sticky_ttl: None,
                 now: now(),
             }),
@@ -3592,6 +3679,8 @@ fn cancel_then_cancel_workflow_e2e() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::CancelWorkflow],
                 force_new_workflow_task: false,
                 now: now(),
@@ -3618,6 +3707,7 @@ fn with_pending_activity_started_wft() -> WorkflowState {
             build_id: None,
             input: Payloads::default(),
             header: None,
+            last_failure: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
@@ -3660,6 +3750,8 @@ fn with_child(
         ChildWorkflowState {
             child_workflow_id: WorkflowId(child_workflow_id.into()),
             namespace_id: state.namespace_id,
+            namespace: None,
+            workflow_type: WorkflowType("child-workflow".into()),
             child_run_id: started.then(RunId::new),
             initiated_event_id,
             started_event_id: started.then_some(initiated_event_id + 1),
@@ -3678,6 +3770,8 @@ fn with_pending_external_signal(
         initiated_event_id,
         PendingExternalSignal {
             initiated_event_id,
+            target_namespace_id: state.namespace_id,
+            target_namespace: None,
             target_workflow_id: WorkflowId(workflow_id.into()),
             target_run_id: Some(RunId::new()),
             signal_name: "sig".into(),
@@ -3695,6 +3789,8 @@ fn with_pending_external_cancel(
         initiated_event_id,
         PendingExternalCancel {
             initiated_event_id,
+            target_namespace_id: state.namespace_id,
+            target_namespace: None,
             target_workflow_id: WorkflowId(workflow_id.into()),
             target_run_id: Some(RunId::new()),
         },
@@ -3731,12 +3827,23 @@ fn start_child_workflow_happy_path() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::StartChildWorkflow {
                     child_workflow_id: child_workflow_id.clone(),
                     namespace_id: NamespaceId::new(),
+                    namespace: None,
                     workflow_type: WorkflowType("child-wf".into()),
                     task_queue: TaskQueueName("child-q".into()),
                     input: payloads("child-input"),
+                    header: None,
+                    memo: Memo::default(),
+                    search_attributes: SearchAttributes::default(),
+                    workflow_execution_timeout: None,
+                    workflow_run_timeout: None,
+                    workflow_task_timeout: Duration::seconds(10),
+                    retry_policy: None,
+                    cron_schedule: None,
                     parent_close_policy: ParentClosePolicy::Terminate,
                 }],
                 force_new_workflow_task: false,
@@ -3886,12 +3993,16 @@ fn signal_external_workflow_happy_path() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::SignalExternalWorkflowExecution {
                     target_namespace_id: state.namespace_id,
+                    target_namespace: None,
                     target_workflow_id: WorkflowId("target".into()),
                     target_run_id: Some(RunId::new()),
                     signal_name: "sig".into(),
                     input: payloads("payload"),
+                    header: None,
                     control: "ctl".into(),
                 }],
                 force_new_workflow_task: false,
@@ -3952,8 +4063,11 @@ fn request_cancel_external_workflow_happy_path() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::RequestCancelExternalWorkflowExecution {
                     target_namespace_id: state.namespace_id,
+                    target_namespace: None,
                     target_workflow_id: WorkflowId("target".into()),
                     target_run_id: Some(RunId::new()),
                     control: "ctl".into(),
@@ -4141,6 +4255,8 @@ fn update_completed_happy_path() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::UpdateCompleted {
                     update_id: "update-1".into(),
                     result: payloads("done"),
@@ -4179,6 +4295,8 @@ fn update_rejected_happy_path() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::UpdateRejected {
                     update_id: "update-1".into(),
                     failure: payload("nope"),
@@ -4217,6 +4335,8 @@ fn update_completed_unknown_update() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::UpdateCompleted {
                     update_id: "missing".into(),
                     result: payloads("done"),
@@ -4245,6 +4365,8 @@ fn update_rejected_unknown_update() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::UpdateRejected {
                     update_id: "missing".into(),
                     failure: payload("nope"),
@@ -4273,6 +4395,8 @@ fn protocol_message_accepted_body() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::ProtocolMessage {
                     message_id: "msg-1".into(),
                     body: UpdateProtocolBody::Accepted {
@@ -4315,6 +4439,8 @@ fn protocol_message_completed_body() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::ProtocolMessage {
                     message_id: "msg-2".into(),
                     body: UpdateProtocolBody::Completed {
@@ -4355,6 +4481,8 @@ fn protocol_message_rejected_body() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::ProtocolMessage {
                     message_id: "msg-3".into(),
                     body: UpdateProtocolBody::Rejected {
@@ -4407,6 +4535,8 @@ fn complete_workflow_clears_pending_updates() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::CompleteWorkflow {
                     result: payloads("done"),
                 }],
@@ -4436,6 +4566,8 @@ fn record_marker_happy_path() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::RecordMarker {
                     marker_name: "marker".into(),
                     details: details.clone(),
@@ -4456,6 +4588,7 @@ fn record_marker_happy_path() {
             details: event_details,
             failure: Some(_),
             header: event_header,
+            ..
         } if marker_name == "marker" && event_details == &details && event_header == &header
     ));
     assert!(transition.next_state.is_open());
@@ -4480,6 +4613,8 @@ fn record_marker_after_close_rejected() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![
                     WorkflowCommand::CompleteWorkflow {
                         result: payloads("done"),
@@ -4635,6 +4770,8 @@ fn schedule_nexus_operation_happy_path() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::ScheduleNexusOperation {
                     operation_id: "op-1".into(),
                     endpoint: "endpoint".into(),
@@ -4683,6 +4820,8 @@ fn schedule_nexus_operation_duplicate_rejected() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::ScheduleNexusOperation {
                     operation_id: "op-1".into(),
                     endpoint: "endpoint".into(),
@@ -4716,6 +4855,8 @@ fn cancel_nexus_operation_happy_path() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::CancelNexusOperation {
                     scheduled_event_id: 12,
                 }],
@@ -4768,6 +4909,8 @@ fn cancel_nexus_operation_unknown() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::CancelNexusOperation {
                     scheduled_event_id: 12,
                 }],
@@ -5083,6 +5226,8 @@ fn close_via_complete_clears_pending_nexus_operations() {
                     shard_epoch: ShardEpoch::ZERO,
                 },
                 identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                worker_version: None,
                 commands: vec![WorkflowCommand::CompleteWorkflow {
                     result: payloads("done"),
                 }],

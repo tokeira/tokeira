@@ -51,6 +51,25 @@ fn opt_string(s: &Option<String>) -> String {
     s.clone().unwrap_or_default()
 }
 
+fn marker_detail(value: &str) -> tokeira_types::Payloads {
+    tokeira_types::Payloads(vec![tokeira_types::Payload::new(value.as_bytes().to_vec())])
+}
+
+fn pause_marker(marker_name: &str, identity: &str, reason: &str, request_id: &str) -> Attributes {
+    Attributes::MarkerRecordedEventAttributes(history::MarkerRecordedEventAttributes {
+        marker_name: marker_name.to_string(),
+        details: [
+            ("identity".to_string(), marker_detail(identity)),
+            ("reason".to_string(), marker_detail(reason)),
+            ("request_id".to_string(), marker_detail(request_id)),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key, payloads_from_domain(&value)))
+        .collect(),
+        ..Default::default()
+    })
+}
+
 fn event_type_for_kind(kind: &HistoryEventKind) -> i32 {
     use tokeira_proto::enums::EventType as E;
     let et = match kind {
@@ -61,15 +80,14 @@ fn event_type_for_kind(kind: &HistoryEventKind) -> i32 {
         HistoryEventKind::WorkflowExecutionCancelRequested { .. } => {
             E::WorkflowExecutionCancelRequested
         }
-        HistoryEventKind::WorkflowExecutionCanceled => E::WorkflowExecutionCanceled,
+        HistoryEventKind::WorkflowExecutionCanceled { .. } => E::WorkflowExecutionCanceled,
         HistoryEventKind::WorkflowExecutionTerminated { .. } => E::WorkflowExecutionTerminated,
         HistoryEventKind::WorkflowExecutionContinuedAsNew { .. } => {
             E::WorkflowExecutionContinuedAsNew
         }
         HistoryEventKind::WorkflowExecutionSignaled { .. } => E::WorkflowExecutionSignaled,
-        // Paused/Unpaused are Tokeira-specific; no upstream EventType yet.
-        HistoryEventKind::WorkflowExecutionPaused { .. } => E::Unspecified,
-        HistoryEventKind::WorkflowExecutionUnpaused { .. } => E::Unspecified,
+        HistoryEventKind::WorkflowExecutionPaused { .. }
+        | HistoryEventKind::WorkflowExecutionUnpaused { .. } => E::MarkerRecorded,
         HistoryEventKind::WorkflowTaskScheduled { .. } => E::WorkflowTaskScheduled,
         HistoryEventKind::WorkflowTaskStarted { .. } => E::WorkflowTaskStarted,
         HistoryEventKind::WorkflowTaskCompleted { .. } => E::WorkflowTaskCompleted,
@@ -178,9 +196,11 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             workflow_type,
             task_queue,
             input,
+            header,
             memo,
             search_attributes,
-            request_id,
+            request_id: _,
+            identity,
             continued_execution_run_id,
             first_execution_run_id,
             retry_policy,
@@ -226,19 +246,25 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 workflow_execution_timeout: to_opt_proto_duration(*workflow_execution_timeout),
                 workflow_run_timeout: to_opt_proto_duration(*workflow_run_timeout),
                 workflow_task_timeout: Some(to_proto_duration(*workflow_task_timeout)),
-                identity: request_id.clone(),
+                identity: identity.clone(),
+                header: header.as_ref().map(headers_from_domain),
                 ..Default::default()
             },
         ),
-        HistoryEventKind::WorkflowExecutionCompleted { result } => {
+        HistoryEventKind::WorkflowExecutionCompleted {
+            workflow_task_completed_event_id,
+            result,
+        } => {
             Attributes::WorkflowExecutionCompletedEventAttributes(
                 history::WorkflowExecutionCompletedEventAttributes {
                     result: Some(payloads_from_domain(result)),
+                    workflow_task_completed_event_id: *workflow_task_completed_event_id,
                     ..Default::default()
                 },
             )
         }
         HistoryEventKind::WorkflowExecutionFailed {
+            workflow_task_completed_event_id,
             failure,
             retry_state,
             attempt: _,
@@ -248,6 +274,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 history::WorkflowExecutionFailedEventAttributes {
                     failure,
                     retry_state: retry_state_i32(retry_state),
+                    workflow_task_completed_event_id: *workflow_task_completed_event_id,
                     ..Default::default()
                 },
             )
@@ -255,15 +282,19 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
         HistoryEventKind::WorkflowExecutionTimedOut {
             timeout_type: _,
             retry_state,
+            new_execution_run_id,
         } => Attributes::WorkflowExecutionTimedOutEventAttributes(
             history::WorkflowExecutionTimedOutEventAttributes {
                 retry_state: retry_state_i32(retry_state),
+                new_execution_run_id: opt_run_id(new_execution_run_id),
                 ..Default::default()
             },
         ),
         HistoryEventKind::WorkflowExecutionCancelRequested {
             reason,
             external_workflow_execution,
+            external_initiated_event_id,
+            identity,
             request_id: _,
         } => {
             let ext_exec =
@@ -276,15 +307,21 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             Attributes::WorkflowExecutionCancelRequestedEventAttributes(
                 history::WorkflowExecutionCancelRequestedEventAttributes {
                     cause: reason.clone(),
+                    external_initiated_event_id: *external_initiated_event_id,
                     external_workflow_execution: ext_exec,
+                    identity: identity.clone(),
                     ..Default::default()
                 },
             )
         }
-        HistoryEventKind::WorkflowExecutionCanceled => {
+        HistoryEventKind::WorkflowExecutionCanceled {
+            workflow_task_completed_event_id,
+            details,
+        } => {
             Attributes::WorkflowExecutionCanceledEventAttributes(
                 history::WorkflowExecutionCanceledEventAttributes {
-                    ..Default::default()
+                    workflow_task_completed_event_id: *workflow_task_completed_event_id,
+                    details: details.as_ref().map(payloads_from_domain),
                 },
             )
         }
@@ -313,6 +350,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             initiator,
             failure,
             last_completion_result,
+            workflow_task_completed_event_id,
         } => Attributes::WorkflowExecutionContinuedAsNewEventAttributes(
             history::WorkflowExecutionContinuedAsNewEventAttributes {
                 new_execution_run_id: new_run_id.0.to_string(),
@@ -328,12 +366,14 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 initiator: continue_as_new_initiator_i32(initiator),
                 failure: failure.as_ref().map(payload_to_failure),
                 last_completion_result: last_completion_result.as_ref().map(payloads_from_domain),
+                workflow_task_completed_event_id: *workflow_task_completed_event_id,
                 ..Default::default()
             },
         ),
         HistoryEventKind::WorkflowExecutionSignaled {
             signal_name,
             input,
+            header,
             request_id: _,
             identity,
         } => Attributes::WorkflowExecutionSignaledEventAttributes(
@@ -341,25 +381,20 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 signal_name: signal_name.clone(),
                 input: Some(payloads_from_domain(input)),
                 identity: opt_string(identity),
+                header: header.as_ref().map(headers_from_domain),
                 ..Default::default()
             },
         ),
-        // Paused/Unpaused are Tokeira-specific; no upstream proto type yet.
-        // Map to WorkflowExecutionCanceledEventAttributes as a placeholder.
-        HistoryEventKind::WorkflowExecutionPaused { .. } => {
-            Attributes::WorkflowExecutionCanceledEventAttributes(
-                history::WorkflowExecutionCanceledEventAttributes {
-                    ..Default::default()
-                },
-            )
-        }
-        HistoryEventKind::WorkflowExecutionUnpaused { .. } => {
-            Attributes::WorkflowExecutionCanceledEventAttributes(
-                history::WorkflowExecutionCanceledEventAttributes {
-                    ..Default::default()
-                },
-            )
-        }
+        HistoryEventKind::WorkflowExecutionPaused {
+            identity,
+            reason,
+            request_id,
+        } => pause_marker("tokeira:paused", identity, reason, request_id),
+        HistoryEventKind::WorkflowExecutionUnpaused {
+            identity,
+            reason,
+            request_id,
+        } => pause_marker("tokeira:unpaused", identity, reason, request_id),
         HistoryEventKind::WorkflowTaskScheduled {
             logical_seq: _,
             task_queue,
@@ -377,10 +412,16 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             scheduled_event_id,
             attempt: _,
             identity,
+            request_id,
+            history_size_bytes,
+            suggest_continue_as_new,
         } => Attributes::WorkflowTaskStartedEventAttributes(
             history::WorkflowTaskStartedEventAttributes {
                 scheduled_event_id: *scheduled_event_id,
                 identity: identity.0.clone(),
+                request_id: request_id.clone(),
+                history_size_bytes: *history_size_bytes,
+                suggest_continue_as_new: *suggest_continue_as_new,
                 ..Default::default()
             },
         ),
@@ -389,11 +430,22 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             scheduled_event_id,
             started_event_id,
             identity,
+            sdk_metadata,
+            worker_version,
         } => Attributes::WorkflowTaskCompletedEventAttributes(
             history::WorkflowTaskCompletedEventAttributes {
                 scheduled_event_id: *scheduled_event_id,
                 started_event_id: *started_event_id,
                 identity: identity.0.clone(),
+                sdk_metadata: sdk_metadata.as_ref().and_then(|bytes| {
+                    tokeira_proto::public::temporal::api::sdk::v1::WorkflowTaskCompletedMetadata::decode(bytes.as_slice()).ok()
+                }),
+                worker_version: worker_version.as_ref().map(|build_id| {
+                    proto_common::WorkerVersionStamp {
+                        build_id: build_id.clone(),
+                        ..Default::default()
+                    }
+                }),
                 ..Default::default()
             },
         ),
@@ -437,6 +489,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             },
         ),
         HistoryEventKind::ActivityTaskScheduled {
+            workflow_task_completed_event_id,
             activity_id,
             activity_type,
             task_queue,
@@ -461,6 +514,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 start_to_close_timeout: to_opt_proto_duration(*start_to_close_timeout),
                 heartbeat_timeout: to_opt_proto_duration(*heartbeat_timeout),
                 retry_policy: retry_policy.as_ref().map(retry_policy_to_proto),
+                workflow_task_completed_event_id: *workflow_task_completed_event_id,
                 ..Default::default()
             },
         ),
@@ -469,11 +523,15 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             scheduled_event_id,
             attempt,
             identity,
+            request_id,
+            last_failure,
         } => Attributes::ActivityTaskStartedEventAttributes(
             history::ActivityTaskStartedEventAttributes {
                 scheduled_event_id: *scheduled_event_id,
                 identity: identity.0.clone(),
                 attempt: *attempt as i32,
+                request_id: request_id.clone(),
+                last_failure: last_failure.as_ref().map(payload_to_failure),
                 ..Default::default()
             },
         ),
@@ -481,12 +539,17 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             activity_id: _,
             scheduled_event_id,
             started_event_id,
+            identity,
             result,
         } => Attributes::ActivityTaskCompletedEventAttributes(
             history::ActivityTaskCompletedEventAttributes {
                 result: Some(payloads_from_domain(result)),
                 scheduled_event_id: *scheduled_event_id,
                 started_event_id: *started_event_id,
+                identity: identity
+                    .as_ref()
+                    .map(|worker| worker.0.clone())
+                    .unwrap_or_default(),
                 ..Default::default()
             },
         ),
@@ -494,6 +557,8 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             activity_id: _,
             scheduled_event_id,
             started_event_id,
+            identity,
+            retry_state,
             failure,
         } => {
             let failure = Some(payload_to_failure(failure));
@@ -502,6 +567,11 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                     failure,
                     scheduled_event_id: *scheduled_event_id,
                     started_event_id: *started_event_id,
+                    identity: identity
+                        .as_ref()
+                        .map(|worker| worker.0.clone())
+                        .unwrap_or_default(),
+                    retry_state: retry_state_i32(retry_state),
                     ..Default::default()
                 },
             )
@@ -511,6 +581,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             scheduled_event_id,
             started_event_id,
             timeout_type,
+            retry_state,
         } => Attributes::ActivityTaskTimedOutEventAttributes(
             history::ActivityTaskTimedOutEventAttributes {
                 failure: Some(proto_failure::Failure {
@@ -525,6 +596,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 }),
                 scheduled_event_id: *scheduled_event_id,
                 started_event_id: *started_event_id,
+                retry_state: retry_state_i32(retry_state),
                 ..Default::default()
             },
         ),
@@ -532,29 +604,44 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             activity_id: _,
             scheduled_event_id,
             started_event_id,
+            identity,
             details,
         } => Attributes::ActivityTaskCanceledEventAttributes(
             history::ActivityTaskCanceledEventAttributes {
                 details: details.as_ref().map(payloads_from_domain),
                 scheduled_event_id: *scheduled_event_id,
                 started_event_id: *started_event_id,
+                identity: identity
+                    .as_ref()
+                    .map(|worker| worker.0.clone())
+                    .unwrap_or_default(),
                 ..Default::default()
             },
         ),
-        HistoryEventKind::ActivityTaskCancelRequested { activity_id } => {
+        HistoryEventKind::ActivityTaskCancelRequested {
+            activity_id,
+            scheduled_event_id,
+            workflow_task_completed_event_id,
+        } => {
             let _ = activity_id;
             Attributes::ActivityTaskCancelRequestedEventAttributes(
                 history::ActivityTaskCancelRequestedEventAttributes {
-                    ..Default::default()
+                    scheduled_event_id: *scheduled_event_id,
+                    workflow_task_completed_event_id: *workflow_task_completed_event_id,
                 },
             )
         }
-        HistoryEventKind::TimerStarted { timer_id, fire_at } => {
+        HistoryEventKind::TimerStarted {
+            workflow_task_completed_event_id,
+            timer_id,
+            fire_at,
+        } => {
             Attributes::TimerStartedEventAttributes(history::TimerStartedEventAttributes {
                 timer_id: timer_id.clone(),
                 start_to_fire_timeout: Some(to_proto_duration(
                     (*fire_at - event.happened_at).max(time::Duration::ZERO),
                 )),
+                workflow_task_completed_event_id: *workflow_task_completed_event_id,
                 ..Default::default()
             })
         }
@@ -565,13 +652,20 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             timer_id: timer_id.clone(),
             started_event_id: *started_event_id,
         }),
-        HistoryEventKind::TimerCanceled { timer_id } => {
+        HistoryEventKind::TimerCanceled {
+            workflow_task_completed_event_id,
+            timer_id,
+            started_event_id,
+        } => {
             Attributes::TimerCanceledEventAttributes(history::TimerCanceledEventAttributes {
                 timer_id: timer_id.clone(),
+                started_event_id: *started_event_id,
+                workflow_task_completed_event_id: *workflow_task_completed_event_id,
                 ..Default::default()
             })
         }
         HistoryEventKind::MarkerRecorded {
+            workflow_task_completed_event_id,
             marker_name,
             details,
             failure,
@@ -589,17 +683,29 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                     .map(|(k, v)| (k.clone(), payload_from_domain(v)))
                     .collect(),
             }),
+            workflow_task_completed_event_id: *workflow_task_completed_event_id,
             ..Default::default()
         }),
         HistoryEventKind::StartChildWorkflowExecutionInitiated {
+            workflow_task_completed_event_id,
             child_workflow_id,
             workflow_type,
             task_queue,
             input,
             namespace_id,
+            namespace,
+            header,
+            memo,
+            search_attributes,
+            workflow_execution_timeout,
+            workflow_run_timeout,
+            workflow_task_timeout,
+            retry_policy,
+            cron_schedule,
             parent_close_policy,
         } => Attributes::StartChildWorkflowExecutionInitiatedEventAttributes(
             history::StartChildWorkflowExecutionInitiatedEventAttributes {
+                namespace: namespace.clone().unwrap_or_default(),
                 workflow_id: child_workflow_id.0.clone(),
                 workflow_type: Some(proto_common::WorkflowType {
                     name: workflow_type.0.clone(),
@@ -607,6 +713,15 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 task_queue: Some(task_queue_from_domain(task_queue)),
                 input: Some(payloads_from_domain(input)),
                 namespace_id: namespace_id.0.to_string(),
+                header: header.as_ref().map(headers_from_domain),
+                memo: Some(memo_from_domain(memo)),
+                search_attributes: Some(search_attributes_from_domain(search_attributes)),
+                workflow_execution_timeout: to_opt_proto_duration(*workflow_execution_timeout),
+                workflow_run_timeout: to_opt_proto_duration(*workflow_run_timeout),
+                workflow_task_timeout: Some(to_proto_duration(*workflow_task_timeout)),
+                retry_policy: retry_policy.as_ref().map(retry_policy_to_proto),
+                cron_schedule: cron_schedule.clone().unwrap_or_default(),
+                workflow_task_completed_event_id: *workflow_task_completed_event_id,
                 parent_close_policy: parent_close_policy_i32(parent_close_policy),
                 ..Default::default()
             },
@@ -631,145 +746,228 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
         ),
         HistoryEventKind::StartChildWorkflowExecutionFailed {
             child_workflow_id,
+            initiated_event_id,
+            namespace_id,
+            namespace,
+            workflow_type,
             cause,
         } => Attributes::StartChildWorkflowExecutionFailedEventAttributes(
             history::StartChildWorkflowExecutionFailedEventAttributes {
+                namespace: namespace.clone().unwrap_or_default(),
+                namespace_id: namespace_id.0.to_string(),
                 workflow_id: child_workflow_id.0.clone(),
+                workflow_type: Some(proto_common::WorkflowType {
+                    name: workflow_type.0.clone(),
+                }),
                 cause: start_child_workflow_failed_cause_i32(cause),
+                initiated_event_id: *initiated_event_id,
                 ..Default::default()
             },
         ),
         HistoryEventKind::ChildWorkflowExecutionCompleted {
             child_workflow_id,
+            namespace_id,
+            namespace,
+            child_run_id,
+            workflow_type,
             result,
             initiated_event_id,
             started_event_id,
         } => Attributes::ChildWorkflowExecutionCompletedEventAttributes(
             history::ChildWorkflowExecutionCompletedEventAttributes {
                 result: Some(payloads_from_domain(result)),
+                namespace: namespace.clone().unwrap_or_default(),
+                namespace_id: namespace_id.0.to_string(),
                 initiated_event_id: *initiated_event_id,
                 started_event_id: *started_event_id,
                 workflow_execution: Some(proto_common::WorkflowExecution {
                     workflow_id: child_workflow_id.0.clone(),
-                    ..Default::default()
+                    run_id: opt_run_id(child_run_id),
+                }),
+                workflow_type: Some(proto_common::WorkflowType {
+                    name: workflow_type.0.clone(),
                 }),
                 ..Default::default()
             },
         ),
         HistoryEventKind::ChildWorkflowExecutionFailed {
             child_workflow_id,
+            namespace_id,
+            namespace,
+            child_run_id,
+            workflow_type,
+            retry_state,
             failure,
             initiated_event_id,
             started_event_id,
         } => Attributes::ChildWorkflowExecutionFailedEventAttributes(
             history::ChildWorkflowExecutionFailedEventAttributes {
                 failure: Some(payload_to_failure(failure)),
+                namespace: namespace.clone().unwrap_or_default(),
+                namespace_id: namespace_id.0.to_string(),
                 initiated_event_id: *initiated_event_id,
                 started_event_id: *started_event_id,
                 workflow_execution: Some(proto_common::WorkflowExecution {
                     workflow_id: child_workflow_id.0.clone(),
-                    ..Default::default()
+                    run_id: opt_run_id(child_run_id),
                 }),
+                workflow_type: Some(proto_common::WorkflowType {
+                    name: workflow_type.0.clone(),
+                }),
+                retry_state: retry_state_i32(retry_state),
                 ..Default::default()
             },
         ),
         HistoryEventKind::ChildWorkflowExecutionCanceled {
             child_workflow_id,
+            namespace_id,
+            namespace,
+            child_run_id,
+            workflow_type,
+            details,
             initiated_event_id,
             started_event_id,
         } => Attributes::ChildWorkflowExecutionCanceledEventAttributes(
             history::ChildWorkflowExecutionCanceledEventAttributes {
+                details: details.as_ref().map(payloads_from_domain),
+                namespace: namespace.clone().unwrap_or_default(),
+                namespace_id: namespace_id.0.to_string(),
                 initiated_event_id: *initiated_event_id,
                 started_event_id: *started_event_id,
                 workflow_execution: Some(proto_common::WorkflowExecution {
                     workflow_id: child_workflow_id.0.clone(),
-                    ..Default::default()
+                    run_id: opt_run_id(child_run_id),
+                }),
+                workflow_type: Some(proto_common::WorkflowType {
+                    name: workflow_type.0.clone(),
                 }),
                 ..Default::default()
             },
         ),
         HistoryEventKind::ChildWorkflowExecutionTerminated {
             child_workflow_id,
+            namespace_id,
+            namespace,
+            workflow_type,
             initiated_event_id,
             started_event_id,
         } => Attributes::ChildWorkflowExecutionTerminatedEventAttributes(
             history::ChildWorkflowExecutionTerminatedEventAttributes {
+                namespace: namespace.clone().unwrap_or_default(),
+                namespace_id: namespace_id.0.to_string(),
                 initiated_event_id: *initiated_event_id,
                 started_event_id: *started_event_id,
                 workflow_execution: Some(proto_common::WorkflowExecution {
                     workflow_id: child_workflow_id.0.clone(),
                     ..Default::default()
+                }),
+                workflow_type: Some(proto_common::WorkflowType {
+                    name: workflow_type.0.clone(),
                 }),
                 ..Default::default()
             },
         ),
         HistoryEventKind::ChildWorkflowExecutionTimedOut {
             child_workflow_id,
+            namespace_id,
+            namespace,
+            workflow_type,
+            retry_state,
             initiated_event_id,
             started_event_id,
         } => Attributes::ChildWorkflowExecutionTimedOutEventAttributes(
             history::ChildWorkflowExecutionTimedOutEventAttributes {
+                namespace: namespace.clone().unwrap_or_default(),
+                namespace_id: namespace_id.0.to_string(),
                 initiated_event_id: *initiated_event_id,
                 started_event_id: *started_event_id,
                 workflow_execution: Some(proto_common::WorkflowExecution {
                     workflow_id: child_workflow_id.0.clone(),
                     ..Default::default()
                 }),
+                workflow_type: Some(proto_common::WorkflowType {
+                    name: workflow_type.0.clone(),
+                }),
+                retry_state: retry_state_i32(retry_state),
                 ..Default::default()
             },
         ),
         HistoryEventKind::SignalExternalWorkflowExecutionInitiated {
+            workflow_task_completed_event_id,
+            namespace_id,
+            namespace,
             target_workflow_id,
             target_run_id,
             signal_name,
             input,
+            header,
             control,
         } => Attributes::SignalExternalWorkflowExecutionInitiatedEventAttributes(
             history::SignalExternalWorkflowExecutionInitiatedEventAttributes {
+                workflow_task_completed_event_id: *workflow_task_completed_event_id,
+                namespace: namespace.clone().unwrap_or_default(),
+                namespace_id: namespace_id.0.to_string(),
                 workflow_execution: Some(proto_common::WorkflowExecution {
                     workflow_id: target_workflow_id.0.clone(),
                     run_id: opt_run_id(target_run_id),
                 }),
                 signal_name: signal_name.clone(),
                 input: Some(payloads_from_domain(input)),
+                header: header.as_ref().map(headers_from_domain),
                 control: control.clone(),
                 ..Default::default()
             },
         ),
         HistoryEventKind::ExternalWorkflowExecutionSignaled {
             initiated_event_id,
+            namespace_id,
+            namespace,
             target_workflow_id,
+            target_run_id,
         } => Attributes::ExternalWorkflowExecutionSignaledEventAttributes(
             history::ExternalWorkflowExecutionSignaledEventAttributes {
                 initiated_event_id: *initiated_event_id,
+                namespace: namespace.clone().unwrap_or_default(),
+                namespace_id: namespace_id.0.to_string(),
                 workflow_execution: Some(proto_common::WorkflowExecution {
                     workflow_id: target_workflow_id.0.clone(),
-                    ..Default::default()
+                    run_id: opt_run_id(target_run_id),
                 }),
                 ..Default::default()
             },
         ),
         HistoryEventKind::SignalExternalWorkflowExecutionFailed {
             initiated_event_id,
+            namespace_id,
+            namespace,
             target_workflow_id,
+            target_run_id,
             cause,
         } => Attributes::SignalExternalWorkflowExecutionFailedEventAttributes(
             history::SignalExternalWorkflowExecutionFailedEventAttributes {
                 cause: signal_external_workflow_failed_cause_i32(cause),
                 initiated_event_id: *initiated_event_id,
+                namespace: namespace.clone().unwrap_or_default(),
+                namespace_id: namespace_id.0.to_string(),
                 workflow_execution: Some(proto_common::WorkflowExecution {
                     workflow_id: target_workflow_id.0.clone(),
-                    ..Default::default()
+                    run_id: opt_run_id(target_run_id),
                 }),
                 ..Default::default()
             },
         ),
         HistoryEventKind::RequestCancelExternalWorkflowExecutionInitiated {
+            workflow_task_completed_event_id,
+            namespace_id,
+            namespace,
             target_workflow_id,
             target_run_id,
             control,
         } => Attributes::RequestCancelExternalWorkflowExecutionInitiatedEventAttributes(
             history::RequestCancelExternalWorkflowExecutionInitiatedEventAttributes {
+                workflow_task_completed_event_id: *workflow_task_completed_event_id,
+                namespace: namespace.clone().unwrap_or_default(),
+                namespace_id: namespace_id.0.to_string(),
                 workflow_execution: Some(proto_common::WorkflowExecution {
                     workflow_id: target_workflow_id.0.clone(),
                     run_id: opt_run_id(target_run_id),
@@ -780,46 +978,62 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
         ),
         HistoryEventKind::ExternalWorkflowExecutionCancelRequested {
             initiated_event_id,
+            namespace_id,
+            namespace,
             target_workflow_id,
+            target_run_id,
         } => Attributes::ExternalWorkflowExecutionCancelRequestedEventAttributes(
             history::ExternalWorkflowExecutionCancelRequestedEventAttributes {
                 initiated_event_id: *initiated_event_id,
+                namespace: namespace.clone().unwrap_or_default(),
+                namespace_id: namespace_id.0.to_string(),
                 workflow_execution: Some(proto_common::WorkflowExecution {
                     workflow_id: target_workflow_id.0.clone(),
-                    ..Default::default()
+                    run_id: opt_run_id(target_run_id),
                 }),
                 ..Default::default()
             },
         ),
         HistoryEventKind::RequestCancelExternalWorkflowExecutionFailed {
             initiated_event_id,
+            namespace_id,
+            namespace,
             target_workflow_id,
+            target_run_id,
             cause,
         } => Attributes::RequestCancelExternalWorkflowExecutionFailedEventAttributes(
             history::RequestCancelExternalWorkflowExecutionFailedEventAttributes {
                 cause: cancel_external_workflow_failed_cause_i32(cause),
                 initiated_event_id: *initiated_event_id,
+                namespace: namespace.clone().unwrap_or_default(),
+                namespace_id: namespace_id.0.to_string(),
                 workflow_execution: Some(proto_common::WorkflowExecution {
                     workflow_id: target_workflow_id.0.clone(),
-                    ..Default::default()
+                    run_id: opt_run_id(target_run_id),
                 }),
                 ..Default::default()
             },
         ),
         HistoryEventKind::NexusOperationScheduled {
+            workflow_task_completed_event_id,
             operation_id: _,
             endpoint,
+            endpoint_id,
             service,
             operation,
             input,
+            nexus_header,
             schedule_to_close_timeout,
         } => Attributes::NexusOperationScheduledEventAttributes(
             history::NexusOperationScheduledEventAttributes {
                 endpoint: endpoint.clone(),
+                endpoint_id: endpoint_id.clone(),
                 service: service.clone(),
                 operation: operation.clone(),
                 input: input.0.first().map(payload_from_domain),
+                nexus_header: nexus_header.clone(),
                 schedule_to_close_timeout: to_opt_proto_duration(*schedule_to_close_timeout),
+                workflow_task_completed_event_id: *workflow_task_completed_event_id,
                 ..Default::default()
             },
         ),
@@ -829,46 +1043,50 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
         } => Attributes::NexusOperationStartedEventAttributes(
             history::NexusOperationStartedEventAttributes {
                 scheduled_event_id: *scheduled_event_id,
-                operation_id: operation_id.clone(),
+                request_id: operation_id.clone(),
                 ..Default::default()
             },
         ),
         HistoryEventKind::NexusOperationCompleted {
-            operation_id: _,
+            operation_id,
             scheduled_event_id,
             result,
         } => Attributes::NexusOperationCompletedEventAttributes(
             history::NexusOperationCompletedEventAttributes {
+                request_id: operation_id.clone(),
                 scheduled_event_id: *scheduled_event_id,
                 result: result.0.first().map(payload_from_domain),
                 ..Default::default()
             },
         ),
         HistoryEventKind::NexusOperationFailed {
-            operation_id: _,
+            operation_id,
             scheduled_event_id,
             failure,
         } => Attributes::NexusOperationFailedEventAttributes(
             history::NexusOperationFailedEventAttributes {
+                request_id: operation_id.clone(),
                 scheduled_event_id: *scheduled_event_id,
                 failure: Some(payload_to_failure(failure)),
                 ..Default::default()
             },
         ),
         HistoryEventKind::NexusOperationCanceled {
-            operation_id: _,
+            operation_id,
             scheduled_event_id,
         } => Attributes::NexusOperationCanceledEventAttributes(
             history::NexusOperationCanceledEventAttributes {
+                request_id: operation_id.clone(),
                 scheduled_event_id: *scheduled_event_id,
                 ..Default::default()
             },
         ),
         HistoryEventKind::NexusOperationTimedOut {
-            operation_id: _,
+            operation_id,
             scheduled_event_id,
         } => Attributes::NexusOperationTimedOutEventAttributes(
             history::NexusOperationTimedOutEventAttributes {
+                request_id: operation_id.clone(),
                 scheduled_event_id: *scheduled_event_id,
                 ..Default::default()
             },
@@ -885,10 +1103,12 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             update_id,
             update_name,
             input,
+            accepted_request_sequencing_event_id,
         } => Attributes::WorkflowExecutionUpdateAcceptedEventAttributes(
             history::WorkflowExecutionUpdateAcceptedEventAttributes {
                 protocol_instance_id: update_id.clone(),
                 accepted_request_message_id: update_id.clone(),
+                accepted_request_sequencing_event_id: *accepted_request_sequencing_event_id,
                 accepted_request: Some(proto_update::Request {
                     meta: Some(proto_update::Meta {
                         update_id: update_id.clone(),
@@ -903,7 +1123,11 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 ..Default::default()
             },
         ),
-        HistoryEventKind::WorkflowExecutionUpdateCompleted { update_id, result } => {
+        HistoryEventKind::WorkflowExecutionUpdateCompleted {
+            update_id,
+            result,
+            accepted_event_id,
+        } => {
             Attributes::WorkflowExecutionUpdateCompletedEventAttributes(
                 history::WorkflowExecutionUpdateCompletedEventAttributes {
                     meta: Some(proto_update::Meta {
@@ -915,14 +1139,22 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                             result,
                         ))),
                     }),
+                    accepted_event_id: *accepted_event_id,
                     ..Default::default()
                 },
             )
         }
-        HistoryEventKind::WorkflowExecutionUpdateRejected { update_id, failure } => {
+        HistoryEventKind::WorkflowExecutionUpdateRejected {
+            update_id,
+            failure,
+            rejected_request_message_id,
+            rejected_request_sequencing_event_id,
+        } => {
             Attributes::WorkflowExecutionUpdateRejectedEventAttributes(
                 history::WorkflowExecutionUpdateRejectedEventAttributes {
                     protocol_instance_id: update_id.clone(),
+                    rejected_request_message_id: rejected_request_message_id.clone(),
+                    rejected_request_sequencing_event_id: *rejected_request_sequencing_event_id,
                     failure: Some(payload_to_failure(failure)),
                     ..Default::default()
                 },
@@ -1167,9 +1399,11 @@ mod tests {
                             workflow_type: WorkflowType(wt),
                             task_queue: TaskQueueName(tq),
                             input,
+                            header: None,
                             memo: Memo::default(),
                             search_attributes: SearchAttributes::default(),
                             request_id: rid,
+                            identity: "client".to_string(),
                             continued_execution_run_id: cont,
                             first_execution_run_id: first,
                             retry_policy: rp,
@@ -1188,16 +1422,24 @@ mod tests {
                         }
                     }
                 ),
-            arb_payloads()
-                .prop_map(|r| { HistoryEventKind::WorkflowExecutionCompleted { result: r } }),
+            arb_payloads().prop_map(|r| {
+                HistoryEventKind::WorkflowExecutionCompleted {
+                    workflow_task_completed_event_id: 4,
+                    result: r,
+                }
+            }),
             (arb_failure_payload(), arb_retry_state(), 0u32..5).prop_map(|(failure, rs, att)| {
                 HistoryEventKind::WorkflowExecutionFailed {
+                    workflow_task_completed_event_id: 4,
                     failure,
                     retry_state: rs,
                     attempt: att,
                 }
             },),
-            Just(HistoryEventKind::WorkflowExecutionCanceled),
+            Just(HistoryEventKind::WorkflowExecutionCanceled {
+                workflow_task_completed_event_id: 4,
+                details: None,
+            }),
             "[a-z]{1,8}".prop_map(|r| {
                 HistoryEventKind::WorkflowExecutionTerminated {
                     reason: r,
@@ -1209,6 +1451,7 @@ mod tests {
                 HistoryEventKind::WorkflowExecutionSignaled {
                     signal_name: sn,
                     input,
+                    header: None,
                     request_id: rid,
                     identity: None,
                 }
@@ -1227,6 +1470,9 @@ mod tests {
                     scheduled_event_id: sched,
                     attempt: att,
                     identity: WorkerIdentity("w".to_string()),
+                    request_id: "start-req".to_string(),
+                    history_size_bytes: 0,
+                    suggest_continue_as_new: false,
                 }
             }),
             (1u64..100, 1i64..100, 1i64..100).prop_map(|(seq, sched, started)| {
@@ -1235,6 +1481,8 @@ mod tests {
                     scheduled_event_id: sched,
                     started_event_id: started,
                     identity: WorkerIdentity("w".to_string()),
+                    sdk_metadata: None,
+                    worker_version: None,
                 }
             }),
             (
@@ -1251,6 +1499,7 @@ mod tests {
             )
                 .prop_map(|(aid, at, tq, input, hdr, rp, s2c, s2s, stc, hb)| {
                     HistoryEventKind::ActivityTaskScheduled {
+                        workflow_task_completed_event_id: 4,
                         activity_id: aid,
                         activity_type: at,
                         task_queue: TaskQueueName(tq),
@@ -1268,6 +1517,7 @@ mod tests {
                     activity_id: aid,
                     scheduled_event_id: 5,
                     started_event_id: 6,
+                    identity: Some(WorkerIdentity("w".to_string())),
                     result,
                 }
             }),
@@ -1276,6 +1526,8 @@ mod tests {
                     activity_id: aid,
                     scheduled_event_id: 5,
                     started_event_id: 6,
+                    identity: Some(WorkerIdentity("w".to_string())),
+                    retry_state: RetryState::RetryPolicyNotSet,
                     failure,
                 }
             }),
@@ -1285,10 +1537,13 @@ mod tests {
                     scheduled_event_id: sched,
                     attempt: att,
                     identity: WorkerIdentity("w".to_string()),
+                    request_id: "activity-start".to_string(),
+                    last_failure: None,
                 }
             }),
             ("[a-z]{1,6}", arb_timestamp()).prop_map(|(tid, fire_at)| {
                 HistoryEventKind::TimerStarted {
+                    workflow_task_completed_event_id: 4,
                     timer_id: tid,
                     fire_at,
                 }
@@ -1297,9 +1552,17 @@ mod tests {
                 timer_id: tid,
                 started_event_id: 5,
             }),
-            "[a-z]{1,6}".prop_map(|tid| HistoryEventKind::TimerCanceled { timer_id: tid }),
+            "[a-z]{1,6}".prop_map(|tid| HistoryEventKind::TimerCanceled {
+                workflow_task_completed_event_id: 4,
+                timer_id: tid,
+                started_event_id: 5,
+            }),
             "[a-z]{1,6}".prop_map(|aid| {
-                HistoryEventKind::ActivityTaskCancelRequested { activity_id: aid }
+                HistoryEventKind::ActivityTaskCancelRequested {
+                    workflow_task_completed_event_id: 4,
+                    activity_id: aid,
+                    scheduled_event_id: 5,
+                }
             }),
             ("[a-z]{1,6}", arb_run_id(), "[a-z]{1,6}", 1i64..100).prop_map(
                 |(cwid, crid, wt, iei)| {
@@ -1315,6 +1578,10 @@ mod tests {
                 |(cwid, result, iei, sei)| {
                     HistoryEventKind::ChildWorkflowExecutionCompleted {
                         child_workflow_id: WorkflowId(cwid),
+                        namespace_id: NamespaceId::new(),
+                        namespace: Some("default".to_string()),
+                        child_run_id: Some(RunId::new()),
+                        workflow_type: WorkflowType("child".to_string()),
                         result,
                         initiated_event_id: iei,
                         started_event_id: sei,
@@ -1325,6 +1592,11 @@ mod tests {
                 |(cwid, failure, iei, sei)| {
                     HistoryEventKind::ChildWorkflowExecutionFailed {
                         child_workflow_id: WorkflowId(cwid),
+                        namespace_id: NamespaceId::new(),
+                        namespace: Some("default".to_string()),
+                        child_run_id: Some(RunId::new()),
+                        workflow_type: WorkflowType("child".to_string()),
+                        retry_state: RetryState::RetryPolicyNotSet,
                         failure,
                         initiated_event_id: iei,
                         started_event_id: sei,
@@ -1334,6 +1606,11 @@ mod tests {
             ("[a-z]{1,6}", 1i64..100, 1i64..100).prop_map(|(cwid, iei, sei)| {
                 HistoryEventKind::ChildWorkflowExecutionCanceled {
                     child_workflow_id: WorkflowId(cwid),
+                    namespace_id: NamespaceId::new(),
+                    namespace: Some("default".to_string()),
+                    child_run_id: Some(RunId::new()),
+                    workflow_type: WorkflowType("child".to_string()),
+                    details: None,
                     initiated_event_id: iei,
                     started_event_id: sei,
                 }
@@ -1341,6 +1618,9 @@ mod tests {
             ("[a-z]{1,6}", 1i64..100, 1i64..100).prop_map(|(cwid, iei, sei)| {
                 HistoryEventKind::ChildWorkflowExecutionTerminated {
                     child_workflow_id: WorkflowId(cwid),
+                    namespace_id: NamespaceId::new(),
+                    namespace: Some("default".to_string()),
+                    workflow_type: WorkflowType("child".to_string()),
                     initiated_event_id: iei,
                     started_event_id: sei,
                 }
@@ -1348,6 +1628,10 @@ mod tests {
             ("[a-z]{1,6}", 1i64..100, 1i64..100).prop_map(|(cwid, iei, sei)| {
                 HistoryEventKind::ChildWorkflowExecutionTimedOut {
                     child_workflow_id: WorkflowId(cwid),
+                    namespace_id: NamespaceId::new(),
+                    namespace: Some("default".to_string()),
+                    workflow_type: WorkflowType("child".to_string()),
+                    retry_state: RetryState::Timeout,
                     initiated_event_id: iei,
                     started_event_id: sei,
                 }
@@ -1362,11 +1646,14 @@ mod tests {
             )
                 .prop_map(|(oid, ep, svc, op, input, timeout)| {
                     HistoryEventKind::NexusOperationScheduled {
+                        workflow_task_completed_event_id: 4,
                         operation_id: oid,
                         endpoint: ep,
+                        endpoint_id: "endpoint-id".to_string(),
                         service: svc,
                         operation: op,
                         input,
+                        nexus_header: std::collections::BTreeMap::new(),
                         schedule_to_close_timeout: timeout,
                     }
                 }),
@@ -1375,18 +1662,22 @@ mod tests {
                     update_id: uid,
                     update_name: uname,
                     input,
+                    accepted_request_sequencing_event_id: 3,
                 }
             }),
             ("[a-z]{1,6}", arb_payloads()).prop_map(|(uid, result)| {
                 HistoryEventKind::WorkflowExecutionUpdateCompleted {
                     update_id: uid,
                     result,
+                    accepted_event_id: 2,
                 }
             }),
             ("[a-z]{1,6}", arb_failure_payload()).prop_map(|(uid, failure)| {
                 HistoryEventKind::WorkflowExecutionUpdateRejected {
                     update_id: uid,
                     failure,
+                    rejected_request_message_id: "msg".to_string(),
+                    rejected_request_sequencing_event_id: 3,
                 }
             }),
         ]
@@ -1436,9 +1727,11 @@ mod tests {
                 workflow_type: WorkflowType("MyWorkflow".to_string()),
                 task_queue: TaskQueueName("default".to_string()),
                 input: Payloads::default(),
+                header: None,
                 memo: Memo::default(),
                 search_attributes: SearchAttributes::default(),
                 request_id: "req-1".to_string(),
+                identity: "client".to_string(),
                 continued_execution_run_id: None,
                 first_execution_run_id: None,
                 retry_policy: None,
@@ -1481,9 +1774,11 @@ mod tests {
                 workflow_type: WorkflowType("ScheduledWorkflow".to_string()),
                 task_queue: TaskQueueName("default".to_string()),
                 input: Payloads::default(),
+                header: None,
                 memo: Memo::default(),
                 search_attributes: SearchAttributes::default(),
                 request_id: "req-1".to_string(),
+                identity: "client".to_string(),
                 continued_execution_run_id: None,
                 first_execution_run_id: None,
                 retry_policy: None,
@@ -1519,9 +1814,11 @@ mod tests {
                 workflow_type: WorkflowType("NormalWorkflow".to_string()),
                 task_queue: TaskQueueName("default".to_string()),
                 input: Payloads::default(),
+                header: None,
                 memo: Memo::default(),
                 search_attributes: SearchAttributes::default(),
                 request_id: "req-1".to_string(),
+                identity: "client".to_string(),
                 continued_execution_run_id: None,
                 first_execution_run_id: None,
                 retry_policy: None,
@@ -1554,6 +1851,7 @@ mod tests {
             event_id: 5,
             happened_at: OffsetDateTime::from_unix_timestamp(2000).unwrap(),
             kind: HistoryEventKind::ActivityTaskScheduled {
+                workflow_task_completed_event_id: 4,
                 activity_id: "act-1".to_string(),
                 activity_type: "activity-type".to_string(),
                 task_queue: TaskQueueName("q".to_string()),
@@ -1588,6 +1886,7 @@ mod tests {
             event_id: 10,
             happened_at: OffsetDateTime::from_unix_timestamp(4000).unwrap(),
             kind: HistoryEventKind::TimerStarted {
+                workflow_task_completed_event_id: 4,
                 timer_id: "t1".to_string(),
                 fire_at,
             },
@@ -1611,11 +1910,21 @@ mod tests {
             event_id: 20,
             happened_at: OffsetDateTime::from_unix_timestamp(3000).unwrap(),
             kind: HistoryEventKind::StartChildWorkflowExecutionInitiated {
+                workflow_task_completed_event_id: 4,
                 child_workflow_id: WorkflowId("child-1".to_string()),
                 workflow_type: WorkflowType("ChildWf".to_string()),
                 task_queue: TaskQueueName("child-q".to_string()),
                 input: Payloads::default(),
                 namespace_id: NamespaceId(uuid::Uuid::nil()),
+                namespace: None,
+                header: None,
+                memo: Memo::default(),
+                search_attributes: SearchAttributes::default(),
+                workflow_execution_timeout: None,
+                workflow_run_timeout: None,
+                workflow_task_timeout: time::Duration::seconds(10),
+                retry_policy: None,
+                cron_schedule: None,
                 parent_close_policy: ParentClosePolicy::Terminate,
             },
         };
@@ -1681,6 +1990,7 @@ mod tests {
                 event_id: 1,
                 happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
                 kind: HistoryEventKind::WorkflowExecutionFailed {
+                    workflow_task_completed_event_id: 4,
                     failure: payload,
                     retry_state,
                     attempt,
@@ -1713,6 +2023,8 @@ mod tests {
                     activity_id: "act-1".to_string(),
                     scheduled_event_id: 5,
                     started_event_id: 6,
+                    identity: Some(WorkerIdentity("worker".to_string())),
+                    retry_state: RetryState::RetryPolicyNotSet,
                     failure: payload,
                 },
             };
@@ -1741,6 +2053,11 @@ mod tests {
                 happened_at: OffsetDateTime::from_unix_timestamp(3000).unwrap(),
                 kind: HistoryEventKind::ChildWorkflowExecutionFailed {
                     child_workflow_id: WorkflowId("child-1".to_string()),
+                    namespace_id: NamespaceId(uuid::Uuid::nil()),
+                    namespace: None,
+                    child_run_id: Some(RunId::new()),
+                    workflow_type: WorkflowType("ChildWf".to_string()),
+                    retry_state: RetryState::RetryPolicyNotSet,
                     failure: payload,
                     initiated_event_id: 10,
                     started_event_id: 11,
@@ -1805,6 +2122,7 @@ mod tests {
             let payload = make_failure_payload(&failure);
             let kind = match variant {
                 0 => HistoryEventKind::WorkflowExecutionFailed {
+                    workflow_task_completed_event_id: 4,
                     failure: payload,
                     retry_state: RetryState::InProgress,
                     attempt: 1,
@@ -1813,10 +2131,17 @@ mod tests {
                     activity_id: "act-1".to_string(),
                     scheduled_event_id: 5,
                     started_event_id: 6,
+                    identity: Some(WorkerIdentity("worker".to_string())),
+                    retry_state: RetryState::RetryPolicyNotSet,
                     failure: payload,
                 },
                 2 => HistoryEventKind::ChildWorkflowExecutionFailed {
                     child_workflow_id: WorkflowId("child-1".to_string()),
+                    namespace_id: NamespaceId(uuid::Uuid::nil()),
+                    namespace: None,
+                    child_run_id: Some(RunId::new()),
+                    workflow_type: WorkflowType("ChildWf".to_string()),
+                    retry_state: RetryState::RetryPolicyNotSet,
                     failure: payload,
                     initiated_event_id: 10,
                     started_event_id: 11,
@@ -1829,6 +2154,8 @@ mod tests {
                 _ => HistoryEventKind::WorkflowExecutionUpdateRejected {
                     update_id: "update-1".to_string(),
                     failure: payload,
+                    rejected_request_message_id: "msg".to_string(),
+                    rejected_request_sequencing_event_id: 3,
                 },
             };
             let event = HistoryEvent {
@@ -1880,6 +2207,7 @@ mod tests {
             event_id: 5,
             happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
             kind: HistoryEventKind::WorkflowExecutionFailed {
+                workflow_task_completed_event_id: 4,
                 failure: make_failure_payload(&failure),
                 retry_state: RetryState::NonRetryableFailure,
                 attempt: 1,
@@ -1933,6 +2261,8 @@ mod tests {
                 activity_id: "act-1".to_string(),
                 scheduled_event_id: 5,
                 started_event_id: 6,
+                identity: Some(WorkerIdentity("worker".to_string())),
+                retry_state: RetryState::RetryPolicyNotSet,
                 failure: make_failure_payload(&failure),
             },
         };
@@ -2006,6 +2336,7 @@ mod tests {
             event_id: 9,
             happened_at: OffsetDateTime::from_unix_timestamp(2000).unwrap(),
             kind: HistoryEventKind::MarkerRecorded {
+                workflow_task_completed_event_id: 4,
                 marker_name: "test-marker".to_string(),
                 details: Default::default(),
                 failure: Some(make_failure_payload(&failure)),
@@ -2066,9 +2397,11 @@ mod tests {
                 workflow_type: WorkflowType("W".to_string()),
                 task_queue: TaskQueueName("q".to_string()),
                 input: Payloads::default(),
+                header: None,
                 memo: Memo::default(),
                 search_attributes: SearchAttributes::default(),
                 request_id: "r".to_string(),
+                identity: "client".to_string(),
                 continued_execution_run_id: None,
                 first_execution_run_id: None,
                 retry_policy: None,
@@ -2193,6 +2526,7 @@ mod tests {
                 event_id: 1,
                 happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
                 kind: HistoryEventKind::WorkflowExecutionContinuedAsNew {
+                    workflow_task_completed_event_id: 4,
                     new_run_id: RunId(Uuid::from_u128(42)),
                     workflow_type: WorkflowType("W".to_string()),
                     task_queue: TaskQueueName("q".to_string()),
@@ -2242,10 +2576,14 @@ mod tests {
                 event_id: 1,
                 happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
                 kind: HistoryEventKind::SignalExternalWorkflowExecutionInitiated {
+                    workflow_task_completed_event_id: 4,
+                    namespace_id: NamespaceId(uuid::Uuid::nil()),
+                    namespace: None,
                     target_workflow_id: wid,
                     target_run_id: rid,
                     signal_name: "sig".to_string(),
                     input: Payloads::default(),
+                    header: None,
                     control: control.clone(),
                 },
             };
@@ -2270,6 +2608,9 @@ mod tests {
                 event_id: 1,
                 happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
                 kind: HistoryEventKind::RequestCancelExternalWorkflowExecutionInitiated {
+                    workflow_task_completed_event_id: 4,
+                    namespace_id: NamespaceId(uuid::Uuid::nil()),
+                    namespace: None,
                     target_workflow_id: wid,
                     target_run_id: rid,
                     control: control.clone(),
@@ -2311,6 +2652,7 @@ mod tests {
                 event_id: 5,
                 happened_at: OffsetDateTime::from_unix_timestamp(2000).unwrap(),
                 kind: HistoryEventKind::ActivityTaskScheduled {
+                    workflow_task_completed_event_id: 4,
                     activity_id: "act-1".to_string(),
                     activity_type: "at".to_string(),
                     task_queue: TaskQueueName("q".to_string()),

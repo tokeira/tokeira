@@ -76,7 +76,7 @@ Property 1: Bug Condition — Serializer emits authoritative data for all classi
 
 _For any_ history event where a proto field has been classified as serializer-only, kernel-enrichment (after enrichment), or runtime-context (after context is provided), the serializer SHALL emit the authoritative value for that field rather than the field's default/zero value.
 
-**Validates: Requirements 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13, 2.14, 2.15, 2.16, 2.17, 2.18, 2.19, 2.20, 2.21, 2.22, 2.23, 2.24, 2.25, 2.26, 2.27, 2.28, 2.29**
+**Validates: Requirements 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.12, 2.13, 2.14, 2.15, 2.16, 2.17, 2.18, 2.19, 2.20, 2.21, 2.22, 2.24, 2.25, 2.26, 2.27, 2.29**
 
 Property 2: Preservation — Existing correct serialization unchanged
 
@@ -114,31 +114,32 @@ New fields must be added to `HistoryEventKind` variants in `crates/tokeira-kerne
 | `WorkflowExecutionCanceled` | `details: Option<Payloads>` | Cancel command payload |
 | `WorkflowExecutionTimedOut` | `new_execution_run_id: Option<RunId>` | Timeout retry path |
 | `WorkflowExecutionSignaled` | `header: Option<Headers>` | Signal request headers |
-| `WorkflowTaskStarted` | `request_id: String` | Task start metadata |
-| `WorkflowTaskCompleted` | `sdk_metadata: Option<Payload>`, `worker_version: Option<String>` | Completion response |
-| `WorkflowTaskFailed` | `worker_version: Option<String>` | Failure response |
+| `WorkflowTaskStarted` | `request_id: String` | Runtime-generated `StartWorkflowTaskRequest.request_id` |
+| `WorkflowTaskCompleted` | `sdk_metadata: Option<Vec<u8>>`, `worker_version: Option<String>` | Completion response after edge translation preserves metadata |
 | `ActivityTaskStarted` | `request_id: String`, `last_failure: Option<Payload>` | Activity start metadata |
 | `ActivityTaskCompleted` | `identity: WorkerIdentity` | Worker that completed |
 | `ActivityTaskFailed` | `identity: WorkerIdentity`, `retry_state: RetryState` | Worker + retry resolution |
 | `ActivityTaskTimedOut` | `retry_state: RetryState` | Retry resolution |
 | `ActivityTaskCanceled` | `identity: WorkerIdentity` | Worker that reported cancel |
-| `StartChildWorkflowExecutionInitiated` | `namespace: String`, `header: Option<Headers>`, `memo: Memo`, `search_attributes: SearchAttributes`, `workflow_execution_timeout: Option<Duration>`, `workflow_run_timeout: Option<Duration>`, `workflow_task_timeout: Duration`, `retry_policy: Option<RetryPolicy>`, `cron_schedule: Option<String>` | Child-start command |
-| `StartChildWorkflowExecutionFailed` | `initiated_event_id: i64`, `namespace: String`, `workflow_type: WorkflowType` | Failure context |
-| `ChildWorkflowExecutionCompleted` | `namespace: String`, `child_run_id: RunId` | Child metadata |
-| `ChildWorkflowExecutionFailed` | `namespace: String`, `child_run_id: RunId`, `retry_state: RetryState` | Child metadata |
-| `ChildWorkflowExecutionCanceled` | `namespace: String`, `child_run_id: RunId`, `workflow_type: WorkflowType`, `details: Option<Payloads>` | Child metadata |
-| `ChildWorkflowExecutionTerminated` | `namespace: String`, `workflow_type: WorkflowType` | Child metadata |
-| `ChildWorkflowExecutionTimedOut` | `namespace: String`, `workflow_type: WorkflowType`, `retry_state: RetryState` | Child metadata |
-| `ExternalWorkflowExecutionSignaled` | `namespace: String`, `target_run_id: Option<RunId>` | Signal result |
-| `SignalExternalWorkflowExecutionFailed` | `namespace: String`, `target_run_id: Option<RunId>` | Signal failure |
-| `ExternalWorkflowExecutionCancelRequested` | `namespace: String`, `target_run_id: Option<RunId>` | Cancel result |
-| `RequestCancelExternalWorkflowExecutionFailed` | `namespace: String`, `target_run_id: Option<RunId>` | Cancel failure |
-| `SignalExternalWorkflowExecutionInitiated` | `namespace: String`, `header: Option<Headers>` | Signal command |
-| `RequestCancelExternalWorkflowExecutionInitiated` | `namespace: String` | Cancel command |
+| `StartChildWorkflowExecutionInitiated` | `namespace: Option<String>`, `header: Option<Headers>`, `memo: Memo`, `search_attributes: SearchAttributes`, `workflow_execution_timeout: Option<Duration>`, `workflow_run_timeout: Option<Duration>`, `workflow_task_timeout: Duration`, `retry_policy: Option<RetryPolicy>`, `cron_schedule: Option<String>` | Child-start command after edge translation threads the SDK command attributes through `WorkflowCommand::StartChildWorkflow` |
+| `StartChildWorkflowExecutionFailed` | `initiated_event_id: i64`, `namespace: Option<String>`, `workflow_type: WorkflowType` | Failure context |
+| `ChildWorkflowExecutionCompleted` | `namespace: Option<String>`, `child_run_id: RunId` | Child metadata |
+| `ChildWorkflowExecutionFailed` | `namespace: Option<String>`, `child_run_id: RunId`, `retry_state: RetryState` | Child metadata |
+| `ChildWorkflowExecutionCanceled` | `namespace: Option<String>`, `child_run_id: RunId`, `workflow_type: WorkflowType`, `details: Option<Payloads>` | Child metadata |
+| `ChildWorkflowExecutionTerminated` | `namespace: Option<String>`, `workflow_type: WorkflowType` | Child metadata |
+| `ChildWorkflowExecutionTimedOut` | `namespace: Option<String>`, `workflow_type: WorkflowType`, `retry_state: RetryState` | Child metadata |
+| `ExternalWorkflowExecutionSignaled` | `namespace: Option<String>`, `target_run_id: Option<RunId>` | Signal result; namespace name must be persisted from edge/runtime context |
+| `SignalExternalWorkflowExecutionFailed` | `namespace: Option<String>`, `target_run_id: Option<RunId>` | Signal failure; namespace name must be persisted from edge/runtime context |
+| `ExternalWorkflowExecutionCancelRequested` | `namespace: Option<String>`, `target_run_id: Option<RunId>` | Cancel result; namespace name must be persisted from edge/runtime context |
+| `RequestCancelExternalWorkflowExecutionFailed` | `namespace: Option<String>`, `target_run_id: Option<RunId>` | Cancel failure; namespace name must be persisted from edge/runtime context |
+| `SignalExternalWorkflowExecutionInitiated` | `namespace: Option<String>`, `header: Option<Headers>` | Signal command after edge translation threads namespace name and headers |
+| `RequestCancelExternalWorkflowExecutionInitiated` | `namespace: Option<String>` | Cancel command after edge translation threads namespace name |
 | `NexusOperationScheduled` | `nexus_header: Option<Headers>`, `endpoint_id: String` | Schedule command |
 | `WorkflowExecutionUpdateAccepted` | `accepted_request_sequencing_event_id: i64` | Update tracking |
 | `WorkflowExecutionUpdateCompleted` | `accepted_event_id: i64` | Update tracking |
 | `WorkflowExecutionUpdateRejected` | `rejected_request_message_id: String`, `rejected_request_sequencing_event_id: i64` | Update tracking |
+
+**Namespace name contract:** Temporal proto fields named `namespace` expect the human-readable namespace name, not Tokeira's internal `NamespaceId` UUID. Event variants MAY carry `namespace: Option<String>` only when edge/runtime request context has an authoritative name to thread into the kernel. When only `NamespaceId` is available, serializers SHALL populate `namespace_id` fields where available and leave human-readable `namespace` empty; they MUST NOT stringify `NamespaceId` into `namespace`.
 
 #### Class 3: Runtime/History-Context Enrichment — `workflow_task_completed_event_id`
 
@@ -161,14 +162,14 @@ This is the most impactful missing field, affecting ~15 events. The value repres
 - `NexusOperationScheduled`
 - `WorkflowTaskCompleted` (self-referential — not needed)
 
-**Design Decision: Stamp at commit time in the lane**
+**Design Decision: Stamp during WFT completion command processing inside the kernel**
 
-The `workflow_task_completed_event_id` is known at the moment the lane commits a WFT completion transition: the `WorkflowTaskCompleted` event is emitted first, then all command-produced events follow in the same transition batch. The lane knows the WFT completed event ID because it just assigned it.
+The `workflow_task_completed_event_id` is known inside `apply_workflow_task_completed`: `TransitionBuilder::emit(WorkflowTaskCompleted { .. })` returns the assigned event ID, and command-produced events are emitted immediately afterward in the same transition batch.
 
 **Chosen approach: Add `workflow_task_completed_event_id: i64` to each affected `HistoryEventKind` variant.**
 
 Rationale:
-- The kernel stays pure — the lane (in `tokeira-runtime`) stamps the field before committing the transition. The kernel's `apply_commands()` method receives the WFT completed event ID as a parameter and threads it into each produced event.
+- The kernel stays pure — no external I/O or runtime state is needed. The event ID is assigned by the kernel and threaded through subsequent command handling within the same deterministic transition.
 - The serializer remains a pure projector — no lookup, no state, just reads the field from the event.
 - No history-context map needed at serialization time.
 - Storage cost is one `i64` per affected event (negligible).
@@ -181,16 +182,16 @@ Rationale:
 **Implementation sketch:**
 
 ```rust
-// In tokeira-kernel, apply_commands gains a parameter:
-pub fn apply_commands(
-    &mut self,
-    commands: Vec<Command>,
-    wft_completed_event_id: i64,  // new
-) -> Vec<HistoryEvent> { ... }
+// In tokeira-kernel, apply_workflow_task_completed captures the ID:
+let wft_completed_event_id = builder.emit(HistoryEventKind::WorkflowTaskCompleted { ... });
+
+for command in req.commands {
+    apply_workflow_command(&mut builder, command, wft_completed_event_id)?;
+}
 
 // Each command-produced event includes the field:
 HistoryEventKind::ActivityTaskScheduled {
-    workflow_task_completed_event_id: i64,  // stamped by apply_commands
+    workflow_task_completed_event_id: wft_completed_event_id,
     activity_id: String,
     // ...
 }
@@ -200,20 +201,21 @@ HistoryEventKind::ActivityTaskScheduled {
 
 | Event | Field | Source | Threading |
 |-------|-------|--------|-----------|
-| `WorkflowTaskStarted` | `history_size_bytes` | Run's accumulated history size | Lane stamps before commit |
-| `WorkflowTaskStarted` | `suggest_continue_as_new` | Derived from history_size_bytes threshold | Lane stamps before commit |
-| `ActivityTaskCancelRequested` | `scheduled_event_id` | Resolve `activity_id` → scheduled event ID | Lane maintains activity registry |
-| `TimerCanceled` | `started_event_id` | Resolve `timer_id` → started event ID | Lane maintains timer registry |
+| `WorkflowTaskStarted` | `request_id` | Runtime-generated UUID v4 for the start command | Runtime passes through `StartWorkflowTaskRequest`; kernel stamps event |
+| `WorkflowTaskStarted` | `history_size_bytes` | Run's accumulated history size | Runtime computes and passes through `StartWorkflowTaskRequest`; kernel stamps event |
+| `WorkflowTaskStarted` | `suggest_continue_as_new` | Derived from history_size_bytes threshold | Runtime computes and passes through `StartWorkflowTaskRequest`; kernel stamps event |
+| `ActivityTaskCancelRequested` | `scheduled_event_id` | Resolve `activity_id` → scheduled event ID | Kernel resolves from `WorkflowState.activities` during command processing |
+| `TimerCanceled` | `started_event_id` | Resolve `timer_id` → started event ID | Kernel resolves from `WorkflowState.timers` during command processing |
 
-These follow the same pattern: the lane (runtime) has the context and stamps the event before commit. The kernel's `apply_commands` receives the necessary lookup closures or pre-resolved values.
+These fields are resolved before commit without serializer lookup. If the value is already in `WorkflowState`, the kernel reads it while processing the command; if the value comes from runtime-only state, the runtime passes it through the command request before `kernel.apply`.
 
 #### Class 4: Deferred Proto-Sync
 
-These fields depend on proto surface delivered by `temporal-api-v1.62-sync` (now complete) or on feature specs not yet implemented. Each is assigned to a specific spec for resolution.
+These fields depend on proto surface not yet checked into `tokeira_proto` or on feature specs not yet implemented. Each is assigned to a specific spec for resolution.
 
 | Event | Field | Owning Spec | Status |
 |-------|-------|-------------|--------|
-| `NexusOperationStarted` | `operation_token` (rename of `operation_id`) | `temporal-api-v1.62-sync` | Proto available — implement in this spec's Phase 6 |
+| `NexusOperationStarted` | `operation_token` (rename of `operation_id`) | `temporal-api-v1.62-sync` | Deferred until `tokeira_proto` exposes the renamed field; keep writing `operation_id` meanwhile |
 | `WorkflowExecutionStarted` | `workflow_execution_expiration_time` | `temporal-compatibility` | Implement when compatibility spec lands |
 | `WorkflowExecutionStarted` | `source_version_stamp` | `worker-deployments` | Implement when deployment versioning lands |
 | `WorkflowExecutionStarted` | `completion_callbacks` | `temporal-compatibility` | Implement when compatibility spec lands |
@@ -229,11 +231,12 @@ Fields that remain default because no authoritative source exists today. Each is
 | Event | Field | Rationale | Unblocked By |
 |-------|-------|-----------|--------------|
 | `WorkflowExecutionStarted` | `initiator` | Only meaningful for retried/cron starts; requires kernel enrichment to distinguish start context. | This spec (Phase 3, task 5.1) — reclassified as kernel enrichment |
-| `WorkflowExecutionContinuedAsNew` | `header` | Only populated if the CAN command carries headers. Command model enrichment needed. | This spec (Phase 3, task 5.7) — add header to CAN command |
+| `WorkflowExecutionContinuedAsNew` | `header` | Only populated if the CAN command carries headers. Current command translation does not preserve headers. | Intentionally default in this spec; add in a future command-model enrichment spec |
 | `WorkflowExecutionContinuedAsNew` | `inherit_build_id` | Versioning feature not yet implemented. | `worker-deployments` |
-| `ChildWorkflowExecutionStarted` | `header` | Only populated if the child-started path carries an authored header. | This spec (Phase 3, task 5.4) — add header to child-started event |
+| `ChildWorkflowExecutionStarted` | `header` | Child-start confirmation currently carries only child run identity, not the child's authored start header. Populating this would require the child start path to echo its header back to the parent. | Future `runtime-child-workflows` enhancement |
 | `WorkflowTaskCompleted` | `binary_checksum` | Legacy field superseded by `worker_version`. Remains empty unless SDK sends it. | Intentionally permanent default — legacy field |
 | `WorkflowTaskFailed` | `binary_checksum` | Same as above. | Intentionally permanent default — legacy field |
+| `WorkflowTaskFailed` | `worker_version` | The current WFT-failed path does not carry worker version metadata into a kernel command; failures are processed by server-side runtime paths without a worker version stamp source. | `worker-deployments` |
 | `ActivityTaskStarted` | `worker_version` | Requires worker version reporting infrastructure. | `worker-heartbeat-observability` + `worker-deployments` |
 | `ActivityTaskCompleted` | `worker_version` | Same. | `worker-heartbeat-observability` + `worker-deployments` |
 | `ActivityTaskFailed` | `worker_version` | Same. | `worker-heartbeat-observability` + `worker-deployments` |
@@ -271,14 +274,31 @@ Rationale:
 4. Add `scheduled_event_id: i64` to `ActivityTaskCancelRequested`
 5. Add `started_event_id: i64` to `TimerCanceled`
 
-**File**: `crates/tokeira-kernel/src/lib.rs` (or command processing)
-1. Thread `wft_completed_event_id` parameter through command application
-2. Accept pre-resolved `activity_id → scheduled_event_id` and `timer_id → started_event_id` mappings
+**File**: `crates/tokeira-kernel/src/command.rs`
+1. Extend `StartRequest` with `header: Option<Headers>` so start headers can reach `WorkflowExecutionStarted`
+2. Extend `StartWorkflowTaskRequest` with `request_id`, `history_size_bytes`, and `suggest_continue_as_new`
+3. Extend `WorkflowTaskCompletedRequest` with `sdk_metadata: Option<Vec<u8>>` and `worker_version`
+4. Extend `WorkflowCommand::StartChildWorkflow` with child-start optional attributes currently dropped by edge translation
+5. Extend activity start/resolve request types and `ActivityState` as needed so activity request ID, previous failure, and worker identity reach emitted events
+6. Carry human-readable namespace names as `Option<String>` only when supplied by edge/runtime context; keep `NamespaceId` as the authoritative internal identifier
+
+**File**: `crates/tokeira-kernel/src/kernel.rs` (or command processing)
+1. Capture the `WorkflowTaskCompleted` event ID returned by `TransitionBuilder::emit`
+2. Thread the captured ID through command application inside `apply_workflow_task_completed`
+3. Resolve `activity_id -> scheduled_event_id` and `timer_id -> started_event_id` from `WorkflowState` where those values already exist
+4. Avoid serializer-side lookup for command-derived event IDs; command application must stamp them while state context is available
+5. Persist child `workflow_type` and child/external namespace name context in state when later terminal events need it
 
 **File**: `crates/tokeira-runtime/src/lane.rs` (or equivalent)
-1. Pass `wft_completed_event_id` when calling kernel command application
-2. Provide activity/timer registry lookups
-3. Stamp `history_size_bytes` on `WorkflowTaskStarted` events
+1. Provide source data that enters the kernel through runtime commands, such as activity worker identity and timeout retry successor run ID
+2. Generate `StartWorkflowTaskRequest.request_id` with UUID v4 and pass it with `history_size_bytes` and `suggest_continue_as_new` before kernel application
+
+**File**: `crates/tokeira-edge/src/grpc/translate.rs`
+1. Preserve start headers from gRPC `StartWorkflowExecutionRequest` through `to_internal::start_request` into `StartRequest.header`
+2. Preserve child-start command attributes (header, memo, search attributes, timeouts, retry policy, cron schedule, namespace name) when translating SDK commands into `WorkflowCommand::StartChildWorkflow`
+3. Preserve external signal/cancel namespace names and headers where the SDK command provides them
+4. Preserve activity completion/failure identity into runtime request DTOs
+5. Preserve workflow task completion `sdk_metadata` and worker version metadata through the edge DTO and internal `WorkflowTaskCompletedRequest`
 
 **File**: `crates/tokeira-edge/src/translate/history_serializer.rs`
 1. Wire through all Class 1 fields (remove `_` bindings, populate proto fields)

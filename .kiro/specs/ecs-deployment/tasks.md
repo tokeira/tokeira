@@ -303,7 +303,7 @@ Implement the ECS on EC2 deployment infrastructure for Tokeira. The work is orga
     - Add to workspace `Cargo.toml` members
     - _Requirements: 6.1.1, 6.1.2, 6.1.3_
 
-  - [ ] 9.2 Create `apps/tokeira-autoscaler/` binary entry point
+  - [x] 9.2 Create `apps/tokeira-autoscaler/` binary entry point
     - Create `apps/tokeira-autoscaler/Cargo.toml` with dependencies: `tokeira-autoscaler`, `tokeira-config`, `anyhow`, `tokio`, `tracing-subscriber`
     - Create `apps/tokeira-autoscaler/src/main.rs` with config loading, leader election loop, and scaling loop orchestration
     - Add to workspace `Cargo.toml` members
@@ -364,14 +364,14 @@ Implement the ECS on EC2 deployment infrastructure for Tokeira. The work is orga
     - Record every scaling decision with input metrics and reason
     - _Requirements: 6.8.1, 6.8.2, 6.8.4_
 
-  - [ ] 9.10 Implement Loop A — REPLICA service scaling in `loop_a.rs`
+  - [x] 9.10 Implement Loop A — REPLICA service scaling in `loop_a.rs`
     - Query Mimir for per-service scaling signals
     - Compute target desired count based on signals and config (min/max/step)
     - Apply hysteresis: require `scale_out_consecutive_samples` for scale-out, `scale_in_consecutive_samples` for scale-in
     - Update desired state in reconciler
     - _Requirements: 6.3.1, 6.3.2, 6.3.3, 6.3.4, 6.3.5, 6.9.1, 6.9.2, 6.9.3, 6.9.4_
 
-  - [ ] 9.11 Implement Loop B — Runtime scale-out in `loop_b.rs`
+  - [x] 9.11 Implement Loop B — Runtime scale-out in `loop_b.rs`
     - Query Mimir for runtime pressure signals
     - Classify pressure: broad saturation, hot-node imbalance, hot-bundle imbalance, DSQL-bound, admission-bound
     - Only scale out on broad saturation with sufficient DSQL headroom
@@ -379,7 +379,7 @@ Implement the ECS on EC2 deployment infrastructure for Tokeira. The work is orga
     - Update desired state in reconciler
     - _Requirements: 6.4.1, 6.4.2, 6.4.3, 6.4.4, 6.4.5, 6.4.6_
 
-  - [ ] 9.12 Implement Loop C — Runtime retirement in `loop_c.rs`
+  - [x] 9.12 Implement Loop C — Runtime retirement in `loop_c.rs`
     - Determine excess capacity from Mimir metrics and controller snapshot
     - Request candidates from controller via `NominateScaleInCandidates` gRPC
     - Mark candidates as draining via `MarkNodeDraining` gRPC

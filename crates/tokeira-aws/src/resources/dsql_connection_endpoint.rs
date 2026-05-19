@@ -14,6 +14,7 @@ pub struct DsqlConnectionEndpointConfig {
     pub security_group_dependency: ResourceId,
     /// Logical dependency on the target DSQL cluster resource.
     pub dsql_cluster_dependency: ResourceId,
+    pub resource_id: Option<ResourceId>,
     pub module: String,
 }
 
@@ -170,7 +171,10 @@ impl Resource for DsqlConnectionEndpoint {
     }
 
     fn resource_id(&self) -> ResourceId {
-        ResourceId(format!("dsql-ce-{}", self.endpoint_identity))
+        self.config
+            .resource_id
+            .clone()
+            .unwrap_or_else(|| ResourceId(format!("dsql-ce-{}", self.endpoint_identity)))
     }
 
     fn dependencies(&self) -> Vec<ResourceId> {

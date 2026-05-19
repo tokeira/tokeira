@@ -24,6 +24,7 @@ pub struct VpcEndpointConfig {
     /// Optional dependency on a SecurityGroup resource for Interface endpoints.
     /// When present, the SG ID is looked up from state.
     pub security_group_dependency: Option<ResourceId>,
+    pub resource_id: Option<ResourceId>,
     pub module: String,
 }
 
@@ -143,7 +144,10 @@ impl Resource for VpcEndpoint {
     }
 
     fn resource_id(&self) -> ResourceId {
-        ResourceId(format!("vpce-{}", self.service_short_name))
+        self.config
+            .resource_id
+            .clone()
+            .unwrap_or_else(|| ResourceId(format!("vpce-{}", self.service_short_name)))
     }
 
     fn dependencies(&self) -> Vec<ResourceId> {
@@ -216,15 +220,25 @@ impl Resource for VpcEndpoint {
 
         let endpoint_id = match self.config.endpoint_type {
             EndpointType::Gateway => {
-                let route_table_id = vpc_state
+                let route_table_ids: Vec<String> = vpc_state
                     .properties
-                    .get("route_table_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                    .get("private_route_table_ids")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_else(|| {
+                        // Older VPC state documents exposed a singleton
+                        // route_table_id. Keep the fallback so in-flight
+                        // deployments can roll forward without state surgery.
+                        vpc_state
+                            .properties
+                            .get("route_table_id")
+                            .and_then(|v| v.as_str())
+                            .filter(|id| !id.is_empty())
+                            .map(|id| vec![id.to_string()])
+                            .unwrap_or_default()
+                    });
 
                 // ec2:CreateVpcEndpoint — Gateway type with route table association.
-                let output = ctx
+                let mut builder = ctx
                     .extension::<crate::AwsClients>()
                     .expect("AwsClients")
                     .ec2
@@ -232,16 +246,13 @@ impl Resource for VpcEndpoint {
                     .vpc_id(&vpc_id)
                     .service_name(&self.config.service_name)
                     .vpc_endpoint_type(aws_sdk_ec2::types::VpcEndpointType::Gateway)
-                    .route_table_ids(&route_table_id)
-                    .tag_specifications(ep_tag_spec)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        IacError::AwsSdk(format!(
-                            "ec2:CreateVpcEndpoint: {}",
-                            e.into_service_error()
-                        ))
-                    })?;
+                    .tag_specifications(ep_tag_spec);
+                for route_table_id in &route_table_ids {
+                    builder = builder.route_table_ids(route_table_id);
+                }
+                let output = builder.send().await.map_err(|e| {
+                    IacError::AwsSdk(format!("ec2:CreateVpcEndpoint: {}", e.into_service_error()))
+                })?;
 
                 output
                     .vpc_endpoint()

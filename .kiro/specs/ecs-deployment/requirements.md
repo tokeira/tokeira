@@ -56,10 +56,10 @@ The authoritative architecture document is [045-autoscaling-on-ecs-ec2](../../..
 - **Service_Connect**: ECS Service Connect for generic service-to-service connectivity and discovery.
 - **Cloud_Map**: AWS Cloud Map used as discovery plumbing for runtime node endpoint registration.
 - **Mimir**: Grafana Mimir, the Prometheus-compatible metrics backend that serves as the source of scaling truth.
-- **Alloy_Sidecar**: A Grafana Alloy container running as a sidecar in each Tokeira task definition. Scrapes Prometheus metrics from localhost and ships logs to Loki. On ECS, implemented as an additional container in the task definition.
+- **Alloy_Sidecar**: A Grafana Alloy container running as a sidecar in each Tokeira task definition. Scrapes Prometheus metrics from localhost and collects stdout/stderr logs through `loki.source.docker` using a task-ARN-scoped Docker discovery filter. Forwards metrics to Mimir via remote-write and logs to Loki via `loki.write`.
 - **Loki**: Grafana Loki, the log aggregation backend. Receives logs from Alloy sidecars and stores them in S3.
 - **Grafana**: Grafana OSS, the dashboarding and visualization service. Reads from Mimir (metrics) and Loki (logs).
-- **Observability_Module**: An IaC module that provisions the Mimir, Loki, and Grafana ECS services on the `cp-control` capacity provider.
+- **Observability_Module**: An IaC module that provisions Mimir, Loki, and Grafana on dedicated capacity providers (`cp-mimir`, `cp-loki`, `cp-grafana`).
 - **ECS_Platform**: The `platforms/ecs/` crate implementing the `Deployment` and `Ops` traits for ECS on EC2.
 - **DSQL_Connection_Headroom**: The remaining capacity in the DSQL connection budget after accounting for current and projected connections.
 
@@ -100,7 +100,7 @@ This spec consumes those surfaces. It does not redefine them.
 1. ALL AWS resources provisioned by the ECS_Platform SHALL carry auto-generated tags: `Name` (resource-specific), `Project` (from `project_name`), `Environment` (from `environment`), and `ManagedBy` (`tkr-cli`).
 2. THE `EcsConfig` SHALL include a `[tags]` section for operator-defined custom tags that are merged with auto-generated tags on every resource.
 3. WHEN auto-generated and custom tags conflict on the same key, THE custom tag SHALL take precedence.
-4. THE tagging SHALL apply to: VPC resources, security groups, VPC endpoints, ALB, ECS cluster, capacity providers, ASGs, launch templates, IAM roles, S3 buckets, DSQL cluster, Cloud Map namespace, ECS services/task definitions, and CloudWatch log groups (including the ecs-exec audit log group from Req 3.4).
+4. THE tagging SHALL apply to: VPC resources, security groups, VPC endpoints, ALB, ECS cluster, capacity providers, ASGs, launch templates, IAM roles, S3 buckets, DSQL cluster, Cloud Map namespace, ECS services/task definitions, and optional CloudWatch log groups.
 
 ### Requirement 1.2: ECS Platform Crate Structure
 
@@ -148,8 +148,9 @@ This spec consumes those surfaces. It does not redefine them.
 3. THE ECS_Platform SHALL provision a gateway VPC endpoint for S3 (ECR layer transfer).
 4. THE ECS_Platform SHALL provision an interface VPC endpoint for `autoscaling` (EC2 Auto Scaling).
 5. THE ECS_Platform SHALL provision an interface VPC endpoint for `servicediscovery` (Cloud Map).
-6. THE ECS_Platform SHALL provision DSQL PrivateLink endpoints (management and connection) for private DSQL connectivity.
-7. WHEN optional endpoints are enabled in config (STS, KMS, Secrets Manager, SSM, CloudWatch Logs, EC2), THE ECS_Platform SHALL provision them as interface VPC endpoints.
+6. THE ECS_Platform SHALL provision interface VPC endpoints for `ssm`, `ssmmessages`, and `ec2messages` because `tkr exec` and `tkr port-forward` are core private-operator access paths.
+7. THE ECS_Platform SHALL provision DSQL PrivateLink endpoints (management and connection) for private DSQL connectivity.
+8. WHEN optional endpoints are enabled in config (STS, KMS, Secrets Manager, CloudWatch Logs, EC2), THE ECS_Platform SHALL provision them as interface VPC endpoints.
 
 ### Requirement 2.3: Internal ALB for Edge Ingress
 
@@ -218,15 +219,15 @@ This spec consumes those surfaces. It does not redefine them.
 
 ### Requirement 3.4: ECS Exec Support
 
-**User Story:** As a Tokeira operator, I want `ecs exec` available on every running task with a central audit log, so that I can diagnose live issues without SSH, a bastion host, or public ingress.
+**User Story:** As a Tokeira operator, I want `ecs exec` available on every running task, so that I can diagnose live issues without SSH, a bastion host, or public ingress.
 
 #### Acceptance Criteria
 
-1. THE ECS_Cluster SHALL configure `execute_command_configuration` with `logging = "OVERRIDE"` and a dedicated CloudWatch log group `/ecs/{project_name}/ecs-exec` capturing every exec session for audit.
-2. THE `/ecs/{project_name}/ecs-exec` log group SHALL carry the auto-generated tags from Req 1.1a and SHALL use the configured `log_retention_days` setting (default 30 days).
+1. THE ECS_Cluster SHALL configure `execute_command_configuration` with `logging = "NONE"` so core ECS Exec does not depend on CloudWatch Logs or a CloudWatch Logs VPC endpoint.
+2. THE ECS_Platform SHALL NOT create a dedicated `/ecs/{project_name}/ecs-exec` CloudWatch log group for core ECS Exec. Operator access is authenticated and attributable through IAM and CloudTrail.
 3. EVERY ECS_Service defined by the ECS_Platform (edge-api, edge-poll, runtime, projection, controller, autoscaler, admin, mimir, loki, grafana) SHALL set `enable_execute_command = true`. A cluster-wide exec toggle does not exist; per-service opt-in is required.
 4. EVERY primary container in every task definition SHALL set `linuxParameters.initProcessEnabled = true`. Without an init process, exec sessions can leave zombie processes when a shell exits.
-5. EVERY task role (not the execution role) for services with exec enabled SHALL include an inline policy granting the four SSM Messages actions (`ssmmessages:CreateControlChannel`, `ssmmessages:CreateDataChannel`, `ssmmessages:OpenControlChannel`, `ssmmessages:OpenDataChannel`) and the three CloudWatch Logs actions needed to write session logs (`logs:CreateLogStream`, `logs:DescribeLogStreams`, `logs:PutLogEvents`), each with `Resource = "*"` or scoped to the ecs-exec log group ARN where supported.
+5. EVERY task role (not the execution role) for services with exec enabled SHALL include an inline policy granting the four SSM Messages actions (`ssmmessages:CreateControlChannel`, `ssmmessages:CreateDataChannel`, `ssmmessages:OpenControlChannel`, `ssmmessages:OpenDataChannel`) with `Resource = "*"`.
 6. THE VPC endpoints required for SSM Session Manager (`ssm`, `ssmmessages`, `ec2messages`) SHALL be provisioned as part of the required endpoint set in Req 2.2.
 7. THE `tkr exec <service> [--container <name>] -- <cmd>` command SHALL open an ECS Exec session. It SHALL discover a running task via `ecs:ListTasks` + `ecs:DescribeTasks`, call `ecs:ExecuteCommand` with `interactive = true`, and hand off to `session-manager-plugin` for the tty data-plane — mirroring the `tkr port-forward` approach.
 8. WHEN the operator omits `--container`, THE CLI SHALL default to the primary application container for the service (for example `tokeira-runtime` for the runtime service), not the Alloy sidecar.
@@ -347,7 +348,7 @@ This spec consumes those surfaces. It does not redefine them.
 #### Acceptance Criteria
 
 1. THE ECS_Platform SHALL generate Task_Definitions as deploy-engine `Service` manifests implementing the `Service` trait from `tokeira-deploy-engine`.
-2. FOR ALL ECS services, THE generated Task_Definition SHALL include: container image reference, CPU and memory limits, port mappings, environment variables, log configuration, and health check settings.
+2. FOR ALL ECS services, THE generated Task_Definition SHALL include: container image reference, CPU and memory limits, port mappings, environment variables, and health check settings. Normal primary containers SHALL omit `logConfiguration`; break-glass CloudWatch logging is added only by `tkr debug logs enable`.
 3. THE generated manifests SHALL be stable for unchanged desired state — the same config produces the same manifest hash.
 4. THE `EcsConfig` loader SHALL validate each service's configured `cpu` against the ECS task-level CPU/memory matrix and reject invalid combinations at parse time with a descriptive error. Valid CPU units are `256`, `512`, `1024`, `2048`, `4096`, `8192`, `16384`. For each CPU value, memory SHALL fall within the ECS-documented range (for example, `cpu = 1024` requires `memory` in 2048–8192 MiB in 1024 MiB increments). The validator SHALL state the invalid pair and the nearest valid pairs in its error message.
 5. EVERY primary container in every task definition SHALL declare a container-level `healthCheck` matching the service's traffic model:
@@ -375,7 +376,7 @@ This spec consumes those surfaces. It does not redefine them.
 
 ### Requirement 5.1: Service Connect Configuration
 
-**User Story:** As a Tokeira operator, I want Service Connect configured for both gRPC traffic and metrics scrape targets, so that services discover each other and Mimir can pull metrics over stable internal DNS instead of relying on Docker-socket-based discovery.
+**User Story:** As a Tokeira operator, I want Service Connect configured for gRPC traffic and diagnostic metrics access, so that services discover each other and operators can reach metrics endpoints by stable DNS names while Alloy sidecars use localhost scraping for ingestion.
 
 #### Acceptance Criteria
 
@@ -383,7 +384,7 @@ This spec consumes those surfaces. It does not redefine them.
 2. THE ECS_Platform SHALL enable Service Connect on all ECS services that need outbound service-to-service connectivity.
 3. THE Service_Connect configuration SHALL register each service's primary gRPC port (where applicable) with `port_name = "grpc"` under the discovery name `<service>` (for example `tokeira-controller.<namespace>`).
 4. THE Service_Connect configuration SHALL register each service's Prometheus metrics port (`9090`) with `port_name = "metrics"` under the discovery name `<service>-metrics` (for example `tokeira-runtime-metrics.<namespace>:9090`). This applies to every service that exposes metrics — including observability services that expose their own metrics.
-5. Mimir SHALL discover scrape targets through the registered `-metrics` Service Connect DNS names rather than the Docker socket. Alloy sidecars continue to scrape `localhost:9090` and forward via remote-write; Service Connect metrics registration is an additional path that lets Mimir pull directly when the sidecar is unavailable.
+5. The `-metrics` Service Connect aliases SHALL exist for diagnostic accessibility (for example, curling `<service>-metrics.<namespace>:9090/metrics` from inside the cluster). Automated metrics ingestion SHALL use one Alloy sidecar per task scraping `localhost:{metrics_port}` and remote-writing to Mimir. Alloy SHALL NOT perform cross-task Service Connect scraping, and Mimir SHALL NOT be treated as a direct scraper.
 6. THE Service_Connect configuration SHALL provide stable internal endpoints for: controller, projection, admin, mimir, loki, and grafana services.
 
 ### Requirement 5.2: Cloud Map Runtime Discovery
@@ -529,7 +530,7 @@ This spec consumes those surfaces. It does not redefine them.
 
 1. THE ECS_Platform SHALL define a `cluster` IaC module implementing the `Module` trait.
 2. THE `cluster` module SHALL depend on the `networking` module.
-3. THE `cluster` module SHALL enumerate resources for: ECS cluster, five capacity providers, five Auto Scaling groups, launch templates, and IAM instance profiles.
+3. THE `cluster` module SHALL enumerate resources for: ECS cluster, eight capacity providers (`cp-edge-api`, `cp-edge-poll`, `cp-runtime`, `cp-projection`, `cp-control`, `cp-mimir`, `cp-loki`, `cp-grafana`), eight Auto Scaling groups, launch templates, and IAM instance profiles.
 4. THE `cluster` module resources SHALL implement the `Resource` trait.
 
 ### Requirement 7.3: Services Module
@@ -605,29 +606,30 @@ This spec consumes those surfaces. It does not redefine them.
 1. THE `EcsDeployment::hydrate_config(config, state)` method SHALL populate empty DSQL fields (`endpoint`, `management_endpoint_id`, `connection_endpoint_id`, `runtime_role_arn`, `admin_role_arn`) from `InfraState` on every engine construction. Hydration is the source of truth during `deploy apply`, `deploy plan`, `scale up`, and `schema setup`; it guarantees correctness even when config-file writeback is missed.
 2. THE `EcsDeployment::collect_writeback(config, state)` method SHALL return `(dotted_key, value)` pairs for discovered DSQL fields that differ from the current config, so the CLI can persist them to `deployment.toml` via `toml_edit`. Writeback is a convenience for operators reading the file; it is NOT the correctness path.
 3. WHEN `dsql.mode == Managed` AND `hydrate_config` cannot find the corresponding resource in state, `EcsDeployment::services()` and `EcsDeployment::images()` SHALL return an error stating `infra apply has not run successfully; DSQL endpoint is not yet known`. This prevents `deploy apply` from using placeholder values.
-4. WHEN a Managed DSQL module is destroyed (removed from state), THE `EcsDeployment::collect_destroy_writeback(config, state, active_modules)` method SHALL return pairs that CLEAR the corresponding DSQL config fields (empty string or `None`), so subsequent `infra plan` does not treat destroyed resources as Preexisting.
-5. THE CLI SHALL call `collect_writeback` after `infra apply` and `collect_destroy_writeback` after `infra destroy`, writing the returned pairs via `toml_edit` (preserving comments and formatting, per the `iac-resource-lifecycle` config writeback requirement).
+4. WHEN a Managed DSQL module is destroyed (removed from state), THE existing `EcsDeployment::collect_writeback(config, state)` method SHALL emit clearing writeback entries for the corresponding DSQL config fields (empty string or `None`), so subsequent `infra plan` does not retain stale discovered values.
+5. THE CLI SHALL call `collect_writeback` after both `infra apply` and `infra destroy`, writing the returned pairs via `toml_edit` (preserving comments and formatting, per the `iac-resource-lifecycle` config writeback requirement).
 6. FOR ALL valid `InfraState` values, `hydrate_config(config, state)` SHALL be idempotent: applying it twice produces the same result as applying it once.
 
 ---
 
 ## Feature 8: Observability Stack
 
-### Requirement 8.1: Alloy Sidecar in Task Definitions
+### Requirement 8.1: Alloy Sidecar Metrics and Log Collection
 
-**User Story:** As a Tokeira operator, I want an Alloy sidecar container in each Tokeira task definition, so that metrics are scraped from localhost and logs are shipped to Loki without requiring a separate log driver.
+**User Story:** As a Tokeira operator, I want an Alloy sidecar in each Tokeira task definition, so that metrics are scraped from localhost and stdout/stderr logs are shipped to Loki without a separate log-router container.
 
 #### Acceptance Criteria
 
-1. EACH Tokeira-owned ECS Task_Definition (edge-api, edge-poll, runtime, projection, controller, autoscaler, admin, mimir, loki, grafana) SHALL include an Alloy_Sidecar container alongside the primary application container. THE observability services' Alloy sidecars ship only logs to Loki — their own metrics are scraped via the `-metrics` Service Connect alias by Mimir itself (except for the Mimir service, whose self-metrics Alloy forwards directly to Mimir's `/api/v1/push`).
+1. EACH Tokeira-owned ECS Task_Definition (edge-api, edge-poll, runtime, projection, controller, autoscaler, admin, mimir, loki, grafana) SHALL include an Alloy_Sidecar container for metrics scraping and stdout/stderr log forwarding.
 2. THE Alloy_Sidecar SHALL scrape Prometheus metrics from the primary container's metrics port on `localhost`.
 3. THE Alloy_Sidecar SHALL forward scraped metrics to the Mimir remote-write endpoint (`/api/v1/push`) over the Service Connect endpoint `mimir.<namespace>:9009`.
-4. THE Alloy_Sidecar SHALL collect container stdout/stderr logs and ship them to the Loki push endpoint (`/loki/api/v1/push`) over the Service Connect endpoint `loki.<namespace>:3100`.
-5. THE Alloy_Sidecar SHALL read its configuration from a shared task volume populated by an init container, NOT from environment variables. The init container (`alloy-config-init`) SHALL fetch the per-service Alloy config from SSM Parameter Store at path `/{project_name}/alloy/sidecar/{service_name}` and write it to a `alloy-config` volume shared with the Alloy container. This lets operators update Alloy configuration by writing a new SSM parameter value without registering a new task definition revision.
-6. THE SSM Parameter Store path `/{project_name}/alloy/sidecar/*` SHALL be readable by the execution role (so the init container can fetch the config) and writable by operator/admin principals only (not by task roles). The parameter content SHALL be the full Alloy HCL config rendered from an Askama template at infra-apply time.
-7. THE Alloy_Sidecar SHALL use a pinned image version matching the compose platform (`grafana/alloy:v1.16.0`).
-8. THE Alloy_Sidecar SHALL have resource limits configured separately from the primary container (CPU and memory).
-9. THE `alloy-config-init` init container SHALL be marked `essential = false` and SHALL exit 0 after writing the config file. The Alloy sidecar SHALL declare `dependsOn = [{ containerName = "alloy-config-init", condition = "SUCCESS" }]`.
+4. THE Alloy_Sidecar SHALL mount `/var/run/docker.sock` from the EC2 host and collect logs with Docker discovery filtered by `com.amazonaws.ecs.task-arn` so it reads only containers in its own ECS task.
+5. THE normal task definition SHALL NOT set `logConfiguration` on primary containers; they use Docker's default `json-file` log driver so the Alloy sidecar can read stdout/stderr via the Docker socket. Break-glass CloudWatch logging is the only explicit override and is controlled by `tkr debug logs enable`.
+6. THE Alloy_Sidecar SHALL read its configuration from a shared task volume populated by an init container, NOT from environment variables. The init container (`alloy-config-init`) SHALL fetch the per-service Alloy config from SSM Parameter Store at path `/{project_name}/alloy/sidecar/{service_name}`, inject the current ECS task ARN into the config, and write it to a `alloy-config` volume shared with the Alloy container. This lets operators update Alloy configuration by writing a new SSM parameter value without registering a new task definition revision.
+7. THE SSM Parameter Store path `/{project_name}/alloy/sidecar/*` SHALL be readable by every service task role because `alloy-config-init` runs inside the task and uses task-role credentials. The path SHALL be writable by operator/admin principals only, not by service task roles. The parameter content SHALL be the full Alloy HCL config rendered from an Askama template at infra-apply time.
+8. THE Alloy_Sidecar SHALL use a pinned image version matching the compose platform (`grafana/alloy:v1.16.0`).
+9. THE Alloy_Sidecar SHALL have resource limits configured separately from the primary container (CPU and memory).
+10. THE `alloy-config-init` init container SHALL be marked `essential = false` and SHALL exit 0 after writing the config file. The Alloy sidecar SHALL declare `dependsOn = [{ containerName = "alloy-config-init", condition = "SUCCESS" }]`.
 
 ### Requirement 8.2: Mimir ECS Service
 
@@ -687,7 +689,7 @@ This spec consumes those surfaces. It does not redefine them.
 1. THE `EcsConfig` SHALL include an `observability` section with fields for: Mimir image and resource limits, Loki image and resource limits, Grafana image and resource limits, Alloy sidecar image and resource limits, S3 bucket names for metrics and log storage, and `retention_days`.
 2. THE `observability` section SHALL have sensible defaults matching the pinned versions from the compose platform.
 3. THE `observability.retention_days` field SHALL default to `30` and SHALL apply to both Mimir metrics and Loki logs.
-4. THE `observability` section SHALL be optional — if omitted, the observability stack is not deployed, but Alloy sidecars are still included in task definitions (they will fail to connect until Mimir/Loki are available).
+4. THE `observability` section SHALL be required for ECS deployments. The observability module provides the metrics ingestion path that the autoscaler depends on and the log storage destination used by Alloy.
 
 ---
 

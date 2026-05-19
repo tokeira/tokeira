@@ -237,15 +237,15 @@ impl<D: Deployment> InfraEngine<D> {
     /// [`Deployment`] and let this facade coordinate state and ordering.
     pub async fn new(deployment: D, config: &D::Config, deployment_dir: &Path) -> Result<Self> {
         let mut ctx = iac::ProvisionContext::default();
+        deployment
+            .register_infra_extensions(config, &mut ctx)
+            .await?;
         let state_store = Arc::new(StateStore::new(
             deployment.create_infra_store(config, deployment_dir),
             "infra".to_string(),
         ));
         let (state, _) = state_store.load().await?;
         ctx.state = state;
-        deployment
-            .register_infra_extensions(config, &mut ctx)
-            .await?;
         Ok(Self {
             deployment,
             engine: iac::Engine::new(),

@@ -8,8 +8,23 @@ use tokeira_iac::{
 /// Configuration for a single Secrets Manager secret provider resource.
 #[derive(Debug)]
 pub struct SecretsManagerSecretConfig {
-    pub initial_value: String,
+    pub value: SecretValue,
+    pub recovery_window_days: Option<i64>,
     pub module: String,
+}
+
+/// First-apply secret material source.
+///
+/// Generated values are intentionally not recomputed by `update()`: apply must
+/// stay idempotent, and credential rotation is an operator action with its own
+/// audit trail.
+#[derive(Debug)]
+pub enum SecretValue {
+    Static(String),
+    GeneratedPasswordJson {
+        username: String,
+        password_length: i32,
+    },
 }
 
 /// Generic provider resource that provisions exactly one Secrets Manager secret.
@@ -34,6 +49,36 @@ impl SecretsManagerSecret {
             project: rctx.project.clone(),
             region: rctx.region.clone(),
             tags: rctx.tags.clone(),
+        }
+    }
+
+    async fn initial_secret_string(&self, ctx: &ProvisionContext) -> Result<String, IacError> {
+        match &self.config.value {
+            SecretValue::Static(value) => Ok(value.clone()),
+            SecretValue::GeneratedPasswordJson {
+                username,
+                password_length,
+            } => {
+                let output = ctx
+                    .extension::<crate::AwsClients>()
+                    .expect("AwsClients")
+                    .secretsmanager
+                    .get_random_password()
+                    .password_length((*password_length).into())
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        IacError::AwsSdk(format!(
+                            "secretsmanager:GetRandomPassword: {}",
+                            e.into_service_error()
+                        ))
+                    })?;
+                Ok(serde_json::json!({
+                    "username": username,
+                    "password": output.random_password().unwrap_or_default(),
+                })
+                .to_string())
+            }
         }
     }
 
@@ -107,6 +152,7 @@ impl Resource for SecretsManagerSecret {
         let name = &self.secret_name;
         let tags = ctx.resource_tags(name);
         let sm_tag_list = super::secretsmanager_tags(&tags);
+        let secret_string = self.initial_secret_string(ctx).await?;
 
         let secret_arn;
 
@@ -117,7 +163,7 @@ impl Resource for SecretsManagerSecret {
             .secretsmanager
             .create_secret()
             .name(name)
-            .secret_string(&self.config.initial_value)
+            .secret_string(secret_string)
             .set_tags(Some(sm_tag_list))
             .send()
             .await
@@ -192,17 +238,21 @@ impl Resource for SecretsManagerSecret {
     ) -> Result<(), IacError> {
         let name = &self.secret_name;
 
-        // secretsmanager:DeleteSecret with force (no recovery window)
-        match ctx
+        let mut request = ctx
             .extension::<crate::AwsClients>()
             .expect("AwsClients")
             .secretsmanager
             .delete_secret()
-            .secret_id(name)
-            .force_delete_without_recovery(true)
-            .send()
-            .await
-        {
+            .secret_id(name);
+        request = if let Some(days) = self.config.recovery_window_days {
+            // Secrets that protect operator access should be recoverable after
+            // accidental destroy. Other callers can still opt into force delete.
+            request.recovery_window_in_days(days)
+        } else {
+            request.force_delete_without_recovery(true)
+        };
+
+        match request.send().await {
             Ok(_) => {}
             Err(e) => {
                 let svc_err = e.into_service_error();

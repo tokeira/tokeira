@@ -52,7 +52,15 @@ pub async fn run(
             if matches!(&action, InfraAction::Apply { .. }) {
                 validate_ecs_mirrors(config).await?;
             }
-            run_with_engine(action, deployments, &ctx, EcsDeployment, config, format).await
+            run_with_engine(
+                action,
+                deployments,
+                &ctx,
+                EcsDeployment::new(),
+                config,
+                format,
+            )
+            .await
         }
     }
 }
@@ -68,7 +76,7 @@ pub async fn run(
 ///
 /// Failing here saves the operator minutes of rollback work.
 async fn validate_ecs_mirrors(config: &EcsConfig) -> Result<()> {
-    let deployment = EcsDeployment;
+    let deployment = EcsDeployment::new();
     let mut image_ctx = ImageContext::default();
     deployment
         .register_image_extensions(config, &mut image_ctx)

@@ -10,13 +10,17 @@ pub mod dynamodb_table;
 pub mod ebs_volume;
 pub mod ec2_instance;
 pub mod ecr_repository;
+pub mod ecs_cluster;
+pub mod ecs_service;
 pub mod eks;
+pub mod elbv2;
 pub mod iam_instance_profile;
 pub mod iam_role;
 pub mod pod_identity_association;
 pub mod s3_bucket;
 pub mod secrets_manager_secret;
 pub mod security_group;
+pub mod ssm_parameter;
 pub mod vpc;
 pub mod vpc_endpoint;
 
@@ -130,6 +134,21 @@ pub fn dynamodb_tags(tags: &HashMap<String, String>) -> Vec<aws_sdk_dynamodb::ty
                 .expect("key and value are set")
         })
         .collect()
+}
+
+/// Convert a tag map to Elastic Load Balancing v2 tag format.
+pub fn elbv2_tags(
+    tags: &HashMap<String, String>,
+) -> Result<Vec<aws_sdk_elasticloadbalancingv2::types::Tag>, IacError> {
+    Ok(tags
+        .iter()
+        .map(|(k, v)| {
+            aws_sdk_elasticloadbalancingv2::types::Tag::builder()
+                .key(k)
+                .value(v)
+                .build()
+        })
+        .collect())
 }
 
 /// Convert a tag map to Secrets Manager tag format.

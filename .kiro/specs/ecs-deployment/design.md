@@ -82,9 +82,9 @@ remote-state → networking → dsql → cluster → observability → services
 - **remote-state**: S3 state bucket with shared-bucket semantics — snapshot delete prevention policy, versioning enforcement, public access block, adoption of existing buckets, no-op delete. Implemented as a `RemoteStateBucket` resource in `platforms/` (shared across all AWS-backed platforms).
 - **networking**: VPC subnets, security groups, VPC endpoints, internal ALB
 - **dsql**: DSQL cluster, DSQL PrivateLink endpoints, IAM authentication roles
-- **cluster**: ECS cluster, 8 capacity providers (application plane: edge-api, edge-poll, runtime, projection, control; observability plane: mimir, loki, grafana), 8 ASGs, launch templates, IAM instance profiles, ecs-exec CloudWatch log group
+- **cluster**: ECS cluster, 8 capacity providers (application plane: edge-api, edge-poll, runtime, projection, control; observability plane: mimir, loki, grafana), 8 ASGs, launch templates, IAM instance profiles
 - **observability**: Mimir, Loki, Grafana ECS services, S3 buckets for metrics/log storage, IAM roles
-- **services**: 7 Tokeira ECS service definitions, 7 task definitions (each with Alloy sidecar), Service Connect config, Cloud Map namespace. Depends on observability because Alloy sidecars need Mimir/Loki endpoints.
+- **services**: 7 Tokeira ECS service definitions, 7 task definitions (each with an `alloy-config-init` init container, Alloy sidecar, Docker socket host-volume mount, and no primary-container `logConfiguration`), Service Connect config, Cloud Map namespace. Depends on observability because Alloy sidecars need Mimir/Loki endpoints.
 
 ## Components and Interfaces
 
@@ -98,7 +98,7 @@ Notably:
 - `ActionTuiHandle` uses the `ActiveSpinners` map pattern (per-resource `SpinnerEntry` keyed by `ResourceId`), not a single `overall` + `detail` pair.
 - The test-only `with_terminal_detected(format, is_terminal)` constructor is the deterministic injection seam for unit tests.
 
-New IaC resources in this spec call `ctx.emit_apply_progress` at the start of their lifecycle methods, `ctx.emit_wait_progress` during polling waits (for example while waiting for an OpenSearch domain to reach `Active`), and `ctx.emit_note_progress` for informational events (for example "adopting existing DSQL cluster", "ecs-exec log group already exists"). They call `ctx.emit_complete_progress` / `ctx.emit_failed_progress` on return via the engine's generic `apply_changes` / `destroy_changes` machinery — resource implementations do not call these directly.
+New IaC resources in this spec call `ctx.emit_apply_progress` at the start of their lifecycle methods, `ctx.emit_wait_progress` during polling waits (for example while waiting for a DSQL endpoint to become available), and `ctx.emit_note_progress` for informational events (for example "adopting existing DSQL cluster"). They call `ctx.emit_complete_progress` / `ctx.emit_failed_progress` on return via the engine's generic `apply_changes` / `destroy_changes` machinery — resource implementations do not call these directly.
 
 ### 1a. ECS Platform Configuration (`platforms/ecs/src/config.rs`)
 
@@ -120,7 +120,7 @@ pub struct EcsConfig {
     pub services: ServiceConfigs,
     pub autoscaler: AutoscalerConfig,
     pub alb: AlbConfig,
-    pub observability: Option<ObservabilityStackConfig>,
+    pub observability: ObservabilityStackConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,7 +147,6 @@ pub struct OptionalEndpoints {
     pub sts: bool,
     pub kms: bool,
     pub secrets_manager: bool,
-    pub ssm: bool,
     pub cloudwatch_logs: bool,
     pub ec2: bool,
 }
@@ -404,6 +403,23 @@ impl Default for EcsConfig {
                 health_check_path: "/health".into(),
                 health_check_interval_secs: 10,
             },
+            observability: ObservabilityStackConfig {
+                mimir_image: "grafana/mimir:3.0.6".into(),
+                mimir_cpu: 1536,
+                mimir_memory_mb: 12_288,
+                loki_image: "grafana/loki:3.7.1".into(),
+                loki_cpu: 1024,
+                loki_memory_mb: 12_288,
+                grafana_image: "grafana/grafana-oss:12.4.3".into(),
+                grafana_cpu: 1024,
+                grafana_memory_mb: 2048,
+                alloy_sidecar_image: "grafana/alloy:v1.16.0".into(),
+                alloy_sidecar_cpu: 128,
+                alloy_sidecar_memory_mb: 256,
+                mimir_s3_bucket: "tokeira-dev-mimir".into(),
+                loki_s3_bucket: "tokeira-dev-loki".into(),
+                retention_days: 30,
+            },
         }
     }
 }
@@ -429,7 +445,7 @@ fn resource_tags(config: &EcsConfig, resource_name: &str) -> HashMap<String, Str
 }
 ```
 
-Every `Resource` implementation passes `resource_tags(config, name)` to the AWS SDK create/update calls. This applies to VPC resources, security groups, VPC endpoints, ALB, ECS cluster, capacity providers, ASGs, launch templates, IAM roles, S3 buckets, DSQL cluster, Cloud Map namespace, ECS services/task definitions, and CloudWatch log groups (including the ecs-exec audit log group from §3d).
+Every `Resource` implementation passes `resource_tags(config, name)` to the AWS SDK create/update calls. This applies to VPC resources, security groups, VPC endpoints, ALB, ECS cluster, capacity providers, ASGs, launch templates, IAM roles, S3 buckets, DSQL cluster, Cloud Map namespace, ECS services/task definitions, and optional CloudWatch log groups created by break-glass debug logging.
 
 #### ECS Task CPU/Memory Validation
 
@@ -587,6 +603,7 @@ Required VPC endpoints (always provisioned):
 | `s3` | Gateway | 1 |
 | `autoscaling` | Interface | 1 |
 | `servicediscovery` | Interface | 1 |
+| `ssm`, `ssmmessages`, `ec2messages` | Interface | 3 |
 | DSQL management + connection | PrivateLink | 2 |
 
 #### DSQL Module
@@ -607,6 +624,10 @@ impl iac::Module for DsqlModule {
         let mut resources: Vec<Box<dyn iac::Resource>> = Vec::new();
         // DSQL cluster (reuses existing tokeira-aws DsqlCluster resource)
         resources.push(Box::new(DsqlClusterResource { /* ... */ }));
+        // DSQL PrivateLink endpoints for private-only management and connection traffic.
+        // Resource state exposes properties["endpoint_id"] for config hydration.
+        resources.push(Box::new(DsqlPrivatelinkEndpointResource { /* management */ }));
+        resources.push(Box::new(DsqlPrivatelinkEndpointResource { /* connection */ }));
         // IAM roles for runtime and admin DSQL access
         resources.push(Box::new(IamRoleResource { /* runtime DSQL access */ }));
         resources.push(Box::new(IamRoleResource { /* admin DSQL access */ }));
@@ -717,8 +738,8 @@ pub struct InitContainerSpec {
 }
 
 /// Service Connect service registrations. Each service registers both its
-/// primary gRPC port (where applicable) and its Prometheus metrics port so
-/// Mimir can use Service Connect DNS to discover scrape targets.
+/// primary gRPC port (where applicable) and its Prometheus metrics port.
+/// Metrics aliases are for diagnostics; Alloy sidecars scrape localhost.
 #[derive(Debug, Clone, Default)]
 pub struct ServiceConnectSpec {
     pub grpc: Option<ServiceConnectPort>,     // discovery name "<service>"
@@ -759,7 +780,7 @@ impl deploy_engine::Service for EcsWorkload {
 
 **Wait-for init containers** — `EcsWorkload::build` synthesises one `wait-for-<dep>` init container per upstream dependency from the `dependencies()` list. Each primary container declares a `dependsOn` for its matching init containers. The init image is the public busybox, the command polls the dependency's Service Connect endpoint every 2 seconds until TCP connect succeeds, and CPU/memory reservations (32/64) are deducted from the primary container's budget.
 
-**Service Connect metrics registration** — `ServiceConnectSpec::metrics` registers every service's Prometheus endpoint on Service Connect. This gives Mimir a stable DNS target (for example `tokeira-runtime-metrics.tokeira.local:9090`) and allows it to discover scrape targets via DNS SD instead of via the Docker socket. Alloy sidecars still scrape localhost and forward via remote-write; the Service Connect metrics aliases are a second path for Mimir pull scraping when sidecars are unhealthy or during break-glass debugging.
+**Service Connect metrics registration** — `ServiceConnectSpec::metrics` registers every service's Prometheus endpoint on Service Connect. This gives operators stable DNS targets (for example `tokeira-runtime-metrics.tokeira.local:9090`) for ad-hoc diagnostics from inside the cluster. It is not the metrics ingestion path: each Alloy sidecar scrapes its own task on `localhost:{metrics_port}` and remote-writes to Mimir.
 
 **ECS Exec readiness** — every `EcsWorkload` sets `enable_execute_command = true` on the service and `linuxParameters.initProcessEnabled = true` on the primary container. See §3d for the cluster-level logging configuration and task role IAM.
 
@@ -975,26 +996,19 @@ service.placement_constraints = Some(vec![
 
 This is belt-and-braces — the capacity provider strategy already binds services to the right ASG — but the attribute makes the binding discoverable at placement time and allows `ecs:RunTask` ad-hoc invocations (for example the admin service) to land on the right plane.
 
-### 3d. ECS Exec (`ecs exec` with central audit)
+### 3d. ECS Exec (`ecs exec`)
 
-ECS Exec is configured at four levels, all three of which this design requires:
+ECS Exec is configured at four levels:
 
-**1. Cluster level.** The `EcsClusterResource` configures `execute_command_configuration` with `logging = "OVERRIDE"` and a dedicated CloudWatch log group `/ecs/{project}/ecs-exec` for the session audit trail:
+**1. Cluster level.** The `EcsClusterResource` configures `execute_command_configuration` with `logging = "NONE"`. This keeps the core exec path dependent only on Session Manager endpoints (`ssm`, `ssmmessages`, `ec2messages`). IAM and CloudTrail provide operator attribution.
 
 ```rust
 let cluster = ecs.create_cluster()
     .cluster_name(&cluster_name)
-    .settings(ClusterSetting::builder()
-        .name("containerInsights")
-        .value("enabled")
-        .build())
     .configuration(ClusterConfiguration::builder()
         .execute_command_configuration(
             ExecuteCommandConfiguration::builder()
-                .logging(ExecuteCommandLogging::Override)
-                .log_configuration(ExecuteCommandLogConfiguration::builder()
-                    .cloud_watch_log_group_name(format!("/ecs/{project}/ecs-exec"))
-                    .build())
+                .logging(ExecuteCommandLogging::None)
                 .build())
         .build())
     .service_connect_defaults(ClusterServiceConnectDefaultsRequest::builder()
@@ -1019,7 +1033,7 @@ ContainerDefinition {
 }
 ```
 
-**4. IAM task role level.** The four SSM Messages actions plus the three CloudWatch Logs actions are granted on the task role (not the execution role):
+**4. IAM task role level.** The four SSM Messages actions are granted on the task role (not the execution role):
 
 ```rust
 let policy = json!({
@@ -1034,17 +1048,6 @@ let policy = json!({
                 "ssmmessages:OpenDataChannel",
             ],
             "Resource": "*"
-        },
-        {
-            "Effect": "Allow",
-            "Action": [
-                "logs:CreateLogStream",
-                "logs:DescribeLogStreams",
-                "logs:PutLogEvents",
-            ],
-            "Resource": format!(
-                "arn:aws:logs:{region}:{account}:log-group:/ecs/{project}/ecs-exec:*"
-            )
         }
     ]
 });
@@ -1118,7 +1121,7 @@ tkr exec runtime --container alloy -- ps aux
 tkr exec grafana -- /bin/bash
 ```
 
-**Audit trail.** Every exec session writes to `/ecs/{project}/ecs-exec` with the session ID, the invoking principal's ARN, and the command. Retention follows `observability.retention_days` (default 30 days).
+**Audit trail.** ECS Exec does not write a CloudWatch session log by default. Operator access is authenticated and attributable through IAM and CloudTrail. If full session transcript logging is needed later, it should be added as an optional enhancement rather than a dependency of the core private exec path.
 
 ### 4. Autoscaler Service (`crates/tokeira-autoscaler/`)
 
@@ -1324,26 +1327,27 @@ impl DesiredState {
 
 ### 4b. Alloy Sidecar in Task Definitions (init-container + SSM Parameter Store pattern)
 
-Every Tokeira task definition includes an Alloy sidecar container plus a small **config init container** that fetches the Alloy config from SSM Parameter Store and writes it into a shared task volume. This decouples Alloy configuration from task definition revisions — operators can update Alloy settings by writing a new SSM parameter value; the next task start picks up the change.
+Every Tokeira task definition includes an Alloy sidecar container for metrics and logs plus a small **config init container** that fetches the Alloy config from SSM Parameter Store, injects the current ECS task ARN, and writes the rendered config into a shared task volume. This decouples Alloy configuration from task definition revisions — operators can update Alloy settings by writing a new SSM parameter value; the next task start picks up the change.
 
 The sidecar:
 
 - Scrapes Prometheus metrics from `localhost:{metrics_port}` on the primary container
 - Forwards metrics to Mimir via remote-write (`http://mimir.<namespace>:9009/api/v1/push`)
-- Collects container stdout/stderr and ships to Loki (`http://loki.<namespace>:3100/loki/api/v1/push`)
+- Reads stdout/stderr logs through the host Docker socket using `discovery.docker` plus a `com.amazonaws.ecs.task-arn` filter scoped to the current task
+- Forwards logs to Loki (`http://loki.<namespace>:3100/loki/api/v1/push`)
 - Uses pinned image `grafana/alloy:v1.16.0`
 
 ```rust
 /// Pair of container definitions: the init container that stages the Alloy
 /// config, and the Alloy sidecar that consumes it.
-fn alloy_containers(service_name: &str, project: &str, metrics_port: u16)
+fn alloy_containers(service_name: &str, project: &str, region: &str, metrics_port: u16)
     -> (ContainerDefinition, ContainerDefinition)
 {
     let param_path = format!("/{project}/alloy/sidecar/{service_name}");
 
     let init = ContainerDefinition {
         name: "alloy-config-init".into(),
-        image: "public.ecr.aws/aws-cli/aws-cli:latest".into(),
+        image: "amazon/aws-cli:latest".into(),
         essential: false,
         cpu: 64,
         memory_mb: 128,
@@ -1352,12 +1356,18 @@ fn alloy_containers(service_name: &str, project: &str, metrics_port: u16)
             container_path: "/etc/alloy".into(),
             read_only: false,
         }],
-        // Fetch the parameter value and write it to the shared volume.
+        // Fetch the parameter value, inject task identity, and write it to the shared volume.
         command: vec![
             "sh".into(), "-c".into(),
             format!(
-                "aws ssm get-parameter --name {param_path} --with-decryption \
-                 --query 'Parameter.Value' --output text > /etc/alloy/config.alloy"
+                "TASK_ARN=$(curl -s \"$ECS_CONTAINER_METADATA_URI_V4/task\" \
+                   | grep -o '\"TaskARN\":\"[^\"]*' | cut -d'\"' -f4) && \
+                 TASK_ID=$(echo \"$TASK_ARN\" | grep -oE '[^/]+$') && \
+                 aws ssm get-parameter --name {param_path} --with-decryption --region {region} \
+                   --query 'Parameter.Value' --output text \
+                   | sed \"s|TASK_ARN_PLACEHOLDER|$TASK_ARN|g\" \
+                   | sed \"s|TASK_ID_PLACEHOLDER|$TASK_ID|g\" \
+                   > /etc/alloy/config.alloy"
             ),
         ],
         ..Default::default()
@@ -1377,6 +1387,10 @@ fn alloy_containers(service_name: &str, project: &str, metrics_port: u16)
             source_volume: "alloy-config".into(),
             container_path: "/etc/alloy".into(),
             read_only: true,
+        }, MountPoint {
+            source_volume: "docker-sock".into(),
+            container_path: "/var/run/docker.sock".into(),
+            read_only: true,
         }],
         command: vec![
             "run".into(), "--server.http.listen-addr=0.0.0.0:12345".into(),
@@ -1389,14 +1403,20 @@ fn alloy_containers(service_name: &str, project: &str, metrics_port: u16)
 }
 ```
 
-The task definition declares a shared `alloy-config` volume:
+The task definition declares a shared `alloy-config` volume and a Docker socket host-path volume:
 
 ```rust
 task_definition.volumes.push(Volume {
     name: "alloy-config".into(),
     host: None, // ephemeral scratch volume
 });
+task_definition.volumes.push(Volume {
+    name: "docker-sock".into(),
+    host: Some(HostVolume { source_path: "/var/run/docker.sock".into() }),
+});
 ```
+
+**Log routing.** Primary application containers do not set `logConfiguration` in the normal task definition. They use Docker's default `json-file` log driver, and the co-located Alloy sidecar reads those logs through `/var/run/docker.sock`. Alloy scopes Docker discovery to the current ECS task by filtering on the `com.amazonaws.ecs.task-arn` Docker label after the init container injects the task ARN into the config. This matches the ECS-on-EC2 production pattern and avoids a separate log-router container.
 
 **Config content.** The full Alloy HCL config is rendered from an Askama template at `infra apply` time (see §4d) and written to SSM by an IaC resource:
 
@@ -1427,8 +1447,8 @@ impl Resource for AlloyParameterResource {
 Each service's `AlloyParameterResource` is enumerated by the `observability` module alongside Mimir/Loki/Grafana.
 
 **IAM.**
-- The **execution role** needs `ssm:GetParameter` on `arn:aws:ssm:*:*:parameter/{project}/alloy/sidecar/*` so the init container can fetch the config at task start.
-- The **task role** does NOT need these permissions — only the init container reads SSM.
+- The **task role** needs `ssm:GetParameter` on `arn:aws:ssm:*:*:parameter/{project}/alloy/sidecar/*` because `alloy-config-init` runs as a normal task container and uses task-role credentials.
+- The **execution role** does NOT need this permission for the Alloy config fetch; it is only used by the ECS agent for image pulls, secret injection, and optional log drivers.
 - Writing the parameter (at `infra apply` time) is performed by the operator's credentials via the `AlloyParameterResource`, not by any task role.
 
 **Why this pattern.** Two wins over env-var configuration:
@@ -1438,7 +1458,7 @@ Each service's `AlloyParameterResource` is enumerated by the `observability` mod
 
 ### 4c. Observability Module (`platforms/ecs/src/modules.rs`)
 
-The observability module provisions Mimir, Loki, and Grafana as ECS services on `cp-control`, plus S3 buckets for metrics and log storage:
+The observability module provisions Mimir, Loki, and Grafana as ECS services on dedicated capacity providers (`cp-mimir`, `cp-loki`, and `cp-grafana`), plus S3 buckets for metrics and log storage:
 
 ```rust
 #[derive(Debug)]
@@ -1473,15 +1493,15 @@ Mimir and Loki both run in single-binary mode with S3 as the long-term storage b
 
 ### 4d. Observability Configuration Details
 
-Each observability component requires a configuration payload embedded in the ECS task definition as an environment variable or mounted via an S3-backed config file. These configs are generated programmatically from `EcsConfig` values — no static YAML files. The ECS platform uses Askama templates (same pattern as the compose platform) for config content that is too verbose for inline Rust strings.
+Each observability component requires a configuration payload mounted into the ECS task definition, and each Alloy sidecar requires a metrics/logs configuration payload. These configs are generated programmatically from `EcsConfig` values — no static YAML files. The ECS platform uses Askama templates (same pattern as the compose platform) for config content that is too verbose for inline Rust strings.
 
 #### Alloy Sidecar Configuration
 
-Each Tokeira task definition includes an Alloy sidecar. On ECS, the sidecar scrapes the co-located primary container on localhost and ships metrics/logs to Mimir/Loki via Service Connect endpoints. Unlike the Kubernetes sidecar pattern (which uses pod-level service discovery), the ECS sidecar uses a static localhost target.
+Each Tokeira task definition includes an Alloy sidecar. On ECS, the sidecar scrapes the co-located primary container on localhost, remote-writes metrics to Mimir via Service Connect, and tails task-local Docker logs through the host Docker socket using a task-ARN-scoped Docker discovery filter.
 
 ```
 // Alloy sidecar config for tokeira-{service}
-// Injected as ALLOY_CONFIG environment variable or mounted config file
+// Mounted from the SSM-populated alloy-config volume
 
 prometheus.scrape "tokeira" {
   targets         = [{ __address__ = "localhost:{{ metrics_port }}" }]
@@ -1501,9 +1521,23 @@ prometheus.remote_write "mimir" {
   }
 }
 
-loki.source.docker "container" {
+discovery.docker "task" {
+  host = "unix:///var/run/docker.sock"
+}
+
+discovery.relabel "task_logs" {
+  targets = discovery.docker.task.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_amazonaws_ecs_task_arn"]
+    regex         = "TASK_ARN_PLACEHOLDER"
+    action        = "keep"
+  }
+}
+
+loki.source.docker "task" {
   host       = "unix:///var/run/docker.sock"
-  targets    = []
+  targets    = discovery.relabel.task_logs.output
   forward_to = [loki.write.default.receiver]
 }
 
@@ -1515,15 +1549,18 @@ loki.write "default" {
     service_name = "tokeira-{{ service_name }}",
     environment  = "{{ environment }}",
     project      = "{{ project_name }}",
+    task_id      = "TASK_ID_PLACEHOLDER",
   }
 }
 ```
 
 Key design decisions:
 - **Static localhost target** — no service discovery needed. The sidecar always scrapes the co-located primary container.
-- **External labels** — `service_name`, `environment`, `project` are injected so Mimir/Loki queries can filter by service and environment.
+- **Task-ARN-scoped log discovery** — Alloy can see Docker metadata through the host socket, but the relabel rule keeps only containers with the current task ARN.
+- **Default Docker logging** — primary containers intentionally omit `logConfiguration` so Docker writes stdout/stderr to json-file logs that Alloy can read.
+- **External labels** — `service_name`, `environment`, `project` are injected so Mimir and Loki queries can filter by service and environment.
 - **15s scrape interval** — matches the autoscaler polling interval. Faster scraping wastes CPU; slower scraping delays scaling decisions.
-- **Docker socket for logs** — on ECS EC2, the Alloy sidecar can read container logs via the Docker socket mounted from the host. This avoids the `awslogs` driver dependency.
+- **Docker socket mount** — the Alloy sidecar mounts `/var/run/docker.sock` read-only. This is ECS-on-EC2 specific and is not intended to be portable to Fargate.
 
 #### Mimir Configuration
 
@@ -1713,7 +1750,7 @@ Key design decisions:
 - **Secrets Manager for admin credentials** — Grafana admin user/password are sourced from Secrets Manager via ECS task definition secrets, not hardcoded in config.
 - **Pre-provisioned dashboards** — dashboard JSON files are baked into the container image or mounted from S3. The provisioning YAML tells Grafana where to find them.
 - **Service Connect URLs** — data source URLs use the Service Connect namespace (`mimir.tokeira.local`, `loki.tokeira.local`) for stable internal routing.
-- **Anonymous auth disabled** — all access requires authentication. Grafana is accessible via internal ALB or port-forward only.
+- **Anonymous auth disabled** — all access requires authentication. Grafana is accessible via `tkr port-forward` only; it is not registered with the internal ALB.
 
 #### Config Generation Pattern
 
@@ -1730,7 +1767,7 @@ platforms/ecs/templates/
 ```
 
 Each template receives a context struct with the relevant `EcsConfig` fields. The generated config is either:
-- Injected as an environment variable (Alloy sidecar — small config)
+- Written to SSM Parameter Store and mounted through the `alloy-config-init` volume flow (Alloy sidecar)
 - Stored in S3 and referenced by the task definition (Mimir, Loki, Grafana — larger configs)
 
 This follows the same pattern as the compose platform's config generation, adapted for ECS's config delivery mechanisms.
@@ -2038,12 +2075,24 @@ impl Deployment for EcsDeployment {
         h
     }
 
-    /// Called after infra apply. Returns (dotted_key, value) pairs the CLI
-    /// persists to deployment.toml via toml_edit. Convenience only — downstream
-    /// commands use hydrate_config as the source of truth.
+    /// Called after infra apply and infra destroy. Returns (dotted_key, value)
+    /// pairs the CLI persists to deployment.toml via toml_edit. Convenience
+    /// only — downstream commands use hydrate_config as the source of truth.
+    /// On destroy, an empty post-destroy state clears previously-written
+    /// Managed DSQL values so stale references are not retained.
     fn collect_writeback(&self, config: &EcsConfig, state: &InfraState) -> Vec<(String, String)> {
         let mut entries = Vec::new();
         if config.dsql.mode == DsqlClusterMode::Managed {
+            if !state.resources.contains_key(&ResourceId("dsql:cluster".into()))
+                && config.dsql.endpoint.is_some()
+            {
+                entries.push(("dsql.endpoint".into(), String::new()));
+                entries.push(("dsql.management_endpoint_id".into(), String::new()));
+                entries.push(("dsql.connection_endpoint_id".into(), String::new()));
+                entries.push(("dsql.runtime_role_arn".into(), String::new()));
+                entries.push(("dsql.admin_role_arn".into(), String::new()));
+                return entries;
+            }
             let hydrated = self.hydrate_config(config, state);
             // Emit pairs only when the discovered value differs from the
             // current config (or the current config is empty).
@@ -2054,31 +2103,6 @@ impl Deployment for EcsDeployment {
             }
             // ... similar for management_endpoint_id, connection_endpoint_id,
             //     runtime_role_arn, admin_role_arn
-        }
-        entries
-    }
-
-    /// Called after infra destroy. Returns pairs that CLEAR previously-written
-    /// config values when the corresponding Managed resource has been removed
-    /// from state — otherwise a subsequent plan would treat the destroyed
-    /// cluster as Preexisting.
-    fn collect_destroy_writeback(
-        &self,
-        config: &EcsConfig,
-        state: &InfraState,
-        active_modules: &[String],
-    ) -> Vec<(String, String)> {
-        let mut entries = Vec::new();
-        if active_modules.iter().any(|m| m == "dsql") {
-            if !state.resources.contains_key(&ResourceId("dsql:cluster".into()))
-                && config.dsql.endpoint.is_some()
-            {
-                entries.push(("dsql.endpoint".into(), String::new()));
-                entries.push(("dsql.management_endpoint_id".into(), String::new()));
-                entries.push(("dsql.connection_endpoint_id".into(), String::new()));
-                entries.push(("dsql.runtime_role_arn".into(), String::new()));
-                entries.push(("dsql.admin_role_arn".into(), String::new()));
-            }
         }
         entries
     }

@@ -380,6 +380,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-autoscaling"
+version = "1.115.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70ba1d752ca449e9d3dfcd62c580033abae6e6cadd6e066059a0a8ebe0394abd"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-query",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-dsql"
 version = "1.55.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -479,6 +504,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-ecs"
+version = "1.124.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e28ffb1fa2097067108e6a0a6dd92cf9075391b50c709b268ef5f42ae0642a0"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-eks"
 version = "1.129.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -495,6 +544,31 @@ dependencies = [
  "aws-smithy-types",
  "aws-types",
  "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-elasticloadbalancingv2"
+version = "1.111.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4bd66766a292124e7d4e1c7270de6c6414ba88ec3a7f71eb296f14e05dce1d5c"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-query",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
  "fastrand",
  "http 0.2.12",
  "http 1.4.0",
@@ -567,6 +641,30 @@ name = "aws-sdk-secretsmanager"
 version = "1.104.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "811bcb3da8bf26e571da7a248c0a93152bba9642aa4c8c907c58d949fa5f1d5c"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-servicediscovery"
+version = "1.98.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d0f242825f0d720a6e9d69c642e836af55842c7c2feea97382b01d41537637c"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -5709,6 +5807,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokeira-autoscaler"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "proptest",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "time",
+ "tokeira-config",
+ "tokeira-proto",
+ "tokeira-storage",
+ "tokeira-types",
+ "tokio",
+ "tonic 0.11.0",
+ "tracing",
+]
+
+[[package]]
+name = "tokeira-autoscaler-bin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tokeira-autoscaler",
+ "tokeira-config",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "tokeira-aws"
 version = "0.1.0"
 dependencies = [
@@ -5716,14 +5846,18 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-iam",
+ "aws-sdk-autoscaling",
  "aws-sdk-dsql",
  "aws-sdk-dynamodb",
  "aws-sdk-ec2",
  "aws-sdk-ecr",
+ "aws-sdk-ecs",
  "aws-sdk-eks",
+ "aws-sdk-elasticloadbalancingv2",
  "aws-sdk-iam",
  "aws-sdk-s3",
  "aws-sdk-secretsmanager",
+ "aws-sdk-servicediscovery",
  "aws-sdk-ssm",
  "aws-sdk-sts",
  "base64 0.22.1",
@@ -5890,6 +6024,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "aws-config",
+ "chrono",
  "proptest",
  "serde",
  "serde_json",
@@ -5901,6 +6037,8 @@ dependencies = [
  "tokeira-orchestrator",
  "tokeira-state",
  "tokio",
+ "toml 0.8.23",
+ "tracing",
 ]
 
 [[package]]

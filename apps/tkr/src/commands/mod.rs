@@ -69,7 +69,9 @@ impl PlatformOps {
                 config.clone(),
                 ctx.path.clone(),
             )),
-            PlatformDeploymentConfig::Ecs(config) => Ok(Self::Ecs(EcsDeployment, config.clone())),
+            PlatformDeploymentConfig::Ecs(config) => {
+                Ok(Self::Ecs(EcsDeployment::new(), config.clone()))
+            }
         }
     }
 

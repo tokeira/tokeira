@@ -27,6 +27,7 @@ mod cas_store;
 mod error;
 mod local;
 mod manifest;
+mod s3_backend;
 mod s3_store;
 
 /// Validation hook called after deserializing a document.
@@ -42,6 +43,7 @@ pub use cas_store::CasStore;
 pub use error::StateError;
 pub use local::LocalBackend;
 pub use manifest::{LockGuard, ManifestState, SnapshotRef, StateLeaseLock, StateManifest};
+pub use s3_backend::S3Backend;
 pub use s3_store::S3StateStore;
 
 /// Backward-compatible alias. Prefer [`CasStore`] in new code.

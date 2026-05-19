@@ -1,0 +1,21 @@
+[package]
+name = "tokeira-autoscaler-bin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "tokeira-autoscaler"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+tokeira-autoscaler = { path = "../../crates/tokeira-autoscaler" }
+tokeira-config.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

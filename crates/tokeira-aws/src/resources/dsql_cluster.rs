@@ -29,6 +29,7 @@ pub struct DsqlClusterConfig {
     /// Fallback cluster identifier when not available from state.
     /// Extracted from config ARN/endpoint by the project crate.
     pub fallback_identifier: Option<String>,
+    pub resource_id: Option<ResourceId>,
     pub module: String,
 }
 
@@ -82,7 +83,10 @@ impl Resource for DsqlCluster {
     }
 
     fn resource_id(&self) -> ResourceId {
-        ResourceId(format!("dsql-{}", self.cluster_identity))
+        self.config
+            .resource_id
+            .clone()
+            .unwrap_or_else(|| ResourceId(format!("dsql-{}", self.cluster_identity)))
     }
 
     fn dependencies(&self) -> Vec<ResourceId> {

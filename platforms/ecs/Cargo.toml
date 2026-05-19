@@ -8,9 +8,12 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+chrono = { version = "0.4", features = ["serde"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 tokeira-aws = { path = "../../crates/tokeira-aws" }
 tokeira-config.workspace = true
 tokeira-deploy-engine = { path = "../../crates/tokeira-deploy-engine" }
@@ -21,6 +24,7 @@ tokeira-state = { path = "../../crates/tokeira-state" }
 [dev-dependencies]
 proptest = "1"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+toml = "0.8"
 
 [lints]
 workspace = true

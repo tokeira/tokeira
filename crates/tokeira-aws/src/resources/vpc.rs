@@ -242,6 +242,7 @@ impl Resource for VpcResource {
                 "vpc_id": vpc_id,
                 "subnet_ids": subnet_ids,
                 "route_table_id": route_table_id,
+                "private_route_table_ids": [route_table_id],
                 "route_table_association_ids": association_ids,
                 "cidr": self.cidr,
                 "availability_zones": self.availability_zones,
@@ -315,6 +316,10 @@ impl Resource for VpcResource {
                 "vpc_id": vpc_id,
                 "subnet_ids": subnet_ids,
                 "route_table_id": current.properties.get("route_table_id").and_then(|v| v.as_str()).unwrap_or(""),
+                "private_route_table_ids": current.properties.get("private_route_table_ids").cloned().unwrap_or_else(|| {
+                    let route_table_id = current.properties.get("route_table_id").and_then(|v| v.as_str()).unwrap_or("");
+                    serde_json::json!([route_table_id])
+                }),
                 "route_table_association_ids": current.properties.get("route_table_association_ids").cloned().unwrap_or(serde_json::json!([])),
                 "cidr": self.cidr,
                 "availability_zones": self.availability_zones,
@@ -689,6 +694,7 @@ impl Resource for VpcResource {
                 "vpc_id": vpc_id,
                 "subnet_ids": subnet_ids,
                 "route_table_id": route_table_id,
+                "private_route_table_ids": [route_table_id],
                 "route_table_association_ids": route_table_association_ids,
                 "cidr": vpc.cidr_block().unwrap_or_default(),
                 "availability_zones": self.availability_zones,

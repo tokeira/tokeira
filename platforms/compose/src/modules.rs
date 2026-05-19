@@ -188,6 +188,7 @@ impl iac::Module for DsqlModule {
             preexisting_endpoint: self.config.endpoint.clone(),
             preexisting_arn: self.config.arn.clone(),
             fallback_identifier: None,
+            resource_id: None,
             module: self.name().to_owned(),
         };
         let mut resources: Vec<Box<dyn iac::Resource>> = vec![

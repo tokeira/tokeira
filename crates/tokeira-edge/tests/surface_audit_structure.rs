@@ -2,6 +2,9 @@ use std::{collections::BTreeSet, fs, path::PathBuf};
 
 #[derive(Debug)]
 struct SurfaceAuditRow {
+    qualified_name: String,
+    classification: String,
+    implementation_notes: String,
     target_spec: String,
 }
 
@@ -51,6 +54,9 @@ fn surface_audit_rows(design: &str) -> Vec<SurfaceAuditRow> {
         .filter_map(table_cells)
         .filter(|cells| cells.len() == 6 && cells[0] != "Kind")
         .map(|cells| SurfaceAuditRow {
+            qualified_name: cells[1].clone(),
+            classification: cells[3].clone(),
+            implementation_notes: cells[4].clone(),
             target_spec: cells[5].clone(),
         })
         .collect()
@@ -127,7 +133,10 @@ fn implementation_matrix_escalation_invariant_holds() {
                     || row.runtime_impact.contains("existing broker state")
                     || row
                         .runtime_impact
-                        .contains("existing reachability queries unchanged"),
+                        .contains("existing reachability queries unchanged")
+                    || row
+                        .runtime_impact
+                        .contains("new in-memory `HeartbeatStore`"),
                 "runtime-impact row exceeds in-scope budget: {row:?}"
             );
         }
@@ -161,4 +170,24 @@ fn implementation_matrix_escalation_invariant_holds() {
             );
         }
     }
+}
+
+#[test]
+fn record_worker_heartbeat_surface_audit_is_observation_backed() {
+    let design = design_doc();
+    let rows = surface_audit_rows(&design);
+    let row = rows
+        .iter()
+        .find(|row| row.qualified_name == "`WorkflowService.RecordWorkerHeartbeat`")
+        .expect("RecordWorkerHeartbeat surface audit row should exist");
+
+    assert_eq!(row.classification, "Wire through");
+    assert!(
+        row.implementation_notes.contains("HeartbeatStore"),
+        "RecordWorkerHeartbeat row should mention HeartbeatStore: {row:?}"
+    );
+    assert_eq!(
+        target_spec_name(&row.target_spec).as_deref(),
+        Some("worker-heartbeat-observability")
+    );
 }

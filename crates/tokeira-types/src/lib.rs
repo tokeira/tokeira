@@ -52,6 +52,8 @@ pub mod task_queue;
 pub mod tokens;
 /// Projection cursors and visibility-plane helpers.
 pub mod visibility;
+/// Worker heartbeat observations and store contracts.
+pub mod worker_heartbeat;
 
 pub use execution::*;
 pub use ids::*;
@@ -65,3 +67,4 @@ pub use spread::*;
 pub use task_queue::*;
 pub use tokens::*;
 pub use visibility::*;
+pub use worker_heartbeat::*;

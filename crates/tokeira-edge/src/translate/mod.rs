@@ -32,6 +32,7 @@ pub mod history_serializer;
 pub mod nexus;
 pub mod schedule;
 pub mod to_internal;
+pub mod worker_heartbeat;
 
 /// Client-supplied worker-versioning override for starts.
 ///

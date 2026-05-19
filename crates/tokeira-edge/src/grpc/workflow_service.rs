@@ -22,7 +22,7 @@ use tokeira_types::{BuildId, TaskQueueName, WorkerIdentity};
 
 use crate::{
     grpc::{errors::proto_conversion_status, metadata::metadata_to_header_map, translate},
-    translate::{batch, nexus, schedule, to_internal},
+    translate::{batch, nexus, schedule, to_internal, worker_heartbeat},
     workflow_service::WorkflowService,
 };
 
@@ -663,12 +663,32 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     ) -> Result<Response<workflowservice::RecordWorkerHeartbeatResponse>, Status> {
         let req = request.into_inner();
         if req.namespace.is_empty() {
+            tokeira_runtime::metrics::record_worker_heartbeat_rejected("", "invalid_namespace");
             return Err(Status::invalid_argument("namespace is required"));
+        }
+        let namespace_id = crate::to_internal::namespace_id_for(&req.namespace);
+        let now = OffsetDateTime::now_utc();
+        let heartbeat_count = req.worker_heartbeat.len();
+        for proto in req.worker_heartbeat {
+            let heartbeat = worker_heartbeat::worker_heartbeat_from_proto(namespace_id, proto, now);
+            let key = heartbeat.worker_instance_key.clone();
+            self.inner
+                .heartbeat_store()
+                .insert(heartbeat)
+                .map_err(|error| {
+                    tokeira_runtime::metrics::record_worker_heartbeat_rejected(
+                        &req.namespace,
+                        "store_error",
+                    );
+                    Status::internal(error.to_string())
+                })?;
+            tokeira_runtime::metrics::record_worker_heartbeat_accepted(namespace_id, &key);
+            tokeira_runtime::metrics::record_worker_heartbeat_active(namespace_id, &key, true);
         }
         debug!(
             rpc = "RecordWorkerHeartbeat",
             namespace = %req.namespace,
-            heartbeat_count = req.worker_heartbeat.len(),
+            heartbeat_count,
             "record_worker_heartbeat"
         );
         Ok(Response::new(
@@ -685,10 +705,32 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 "namespace and sticky_task_queue are required",
             ));
         }
+        let namespace_id = crate::to_internal::namespace_id_for(&req.namespace);
+        if let Some(proto) = req.worker_heartbeat {
+            let heartbeat = worker_heartbeat::worker_heartbeat_from_proto(
+                namespace_id,
+                proto,
+                OffsetDateTime::now_utc(),
+            );
+            let key = heartbeat.worker_instance_key.clone();
+            match self.inner.heartbeat_store().insert(heartbeat) {
+                Ok(()) => {
+                    tokeira_runtime::metrics::record_worker_heartbeat_accepted(namespace_id, &key);
+                    tokeira_runtime::metrics::record_worker_heartbeat_active(
+                        namespace_id,
+                        &key,
+                        true,
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(?error, "failed to store shutdown worker heartbeat");
+                }
+            }
+        }
         self.inner
             .broker()
             .deny_worker(
-                crate::to_internal::namespace_id_for(&req.namespace),
+                namespace_id,
                 TaskQueueName(req.sticky_task_queue),
                 WorkerIdentity(req.identity),
             )
@@ -1586,7 +1628,9 @@ mod tests {
     use tokeira_kernel::{
         BasicKernel, Command, Kernel, LoadedRun, NexusResolution, SignalRequest, StartRequest,
     };
-    use tokeira_proto::public::temporal::api::nexus::v1 as nexus_v1;
+    use tokeira_proto::public::temporal::api::{
+        deployment::v1::WorkerDeploymentVersion, nexus::v1 as nexus_v1, worker::v1 as worker_v1,
+    };
     use tokeira_runtime::{
         NexusTask, NexusTaskBroker, NexusTaskRequest, NexusTaskToken, VersioningRuleStore,
         WorkerRegistrationKey, WorkerRegistry, WorkerVersionMetadata,
@@ -1594,8 +1638,8 @@ mod tests {
     use tokeira_storage::{CommitResult, DispatchableWorkflowTask, RunRepository};
     use tokeira_types::{
         BuildId, LogicalTaskSeq, Memo, Payloads, QueueKey, RequestContext, RequestId, RunId,
-        RunKey, SearchAttributes, ShardEpoch, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId,
-        WorkflowType,
+        RunKey, SearchAttributes, ShardEpoch, TaskKind, TaskQueueName, WorkerIdentity,
+        WorkerInstanceKey, WorkflowId, WorkflowType,
     };
 
     struct PollNoneRuntime;
@@ -1608,6 +1652,38 @@ mod tests {
     struct NexusRecordingRuntime {
         applied: bool,
         resolutions: Mutex<Vec<(RunKey, String, i64, NexusResolution)>>,
+    }
+
+    fn test_worker_heartbeat(key: &str) -> worker_v1::WorkerHeartbeat {
+        worker_v1::WorkerHeartbeat {
+            worker_instance_key: key.to_string(),
+            worker_identity: format!("identity-{key}"),
+            host_info: None,
+            task_queue: "queue".to_string(),
+            deployment_version: Some(WorkerDeploymentVersion {
+                build_id: "build-a".to_string(),
+                deployment_name: "deployment-a".to_string(),
+            }),
+            sdk_name: String::new(),
+            sdk_version: "rust-0.4".to_string(),
+            status: 1,
+            start_time: None,
+            heartbeat_time: None,
+            elapsed_since_last_heartbeat: None,
+            workflow_task_slots_info: None,
+            activity_task_slots_info: None,
+            nexus_task_slots_info: None,
+            local_activity_slots_info: None,
+            workflow_poller_info: None,
+            workflow_sticky_poller_info: None,
+            activity_poller_info: None,
+            nexus_poller_info: None,
+            total_sticky_cache_hit: 0,
+            total_sticky_cache_miss: 0,
+            current_sticky_cache_size: 0,
+            plugins: Vec::new(),
+            drivers: Vec::new(),
+        }
     }
 
     impl NexusRecordingRuntime {
@@ -2194,6 +2270,7 @@ mod tests {
                 HistoryWaitRegistry::default(),
                 store.clone(),
                 worker_registry.clone(),
+                Arc::new(tokeira_runtime::InMemoryHeartbeatStore::default()),
                 Arc::new(tokeira_runtime::ScheduleStore::default()),
                 Arc::new(tokeira_runtime::InMemoryTaskQueueConfigStore::default()),
                 Arc::new(tokeira_runtime::BatchOperationStore::default()),
@@ -2447,6 +2524,7 @@ mod tests {
                 HistoryWaitRegistry::default(),
                 Arc::new(VersioningRuleStore::default()),
                 WorkerRegistry::default(),
+                Arc::new(tokeira_runtime::InMemoryHeartbeatStore::default()),
                 Arc::new(tokeira_runtime::ScheduleStore::default()),
                 Arc::new(tokeira_runtime::InMemoryTaskQueueConfigStore::default()),
                 Arc::new(tokeira_runtime::BatchOperationStore::default()),
@@ -2698,6 +2776,66 @@ mod tests {
 
         assert!(denied.is_none());
         assert!(allowed.is_some());
+    }
+
+    #[tokio::test]
+    async fn record_worker_heartbeat_stores_compact_heartbeat() {
+        let (grpc, _versioning, _registry, _broker) = versioning_test_service();
+        let store = grpc.inner.heartbeat_store();
+
+        grpc.record_worker_heartbeat(Request::new(
+            workflowservice::RecordWorkerHeartbeatRequest {
+                namespace: "default".to_string(),
+                identity: "client".to_string(),
+                worker_heartbeat: vec![test_worker_heartbeat("worker-a")],
+                resource_id: String::new(),
+            },
+        ))
+        .await
+        .expect("heartbeat should be accepted");
+
+        let stored = store
+            .get_worker(
+                &namespace_id_for("default"),
+                &WorkerInstanceKey("worker-a".to_string()),
+            )
+            .expect("store read should succeed")
+            .expect("heartbeat should be stored");
+        assert_eq!(stored.build_id.as_deref(), Some("build-a"));
+        assert_eq!(stored.deployment_name.as_deref(), Some("deployment-a"));
+        assert_eq!(stored.sdk_name, None);
+        assert_eq!(stored.sdk_version.as_deref(), Some("rust-0.4"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_worker_records_final_heartbeat_before_denying_worker() {
+        let (grpc, _versioning, _registry, _broker) = versioning_test_service();
+        let store = grpc.inner.heartbeat_store();
+
+        grpc.shutdown_worker(Request::new(workflowservice::ShutdownWorkerRequest {
+            namespace: "default".to_string(),
+            sticky_task_queue: "sticky".to_string(),
+            identity: "worker-a".to_string(),
+            reason: "test".to_string(),
+            worker_heartbeat: Some(test_worker_heartbeat("worker-a")),
+            worker_instance_key: "worker-a".to_string(),
+            task_queue: "queue".to_string(),
+            task_queue_types: Vec::new(),
+        }))
+        .await
+        .expect("shutdown should succeed");
+
+        let stored = store
+            .get_worker(
+                &namespace_id_for("default"),
+                &WorkerInstanceKey("worker-a".to_string()),
+            )
+            .expect("store read should succeed")
+            .expect("heartbeat should be stored");
+        assert_eq!(
+            stored.worker_identity,
+            WorkerIdentity("identity-worker-a".to_string())
+        );
     }
 
     #[tokio::test]

@@ -363,6 +363,7 @@ async fn build_service(
         tokeira_edge::HistoryWaitRegistry::default(),
         Arc::new(VersioningRuleStore::default()),
         WorkerRegistry::default(),
+        Arc::new(tokeira_runtime::InMemoryHeartbeatStore::default()),
         Arc::new(ScheduleStore::default()),
         Arc::new(tokeira_runtime::InMemoryTaskQueueConfigStore::default()),
         Arc::new(BatchOperationStore::default()),

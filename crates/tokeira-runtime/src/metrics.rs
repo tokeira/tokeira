@@ -3,7 +3,7 @@
 use metrics::{counter, gauge, histogram};
 #[cfg(test)]
 use tokeira_types::validate_metric_name;
-use tokeira_types::{MetricType, QueueKey, TaskKind};
+use tokeira_types::{MetricType, NamespaceId, QueueKey, TaskKind, WorkerInstanceKey};
 
 pub const BROKER_PUBLISH_TOTAL: &str = "tokeira_runtime_broker_publish_total";
 pub const BROKER_SYNC_MATCH_TOTAL: &str = "tokeira_runtime_broker_sync_match_total";
@@ -20,6 +20,12 @@ pub const OCC_RETRY_TOTAL: &str = "tokeira_runtime_occ_retry_total";
 pub const KERNEL_TRANSITION_COMMITTED_TOTAL: &str = "tokeira_kernel_transition_committed_total";
 pub const KERNEL_EVENTS_EMITTED_TOTAL: &str = "tokeira_kernel_events_emitted_total";
 pub const KERNEL_COMMANDS_PROCESSED_TOTAL: &str = "tokeira_kernel_commands_processed_total";
+pub const WORKER_HEARTBEATS_ACCEPTED_TOTAL: &str = "tokeira_worker_heartbeats_accepted_total";
+pub const WORKER_HEARTBEATS_REJECTED_TOTAL: &str = "tokeira_worker_heartbeats_rejected_total";
+pub const WORKERS_OBSERVED: &str = "tokeira_worker_heartbeat_entries_observed";
+pub const WORKERS_TOTAL: &str = "tokeira_worker_heartbeat_entries_total";
+pub const WORKER_HEARTBEAT_ACTIVE: &str = "tokeira_worker_heartbeat_active_state";
+pub const WORKER_LAST_HEARTBEAT_AGE_SECONDS: &str = "tokeira_worker_last_heartbeat_age_seconds";
 
 pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (BROKER_PUBLISH_TOTAL, MetricType::Counter),
@@ -39,6 +45,15 @@ pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (KERNEL_TRANSITION_COMMITTED_TOTAL, MetricType::Counter),
     (KERNEL_EVENTS_EMITTED_TOTAL, MetricType::Counter),
     (KERNEL_COMMANDS_PROCESSED_TOTAL, MetricType::Counter),
+    (WORKER_HEARTBEATS_ACCEPTED_TOTAL, MetricType::Counter),
+    (WORKER_HEARTBEATS_REJECTED_TOTAL, MetricType::Counter),
+    (WORKERS_OBSERVED, MetricType::Gauge),
+    (WORKERS_TOTAL, MetricType::Gauge),
+    (WORKER_HEARTBEAT_ACTIVE, MetricType::Gauge),
+    (
+        WORKER_LAST_HEARTBEAT_AGE_SECONDS,
+        MetricType::DurationHistogram,
+    ),
 ];
 
 fn task_type_name(kind: TaskKind) -> &'static str {
@@ -164,6 +179,53 @@ pub fn record_events_emitted(event_type: &'static str, count: usize) {
 /// Record processed commands by command type.
 pub fn record_commands_processed(command_type: &'static str) {
     counter!(KERNEL_COMMANDS_PROCESSED_TOTAL, "command_type" => command_type).increment(1);
+}
+
+pub fn record_worker_heartbeat_accepted(namespace: NamespaceId, key: &WorkerInstanceKey) {
+    counter!(
+        WORKER_HEARTBEATS_ACCEPTED_TOTAL,
+        "namespace" => namespace.0.to_string(),
+        "worker_instance_key" => key.0.clone(),
+    )
+    .increment(1);
+}
+
+pub fn record_worker_heartbeat_rejected(namespace: &str, reason: &'static str) {
+    counter!(
+        WORKER_HEARTBEATS_REJECTED_TOTAL,
+        "namespace" => namespace.to_string(),
+        "reason" => reason,
+    )
+    .increment(1);
+}
+
+pub fn record_worker_heartbeat_active(
+    namespace: NamespaceId,
+    key: &WorkerInstanceKey,
+    active: bool,
+) {
+    gauge!(
+        WORKER_HEARTBEAT_ACTIVE,
+        "namespace" => namespace.0.to_string(),
+        "worker_instance_key" => key.0.clone(),
+    )
+    .set(if active { 1.0 } else { 0.0 });
+}
+
+pub fn record_worker_last_heartbeat_age(namespace: NamespaceId, age: time::Duration) {
+    histogram!(
+        WORKER_LAST_HEARTBEAT_AGE_SECONDS,
+        "namespace" => namespace.0.to_string(),
+    )
+    .record(age.as_seconds_f64().max(0.0));
+}
+
+pub fn set_workers_observed(namespace: NamespaceId, count: usize) {
+    gauge!(WORKERS_OBSERVED, "namespace" => namespace.0.to_string()).set(count as f64);
+}
+
+pub fn set_workers_total(count: usize) {
+    gauge!(WORKERS_TOTAL).set(count as f64);
 }
 
 #[cfg(test)]

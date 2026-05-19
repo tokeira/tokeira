@@ -26,9 +26,9 @@ use tokeira_storage::{
 };
 use tokeira_types::{
     ActivityTaskToken, BuildId, DeploymentId, ExecutionRef, ExecutionStatus, Headers,
-    IncarnationId, NamespaceId, Payload, Payloads, QueueKey, RequestContext, RetryPolicy, RunId,
-    RunKey, ShardEpoch, ShardId, TaskKind, TaskQueueName, TransitionSeq, WorkerIdentity,
-    WorkflowTaskToken,
+    HeartbeatStore, IncarnationId, NamespaceId, Payload, Payloads, QueueKey, RequestContext,
+    RetryPolicy, RunId, RunKey, ShardEpoch, ShardId, TaskKind, TaskQueueName, TransitionSeq,
+    WorkerIdentity, WorkflowTaskToken,
 };
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -44,6 +44,7 @@ use crate::{
     drain::RuntimeDrain,
     errors::NotShardOwner,
     fairness::{DeliveryMetrics, FairnessState, run_control_loop},
+    heartbeat::{InMemoryHeartbeatStore, spawn_heartbeat_maintenance},
     lane::{LaneConfig, LaneHandle, spawn_lane},
     membership::{ConnectionBudgetApplier, HeartbeatInputs, MembershipClient, MembershipConfig},
     metrics as runtime_metrics,
@@ -121,6 +122,8 @@ pub struct TokeiraRuntime<R> {
     buffered_queries: BufferedQueryRegistry,
     /// Observational registry of worker version metadata.
     worker_registry: WorkerRegistry,
+    /// Latest worker-heartbeat observations for operator visibility.
+    heartbeat_store: Arc<dyn HeartbeatStore>,
     /// Runtime-local delivery metrics for fairness/observability.
     delivery_metrics: DeliveryMetrics,
     /// Runtime-local backlog fairness state.
@@ -147,6 +150,10 @@ pub struct TokeiraRuntime<R> {
     control_loop_handle: Option<tokio::task::JoinHandle<()>>,
     /// Cancellation token for the fairness control loop.
     control_loop_cancel: CancellationToken,
+    /// Background worker-heartbeat maintenance task.
+    heartbeat_maintenance_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Cancellation token for worker-heartbeat maintenance.
+    heartbeat_maintenance_cancel: CancellationToken,
     /// Runtime-local shard ownership view.
     shard_owner: Arc<RwLock<ShardOwner>>,
     /// Shared runtime drain state used by membership and admission.
@@ -452,6 +459,7 @@ where
         let update_registry = UpdateRegistry::new();
         let buffered_queries = BufferedQueryRegistry::default();
         let worker_registry = WorkerRegistry::default();
+        let heartbeat_store: Arc<dyn HeartbeatStore> = Arc::new(InMemoryHeartbeatStore::new());
         let delivery_metrics = DeliveryMetrics::new();
         let fairness_state = FairnessState::new();
         let runtime_drain = Arc::new(RuntimeDrain::default());
@@ -558,6 +566,11 @@ where
             fairness_state.clone(),
             control_loop_cancel.clone(),
         )));
+        let heartbeat_maintenance_cancel = CancellationToken::new();
+        let heartbeat_maintenance_handle = Some(spawn_heartbeat_maintenance(
+            heartbeat_store.clone(),
+            heartbeat_maintenance_cancel.clone(),
+        ));
         let nexus_timeout_scanner_cancel = CancellationToken::new();
         let nexus_timeout_scanner_handle = Some(tokio::spawn(run_nexus_timeout_scanner(
             nexus_timeout_tracking.clone(),
@@ -587,6 +600,7 @@ where
             update_registry,
             buffered_queries,
             worker_registry,
+            heartbeat_store,
             delivery_metrics,
             fairness_state,
             nexus_timeout_scanner_handle,
@@ -599,6 +613,8 @@ where
             drain_loop_cancel,
             control_loop_handle,
             control_loop_cancel,
+            heartbeat_maintenance_handle,
+            heartbeat_maintenance_cancel,
             shard_owner,
             runtime_drain,
             owner_identity,
@@ -678,6 +694,10 @@ where
 
     pub fn worker_registry(&self) -> WorkerRegistry {
         self.worker_registry.clone()
+    }
+
+    pub fn heartbeat_store(&self) -> Arc<dyn HeartbeatStore> {
+        self.heartbeat_store.clone()
     }
 
     pub fn versioning_rule_store(&self) -> Arc<VersioningRuleStore> {
@@ -2009,6 +2029,17 @@ where
                 .await
                 .map_err(|_| anyhow!("control loop shutdown timed out"))?
                 .map_err(|error| anyhow!("control loop join failed: {error}"))?;
+        }
+        Ok(())
+    }
+
+    pub async fn shutdown_heartbeat_maintenance(&mut self) -> Result<()> {
+        self.heartbeat_maintenance_cancel.cancel();
+        if let Some(handle) = self.heartbeat_maintenance_handle.take() {
+            tokio::time::timeout(tokio::time::Duration::from_secs(5), handle)
+                .await
+                .map_err(|_| anyhow!("heartbeat maintenance shutdown timed out"))?
+                .map_err(|error| anyhow!("heartbeat maintenance join failed: {error}"))?;
         }
         Ok(())
     }

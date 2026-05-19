@@ -1001,7 +1001,7 @@ Every `Classification_WireThrough` row whose Kernel, Runtime, or Projection impa
 |---|---|---|---|---|---|
 | RPC | `WorkflowService.CountSchedules` | v1.55 | Wire through | Implemented against `ScheduleStore::count_schedules`; filter via `filter.rs` | — |
 | RPC | `WorkflowService.UpdateTaskQueueConfig` | v1.58 | Wire through | Implemented; setter on new `TaskQueueConfigStore`; read-back on `DescribeTaskQueue` | — |
-| RPC | `WorkflowService.RecordWorkerHeartbeat` | v1.48 | No-op | No-op handler; validates namespace; `debug!` per call; real obs deferred | `worker-heartbeat-observability` |
+| RPC | `WorkflowService.RecordWorkerHeartbeat` | v1.48 | Wire through | Observation-backed handler; validates namespace; decodes compact heartbeat model; inserts into `HeartbeatStore`; emits metrics | `worker-heartbeat-observability` |
 | RPC | `WorkflowService.DescribeWorker` | v1.55 | Deferred | Stub; inside Worker Deployments block | `worker-deployments` |
 | RPC | `WorkflowService.ListWorkers` | v1.55 | Deferred | Stub; inside Worker Deployments block | `worker-deployments` |
 | RPC | `WorkflowService.DescribeWorkerDeployment` | v1.55 | Deferred | Stub; inside Worker Deployments block | `worker-deployments` |
@@ -1269,7 +1269,7 @@ Columns per Req 5.1.1.
 |---|---|---|---|---|---|
 | `WorkflowService.CountSchedules` | New `CountSchedulesRequest` / `Response` DTOs | none | existing `ScheduleStore` gains `count_schedules` method (single-file edit) | none | In scope; see §4 handler and store extension |
 | `WorkflowService.UpdateTaskQueueConfig` | New `UpdateTaskQueueConfigRequest` / `Response` DTOs + `TaskQueueConfig` | none | new `TaskQueueConfigStore` trait + in-memory backing (single new file) | none | In scope; see §5 |
-| `WorkflowService.RecordWorkerHeartbeat` | `RecordWorkerHeartbeatRequest` uses upstream `WorkerHeartbeat` types | none | none | none | In scope (no-op handler); see §9 for validation, logging, and the Commit_214895e migration |
+| `WorkflowService.RecordWorkerHeartbeat` | `RecordWorkerHeartbeatRequest` uses upstream `WorkerHeartbeat` types | none | new in-memory `HeartbeatStore`; heartbeat acceptance, active-worker, count, and staleness metrics | none | Promoted by `worker-heartbeat-observability`; accept, decode compact heartbeat model, insert into `HeartbeatStore`, emit metrics |
 | `UpdateActivityOptionsRequest.activity_type` | DTO gains `activity_type: Option<ActivityType>` | none | existing activity-options handler reads field; branches on id-vs-type addressing (single-file edit) | none | In scope |
 | `PauseActivityRequest.identity` | DTO gains `identity: String` | none | existing pause-activity handler passes through to runtime pause (single-file edit) | none | In scope |
 | `UnpauseActivityRequest.reset_heartbeat` | DTO gains `reset_heartbeat: bool` | none | existing unpause handler applies to `ActivityRetryState` (single-file edit in `runtime/src/activity_pump.rs`) | none | In scope |

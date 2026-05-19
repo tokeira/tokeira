@@ -40,8 +40,8 @@ use tokeira_runtime::{
 };
 use tokeira_storage::RunRepository;
 use tokeira_types::{
-    ActivityTaskToken, ExecutionRef, ExecutionStatus, Payload, Payloads, QueueKey, RequestContext,
-    RequestId, RunId, RunKey, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId,
+    ActivityTaskToken, ExecutionRef, ExecutionStatus, HeartbeatStore, Payload, Payloads, QueueKey,
+    RequestContext, RequestId, RunId, RunKey, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId,
 };
 use uuid::Uuid;
 
@@ -347,6 +347,7 @@ pub struct WorkflowService {
     history_waiters: HistoryWaitRegistry,
     versioning_rule_store: Arc<VersioningRuleStore>,
     worker_registry: WorkerRegistry,
+    heartbeat_store: Arc<dyn HeartbeatStore>,
     schedule_store: Arc<ScheduleStore>,
     task_queue_config_store: Arc<dyn TaskQueueConfigStore>,
     batch_store: Arc<BatchOperationStore>,
@@ -440,6 +441,7 @@ impl WorkflowService {
             HistoryWaitRegistry::default(),
             Arc::new(VersioningRuleStore::default()),
             WorkerRegistry::default(),
+            Arc::new(tokeira_runtime::InMemoryHeartbeatStore::default()),
             Arc::new(ScheduleStore::default()),
             Arc::new(tokeira_runtime::InMemoryTaskQueueConfigStore::default()),
             Arc::new(BatchOperationStore::default()),
@@ -479,6 +481,7 @@ impl WorkflowService {
             HistoryWaitRegistry::default(),
             Arc::new(VersioningRuleStore::default()),
             WorkerRegistry::default(),
+            Arc::new(tokeira_runtime::InMemoryHeartbeatStore::default()),
             Arc::new(ScheduleStore::default()),
             Arc::new(tokeira_runtime::InMemoryTaskQueueConfigStore::default()),
             Arc::new(BatchOperationStore::default()),
@@ -518,6 +521,7 @@ impl WorkflowService {
             history_waiters,
             Arc::new(VersioningRuleStore::default()),
             WorkerRegistry::default(),
+            Arc::new(tokeira_runtime::InMemoryHeartbeatStore::default()),
             Arc::new(ScheduleStore::default()),
             Arc::new(tokeira_runtime::InMemoryTaskQueueConfigStore::default()),
             Arc::new(BatchOperationStore::default()),
@@ -542,6 +546,7 @@ impl WorkflowService {
         history_waiters: HistoryWaitRegistry,
         versioning_rule_store: Arc<VersioningRuleStore>,
         worker_registry: WorkerRegistry,
+        heartbeat_store: Arc<dyn HeartbeatStore>,
         schedule_store: Arc<ScheduleStore>,
         task_queue_config_store: Arc<dyn TaskQueueConfigStore>,
         batch_store: Arc<BatchOperationStore>,
@@ -564,6 +569,7 @@ impl WorkflowService {
             history_waiters,
             versioning_rule_store,
             worker_registry,
+            heartbeat_store,
             schedule_store,
             task_queue_config_store,
             batch_store,
@@ -585,6 +591,15 @@ impl WorkflowService {
 
     pub fn worker_registry(&self) -> WorkerRegistry {
         self.worker_registry.clone()
+    }
+
+    pub fn heartbeat_store(&self) -> Arc<dyn HeartbeatStore> {
+        self.heartbeat_store.clone()
+    }
+
+    pub fn with_heartbeat_store(mut self, heartbeat_store: Arc<dyn HeartbeatStore>) -> Self {
+        self.heartbeat_store = heartbeat_store;
+        self
     }
 
     pub fn schedule_store(&self) -> Arc<ScheduleStore> {
@@ -1489,6 +1504,7 @@ impl WorkflowService {
             history_waiters,
             Arc::new(VersioningRuleStore::default()),
             WorkerRegistry::default(),
+            Arc::new(tokeira_runtime::InMemoryHeartbeatStore::default()),
             Arc::new(ScheduleStore::default()),
             Arc::new(tokeira_runtime::InMemoryTaskQueueConfigStore::default()),
             Arc::new(BatchOperationStore::default()),

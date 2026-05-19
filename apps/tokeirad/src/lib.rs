@@ -565,6 +565,7 @@ where
             history_waits,
             versioning_rule_store,
             worker_registry,
+            runtime.heartbeat_store(),
             schedule_store,
             task_queue_config_store,
             Arc::new(tokeira_runtime::BatchOperationStore::default()),

@@ -11,12 +11,15 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-dynamodb = "1"
 time.workspace = true
 tokeira-autoscaler = { path = "../../crates/tokeira-autoscaler" }
 tokeira-config.workspace = true
-tokeira-storage = { path = "../../crates/tokeira-storage" }
+tokeira-storage = { path = "../../crates/tokeira-storage", features = ["dsql"] }
 tokio.workspace = true
-tokio-util.workspace = true
+tokio-util = "0.7"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid = { version = "1", features = ["v4"] }

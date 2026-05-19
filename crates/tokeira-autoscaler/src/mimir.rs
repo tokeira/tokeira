@@ -98,6 +98,27 @@ impl MimirClient {
         Ok(response.into_samples())
     }
 
+    /// Query Mimir for a single instant value, returning the numeric result.
+    ///
+    /// Returns `None` when the query succeeds but produces no samples (e.g.,
+    /// the metric doesn't exist yet). Callers use this for threshold-based
+    /// pressure classification where the raw value matters.
+    pub async fn query_instant_value(&self, query: &str) -> Result<Option<f64>> {
+        let response: PromQueryResponse = self
+            .client
+            .get(format!("{}/api/v1/query", self.endpoint))
+            .query(&[("query", query)])
+            .send()
+            .await
+            .context("failed to query Mimir instant endpoint")?
+            .error_for_status()
+            .context("Mimir instant query failed")?
+            .json()
+            .await
+            .context("failed to decode Mimir instant response")?;
+        Ok(response.into_samples().into_iter().next().map(|s| s.value))
+    }
+
     pub async fn is_available(&self) -> bool {
         self.client
             .get(format!("{}/-/ready", self.endpoint))

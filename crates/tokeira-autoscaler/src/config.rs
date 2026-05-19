@@ -47,6 +47,8 @@ pub struct AutoscalerServiceConfig {
     pub per_runtime_reserved_connections: u32,
     pub per_runtime_startup_connection_rate: u32,
     pub cluster_name: String,
+    pub dsql_endpoint: String,
+    pub dsql_region: String,
     pub service_configs: BTreeMap<String, ServiceScaleConfig>,
 }
 
@@ -73,6 +75,8 @@ impl Default for AutoscalerServiceConfig {
             per_runtime_reserved_connections: 64,
             per_runtime_startup_connection_rate: 10,
             cluster_name: "tokeira".into(),
+            dsql_endpoint: String::new(),
+            dsql_region: String::new(),
             service_configs: default_service_configs(),
         }
     }

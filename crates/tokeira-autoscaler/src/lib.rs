@@ -42,3 +42,4 @@ pub mod loop_b;
 pub mod loop_c;
 pub mod mimir;
 pub mod reconciler;
+pub mod signals;

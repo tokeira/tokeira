@@ -5831,11 +5831,18 @@ name = "tokeira-autoscaler-bin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-dynamodb",
+ "time",
  "tokeira-autoscaler",
  "tokeira-config",
+ "tokeira-storage",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

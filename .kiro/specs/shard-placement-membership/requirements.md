@@ -187,7 +187,7 @@ The authoritative architecture documents are [035-placement-and-membership](../.
 4. IF the caller's epoch is stale, THEN THE `relinquish_bundle` method SHALL return a rejection indicating the lease was already transferred.
 5. THE `relinquish_bundle` SHALL use epoch-checked CAS to ensure safe concurrent relinquish.
 6. THE `try_acquire_bundle` method SHALL treat a lease row with `owner IS NULL` as immediately acquirable regardless of `lease_expiry`. The DSQL acquire predicate SHALL include `owner IS NULL` alongside the existing `owner = $caller` and `lease_expiry <= now` conditions.
-7. THE InMemoryStore `try_acquire_bundle` SHALL treat entries with `None` owner as acquirable (advance epoch, set new owner).
+7. THE InMemoryStore `try_acquire_bundle` SHALL treat entries with `None` owner as acquirable (advance epoch, set new owner). Acquisition MAY still fail if the caller's epoch is stale or the bundle is in a transitional state unrelated to owner presence.
 
 ### Requirement 3.2a: Lease Endpoint Write Path
 
@@ -226,7 +226,7 @@ The authoritative architecture documents are [035-placement-and-membership](../.
 3. THE Routing_Snapshot SHALL contain a monotonically increasing Generation_Counter persisted in DSQL with CAS protection, so that any controller instance after restart starts from the last published generation.
 4. THE Routing_Snapshot SHALL contain a `node_endpoints: HashMap<Incarnation_Id, NodeEndpoint>` map so that edges can resolve node IDs to concrete network addresses. Node endpoints SHALL be sourced from the `node_endpoint` column on `shard_lease` rows in DSQL, not from membership streams. Membership streams carry pressure metrics only.
 5. THE Routing_Snapshot SHALL contain a `PlacementConfig` with `shard_count`, `bundle_count`, `partition_count`, and `hash_version` for deterministic hash/mapping versioning.
-6. WHEN bundle ownership changes (new acquisition, relinquish, or lease expiry), THE Placement_Controller SHALL recompute and publish an updated Routing_Snapshot.
+6. WHEN bundle ownership changes (new acquisition, relinquish, or lease expiry), OR WHEN routing-relevant configuration changes (placement config update, node endpoint change), THE Placement_Controller SHALL recompute and publish an updated Routing_Snapshot.
 7. THE bundle routing entries SHALL include the lease epoch so that edges can include `observed_bundle_epoch` in requests and runtimes can fast-fail on epoch mismatch before attempting a DSQL transaction.
 
 ### Requirement 4.2: Routing Snapshot Subscription

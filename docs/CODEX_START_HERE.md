@@ -4,7 +4,7 @@ This document is the intended entry point for machine-assisted
 contributions. It captures what has been built, what remains,
 and where to contribute safely.
 
-Last updated: 2026-05-07
+Last updated: 2026-05-18
 
 ## Codebase snapshot
 
@@ -175,9 +175,9 @@ Items marked **spec complete** already have `requirements.md` (and often `design
 
 ### P0 — `temporal-api-v1.62-sync`
 
-**Status:** spec in progress (requirements drafted).
+**Status:** ✅ complete.
 
-Resync the vendored Temporal API proto tree from `v1.43.0` to `v1.62.11` via `tools/proto-sync`. Classify every new RPC, field, message, and enum into one of `Ignore`, `No-op stub`, `Capability advertise`, `Wire through`, or `Full implementation (deferred)`. Delivers `CountSchedules`, `UpdateTaskQueueConfig`, the Nexus v2 wire surface, the `discard_speculative_workflow_task_with_events` client capability, and renames the `*ById` activity RPCs to their v1.62 unsuffixed names.
+Resynced the vendored Temporal API proto tree from `v1.43.0` to `v1.62.11` via `tools/proto-sync`. Classified every new RPC, field, message, and enum. Delivered `CountSchedules`, `UpdateTaskQueueConfig`, the Nexus v2 wire surface, the `discard_speculative_workflow_task_with_events` client capability, and renamed the `*ById` activity RPCs to their v1.62 unsuffixed names.
 
 Unblocks: every subsequent backlog item that touches a v1.62-era proto surface. Compose-DSQL becomes operationally useful once a v0.4 SDK worker can complete a workflow against `tokeirad`.
 
@@ -187,17 +187,15 @@ Unblocks: every subsequent backlog item that touches a v1.62-era proto surface. 
 
 Temporal-server compatibility scope — the behaviours tokeirad must match beyond wire-compat, and the **version metadata tokeirad surfaces** to different consumers. Sits immediately after `temporal-api-v1.62-sync` because the sync establishes the Temporal API version tokeirad speaks (v1.62.11) and the SDK generation it targets (v0.4), and this spec is the one that exposes those facts in a consumable form to operators, SDKs, and downstream tooling (`GetSystemInfo.server_version`, `tkr` CLI reporting, README / CONTRIBUTING statements, operator-facing metrics labels). Details otherwise tracked in the spec itself.
 
-Blocked on: `temporal-api-v1.62-sync` (the API version is the thing this spec surfaces).
+No longer blocked — `temporal-api-v1.62-sync` is complete.
 
 ### P2 — `edge-history-serializer-completeness`
 
-**Status:** to spec.
+**Status:** spec complete (bugfix requirements, design, tasks).
 
-Audit every `HistoryEvent.attributes` variant in `tokeira-edge::grpc::translate` where the translator currently falls back to `Default::default()` placeholders because the kernel event does not yet carry the full proto field set. For each placeholder, classify as: (a) kernel-available-but-unplumbed → wire through, (b) kernel-unavailable → surface kernel-side requirement and thread the field through kernel + runtime + edge, or (c) not-meaningful-in-tokeira's-model → document the rationale and mark the field as intentionally defaulted. Drive every placeholder to a decided resolution so SDKs that branch on history-event attributes see complete data.
+Audit every `HistoryEvent.attributes` variant in `tokeira-edge::grpc::translate` where the translator currently falls back to `Default::default()` placeholders. 42 defect clauses identified across 4 implementation classes: serializer-only (6 fields), kernel enrichment (~30 fields), runtime-context enrichment (`workflow_task_completed_event_id` on ~15 events), and deferred (assigned to `worker-deployments`, `temporal-compatibility`, `observability-production`). Pause/unpause encoding fixed from `WorkflowExecutionCanceled` to `MarkerRecorded`.
 
-Sits immediately after `temporal-compatibility` because it is the "tokeirad speaks completely on the wire" follow-on: compatibility surfaces server version, this surfaces history content.
-
-Blocked on: `temporal-api-v1.62-sync` (some v1.62-added event attributes need decoding before the audit is complete).
+No longer blocked on `temporal-api-v1.62-sync` (complete). Ready for implementation.
 
 ### P3 — `observability-production`
 
@@ -209,11 +207,9 @@ The name matches `observability-foundation`'s full-word style, and distinguishes
 
 ### P4 — `compose-dsql`
 
-**Status:** spec complete (requirements).
+**Status:** ✅ complete.
 
-Adds Aurora DSQL persistence to the compose platform (alongside the existing in-memory option). Covers: `DsqlModule` (managed + preexisting), `ComposeConfig.dsql` fields, endpoint writeback into `tokeirad.toml`, AWS credentials forwarded via the standard provider chain, `tkr schema setup|status|validate` wiring with build.rs-embedded migrations, two-phase infra apply lifecycle, tokeirad storage-backend selection via `infrastructure.storage`, visibility / projection wiring over `DsqlVisibilityStore`, rename of compose's `LocalStateModule` from `"remote-state"` to `"local-state"`.
-
-Blocked on: `temporal-api-v1.62-sync` for the DSQL server to actually accept SDK traffic.
+Added Aurora DSQL persistence to the compose platform. Covers: `DsqlModule` (managed + preexisting), `ComposeConfig.dsql` fields, endpoint writeback into `tokeirad.toml`, AWS credentials forwarded via the standard provider chain, `tkr schema setup|status` wiring, two-phase infra apply lifecycle, tokeirad storage-backend selection via `infrastructure.storage`, visibility/projection wiring over `DsqlVisibilityStore`. Bench validated at 156 wf/s sustained.
 
 ### P5 — `projection-batched-apply-and-failure-policies`
 
@@ -231,7 +227,7 @@ Self-contained — no external blockers beyond `compose-dsql` providing a worklo
 
 Absorb `RecordWorkerHeartbeat` from a no-op into durable observability: persist `WorkerHeartbeat` records with TTL, surface `ListWorkers` over the persisted data, expose derived metrics (polls/sec, slot occupancy, worker-fleet health), expire stale heartbeats on a sweep interval. Requires a storage migration (new `worker_heartbeat` table with `ttl_epoch` column for DSQL, in-memory mirror for local).
 
-Blocked on: `temporal-api-v1.62-sync` (delivers the real `WorkerHeartbeat` proto surface that this spec consumes).
+No longer blocked — `temporal-api-v1.62-sync` is complete. Proto surface available.
 
 ### P7 — `worker-config-management`
 
@@ -239,7 +235,7 @@ Blocked on: `temporal-api-v1.62-sync` (delivers the real `WorkerHeartbeat` proto
 
 Server-backed worker configuration: `FetchWorkerConfig` and `UpdateWorkerConfig`. Lets operators push configuration changes (poller counts, slot sizes, rate limits) to workers without redeploying. Requires a new worker-config store (DSQL table + in-memory backend), versioning for optimistic concurrency on updates, and client plumbing that matches what the v0.4 SDK expects on startup and reconfig.
 
-Blocked on: `temporal-api-v1.62-sync` (delivers the proto surface).
+No longer blocked — `temporal-api-v1.62-sync` is complete. Proto surface available.
 
 ### P8 — `ecs-deployment`
 
@@ -265,7 +261,7 @@ Self-contained — local to `tokeira-runtime/`, no storage or kernel changes.
 
 First-class workflow-execution pause: `PauseWorkflowExecution` and `UnpauseWorkflowExecution`. Distinct from the v1.43-era activity-level pause-by-id surface. Requires a new kernel transition variant for paused state, timer scanner changes to skip paused workflows, dispatch-path routing to withhold tasks for paused executions, projection changes to surface paused state in visibility. Parallel to the existing `kernel-pause-activity-management` spec.
 
-Blocked on: `temporal-api-v1.62-sync` (delivers the proto surface).
+No longer blocked — `temporal-api-v1.62-sync` is complete. Proto surface available.
 
 ### P11 — `activity-executions-first-class`
 
@@ -273,7 +269,7 @@ Blocked on: `temporal-api-v1.62-sync` (delivers the proto surface).
 
 Activities as first-class queryable objects, per the v1.52+ Temporal shift. Delivers: `StartActivityExecution`, `DescribeActivityExecution`, `PollActivityExecution`, `ListActivityExecutions`, `CountActivityExecutions`, `RequestCancelActivityExecution`, `TerminateActivityExecution`, `DeleteActivityExecution`. Requires storage for standalone activities, projection/visibility extensions for activity records, runtime routing for activities outside a workflow context, kernel changes to handle activity executions as their own streams.
 
-Blocked on: `temporal-api-v1.62-sync` (delivers the proto surface).
+No longer blocked — `temporal-api-v1.62-sync` is complete. Proto surface available.
 
 ### P12 — `kernel-snapshot-suffix-recovery`
 

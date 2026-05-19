@@ -432,6 +432,23 @@ Key changes from the previous plan:
   - Run `cargo test --workspace` and verify all new and existing tests pass.
   - Run `cargo lint` and `cargo +nightly fmt --all --check` to verify code quality.
 
+- [ ] 11. Phase 6 — Controller Binary Entry Point
+  - [ ] 11.1 Create `apps/tokeira-controller/Cargo.toml`
+    - Dependencies: `tokeira-controller`, `tokeira-config`, `tokeira-storage` (dsql feature), `aws-config`, `aws-sdk-dynamodb`, `anyhow`, `tokio`, `tokio-util`, `tonic`, `tracing`, `tracing-subscriber`, `uuid`
+    - Add to workspace `Cargo.toml` members
+  - [ ] 11.2 Create `apps/tokeira-controller/src/main.rs`
+    - Load controller config (DSQL endpoint, region, gRPC listen address, placement parameters)
+    - Construct DSQL connection for lease repository and control repository
+    - Start the gRPC membership server (accepting runtime node streams)
+    - Run the placement loop: periodic lease scan → compute assignments → publish routing snapshots
+    - Run the budget allocation loop: periodic headroom assessment → allocate connection budgets
+    - Graceful shutdown via cancellation token on SIGTERM/ctrl-c
+    - _Requirements: 5.1, 5.2, 5.3, 12.1, 12.2, 12.3, 12.4, 12.5, 12.6_
+  - [ ] 11.3 Add controller config to `tokeira-config` or define a standalone `ControllerConfig`
+    - Fields: `dsql_endpoint`, `dsql_region`, `grpc_listen_addr`, `placement_interval`, `budget_interval`, `cluster_name`
+    - Use `serde(deny_unknown_fields)` with sensible defaults
+    - _Requirements: 5.1_
+
 ## Notes
 
 - Tasks marked with `*` are test tasks — ALL tests are REQUIRED per project convention

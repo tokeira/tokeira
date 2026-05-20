@@ -25,6 +25,7 @@ members = [
     "apps/tkr",
     "apps/tokeirad",
     "apps/tokeira-autoscaler",
+    "apps/tokeira-controller",
     "apps/tokeira-bench",
     "crates/dagger-client",
     "crates/tokeira-build",

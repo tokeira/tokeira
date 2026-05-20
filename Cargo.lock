@@ -6008,6 +6008,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokeira-controller-bin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aws-config",
+ "aws-sdk-dynamodb",
+ "clap",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "serde",
+ "time",
+ "tokeira-config",
+ "tokeira-controller",
+ "tokeira-proto",
+ "tokeira-storage",
+ "tokeira-types",
+ "tokio",
+ "tokio-util",
+ "toml 0.8.23",
+ "tonic 0.11.0",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "tokeira-deploy-engine"
 version = "0.1.0"
 dependencies = [

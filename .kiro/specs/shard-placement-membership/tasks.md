@@ -432,12 +432,12 @@ Key changes from the previous plan:
   - Run `cargo test --workspace` and verify all new and existing tests pass.
   - Run `cargo lint` and `cargo +nightly fmt --all --check` to verify code quality.
 
-- [ ] 11. Phase 6 — Controller Binary Entry Point
-  - [ ] 11.1 Create `apps/tokeira-controller/Cargo.toml`
+- [x] 11. Phase 6 — Controller Binary Entry Point
+  - [x] 11.1 Create `apps/tokeira-controller/Cargo.toml`
     - Dependencies: `tokeira-controller`, `tokeira-config`, `tokeira-storage` (dsql feature), `tokeira-types`, `aws-config`, `aws-sdk-dynamodb`, `anyhow`, `tokio`, `tokio-util`, `tonic`, `tracing`, `tracing-subscriber`, `uuid`, `serde`, `toml`, `clap`, `metrics`, `metrics-exporter-prometheus`
     - Add to workspace `Cargo.toml` members
     - _Requirements: 10.1.1_
-  - [ ] 11.2 Create `apps/tokeira-controller/src/main.rs`
+  - [x] 11.2 Create `apps/tokeira-controller/src/main.rs`
     - Parse CLI args (`--config` path, defaults to `controller.toml`)
     - Load and validate `ControllerProcessConfig` from TOML (fail fast if `dsql_endpoint` is empty)
     - Install structured tracing with `RUST_LOG` env filter
@@ -449,14 +449,14 @@ Key changes from the previous plan:
     - Spawn budget allocation loop: periodic CAS allocation → compute per-node shares → send `ConnectionBudgetDirective` over membership streams
     - Await SIGTERM/ctrl-c → cancel loops → drain streams → exit
     - _Requirements: 10.1.1, 10.1.2, 10.1.3, 10.1.4, 10.1.5, 10.1.6, 10.1.7, 10.1.8, 10.1.9_
-  - [ ] 11.3 Define `ControllerProcessConfig` in the binary crate
+  - [x] 11.3 Define `ControllerProcessConfig` in the binary crate
     - Top-level fields: `dsql_endpoint`, `dsql_region`, `grpc_listen_addr`, `metrics_addr`, `placement_interval_secs`, `budget_interval_secs`, `cluster_name`, `dsql_connection_rate_budget`, `dsql_connection_capacity_budget`
     - Nested `[placement]` table: `bundle_count`, `partition_count`, `shard_count`, `hash_version`
     - Nested `[membership]` table: `heartbeat_interval_secs`, `grace_interval_secs`, `snapshot_publish_interval_secs`, `budget_directive_validity_secs`
     - Use `serde(deny_unknown_fields)` with sensible defaults on all optional fields
     - Implement `validate()` method that checks `dsql_endpoint` is non-empty and `cluster_name` is non-empty
     - _Requirements: 10.2.1, 10.2.2, 10.2.3_
-  - [ ]* 11.4 Write unit tests for controller binary config
+  - [x]* 11.4 Write unit tests for controller binary config
     - Test config loads from valid TOML with all defaults
     - Test config rejects unknown fields
     - Test config validation fails on empty `dsql_endpoint`

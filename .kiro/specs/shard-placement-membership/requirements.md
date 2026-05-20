@@ -479,3 +479,44 @@ The authoritative architecture documents are [035-placement-and-membership](../.
 
 1. THE Placement_Controller SHALL aggregate `available_connections` and `connection_rate_headroom` from runtime heartbeats.
 2. THE Placement_Controller SHALL expose aggregate connection headroom via the `NominateScaleInCandidates` response or a dedicated query, so the autoscaler can compute the connection-aware scaling envelope.
+
+---
+
+## Feature 10: Controller Binary Entry Point
+
+### Requirement 10.1: Controller Process Lifecycle
+
+**User Story:** As a Tokeira operator, I want a standalone `tokeira-controller` binary that loads configuration, connects to DSQL, starts the gRPC membership server, and runs the placement and budget allocation loops, so that I can deploy the controller as an independent ECS service.
+
+#### Acceptance Criteria
+
+1. THE `apps/tokeira-controller/` binary SHALL load a `ControllerConfig` from a TOML file (default path: `controller.toml`, overridable via `--config`).
+2. THE binary SHALL validate the config at startup and fail with a clear error message if `dsql_endpoint` is empty (the controller requires DSQL — there is no in-memory fallback for multi-node coordination).
+3. THE binary SHALL construct a DSQL connection from the config to obtain `LeaseRepository` and `ControlRepository` implementations.
+4. THE binary SHALL start a gRPC server on `grpc_listen_addr` serving the `PlacementController` service (bidirectional streaming for runtime membership, server-streaming for routing subscriptions, unary RPCs for refresh/nominate/drain).
+5. THE binary SHALL run the placement loop on `placement_interval`: scan DSQL lease state → compute routing snapshot → advance generation via CAS → publish to subscribed edges and runtimes.
+6. THE binary SHALL run the budget allocation loop on `budget_interval`: aggregate heartbeat data from live membership → compute per-node connection budgets → send `ConnectionBudgetDirective` over membership streams.
+7. THE binary SHALL shut down gracefully on SIGTERM or ctrl-c: stop accepting new streams, drain active streams, allow in-flight RPCs to complete.
+8. THE binary SHALL install structured tracing (JSON or text format, configurable via `RUST_LOG` env filter).
+9. THE binary SHALL expose a Prometheus metrics endpoint on a configurable port (default `0.0.0.0:9090`) for scraping by the Alloy sidecar.
+
+### Requirement 10.2: Controller Configuration
+
+**User Story:** As a Tokeira operator, I want the controller configuration to be a single TOML file with sensible defaults, so that minimal configuration is needed for a standard deployment.
+
+#### Acceptance Criteria
+
+1. THE `ControllerConfig` SHALL include: `dsql_endpoint` (required), `dsql_region` (default: `us-east-1`), `grpc_listen_addr` (default: `0.0.0.0:7240`), `metrics_addr` (default: `0.0.0.0:9090`), `placement_interval_secs` (default: 5), `budget_interval_secs` (default: 10), `cluster_name` (required), `dsql_connection_rate_budget` (default: 100), `dsql_connection_capacity_budget` (default: 10000).
+2. THE config SHALL use `serde(deny_unknown_fields)` to reject typos at parse time.
+3. THE config SHALL be loadable from a file path specified via `--config` CLI argument, defaulting to `controller.toml` in the working directory.
+
+### Requirement 10.3: Controller Deployment Model
+
+**User Story:** As a Tokeira operator, I want the controller to run as a small REPLICA ECS service with 1-3 instances, so that it is highly available without consuming significant resources.
+
+#### Acceptance Criteria
+
+1. THE controller binary SHALL be deployable as an ECS REPLICA service with multiple instances running active-active.
+2. ALL controller instances SHALL independently serve routing snapshots and membership streams — no instance is special.
+3. THE controller SHALL NOT hold any DSQL lease for its own operation (unlike the autoscaler which uses a shard lease for leader election). The only DSQL mutations are CAS on `routing_generation` and `budget_allocation` singleton rows.
+4. THE controller SHALL expose a health check endpoint (gRPC health or HTTP `/health`) for ECS service health monitoring.

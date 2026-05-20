@@ -1124,6 +1124,333 @@ The previous design had a correctness bug: Start routed by queue partition (prod
 3. **Routing snapshot generation monotonicity with CAS** — verify no regression across multiple active controllers.
 4. **Two-phase drain** — verify no window where routing advertises unconfirmed ownership.
 
+---
+
+## Controller Binary Entry Point (`apps/tokeira-controller/`)
+
+### Purpose
+
+The controller binary is a thin process wrapper around the `crates/tokeira-controller/` library. It owns process lifecycle (config loading, signal handling, metrics endpoint) but delegates all placement logic to the library crate. The binary is the deployable unit — the library crate is the testable unit.
+
+### Startup Sequence
+
+```text
+1. Parse CLI args (--config path, defaults to controller.toml)
+2. Load ControllerConfig from TOML file
+3. Install tracing (structured logging, RUST_LOG env filter)
+4. Validate config (dsql_endpoint must be non-empty — fail fast with clear error)
+5. Construct DSQL connection:
+   a. Build DsqlAuthConfig from dsql_endpoint + dsql_region
+   b. Create SQLx pool with IAM token refresh
+   c. Wrap as DsqlStore implementing LeaseRepository + ControlRepository
+6. Start Prometheus metrics endpoint (metrics_addr, default 0.0.0.0:9090)
+7. Construct library components:
+   a. GenerationManager(Arc<dyn ControlRepository>)
+   b. LiveMembership(grace_interval from config)
+   c. PlacementEngine(placement_config from config)
+   d. BudgetAllocator(rate_budget, capacity_budget from config)
+8. Start gRPC server (grpc_listen_addr, default 0.0.0.0:7240):
+   a. PlacementController service (RuntimeMembership, SubscribeRouting, RefreshBundle, NominateScaleInCandidates, MarkNodeDraining)
+   b. gRPC health service for ECS health checks
+9. Spawn placement loop (tokio::spawn):
+   a. Every placement_interval_secs: list_bundle_leases → compute_routing_snapshot → advance_generation (CAS) → publish to subscribers
+   b. On CAS conflict: re-read generation, retry
+10. Spawn budget allocation loop (tokio::spawn):
+    a. Every budget_interval_secs: read live membership → compute_connection_budget → allocate_budget (CAS) → send ConnectionBudgetDirective to each runtime stream
+    b. On CAS conflict: re-read version, retry
+11. Await shutdown signal (SIGTERM / ctrl-c via tokio::signal)
+12. Graceful drain:
+    a. Cancel placement and budget loops
+    b. Stop accepting new gRPC connections
+    c. Allow in-flight RPCs to complete (with timeout)
+    d. Close all membership streams
+    e. Exit
+```
+
+### Configuration Model
+
+```rust
+/// Controller process configuration.
+/// Lives in apps/tokeira-controller/ (not in the library crate).
+/// The library crate's ControllerConfig covers placement parameters;
+/// this struct adds process-level concerns (DSQL connection, listen addresses).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControllerProcessConfig {
+    /// DSQL cluster endpoint for lease and control table access.
+    /// Required — controller cannot operate without DSQL.
+    pub dsql_endpoint: String,
+    /// AWS region for DSQL IAM auth.
+    #[serde(default = "default_region")]
+    pub dsql_region: String,  // "us-east-1"
+    /// gRPC listen address for the PlacementController service.
+    #[serde(default = "default_grpc_addr")]
+    pub grpc_listen_addr: String,  // "0.0.0.0:7240"
+    /// Prometheus metrics listen address.
+    #[serde(default = "default_metrics_addr")]
+    pub metrics_addr: String,  // "0.0.0.0:9090"
+    /// How often the placement loop scans lease state and publishes snapshots.
+    #[serde(default = "default_placement_interval")]
+    pub placement_interval_secs: u64,  // 5
+    /// How often the budget allocation loop runs.
+    #[serde(default = "default_budget_interval")]
+    pub budget_interval_secs: u64,  // 10
+    /// Cluster name for metrics labels.
+    pub cluster_name: String,
+    /// Cluster-wide DSQL connection rate budget (connections/sec).
+    /// Matches DSQL's sustained rate limit.
+    #[serde(default = "default_rate_budget")]
+    pub dsql_connection_rate_budget: u32,  // 100
+    /// Cluster-wide DSQL connection capacity budget.
+    /// Matches DSQL's default connection limit.
+    #[serde(default = "default_capacity_budget")]
+    pub dsql_connection_capacity_budget: u32,  // 10_000
+    /// Placement parameters (bundle_count, partition_count, shard_count, hash_version).
+    /// Embedded from the library crate's PlacementConfig.
+    #[serde(default)]
+    pub placement: PlacementConfigToml,
+    /// Membership parameters (heartbeat_interval, grace_interval).
+    #[serde(default)]
+    pub membership: MembershipConfigToml,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlacementConfigToml {
+    #[serde(default = "default_bundle_count")]
+    pub bundle_count: u32,  // 64
+    #[serde(default = "default_partition_count")]
+    pub partition_count: u32,  // 1024
+    #[serde(default = "default_shard_count")]
+    pub shard_count: u32,  // 64
+    #[serde(default = "default_hash_version")]
+    pub hash_version: u32,  // 1
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MembershipConfigToml {
+    /// Expected heartbeat interval from runtimes (seconds).
+    #[serde(default = "default_heartbeat_interval")]
+    pub heartbeat_interval_secs: u64,  // 5
+    /// Grace period before marking a disconnected node unavailable (seconds).
+    #[serde(default = "default_grace_interval")]
+    pub grace_interval_secs: u64,  // 30
+    /// Minimum interval between snapshot publications (seconds).
+    #[serde(default = "default_snapshot_publish_interval")]
+    pub snapshot_publish_interval_secs: u64,  // 5
+    /// How long a connection budget directive is valid (seconds).
+    #[serde(default = "default_budget_validity")]
+    pub budget_directive_validity_secs: u64,  // 60
+}
+```
+
+### Example `controller.toml`
+
+```toml
+dsql_endpoint = "your-cluster.dsql.us-east-1.on.aws"
+dsql_region = "us-east-1"
+cluster_name = "tokeira-prod"
+
+# Optional overrides (all have sensible defaults)
+# grpc_listen_addr = "0.0.0.0:7240"
+# metrics_addr = "0.0.0.0:9090"
+# placement_interval_secs = 5
+# budget_interval_secs = 10
+# dsql_connection_rate_budget = 100
+# dsql_connection_capacity_budget = 10000
+
+# [placement]
+# bundle_count = 64
+# partition_count = 1024
+# shard_count = 64
+# hash_version = 1
+
+# [membership]
+# heartbeat_interval_secs = 5
+# grace_interval_secs = 30
+# snapshot_publish_interval_secs = 5
+# budget_directive_validity_secs = 60
+```
+
+### Relationship to Library Crate
+
+The binary imports from `tokeira-controller`:
+- `PlacementControllerService` — the tonic gRPC service implementation
+- `LiveMembership` — tracks connected runtime nodes
+- `PlacementEngine` / `compute_routing_snapshot` — computes routing snapshots from lease state
+- `BudgetAllocator` / `compute_connection_budget` — divides connection budget across nodes
+- `GenerationManager` — CAS-based generation counter for snapshot versioning
+- `DrainCoordinator` — two-phase drain coordination
+- `ControllerConfig` — library-level configuration (placement parameters, intervals)
+
+The binary does NOT contain placement logic — it only:
+1. Parses CLI args and loads TOML config
+2. Constructs the DSQL connection (process-level concern)
+3. Wires library components together
+4. Owns the tokio runtime and signal handling
+5. Exposes the metrics endpoint
+
+### Placement Loop Detail
+
+```rust
+async fn run_placement_loop(
+    lease_repo: Arc<dyn LeaseRepository>,
+    generation_mgr: Arc<GenerationManager>,
+    placement_engine: Arc<PlacementEngine>,
+    membership: Arc<RwLock<LiveMembership>>,
+    subscribers: Arc<RoutingSubscribers>,
+    interval: Duration,
+    cancel: CancellationToken,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    let mut previous_generation = generation_mgr.current_generation().await
+        .unwrap_or(GenerationCounter::ZERO);
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = ticker.tick() => {
+                // 1. Read current lease state from DSQL
+                let leases = match lease_repo.list_bundle_leases().await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to read lease state, skipping cycle");
+                        continue;
+                    }
+                };
+
+                // 2. Compute routing snapshot and delta
+                let membership_guard = membership.read().await;
+                let placement_config = placement_engine.placement_config();
+                let (snapshot, delta) = compute_routing_snapshot(
+                    &membership_guard,
+                    &leases,
+                    &placement_config,
+                    previous_generation,
+                );
+                drop(membership_guard);
+
+                // 3. Advance generation via CAS
+                match generation_mgr.advance_generation(previous_generation).await {
+                    Ok(GenerationAdvanceResult::Advanced(gen)) => {
+                        previous_generation = gen;
+                        // 4. Publish to subscribers
+                        subscribers.publish(delta).await;
+                    }
+                    Ok(GenerationAdvanceResult::Conflict(current)) => {
+                        // Another controller advanced — re-read and retry next cycle
+                        previous_generation = current;
+                        tracing::debug!(generation = current.0, "CAS conflict, will retry");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "generation advance failed");
+                    }
+                }
+
+                // 5. Compute and send desired placement directives
+                let membership_guard = membership.read().await;
+                let directives = compute_desired_placement(
+                    &membership_guard,
+                    &leases,
+                    placement_config.bundle_count,
+                );
+                for directive in directives {
+                    membership_guard.send_directive(directive).await;
+                }
+            }
+        }
+    }
+}
+```
+
+### Budget Allocation Loop Detail
+
+```rust
+async fn run_budget_loop(
+    control_repo: Arc<dyn ControlRepository>,
+    membership: Arc<RwLock<LiveMembership>>,
+    rate_budget: f64,
+    capacity_budget: u64,
+    validity: Duration,
+    interval: Duration,
+    cancel: CancellationToken,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    let allocator_id = Uuid::new_v4(); // unique per controller instance
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = ticker.tick() => {
+                // 1. Get current budget version for CAS
+                let version = match control_repo.current_budget_version().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to read budget version");
+                        continue;
+                    }
+                };
+
+                // 2. Attempt CAS allocation
+                match control_repo.allocate_budget(version, allocator_id, rate_budget, capacity_budget).await {
+                    Ok(BudgetAllocationResult::Allocated { .. }) => {
+                        // 3. Compute per-node shares
+                        let membership_guard = membership.read().await;
+                        let active: Vec<_> = membership_guard.active_node_ids_sorted();
+                        let budgets = compute_connection_budget(
+                            rate_budget,
+                            capacity_budget,
+                            &active,
+                            validity,
+                        );
+
+                        // 4. Send directives to each runtime
+                        for (node_id, directive) in budgets {
+                            membership_guard.send_budget_directive(node_id, directive).await;
+                        }
+                    }
+                    Ok(BudgetAllocationResult::Conflict { current_version }) => {
+                        tracing::debug!(version = current_version, "budget CAS conflict, will retry");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "budget allocation failed");
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+### Deployment
+
+- Runs as an ECS REPLICA service (1-3 instances, `cp-control` capacity provider)
+- Active-active: all instances run independently, CAS on generation counter prevents conflicting snapshots
+- No leader election needed (unlike the autoscaler which uses a shard lease)
+- Health check: gRPC health service (`grpc.health.v1.Health`) for ECS health monitoring
+- Resource requirements: minimal (no workflow execution, no history storage) — 0.5 vCPU, 1 GiB RAM per instance
+- The controller's own DSQL connection pool is small (5-10 connections) since it only reads lease rows and performs CAS updates on singleton rows
+
+### Metrics Exposed
+
+The controller binary exposes the following Prometheus metrics on the metrics endpoint:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `tokeira_controller_placement_cycles_total` | Counter | `result={success,cas_conflict,error}` | Placement loop iterations |
+| `tokeira_controller_placement_duration_seconds` | Histogram | — | Time per placement cycle |
+| `tokeira_controller_budget_cycles_total` | Counter | `result={success,cas_conflict,error}` | Budget allocation iterations |
+| `tokeira_controller_active_nodes` | Gauge | — | Number of active runtime nodes in membership |
+| `tokeira_controller_draining_nodes` | Gauge | — | Number of nodes in drain state |
+| `tokeira_controller_owned_bundles` | Gauge | — | Total bundles with active owners |
+| `tokeira_controller_unowned_bundles` | Gauge | — | Bundles without an owner |
+| `tokeira_controller_routing_generation` | Gauge | — | Current routing snapshot generation |
+| `tokeira_controller_routing_subscribers` | Gauge | — | Active routing subscription count |
+| `tokeira_controller_membership_streams` | Gauge | — | Active membership stream count |
+
+---
+
 ## Correctness Properties
 
 ### Property 1: Deterministic queue partition mapping

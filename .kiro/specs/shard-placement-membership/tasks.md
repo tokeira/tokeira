@@ -434,20 +434,35 @@ Key changes from the previous plan:
 
 - [ ] 11. Phase 6 — Controller Binary Entry Point
   - [ ] 11.1 Create `apps/tokeira-controller/Cargo.toml`
-    - Dependencies: `tokeira-controller`, `tokeira-config`, `tokeira-storage` (dsql feature), `aws-config`, `aws-sdk-dynamodb`, `anyhow`, `tokio`, `tokio-util`, `tonic`, `tracing`, `tracing-subscriber`, `uuid`
+    - Dependencies: `tokeira-controller`, `tokeira-config`, `tokeira-storage` (dsql feature), `tokeira-types`, `aws-config`, `aws-sdk-dynamodb`, `anyhow`, `tokio`, `tokio-util`, `tonic`, `tracing`, `tracing-subscriber`, `uuid`, `serde`, `toml`, `clap`, `metrics`, `metrics-exporter-prometheus`
     - Add to workspace `Cargo.toml` members
+    - _Requirements: 10.1.1_
   - [ ] 11.2 Create `apps/tokeira-controller/src/main.rs`
-    - Load controller config (DSQL endpoint, region, gRPC listen address, placement parameters)
-    - Construct DSQL connection for lease repository and control repository
-    - Start the gRPC membership server (accepting runtime node streams)
-    - Run the placement loop: periodic lease scan → compute assignments → publish routing snapshots
-    - Run the budget allocation loop: periodic headroom assessment → allocate connection budgets
-    - Graceful shutdown via cancellation token on SIGTERM/ctrl-c
-    - _Requirements: 5.1, 5.2, 5.3, 12.1, 12.2, 12.3, 12.4, 12.5, 12.6_
-  - [ ] 11.3 Add controller config to `tokeira-config` or define a standalone `ControllerConfig`
-    - Fields: `dsql_endpoint`, `dsql_region`, `grpc_listen_addr`, `placement_interval`, `budget_interval`, `cluster_name`
-    - Use `serde(deny_unknown_fields)` with sensible defaults
-    - _Requirements: 5.1_
+    - Parse CLI args (`--config` path, defaults to `controller.toml`)
+    - Load and validate `ControllerProcessConfig` from TOML (fail fast if `dsql_endpoint` is empty)
+    - Install structured tracing with `RUST_LOG` env filter
+    - Construct DSQL connection (DsqlAuthConfig → pool → DsqlStore implementing LeaseRepository + ControlRepository)
+    - Start Prometheus metrics endpoint on `metrics_addr`
+    - Construct library components: `GenerationManager`, `LiveMembership`, `PlacementEngine`, `BudgetAllocator`
+    - Start gRPC server on `grpc_listen_addr` with `PlacementControllerService` and gRPC health service
+    - Spawn placement loop: periodic lease scan → compute routing snapshot → CAS generation advance → publish to subscribers → send desired placement directives
+    - Spawn budget allocation loop: periodic CAS allocation → compute per-node shares → send `ConnectionBudgetDirective` over membership streams
+    - Await SIGTERM/ctrl-c → cancel loops → drain streams → exit
+    - _Requirements: 10.1.1, 10.1.2, 10.1.3, 10.1.4, 10.1.5, 10.1.6, 10.1.7, 10.1.8, 10.1.9_
+  - [ ] 11.3 Define `ControllerProcessConfig` in the binary crate
+    - Top-level fields: `dsql_endpoint`, `dsql_region`, `grpc_listen_addr`, `metrics_addr`, `placement_interval_secs`, `budget_interval_secs`, `cluster_name`, `dsql_connection_rate_budget`, `dsql_connection_capacity_budget`
+    - Nested `[placement]` table: `bundle_count`, `partition_count`, `shard_count`, `hash_version`
+    - Nested `[membership]` table: `heartbeat_interval_secs`, `grace_interval_secs`, `snapshot_publish_interval_secs`, `budget_directive_validity_secs`
+    - Use `serde(deny_unknown_fields)` with sensible defaults on all optional fields
+    - Implement `validate()` method that checks `dsql_endpoint` is non-empty and `cluster_name` is non-empty
+    - _Requirements: 10.2.1, 10.2.2, 10.2.3_
+  - [ ]* 11.4 Write unit tests for controller binary config
+    - Test config loads from valid TOML with all defaults
+    - Test config rejects unknown fields
+    - Test config validation fails on empty `dsql_endpoint`
+    - Test config validation fails on empty `cluster_name`
+    - Test `--config` CLI arg is parsed correctly
+    - _Requirements: 10.2.1, 10.2.2, 10.2.3_
 
 ## Notes
 

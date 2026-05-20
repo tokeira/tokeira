@@ -6033,6 +6033,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "buffa",
+ "connectrpc",
  "proptest",
  "reqwest",
  "serde",

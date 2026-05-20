@@ -34,6 +34,7 @@
 
 pub mod actuator;
 pub mod config;
+pub mod controller_client;
 pub mod envelope;
 pub mod freshness;
 pub mod leader;

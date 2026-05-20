@@ -1,4 +1,8 @@
 //! Runtime membership client primitives for placement-controller streams.
+//!
+//! Uses connect-rust for the bidi streaming membership RPC. The controller
+//! sends directives (placement, budget, drain) and the runtime sends
+//! registration + periodic heartbeats.
 
 use std::{
     sync::{Arc, Mutex, RwLock},
@@ -8,11 +12,10 @@ use std::{
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
-use tokeira_proto::controller::{
-    self as proto, ConnectionBudgetDirective, LanePressure, RuntimeHeartbeat,
-    RuntimeMembershipRequest, RuntimeRegistration, controller_directive::Directive,
-    placement_controller_client::PlacementControllerClient,
-    runtime_membership_request::Request as MembershipRequest,
+use tokeira_proto::connect::tokeira::internal::controller::v1::{
+    self as pb, PlacementControllerClient, RuntimeMembershipRequest,
+    RuntimeRegistration, RuntimeHeartbeat, LanePressure,
+    controller_directive, runtime_membership_request,
 };
 use tokeira_storage::{LeaseOutcome, LeaseRepository};
 use tokeira_types::{IncarnationId, NodeEndpoint, ShardEpoch, ShardId};
@@ -50,7 +53,13 @@ where
     shard_owner: Arc<RwLock<ShardOwner>>,
     drain: Arc<RuntimeDrain>,
     budget_applier: Arc<dyn ConnectionBudgetApplier>,
-    last_budget_valid_until: Arc<Mutex<Option<prost_types::Timestamp>>>,
+    last_budget_valid_until: Arc<Mutex<Option<BudgetExpiry>>>,
+}
+
+/// Tracks when the last connection budget directive expires.
+#[derive(Clone, Debug)]
+struct BudgetExpiry {
+    seconds: i64,
 }
 
 impl<R> Clone for MembershipClient<R>
@@ -125,44 +134,53 @@ where
     }
 
     async fn run_once(&self, shutdown: CancellationToken) -> Result<()> {
-        let mut client =
-            PlacementControllerClient::connect(self.config.controller_endpoint.clone()).await?;
-        let (tx, rx) = tokio::sync::mpsc::channel(8);
-        tx.send(RuntimeMembershipRequest {
-            request: Some(MembershipRequest::Registration(self.registration_message())),
+        let http = connectrpc::client::HttpClient::plaintext();
+        let config = connectrpc::client::ClientConfig::new(
+            self.config
+                .controller_endpoint
+                .parse()
+                .map_err(|e| anyhow!("invalid controller endpoint: {e}"))?,
+        );
+        let client = PlacementControllerClient::new(http, config);
+
+        let mut bidi = client
+            .runtime_membership()
+            .await
+            .map_err(|e| anyhow!("runtime_membership stream failed: {e}"))?;
+
+        // Send registration as the first message.
+        bidi.send(RuntimeMembershipRequest {
+            request: Some(runtime_membership_request::Request::Registration(
+                self.registration_message().into(),
+            )),
+            ..Default::default()
         })
         .await
-        .map_err(|_| anyhow!("membership request stream closed"))?;
-        let response = client
-            .runtime_membership(tokio_stream::wrappers::ReceiverStream::new(rx))
-            .await?;
-        let mut directives = response.into_inner();
-        let heartbeat_tx = tx.clone();
-        let heartbeat_client = self.clone();
-        let heartbeat_shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(heartbeat_client.config.heartbeat_interval);
-            loop {
-                tokio::select! {
-                    _ = heartbeat_shutdown.cancelled() => break,
-                    _ = interval.tick() => {
-                        if heartbeat_tx.send(RuntimeMembershipRequest {
-                            request: Some(MembershipRequest::Heartbeat(heartbeat_client.heartbeat_message())),
-                        }).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
+        .map_err(|e| anyhow!("failed to send registration: {e}"))?;
+
+        // Heartbeat ticker — we send heartbeats inline in the select loop
+        // because BidiStream is a single handle (no split/clone).
+        let mut heartbeat_interval = tokio::time::interval(self.config.heartbeat_interval);
+        heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => return Ok(()),
-                directive = directives.message() => {
-                    let Some(directive) = directive? else {
+                _ = heartbeat_interval.tick() => {
+                    let msg = RuntimeMembershipRequest {
+                        request: Some(runtime_membership_request::Request::Heartbeat(
+                            self.heartbeat_message().into(),
+                        )),
+                        ..Default::default()
+                    };
+                    bidi.send(msg).await.map_err(|e| anyhow!("heartbeat send failed: {e}"))?;
+                }
+                directive = bidi.message() => {
+                    let Some(directive) = directive.map_err(|e| anyhow!("{e}"))? else {
                         return Ok(());
                     };
-                    self.handle_directive(directive).await?;
+                    let owned = directive.to_owned_message();
+                    self.handle_directive(owned).await?;
                 }
             }
         }
@@ -176,6 +194,7 @@ where
             zone: self.config.zone.clone().unwrap_or_default(),
             version: self.config.version.clone(),
             build_id: self.config.build_id.clone(),
+            ..Default::default()
         }
     }
 
@@ -187,10 +206,11 @@ where
     }
 
     pub fn heartbeat_message_with_inputs(&self, inputs: HeartbeatInputs) -> RuntimeHeartbeat {
+        use buffa::EnumValue;
         let drain_state = match inputs.drain_state {
-            RuntimeDrainState::Active => proto::NodeDrainState::Active as i32,
-            RuntimeDrainState::Draining => proto::NodeDrainState::Draining as i32,
-            RuntimeDrainState::SafeToTerminate => proto::NodeDrainState::SafeToTerminate as i32,
+            RuntimeDrainState::Active => EnumValue::Known(pb::NodeDrainState::NODE_DRAIN_STATE_ACTIVE),
+            RuntimeDrainState::Draining => EnumValue::Known(pb::NodeDrainState::NODE_DRAIN_STATE_DRAINING),
+            RuntimeDrainState::SafeToTerminate => EnumValue::Known(pb::NodeDrainState::NODE_DRAIN_STATE_SAFE_TO_TERMINATE),
         };
         RuntimeHeartbeat {
             owned_bundle_count: inputs.owned_bundles.len() as u32,
@@ -201,7 +221,18 @@ where
             available_connections: inputs.available_connections,
             connection_rate_headroom: inputs.connection_rate_headroom,
             drain_state,
-            lane_pressures: inputs.lane_pressures,
+            lane_pressures: inputs
+                .lane_pressures
+                .into_iter()
+                .map(|lp| LanePressure {
+                    lane_id: lp.lane_id,
+                    runnable_depth: lp.runnable_depth,
+                    active_actors: lp.active_actors,
+                    utilization: lp.utilization,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
         }
     }
 }
@@ -215,7 +246,16 @@ pub struct HeartbeatInputs {
     pub available_connections: u32,
     pub connection_rate_headroom: f32,
     pub drain_state: RuntimeDrainState,
-    pub lane_pressures: Vec<LanePressure>,
+    pub lane_pressures: Vec<HeartbeatLanePressure>,
+}
+
+/// Lane pressure data collected for heartbeat reporting.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HeartbeatLanePressure {
+    pub lane_id: u32,
+    pub runnable_depth: u64,
+    pub active_actors: u64,
+    pub utilization: f32,
 }
 
 impl HeartbeatInputs {
@@ -246,7 +286,7 @@ impl HeartbeatInputs {
             .map(|(lane_id, lane)| {
                 let runnable_depth = lane.queued_depth() as u64;
                 let utilization = if lane.queued_depth() == 0 { 0.0 } else { 1.0 };
-                LanePressure {
+                HeartbeatLanePressure {
                     lane_id: lane_id as u32,
                     runnable_depth,
                     active_actors: if runnable_depth > 0 { 1 } else { 0 },
@@ -254,14 +294,8 @@ impl HeartbeatInputs {
                 }
             })
             .collect::<Vec<_>>();
-        let runnable_transitions = lane_pressures
-            .iter()
-            .map(|pressure| pressure.runnable_depth)
-            .sum();
-        let active_actor_count = lane_pressures
-            .iter()
-            .map(|pressure| pressure.active_actors)
-            .sum();
+        let runnable_transitions = lane_pressures.iter().map(|p| p.runnable_depth).sum();
+        let active_actor_count = lane_pressures.iter().map(|p| p.active_actors).sum();
         Self {
             owned_bundles: owner.owned_shards().collect(),
             runnable_transitions,
@@ -279,9 +313,10 @@ impl<R> MembershipClient<R>
 where
     R: LeaseRepository + 'static,
 {
-    pub async fn handle_directive(&self, directive: proto::ControllerDirective) -> Result<()> {
+    /// Handle a controller directive (buffa-generated owned type).
+    pub async fn handle_directive(&self, directive: pb::ControllerDirective) -> Result<()> {
         match directive.directive {
-            Some(Directive::DesiredPlacement(desired)) => {
+            Some(controller_directive::Directive::DesiredPlacement(desired)) => {
                 for bundle in desired.acquire_bundles {
                     let bundle = ShardId(bundle);
                     let outcome = self
@@ -303,10 +338,10 @@ where
                     self.relinquish_owned_bundle(ShardId(bundle)).await?;
                 }
             }
-            Some(Directive::ConnectionBudget(budget)) => {
-                self.apply_connection_budget(budget)?;
+            Some(controller_directive::Directive::ConnectionBudget(budget)) => {
+                self.apply_connection_budget(&budget)?;
             }
-            Some(Directive::Drain(_)) => {
+            Some(controller_directive::Directive::Drain(_)) => {
                 self.drain.begin();
                 let bundles = self
                     .shard_owner
@@ -320,13 +355,20 @@ where
                 let owned_bundle_count = self.shard_owner.read().unwrap().owned_shards().count();
                 self.drain.record_progress(owned_bundle_count, 0, 0);
             }
-            Some(Directive::RoutingUpdate(_)) | None => {}
+            Some(controller_directive::Directive::RoutingUpdate(_)) | None => {}
         }
         Ok(())
     }
 
-    fn apply_connection_budget(&self, budget: ConnectionBudgetDirective) -> Result<()> {
-        *self.last_budget_valid_until.lock().unwrap() = budget.valid_until;
+    fn apply_connection_budget(&self, budget: &pb::ConnectionBudgetDirective) -> Result<()> {
+        let valid_until = if budget.valid_until.is_set() {
+            Some(BudgetExpiry {
+                seconds: budget.valid_until.seconds,
+            })
+        } else {
+            None
+        };
+        *self.last_budget_valid_until.lock().unwrap() = valid_until;
         self.budget_applier.apply_budget(
             budget.rate_per_second,
             budget.capacity,
@@ -335,7 +377,16 @@ where
     }
 
     pub fn last_budget_expired(&self) -> bool {
-        budget_valid_until_expired(self.last_budget_valid_until.lock().unwrap().clone())
+        let guard = self.last_budget_valid_until.lock().unwrap();
+        match &*guard {
+            None => false,
+            Some(expiry) => {
+                let Ok(deadline) = OffsetDateTime::from_unix_timestamp(expiry.seconds) else {
+                    return true;
+                };
+                deadline < OffsetDateTime::now_utc()
+            }
+        }
     }
 
     async fn relinquish_owned_bundle(&self, bundle: ShardId) -> Result<()> {
@@ -369,11 +420,11 @@ pub trait ConnectionBudgetApplier: Send + Sync + std::fmt::Debug {
     ) -> Result<()>;
 }
 
-pub fn budget_valid_until_expired(valid_until: Option<prost_types::Timestamp>) -> bool {
-    let Some(valid_until) = valid_until else {
+pub fn budget_valid_until_expired(valid_until_seconds: Option<i64>) -> bool {
+    let Some(seconds) = valid_until_seconds else {
         return false;
     };
-    let Ok(deadline) = OffsetDateTime::from_unix_timestamp(valid_until.seconds) else {
+    let Ok(deadline) = OffsetDateTime::from_unix_timestamp(seconds) else {
         return true;
     };
     deadline < OffsetDateTime::now_utc()
@@ -458,13 +509,15 @@ mod tests {
         let budget = Arc::new(RecordingBudgetApplier::default());
         let client = client(Arc::clone(&store), budget);
         client
-            .handle_directive(proto::ControllerDirective {
-                directive: Some(Directive::DesiredPlacement(
-                    proto::DesiredPlacementDirective {
+            .handle_directive(pb::ControllerDirective {
+                directive: Some(controller_directive::Directive::DesiredPlacement(
+                    pb::DesiredPlacementDirective {
                         acquire_bundles: vec![1],
                         relinquish_bundles: Vec::new(),
-                    },
+                        ..Default::default()
+                    }.into(),
                 )),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -477,13 +530,15 @@ mod tests {
         }));
 
         client
-            .handle_directive(proto::ControllerDirective {
-                directive: Some(Directive::DesiredPlacement(
-                    proto::DesiredPlacementDirective {
+            .handle_directive(pb::ControllerDirective {
+                directive: Some(controller_directive::Directive::DesiredPlacement(
+                    pb::DesiredPlacementDirective {
                         acquire_bundles: Vec::new(),
                         relinquish_bundles: vec![1],
-                    },
+                        ..Default::default()
+                    }.into(),
                 )),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -502,16 +557,21 @@ mod tests {
         let client = client(store, Arc::clone(&budget));
 
         client
-            .handle_directive(proto::ControllerDirective {
-                directive: Some(Directive::ConnectionBudget(ConnectionBudgetDirective {
-                    rate_per_second: 10.0,
-                    capacity: 20,
-                    max_reservoir_size: 3,
-                    valid_until: Some(prost_types::Timestamp {
-                        seconds: OffsetDateTime::now_utc().unix_timestamp() + 60,
-                        nanos: 0,
-                    }),
-                })),
+            .handle_directive(pb::ControllerDirective {
+                directive: Some(controller_directive::Directive::ConnectionBudget(
+                    pb::ConnectionBudgetDirective {
+                        rate_per_second: 10.0,
+                        capacity: 20,
+                        max_reservoir_size: 3,
+                        valid_until: buffa_types::google::protobuf::Timestamp {
+                            seconds: OffsetDateTime::now_utc().unix_timestamp() + 60,
+                            nanos: 0,
+                            ..Default::default()
+                        }.into(),
+                        ..Default::default()
+                    }.into(),
+                )),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -519,8 +579,11 @@ mod tests {
         assert!(!client.last_budget_expired());
 
         client
-            .handle_directive(proto::ControllerDirective {
-                directive: Some(Directive::Drain(proto::DrainDirective {})),
+            .handle_directive(pb::ControllerDirective {
+                directive: Some(controller_directive::Directive::Drain(
+                    pb::DrainDirective::default().into(),
+                )),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -533,20 +596,25 @@ mod tests {
         let budget = Arc::new(RecordingBudgetApplier::default());
         let client = client(Arc::clone(&store), budget);
         client
-            .handle_directive(proto::ControllerDirective {
-                directive: Some(Directive::DesiredPlacement(
-                    proto::DesiredPlacementDirective {
+            .handle_directive(pb::ControllerDirective {
+                directive: Some(controller_directive::Directive::DesiredPlacement(
+                    pb::DesiredPlacementDirective {
                         acquire_bundles: vec![1, 2],
                         relinquish_bundles: Vec::new(),
-                    },
+                        ..Default::default()
+                    }.into(),
                 )),
+                ..Default::default()
             })
             .await
             .unwrap();
 
         client
-            .handle_directive(proto::ControllerDirective {
-                directive: Some(Directive::Drain(proto::DrainDirective {})),
+            .handle_directive(pb::ControllerDirective {
+                directive: Some(controller_directive::Directive::Drain(
+                    pb::DrainDirective::default().into(),
+                )),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -580,7 +648,7 @@ mod tests {
         assert_eq!(heartbeat.owned_bundles, vec![2]);
         assert_eq!(
             heartbeat.drain_state,
-            proto::NodeDrainState::SafeToTerminate as i32
+            buffa::EnumValue::Known(pb::NodeDrainState::NODE_DRAIN_STATE_SAFE_TO_TERMINATE)
         );
     }
 

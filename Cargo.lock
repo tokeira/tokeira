@@ -6490,8 +6490,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "buffa",
+ "buffa-types",
  "chrono",
  "chrono-tz",
+ "connectrpc",
  "dashmap",
  "metrics",
  "metrics-util",

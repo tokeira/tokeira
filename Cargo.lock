@@ -6308,6 +6308,8 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
+ "buffa",
+ "connectrpc",
  "http 1.4.0",
  "metrics",
  "metrics-util",

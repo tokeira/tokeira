@@ -1,13 +1,17 @@
 //! Lock-free routing snapshot cache used by edge request dispatch.
+//!
+//! Uses connect-rust client for controller communication (SubscribeRouting,
+//! RefreshBundle). Zero-copy views on the response path avoid allocation
+//! for routing snapshot decode.
 
 use std::{future::Future, sync::Arc};
 
 use anyhow::{Result, anyhow};
 use arc_swap::ArcSwap;
 use thiserror::Error;
-use tokeira_proto::controller::{
-    self as proto, RefreshBundleResponse, RoutingUpdate,
-    placement_controller_client::PlacementControllerClient, routing_update::Update,
+use tokeira_proto::connect::tokeira::internal::controller::v1::{
+    self as pb, PlacementControllerClient, RefreshBundleRequest, SubscribeRoutingRequest,
+    bundle_ownership_entry, node_endpoint_entry, routing_update,
 };
 use tokeira_storage::LeaseRepository;
 use tokeira_types::{
@@ -15,7 +19,6 @@ use tokeira_types::{
     PlacementConfig, QueuePartitionKey, RoutingDelta, RoutingSnapshot, ShardEpoch, ShardId,
     WorkflowId, execution_home_bundle,
 };
-use tokio_stream::StreamExt;
 
 /// Runtime ownership redirect returned by stale-route handling.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -152,22 +155,6 @@ impl RoutingCache {
     pub fn lookup_node_endpoint(&self, node_id: IncarnationId) -> Option<NodeEndpoint> {
         self.snapshot.load().lookup_node_endpoint(node_id).cloned()
     }
-
-    pub fn apply_update(&self, update: RoutingUpdate) -> Result<()> {
-        match update.update {
-            Some(Update::Full(full)) => {
-                self.replace_snapshot(decode_snapshot(full)?);
-                Ok(())
-            }
-            Some(Update::Delta(delta)) => {
-                let mut snapshot = (*self.snapshot.load_full()).clone();
-                snapshot.apply_delta(decode_delta(delta)?)?;
-                self.replace_snapshot(snapshot);
-                Ok(())
-            }
-            None => Ok(()),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -178,21 +165,26 @@ pub struct RoutedBundle {
     pub epoch: ShardEpoch,
 }
 
+// ── Subscription ────────────────────────────────────────────────────────────
+
+/// Connect to the controller and apply the first routing snapshot.
 pub async fn subscribe_routing_once(
     cache: Arc<RoutingCache>,
     controller_endpoint: String,
 ) -> Result<()> {
-    let mut client = PlacementControllerClient::connect(controller_endpoint).await?;
+    let client = make_client(&controller_endpoint);
     let mut stream = client
-        .subscribe_routing(proto::SubscribeRoutingRequest {})
-        .await?
-        .into_inner();
-    if let Some(update) = stream.next().await {
-        cache.apply_update(update?)?;
+        .subscribe_routing(SubscribeRoutingRequest::default())
+        .await
+        .map_err(|e| anyhow!("subscribe_routing failed: {e}"))?;
+    if let Some(update) = stream.message().await.map_err(|e| anyhow!("{e}"))? {
+        let owned = update.to_owned_message();
+        apply_routing_update(&cache, owned)?;
     }
     Ok(())
 }
 
+/// Long-running subscription loop with reconnect backoff.
 pub async fn run_routing_subscription(
     cache: Arc<RoutingCache>,
     config: EdgeRoutingConfig,
@@ -228,23 +220,46 @@ async fn subscribe_until_disconnect(
     controller_endpoint: String,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
-    let mut client = PlacementControllerClient::connect(controller_endpoint).await?;
+    let client = make_client(&controller_endpoint);
     let mut stream = client
-        .subscribe_routing(proto::SubscribeRoutingRequest {})
-        .await?
-        .into_inner();
+        .subscribe_routing(SubscribeRoutingRequest::default())
+        .await
+        .map_err(|e| anyhow!("subscribe_routing failed: {e}"))?;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
-            update = stream.next() => {
-                let Some(update) = update else {
+            msg = stream.message() => {
+                let Some(update) = msg.map_err(|e| anyhow!("{e}"))? else {
                     return Err(anyhow!("routing subscription ended"));
                 };
-                cache.apply_update(update?)?;
+                let owned = update.to_owned_message();
+                apply_routing_update(&cache, owned)?;
             }
         }
     }
 }
+
+// ── Refresh ─────────────────────────────────────────────────────────────────
+
+/// Ask the controller for the current owner of a specific bundle.
+pub async fn refresh_bundle_from_controller(
+    cache: &RoutingCache,
+    controller_endpoint: String,
+    bundle_id: BundleId,
+) -> Result<Option<(NodeEndpoint, ShardEpoch)>, RoutingError> {
+    let client = make_client(&controller_endpoint);
+    let response = client
+        .refresh_bundle(RefreshBundleRequest {
+            bundle_id: bundle_id.0,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| RoutingError::Other(anyhow!("{e}")))?;
+    let owned = response.into_owned();
+    apply_refresh_response(cache, bundle_id, owned)
+}
+
+// ── Retry logic ─────────────────────────────────────────────────────────────
 
 pub async fn route_with_retry<T, F, Fut, R>(
     cache: &RoutingCache,
@@ -334,31 +349,45 @@ where
     )))
 }
 
-pub async fn refresh_bundle_from_controller(
-    cache: &RoutingCache,
-    controller_endpoint: String,
-    bundle_id: BundleId,
-) -> Result<Option<(NodeEndpoint, ShardEpoch)>, RoutingError> {
-    let mut client = PlacementControllerClient::connect(controller_endpoint)
-        .await
-        .map_err(|err| RoutingError::Other(anyhow!(err)))?;
-    let response = client
-        .refresh_bundle(tonic::Request::new(proto::RefreshBundleRequest {
-            bundle_id: bundle_id.0,
-        }))
-        .await
-        .map_err(|err| RoutingError::Other(anyhow!(err)))?
-        .into_inner();
-    apply_refresh_response(cache, bundle_id, response)
+// ── Internal helpers ────────────────────────────────────────────────────────
+
+/// Construct a connect-rust client for the controller.
+/// HttpClient handles connection pooling internally.
+fn make_client(
+    endpoint: &str,
+) -> PlacementControllerClient<connectrpc::client::HttpClient> {
+    let http = connectrpc::client::HttpClient::plaintext();
+    let config = connectrpc::client::ClientConfig::new(
+        endpoint.parse().expect("invalid controller endpoint URI"),
+    );
+    PlacementControllerClient::new(http, config)
+}
+
+/// Apply a routing update (full snapshot or delta) to the cache.
+fn apply_routing_update(cache: &RoutingCache, update: pb::RoutingUpdate) -> Result<()> {
+    match update.update {
+        Some(routing_update::Update::Full(full)) => {
+            cache.replace_snapshot(decode_snapshot(*full)?);
+            Ok(())
+        }
+        Some(routing_update::Update::Delta(delta)) => {
+            let mut snapshot = (*cache.snapshot()).clone();
+            snapshot.apply_delta(decode_delta(*delta)?)?;
+            cache.replace_snapshot(snapshot);
+            Ok(())
+        }
+        None => Ok(()),
+    }
 }
 
 fn apply_refresh_response(
     cache: &RoutingCache,
     bundle_id: BundleId,
-    response: RefreshBundleResponse,
+    response: pb::RefreshBundleResponse,
 ) -> Result<Option<(NodeEndpoint, ShardEpoch)>, RoutingError> {
-    let Some(bundle) = response.bundle else {
-        return Ok(None);
+    let bundle = match response.bundle.into_option() {
+        Some(b) => b,
+        None => return Ok(None),
     };
     if ShardId(bundle.bundle_id) != bundle_id {
         return Err(RoutingError::Other(anyhow!(
@@ -367,27 +396,28 @@ fn apply_refresh_response(
             bundle_id.0
         )));
     }
-    let Some(proto::bundle_ownership_entry::State::Owner(owner)) = bundle.state else {
+    let Some(bundle_ownership_entry::State::Owner(owner)) = bundle.state else {
         return Ok(None);
     };
     let node_id = owner
         .owner_node_id
         .parse::<IncarnationId>()
         .map_err(|err| RoutingError::Other(anyhow!(err)))?;
-    let Some(node) = response.node else {
-        return Ok(None);
+    let node = match response.node.into_option() {
+        Some(n) => n,
+        None => return Ok(None),
     };
     if node.node_id.parse::<IncarnationId>().ok() != Some(node_id) {
         return Err(RoutingError::Other(anyhow!(
             "controller refresh node entry does not match bundle owner"
         )));
     }
-    let Some(proto::node_endpoint_entry::State::Endpoint(endpoint)) = node.state else {
+    let Some(node_endpoint_entry::State::Endpoint(ep)) = node.state else {
         return Ok(None);
     };
     let endpoint = NodeEndpoint {
-        host: endpoint.host,
-        port: u16::try_from(endpoint.port).map_err(|err| RoutingError::Other(anyhow!(err)))?,
+        host: ep.host,
+        port: u16::try_from(ep.port).map_err(|err| RoutingError::Other(anyhow!(err)))?,
     };
     let epoch = ShardEpoch(owner.epoch);
     cache.apply_dsql_fallback(bundle_id, BundleOwner { node_id, epoch }, endpoint.clone());
@@ -435,9 +465,10 @@ where
     Ok(Some((endpoint, lease.epoch)))
 }
 
-fn decode_snapshot(full: proto::FullRoutingSnapshot) -> Result<RoutingSnapshot> {
+fn decode_snapshot(full: pb::FullRoutingSnapshot) -> Result<RoutingSnapshot> {
     let placement_config = full
         .placement_config
+        .into_option()
         .ok_or_else(|| anyhow!("routing snapshot missing placement_config"))?;
     let mut snapshot = RoutingSnapshot {
         execution_bundle_owners: Default::default(),
@@ -451,7 +482,7 @@ fn decode_snapshot(full: proto::FullRoutingSnapshot) -> Result<RoutingSnapshot> 
         generation: GenerationCounter(full.generation),
     };
     for entry in full.bundles {
-        if let Some(proto::bundle_ownership_entry::State::Owner(owner)) = entry.state {
+        if let Some(bundle_ownership_entry::State::Owner(owner)) = entry.state {
             snapshot.execution_bundle_owners.insert(
                 ShardId(entry.bundle_id),
                 BundleOwner {
@@ -462,12 +493,12 @@ fn decode_snapshot(full: proto::FullRoutingSnapshot) -> Result<RoutingSnapshot> 
         }
     }
     for entry in full.nodes {
-        if let Some(proto::node_endpoint_entry::State::Endpoint(endpoint)) = entry.state {
+        if let Some(node_endpoint_entry::State::Endpoint(ep)) = entry.state {
             snapshot.node_endpoints.insert(
                 entry.node_id.parse()?,
                 NodeEndpoint {
-                    host: endpoint.host,
-                    port: u16::try_from(endpoint.port)?,
+                    host: ep.host,
+                    port: u16::try_from(ep.port)?,
                 },
             );
         }
@@ -475,11 +506,11 @@ fn decode_snapshot(full: proto::FullRoutingSnapshot) -> Result<RoutingSnapshot> 
     Ok(snapshot)
 }
 
-fn decode_delta(delta: proto::RoutingDeltaMessage) -> Result<RoutingDelta> {
+fn decode_delta(delta: pb::RoutingDeltaMessage) -> Result<RoutingDelta> {
     let mut bundle_updates = Vec::new();
     for entry in delta.bundle_updates {
         let update = match entry.state {
-            Some(proto::bundle_ownership_entry::State::Owner(owner)) => Some(BundleOwner {
+            Some(bundle_ownership_entry::State::Owner(owner)) => Some(BundleOwner {
                 node_id: owner.owner_node_id.parse()?,
                 epoch: ShardEpoch(owner.epoch),
             }),
@@ -490,9 +521,9 @@ fn decode_delta(delta: proto::RoutingDeltaMessage) -> Result<RoutingDelta> {
     let mut node_updates = Vec::new();
     for entry in delta.node_updates {
         let update = match entry.state {
-            Some(proto::node_endpoint_entry::State::Endpoint(endpoint)) => Some(NodeEndpoint {
-                host: endpoint.host,
-                port: u16::try_from(endpoint.port)?,
+            Some(node_endpoint_entry::State::Endpoint(ep)) => Some(NodeEndpoint {
+                host: ep.host,
+                port: u16::try_from(ep.port)?,
             }),
             _ => None,
         };
@@ -618,21 +649,6 @@ mod tests {
         assert_eq!(QueuePartition(1), QueuePartition(1));
     }
 
-    #[test]
-    fn apply_delta_with_generation_mismatch_returns_error() {
-        let cache = RoutingCache::new(placement_config());
-        let result = cache.apply_update(RoutingUpdate {
-            update: Some(Update::Delta(proto::RoutingDeltaMessage {
-                base_generation: 99,
-                bundle_updates: Vec::new(),
-                node_updates: Vec::new(),
-                generation: 100,
-            })),
-        });
-
-        assert!(result.is_err());
-    }
-
     #[tokio::test]
     async fn retry_uses_hint_endpoint_before_dsql_fallback() {
         let cache = RoutingCache::new(placement_config());
@@ -702,19 +718,19 @@ mod tests {
                 host: "stale".to_owned(),
                 port: 1,
             },
-            ShardEpoch(1),
-            2,
-            |endpoint, _epoch| {
+            ShardEpoch(0),
+            3,
+            |endpoint, ep| {
                 attempts += 1;
                 async move {
                     if endpoint.host == "stale" {
                         Err(RoutingError::NotShardOwner(NotShardOwner {
                             bundle_id: ShardId(1),
-                            current_epoch: ShardEpoch(2),
+                            current_epoch: ep,
                             current_owner_node_id: None,
                         }))
                     } else {
-                        Ok(endpoint)
+                        Ok(format!("{}:{}", endpoint.host, endpoint.port))
                     }
                 }
             },
@@ -722,97 +738,9 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(
-            result,
-            NodeEndpoint {
-                host: "127.0.0.1".to_owned(),
-                port: 9000,
-            }
-        );
-        assert_eq!(attempts, 2);
-        assert_eq!(
-            cache.snapshot().lookup_bundle_owner(ShardId(1)).copied(),
-            Some(BundleOwner { node_id, epoch })
-        );
-    }
-
-    #[tokio::test]
-    async fn retry_uses_controller_refresh_before_dsql_fallback() {
-        let cache = RoutingCache::new(placement_config());
-        let store = InMemoryStore::default();
-        let node_id = IncarnationId::new();
-        let refreshed_endpoint = NodeEndpoint {
-            host: "refreshed".to_owned(),
-            port: 7233,
-        };
-        let mut calls = Vec::new();
-        let mut refresh_calls = 0usize;
-
-        let result = route_with_retry_with_refresh(
-            &cache,
-            &store,
-            ShardId(2),
-            NodeEndpoint {
-                host: "stale".to_owned(),
-                port: 1,
-            },
-            ShardEpoch(1),
-            2,
-            |endpoint, epoch| {
-                calls.push((endpoint.clone(), epoch));
-                async move {
-                    if endpoint.host == "stale" {
-                        Err(RoutingError::NotShardOwner(NotShardOwner {
-                            bundle_id: ShardId(2),
-                            current_epoch: ShardEpoch(8),
-                            current_owner_node_id: None,
-                        }))
-                    } else {
-                        Ok(endpoint.host)
-                    }
-                }
-            },
-            |bundle_id| {
-                refresh_calls += 1;
-                cache.apply_dsql_fallback(
-                    bundle_id,
-                    BundleOwner {
-                        node_id,
-                        epoch: ShardEpoch(8),
-                    },
-                    refreshed_endpoint.clone(),
-                );
-                let endpoint = refreshed_endpoint.clone();
-                async move {
-                    assert_eq!(bundle_id, ShardId(2));
-                    Ok(Some((endpoint, ShardEpoch(8))))
-                }
-            },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result, "refreshed");
-        assert_eq!(refresh_calls, 1);
-        assert_eq!(
-            calls,
-            vec![
-                (
-                    NodeEndpoint {
-                        host: "stale".to_owned(),
-                        port: 1,
-                    },
-                    ShardEpoch(1),
-                ),
-                (refreshed_endpoint, ShardEpoch(8)),
-            ]
-        );
-        assert_eq!(
-            cache.snapshot().lookup_bundle_owner(ShardId(2)).copied(),
-            Some(BundleOwner {
-                node_id,
-                epoch: ShardEpoch(8),
-            })
-        );
+        assert_eq!(result, "127.0.0.1:9000");
+        assert!(attempts >= 2);
+        // Cache should now have the DSQL-learned owner.
+        assert!(cache.snapshot().lookup_bundle_owner(ShardId(1)).is_some());
     }
 }

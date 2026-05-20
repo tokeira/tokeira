@@ -105,6 +105,16 @@ impl RoutingSnapshot {
         self.execution_bundle_owners.get(&bundle_id)
     }
 
+    /// Iterate over all bundle ownership entries.
+    pub fn bundle_owners(&self) -> impl Iterator<Item = (BundleId, &BundleOwner)> {
+        self.execution_bundle_owners.iter().map(|(&id, owner)| (id, owner))
+    }
+
+    /// Iterate over all node endpoint entries.
+    pub fn node_endpoints_iter(&self) -> impl Iterator<Item = (IncarnationId, &NodeEndpoint)> {
+        self.node_endpoints.iter().map(|(&id, ep)| (id, ep))
+    }
+
     /// Apply a delta if it is based on this snapshot's current generation.
     pub fn apply_delta(&mut self, delta: RoutingDelta) -> Result<(), RoutingDeltaError> {
         if delta.base_generation != self.generation {

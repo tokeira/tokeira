@@ -84,6 +84,16 @@ pub struct LiveMembership {
     nodes: HashMap<IncarnationId, LiveNode>,
 }
 
+/// A node nominated for scale-in retirement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScaleInCandidate {
+    pub node_id: IncarnationId,
+    pub owned_bundle_count: u32,
+    pub runnable_transitions: u64,
+    pub active_actor_count: u64,
+    pub backlog_depth: u64,
+}
+
 impl LiveMembership {
     pub fn register_node(
         &mut self,
@@ -131,9 +141,12 @@ impl LiveMembership {
         }
     }
 
-    pub fn mark_draining(&mut self, node_id: IncarnationId) {
+    pub fn mark_draining(&mut self, node_id: IncarnationId) -> bool {
         if let Some(node) = self.nodes.get_mut(&node_id) {
             node.membership_state = NodeMembershipState::Draining;
+            true
+        } else {
+            false
         }
     }
 
@@ -174,6 +187,38 @@ impl LiveMembership {
                 node.reachability = NodeReachability::Unavailable;
             }
         }
+    }
+
+    /// Rank active nodes by bundle count and pressure for scale-in nomination.
+    /// Excludes draining nodes. Returns up to `limit` candidates.
+    pub fn nominate_scale_in(&self, limit: u32) -> Vec<ScaleInCandidate> {
+        let mut candidates: Vec<_> = self
+            .nodes
+            .values()
+            .filter(|n| n.membership_state == NodeMembershipState::Active)
+            .map(|n| ScaleInCandidate {
+                node_id: n.node_id,
+                owned_bundle_count: n.heartbeat.owned_bundle_count,
+                runnable_transitions: n.heartbeat.runnable_transitions,
+                active_actor_count: n.heartbeat.active_actor_count,
+                backlog_depth: n.heartbeat.backlog_depth,
+            })
+            .collect();
+        // Prefer nodes with fewest bundles, then lowest pressure.
+        candidates.sort_by_key(|c| (c.owned_bundle_count, c.runnable_transitions));
+        candidates.truncate(limit as usize);
+        candidates
+    }
+
+    /// Aggregate connection headroom across all active nodes.
+    pub fn aggregate_headroom(&self) -> (u32, f32) {
+        let mut total_connections: u32 = 0;
+        let mut total_rate: f32 = 0.0;
+        for node in self.active_nodes() {
+            total_connections += node.heartbeat.available_connections;
+            total_rate += node.heartbeat.connection_rate_headroom;
+        }
+        (total_connections, total_rate)
     }
 }
 

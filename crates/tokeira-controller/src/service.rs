@@ -138,6 +138,11 @@ impl PlacementControllerState {
             hash_version: self.config.hash_version,
         }
     }
+
+    /// Public accessor for the connect-rust service impl.
+    pub fn placement_config_value(&self) -> PlacementConfig {
+        self.placement_config()
+    }
 }
 
 #[tonic::async_trait]

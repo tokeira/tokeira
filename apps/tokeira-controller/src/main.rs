@@ -11,9 +11,10 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
 use config::ControllerProcessConfig;
+use connectrpc::Router;
 use metrics_exporter_prometheus::PrometheusBuilder;
-use tokeira_controller::PlacementControllerState;
-use tokeira_proto::controller::placement_controller_server::PlacementControllerServer;
+use tokeira_controller::{ConnectPlacementController, PlacementControllerState};
+use tokeira_proto::connect::tokeira::internal::controller::v1::PlacementControllerExt;
 use tokeira_storage::{
     ControlRepository, LeaseRepository,
     dsql::{DsqlAuthConfig, DsqlCoordinationConfig, DsqlPoolConfig, DsqlStore},
@@ -21,7 +22,6 @@ use tokeira_storage::{
 use tokeira_types::IncarnationId;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
-use tonic::transport::Server;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -105,17 +105,25 @@ async fn main() -> Result<()> {
         run_budget_loop(budget_state, allocator_id, budget_interval, budget_cancel).await;
     });
 
-    // gRPC server with the PlacementController service.
+    // gRPC server with the PlacementController service via connect-rust.
+    // Serves Connect, gRPC, and gRPC-Web on the same handlers.
     let grpc_addr: SocketAddr = config
         .grpc_listen_addr
         .parse()
         .context("invalid grpc_listen_addr")?;
     let grpc_cancel = cancel.clone();
+
+    let connect_service = Arc::new(ConnectPlacementController::new(state));
+    let connect_router = connect_service.register(Router::new());
+    let app = axum::Router::new().fallback_service(connect_router.into_axum_service());
+
     let grpc_handle = tokio::spawn(async move {
-        info!(%grpc_addr, "gRPC server listening");
-        Server::builder()
-            .add_service(PlacementControllerServer::new(state))
-            .serve_with_shutdown(grpc_addr, grpc_cancel.cancelled_owned())
+        info!(%grpc_addr, "gRPC server listening (connect-rust)");
+        let listener = tokio::net::TcpListener::bind(grpc_addr)
+            .await
+            .expect("failed to bind gRPC listener");
+        axum::serve(listener, app)
+            .with_graceful_shutdown(grpc_cancel.cancelled_owned())
             .await
             .context("gRPC server failed")
     });

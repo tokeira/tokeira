@@ -3,15 +3,28 @@
 //! This crate deliberately separates:
 //!
 //! - `public`: Temporal-compatible API packages and service constants
-//! - `internal`: Tokeira-only runtime/admin packages
+//! - `internal`: Tokeira-only runtime/admin packages (tonic/prost — legacy)
+//! - `connect`: Tokeira-internal controller surface (buffa + connect-rust)
 //! - `conversions`: small, explicit helpers between wire structs and `tokeira-types`
 //!
-//! Keeping these concerns together prevents the rest of the workspace from depending directly on
-//! generated protobuf details.
+//! The `connect` module is the preferred path for controller ↔ runtime/edge/autoscaler
+//! communication. It provides zero-copy view types and the connect-rust service traits.
+//! The `internal` module retains the tonic/prost output for code that hasn't migrated.
+
+#![allow(refining_impl_trait_internal, refining_impl_trait_reachable)]
 
 pub mod conversions;
 pub mod internal;
 pub mod public;
+
+/// Connect-rust generated types for the internal controller surface.
+///
+/// Provides buffa message types (owned + zero-copy views), connect-rust
+/// service traits, and generated clients. Speaks Connect, gRPC, and
+/// gRPC-Web on the same handlers.
+pub mod connect {
+    connectrpc::include_generated!("_connectrpc_controller.rs");
+}
 
 pub use internal::{admin, controller, runtime};
 pub use public::{

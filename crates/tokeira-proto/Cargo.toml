@@ -6,6 +6,10 @@ description = "Temporal-compatible and Tokeira-internal protobuf bindings"
 license = "Apache-2.0"
 
 [dependencies]
+buffa = { version = "0.6", features = ["json"] }
+buffa-types = { version = "0.6", features = ["json"] }
+connectrpc = { version = "0.6", features = ["client"] }
+http-body = "1"
 prost = "0.12"
 prost-types = "0.12"
 serde = { version = "1", features = ["derive"] }
@@ -19,5 +23,6 @@ uuid = { version = "1", features = ["serde", "v4"] }
 path = "../tokeira-types"
 
 [build-dependencies]
+connectrpc-build = "0.6"
 tonic-build = "0.11"
 walkdir = "2"

@@ -396,7 +396,7 @@ Implement the ECS on EC2 deployment infrastructure for Tokeira. The work is orga
     - Use `proptest` crate
     - _Validates: Requirements 6.6, 6.7, 6.8_
 
-  - [ ]* 9.14 Write unit tests for autoscaler components
+  - [x]* 9.14 Write unit tests for autoscaler components
     - Test leader lease: acquire, renew, revert on failure
     - Test Mimir client: parse instant query response, handle missing series, detect staleness
     - Test AWS actuator: no-op when state matches target (mocked clients)
@@ -411,7 +411,7 @@ Implement the ECS on EC2 deployment infrastructure for Tokeira. The work is orga
 - [ ] 10. Checkpoint — Phase 5 tests pass
   - Run `cargo test --workspace` and verify all new and existing tests pass.
 
-- [ ] 11. Phase 6 — CLI Integration
+- [x] 11. Phase 6 — CLI Integration
   - [x] 11.1 Wire ECS platform into `tkr` CLI
     - Add `PlatformKind::Ecs` handling in `tkr/src/commands/infra.rs` and `tkr/src/commands/deploy.rs`
     - Load `EcsConfig` from deployment TOML when ECS platform is selected
@@ -425,14 +425,14 @@ Implement the ECS on EC2 deployment infrastructure for Tokeira. The work is orga
     - The generated `[dsql]` section SHALL include `mode = "managed"` with placeholder `endpoint`/`*_id`/`*_arn` fields commented out, plus an example `[dsql]` block with `mode = "preexisting"` and all required fields filled in as comments for operators adopting an existing DSQL cluster
     - _Requirements: 9.2.1, 9.2.2, 9.2.3_
 
-  - [ ] 11.3 Implement ECS operations commands
+  - [x] 11.3 Implement ECS operations commands
     - Implement `scale_up` via `ecs:UpdateService` (increase desired count)
     - Implement `scale_down` via `ecs:UpdateService` (decrease desired count)
     - Implement `logs` via ECS task log retrieval
     - Validate service names against `valid_services()`
     - _Requirements: 9.3.1, 9.3.2, 9.3.3_
 
-  - [ ] 11.4 Implement `tkr port-forward` for ECS services
+  - [x] 11.4 Implement `tkr port-forward` for ECS services
     - Add a `port-forward` subcommand to `tkr/src/cli.rs` accepting `<service>` and optional `--local-port`
     - Implement `commands::port_forward::run_ecs(service, local_port, config)` in `tkr/src/commands/port_forward.rs`
     - Service-to-default-port mapping: `grafana=3000`, `edge-api=7233`, `edge-poll=7234`, `controller=7240`, `mimir=9009`, `loki=3100`
@@ -448,7 +448,7 @@ Implement the ECS on EC2 deployment infrastructure for Tokeira. The work is orga
     - Verify SSM VPC endpoints (`ssm`, `ssmmessages`, `ec2messages`) are present in the required endpoint set so Session Manager works without internet
     - _Requirements: 9.6.5, 3.3.2, 3.4.6_
 
-  - [ ] 11.6 Implement `tkr exec` for interactive container access
+  - [x] 11.6 Implement `tkr exec` for interactive container access
     - Add an `exec` subcommand to `tkr/src/cli.rs` accepting `<service> [--container <name>] -- <cmd>...`
     - Implement `commands::exec::run_ecs(service, container, cmd, config)` in `tkr/src/commands/exec.rs`
     - Resolve the container name: if `--container` omitted, default to the primary application container for the service (`tokeira-runtime` for runtime, `tokeira-mimir` for mimir, etc.). Never default to the Alloy sidecar
@@ -459,7 +459,7 @@ Implement the ECS on EC2 deployment infrastructure for Tokeira. The work is orga
     - Print a helpful error with remediation hints if the task role is missing `ssmmessages:*` permissions (first-deploy misconfiguration)
     - _Requirements: 3.4.7, 3.4.8_
 
-  - [ ] 11.7 Implement `tkr admin <subcommand>` for on-demand admin execution
+  - [x] 11.7 Implement `tkr admin <subcommand>` for on-demand admin execution
     - Add an `admin` subcommand group to `tkr/src/cli.rs` that accepts any sub-subcommand (passed through to the admin binary)
     - Implement `commands::admin::run(subcommand, args, config)` that: scales `tokeira-admin` from 0 to 1, polls `ecs:DescribeServices` until `runningCount == 1` and `desiredCount == 1` with a 120s default timeout, calls `ecs:ExecuteCommand` against the running task with the supplied subcommand, streams output, and scales back to 0 in a `finally`-equivalent block (so Ctrl-C still scales down)
     - If the task fails to reach RUNNING within timeout, fetch `ecs:DescribeTasks` for the task's `stoppedReason` and surface it in the error message. Do NOT scale back to 0 on this failure path — the next `tkr admin` call decides whether to reuse the failing service or scale-to-0 first

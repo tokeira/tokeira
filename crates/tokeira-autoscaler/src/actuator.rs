@@ -130,3 +130,99 @@ pub trait Actuator: Send + Sync + std::fmt::Debug {
 // The platform-specific actuator implementation should handle throttle retry
 // internally. See `platforms/ecs/` for the ECS implementation which uses
 // exponential backoff on AWS API throttling errors.
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct MockActuator {
+        service_state: ServiceState,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Actuator for MockActuator {
+        async fn update_service_desired_count(
+            &self,
+            _cluster: &str,
+            service: &str,
+            desired: u32,
+        ) -> Result<bool> {
+            if self.service_state.desired_count == desired {
+                return Ok(false);
+            }
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push(format!("{service}:{desired}"));
+            Ok(true)
+        }
+
+        async fn set_asg_desired_capacity(&self, _asg_name: &str, _desired: u32) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn drain_container_instance(
+            &self,
+            _cluster: &str,
+            _container_instance_arn: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn clear_instance_protection(
+            &self,
+            _asg_name: &str,
+            _instance_id: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn terminate_instance_with_decrement(&self, _instance_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn describe_service(&self, _cluster: &str, _service: &str) -> Result<ServiceState> {
+            Ok(self.service_state.clone())
+        }
+
+        async fn describe_asg(&self, _asg_name: &str) -> Result<AsgState> {
+            Ok(AsgState {
+                desired_capacity: 1,
+                min_size: 1,
+                max_size: 1,
+            })
+        }
+
+        async fn resolve_container_instance_for_ec2(
+            &self,
+            _cluster: &str,
+            ec2_instance_id: &str,
+        ) -> Result<String> {
+            Ok(format!("container:{ec2_instance_id}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_actuator_noops_when_service_state_matches_target() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let actuator = MockActuator {
+            service_state: ServiceState {
+                desired_count: 3,
+                running_count: 3,
+            },
+            calls: calls.clone(),
+        };
+
+        assert!(
+            !actuator
+                .update_service_desired_count("cluster", "edge", 3)
+                .await
+                .expect("no-op update succeeds")
+        );
+        assert!(calls.lock().expect("calls lock").is_empty());
+    }
+}

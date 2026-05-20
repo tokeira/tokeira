@@ -216,4 +216,26 @@ mod tests {
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].value, 42.0);
     }
+
+    #[test]
+    fn missing_series_decodes_to_empty_samples() {
+        let response: PromQueryResponse =
+            serde_json::from_str(r#"{"status":"success","data":{"result":[]}}"#)
+                .expect("valid response");
+
+        assert!(response.into_samples().is_empty());
+    }
+
+    #[test]
+    fn stale_sample_is_classified_by_age() {
+        let sample = MetricSample {
+            value: 1.0,
+            timestamp: OffsetDateTime::now_utc() - Duration::minutes(10),
+        };
+
+        assert_eq!(
+            classify_sample(sample, Duration::seconds(30)).expect("classification succeeds"),
+            MetricFreshness::Stale
+        );
+    }
 }

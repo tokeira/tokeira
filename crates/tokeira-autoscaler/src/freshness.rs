@@ -120,6 +120,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn overload_signal_allows_scale_out_with_partial_staleness() {
+        let tracker = FreshnessTracker {
+            mimir_available: true,
+            service_metrics: MetricFreshness::Stale,
+            controller_snapshot: MetricFreshness::Missing,
+            dsql_headroom: MetricFreshness::Fresh,
+            overload_signal: true,
+        };
+
+        assert_eq!(tracker.scaling_permission(true), ScalingPermission::Allow);
+    }
+
+    #[test]
+    fn missing_dsql_headroom_blocks_scale_out_without_overload_override() {
+        let tracker = FreshnessTracker {
+            mimir_available: true,
+            service_metrics: MetricFreshness::Fresh,
+            controller_snapshot: MetricFreshness::Fresh,
+            dsql_headroom: MetricFreshness::Missing,
+            overload_signal: false,
+        };
+
+        assert_eq!(
+            tracker.scaling_permission(true),
+            ScalingPermission::BlockScaleIn
+        );
+    }
+
     proptest! {
         #[test]
         fn property_mimir_unavailable_never_allows_scale_in(

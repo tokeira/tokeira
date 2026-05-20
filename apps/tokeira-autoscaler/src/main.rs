@@ -89,11 +89,7 @@ async fn build_lease_repository(
 
     let region = if config.dsql_region.is_empty() {
         // Derive region from endpoint (e.g., "cluster.dsql.us-east-1.on.aws").
-        config
-            .dsql_endpoint
-            .split('.')
-            .nth(2)
-            .map(|s| s.to_owned())
+        config.dsql_endpoint.split('.').nth(2).map(|s| s.to_owned())
     } else {
         Some(config.dsql_region.clone())
     };
@@ -105,10 +101,9 @@ async fn build_lease_repository(
     };
 
     let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(aws_config::Region::new(
-            auth.resolved_region()
-                .ok_or_else(|| anyhow::anyhow!("cannot derive DSQL region from endpoint"))?,
-        ))
+        .region(aws_config::Region::new(auth.resolved_region().ok_or_else(
+            || anyhow::anyhow!("cannot derive DSQL region from endpoint"),
+        )?))
         .load()
         .await;
 
@@ -263,7 +258,10 @@ async fn run_leader_loop(
         let actions = tokeira_autoscaler::reconciler::reconcile(&desired, &current);
 
         if !actions.is_empty() {
-            info!(action_count = actions.len(), "reconciler produced scaling actions");
+            info!(
+                action_count = actions.len(),
+                "reconciler produced scaling actions"
+            );
             for action in &actions {
                 apply_action(&actuator, &config.cluster_name, action).await;
             }
@@ -287,10 +285,7 @@ async fn apply_action(actuator: &Arc<dyn Actuator>, cluster: &str, action: &Scal
             .set_asg_desired_capacity(asg, *desired_capacity)
             .await
             .map(|_| ()),
-        ScalingAction::AdvanceDrain {
-            instance_id,
-            phase,
-        } => {
+        ScalingAction::AdvanceDrain { instance_id, phase } => {
             info!(?phase, instance_id, "advancing drain phase");
             Ok(())
         }
@@ -318,7 +313,10 @@ impl Actuator for LoggingActuator {
         service: &str,
         desired: u32,
     ) -> Result<bool> {
-        info!(cluster, service, desired, "would update service desired count");
+        info!(
+            cluster,
+            service, desired, "would update service desired count"
+        );
         Ok(true)
     }
 
@@ -332,7 +330,10 @@ impl Actuator for LoggingActuator {
         cluster: &str,
         container_instance_arn: &str,
     ) -> Result<()> {
-        info!(cluster, container_instance_arn, "would drain container instance");
+        info!(
+            cluster,
+            container_instance_arn, "would drain container instance"
+        );
         Ok(())
     }
 

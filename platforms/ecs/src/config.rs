@@ -206,6 +206,10 @@ pub struct ObservabilityConfig {
     #[serde(default = "default_busybox_image")]
     pub busybox_image: String,
     pub retention_days: u32,
+    /// Loki query endpoint for `tkr logs`. Defaults to localhost:3100
+    /// (reachable when `tkr port-forward loki` is active).
+    #[serde(default = "default_loki_query_url")]
+    pub loki_query_url: String,
 }
 
 impl EcsConfig {
@@ -472,6 +476,7 @@ impl Default for ObservabilityConfig {
             aws_cli_image: default_aws_cli_image(),
             busybox_image: default_busybox_image(),
             retention_days: 30,
+            loki_query_url: default_loki_query_url(),
         }
     }
 }
@@ -653,4 +658,8 @@ fn default_aws_cli_image() -> String {
 
 fn default_busybox_image() -> String {
     "public.ecr.aws/docker/library/busybox:latest".into()
+}
+
+fn default_loki_query_url() -> String {
+    "http://localhost:3100".into()
 }

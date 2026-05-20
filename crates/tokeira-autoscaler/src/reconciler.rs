@@ -135,6 +135,41 @@ mod tests {
         assert!(reconcile(&desired, &current).is_empty());
     }
 
+    #[test]
+    fn differing_desired_and_current_produces_expected_actions() {
+        let mut desired = DesiredState::default();
+        desired.service_counts.insert("edge".into(), 3);
+        desired.asg_capacities.insert("runtime".into(), 5);
+        desired
+            .drain_intents
+            .insert("i-123".into(), DrainPhase::ProtectionCleared);
+
+        let mut current = CurrentState::default();
+        current.service_counts.insert("edge".into(), 2);
+        current.asg_capacities.insert("runtime".into(), 4);
+        current
+            .drain_intents
+            .insert("i-123".into(), DrainPhase::EcsDraining);
+
+        assert_eq!(
+            reconcile(&desired, &current),
+            vec![
+                ScalingAction::UpdateService {
+                    service: "edge".into(),
+                    desired_count: 3,
+                },
+                ScalingAction::UpdateAsg {
+                    asg: "runtime".into(),
+                    desired_capacity: 5,
+                },
+                ScalingAction::AdvanceDrain {
+                    instance_id: "i-123".into(),
+                    phase: DrainPhase::ProtectionCleared,
+                },
+            ]
+        );
+    }
+
     proptest! {
         #[test]
         fn property_matching_desired_and_current_is_idempotent(

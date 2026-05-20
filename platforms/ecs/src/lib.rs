@@ -354,25 +354,85 @@ impl Ops for EcsDeployment {
         &VALID
     }
 
-    fn desired_replicas(&self, _config: &Self::Config) -> Vec<ServiceReplicas> {
-        Vec::new()
+    fn desired_replicas(&self, config: &Self::Config) -> Vec<ServiceReplicas> {
+        vec![
+            ServiceReplicas {
+                service: "edge-api".into(),
+                replicas: config.services.edge_api.desired_count,
+            },
+            ServiceReplicas {
+                service: "edge-poll".into(),
+                replicas: config.services.edge_poll.desired_count,
+            },
+            ServiceReplicas {
+                service: "projection".into(),
+                replicas: config.services.projection.desired_count,
+            },
+            ServiceReplicas {
+                service: "controller".into(),
+                replicas: config.services.controller.desired_count,
+            },
+            ServiceReplicas {
+                service: "autoscaler".into(),
+                replicas: config.services.autoscaler.desired_count,
+            },
+            ServiceReplicas {
+                service: "admin".into(),
+                replicas: config.services.admin.desired_count,
+            },
+            ServiceReplicas {
+                service: "mimir".into(),
+                replicas: 1,
+            },
+            ServiceReplicas {
+                service: "loki".into(),
+                replicas: 1,
+            },
+            ServiceReplicas {
+                service: "grafana".into(),
+                replicas: 1,
+            },
+        ]
     }
 
-    async fn scale_up(&self, _service: &str, _replicas: u32, _config: &Self::Config) -> Result<()> {
-        Err(anyhow::anyhow!("ECS scale operations are not implemented yet").into())
+    async fn scale_up(&self, service: &str, replicas: u32, config: &Self::Config) -> Result<()> {
+        reject_observability_scale(service)?;
+        let current = self.describe_service_desired_count(service, config).await?;
+        self.update_service_desired_count(service, current.saturating_add(replicas), config)
+            .await
     }
 
-    async fn scale_down(
-        &self,
-        _service: &str,
-        _replicas: u32,
-        _config: &Self::Config,
-    ) -> Result<()> {
-        Err(anyhow::anyhow!("ECS scale operations are not implemented yet").into())
+    async fn scale_down(&self, service: &str, replicas: u32, config: &Self::Config) -> Result<()> {
+        reject_observability_scale(service)?;
+        let current = self.describe_service_desired_count(service, config).await?;
+        self.update_service_desired_count(service, current.saturating_sub(replicas), config)
+            .await
     }
 
-    async fn logs(&self, _service: &str, _config: &Self::Config) -> Result<Vec<String>> {
-        Err(anyhow::anyhow!("ECS logs are not implemented yet").into())
+    async fn logs(&self, service: &str, config: &Self::Config) -> Result<Vec<String>> {
+        validate_service_name(self.valid_services(), service)?;
+        // Primary: query Loki via HTTP API at localhost (requires `tkr port-forward loki`)
+        let ecs_service = ecs_service_name(service);
+        match query_loki_logs(ecs_service, &config.observability.loki_query_url).await {
+            Ok(lines) => Ok(lines),
+            Err(loki_err) => {
+                tracing::debug!(?loki_err, "Loki query failed, attempting ECS task log fallback");
+                // Fallback: list running tasks and retrieve logs via ecs:DescribeTasks
+                match self.ecs_task_logs_fallback(service, config).await {
+                    Ok(lines) => Ok(lines),
+                    Err(_) => Err(anyhow::anyhow!(
+                        "could not retrieve logs for '{service}'\n\n\
+                         Loki query failed: {loki_err}\n\n\
+                         Logs are collected by Alloy sidecars and stored in Loki.\n\
+                         To view logs, either:\n  \
+                         1. Run `tkr port-forward loki` then retry `tkr logs {service}`\n  \
+                         2. Open Grafana: `tkr port-forward grafana` → http://localhost:3000\n  \
+                         3. Enable break-glass CloudWatch: `tkr debug logs enable`"
+                    )
+                    .into())
+                }
+            }
+        }
     }
 
     async fn port_mappings(
@@ -381,6 +441,225 @@ impl Ops for EcsDeployment {
         _config: &Self::Config,
     ) -> Result<Vec<PortMapping>> {
         Err(anyhow::anyhow!("ECS port mappings are not implemented yet").into())
+    }
+}
+
+impl EcsDeployment {
+    async fn describe_service_desired_count(
+        &self,
+        service: &str,
+        config: &EcsConfig,
+    ) -> Result<u32> {
+        validate_service_name(Ops::valid_services(self), service)?;
+        let clients = self.ensure_aws_clients(config).await?;
+        let ecs_service = ecs_service_name(service);
+        let output = clients
+            .ecs
+            .describe_services()
+            .cluster(&config.cluster.name)
+            .services(ecs_service)
+            .send()
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("ecs:DescribeServices failed: {}", err.into_service_error())
+            })?;
+        let service = output
+            .services()
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("ECS service '{ecs_service}' was not found"))?;
+        Ok(service.desired_count().max(0) as u32)
+    }
+
+    async fn update_service_desired_count(
+        &self,
+        service: &str,
+        desired_count: u32,
+        config: &EcsConfig,
+    ) -> Result<()> {
+        validate_service_name(Ops::valid_services(self), service)?;
+        let clients = self.ensure_aws_clients(config).await?;
+        let ecs_service = ecs_service_name(service);
+        clients
+            .ecs
+            .update_service()
+            .cluster(&config.cluster.name)
+            .service(ecs_service)
+            .desired_count(desired_count as i32)
+            .send()
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("ecs:UpdateService failed: {}", err.into_service_error())
+            })?;
+        Ok(())
+    }
+
+    /// Fallback log retrieval: list running tasks and return their ARNs
+    /// with status info so the operator knows what's running.
+    async fn ecs_task_logs_fallback(
+        &self,
+        service: &str,
+        config: &EcsConfig,
+    ) -> Result<Vec<String>> {
+        let clients = self.ensure_aws_clients(config).await?;
+        let ecs_service = ecs_service_name(service);
+        let task_list = clients
+            .ecs
+            .list_tasks()
+            .cluster(&config.cluster.name)
+            .service_name(ecs_service)
+            .desired_status(aws_sdk_ecs::types::DesiredStatus::Running)
+            .send()
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("ecs:ListTasks failed: {}", err.into_service_error())
+            })?;
+
+        let task_arns = task_list.task_arns();
+        if task_arns.is_empty() {
+            return Err(
+                anyhow::anyhow!("no running tasks found for service '{ecs_service}'").into(),
+            );
+        }
+
+        let describe_output = clients
+            .ecs
+            .describe_tasks()
+            .cluster(&config.cluster.name)
+            .set_tasks(Some(task_arns.to_vec()))
+            .send()
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("ecs:DescribeTasks failed: {}", err.into_service_error())
+            })?;
+
+        let mut lines = Vec::new();
+        lines.push(format!("--- ECS task info for {ecs_service} (Loki unavailable) ---"));
+        for task in describe_output.tasks() {
+            let task_arn = task.task_arn().unwrap_or("unknown");
+            let status = task.last_status().unwrap_or("unknown");
+            let started_at = task
+                .started_at()
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "not started".into());
+            lines.push(format!("  task: {task_arn}"));
+            lines.push(format!("  status: {status}, started: {started_at}"));
+            lines.push(String::new());
+        }
+        lines.push("hint: logs are collected by Alloy sidecars → Loki".into());
+        lines.push(format!(
+            "hint: run `tkr port-forward loki` then `tkr logs {service}` for full logs"
+        ));
+        Ok(lines)
+    }
+}
+
+/// Query Loki's HTTP API for recent log lines matching the given ECS service name.
+///
+/// Uses the LogQL query `{container_name=~"<service>.*"}` to match logs
+/// collected by Alloy sidecars. The Loki endpoint is typically reachable
+/// via `tkr port-forward loki` at localhost:3100.
+async fn query_loki_logs(ecs_service: &str, loki_url: &str) -> anyhow::Result<Vec<String>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+
+    // LogQL query: match logs from the service's containers
+    let query = format!("{{container_name=~\"{ecs_service}.*\"}}");
+    let url = format!("{loki_url}/loki/api/v1/query_range");
+
+    let response = client
+        .get(&url)
+        .query(&[
+            ("query", query.as_str()),
+            ("limit", "100"),
+            ("direction", "backward"),
+        ])
+        .send()
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to connect to Loki at {loki_url}: {err}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!(
+            "Loki returned {status}: {body}"
+        ));
+    }
+
+    let body: serde_json::Value = response.json().await?;
+    let mut lines = Vec::new();
+
+    // Parse Loki query_range response: data.result[].values[][1]
+    if let Some(results) = body
+        .get("data")
+        .and_then(|d| d.get("result"))
+        .and_then(|r| r.as_array())
+    {
+        for stream in results {
+            if let Some(values) = stream.get("values").and_then(|v| v.as_array()) {
+                for entry in values {
+                    if let Some(log_line) = entry.get(1).and_then(|v| v.as_str()) {
+                        lines.push(log_line.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no log entries found for '{ecs_service}' in Loki"
+        ));
+    }
+
+    // Loki returns newest-first with direction=backward; reverse for chronological order
+    lines.reverse();
+    Ok(lines)
+}
+
+fn validate_service_name(valid: &[&str], service: &str) -> Result<()> {
+    if valid.contains(&service) {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "unknown service '{service}'. valid services: {}",
+            valid.join(", ")
+        )
+        .into())
+    }
+}
+
+/// Observability services have their desired-count managed by the
+/// observability IaC module. Manual scaling would be overwritten on the
+/// next `tkr infra apply` and could break the single-host invariant
+/// that `tkr port-forward` relies on.
+fn reject_observability_scale(service: &str) -> Result<()> {
+    const OBSERVABILITY_SERVICES: &[&str] = &["mimir", "loki", "grafana"];
+    if OBSERVABILITY_SERVICES.contains(&service) {
+        Err(anyhow::anyhow!(
+            "cannot scale '{service}' — its desired-count is managed by the observability module.\n\
+             To change capacity, update the `capacity_providers.{service}` section in deployment.toml \
+             and run `tkr infra apply`."
+        )
+        .into())
+    } else {
+        Ok(())
+    }
+}
+
+fn ecs_service_name(service: &str) -> &'static str {
+    match service {
+        "edge-api" => "tokeira-edge-api",
+        "edge-poll" => "tokeira-edge-poll",
+        "runtime" => "tokeira-runtime",
+        "projection" => "tokeira-projection",
+        "controller" => "tokeira-controller",
+        "autoscaler" => "tokeira-autoscaler",
+        "admin" => "tokeira-admin",
+        "mimir" => "tokeira-mimir",
+        "loki" => "tokeira-loki",
+        "grafana" => "tokeira-grafana",
+        _ => "unknown",
     }
 }
 
@@ -481,6 +760,25 @@ mod tests {
         assert!(deployment.valid_services().contains(&"mimir"));
         assert!(deployment.valid_services().contains(&"loki"));
         assert!(deployment.valid_services().contains(&"grafana"));
+    }
+
+    #[test]
+    fn observability_services_reject_scale() {
+        for service in ["mimir", "loki", "grafana"] {
+            let err = reject_observability_scale(service).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("managed by the observability module"),
+                "expected observability rejection for '{service}', got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn application_services_pass_observability_check() {
+        for service in ["edge-api", "edge-poll", "runtime", "projection", "controller", "autoscaler", "admin"] {
+            reject_observability_scale(service).expect(&format!("{service} should not be rejected"));
+        }
     }
 
     #[test]

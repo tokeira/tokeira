@@ -14,10 +14,12 @@
 //! 3. Wire up the dispatch arm in `main::main`.
 //! 4. Re-use `require_confirmation` for any destructive operation.
 
+pub mod admin;
 pub mod config;
 pub mod deploy;
 pub mod deployment;
 pub mod dev;
+pub mod exec;
 pub mod image;
 pub mod infra;
 pub mod logs;

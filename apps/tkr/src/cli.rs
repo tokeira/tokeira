@@ -75,6 +75,22 @@ pub enum Command {
     },
     PortForward {
         service: String,
+        /// Local port to bind. Defaults to the service's canonical port
+        /// (grafana=3000, edge-api=7233, edge-poll=7234, controller=7240,
+        /// mimir=9009, loki=3100).
+        #[arg(long)]
+        local_port: Option<u16>,
+    },
+    /// Execute a command in a running ECS container.
+    Exec {
+        service: String,
+        /// Container name to exec into. Defaults to the primary application
+        /// container for the service (never the Alloy sidecar).
+        #[arg(long)]
+        container: Option<String>,
+        /// Command to execute inside the container.
+        #[arg(last = true)]
+        cmd: Vec<String>,
     },
     Config {
         #[command(subcommand)]
@@ -83,6 +99,15 @@ pub enum Command {
     Workstation {
         #[command(subcommand)]
         action: WorkstationAction,
+    },
+    /// Run an admin command against the tokeira-admin ECS service.
+    ///
+    /// Scales the admin service from 0→1, waits for RUNNING, executes the
+    /// command via ECS Exec, streams output, then scales back to 0.
+    Admin {
+        /// The full command to forward to the admin binary (e.g. "schema setup").
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
     },
     Version,
 }

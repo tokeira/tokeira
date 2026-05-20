@@ -81,6 +81,20 @@ mod tests {
         assert!(!envelope.allows_scale_to(4));
     }
 
+    #[test]
+    fn zero_budget_blocks_runtime_hosts_when_per_host_reservation_is_nonzero() {
+        let envelope = ScalingEnvelope {
+            configured_max_runtime_hosts: 10,
+            dsql_connection_budget: 0,
+            dsql_connection_rate_budget: 100,
+            per_runtime_reserved_connections: 64,
+            per_runtime_startup_connection_rate: 10,
+        };
+
+        assert_eq!(envelope.effective_max_runtime_hosts(), 0);
+        assert!(!envelope.allows_scale_to(1));
+    }
+
     proptest! {
         #[test]
         fn property_effective_max_decreases_as_per_runtime_reserved_increases(

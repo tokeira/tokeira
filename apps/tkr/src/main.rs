@@ -109,9 +109,17 @@ async fn main() -> Result<()> {
             let ctx = load_context(&deployments, cli.deployment.as_deref())?;
             commands::logs::run(&service, follow, tail, ctx).await
         }
-        Command::PortForward { service } => {
+        Command::PortForward { service, local_port } => {
             let ctx = load_context(&deployments, cli.deployment.as_deref())?;
-            commands::port_forward::run(&service, ctx).await
+            commands::port_forward::run(&service, local_port, ctx).await
+        }
+        Command::Exec {
+            service,
+            container,
+            cmd,
+        } => {
+            let ctx = load_context(&deployments, cli.deployment.as_deref())?;
+            commands::exec::run(&service, container.as_deref(), &cmd, ctx).await
         }
         Command::Config {
             action: ConfigAction::Show,
@@ -120,6 +128,10 @@ async fn main() -> Result<()> {
             commands::config::run_show(ctx)
         }
         Command::Workstation { action } => commands::workstation::run(action, cli.json).await,
+        Command::Admin { command } => {
+            let ctx = load_context(&deployments, cli.deployment.as_deref())?;
+            commands::admin::run(command, ctx).await
+        }
         Command::Version => {
             commands::version::run();
             Ok(())
@@ -347,7 +359,7 @@ mod tests {
             Cli::try_parse_from(["tkr", "port-forward", "grafana"])
                 .unwrap()
                 .command,
-            Command::PortForward { service } if service == "grafana"
+            Command::PortForward { service, local_port: None } if service == "grafana"
         ));
         assert!(matches!(
             Cli::try_parse_from(["tkr", "config", "show"])

@@ -223,7 +223,10 @@ mod tests {
         let result: Result<ControllerProcessConfig, _> = toml::from_str(toml_str);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("unknown field"), "error should mention unknown field: {err}");
+        assert!(
+            err.contains("unknown field"),
+            "error should mention unknown field: {err}"
+        );
     }
 
     #[test]
@@ -239,7 +242,10 @@ mod tests {
         let result: Result<ControllerProcessConfig, _> = toml::from_str(toml_str);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("unknown field"), "error should mention unknown field: {err}");
+        assert!(
+            err.contains("unknown field"),
+            "error should mention unknown field: {err}"
+        );
     }
 
     #[test]
@@ -255,7 +261,10 @@ mod tests {
         let result: Result<ControllerProcessConfig, _> = toml::from_str(toml_str);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("unknown field"), "error should mention unknown field: {err}");
+        assert!(
+            err.contains("unknown field"),
+            "error should mention unknown field: {err}"
+        );
     }
 
     #[test]
@@ -323,14 +332,19 @@ mod tests {
         let result = parse_config_path(args.into_iter());
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().to_string().contains("--config requires a path"),
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("--config requires a path"),
             "should indicate missing path"
         );
     }
 
     /// Testable version of config_path_from_args that accepts an iterator
     /// instead of reading from std::env::args.
-    fn parse_config_path(mut args: impl Iterator<Item = String>) -> anyhow::Result<std::path::PathBuf> {
+    fn parse_config_path(
+        mut args: impl Iterator<Item = String>,
+    ) -> anyhow::Result<std::path::PathBuf> {
         use anyhow::Context;
 
         let Some(first) = args.next() else {

@@ -110,3 +110,50 @@ fn increment_counter(counters: &mut BTreeMap<String, u32>, service: &str) -> u32
     *value = value.saturating_add(1);
     *value
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scale_out_requires_configured_consecutive_samples() {
+        let mut config = AutoscalerServiceConfig::default();
+        config.scale_out_consecutive_samples = 2;
+        let mut desired = DesiredState::default();
+        let mut loop_a = ReplicaScalingLoop::default();
+        let signal = ServiceSignal {
+            service: "tokeira-edge-api".to_owned(),
+            current_count: 2,
+            pressure: ServicePressure::ScaleOut,
+        };
+
+        loop_a.apply_signals(&config, &mut desired, std::slice::from_ref(&signal));
+        assert_eq!(desired.service_counts["tokeira-edge-api"], 2);
+
+        loop_a.apply_signals(&config, &mut desired, &[signal]);
+        assert_eq!(desired.service_counts["tokeira-edge-api"], 3);
+    }
+
+    #[test]
+    fn hold_resets_hysteresis_counters() {
+        let mut config = AutoscalerServiceConfig::default();
+        config.scale_out_consecutive_samples = 2;
+        let mut desired = DesiredState::default();
+        let mut loop_a = ReplicaScalingLoop::default();
+        let scale_out = ServiceSignal {
+            service: "tokeira-edge-api".to_owned(),
+            current_count: 2,
+            pressure: ServicePressure::ScaleOut,
+        };
+        let hold = ServiceSignal {
+            pressure: ServicePressure::Hold,
+            ..scale_out.clone()
+        };
+
+        loop_a.apply_signals(&config, &mut desired, std::slice::from_ref(&scale_out));
+        loop_a.apply_signals(&config, &mut desired, &[hold]);
+        loop_a.apply_signals(&config, &mut desired, &[scale_out]);
+
+        assert_eq!(desired.service_counts["tokeira-edge-api"], 2);
+    }
+}

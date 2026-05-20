@@ -141,9 +141,7 @@ pub async fn query_runtime_pressure(
         .context("lane queue saturation query failed")?;
 
     let dsql_headroom = mimir
-        .query_instant_value(
-            "tokeira_dsql_pool_connections_total - tokeira_dsql_pool_class_in_use",
-        )
+        .query_instant_value("tokeira_dsql_pool_connections_total - tokeira_dsql_pool_class_in_use")
         .await
         .context("DSQL connection headroom query failed")?;
 

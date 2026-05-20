@@ -227,11 +227,7 @@ async fn build_repositories(
 ) -> Result<(Arc<dyn LeaseRepository>, Arc<dyn ControlRepository>)> {
     let region = if config.dsql_region.is_empty() {
         // Derive region from endpoint (e.g., "cluster.dsql.us-east-1.on.aws").
-        config
-            .dsql_endpoint
-            .split('.')
-            .nth(2)
-            .map(|s| s.to_owned())
+        config.dsql_endpoint.split('.').nth(2).map(|s| s.to_owned())
     } else {
         Some(config.dsql_region.clone())
     };

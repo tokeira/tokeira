@@ -68,3 +68,48 @@ pub fn advance_drain_phase(desired: &mut DesiredState, instance_id: &str) -> Opt
     desired.drain_intents.insert(instance_id.to_owned(), next);
     Some(next)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retirement_request_is_idempotent() {
+        let mut desired = DesiredState::default();
+        let candidate = RetirementCandidate {
+            instance_id: "i-abc".to_owned(),
+        };
+
+        assert!(request_runtime_retirement(&mut desired, candidate.clone()));
+        assert!(!request_runtime_retirement(&mut desired, candidate));
+        assert_eq!(
+            desired.drain_intents["i-abc"],
+            DrainPhase::ControllerDraining
+        );
+    }
+
+    #[test]
+    fn drain_phase_progresses_to_terminal_state() {
+        let mut desired = DesiredState::default();
+        desired
+            .drain_intents
+            .insert("i-abc".to_owned(), DrainPhase::ControllerDraining);
+
+        assert_eq!(
+            advance_drain_phase(&mut desired, "i-abc"),
+            Some(DrainPhase::EcsDraining)
+        );
+        assert_eq!(
+            advance_drain_phase(&mut desired, "i-abc"),
+            Some(DrainPhase::ProtectionCleared)
+        );
+        assert_eq!(
+            advance_drain_phase(&mut desired, "i-abc"),
+            Some(DrainPhase::Terminated)
+        );
+        assert_eq!(
+            advance_drain_phase(&mut desired, "i-abc"),
+            Some(DrainPhase::Terminated)
+        );
+    }
+}

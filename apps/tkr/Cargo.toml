@@ -12,6 +12,7 @@ integration-test = []
 anyhow.workspace = true
 async-trait.workspace = true
 aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-ecs = "1"
 base64 = "0.22"
 chrono.workspace = true
 clap.workspace = true

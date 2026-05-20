@@ -71,3 +71,75 @@ pub fn apply_runtime_scale_out(
     desired.asg_capacities.insert(asg_name.to_owned(), target);
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn envelope() -> ScalingEnvelope {
+        ScalingEnvelope {
+            configured_max_runtime_hosts: 10,
+            dsql_connection_budget: 1_000,
+            dsql_connection_rate_budget: 100,
+            per_runtime_reserved_connections: 64,
+            per_runtime_startup_connection_rate: 10,
+        }
+    }
+
+    #[test]
+    fn scale_out_is_blocked_without_dsql_headroom() {
+        let mut desired = DesiredState::default();
+        let changed = apply_runtime_scale_out(
+            &mut desired,
+            "runtime",
+            envelope(),
+            RuntimeScaleOutInput {
+                current_hosts: 3,
+                step: 1,
+                pressure: RuntimePressure::BroadSaturation,
+                dsql_headroom_available: false,
+            },
+        );
+
+        assert!(!changed);
+        assert!(desired.asg_capacities.is_empty());
+    }
+
+    #[test]
+    fn hot_bundle_imbalance_does_not_scale_runtime_hosts() {
+        let mut desired = DesiredState::default();
+        let changed = apply_runtime_scale_out(
+            &mut desired,
+            "runtime",
+            envelope(),
+            RuntimeScaleOutInput {
+                current_hosts: 3,
+                step: 1,
+                pressure: RuntimePressure::HotBundleImbalance,
+                dsql_headroom_available: true,
+            },
+        );
+
+        assert!(!changed);
+        assert!(desired.asg_capacities.is_empty());
+    }
+
+    #[test]
+    fn broad_saturation_with_headroom_sets_target_capacity() {
+        let mut desired = DesiredState::default();
+        let changed = apply_runtime_scale_out(
+            &mut desired,
+            "runtime",
+            envelope(),
+            RuntimeScaleOutInput {
+                current_hosts: 3,
+                step: 2,
+                pressure: RuntimePressure::BroadSaturation,
+                dsql_headroom_available: true,
+            },
+        );
+
+        assert!(changed);
+        assert_eq!(desired.asg_capacities["runtime"], 5);
+    }
+}

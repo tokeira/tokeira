@@ -11,7 +11,8 @@ use arc_swap::ArcSwap;
 use thiserror::Error;
 use tokeira_proto::connect::tokeira::internal::controller::v1::{
     self as pb, PlacementControllerClient, RefreshBundleRequest, SubscribeRoutingRequest,
-    bundle_ownership_entry, node_endpoint_entry, routing_update,
+    bundle_ownership_entry, node_endpoint_entry,
+    RoutingUpdateView,
 };
 use tokeira_storage::LeaseRepository;
 use tokeira_types::{
@@ -178,8 +179,8 @@ pub async fn subscribe_routing_once(
         .await
         .map_err(|e| anyhow!("subscribe_routing failed: {e}"))?;
     if let Some(update) = stream.message().await.map_err(|e| anyhow!("{e}"))? {
-        let owned = update.to_owned_message();
-        apply_routing_update(&cache, owned)?;
+        // Work directly with the zero-copy view — no .to_owned_message().
+        apply_routing_update_view(&cache, &*update)?;
     }
     Ok(())
 }
@@ -232,8 +233,8 @@ async fn subscribe_until_disconnect(
                 let Some(update) = msg.map_err(|e| anyhow!("{e}"))? else {
                     return Err(anyhow!("routing subscription ended"));
                 };
-                let owned = update.to_owned_message();
-                apply_routing_update(&cache, owned)?;
+                // Zero-copy: read fields directly from the view without allocating.
+                apply_routing_update_view(&cache, &*update)?;
             }
         }
     }
@@ -363,16 +364,84 @@ fn make_client(
     PlacementControllerClient::new(http, config)
 }
 
-/// Apply a routing update (full snapshot or delta) to the cache.
-fn apply_routing_update(cache: &RoutingCache, update: pb::RoutingUpdate) -> Result<()> {
-    match update.update {
-        Some(routing_update::Update::Full(full)) => {
-            cache.replace_snapshot(decode_snapshot(*full)?);
+/// Apply a routing update working directly from the zero-copy view.
+/// String fields are borrowed &str from the wire buffer — no allocation.
+fn apply_routing_update_view(cache: &RoutingCache, update: &RoutingUpdateView<'_>) -> Result<()> {
+    use tokeira_proto::connect::tokeira::internal::controller::v1::__buffa::view::oneof::{
+        bundle_ownership_entry::State as BundleState,
+        node_endpoint_entry::State as NodeState,
+        routing_update::Update,
+    };
+
+    match &update.update {
+        Some(Update::Full(full)) => {
+            let pc = &full.placement_config;
+            let mut snapshot = RoutingSnapshot {
+                execution_bundle_owners: Default::default(),
+                node_endpoints: Default::default(),
+                placement_config: PlacementConfig {
+                    shard_count: pc.shard_count,
+                    bundle_count: pc.bundle_count,
+                    partition_count: pc.partition_count,
+                    hash_version: pc.hash_version,
+                },
+                generation: GenerationCounter(full.generation),
+            };
+            for entry in full.bundles.iter() {
+                if let Some(BundleState::Owner(owner)) = &entry.state {
+                    snapshot.execution_bundle_owners.insert(
+                        ShardId(entry.bundle_id),
+                        BundleOwner {
+                            node_id: owner.owner_node_id.parse()?,
+                            epoch: ShardEpoch(owner.epoch),
+                        },
+                    );
+                }
+            }
+            for entry in full.nodes.iter() {
+                if let Some(NodeState::Endpoint(ep)) = &entry.state {
+                    snapshot.node_endpoints.insert(
+                        entry.node_id.parse()?,
+                        NodeEndpoint {
+                            host: ep.host.to_owned(),
+                            port: u16::try_from(ep.port)?,
+                        },
+                    );
+                }
+            }
+            cache.replace_snapshot(snapshot);
             Ok(())
         }
-        Some(routing_update::Update::Delta(delta)) => {
+        Some(Update::Delta(delta)) => {
             let mut snapshot = (*cache.snapshot()).clone();
-            snapshot.apply_delta(decode_delta(*delta)?)?;
+            let mut bundle_updates = Vec::new();
+            for entry in delta.bundle_updates.iter() {
+                let update = match &entry.state {
+                    Some(BundleState::Owner(owner)) => Some(BundleOwner {
+                        node_id: owner.owner_node_id.parse()?,
+                        epoch: ShardEpoch(owner.epoch),
+                    }),
+                    _ => None,
+                };
+                bundle_updates.push((ShardId(entry.bundle_id), update));
+            }
+            let mut node_updates = Vec::new();
+            for entry in delta.node_updates.iter() {
+                let update = match &entry.state {
+                    Some(NodeState::Endpoint(ep)) => Some(NodeEndpoint {
+                        host: ep.host.to_owned(),
+                        port: u16::try_from(ep.port)?,
+                    }),
+                    _ => None,
+                };
+                node_updates.push((entry.node_id.parse()?, update));
+            }
+            snapshot.apply_delta(RoutingDelta {
+                base_generation: GenerationCounter(delta.base_generation),
+                bundle_updates,
+                node_updates,
+                generation: GenerationCounter(delta.generation),
+            })?;
             cache.replace_snapshot(snapshot);
             Ok(())
         }
@@ -463,78 +532,6 @@ where
         endpoint.clone(),
     );
     Ok(Some((endpoint, lease.epoch)))
-}
-
-fn decode_snapshot(full: pb::FullRoutingSnapshot) -> Result<RoutingSnapshot> {
-    let placement_config = full
-        .placement_config
-        .into_option()
-        .ok_or_else(|| anyhow!("routing snapshot missing placement_config"))?;
-    let mut snapshot = RoutingSnapshot {
-        execution_bundle_owners: Default::default(),
-        node_endpoints: Default::default(),
-        placement_config: PlacementConfig {
-            shard_count: placement_config.shard_count,
-            bundle_count: placement_config.bundle_count,
-            partition_count: placement_config.partition_count,
-            hash_version: placement_config.hash_version,
-        },
-        generation: GenerationCounter(full.generation),
-    };
-    for entry in full.bundles {
-        if let Some(bundle_ownership_entry::State::Owner(owner)) = entry.state {
-            snapshot.execution_bundle_owners.insert(
-                ShardId(entry.bundle_id),
-                BundleOwner {
-                    node_id: owner.owner_node_id.parse()?,
-                    epoch: ShardEpoch(owner.epoch),
-                },
-            );
-        }
-    }
-    for entry in full.nodes {
-        if let Some(node_endpoint_entry::State::Endpoint(ep)) = entry.state {
-            snapshot.node_endpoints.insert(
-                entry.node_id.parse()?,
-                NodeEndpoint {
-                    host: ep.host,
-                    port: u16::try_from(ep.port)?,
-                },
-            );
-        }
-    }
-    Ok(snapshot)
-}
-
-fn decode_delta(delta: pb::RoutingDeltaMessage) -> Result<RoutingDelta> {
-    let mut bundle_updates = Vec::new();
-    for entry in delta.bundle_updates {
-        let update = match entry.state {
-            Some(bundle_ownership_entry::State::Owner(owner)) => Some(BundleOwner {
-                node_id: owner.owner_node_id.parse()?,
-                epoch: ShardEpoch(owner.epoch),
-            }),
-            _ => None,
-        };
-        bundle_updates.push((ShardId(entry.bundle_id), update));
-    }
-    let mut node_updates = Vec::new();
-    for entry in delta.node_updates {
-        let update = match entry.state {
-            Some(node_endpoint_entry::State::Endpoint(ep)) => Some(NodeEndpoint {
-                host: ep.host,
-                port: u16::try_from(ep.port)?,
-            }),
-            _ => None,
-        };
-        node_updates.push((entry.node_id.parse()?, update));
-    }
-    Ok(RoutingDelta {
-        base_generation: GenerationCounter(delta.base_generation),
-        bundle_updates,
-        node_updates,
-        generation: GenerationCounter(delta.generation),
-    })
 }
 
 #[cfg(test)]

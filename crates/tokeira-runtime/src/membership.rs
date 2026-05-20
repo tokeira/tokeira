@@ -179,8 +179,9 @@ where
                     let Some(directive) = directive.map_err(|e| anyhow!("{e}"))? else {
                         return Ok(());
                     };
-                    let owned = directive.to_owned_message();
-                    self.handle_directive(owned).await?;
+                    // Work directly with the zero-copy view — only allocate
+                    // when storing data (lease operations need owned strings).
+                    self.handle_directive_view(&*directive).await?;
                 }
             }
         }
@@ -313,7 +314,73 @@ impl<R> MembershipClient<R>
 where
     R: LeaseRepository + 'static,
 {
+    /// Handle a controller directive from the zero-copy view.
+    /// Only allocates when storing data (lease owner strings for DSQL operations).
+    pub async fn handle_directive_view(
+        &self,
+        directive: &pb::ControllerDirectiveView<'_>,
+    ) -> Result<()> {
+        use tokeira_proto::connect::tokeira::internal::controller::v1::__buffa::view::oneof::controller_directive::Directive;
+
+        match &directive.directive {
+            Some(Directive::DesiredPlacement(desired)) => {
+                for &bundle in desired.acquire_bundles.iter() {
+                    let bundle = ShardId(bundle);
+                    let outcome = self
+                        .leases
+                        .try_acquire_bundle(
+                            bundle,
+                            self.config.owner_identity(),
+                            self.config.node_endpoint.as_authority(),
+                        )
+                        .await?;
+                    if let LeaseOutcome::Acquired { epoch } = outcome {
+                        self.shard_owner
+                            .write()
+                            .unwrap()
+                            .record_acquired(bundle, epoch);
+                    }
+                }
+                for &bundle in desired.relinquish_bundles.iter() {
+                    self.relinquish_owned_bundle(ShardId(bundle)).await?;
+                }
+            }
+            Some(Directive::ConnectionBudget(budget)) => {
+                let valid_until = if budget.valid_until.is_set() {
+                    Some(BudgetExpiry {
+                        seconds: budget.valid_until.seconds,
+                    })
+                } else {
+                    None
+                };
+                *self.last_budget_valid_until.lock().unwrap() = valid_until;
+                self.budget_applier.apply_budget(
+                    budget.rate_per_second,
+                    budget.capacity,
+                    budget.max_reservoir_size,
+                )?;
+            }
+            Some(Directive::Drain(_)) => {
+                self.drain.begin();
+                let bundles = self
+                    .shard_owner
+                    .read()
+                    .unwrap()
+                    .owned_shards()
+                    .collect::<Vec<_>>();
+                for bundle in bundles {
+                    self.relinquish_owned_bundle(bundle).await?;
+                }
+                let owned_bundle_count = self.shard_owner.read().unwrap().owned_shards().count();
+                self.drain.record_progress(owned_bundle_count, 0, 0);
+            }
+            Some(Directive::RoutingUpdate(_)) | None => {}
+        }
+        Ok(())
+    }
+
     /// Handle a controller directive (buffa-generated owned type).
+    /// Used by tests that construct directives directly.
     pub async fn handle_directive(&self, directive: pb::ControllerDirective) -> Result<()> {
         match directive.directive {
             Some(controller_directive::Directive::DesiredPlacement(desired)) => {

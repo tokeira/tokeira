@@ -4,7 +4,7 @@ This document is the intended entry point for machine-assisted
 contributions. It captures what has been built, what remains,
 and where to contribute safely.
 
-Last updated: 2026-05-20
+Last updated: 2026-05-21
 
 ## Codebase snapshot
 
@@ -93,6 +93,24 @@ Controller binary (`apps/tokeira-controller/`): config loading,
 DSQL connection, gRPC server, placement loop, budget loop,
 graceful shutdown.
 
+### Worker heartbeat observability — complete
+
+In-memory heartbeat store (`InMemoryHeartbeatStore` in
+`tokeira-runtime/src/heartbeat.rs`): DashMap-backed, last-write-wins,
+monotonic `last_seen`, TTL eviction, capacity eviction, maintenance
+loop with staleness sampling. Shared `HeartbeatStore` trait in
+`tokeira-types`. Edge decoder from upstream proto. Handler migration
+for `RecordWorkerHeartbeat` and `ShutdownWorker`. Metrics: accepted/
+rejected counters, active state gauge, age histogram, entry counts.
+
+### Commit fencing correctness — complete
+
+Closed the TOCTOU race in `commit_transition_for_bundle` (epoch check
+and write now atomic in same transaction/lock). Routed activity start
+and retry through fenced commit. Fixed hard-coded shard count in
+continue-as-new successor timeout routing. Split `run_repository.rs`
+and `runtime.rs` into focused sub-modules along correctness boundaries.
+
 ### Autoscaler — complete
 
 Autoscaler library (`crates/tokeira-autoscaler/`): Loop A (REPLICA
@@ -164,65 +182,59 @@ Production-facing observability: export pipeline (Prometheus scrape, OTLP), OCC-
 
 Batched projection sink (`apply_batch` with multi-row DSQL inserts) and per-sink failure policies (retry_backoff, max_retries, dead_letter).
 
-### P4 — `worker-heartbeat-observability`
-
-**Status:** to spec.
-
-Durable worker heartbeat persistence with TTL, `ListWorkers` over persisted data, derived metrics (polls/sec, slot occupancy, worker-fleet health).
-
-### P5 — `worker-config-management`
+### P4 — `worker-config-management`
 
 **Status:** to spec.
 
 Server-backed worker configuration: `FetchWorkerConfig` and `UpdateWorkerConfig`. Lets operators push configuration changes to workers without redeploying.
 
-### P6 — `ecs-deployment` (remaining test tasks)
+### P5 — `ecs-deployment` (remaining test tasks)
 
 **Status:** implementation substantially complete. Outstanding: property tests (1.6, 1.7, 1.9), checkpoint verifications, and unit test task 9.14.
 
-### P7 — `runtime-broker-tiered-delivery`
+### P6 — `runtime-broker-tiered-delivery`
 
 **Status:** to spec.
 
 Split the broker into explicit sticky / live / backlog tiers. Local to `tokeira-runtime/`.
 
-### P8 — `kernel-pause-workflow`
+### P7 — `kernel-pause-workflow`
 
 **Status:** to spec.
 
 First-class workflow-execution pause: `PauseWorkflowExecution` and `UnpauseWorkflowExecution`.
 
-### P9 — `activity-executions-first-class`
+### P8 — `activity-executions-first-class`
 
 **Status:** to spec.
 
 Activities as first-class queryable objects (8 RPCs).
 
-### P10 — `kernel-snapshot-suffix-recovery`
+### P9 — `kernel-snapshot-suffix-recovery`
 
 **Status:** to spec.
 
 Persist snapshot refs for recovery from snapshot + suffix instead of full history prefix.
 
-### P11 — `worker-deployments`
+### P10 — `worker-deployments`
 
-**Status:** to spec. Blocked on `worker-heartbeat-observability`.
+**Status:** to spec.
 
 Named deployments, per-version ramping, task-queue routing by version.
 
-### P12 — `workflow-rules`
+### P11 — `workflow-rules`
 
 **Status:** to spec.
 
 Server-side declarative policies (5 RPCs).
 
-### P13 — `storage-archival-sweeps`
+### P12 — `storage-archival-sweeps`
 
 **Status:** to spec. Blocked on `ecs-deployment`.
 
 Sweep-eligibility + archival to S3.
 
-### P14 — `pipeline-foundation`
+### P13 — `pipeline-foundation`
 
 **Status:** spec complete (requirements, design, tasks).
 

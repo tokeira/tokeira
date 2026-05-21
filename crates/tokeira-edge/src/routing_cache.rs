@@ -10,9 +10,8 @@ use anyhow::{Result, anyhow};
 use arc_swap::ArcSwap;
 use thiserror::Error;
 use tokeira_proto::connect::tokeira::internal::controller::v1::{
-    self as pb, PlacementControllerClient, RefreshBundleRequest, SubscribeRoutingRequest,
-    bundle_ownership_entry, node_endpoint_entry,
-    RoutingUpdateView,
+    self as pb, PlacementControllerClient, RefreshBundleRequest, RoutingUpdateView,
+    SubscribeRoutingRequest, bundle_ownership_entry, node_endpoint_entry,
 };
 use tokeira_storage::LeaseRepository;
 use tokeira_types::{
@@ -354,9 +353,7 @@ where
 
 /// Construct a connect-rust client for the controller.
 /// HttpClient handles connection pooling internally.
-fn make_client(
-    endpoint: &str,
-) -> PlacementControllerClient<connectrpc::client::HttpClient> {
+fn make_client(endpoint: &str) -> PlacementControllerClient<connectrpc::client::HttpClient> {
     let http = connectrpc::client::HttpClient::plaintext();
     let config = connectrpc::client::ClientConfig::new(
         endpoint.parse().expect("invalid controller endpoint URI"),
@@ -368,8 +365,7 @@ fn make_client(
 /// String fields are borrowed &str from the wire buffer — no allocation.
 fn apply_routing_update_view(cache: &RoutingCache, update: &RoutingUpdateView<'_>) -> Result<()> {
     use tokeira_proto::connect::tokeira::internal::controller::v1::__buffa::view::oneof::{
-        bundle_ownership_entry::State as BundleState,
-        node_endpoint_entry::State as NodeState,
+        bundle_ownership_entry::State as BundleState, node_endpoint_entry::State as NodeState,
         routing_update::Update,
     };
 

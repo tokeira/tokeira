@@ -35,7 +35,9 @@ pub async fn run(command: Vec<String>, ctx: DeploymentContext) -> Result<()> {
     };
 
     if command.is_empty() {
-        bail!("no admin subcommand provided. examples: schema setup, schema migrate 5, diagnostics runtime");
+        bail!(
+            "no admin subcommand provided. examples: schema setup, schema migrate 5, diagnostics runtime"
+        );
     }
 
     let full_command = command.join(" ");
@@ -90,15 +92,23 @@ pub async fn run(command: Vec<String>, ctx: DeploymentContext) -> Result<()> {
                     STARTUP_TIMEOUT.as_secs()
                 ),
             };
-            bail!("{msg}\n\nnote: service was NOT scaled back to 0. Re-run `tkr admin` to retry or investigate via `tkr exec admin`.");
+            bail!(
+                "{msg}\n\nnote: service was NOT scaled back to 0. Re-run `tkr admin` to retry or investigate via `tkr exec admin`."
+            );
         }
     };
 
     println!("admin: task {task_arn} is RUNNING, executing command");
 
     // Execute the command via ECS Exec, handing off to session-manager-plugin.
-    let exec_result =
-        execute_command(&ecs_client, cluster, &task_arn, &full_command, ADMIN_SHORT_NAME).await;
+    let exec_result = execute_command(
+        &ecs_client,
+        cluster,
+        &task_arn,
+        &full_command,
+        ADMIN_SHORT_NAME,
+    )
+    .await;
 
     // The guard will scale back to 0 on drop. We explicitly drop it here
     // so the scale-down happens before we propagate any exec error.
@@ -121,10 +131,9 @@ async fn describe_desired_count(
         .await
         .context("ecs:DescribeServices failed")?;
 
-    let svc = output
-        .services()
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("ECS service '{service}' not found in cluster '{cluster}'"))?;
+    let svc = output.services().first().ok_or_else(|| {
+        anyhow::anyhow!("ECS service '{service}' not found in cluster '{cluster}'")
+    })?;
 
     Ok(svc.desired_count().max(0) as u32)
 }
@@ -277,7 +286,11 @@ async fn execute_command(
         "TokenValue": session.token_value().unwrap_or_default(),
     });
 
-    let region = client.config().region().map(|r| r.as_ref()).unwrap_or("us-east-1");
+    let region = client
+        .config()
+        .region()
+        .map(|r| r.as_ref())
+        .unwrap_or("us-east-1");
     let endpoint = format!("https://ecs.{region}.amazonaws.com");
 
     // Check that session-manager-plugin is installed.

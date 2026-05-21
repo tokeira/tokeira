@@ -109,7 +109,10 @@ async fn main() -> Result<()> {
             let ctx = load_context(&deployments, cli.deployment.as_deref())?;
             commands::logs::run(&service, follow, tail, ctx).await
         }
-        Command::PortForward { service, local_port } => {
+        Command::PortForward {
+            service,
+            local_port,
+        } => {
             let ctx = load_context(&deployments, cli.deployment.as_deref())?;
             commands::port_forward::run(&service, local_port, ctx).await
         }

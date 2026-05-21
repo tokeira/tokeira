@@ -7,13 +7,12 @@
 use connectrpc::{RequestContext, Response, ServiceResult, ServiceStream};
 use futures::StreamExt;
 use tokeira_proto::connect::tokeira::internal::controller::v1::{
-    self as pb, BundleOwnerMessage, BundleOwnershipEntry,
-    ControllerDirective, FullRoutingSnapshot, MarkDrainingResponse, NodeEndpointEntry,
-    NodeEndpointMessage, NominateResponse, PlacementConfigMessage, PlacementController,
-    RefreshBundleResponse, RoutingUpdate, ScaleInCandidate,
-    bundle_ownership_entry, node_endpoint_entry, routing_update,
+    self as pb, BundleOwnerMessage, BundleOwnershipEntry, ControllerDirective, FullRoutingSnapshot,
+    MarkDrainingResponse, NodeEndpointEntry, NodeEndpointMessage, NominateResponse,
     OwnedMarkDrainingRequestView, OwnedNominateRequestView, OwnedRefreshBundleRequestView,
-    OwnedRuntimeMembershipRequestView, OwnedSubscribeRoutingRequestView,
+    OwnedRuntimeMembershipRequestView, OwnedSubscribeRoutingRequestView, PlacementConfigMessage,
+    PlacementController, RefreshBundleResponse, RoutingUpdate, ScaleInCandidate,
+    bundle_ownership_entry, node_endpoint_entry, routing_update,
 };
 use tokeira_types::{IncarnationId, PlacementConfig, ShardId};
 
@@ -71,11 +70,11 @@ impl PlacementController for ConnectPlacementController {
                             version: reg.version,
                             build_id: reg.build_id,
                         };
-                        state
-                            .membership
-                            .write()
-                            .await
-                            .register_node(registration, RuntimeHeartbeat::empty(), None);
+                        state.membership.write().await.register_node(
+                            registration,
+                            RuntimeHeartbeat::empty(),
+                            None,
+                        );
                     }
                     Some(Request::Heartbeat(hb)) => {
                         if let Some(nid) = node_id {

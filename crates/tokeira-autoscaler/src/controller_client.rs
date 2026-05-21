@@ -40,10 +40,7 @@ impl ControllerClient {
     }
 
     /// Ask the controller which runtime hosts are safe to retire.
-    pub async fn nominate_scale_in_candidates(
-        &self,
-        limit: u32,
-    ) -> Result<NominationResult> {
+    pub async fn nominate_scale_in_candidates(&self, limit: u32) -> Result<NominationResult> {
         let response = self
             .client
             .nominate_scale_in_candidates(NominateRequest {

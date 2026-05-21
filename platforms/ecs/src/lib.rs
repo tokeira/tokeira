@@ -416,7 +416,10 @@ impl Ops for EcsDeployment {
         match query_loki_logs(ecs_service, &config.observability.loki_query_url).await {
             Ok(lines) => Ok(lines),
             Err(loki_err) => {
-                tracing::debug!(?loki_err, "Loki query failed, attempting ECS task log fallback");
+                tracing::debug!(
+                    ?loki_err,
+                    "Loki query failed, attempting ECS task log fallback"
+                );
                 // Fallback: list running tasks and retrieve logs via ecs:DescribeTasks
                 match self.ecs_task_logs_fallback(service, config).await {
                     Ok(lines) => Ok(lines),
@@ -429,7 +432,7 @@ impl Ops for EcsDeployment {
                          2. Open Grafana: `tkr port-forward grafana` → http://localhost:3000\n  \
                          3. Enable break-glass CloudWatch: `tkr debug logs enable`"
                     )
-                    .into())
+                    .into()),
                 }
             }
         }
@@ -510,9 +513,7 @@ impl EcsDeployment {
             .desired_status(aws_sdk_ecs::types::DesiredStatus::Running)
             .send()
             .await
-            .map_err(|err| {
-                anyhow::anyhow!("ecs:ListTasks failed: {}", err.into_service_error())
-            })?;
+            .map_err(|err| anyhow::anyhow!("ecs:ListTasks failed: {}", err.into_service_error()))?;
 
         let task_arns = task_list.task_arns();
         if task_arns.is_empty() {
@@ -533,7 +534,9 @@ impl EcsDeployment {
             })?;
 
         let mut lines = Vec::new();
-        lines.push(format!("--- ECS task info for {ecs_service} (Loki unavailable) ---"));
+        lines.push(format!(
+            "--- ECS task info for {ecs_service} (Loki unavailable) ---"
+        ));
         for task in describe_output.tasks() {
             let task_arn = task.task_arn().unwrap_or("unknown");
             let status = task.last_status().unwrap_or("unknown");
@@ -581,9 +584,7 @@ async fn query_loki_logs(ecs_service: &str, loki_url: &str) -> anyhow::Result<Ve
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!(
-            "Loki returned {status}: {body}"
-        ));
+        return Err(anyhow::anyhow!("Loki returned {status}: {body}"));
     }
 
     let body: serde_json::Value = response.json().await?;
@@ -776,8 +777,17 @@ mod tests {
 
     #[test]
     fn application_services_pass_observability_check() {
-        for service in ["edge-api", "edge-poll", "runtime", "projection", "controller", "autoscaler", "admin"] {
-            reject_observability_scale(service).expect(&format!("{service} should not be rejected"));
+        for service in [
+            "edge-api",
+            "edge-poll",
+            "runtime",
+            "projection",
+            "controller",
+            "autoscaler",
+            "admin",
+        ] {
+            reject_observability_scale(service)
+                .expect(&format!("{service} should not be rejected"));
         }
     }
 

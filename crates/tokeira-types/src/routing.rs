@@ -107,7 +107,9 @@ impl RoutingSnapshot {
 
     /// Iterate over all bundle ownership entries.
     pub fn bundle_owners(&self) -> impl Iterator<Item = (BundleId, &BundleOwner)> {
-        self.execution_bundle_owners.iter().map(|(&id, owner)| (id, owner))
+        self.execution_bundle_owners
+            .iter()
+            .map(|(&id, owner)| (id, owner))
     }
 
     /// Iterate over all node endpoint entries.

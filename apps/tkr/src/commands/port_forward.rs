@@ -20,8 +20,7 @@
 use std::process::Stdio;
 
 use anyhow::{Result, bail};
-use tokio::process::Command as TokioCommand;
-use tokio::signal;
+use tokio::{process::Command as TokioCommand, signal};
 
 use crate::deployment_dir::{DeploymentContext, PlatformDeploymentConfig};
 
@@ -71,14 +70,18 @@ fn service_connect_host(service: &str, namespace: &str) -> String {
     format!("{name}.{namespace}")
 }
 
-const VALID_PORT_FORWARD_SERVICES: &[&str] =
-    &["grafana", "edge-api", "edge-poll", "controller", "mimir", "loki"];
+const VALID_PORT_FORWARD_SERVICES: &[&str] = &[
+    "grafana",
+    "edge-api",
+    "edge-poll",
+    "controller",
+    "mimir",
+    "loki",
+];
 
 pub async fn run(service: &str, local_port: Option<u16>, ctx: DeploymentContext) -> Result<()> {
     match &ctx.platform_config {
-        PlatformDeploymentConfig::Ecs(config) => {
-            run_ecs(service, local_port, config).await
-        }
+        PlatformDeploymentConfig::Ecs(config) => run_ecs(service, local_port, config).await,
         _ => {
             // Compose/local: show port mappings (original behaviour).
             run_compose_local(service, &ctx).await
@@ -122,8 +125,7 @@ pub async fn run_ecs(
     }
 
     // 2. Resolve the target port.
-    let remote_port = default_port(service)
-        .expect("validated service always has a default port");
+    let remote_port = default_port(service).expect("validated service always has a default port");
     let local = local_port.unwrap_or(remote_port);
 
     // 3. Check session-manager-plugin is available.
@@ -142,18 +144,10 @@ pub async fn run_ecs(
     // 5. Build and run the SSM session command.
     if is_single_host_service(service) {
         // Direct port-forward to the instance.
-        run_ssm_port_forward(
-            &config.region,
-            &instance_id,
-            local,
-            remote_port,
-            service,
-        )
-        .await
+        run_ssm_port_forward(&config.region, &instance_id, local, remote_port, service).await
     } else {
         // Remote-host port-forward via Service Connect endpoint.
-        let remote_host =
-            service_connect_host(service, &config.cluster.service_connect_namespace);
+        let remote_host = service_connect_host(service, &config.cluster.service_connect_namespace);
         run_ssm_port_forward_remote_host(
             &config.region,
             &instance_id,

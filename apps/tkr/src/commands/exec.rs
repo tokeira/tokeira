@@ -157,8 +157,7 @@ pub async fn run_ecs(
         Ok(output) => output,
         Err(err) => {
             let err_str = format!("{err}");
-            if err_str.contains("ssmmessages") || err_str.contains("TargetNotConnectedException")
-            {
+            if err_str.contains("ssmmessages") || err_str.contains("TargetNotConnectedException") {
                 bail!(
                     "ECS Exec failed — the task role is likely missing ssmmessages permissions.\n\n\
                      Remediation:\n\

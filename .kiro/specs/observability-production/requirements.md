@@ -10,13 +10,13 @@ This spec builds on two completed specs:
 
 The `dsql-observability-metrics` spec should be treated as the authoritative reference for DSQL metric names, label conventions, and dashboard panel styling. This spec extends that work to cover the full deployment footprint.
 
-### Known Instrumentation Constraint
+### Instrumentation Practice
 
-A `tracing-subscriber` panic (`tried to clone a span that already closed`) has been observed under high concurrency in DSQL/runtime paths. The suspected cause is a race around `#[instrument]` spans on async paths under cancellation or heavy task churn. Until this is resolved:
-- Prefer explicit span creation/recording around stable boundaries over `#[instrument]` on hot/cancellable async functions.
-- Avoid adding new `#[instrument]` attributes to high-concurrency storage commit paths or lane execution paths.
-- Consider upgrading `tracing-subscriber` if a post-0.3.23 fix exists.
-- The trace attributes requirement (Requirement 9) must account for this constraint — use manual span creation where `#[instrument]` is unsafe.
+The following guidance applies to all new span and metric instrumentation in this spec:
+- Prefer explicit `tracing::span!` creation around stable boundaries over `#[instrument]` on hot or cancellable async functions.
+- Reserve `#[instrument]` for low-concurrency entry points (gRPC handler entry, controller placement loop, autoscaler control loop) where the concurrency risk is negligible.
+- On high-concurrency storage commit paths and lane execution paths, use manual span creation to avoid span lifecycle issues under task cancellation.
+- Metric recording (`counter!`, `gauge!`, `histogram!`) is always safe regardless of concurrency — the constraint applies only to tracing spans.
 
 ## Glossary
 
@@ -147,8 +147,8 @@ A `tracing-subscriber` panic (`tried to clone a span that already closed`) has b
 3. WHEN the runtime invokes the kernel, THE Runtime_Layer SHALL create a child span with attributes: `tokeira.run_id`, `tokeira.workflow_type`, and `tokeira.transition_number`.
 4. WHEN the runtime commits to storage, THE Storage_Layer SHALL create a child span with attributes: `tokeira.storage_operation`, `tokeira.dsql_class`, `tokeira.occ_retries`, and `tokeira.commit_duration_ms`.
 5. THE Export_Pipeline SHALL propagate W3C TraceContext headers across all internal async boundaries so that spans form a connected trace.
-6. SPANS on high-concurrency storage commit paths and lane execution paths SHALL use explicit `tracing::span!` creation rather than `#[instrument]` to avoid the known `tracing-subscriber` span-clone panic under cancellation.
-7. SPANS on low-concurrency paths (gRPC handler entry, controller placement loop, autoscaler control loop) MAY use `#[instrument]` where the concurrency risk is negligible.
+6. SPANS on high-concurrency storage commit paths and lane execution paths SHALL use explicit `tracing::span!` creation rather than `#[instrument]`, following the project's instrumentation practice guidance.
+7. SPANS on low-concurrency paths (gRPC handler entry, controller placement loop, autoscaler control loop) MAY use `#[instrument]`.
 
 ### Requirement 10: Dashboard Provisioning
 

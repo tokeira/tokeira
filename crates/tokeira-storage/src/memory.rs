@@ -587,35 +587,18 @@ impl RunRepository for InMemoryStore {
     async fn commit_transition_for_bundle(
         &self,
         run_key: RunKey,
-        execution_home_bundle: ShardId,
+        _execution_home_bundle: ShardId,
         transition: Transition,
         epoch: ShardEpoch,
     ) -> Result<CommitResult> {
-        if epoch != ShardEpoch::ZERO {
-            let store = self.inner.lock().await;
-            match store.bundle_leases.get(&execution_home_bundle) {
-                Some((_owner, current_epoch, _endpoint)) if *current_epoch == epoch => {}
-                Some((_owner, current_epoch, _endpoint)) => {
-                    return Ok(CommitResult::Conflict {
-                        reason: format!(
-                            "stale shard epoch {:?} for execution-home bundle {:?}; current {:?}",
-                            epoch, execution_home_bundle, current_epoch
-                        ),
-                    });
-                }
-                None => {
-                    return Ok(CommitResult::Conflict {
-                        reason: format!(
-                            "no active lease for execution-home bundle {:?} at epoch {:?}",
-                            execution_home_bundle, epoch
-                        ),
-                    });
-                }
-            }
-        }
-
-        self.commit_transition(run_key, transition, ShardEpoch::ZERO)
-            .await
+        // Pass the real epoch through to commit_transition so the epoch check
+        // and the mutation write execute under the same Mutex lock acquisition.
+        // Previously this method acquired the lock for an epoch check, dropped
+        // it, then called commit_transition with ShardEpoch::ZERO — creating a
+        // TOCTOU race window. commit_transition already performs an atomic epoch
+        // check when epoch != ShardEpoch::ZERO, so forwarding the real epoch is
+        // sufficient to close the race.
+        self.commit_transition(run_key, transition, epoch).await
     }
 
     async fn materialize_reset_successor(
@@ -1269,6 +1252,10 @@ fn shard_for_run_key(run_key: RunKey, shard_count: u32) -> ShardId {
 
 #[cfg(test)]
 mod tests {
+    // These tests use `ShardEpoch::ZERO` intentionally: they validate storage
+    // mechanics (transition_seq OCC, activity side-tables, timer side-tables,
+    // workflow-id uniqueness) without a placement controller. Epoch fencing is
+    // tested separately in the fencing-specific test suites.
     use proptest::prelude::*;
     use time::Duration;
     use tokeira_kernel::{

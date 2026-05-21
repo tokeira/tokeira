@@ -323,6 +323,8 @@ mod tests {
         ) -> Result<Vec<TransitionAuditRecord>> {
             Ok(Vec::new())
         }
+        // Test mock: backlog tests validate dispatch draining, not commit
+        // fencing. These methods are unused stubs required by the trait.
         async fn commit_transition(
             &self,
             _run_key: RunKey,

@@ -12,6 +12,8 @@ pub mod backlog;
 pub mod batch;
 pub mod broker;
 pub mod buffered_queries;
+#[cfg(test)]
+mod bug_condition_exploration_tests;
 pub mod drain;
 pub mod errors;
 pub mod fairness;

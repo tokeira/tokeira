@@ -672,6 +672,7 @@ where
                                     let workflow_timeout_tracking =
                                         workflow_timeout_tracking.clone();
                                     let predecessor_run_key = message.run_key;
+                                    let shard_count = shard_owner.read().unwrap().shard_count();
                                     tokio::spawn(async move {
                                         match publisher
                                             .submit_to_run(
@@ -689,7 +690,7 @@ where
                                                             run_key: new_state.run_key,
                                                             shard_id: crate::shard::shard_for(
                                                                 new_state.run_key,
-                                                                1,
+                                                                shard_count,
                                                             ),
                                                             workflow_execution_timeout: new_state
                                                                 .workflow_execution_timeout,
@@ -1248,6 +1249,10 @@ mod tests {
             Ok(Vec::new())
         }
 
+        // Test mock: ShardEpoch is intentionally ignored. The lane tests
+        // validate OCC retry logic and dispatch behaviour, not epoch fencing.
+        // Production code routes through commit_transition_for_bundle which
+        // carries the real epoch from the ShardOwner.
         async fn commit_transition(
             &self,
             _run_key: RunKey,

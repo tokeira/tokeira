@@ -13,9 +13,9 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokeira_proto::connect::tokeira::internal::controller::v1::{
-    self as pb, PlacementControllerClient, RuntimeMembershipRequest,
-    RuntimeRegistration, RuntimeHeartbeat, LanePressure,
-    controller_directive, runtime_membership_request,
+    self as pb, LanePressure, PlacementControllerClient, RuntimeHeartbeat,
+    RuntimeMembershipRequest, RuntimeRegistration, controller_directive,
+    runtime_membership_request,
 };
 use tokeira_storage::{LeaseOutcome, LeaseRepository};
 use tokeira_types::{IncarnationId, NodeEndpoint, ShardEpoch, ShardId};
@@ -209,9 +209,15 @@ where
     pub fn heartbeat_message_with_inputs(&self, inputs: HeartbeatInputs) -> RuntimeHeartbeat {
         use buffa::EnumValue;
         let drain_state = match inputs.drain_state {
-            RuntimeDrainState::Active => EnumValue::Known(pb::NodeDrainState::NODE_DRAIN_STATE_ACTIVE),
-            RuntimeDrainState::Draining => EnumValue::Known(pb::NodeDrainState::NODE_DRAIN_STATE_DRAINING),
-            RuntimeDrainState::SafeToTerminate => EnumValue::Known(pb::NodeDrainState::NODE_DRAIN_STATE_SAFE_TO_TERMINATE),
+            RuntimeDrainState::Active => {
+                EnumValue::Known(pb::NodeDrainState::NODE_DRAIN_STATE_ACTIVE)
+            }
+            RuntimeDrainState::Draining => {
+                EnumValue::Known(pb::NodeDrainState::NODE_DRAIN_STATE_DRAINING)
+            }
+            RuntimeDrainState::SafeToTerminate => {
+                EnumValue::Known(pb::NodeDrainState::NODE_DRAIN_STATE_SAFE_TO_TERMINATE)
+            }
         };
         RuntimeHeartbeat {
             owned_bundle_count: inputs.owned_bundles.len() as u32,
@@ -582,7 +588,8 @@ mod tests {
                         acquire_bundles: vec![1],
                         relinquish_bundles: Vec::new(),
                         ..Default::default()
-                    }.into(),
+                    }
+                    .into(),
                 )),
                 ..Default::default()
             })
@@ -603,7 +610,8 @@ mod tests {
                         acquire_bundles: Vec::new(),
                         relinquish_bundles: vec![1],
                         ..Default::default()
-                    }.into(),
+                    }
+                    .into(),
                 )),
                 ..Default::default()
             })
@@ -634,9 +642,11 @@ mod tests {
                             seconds: OffsetDateTime::now_utc().unix_timestamp() + 60,
                             nanos: 0,
                             ..Default::default()
-                        }.into(),
+                        }
+                        .into(),
                         ..Default::default()
-                    }.into(),
+                    }
+                    .into(),
                 )),
                 ..Default::default()
             })
@@ -669,7 +679,8 @@ mod tests {
                         acquire_bundles: vec![1, 2],
                         relinquish_bundles: Vec::new(),
                         ..Default::default()
-                    }.into(),
+                    }
+                    .into(),
                 )),
                 ..Default::default()
             })

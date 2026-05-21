@@ -15,10 +15,14 @@
 //! can run without SQLx/DSQL dependencies.
 
 pub mod api;
+#[cfg(test)]
+mod bug_condition_exploration_tests;
 #[cfg(feature = "dsql")]
 pub mod dsql;
 pub mod memory;
 pub mod metrics;
+#[cfg(test)]
+mod preservation_property_tests;
 
 pub use api::*;
 pub use memory::*;

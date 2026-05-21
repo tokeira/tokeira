@@ -222,6 +222,10 @@ pub(crate) fn lease_rejected_error(shard_id: ShardId) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
+    // These tests use `ShardEpoch::ZERO` intentionally: they exercise recovery
+    // sweep logic against an InMemoryStore with no placement controller. Fencing
+    // is not relevant here — the tests validate timeout reconstruction, not
+    // commit ownership.
     use super::*;
     use crate::{
         broker::{InMemoryActivityBroker, InMemoryBroker},

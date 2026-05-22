@@ -2,7 +2,7 @@
 
 ## Introduction
 
-The ECS platform layer (`platforms/ecs/`, `crates/tokeira-aws/`) has five confirmed deployment correctness bugs that can cause silent deployment failures, secret injection failures, and resource starvation. These bugs affect the core deployment lifecycle: task definition rollout, execution role assignment, environment variable mapping, resource arithmetic, and VPC endpoint inventory completeness. Left unfixed, deployments appear successful while old code continues running, secrets fail to inject at task startup, environment configuration is silently dropped, containers are starved of resources, and private-only deployments fail due to missing endpoints.
+The ECS platform layer (`platforms/ecs/`, `crates/tokeira-aws/`) has deployment correctness bugs that can cause silent deployment failures, secret injection failures, and resource starvation. These bugs affect the core deployment lifecycle: task definition rollout, execution role assignment, resource arithmetic, and VPC endpoint inventory completeness. A previously identified environment variable mapping defect is already fixed in the current codebase and is retained here as regression coverage. Left unfixed, deployments appear successful while old code continues running, secrets fail to inject at task startup, containers are starved of resources, and private-only deployments fail due to missing endpoints.
 
 ## Bug Analysis
 
@@ -12,11 +12,11 @@ The ECS platform layer (`platforms/ecs/`, `crates/tokeira-aws/`) has five confir
 
 1.2 WHEN a task definition includes containers with `secrets` referencing Secrets Manager ARNs THEN the task definition is registered without an execution role, causing ECS to fail task startup with "unable to pull secrets" because the ECS agent lacks `secretsmanager:GetSecretValue` permission
 
-1.3 WHEN a `ContainerSpec` has a non-empty `environment` vector THEN the `to_aws_container` function in `platforms/ecs/src/modules/services.rs` maps `secrets` but ignores `environment`, silently dropping all plain environment variables from the AWS container definition
+1.3 HISTORICAL DEFECT: WHEN a `ContainerSpec` had a non-empty `environment` vector THEN the `to_aws_container` function in `platforms/ecs/src/modules/services.rs` mapped `secrets` but ignored `environment`, silently dropping all plain environment variables from the AWS container definition. This is fixed in the current codebase and covered by regression tests.
 
 1.4 WHEN task-level CPU/memory is less than or equal to the sum of sidecar and init-container reservations THEN `saturating_sub` produces a primary container with zero CPU or zero memory without any error, passing config validation while the actual container is resource-starved
 
-1.5 WHEN `EcsConfig::required_vpc_endpoints(region)` includes DSQL endpoints (`dsql`, `dsql-control`) but `networking::required_endpoint_specs` only covers core ECS/ECR/S3/SSM/Cloud Map endpoints THEN there is no test proving the union of all module-created endpoints matches the expected inventory, allowing private-only deployments to fail due to missing endpoints
+1.5 WHEN `EcsConfig::required_vpc_endpoints(region)` includes both static generic endpoints and DSQL endpoint categories but tests only cover `networking::required_endpoint_specs` THEN there is no proof that the ECS platform inventory covers DSQL endpoint ownership, allowing private-only deployments to fail due to missing endpoint resources
 
 ### Expected Behavior (Correct)
 
@@ -28,13 +28,13 @@ The ECS platform layer (`platforms/ecs/`, `crates/tokeira-aws/`) has five confir
 
 2.4 WHEN task-level CPU/memory minus sidecar and init-container reservations would result in a primary container with insufficient resources THEN the system SHALL return a configuration error instead of silently producing a zero-resource container; validation SHALL verify that `primary.cpu > 0` and `primary.memory_mb > 0` after subtraction
 
-2.5 WHEN the ECS platform is deployed in private-only mode THEN a test SHALL verify that the union of VPC endpoints created by all modules (networking + DSQL) equals `EcsConfig::required_vpc_endpoints(region)`, preventing endpoint inventory drift
+2.5 WHEN the ECS platform is deployed in private-only mode THEN tests SHALL verify that networking owns the complete static/generic endpoint set and that `DsqlModule` owns the DSQL logical endpoint categories (`dsql-control`, `dsql-connection`), preventing endpoint inventory drift without statically asserting the dynamic DSQL connection service name
 
 ### Unchanged Behavior (Regression Prevention)
 
 3.1 WHEN a task definition has not changed between plan cycles THEN `EcsServiceResource.diff()` SHALL CONTINUE TO report no change and `update()` SHALL NOT call `UpdateService`
 
-3.2 WHEN a task definition has no `secrets` and uses public images THEN the system SHALL CONTINUE TO register the task definition without requiring an execution role
+3.2 WHEN a task definition has no `secrets` and uses public images THEN the system SHALL CONTINUE TO register the task definition with only a task role and no execution role; the task role SHALL CONTINUE TO provide in-container permissions for DSQL auth, SSM reads, and ECS Exec
 
 3.3 WHEN a `ContainerSpec` has an empty `environment` vector THEN the system SHALL CONTINUE TO produce a valid AWS container definition with no environment key-value pairs
 

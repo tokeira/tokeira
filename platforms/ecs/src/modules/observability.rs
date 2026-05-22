@@ -113,12 +113,22 @@ impl Module for ObservabilityModule {
                 );
             }
             let task_role_dependency = task_role.resource_id();
+            let execution_role =
+                super::services::execution_role_for_workload(&workload, &self.config, self.name());
+            let execution_role_dependency = execution_role.as_ref().map(Resource::resource_id);
             resources.push(Box::new(task_role));
+            if let Some(role) = execution_role {
+                resources.push(Box::new(role));
+            }
+            let task_definition = super::services::to_aws_task_definition(
+                &workload.task_definition,
+                Some(task_role_dependency),
+                execution_role_dependency,
+            );
+            let task_definition_manifest =
+                super::services::task_definition_manifest(&task_definition)?;
             resources.push(Box::new(aws_ecs::TaskDefinitionResource {
-                spec: super::services::to_aws_task_definition(
-                    &workload.task_definition,
-                    Some(task_role_dependency),
-                ),
+                spec: task_definition,
                 module: self.name().to_owned(),
             }));
             resources.push(Box::new(aws_ecs::EcsServiceResource {
@@ -136,6 +146,7 @@ impl Module for ObservabilityModule {
                     "task-definition:{}",
                     workload.task_definition.family
                 )),
+                task_definition_manifest,
                 vpc_dependency: vpc_id.clone(),
                 security_group_dependency: ResourceId("sg-control".to_owned()),
                 module: self.name().to_owned(),
@@ -449,7 +460,7 @@ mod tests {
         );
         assert_eq!(
             ids.iter().filter(|id| id.starts_with("iam-role-")).count(),
-            5
+            6
         );
         assert_eq!(
             ids.iter().filter(|id| id.starts_with("s3-object:")).count(),

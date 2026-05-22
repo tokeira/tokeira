@@ -18,6 +18,7 @@ pub struct TaskDefinitionSpec {
     pub containers: Vec<ContainerSpec>,
     pub volumes: Vec<VolumeSpec>,
     pub task_role_dependency: Option<ResourceId>,
+    pub execution_role_dependency: Option<ResourceId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,7 +110,12 @@ impl Resource for TaskDefinitionResource {
     }
 
     fn dependencies(&self) -> Vec<ResourceId> {
-        self.spec.task_role_dependency.clone().into_iter().collect()
+        self.spec
+            .task_role_dependency
+            .clone()
+            .into_iter()
+            .chain(self.spec.execution_role_dependency.clone())
+            .collect()
     }
 
     fn module(&self) -> &str {
@@ -141,6 +147,12 @@ impl Resource for TaskDefinitionResource {
             .memory(self.spec.memory_mb.to_string())
             .set_container_definitions(Some(containers))
             .set_volumes(Some(volumes));
+        if requires_execution_role(&self.spec) && self.spec.execution_role_dependency.is_none() {
+            tracing::warn!(
+                task_definition = %self.spec.family,
+                "task definition uses ECS-agent-side features but has no execution role dependency"
+            );
+        }
         if let Some(role_dependency) = &self.spec.task_role_dependency {
             let role_state = ctx.get_resource_state(role_dependency)?;
             let role_arn = role_state
@@ -151,6 +163,15 @@ impl Resource for TaskDefinitionResource {
             // ECS Exec and the Alloy config init container both use task-role
             // credentials from inside the running container, not the execution role.
             request = request.task_role_arn(role_arn);
+        }
+        if let Some(role_dependency) = &self.spec.execution_role_dependency {
+            let role_state = ctx.get_resource_state(role_dependency)?;
+            let role_arn = role_state
+                .properties
+                .get("role_arn")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| IacError::StateNotFound("role_arn missing".into()))?;
+            request = request.execution_role_arn(role_arn);
         }
         let output = request.send().await.map_err(|e| {
             IacError::AwsSdk(format!(
@@ -199,11 +220,27 @@ impl Resource for TaskDefinitionResource {
         Ok(None)
     }
 
-    fn diff(&self, _current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {
-        InternalChange::Update {
-            resource_id: self.resource_id(),
-            resource_type: self.resource_type(),
-            details: "task definition revisions are immutable".into(),
+    fn diff(&self, current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {
+        let desired_manifest = match serde_json::to_value(&self.spec) {
+            Ok(value) => value,
+            Err(error) => {
+                return InternalChange::Update {
+                    resource_id: self.resource_id(),
+                    resource_type: self.resource_type(),
+                    details: format!("task definition manifest serialization failed: {error}"),
+                };
+            }
+        };
+        if current.properties.get("manifest") == Some(&desired_manifest) {
+            InternalChange::NoChange {
+                resource_id: self.resource_id(),
+            }
+        } else {
+            InternalChange::Update {
+                resource_id: self.resource_id(),
+                resource_type: self.resource_type(),
+                details: "task definition manifest changed".into(),
+            }
         }
     }
 }
@@ -217,6 +254,7 @@ pub struct EcsServiceResource {
     pub placement_constraints: Vec<PlacementConstraintSpec>,
     pub cluster_dependency: ResourceId,
     pub task_definition_dependency: ResourceId,
+    pub task_definition_manifest: serde_json::Value,
     pub vpc_dependency: ResourceId,
     pub security_group_dependency: ResourceId,
     pub module: String,
@@ -320,15 +358,44 @@ impl Resource for EcsServiceResource {
             .and_then(|service| service.service_arn())
             .unwrap_or(&self.service_name)
             .to_owned();
-        Ok(service_state(self, arn))
+        Ok(service_state(
+            self,
+            arn,
+            task_definition.physical_id.clone(),
+        ))
     }
 
     async fn update(
         &self,
         current: &ResourceState,
-        _ctx: &ProvisionContext,
+        ctx: &ProvisionContext,
     ) -> Result<ResourceState, IacError> {
-        Ok(current.clone())
+        let cluster = ctx.get_resource_state(&self.cluster_dependency)?;
+        let task_definition = ctx.get_resource_state(&self.task_definition_dependency)?;
+        let output = ctx
+            .extension::<crate::AwsClients>()
+            .expect("AwsClients")
+            .ecs
+            .update_service()
+            .cluster(&cluster.physical_id)
+            .service(&current.physical_id)
+            .task_definition(&task_definition.physical_id)
+            .force_new_deployment(true)
+            .send()
+            .await
+            .map_err(|e| {
+                IacError::AwsSdk(format!("ecs:UpdateService: {}", e.into_service_error()))
+            })?;
+        let arn = output
+            .service()
+            .and_then(|service| service.service_arn())
+            .unwrap_or(&current.physical_id)
+            .to_owned();
+        Ok(service_state(
+            self,
+            arn,
+            task_definition.physical_id.clone(),
+        ))
     }
 
     async fn delete(
@@ -356,9 +423,33 @@ impl Resource for EcsServiceResource {
         Ok(None)
     }
 
-    fn diff(&self, _current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {
-        InternalChange::NoChange {
-            resource_id: self.resource_id(),
+    fn diff(&self, current: &ResourceState, ctx: &ProvisionContext) -> InternalChange {
+        let desired_task_definition = ctx
+            .get_resource_state(&self.task_definition_dependency)
+            .ok()
+            .map(|state| state.physical_id.as_str());
+        let current_task_definition = current
+            .properties
+            .get("task_definition_arn")
+            .and_then(|value| value.as_str());
+        if desired_task_definition != current_task_definition {
+            InternalChange::Update {
+                resource_id: self.resource_id(),
+                resource_type: self.resource_type(),
+                details: "service task definition revision changed".into(),
+            }
+        } else if current.properties.get("task_definition_manifest")
+            != Some(&self.task_definition_manifest)
+        {
+            InternalChange::Update {
+                resource_id: self.resource_id(),
+                resource_type: self.resource_type(),
+                details: "service task definition manifest changed".into(),
+            }
+        } else {
+            InternalChange::NoChange {
+                resource_id: self.resource_id(),
+            }
         }
     }
 }
@@ -491,6 +582,12 @@ fn container_definition(
     Ok(builder.build())
 }
 
+fn requires_execution_role(spec: &TaskDefinitionSpec) -> bool {
+    spec.containers
+        .iter()
+        .any(|container| !container.secrets.is_empty() || container.image.contains(".dkr.ecr."))
+}
+
 fn container_environment(
     spec: &EnvironmentSpec,
 ) -> Result<aws_sdk_ecs::types::KeyValuePair, IacError> {
@@ -598,7 +695,11 @@ fn task_definition_state(resource: &TaskDefinitionResource, arn: String) -> Reso
     }
 }
 
-fn service_state(resource: &EcsServiceResource, arn: String) -> ResourceState {
+fn service_state(
+    resource: &EcsServiceResource,
+    arn: String,
+    task_definition_arn: String,
+) -> ResourceState {
     let now = chrono::Utc::now().to_rfc3339();
     ResourceState {
         resource_type: resource.resource_type(),
@@ -608,6 +709,8 @@ fn service_state(resource: &EcsServiceResource, arn: String) -> ResourceState {
             "service_name": resource.service_name,
             "capacity_provider": resource.capacity_provider,
             "enable_execute_command": true,
+            "task_definition_arn": task_definition_arn,
+            "task_definition_manifest": resource.task_definition_manifest,
         }),
         dependencies: resource.dependencies(),
         created_at: now.clone(),
@@ -629,5 +732,281 @@ fn namespace_state(resource: &CloudMapNamespaceResource, operation_id: String) -
         created_at: now.clone(),
         updated_at: now,
         module: resource.module.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn task_definition_spec(image: &str) -> TaskDefinitionSpec {
+        TaskDefinitionSpec {
+            family: "svc".into(),
+            cpu: 256,
+            memory_mb: 512,
+            containers: vec![ContainerSpec {
+                name: "svc".into(),
+                image: image.into(),
+                essential: true,
+                cpu: 128,
+                memory_mb: 256,
+                command: Vec::new(),
+                port_mappings: Vec::new(),
+                mount_points: Vec::new(),
+                depends_on: Vec::new(),
+                init_process_enabled: false,
+                environment: Vec::new(),
+                secrets: Vec::new(),
+            }],
+            volumes: Vec::new(),
+            task_role_dependency: None,
+            execution_role_dependency: None,
+        }
+    }
+
+    fn task_definition_resource(image: &str) -> TaskDefinitionResource {
+        TaskDefinitionResource {
+            spec: task_definition_spec(image),
+            module: "services".into(),
+        }
+    }
+
+    fn task_definition_state_for(arn: &str) -> ResourceState {
+        let now = chrono::Utc::now().to_rfc3339();
+        ResourceState {
+            resource_type: ResourceType::new("EcsTaskDefinition"),
+            physical_id: arn.to_owned(),
+            properties: serde_json::json!({ "task_definition_arn": arn }),
+            dependencies: Vec::new(),
+            created_at: now.clone(),
+            updated_at: now,
+            module: "services".into(),
+        }
+    }
+
+    #[test]
+    fn task_definition_diff_noops_when_manifest_matches() {
+        let resource = task_definition_resource("image:new");
+        let current = task_definition_state(&resource, "arn:task:same".into());
+
+        let change = resource.diff(&current, &ProvisionContext::new("test", HashMap::new()));
+
+        assert!(matches!(change, InternalChange::NoChange { .. }));
+    }
+
+    #[test]
+    fn task_definition_diff_updates_when_manifest_changes() {
+        let resource = task_definition_resource("image:new");
+        let old_resource = task_definition_resource("image:old");
+        let current = task_definition_state(&old_resource, "arn:task:old".into());
+
+        let change = resource.diff(&current, &ProvisionContext::new("test", HashMap::new()));
+
+        assert!(matches!(change, InternalChange::Update { .. }));
+    }
+
+    #[test]
+    fn task_definition_diff_updates_when_manifest_missing_from_state() {
+        let resource = task_definition_resource("image:new");
+        let current = task_definition_state_for("arn:task:old");
+
+        let change = resource.diff(&current, &ProvisionContext::new("test", HashMap::new()));
+
+        assert!(matches!(change, InternalChange::Update { .. }));
+    }
+
+    fn service_resource(task_definition_dependency: ResourceId) -> EcsServiceResource {
+        EcsServiceResource {
+            service_name: "svc".into(),
+            scheduling: EcsScheduling::Replica { desired_count: 1 },
+            capacity_provider: "cp".into(),
+            service_connect: ServiceConnectSpec {
+                grpc: None,
+                metrics: ServiceConnectPort {
+                    port_name: "metrics".into(),
+                    container_port: 9090,
+                    discovery_name: "svc-metrics".into(),
+                    dns_name: "svc-metrics".into(),
+                },
+            },
+            placement_constraints: Vec::new(),
+            cluster_dependency: ResourceId("cluster".into()),
+            task_definition_dependency,
+            task_definition_manifest: serde_json::json!({ "family": "svc", "image": "new" }),
+            vpc_dependency: ResourceId("vpc".into()),
+            security_group_dependency: ResourceId("sg".into()),
+            module: "services".into(),
+        }
+    }
+
+    fn current_service_state(
+        task_definition_arn: Option<&str>,
+        task_definition_manifest: Option<serde_json::Value>,
+    ) -> ResourceState {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut properties = serde_json::json!({
+            "service_arn": "arn:service",
+            "service_name": "svc",
+        });
+        if let Some(arn) = task_definition_arn {
+            properties["task_definition_arn"] = serde_json::json!(arn);
+        }
+        if let Some(manifest) = task_definition_manifest {
+            properties["task_definition_manifest"] = manifest;
+        }
+        ResourceState {
+            resource_type: ResourceType::new("EcsService"),
+            physical_id: "arn:service".into(),
+            properties,
+            dependencies: Vec::new(),
+            created_at: now.clone(),
+            updated_at: now,
+            module: "services".into(),
+        }
+    }
+
+    #[test]
+    fn service_diff_updates_when_task_definition_revision_changes() {
+        let task_definition_id = ResourceId("task-definition:svc".into());
+        let service = service_resource(task_definition_id.clone());
+        let mut ctx = ProvisionContext::new("test", HashMap::new());
+        ctx.state.resources.insert(
+            task_definition_id.clone(),
+            task_definition_state_for("arn:task:new"),
+        );
+
+        let change = service.diff(
+            &current_service_state(
+                Some("arn:task:old"),
+                Some(serde_json::json!({ "family": "svc", "image": "new" })),
+            ),
+            &ctx,
+        );
+
+        assert!(matches!(change, InternalChange::Update { .. }));
+    }
+
+    #[test]
+    fn service_diff_updates_when_task_definition_arn_missing_from_state() {
+        let task_definition_id = ResourceId("task-definition:svc".into());
+        let service = service_resource(task_definition_id.clone());
+        let mut ctx = ProvisionContext::new("test", HashMap::new());
+        ctx.state.resources.insert(
+            task_definition_id.clone(),
+            task_definition_state_for("arn:task:new"),
+        );
+
+        let change = service.diff(
+            &current_service_state(
+                None,
+                Some(serde_json::json!({ "family": "svc", "image": "new" })),
+            ),
+            &ctx,
+        );
+
+        assert!(matches!(change, InternalChange::Update { .. }));
+    }
+
+    #[test]
+    fn service_diff_updates_when_task_definition_manifest_changes() {
+        let task_definition_id = ResourceId("task-definition:svc".into());
+        let service = service_resource(task_definition_id.clone());
+        let mut ctx = ProvisionContext::new("test", HashMap::new());
+        ctx.state.resources.insert(
+            task_definition_id.clone(),
+            task_definition_state_for("arn:task:same"),
+        );
+
+        let change = service.diff(
+            &current_service_state(
+                Some("arn:task:same"),
+                Some(serde_json::json!({ "family": "svc", "image": "old" })),
+            ),
+            &ctx,
+        );
+
+        assert!(matches!(change, InternalChange::Update { .. }));
+    }
+
+    #[test]
+    fn service_diff_noops_when_task_definition_revision_matches() {
+        let task_definition_id = ResourceId("task-definition:svc".into());
+        let service = service_resource(task_definition_id.clone());
+        let mut ctx = ProvisionContext::new("test", HashMap::new());
+        ctx.state.resources.insert(
+            task_definition_id.clone(),
+            task_definition_state_for("arn:task:same"),
+        );
+
+        let change = service.diff(
+            &current_service_state(
+                Some("arn:task:same"),
+                Some(serde_json::json!({ "family": "svc", "image": "new" })),
+            ),
+            &ctx,
+        );
+
+        assert!(matches!(change, InternalChange::NoChange { .. }));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn service_diff_updates_for_different_task_definition_arns(
+            current_suffix in "[a-z0-9]{1,16}",
+            desired_suffix in "[a-z0-9]{1,16}",
+        ) {
+            prop_assume!(current_suffix != desired_suffix);
+            let current_arn = format!("arn:task:{current_suffix}");
+            let desired_arn = format!("arn:task:{desired_suffix}");
+            let task_definition_id = ResourceId("task-definition:svc".into());
+            let service = service_resource(task_definition_id.clone());
+            let mut ctx = ProvisionContext::new("test", HashMap::new());
+            ctx.state.resources.insert(
+                task_definition_id,
+                task_definition_state_for(&desired_arn),
+            );
+
+            let change = service.diff(
+                &current_service_state(
+                    Some(&current_arn),
+                    Some(serde_json::json!({ "family": "svc", "image": "new" })),
+                ),
+                &ctx,
+            );
+            let is_update = matches!(change, InternalChange::Update { .. });
+
+            prop_assert!(is_update);
+        }
+
+        #[test]
+        fn service_diff_noops_for_matching_task_definition_arns(
+            suffix in "[a-z0-9]{1,16}",
+        ) {
+            let arn = format!("arn:task:{suffix}");
+            let task_definition_id = ResourceId("task-definition:svc".into());
+            let service = service_resource(task_definition_id.clone());
+            let mut ctx = ProvisionContext::new("test", HashMap::new());
+            ctx.state.resources.insert(
+                task_definition_id,
+                task_definition_state_for(&arn),
+            );
+
+            let change = service.diff(
+                &current_service_state(
+                    Some(&arn),
+                    Some(serde_json::json!({ "family": "svc", "image": "new" })),
+                ),
+                &ctx,
+            );
+            let is_no_change = matches!(change, InternalChange::NoChange { .. });
+
+            prop_assert!(is_no_change);
+        }
     }
 }

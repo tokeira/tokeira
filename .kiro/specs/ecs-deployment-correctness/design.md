@@ -2,7 +2,7 @@
 
 ## Overview
 
-The ECS platform layer has five deployment correctness bugs that cause silent failures across the deployment lifecycle. The bugs span two crates (`tokeira-aws` and `platforms/ecs`) and affect task definition rollout, execution role assignment, environment variable mapping, resource arithmetic, and VPC endpoint inventory completeness. The fix strategy is minimal and targeted: each bug has a well-defined condition, a clear expected behavior, and a preservation boundary that ensures non-buggy paths remain unchanged.
+The ECS platform layer has deployment correctness bugs that cause silent failures across the deployment lifecycle. The bugs span two crates (`tokeira-aws` and `platforms/ecs`) and affect task definition rollout, execution role assignment, resource arithmetic, and VPC endpoint inventory completeness. A previously identified environment variable mapping defect is already fixed and remains in scope as regression coverage. The fix strategy is minimal and targeted: each active bug has a well-defined condition, a clear expected behavior, and a preservation boundary that ensures non-buggy paths remain unchanged.
 
 ## Glossary
 
@@ -57,7 +57,7 @@ END FUNCTION
 
 ### Bug 3: Container Environment Not Mapped
 
-The bug manifests when a `ContainerSpec` in `platforms/ecs` has a non-empty `environment` vector but `to_aws_container` in `platforms/ecs/src/modules/services.rs` does not map it to the AWS-layer `ContainerSpec`. The AWS-layer struct in `crates/tokeira-aws` lacks an `environment` field entirely, so the mapping silently drops all plain environment variables.
+The bug manifested when a `ContainerSpec` in `platforms/ecs` had a non-empty `environment` vector but `to_aws_container` in `platforms/ecs/src/modules/services.rs` did not map it to the AWS-layer `ContainerSpec`. UPDATE: this bug has already been fixed in the current codebase. The AWS-layer `EnvironmentSpec` struct and mapping exist. The remaining work for Bug 3 is regression coverage only.
 
 **Formal Specification:**
 ```
@@ -90,7 +90,7 @@ END FUNCTION
 
 ### Bug 5: VPC Endpoint Inventory Drift
 
-The bug manifests when `EcsConfig::required_vpc_endpoints(region)` includes DSQL endpoints (`dsql`, `dsql-control`) but `networking::required_endpoint_specs` only covers core ECS/ECR/S3/SSM/Cloud Map endpoints. No test asserts that the union of all module-created endpoints matches the expected inventory, so private-only deployments can fail due to missing endpoints.
+The bug manifests when `EcsConfig::required_vpc_endpoints(region)` includes both static generic endpoints and DSQL endpoint categories but tests only cover `networking::required_endpoint_specs`. The DSQL connection endpoint's concrete AWS service name is dynamic, so correctness must be checked by logical category/resource coverage rather than by a single static service-name set.
 
 **Formal Specification:**
 ```
@@ -111,9 +111,9 @@ END FUNCTION
 
 - **Bug 1**: Deploy with image tag `v1.2.3`, then update to `v1.2.4`. Task definition registers revision 2, but service stays on revision 1. Operator sees "no changes" in plan output.
 - **Bug 2**: Grafana container has `secrets: [{ name: "ADMIN_PASSWORD", value_from: "arn:aws:secretsmanager:..." }]`. Task starts, ECS agent cannot pull the secret, task fails with "unable to pull secrets or registry auth".
-- **Bug 3**: Primary container has `environment: [{ name: "TOKEIRA_ROLE", value: "runtime" }]`. Container starts with no `TOKEIRA_ROLE` env var set.
+- **Bug 3**: Historical example: primary container has `environment: [{ name: "TOKEIRA_ROLE", value: "runtime" }]`. Before the existing fix, the container started with no `TOKEIRA_ROLE` env var set. Current work keeps regression coverage for this path.
 - **Bug 4**: Task CPU = 256, Alloy sidecar = 128, Alloy init = 64, wait-for = 32. Total overhead = 224. Primary gets 32 CPU. But if task CPU = 192, primary gets 0 CPU.
-- **Bug 5**: Private deployment in `eu-west-2`. Networking module creates 11 endpoints. Config expects 13 (includes `dsql`, `dsql-control`). DSQL module doesn't create its own endpoints. Private connectivity to DSQL fails.
+- **Bug 5**: Private deployment in `eu-west-2`. Networking module creates 11 static generic endpoints and DSQL module owns DSQL-specific endpoint resources. Config expects both the static endpoint set and DSQL logical categories to be covered. Without tests for both layers, endpoint drift can go undetected.
 
 ## Expected Behavior
 
@@ -142,11 +142,11 @@ Based on code analysis, the root causes are confirmed (not hypothesized):
 
 2. **Missing Execution Role**: `TaskDefinitionResource.create()` at line 112 sets `task_role_arn` (for in-container credentials) but never sets `execution_role_arn` (for ECS agent credentials). The `TaskDefinitionSpec` struct has `task_role_dependency` but no `execution_role_dependency` field.
 
-3. **Container Environment Not Mapped**: `to_aws_container` in `platforms/ecs/src/modules/services.rs` at line 108 maps `secrets`, `port_mappings`, `mount_points`, and `depends_on` but does not map `environment`. The AWS-layer `ContainerSpec` in `crates/tokeira-aws/src/resources/ecs_service.rs` at line 24 has no `environment` field.
+3. **Container Environment Not Mapped**: UPDATE: this root cause is stale for the current codebase. `to_aws_container` maps environment variables and the AWS-layer `ContainerSpec` has an `environment` field. Task 3.3 preserves this behavior with regression coverage.
 
 4. **Resource Sizing saturating_sub**: `workload_from_parts` at line 389 uses `cpu.saturating_sub(sidecar_cpu + wait_cpu)` and `memory_mb.saturating_sub(sidecar_memory + wait_memory)`. When the result is zero, no error is raised and the zero value flows into `primary_container()`.
 
-5. **VPC Endpoint Inventory Drift**: `required_endpoint_specs` in `networking.rs` at line 168 lists 11 endpoints (ECS, ECR, S3, autoscaling, servicediscovery, SSM). `required_vpc_endpoints` in `config.rs` at line 484 lists 13 (adds `dsql`, `dsql-control`). No module creates the DSQL endpoints, and no test asserts the union matches.
+5. **VPC Endpoint Inventory Drift**: `required_endpoint_specs` in `networking.rs` lists the static generic endpoints (ECS, ECR, S3, autoscaling, servicediscovery, SSM). `required_vpc_endpoints` in `config.rs` also includes DSQL-specific entries owned by `DsqlModule`. The bug is the missing two-layer inventory test: static service names for networking, and logical endpoint categories/resources for DSQL.
 
 ## Correctness Properties
 
@@ -158,7 +158,9 @@ _For any_ ECS service resource where the task definition dependency's `physical_
 
 Property 2: Bug Condition — Execution Role Assigned When Secrets or Private ECR Present
 
-_For any_ `TaskDefinitionSpec` where at least one container has a non-empty `secrets` vector or references a private ECR image, the fixed `TaskDefinitionResource.create()` SHALL include an `execution_role_arn` in the `RegisterTaskDefinition` call, and the `TaskDefinitionSpec` struct SHALL carry an `execution_role_dependency` field.
+_For any_ `TaskDefinitionSpec` produced by `ServicesModule.resources()` where at least one container has a non-empty `secrets` vector or references a private ECR image, the fixed module output SHALL include `execution_role_dependency = Some(...)`, and `TaskDefinitionResource.create()` SHALL include the resolved `execution_role_arn` in the `RegisterTaskDefinition` call.
+
+If `TaskDefinitionResource.create()` receives a raw `TaskDefinitionSpec` with secrets or private ECR images and `execution_role_dependency = None`, it SHALL emit a `tracing::warn!` indicating that the task definition may fail at runtime due to a missing execution role. It SHALL NOT reject the spec because raw task definitions may be used by tests or intentionally pre-authorized fixtures.
 
 **Validates: Requirements 2.2**
 
@@ -176,7 +178,7 @@ _For any_ workload configuration where `task_cpu - (sidecar_cpu + wait_cpu) <= 0
 
 Property 5: Bug Condition — VPC Endpoint Inventory Completeness
 
-_For any_ region, the union of VPC endpoints created by all infrastructure modules SHALL equal `EcsConfig::required_vpc_endpoints(region)`. A test SHALL assert this equality, preventing endpoint inventory drift.
+_For any_ region, the static/generic endpoints created by the networking module SHALL equal the static/generic subset of `EcsConfig::required_vpc_endpoints(region)`. DSQL endpoint coverage SHALL be validated by logical endpoint categories (`dsql-control`, `dsql-connection`) and by the presence of DSQL module resources for those categories. The DSQL connection endpoint's concrete AWS service name is resolved dynamically during apply and SHALL NOT be statically asserted.
 
 **Validates: Requirements 2.5**
 
@@ -206,7 +208,7 @@ _For any_ workload configuration where `task_cpu > (sidecar_cpu + wait_cpu)` AND
 
 Property 10: Preservation — Module Endpoint Ownership Unchanged
 
-_For any_ infrastructure module that creates VPC endpoints, the fixed system SHALL continue to allow that module to own its endpoint resources independently. The fix adds DSQL endpoints to the networking module (or a dedicated module) without changing ownership of existing endpoints.
+_For any_ infrastructure module that creates VPC endpoints, the fixed system SHALL continue to allow that module to own its endpoint resources independently. The fix adds an inventory completeness test over all module-owned endpoints; it does not move DSQL endpoints into the networking module.
 
 **Validates: Requirements 3.5**
 
@@ -220,21 +222,21 @@ _For any_ infrastructure module that creates VPC endpoints, the fixed system SHA
 1. **Add `task_definition_arn` to `service_state` properties**: Store the task definition ARN used at service creation so `diff()` can compare against it.
 2. **Fix `EcsServiceResource.diff()`**: Read the task definition dependency's current `physical_id` from `ProvisionContext`, compare against `current.properties["task_definition_arn"]`. Return `InternalChange::Update` if they differ, `NoChange` otherwise.
 3. **Fix `EcsServiceResource.update()`**: Call `UpdateService` with the new task definition ARN and `force_new_deployment(true)`. Return updated `ResourceState` with the new task definition ARN in properties.
+4. **Handle pre-fix state**: If `current.properties["task_definition_arn"]` is absent, treat the service as needing update so the next apply backfills the property. This is safe because `UpdateService` with the current task definition ARN is a no-op when no deployment change is needed.
 
 **Bug 2 — Execution Role:**
-4. **Add `execution_role_dependency: Option<ResourceId>` to `TaskDefinitionSpec`** (AWS-layer struct).
-5. **In `TaskDefinitionResource.create()`**: If `execution_role_dependency` is `Some`, resolve the role ARN from state and set `.execution_role_arn(role_arn)` on the `RegisterTaskDefinition` request.
+5. **Add `execution_role_dependency: Option<ResourceId>` to `TaskDefinitionSpec`** (AWS-layer struct).
+6. **In `TaskDefinitionResource.create()`**: If `execution_role_dependency` is `Some`, resolve the role ARN from state and set `.execution_role_arn(role_arn)` on the `RegisterTaskDefinition` request.
+7. **Preserve task role semantics**: The existing `task_role_dependency` is preserved unchanged. It provides in-container application credentials (DSQL auth, SSM config reads, ECS Exec). The new `execution_role_dependency` provides ECS-agent-side credentials (secret injection, ECR pull, log driver). Both fields coexist on `TaskDefinitionSpec`.
 
 **Bug 3 — Environment Mapping:**
-6. **Add `environment: Vec<EnvironmentSpec>` to AWS-layer `ContainerSpec`** with a new `EnvironmentSpec { name, value }` struct.
-7. **In `container_definition()`**: Map `spec.environment` to `.set_environment(Some(...))` using `aws_sdk_ecs::types::KeyValuePair`.
-8. **In `to_aws_container()` (platforms/ecs)**: Map `spec.environment` entries to `aws_ecs::EnvironmentSpec` structs.
+8. **Regression coverage only**: The AWS-layer `ContainerSpec`, `EnvironmentSpec`, `container_definition()` mapping, and `to_aws_container()` mapping already exist. Keep a regression test confirming environment variables continue to be preserved.
 
 **File**: `platforms/ecs/src/services.rs`
 
 **Bug 4 — Resource Sizing Validation:**
-9. **Replace `saturating_sub` with checked subtraction + error**: In `workload_from_parts`, compute `primary_cpu` and `primary_memory` using checked subtraction. If either result is zero or would underflow, return an `IacError` with a descriptive message indicating the task-level resources are insufficient for the sidecar overhead.
-10. **Propagate the error**: Change `workload_from_parts` return type from `EcsWorkload` to `Result<EcsWorkload, IacError>` and propagate through callers.
+9. **Validate resource sufficiency at config load time**: Add checks to `EcsConfig::validate()` using `EcsConfigError`. For each service workload, compute sidecar/init overhead and verify `task_cpu > overhead_cpu` and `task_memory_mb > overhead_memory`.
+10. **Keep workload construction infallible after validation**: Replace `saturating_sub` in `workload_from_parts` with plain subtraction. This is safe because `EcsConfig::validate()` proves the result is positive before IaC or service-manifest construction. `Deployment::services()` remains infallible.
 
 **File**: `platforms/ecs/src/modules/services.rs`
 
@@ -242,37 +244,37 @@ _For any_ infrastructure module that creates VPC endpoints, the fixed system SHA
 11. **In `to_aws_task_definition()`**: Accept an `execution_role_dependency: Option<ResourceId>` parameter and set it on the AWS-layer `TaskDefinitionSpec`.
 12. **In `ServicesModule.resources()`**: For workloads with secrets or private ECR images, create an execution role resource and pass its `ResourceId` as the execution role dependency.
 
-**File**: `platforms/ecs/src/modules/networking.rs`
+**Files**: `platforms/ecs/src/modules/networking.rs`, `platforms/ecs/src/modules/dsql.rs`, `platforms/ecs/src/config.rs`
 
 **Bug 5 — VPC Endpoint Inventory:**
-13. **Add DSQL endpoints to `required_endpoint_specs()`**: Add `("dsql", "dsql", EndpointType::Interface)` and `("dsql-control", "dsql-control", EndpointType::Interface)` to the endpoint list.
-14. **Add inventory completeness test**: Assert that `required_endpoint_specs(region).map(|e| e.service_name)` equals `config::required_vpc_endpoints(region)` (as a set).
+13. **Keep module endpoint ownership unchanged**: Networking continues to own generic AWS service endpoints. `DsqlModule` continues to own DSQL management and connection endpoints.
+14. **Add two-layer inventory coverage**: Static generic endpoints (ECS, ECR, S3, SSM, Cloud Map, etc.) are validated by comparing `networking::required_endpoint_specs(region)` against the static subset of `config::required_vpc_endpoints(region)`. DSQL endpoints are validated by asserting that `DsqlModule` declares the logical endpoint categories `dsql-connection` and `dsql-control`, and that `DsqlModule::resources()` outputs VPC endpoint resources for each category. The actual AWS service name for the DSQL connection endpoint is resolved at apply time with `GetVpcEndpointServiceName` and cannot be statically asserted.
 
 ## Testing Strategy
 
 ### Validation Approach
 
-The testing strategy follows a two-phase approach: first, surface counterexamples that demonstrate the bugs on unfixed code, then verify the fixes work correctly and preserve existing behavior.
+The testing strategy follows the repository rule that tests pass at every commit boundary. For active bugs, add the bug-condition test in the same change as the fix. For the already-fixed environment mapping defect, keep a passing regression test.
 
-### Exploratory Bug Condition Checking
+### Bug Condition Checking
 
-**Goal**: Surface counterexamples that demonstrate the bugs BEFORE implementing the fix. Confirm the root cause analysis.
+**Goal**: Encode the expected behavior for each bug condition without committing failing tests.
 
-**Test Plan**: Write unit tests that exercise each bug condition on the current (unfixed) code and observe the incorrect behavior.
+**Test Plan**: Write unit or property tests that exercise each bug condition alongside the corresponding fix.
 
 **Test Cases**:
-1. **Rollout Gap Test**: Create an `EcsServiceResource` with a `task_definition_dependency` whose state has a different `physical_id` than what was used at creation. Call `diff()` — observe it returns `NoChange` (will fail after fix, confirming the bug).
-2. **Missing Execution Role Test**: Create a `TaskDefinitionSpec` with containers that have secrets. Call `create()` with a mock context — observe no `execution_role_arn` is set (will fail after fix).
-3. **Environment Drop Test**: Create a platform-layer `ContainerSpec` with `environment: vec![EnvironmentVar { name: "FOO", value: "bar" }]`. Call `to_aws_container()` — observe the result has no environment field (will fail after fix).
-4. **Zero Resource Test**: Call `workload_from_parts` with `cpu = 128` (less than sidecar overhead). Observe it produces a container with `cpu: 0` (will fail after fix).
-5. **Endpoint Drift Test**: Compare `required_endpoint_specs("eu-west-2")` service names against `required_vpc_endpoints("eu-west-2")` — observe they don't match (will fail after fix).
+1. **Rollout Gap Test**: Create an `EcsServiceResource` with a `task_definition_dependency` whose state has a different `physical_id` than the ARN stored in service state. Call `diff()` and assert it returns `Update`.
+2. **Missing Execution Role Test**: Build ECS service resources through `ServicesModule.resources()`. For workloads with secrets, assert the generated task definition carries an `execution_role_dependency` and `RegisterTaskDefinition` receives an execution role ARN. Also test that a raw spec with secrets and no execution role emits a warning rather than rejecting.
+3. **Environment Mapping Regression Test**: Create a platform-layer `ContainerSpec` with `environment: vec![EnvironmentVar { name: "FOO", value: "bar" }]`. Call `to_aws_container()` and assert the result preserves the environment entry. This passes on current code.
+4. **Zero Resource Test**: Call `workload_from_parts` with task resources less than or equal to sidecar/init overhead. Assert it returns an error.
+5. **Endpoint Inventory Test**: Compare `networking::required_endpoint_specs("eu-west-2")` against the static/generic subset of `required_vpc_endpoints("eu-west-2")`. Separately assert that `DsqlModule::resources()` includes resources for logical endpoint categories `dsql-control` and `dsql-connection`; do not assert the exact AWS service name for the dynamic connection endpoint.
 
-**Expected Counterexamples**:
-- `diff()` returns `NoChange` even when task definition ARN has changed
-- `RegisterTaskDefinition` request has no execution role despite secrets being present
-- AWS container definition has no environment entries despite platform spec having them
-- Primary container has `cpu: 0` without any error
-- Endpoint sets differ by 2 entries (`dsql`, `dsql-control`)
+**Expected Coverage**:
+- `diff()` returns `Update` when task definition ARN has changed
+- `RegisterTaskDefinition` request has an execution role when secrets are present
+- AWS container definition preserves environment entries
+- Resource-starved primary container configuration returns an error
+- Endpoint inventory covers static networking endpoints and DSQL logical endpoint categories
 
 ### Fix Checking
 
@@ -286,7 +288,7 @@ FOR ALL input WHERE isBugCondition_1(input) DO
 END FOR
 
 FOR ALL input WHERE isBugCondition_2(input) DO
-  spec := build_task_definition_spec(input)
+  spec := build_task_definition_spec_via_services_module(input)
   ASSERT spec.execution_role_dependency IS SOME
 END FOR
 
@@ -304,9 +306,10 @@ FOR ALL input WHERE isBugCondition_4(input) DO
 END FOR
 
 FOR ALL regions DO
-  expected := config::required_vpc_endpoints(region)
-  actual := networking::required_endpoint_specs(region).map(service_name)
-  ASSERT expected == actual (as sets)
+  expected_static := config::required_vpc_endpoints(region) EXCLUDING DSQL entries
+  actual_static := networking::required_endpoint_specs(region).map(service_name)
+  ASSERT expected_static == actual_static (as sets)
+  ASSERT dsql_module_endpoint_categories() == {"dsql-control", "dsql-connection"}
 END FOR
 ```
 
@@ -343,7 +346,7 @@ END FOR
 - It catches edge cases that manual unit tests might miss (e.g., boundary values for resource arithmetic)
 - It provides strong guarantees that behavior is unchanged for all non-buggy inputs
 
-**Test Plan**: Observe behavior on UNFIXED code first for non-buggy inputs, then write property-based tests capturing that behavior.
+**Test Plan**: Write property-based tests for non-buggy inputs and keep them passing throughout the implementation.
 
 **Test Cases**:
 1. **Service Diff Preservation**: For any service where task definition ARN matches, verify `diff()` returns `NoChange`
@@ -363,18 +366,18 @@ END FOR
 - Test `workload_from_parts` returns error when primary CPU would be zero
 - Test `workload_from_parts` returns error when primary memory would be zero
 - Test `workload_from_parts` succeeds when resources are sufficient
-- Test `required_endpoint_specs` includes DSQL endpoints
-- Test endpoint inventory matches `required_vpc_endpoints`
+- Test static networking endpoint inventory matches the static endpoint subset
+- Test DSQL module declares logical endpoint categories `dsql-control` and `dsql-connection`
 
 ### Property-Based Tests
 
 - Generate random `(task_cpu, sidecar_cpu, wait_cpu)` tuples and verify: if `task_cpu > sidecar_cpu + wait_cpu` then result is `Ok` with correct subtraction; if `task_cpu <= sidecar_cpu + wait_cpu` then result is `Err`
 - Generate random `ContainerSpec` with varying environment lengths and verify: environment length in output equals environment length in input
 - Generate random task definition ARN pairs and verify: `diff()` returns `Update` iff ARNs differ, `NoChange` iff ARNs match
-- Generate random `TaskDefinitionSpec` with varying secrets presence and verify: execution role dependency is `Some` iff any container has secrets
+- Generate service module workloads with varying secrets presence and verify: execution role dependency is `Some` iff a module-generated workload container has secrets
 
 ### Integration Tests
 
 - Test full workload generation pipeline with realistic ECS config produces valid task definitions with correct resource allocation
 - Test that `ServicesModule.resources()` produces task definitions with execution roles for workloads that have secrets (e.g., Grafana)
-- Test that the networking module's endpoint list stays synchronized with config's expected endpoint list across multiple regions
+- Test that static networking endpoint lists and DSQL logical endpoint categories stay synchronized with config's expected endpoint inventory across multiple regions

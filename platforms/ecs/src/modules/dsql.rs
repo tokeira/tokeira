@@ -522,6 +522,19 @@ mod tests {
     }
 
     #[test]
+    fn managed_mode_declares_dsql_endpoint_categories() {
+        let module = DsqlModule::new(EcsConfig::default());
+        let resources = module.resources(&module_context()).expect("resources");
+        let ids: Vec<String> = resources
+            .iter()
+            .map(|resource| resource.resource_id().0)
+            .collect();
+
+        assert!(ids.contains(&DSQL_MANAGEMENT_ENDPOINT_ID.to_owned()));
+        assert!(ids.contains(&DSQL_CONNECTION_ENDPOINT_ID.to_owned()));
+    }
+
+    #[test]
     fn preexisting_mode_requires_all_hydration_fields() {
         let mut config = EcsConfig::default();
         config.dsql.mode = DsqlClusterMode::Preexisting;

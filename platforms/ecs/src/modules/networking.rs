@@ -272,7 +272,10 @@ fn vpc_endpoint(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
+    use crate::config::required_vpc_endpoints;
     use tokeira_iac::InfraState;
 
     #[test]
@@ -310,5 +313,23 @@ mod tests {
 
         assert_eq!(s3.endpoint_type, EndpointType::Gateway);
         assert_eq!(endpoints.len(), 11);
+    }
+
+    #[test]
+    fn static_endpoint_specs_match_config_without_dsql_categories() {
+        let region = "eu-west-2";
+        let actual: BTreeSet<String> = required_endpoint_specs(region)
+            .into_iter()
+            .map(|endpoint| endpoint.service_name)
+            .collect();
+        let expected: BTreeSet<String> = required_vpc_endpoints(region)
+            .into_iter()
+            .filter(|service| {
+                service != &format!("com.amazonaws.{region}.dsql")
+                    && service != &format!("com.amazonaws.{region}.dsql-control")
+            })
+            .collect();
+
+        assert_eq!(actual, expected);
     }
 }

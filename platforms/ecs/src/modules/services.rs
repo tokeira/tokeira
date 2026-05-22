@@ -49,10 +49,19 @@ impl Module for ServicesModule {
         for workload in EcsWorkload::build_all(&self.config) {
             let task_role = service_task_role(&workload.name, &self.config, self.name());
             let task_role_dependency = task_role.resource_id();
-            let task_definition =
-                to_aws_task_definition(&workload.task_definition, Some(task_role_dependency));
+            let execution_role = execution_role_for_workload(&workload, &self.config, self.name());
+            let execution_role_dependency = execution_role.as_ref().map(Resource::resource_id);
+            let task_definition = to_aws_task_definition(
+                &workload.task_definition,
+                Some(task_role_dependency),
+                execution_role_dependency,
+            );
+            let task_definition_manifest = task_definition_manifest(&task_definition)?;
             let service = to_aws_service(&workload.service_connect);
             resources.push(Box::new(task_role));
+            if let Some(role) = execution_role {
+                resources.push(Box::new(role));
+            }
             resources.push(Box::new(aws_ecs::TaskDefinitionResource {
                 spec: task_definition,
                 module: self.name().to_owned(),
@@ -72,6 +81,7 @@ impl Module for ServicesModule {
                     "task-definition:{}",
                     workload.task_definition.family
                 )),
+                task_definition_manifest,
                 vpc_dependency: vpc_id.clone(),
                 security_group_dependency: security_group_for_workload(&workload.name),
                 module: self.name().to_owned(),
@@ -94,6 +104,7 @@ pub(crate) fn to_aws_scheduling(scheduling: &EcsScheduling) -> aws_ecs::EcsSched
 pub(crate) fn to_aws_task_definition(
     spec: &TaskDefinitionSpec,
     task_role_dependency: Option<ResourceId>,
+    execution_role_dependency: Option<ResourceId>,
 ) -> aws_ecs::TaskDefinitionSpec {
     aws_ecs::TaskDefinitionSpec {
         family: spec.family.clone(),
@@ -102,7 +113,15 @@ pub(crate) fn to_aws_task_definition(
         containers: spec.containers.iter().map(to_aws_container).collect(),
         volumes: spec.volumes.iter().map(to_aws_volume).collect(),
         task_role_dependency,
+        execution_role_dependency,
     }
+}
+
+pub(crate) fn task_definition_manifest(
+    spec: &aws_ecs::TaskDefinitionSpec,
+) -> Result<serde_json::Value, IacError> {
+    serde_json::to_value(spec)
+        .map_err(|error| IacError::Other(anyhow::anyhow!("serialize task definition: {error}")))
 }
 
 fn to_aws_container(spec: &ContainerSpec) -> aws_ecs::ContainerSpec {
@@ -224,8 +243,39 @@ pub(crate) fn service_task_role(service_name: &str, config: &EcsConfig, module: 
     )
 }
 
+pub(crate) fn execution_role_for_workload(
+    workload: &EcsWorkload,
+    config: &EcsConfig,
+    module: &str,
+) -> Option<IamRole> {
+    task_definition_needs_execution_role(&workload.task_definition).then(|| {
+        let mut inline_policies = HashMap::new();
+        inline_policies.insert("ecs-agent-access".to_owned(), ecs_agent_access_policy());
+        IamRole::new(
+            service_execution_role_name(&workload.name, config),
+            IamRoleConfig {
+                trust_policy: ecs_tasks_assume_role_policy(),
+                inline_policies,
+                managed_policy_arns: Vec::new(),
+                module: module.to_owned(),
+            },
+            &resource_context(config),
+        )
+    })
+}
+
+pub(crate) fn task_definition_needs_execution_role(spec: &TaskDefinitionSpec) -> bool {
+    spec.containers
+        .iter()
+        .any(|container| !container.secrets.is_empty() || container.image.contains(".dkr.ecr."))
+}
+
 fn service_task_role_name(service_name: &str, config: &EcsConfig) -> String {
     format!("{}-{}-task", config.project_name, service_name)
+}
+
+fn service_execution_role_name(service_name: &str, config: &EcsConfig) -> String {
+    format!("{}-{}-execution", config.project_name, service_name)
 }
 
 fn ecs_tasks_assume_role_policy() -> String {
@@ -272,6 +322,30 @@ fn alloy_config_read_policy(config: &EcsConfig) -> String {
     .to_string()
 }
 
+fn ecs_agent_access_policy() -> String {
+    serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "ecr:GetAuthorizationToken",
+                    "ecr:BatchCheckLayerAvailability",
+                    "ecr:BatchGetImage",
+                    "ecr:GetDownloadUrlForLayer"
+                ],
+                "Resource": "*"
+            },
+            {
+                "Effect": "Allow",
+                "Action": "secretsmanager:GetSecretValue",
+                "Resource": "*"
+            }
+        ]
+    })
+    .to_string()
+}
+
 fn resource_context(config: &EcsConfig) -> ResourceContext {
     ResourceContext {
         project: config.project_name.clone(),
@@ -283,12 +357,37 @@ fn resource_context(config: &EcsConfig) -> ResourceContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use tokeira_iac::InfraState;
 
     fn module_context() -> ModuleContext<'static> {
         let state = Box::leak(Box::new(InfraState::default()));
         let extensions = Box::leak(Box::new(std::collections::HashMap::new()));
         ModuleContext::new(state, extensions)
+    }
+
+    fn env_var_strategy() -> impl Strategy<Value = crate::services::EnvironmentVar> {
+        ("[A-Z_]{1,16}", "[a-zA-Z0-9_:/.-]{0,32}")
+            .prop_map(|(name, value)| crate::services::EnvironmentVar { name, value })
+    }
+
+    fn container_with_environment(
+        environment: Vec<crate::services::EnvironmentVar>,
+    ) -> ContainerSpec {
+        ContainerSpec {
+            name: "svc".into(),
+            image: "example/svc:latest".into(),
+            essential: true,
+            cpu: 128,
+            memory_mb: 256,
+            command: Vec::new(),
+            port_mappings: Vec::new(),
+            mount_points: Vec::new(),
+            depends_on: Vec::new(),
+            linux_parameters: None,
+            environment,
+            secrets: Vec::new(),
+        }
     }
 
     #[test]
@@ -363,7 +462,7 @@ mod tests {
             .into_iter()
             .find(|workload| workload.name == "tokeira-runtime")
             .expect("runtime workload");
-        let task_definition = to_aws_task_definition(&workload.task_definition, None);
+        let task_definition = to_aws_task_definition(&workload.task_definition, None, None);
         let primary = task_definition
             .containers
             .iter()
@@ -380,5 +479,65 @@ mod tests {
             Some(&"0.0.0.0:9090")
         );
         assert_eq!(env.get("TOKEIRA_OBSERVABILITY_CLUSTER"), Some(&"tokeira"));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn to_aws_container_preserves_environment_variables(
+            environment in proptest::collection::vec(env_var_strategy(), 0..8),
+        ) {
+            let spec = container_with_environment(environment.clone());
+
+            let aws = to_aws_container(&spec);
+
+            prop_assert_eq!(aws.environment.len(), environment.len());
+            for (actual, expected) in aws.environment.iter().zip(&environment) {
+                prop_assert_eq!(actual.name.as_str(), expected.name.as_str());
+                prop_assert_eq!(actual.value.as_str(), expected.value.as_str());
+            }
+        }
+    }
+
+    #[test]
+    fn module_generated_secret_workloads_require_execution_role() {
+        let config = EcsConfig::default();
+        let grafana = EcsWorkload::build_observability(&config)
+            .into_iter()
+            .find(|workload| workload.name == "tokeira-grafana")
+            .expect("grafana workload");
+        let execution_role = execution_role_for_workload(&grafana, &config, "observability")
+            .expect("grafana execution role");
+        let task_role = service_task_role(&grafana.name, &config, "observability");
+        let task_definition = to_aws_task_definition(
+            &grafana.task_definition,
+            Some(task_role.resource_id()),
+            Some(execution_role.resource_id()),
+        );
+
+        assert!(task_definition.execution_role_dependency.is_some());
+        assert!(task_definition.task_role_dependency.is_some());
+    }
+
+    #[test]
+    fn module_generated_public_workloads_do_not_require_execution_role() {
+        let config = EcsConfig::default();
+        let runtime = EcsWorkload::build_all(&config)
+            .into_iter()
+            .find(|workload| workload.name == "tokeira-runtime")
+            .expect("runtime workload");
+        let task_role = service_task_role(&runtime.name, &config, "services");
+        let task_definition = to_aws_task_definition(
+            &runtime.task_definition,
+            Some(task_role.resource_id()),
+            None,
+        );
+
+        assert!(!task_definition_needs_execution_role(
+            &runtime.task_definition
+        ));
+        assert!(task_definition.execution_role_dependency.is_none());
+        assert!(task_definition.task_role_dependency.is_some());
     }
 }

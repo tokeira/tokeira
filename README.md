@@ -207,7 +207,7 @@ The compose platform organizes services into two modules:
 
 **Storage and schema.** The example above uses `--storage in-memory`, which needs no schema setup. Compose also supports Aurora DSQL through the `dsql` infrastructure module. DSQL deployments use `deployment.toml` for platform storage intent and `tokeirad.toml` writeback for the server runtime endpoint/region.
 
-Recommended compose+DSQL lifecycle:
+##### Recommended compose+DSQL lifecycle:
 
 ```bash
 # Create DSQL-backed compose config. Region defaults to us-east-1.

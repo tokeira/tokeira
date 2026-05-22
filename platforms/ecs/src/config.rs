@@ -28,7 +28,22 @@ pub enum EcsConfigError {
     },
     #[error("capacity provider {provider} must have max_capacity >= min_capacity")]
     InvalidCapacityRange { provider: &'static str },
+    #[error(
+        "service {service} task resources are insufficient: cpu {task_cpu} <= overhead {overhead_cpu}, memory {task_memory} MiB <= overhead {overhead_memory} MiB"
+    )]
+    InsufficientTaskResources {
+        service: &'static str,
+        task_cpu: u32,
+        overhead_cpu: u32,
+        task_memory: u32,
+        overhead_memory: u32,
+    },
 }
+
+pub(crate) const WAIT_FOR_CPU: u32 = 32;
+pub(crate) const WAIT_FOR_MEMORY_MB: u32 = 64;
+pub(crate) const ALLOY_CONFIG_INIT_CPU: u32 = 64;
+pub(crate) const ALLOY_CONFIG_INIT_MEMORY_MB: u32 = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -297,6 +312,7 @@ impl EcsConfig {
             self.observability.grafana_cpu,
             self.observability.grafana_memory_mb,
         )?;
+        validate_service_resource_sufficiency(self)?;
         Ok(())
     }
 }
@@ -614,6 +630,104 @@ fn validate_service_ports(config: &EcsConfig) -> Result<(), EcsConfigError> {
     Ok(())
 }
 
+fn validate_service_resource_sufficiency(config: &EcsConfig) -> Result<(), EcsConfigError> {
+    validate_resource_sufficiency(
+        "edge-api",
+        config.services.edge_api.cpu,
+        config.services.edge_api.memory_mb,
+        2,
+        config,
+    )?;
+    validate_resource_sufficiency(
+        "edge-poll",
+        config.services.edge_poll.cpu,
+        config.services.edge_poll.memory_mb,
+        2,
+        config,
+    )?;
+    validate_resource_sufficiency(
+        "runtime",
+        config.services.runtime.cpu,
+        config.services.runtime.memory_mb,
+        1,
+        config,
+    )?;
+    validate_resource_sufficiency(
+        "projection",
+        config.services.projection.cpu,
+        config.services.projection.memory_mb,
+        1,
+        config,
+    )?;
+    validate_resource_sufficiency(
+        "controller",
+        config.services.controller.cpu,
+        config.services.controller.memory_mb,
+        0,
+        config,
+    )?;
+    validate_resource_sufficiency(
+        "autoscaler",
+        config.services.autoscaler.cpu,
+        config.services.autoscaler.memory_mb,
+        2,
+        config,
+    )?;
+    validate_resource_sufficiency(
+        "admin",
+        config.services.admin.cpu,
+        config.services.admin.memory_mb,
+        0,
+        config,
+    )?;
+    validate_resource_sufficiency(
+        "mimir",
+        config.observability.mimir_cpu,
+        config.observability.mimir_memory_mb,
+        0,
+        config,
+    )?;
+    validate_resource_sufficiency(
+        "loki",
+        config.observability.loki_cpu,
+        config.observability.loki_memory_mb,
+        0,
+        config,
+    )?;
+    validate_resource_sufficiency(
+        "grafana",
+        config.observability.grafana_cpu,
+        config.observability.grafana_memory_mb,
+        2,
+        config,
+    )
+}
+
+fn validate_resource_sufficiency(
+    service: &'static str,
+    task_cpu: u32,
+    task_memory: u32,
+    wait_for_count: u32,
+    config: &EcsConfig,
+) -> Result<(), EcsConfigError> {
+    let overhead_cpu =
+        config.observability.alloy_cpu + ALLOY_CONFIG_INIT_CPU + wait_for_count * WAIT_FOR_CPU;
+    let overhead_memory = config.observability.alloy_memory_mb
+        + ALLOY_CONFIG_INIT_MEMORY_MB
+        + wait_for_count * WAIT_FOR_MEMORY_MB;
+    if task_cpu <= overhead_cpu || task_memory <= overhead_memory {
+        Err(EcsConfigError::InsufficientTaskResources {
+            service,
+            task_cpu,
+            overhead_cpu,
+            task_memory,
+            overhead_memory,
+        })
+    } else {
+        Ok(())
+    }
+}
+
 fn expect_metrics(service: &'static str, actual: u16) -> Result<(), EcsConfigError> {
     expect_port(service, "metrics_port", actual, 9090)
 }
@@ -662,4 +776,71 @@ fn default_busybox_image() -> String {
 
 fn default_loki_query_url() -> String {
     "http://localhost:3100".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    #[test]
+    fn insufficient_service_cpu_fails_validation() {
+        let mut config = EcsConfig::default();
+        config.services.edge_api.cpu =
+            config.observability.alloy_cpu + ALLOY_CONFIG_INIT_CPU + 2 * WAIT_FOR_CPU;
+
+        let err = config.validate().expect_err("insufficient resources");
+
+        assert!(matches!(
+            err,
+            EcsConfigError::InsufficientTaskResources {
+                service: "edge-api",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn default_resources_pass_sufficiency_validation() {
+        EcsConfig::default().validate().expect("default config");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn insufficient_edge_api_cpu_fails_validation(_case in 0_u8..16) {
+            let mut config = EcsConfig::default();
+            config.services.edge_api.cpu = 256;
+            config.services.edge_api.memory_mb = 512;
+
+            let err = config.validate().expect_err("insufficient edge-api CPU");
+            let is_resource_error = matches!(
+                err,
+                EcsConfigError::InsufficientTaskResources {
+                    service: "edge-api",
+                    ..
+                }
+            );
+
+            prop_assert!(is_resource_error);
+        }
+
+        #[test]
+        fn sufficient_edge_api_resources_pass_validation(
+            (cpu, memory_mb) in proptest::sample::select(vec![
+                (512_u32, 1024_u32),
+                (1024, 2048),
+                (2048, 4096),
+                (4096, 8192),
+            ]),
+        ) {
+            let mut config = EcsConfig::default();
+            config.services.edge_api.cpu = cpu;
+            config.services.edge_api.memory_mb = memory_mb;
+
+            prop_assert!(config.validate().is_ok());
+        }
+    }
 }

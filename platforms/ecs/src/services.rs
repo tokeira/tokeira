@@ -1,7 +1,10 @@
 use serde::Serialize;
 use tokeira_deploy_engine as deploy_engine;
 
-use crate::config::{DaemonServiceConfig, EcsConfig, ReplicaServiceConfig};
+use crate::config::{
+    ALLOY_CONFIG_INIT_CPU, ALLOY_CONFIG_INIT_MEMORY_MB, DaemonServiceConfig, EcsConfig,
+    ReplicaServiceConfig, WAIT_FOR_CPU, WAIT_FOR_MEMORY_MB,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -328,21 +331,19 @@ fn observability_workload(
         dependencies,
         config,
     );
-    if name == "tokeira-grafana" {
-        if let Some(primary) = workload
+    if name == "tokeira-grafana"
+        && let Some(primary) = workload
             .task_definition
             .containers
             .iter_mut()
             .find(|container| container.name == "tokeira-grafana")
-        {
-            primary.secrets.push(SecretEnvVar {
-                name: "GRAFANA_ADMIN_PASSWORD".into(),
-                // ECS resolves the JSON key at task start; neither the
-                // generated password nor a resolved ARN is written into the
-                // deployment config or deploy manifest.
-                value_from: format!("{}/grafana/admin:password::", config.project_name),
-            });
-        }
+    {
+        primary.secrets.push(SecretEnvVar {
+            name: "GRAFANA_ADMIN_PASSWORD".into(),
+            // ECS resolves the JSON key at task start; neither the generated
+            // password nor a resolved ARN is written into config or manifests.
+            value_from: format!("{}/grafana/admin:password::", config.project_name),
+        });
     }
     workload
 }
@@ -382,8 +383,8 @@ fn workload_from_parts(
     let primary = primary_container(
         name,
         image,
-        cpu.saturating_sub(sidecar_cpu + wait_cpu),
-        memory_mb.saturating_sub(sidecar_memory + wait_memory),
+        cpu - (sidecar_cpu + wait_cpu),
+        memory_mb - (sidecar_memory + wait_memory),
         grpc_port,
         metrics_port,
         primary_depends_on,
@@ -506,8 +507,8 @@ fn wait_for_containers(dependencies: &[&str], config: &EcsConfig) -> Vec<Contain
                 name: format!("wait-for-{dependency}"),
                 image: config.observability.busybox_image.clone(),
                 essential: false,
-                cpu: 32,
-                memory_mb: 64,
+                cpu: WAIT_FOR_CPU,
+                memory_mb: WAIT_FOR_MEMORY_MB,
                 command: vec![
                     "sh".into(),
                     "-c".into(),
@@ -537,8 +538,8 @@ fn alloy_containers(
         name: "alloy-config-init".into(),
         image: config.observability.aws_cli_image.clone(),
         essential: false,
-        cpu: 64,
-        memory_mb: 128,
+        cpu: ALLOY_CONFIG_INIT_CPU,
+        memory_mb: ALLOY_CONFIG_INIT_MEMORY_MB,
         command: vec![
             "sh".into(),
             "-c".into(),
@@ -721,6 +722,35 @@ mod tests {
             Some(&"0.0.0.0:9090")
         );
         assert_eq!(env.get("TOKEIRA_OBSERVABILITY_LOG_FORMAT"), Some(&"json"));
+    }
+
+    #[test]
+    fn primary_resources_subtract_sidecar_and_wait_overhead() {
+        let config = EcsConfig::default();
+        config.validate().expect("validated config");
+        let workload = EcsWorkload::build_all(&config)
+            .into_iter()
+            .find(|workload| workload.name == "tokeira-edge-api")
+            .expect("edge api workload");
+        let primary = workload
+            .task_definition
+            .containers
+            .iter()
+            .find(|container| container.name == "tokeira-edge-api")
+            .expect("primary container");
+
+        assert_eq!(
+            primary.cpu,
+            config.services.edge_api.cpu
+                - (config.observability.alloy_cpu + ALLOY_CONFIG_INIT_CPU + 2 * WAIT_FOR_CPU)
+        );
+        assert_eq!(
+            primary.memory_mb,
+            config.services.edge_api.memory_mb
+                - (config.observability.alloy_memory_mb
+                    + ALLOY_CONFIG_INIT_MEMORY_MB
+                    + 2 * WAIT_FOR_MEMORY_MB)
+        );
     }
 
     #[test]

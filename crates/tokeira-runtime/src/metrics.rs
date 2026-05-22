@@ -1,6 +1,10 @@
 //! Runtime metric definitions and recording helpers.
 
 use metrics::{counter, gauge, histogram};
+use tokeira_observability::{
+    NotShardOwnerOperationLabel, OutcomeLabel, QueryBufferOutcomeLabel, QueryDispatchOutcomeLabel,
+    QueryDispatchPathLabel, RetryOutcomeLabel,
+};
 #[cfg(test)]
 use tokeira_types::validate_metric_name;
 use tokeira_types::{MetricType, NamespaceId, QueueKey, TaskKind, WorkerInstanceKey};
@@ -14,6 +18,17 @@ pub const LANE_SUBMIT_DURATION_SECONDS: &str = "tokeira_runtime_lane_submit_dura
 pub const LANE_QUEUE_WAIT_SECONDS: &str = "tokeira_runtime_lane_queue_wait_seconds";
 pub const LANE_PROCESSING_DURATION_SECONDS: &str =
     "tokeira_runtime_lane_processing_duration_seconds";
+pub const NOT_SHARD_OWNER_TOTAL: &str = "tokeira_runtime_not_shard_owner_total";
+pub const QUERY_DISPATCH_TOTAL: &str = "tokeira_runtime_query_dispatch_total";
+pub const QUERY_BUFFER_WAIT_SECONDS: &str = "tokeira_runtime_query_buffer_wait_seconds";
+pub const WORKFLOW_TASK_STARTED_TOTAL: &str = "tokeira_runtime_workflow_task_started_total";
+pub const WORKFLOW_TASK_COMPLETED_TOTAL: &str = "tokeira_runtime_workflow_task_completed_total";
+pub const WORKFLOW_TASK_TIMED_OUT_TOTAL: &str = "tokeira_runtime_workflow_task_timed_out_total";
+pub const ACTIVITY_TASK_STARTED_TOTAL: &str = "tokeira_runtime_activity_task_started_total";
+pub const ACTIVITY_TASK_COMPLETED_TOTAL: &str = "tokeira_runtime_activity_task_completed_total";
+pub const ACTIVITY_TASK_FAILED_TOTAL: &str = "tokeira_runtime_activity_task_failed_total";
+pub const ACTIVITY_TASK_RETRY_TOTAL: &str = "tokeira_runtime_activity_task_retry_total";
+pub const ACTIVITY_TASK_TIMED_OUT_TOTAL: &str = "tokeira_runtime_activity_task_timed_out_total";
 pub const SCANNER_TICK_TOTAL: &str = "tokeira_runtime_scanner_tick_total";
 pub const SCANNER_DISPATCHED_TOTAL: &str = "tokeira_runtime_scanner_dispatched_total";
 pub const OCC_RETRY_TOTAL: &str = "tokeira_runtime_occ_retry_total";
@@ -39,6 +54,17 @@ pub const METRIC_NAMES: &[(&str, MetricType)] = &[
         LANE_PROCESSING_DURATION_SECONDS,
         MetricType::DurationHistogram,
     ),
+    (NOT_SHARD_OWNER_TOTAL, MetricType::Counter),
+    (QUERY_DISPATCH_TOTAL, MetricType::Counter),
+    (QUERY_BUFFER_WAIT_SECONDS, MetricType::DurationHistogram),
+    (WORKFLOW_TASK_STARTED_TOTAL, MetricType::Counter),
+    (WORKFLOW_TASK_COMPLETED_TOTAL, MetricType::Counter),
+    (WORKFLOW_TASK_TIMED_OUT_TOTAL, MetricType::Counter),
+    (ACTIVITY_TASK_STARTED_TOTAL, MetricType::Counter),
+    (ACTIVITY_TASK_COMPLETED_TOTAL, MetricType::Counter),
+    (ACTIVITY_TASK_FAILED_TOTAL, MetricType::Counter),
+    (ACTIVITY_TASK_RETRY_TOTAL, MetricType::Counter),
+    (ACTIVITY_TASK_TIMED_OUT_TOTAL, MetricType::Counter),
     (SCANNER_TICK_TOTAL, MetricType::Counter),
     (SCANNER_DISPATCHED_TOTAL, MetricType::Counter),
     (OCC_RETRY_TOTAL, MetricType::Counter),
@@ -136,6 +162,55 @@ pub fn record_lane_processing_duration(command_type: &'static str, duration: std
         .record(duration.as_secs_f64());
 }
 
+/// Record a runtime ownership rejection.
+pub fn record_not_shard_owner(operation: NotShardOwnerOperationLabel) {
+    counter!(NOT_SHARD_OWNER_TOTAL, "operation" => operation.as_str()).increment(1);
+}
+
+/// Record a query delivery decision without exposing query/workflow identity.
+pub fn record_query_dispatch(path: QueryDispatchPathLabel, outcome: QueryDispatchOutcomeLabel) {
+    counter!(QUERY_DISPATCH_TOTAL, "path" => path.as_str(), "outcome" => outcome.as_str())
+        .increment(1);
+}
+
+/// Record how long a query waited behind a workflow-task consistency barrier.
+pub fn record_query_buffer_wait(duration: std::time::Duration, outcome: QueryBufferOutcomeLabel) {
+    histogram!(QUERY_BUFFER_WAIT_SECONDS, "outcome" => outcome.as_str())
+        .record(duration.as_secs_f64());
+}
+
+pub fn record_workflow_task_started(outcome: OutcomeLabel) {
+    counter!(WORKFLOW_TASK_STARTED_TOTAL, "outcome" => outcome.as_str()).increment(1);
+}
+
+pub fn record_workflow_task_completed(outcome: OutcomeLabel) {
+    counter!(WORKFLOW_TASK_COMPLETED_TOTAL, "outcome" => outcome.as_str()).increment(1);
+}
+
+pub fn record_workflow_task_timed_out(outcome: OutcomeLabel) {
+    counter!(WORKFLOW_TASK_TIMED_OUT_TOTAL, "outcome" => outcome.as_str()).increment(1);
+}
+
+pub fn record_activity_task_started(outcome: OutcomeLabel) {
+    counter!(ACTIVITY_TASK_STARTED_TOTAL, "outcome" => outcome.as_str()).increment(1);
+}
+
+pub fn record_activity_task_completed(outcome: OutcomeLabel) {
+    counter!(ACTIVITY_TASK_COMPLETED_TOTAL, "outcome" => outcome.as_str()).increment(1);
+}
+
+pub fn record_activity_task_failed(outcome: OutcomeLabel) {
+    counter!(ACTIVITY_TASK_FAILED_TOTAL, "outcome" => outcome.as_str()).increment(1);
+}
+
+pub fn record_activity_task_retry(outcome: OutcomeLabel) {
+    counter!(ACTIVITY_TASK_RETRY_TOTAL, "outcome" => outcome.as_str()).increment(1);
+}
+
+pub fn record_activity_task_timed_out(outcome: OutcomeLabel) {
+    counter!(ACTIVITY_TASK_TIMED_OUT_TOTAL, "outcome" => outcome.as_str()).increment(1);
+}
+
 /// Record a scanner tick for one shard.
 pub fn record_scanner_tick(scanner_type: &'static str, shard_id: u32) {
     counter!(
@@ -157,8 +232,8 @@ pub fn record_scanner_dispatched(scanner_type: &'static str, shard_id: u32) {
 }
 
 /// Record an OCC retry outcome.
-pub fn record_occ_retry(outcome: &'static str) {
-    counter!(OCC_RETRY_TOTAL, "outcome" => outcome).increment(1);
+pub fn record_occ_retry(outcome: RetryOutcomeLabel) {
+    counter!(OCC_RETRY_TOTAL, "outcome" => outcome.as_str()).increment(1);
 }
 
 /// Record a committed kernel transition observed by the runtime.
@@ -281,9 +356,30 @@ mod tests {
             record_poll_timeout(&queue);
             set_queue_depth(&queue, "ready", 7);
             record_lane_submit_duration(3, std::time::Duration::from_millis(25));
+            record_lane_processing_duration(
+                "WorkflowTaskCompleted",
+                std::time::Duration::from_millis(19),
+            );
+            record_not_shard_owner(NotShardOwnerOperationLabel::Submit);
+            record_query_dispatch(
+                QueryDispatchPathLabel::Direct,
+                QueryDispatchOutcomeLabel::Published,
+            );
+            record_query_buffer_wait(
+                std::time::Duration::from_millis(13),
+                QueryBufferOutcomeLabel::Released,
+            );
+            record_workflow_task_started(OutcomeLabel::Success);
+            record_workflow_task_completed(OutcomeLabel::Failure);
+            record_workflow_task_timed_out(OutcomeLabel::Success);
+            record_activity_task_started(OutcomeLabel::Success);
+            record_activity_task_completed(OutcomeLabel::Success);
+            record_activity_task_failed(OutcomeLabel::Failure);
+            record_activity_task_retry(OutcomeLabel::Success);
+            record_activity_task_timed_out(OutcomeLabel::Failure);
             record_scanner_tick("timer", 4);
             record_scanner_dispatched("timer", 4);
-            record_occ_retry("retry");
+            record_occ_retry(RetryOutcomeLabel::Retry);
             record_transition_committed("default", "Start");
             record_events_emitted("WorkflowExecutionStarted", 2);
             record_commands_processed("Start");
@@ -326,6 +422,75 @@ mod tests {
             }
             other => panic!("expected histogram, got {other:?}"),
         }
+
+        let (labels, value) = snapshot.get(LANE_PROCESSING_DURATION_SECONDS).unwrap();
+        assert_eq!(
+            labels.get("command_type"),
+            Some(&"WorkflowTaskCompleted".to_string())
+        );
+        match value {
+            DebugValue::Histogram(values) => {
+                assert_eq!(values.len(), 1);
+                assert_eq!(values[0].into_inner(), 0.019f64);
+            }
+            other => panic!("expected histogram, got {other:?}"),
+        }
+
+        let (labels, value) = snapshot.get(NOT_SHARD_OWNER_TOTAL).unwrap();
+        assert_eq!(labels.get("operation"), Some(&"submit".to_string()));
+        assert_eq!(value, &DebugValue::Counter(1));
+        assert!(!labels.contains_key("workflow_id"));
+        assert!(!labels.contains_key("run_id"));
+
+        let (labels, value) = snapshot.get(QUERY_DISPATCH_TOTAL).unwrap();
+        assert_eq!(labels.get("path"), Some(&"direct".to_string()));
+        assert_eq!(labels.get("outcome"), Some(&"published".to_string()));
+        assert_eq!(value, &DebugValue::Counter(1));
+        assert!(!labels.contains_key("query_id"));
+        assert!(!labels.contains_key("workflow_id"));
+        assert!(!labels.contains_key("run_id"));
+
+        let (labels, value) = snapshot.get(QUERY_BUFFER_WAIT_SECONDS).unwrap();
+        assert_eq!(labels.get("outcome"), Some(&"released".to_string()));
+        match value {
+            DebugValue::Histogram(values) => {
+                assert_eq!(values.len(), 1);
+                assert_eq!(values[0].into_inner(), 0.013f64);
+            }
+            other => panic!("expected histogram, got {other:?}"),
+        }
+
+        let (labels, value) = snapshot.get(WORKFLOW_TASK_STARTED_TOTAL).unwrap();
+        assert_eq!(labels.get("outcome"), Some(&"success".to_string()));
+        assert_eq!(value, &DebugValue::Counter(1));
+
+        let (labels, value) = snapshot.get(WORKFLOW_TASK_COMPLETED_TOTAL).unwrap();
+        assert_eq!(labels.get("outcome"), Some(&"failure".to_string()));
+        assert_eq!(value, &DebugValue::Counter(1));
+
+        let (labels, value) = snapshot.get(WORKFLOW_TASK_TIMED_OUT_TOTAL).unwrap();
+        assert_eq!(labels.get("outcome"), Some(&"success".to_string()));
+        assert_eq!(value, &DebugValue::Counter(1));
+
+        let (labels, value) = snapshot.get(ACTIVITY_TASK_STARTED_TOTAL).unwrap();
+        assert_eq!(labels.get("outcome"), Some(&"success".to_string()));
+        assert_eq!(value, &DebugValue::Counter(1));
+
+        let (labels, value) = snapshot.get(ACTIVITY_TASK_COMPLETED_TOTAL).unwrap();
+        assert_eq!(labels.get("outcome"), Some(&"success".to_string()));
+        assert_eq!(value, &DebugValue::Counter(1));
+
+        let (labels, value) = snapshot.get(ACTIVITY_TASK_FAILED_TOTAL).unwrap();
+        assert_eq!(labels.get("outcome"), Some(&"failure".to_string()));
+        assert_eq!(value, &DebugValue::Counter(1));
+
+        let (labels, value) = snapshot.get(ACTIVITY_TASK_RETRY_TOTAL).unwrap();
+        assert_eq!(labels.get("outcome"), Some(&"success".to_string()));
+        assert_eq!(value, &DebugValue::Counter(1));
+
+        let (labels, value) = snapshot.get(ACTIVITY_TASK_TIMED_OUT_TOTAL).unwrap();
+        assert_eq!(labels.get("outcome"), Some(&"failure".to_string()));
+        assert_eq!(value, &DebugValue::Counter(1));
 
         let (labels, value) = snapshot.get(SCANNER_TICK_TOTAL).unwrap();
         assert_eq!(labels.get("scanner_type"), Some(&"timer".to_string()));

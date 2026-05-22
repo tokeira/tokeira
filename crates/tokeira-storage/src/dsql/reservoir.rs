@@ -18,6 +18,7 @@ use std::{
 use anyhow::Result;
 use rand::Rng;
 use sqlx::PgConnection;
+use tokeira_observability::OutcomeLabel;
 use tokio::{
     sync::{Semaphore, mpsc},
     task::JoinHandle,
@@ -125,6 +126,8 @@ impl Reservoir {
         let (return_tx, return_rx) = mpsc::unbounded_channel();
         let inflight = Arc::new(Semaphore::new(config.inflight_limit));
         let target_ready = Arc::new(AtomicUsize::new(config.target_ready));
+        metrics::set_dsql_reservoir_target_connections(config.target_ready);
+        metrics::set_dsql_reservoir_ready_connections(0);
         let refiller_handle = spawn_refiller(
             config.clone(),
             Arc::clone(&factory),
@@ -170,6 +173,7 @@ impl Reservoir {
             tokio::task::yield_now().await;
         }
         metrics::record_dsql_pool_connections_total(self.ready.len());
+        metrics::set_dsql_reservoir_ready_connections(self.ready.len());
         Ok(())
     }
 
@@ -180,6 +184,7 @@ impl Reservoir {
         match self.ready.try_recv() {
             Ok(entry) => {
                 metrics::record_dsql_pool_connections_total(self.ready.len());
+                metrics::set_dsql_reservoir_ready_connections(self.ready.len());
                 Ok(entry)
             }
             Err(async_channel::TryRecvError::Empty) => {
@@ -205,6 +210,7 @@ impl Reservoir {
     pub fn reconfigure_target(&self, new_target: u32) {
         self.target_ready
             .store((new_target as usize).max(1), Ordering::Release);
+        metrics::set_dsql_reservoir_target_connections((new_target as usize).max(1));
     }
 
     pub fn retire_excess(&self, new_target: u32) -> usize {
@@ -220,6 +226,7 @@ impl Reservoir {
             }
         }
         metrics::record_dsql_pool_connections_total(self.ready.len());
+        metrics::set_dsql_reservoir_ready_connections(self.ready.len());
         retired
     }
 
@@ -264,14 +271,21 @@ fn spawn_refiller(
                 return;
             };
             let Ok(_slot) = slot_manager.acquire_slot().await else {
+                metrics::record_dsql_reservoir_refill_error("slot_unavailable");
                 tokio::time::sleep(StdDuration::from_secs(1)).await;
                 continue;
             };
+            let refill_started = Instant::now();
             if let Err(error) = distributed_bucket.wait().await {
                 // A slot is reserved before the global rate token so local
                 // refillers cannot collectively overshoot capacity while
                 // waiting for token-bucket admission.
                 slot_manager.release_slot();
+                metrics::record_dsql_reservoir_refill_error("rate_limiter");
+                metrics::record_dsql_reservoir_refill_duration(
+                    OutcomeLabel::Failure,
+                    refill_started.elapsed(),
+                );
                 tracing::warn!(error = %error, "failed to acquire DSQL distributed rate token");
                 tokio::time::sleep(REFILLER_ERROR_BACKOFF).await;
                 continue;
@@ -293,14 +307,29 @@ fn spawn_refiller(
                         // physical connection was created. Dropping the
                         // connection must also release its reserved slot.
                         slot_manager.release_slot();
+                        metrics::record_dsql_reservoir_refill_error("ready_channel_closed");
+                        metrics::record_dsql_reservoir_refill_duration(
+                            OutcomeLabel::Failure,
+                            refill_started.elapsed(),
+                        );
                         return;
                     }
                     metrics::record_dsql_pool_connections_total(ready_tx.len());
+                    metrics::set_dsql_reservoir_ready_connections(ready_tx.len());
+                    metrics::record_dsql_reservoir_refill_duration(
+                        OutcomeLabel::Success,
+                        refill_started.elapsed(),
+                    );
                 }
                 Err(error) => {
                     slot_manager.release_slot();
                     metrics::record_dsql_reservoir_connection_create_duration(
                         create_started.elapsed(),
+                    );
+                    metrics::record_dsql_reservoir_refill_error("factory");
+                    metrics::record_dsql_reservoir_refill_duration(
+                        OutcomeLabel::Failure,
+                        refill_started.elapsed(),
                     );
                     metrics::record_dsql_connection_error(error.kind());
                     tracing::warn!(error = %error, "failed to create DSQL connection");
@@ -342,6 +371,7 @@ fn spawn_scanner(
                             // the owner of the discard and must release the slot.
                             slot_manager.release_slot();
                             metrics::record_dsql_pool_connection_retired("ready_channel_full");
+                            metrics::set_dsql_reservoir_ready_connections(ready_tx.len());
                             break;
                         }
                     }
@@ -349,6 +379,7 @@ fn spawn_scanner(
                 }
             }
             metrics::record_dsql_pool_connections_total(ready_tx.len());
+            metrics::set_dsql_reservoir_ready_connections(ready_tx.len());
         }
     })
 }
@@ -388,6 +419,7 @@ fn spawn_return_processor(
                 return;
             }
             metrics::record_dsql_pool_connections_total(ready_tx.len());
+            metrics::set_dsql_reservoir_ready_connections(ready_tx.len());
         }
     })
 }

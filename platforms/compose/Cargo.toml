@@ -28,5 +28,6 @@ tokeira-state = { path = "../../crates/tokeira-state" }
 [dev-dependencies]
 proptest = "1"
 tempfile.workspace = true
+tokeira-observability = { path = "../../crates/tokeira-observability" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 toml.workspace = true

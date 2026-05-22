@@ -41,6 +41,7 @@ pub mod leader;
 pub mod loop_a;
 pub mod loop_b;
 pub mod loop_c;
+pub mod metrics;
 pub mod mimir;
 pub mod reconciler;
 pub mod signals;

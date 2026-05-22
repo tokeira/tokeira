@@ -22,6 +22,7 @@ time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tokeira-kernel = { path = "../tokeira-kernel" }
+tokeira-observability = { path = "../tokeira-observability" }
 tokeira-types = { path = "../tokeira-types" }
 uuid.workspace = true
 

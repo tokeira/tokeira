@@ -10,11 +10,13 @@ anyhow.workspace = true
 async-trait.workspace = true
 buffa = { version = "0.6", features = ["json"] }
 connectrpc = { version = "0.6", features = ["client"] }
+metrics.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
 tokeira-config.workspace = true
+tokeira-observability = { path = "../tokeira-observability" }
 tokeira-proto = { path = "../tokeira-proto" }
 tokeira-storage = { path = "../tokeira-storage" }
 tokeira-types = { path = "../tokeira-types" }
@@ -23,6 +25,7 @@ tonic.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+metrics-util.workspace = true
 proptest.workspace = true
 
 [lints]

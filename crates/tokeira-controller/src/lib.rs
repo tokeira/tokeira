@@ -7,6 +7,7 @@ pub mod connect_service;
 pub mod drain;
 pub mod generation;
 pub mod membership;
+pub mod metrics;
 pub mod placement;
 pub mod service;
 

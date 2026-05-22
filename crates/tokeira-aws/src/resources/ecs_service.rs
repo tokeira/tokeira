@@ -32,7 +32,14 @@ pub struct ContainerSpec {
     pub mount_points: Vec<MountPointSpec>,
     pub depends_on: Vec<ContainerDependencySpec>,
     pub init_process_enabled: bool,
+    pub environment: Vec<EnvironmentSpec>,
     pub secrets: Vec<SecretSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentSpec {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -456,6 +463,12 @@ fn container_definition(
                 .map(mount_point)
                 .collect::<Vec<_>>(),
         ))
+        .set_environment(Some(
+            spec.environment
+                .iter()
+                .map(container_environment)
+                .collect::<Result<Vec<_>, _>>()?,
+        ))
         .set_secrets(Some(
             spec.secrets
                 .iter()
@@ -476,6 +489,15 @@ fn container_definition(
         );
     }
     Ok(builder.build())
+}
+
+fn container_environment(
+    spec: &EnvironmentSpec,
+) -> Result<aws_sdk_ecs::types::KeyValuePair, IacError> {
+    Ok(aws_sdk_ecs::types::KeyValuePair::builder()
+        .name(&spec.name)
+        .value(&spec.value)
+        .build())
 }
 
 fn container_secret(spec: &SecretSpec) -> Result<aws_sdk_ecs::types::Secret, IacError> {

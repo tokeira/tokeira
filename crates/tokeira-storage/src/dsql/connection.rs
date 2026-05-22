@@ -9,15 +9,16 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration as StdDuration, Instant},
 };
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use sqlx::PgConnection;
+use tokeira_observability::DbClassLabel;
 use tokio::{
     sync::{OwnedSemaphorePermit, RwLock, Semaphore},
     task::JoinHandle,
@@ -28,6 +29,9 @@ use crate::{ConnectionDirector, DbClass, metrics};
 use super::{
     DsqlPoolConfig, Reservoir, ReservoirEntry, ReturnedConnection, config::ReservoirConfig,
 };
+
+const LEAK_SUSPECT_AFTER: StdDuration = StdDuration::from_secs(30);
+const LEAK_SCAN_INTERVAL: StdDuration = StdDuration::from_secs(5);
 
 #[derive(Debug)]
 pub struct ClassBudgets {
@@ -116,6 +120,14 @@ impl ClassBudgets {
         let available = semaphore.available_permits();
         let in_use = total.saturating_sub(available);
         metrics::record_dsql_pool_class_budget(db_class_label(class), total, in_use, 0);
+        if total > 0 && in_use as f64 / total as f64 > 0.9 {
+            tracing::warn!(
+                class = db_class_label(class).as_str(),
+                total_permits = total,
+                in_use_permits = in_use,
+                "DSQL class budget utilization is above 90%"
+            );
+        }
     }
 }
 
@@ -127,8 +139,12 @@ pub struct DsqlConnectionDirector {
     class_budgets: Arc<ClassBudgets>,
     /// Number of permits currently holding a physical connection.
     in_flight: Arc<AtomicUsize>,
+    /// Tracks long-lived checkouts without using stack traces or raw call-site
+    /// strings as labels. The call-site dimension is derived from `DbClass`.
+    leak_tracker: Arc<CheckoutLeakTracker>,
     /// Periodic reporter for class budget and reservoir snapshots.
     reporter_handle: JoinHandle<()>,
+    leak_detector_handle: JoinHandle<()>,
 }
 
 impl DsqlConnectionDirector {
@@ -137,16 +153,20 @@ impl DsqlConnectionDirector {
         let reservoir = Arc::new(reservoir);
         let class_budgets = Arc::new(ClassBudgets::new(&default_allocations(&config.reservoir))?);
         let in_flight = Arc::new(AtomicUsize::new(0));
+        let leak_tracker = Arc::new(CheckoutLeakTracker::default());
         let reporter_handle = spawn_periodic_reporter(
             Arc::clone(&class_budgets),
             Arc::clone(&reservoir),
             Arc::clone(&in_flight),
         );
+        let leak_detector_handle = spawn_leak_detector(Arc::clone(&leak_tracker));
         Ok(Self {
             reservoir,
             class_budgets,
             in_flight,
+            leak_tracker,
             reporter_handle,
+            leak_detector_handle,
         })
     }
 
@@ -159,6 +179,7 @@ impl DsqlConnectionDirector {
 
     pub async fn shutdown(&self) -> Result<()> {
         self.reporter_handle.abort();
+        self.leak_detector_handle.abort();
         self.reservoir.shutdown().await
     }
 }
@@ -177,6 +198,7 @@ impl ConnectionDirector for DsqlConnectionDirector {
         metrics::record_dsql_pool_checkout_duration(db_class_label(class), started.elapsed());
         metrics::set_dsql_reservoir_in_flight(in_flight);
         metrics::set_dsql_reservoir_utilization_ratio(in_flight, self.reservoir.ready_count());
+        let leak_checkout = self.leak_tracker.track(class, Instant::now());
         Ok(DsqlPermit::new(
             class,
             entry,
@@ -184,6 +206,8 @@ impl ConnectionDirector for DsqlConnectionDirector {
             self.reservoir.return_sender(),
             self.reservoir.slot_manager(),
             Arc::clone(&self.in_flight),
+            Arc::clone(&self.leak_tracker),
+            leak_checkout,
         ))
     }
 }
@@ -191,6 +215,7 @@ impl ConnectionDirector for DsqlConnectionDirector {
 impl Drop for DsqlConnectionDirector {
     fn drop(&mut self) {
         self.reporter_handle.abort();
+        self.leak_detector_handle.abort();
     }
 }
 
@@ -203,6 +228,83 @@ pub(crate) trait DsqlConnectionAcquirer: std::fmt::Debug + Send + Sync {
 impl DsqlConnectionAcquirer for DsqlConnectionDirector {
     async fn acquire(&self, class: DbClass) -> Result<DsqlPermit> {
         ConnectionDirector::acquire(self, class).await
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CheckoutLeak {
+    id: u64,
+    class: DbClass,
+    call_site: &'static str,
+}
+
+#[derive(Debug)]
+struct CheckoutLeakEntry {
+    checkout: CheckoutLeak,
+    started_at: Instant,
+    suspected: bool,
+}
+
+#[derive(Debug, Default)]
+struct CheckoutLeakTracker {
+    next_id: AtomicU64,
+    entries: Mutex<HashMap<u64, CheckoutLeakEntry>>,
+}
+
+impl CheckoutLeakTracker {
+    fn track(&self, class: DbClass, started_at: Instant) -> CheckoutLeak {
+        let checkout = CheckoutLeak {
+            id: self.next_id.fetch_add(1, Ordering::AcqRel),
+            class,
+            call_site: checkout_call_site(class),
+        };
+        let mut entries = self.entries.lock().expect("checkout leak tracker poisoned");
+        entries.insert(
+            checkout.id,
+            CheckoutLeakEntry {
+                checkout,
+                started_at,
+                suspected: false,
+            },
+        );
+        checkout
+    }
+
+    fn scan(&self, now: Instant, suspect_after: StdDuration) -> Vec<CheckoutLeak> {
+        let mut entries = self.entries.lock().expect("checkout leak tracker poisoned");
+        let mut newly_suspected = Vec::new();
+        for entry in entries.values_mut() {
+            if !entry.suspected && now.duration_since(entry.started_at) >= suspect_after {
+                entry.suspected = true;
+                newly_suspected.push(entry.checkout);
+            }
+        }
+        newly_suspected
+    }
+
+    fn complete(&self, checkout: CheckoutLeak) {
+        let removed = {
+            let mut entries = self.entries.lock().expect("checkout leak tracker poisoned");
+            entries.remove(&checkout.id)
+        };
+        let Some(entry) = removed else {
+            return;
+        };
+        if entry.suspected {
+            metrics::resolve_dsql_connection_leak_suspect(
+                db_class_label(entry.checkout.class),
+                entry.checkout.call_site,
+                entry.started_at.elapsed(),
+            );
+        }
+    }
+
+    #[cfg(test)]
+    fn active_count(&self) -> usize {
+        self.entries
+            .lock()
+            .expect("checkout leak tracker poisoned")
+            .len()
     }
 }
 
@@ -228,6 +330,8 @@ pub struct DsqlPermit {
     slot_manager: Arc<super::SlotBlockManager>,
     /// Shared in-flight counter owned by the director.
     director_in_flight: Arc<AtomicUsize>,
+    leak_tracker: Arc<CheckoutLeakTracker>,
+    leak_checkout: CheckoutLeak,
     /// Caller-set flag that causes return processing to discard the connection.
     marked_bad: bool,
 }
@@ -240,6 +344,8 @@ impl DsqlPermit {
         reservoir_return: tokio::sync::mpsc::UnboundedSender<ReturnedConnection>,
         slot_manager: Arc<super::SlotBlockManager>,
         director_in_flight: Arc<AtomicUsize>,
+        leak_tracker: Arc<CheckoutLeakTracker>,
+        leak_checkout: CheckoutLeak,
     ) -> Self {
         Self {
             class,
@@ -250,6 +356,8 @@ impl DsqlPermit {
             reservoir_return,
             slot_manager,
             director_in_flight,
+            leak_tracker,
+            leak_checkout,
             marked_bad: false,
         }
     }
@@ -273,6 +381,7 @@ impl Drop for DsqlPermit {
     fn drop(&mut self) {
         let previous = self.director_in_flight.fetch_sub(1, Ordering::AcqRel);
         metrics::set_dsql_reservoir_in_flight(previous.saturating_sub(1));
+        self.leak_tracker.complete(self.leak_checkout);
         // Dropping the permit is the storage-layer "return connection" API.
         // Expired connections are intentionally discarded here because handing
         // them back to the ready pool would create rare mid-transaction expiry
@@ -316,8 +425,39 @@ fn spawn_periodic_reporter(
             let ready = reservoir.ready_count();
             let in_flight = in_flight.load(Ordering::Acquire);
             metrics::record_dsql_pool_connections_total(ready);
+            metrics::set_dsql_reservoir_ready_connections(ready);
+            metrics::set_dsql_reservoir_target_connections(reservoir.config().target_ready);
             metrics::set_dsql_reservoir_in_flight(in_flight);
             metrics::set_dsql_reservoir_utilization_ratio(in_flight, ready);
+            let total = ready + in_flight;
+            if total > 0 && in_flight as f64 / total as f64 > 0.8 {
+                tracing::warn!(
+                    ready_connections = ready,
+                    in_flight_connections = in_flight,
+                    "DSQL reservoir utilization is above 80%"
+                );
+            }
+        }
+    })
+}
+
+fn spawn_leak_detector(leak_tracker: Arc<CheckoutLeakTracker>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(LEAK_SCAN_INTERVAL);
+        loop {
+            interval.tick().await;
+            for checkout in leak_tracker.scan(Instant::now(), LEAK_SUSPECT_AFTER) {
+                metrics::record_dsql_connection_leak_detected(
+                    db_class_label(checkout.class),
+                    checkout.call_site,
+                );
+                tracing::warn!(
+                    class = db_class_label(checkout.class).as_str(),
+                    call_site = checkout.call_site,
+                    suspect_after_seconds = LEAK_SUSPECT_AFTER.as_secs(),
+                    "DSQL connection checkout exceeded leak suspicion deadline"
+                );
+            }
         }
     })
 }
@@ -333,6 +473,16 @@ fn validate_allocations(allocations: &HashMap<DbClass, usize>) -> Result<usize> 
         }
     }
     Ok(total_budget)
+}
+
+fn checkout_call_site(class: DbClass) -> &'static str {
+    match class {
+        DbClass::Control => "db_class_control",
+        DbClass::Commit => "db_class_commit",
+        DbClass::Read => "db_class_read",
+        DbClass::Projection => "db_class_projection",
+        DbClass::Maintenance => "db_class_maintenance",
+    }
 }
 
 fn build_budget_map(allocations: &HashMap<DbClass, usize>) -> HashMap<DbClass, Arc<Semaphore>> {
@@ -378,13 +528,13 @@ fn all_classes() -> [DbClass; 5] {
     ]
 }
 
-fn db_class_label(class: DbClass) -> &'static str {
+fn db_class_label(class: DbClass) -> DbClassLabel {
     match class {
-        DbClass::Control => "control",
-        DbClass::Commit => "commit",
-        DbClass::Read => "read",
-        DbClass::Projection => "projection",
-        DbClass::Maintenance => "maintenance",
+        DbClass::Control => DbClassLabel::Control,
+        DbClass::Commit => DbClassLabel::Commit,
+        DbClass::Read => DbClassLabel::Read,
+        DbClass::Projection => DbClassLabel::Projection,
+        DbClass::Maintenance => DbClassLabel::Maintenance,
     }
 }
 
@@ -439,6 +589,8 @@ mod tests {
         let class_guard = budgets.acquire(DbClass::Commit).await.unwrap();
         let (return_tx, _return_rx) = tokio::sync::mpsc::unbounded_channel();
         let in_flight = Arc::new(AtomicUsize::new(1));
+        let leak_tracker = Arc::new(CheckoutLeakTracker::default());
+        let leak_checkout = leak_tracker.track(DbClass::Commit, Instant::now());
         let mut permit = DsqlPermit {
             class: DbClass::Commit,
             connection: None,
@@ -448,6 +600,8 @@ mod tests {
             reservoir_return: return_tx,
             slot_manager: crate::dsql::SlotBlockManager::local_for_tests(1),
             director_in_flight: Arc::clone(&in_flight),
+            leak_tracker: Arc::clone(&leak_tracker),
+            leak_checkout,
             marked_bad: false,
         };
 
@@ -456,6 +610,21 @@ mod tests {
         assert!(permit.marked_bad);
         drop(permit);
         assert_eq!(in_flight.load(Ordering::Acquire), 0);
+        assert_eq!(leak_tracker.active_count(), 0);
+    }
+
+    #[test]
+    fn checkout_leak_tracker_marks_and_resolves_bounded_call_sites() {
+        let tracker = CheckoutLeakTracker::default();
+        let started_at = Instant::now() - StdDuration::from_secs(60);
+        let checkout = tracker.track(DbClass::Projection, started_at);
+
+        let suspected = tracker.scan(Instant::now(), StdDuration::from_secs(30));
+
+        assert_eq!(suspected.len(), 1);
+        assert_eq!(suspected[0].call_site, "db_class_projection");
+        tracker.complete(checkout);
+        assert_eq!(tracker.active_count(), 0);
     }
 
     proptest! {

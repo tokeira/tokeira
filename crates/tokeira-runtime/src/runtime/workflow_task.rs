@@ -1,4 +1,5 @@
 use super::*;
+use tokeira_observability::OutcomeLabel;
 
 impl<R> TokeiraRuntime<R>
 where
@@ -101,10 +102,23 @@ where
         &self,
         req: WorkflowTaskCompletedRequest,
     ) -> Result<CommitResult> {
-        self.validate_workflow_task_token(&req.token).await?;
+        if let Err(error) = self.validate_workflow_task_token(&req.token).await {
+            runtime_metrics::record_workflow_task_completed(OutcomeLabel::Rejected);
+            return Err(error);
+        }
         let run_key = req.token.run_key;
-        self.submit_for_owned_shard(run_key, Command::WorkflowTaskCompleted(req))
-            .await
+        let result = self
+            .submit_for_owned_shard(run_key, Command::WorkflowTaskCompleted(req))
+            .await;
+        match &result {
+            Ok(CommitResult::Applied { .. } | CommitResult::Duplicate) => {
+                runtime_metrics::record_workflow_task_completed(OutcomeLabel::Success);
+            }
+            Ok(CommitResult::Conflict { .. }) | Err(_) => {
+                runtime_metrics::record_workflow_task_completed(OutcomeLabel::Failure);
+            }
+        }
+        result
     }
 
     /// Atomically transition a polled workflow task into the Started state.
@@ -124,18 +138,30 @@ where
             sticky_ttl: Some(Duration::seconds(30)),
             now,
         };
-        let result = self
+        let result = match self
             .submit(offered.run_key, Command::WorkflowTaskStarted(request))
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                runtime_metrics::record_workflow_task_started(OutcomeLabel::Failure);
+                return Err(error);
+            }
+        };
 
         let new_state = match result {
-            CommitResult::Applied { new_state } => new_state,
+            CommitResult::Applied { new_state } => {
+                runtime_metrics::record_workflow_task_started(OutcomeLabel::Success);
+                new_state
+            }
             CommitResult::Conflict { reason } => {
+                runtime_metrics::record_workflow_task_started(OutcomeLabel::Failure);
                 return Err(anyhow!(
                     "failed to start workflow task due to conflict: {reason}"
                 ));
             }
             CommitResult::Duplicate => {
+                runtime_metrics::record_workflow_task_started(OutcomeLabel::Failure);
                 return Err(anyhow!("unexpected duplicate while starting workflow task"));
             }
         };

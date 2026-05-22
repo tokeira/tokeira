@@ -5,7 +5,13 @@
 //! here ensures consistent at-least-once delivery semantics across all sink
 //! implementations, whether in-memory or backed by a durable store.
 
+use std::time::{Duration, Instant};
+
 use anyhow::Result;
+use tokeira_observability::{
+    ErrorBiasedSamplingReason, ProjectionErrorKindLabel, ProjectionOutcomeLabel,
+    mark_error_biased_sample,
+};
 use tokeira_storage::ProjectionLog;
 use tokeira_types::ProjectionCursor;
 use tokio_util::sync::CancellationToken;
@@ -37,6 +43,7 @@ where
     pub async fn run_once(&self, cursor: ProjectionCursor) -> Result<ProjectionCursor> {
         let batch = self.log.read_from(&cursor, self.batch_size).await?;
         if batch.records.is_empty() {
+            projection_metrics::record_poll_empty(cursor.partition_id);
             projection_metrics::set_projection_lag(cursor.partition_id, 0);
             debug!(
                 partition = cursor.partition_id,
@@ -46,10 +53,22 @@ where
             return Ok(cursor);
         }
 
+        record_batch_observability(cursor.partition_id, &batch);
         projection_metrics::set_projection_lag(cursor.partition_id, batch.records.len());
 
         for record in &batch.records {
-            self.sink.apply(record, cursor.partition_id).await?;
+            if let Err(error) = self.sink.apply(record, cursor.partition_id).await {
+                projection_metrics::record_records_processed_with_outcome(
+                    cursor.partition_id,
+                    1,
+                    ProjectionOutcomeLabel::Failure,
+                );
+                projection_metrics::record_sink_error_with_kind(
+                    cursor.partition_id,
+                    ProjectionErrorKindLabel::Sink,
+                );
+                return Err(error);
+            }
         }
         projection_metrics::record_records_processed(cursor.partition_id, batch.records.len());
         projection_metrics::set_projection_lag(cursor.partition_id, 0);
@@ -86,20 +105,25 @@ where
             .unwrap_or(initial_cursor);
         let mut backoff = tokio::time::Duration::from_millis(100);
         let max_backoff = tokio::time::Duration::from_secs(5);
+        let mut last_checkpoint = Instant::now();
+        record_checkpoint_sequence(&cursor);
 
         loop {
             if cancel.is_cancelled() {
-                self.sink.save_checkpoint(sink_id, &cursor).await?;
+                self.save_checkpoint_with_metrics(sink_id, &cursor, &mut last_checkpoint)
+                    .await?;
                 return Ok(());
             }
 
             let batch = self.log.read_from(&cursor, self.batch_size).await?;
             if batch.records.is_empty() {
+                projection_metrics::record_poll_empty(cursor.partition_id);
                 projection_metrics::set_projection_lag(cursor.partition_id, 0);
+                projection_metrics::record_checkpoint_lag(last_checkpoint.elapsed());
                 debug!("projection substream idle");
                 tokio::select! {
                     _ = cancel.cancelled() => {
-                        self.sink.save_checkpoint(sink_id, &cursor).await?;
+                        self.save_checkpoint_with_metrics(sink_id, &cursor, &mut last_checkpoint).await?;
                         return Ok(());
                     }
                     _ = tokio::time::sleep(backoff) => {}
@@ -108,20 +132,32 @@ where
                 continue;
             }
             backoff = tokio::time::Duration::from_millis(100);
+            record_batch_observability(cursor.partition_id, &batch);
             projection_metrics::set_projection_lag(cursor.partition_id, batch.records.len());
 
             let mut failed = false;
             for record in &batch.records {
                 if let Err(error) = self.sink.apply(record, cursor.partition_id).await {
+                    mark_error_biased_sample(ErrorBiasedSamplingReason::ProjectionSinkFailure);
+                    projection_metrics::record_records_processed_with_outcome(
+                        cursor.partition_id,
+                        1,
+                        ProjectionOutcomeLabel::Failure,
+                    );
+                    projection_metrics::record_sink_error_with_kind(
+                        cursor.partition_id,
+                        ProjectionErrorKindLabel::Sink,
+                    );
                     tracing::warn!(?error, "projection sink apply failed");
                     failed = true;
                     break;
                 }
             }
             if failed {
+                projection_metrics::record_checkpoint_lag(last_checkpoint.elapsed());
                 tokio::select! {
                     _ = cancel.cancelled() => {
-                        self.sink.save_checkpoint(sink_id, &cursor).await?;
+                        self.save_checkpoint_with_metrics(sink_id, &cursor, &mut last_checkpoint).await?;
                         return Ok(());
                     }
                     _ = tokio::time::sleep(backoff) => {}
@@ -132,7 +168,8 @@ where
             projection_metrics::record_records_processed(cursor.partition_id, batch.records.len());
             cursor = batch.next_cursor;
             projection_metrics::set_projection_lag(cursor.partition_id, 0);
-            self.sink.save_checkpoint(sink_id, &cursor).await?;
+            self.save_checkpoint_with_metrics(sink_id, &cursor, &mut last_checkpoint)
+                .await?;
             info!(
                 partition = cursor.partition_id,
                 fanout = cursor.fanout,
@@ -144,6 +181,42 @@ where
     pub async fn run(&self, sink_id: &str, cancel: CancellationToken) -> Result<()> {
         self.run_from_cursor(sink_id, cancel, beginning_cursor())
             .await
+    }
+
+    async fn save_checkpoint_with_metrics(
+        &self,
+        sink_id: &str,
+        cursor: &ProjectionCursor,
+        last_checkpoint: &mut Instant,
+    ) -> Result<()> {
+        if let Err(error) = self.sink.save_checkpoint(sink_id, cursor).await {
+            projection_metrics::record_sink_error_with_kind(
+                cursor.partition_id,
+                ProjectionErrorKindLabel::Checkpoint,
+            );
+            return Err(error);
+        }
+
+        *last_checkpoint = Instant::now();
+        projection_metrics::record_checkpoint_lag(Duration::ZERO);
+        record_checkpoint_sequence(cursor);
+        Ok(())
+    }
+}
+
+fn record_batch_observability(partition_id: u32, batch: &tokeira_storage::ProjectionBatch) {
+    projection_metrics::record_worker_batch_records(partition_id, batch.records.len());
+    if let Some(last_record) = batch.records.last() {
+        projection_metrics::set_latest_transition_sequence(
+            partition_id,
+            last_record.transition_seq.0,
+        );
+    }
+}
+
+fn record_checkpoint_sequence(cursor: &ProjectionCursor) {
+    if let Some(sequence) = cursor.last_transition_seq {
+        projection_metrics::set_checkpoint_transition_sequence(cursor.partition_id, sequence.0);
     }
 }
 

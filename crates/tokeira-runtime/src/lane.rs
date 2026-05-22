@@ -23,12 +23,16 @@ use time::OffsetDateTime;
 use tokeira_kernel::{
     Command, DispatchOp, HistoryEvent, HistoryEventKind, Kernel, LoadedRun, StartRequest,
 };
+use tokeira_observability::{
+    ChannelTraceContext, ErrorBiasedSamplingReason, RetryOutcomeLabel, mark_error_biased_sample,
+};
 use tokeira_proto::{
     conversions::common::failure_to_payload, public::temporal::api::failure::v1 as failure_proto,
 };
 use tokeira_storage::{CommitResult, RunRepository, metrics as storage_metrics};
 use tokeira_types::{ExecutionStatus, RunKey, ShardEpoch, execution_home_bundle};
 use tokio::sync::{mpsc, oneshot};
+use tracing::Instrument;
 
 use crate::{
     UpdateRegistry, UpdateResolution, metrics as runtime_metrics,
@@ -97,6 +101,7 @@ pub trait DispatchPublisher: Send + Sync {
 /// durable state remains the source of truth.
 #[derive(Clone)]
 pub struct LaneHandle {
+    lane_id: usize,
     tx: mpsc::Sender<LaneMessage>,
 }
 
@@ -110,12 +115,7 @@ impl LaneHandle {
     pub async fn submit(&self, run_key: RunKey, command: Command) -> Result<CommitResult> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(LaneMessage {
-                run_key,
-                command,
-                reply_tx,
-                enqueued_at: std::time::Instant::now(),
-            })
+            .send(LaneMessage::new(self.lane_id, run_key, command, reply_tx))
             .await?;
         reply_rx.await?
     }
@@ -127,10 +127,30 @@ impl LaneHandle {
 }
 
 struct LaneMessage {
+    lane_id: usize,
     run_key: RunKey,
     command: Command,
     reply_tx: oneshot::Sender<Result<CommitResult>>,
     enqueued_at: std::time::Instant,
+    trace_context: Option<ChannelTraceContext>,
+}
+
+impl LaneMessage {
+    fn new(
+        lane_id: usize,
+        run_key: RunKey,
+        command: Command,
+        reply_tx: oneshot::Sender<Result<CommitResult>>,
+    ) -> Self {
+        Self {
+            lane_id,
+            run_key,
+            command,
+            reply_tx,
+            enqueued_at: std::time::Instant::now(),
+            trace_context: ChannelTraceContext::capture_current(),
+        }
+    }
 }
 
 struct LaneCache {
@@ -225,6 +245,39 @@ where
     R: RunRepository + 'static,
     P: DispatchPublisher + Clone + 'static,
 {
+    spawn_lane_with_id(
+        0,
+        kernel,
+        repo,
+        publisher,
+        shard_owner,
+        activity_tracking,
+        workflow_timeout_tracking,
+        wft_timeout_tracking,
+        nexus_timeout_tracking,
+        update_registry,
+        config,
+    )
+}
+
+pub(crate) fn spawn_lane_with_id<K, R, P>(
+    lane_id: usize,
+    kernel: K,
+    repo: R,
+    publisher: P,
+    shard_owner: Arc<RwLock<ShardOwner>>,
+    activity_tracking: crate::activity_timeout::ActivityTrackingState,
+    workflow_timeout_tracking: crate::timeout::WorkflowTimeoutTrackingState,
+    wft_timeout_tracking: crate::wft_timeout::WftTimeoutTrackingState,
+    nexus_timeout_tracking: crate::nexus::NexusTimeoutTrackingState,
+    update_registry: UpdateRegistry,
+    config: LaneConfig,
+) -> LaneHandle
+where
+    K: Kernel + Send + Sync + 'static,
+    R: RunRepository + 'static,
+    P: DispatchPublisher + Clone + 'static,
+{
     let (tx, mut rx) = mpsc::channel::<LaneMessage>(1024);
     let requeue_tx = tx.clone();
     tokio::spawn(async move {
@@ -253,7 +306,7 @@ where
             }
         }
     });
-    LaneHandle { tx }
+    LaneHandle { lane_id, tx }
 }
 
 #[cfg(test)]
@@ -326,6 +379,11 @@ where
         let command_type = command_type_name(&message.command);
         runtime_metrics::record_lane_queue_wait(message.enqueued_at.elapsed());
         let processing_start = std::time::Instant::now();
+        let shard_id = {
+            let owner = shard_owner.read().unwrap();
+            shard_for(message.run_key, owner.shard_count())
+        };
+        let processing_span = lane_processing_span(&message, command_type, shard_id);
         let result = handle_message_with_cache(
             kernel,
             repo,
@@ -336,6 +394,7 @@ where
             config.max_occ_retries,
             cache,
         )
+        .instrument(processing_span)
         .await;
 
         let stop_draining = result.is_err();
@@ -769,6 +828,30 @@ where
     buffered
 }
 
+fn lane_processing_span(
+    message: &LaneMessage,
+    command_type: &'static str,
+    shard_id: tokeira_types::ShardId,
+) -> tracing::Span {
+    let origin_trace_id = message
+        .trace_context
+        .map(ChannelTraceContext::origin_trace_id_hex)
+        .unwrap_or_default();
+    let origin_span_id = message
+        .trace_context
+        .map(ChannelTraceContext::origin_span_id_hex)
+        .unwrap_or_default();
+    tracing::info_span!(
+        "lane.process",
+        tokeira.lane_id = message.lane_id,
+        tokeira.shard_id = shard_id.0,
+        tokeira.bundle_id = shard_id.0,
+        tokeira.command_type = command_type,
+        origin_trace_id = origin_trace_id.as_str(),
+        origin_span_id = origin_span_id.as_str(),
+    )
+}
+
 #[cfg(test)]
 async fn handle_message<K, R>(
     kernel: &K,
@@ -825,6 +908,9 @@ where
             "kernel.transition",
             command_type = command_type_name(&command),
             run_key = %run_key.0,
+            tokeira.run_id = tracing::field::Empty,
+            tokeira.workflow_type = tracing::field::Empty,
+            tokeira.transition_number = tracing::field::Empty,
             transition_seq = tracing::field::Empty,
         );
         let loaded = match cache.get(run_key) {
@@ -840,6 +926,15 @@ where
                 .apply(loaded, command.clone())
                 .map_err(|reject| anyhow!("kernel rejected command: {reject}"))
         })?;
+        transition_span.record("tokeira.run_id", transition.next_state.run_id.0.to_string());
+        transition_span.record(
+            "tokeira.workflow_type",
+            transition.next_state.workflow_type.0.as_str(),
+        );
+        transition_span.record(
+            "tokeira.transition_number",
+            transition.next_state.transition_seq.0 as i64,
+        );
         let (execution_home_bundle, epoch) = {
             let owner = shard_owner.read().unwrap();
             let bundle_id = execution_home_bundle(
@@ -872,12 +967,20 @@ where
 
         match repo
             .commit_transition_for_bundle(run_key, execution_home_bundle, transition, epoch)
+            .instrument(storage_commit_span(
+                execution_home_bundle,
+                "commit_transition_for_bundle",
+                attempts,
+            ))
             .await?
         {
             CommitResult::Applied { new_state } => {
                 cache.insert(run_key, LoadedRun::Existing(new_state.clone()));
                 if attempts > 0 {
-                    storage_metrics::record_dsql_retry("commit_transition_for_bundle", "success");
+                    storage_metrics::record_dsql_retry(
+                        tokeira_observability::StorageOperationLabel::CommitTransitionForBundle,
+                        RetryOutcomeLabel::Success,
+                    );
                 }
                 runtime_metrics::record_transition_committed(
                     &new_state.namespace_id.0.to_string(),
@@ -898,10 +1001,14 @@ where
             }
             CommitResult::Conflict { reason } => {
                 cache.evict(run_key);
-                runtime_metrics::record_occ_retry("retry");
+                runtime_metrics::record_occ_retry(RetryOutcomeLabel::Retry);
                 if attempts >= max_retries {
-                    runtime_metrics::record_occ_retry("exhausted");
-                    storage_metrics::record_dsql_retry("commit_transition_for_bundle", "exhausted");
+                    runtime_metrics::record_occ_retry(RetryOutcomeLabel::Exhausted);
+                    storage_metrics::record_dsql_retry(
+                        tokeira_observability::StorageOperationLabel::CommitTransitionForBundle,
+                        RetryOutcomeLabel::Exhausted,
+                    );
+                    mark_error_biased_sample(ErrorBiasedSamplingReason::OccRetryExhausted);
                     return Err(anyhow!(
                         "lane OCC retry exhausted after {} conflicts for {:?}: {}",
                         attempts + 1,
@@ -913,6 +1020,20 @@ where
             }
         }
     }
+}
+
+fn storage_commit_span(
+    execution_home_bundle: tokeira_types::ShardId,
+    operation: &'static str,
+    occ_retries: u32,
+) -> tracing::Span {
+    tracing::info_span!(
+        "storage.commit",
+        tokeira.storage_operation = operation,
+        tokeira.dsql_class = "commit",
+        tokeira.occ_retries = occ_retries,
+        tokeira.bundle_id = execution_home_bundle.0,
+    )
 }
 
 fn command_type_name(command: &Command) -> &'static str {
@@ -1061,11 +1182,12 @@ fn extract_reset_metadata(history_events: &[HistoryEvent]) -> Option<(tokeira_ty
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{BTreeMap, VecDeque},
+        collections::{BTreeMap, HashMap, VecDeque},
         sync::{Arc, Mutex},
         time::{Duration as StdDuration, Instant},
     };
 
+    use opentelemetry::trace::TracerProvider;
     use proptest::prelude::*;
     use smallvec::smallvec;
     use time::{Duration, OffsetDateTime};
@@ -1088,13 +1210,87 @@ mod tests {
         runtime::Runtime,
         sync::{Mutex as AsyncMutex, Notify},
     };
-    use tracing_subscriber::layer::SubscriberExt;
+    use tracing::{
+        Subscriber,
+        field::{Field, Visit},
+        span::{Attributes, Id},
+    };
+    use tracing_subscriber::{
+        Layer,
+        layer::{Context, SubscriberExt},
+        registry::LookupSpan,
+    };
 
     use super::*;
 
     #[derive(Clone)]
     struct MockKernel {
         state: Arc<Mutex<MockKernelState>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct SpanCapture(Arc<Mutex<Vec<(String, HashMap<String, String>)>>>);
+
+    struct FieldRecorder {
+        values: HashMap<String, String>,
+    }
+
+    impl Visit for FieldRecorder {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.values
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.values
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.values
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.values
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    impl<S> Layer<S> for SpanCapture
+    where
+        S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    {
+        fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+            let mut recorder = FieldRecorder {
+                values: HashMap::new(),
+            };
+            attrs.record(&mut recorder);
+            if let Some(span) = ctx.span(id) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((span.metadata().name().to_string(), recorder.values));
+            }
+        }
+
+        fn on_record(&self, id: &Id, values: &tracing::span::Record<'_>, ctx: Context<'_, S>) {
+            let mut recorder = FieldRecorder {
+                values: HashMap::new(),
+            };
+            values.record(&mut recorder);
+            if let Some(span) = ctx.span(id) {
+                let span_name = span.metadata().name();
+                let mut captured = self.0.lock().unwrap();
+                if let Some((_, fields)) = captured
+                    .iter_mut()
+                    .rev()
+                    .find(|(name, _)| name == span_name)
+                {
+                    fields.extend(recorder.values);
+                }
+            }
+        }
     }
 
     struct MockKernelState {
@@ -1755,12 +1951,7 @@ mod tests {
     ) -> (LaneMessage, oneshot::Receiver<Result<CommitResult>>) {
         let (reply_tx, reply_rx) = oneshot::channel();
         (
-            LaneMessage {
-                run_key,
-                command: sample_command(label),
-                reply_tx,
-                enqueued_at: std::time::Instant::now(),
-            },
+            LaneMessage::new(0, run_key, sample_command(label), reply_tx),
             reply_rx,
         )
     }
@@ -1913,21 +2104,129 @@ mod tests {
     #[test]
     fn queued_depth_reflects_bounded_channel_occupancy() {
         let (tx, _rx) = mpsc::channel(4);
-        let handle = LaneHandle { tx };
+        let handle = LaneHandle { lane_id: 0, tx };
         assert_eq!(handle.queued_depth(), 0);
 
         let (reply_tx, _reply_rx) = oneshot::channel();
         handle
             .tx
-            .try_send(LaneMessage {
-                run_key: RunKey::new(),
-                command: sample_command("queued"),
+            .try_send(LaneMessage::new(
+                0,
+                RunKey::new(),
+                sample_command("queued"),
                 reply_tx,
-                enqueued_at: std::time::Instant::now(),
-            })
+            ))
             .unwrap();
 
         assert_eq!(handle.queued_depth(), 1);
+    }
+
+    #[test]
+    fn lane_processing_span_records_origin_trace_context() {
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("lane-test");
+        let capture = SpanCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(capture.clone())
+            .with(tracing_opentelemetry::layer().with_tracer(tracer));
+        let dispatch = tracing::Dispatch::new(subscriber);
+
+        let (message, expected_trace_id, expected_span_id) =
+            tracing::dispatcher::with_default(&dispatch, || {
+                let dispatch_span = tracing::info_span!("edge.dispatch");
+                let _entered = dispatch_span.enter();
+                let (reply_tx, _reply_rx) = oneshot::channel();
+                let message =
+                    LaneMessage::new(7, RunKey::new(), sample_command("traced"), reply_tx);
+                let context = message
+                    .trace_context
+                    .expect("message should capture active OTel span context");
+                let expected_trace_id = context.origin_trace_id_hex();
+                let expected_span_id = context.origin_span_id_hex();
+                let _processing_span =
+                    lane_processing_span(&message, command_type_name(&message.command), ShardId(3));
+                (message, expected_trace_id, expected_span_id)
+            });
+
+        assert!(message.trace_context.is_some());
+        let spans = capture.0.lock().unwrap();
+        let (_, fields) = spans
+            .iter()
+            .find(|(name, _)| name == "lane.process")
+            .expect("lane processing span should be created");
+        assert_eq!(fields.get("origin_trace_id"), Some(&expected_trace_id));
+        assert_eq!(fields.get("origin_span_id"), Some(&expected_span_id));
+        assert_eq!(fields.get("tokeira.lane_id"), Some(&"7".to_string()));
+        assert_eq!(fields.get("tokeira.shard_id"), Some(&"3".to_string()));
+        assert_eq!(
+            fields.get("tokeira.command_type"),
+            Some(&"Signal".to_string())
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_message_records_kernel_and_storage_span_attributes() {
+        let capture = SpanCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        let run_key = RunKey::new();
+        let state = sample_state(run_key);
+        let repo = MockRepo::new(
+            LoadedRun::Existing(state.clone()),
+            vec![CommitBehavior::Applied],
+        );
+        let kernel = MockKernel::new(SmallVec::new());
+        let shard_owner = test_shard_owner();
+
+        let result = handle_message(
+            &kernel,
+            &repo,
+            &shard_owner,
+            run_key,
+            sample_command("span-attrs"),
+            &LaneConfig::default(),
+            5,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result.0, CommitResult::Applied { .. }));
+        let captured = capture.0.lock().unwrap();
+        let kernel_span = captured
+            .iter()
+            .find(|(name, _)| name == "kernel.transition")
+            .expect("kernel transition span should be emitted");
+        assert_eq!(
+            kernel_span.1.get("tokeira.run_id"),
+            Some(&state.run_id.0.to_string())
+        );
+        assert_eq!(
+            kernel_span.1.get("tokeira.workflow_type"),
+            Some(&state.workflow_type.0)
+        );
+        assert_eq!(
+            kernel_span.1.get("tokeira.transition_number"),
+            Some(&state.transition_seq.next().0.to_string())
+        );
+
+        let storage_span = captured
+            .iter()
+            .find(|(name, _)| name == "storage.commit")
+            .expect("storage commit span should be emitted");
+        assert_eq!(
+            storage_span.1.get("tokeira.storage_operation"),
+            Some(&"commit_transition_for_bundle".to_string())
+        );
+        assert_eq!(
+            storage_span.1.get("tokeira.dsql_class"),
+            Some(&"commit".to_string())
+        );
+        assert_eq!(
+            storage_span.1.get("tokeira.occ_retries"),
+            Some(&"0".to_string())
+        );
     }
 
     proptest! {

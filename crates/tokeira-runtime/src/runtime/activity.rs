@@ -1,4 +1,5 @@
 use super::*;
+use tokeira_observability::OutcomeLabel;
 
 impl<R> TokeiraRuntime<R>
 where
@@ -58,7 +59,10 @@ where
         worker_identity: Option<WorkerIdentity>,
     ) -> Result<CommitResult> {
         let activity_id = token.activity_id.clone();
-        self.validate_activity_token(&token).await?;
+        if let Err(error) = self.validate_activity_token(&token).await {
+            runtime_metrics::record_activity_task_completed(OutcomeLabel::Rejected);
+            return Err(error);
+        }
         let result = self
             .submit_for_owned_shard(
                 token.run_key,
@@ -70,6 +74,14 @@ where
                 }),
             )
             .await?;
+        match &result {
+            CommitResult::Applied { .. } | CommitResult::Duplicate => {
+                runtime_metrics::record_activity_task_completed(OutcomeLabel::Success);
+            }
+            CommitResult::Conflict { .. } => {
+                runtime_metrics::record_activity_task_completed(OutcomeLabel::Failure);
+            }
+        }
         if matches!(
             result,
             CommitResult::Applied { .. } | CommitResult::Duplicate
@@ -91,7 +103,13 @@ where
         is_non_retryable: bool,
         worker_identity: Option<WorkerIdentity>,
     ) -> Result<()> {
-        let (activity, workflow_retry_policy) = self.validate_activity_token(&token).await?;
+        let (activity, workflow_retry_policy) = match self.validate_activity_token(&token).await {
+            Ok(validated) => validated,
+            Err(error) => {
+                runtime_metrics::record_activity_task_failed(OutcomeLabel::Rejected);
+                return Err(error);
+            }
+        };
         let activity_id = token.activity_id.clone();
         let retry_policy = activity.retry_policy.clone().or(workflow_retry_policy);
 
@@ -108,11 +126,17 @@ where
         });
 
         if let Some(RetryDecision::Retry { next_attempt }) = should_retry {
-            self.retry_activity_task(&token, next_attempt).await?;
+            match self.retry_activity_task(&token, next_attempt).await {
+                Ok(()) => runtime_metrics::record_activity_task_retry(OutcomeLabel::Success),
+                Err(error) => {
+                    runtime_metrics::record_activity_task_retry(OutcomeLabel::Failure);
+                    return Err(error);
+                }
+            }
             return Ok(());
         }
 
-        let _ = self
+        let result = self
             .submit_for_owned_shard(
                 token.run_key,
                 Command::ActivityResolved(ActivityResolvedRequest {
@@ -122,7 +146,16 @@ where
                     now: OffsetDateTime::now_utc(),
                 }),
             )
-            .await?;
+            .await;
+        match &result {
+            Ok(CommitResult::Applied { .. } | CommitResult::Duplicate) => {
+                runtime_metrics::record_activity_task_failed(OutcomeLabel::Success);
+            }
+            Ok(CommitResult::Conflict { .. }) | Err(_) => {
+                runtime_metrics::record_activity_task_failed(OutcomeLabel::Failure);
+            }
+        }
+        result?;
         self.activity_tracking
             .remove(token.run_key, &token.activity_id);
         Ok(())
@@ -260,6 +293,7 @@ where
                 .await?
             {
                 CommitResult::Applied { .. } => {
+                    runtime_metrics::record_activity_task_started(OutcomeLabel::Success);
                     self.delivery_metrics
                         .record_latency(&task.queue, entered_at.elapsed());
                     self.activity_tracking.record_started(
@@ -293,6 +327,7 @@ where
                 }
                 CommitResult::Conflict { .. } => {
                     if attempts >= self.config.max_occ_retries {
+                        runtime_metrics::record_activity_task_started(OutcomeLabel::Failure);
                         if let Err(error) = self
                             .activity_broker
                             .publish_activity_task(task.clone(), Some(&self.delivery_metrics))
@@ -304,7 +339,10 @@ where
                     }
                     attempts += 1;
                 }
-                CommitResult::Duplicate => return Ok(None),
+                CommitResult::Duplicate => {
+                    runtime_metrics::record_activity_task_started(OutcomeLabel::Failure);
+                    return Ok(None);
+                }
             }
         }
     }

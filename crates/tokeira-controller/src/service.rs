@@ -6,6 +6,7 @@
 
 use std::{pin::Pin, str::FromStr, sync::Arc};
 
+use tokeira_observability::{ControllerCasOutcomeLabel, OutcomeLabel};
 use tokeira_proto::controller::{
     self as proto, BundleOwnerMessage, BundleOwnershipEntry,
     ConnectionBudgetDirective as ProtoConnectionBudgetDirective,
@@ -30,6 +31,7 @@ use tonic::{Request, Response, Status};
 use crate::{
     ControllerConfig, DrainCoordinator, GenerationManager, LiveMembership,
     membership::{LanePressure, NodeDrainState, RuntimeHeartbeat, RuntimeRegistration},
+    metrics,
     placement::{
         ConnectionBudgetDirective, compute_connection_budget, compute_desired_placement,
         compute_routing_snapshot, empty_previous_snapshot,
@@ -76,8 +78,10 @@ impl PlacementControllerState {
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
         let previous = empty_previous_snapshot(self.placement_config());
-        let (snapshot, _delta) =
+        let (snapshot, delta) =
             compute_routing_snapshot(&leases, self.placement_config(), &previous);
+        metrics::set_routing_snapshot_size(snapshot.execution_bundle_owners.len());
+        metrics::record_bundle_ownership_churn(delta.bundle_updates.len());
         Ok(snapshot)
     }
 
@@ -85,14 +89,22 @@ impl PlacementControllerState {
         &self,
         expected: tokeira_types::GenerationCounter,
     ) -> Result<tokeira_types::GenerationCounter, Status> {
-        match self
-            .generation
-            .advance_generation(expected)
-            .await
-            .map_err(|err| Status::internal(err.to_string()))?
-        {
-            GenerationAdvanceResult::Advanced(generation)
-            | GenerationAdvanceResult::Conflict(generation) => Ok(generation),
+        let result = match self.generation.advance_generation(expected).await {
+            Ok(result) => result,
+            Err(err) => {
+                metrics::record_generation_cas(ControllerCasOutcomeLabel::Error);
+                return Err(Status::internal(err.to_string()));
+            }
+        };
+        match result {
+            GenerationAdvanceResult::Advanced(generation) => {
+                metrics::record_generation_cas(ControllerCasOutcomeLabel::Success);
+                Ok(generation)
+            }
+            GenerationAdvanceResult::Conflict(generation) => {
+                metrics::record_generation_cas(ControllerCasOutcomeLabel::Conflict);
+                Ok(generation)
+            }
         }
     }
 
@@ -100,12 +112,14 @@ impl PlacementControllerState {
         &self,
         allocator_id: IncarnationId,
     ) -> Result<Vec<(IncarnationId, ConnectionBudgetDirective)>, Status> {
-        let version = self
-            .generation
-            .current_budget_version()
-            .await
-            .map_err(|err| Status::internal(err.to_string()))?;
-        match self
+        let version = match self.generation.current_budget_version().await {
+            Ok(version) => version,
+            Err(err) => {
+                metrics::record_budget_allocation(OutcomeLabel::Error);
+                return Err(Status::internal(err.to_string()));
+            }
+        };
+        let allocation = match self
             .generation
             .allocate_budget(
                 version,
@@ -114,9 +128,16 @@ impl PlacementControllerState {
                 self.config.dsql_connection_capacity_budget,
             )
             .await
-            .map_err(|err| Status::internal(err.to_string()))?
         {
+            Ok(allocation) => allocation,
+            Err(err) => {
+                metrics::record_budget_allocation(OutcomeLabel::Error);
+                return Err(Status::internal(err.to_string()));
+            }
+        };
+        match allocation {
             BudgetAllocationResult::Allocated { .. } => {
+                metrics::record_budget_allocation(OutcomeLabel::Success);
                 let nodes = self.membership.read().await.active_node_ids_sorted();
                 Ok(compute_connection_budget(
                     self.config.dsql_connection_rate_budget,
@@ -126,7 +147,10 @@ impl PlacementControllerState {
                     self.config.dsql_connection_capacity_budget as u32,
                 ))
             }
-            BudgetAllocationResult::Conflict { .. } => Ok(Vec::new()),
+            BudgetAllocationResult::Conflict { .. } => {
+                metrics::record_budget_allocation(OutcomeLabel::Conflict);
+                Ok(Vec::new())
+            }
         }
     }
 
@@ -173,6 +197,7 @@ impl PlacementController for PlacementControllerState {
         {
             let mut membership = self.membership.write().await;
             membership.register_node(registration, RuntimeHeartbeat::empty(), None);
+            metrics::set_membership_nodes_total(membership.nodes().count());
         }
 
         let state = self.clone();
@@ -183,16 +208,13 @@ impl PlacementController for PlacementControllerState {
                         if let Some(MembershipRequest::Heartbeat(heartbeat)) = message.request {
                             match decode_heartbeat(heartbeat) {
                                 Ok(heartbeat) => {
-                                    state
-                                        .drain
-                                        .write()
-                                        .await
-                                        .record_progress(node_id, heartbeat.drain_state);
-                                    state
-                                        .membership
-                                        .write()
-                                        .await
-                                        .update_heartbeat(node_id, heartbeat);
+                                    let mut drain = state.drain.write().await;
+                                    drain.record_progress(node_id, heartbeat.drain_state);
+                                    metrics::set_drain_active_nodes(drain.active_count());
+                                    drop(drain);
+                                    let mut membership = state.membership.write().await;
+                                    membership.update_heartbeat(node_id, heartbeat);
+                                    metrics::set_membership_nodes_total(membership.nodes().count());
                                 }
                                 Err(err) => {
                                     tracing::warn!(%err, "dropping invalid runtime heartbeat");
@@ -206,7 +228,9 @@ impl PlacementController for PlacementControllerState {
                     }
                 }
             }
-            state.membership.write().await.mark_grace_period(node_id);
+            let mut membership = state.membership.write().await;
+            membership.mark_grace_period(node_id);
+            metrics::set_membership_nodes_total(membership.nodes().count());
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel(4);
@@ -334,7 +358,9 @@ impl PlacementController for PlacementControllerState {
         let node_id = IncarnationId::from_str(&request.into_inner().node_id)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
         self.membership.write().await.mark_draining(node_id);
-        self.drain.write().await.mark_draining(node_id);
+        let mut drain = self.drain.write().await;
+        drain.mark_draining(node_id);
+        metrics::set_drain_active_nodes(drain.active_count());
         Ok(Response::new(MarkDrainingResponse { accepted: true }))
     }
 }

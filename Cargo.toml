@@ -16,6 +16,7 @@ members = [
     "crates/tokeira-compose",
     "crates/tokeira-storage",
     "crates/tokeira-controller",
+    "crates/tokeira-observability",
     "crates/tokeira-runtime",
     "crates/tokeira-projection",
     "crates/tokeira-edge",
@@ -92,6 +93,7 @@ tokeira-iac = { path = "crates/tokeira-iac" }
 tokeira-deploy-engine = { path = "crates/tokeira-deploy-engine" }
 tokeira-config = { path = "crates/tokeira-config" }
 tokeira-aws = { path = "crates/tokeira-aws" }
+tokeira-observability = { path = "crates/tokeira-observability" }
 dagger-client = { path = "crates/dagger-client" }
 tokeira-build = { path = "crates/tokeira-build" }
 

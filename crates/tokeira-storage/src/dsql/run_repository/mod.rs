@@ -21,7 +21,7 @@ use tokeira_types::{
     RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskKind, TaskQueueName, TransitionSeq,
     WorkerIdentity, WorkflowId, dsql_spread_uuid,
 };
-use tracing::instrument;
+use tracing::{Instrument, instrument};
 use uuid::Uuid;
 
 use crate::{
@@ -45,6 +45,18 @@ fn effective_history_limit(limit: usize) -> usize {
         DEFAULT_HISTORY_PAGE_SIZE
     } else {
         limit
+    }
+}
+
+fn dsql_retry_operation_label(
+    operation: &str,
+) -> Option<tokeira_observability::StorageOperationLabel> {
+    match operation {
+        "commit_transition" => Some(tokeira_observability::StorageOperationLabel::CommitTransition),
+        "commit_transition_for_bundle" => {
+            Some(tokeira_observability::StorageOperationLabel::CommitTransitionForBundle)
+        }
+        _ => None,
     }
 }
 
@@ -294,7 +306,9 @@ impl DsqlRunRepository {
         }
         if let Err(error) = result {
             if outcome == "conflict" {
-                metrics::record_dsql_occ_conflict(operation);
+                if let Some(operation) = dsql_retry_operation_label(operation) {
+                    metrics::record_dsql_occ_conflict(operation);
+                }
             }
             if let Some(sqlstate) = extract_sqlstate(error) {
                 metrics::record_dsql_error_code(&sqlstate);
@@ -336,7 +350,9 @@ impl DsqlRunRepository {
             }
         }
         if outcome == "conflict" {
-            metrics::record_dsql_occ_conflict(operation);
+            if let Some(operation) = dsql_retry_operation_label(operation) {
+                metrics::record_dsql_occ_conflict(operation);
+            }
         }
         if let Err(error) = result {
             if let Some(sqlstate) = extract_sqlstate(error) {

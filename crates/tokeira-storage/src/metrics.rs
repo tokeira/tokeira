@@ -5,6 +5,7 @@
 //! ad hoc metrics, which keeps label sets stable for dashboards and alerts.
 
 use metrics::{counter, gauge, histogram};
+use tokeira_observability::{DbClassLabel, OutcomeLabel, RetryOutcomeLabel, StorageOperationLabel};
 use tokeira_types::MetricType;
 #[cfg(test)]
 use tokeira_types::validate_metric_name;
@@ -36,7 +37,12 @@ pub const DSQL_STATEMENT_DURATION_SECONDS: &str = "tokeira_storage_dsql_statemen
 pub const DSQL_OCC_CONFLICT_TOTAL: &str = "tokeira_storage_dsql_occ_conflict_total";
 pub const DSQL_RETRY_TOTAL: &str = "tokeira_storage_dsql_retry_total";
 pub const DSQL_OPERATION_TOTAL: &str = "tokeira_storage_dsql_operation_total";
+pub const DSQL_RESERVOIR_READY_CONNECTIONS: &str = "tokeira_dsql_reservoir_ready_connections";
 pub const DSQL_RESERVOIR_IN_FLIGHT: &str = "tokeira_dsql_reservoir_in_flight";
+pub const DSQL_RESERVOIR_TARGET_CONNECTIONS: &str = "tokeira_dsql_reservoir_target_connections";
+pub const DSQL_RESERVOIR_REFILL_ERRORS_TOTAL: &str = "tokeira_dsql_reservoir_refill_errors_total";
+pub const DSQL_RESERVOIR_REFILL_DURATION_SECONDS: &str =
+    "tokeira_dsql_reservoir_refill_duration_seconds";
 pub const DSQL_PROJECTION_READ_DURATION_SECONDS: &str =
     "tokeira_storage_dsql_projection_read_duration_seconds";
 pub const DSQL_PROJECTION_BATCH_SIZE: &str = "tokeira_storage_dsql_projection_batch_size";
@@ -62,6 +68,12 @@ pub const DSQL_CONNECTION_ERROR_TOTAL: &str = "tokeira_dsql_connection_error_tot
 pub const DSQL_ERROR_CODE_TOTAL: &str = "tokeira_dsql_error_code_total";
 pub const DSQL_SLOT_BLOCKS_OWNED: &str = "tokeira_dsql_slot_blocks_owned";
 pub const DSQL_SLOT_BLOCK_LOST_TOTAL: &str = "tokeira_dsql_slot_block_lost_total";
+pub const DSQL_CONNECTION_LEAK_DETECTED_TOTAL: &str = "tokeira_dsql_connection_leak_detected_total";
+pub const DSQL_CONNECTION_LEAK_SUSPECTS: &str = "tokeira_dsql_connection_leak_suspects";
+pub const DSQL_CONNECTION_CHECKOUT_OVERDUE_SECONDS: &str =
+    "tokeira_dsql_connection_checkout_overdue_seconds";
+pub const MIGRATION_APPLIED_TOTAL: &str = "tokeira_storage_migration_applied_total";
+pub const MIGRATION_DURATION_SECONDS: &str = "tokeira_storage_migration_duration_seconds";
 
 pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (
@@ -103,7 +115,14 @@ pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (DSQL_OCC_CONFLICT_TOTAL, MetricType::Counter),
     (DSQL_RETRY_TOTAL, MetricType::Counter),
     (DSQL_OPERATION_TOTAL, MetricType::Counter),
+    (DSQL_RESERVOIR_READY_CONNECTIONS, MetricType::Gauge),
     (DSQL_RESERVOIR_IN_FLIGHT, MetricType::Gauge),
+    (DSQL_RESERVOIR_TARGET_CONNECTIONS, MetricType::Gauge),
+    (DSQL_RESERVOIR_REFILL_ERRORS_TOTAL, MetricType::Counter),
+    (
+        DSQL_RESERVOIR_REFILL_DURATION_SECONDS,
+        MetricType::DurationHistogram,
+    ),
     (
         DSQL_PROJECTION_READ_DURATION_SECONDS,
         MetricType::DurationHistogram,
@@ -139,6 +158,14 @@ pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (DSQL_ERROR_CODE_TOTAL, MetricType::Counter),
     (DSQL_SLOT_BLOCKS_OWNED, MetricType::Gauge),
     (DSQL_SLOT_BLOCK_LOST_TOTAL, MetricType::Counter),
+    (DSQL_CONNECTION_LEAK_DETECTED_TOTAL, MetricType::Counter),
+    (DSQL_CONNECTION_LEAK_SUSPECTS, MetricType::Gauge),
+    (
+        DSQL_CONNECTION_CHECKOUT_OVERDUE_SECONDS,
+        MetricType::DurationHistogram,
+    ),
+    (MIGRATION_APPLIED_TOTAL, MetricType::Counter),
+    (MIGRATION_DURATION_SECONDS, MetricType::DurationHistogram),
 ];
 
 pub fn record_commit_transition_duration(
@@ -185,8 +212,8 @@ pub fn record_dsql_pool_connections_total(count: usize) {
     gauge!(DSQL_POOL_CONNECTIONS_TOTAL).set(count as f64);
 }
 
-pub fn record_dsql_pool_checkout_duration(class: &'static str, duration: std::time::Duration) {
-    histogram!(DSQL_POOL_CHECKOUT_DURATION_SECONDS, "class" => class)
+pub fn record_dsql_pool_checkout_duration(class: DbClassLabel, duration: std::time::Duration) {
+    histogram!(DSQL_POOL_CHECKOUT_DURATION_SECONDS, "class" => class.as_str())
         .record(duration.as_secs_f64());
 }
 
@@ -212,28 +239,28 @@ pub fn record_dsql_pool_rate_limiter(tokens: f64, rate: f64) {
 }
 
 pub fn record_dsql_pool_class_budget(
-    class: &'static str,
+    class: DbClassLabel,
     total: usize,
     in_use: usize,
     waiters: usize,
 ) {
     // Class-budget metrics are recorded together so operators can compare
     // configured permits, live usage, and wait pressure on the same label set.
-    gauge!(DSQL_POOL_CLASS_BUDGET_TOTAL, "class" => class).set(total as f64);
-    gauge!(DSQL_POOL_CLASS_IN_USE, "class" => class).set(in_use as f64);
-    gauge!(DSQL_POOL_CLASS_WAITERS, "class" => class).set(waiters as f64);
+    gauge!(DSQL_POOL_CLASS_BUDGET_TOTAL, "class" => class.as_str()).set(total as f64);
+    gauge!(DSQL_POOL_CLASS_IN_USE, "class" => class.as_str()).set(in_use as f64);
+    gauge!(DSQL_POOL_CLASS_WAITERS, "class" => class.as_str()).set(waiters as f64);
 }
 
-pub fn increment_dsql_pool_waiting(class: &'static str) {
-    gauge!(DSQL_POOL_WAITING, "class" => class).increment(1.0);
+pub fn increment_dsql_pool_waiting(class: DbClassLabel) {
+    gauge!(DSQL_POOL_WAITING, "class" => class.as_str()).increment(1.0);
 }
 
-pub fn decrement_dsql_pool_waiting(class: &'static str) {
-    gauge!(DSQL_POOL_WAITING, "class" => class).decrement(1.0);
+pub fn decrement_dsql_pool_waiting(class: DbClassLabel) {
+    gauge!(DSQL_POOL_WAITING, "class" => class.as_str()).decrement(1.0);
 }
 
-pub fn record_dsql_class_permit_wait_duration(class: &'static str, duration: std::time::Duration) {
-    histogram!(DSQL_CLASS_PERMIT_WAIT_DURATION_SECONDS, "class" => class)
+pub fn record_dsql_class_permit_wait_duration(class: DbClassLabel, duration: std::time::Duration) {
+    histogram!(DSQL_CLASS_PERMIT_WAIT_DURATION_SECONDS, "class" => class.as_str())
         .record(duration.as_secs_f64());
 }
 
@@ -255,12 +282,13 @@ pub fn record_dsql_statement_duration(
         .record(duration.as_secs_f64());
 }
 
-pub fn record_dsql_occ_conflict(operation: &'static str) {
-    counter!(DSQL_OCC_CONFLICT_TOTAL, "operation" => operation).increment(1);
+pub fn record_dsql_occ_conflict(operation: StorageOperationLabel) {
+    counter!(DSQL_OCC_CONFLICT_TOTAL, "operation" => operation.as_str()).increment(1);
 }
 
-pub fn record_dsql_retry(operation: &'static str, outcome: &'static str) {
-    counter!(DSQL_RETRY_TOTAL, "operation" => operation, "outcome" => outcome).increment(1);
+pub fn record_dsql_retry(operation: StorageOperationLabel, outcome: RetryOutcomeLabel) {
+    counter!(DSQL_RETRY_TOTAL, "operation" => operation.as_str(), "outcome" => outcome.as_str())
+        .increment(1);
 }
 
 pub fn record_dsql_operation_total(operation: &'static str, outcome: &'static str) {
@@ -269,6 +297,23 @@ pub fn record_dsql_operation_total(operation: &'static str, outcome: &'static st
 
 pub fn set_dsql_reservoir_in_flight(count: usize) {
     gauge!(DSQL_RESERVOIR_IN_FLIGHT).set(count as f64);
+}
+
+pub fn set_dsql_reservoir_ready_connections(count: usize) {
+    gauge!(DSQL_RESERVOIR_READY_CONNECTIONS).set(count as f64);
+}
+
+pub fn set_dsql_reservoir_target_connections(count: usize) {
+    gauge!(DSQL_RESERVOIR_TARGET_CONNECTIONS).set(count as f64);
+}
+
+pub fn record_dsql_reservoir_refill_error(reason: &'static str) {
+    counter!(DSQL_RESERVOIR_REFILL_ERRORS_TOTAL, "reason" => reason).increment(1);
+}
+
+pub fn record_dsql_reservoir_refill_duration(outcome: OutcomeLabel, duration: std::time::Duration) {
+    histogram!(DSQL_RESERVOIR_REFILL_DURATION_SECONDS, "outcome" => outcome.as_str())
+        .record(duration.as_secs_f64());
 }
 
 pub fn record_dsql_projection_read_duration(partition_id: u32, duration: std::time::Duration) {
@@ -367,6 +412,49 @@ pub fn record_dsql_slot_block_lost() {
     counter!(DSQL_SLOT_BLOCK_LOST_TOTAL).increment(1);
 }
 
+pub fn record_dsql_connection_leak_detected(class: DbClassLabel, call_site: &'static str) {
+    counter!(
+        DSQL_CONNECTION_LEAK_DETECTED_TOTAL,
+        "class" => class.as_str(),
+        "call_site" => call_site,
+    )
+    .increment(1);
+    gauge!(
+        DSQL_CONNECTION_LEAK_SUSPECTS,
+        "class" => class.as_str(),
+        "call_site" => call_site,
+    )
+    .increment(1.0);
+}
+
+pub fn resolve_dsql_connection_leak_suspect(
+    class: DbClassLabel,
+    call_site: &'static str,
+    overdue: std::time::Duration,
+) {
+    gauge!(
+        DSQL_CONNECTION_LEAK_SUSPECTS,
+        "class" => class.as_str(),
+        "call_site" => call_site,
+    )
+    .decrement(1.0);
+    histogram!(
+        DSQL_CONNECTION_CHECKOUT_OVERDUE_SECONDS,
+        "class" => class.as_str(),
+        "call_site" => call_site,
+    )
+    .record(overdue.as_secs_f64());
+}
+
+pub fn record_migration_applied(status: OutcomeLabel) {
+    counter!(MIGRATION_APPLIED_TOTAL, "status" => status.as_str()).increment(1);
+}
+
+pub fn record_migration_duration(status: OutcomeLabel, duration: std::time::Duration) {
+    histogram!(MIGRATION_DURATION_SECONDS, "status" => status.as_str())
+        .record(duration.as_secs_f64());
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -416,16 +504,22 @@ mod tests {
             record_read_history_duration(std::time::Duration::from_millis(9));
             record_storage_operation("load_run", "success");
             record_dsql_pool_connections_total(2);
-            record_dsql_pool_checkout_duration("commit", std::time::Duration::from_millis(11));
+            record_dsql_pool_checkout_duration(
+                DbClassLabel::Commit,
+                std::time::Duration::from_millis(11),
+            );
             record_dsql_pool_empty_reservoir();
             record_dsql_pool_connection_created();
             record_dsql_pool_connection_retired("expired");
             record_dsql_pool_connection_returned();
             record_dsql_pool_rate_limiter(4.0, 100.0);
-            record_dsql_pool_class_budget("commit", 5, 1, 0);
-            increment_dsql_pool_waiting("commit");
-            decrement_dsql_pool_waiting("commit");
-            record_dsql_class_permit_wait_duration("commit", std::time::Duration::from_millis(3));
+            record_dsql_pool_class_budget(DbClassLabel::Commit, 5, 1, 0);
+            increment_dsql_pool_waiting(DbClassLabel::Commit);
+            decrement_dsql_pool_waiting(DbClassLabel::Commit);
+            record_dsql_class_permit_wait_duration(
+                DbClassLabel::Commit,
+                std::time::Duration::from_millis(3),
+            );
         });
 
         let snapshot = snapshot_map(&recorder);
@@ -492,10 +586,20 @@ mod tests {
                 "load_hot",
                 std::time::Duration::from_millis(5),
             );
-            record_dsql_occ_conflict("commit_transition");
-            record_dsql_retry("commit_transition_for_bundle", "success");
+            record_dsql_occ_conflict(StorageOperationLabel::CommitTransition);
+            record_dsql_retry(
+                StorageOperationLabel::CommitTransitionForBundle,
+                RetryOutcomeLabel::Success,
+            );
             record_dsql_operation_total("load_run", "success");
+            set_dsql_reservoir_ready_connections(4);
             set_dsql_reservoir_in_flight(3);
+            set_dsql_reservoir_target_connections(50);
+            record_dsql_reservoir_refill_error("factory");
+            record_dsql_reservoir_refill_duration(
+                OutcomeLabel::Failure,
+                std::time::Duration::from_millis(44),
+            );
             record_dsql_projection_read_duration(7, std::time::Duration::from_millis(21));
             record_dsql_projection_batch_size(7, 42);
             record_dsql_reservoir_connection_create_duration(std::time::Duration::from_millis(31));
@@ -516,6 +620,14 @@ mod tests {
             record_dsql_error_code("40001");
             set_dsql_slot_blocks_owned(1);
             record_dsql_slot_block_lost();
+            record_dsql_connection_leak_detected(DbClassLabel::Commit, "commit_transition");
+            resolve_dsql_connection_leak_suspect(
+                DbClassLabel::Commit,
+                "commit_transition",
+                std::time::Duration::from_secs(70),
+            );
+            record_migration_applied(OutcomeLabel::Success);
+            record_migration_duration(OutcomeLabel::Success, std::time::Duration::from_millis(14));
         });
 
         let snapshot = snapshot_map(&recorder);
@@ -524,7 +636,11 @@ mod tests {
         assert!(snapshot.contains_key(DSQL_OCC_CONFLICT_TOTAL));
         assert!(snapshot.contains_key(DSQL_RETRY_TOTAL));
         assert!(snapshot.contains_key(DSQL_OPERATION_TOTAL));
+        assert!(snapshot.contains_key(DSQL_RESERVOIR_READY_CONNECTIONS));
         assert!(snapshot.contains_key(DSQL_RESERVOIR_IN_FLIGHT));
+        assert!(snapshot.contains_key(DSQL_RESERVOIR_TARGET_CONNECTIONS));
+        assert!(snapshot.contains_key(DSQL_RESERVOIR_REFILL_ERRORS_TOTAL));
+        assert!(snapshot.contains_key(DSQL_RESERVOIR_REFILL_DURATION_SECONDS));
         assert!(snapshot.contains_key(DSQL_PROJECTION_READ_DURATION_SECONDS));
         assert!(snapshot.contains_key(DSQL_PROJECTION_BATCH_SIZE));
         assert!(snapshot.contains_key(DSQL_RESERVOIR_CONNECTION_CREATE_DURATION_SECONDS));
@@ -545,6 +661,11 @@ mod tests {
         assert!(snapshot.contains_key(DSQL_ERROR_CODE_TOTAL));
         assert!(snapshot.contains_key(DSQL_SLOT_BLOCKS_OWNED));
         assert!(snapshot.contains_key(DSQL_SLOT_BLOCK_LOST_TOTAL));
+        assert!(snapshot.contains_key(DSQL_CONNECTION_LEAK_DETECTED_TOTAL));
+        assert!(snapshot.contains_key(DSQL_CONNECTION_LEAK_SUSPECTS));
+        assert!(snapshot.contains_key(DSQL_CONNECTION_CHECKOUT_OVERDUE_SECONDS));
+        assert!(snapshot.contains_key(MIGRATION_APPLIED_TOTAL));
+        assert!(snapshot.contains_key(MIGRATION_DURATION_SECONDS));
 
         let (labels, value) = snapshot.get(DSQL_RETRY_TOTAL).unwrap();
         assert_eq!(
@@ -554,8 +675,49 @@ mod tests {
         assert_eq!(labels.get("outcome"), Some(&"success".to_string()));
         assert_eq!(value, &DebugValue::Counter(1));
 
+        let (labels, value) = snapshot.get(DSQL_OCC_CONFLICT_TOTAL).unwrap();
+        assert_eq!(
+            labels.get("operation"),
+            Some(&"commit_transition".to_string())
+        );
+        assert_eq!(value, &DebugValue::Counter(1));
+
         let (_, value) = snapshot.get(DSQL_RESERVOIR_UTILIZATION_RATIO).unwrap();
         assert_eq!(value, &DebugValue::Gauge(0.25.into()));
+
+        let (labels, value) = snapshot.get(MIGRATION_APPLIED_TOTAL).unwrap();
+        assert_eq!(labels.get("status"), Some(&"success".to_string()));
+        assert_eq!(value, &DebugValue::Counter(1));
+    }
+
+    #[test]
+    fn dsql_occ_and_retry_helpers_use_bounded_operation_labels() {
+        let recorder = DebuggingRecorder::new();
+
+        with_local_recorder(&recorder, || {
+            record_dsql_occ_conflict(StorageOperationLabel::CommitTransitionForBundle);
+            record_dsql_retry(
+                StorageOperationLabel::CommitTransitionForBundle,
+                RetryOutcomeLabel::Exhausted,
+            );
+        });
+
+        let snapshot = snapshot_map(&recorder);
+        for metric in [DSQL_OCC_CONFLICT_TOTAL, DSQL_RETRY_TOTAL] {
+            let (labels, _) = snapshot.get(metric).unwrap();
+            assert_eq!(
+                labels.get("operation"),
+                Some(&"commit_transition_for_bundle".to_string())
+            );
+            assert!(!labels.contains_key("sql"));
+            assert!(!labels.contains_key("error"));
+            assert!(!labels.contains_key("workflow_id"));
+            assert!(!labels.contains_key("run_id"));
+        }
+
+        let (labels, value) = snapshot.get(DSQL_RETRY_TOTAL).unwrap();
+        assert_eq!(labels.get("outcome"), Some(&"exhausted".to_string()));
+        assert_eq!(value, &DebugValue::Counter(1));
     }
 
     proptest! {

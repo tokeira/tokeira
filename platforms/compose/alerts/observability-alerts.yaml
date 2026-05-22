@@ -1,0 +1,133 @@
+groups:
+  - name: tokeira-observability
+    rules:
+      - alert: DsqlReservoirExhaustion
+        expr: tokeira_dsql_reservoir_utilization_ratio > 0.9
+        for: 5m
+        labels:
+          severity: warning
+          service: tokeirad
+        annotations:
+          summary: DSQL reservoir utilization is high
+          description: DSQL ready connection capacity is close to exhaustion.
+          runbook_url: docs/runbooks/observability/dsql-reservoir-exhaustion.md
+      - alert: DsqlOccConflictSpike
+        expr: sum(rate(tokeira_storage_dsql_occ_conflict_total[5m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+          service: tokeirad
+        annotations:
+          summary: DSQL OCC conflicts are elevated
+          description: Storage commits are seeing sustained serialization conflicts.
+          runbook_url: docs/runbooks/observability/dsql-occ-conflict-spike.md
+      - alert: DsqlConnectionLeakDetected
+        expr: sum(rate(tokeira_dsql_connection_leak_detected_total[5m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+          service: tokeirad
+        annotations:
+          summary: DSQL connection leak suspected
+          description: One or more DSQL checkouts exceeded the leak detection deadline.
+          runbook_url: docs/runbooks/observability/dsql-connection-leak-detected.md
+      - alert: DsqlRateLimiterThrottling
+        expr: sum(rate(tokeira_dsql_rate_limiter_throttled_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: tokeirad
+        annotations:
+          summary: DSQL connection creation is throttled
+          description: Distributed DSQL rate limiting is delaying new connection creation.
+          runbook_url: docs/runbooks/observability/dsql-rate-limiter-throttling.md
+      - alert: DsqlClassBudgetSaturation
+        expr: max(tokeira_dsql_pool_class_in_use / clamp_min(tokeira_dsql_pool_class_budget_total, 1)) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+          service: tokeirad
+        annotations:
+          summary: DSQL class budget is saturated
+          description: A DSQL class budget is above its saturation threshold.
+          runbook_url: docs/runbooks/observability/dsql-class-budget-saturation.md
+      - alert: ScrapeFailing
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: alloy
+        annotations:
+          summary: Telemetry scrape target is down
+          description: Alloy cannot scrape one or more process or infrastructure targets.
+          runbook_url: docs/runbooks/observability/scrape-failing.md
+      - alert: TelemetryIngestionStalled
+        expr: sum(up) == 0
+        for: 5m
+        labels:
+          severity: critical
+          service: alloy
+        annotations:
+          summary: Telemetry ingestion appears stalled
+          description: No scrape targets are reporting as up.
+          runbook_url: docs/runbooks/observability/telemetry-ingestion-stalled.md
+      - alert: ControllerGenerationCasFailures
+        expr: sum(rate(tokeira_controller_generation_cas_total{outcome!="success"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: tokeira-controller
+        annotations:
+          summary: Controller generation CAS failures detected
+          description: Placement generation writes are conflicting or failing.
+          runbook_url: docs/runbooks/observability/controller-generation-cas-failures.md
+      - alert: ControllerOwnershipChurnSpike
+        expr: sum(rate(tokeira_controller_bundle_ownership_churn_total[5m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+          service: tokeira-controller
+        annotations:
+          summary: Controller ownership churn is elevated
+          description: Bundle ownership is changing at an unusual rate.
+          runbook_url: docs/runbooks/observability/controller-ownership-churn-spike.md
+      - alert: AutoscalerStaleMetrics
+        expr: sum(rate(tokeira_autoscaler_stale_metrics_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: tokeira-autoscaler
+        annotations:
+          summary: Autoscaler metrics are stale
+          description: The autoscaler is suppressing decisions because input metrics are stale.
+          runbook_url: docs/runbooks/observability/autoscaler-stale-metrics.md
+      - alert: AutoscalerActiveReconcilerAbsent
+        expr: max(tokeira_autoscaler_active_reconciler_lease_held) < 1
+        for: 2m
+        labels:
+          severity: critical
+          service: tokeira-autoscaler
+        annotations:
+          summary: No autoscaler active reconciler is present
+          description: No autoscaler instance currently holds the active reconciliation lease.
+          runbook_url: docs/runbooks/observability/autoscaler-active-reconciler-absent.md
+      - alert: ProjectionCheckpointLag
+        expr: tokeira_projection_checkpoint_lag_seconds > 60
+        for: 5m
+        labels:
+          severity: warning
+          service: tokeirad
+        annotations:
+          summary: Projection checkpoint lag is high
+          description: Projection workers have not written a checkpoint recently.
+          runbook_url: docs/runbooks/observability/projection-checkpoint-lag.md
+      - alert: ProjectionSinkErrorRate
+        expr: sum(rate(tokeira_projection_sink_error_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: tokeirad
+        annotations:
+          summary: Projection sink errors are occurring
+          description: Projection sink writes are failing or being rejected.
+          runbook_url: docs/runbooks/observability/projection-sink-error-rate.md

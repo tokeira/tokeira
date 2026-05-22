@@ -1,4 +1,5 @@
 use super::*;
+use tokeira_observability::{QueryDispatchOutcomeLabel, QueryDispatchPathLabel};
 
 impl<R> TokeiraRuntime<R>
 where
@@ -61,10 +62,21 @@ where
                         query_type,
                         query_args,
                         required_barrier,
+                        enqueued_at: std::time::Instant::now(),
                         response_tx,
                     },
                 )
-                .map_err(|_| anyhow!("too many buffered queries for run {:?}", run_key))?;
+                .map_err(|_| {
+                    runtime_metrics::record_query_dispatch(
+                        QueryDispatchPathLabel::Buffered,
+                        QueryDispatchOutcomeLabel::Rejected,
+                    );
+                    anyhow!("too many buffered queries for run {:?}", run_key)
+                })?;
+            runtime_metrics::record_query_dispatch(
+                QueryDispatchPathLabel::Buffered,
+                QueryDispatchOutcomeLabel::Queued,
+            );
         } else {
             self.broker
                 .publish_query_task(QueryTask {
@@ -76,6 +88,10 @@ where
                     response_tx,
                 })
                 .await;
+            runtime_metrics::record_query_dispatch(
+                QueryDispatchPathLabel::Direct,
+                QueryDispatchOutcomeLabel::Published,
+            );
         }
 
         let timeout_after: std::time::Duration = timeout_after

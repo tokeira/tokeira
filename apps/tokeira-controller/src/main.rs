@@ -12,8 +12,15 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use anyhow::{Context, Result};
 use config::ControllerProcessConfig;
 use connectrpc::Router;
-use metrics_exporter_prometheus::PrometheusBuilder;
-use tokeira_controller::{ConnectPlacementController, PlacementControllerState};
+use tokeira_controller::{
+    ConnectPlacementController, PlacementControllerState, metrics as controller_metrics,
+};
+use tokeira_observability::{
+    ErrorBiasedSamplingReason, LogFormat, MetricManifest, ObservabilityRuntime, OtlpMetricsConfig,
+    PROCESS_METRIC_MANIFEST, ProcessObservabilityConfig, ReadinessHandle, ReadinessRegistry,
+    ReadinessStatus, ServiceName, TraceExportConfig, install_observability,
+    mark_error_biased_sample,
+};
 use tokeira_proto::connect::tokeira::internal::controller::v1::PlacementControllerExt;
 use tokeira_storage::{
     ControlRepository, LeaseRepository,
@@ -23,12 +30,47 @@ use tokeira_types::IncarnationId;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
-use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+
+static PROCESS_MANIFESTS: &[&MetricManifest] = &[&PROCESS_METRIC_MANIFEST];
+
+#[derive(Clone, Debug)]
+struct ControllerReadiness {
+    registry: ReadinessRegistry,
+    storage: ReadinessHandle,
+    placement: ReadinessHandle,
+    membership: ReadinessHandle,
+}
+
+impl ControllerReadiness {
+    fn new() -> Self {
+        let storage = readiness_handle("storage");
+        let placement = readiness_handle("placement_state");
+        let membership = readiness_handle("membership_streams");
+        let registry = ReadinessRegistry::from_handles(vec![
+            storage.clone(),
+            placement.clone(),
+            membership.clone(),
+        ]);
+        Self {
+            registry,
+            storage,
+            placement,
+            membership,
+        }
+    }
+}
+
+fn readiness_handle(name: &'static str) -> ReadinessHandle {
+    let (_, handle) = ReadinessRegistry::mutable(
+        name,
+        ReadinessStatus::NotReady,
+        Some("component is still starting".to_string()),
+    );
+    handle
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    install_tracing()?;
-
     let config_path = config_path_from_args()?;
     let config: ControllerProcessConfig = tokeira_config::load_config(&config_path, None)
         .with_context(|| {
@@ -39,6 +81,8 @@ async fn main() -> Result<()> {
         })?;
     config.validate()?;
 
+    let readiness = ControllerReadiness::new();
+    let _observability = install_process_observability(&config, readiness.registry.clone()).await?;
     let controller_config = config.to_controller_config();
 
     info!(
@@ -70,11 +114,9 @@ async fn main() -> Result<()> {
         cancel_on_signal.cancel();
     });
 
-    // Prometheus metrics endpoint.
-    install_metrics(&config.metrics_addr)?;
-
     // DSQL storage backend — required for production operation.
     let (lease_repo, control_repo) = build_repositories(&config).await?;
+    readiness.storage.ready();
 
     // Library components wired from the shared repositories.
     let state = PlacementControllerState::new(
@@ -82,6 +124,7 @@ async fn main() -> Result<()> {
         Arc::clone(&lease_repo),
         Arc::clone(&control_repo),
     );
+    readiness.placement.ready();
 
     // Unique identity for this controller instance's CAS budget allocations.
     let allocator_id = IncarnationId::new();
@@ -116,6 +159,7 @@ async fn main() -> Result<()> {
     let connect_service = Arc::new(ConnectPlacementController::new(state));
     let connect_router = connect_service.register(Router::new());
     let app = axum::Router::new().fallback_service(connect_router.into_axum_service());
+    readiness.membership.ready();
 
     let grpc_handle = tokio::spawn(async move {
         info!(%grpc_addr, "gRPC server listening (connect-rust)");
@@ -161,10 +205,13 @@ async fn run_placement_loop(
             _ = ticker.tick() => {}
         }
 
+        let loop_started = std::time::Instant::now();
         let generation = match state.generation.current_generation().await {
             Ok(current) => current,
             Err(err) => {
+                mark_error_biased_sample(ErrorBiasedSamplingReason::ControllerPlacementError);
                 warn!(%err, "placement loop: failed to read current generation");
+                controller_metrics::record_placement_loop_duration(loop_started.elapsed());
                 continue;
             }
         };
@@ -178,9 +225,11 @@ async fn run_placement_loop(
                 );
             }
             Err(err) => {
+                mark_error_biased_sample(ErrorBiasedSamplingReason::ControllerPlacementError);
                 warn!(%err, "placement loop: generation advance failed");
             }
         }
+        controller_metrics::record_placement_loop_duration(loop_started.elapsed());
     }
 
     info!("placement loop exited");
@@ -280,25 +329,41 @@ async fn build_repositories(
     ))
 }
 
-fn install_tracing() -> Result<()> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt::layer())
-        .try_init()
-        .context("failed to install tracing subscriber")
+async fn install_process_observability(
+    config: &ControllerProcessConfig,
+    readiness: ReadinessRegistry,
+) -> Result<ObservabilityRuntime> {
+    install_observability(
+        process_observability_config(config)?,
+        PROCESS_MANIFESTS,
+        readiness,
+    )
+    .await
+    .context("failed to install controller observability")
 }
 
-fn install_metrics(metrics_addr: &str) -> Result<()> {
-    let addr: SocketAddr = metrics_addr
+fn process_observability_config(
+    config: &ControllerProcessConfig,
+) -> Result<ProcessObservabilityConfig> {
+    let metrics_addr: SocketAddr = config
+        .metrics_addr
         .parse()
-        .context("invalid metrics_addr for Prometheus exporter")?;
-    PrometheusBuilder::new()
-        .with_http_listener(addr)
-        .install()
-        .context("failed to install Prometheus metrics exporter")?;
-    info!(%addr, "Prometheus metrics endpoint listening");
-    Ok(())
+        .context("invalid metrics_addr for observability endpoint")?;
+    Ok(ProcessObservabilityConfig {
+        service_name: ServiceName::Controller,
+        cluster_name: config.cluster_name.clone(),
+        deployment_name: config.cluster_name.clone(),
+        node_id: None,
+        task_id: None,
+        metrics_enabled: true,
+        metrics_addr,
+        log_format: LogFormat::Text,
+        log_filter: std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
+        otlp_metrics: OtlpMetricsConfig::default(),
+        tracing: TraceExportConfig::default(),
+        shutdown_flush_timeout: std::time::Duration::from_secs(5),
+        redacted_config: None,
+    })
 }
 
 fn config_path_from_args() -> Result<PathBuf> {
@@ -312,5 +377,67 @@ fn config_path_from_args() -> Result<PathBuf> {
             .context("--config requires a path")
     } else {
         Ok(PathBuf::from(first))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn controller_config() -> ControllerProcessConfig {
+        ControllerProcessConfig {
+            dsql_endpoint: "cluster.dsql.eu-west-2.on.aws".to_string(),
+            dsql_region: "eu-west-2".to_string(),
+            grpc_listen_addr: "127.0.0.1:0".to_string(),
+            metrics_addr: "127.0.0.1:0".to_string(),
+            placement_interval_secs: 5,
+            budget_interval_secs: 10,
+            cluster_name: "test-cluster".to_string(),
+            dsql_connection_rate_budget: 100.0,
+            dsql_connection_capacity_budget: 10_000,
+            placement: config::PlacementTable::default(),
+            membership: config::MembershipTable::default(),
+        }
+    }
+
+    #[test]
+    fn controller_process_observability_config_validates() {
+        let observability = process_observability_config(&controller_config()).unwrap();
+
+        observability.validate().unwrap();
+        assert_eq!(observability.service_name.as_str(), "tokeira-controller");
+        assert_eq!(observability.cluster_name, "test-cluster");
+    }
+
+    #[test]
+    fn controller_process_manifest_validates() {
+        tokeira_observability::validate_manifests(&[&PROCESS_METRIC_MANIFEST]).unwrap();
+    }
+
+    #[tokio::test]
+    async fn controller_readiness_handles_track_startup_state() {
+        let readiness = ControllerReadiness::new();
+
+        assert!(
+            readiness
+                .registry
+                .check_all()
+                .await
+                .iter()
+                .all(|check| check.status == ReadinessStatus::NotReady)
+        );
+
+        readiness.storage.ready();
+        readiness.placement.ready();
+        readiness.membership.ready();
+
+        assert!(
+            readiness
+                .registry
+                .check_all()
+                .await
+                .iter()
+                .all(|check| check.status == ReadinessStatus::Ready)
+        );
     }
 }

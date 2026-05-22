@@ -14,6 +14,7 @@ pub const GRPC_REQUEST_TOTAL: &str = "tokeira_edge_grpc_request_total";
 pub const GRPC_REQUEST_DURATION_SECONDS: &str = "tokeira_edge_grpc_request_duration_seconds";
 pub const GRPC_ERROR_TOTAL: &str = "tokeira_edge_grpc_error_total";
 pub const GRPC_ACTIVE_REQUESTS: &str = "tokeira_edge_grpc_active_requests";
+const EDGE_SERVICE_LABEL: &str = "edge";
 
 pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (GRPC_REQUEST_TOTAL, MetricType::Counter),
@@ -31,6 +32,7 @@ fn active_requests() -> &'static Mutex<HashMap<String, u64>> {
 pub fn record_grpc_request(method: &str, namespace: &str, status: &str) {
     counter!(
         GRPC_REQUEST_TOTAL,
+        "service" => EDGE_SERVICE_LABEL,
         "method" => method.to_string(),
         "namespace" => namespace.to_string(),
         "status" => status.to_string(),
@@ -41,6 +43,7 @@ pub fn record_grpc_request(method: &str, namespace: &str, status: &str) {
 pub fn record_grpc_request_duration(method: &str, namespace: &str, duration: std::time::Duration) {
     histogram!(
         GRPC_REQUEST_DURATION_SECONDS,
+        "service" => EDGE_SERVICE_LABEL,
         "method" => method.to_string(),
         "namespace" => namespace.to_string(),
     )
@@ -144,20 +147,26 @@ mod tests {
         let snapshot = snapshot_map(&recorder);
 
         let (labels, value) = snapshot.get(GRPC_REQUEST_TOTAL).unwrap();
+        assert_eq!(labels.get("service"), Some(&"edge".to_string()));
         assert_eq!(
             labels.get("method"),
             Some(&"StartWorkflowExecution".to_string())
         );
         assert_eq!(labels.get("namespace"), Some(&"default".to_string()));
         assert_eq!(labels.get("status"), Some(&"ok".to_string()));
+        assert!(!labels.contains_key("workflow_id"));
+        assert!(!labels.contains_key("run_id"));
         assert_eq!(value, &DebugValue::Counter(1));
 
         let (labels, value) = snapshot.get(GRPC_REQUEST_DURATION_SECONDS).unwrap();
+        assert_eq!(labels.get("service"), Some(&"edge".to_string()));
         assert_eq!(
             labels.get("method"),
             Some(&"StartWorkflowExecution".to_string())
         );
         assert_eq!(labels.get("namespace"), Some(&"default".to_string()));
+        assert!(!labels.contains_key("workflow_id"));
+        assert!(!labels.contains_key("run_id"));
         match value {
             DebugValue::Histogram(values) => {
                 assert_eq!(values.len(), 1);

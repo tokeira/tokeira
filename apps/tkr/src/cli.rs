@@ -96,6 +96,10 @@ pub enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    Observability {
+        #[command(subcommand)]
+        action: ObservabilityAction,
+    },
     Workstation {
         #[command(subcommand)]
         action: WorkstationAction,
@@ -256,6 +260,14 @@ pub enum ScaleAction {
 #[derive(Subcommand)]
 pub enum ConfigAction {
     Show,
+}
+
+#[derive(Subcommand)]
+pub enum ObservabilityAction {
+    Check {
+        #[arg(long, default_value = "30")]
+        timeout_seconds: u64,
+    },
 }
 
 #[derive(Debug, Subcommand)]

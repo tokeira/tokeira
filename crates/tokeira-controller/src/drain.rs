@@ -43,6 +43,10 @@ impl DrainCoordinator {
         self.drain_states.get(&node_id).copied()
     }
 
+    pub fn active_count(&self) -> usize {
+        self.draining_nodes.len()
+    }
+
     pub fn filter_new_work_owners(
         &self,
         owners: impl IntoIterator<Item = (ShardId, IncarnationId)>,

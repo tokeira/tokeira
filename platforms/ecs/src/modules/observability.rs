@@ -6,6 +6,7 @@ use tokeira_aws::{
         ecs_service as aws_ecs,
         iam_role::{IamRole, IamRoleConfig},
         s3_bucket::{S3Bucket, S3BucketConfig},
+        s3_object::S3Object,
         secrets_manager_secret::{SecretValue, SecretsManagerSecret, SecretsManagerSecretConfig},
         ssm_parameter::SsmParameterResource,
     },
@@ -47,6 +48,11 @@ impl Module for ObservabilityModule {
                 &rctx,
                 self.name(),
             )),
+            Box::new(storage_bucket(
+                format!("{}-observability-artifacts", self.config.project_name),
+                &rctx,
+                self.name(),
+            )),
             Box::new(storage_role(
                 format!("{}-mimir-s3", self.config.project_name),
                 format!("{}-mimir-data", self.config.project_name),
@@ -78,6 +84,20 @@ impl Module for ObservabilityModule {
                 name: format!("/{}/alloy/sidecar/{service_name}", self.config.project_name),
                 value: render_alloy_config(service_name, &self.config),
                 secure: true,
+                module: self.name().to_owned(),
+            }));
+        }
+
+        let artifacts_bucket = ResourceId(format!(
+            "s3-{}-observability-artifacts",
+            self.config.project_name
+        ));
+        for artifact in observability_artifacts() {
+            resources.push(Box::new(S3Object {
+                bucket_dependency: artifacts_bucket.clone(),
+                key: artifact.key.to_owned(),
+                content: artifact.content.to_owned(),
+                content_type: artifact.content_type.to_owned(),
                 module: self.name().to_owned(),
             }));
         }
@@ -138,6 +158,73 @@ pub fn all_alloy_services() -> [&'static str; 10] {
         "tokeira-mimir",
         "tokeira-loki",
         "tokeira-grafana",
+    ]
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ObservabilityArtifact {
+    key: &'static str,
+    content_type: &'static str,
+    content: &'static str,
+}
+
+fn observability_artifacts() -> &'static [ObservabilityArtifact] {
+    &[
+        ObservabilityArtifact {
+            key: "dashboards/grpc-edge-health.json",
+            content_type: "application/json",
+            content: include_str!("../../../compose/dashboards/grpc-edge-health.json"),
+        },
+        ObservabilityArtifact {
+            key: "dashboards/broker-runtime-health.json",
+            content_type: "application/json",
+            content: include_str!("../../../compose/dashboards/broker-runtime-health.json"),
+        },
+        ObservabilityArtifact {
+            key: "dashboards/storage-projection-health.json",
+            content_type: "application/json",
+            content: include_str!("../../../compose/dashboards/storage-projection-health.json"),
+        },
+        ObservabilityArtifact {
+            key: "dashboards/log-exploration.json",
+            content_type: "application/json",
+            content: include_str!("../../../compose/dashboards/log-exploration.json"),
+        },
+        ObservabilityArtifact {
+            key: "dashboards/dsql-connection-health.json",
+            content_type: "application/json",
+            content: include_str!("../../../compose/dashboards/dsql-connection-health.json"),
+        },
+        ObservabilityArtifact {
+            key: "dashboards/occ-contention.json",
+            content_type: "application/json",
+            content: include_str!("../../../compose/dashboards/occ-contention.json"),
+        },
+        ObservabilityArtifact {
+            key: "dashboards/placement-controller.json",
+            content_type: "application/json",
+            content: include_str!("../../../compose/dashboards/placement-controller.json"),
+        },
+        ObservabilityArtifact {
+            key: "dashboards/autoscaler.json",
+            content_type: "application/json",
+            content: include_str!("../../../compose/dashboards/autoscaler.json"),
+        },
+        ObservabilityArtifact {
+            key: "dashboards/projection-workers.json",
+            content_type: "application/json",
+            content: include_str!("../../../compose/dashboards/projection-workers.json"),
+        },
+        ObservabilityArtifact {
+            key: "dashboards/infrastructure-health.json",
+            content_type: "application/json",
+            content: include_str!("../../../compose/dashboards/infrastructure-health.json"),
+        },
+        ObservabilityArtifact {
+            key: "alerts/observability-alerts.yaml",
+            content_type: "application/yaml",
+            content: include_str!("../../../compose/alerts/observability-alerts.yaml"),
+        },
     ]
 }
 
@@ -217,9 +304,17 @@ fn grafana_secret_read_policy(config: &EcsConfig) -> String {
 pub fn render_alloy_config(service_name: &str, config: &EcsConfig) -> String {
     let namespace = &config.networking.private_dns_zone;
     let metrics_port = metrics_port_for(service_name, config);
+    let target_kind = if matches!(
+        service_name,
+        "tokeira-mimir" | "tokeira-loki" | "tokeira-grafana"
+    ) {
+        "infrastructure"
+    } else {
+        "process"
+    };
     format!(
         r#"prometheus.scrape "tokeira" {{
-  targets         = [{{ __address__ = "localhost:{metrics_port}" }}]
+  targets         = [{{ __address__ = "localhost:{metrics_port}", service = "{service_name}", target_kind = "{target_kind}", cluster = "{}", deployment = "{}" }}]
   forward_to      = [prometheus.remote_write.mimir.receiver]
   scrape_interval = "15s"
   job_name        = "{service_name}"
@@ -230,9 +325,13 @@ prometheus.remote_write "mimir" {{
     url = "http://mimir.{namespace}:9009/api/v1/push"
   }}
   external_labels = {{
+    service     = "{service_name}"
     service_name = "{service_name}"
-    environment  = "{}"
-    project      = "{}"
+    target_kind = "{target_kind}"
+    cluster     = "{}"
+    deployment  = "{}"
+    environment = "{}"
+    project     = "{}"
   }}
 }}
 
@@ -267,7 +366,14 @@ loki.write "default" {{
   }}
 }}
 "#,
-        config.environment, config.project_name, config.environment, config.project_name
+        config.cluster.name,
+        config.environment,
+        config.cluster.name,
+        config.environment,
+        config.environment,
+        config.project_name,
+        config.environment,
+        config.project_name
     )
 }
 
@@ -345,9 +451,14 @@ mod tests {
             ids.iter().filter(|id| id.starts_with("iam-role-")).count(),
             5
         );
+        assert_eq!(
+            ids.iter().filter(|id| id.starts_with("s3-object:")).count(),
+            11
+        );
         assert!(ids.contains(&"secret-tokeira/grafana/admin".to_owned()));
         assert!(ids.iter().any(|id| id.contains("mimir-data")));
         assert!(ids.iter().any(|id| id.contains("loki-data")));
+        assert!(ids.iter().any(|id| id.contains("observability-artifacts")));
     }
 
     #[test]
@@ -362,7 +473,7 @@ mod tests {
         );
         assert_eq!(
             policy["Statement"][0]["Resource"].as_str(),
-            Some("arn:aws:secretsmanager:us-east-1:*:secret:tokeira/grafana/admin-*")
+            Some("arn:aws:secretsmanager:eu-west-2:*:secret:tokeira/grafana/admin-*")
         );
     }
 
@@ -371,8 +482,21 @@ mod tests {
         let config = render_alloy_config("tokeira-runtime", &EcsConfig::default());
 
         assert!(config.contains("localhost:9090"));
+        assert!(config.contains("service = \"tokeira-runtime\""));
+        assert!(config.contains("target_kind = \"process\""));
+        assert!(config.contains("cluster = \"tokeira\""));
+        assert!(config.contains("deployment = \"dev\""));
         assert!(config.contains("TASK_ARN_PLACEHOLDER"));
         assert!(config.contains("TASK_ID_PLACEHOLDER"));
         assert!(config.contains("loki.source.docker"));
+    }
+
+    #[test]
+    fn infrastructure_alloy_config_uses_infrastructure_target_kind() {
+        let config = render_alloy_config("tokeira-mimir", &EcsConfig::default());
+
+        assert!(config.contains("localhost:9009"));
+        assert!(config.contains("service = \"tokeira-mimir\""));
+        assert!(config.contains("target_kind = \"infrastructure\""));
     }
 }

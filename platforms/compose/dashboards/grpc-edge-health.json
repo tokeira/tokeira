@@ -10,6 +10,20 @@
     "grpc"
   ],
   "timezone": "browser",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {
+          "selected": true,
+          "text": "Mimir",
+          "value": "mimir"
+        }
+      }
+    ]
+  },
   "panels": [
     {
       "id": 1,

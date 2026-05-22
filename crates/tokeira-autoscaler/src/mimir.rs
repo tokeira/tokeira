@@ -26,8 +26,9 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use time::{Duration, OffsetDateTime};
+use tokeira_observability::OutcomeLabel;
 
-use crate::freshness::MetricFreshness;
+use crate::{freshness::MetricFreshness, metrics};
 
 #[derive(Debug, Clone)]
 pub struct MimirClient {
@@ -52,22 +53,36 @@ impl MimirClient {
     }
 
     pub async fn query_instant(&self, query: &str) -> Result<MetricFreshness> {
-        let response: PromQueryResponse = self
-            .client
-            .get(format!("{}/api/v1/query", self.endpoint))
-            .query(&[("query", query)])
-            .send()
-            .await
-            .context("failed to query Mimir instant endpoint")?
-            .error_for_status()
-            .context("Mimir instant query failed")?
-            .json()
-            .await
-            .context("failed to decode Mimir instant response")?;
-        let Some(sample) = response.into_samples().into_iter().next() else {
-            return Ok(MetricFreshness::Missing);
-        };
-        classify_sample(sample, self.staleness_threshold)
+        let started = std::time::Instant::now();
+        let result = async {
+            let response: PromQueryResponse = self
+                .client
+                .get(format!("{}/api/v1/query", self.endpoint))
+                .query(&[("query", query)])
+                .send()
+                .await
+                .context("failed to query Mimir instant endpoint")?
+                .error_for_status()
+                .context("Mimir instant query failed")?
+                .json()
+                .await
+                .context("failed to decode Mimir instant response")?;
+            let Some(sample) = response.into_samples().into_iter().next() else {
+                return Ok(MetricFreshness::Missing);
+            };
+            classify_sample(sample, self.staleness_threshold)
+        }
+        .await;
+        metrics::record_mimir_query_duration(
+            "instant",
+            if result.is_ok() {
+                OutcomeLabel::Success
+            } else {
+                OutcomeLabel::Failure
+            },
+            started.elapsed(),
+        );
+        result
     }
 
     pub async fn query_range(
@@ -76,26 +91,40 @@ impl MimirClient {
         range: Duration,
         step: Duration,
     ) -> Result<Vec<MetricSample>> {
-        let end = OffsetDateTime::now_utc();
-        let start = end - range;
-        let response: PromQueryResponse = self
-            .client
-            .get(format!("{}/api/v1/query_range", self.endpoint))
-            .query(&[
-                ("query", query.to_owned()),
-                ("start", start.unix_timestamp().to_string()),
-                ("end", end.unix_timestamp().to_string()),
-                ("step", step.whole_seconds().max(1).to_string()),
-            ])
-            .send()
-            .await
-            .context("failed to query Mimir range endpoint")?
-            .error_for_status()
-            .context("Mimir range query failed")?
-            .json()
-            .await
-            .context("failed to decode Mimir range response")?;
-        Ok(response.into_samples())
+        let started = std::time::Instant::now();
+        let result = async {
+            let end = OffsetDateTime::now_utc();
+            let start = end - range;
+            let response: PromQueryResponse = self
+                .client
+                .get(format!("{}/api/v1/query_range", self.endpoint))
+                .query(&[
+                    ("query", query.to_owned()),
+                    ("start", start.unix_timestamp().to_string()),
+                    ("end", end.unix_timestamp().to_string()),
+                    ("step", step.whole_seconds().max(1).to_string()),
+                ])
+                .send()
+                .await
+                .context("failed to query Mimir range endpoint")?
+                .error_for_status()
+                .context("Mimir range query failed")?
+                .json()
+                .await
+                .context("failed to decode Mimir range response")?;
+            Ok(response.into_samples())
+        }
+        .await;
+        metrics::record_mimir_query_duration(
+            "range",
+            if result.is_ok() {
+                OutcomeLabel::Success
+            } else {
+                OutcomeLabel::Failure
+            },
+            started.elapsed(),
+        );
+        result
     }
 
     /// Query Mimir for a single instant value, returning the numeric result.
@@ -104,19 +133,33 @@ impl MimirClient {
     /// the metric doesn't exist yet). Callers use this for threshold-based
     /// pressure classification where the raw value matters.
     pub async fn query_instant_value(&self, query: &str) -> Result<Option<f64>> {
-        let response: PromQueryResponse = self
-            .client
-            .get(format!("{}/api/v1/query", self.endpoint))
-            .query(&[("query", query)])
-            .send()
-            .await
-            .context("failed to query Mimir instant endpoint")?
-            .error_for_status()
-            .context("Mimir instant query failed")?
-            .json()
-            .await
-            .context("failed to decode Mimir instant response")?;
-        Ok(response.into_samples().into_iter().next().map(|s| s.value))
+        let started = std::time::Instant::now();
+        let result = async {
+            let response: PromQueryResponse = self
+                .client
+                .get(format!("{}/api/v1/query", self.endpoint))
+                .query(&[("query", query)])
+                .send()
+                .await
+                .context("failed to query Mimir instant endpoint")?
+                .error_for_status()
+                .context("Mimir instant query failed")?
+                .json()
+                .await
+                .context("failed to decode Mimir instant response")?;
+            Ok(response.into_samples().into_iter().next().map(|s| s.value))
+        }
+        .await;
+        metrics::record_mimir_query_duration(
+            "instant_value",
+            if result.is_ok() {
+                OutcomeLabel::Success
+            } else {
+                OutcomeLabel::Failure
+            },
+            started.elapsed(),
+        );
+        result
     }
 
     pub async fn is_available(&self) -> bool {

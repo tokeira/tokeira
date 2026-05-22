@@ -28,6 +28,10 @@ pub fn compose_services(config: &ComposeConfig) -> Vec<ComposeService> {
         "{}:/etc/mimir/mimir.yaml",
         config_dir.join("mimir.yaml").display()
     );
+    let mimir_rules_vol = format!(
+        "{}:/data/mimir/rules",
+        config_dir.join("mimir/rules").display()
+    );
     let loki_config_vol = format!(
         "{}:/etc/loki/loki.yaml",
         config_dir.join("loki.yaml").display()
@@ -84,7 +88,7 @@ pub fn compose_services(config: &ComposeConfig) -> Vec<ComposeService> {
             name: "mimir".into(),
             image: config.observability.mimir_image.clone(),
             ports: vec!["9009:9009".into()],
-            volumes: vec![mimir_vol, mimir_config_vol],
+            volumes: vec![mimir_vol, mimir_config_vol, mimir_rules_vol],
             environment: HashMap::new(),
             depends_on: Vec::new(),
             healthcheck: None,
@@ -134,6 +138,7 @@ pub fn compose_services(config: &ComposeConfig) -> Vec<ComposeService> {
             environment: HashMap::from([
                 ("GF_SECURITY_ADMIN_USER".into(), "admin".into()),
                 ("GF_SECURITY_ADMIN_PASSWORD".into(), "admin".into()),
+                ("GF_METRICS_ENABLED".into(), "true".into()),
             ]),
             depends_on: vec!["mimir".into(), "loki".into()],
             healthcheck: None,

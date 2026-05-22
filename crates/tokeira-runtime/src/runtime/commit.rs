@@ -1,4 +1,7 @@
 use super::*;
+use tokeira_observability::{
+    ErrorBiasedSamplingReason, NotShardOwnerOperationLabel, mark_error_biased_sample,
+};
 
 impl<R> TokeiraRuntime<R>
 where
@@ -13,12 +16,18 @@ where
                 .unwrap()
                 .epoch_of(shard_id)
                 .unwrap_or(ShardEpoch::ZERO);
+            runtime_metrics::record_not_shard_owner(NotShardOwnerOperationLabel::SubmitDrain);
+            mark_error_biased_sample(ErrorBiasedSamplingReason::NotShardOwner);
             return Err(NotShardOwner::local(shard_id, current_epoch).into());
         }
         {
             let owner = self.shard_owner.read().unwrap();
             if !owner.is_active(shard_id) {
                 let current_epoch = owner.epoch_of(shard_id).unwrap_or(ShardEpoch::ZERO);
+                runtime_metrics::record_not_shard_owner(
+                    NotShardOwnerOperationLabel::SubmitInactive,
+                );
+                mark_error_biased_sample(ErrorBiasedSamplingReason::NotShardOwner);
                 return Err(NotShardOwner::local(shard_id, current_epoch).into());
             }
         }
@@ -40,6 +49,10 @@ where
         {
             let owner = self.shard_owner.read().unwrap();
             if owner.epoch_of(shard_id).is_none() {
+                runtime_metrics::record_not_shard_owner(
+                    NotShardOwnerOperationLabel::SubmitForOwnedShard,
+                );
+                mark_error_biased_sample(ErrorBiasedSamplingReason::NotShardOwner);
                 return Err(NotShardOwner::local(shard_id, ShardEpoch::ZERO).into());
             }
         }
@@ -74,6 +87,8 @@ where
         let shard_id = self.shard_id_for(run_key).await;
         let owner = self.shard_owner.read().unwrap();
         owner.owns(shard_id).ok_or_else(|| {
+            runtime_metrics::record_not_shard_owner(NotShardOwnerOperationLabel::CurrentShardEpoch);
+            mark_error_biased_sample(ErrorBiasedSamplingReason::NotShardOwner);
             NotShardOwner::local(
                 shard_id,
                 owner.epoch_of(shard_id).unwrap_or(ShardEpoch::ZERO),
@@ -85,9 +100,13 @@ where
     pub(super) async fn shard_epoch_for_completion(&self, run_key: RunKey) -> Result<ShardEpoch> {
         let shard_id = self.shard_id_for(run_key).await;
         let owner = self.shard_owner.read().unwrap();
-        owner
-            .epoch_of(shard_id)
-            .ok_or_else(|| NotShardOwner::local(shard_id, ShardEpoch::ZERO).into())
+        owner.epoch_of(shard_id).ok_or_else(|| {
+            runtime_metrics::record_not_shard_owner(
+                NotShardOwnerOperationLabel::ShardEpochForCompletion,
+            );
+            mark_error_biased_sample(ErrorBiasedSamplingReason::NotShardOwner);
+            NotShardOwner::local(shard_id, ShardEpoch::ZERO).into()
+        })
     }
 
     pub(super) async fn shard_id_for(&self, run_key: RunKey) -> ShardId {

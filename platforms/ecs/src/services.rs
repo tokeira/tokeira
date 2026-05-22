@@ -387,6 +387,7 @@ fn workload_from_parts(
         grpc_port,
         metrics_port,
         primary_depends_on,
+        config,
     );
     let mut containers = wait_for;
     containers.push(alloy_init);
@@ -435,6 +436,7 @@ fn primary_container(
     grpc_port: Option<u16>,
     metrics_port: u16,
     depends_on: Vec<ContainerDependencySpec>,
+    config: &EcsConfig,
 ) -> ContainerSpec {
     let mut port_mappings = vec![PortMappingSpec {
         name: "metrics".into(),
@@ -461,9 +463,38 @@ fn primary_container(
         linux_parameters: Some(LinuxParametersSpec {
             init_process_enabled: true,
         }),
-        environment: Vec::new(),
+        environment: observability_environment(name, metrics_port, config),
         secrets: Vec::new(),
     }
+}
+
+fn observability_environment(
+    service_name: &str,
+    metrics_port: u16,
+    config: &EcsConfig,
+) -> Vec<EnvironmentVar> {
+    vec![
+        EnvironmentVar {
+            name: "TOKEIRA_OBSERVABILITY_SERVICE".into(),
+            value: service_name.to_owned(),
+        },
+        EnvironmentVar {
+            name: "TOKEIRA_OBSERVABILITY_CLUSTER".into(),
+            value: config.cluster.name.clone(),
+        },
+        EnvironmentVar {
+            name: "TOKEIRA_OBSERVABILITY_DEPLOYMENT".into(),
+            value: config.environment.clone(),
+        },
+        EnvironmentVar {
+            name: "TOKEIRA_OBSERVABILITY_METRICS_ADDR".into(),
+            value: format!("0.0.0.0:{metrics_port}"),
+        },
+        EnvironmentVar {
+            name: "TOKEIRA_OBSERVABILITY_LOG_FORMAT".into(),
+            value: "json".into(),
+        },
+    ]
 }
 
 fn wait_for_containers(dependencies: &[&str], config: &EcsConfig) -> Vec<ContainerSpec> {
@@ -661,6 +692,35 @@ mod tests {
             })
         );
         assert!(manifest.get("logConfiguration").is_none());
+    }
+
+    #[test]
+    fn primary_container_includes_observability_environment() {
+        let workload = EcsWorkload::build_all(&EcsConfig::default())
+            .into_iter()
+            .find(|workload| workload.name == "tokeira-runtime")
+            .expect("runtime workload");
+        let primary = workload
+            .task_definition
+            .containers
+            .iter()
+            .find(|container| container.name == "tokeira-runtime")
+            .expect("primary container");
+        let env: HashMap<&str, &str> = primary
+            .environment
+            .iter()
+            .map(|var| (var.name.as_str(), var.value.as_str()))
+            .collect();
+
+        assert_eq!(
+            env.get("TOKEIRA_OBSERVABILITY_SERVICE"),
+            Some(&"tokeira-runtime")
+        );
+        assert_eq!(
+            env.get("TOKEIRA_OBSERVABILITY_METRICS_ADDR"),
+            Some(&"0.0.0.0:9090")
+        );
+        assert_eq!(env.get("TOKEIRA_OBSERVABILITY_LOG_FORMAT"), Some(&"json"));
     }
 
     #[test]

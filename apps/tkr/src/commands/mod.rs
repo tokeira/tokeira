@@ -23,6 +23,7 @@ pub mod exec;
 pub mod image;
 pub mod infra;
 pub mod logs;
+pub mod observability;
 pub mod port_forward;
 pub mod scale;
 pub mod schema;

@@ -22,6 +22,7 @@ serde.workspace = true
 time.workspace = true
 tokeira-config.workspace = true
 tokeira-controller = { path = "../../crates/tokeira-controller" }
+tokeira-observability.workspace = true
 tokeira-proto = { path = "../../crates/tokeira-proto" }
 tokeira-storage = { path = "../../crates/tokeira-storage", features = ["dsql"] }
 tokeira-types = { path = "../../crates/tokeira-types" }

@@ -1,0 +1,64 @@
+{
+  "uid": "tokeira-infrastructure-health",
+  "title": "Infrastructure Health",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "tags": ["tokeira", "infrastructure"],
+  "timezone": "browser",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {
+          "selected": true,
+          "text": "Mimir",
+          "value": "mimir"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Scrapes",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Scrape Up",
+      "datasource": { "type": "prometheus", "uid": "mimir" },
+      "targets": [
+        {
+          "expr": "up{target_kind=\"infrastructure\"}",
+          "legendFormat": "{{service}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bool",
+          "custom": {
+            "lineInterpolation": "smooth",
+            "showPoints": "never",
+            "pointSize": 0
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "mean", "max"]
+        }
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 1 },
+      "description": "Scrape success for infrastructure targets such as Alloy, Mimir, Loki, and Grafana."
+    }
+  ]
+}

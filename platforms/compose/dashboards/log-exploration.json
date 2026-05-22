@@ -164,6 +164,16 @@
   "templating": {
     "list": [
       {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "loki",
+        "current": {
+          "selected": true,
+          "text": "Loki",
+          "value": "loki"
+        }
+      },
+      {
         "name": "service",
         "type": "query",
         "datasource": {

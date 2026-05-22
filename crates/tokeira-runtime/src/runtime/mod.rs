@@ -45,7 +45,7 @@ use crate::{
     errors::NotShardOwner,
     fairness::{DeliveryMetrics, FairnessState, run_control_loop},
     heartbeat::{InMemoryHeartbeatStore, spawn_heartbeat_maintenance},
-    lane::{LaneConfig, LaneHandle, spawn_lane},
+    lane::{LaneConfig, LaneHandle, spawn_lane_with_id},
     membership::{ConnectionBudgetApplier, HeartbeatInputs, MembershipClient, MembershipConfig},
     metrics as runtime_metrics,
     nexus::{
@@ -475,7 +475,7 @@ where
         let lane_count = lane_count.max(1);
         let shared_lanes = Arc::new(Mutex::new(Vec::with_capacity(lane_count)));
         let lanes: Vec<_> = (0..lane_count)
-            .map(|_| {
+            .map(|lane_id| {
                 let publisher = RuntimeDispatchPublisher::new(
                     broker.clone(),
                     activity_broker.clone(),
@@ -491,7 +491,8 @@ where
                     delivery_metrics.clone(),
                     Some(versioning_rule_store.clone()),
                 );
-                spawn_lane(
+                spawn_lane_with_id(
+                    lane_id,
                     BasicKernel,
                     repo.clone(),
                     publisher,

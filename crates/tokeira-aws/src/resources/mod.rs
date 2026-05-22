@@ -18,6 +18,7 @@ pub mod iam_instance_profile;
 pub mod iam_role;
 pub mod pod_identity_association;
 pub mod s3_bucket;
+pub mod s3_object;
 pub mod secrets_manager_secret;
 pub mod security_group;
 pub mod ssm_parameter;

@@ -115,6 +115,14 @@ fn to_aws_container(spec: &ContainerSpec) -> aws_ecs::ContainerSpec {
         command: spec.command.clone(),
         port_mappings: spec.port_mappings.iter().map(to_aws_port_mapping).collect(),
         mount_points: spec.mount_points.iter().map(to_aws_mount_point).collect(),
+        environment: spec
+            .environment
+            .iter()
+            .map(|env| aws_ecs::EnvironmentSpec {
+                name: env.name.clone(),
+                value: env.value.clone(),
+            })
+            .collect(),
         secrets: spec.secrets.iter().map(to_aws_secret).collect(),
         depends_on: spec
             .depends_on
@@ -345,7 +353,32 @@ mod tests {
         );
         assert_eq!(
             ssm_policy["Statement"][0]["Resource"].as_str(),
-            Some("arn:aws:ssm:us-east-1:*:parameter/tokeira/alloy/sidecar/*")
+            Some("arn:aws:ssm:eu-west-2:*:parameter/tokeira/alloy/sidecar/*")
         );
+    }
+
+    #[test]
+    fn aws_task_definition_preserves_observability_environment() {
+        let workload = EcsWorkload::build_all(&EcsConfig::default())
+            .into_iter()
+            .find(|workload| workload.name == "tokeira-runtime")
+            .expect("runtime workload");
+        let task_definition = to_aws_task_definition(&workload.task_definition, None);
+        let primary = task_definition
+            .containers
+            .iter()
+            .find(|container| container.name == "tokeira-runtime")
+            .expect("runtime container");
+        let env: HashMap<&str, &str> = primary
+            .environment
+            .iter()
+            .map(|var| (var.name.as_str(), var.value.as_str()))
+            .collect();
+
+        assert_eq!(
+            env.get("TOKEIRA_OBSERVABILITY_METRICS_ADDR"),
+            Some(&"0.0.0.0:9090")
+        );
+        assert_eq!(env.get("TOKEIRA_OBSERVABILITY_CLUSTER"), Some(&"tokeira"));
     }
 }

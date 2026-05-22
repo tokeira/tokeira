@@ -8,6 +8,7 @@ use std::{
 use anyhow::Result;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{Command, WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType};
+use tokeira_observability::OutcomeLabel;
 use tokeira_types::{LogicalTaskSeq, RunKey, ShardId};
 use tokio_util::sync::CancellationToken;
 
@@ -106,10 +107,14 @@ pub(crate) async fn scan_wft_timeouts_once<F, Fut>(
         }
 
         match submit_timeout(entry.clone(), now).await {
-            Ok(()) => tracking.remove(entry.run_key),
+            Ok(()) => {
+                runtime_metrics::record_workflow_task_timed_out(OutcomeLabel::Success);
+                tracking.remove(entry.run_key);
+            }
             Err(error) => {
                 let message = error.to_string();
                 if message.contains("kernel rejected") {
+                    runtime_metrics::record_workflow_task_timed_out(OutcomeLabel::Rejected);
                     tracing::debug!(
                         ?error,
                         run_key = ?entry.run_key,
@@ -117,6 +122,7 @@ pub(crate) async fn scan_wft_timeouts_once<F, Fut>(
                     );
                     tracking.remove(entry.run_key);
                 } else {
+                    runtime_metrics::record_workflow_task_timed_out(OutcomeLabel::Failure);
                     tracing::warn!(
                         ?error,
                         run_key = ?entry.run_key,

@@ -210,13 +210,19 @@ where
                 .resolve_attr(record.context.namespace_id, name)
                 .await?
             else {
-                projection_metrics::record_sink_error(record.partition_id);
+                projection_metrics::record_sink_error_with_kind(
+                    record.partition_id,
+                    tokeira_observability::ProjectionErrorKindLabel::Sink,
+                );
                 return Err(anyhow!("unknown search attribute: {name}"));
             };
             let expected = attr.attr_type;
             let actual = search_attr_type_of(value);
             if expected != actual {
-                projection_metrics::record_sink_error(record.partition_id);
+                projection_metrics::record_sink_error_with_kind(
+                    record.partition_id,
+                    tokeira_observability::ProjectionErrorKindLabel::Serialization,
+                );
                 return Err(anyhow!(
                     "search attribute type mismatch for {name}: expected {:?}, got {:?}",
                     expected,

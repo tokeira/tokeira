@@ -103,17 +103,25 @@ impl DsqlVisibilityStore {
                 match result {
                     Ok(()) => {
                         if attempts > 0 {
-                            storage_metrics::record_dsql_retry("accumulate_rollup", "success");
+                            storage_metrics::record_dsql_retry(
+                                tokeira_observability::StorageOperationLabel::AccumulateRollup,
+                                tokeira_observability::RetryOutcomeLabel::Success,
+                            );
                         }
                         break;
                     }
                     Err(error) if Self::is_occ_conflict(&error) && attempts < 5 => {
                         attempts += 1;
-                        storage_metrics::record_dsql_occ_conflict("accumulate_rollup");
+                        storage_metrics::record_dsql_occ_conflict(
+                            tokeira_observability::StorageOperationLabel::AccumulateRollup,
+                        );
                         tokio::time::sleep(Self::retry_delay(attempts)).await;
                     }
                     Err(error) if Self::is_occ_conflict(&error) => {
-                        storage_metrics::record_dsql_retry("accumulate_rollup", "exhausted");
+                        storage_metrics::record_dsql_retry(
+                            tokeira_observability::StorageOperationLabel::AccumulateRollup,
+                            tokeira_observability::RetryOutcomeLabel::Exhausted,
+                        );
                         return Err(error);
                     }
                     Err(error) => return Err(error),
@@ -470,6 +478,7 @@ impl VisibilityStore for DsqlVisibilityStore {
 impl ProjectionSink for DsqlVisibilityStore {
     #[instrument(skip_all, fields(run_key = %record.run_key.0, transition_seq = record.transition_seq.0))]
     async fn apply(&self, record: &ProjectionRecord, partition_id: u32) -> Result<()> {
+        let sink_started = Instant::now();
         let previous = self.get_row(record.run_key).await;
         let mut row = previous.clone().unwrap_or_else(|| ExecutionRow {
             run_key: record.run_key,
@@ -520,10 +529,18 @@ impl ProjectionSink for DsqlVisibilityStore {
         let mut resolved_search_attrs = Vec::new();
         for (name, value) in &search_patch.0 {
             let Some(attr) = self.resolve_attr(record.context.namespace_id, name).await? else {
+                projection_metrics::record_sink_error_with_kind(
+                    partition_id,
+                    tokeira_observability::ProjectionErrorKindLabel::Sink,
+                );
                 bail!("unknown search attribute: {name}");
             };
             let actual = search_attr_type_of(value);
             if attr.attr_type != actual {
+                projection_metrics::record_sink_error_with_kind(
+                    partition_id,
+                    tokeira_observability::ProjectionErrorKindLabel::Serialization,
+                );
                 bail!(
                     "search attribute type mismatch for {name}: expected {:?}, got {:?}",
                     attr.attr_type,
@@ -585,23 +602,50 @@ impl ProjectionSink for DsqlVisibilityStore {
                 Ok(()) => break,
                 Err(error) if Self::is_occ_conflict(&error) && attempts < 5 => {
                     attempts += 1;
-                    storage_metrics::record_dsql_occ_conflict("projection_apply_tx");
+                    storage_metrics::record_dsql_occ_conflict(
+                        tokeira_observability::StorageOperationLabel::ProjectionApplyTx,
+                    );
                     tokio::time::sleep(Self::retry_delay(attempts)).await;
                 }
                 Err(error) if Self::is_occ_conflict(&error) => {
-                    storage_metrics::record_dsql_retry("projection_apply_tx", "exhausted");
+                    storage_metrics::record_dsql_retry(
+                        tokeira_observability::StorageOperationLabel::ProjectionApplyTx,
+                        tokeira_observability::RetryOutcomeLabel::Exhausted,
+                    );
+                    projection_metrics::record_sink_error_with_kind(
+                        partition_id,
+                        tokeira_observability::ProjectionErrorKindLabel::Storage,
+                    );
                     return Err(error);
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    projection_metrics::record_sink_error_with_kind(
+                        partition_id,
+                        tokeira_observability::ProjectionErrorKindLabel::Storage,
+                    );
+                    return Err(error);
+                }
             }
         }
         if attempts > 0 {
-            storage_metrics::record_dsql_retry("projection_apply_tx", "success");
+            storage_metrics::record_dsql_retry(
+                tokeira_observability::StorageOperationLabel::ProjectionApplyTx,
+                tokeira_observability::RetryOutcomeLabel::Success,
+            );
         }
 
         let deltas = compute_rollup_deltas(previous.as_ref(), &row);
-        self.accumulate_rollup_partitioned(partition_id, &deltas)
-            .await?;
+        if let Err(error) = self
+            .accumulate_rollup_partitioned(partition_id, &deltas)
+            .await
+        {
+            projection_metrics::record_sink_error_with_kind(
+                partition_id,
+                tokeira_observability::ProjectionErrorKindLabel::Storage,
+            );
+            return Err(error);
+        }
+        projection_metrics::record_sink_write_duration(partition_id, sink_started.elapsed());
         Ok(())
     }
 }

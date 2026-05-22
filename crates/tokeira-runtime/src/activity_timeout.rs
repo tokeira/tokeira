@@ -9,6 +9,7 @@ use time::OffsetDateTime;
 use tokeira_kernel::{
     ActivityResolution, ActivityResolvedRequest, ActivityState, Command, LoadedRun,
 };
+use tokeira_observability::OutcomeLabel;
 use tokeira_storage::RunRepository;
 use tokeira_types::{RunKey, ShardId};
 use tokio_util::sync::CancellationToken;
@@ -279,10 +280,14 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
             .map(|_| ());
 
         match result {
-            Ok(()) => tracking.remove(entry.run_key, &entry.activity_id),
+            Ok(()) => {
+                runtime_metrics::record_activity_task_timed_out(OutcomeLabel::Success);
+                tracking.remove(entry.run_key, &entry.activity_id);
+            }
             Err(error) => {
                 let message = error.to_string();
                 if message.contains("kernel rejected") {
+                    runtime_metrics::record_activity_task_timed_out(OutcomeLabel::Rejected);
                     tracing::debug!(
                         ?error,
                         run_key = ?entry.run_key,
@@ -291,6 +296,7 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
                     );
                     tracking.remove(entry.run_key, &entry.activity_id);
                 } else {
+                    runtime_metrics::record_activity_task_timed_out(OutcomeLabel::Failure);
                     tracing::warn!(
                         ?error,
                         run_key = ?entry.run_key,

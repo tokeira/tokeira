@@ -9,6 +9,8 @@ use opentelemetry_sdk::propagation::TraceContextPropagator;
 use tracing::{Instrument, field};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+use crate::request_id::REQUEST_ID_HEADER;
+
 struct HeaderExtractor<'a> {
     headers: &'a HeaderMap,
 }
@@ -43,16 +45,31 @@ where
         tracing::Level::INFO,
         "grpc.request",
         otel.name = span_name.as_str(),
+        rpc.system = "grpc",
+        rpc.service = "tokeira-edge",
+        rpc.method = method,
+        server.address = field::Empty,
+        tokeira.namespace = field::Empty,
+        tokeira.request_id = field::Empty,
+        tokeira.workflow_id = field::Empty,
         method = method,
         namespace = field::Empty,
         workflow_id = field::Empty,
     );
     let _ = span.set_parent(parent);
+    if let Some(request_id) = headers
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+    {
+        span.record("tokeira.request_id", request_id);
+    }
     if let Some(namespace) = namespace {
         span.record("namespace", namespace);
+        span.record("tokeira.namespace", namespace);
     }
     if let Some(workflow_id) = workflow_id {
         span.record("workflow_id", workflow_id);
+        span.record("tokeira.workflow_id", workflow_id);
     }
     fut.instrument(span).await
 }
@@ -114,6 +131,24 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push((span.metadata().name().to_string(), recorder.values));
+            }
+        }
+
+        fn on_record(&self, id: &Id, values: &tracing::span::Record<'_>, ctx: Context<'_, S>) {
+            let mut recorder = FieldRecorder {
+                values: HashMap::new(),
+            };
+            values.record(&mut recorder);
+            if let Some(span) = ctx.span(id) {
+                let span_name = span.metadata().name();
+                let mut captured = self.0.lock().unwrap();
+                if let Some((_, fields)) = captured
+                    .iter_mut()
+                    .rev()
+                    .find(|(name, _)| name == span_name)
+                {
+                    fields.extend(recorder.values);
+                }
             }
         }
     }
@@ -205,5 +240,44 @@ mod tests {
             name == "grpc.request"
                 && fields.get("otel.name") == Some(&"grpc.poll_workflow_task_queue".to_string())
         }));
+    }
+
+    #[tokio::test]
+    async fn records_standard_rpc_and_tokeira_request_attributes() {
+        let capture = SpanCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(REQUEST_ID_HEADER, "req-123".parse().unwrap());
+        instrument_grpc_call(
+            &headers,
+            "start_workflow_execution",
+            Some("default"),
+            Some("workflow-a"),
+            async {},
+        )
+        .await;
+
+        let spans = capture.0.lock().unwrap();
+        let (_, fields) = spans
+            .iter()
+            .find(|(name, _)| name == "grpc.request")
+            .expect("gRPC root span should be emitted");
+        assert_eq!(fields.get("rpc.system"), Some(&"grpc".to_string()));
+        assert_eq!(fields.get("rpc.service"), Some(&"tokeira-edge".to_string()));
+        assert_eq!(
+            fields.get("rpc.method"),
+            Some(&"start_workflow_execution".to_string())
+        );
+        assert_eq!(
+            fields.get("tokeira.namespace"),
+            Some(&"default".to_string())
+        );
+        assert_eq!(
+            fields.get("tokeira.request_id"),
+            Some(&"req-123".to_string())
+        );
     }
 }

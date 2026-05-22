@@ -16,12 +16,14 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use tokeira_types::{Payloads, RunKey};
 use tokio::sync::oneshot;
 
 use crate::QueryResult;
+use tokeira_observability::QueryBufferOutcomeLabel;
 
 const MAX_BUFFERED_QUERIES_PER_RUN: usize = 256;
 
@@ -33,6 +35,7 @@ pub struct BufferedQuery {
     pub query_type: String,
     pub query_args: Payloads,
     pub required_barrier: i64,
+    pub enqueued_at: Instant,
     pub response_tx: oneshot::Sender<QueryResult>,
 }
 
@@ -66,6 +69,10 @@ impl BufferedQueryRegistry {
         let mut remaining = VecDeque::with_capacity(queries.len());
         while let Some(query) = queries.pop_front() {
             if query.required_barrier <= observable_barrier {
+                crate::metrics::record_query_buffer_wait(
+                    query.enqueued_at.elapsed(),
+                    QueryBufferOutcomeLabel::Released,
+                );
                 drained.push(query);
             } else {
                 remaining.push_back(query);
@@ -113,6 +120,10 @@ impl BufferedQueryRegistry {
     pub fn fail_run_queries(&self, run_key: RunKey, message: impl Into<String>) {
         let message = message.into();
         for query in self.drain_all(run_key) {
+            crate::metrics::record_query_buffer_wait(
+                query.enqueued_at.elapsed(),
+                QueryBufferOutcomeLabel::Failed,
+            );
             let _ = query.response_tx.send(QueryResult::Failed {
                 message: message.clone(),
             });
@@ -131,6 +142,7 @@ mod tests {
             query_type: "query".to_string(),
             query_args: Payloads::default(),
             required_barrier: barrier,
+            enqueued_at: Instant::now(),
             response_tx: tx,
         }
     }

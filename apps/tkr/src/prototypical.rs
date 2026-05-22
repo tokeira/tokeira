@@ -101,7 +101,7 @@ mod tests {
     fn ecs_prototypical_config_contains_image_defaults_and_comments() {
         let toml = deployment_config(PlatformKind::Ecs, StorageKind::Dsql, None).unwrap();
         assert!(toml.contains("image = \"tokeirad:latest\""));
-        assert!(toml.contains("aws_cli_image = \"public.ecr.aws/aws-cli/aws-cli:latest\""));
+        assert!(toml.contains("aws_cli_image = \"amazon/aws-cli:latest\""));
         assert!(toml.contains("busybox_image = \"public.ecr.aws/docker/library/busybox:latest\""));
         assert!(toml.contains("populated by `tkr image push`"));
         assert!(toml.contains("populated by `tkr image mirror`"));

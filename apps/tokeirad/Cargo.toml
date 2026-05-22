@@ -44,6 +44,7 @@ toml.workspace = true
 tokio-util = { version = "0.7", features = ["rt"] }
 tokeira-edge = { path = "../../crates/tokeira-edge" }
 tokeira-kernel = { path = "../../crates/tokeira-kernel" }
+tokeira-observability.workspace = true
 tokeira-proto = { path = "../../crates/tokeira-proto" }
 tokeira-projection = { path = "../../crates/tokeira-projection", features = ["dsql"] }
 tokeira-runtime = { path = "../../crates/tokeira-runtime" }

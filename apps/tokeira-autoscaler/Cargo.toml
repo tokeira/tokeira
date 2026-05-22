@@ -17,6 +17,7 @@ aws-sdk-dynamodb = "1"
 time.workspace = true
 tokeira-autoscaler = { path = "../../crates/tokeira-autoscaler" }
 tokeira-config.workspace = true
+tokeira-observability.workspace = true
 tokeira-storage = { path = "../../crates/tokeira-storage", features = ["dsql"] }
 tokio.workspace = true
 tokio-util = "0.7"

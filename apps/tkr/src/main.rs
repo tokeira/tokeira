@@ -130,6 +130,10 @@ async fn main() -> Result<()> {
             let ctx = load_context(&deployments, cli.deployment.as_deref())?;
             commands::config::run_show(ctx)
         }
+        Command::Observability { action } => {
+            let ctx = load_context(&deployments, cli.deployment.as_deref())?;
+            commands::observability::run(action, ctx)
+        }
         Command::Workstation { action } => commands::workstation::run(action, cli.json).await,
         Command::Admin { command } => {
             let ctx = load_context(&deployments, cli.deployment.as_deref())?;
@@ -148,7 +152,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        cli::{ConfigAction, DeployAction, DeploymentAction, DevAction, InfraAction, ScaleAction},
+        cli::{
+            ConfigAction, DeployAction, DeploymentAction, DevAction, InfraAction,
+            ObservabilityAction, ScaleAction,
+        },
         deployment_dir::{DEPLOYMENT_TOML, METADATA_JSON, TOKEIRAD_TOML},
     };
     use serde_json::json;
@@ -370,6 +377,16 @@ mod tests {
                 .command,
             Command::Config {
                 action: ConfigAction::Show
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["tkr", "observability", "check", "--timeout-seconds", "15"])
+                .unwrap()
+                .command,
+            Command::Observability {
+                action: ObservabilityAction::Check {
+                    timeout_seconds: 15
+                }
             }
         ));
         assert!(matches!(

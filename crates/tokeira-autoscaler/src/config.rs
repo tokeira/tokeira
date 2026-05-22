@@ -40,6 +40,8 @@ pub struct AutoscalerServiceConfig {
     #[serde(with = "duration_secs")]
     pub cooldown: Duration,
     pub mimir_endpoint: String,
+    #[serde(default = "default_metrics_addr")]
+    pub metrics_addr: String,
     #[serde(with = "duration_secs")]
     pub staleness_threshold: Duration,
     pub dsql_connection_budget: u32,
@@ -69,6 +71,7 @@ impl Default for AutoscalerServiceConfig {
             scale_in_consecutive_samples: 6,
             cooldown: Duration::minutes(5),
             mimir_endpoint: "http://mimir.tokeira.local:9009".into(),
+            metrics_addr: default_metrics_addr(),
             staleness_threshold: Duration::seconds(45),
             dsql_connection_budget: 10_000,
             dsql_connection_rate_budget: 1_000,
@@ -80,6 +83,10 @@ impl Default for AutoscalerServiceConfig {
             service_configs: default_service_configs(),
         }
     }
+}
+
+fn default_metrics_addr() -> String {
+    "0.0.0.0:9090".to_string()
 }
 
 fn default_service_configs() -> BTreeMap<String, ServiceScaleConfig> {

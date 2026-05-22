@@ -140,6 +140,44 @@ pub struct ObservabilityConfig {
     pub log_format: LogFormatConfig,
     #[serde(default = "default_log_filter")]
     pub log_filter: String,
+    #[serde(default)]
+    pub otlp_metrics: OtlpMetricsConfig,
+    #[serde(default = "default_leak_detection_deadline_ms")]
+    pub leak_detection_deadline_ms: u64,
+    #[serde(default)]
+    pub alert_thresholds: AlertThresholdConfig,
+    #[serde(default = "default_true")]
+    pub dashboard_provisioning_enabled: bool,
+    #[serde(default = "default_runbook_base_url")]
+    pub runbook_base_url: String,
+    #[serde(default = "default_smoke_test_timeout_ms")]
+    pub smoke_test_timeout_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OtlpMetricsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default = "default_otlp_protocol")]
+    pub protocol: OtlpProtocol,
+    #[serde(default = "default_otlp_metrics_max_buffered_batches")]
+    pub max_buffered_batches: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlertThresholdConfig {
+    #[serde(default = "default_dsql_reservoir_exhaustion_ratio")]
+    pub dsql_reservoir_exhaustion_ratio: f64,
+    #[serde(default = "default_dsql_occ_conflict_rate_per_sec")]
+    pub dsql_occ_conflict_rate_per_sec: f64,
+    #[serde(default = "default_projection_checkpoint_lag_seconds")]
+    pub projection_checkpoint_lag_seconds: u64,
+    #[serde(default = "default_autoscaler_metric_staleness_seconds")]
+    pub autoscaler_metric_staleness_seconds: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,6 +333,34 @@ impl Default for ObservabilityConfig {
             trace_sample_rate: default_sample_rate(),
             log_format: LogFormatConfig::Text,
             log_filter: default_log_filter(),
+            otlp_metrics: OtlpMetricsConfig::default(),
+            leak_detection_deadline_ms: default_leak_detection_deadline_ms(),
+            alert_thresholds: AlertThresholdConfig::default(),
+            dashboard_provisioning_enabled: true,
+            runbook_base_url: default_runbook_base_url(),
+            smoke_test_timeout_ms: default_smoke_test_timeout_ms(),
+        }
+    }
+}
+
+impl Default for OtlpMetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: None,
+            protocol: OtlpProtocol::Grpc,
+            max_buffered_batches: default_otlp_metrics_max_buffered_batches(),
+        }
+    }
+}
+
+impl Default for AlertThresholdConfig {
+    fn default() -> Self {
+        Self {
+            dsql_reservoir_exhaustion_ratio: default_dsql_reservoir_exhaustion_ratio(),
+            dsql_occ_conflict_rate_per_sec: default_dsql_occ_conflict_rate_per_sec(),
+            projection_checkpoint_lag_seconds: default_projection_checkpoint_lag_seconds(),
+            autoscaler_metric_staleness_seconds: default_autoscaler_metric_staleness_seconds(),
         }
     }
 }
@@ -394,10 +460,84 @@ impl TokeiraConfig {
             });
         }
         let sample_rate = self.infrastructure.observability.trace_sample_rate;
-        if !(0.0..=1.0).contains(&sample_rate) {
+        if !(0.0..=1.0).contains(&sample_rate) || !sample_rate.is_finite() {
             errors.push(ValidationError::Field {
                 field: "infrastructure.observability.trace_sample_rate".to_string(),
                 message: format!("must be between 0.0 and 1.0, got {sample_rate}"),
+            });
+        }
+        let observability = &self.infrastructure.observability;
+        if observability.otlp_metrics.enabled
+            && observability
+                .otlp_metrics
+                .endpoint
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+        {
+            errors.push(ValidationError::Field {
+                field: "infrastructure.observability.otlp_metrics.endpoint".to_string(),
+                message: "is required when OTLP metrics are enabled".to_string(),
+            });
+        }
+        if observability.otlp_metrics.max_buffered_batches == 0 {
+            errors.push(ValidationError::Field {
+                field: "infrastructure.observability.otlp_metrics.max_buffered_batches".to_string(),
+                message: "must be positive".to_string(),
+            });
+        }
+        if observability.leak_detection_deadline_ms == 0 {
+            errors.push(ValidationError::Field {
+                field: "infrastructure.observability.leak_detection_deadline_ms".to_string(),
+                message: "must be positive".to_string(),
+            });
+        }
+        if observability.smoke_test_timeout_ms == 0 {
+            errors.push(ValidationError::Field {
+                field: "infrastructure.observability.smoke_test_timeout_ms".to_string(),
+                message: "must be positive".to_string(),
+            });
+        }
+        if observability.runbook_base_url.trim().is_empty() {
+            errors.push(ValidationError::Field {
+                field: "infrastructure.observability.runbook_base_url".to_string(),
+                message: "must not be empty".to_string(),
+            });
+        }
+        let alert_thresholds = &observability.alert_thresholds;
+        if !(0.0..=1.0).contains(&alert_thresholds.dsql_reservoir_exhaustion_ratio)
+            || !alert_thresholds.dsql_reservoir_exhaustion_ratio.is_finite()
+        {
+            errors.push(ValidationError::Field {
+                field:
+                    "infrastructure.observability.alert_thresholds.dsql_reservoir_exhaustion_ratio"
+                        .to_string(),
+                message: "must be finite and between 0.0 and 1.0".to_string(),
+            });
+        }
+        if alert_thresholds.dsql_occ_conflict_rate_per_sec <= 0.0
+            || !alert_thresholds.dsql_occ_conflict_rate_per_sec.is_finite()
+        {
+            errors.push(ValidationError::Field {
+                field:
+                    "infrastructure.observability.alert_thresholds.dsql_occ_conflict_rate_per_sec"
+                        .to_string(),
+                message: "must be finite and positive".to_string(),
+            });
+        }
+        if alert_thresholds.projection_checkpoint_lag_seconds == 0 {
+            errors.push(ValidationError::Field {
+                field:
+                    "infrastructure.observability.alert_thresholds.projection_checkpoint_lag_seconds"
+                        .to_string(),
+                message: "must be positive".to_string(),
+            });
+        }
+        if alert_thresholds.autoscaler_metric_staleness_seconds == 0 {
+            errors.push(ValidationError::Field {
+                field: "infrastructure.observability.alert_thresholds.autoscaler_metric_staleness_seconds".to_string(),
+                message: "must be positive".to_string(),
             });
         }
         if self.infrastructure.storage == ConfigStorageKind::Dsql
@@ -639,6 +779,38 @@ fn default_log_filter() -> String {
     "info".to_string()
 }
 
+fn default_otlp_metrics_max_buffered_batches() -> usize {
+    1024
+}
+
+fn default_leak_detection_deadline_ms() -> u64 {
+    30_000
+}
+
+fn default_runbook_base_url() -> String {
+    "docs/runbooks/observability".to_string()
+}
+
+fn default_smoke_test_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_dsql_reservoir_exhaustion_ratio() -> f64 {
+    0.90
+}
+
+fn default_dsql_occ_conflict_rate_per_sec() -> f64 {
+    10.0
+}
+
+fn default_projection_checkpoint_lag_seconds() -> u64 {
+    60
+}
+
+fn default_autoscaler_metric_staleness_seconds() -> u64 {
+    30
+}
+
 fn default_retention_days() -> u32 {
     30
 }
@@ -732,6 +904,44 @@ mod tests {
             ConfigError::Validation(errors) => assert_eq!(errors.len(), 3),
             other => panic!("expected validation errors, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn observability_defaults_are_valid() {
+        let config = TokeiraConfig::default();
+
+        config.validate().unwrap();
+        assert!(config.infrastructure.observability.metrics_enabled);
+        assert!(!config.infrastructure.observability.otlp_metrics.enabled);
+        assert!(
+            config
+                .infrastructure
+                .observability
+                .dashboard_provisioning_enabled
+        );
+        assert_eq!(
+            config
+                .infrastructure
+                .observability
+                .alert_thresholds
+                .projection_checkpoint_lag_seconds,
+            60
+        );
+    }
+
+    #[test]
+    fn otlp_metrics_enabled_requires_endpoint() {
+        let mut config = TokeiraConfig::default();
+        config.infrastructure.observability.otlp_metrics.enabled = true;
+
+        let errors = match config.validate().unwrap_err() {
+            ConfigError::Validation(errors) => errors,
+            other => panic!("expected validation errors, got {other:?}"),
+        };
+        assert!(errors.iter().any(|error| match error {
+            ValidationError::Field { field, .. } =>
+                field == "infrastructure.observability.otlp_metrics.endpoint",
+        }));
     }
 
     #[test]
@@ -1019,6 +1229,7 @@ mod tests {
                             trace_sample_rate,
                             log_format,
                             log_filter: default_log_filter(),
+                            ..ObservabilityConfig::default()
                         },
                     },
                     policy: PolicyConfig {

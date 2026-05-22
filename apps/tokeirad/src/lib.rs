@@ -260,18 +260,17 @@ pub async fn run_from_cli(cli: Cli) -> Result<()> {
         return Ok(());
     }
     let observability = observability::ObservabilityConfig::from_tokeira_config(&effective_config)?;
-    let metrics_handle = observability::install_metrics(&observability)?;
-    let log_reload = observability::install_tracing(&observability)?;
+    let effective_config = Arc::new(effective_config);
+    let readiness = observability::TokeiradReadiness::new();
+    let _observability_runtime = observability::install_process_observability(
+        &observability,
+        effective_config.clone(),
+        readiness.registry.clone(),
+    )
+    .await?;
     for warning in effective_config.emergency_warnings() {
         tracing::warn!("{warning}");
     }
-    let effective_config = Arc::new(effective_config);
-    let _observability_server = observability::spawn_observability_server(
-        &observability,
-        effective_config.clone(),
-        metrics_handle,
-        log_reload,
-    );
 
     let addr: SocketAddr = effective_config
         .infrastructure
@@ -288,6 +287,7 @@ pub async fn run_from_cli(cli: Cli) -> Result<()> {
 
     let (server_task, bound_addr, _shutdown_tx, _background_cancel, _log_broadcast) =
         build_and_serve(addr, effective_config).await?;
+    readiness.mark_started();
     info!("tokeirad gRPC server listening on {bound_addr}");
     server_task
         .await

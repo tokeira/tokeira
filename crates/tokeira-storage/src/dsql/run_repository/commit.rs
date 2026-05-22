@@ -1,18 +1,24 @@
 use super::*;
 
 impl DsqlRunRepository {
-    #[instrument(name = "dsql.commit_transition", skip(self, transition), fields(run_key = %run_key.0, expected_seq = transition.expected_seq.0, epoch = epoch.0))]
     pub(super) async fn do_commit_transition(
         &self,
         run_key: RunKey,
         transition: Transition,
         epoch: ShardEpoch,
     ) -> Result<CommitResult> {
-        record_dsql_commit_operation!(
-            self,
-            "commit_transition",
-            Some(self.shard_for_run_key(run_key)),
-            {
+        let shard_id = self.shard_for_run_key(run_key);
+        let span = tracing::info_span!(
+            "dsql.commit_transition",
+            run_key = %run_key.0,
+            expected_seq = transition.expected_seq.0,
+            epoch = epoch.0,
+            tokeira.storage_operation = "commit_transition",
+            tokeira.dsql_class = "commit",
+            tokeira.shard_id = shard_id.0,
+        );
+        async move {
+            record_dsql_commit_operation!(self, "commit_transition", Some(shard_id), {
                 // Validate i64 conversions before acquiring a connection or starting a
                 // transaction. This prevents mid-transaction failures from overflow on
                 // values that are structurally u64 but stored as BIGINT (i64) in DSQL.
@@ -182,13 +188,19 @@ impl DsqlRunRepository {
                             reason: "DSQL serialization conflict".to_owned(),
                         })
                     }
-                    Err(err) => Err(err.into()),
+                    Err(err) => {
+                        tokeira_observability::mark_error_biased_sample(
+                            tokeira_observability::ErrorBiasedSamplingReason::StorageCommitError,
+                        );
+                        Err(err.into())
+                    }
                 }
-            }
-        )
+            })
+        }
+        .instrument(span)
+        .await
     }
 
-    #[instrument(name = "dsql.commit_transition_for_bundle", skip(self, transition), fields(run_key = %run_key.0, bundle = execution_home_bundle.0, expected_seq = transition.expected_seq.0, epoch = epoch.0))]
     pub(super) async fn do_commit_transition_for_bundle(
         &self,
         run_key: RunKey,
@@ -196,11 +208,22 @@ impl DsqlRunRepository {
         transition: Transition,
         epoch: ShardEpoch,
     ) -> Result<CommitResult> {
-        record_dsql_commit_operation!(
-            self,
-            "commit_transition_for_bundle",
-            Some(execution_home_bundle),
-            {
+        let span = tracing::info_span!(
+            "dsql.commit_transition_for_bundle",
+            run_key = %run_key.0,
+            bundle = execution_home_bundle.0,
+            expected_seq = transition.expected_seq.0,
+            epoch = epoch.0,
+            tokeira.storage_operation = "commit_transition_for_bundle",
+            tokeira.dsql_class = "commit",
+            tokeira.bundle_id = execution_home_bundle.0,
+        );
+        async move {
+            record_dsql_commit_operation!(
+                self,
+                "commit_transition_for_bundle",
+                Some(execution_home_bundle),
+                {
                 if should_check_epoch(epoch) {
                     // Multi-node/controller-managed deployments keep the
                     // durable shard_lease fence. Single-node compose passes
@@ -242,8 +265,11 @@ impl DsqlRunRepository {
                     .await;
                 metrics::decrement_dsql_commits_in_flight();
                 result
-            }
-        )
+                }
+            )
+        }
+        .instrument(span)
+        .await
     }
 }
 

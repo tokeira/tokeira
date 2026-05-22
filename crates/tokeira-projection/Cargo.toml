@@ -20,6 +20,7 @@ tokio.workspace = true
 tokio-util = "0.7"
 tracing.workspace = true
 tokeira-kernel = { path = "../tokeira-kernel" }
+tokeira-observability.workspace = true
 tokeira-storage = { path = "../tokeira-storage" }
 tokeira-types = { path = "../tokeira-types" }
 uuid.workspace = true

@@ -23,13 +23,23 @@ const MIMIR_CONFIG: &str = "config/mimir.yaml";
 const LOKI_CONFIG: &str = "config/loki.yaml";
 const GRAFANA_DATASOURCES: &str = "config/grafana/provisioning/datasources/datasources.yaml";
 const GRAFANA_DASHBOARDS: &str = "config/grafana/provisioning/dashboards/dashboards.yaml";
+const ALERT_RULES: &str = "config/mimir/rules/observability-alerts.yaml";
 const GRPC_EDGE_DASHBOARD: &str = "config/grafana/dashboards/grpc-edge-health.json";
 const BROKER_RUNTIME_DASHBOARD: &str = "config/grafana/dashboards/broker-runtime-health.json";
 const STORAGE_PROJECTION_DASHBOARD: &str =
     "config/grafana/dashboards/storage-projection-health.json";
 const LOG_EXPLORATION_DASHBOARD: &str = "config/grafana/dashboards/log-exploration.json";
+const DSQL_CONNECTION_DASHBOARD: &str = "config/grafana/dashboards/dsql-connection-health.json";
+const OCC_CONTENTION_DASHBOARD: &str = "config/grafana/dashboards/occ-contention.json";
+const PLACEMENT_CONTROLLER_DASHBOARD: &str = "config/grafana/dashboards/placement-controller.json";
+const AUTOSCALER_DASHBOARD: &str = "config/grafana/dashboards/autoscaler.json";
+const PROJECTION_WORKERS_DASHBOARD: &str = "config/grafana/dashboards/projection-workers.json";
+const INFRASTRUCTURE_HEALTH_DASHBOARD: &str =
+    "config/grafana/dashboards/infrastructure-health.json";
 
 const MANAGED_DIRECTORIES: &[&str] = &[
+    "config/mimir/rules",
+    "config/mimir",
     "config/grafana/provisioning/datasources",
     "config/grafana/provisioning/dashboards",
     "config/grafana/provisioning",
@@ -43,6 +53,8 @@ const MANAGED_DIRECTORIES: &[&str] = &[
 pub struct AlloyConfigTemplate {
     pub metrics_target_host: String,
     pub metrics_target_port: u16,
+    pub cluster: String,
+    pub deployment: String,
     pub mimir_remote_write_url: String,
     pub loki_push_url: String,
 }
@@ -77,6 +89,8 @@ pub struct GrafanaDashboardProviderTemplate {
 pub struct ObservabilityParams {
     pub metrics_target_host: String,
     pub metrics_target_port: u16,
+    pub cluster: String,
+    pub deployment: String,
     pub mimir_remote_write_url: String,
     pub loki_push_url: String,
     pub mimir_http_port: u16,
@@ -89,6 +103,8 @@ impl ObservabilityParams {
         Self {
             metrics_target_host: "tokeirad".into(),
             metrics_target_port: config.tokeirad.metrics_port,
+            cluster: config.project_name.clone(),
+            deployment: config.project_name.clone(),
             mimir_remote_write_url: "http://mimir:9009/api/v1/push".into(),
             loki_push_url: "http://loki:3100/loki/api/v1/push".into(),
             mimir_http_port: 9009,
@@ -147,16 +163,25 @@ impl ConfigGenerator {
             self.render_loki(params)?,
             self.render_grafana_datasources()?,
             self.render_grafana_dashboard_provider()?,
+            self.alert_rules(),
             self.grpc_edge_dashboard(),
             self.broker_runtime_dashboard(),
             self.storage_projection_dashboard(),
             self.log_exploration_dashboard(),
+            self.dsql_connection_dashboard(),
+            self.occ_contention_dashboard(),
+            self.placement_controller_dashboard(),
+            self.autoscaler_dashboard(),
+            self.projection_workers_dashboard(),
+            self.infrastructure_health_dashboard(),
         ])
     }
 
     fn validate(&self, params: &ObservabilityParams) -> Result<(), ConfigGenError> {
         validate_non_empty("metrics_target_host", &params.metrics_target_host)?;
         validate_non_zero("metrics_target_port", params.metrics_target_port)?;
+        validate_non_empty("cluster", &params.cluster)?;
+        validate_non_empty("deployment", &params.deployment)?;
         validate_non_empty("mimir_remote_write_url", &params.mimir_remote_write_url)?;
         validate_non_empty("loki_push_url", &params.loki_push_url)?;
         validate_non_zero("mimir_http_port", params.mimir_http_port)?;
@@ -171,6 +196,8 @@ impl ConfigGenerator {
         let template = AlloyConfigTemplate {
             metrics_target_host: params.metrics_target_host.clone(),
             metrics_target_port: params.metrics_target_port,
+            cluster: params.cluster.clone(),
+            deployment: params.deployment.clone(),
             mimir_remote_write_url: params.mimir_remote_write_url.clone(),
             loki_push_url: params.loki_push_url.clone(),
         };
@@ -213,6 +240,13 @@ impl ConfigGenerator {
         render_template(GRAFANA_DASHBOARDS, "grafana-dashboards.yaml", &template)
     }
 
+    fn alert_rules(&self) -> RenderedConfigFile {
+        RenderedConfigFile {
+            relative_path: PathBuf::from(ALERT_RULES),
+            contents: include_str!("../alerts/observability-alerts.yaml").to_string(),
+        }
+    }
+
     fn grpc_edge_dashboard(&self) -> RenderedConfigFile {
         RenderedConfigFile {
             relative_path: PathBuf::from(GRPC_EDGE_DASHBOARD),
@@ -238,6 +272,48 @@ impl ConfigGenerator {
         RenderedConfigFile {
             relative_path: PathBuf::from(LOG_EXPLORATION_DASHBOARD),
             contents: include_str!("../dashboards/log-exploration.json").to_string(),
+        }
+    }
+
+    fn dsql_connection_dashboard(&self) -> RenderedConfigFile {
+        RenderedConfigFile {
+            relative_path: PathBuf::from(DSQL_CONNECTION_DASHBOARD),
+            contents: include_str!("../dashboards/dsql-connection-health.json").to_string(),
+        }
+    }
+
+    fn occ_contention_dashboard(&self) -> RenderedConfigFile {
+        RenderedConfigFile {
+            relative_path: PathBuf::from(OCC_CONTENTION_DASHBOARD),
+            contents: include_str!("../dashboards/occ-contention.json").to_string(),
+        }
+    }
+
+    fn placement_controller_dashboard(&self) -> RenderedConfigFile {
+        RenderedConfigFile {
+            relative_path: PathBuf::from(PLACEMENT_CONTROLLER_DASHBOARD),
+            contents: include_str!("../dashboards/placement-controller.json").to_string(),
+        }
+    }
+
+    fn autoscaler_dashboard(&self) -> RenderedConfigFile {
+        RenderedConfigFile {
+            relative_path: PathBuf::from(AUTOSCALER_DASHBOARD),
+            contents: include_str!("../dashboards/autoscaler.json").to_string(),
+        }
+    }
+
+    fn projection_workers_dashboard(&self) -> RenderedConfigFile {
+        RenderedConfigFile {
+            relative_path: PathBuf::from(PROJECTION_WORKERS_DASHBOARD),
+            contents: include_str!("../dashboards/projection-workers.json").to_string(),
+        }
+    }
+
+    fn infrastructure_health_dashboard(&self) -> RenderedConfigFile {
+        RenderedConfigFile {
+            relative_path: PathBuf::from(INFRASTRUCTURE_HEALTH_DASHBOARD),
+            contents: include_str!("../dashboards/infrastructure-health.json").to_string(),
         }
     }
 }
@@ -516,6 +592,7 @@ fn managed_relative_paths() -> &'static [&'static str] {
     &[
         ALLOY_CONFIG,
         MIMIR_CONFIG,
+        ALERT_RULES,
         LOKI_CONFIG,
         GRAFANA_DATASOURCES,
         GRAFANA_DASHBOARDS,
@@ -523,6 +600,12 @@ fn managed_relative_paths() -> &'static [&'static str] {
         BROKER_RUNTIME_DASHBOARD,
         STORAGE_PROJECTION_DASHBOARD,
         LOG_EXPLORATION_DASHBOARD,
+        DSQL_CONNECTION_DASHBOARD,
+        OCC_CONTENTION_DASHBOARD,
+        PLACEMENT_CONTROLLER_DASHBOARD,
+        AUTOSCALER_DASHBOARD,
+        PROJECTION_WORKERS_DASHBOARD,
+        INFRASTRUCTURE_HEALTH_DASHBOARD,
     ]
 }
 
@@ -598,6 +681,8 @@ mod tests {
         ObservabilityParams {
             metrics_target_host: "tokeirad".into(),
             metrics_target_port: 9090,
+            cluster: "tokeira".into(),
+            deployment: "tokeira".into(),
             mimir_remote_write_url: "http://mimir:9009/api/v1/push".into(),
             loki_push_url: "http://loki:3100/loki/api/v1/push".into(),
             mimir_http_port: 9009,
@@ -622,6 +707,8 @@ mod tests {
             let params = ObservabilityParams {
                 metrics_target_host: host.clone(),
                 metrics_target_port: metrics_port,
+                cluster: "tokeira".into(),
+                deployment: "tokeira".into(),
                 mimir_remote_write_url: format!("http://mimir:{mimir_port}/api/v1/push"),
                 loki_push_url: format!("http://loki:{loki_port}/loki/api/v1/push"),
                 mimir_http_port: mimir_port,
@@ -650,14 +737,16 @@ mod tests {
         }
 
         #[test]
-        fn render_all_rejects_invalid_parameters(case in 0u8..6) {
+        fn render_all_rejects_invalid_parameters(case in 0u8..8) {
             let mut params = default_params();
             match case {
                 0 => params.metrics_target_host.clear(),
                 1 => params.metrics_target_port = 0,
-                2 => params.mimir_remote_write_url.clear(),
-                3 => params.loki_push_url.clear(),
-                4 => params.mimir_http_port = 0,
+                2 => params.cluster.clear(),
+                3 => params.deployment.clear(),
+                4 => params.mimir_remote_write_url.clear(),
+                5 => params.loki_push_url.clear(),
+                6 => params.mimir_http_port = 0,
                 _ => params.loki_http_port = 0,
             }
             let generator = ConfigGenerator::new(PathBuf::new());
@@ -810,6 +899,96 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn alloy_log_labels_stay_low_cardinality() {
+        let generator = ConfigGenerator::new(PathBuf::new());
+        let files = generator.render_all(&default_params()).unwrap();
+        let alloy = contents_for(&files, ALLOY_CONFIG);
+
+        assert!(alloy.contains("target_label  = \"container\""));
+        assert!(alloy.contains("target_label  = \"service\""));
+        for forbidden in [
+            "workflow_id",
+            "run_id",
+            "request_id",
+            "trace_id",
+            "span_id",
+            "task_arn",
+        ] {
+            assert!(
+                !alloy.contains(&format!("target_label  = \"{forbidden}\"")),
+                "{forbidden} must remain a log field, not a Loki label"
+            );
+        }
+    }
+
+    #[test]
+    fn alloy_config_scrapes_process_and_infrastructure_targets() {
+        let generator = ConfigGenerator::new(PathBuf::new());
+        let files = generator.render_all(&default_params()).unwrap();
+        let alloy = contents_for(&files, ALLOY_CONFIG);
+
+        for service in ["tokeirad", "alloy", "mimir", "loki", "grafana"] {
+            assert!(
+                alloy.contains(&format!("prometheus.scrape \"{service}\"")),
+                "{service} scrape job missing"
+            );
+            assert!(
+                alloy.contains(&format!("service = \"{service}\"")),
+                "{service} scrape label missing"
+            );
+        }
+        assert!(alloy.contains("target_kind = \"process\""));
+        assert!(alloy.contains("target_kind = \"infrastructure\""));
+        assert!(alloy.contains("cluster = \"tokeira\""));
+        assert!(alloy.contains("deployment = \"tokeira\""));
+    }
+
+    #[test]
+    fn required_dashboards_are_provisioned_and_valid() {
+        let generator = ConfigGenerator::new(PathBuf::new());
+        let files = generator.render_all(&default_params()).unwrap();
+        let required = [
+            ("DSQL Connection Health", DSQL_CONNECTION_DASHBOARD),
+            ("OCC Contention", OCC_CONTENTION_DASHBOARD),
+            ("Placement Controller", PLACEMENT_CONTROLLER_DASHBOARD),
+            ("Autoscaler", AUTOSCALER_DASHBOARD),
+            ("Projection Workers", PROJECTION_WORKERS_DASHBOARD),
+            ("Infrastructure Health", INFRASTRUCTURE_HEALTH_DASHBOARD),
+        ];
+
+        for (title, path) in required {
+            let contents = contents_for(&files, path);
+            tokeira_observability::testing::DashboardValidator::validate_str(
+                Path::new(path),
+                contents,
+            )
+            .unwrap();
+            let dashboard: Value = serde_json::from_str(contents).unwrap();
+            assert_eq!(dashboard["title"].as_str(), Some(title));
+        }
+    }
+
+    #[test]
+    fn alert_rules_are_provisioned_and_valid() {
+        let generator = ConfigGenerator::new(PathBuf::new());
+        let files = generator.render_all(&default_params()).unwrap();
+        let alerts = contents_for(&files, ALERT_RULES);
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root");
+
+        tokeira_observability::testing::AlertRuleValidator::validate_str(
+            Path::new(ALERT_RULES),
+            alerts,
+            repo_root,
+        )
+        .unwrap();
+        assert!(alerts.contains("DsqlReservoirExhaustion"));
+        assert!(alerts.contains("ProjectionSinkErrorRate"));
     }
 
     fn contents_for<'a>(files: &'a [RenderedConfigFile], path: &str) -> &'a str {

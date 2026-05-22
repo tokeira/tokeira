@@ -5,14 +5,16 @@
 //! one SQL statement per file, and version gaps must be rejected so every
 //! environment converges through the same ordered schema path.
 
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, time::Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, PgConnection, PgPool};
 use time::OffsetDateTime;
+use tokeira_observability::{ErrorBiasedSamplingReason, OutcomeLabel, mark_error_biased_sample};
 
 use super::{MigrationConfig, validation::DdlValidator};
+use crate::metrics as storage_metrics;
 
 /// Forward-only schema migration runner for DSQL.
 #[derive(Clone, Debug)]
@@ -108,26 +110,45 @@ impl MigrationRunner {
             if self.is_applied(pool, &migration).await? {
                 continue;
             }
+            let started_at = Instant::now();
             let mut tx = pool.begin().await?;
-            sqlx::query(&migration.sql)
-                .execute(&mut *tx)
-                .await
-                .with_context(|| {
+            if let Err(error) = sqlx::query(&migration.sql).execute(&mut *tx).await {
+                record_migration_failure(&migration, started_at.elapsed(), &error);
+                return Err(error).with_context(|| {
                     format!(
                         "failed to apply migration V{:03}__{}",
                         migration.version, migration.name
                     )
-                })?;
-            tx.commit().await?;
+                });
+            }
+            if let Err(error) = tx.commit().await {
+                record_migration_failure(&migration, started_at.elapsed(), &error);
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to commit migration V{:03}__{}",
+                        migration.version, migration.name
+                    )
+                });
+            }
 
-            sqlx::query(
+            if let Err(error) = sqlx::query(
                 "INSERT INTO schema_version (version, name, checksum, applied_at) VALUES ($1, $2, $3, now())",
             )
             .bind(i32::try_from(migration.version)?)
             .bind(&migration.name)
             .bind(&migration.checksum)
             .execute(pool)
-            .await?;
+            .await
+            {
+                record_migration_failure(&migration, started_at.elapsed(), &error);
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to record migration V{:03}__{}",
+                        migration.version, migration.name
+                    )
+                });
+            }
+            record_migration_success(&migration, started_at.elapsed());
             applied += 1;
         }
         Ok(MigrationReport { applied })
@@ -142,26 +163,45 @@ impl MigrationRunner {
             if self.is_applied_connection(connection, &migration).await? {
                 continue;
             }
+            let started_at = Instant::now();
             let mut tx = connection.begin().await?;
-            sqlx::query(&migration.sql)
-                .execute(&mut *tx)
-                .await
-                .with_context(|| {
+            if let Err(error) = sqlx::query(&migration.sql).execute(&mut *tx).await {
+                record_migration_failure(&migration, started_at.elapsed(), &error);
+                return Err(error).with_context(|| {
                     format!(
                         "failed to apply migration V{:03}__{}",
                         migration.version, migration.name
                     )
-                })?;
-            tx.commit().await?;
+                });
+            }
+            if let Err(error) = tx.commit().await {
+                record_migration_failure(&migration, started_at.elapsed(), &error);
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to commit migration V{:03}__{}",
+                        migration.version, migration.name
+                    )
+                });
+            }
 
-            sqlx::query(
+            if let Err(error) = sqlx::query(
                 "INSERT INTO schema_version (version, name, checksum, applied_at) VALUES ($1, $2, $3, now())",
             )
             .bind(i32::try_from(migration.version)?)
             .bind(&migration.name)
             .bind(&migration.checksum)
             .execute(&mut *connection)
-            .await?;
+            .await
+            {
+                record_migration_failure(&migration, started_at.elapsed(), &error);
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to record migration V{:03}__{}",
+                        migration.version, migration.name
+                    )
+                });
+            }
+            record_migration_success(&migration, started_at.elapsed());
             applied += 1;
         }
         Ok(MigrationReport { applied })
@@ -380,6 +420,57 @@ fn verify_checksum(version: u32, stored: &str, file: &str) -> Result<bool> {
     bail!("checksum mismatch for migration {version}: stored={stored}, file={file}")
 }
 
+fn record_migration_success(migration: &MigrationFile, duration: std::time::Duration) {
+    storage_metrics::record_migration_applied(OutcomeLabel::Success);
+    storage_metrics::record_migration_duration(OutcomeLabel::Success, duration);
+    tracing::info!(
+        migration_file = %migration.path.display(),
+        migration_version = migration.version,
+        migration_name = %migration.name,
+        duration_ms = duration.as_millis() as u64,
+        schema_version = migration.version,
+        "applied DSQL migration"
+    );
+}
+
+fn record_migration_failure(
+    migration: &MigrationFile,
+    duration: std::time::Duration,
+    error: &sqlx::Error,
+) {
+    storage_metrics::record_migration_applied(OutcomeLabel::Failure);
+    storage_metrics::record_migration_duration(OutcomeLabel::Failure, duration);
+    mark_error_biased_sample(ErrorBiasedSamplingReason::MigrationFailure);
+    tracing::error!(
+        migration_file = %migration.path.display(),
+        migration_version = migration.version,
+        migration_name = %migration.name,
+        duration_ms = duration.as_millis() as u64,
+        error_class = migration_error_class(error),
+        sqlstate = sqlstate(error).as_deref().unwrap_or("unknown"),
+        "failed to apply DSQL migration"
+    );
+}
+
+fn migration_error_class(error: &sqlx::Error) -> &'static str {
+    match error {
+        sqlx::Error::Database(_) => "database",
+        sqlx::Error::Io(_) => "io",
+        sqlx::Error::Tls(_) => "tls",
+        sqlx::Error::PoolTimedOut => "pool_timeout",
+        sqlx::Error::PoolClosed => "pool_closed",
+        sqlx::Error::WorkerCrashed => "worker_crashed",
+        _ => "sqlx",
+    }
+}
+
+fn sqlstate(error: &sqlx::Error) -> Option<String> {
+    match error {
+        sqlx::Error::Database(database) => database.code().map(|code| code.into_owned()),
+        _ => None,
+    }
+}
+
 fn is_missing_schema_version(error: &sqlx::Error) -> bool {
     matches!(
         error,
@@ -436,14 +527,20 @@ fn count_statements(sql: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
         fs,
         path::{Path, PathBuf},
     };
 
+    use metrics::with_local_recorder;
+    use metrics_util::debugging::DebuggingRecorder;
     use proptest::prelude::*;
 
-    use super::{MigrationRunner, checksum, parse_migration_filename};
-    use crate::dsql::MigrationConfig;
+    use super::{MigrationFile, MigrationRunner, checksum, parse_migration_filename};
+    use crate::{
+        dsql::MigrationConfig,
+        metrics::{MIGRATION_APPLIED_TOTAL, MIGRATION_DURATION_SECONDS},
+    };
 
     #[test]
     fn parses_valid_filename() {
@@ -509,6 +606,60 @@ mod tests {
         assert!(super::verify_checksum(7, "same", "same").unwrap());
     }
 
+    #[test]
+    fn migration_success_and_failure_record_metrics_without_filename_labels() {
+        let recorder = DebuggingRecorder::new();
+        let migration = MigrationFile {
+            version: 7,
+            name: "add_visibility_index".to_string(),
+            path: PathBuf::from("V007__add_visibility_index.sql"),
+            sql: "CREATE TABLE example (id UUID);".to_string(),
+            checksum: "checksum".to_string(),
+        };
+
+        with_local_recorder(&recorder, || {
+            super::record_migration_success(&migration, std::time::Duration::from_millis(12));
+            super::record_migration_failure(
+                &migration,
+                std::time::Duration::from_millis(34),
+                &sqlx::Error::RowNotFound,
+            );
+        });
+
+        let entries = recorder
+            .snapshotter()
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(key, _, _, _)| {
+                let labels = key
+                    .key()
+                    .labels()
+                    .map(|label| (label.key().to_string(), label.value().to_string()))
+                    .collect::<HashMap<_, _>>();
+                (key.key().name().to_string(), labels)
+            })
+            .collect::<Vec<_>>();
+        assert_metric_with_status(&entries, MIGRATION_APPLIED_TOTAL, "success");
+        assert_metric_with_status(&entries, MIGRATION_APPLIED_TOTAL, "failure");
+        assert_metric_with_status(&entries, MIGRATION_DURATION_SECONDS, "success");
+        assert_metric_with_status(&entries, MIGRATION_DURATION_SECONDS, "failure");
+
+        for (_, labels) in entries {
+            assert!(!labels.contains_key("migration_file"));
+            assert!(!labels.contains_key("migration_name"));
+        }
+    }
+
+    #[test]
+    fn non_database_migration_errors_have_no_sqlstate() {
+        assert_eq!(
+            super::migration_error_class(&sqlx::Error::RowNotFound),
+            "sqlx"
+        );
+        assert!(super::sqlstate(&sqlx::Error::RowNotFound).is_none());
+    }
+
     proptest! {
         #[test]
         fn filename_parser_accepts_expected_pattern(version in 1u32..999, name in "[a-z][a-z0-9_]{0,20}") {
@@ -547,5 +698,15 @@ mod tests {
 
     fn write_migration(dir: &Path, filename: &str, sql: &str) {
         fs::write(dir.join(filename), sql).unwrap();
+    }
+
+    fn assert_metric_with_status(
+        entries: &[(String, HashMap<String, String>)],
+        metric: &str,
+        status: &str,
+    ) {
+        assert!(entries.iter().any(|(name, labels)| {
+            name == metric && labels.get("status").is_some_and(|value| value == status)
+        }));
     }
 }

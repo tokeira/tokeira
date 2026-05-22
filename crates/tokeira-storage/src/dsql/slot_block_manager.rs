@@ -188,7 +188,7 @@ impl SlotBlockManager {
     }
 
     async fn ensure_capacity(&self, requested_slots: usize) -> Result<()> {
-        while self.total_slots.load(Ordering::Acquire) < requested_slots
+        if self.total_slots.load(Ordering::Acquire) < requested_slots
             || self.used_slots.load(Ordering::Acquire) >= self.total_slots.load(Ordering::Acquire)
         {
             let Some(block_id) = self.try_acquire_any_block().await? else {
@@ -200,7 +200,6 @@ impl SlotBlockManager {
                     .fetch_add(SLOT_BLOCK_SIZE, Ordering::AcqRel);
                 metrics::set_dsql_slot_blocks_owned(owned.len());
             }
-            return Ok(());
         }
         Ok(())
     }

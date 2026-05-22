@@ -306,7 +306,7 @@ impl Default for EcsConfig {
         Self {
             project_name: "tokeira".into(),
             environment: "dev".into(),
-            region: "us-east-1".into(),
+            region: "eu-west-2".into(),
             tags: HashMap::new(),
             cluster: ClusterConfig::default(),
             networking: NetworkingConfig::default(),
@@ -333,7 +333,7 @@ impl Default for NetworkingConfig {
     fn default() -> Self {
         Self {
             vpc_cidr: "10.0.0.0/16".into(),
-            availability_zones: vec!["us-east-1a".into(), "us-east-1b".into()],
+            availability_zones: vec!["eu-west-2a".into(), "eu-west-2b".into()],
             private_dns_zone: "tokeira.local".into(),
             optional_endpoints: OptionalEndpoints::default(),
         }
@@ -343,20 +343,20 @@ impl Default for NetworkingConfig {
 impl Default for CapacityProviderConfigs {
     fn default() -> Self {
         Self {
-            edge_api: CapacityProviderConfig::new("c7g.large", 1, 2, 8),
-            edge_poll: CapacityProviderConfig::new("c7g.large", 1, 2, 8),
+            edge_api: CapacityProviderConfig::new("c8g.large", 1, 2, 8),
+            edge_poll: CapacityProviderConfig::new("c8g.large", 1, 2, 8),
             runtime: RuntimeCapacityProviderConfig {
-                instance_type: "c7g.large".into(),
+                instance_type: "c8g.large".into(),
                 min_capacity: 1,
                 desired_capacity: 3,
                 max_capacity: 16,
                 scale_in_protection: true,
             },
-            projection: CapacityProviderConfig::new("c7g.large", 1, 1, 8),
-            control: CapacityProviderConfig::new("c7g.large", 1, 1, 3),
-            mimir: CapacityProviderConfig::new("m7g.large", 1, 1, 1),
-            loki: CapacityProviderConfig::new("m7g.large", 1, 1, 1),
-            grafana: CapacityProviderConfig::new("t4g.medium", 1, 1, 1),
+            projection: CapacityProviderConfig::new("c8g.large", 1, 1, 8),
+            control: CapacityProviderConfig::new("c8g.large", 1, 1, 3),
+            mimir: CapacityProviderConfig::new("m8g.large", 1, 1, 1),
+            loki: CapacityProviderConfig::new("m8g.large", 1, 1, 1),
+            grafana: CapacityProviderConfig::new("c8g.medium", 1, 1, 1),
         }
     }
 }

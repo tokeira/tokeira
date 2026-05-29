@@ -9,6 +9,8 @@ use anyhow::Result;
 use serde::Serialize;
 use std::fmt::Display;
 
+pub mod build_info;
+
 pub struct OutputFormatter {
     json: bool,
 }

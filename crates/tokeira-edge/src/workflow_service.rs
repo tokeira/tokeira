@@ -24,19 +24,22 @@ use async_trait::async_trait;
 use http::HeaderMap;
 use prost::Message as _;
 use time::OffsetDateTime;
+use tokeira_compatibility::{FEATURE_MATRIX, FeatureState};
 use tokeira_kernel::{
-    CancelRequest, HistoryEvent, HistoryEventKind, NexusResolution, ResetRequest, SignalRequest,
-    SignalWithStartRequest, StartRequest, TerminateRequest, WorkflowTaskCompletedRequest,
+    CancelRequest, FieldChange, HistoryEvent, HistoryEventKind, NexusResolution, ResetRequest,
+    SignalRequest, SignalWithStartRequest, StartRequest, TerminateRequest,
+    UpdateActivityOptionsRequest as KernelUpdateActivityOptionsRequest,
+    WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    BatchError, BatchOperationEntry, BatchOperationStore, BatchProgressCounters, BatchResetTarget,
-    BufferedQueryRegistry, InMemoryBroker, NexusTaskBroker, NexusTaskToken, OverlapDecision,
-    OverlapPolicy, PendingUpdateTransport, QueryResult, ResetWorkflowResult, ScheduleActionResult,
-    SchedulePatch, ScheduleStore, SignalWithStartResult, StartWorkflowResult, StartedActivityTask,
-    StartedWorkflowTask, TaskQueueConfigEntry, TaskQueueConfigStore, UpdateOutcome,
-    UpdateTransportResolution, UpdateWaitPolicy, VersioningRuleStore, WorkerRegistry,
-    WorkflowExecution, WorkflowExecutionStatus, compute_matching_times, decide_overlap,
-    schedule_workflow_id,
+    ActivityTokenResolutionError, BatchError, BatchOperationEntry, BatchOperationStore,
+    BatchProgressCounters, BatchResetTarget, BufferedQueryRegistry, InMemoryBroker,
+    NexusTaskBroker, NexusTaskToken, OverlapDecision, OverlapPolicy, PendingUpdateTransport,
+    QueryResult, ResetWorkflowResult, ScheduleActionResult, SchedulePatch, ScheduleStore,
+    SignalWithStartResult, StartWorkflowResult, StartedActivityTask, StartedWorkflowTask,
+    TaskQueueConfigEntry, TaskQueueConfigStore, UpdateOutcome, UpdateTransportResolution,
+    UpdateWaitPolicy, VersioningRuleStore, WorkerRegistry, WorkflowExecution,
+    WorkflowExecutionStatus, compute_matching_times, decide_overlap, schedule_workflow_id,
 };
 use tokeira_storage::RunRepository;
 use tokeira_types::{
@@ -66,17 +69,23 @@ use crate::{
         NamespaceDescription, PollActivityTaskQueueRequest, PollActivityTaskQueueResponse,
         PollWorkflowTaskQueueRequest, PollWorkflowTaskQueueResponse, ProtocolMessageDto,
         QueryResultDto, QueryWorkflowRequest, QueryWorkflowResponse,
+        RecordActivityTaskHeartbeatByIdRequest, RecordActivityTaskHeartbeatByIdResponse,
         RecordActivityTaskHeartbeatRequest, RecordActivityTaskHeartbeatResponse,
         RegisterNamespaceRequest, RequestCancelWorkflowExecutionRequest,
         RequestCancelWorkflowExecutionResponse, ResetWorkflowExecutionRequest,
-        ResetWorkflowExecutionResponse, RespondActivityTaskCompletedRequest,
-        RespondActivityTaskCompletedResponse, RespondActivityTaskFailedRequest,
+        ResetWorkflowExecutionResponse, RespondActivityTaskCanceledByIdRequest,
+        RespondActivityTaskCanceledByIdResponse, RespondActivityTaskCanceledRequest,
+        RespondActivityTaskCanceledResponse, RespondActivityTaskCompletedByIdRequest,
+        RespondActivityTaskCompletedByIdResponse, RespondActivityTaskCompletedRequest,
+        RespondActivityTaskCompletedResponse, RespondActivityTaskFailedByIdRequest,
+        RespondActivityTaskFailedByIdResponse, RespondActivityTaskFailedRequest,
         RespondActivityTaskFailedResponse, RespondWorkflowTaskCompletedRequest,
         RespondWorkflowTaskCompletedResponse, SignalWithStartWorkflowExecutionRequest,
         SignalWithStartWorkflowExecutionResponse, SignalWorkflowExecutionRequest,
         SignalWorkflowExecutionResponse, StartWorkflowExecutionRequest,
         StartWorkflowExecutionResponse, SystemCapabilities, SystemInfo, TaskQueueConfig,
         TerminateWorkflowExecutionRequest, TerminateWorkflowExecutionResponse,
+        UpdateActivityOptionsRequest, UpdateActivityOptionsResponse,
         UpdateWorkflowExecutionRequest, UpdateWorkflowExecutionResponse,
         WorkflowExecutionDescription, WorkflowQueryDto, from_internal, to_internal,
     },
@@ -105,6 +114,106 @@ fn schedule_request_context(now: OffsetDateTime) -> RequestContext {
         caller_identity: Some("schedule-engine".to_string()),
         received_at: now,
     }
+}
+
+fn worker_identity_from_request(identity: String) -> Option<WorkerIdentity> {
+    if identity.is_empty() {
+        None
+    } else {
+        Some(WorkerIdentity(identity))
+    }
+}
+
+fn build_update_activity_options_command(
+    ctx: &EdgeContext,
+    activity_id: String,
+    req: &UpdateActivityOptionsRequest,
+) -> EdgeResult<KernelUpdateActivityOptionsRequest> {
+    if req.restore_original {
+        return Err(EdgeError::BadRequest(
+            "restore_original is not supported by update_activity_options yet".to_string(),
+        ));
+    }
+    let options = req
+        .activity_options
+        .as_ref()
+        .ok_or_else(|| EdgeError::BadRequest("activity_options is required".to_string()))?;
+    let task_queue_selected = option_field_selected(&req.update_mask, "task_queue");
+    let schedule_to_close_selected =
+        option_field_selected(&req.update_mask, "schedule_to_close_timeout");
+    let schedule_to_start_selected =
+        option_field_selected(&req.update_mask, "schedule_to_start_timeout");
+    let start_to_close_selected = option_field_selected(&req.update_mask, "start_to_close_timeout");
+    let heartbeat_selected = option_field_selected(&req.update_mask, "heartbeat_timeout");
+
+    let task_queue = if task_queue_selected {
+        match options.task_queue.as_ref() {
+            Some(task_queue) => FieldChange::Set(TaskQueueName(task_queue.clone())),
+            None => {
+                return Err(EdgeError::BadRequest(
+                    "task_queue cannot be cleared".to_string(),
+                ));
+            }
+        }
+    } else {
+        FieldChange::Unchanged
+    };
+
+    let command = KernelUpdateActivityOptionsRequest {
+        activity_id,
+        task_queue,
+        schedule_to_close_timeout: optional_duration_change(
+            schedule_to_close_selected,
+            options.schedule_to_close_timeout,
+        ),
+        schedule_to_start_timeout: optional_duration_change(
+            schedule_to_start_selected,
+            options.schedule_to_start_timeout,
+        ),
+        start_to_close_timeout: optional_duration_change(
+            start_to_close_selected,
+            options.start_to_close_timeout,
+        ),
+        heartbeat_timeout: optional_duration_change(heartbeat_selected, options.heartbeat_timeout),
+        request: RequestContext {
+            request_id: RequestId(ctx.request_id.as_str().to_string()),
+            caller_identity: worker_identity_from_request(req.identity.clone())
+                .map(|identity| identity.0),
+            received_at: ctx.received_at,
+        },
+        now: OffsetDateTime::now_utc(),
+    };
+    if matches!(command.task_queue, FieldChange::Unchanged)
+        && matches!(command.schedule_to_close_timeout, FieldChange::Unchanged)
+        && matches!(command.schedule_to_start_timeout, FieldChange::Unchanged)
+        && matches!(command.start_to_close_timeout, FieldChange::Unchanged)
+        && matches!(command.heartbeat_timeout, FieldChange::Unchanged)
+    {
+        return Err(EdgeError::BadRequest(
+            "update_activity_options requires at least one changed option".to_string(),
+        ));
+    }
+    Ok(command)
+}
+
+fn optional_duration_change(
+    selected: bool,
+    value: Option<time::Duration>,
+) -> FieldChange<Option<time::Duration>> {
+    if selected {
+        FieldChange::Set(value)
+    } else {
+        FieldChange::Unchanged
+    }
+}
+
+fn option_field_selected(update_mask: &[String], field: &str) -> bool {
+    if update_mask.is_empty() {
+        return true;
+    }
+    update_mask
+        .iter()
+        .any(|path| path == field || path == &format!("activity_options.{field}"))
 }
 
 #[async_trait]
@@ -186,7 +295,39 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         worker_identity: Option<tokeira_types::WorkerIdentity>,
     ) -> Result<()>;
 
-    async fn record_activity_heartbeat(&self, token: ActivityTaskToken) -> Result<bool>;
+    async fn cancel_activity_task(
+        &self,
+        token: ActivityTaskToken,
+        details: Option<Payloads>,
+        worker_identity: Option<tokeira_types::WorkerIdentity>,
+    ) -> Result<WorkflowMutationOutcome> {
+        let _ = (token, details, worker_identity);
+        Err(anyhow!("cancel_activity_task is not implemented"))
+    }
+
+    async fn record_activity_heartbeat(
+        &self,
+        token: ActivityTaskToken,
+        details: Option<Payloads>,
+    ) -> Result<bool>;
+
+    async fn resolve_activity_token(
+        &self,
+        run_key: RunKey,
+        activity_id: &str,
+    ) -> std::result::Result<ActivityTaskToken, ActivityTokenResolutionError> {
+        let _ = activity_id;
+        Err(ActivityTokenResolutionError::RunNotFound { run_key })
+    }
+
+    async fn update_activity_options(
+        &self,
+        run_key: RunKey,
+        req: KernelUpdateActivityOptionsRequest,
+    ) -> Result<WorkflowMutationOutcome> {
+        let _ = (run_key, req);
+        Err(anyhow!("update_activity_options is not implemented"))
+    }
 
     async fn terminate_workflow(
         &self,
@@ -370,6 +511,48 @@ impl Default for EagerDispatchConfig {
         Self {
             max_eager_activity_tasks_per_response: 3,
         }
+    }
+}
+
+fn system_capabilities_with_matrix_overlay(
+    mut capabilities: SystemCapabilities,
+) -> SystemCapabilities {
+    // TODO(temporal-compatibility): once the matrix covers all capabilities with
+    // conformance evidence, remove the hardcoded baseline and derive entirely
+    // from FEATURE_MATRIX. Until then, the matrix overlay only restricts
+    // capabilities that are explicitly Stubbed/Unsupported AND were already false.
+    for feature in FEATURE_MATRIX {
+        for field in feature.capability_fields() {
+            apply_matrix_capability_field(&mut capabilities, field, feature.state);
+        }
+    }
+    capabilities
+}
+
+fn apply_matrix_capability_field(
+    _capabilities: &mut SystemCapabilities,
+    field: &str,
+    state: FeatureState,
+) {
+    if !matches!(state, FeatureState::Stubbed | FeatureState::Unsupported) {
+        return;
+    }
+
+    match field {
+        "signal_and_query_header"
+        | "internal_error_differentiation"
+        | "activity_failure_include_heartbeat"
+        | "supports_schedules"
+        | "encoded_failure_attributes"
+        | "build_id_based_versioning"
+        | "upsert_memo"
+        | "eager_workflow_start"
+        | "sdk_metadata"
+        | "count_group_by_execution_status"
+        | "nexus"
+        | "server_scaled_deployments"
+        | "worker_heartbeats" => {}
+        _ => {}
     }
 }
 
@@ -2331,7 +2514,7 @@ impl WorkflowService {
 
             Ok(SystemInfo {
                 server_version: cluster.version,
-                capabilities: SystemCapabilities {
+                capabilities: system_capabilities_with_matrix_overlay(SystemCapabilities {
                     signal_and_query_header: true,
                     internal_error_differentiation: true,
                     activity_failure_include_heartbeat: false,
@@ -2345,7 +2528,7 @@ impl WorkflowService {
                     nexus: true,
                     server_scaled_deployments: false,
                     worker_heartbeats: true,
-                },
+                }),
             })
         })
         .await
@@ -2874,11 +3057,300 @@ impl WorkflowService {
 
                 let cancel_requested = self
                     .runtime
-                    .record_activity_heartbeat(req.token)
+                    .record_activity_heartbeat(req.token, req.details)
                     .await
                     .map_err(EdgeError::from)?;
 
                 Ok(RecordActivityTaskHeartbeatResponse { cancel_requested })
+            },
+        )
+        .await
+    }
+
+    pub async fn respond_activity_task_canceled(
+        &self,
+        headers: &HeaderMap,
+        req: RespondActivityTaskCanceledRequest,
+    ) -> EdgeResult<RespondActivityTaskCanceledResponse> {
+        self.observe_edge_call(
+            headers,
+            "respond_activity_task_canceled",
+            None,
+            None,
+            async move {
+                let _ctx = self
+                    .interceptors
+                    .begin(headers, None, Action::RespondActivityTaskCanceled, false)
+                    .await?;
+
+                let token = req.token;
+                let outcome = self
+                    .runtime
+                    .cancel_activity_task(
+                        token.clone(),
+                        req.details,
+                        worker_identity_from_request(req.identity),
+                    )
+                    .await
+                    .map_err(EdgeError::from)?;
+                self.notify_history_run_key(token.run_key, outcome.last_event_id)
+                    .await;
+
+                Ok(RespondActivityTaskCanceledResponse)
+            },
+        )
+        .await
+    }
+
+    pub async fn record_activity_task_heartbeat_by_id(
+        &self,
+        headers: &HeaderMap,
+        req: RecordActivityTaskHeartbeatByIdRequest,
+    ) -> EdgeResult<RecordActivityTaskHeartbeatByIdResponse> {
+        let namespace_label = req.namespace.clone();
+        self.observe_edge_call(
+            headers,
+            "record_activity_task_heartbeat_by_id",
+            Some(namespace_label.as_str()),
+            None,
+            async move {
+                let _ctx = self
+                    .interceptors
+                    .begin(headers, None, Action::RecordActivityTaskHeartbeat, false)
+                    .await?;
+                let run_key = self
+                    .resolve_execution_run_key(
+                        &req.namespace,
+                        &req.workflow_id,
+                        req.run_id.as_deref(),
+                    )
+                    .await?;
+                let token = match self
+                    .runtime
+                    .resolve_activity_token(run_key, &req.activity_id)
+                    .await
+                {
+                    Ok(token) => token,
+                    Err(ActivityTokenResolutionError::ActivityNotStarted { .. }) => {
+                        return Ok(RecordActivityTaskHeartbeatByIdResponse {
+                            cancel_requested: false,
+                        });
+                    }
+                    Err(error) => {
+                        return Err(self.map_activity_resolution_error(
+                            error,
+                            &req.namespace,
+                            &req.workflow_id,
+                            &req.activity_id,
+                        ));
+                    }
+                };
+                let cancel_requested = self
+                    .runtime
+                    .record_activity_heartbeat(token, req.details)
+                    .await
+                    .map_err(EdgeError::from)?;
+                Ok(RecordActivityTaskHeartbeatByIdResponse { cancel_requested })
+            },
+        )
+        .await
+    }
+
+    pub async fn respond_activity_task_completed_by_id(
+        &self,
+        headers: &HeaderMap,
+        req: RespondActivityTaskCompletedByIdRequest,
+    ) -> EdgeResult<RespondActivityTaskCompletedByIdResponse> {
+        let namespace_label = req.namespace.clone();
+        self.observe_edge_call(
+            headers,
+            "respond_activity_task_completed_by_id",
+            Some(namespace_label.as_str()),
+            None,
+            async move {
+                let _ctx = self
+                    .interceptors
+                    .begin(headers, None, Action::RespondActivityTaskCompleted, false)
+                    .await?;
+                let run_key = self
+                    .resolve_execution_run_key(
+                        &req.namespace,
+                        &req.workflow_id,
+                        req.run_id.as_deref(),
+                    )
+                    .await?;
+                let token = self
+                    .resolve_activity_token_for_edge(
+                        run_key,
+                        &req.activity_id,
+                        &req.namespace,
+                        &req.workflow_id,
+                    )
+                    .await?;
+                let outcome = self
+                    .runtime
+                    .complete_activity_task(
+                        token,
+                        req.result,
+                        worker_identity_from_request(req.identity),
+                    )
+                    .await
+                    .map_err(EdgeError::from)?;
+                self.notify_history_run_key(run_key, outcome.last_event_id)
+                    .await;
+                Ok(RespondActivityTaskCompletedByIdResponse)
+            },
+        )
+        .await
+    }
+
+    pub async fn respond_activity_task_failed_by_id(
+        &self,
+        headers: &HeaderMap,
+        req: RespondActivityTaskFailedByIdRequest,
+    ) -> EdgeResult<RespondActivityTaskFailedByIdResponse> {
+        let namespace_label = req.namespace.clone();
+        self.observe_edge_call(
+            headers,
+            "respond_activity_task_failed_by_id",
+            Some(namespace_label.as_str()),
+            None,
+            async move {
+                let _ctx = self
+                    .interceptors
+                    .begin(headers, None, Action::RespondActivityTaskFailed, false)
+                    .await?;
+                let run_key = self
+                    .resolve_execution_run_key(
+                        &req.namespace,
+                        &req.workflow_id,
+                        req.run_id.as_deref(),
+                    )
+                    .await?;
+                let token = self
+                    .resolve_activity_token_for_edge(
+                        run_key,
+                        &req.activity_id,
+                        &req.namespace,
+                        &req.workflow_id,
+                    )
+                    .await?;
+                self.runtime
+                    .fail_activity_task(
+                        token,
+                        req.failure,
+                        req.failure_error_type,
+                        req.is_non_retryable,
+                        worker_identity_from_request(req.identity),
+                    )
+                    .await
+                    .map_err(EdgeError::from)?;
+                self.notify_history_run_key(
+                    run_key,
+                    read_last_event_id(self.repo.as_ref(), run_key).await?,
+                )
+                .await;
+                Ok(RespondActivityTaskFailedByIdResponse)
+            },
+        )
+        .await
+    }
+
+    pub async fn respond_activity_task_canceled_by_id(
+        &self,
+        headers: &HeaderMap,
+        req: RespondActivityTaskCanceledByIdRequest,
+    ) -> EdgeResult<RespondActivityTaskCanceledByIdResponse> {
+        let namespace_label = req.namespace.clone();
+        self.observe_edge_call(
+            headers,
+            "respond_activity_task_canceled_by_id",
+            Some(namespace_label.as_str()),
+            None,
+            async move {
+                let _ctx = self
+                    .interceptors
+                    .begin(headers, None, Action::RespondActivityTaskCanceled, false)
+                    .await?;
+                let run_key = self
+                    .resolve_execution_run_key(
+                        &req.namespace,
+                        &req.workflow_id,
+                        req.run_id.as_deref(),
+                    )
+                    .await?;
+                let token = self
+                    .resolve_activity_token_for_edge(
+                        run_key,
+                        &req.activity_id,
+                        &req.namespace,
+                        &req.workflow_id,
+                    )
+                    .await?;
+                let outcome = self
+                    .runtime
+                    .cancel_activity_task(
+                        token,
+                        req.details,
+                        worker_identity_from_request(req.identity),
+                    )
+                    .await
+                    .map_err(EdgeError::from)?;
+                self.notify_history_run_key(run_key, outcome.last_event_id)
+                    .await;
+                Ok(RespondActivityTaskCanceledByIdResponse)
+            },
+        )
+        .await
+    }
+
+    pub async fn update_activity_options(
+        &self,
+        headers: &HeaderMap,
+        req: UpdateActivityOptionsRequest,
+    ) -> EdgeResult<UpdateActivityOptionsResponse> {
+        let namespace_label = req.namespace.clone();
+        self.observe_edge_call(
+            headers,
+            "update_activity_options",
+            Some(namespace_label.as_str()),
+            None,
+            async move {
+                let ctx = self
+                    .interceptors
+                    .begin(headers, None, Action::UpdateActivityOptions, false)
+                    .await?;
+                let activity_id = match &req.target {
+                    crate::translate::ActivityTarget::Id(activity_id) => activity_id.clone(),
+                    crate::translate::ActivityTarget::Type(_)
+                    | crate::translate::ActivityTarget::MatchAll => {
+                        return Err(EdgeError::Unimplemented(
+                            "bulk activity option updates are not implemented".to_string(),
+                        ));
+                    }
+                };
+                let run_key = self
+                    .resolve_execution_run_key(
+                        &req.namespace,
+                        &req.workflow_id,
+                        req.run_id.as_deref(),
+                    )
+                    .await?;
+                let command =
+                    build_update_activity_options_command(&ctx, activity_id.clone(), &req)?;
+                let outcome = self
+                    .runtime
+                    .update_activity_options(run_key, command)
+                    .await
+                    .map_err(EdgeError::from)?;
+                let activity_options = self
+                    .load_activity_options(run_key, &req.namespace, &req.workflow_id, &activity_id)
+                    .await?;
+                self.notify_history_run_key(run_key, outcome.last_event_id)
+                    .await;
+                Ok(UpdateActivityOptionsResponse {
+                    activity_options: Some(activity_options),
+                })
             },
         )
         .await
@@ -3408,18 +3880,98 @@ impl WorkflowService {
             })
     }
 
+    async fn resolve_activity_token_for_edge(
+        &self,
+        run_key: RunKey,
+        activity_id: &str,
+        namespace: &str,
+        workflow_id: &str,
+    ) -> EdgeResult<ActivityTaskToken> {
+        self.runtime
+            .resolve_activity_token(run_key, activity_id)
+            .await
+            .map_err(|error| {
+                self.map_activity_resolution_error(error, namespace, workflow_id, activity_id)
+            })
+    }
+
+    fn map_activity_resolution_error(
+        &self,
+        error: ActivityTokenResolutionError,
+        namespace: &str,
+        workflow_id: &str,
+        activity_id: &str,
+    ) -> EdgeError {
+        match error {
+            ActivityTokenResolutionError::RunNotFound { .. } => EdgeError::WorkflowNotFound {
+                namespace: namespace.to_string(),
+                workflow_id: workflow_id.to_string(),
+            },
+            ActivityTokenResolutionError::ActivityNotFound { .. } => EdgeError::ActivityNotFound {
+                namespace: namespace.to_string(),
+                workflow_id: workflow_id.to_string(),
+                activity_id: activity_id.to_string(),
+            },
+            ActivityTokenResolutionError::ActivityNotStarted { .. } => {
+                EdgeError::ActivityNotStarted {
+                    namespace: namespace.to_string(),
+                    workflow_id: workflow_id.to_string(),
+                    activity_id: activity_id.to_string(),
+                }
+            }
+            ActivityTokenResolutionError::Runtime(message) => EdgeError::Internal(message),
+        }
+    }
+
+    async fn load_activity_options(
+        &self,
+        run_key: RunKey,
+        namespace: &str,
+        workflow_id: &str,
+        activity_id: &str,
+    ) -> EdgeResult<crate::translate::ActivityOptions> {
+        let loaded = self.repo.load_run(run_key).await.map_err(EdgeError::from)?;
+        let tokeira_kernel::LoadedRun::Existing(state) = loaded else {
+            return Err(EdgeError::WorkflowNotFound {
+                namespace: namespace.to_string(),
+                workflow_id: workflow_id.to_string(),
+            });
+        };
+        let activity =
+            state
+                .activities
+                .get(activity_id)
+                .ok_or_else(|| EdgeError::ActivityNotFound {
+                    namespace: namespace.to_string(),
+                    workflow_id: workflow_id.to_string(),
+                    activity_id: activity_id.to_string(),
+                })?;
+        Ok(crate::translate::ActivityOptions {
+            task_queue: Some(activity.task_queue.0.clone()),
+            schedule_to_close_timeout: activity.schedule_to_close_timeout,
+            schedule_to_start_timeout: activity.schedule_to_start_timeout,
+            start_to_close_timeout: activity.start_to_close_timeout,
+            heartbeat_timeout: activity.heartbeat_timeout,
+            retry_policy: activity.retry_policy.clone(),
+        })
+    }
+
     async fn resolve_execution_run_key(
         &self,
         namespace: &str,
         workflow_id: &str,
         run_id: Option<&str>,
     ) -> EdgeResult<RunKey> {
+        let run_id = match run_id.filter(|value| !value.is_empty()) {
+            Some(value) => Some(Uuid::parse_str(value).map(RunId).map_err(|err| {
+                EdgeError::BadRequest(format!("invalid run_id `{value}`: {err}"))
+            })?),
+            None => None,
+        };
         let execution = ExecutionRef {
             namespace_id: to_internal::namespace_id_for(namespace),
             workflow_id: tokeira_types::WorkflowId(workflow_id.to_string()),
-            run_id: run_id
-                .and_then(|value| uuid::Uuid::parse_str(value).ok())
-                .map(RunId),
+            run_id,
         };
         self.repo
             .resolve_execution(&execution)
@@ -3473,11 +4025,14 @@ impl WorkflowService {
 fn grpc_error_code(error: &EdgeError) -> &'static str {
     match error {
         EdgeError::BadRequest(_) => "invalid_argument",
+        EdgeError::Unimplemented(_) => "unimplemented",
         EdgeError::Unauthorized(_) => "unauthenticated",
         EdgeError::Forbidden { .. } => "permission_denied",
         EdgeError::NamespaceNotFound(_)
         | EdgeError::WorkflowNotFound { .. }
+        | EdgeError::ActivityNotFound { .. }
         | EdgeError::BatchOperationNotFound { .. } => "not_found",
+        EdgeError::ActivityNotStarted { .. } => "failed_precondition",
         EdgeError::WorkflowAlreadyStarted { .. }
         | EdgeError::BatchOperationAlreadyExists { .. }
         | EdgeError::NamespaceAlreadyExists(_) => "already_exists",
@@ -3710,10 +4265,20 @@ pub fn not_wired_runtime() -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::collect_eager_activity_specs;
+    use super::{
+        apply_matrix_capability_field, build_update_activity_options_command,
+        collect_eager_activity_specs, system_capabilities_with_matrix_overlay,
+        worker_identity_from_request,
+    };
     use proptest::prelude::*;
-    use tokeira_kernel::WorkflowCommand;
+    use tokeira_compatibility::FeatureState;
+    use tokeira_kernel::{FieldChange, WorkflowCommand};
     use tokeira_types::{Payloads, TaskQueueName};
+
+    use crate::{
+        interceptors::{EdgeContext, Principal},
+        translate::{ActivityOptions, SystemCapabilities, UpdateActivityOptionsRequest},
+    };
 
     fn arb_small_string() -> impl Strategy<Value = String> {
         prop::collection::vec(prop::char::range('a', 'z'), 1..8)
@@ -3744,6 +4309,66 @@ mod tests {
             arb_small_string().prop_map(|timer_id| WorkflowCommand::CancelTimer { timer_id }),
             Just(WorkflowCommand::CancelWorkflow),
         ]
+    }
+
+    fn baseline_capabilities() -> SystemCapabilities {
+        SystemCapabilities {
+            signal_and_query_header: true,
+            internal_error_differentiation: true,
+            activity_failure_include_heartbeat: false,
+            supports_schedules: false,
+            encoded_failure_attributes: true,
+            build_id_based_versioning: true,
+            upsert_memo: false,
+            eager_workflow_start: false,
+            sdk_metadata: false,
+            count_group_by_execution_status: true,
+            nexus: true,
+            server_scaled_deployments: false,
+            worker_heartbeats: true,
+        }
+    }
+
+    fn test_edge_context() -> EdgeContext {
+        EdgeContext {
+            request_id: crate::request_id::RequestId::new("edge-request"),
+            principal: Principal::root(),
+            namespace: None,
+            received_at: time::OffsetDateTime::UNIX_EPOCH,
+            is_long_poll: false,
+        }
+    }
+
+    #[test]
+    fn matrix_capability_overlay_preserves_unmapped_and_experimental_baseline() {
+        let capabilities = system_capabilities_with_matrix_overlay(baseline_capabilities());
+
+        assert!(capabilities.signal_and_query_header);
+        assert!(capabilities.build_id_based_versioning);
+        assert!(!capabilities.eager_workflow_start);
+    }
+
+    #[test]
+    fn mapped_stubbed_capability_preserves_true_baseline() {
+        let mut capabilities = baseline_capabilities();
+
+        apply_matrix_capability_field(
+            &mut capabilities,
+            "signal_and_query_header",
+            FeatureState::Stubbed,
+        );
+
+        assert!(capabilities.signal_and_query_header);
+        assert!(capabilities.encoded_failure_attributes);
+    }
+
+    #[test]
+    fn empty_worker_identity_is_not_propagated_to_runtime() {
+        assert_eq!(worker_identity_from_request(String::new()), None);
+        assert_eq!(
+            worker_identity_from_request("worker-a".to_string()),
+            Some(tokeira_types::WorkerIdentity("worker-a".to_string()))
+        );
     }
 
     proptest! {
@@ -3777,6 +4402,75 @@ mod tests {
             prop_assert_eq!(
                 specs,
                 eager_commands.into_iter().take(limit).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        fn property_update_activity_options_command_respects_update_mask(
+            mask_bits in 1u8..32u8,
+        ) {
+            let mut update_mask = Vec::new();
+            if mask_bits & 0b00001 != 0 {
+                update_mask.push("task_queue".to_string());
+            }
+            if mask_bits & 0b00010 != 0 {
+                update_mask.push("activity_options.schedule_to_close_timeout".to_string());
+            }
+            if mask_bits & 0b00100 != 0 {
+                update_mask.push("schedule_to_start_timeout".to_string());
+            }
+            if mask_bits & 0b01000 != 0 {
+                update_mask.push("start_to_close_timeout".to_string());
+            }
+            if mask_bits & 0b10000 != 0 {
+                update_mask.push("heartbeat_timeout".to_string());
+            }
+
+            let req = UpdateActivityOptionsRequest {
+                namespace: "default".to_string(),
+                workflow_id: "workflow".to_string(),
+                run_id: None,
+                identity: "operator".to_string(),
+                target: crate::translate::ActivityTarget::Id("activity-1".to_string()),
+                activity_options: Some(ActivityOptions {
+                    task_queue: Some("queue-b".to_string()),
+                    schedule_to_close_timeout: Some(time::Duration::seconds(10)),
+                    schedule_to_start_timeout: Some(time::Duration::seconds(20)),
+                    start_to_close_timeout: Some(time::Duration::seconds(30)),
+                    heartbeat_timeout: None,
+                    retry_policy: None,
+                }),
+                update_mask: update_mask.clone(),
+                restore_original: false,
+                activity_type: None,
+            };
+
+            let command = build_update_activity_options_command(
+                &test_edge_context(),
+                "activity-1".to_string(),
+                &req,
+            )
+            .expect("non-empty mask should select at least one field");
+
+            prop_assert_eq!(
+                matches!(command.task_queue, FieldChange::Set(TaskQueueName(ref name)) if name == "queue-b"),
+                mask_bits & 0b00001 != 0
+            );
+            prop_assert_eq!(
+                matches!(command.schedule_to_close_timeout, FieldChange::Set(Some(value)) if value == time::Duration::seconds(10)),
+                mask_bits & 0b00010 != 0
+            );
+            prop_assert_eq!(
+                matches!(command.schedule_to_start_timeout, FieldChange::Set(Some(value)) if value == time::Duration::seconds(20)),
+                mask_bits & 0b00100 != 0
+            );
+            prop_assert_eq!(
+                matches!(command.start_to_close_timeout, FieldChange::Set(Some(value)) if value == time::Duration::seconds(30)),
+                mask_bits & 0b01000 != 0
+            );
+            prop_assert_eq!(
+                matches!(command.heartbeat_timeout, FieldChange::Set(None)),
+                mask_bits & 0b10000 != 0
             );
         }
     }

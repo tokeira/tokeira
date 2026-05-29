@@ -455,11 +455,14 @@ fn execution_status_to_proto(status: ExecutionStatus) -> i32 {
 fn expected_code(err: &EdgeError) -> Code {
     match err {
         EdgeError::BadRequest(_) => Code::InvalidArgument,
+        EdgeError::Unimplemented(_) => Code::Unimplemented,
         EdgeError::Unauthorized(_) => Code::Unauthenticated,
         EdgeError::Forbidden { .. } => Code::PermissionDenied,
         EdgeError::NamespaceNotFound(_)
         | EdgeError::WorkflowNotFound { .. }
+        | EdgeError::ActivityNotFound { .. }
         | EdgeError::BatchOperationNotFound { .. } => Code::NotFound,
+        EdgeError::ActivityNotStarted { .. } => Code::FailedPrecondition,
         EdgeError::WorkflowAlreadyStarted { .. }
         | EdgeError::BatchOperationAlreadyExists { .. } => Code::AlreadyExists,
         EdgeError::NamespaceDeleted(_) => Code::FailedPrecondition,

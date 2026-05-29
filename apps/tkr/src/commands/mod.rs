@@ -15,6 +15,8 @@
 //! 4. Re-use `require_confirmation` for any destructive operation.
 
 pub mod admin;
+pub mod ci;
+pub mod compat;
 pub mod config;
 pub mod deploy;
 pub mod deployment;

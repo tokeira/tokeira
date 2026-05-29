@@ -22,6 +22,40 @@ This is not a service-by-service port of Temporal's Frontend / History / Matchin
 
 **Configuration stays minimal.** Prefer policies and auto-tuning over exposed mechanical knobs.
 
+## Temporal Compatibility
+
+Tokeira separates proto compatibility from behavioral server compatibility.
+`TEMPORAL_PROTO_VERSION` records the vendored upstream Temporal proto set, while
+`TEMPORAL_SERVER_COMPAT` records the conservative SDK-visible server behavior
+claim. Updating protos does not automatically increase the server compatibility
+claim.
+
+Compatibility state is recorded in two checked-in matrices:
+
+- `FEATURE_MATRIX` classifies WorkflowService and OperatorService surfaces as
+  `Implemented`, `Partial`, `Experimental`, `Stubbed`, or `Unsupported`.
+- `SDK_MATRIX` records supported SDK languages, tested version ranges, known
+  incompatible versions, and verification state.
+
+Use `tkr compat show` to inspect the local binary metadata and matrix summary.
+Use `tkr compat show --json` to emit a machine-readable document, and
+`tkr compat diff --a <left.json> --b <right.json>` to compare two exported
+documents. Remote compatibility inspection is reserved for the Tokeira
+Compatibility Service transport wiring; until that lands, the CLI fails
+explicitly instead of pretending to query a deployment.
+
+Tokeira-owned compatibility metadata is exposed through Buffa/connect-rust
+messages in `proto/tokeira/compatibility/v1/`. Upstream Temporal protos remain
+unchanged and are not patched with Tokeira extension fields.
+
+Build metadata comes from `tokeira-build-info`. Versioned builds use a
+Dagger-generated manifest; local dev builds use workspace-derived fallback
+metadata. Ambient environment variables are not the source of release
+provenance.
+
+See `docs/compatibility.md` for the feature matrix, SDK matrix,
+Buffa/connect-rust service, Dagger check, and compatibility bump workflow.
+
 ## Architecture
 
 Tokeira is organized into three planes:

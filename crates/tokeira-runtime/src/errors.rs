@@ -1,5 +1,5 @@
 use thiserror::Error;
-use tokeira_types::{BundleId, IncarnationId, ShardEpoch};
+use tokeira_types::{BundleId, IncarnationId, RunKey, ShardEpoch};
 
 /// Runtime rejected a mutation because the local node is not the active bundle owner.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -20,4 +20,26 @@ impl NotShardOwner {
             current_owner_node_id: None,
         }
     }
+}
+
+/// Runtime could not construct an activity task token from authoritative state.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum ActivityTokenResolutionError {
+    #[error("run not found while resolving activity token: {run_key:?}")]
+    RunNotFound { run_key: RunKey },
+
+    #[error("activity not found while resolving activity token: {run_key:?}/{activity_id}")]
+    ActivityNotFound {
+        run_key: RunKey,
+        activity_id: String,
+    },
+
+    #[error("activity has not started while resolving activity token: {run_key:?}/{activity_id}")]
+    ActivityNotStarted {
+        run_key: RunKey,
+        activity_id: String,
+    },
+
+    #[error("activity token resolution failed: {0}")]
+    Runtime(String),
 }

@@ -2,6 +2,10 @@
 resolver = "2"
 members = [
     "tools/proto-sync",
+    "crates/tokeira-build-info",
+    "crates/tokeira-compatibility",
+    "crates/tokeira-compatibility-proto",
+    "crates/tokeira-compatibility-service",
     "crates/tokeira-types",
     "crates/tokeira-proto",
     "crates/tokeira-kernel",
@@ -94,6 +98,10 @@ tokeira-deploy-engine = { path = "crates/tokeira-deploy-engine" }
 tokeira-config = { path = "crates/tokeira-config" }
 tokeira-aws = { path = "crates/tokeira-aws" }
 tokeira-observability = { path = "crates/tokeira-observability" }
+tokeira-build-info = { path = "crates/tokeira-build-info" }
+tokeira-compatibility = { path = "crates/tokeira-compatibility" }
+tokeira-compatibility-proto = { path = "crates/tokeira-compatibility-proto" }
+tokeira-compatibility-service = { path = "crates/tokeira-compatibility-service" }
 dagger-client = { path = "crates/dagger-client" }
 tokeira-build = { path = "crates/tokeira-build" }
 

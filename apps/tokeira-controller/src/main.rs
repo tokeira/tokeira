@@ -83,6 +83,7 @@ async fn main() -> Result<()> {
 
     let readiness = ControllerReadiness::new();
     let _observability = install_process_observability(&config, readiness.registry.clone()).await?;
+    log_build_info("tokeira-controller");
     let controller_config = config.to_controller_config();
 
     info!(
@@ -183,6 +184,23 @@ async fn main() -> Result<()> {
 
     info!("tokeira-controller shut down cleanly");
     Ok(())
+}
+
+fn log_build_info(process: &'static str) {
+    let info = tokeira_build_info::summary();
+    info!(
+        process,
+        tokeira_version = info.tokeira_version,
+        tokeira_git_sha = info.tokeira_git_sha,
+        temporal_proto_version = info.temporal_proto_version,
+        temporal_server_compat = info.temporal_server_compat,
+        rust_toolchain = info.rust_toolchain,
+        source_tree_hash = info.source_tree_hash,
+        feature_matrix_digest = info.feature_matrix_digest,
+        sdk_matrix_digest = info.sdk_matrix_digest,
+        build_mode = info.build_mode,
+        "tokeira build provenance"
+    );
 }
 
 /// Periodic placement loop.

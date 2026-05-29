@@ -118,6 +118,7 @@ async fn main() -> Result<()> {
     let mimir = MimirClient::new(config.mimir_endpoint.clone(), config.staleness_threshold);
     let readiness = AutoscalerReadiness::new(mimir.clone());
     let _observability = install_process_observability(&config, readiness.registry.clone()).await?;
+    log_build_info("tokeira-autoscaler");
 
     info!(
         cluster = %config.cluster_name,
@@ -142,6 +143,23 @@ async fn main() -> Result<()> {
     readiness.control_plane.ready();
 
     run_leader_loop(config, mimir, lease_repo, actuator, cancel).await
+}
+
+fn log_build_info(process: &'static str) {
+    let info = tokeira_build_info::summary();
+    info!(
+        process,
+        tokeira_version = info.tokeira_version,
+        tokeira_git_sha = info.tokeira_git_sha,
+        temporal_proto_version = info.temporal_proto_version,
+        temporal_server_compat = info.temporal_server_compat,
+        rust_toolchain = info.rust_toolchain,
+        source_tree_hash = info.source_tree_hash,
+        feature_matrix_digest = info.feature_matrix_digest,
+        sdk_matrix_digest = info.sdk_matrix_digest,
+        build_mode = info.build_mode,
+        "tokeira build provenance"
+    );
 }
 
 /// Build a LeaseRepository from the DSQL config fields.

@@ -1,0 +1,23 @@
+[package]
+name = "tokeira-compatibility-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Buffa/connect-rust bindings for Tokeira compatibility metadata"
+
+[dependencies]
+buffa = { version = "0.6", features = ["json"] }
+buffa-types = { version = "0.6", features = ["json"] }
+connectrpc = { version = "0.6", features = ["client"] }
+http-body = "1"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+connectrpc-build = "0.6"
+walkdir = "2"
+
+[lints]
+workspace = true

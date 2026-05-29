@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(clap::Parser, Debug)]
-#[command(name = "tokeirad")]
+#[command(name = "tokeirad", disable_version_flag = true)]
 pub struct Cli {
     /// Path to the TOML configuration file.
     #[arg(long)]
@@ -16,6 +16,18 @@ pub struct Cli {
     /// Print resolved configuration as TOML and exit.
     #[arg(long)]
     pub dump_config: bool,
+
+    /// Print deterministic build provenance and exit.
+    #[arg(long)]
+    pub version: bool,
+
+    /// Include all build provenance fields with `--version`.
+    #[arg(long, requires = "version")]
+    pub verbose: bool,
+
+    /// Render `--version` output as stable JSON.
+    #[arg(long, requires = "version")]
+    pub json: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -846,10 +858,23 @@ fn default_burst() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use proptest::prelude::*;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn parses_version_flags_without_config() {
+        let cli = Cli::try_parse_from(["tokeirad", "--version", "--verbose"]).unwrap();
+        assert!(cli.version);
+        assert!(cli.verbose);
+        assert!(!cli.json);
+
+        let cli = Cli::try_parse_from(["tokeirad", "--version", "--json"]).unwrap();
+        assert!(cli.version);
+        assert!(cli.json);
+    }
 
     #[test]
     fn empty_toml_uses_defaults() {

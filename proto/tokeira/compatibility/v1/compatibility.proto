@@ -1,0 +1,132 @@
+syntax = "proto3";
+
+package tokeira.compatibility.v1;
+
+service CompatibilityService {
+  rpc GetCompatibility(GetCompatibilityRequest) returns (GetCompatibilityResponse);
+  rpc ListCompatibilitySurfaces(ListCompatibilitySurfacesRequest) returns (ListCompatibilitySurfacesResponse);
+  rpc GetFeature(GetFeatureRequest) returns (GetFeatureResponse);
+  rpc GetSdkCompatibility(GetSdkCompatibilityRequest) returns (GetSdkCompatibilityResponse);
+}
+
+message GetCompatibilityRequest {
+  string namespace = 1;
+}
+
+message GetCompatibilityResponse {
+  BuildInfo build_info = 1;
+  repeated FeatureEntry features = 2;
+  repeated SdkCompatEntry sdk_matrix = 3;
+  string process_kind = 4;
+  string process_identity = 5;
+  string feature_matrix_digest = 6;
+  string sdk_matrix_digest = 7;
+}
+
+message ListCompatibilitySurfacesRequest {}
+
+message ListCompatibilitySurfacesResponse {
+  repeated CompatibilitySurface surfaces = 1;
+}
+
+message GetFeatureRequest {
+  string feature_id = 1;
+}
+
+message GetFeatureResponse {
+  FeatureEntry feature = 1;
+}
+
+message GetSdkCompatibilityRequest {
+  string language = 1;
+}
+
+message GetSdkCompatibilityResponse {
+  repeated SdkCompatEntry sdk_matrix = 1;
+}
+
+message BuildInfo {
+  string tokeira_version = 1;
+  string tokeira_git_sha = 2;
+  string temporal_proto_version = 3;
+  string temporal_server_compat = 4;
+  string rust_toolchain = 5;
+  string source_tree_hash = 6;
+  string feature_matrix_digest = 7;
+  string sdk_matrix_digest = 8;
+  string build_mode = 9;
+}
+
+message FeatureEntry {
+  string id = 1;
+  string name = 2;
+  FeatureState state = 3;
+  repeated CompatibilitySurface surfaces = 4;
+  string capability_field = 5;
+  string dynamic_config_key = 6;
+  repeated string rpcs = 7;
+  string notes = 8;
+  repeated CompatibilityEvidence evidence = 9;
+}
+
+enum FeatureState {
+  FEATURE_STATE_UNSPECIFIED = 0;
+  FEATURE_STATE_IMPLEMENTED = 1;
+  FEATURE_STATE_EXPERIMENTAL = 2;
+  FEATURE_STATE_STUBBED = 3;
+  FEATURE_STATE_UNSUPPORTED = 4;
+  FEATURE_STATE_PARTIAL = 5;
+}
+
+message CompatibilitySurface {
+  CompatibilitySurfaceKind kind = 1;
+  string identifier = 2;
+  string feature_id = 3;
+}
+
+enum CompatibilitySurfaceKind {
+  COMPATIBILITY_SURFACE_KIND_UNSPECIFIED = 0;
+  COMPATIBILITY_SURFACE_KIND_RPC = 1;
+  COMPATIBILITY_SURFACE_KIND_REQUEST_FIELD = 2;
+  COMPATIBILITY_SURFACE_KIND_RESPONSE_FIELD = 3;
+  COMPATIBILITY_SURFACE_KIND_HISTORY_EVENT = 4;
+  COMPATIBILITY_SURFACE_KIND_COMMAND_ATTRIBUTE = 5;
+  COMPATIBILITY_SURFACE_KIND_ENUM_VARIANT = 6;
+  COMPATIBILITY_SURFACE_KIND_CAPABILITY_FLAG = 7;
+  COMPATIBILITY_SURFACE_KIND_ERROR_DETAIL = 8;
+  COMPATIBILITY_SURFACE_KIND_BEHAVIOURAL_INVARIANT = 9;
+}
+
+message CompatibilityEvidence {
+  CompatibilityEvidenceKind kind = 1;
+  string reference = 2;
+}
+
+enum CompatibilityEvidenceKind {
+  COMPATIBILITY_EVIDENCE_KIND_UNSPECIFIED = 0;
+  COMPATIBILITY_EVIDENCE_KIND_TEST = 1;
+  COMPATIBILITY_EVIDENCE_KIND_MANUAL_REVIEW = 2;
+  COMPATIBILITY_EVIDENCE_KIND_SDK_CONFORMANCE = 3;
+}
+
+message SdkCompatEntry {
+  string language = 1;
+  string minimum_supported_version = 2;
+  string maximum_tested_version = 3;
+  repeated IncompatibleVersion known_incompatible = 4;
+  SdkVerificationState verification_state = 5;
+  repeated CompatibilityEvidence evidence = 6;
+}
+
+message IncompatibleVersion {
+  string version = 1;
+  string reason = 2;
+}
+
+enum SdkVerificationState {
+  SDK_VERIFICATION_STATE_UNSPECIFIED = 0;
+  SDK_VERIFICATION_STATE_UNTESTED = 1;
+  SDK_VERIFICATION_STATE_SMOKE_TESTED = 2;
+  SDK_VERIFICATION_STATE_CONFORMANCE_PARTIAL = 3;
+  SDK_VERIFICATION_STATE_CONFORMANCE_PASSING = 4;
+}

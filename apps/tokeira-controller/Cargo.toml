@@ -21,6 +21,7 @@ metrics-exporter-prometheus.workspace = true
 serde.workspace = true
 time.workspace = true
 tokeira-config.workspace = true
+tokeira-build-info.workspace = true
 tokeira-controller = { path = "../../crates/tokeira-controller" }
 tokeira-observability.workspace = true
 tokeira-proto = { path = "../../crates/tokeira-proto" }

@@ -208,6 +208,7 @@ cargo test-lint                    # clippy on tests
 cargo check --workspace            # compilation
 cargo test --workspace             # unit tests
 cargo doc --workspace --no-deps    # documentation (RUSTDOCFLAGS="-D warnings")
+tkr ci check                       # compatibility invariants once Dagger module is available
 ```
 
 Use `cargo lint` to check if everything compiles without running tests. `cargo check` alone does not build test targets.
@@ -233,6 +234,14 @@ Use `cargo lint` to check if everything compiles without running tests. `cargo c
 ---
 
 ## Working Agreements
+
+### Temporal Compatibility Changes
+
+1. `TEMPORAL_PROTO_VERSION` and `TEMPORAL_SERVER_COMPAT` are independent pins in `crates/tokeira-build-info/src/pinned.rs`. Do not bump the server compatibility claim just because the vendored proto version changed.
+2. New WorkflowService or OperatorService surfaces must be classified in `FEATURE_MATRIX` in `crates/tokeira-compatibility/src/matrix.rs`.
+3. New SDK claims must update `SDK_MATRIX` in `crates/tokeira-compatibility/src/sdk.rs` with evidence and verification state.
+4. Tokeira-owned compatibility metadata uses Buffa/connect-rust under `proto/tokeira/compatibility/v1/`; do not add Tokeira extension fields to upstream Temporal protos.
+5. Run `tkr ci check` when the Dagger compatibility module is available. Until then, use the focused matrix, CLI, and edge tests described in `.kiro/specs/temporal-compatibility/`.
 
 ### Adding a New Platform
 

@@ -509,38 +509,77 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     }
     async fn record_activity_task_heartbeat_by_id(
         &self,
-        _request: Request<workflowservice::RecordActivityTaskHeartbeatByIdRequest>,
+        request: Request<workflowservice::RecordActivityTaskHeartbeatByIdRequest>,
     ) -> Result<Response<workflowservice::RecordActivityTaskHeartbeatByIdResponse>, Status> {
-        Err(Status::unimplemented(
-            "record_activity_task_heartbeat_by_id",
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::record_activity_heartbeat_by_id_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let edge_resp = self
+            .inner
+            .record_activity_task_heartbeat_by_id(&headers, edge_req)
+            .await?;
+        Ok(Response::new(
+            translate::record_activity_heartbeat_by_id_to_proto(edge_resp),
         ))
     }
     async fn respond_activity_task_completed_by_id(
         &self,
-        _request: Request<workflowservice::RespondActivityTaskCompletedByIdRequest>,
+        request: Request<workflowservice::RespondActivityTaskCompletedByIdRequest>,
     ) -> Result<Response<workflowservice::RespondActivityTaskCompletedByIdResponse>, Status> {
-        Err(Status::unimplemented(
-            "respond_activity_task_completed_by_id",
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::respond_activity_completed_by_id_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let _edge_resp = self
+            .inner
+            .respond_activity_task_completed_by_id(&headers, edge_req)
+            .await?;
+        Ok(Response::new(
+            translate::respond_activity_completed_by_id_to_proto(),
         ))
     }
     async fn respond_activity_task_failed_by_id(
         &self,
-        _request: Request<workflowservice::RespondActivityTaskFailedByIdRequest>,
+        request: Request<workflowservice::RespondActivityTaskFailedByIdRequest>,
     ) -> Result<Response<workflowservice::RespondActivityTaskFailedByIdResponse>, Status> {
-        Err(Status::unimplemented("respond_activity_task_failed_by_id"))
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::respond_activity_failed_by_id_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let _edge_resp = self
+            .inner
+            .respond_activity_task_failed_by_id(&headers, edge_req)
+            .await?;
+        Ok(Response::new(
+            translate::respond_activity_failed_by_id_to_proto(),
+        ))
     }
     async fn respond_activity_task_canceled(
         &self,
-        _request: Request<workflowservice::RespondActivityTaskCanceledRequest>,
+        request: Request<workflowservice::RespondActivityTaskCanceledRequest>,
     ) -> Result<Response<workflowservice::RespondActivityTaskCanceledResponse>, Status> {
-        Err(Status::unimplemented("respond_activity_task_canceled"))
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::respond_activity_canceled_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let _edge_resp = self
+            .inner
+            .respond_activity_task_canceled(&headers, edge_req)
+            .await?;
+        Ok(Response::new(
+            translate::respond_activity_canceled_to_proto(),
+        ))
     }
     async fn respond_activity_task_canceled_by_id(
         &self,
-        _request: Request<workflowservice::RespondActivityTaskCanceledByIdRequest>,
+        request: Request<workflowservice::RespondActivityTaskCanceledByIdRequest>,
     ) -> Result<Response<workflowservice::RespondActivityTaskCanceledByIdResponse>, Status> {
-        Err(Status::unimplemented(
-            "respond_activity_task_canceled_by_id",
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::respond_activity_canceled_by_id_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let _edge_resp = self
+            .inner
+            .respond_activity_task_canceled_by_id(&headers, edge_req)
+            .await?;
+        Ok(Response::new(
+            translate::respond_activity_canceled_by_id_to_proto(),
         ))
     }
     async fn signal_with_start_workflow_execution(
@@ -1570,9 +1609,18 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     );
     async fn update_activity_options(
         &self,
-        _request: Request<workflowservice::UpdateActivityOptionsRequest>,
+        request: Request<workflowservice::UpdateActivityOptionsRequest>,
     ) -> Result<Response<workflowservice::UpdateActivityOptionsResponse>, Status> {
-        Err(Status::unimplemented("update_activity_options"))
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::update_activity_options_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let edge_resp = self
+            .inner
+            .update_activity_options(&headers, edge_req)
+            .await?;
+        Ok(Response::new(translate::update_activity_options_to_proto(
+            edge_resp,
+        )))
     }
     async fn update_workflow_execution_options(
         &self,
@@ -1778,6 +1826,7 @@ mod tests {
         async fn record_activity_heartbeat(
             &self,
             _token: tokeira_types::ActivityTaskToken,
+            _details: Option<tokeira_types::Payloads>,
         ) -> Result<bool> {
             unreachable!()
         }
@@ -1944,6 +1993,7 @@ mod tests {
         async fn record_activity_heartbeat(
             &self,
             _token: tokeira_types::ActivityTaskToken,
+            _details: Option<tokeira_types::Payloads>,
         ) -> Result<bool> {
             unreachable!()
         }
@@ -2108,6 +2158,7 @@ mod tests {
         async fn record_activity_heartbeat(
             &self,
             _token: tokeira_types::ActivityTaskToken,
+            _details: Option<tokeira_types::Payloads>,
         ) -> Result<bool> {
             unreachable!()
         }

@@ -130,6 +130,8 @@ async fn main() -> Result<()> {
             let ctx = load_context(&deployments, cli.deployment.as_deref())?;
             commands::config::run_show(ctx)
         }
+        Command::Compat(args) => commands::compat::run(args.command, cli.json),
+        Command::Ci(args) => commands::ci::run(args.command, cli.json).await,
         Command::Observability { action } => {
             let ctx = load_context(&deployments, cli.deployment.as_deref())?;
             commands::observability::run(action, ctx)
@@ -139,8 +141,8 @@ async fn main() -> Result<()> {
             let ctx = load_context(&deployments, cli.deployment.as_deref())?;
             commands::admin::run(command, ctx).await
         }
-        Command::Version => {
-            commands::version::run();
+        Command::Version { verbose, json } => {
+            commands::version::run(verbose, cli.json || json);
             Ok(())
         }
     }
@@ -380,6 +382,18 @@ mod tests {
             }
         ));
         assert!(matches!(
+            Cli::try_parse_from(["tkr", "compat", "show", "--verbose"])
+                .unwrap()
+                .command,
+            Command::Compat(crate::cli::CompatArgs {
+                command: crate::cli::CompatCommand::Show {
+                    remote: None,
+                    json: false,
+                    verbose: true
+                }
+            })
+        ));
+        assert!(matches!(
             Cli::try_parse_from(["tkr", "observability", "check", "--timeout-seconds", "15"])
                 .unwrap()
                 .command,
@@ -391,7 +405,19 @@ mod tests {
         ));
         assert!(matches!(
             Cli::try_parse_from(["tkr", "version"]).unwrap().command,
-            Command::Version
+            Command::Version {
+                verbose: false,
+                json: false
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["tkr", "version", "--verbose"])
+                .unwrap()
+                .command,
+            Command::Version {
+                verbose: true,
+                json: false
+            }
         ));
     }
 

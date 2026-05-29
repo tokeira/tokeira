@@ -36,9 +36,10 @@ use tokeira_proto::{
     },
     enums,
     public::temporal::api::{
-        command::v1 as command, common::v1 as proto_common, failure::v1 as failure_proto,
-        namespace::v1 as namespace_proto, replication::v1 as replication_proto,
-        taskqueue::v1 as taskqueue_proto, version::v1 as version_proto, workflow::v1 as workflow,
+        activity::v1 as activity_proto, command::v1 as command, common::v1 as proto_common,
+        failure::v1 as failure_proto, namespace::v1 as namespace_proto,
+        replication::v1 as replication_proto, taskqueue::v1 as taskqueue_proto,
+        version::v1 as version_proto, workflow::v1 as workflow,
     },
     workflowservice,
 };
@@ -2183,6 +2184,28 @@ pub fn respond_activity_completed_to_proto() -> workflowservice::RespondActivity
     workflowservice::RespondActivityTaskCompletedResponse {}
 }
 
+pub fn respond_activity_completed_by_id_to_edge(
+    req: workflowservice::RespondActivityTaskCompletedByIdRequest,
+) -> Result<crate::translate::RespondActivityTaskCompletedByIdRequest, ProtoConversionError> {
+    Ok(crate::translate::RespondActivityTaskCompletedByIdRequest {
+        namespace: req.namespace,
+        workflow_id: req.workflow_id,
+        run_id: non_empty(req.run_id),
+        activity_id: req.activity_id,
+        result: req
+            .result
+            .as_ref()
+            .map(payloads_to_domain)
+            .unwrap_or_default(),
+        identity: req.identity,
+    })
+}
+
+pub fn respond_activity_completed_by_id_to_proto()
+-> workflowservice::RespondActivityTaskCompletedByIdResponse {
+    workflowservice::RespondActivityTaskCompletedByIdResponse {}
+}
+
 pub fn respond_activity_failed_to_edge(
     req: workflowservice::RespondActivityTaskFailedRequest,
 ) -> Result<crate::translate::RespondActivityTaskFailedRequest, ProtoConversionError> {
@@ -2213,12 +2236,80 @@ pub fn respond_activity_failed_to_proto() -> workflowservice::RespondActivityTas
     }
 }
 
+pub fn respond_activity_failed_by_id_to_edge(
+    req: workflowservice::RespondActivityTaskFailedByIdRequest,
+) -> Result<crate::translate::RespondActivityTaskFailedByIdRequest, ProtoConversionError> {
+    let (failure, failure_error_type, is_non_retryable) = match req.failure {
+        Some(f) => {
+            let (error_type, non_retryable) = activity_retry_classification(&f);
+            (failure_to_payload(&f), error_type, non_retryable)
+        }
+        None => (
+            failure_to_payload(&failure_proto::Failure::default()),
+            None,
+            false,
+        ),
+    };
+    Ok(crate::translate::RespondActivityTaskFailedByIdRequest {
+        namespace: req.namespace,
+        workflow_id: req.workflow_id,
+        run_id: non_empty(req.run_id),
+        activity_id: req.activity_id,
+        failure,
+        failure_error_type,
+        is_non_retryable,
+        identity: req.identity,
+    })
+}
+
+pub fn respond_activity_failed_by_id_to_proto()
+-> workflowservice::RespondActivityTaskFailedByIdResponse {
+    workflowservice::RespondActivityTaskFailedByIdResponse {
+        ..Default::default()
+    }
+}
+
+pub fn respond_activity_canceled_to_edge(
+    req: workflowservice::RespondActivityTaskCanceledRequest,
+) -> Result<crate::translate::RespondActivityTaskCanceledRequest, ProtoConversionError> {
+    let token = deserialize_activity_token(&req.task_token)?;
+    Ok(crate::translate::RespondActivityTaskCanceledRequest {
+        token,
+        details: req.details.as_ref().map(payloads_to_domain),
+        identity: req.identity,
+    })
+}
+
+pub fn respond_activity_canceled_to_proto() -> workflowservice::RespondActivityTaskCanceledResponse
+{
+    workflowservice::RespondActivityTaskCanceledResponse {}
+}
+
+pub fn respond_activity_canceled_by_id_to_edge(
+    req: workflowservice::RespondActivityTaskCanceledByIdRequest,
+) -> Result<crate::translate::RespondActivityTaskCanceledByIdRequest, ProtoConversionError> {
+    Ok(crate::translate::RespondActivityTaskCanceledByIdRequest {
+        namespace: req.namespace,
+        workflow_id: req.workflow_id,
+        run_id: non_empty(req.run_id),
+        activity_id: req.activity_id,
+        details: req.details.as_ref().map(payloads_to_domain),
+        identity: req.identity,
+    })
+}
+
+pub fn respond_activity_canceled_by_id_to_proto()
+-> workflowservice::RespondActivityTaskCanceledByIdResponse {
+    workflowservice::RespondActivityTaskCanceledByIdResponse {}
+}
+
 pub fn record_heartbeat_to_edge(
     req: workflowservice::RecordActivityTaskHeartbeatRequest,
 ) -> Result<crate::translate::RecordActivityTaskHeartbeatRequest, ProtoConversionError> {
     let token = deserialize_activity_token(&req.task_token)?;
     Ok(crate::translate::RecordActivityTaskHeartbeatRequest {
         token,
+        details: req.details.as_ref().map(payloads_to_domain),
         identity: req.identity,
     })
 }
@@ -2230,6 +2321,98 @@ pub fn record_heartbeat_to_proto(
         cancel_requested: resp.cancel_requested,
         activity_paused: false,
         activity_reset: false,
+    }
+}
+
+pub fn record_activity_heartbeat_by_id_to_edge(
+    req: workflowservice::RecordActivityTaskHeartbeatByIdRequest,
+) -> Result<crate::translate::RecordActivityTaskHeartbeatByIdRequest, ProtoConversionError> {
+    Ok(crate::translate::RecordActivityTaskHeartbeatByIdRequest {
+        namespace: req.namespace,
+        workflow_id: req.workflow_id,
+        run_id: non_empty(req.run_id),
+        activity_id: req.activity_id,
+        details: req.details.as_ref().map(payloads_to_domain),
+        identity: req.identity,
+    })
+}
+
+pub fn record_activity_heartbeat_by_id_to_proto(
+    resp: crate::translate::RecordActivityTaskHeartbeatByIdResponse,
+) -> workflowservice::RecordActivityTaskHeartbeatByIdResponse {
+    workflowservice::RecordActivityTaskHeartbeatByIdResponse {
+        cancel_requested: resp.cancel_requested,
+        activity_paused: false,
+        activity_reset: false,
+    }
+}
+
+fn activity_options_to_edge(
+    value: &activity_proto::ActivityOptions,
+) -> crate::translate::ActivityOptions {
+    crate::translate::ActivityOptions {
+        task_queue: value.task_queue.as_ref().map(|queue| queue.name.clone()),
+        schedule_to_close_timeout: proto_duration_to_time(value.schedule_to_close_timeout.as_ref()),
+        schedule_to_start_timeout: proto_duration_to_time(value.schedule_to_start_timeout.as_ref()),
+        start_to_close_timeout: proto_duration_to_time(value.start_to_close_timeout.as_ref()),
+        heartbeat_timeout: proto_duration_to_time(value.heartbeat_timeout.as_ref()),
+        retry_policy: value.retry_policy.as_ref().map(retry_policy_to_domain),
+    }
+}
+
+fn activity_options_to_proto(
+    value: &crate::translate::ActivityOptions,
+) -> activity_proto::ActivityOptions {
+    activity_proto::ActivityOptions {
+        task_queue: value.task_queue.as_ref().map(|name| {
+            tokeira_proto::conversions::common::task_queue_from_domain(
+                &tokeira_types::TaskQueueName(name.clone()),
+            )
+        }),
+        schedule_to_close_timeout: value.schedule_to_close_timeout.map(to_proto_duration),
+        schedule_to_start_timeout: value.schedule_to_start_timeout.map(to_proto_duration),
+        start_to_close_timeout: value.start_to_close_timeout.map(to_proto_duration),
+        heartbeat_timeout: value.heartbeat_timeout.map(to_proto_duration),
+        retry_policy: value.retry_policy.as_ref().map(retry_policy_from_domain),
+        priority: None,
+    }
+}
+
+pub fn update_activity_options_to_edge(
+    req: workflowservice::UpdateActivityOptionsRequest,
+) -> Result<crate::translate::UpdateActivityOptionsRequest, ProtoConversionError> {
+    use workflowservice::update_activity_options_request::Activity;
+    let execution = req.execution.ok_or(ProtoConversionError::MissingField(
+        "UpdateActivityOptionsRequest.execution",
+    ))?;
+    let target = match req.activity.ok_or(ProtoConversionError::MissingField(
+        "UpdateActivityOptionsRequest.activity",
+    ))? {
+        Activity::Id(activity_id) => crate::translate::ActivityTarget::Id(activity_id),
+        Activity::Type(activity_type) => crate::translate::ActivityTarget::Type(activity_type),
+        Activity::MatchAll(_) => crate::translate::ActivityTarget::MatchAll,
+    };
+    Ok(crate::translate::UpdateActivityOptionsRequest {
+        namespace: req.namespace,
+        workflow_id: execution.workflow_id,
+        run_id: non_empty(execution.run_id),
+        identity: req.identity,
+        activity_options: req.activity_options.as_ref().map(activity_options_to_edge),
+        update_mask: req.update_mask.map(|mask| mask.paths).unwrap_or_default(),
+        target,
+        restore_original: req.restore_original,
+        activity_type: None,
+    })
+}
+
+pub fn update_activity_options_to_proto(
+    resp: crate::translate::UpdateActivityOptionsResponse,
+) -> workflowservice::UpdateActivityOptionsResponse {
+    workflowservice::UpdateActivityOptionsResponse {
+        activity_options: resp
+            .activity_options
+            .as_ref()
+            .map(activity_options_to_proto),
     }
 }
 
@@ -2574,6 +2757,81 @@ mod tests {
     }
 
     #[test]
+    fn system_info_proto_uses_only_upstream_wire_fields() {
+        const REQUEST_RESPONSE_PROTO: &str = include_str!(
+            "../../../../proto/upstream/temporal/api/workflowservice/v1/request_response.proto"
+        );
+        const EXPECTED_CAPABILITY_FIELDS: &[&str] = &[
+            "signal_and_query_header",
+            "internal_error_differentiation",
+            "activity_failure_include_heartbeat",
+            "supports_schedules",
+            "encoded_failure_attributes",
+            "build_id_based_versioning",
+            "upsert_memo",
+            "eager_workflow_start",
+            "sdk_metadata",
+            "count_group_by_execution_status",
+            "nexus",
+            "server_scaled_deployments",
+        ];
+
+        let proto = system_info_to_proto(SystemInfo {
+            server_version: "1.27.0".to_string(),
+            capabilities: crate::translate::SystemCapabilities {
+                signal_and_query_header: true,
+                internal_error_differentiation: true,
+                activity_failure_include_heartbeat: false,
+                supports_schedules: false,
+                encoded_failure_attributes: true,
+                build_id_based_versioning: true,
+                upsert_memo: false,
+                eager_workflow_start: false,
+                sdk_metadata: false,
+                count_group_by_execution_status: true,
+                nexus: true,
+                server_scaled_deployments: false,
+                worker_heartbeats: true,
+            },
+        });
+
+        assert_eq!(proto.server_version, "1.27.0");
+        assert!(proto.capabilities.is_some());
+        assert_eq!(
+            get_system_info_capability_fields(REQUEST_RESPONSE_PROTO),
+            EXPECTED_CAPABILITY_FIELDS
+        );
+        assert!(
+            !REQUEST_RESPONSE_PROTO
+                .split("message GetSystemInfoResponse")
+                .nth(1)
+                .expect("GetSystemInfoResponse")
+                .contains("tokeira"),
+            "upstream GetSystemInfoResponse must not carry Tokeira-specific fields"
+        );
+    }
+
+    fn get_system_info_capability_fields(proto: &str) -> Vec<&str> {
+        let response = proto
+            .split("message GetSystemInfoResponse")
+            .nth(1)
+            .expect("GetSystemInfoResponse message");
+        let capabilities = response
+            .split("message Capabilities")
+            .nth(1)
+            .expect("GetSystemInfoResponse.Capabilities message");
+
+        capabilities
+            .lines()
+            .map(str::trim)
+            .take_while(|line| *line != "}")
+            .filter_map(|line| line.strip_prefix("bool "))
+            .filter_map(|line| line.split_once(' '))
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    #[test]
     fn command_without_attributes_returns_missing_field() {
         let err = proto_command_to_workflow_command(command::Command {
             attributes: None,
@@ -2633,6 +2891,206 @@ mod tests {
         };
         let proto = record_heartbeat_to_proto(resp);
         assert!(!proto.cancel_requested);
+    }
+
+    #[test]
+    fn activity_heartbeat_translators_preserve_details() {
+        use tokeira_proto::conversions::common::payloads_from_domain;
+        let details = Payloads(vec![tokeira_types::Payload {
+            data: b"progress".to_vec(),
+            metadata: Default::default(),
+        }]);
+        let token = ActivityTaskToken {
+            run_key: RunKey(Uuid::nil()),
+            activity_id: "activity-1".to_string(),
+            schedule_event_id: 7,
+            attempt: 2,
+            shard_epoch: tokeira_types::ShardEpoch(3),
+        };
+
+        let token_edge =
+            record_heartbeat_to_edge(workflowservice::RecordActivityTaskHeartbeatRequest {
+                task_token: serialize_activity_token(&token),
+                details: Some(payloads_from_domain(&details)),
+                identity: "worker".to_string(),
+                ..Default::default()
+            })
+            .expect("token heartbeat should translate");
+        assert_eq!(token_edge.details, Some(details.clone()));
+
+        let by_id_edge = record_activity_heartbeat_by_id_to_edge(
+            workflowservice::RecordActivityTaskHeartbeatByIdRequest {
+                namespace: "default".to_string(),
+                workflow_id: "workflow".to_string(),
+                activity_id: "activity-1".to_string(),
+                details: Some(payloads_from_domain(&details)),
+                identity: "worker".to_string(),
+                ..Default::default()
+            },
+        )
+        .expect("by-id heartbeat should translate");
+        assert_eq!(by_id_edge.details, Some(details));
+    }
+
+    #[test]
+    fn activity_by_id_translators_preserve_run_identity_and_payloads() {
+        use tokeira_proto::conversions::common::payloads_from_domain;
+        let payloads = Payloads(vec![tokeira_types::Payload {
+            data: b"payload".to_vec(),
+            metadata: Default::default(),
+        }]);
+
+        let completed = respond_activity_completed_by_id_to_edge(
+            workflowservice::RespondActivityTaskCompletedByIdRequest {
+                namespace: "default".to_string(),
+                workflow_id: "workflow".to_string(),
+                run_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                activity_id: "activity-1".to_string(),
+                result: Some(payloads_from_domain(&payloads)),
+                identity: "worker-a".to_string(),
+                ..Default::default()
+            },
+        )
+        .expect("completed by-id request should translate");
+        assert_eq!(
+            completed.run_id.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+        assert_eq!(completed.result, payloads);
+        assert_eq!(completed.identity, "worker-a");
+
+        let failed = respond_activity_failed_by_id_to_edge(
+            workflowservice::RespondActivityTaskFailedByIdRequest {
+                namespace: "default".to_string(),
+                workflow_id: "workflow".to_string(),
+                run_id: String::new(),
+                activity_id: "activity-1".to_string(),
+                failure: Some(failure_proto::Failure {
+                    message: "boom".to_string(),
+                    ..Default::default()
+                }),
+                identity: "worker-b".to_string(),
+                ..Default::default()
+            },
+        )
+        .expect("failed by-id request should translate");
+        assert_eq!(failed.run_id, None);
+        assert_eq!(failed.identity, "worker-b");
+        assert!(
+            failed
+                .failure
+                .data
+                .windows(4)
+                .any(|window| window == b"boom")
+        );
+
+        let canceled = respond_activity_canceled_by_id_to_edge(
+            workflowservice::RespondActivityTaskCanceledByIdRequest {
+                namespace: "default".to_string(),
+                workflow_id: "workflow".to_string(),
+                activity_id: "activity-1".to_string(),
+                details: Some(payloads_from_domain(&payloads)),
+                identity: "worker-c".to_string(),
+                ..Default::default()
+            },
+        )
+        .expect("canceled by-id request should translate");
+        assert_eq!(canceled.details, Some(payloads));
+        assert_eq!(canceled.identity, "worker-c");
+    }
+
+    #[test]
+    fn activity_token_translators_reject_malformed_tokens() {
+        let err = respond_activity_canceled_to_edge(
+            workflowservice::RespondActivityTaskCanceledRequest {
+                task_token: b"not-json".to_vec(),
+                ..Default::default()
+            },
+        )
+        .expect_err("malformed activity token should fail translation");
+
+        match err {
+            ProtoConversionError::InvalidTaskToken(_) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_activity_options_translation_preserves_target_variants() {
+        use workflowservice::update_activity_options_request::Activity;
+
+        let base = workflowservice::UpdateActivityOptionsRequest {
+            namespace: "default".to_string(),
+            execution: Some(tokeira_proto::common::WorkflowExecution {
+                workflow_id: "workflow".to_string(),
+                run_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                ..Default::default()
+            }),
+            identity: "operator".to_string(),
+            activity_options: Some(activity_proto::ActivityOptions {
+                task_queue: Some(taskqueue::TaskQueue {
+                    name: "queue-b".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            update_mask: Some(prost_types::FieldMask {
+                paths: vec!["task_queue".to_string()],
+            }),
+            ..Default::default()
+        };
+
+        let id_edge =
+            update_activity_options_to_edge(workflowservice::UpdateActivityOptionsRequest {
+                activity: Some(Activity::Id("activity-1".to_string())),
+                ..base.clone()
+            })
+            .expect("id target should translate");
+        assert_eq!(
+            id_edge.target,
+            crate::translate::ActivityTarget::Id("activity-1".to_string())
+        );
+
+        let type_edge =
+            update_activity_options_to_edge(workflowservice::UpdateActivityOptionsRequest {
+                activity: Some(Activity::Type("ActivityType".to_string())),
+                ..base
+            })
+            .expect("type target should translate for handler rejection");
+        assert_eq!(
+            type_edge.target,
+            crate::translate::ActivityTarget::Type("ActivityType".to_string())
+        );
+    }
+
+    #[test]
+    fn update_activity_options_translation_requires_execution_and_target() {
+        let err = update_activity_options_to_edge(workflowservice::UpdateActivityOptionsRequest {
+            activity: Some(
+                workflowservice::update_activity_options_request::Activity::Id(
+                    "activity-1".to_string(),
+                ),
+            ),
+            ..Default::default()
+        })
+        .expect_err("missing execution should fail");
+        assert!(matches!(
+            err,
+            ProtoConversionError::MissingField("UpdateActivityOptionsRequest.execution")
+        ));
+
+        let err = update_activity_options_to_edge(workflowservice::UpdateActivityOptionsRequest {
+            execution: Some(tokeira_proto::common::WorkflowExecution {
+                workflow_id: "workflow".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .expect_err("missing target should fail");
+        assert!(matches!(
+            err,
+            ProtoConversionError::MissingField("UpdateActivityOptionsRequest.activity")
+        ));
     }
 
     #[test]

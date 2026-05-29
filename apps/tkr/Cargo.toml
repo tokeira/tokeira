@@ -29,6 +29,8 @@ toml.workspace = true
 toml_edit.workspace = true
 tokeira-config.workspace = true
 tokeira-aws.workspace = true
+tokeira-build-info.workspace = true
+tokeira-compatibility.workspace = true
 tokeira-remote-workstation = { path = "../../crates/tokeira-remote-workstation" }
 tokeira-build.workspace = true
 tokeira-deploy-engine = { path = "../../crates/tokeira-deploy-engine" }

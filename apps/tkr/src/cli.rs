@@ -96,6 +96,8 @@ pub enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    Compat(CompatArgs),
+    Ci(CiArgs),
     Observability {
         #[command(subcommand)]
         action: ObservabilityAction,
@@ -113,7 +115,12 @@ pub enum Command {
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
     },
-    Version,
+    Version {
+        #[arg(long)]
+        verbose: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -156,6 +163,58 @@ pub enum DeploymentAction {
 pub struct ImageArgs {
     #[command(subcommand)]
     pub command: ImageCommand,
+}
+
+#[derive(Args)]
+pub struct CompatArgs {
+    #[command(subcommand)]
+    pub command: CompatCommand,
+}
+
+#[derive(Args)]
+pub struct CiArgs {
+    #[command(subcommand)]
+    pub command: CiCommand,
+}
+
+#[derive(Subcommand)]
+pub enum CompatCommand {
+    Show {
+        #[arg(long)]
+        remote: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        verbose: bool,
+    },
+    Diff {
+        #[arg(long)]
+        a: String,
+        #[arg(long)]
+        b: String,
+        #[arg(long)]
+        fail_on_incompatible: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CiCommand {
+    Check {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        update_lock: bool,
+    },
+    Build {
+        #[arg(long)]
+        versioned: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    LockUpdate {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]

@@ -1,8 +1,13 @@
-//! `tkr version` — print the CLI's `CARGO_PKG_VERSION` from its
-//! `Cargo.toml` (workspace-inherited). Trivial by design; kept as a
-//! separate module so it slots into the dispatch pattern without special
-//! cases.
+//! `tkr version` — print compile-time build provenance embedded in the CLI.
 
-pub fn run() {
-    println!("{}", env!("CARGO_PKG_VERSION"));
+pub fn run(verbose: bool, json: bool) {
+    let info = tokeira_build_info::summary();
+    let rendered = if json {
+        crate::output::build_info::format_version_json(&info)
+    } else if verbose {
+        crate::output::build_info::format_version_verbose(&info)
+    } else {
+        crate::output::build_info::format_version_short(&info)
+    };
+    println!("{rendered}");
 }

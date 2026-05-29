@@ -20,6 +20,9 @@ pub enum EdgeError {
     #[error("bad request: {0}")]
     BadRequest(String),
 
+    #[error("unimplemented: {0}")]
+    Unimplemented(String),
+
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 
@@ -42,6 +45,20 @@ pub enum EdgeError {
     WorkflowNotFound {
         namespace: String,
         workflow_id: String,
+    },
+
+    #[error("activity not found: {namespace}/{workflow_id}/{activity_id}")]
+    ActivityNotFound {
+        namespace: String,
+        workflow_id: String,
+        activity_id: String,
+    },
+
+    #[error("activity has not started: {namespace}/{workflow_id}/{activity_id}")]
+    ActivityNotStarted {
+        namespace: String,
+        workflow_id: String,
+        activity_id: String,
     },
 
     #[error("workflow already started: {namespace}/{workflow_id} ({run_id})")]
@@ -89,11 +106,14 @@ impl EdgeError {
     pub fn status_code(&self) -> StatusCode {
         match self {
             EdgeError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            EdgeError::Unimplemented(_) => StatusCode::NOT_IMPLEMENTED,
             EdgeError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             EdgeError::Forbidden { .. } => StatusCode::FORBIDDEN,
             EdgeError::NamespaceNotFound(_)
             | EdgeError::WorkflowNotFound { .. }
+            | EdgeError::ActivityNotFound { .. }
             | EdgeError::BatchOperationNotFound { .. } => StatusCode::NOT_FOUND,
+            EdgeError::ActivityNotStarted { .. } => StatusCode::PRECONDITION_FAILED,
             EdgeError::WorkflowAlreadyStarted { .. }
             | EdgeError::BatchOperationAlreadyExists { .. } => StatusCode::CONFLICT,
             EdgeError::NamespaceDeleted(_) => StatusCode::GONE,
@@ -109,12 +129,15 @@ impl EdgeError {
     pub fn action_name(&self) -> &'static str {
         match self {
             EdgeError::BadRequest(_) => "bad_request",
+            EdgeError::Unimplemented(_) => "unimplemented",
             EdgeError::Unauthorized(_) => "unauthorized",
             EdgeError::Forbidden { .. } => "forbidden",
             EdgeError::NamespaceNotFound(_) => "namespace_not_found",
             EdgeError::NamespaceDeleted(_) => "namespace_deleted",
             EdgeError::NamespaceAlreadyExists(_) => "namespace_already_exists",
             EdgeError::WorkflowNotFound { .. } => "workflow_not_found",
+            EdgeError::ActivityNotFound { .. } => "activity_not_found",
+            EdgeError::ActivityNotStarted { .. } => "activity_not_started",
             EdgeError::WorkflowAlreadyStarted { .. } => "workflow_already_started",
             EdgeError::BatchOperationAlreadyExists { .. } => "batch_operation_already_exists",
             EdgeError::BatchOperationNotFound { .. } => "batch_operation_not_found",

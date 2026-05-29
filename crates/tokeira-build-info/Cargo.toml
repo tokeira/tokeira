@@ -1,0 +1,19 @@
+[package]
+name = "tokeira-build-info"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Compile-time build and compatibility metadata for Tokeira"
+
+[dependencies]
+
+[build-dependencies]
+regex = "1"
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

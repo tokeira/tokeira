@@ -1,0 +1,12 @@
+[package]
+name = "tokeira-compatibility-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+buffa = { version = "0.6", features = ["json"] }
+connectrpc = { version = "0.6", features = ["server"] }
+tokeira-build-info.workspace = true
+tokeira-compatibility.workspace = true
+tokeira-compatibility-proto.workspace = true

@@ -42,7 +42,7 @@ use crate::{
     broker::{InMemoryActivityBroker, InMemoryBroker, ReservedPoller, WorkflowPollResult},
     buffered_queries::{BufferedQuery, BufferedQueryRegistry},
     drain::RuntimeDrain,
-    errors::NotShardOwner,
+    errors::{ActivityTokenResolutionError, NotShardOwner},
     fairness::{DeliveryMetrics, FairnessState, run_control_loop},
     heartbeat::{InMemoryHeartbeatStore, spawn_heartbeat_maintenance},
     lane::{LaneConfig, LaneHandle, spawn_lane_with_id},

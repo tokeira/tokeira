@@ -338,6 +338,19 @@ pub struct RespondActivityTaskCompletedRequest {
 pub struct RespondActivityTaskCompletedResponse;
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct RespondActivityTaskCompletedByIdRequest {
+    pub namespace: String,
+    pub workflow_id: String,
+    pub run_id: Option<String>,
+    pub activity_id: String,
+    pub result: Payloads,
+    pub identity: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RespondActivityTaskCompletedByIdResponse;
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct RespondActivityTaskFailedRequest {
     pub token: ActivityTaskToken,
     pub failure: Payload,
@@ -350,13 +363,67 @@ pub struct RespondActivityTaskFailedRequest {
 pub struct RespondActivityTaskFailedResponse;
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct RespondActivityTaskFailedByIdRequest {
+    pub namespace: String,
+    pub workflow_id: String,
+    pub run_id: Option<String>,
+    pub activity_id: String,
+    pub failure: Payload,
+    pub failure_error_type: Option<String>,
+    pub is_non_retryable: bool,
+    pub identity: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RespondActivityTaskFailedByIdResponse;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RespondActivityTaskCanceledRequest {
+    pub token: ActivityTaskToken,
+    pub details: Option<Payloads>,
+    pub identity: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RespondActivityTaskCanceledResponse;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RespondActivityTaskCanceledByIdRequest {
+    pub namespace: String,
+    pub workflow_id: String,
+    pub run_id: Option<String>,
+    pub activity_id: String,
+    pub details: Option<Payloads>,
+    pub identity: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RespondActivityTaskCanceledByIdResponse;
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct RecordActivityTaskHeartbeatRequest {
     pub token: ActivityTaskToken,
+    pub details: Option<Payloads>,
     pub identity: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecordActivityTaskHeartbeatResponse {
+    pub cancel_requested: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordActivityTaskHeartbeatByIdRequest {
+    pub namespace: String,
+    pub workflow_id: String,
+    pub run_id: Option<String>,
+    pub activity_id: String,
+    pub details: Option<Payloads>,
+    pub identity: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordActivityTaskHeartbeatByIdResponse {
     pub cancel_requested: bool,
 }
 

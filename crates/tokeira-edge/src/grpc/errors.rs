@@ -7,6 +7,7 @@ impl From<EdgeError> for Status {
     fn from(err: EdgeError) -> Self {
         match err {
             EdgeError::BadRequest(message) => Status::invalid_argument(message),
+            EdgeError::Unimplemented(message) => Status::unimplemented(message),
             EdgeError::Unauthorized(message) => Status::unauthenticated(message),
             EdgeError::Forbidden { action, namespace } => {
                 let message = match namespace {
@@ -24,6 +25,18 @@ impl From<EdgeError> for Status {
                 namespace,
                 workflow_id,
             } => Status::not_found(format!("{namespace}/{workflow_id}")),
+            EdgeError::ActivityNotFound {
+                namespace,
+                workflow_id,
+                activity_id,
+            } => Status::not_found(format!("{namespace}/{workflow_id}/{activity_id}")),
+            EdgeError::ActivityNotStarted {
+                namespace,
+                workflow_id,
+                activity_id,
+            } => Status::failed_precondition(format!(
+                "{namespace}/{workflow_id}/{activity_id} has not started"
+            )),
             EdgeError::WorkflowAlreadyStarted {
                 namespace,
                 workflow_id,
@@ -106,6 +119,10 @@ mod tests {
                 Code::InvalidArgument,
             ),
             (
+                EdgeError::Unimplemented("todo".to_string()),
+                Code::Unimplemented,
+            ),
+            (
                 EdgeError::Unauthorized("nope".to_string()),
                 Code::Unauthenticated,
             ),
@@ -126,6 +143,22 @@ mod tests {
                     workflow_id: "wf".to_string(),
                 },
                 Code::NotFound,
+            ),
+            (
+                EdgeError::ActivityNotFound {
+                    namespace: "default".to_string(),
+                    workflow_id: "wf".to_string(),
+                    activity_id: "act".to_string(),
+                },
+                Code::NotFound,
+            ),
+            (
+                EdgeError::ActivityNotStarted {
+                    namespace: "default".to_string(),
+                    workflow_id: "wf".to_string(),
+                    activity_id: "act".to_string(),
+                },
+                Code::FailedPrecondition,
             ),
             (
                 EdgeError::WorkflowAlreadyStarted {

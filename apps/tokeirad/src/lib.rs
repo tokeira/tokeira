@@ -254,6 +254,11 @@ fn dsql_coordination_table_names(config: &TokeiraConfig) -> (String, String) {
 /// serves the gRPC stack on `infrastructure.network.grpc_addr` until
 /// Ctrl-C.
 pub async fn run_from_cli(cli: Cli) -> Result<()> {
+    if cli.version {
+        println!("{}", render_build_info(cli.verbose, cli.json));
+        return Ok(());
+    }
+
     let (effective_config, config_source) = TokeiraConfig::resolve(cli.config.as_deref())?;
     if cli.dump_config {
         println!("{}", effective_config.to_toml()?);
@@ -268,6 +273,7 @@ pub async fn run_from_cli(cli: Cli) -> Result<()> {
         readiness.registry.clone(),
     )
     .await?;
+    log_build_info("tokeirad");
     for warning in effective_config.emergency_warnings() {
         tracing::warn!("{warning}");
     }
@@ -294,6 +300,61 @@ pub async fn run_from_cli(cli: Cli) -> Result<()> {
         .context("tokeirad server task panicked")?
         .context("tokeirad server task returned an error")?;
     Ok(())
+}
+
+fn log_build_info(process: &'static str) {
+    let info = tokeira_build_info::summary();
+    tracing::info!(
+        process,
+        tokeira_version = info.tokeira_version,
+        tokeira_git_sha = info.tokeira_git_sha,
+        temporal_proto_version = info.temporal_proto_version,
+        temporal_server_compat = info.temporal_server_compat,
+        rust_toolchain = info.rust_toolchain,
+        source_tree_hash = info.source_tree_hash,
+        feature_matrix_digest = info.feature_matrix_digest,
+        sdk_matrix_digest = info.sdk_matrix_digest,
+        build_mode = info.build_mode,
+        "tokeira build provenance"
+    );
+}
+
+fn render_build_info(verbose: bool, json: bool) -> String {
+    let info = tokeira_build_info::summary();
+    if json {
+        return serde_json::json!({
+            "tokeira_version": info.tokeira_version,
+            "tokeira_git_sha": info.tokeira_git_sha,
+            "temporal_proto_version": info.temporal_proto_version,
+            "temporal_server_compat": info.temporal_server_compat,
+            "rust_toolchain": info.rust_toolchain,
+            "source_tree_hash": info.source_tree_hash,
+            "feature_matrix_digest": info.feature_matrix_digest,
+            "sdk_matrix_digest": info.sdk_matrix_digest,
+            "build_mode": info.build_mode,
+        })
+        .to_string();
+    }
+
+    if verbose {
+        return [
+            format!("tokeira_version: {}", info.tokeira_version),
+            format!("tokeira_git_sha: {}", info.tokeira_git_sha),
+            format!("temporal_proto_version: {}", info.temporal_proto_version),
+            format!("temporal_server_compat: {}", info.temporal_server_compat),
+            format!("rust_toolchain: {}", info.rust_toolchain),
+            format!("source_tree_hash: {}", info.source_tree_hash),
+            format!("feature_matrix_digest: {}", info.feature_matrix_digest),
+            format!("sdk_matrix_digest: {}", info.sdk_matrix_digest),
+            format!("build_mode: {}", info.build_mode),
+        ]
+        .join("\n");
+    }
+
+    format!(
+        "tokeira {}\ngit {}\nbuild {}",
+        info.tokeira_version, info.tokeira_git_sha, info.build_mode
+    )
 }
 
 /// Build the full server stack and start serving on the given address.
@@ -751,8 +812,8 @@ fn membership_config(
         node_id,
         node_endpoint,
         zone: None,
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        build_id: env!("CARGO_PKG_VERSION").to_string(),
+        version: tokeira_build_info::TOKEIRA_VERSION.to_string(),
+        build_id: tokeira_build_info::TOKEIRA_GIT_SHA.to_string(),
     }
 }
 
@@ -902,6 +963,18 @@ pub fn __cli_parse() -> Cli {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_renderer_is_deterministic() {
+        let short = render_build_info(false, false);
+        let verbose = render_build_info(true, false);
+        let json = render_build_info(false, true);
+
+        assert_eq!(short, render_build_info(false, false));
+        assert_eq!(verbose, render_build_info(true, false));
+        assert_eq!(json, render_build_info(false, true));
+        assert!(json.contains("temporal_proto_version"));
+    }
 
     #[tokio::test]
     async fn build_nexus_endpoint_registry_resolves_worker_namespace_names() {

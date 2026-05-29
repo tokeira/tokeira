@@ -161,12 +161,86 @@ where
         Ok(())
     }
 
-    pub async fn record_activity_heartbeat(&self, token: ActivityTaskToken) -> Result<bool> {
+    pub async fn cancel_activity_task(
+        &self,
+        token: ActivityTaskToken,
+        details: Option<Payloads>,
+        worker_identity: Option<WorkerIdentity>,
+    ) -> Result<CommitResult> {
+        let activity_id = token.activity_id.clone();
+        self.validate_activity_token(&token).await?;
+        let result = self
+            .submit_for_owned_shard(
+                token.run_key,
+                Command::ActivityResolved(ActivityResolvedRequest {
+                    activity_id,
+                    resolution: ActivityResolution::Canceled { details },
+                    worker_identity,
+                    now: OffsetDateTime::now_utc(),
+                }),
+            )
+            .await?;
+        if matches!(
+            result,
+            CommitResult::Applied { .. } | CommitResult::Duplicate
+        ) {
+            self.activity_tracking
+                .remove(token.run_key, &token.activity_id);
+        }
+        Ok(result)
+    }
+
+    pub async fn record_activity_heartbeat(
+        &self,
+        token: ActivityTaskToken,
+        details: Option<Payloads>,
+    ) -> Result<bool> {
+        // Heartbeat details cross the runtime boundary for API parity, but the
+        // current in-memory tracker only stores liveness/cancel state.
+        let _ = details;
         self.validate_activity_token(&token).await?;
         Ok(self
             .activity_tracking
             .record_heartbeat(token.run_key, &token.activity_id, OffsetDateTime::now_utc())
             .unwrap_or(false))
+    }
+
+    pub async fn resolve_activity_token(
+        &self,
+        run_key: RunKey,
+        activity_id: &str,
+    ) -> std::result::Result<ActivityTaskToken, ActivityTokenResolutionError> {
+        let loaded = self
+            .repo
+            .load_run(run_key)
+            .await
+            .map_err(|error| ActivityTokenResolutionError::Runtime(error.to_string()))?;
+        let LoadedRun::Existing(state) = loaded else {
+            return Err(ActivityTokenResolutionError::RunNotFound { run_key });
+        };
+        let activity = state.activities.get(activity_id).ok_or_else(|| {
+            ActivityTokenResolutionError::ActivityNotFound {
+                run_key,
+                activity_id: activity_id.to_string(),
+            }
+        })?;
+        if activity.started_event_id.is_none() {
+            return Err(ActivityTokenResolutionError::ActivityNotStarted {
+                run_key,
+                activity_id: activity_id.to_string(),
+            });
+        }
+        let shard_epoch = self
+            .shard_epoch_for_completion(run_key)
+            .await
+            .map_err(|error| ActivityTokenResolutionError::Runtime(error.to_string()))?;
+        Ok(ActivityTaskToken {
+            run_key,
+            activity_id: activity_id.to_string(),
+            schedule_event_id: activity.schedule_event_id,
+            attempt: activity.attempt,
+            shard_epoch,
+        })
     }
 
     /// Resolve a Nexus operation back into its originator workflow.

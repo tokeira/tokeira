@@ -1620,6 +1620,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.9.0",
  "hyper-util",
+ "libc",
  "percent-encoding",
  "pin-project",
  "serde",
@@ -1628,6 +1629,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower 0.5.3",
+ "tower-http 0.6.8",
  "tracing",
  "wasm-bindgen-futures",
  "zstd",
@@ -6010,6 +6012,8 @@ dependencies = [
  "tempfile",
  "tokeira-aws",
  "tokeira-build",
+ "tokeira-build-info",
+ "tokeira-compatibility",
  "tokeira-compose-deployment",
  "tokeira-config",
  "tokeira-deploy-engine",
@@ -6062,6 +6066,7 @@ dependencies = [
  "aws-sdk-dynamodb",
  "time",
  "tokeira-autoscaler",
+ "tokeira-build-info",
  "tokeira-config",
  "tokeira-observability",
  "tokeira-storage",
@@ -6150,6 +6155,52 @@ dependencies = [
  "thiserror 2.0.18",
  "toml 0.8.23",
  "tracing",
+]
+
+[[package]]
+name = "tokeira-build-info"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "tempfile",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "tokeira-compatibility"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokeira-build-info",
+ "tracing",
+]
+
+[[package]]
+name = "tokeira-compatibility-proto"
+version = "0.1.0"
+dependencies = [
+ "buffa",
+ "buffa-types",
+ "connectrpc",
+ "connectrpc-build",
+ "http-body 1.0.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "walkdir",
+]
+
+[[package]]
+name = "tokeira-compatibility-service"
+version = "0.1.0"
+dependencies = [
+ "buffa",
+ "connectrpc",
+ "tokeira-build-info",
+ "tokeira-compatibility",
+ "tokeira-compatibility-proto",
 ]
 
 [[package]]
@@ -6255,6 +6306,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "serde",
  "time",
+ "tokeira-build-info",
  "tokeira-config",
  "tokeira-controller",
  "tokeira-observability",
@@ -6333,6 +6385,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "time",
+ "tokeira-compatibility",
  "tokeira-kernel",
  "tokeira-projection",
  "tokeira-proto",
@@ -6651,6 +6704,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "time",
+ "tokeira-build-info",
  "tokeira-config",
  "tokeira-edge",
  "tokeira-kernel",
@@ -7056,11 +7110,13 @@ dependencies = [
  "futures-util",
  "http 1.4.0",
  "http-body 1.0.1",
+ "http-body-util",
  "iri-string",
  "pin-project-lite",
  "tower 0.5.3",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]

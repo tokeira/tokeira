@@ -4,10 +4,12 @@ use anyhow::Result;
 use time::{Duration, OffsetDateTime};
 
 use tokeira_kernel::{
-    HistoryEventKind, StartRequest, WorkflowCommand, WorkflowTaskCompletedRequest,
+    Command, FieldChange, HistoryEventKind, LoadedRun, StartRequest, UpdateActivityOptionsRequest,
+    WorkflowCommand, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
+    ActivityTokenResolutionError, BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime,
+    WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -311,6 +313,208 @@ async fn republish_activity_queue_after_restart_restores_pollability() -> Result
         )
         .await?;
     assert!(started.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn resolve_activity_token_matches_started_activity() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = TokeiraRuntime::new(
+        store,
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
+    );
+    let namespace_id = NamespaceId::new();
+    let run_key = start_and_schedule_activity(
+        &runtime,
+        namespace_id,
+        WorkflowId("activity-by-id-token".to_string()),
+        "activity-1",
+        None,
+    )
+    .await?;
+
+    let started = runtime
+        .poll_activity_task(
+            activity_queue(namespace_id),
+            WorkerIdentity("worker-a".to_string()),
+            tokio::time::Duration::from_millis(5),
+        )
+        .await?
+        .expect("activity should be pollable");
+
+    let resolved = runtime
+        .resolve_activity_token(run_key, "activity-1")
+        .await
+        .expect("started activity should resolve to token");
+
+    assert_eq!(resolved, started.token);
+    Ok(())
+}
+
+#[tokio::test]
+async fn resolve_activity_token_distinguishes_missing_and_not_started() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = TokeiraRuntime::new(
+        store,
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
+    );
+    let namespace_id = NamespaceId::new();
+    let run_key = start_and_schedule_activity(
+        &runtime,
+        namespace_id,
+        WorkflowId("activity-by-id-errors".to_string()),
+        "activity-1",
+        None,
+    )
+    .await?;
+
+    let not_started = runtime
+        .resolve_activity_token(run_key, "activity-1")
+        .await
+        .expect_err("scheduled activity should not produce a completion token");
+    assert!(matches!(
+        not_started,
+        ActivityTokenResolutionError::ActivityNotStarted { .. }
+    ));
+
+    let missing = runtime
+        .resolve_activity_token(run_key, "missing-activity")
+        .await
+        .expect_err("missing activity should not resolve");
+    assert!(matches!(
+        missing,
+        ActivityTokenResolutionError::ActivityNotFound { .. }
+    ));
+
+    let missing_run = runtime
+        .resolve_activity_token(tokeira_types::RunKey::new(), "activity-1")
+        .await
+        .expect_err("missing run should not resolve");
+    assert!(matches!(
+        missing_run,
+        ActivityTokenResolutionError::RunNotFound { .. }
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancel_activity_task_emits_canceled_history_with_worker_identity() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = TokeiraRuntime::new(
+        store.clone(),
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
+    );
+    let namespace_id = NamespaceId::new();
+    let run_key = start_and_schedule_activity(
+        &runtime,
+        namespace_id,
+        WorkflowId("activity-cancel".to_string()),
+        "activity-1",
+        None,
+    )
+    .await?;
+
+    let started = runtime
+        .poll_activity_task(
+            activity_queue(namespace_id),
+            WorkerIdentity("worker-a".to_string()),
+            tokio::time::Duration::from_millis(5),
+        )
+        .await?
+        .expect("activity should be pollable");
+    let identity = WorkerIdentity("worker-a".to_string());
+    let details = payloads("cancel-details");
+
+    runtime
+        .cancel_activity_task(started.token, Some(details.clone()), Some(identity.clone()))
+        .await?;
+
+    let history = store.read_history(run_key, 0, 64).await?;
+    assert!(history.iter().any(|event| matches!(
+        &event.kind,
+        HistoryEventKind::ActivityTaskCanceled {
+            activity_id,
+            identity: event_identity,
+            details: event_details,
+            ..
+        } if activity_id == "activity-1"
+            && event_identity.as_ref() == Some(&identity)
+            && event_details.as_ref() == Some(&details)
+    )));
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_activity_options_applies_field_changes_to_scheduled_activity() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = TokeiraRuntime::new(
+        store.clone(),
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
+    );
+    let namespace_id = NamespaceId::new();
+    let run_key = start_and_schedule_activity(
+        &runtime,
+        namespace_id,
+        WorkflowId("activity-options".to_string()),
+        "activity-1",
+        None,
+    )
+    .await?;
+
+    runtime
+        .submit(
+            run_key,
+            Command::UpdateActivityOptions(UpdateActivityOptionsRequest {
+                activity_id: "activity-1".to_string(),
+                task_queue: FieldChange::Set(TaskQueueName("activity-q-b".to_string())),
+                schedule_to_close_timeout: FieldChange::Set(Some(Duration::minutes(9))),
+                schedule_to_start_timeout: FieldChange::Unchanged,
+                start_to_close_timeout: FieldChange::Set(Some(Duration::minutes(2))),
+                heartbeat_timeout: FieldChange::Clear,
+                request: RequestContext {
+                    request_id: RequestId("req-update-activity-options".to_string()),
+                    caller_identity: Some("operator".to_string()),
+                    received_at: OffsetDateTime::now_utc(),
+                },
+                now: OffsetDateTime::now_utc(),
+            }),
+        )
+        .await?;
+
+    let LoadedRun::Existing(state) = store.load_run(run_key).await? else {
+        panic!("run should exist after update");
+    };
+    let activity = state
+        .activities
+        .get("activity-1")
+        .expect("activity should still be tracked");
+
+    assert_eq!(
+        activity.task_queue,
+        TaskQueueName("activity-q-b".to_string())
+    );
+    assert_eq!(
+        activity.schedule_to_close_timeout,
+        Some(Duration::minutes(9))
+    );
+    assert_eq!(activity.start_to_close_timeout, Some(Duration::minutes(2)));
+    assert_eq!(activity.heartbeat_timeout, None);
     Ok(())
 }
 

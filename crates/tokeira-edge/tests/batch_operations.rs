@@ -170,7 +170,11 @@ impl WorkflowRuntimeApi for RecordingRuntime {
         unreachable!()
     }
 
-    async fn record_activity_heartbeat(&self, _token: ActivityTaskToken) -> Result<bool> {
+    async fn record_activity_heartbeat(
+        &self,
+        _token: ActivityTaskToken,
+        _details: Option<Payloads>,
+    ) -> Result<bool> {
         unreachable!()
     }
 

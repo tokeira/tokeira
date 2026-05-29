@@ -1,61 +1,162 @@
-# Requirements Document: Temporal Compatibility
+# Requirements Document
 
 ## Introduction
 
-Tokeira is a Temporal-compatible durable execution engine. The public contract is the Temporal gRPC API, the Temporal protobuf types, and the Temporal SDK behaviour expectations. Tokeira is an original Rust implementation that presents the same wire-level surface as the Temporal Go server; it is not a port.
+Tokeira is a Temporal-compatible durable execution engine implemented in Rust. Its compatibility promise must be explicit, testable, queryable, and bound to release artefacts.
 
-This spec makes compatibility explicit. It governs:
+Tokeira must preserve Temporal SDK compatibility without forking or extending Temporal’s upstream protobuf definitions. Standard Temporal SDKs must see a normal Temporal server surface. Tokeira-specific compatibility metadata, build provenance, feature state, and capability details must be exposed through Tokeira-owned protobuf services.
 
-1. Which version of the Temporal server release tokeira claims compatibility with.
-2. Which version of the Temporal protobuf definitions tokeira vendors.
-3. Which Temporal features tokeira implements, gates behind dynamic config, stubs for wire compatibility, or explicitly does not support.
-4. Which language SDK versions tokeira is known to work with.
-5. What compatibility metadata gets embedded in the `tokeirad` binary and exposed at runtime.
-6. How clients discover all of the above through the standard Temporal capability handshake.
+Tokeira has adopted Buffa and connect-rust for Tokeira-native gRPC communication, including controller and autoscaler control-plane APIs. This specification therefore requires any Tokeira-owned protobuf/RPC surface that exposes build, compatibility, feature, or capability metadata to use the Buffa + connect-rust stack.
 
-The spec owns the compatibility contract and the build-time metadata. It consumes the image build pipeline from [`image-lifecycle`](../image-lifecycle/requirements.md) (which passes git metadata as environment variables to the build) and informs [`ecs-deployment`](../ecs-deployment/requirements.md) and [`shard-placement-membership`](../shard-placement-membership/requirements.md) for mixed-version detection.
+Dagger is the authoritative build and CI substrate for Tokeira. Local developer checks, remote CI checks, generated-code validation, versioned builds, source-tree hashing, compatibility checks, and release artefact validation SHALL execute through the same Dagger functions. Build metadata SHALL be derived inside the Dagger execution graph from repository state and checked-in configuration. Build metadata SHALL NOT be supplied by ambient environment variables.
 
-### What this spec delivers
+Temporal upstream RPCs remain governed by the vendored Temporal API compatibility contract. Tokeira-owned RPCs use Tokeira-owned proto packages and Buffa/connect-rust generated code.
 
-- A new `tokeira-build-info` library crate that exposes compile-time constants for all compatibility metadata.
-- A `build.rs` in `tokeira-build-info` that reads values from environment variables, parses `rust-toolchain.toml`, and computes a source-tree hash.
-- A canonical `FeatureMatrix` in `tokeira-compatibility` (either a sibling crate or a module in `tokeira-build-info` — design phase decides) enumerating every Temporal feature tokeira exposes, each in one of four states.
-- A canonical `SdkMatrix` declaring minimum and maximum tested SDK versions per language.
-- A `GetSystemInfo` RPC implementation in `tokeira-edge` that walks the feature matrix and returns the correct capabilities blob to connecting clients.
-- A `tkr compat show` CLI subcommand that prints build-time metadata, the feature matrix with runtime state, and the SDK matrix — queryable both for local builds and against a running deployment.
-- A Dagger-backed local CI pipeline (Feature 10) invokable via `tkr ci check` that runs the no-wallclock and proto-monotonicity checks against the current workspace. Remote-trigger wiring is deferred to the `pipeline-foundation` spec.
-- Property tests enforcing matrix completeness (every Temporal RPC maps to exactly one state), capability-handshake consistency (every `capabilities.*` flag maps to a feature), and proto version monotonicity (bumps never downgrade).
+---
 
-### What this spec does NOT cover
+## Goals
 
-- The implementation of any Temporal feature. Each feature has its own spec.
-- Dynamic config itself (how experimental features get toggled at runtime). This spec declares the taxonomy; dynamic config is a separate concern.
-- Client-library version negotiation. SDKs negotiate via the capability handshake this spec defines; the SDK-side logic is not our concern.
-- Tokeira internal-state backward compatibility (state schemas, storage migration). Out of scope.
-- ABI or plugin compatibility. Tokeira does not ship plugin interfaces.
-- Remote CI triggers (GitHub Actions, nightly schedules, release pipelines). The Dagger pipeline landed by Feature 10 is the portable local substrate; remote-trigger wiring is owned by the `pipeline-foundation` spec (backlog P16) and will invoke the same `run_ci_checks` function so verdicts do not diverge.
+This specification SHALL define:
 
-### Cross-references
+1. build-time metadata and release provenance,
+2. Dagger as the authoritative local and remote build/CI substrate,
+3. programmatic derivation of build metadata from repository state,
+4. Temporal proto pinning and server compatibility claims,
+5. a canonical feature matrix,
+6. a broader compatibility-surface model beyond RPC names,
+7. a conservative SDK compatibility matrix,
+8. a strict upstream-compatible implementation of Temporal `GetSystemInfo`,
+9. a Tokeira-native compatibility service generated with Buffa and served with connect-rust,
+10. local and remote compatibility CLI commands,
+11. Dagger-based CI guardrails using Dagger lockfile support,
+12. manual compatibility bump governance.
 
-- [`image-lifecycle`](../image-lifecycle/requirements.md): The Dagger build pipeline passes git metadata (`TOKEIRA_GIT_SHA`, working-tree clean flag) as environment variables to the tokeirad build; `tokeira-build-info` reads them in its `build.rs`. Image-lifecycle's reproducible-build property depends on this spec excluding wall-clock timestamps from the binary. This spec reuses image-lifecycle's `DaggerClient` abstraction and `TOKEIRAD_WORKSPACE_EXCLUDES` for Feature 10.
-- [`shard-placement-membership`](../shard-placement-membership/requirements.md): Controller snapshots carry `TOKEIRA_VERSION` per node so the cluster detects mixed-version deployments.
-- [`ecs-deployment`](../ecs-deployment/requirements.md): Operators use `tkr exec` or `tkr compat show` against a live cluster to verify every task is on the same version before a rolling deployment proceeds.
-- [`tkr-cli`](../tkr-cli/requirements.md): Adds the `compat` and `ci` command groups.
-- [`pipeline-foundation`](../pipeline-foundation/requirements.md): Will consume Feature 10's `run_ci_checks` function as the single source of truth for compatibility checks, wiring it into remote triggers (GitHub Actions, nightly, release pipelines). Until `pipeline-foundation` lands, `tkr ci check` is the canonical local pre-push gate.
+---
+
+## Non-goals
+
+This specification SHALL NOT define:
+
+1. the implementation of every individual Temporal feature,
+2. storage schema compatibility,
+3. release automation,
+4. GitHub PR creation,
+5. automatic release-note scraping,
+6. full Temporal SDK conformance orchestration,
+7. Buildkite or other remote CI wiring,
+8. dashboards or long-term observability views.
+
+The previously proposed `tkr compat bump` automation is deferred. This specification may define metadata and checks that future automation consumes, but the MVP SHALL remain manually reviewable.
+
+---
+
+## Design Principles
+
+1. **Do not fork Temporal’s SDK-facing proto surface.**
+2. **Expose Tokeira metadata through Tokeira-owned services.**
+3. **Use Buffa + connect-rust for Tokeira-owned build and capability RPCs.**
+4. **Treat `TEMPORAL_SERVER_COMPAT` as an evidence-backed claim.**
+5. **Treat proto compatibility and behavioural compatibility as separate claims.**
+6. **Prefer conservative feature states until conformance evidence exists.**
+7. **Make compatibility metadata deterministic and digestible.**
+8. **Use Dagger as the build and CI authority.**
+9. **Derive build metadata; do not inject it.**
+10. **Use Dagger lockfiles to reduce CI supply-chain drift.**
+
+---
 
 ## Glossary
 
-- **TOKEIRA_VERSION**: The semver version of the `tokeirad` binary, read from `Cargo.toml` at build time (e.g., `0.1.0`). Identifies the tokeira release independently of any Temporal version.
-- **TOKEIRA_GIT_SHA**: The short git SHA (7 or 8 hex characters) of the source tree at build time, with a `-dirty` suffix if the working tree has uncommitted changes. Supplied to the build via the `TOKEIRA_GIT_SHA` environment variable (set by the Dagger pipeline or by `cargo build` locally).
-- **TEMPORAL_PROTO_VERSION**: The version of the vendored Temporal protobuf definitions — a tagged release of `temporalio/api` (e.g., `v1.47.0`) that tokeira's `tokeira-proto` crate mirrors. Embedded as a `&str` constant.
-- **TEMPORAL_SERVER_COMPAT**: The Temporal server release tokeira claims behavioural compatibility with (e.g., `1.27.0`). A _claim_, not a derivation. SDK test suites use this to pick which tests to run; operator-facing diagnostics cite it. Decoupled from TEMPORAL_PROTO_VERSION — they may move independently.
-- **RUST_TOOLCHAIN**: The Rust toolchain channel or version resolved from `rust-toolchain.toml` at build time (e.g., `1.95.0`). Embedded for reproducibility audits.
-- **SOURCE_TREE_HASH**: A SHA-256 hash of the canonical tokeira source tree, computed with a deterministic file ordering. Excludes `target/`, build artefacts, editor files (`.vscode/`, `.idea/`), and OS junk (`.DS_Store`, `Thumbs.db`). Enables reproducibility audits across hosts.
-- **Feature_Matrix**: The canonical enumeration of Temporal features tokeira knows about, each in exactly one `Feature_State`. Defined once; consumed by kernel (compile-time assertions), edge (runtime handler selection), and CLI (`tkr compat show`).
-- **Feature_State**: One of four values per feature: `Implemented`, `Experimental`, `Stubbed`, `Unsupported`. Semantics defined in Requirement 2.1.
-- **Capability_Handshake**: The response to the Temporal `GetSystemInfo` gRPC that clients call at connection time. Includes `server_version` (string), a `capabilities.*` flags blob, and a tokeira-specific extension field `tokeira_build_info`.
-- **SDK_Compat_Entry**: A record per language (Go, TypeScript, Python, Java, .NET) declaring minimum SDK version, maximum tested SDK version, known-incompatible versions with reasons, and a link to the CI test suite.
-- **Build_Provenance**: The combination of `TOKEIRA_VERSION`, `TOKEIRA_GIT_SHA`, `TEMPORAL_PROTO_VERSION`, `TEMPORAL_SERVER_COMPAT`, `RUST_TOOLCHAIN`, `SOURCE_TREE_HASH`, and the feature-matrix digest. Logged at `tokeirad` startup; printed by `tokeirad --version --verbose`; included in the capability handshake.
+### `TOKEIRA_VERSION`
+
+The semantic version of the Tokeira binary, derived from checked-in Cargo package or workspace metadata.
+
+### `TOKEIRA_GIT_SHA`
+
+The git commit identifier derived from the checked-out repository.
+
+Dirty builds SHALL include a dirty marker.
+
+### `TEMPORAL_PROTO_VERSION`
+
+The upstream `temporalio/api` version vendored by Tokeira.
+
+This value SHALL refer only to the unmodified upstream Temporal protobuf mirror.
+
+### `TEMPORAL_SERVER_COMPAT`
+
+The highest Temporal server version for which Tokeira claims SDK-relevant behavioural compatibility across the supported SDK matrix.
+
+This SHALL be an evidence-backed compatibility claim, not a direct derivation from `TEMPORAL_PROTO_VERSION`.
+
+### `SOURCE_TREE_HASH`
+
+A deterministic SHA-256 digest of the source tree after applying the configured workspace exclusions.
+
+### `BuildInfo`
+
+A structured metadata value containing Tokeira version, git SHA, source-tree hash, Rust toolchain, Temporal proto version, Temporal server compatibility claim, and matrix digests.
+
+### `Build Metadata Manifest`
+
+A deterministic generated file produced by the Dagger build graph. It contains the derived metadata that Cargo embeds into binaries.
+
+The manifest is generated from repository state and checked-in configuration. It is not supplied through environment variables.
+
+### `FeatureState`
+
+The support state for a known Temporal feature.
+
+Allowed values:
+
+- `Implemented`
+- `Experimental`
+- `Stubbed`
+- `Unsupported`
+
+### `CompatibilitySurface`
+
+A classified unit of Temporal compatibility.
+
+Examples include RPCs, request fields, response fields, history events, command attributes, enum variants, capability flags, error details, and behavioural invariants.
+
+### `FeatureMatrix`
+
+The canonical list of known Temporal features and their Tokeira support state.
+
+### `SdkMatrix`
+
+The canonical list of supported Temporal SDK languages, version ranges, known incompatible versions, and conformance evidence.
+
+### Standard Temporal handshake
+
+The upstream-compatible `GetSystemInfo` RPC implemented by Tokeira through Temporal’s standard `WorkflowService`.
+
+### Tokeira compatibility service
+
+A Tokeira-owned RPC service exposing build metadata, feature state, SDK compatibility, capability metadata, and conformance evidence.
+
+### Buffa
+
+The protobuf implementation used for Tokeira-owned protobuf messages in this specification.
+
+### connect-rust
+
+The RPC implementation used for Tokeira-owned compatibility, build, and capability services in this specification.
+
+### Dagger lockfile
+
+The committed `.dagger/lock` file that pins Dagger-resolved mutable inputs such as container image references, Git references, and HTTP fetches.
+
+### Build mode: `dev`
+
+A Dagger build mode for local development. Allows dirty repository state. Derives build metadata where available but does not require a clean git commit or full provenance.
+
+### Build mode: `versioned`
+
+A Dagger build mode for CI and release artefacts. Requires a clean git commit, rejects dirty repository state, derives full build metadata from repository state and checked-in configuration, and verifies embedded `BuildInfo` after build.
+
+---
 
 ## Requirements
 
@@ -63,647 +164,993 @@ The spec owns the compatibility contract and the build-time metadata. It consume
 
 ## Feature 1: Build-Time Compatibility Metadata
 
-### Requirement 1.1: Metadata crate
+### Requirement 1: Build metadata crate
 
-**User Story:** As a Tokeira developer, I want a dedicated crate that owns the compatibility metadata constants, so that kernel, edge, runtime, CLI, and test code all read the same values with zero risk of drift.
-
-#### Acceptance Criteria
-
-1. THE workspace SHALL include a new library crate at `crates/tokeira-build-info/` exposing compile-time constants: `TOKEIRA_VERSION: &str`, `TOKEIRA_GIT_SHA: &str`, `TEMPORAL_PROTO_VERSION: &str`, `TEMPORAL_SERVER_COMPAT: &str`, `RUST_TOOLCHAIN: &str`, `SOURCE_TREE_HASH: &str`.
-2. THE crate SHALL use a `build.rs` to populate each constant at compile time. The `build.rs` SHALL read from environment variables (`TOKEIRA_GIT_SHA`, `TOKEIRA_SOURCE_TREE_HASH`), from `Cargo.toml` (version), from `rust-toolchain.toml` (toolchain), and from constants in a source file (`TEMPORAL_PROTO_VERSION`, `TEMPORAL_SERVER_COMPAT`).
-3. THE crate SHALL have no runtime dependencies beyond `std`. All values are resolved at build time.
-4. THE crate SHALL expose a `fn summary() -> BuildInfo` that returns a struct with all fields, for ergonomic runtime use.
-
-### Requirement 1.2: Build provenance is mandatory in release builds
-
-**User Story:** As a Tokeira operator, I want every release binary to carry non-empty provenance, so that a `tokeirad --version` output is always traceable to a specific source tree and toolchain.
+**User Story:** As a Tokeira developer, I want build metadata to be owned by one crate, so that runtime services, CLI commands, and tests cannot drift.
 
 #### Acceptance Criteria
 
-1. WHEN `CARGO_PROFILE` is `release`, THE `build.rs` SHALL fail the build if `TOKEIRA_VERSION` resolves to an empty string.
-2. WHEN `CARGO_PROFILE` is `release`, THE `build.rs` SHALL fail the build if `TOKEIRA_GIT_SHA` is empty AND the `CI` environment variable is set (i.e., release builds in CI must always have a git SHA).
-3. WHEN `CARGO_PROFILE` is `debug`, THE `build.rs` SHALL tolerate an empty `TOKEIRA_GIT_SHA` and substitute the literal string `dev`. This preserves developer workflow in a fresh clone without git.
-4. WHEN the working tree has uncommitted changes, THE build pipeline (not the `build.rs`) SHALL set `TOKEIRA_GIT_SHA` to `<sha>-dirty`. The `build.rs` accepts whatever value is provided.
-5. THE `build.rs` SHALL fail fast with a descriptive error when `TEMPORAL_PROTO_VERSION` or `TEMPORAL_SERVER_COMPAT` is empty. These are never optional.
+1. THE workspace SHALL include a crate named `tokeira-build-info`.
+2. THE crate SHALL expose `TOKEIRA_VERSION`.
+3. THE crate SHALL expose `TOKEIRA_GIT_SHA`.
+4. THE crate SHALL expose `TEMPORAL_PROTO_VERSION`.
+5. THE crate SHALL expose `TEMPORAL_SERVER_COMPAT`.
+6. THE crate SHALL expose `RUST_TOOLCHAIN`.
+7. THE crate SHALL expose `SOURCE_TREE_HASH`.
+8. THE crate SHALL expose `FEATURE_MATRIX_DIGEST`.
+9. THE crate SHALL expose `SDK_MATRIX_DIGEST`.
+10. THE crate SHALL expose `fn summary() -> BuildInfo`.
+11. THE crate SHALL have no runtime dependencies beyond `std`.
+12. THE crate SHALL NOT own JSON, YAML, table, protobuf, or terminal rendering.
+13. THE crate SHALL NOT treat environment variables as authoritative build metadata.
+14. THE crate SHALL embed metadata derived from repository state and checked-in configuration.
 
-### Requirement 1.3: Source tree hash for reproducibility audits
+### Requirement 2: Programmatic metadata derivation
 
-**User Story:** As a Tokeira operator, I want a deterministic hash of the source tree embedded in the binary, so that I can verify two binaries claiming the same version were built from the same tree.
-
-#### Acceptance Criteria
-
-1. THE `tokeira-build-info` crate SHALL expose a `SOURCE_TREE_HASH: &str` constant of exactly 64 lowercase hex characters (SHA-256).
-2. THE value SHALL be supplied via the `TOKEIRA_SOURCE_TREE_HASH` environment variable by the build pipeline. THE `build.rs` SHALL NOT compute the hash itself — traversing the source tree at build time violates build hermeticity.
-3. THE hash computation (performed by `image-lifecycle`'s Dagger pipeline or a helper binary) SHALL exclude: `target/`, `.git/`, `node_modules/`, `.idea/`, `.vscode/`, `.DS_Store`, `Thumbs.db`, any file matching `*.lock` except `Cargo.lock`, any file matching `.env*`.
-4. THE hash computation SHALL use a deterministic file ordering (sorted by relative path, UTF-8-NFC-normalised).
-5. WHEN `TOKEIRA_SOURCE_TREE_HASH` is empty in a debug build, THE `build.rs` SHALL substitute a 64-character string of the literal character `0`. This is distinguishable from a real hash (all zeros is statistically impossible) and prevents empty-string ambiguity.
-
-### Requirement 1.4: `--version` and `--version --verbose` output
-
-**User Story:** As a Tokeira operator, I want `tokeirad --version` to print compatibility metadata in a predictable format, so that scripts and logs can parse the output without scraping internals.
+**User Story:** As a release engineer, I want build metadata to be derived from the repository and checked-in configuration, so that release provenance does not depend on externally supplied environment variables.
 
 #### Acceptance Criteria
 
-1. `tokeirad --version` SHALL print exactly three lines in this format:
-   ```
-   tokeirad {TOKEIRA_VERSION} ({TOKEIRA_GIT_SHA})
-   temporal-server-compat {TEMPORAL_SERVER_COMPAT}
-   temporal-proto {TEMPORAL_PROTO_VERSION}
-   ```
-2. `tokeirad --version --verbose` SHALL print additional lines appended to the short form:
-   ```
-   rust-toolchain {RUST_TOOLCHAIN}
-   source-tree-hash {SOURCE_TREE_HASH}
-   feature-matrix-digest {digest}
-   sdk-matrix-digest {digest}
-   ```
-3. `tokeirad --version --json` SHALL print a single JSON object with all fields as keys, matching the short form flat, and feature/sdk matrices as nested objects.
-4. FOR ALL invocations of `tokeirad --version` on the same binary, the output SHALL be byte-identical (no timestamps, no locale-dependent formatting).
+1. WHEN the Dagger build metadata derivation function runs, THE function SHALL derive `TOKEIRA_VERSION` from checked-in Cargo package or workspace metadata.
+2. WHEN the Dagger build metadata derivation function runs, THE function SHALL derive `TOKEIRA_GIT_SHA` from the checked-out git repository.
+3. WHEN the Dagger build metadata derivation function runs, THE function SHALL detect whether the checked-out git repository is dirty.
+4. WHEN the checked-out git repository is dirty, THE derived `TOKEIRA_GIT_SHA` SHALL include a dirty marker.
+5. WHEN the Dagger build metadata derivation function runs, THE function SHALL derive `SOURCE_TREE_HASH` by hashing the checked-out source tree using the configured deterministic exclusion list.
+6. WHEN the Dagger build metadata derivation function runs, THE function SHALL derive `RUST_TOOLCHAIN` from `rust-toolchain.toml`.
+7. WHEN the Dagger build metadata derivation function runs, THE function SHALL derive `TEMPORAL_PROTO_VERSION` from checked-in compatibility configuration.
+8. WHEN the Dagger build metadata derivation function runs, THE function SHALL derive `TEMPORAL_SERVER_COMPAT` from checked-in compatibility configuration.
+9. WHEN the Dagger build metadata derivation function runs, THE function SHALL derive feature and SDK matrix digests from checked-in matrix definitions.
+10. THE build metadata derivation SHALL NOT require user-supplied environment variables.
+11. THE build metadata derivation SHALL NOT require CI-supplied environment variables.
+12. THE build metadata derivation SHALL fail with a clear error if required repository metadata cannot be derived.
+13. THE build metadata derivation SHALL NOT embed wall-clock timestamps.
+14. THE build metadata derivation SHALL be reproducible for the same repository state and checked-in configuration.
 
-### Requirement 1.5: Structured startup log entry
+### Requirement 3: Generated build metadata manifest
 
-**User Story:** As a Tokeira operator, I want the first log entry on `tokeirad` startup to carry full build provenance, so that log aggregators can correlate runtime issues with a specific build.
-
-#### Acceptance Criteria
-
-1. WHEN `tokeirad` starts, it SHALL emit exactly one `tracing::info!` entry at the earliest point after logging initialisation, with event name `tokeirad.startup` and all `Build_Provenance` fields as structured fields.
-2. THE startup log SHALL include at minimum: `tokeira_version`, `tokeira_git_sha`, `temporal_server_compat`, `temporal_proto_version`, `rust_toolchain`, `source_tree_hash`, `feature_matrix_digest`, `sdk_matrix_digest`.
-3. THE startup log SHALL NOT include any wall-clock timestamp beyond what the tracing subscriber injects on every event. The entry's own payload is free of timestamps (preserving log-line-for-log-line equality across runs).
-
-### Requirement 1.6: Explicit policy on build timestamps
-
-**User Story:** As a Tokeira developer, I want a documented rule that build timestamps are never embedded in the binary, so that reproducibility audits are mechanically verifiable.
+**User Story:** As a maintainer, I want Cargo builds to consume a deterministic generated metadata manifest, so that build metadata is controlled by Dagger and not by ambient environment state.
 
 #### Acceptance Criteria
 
-1. THE `tokeira-build-info` crate SHALL NOT expose any constant or struct field representing build wall-clock time.
-2. THE `build.rs` SHALL NOT read `chrono::Utc::now()`, `std::time::SystemTime::now()`, or any other source of wall-clock time.
-3. WHEN an operator needs build wall-clock provenance, they SHALL derive it from git commit timestamps (`git show -s --format=%ct`) or from container registry push metadata. This is a documented operator responsibility; tokeira does not embed it.
-4. THE reproducibility property owned by [`image-lifecycle`](../image-lifecycle/requirements.md) SHALL pass byte-for-byte equality of the application binary layer under this rule.
+1. WHEN the Dagger build function prepares a Cargo build, THE function SHALL generate a deterministic build metadata manifest.
+2. THE build metadata manifest SHALL contain all fields required by `tokeira-build-info`.
+3. THE build metadata manifest SHALL be generated from repository state and checked-in configuration.
+4. THE build metadata manifest SHALL NOT be generated from ambient CI environment variables.
+5. THE build metadata manifest SHALL NOT contain wall-clock timestamps.
+6. THE build metadata manifest SHALL be stable for the same repository state and checked-in configuration.
+7. WHEN Cargo builds a Tokeira binary through Dagger, THE `tokeira-build-info` build process SHALL embed metadata from the generated manifest.
+8. WHEN the generated manifest is missing during a versioned build, THE build SHALL fail with a clear error.
+9. WHEN the generated manifest is malformed, THE build SHALL fail with a clear error.
+10. WHEN the generated manifest is inconsistent with checked-in compatibility configuration, THE build SHALL fail with a clear error.
+11. THE manifest format SHALL be documented.
+12. THE manifest format SHALL be covered by tests.
+
+### Requirement 4: CI release provenance validation
+
+**User Story:** As an operator, I want release binaries to prove their provenance was derived from the repository, so that deployments are auditable and not dependent on injected CI metadata.
+
+#### Acceptance Criteria
+
+1. WHEN compatibility checks run in Dagger, THE checks SHALL verify that `TOKEIRA_GIT_SHA` was derived from the checked-out git repository.
+2. WHEN compatibility checks run in Dagger, THE checks SHALL verify that `SOURCE_TREE_HASH` was derived from the checked-out source tree.
+3. WHEN versioned checks run in Dagger, THE checks SHALL fail if the git repository is dirty.
+4. WHEN versioned checks run in Dagger, THE checks SHALL fail if the git commit cannot be derived.
+5. WHEN versioned checks run in Dagger, THE checks SHALL fail if `SOURCE_TREE_HASH` cannot be recomputed independently.
+6. WHEN the independently recomputed source-tree hash differs from the embedded `SOURCE_TREE_HASH`, THE checks SHALL fail.
+7. THE Dagger checks SHALL NOT provide build metadata through environment variables.
+8. THE Dagger checks SHALL validate derived metadata after build rather than supplying metadata before build.
+9. THE Dagger versioned path SHALL reject incomplete repository provenance.
+10. THE Dagger versioned path SHALL reject non-deterministic metadata.
+
+### Requirement 5: Source-tree hash
+
+**User Story:** As a maintainer, I want a deterministic source-tree hash, so that two builds from the same source can be compared across machines.
+
+#### Acceptance Criteria
+
+1. THE source-tree hash SHALL be a SHA-256 digest.
+2. WHEN computing `SOURCE_TREE_HASH`, THE hash input SHALL use deterministic file ordering.
+3. WHEN computing `SOURCE_TREE_HASH`, THE hash input SHALL include relative file paths.
+4. WHEN computing `SOURCE_TREE_HASH`, THE hash input SHALL include file contents.
+5. WHEN computing `SOURCE_TREE_HASH`, THE hash input SHALL exclude build artefacts.
+6. WHEN computing `SOURCE_TREE_HASH`, THE hash input SHALL exclude editor metadata.
+7. WHEN computing `SOURCE_TREE_HASH`, THE hash input SHALL exclude OS junk files.
+8. WHEN computing `SOURCE_TREE_HASH`, THE hash input SHALL exclude local environment files.
+9. WHEN computing `SOURCE_TREE_HASH`, THE hash input SHALL exclude Dagger runtime caches.
+10. THE exclusion list SHALL be declared in one checked-in location.
+11. THE Dagger pipeline and local validation helpers SHALL use the same exclusion list.
+12. THE source-tree hash SHALL be derived inside the Dagger build graph for versioned builds.
+
+### Requirement 6: Version output
+
+**User Story:** As an operator, I want `tokeirad --version` to expose compatibility metadata, so that I can verify what is running.
+
+#### Acceptance Criteria
+
+1. WHEN `tokeirad --version` is executed, THE binary SHALL print `TOKEIRA_VERSION`.
+2. WHEN `tokeirad --version --verbose` is executed, THE binary SHALL print every `BuildInfo` field.
+3. WHEN `tokeirad --version --json` is executed, THE binary SHALL print a stable JSON representation of `BuildInfo`.
+4. THE JSON rendering SHALL be implemented outside `tokeira-build-info`.
+5. THE JSON representation SHALL use stable field names.
+6. THE JSON representation SHALL be covered by a golden-file or snapshot test.
+7. THE version output SHALL identify the build mode (`dev` or `versioned`).
+8. THE version output SHALL NOT include wall-clock build timestamps.
+
+### Requirement 7: Startup provenance log
+
+**User Story:** As an operator, I want each Tokeira process to log build provenance on startup, so that logs identify the deployed version.
+
+#### Acceptance Criteria
+
+1. WHEN `tokeirad` starts, THE process SHALL emit exactly one structured startup log event containing `BuildInfo` covering the host process and its embedded edge and projection components.
+2. WHEN `tokeira-controller` starts, THE process SHALL emit exactly one structured startup log event containing `BuildInfo`.
+3. WHEN `tokeira-autoscaler` starts, THE process SHALL emit exactly one structured startup log event containing `BuildInfo`.
+4. THE startup log SHALL NOT truncate hashes, digests, or version strings.
+5. THE startup log SHALL NOT include wall-clock build timestamps.
+6. THE startup log SHALL include enough metadata to identify source version, source-tree hash, Temporal proto version, and Temporal server compatibility claim.
 
 ---
 
-## Feature 2: Feature Matrix
+## Feature 2: Buffa + connect-rust for Tokeira-Owned Compatibility RPC
 
-### Requirement 2.1: Feature state taxonomy
+### Requirement 8: Tokeira-owned proto generation
 
-**User Story:** As a Tokeira client author, I want four well-defined feature states so that client behaviour under each state is predictable.
-
-#### Acceptance Criteria
-
-1. THE `Feature_State` enum SHALL have exactly four variants: `Implemented`, `Experimental`, `Stubbed`, `Unsupported`. No other states.
-2. **Implemented**: The feature's RPC(s) are fully supported. Requests succeed on the happy path, fail with feature-specific error codes on invalid input. Corresponding `capabilities.*` flag in the handshake is `true`.
-3. **Experimental**: The feature is compiled in but disabled by default. When the operator's dynamic config enables the feature (globally or per-namespace), it behaves as `Implemented`. When disabled, the RPC SHALL return `FailedPrecondition` with `details` naming the feature and pointing at the dynamic-config key that enables it. Corresponding `capabilities.*` flag in the handshake reflects the current dynamic-config state at the time of the handshake.
-4. **Stubbed**: The RPC is accepted for wire compatibility but always returns `Unimplemented` with `details = "tokeira does not implement feature '<name>' (stub)"`. Clients that treat `Unimplemented` as a graceful degradation signal (the Temporal SDK behaviour) adapt automatically. Corresponding `capabilities.*` flag is `false`.
-5. **Unsupported**: The RPC is rejected with `Unimplemented` and `details = "tokeira does not support feature '<name>' (out of scope)"`. The difference from `Stubbed` is operator/roadmap expectation: `Stubbed` means "planned, not yet done"; `Unsupported` means "explicit decision not to support". Corresponding `capabilities.*` flag is `false`.
-6. THE handshake response SHALL include a separate `tokeira_feature_states` extension field (non-standard) mapping each feature name to its state string (`implemented`, `experimental`, `stubbed`, `unsupported`). Standard-SDK clients ignore this extension; tokeira-aware tooling reads it.
-
-### Requirement 2.2: Matrix is the single source of truth
-
-**User Story:** As a Tokeira maintainer, I want the feature matrix declared in exactly one place, so that adding a new feature or bumping a state is a single-file change.
+**User Story:** As a Tokeira developer, I want Tokeira-owned compatibility protos generated with Buffa, so that the control-plane proto stack is consistent with controller and autoscaler communication.
 
 #### Acceptance Criteria
 
-1. THE `Feature_Matrix` SHALL be declared as a `const fn FEATURE_MATRIX: &[(FeatureId, FeatureState, &'static str)]` — or a structurally equivalent `const` slice — in `tokeira-build-info` (or a co-located `tokeira-compatibility` sibling crate; design phase decides).
-2. THE matrix declaration SHALL be the only place feature states are written in the tokeira codebase.
-3. THE matrix SHALL expose a digest: a deterministic hash of the `(feature_id, state)` pairs, computed at compile time via a proc-macro or a const hash function. Digest changes whenever any feature's state changes; used by the startup log and capability handshake as a quick compatibility signal.
-4. THE matrix SHALL be exported with `pub use` for external (test and CLI) access, but direct field mutation SHALL be forbidden by the visibility rules of the crate.
+1. THE Tokeira compatibility proto package SHALL be Tokeira-owned.
+2. THE Tokeira compatibility proto files SHALL NOT live inside the vendored upstream Temporal proto tree.
+3. THE Tokeira compatibility proto files SHALL be generated with Buffa.
+4. THE generated message types for Tokeira compatibility metadata SHALL use Buffa-generated Rust types.
+5. THE generated Tokeira compatibility code SHALL be checked for freshness in Dagger CI.
+6. THE Tokeira compatibility proto generation SHALL be reproducible from checked-in proto files and checked-in generation configuration.
+7. THE Tokeira compatibility proto package SHALL use a stable versioned package name.
+8. THE initial package name SHOULD be `tokeira.compatibility.v1`.
 
-### Requirement 2.3: Matrix completeness property
+### Requirement 9: connect-rust service implementation
 
-**User Story:** As a Tokeira maintainer, I want every RPC in the Temporal proto to map to exactly one feature in the matrix, so that no RPC can accidentally ship without a documented state.
-
-#### Acceptance Criteria
-
-1. THE matrix SHALL cover every `WorkflowService` and `OperatorService` RPC defined in the vendored Temporal proto set.
-2. A property test SHALL enumerate every RPC name in `temporal.api.workflowservice.v1.WorkflowService` and `temporal.api.operatorservice.v1.OperatorService` (via codegen reflection or a generated RPC-name list) and assert that every name has exactly one matching `FeatureId` in the matrix.
-3. THE property test SHALL fail the build when a new RPC is introduced in a proto bump without being classified in the matrix.
-4. THE property test SHALL fail the build when a feature is removed from the proto but left in the matrix (dead entries).
-5. THE property test SHALL run as part of the default `cargo test` invocation.
-
-### Requirement 2.4: Compile-time gates in the kernel
-
-**User Story:** As a Tokeira kernel author, I want the kernel to refuse to compile code paths behind features that are `Stubbed` or `Unsupported`, so that the kernel stays minimal and no one accidentally implements an out-of-scope feature.
+**User Story:** As a Tokeira operator, I want build and capability metadata exposed through the same RPC stack as Tokeira’s control plane, so that internal tooling is coherent.
 
 #### Acceptance Criteria
 
-1. THE kernel SHALL expose a `cfg_feature!(name)` macro (or an equivalent const-generic approach) that emits the gated code only when the named feature is `Implemented` or `Experimental`.
-2. WHEN a kernel module references a `cfg_feature!` name that resolves to `Stubbed` or `Unsupported`, compilation SHALL fail with a message citing the feature name and state.
-3. THE macro SHALL NOT rely on cargo features (which are additive and can drift per-dependency). It SHALL resolve against the matrix at compile time.
+1. THE Tokeira compatibility service SHALL be generated with connect-rust.
+2. THE Tokeira compatibility service SHALL be served with connect-rust.
+3. THE Tokeira compatibility client used by `tkr` SHALL use connect-rust.
+4. THE Tokeira compatibility service SHALL support protobuf binary requests and responses.
+5. THE Tokeira compatibility service MAY support JSON protobuf requests and responses where connect-rust provides this safely.
+6. THE Tokeira compatibility service SHALL NOT use tonic-generated service code.
+7. THE Tokeira compatibility service SHALL NOT use prost-generated Tokeira-owned message types.
+8. THE use of tonic or prost for upstream Temporal SDK-facing services SHALL be treated as separate from this requirement.
 
-### Requirement 2.5: Runtime handler selection in the edge
+### Requirement 10: Tokeira build and capability surfaces
 
-**User Story:** As a Tokeira edge author, I want RPC handlers to dispatch based on feature state uniformly, so that every RPC has consistent behaviour regardless of feature class.
-
-#### Acceptance Criteria
-
-1. THE edge SHALL implement a `dispatch_rpc<F: Feature>(ctx, request)` helper that consults the matrix:
-   - `Implemented`: calls the real handler.
-   - `Experimental`: checks dynamic config; if enabled, calls the real handler; otherwise returns `FailedPrecondition` per Req 2.1.3.
-   - `Stubbed`: returns `Unimplemented` per Req 2.1.4.
-   - `Unsupported`: returns `Unimplemented` per Req 2.1.5.
-2. THE edge SHALL NOT have per-feature conditional logic outside `dispatch_rpc`. This centralises the feature-state policy.
-3. THE dispatch helper SHALL emit a metric per call labelled by feature name and state, so operators can see which stubbed RPCs are being called by which SDKs.
-
-### Requirement 2.6: Initial feature seed
-
-**User Story:** As a Tokeira maintainer, I want an initial seed of feature classifications committed with this spec, so that implementation can start without bikeshedding every feature individually.
+**User Story:** As an architecture maintainer, I want every Tokeira-owned RPC that surfaces build or capability details to use Buffa and connect-rust, so that the metadata surface is not fragmented.
 
 #### Acceptance Criteria
 
-1. THE initial matrix SHALL classify at minimum the following features. The design phase refines exact states:
+1. WHERE a Tokeira-owned gRPC or ConnectRPC service exposes `BuildInfo`, THE service SHALL use Buffa-generated messages.
+2. WHERE a Tokeira-owned gRPC or ConnectRPC service exposes feature state, THE service SHALL use Buffa-generated messages.
+3. WHERE a Tokeira-owned gRPC or ConnectRPC service exposes capability state, THE service SHALL use Buffa-generated messages.
+4. WHERE a Tokeira-owned gRPC or ConnectRPC service exposes SDK compatibility metadata, THE service SHALL use Buffa-generated messages.
+5. WHERE a Tokeira-owned gRPC or ConnectRPC service exposes compatibility evidence, THE service SHALL use Buffa-generated messages.
+6. WHERE a Tokeira-owned service exposes this metadata over RPC, THE service SHALL use connect-rust handlers.
+7. THE controller and autoscaler SHALL follow the same Buffa + connect-rust convention for any build or capability metadata they expose.
+8. THE runtime and edge services SHALL follow the same Buffa + connect-rust convention for any Tokeira-owned build or capability metadata they expose.
 
-   | Feature | Initial state (design may revise) |
-   |---|---|
-   | Workflow namespaces | Implemented |
-   | Workflow queries | Implemented |
-   | Workflow signals | Implemented |
-   | Workflow updates | Experimental |
-   | Child workflows | Implemented |
-   | Cron workflows | Implemented |
-   | Continue-as-new | Implemented |
-   | Schedules | Experimental |
-   | Nexus | Unsupported |
-   | Replication / multi-cluster | Unsupported |
-   | Archival | Unsupported |
-   | Task queue partitions (reachability) | Experimental |
-   | Eager workflow start | Implemented |
-   | Sticky queues | Implemented |
-   | Reset workflow history | Experimental |
+### Requirement 11: Separation from Temporal upstream API
 
-2. Every transition between states SHALL require a spec update (design and tasks) and a property-test update — no silent state changes.
-3. THE initial matrix SHALL be fully populated for every Temporal RPC covered by Req 2.3.1. Gaps are errors, not defaults.
+**User Story:** As a Temporal SDK user, I want standard Temporal APIs to remain unmodified, so that Tokeira remains compatible with existing SDKs and tools.
+
+#### Acceptance Criteria
+
+1. THE vendored Temporal proto files SHALL NOT import Tokeira-owned proto files.
+2. THE vendored Temporal proto files SHALL NOT reference Buffa-specific options.
+3. THE vendored Temporal proto files SHALL NOT reference connect-rust-specific options.
+4. THE standard Temporal `WorkflowService` SHALL NOT expose Tokeira-owned metadata fields.
+5. THE standard Temporal `GetSystemInfoResponse` SHALL NOT include Tokeira-specific fields.
+6. THE Tokeira compatibility service SHALL be the RPC surface for Tokeira-specific build and capability metadata.
+7. THE standard Temporal SDK handshake SHALL remain independent of the Tokeira compatibility service.
+
+### Requirement 12: Generated-code supply-chain control
+
+**User Story:** As a maintainer, I want Buffa and connect-rust code generation to be pinned and reviewed, so that generated compatibility code cannot drift silently.
+
+#### Acceptance Criteria
+
+1. THE versions of Buffa code generation tools SHALL be pinned.
+2. THE versions of connect-rust code generation tools SHALL be pinned.
+3. THE pinned versions SHALL be visible in checked-in configuration or lockfiles.
+4. WHEN Buffa or connect-rust codegen versions change, THE generated output SHALL be refreshed.
+5. WHEN generated output changes, THE pull request SHALL include the generated-code diff.
+6. WHEN generated output changes unexpectedly, THE Dagger freshness check SHALL fail.
+7. THE Dagger lockfile policy SHALL apply to Buffa and connect-rust codegen acquisition when Dagger resolves those inputs.
 
 ---
 
-## Feature 3: SDK Compatibility Matrix
+## Feature 3: Temporal Feature Matrix
 
-### Requirement 3.1: SDK matrix structure
+### Requirement 13: Feature state taxonomy
 
-**User Story:** As a Tokeira operator, I want a single declared matrix of supported SDK versions per language, so that I know which client libraries will work.
-
-#### Acceptance Criteria
-
-1. THE `SdkMatrix` SHALL be declared in `tokeira-build-info` (or the `tokeira-compatibility` sibling crate) as a `const` slice of `SdkCompatEntry { language, min_version, max_tested_version, known_incompatible: &[IncompatibleVersion], test_suite_ref }`.
-2. THE languages covered in the initial matrix SHALL be: Go, TypeScript, Python, Java, .NET.
-3. EACH `IncompatibleVersion` SHALL include the version string, a human-readable reason, and a link to the tracking issue.
-4. `test_suite_ref` SHALL be a path or identifier pointing at the CI job that runs the SDK's canonical integration suite against tokeirad.
-
-### Requirement 3.2: Matrix digest and startup log
-
-**User Story:** As a Tokeira operator, I want a digest of the SDK matrix in the startup log, so that I can detect silent matrix changes across rolling deployments.
+**User Story:** As a maintainer, I want every known Temporal feature to have an explicit support state, so that unsupported behaviour is visible and intentional.
 
 #### Acceptance Criteria
 
-1. THE `SdkMatrix` SHALL expose a `DIGEST: &str` constant computed at compile time over the `(language, min_version, max_tested_version)` tuples. Excluded from the digest: `known_incompatible` details (frequently updated with new reasons) and `test_suite_ref` (non-semantic).
-2. THE digest SHALL be emitted in the startup log (Req 1.5.2).
-3. THE digest SHALL be emitted in `--version --verbose` output (Req 1.4.2).
+1. THE system SHALL define `FeatureState::Implemented`.
+2. THE system SHALL define `FeatureState::Experimental`.
+3. THE system SHALL define `FeatureState::Stubbed`.
+4. THE system SHALL define `FeatureState::Unsupported`.
+5. WHERE a feature is `Implemented`, THE feature SHALL be expected to behave compatibly with `TEMPORAL_SERVER_COMPAT`.
+6. WHERE a feature is `Experimental`, THE feature SHALL be implemented behind runtime configuration.
+7. WHERE a feature is `Experimental`, THE feature SHALL NOT be advertised as generally available by default.
+8. WHERE a feature is `Stubbed`, THE wire surface MAY exist but THE implementation SHALL fail predictably with a Temporal-compatible error.
+9. WHERE a feature is `Unsupported`, THE system SHALL NOT advertise support and SHALL reject use predictably.
 
-### Requirement 3.3: Round-trip and monotonicity properties
+### Requirement 14: Compatibility surface model
 
-**User Story:** As a Tokeira maintainer, I want property tests enforcing matrix invariants, so that accidental drift is caught in CI.
+**User Story:** As a compatibility reviewer, I want compatibility coverage to include more than RPC names, so that subtle SDK assumptions are not missed.
 
 #### Acceptance Criteria
 
-1. THE SDK matrix property test SHALL assert: for every entry, `min_version <= max_tested_version` under semver comparison.
-2. THE property test SHALL assert: no `IncompatibleVersion` entry has a version equal to `max_tested_version` (they are mutually exclusive claims).
-3. THE property test SHALL assert: serialising the matrix to JSON and re-parsing yields a structurally equal matrix (round-trip).
-4. WHEN a tokeira release bumps `min_version` for a language, a test or PR check SHALL flag the change as a potentially breaking compatibility bump requiring deliberate release notes. This is a process requirement; implementation may be as simple as a CODEOWNERS review gate.
+1. THE system SHALL define `CompatibilitySurfaceKind::Rpc`.
+2. THE system SHALL define `CompatibilitySurfaceKind::RequestField`.
+3. THE system SHALL define `CompatibilitySurfaceKind::ResponseField`.
+4. THE system SHALL define `CompatibilitySurfaceKind::HistoryEvent`.
+5. THE system SHALL define `CompatibilitySurfaceKind::CommandAttribute`.
+6. THE system SHALL define `CompatibilitySurfaceKind::EnumVariant`.
+7. THE system SHALL define `CompatibilitySurfaceKind::CapabilityFlag`.
+8. THE system SHALL define `CompatibilitySurfaceKind::ErrorDetail`.
+9. THE system SHALL define `CompatibilitySurfaceKind::BehaviouralInvariant`.
+10. EVERY compatibility surface SHALL have a stable identifier.
+11. EVERY compatibility surface SHALL map to exactly one feature entry unless it is explicitly cross-cutting.
+12. EVERY cross-cutting surface SHALL explain why it cannot be owned by a single feature.
+
+### Requirement 15: Feature matrix source of truth
+
+**User Story:** As a developer, I want the feature matrix to be the single source of truth, so that compile-time gates, runtime dispatch, and CLI reporting agree.
+
+#### Acceptance Criteria
+
+1. THE workspace SHALL include a `tokeira-compatibility` crate.
+2. THE `tokeira-compatibility` crate SHALL own the canonical `FEATURE_MATRIX`.
+3. EACH feature entry SHALL include `id`.
+4. EACH feature entry SHALL include `name`.
+5. EACH feature entry SHALL include `state`.
+6. EACH feature entry SHALL include `surfaces`.
+7. EACH feature entry SHALL include `capability_field` when applicable.
+8. EACH feature entry SHALL include `dynamic_config_key` when applicable.
+9. EACH feature entry SHALL include `notes`.
+10. EACH feature entry SHALL include `evidence`.
+11. EACH feature ID SHALL be a continuous name in kebab-case whose behaviour is consistent across versions.
+12. RENAMING a feature ID SHALL be treated as a breaking change.
+13. EACH feature ID SHALL be unique.
+14. THE matrix SHALL be sorted by feature ID.
+15. THE test suite SHALL fail if the matrix is not sorted.
+16. THE feature matrix digest SHALL be computed from the declared order.
+
+### Requirement 16: Conservative initial states
+
+**User Story:** As a maintainer, I want complex Temporal features to start conservatively, so that Tokeira does not overclaim compatibility.
+
+#### Acceptance Criteria
+
+1. WHEN seeding the initial matrix, THE system SHALL mark a feature `Implemented` only when targeted tests verify SDK-visible behaviour.
+2. WHEN a feature has a handler but lacks behavioural conformance evidence, THE system SHALL mark it `Experimental` or `Stubbed`.
+3. WHERE workflow queries are present, THE feature SHALL NOT be marked `Implemented` until query ordering against prior committed signals is tested.
+4. WHERE sticky task queues are present, THE feature SHALL NOT be marked `Implemented` until sticky replay, cache miss, and fallback behaviour are tested.
+5. WHERE eager workflow start is present, THE feature SHALL NOT be marked `Implemented` until SDK eager-start semantics are tested.
+6. WHERE worker versioning is present, THE feature SHALL NOT be marked `Implemented` until SDK compatibility tests cover the relevant SDK versions.
+7. WHERE Nexus is present, THE feature SHALL include explicit evidence before being marked `Implemented`.
+8. WHERE workflow updates are present, THE feature SHALL include explicit evidence before being marked `Implemented`.
+9. WHERE reset is present, THE feature SHALL include explicit evidence before being marked `Implemented`.
+10. WHERE child workflows are present, THE feature SHALL include explicit evidence before being marked `Implemented`.
+11. WHERE cron or schedules are present, THE feature SHALL include explicit evidence before being marked `Implemented`.
+12. WHERE continue-as-new is present, THE feature SHALL include explicit evidence before being marked `Implemented`.
+13. WHERE search attributes are present, THE feature SHALL include explicit evidence before being marked `Implemented`.
+
+### Requirement 17: RPC completeness property
+
+**User Story:** As a compatibility reviewer, I want every upstream RPC classified, so that no Temporal endpoint is accidentally ignored.
+
+#### Acceptance Criteria
+
+1. WHEN tests run, THE system SHALL enumerate every RPC in the vendored upstream `WorkflowService`.
+2. WHEN tests run, THE system SHALL enumerate every RPC in the vendored upstream `OperatorService`.
+3. FOR EACH enumerated RPC, THE test suite SHALL assert that exactly one feature entry owns it.
+4. FOR EACH RPC referenced by a feature entry, THE test suite SHALL assert that the RPC exists in the vendored upstream proto.
+5. THE RPC completeness property SHALL NOT be treated as sufficient proof of behavioural compatibility.
+6. THE RPC completeness property SHALL be documented as a wire-surface guardrail.
+
+### Requirement 18: Runtime feature dispatch
+
+**User Story:** As an edge developer, I want runtime dispatch to respect feature state, so that unavailable features fail consistently.
+
+#### Acceptance Criteria
+
+1. THE `tokeira-compatibility` crate SHALL expose a runtime dispatch helper.
+2. WHEN a request targets an `Implemented` feature, THE system SHALL allow the real handler to execute.
+3. WHEN a request targets an `Experimental` feature and runtime configuration enables it, THE system SHALL allow the real handler to execute.
+4. WHEN a request targets an `Experimental` feature and runtime configuration disables it, THE system SHALL return a Temporal-compatible unavailable error.
+5. WHEN a request targets a `Stubbed` feature, THE system SHALL return a Temporal-compatible unimplemented or failed-precondition error.
+6. WHEN a request targets an `Unsupported` feature, THE system SHALL return a Temporal-compatible unimplemented error.
+7. THE dispatch helper SHALL emit a metric tagged with feature ID and feature state.
 
 ---
 
-## Feature 4: Capability Handshake on `GetSystemInfo`
+## Feature 4: SDK Compatibility Matrix
 
-### Requirement 4.1: `GetSystemInfo` RPC surface
+### Requirement 19: SDK matrix structure
 
-**User Story:** As a Temporal SDK author, I want tokeira to respond to `GetSystemInfo` with an accurate and stable capabilities blob, so that my SDK can enable or disable features automatically.
-
-#### Acceptance Criteria
-
-1. THE edge SHALL implement the `GetSystemInfo` RPC defined in `temporal.api.workflowservice.v1` exactly as specified by the vendored proto version.
-2. THE response SHALL set `server_version = TEMPORAL_SERVER_COMPAT`.
-3. THE response SHALL populate `capabilities.*` fields by consulting the feature matrix. For each capability flag, the flag is `true` iff the owning feature is `Implemented` OR (`Experimental` AND enabled by dynamic config for the current request's namespace-or-global scope).
-4. THE response SHALL include a non-standard extension field `tokeira_build_info` carrying `TOKEIRA_VERSION`, `TOKEIRA_GIT_SHA`, `TEMPORAL_PROTO_VERSION`, `SOURCE_TREE_HASH`, `feature_matrix_digest`, and `sdk_matrix_digest`. Clients that do not understand the extension SHALL ignore it without error.
-5. THE response SHALL include a non-standard extension field `tokeira_feature_states` per Req 2.1.6.
-6. THE RPC SHALL be callable without authentication, matching Temporal's default (operators that gate it do so via a separate network-level control).
-
-### Requirement 4.2: Handshake consistency property
-
-**User Story:** As a Tokeira maintainer, I want every `capabilities.*` flag in the handshake to map to a feature in the matrix, so that we can never ship a capability that is not backed by a classified feature.
+**User Story:** As an operator, I want Tokeira to publish known SDK compatibility, so that I can assess client upgrade risk.
 
 #### Acceptance Criteria
 
-1. A property test SHALL enumerate every field in `temporal.api.workflowservice.v1.GetSystemInfoResponse.Capabilities` and assert that a matching feature exists in the matrix.
-2. THE property test SHALL fail the build when a new capability is introduced in a proto bump without being classified.
-3. A separate property test SHALL verify that for every feature, the `capabilities.*` flag it owns is `true` iff the feature is `Implemented` in the matrix (the default dynamic-config state for `Experimental` is `disabled`, so the handshake reports `false` — this is the deterministic baseline). The dynamic-config-aware path is tested separately via integration tests.
+1. THE system SHALL define a canonical `SDK_MATRIX`.
+2. EACH SDK entry SHALL include language.
+3. EACH SDK entry SHALL include minimum supported version.
+4. EACH SDK entry SHALL include maximum tested version.
+5. EACH SDK entry SHALL include known incompatible versions.
+6. EACH SDK entry SHALL include conformance status.
+7. EACH SDK entry SHALL include evidence.
+8. EACH SDK entry SHALL include `verification_state`.
+9. THE initial SDK languages SHALL include Go, TypeScript, Python, Java, and .NET.
+10. THE allowed verification states SHALL include `Untested`, `SmokeTested`, `ConformancePartial`, and `ConformancePassing`.
+11. THE matrix SHALL NOT imply full SDK support unless the verification state supports that claim.
+12. THE matrix SHALL be exposed by the Tokeira compatibility service.
+13. THE matrix SHALL be printed by `tkr compat show`.
 
-### Requirement 4.3: Handshake is the authoritative compatibility contract
+### Requirement 20: SDK matrix data model
 
-**User Story:** As a Tokeira operator, I want `GetSystemInfo` to be the single public surface for compatibility discovery, so that SDKs, monitoring, and operator tooling all read the same source.
+**User Story:** As a developer, I want static and owned SDK matrix types, so that runtime reporting and serialization tests are straightforward.
 
 #### Acceptance Criteria
 
-1. THE spec SHALL document `GetSystemInfo` as the authoritative compatibility surface. No other RPC exposes per-feature state.
-2. `tkr compat show` (Feature 7) SHALL, when pointed at a remote deployment, read the same data via `GetSystemInfo` rather than via a tokeira-specific RPC.
-3. WHEN a client needs to detect mixed-version deployments, it SHALL call `GetSystemInfo` repeatedly and compare `tokeira_build_info.feature_matrix_digest` across responses.
+1. THE static SDK matrix SHALL use borrow-friendly static string fields where appropriate.
+2. THE system SHALL define an owned SDK matrix representation.
+3. WHEN the static SDK matrix is serialized to JSON, THE JSON SHALL deserialize into the owned representation.
+4. WHEN the owned representation is re-digested, THE digest SHALL match the static SDK matrix digest.
+5. WHEN a compatibility-significant SDK field changes, THE SDK matrix digest SHALL change.
+
+### Requirement 21: SDK version ordering
+
+**User Story:** As a maintainer, I want SDK compatibility ranges to be internally consistent, so that the published matrix is credible.
+
+#### Acceptance Criteria
+
+1. WHEN tests run, THE system SHALL parse every SDK minimum version as semantic versioning.
+2. WHEN tests run, THE system SHALL parse every SDK maximum tested version as semantic versioning.
+3. FOR EACH SDK entry, THE minimum version SHALL be less than or equal to the maximum tested version.
+4. FOR EACH SDK entry, THE maximum tested version SHALL NOT be listed as known incompatible.
+5. FOR EACH known incompatible version, THE matrix SHALL include a reason.
+
+### Requirement 22: Server compatibility claim
+
+**User Story:** As a maintainer, I want `TEMPORAL_SERVER_COMPAT` to mean behavioural compatibility, so that Tokeira does not overclaim based on release dates.
+
+#### Acceptance Criteria
+
+1. `TEMPORAL_SERVER_COMPAT` SHALL identify the highest Temporal server version for which Tokeira has no known SDK-breaking behavioural divergence across the supported SDK matrix.
+2. A newer Temporal release SHALL NOT be sufficient reason to bump `TEMPORAL_SERVER_COMPAT`.
+3. A protobuf bump SHALL NOT be sufficient reason to bump `TEMPORAL_SERVER_COMPAT`.
+4. A calendar drift threshold MAY trigger review of `TEMPORAL_SERVER_COMPAT`.
+5. THE review SHALL NOT update `TEMPORAL_SERVER_COMPAT` unless conformance evidence supports the new claim.
+6. WHERE known divergences exist, THE compatibility metadata SHALL expose them through the feature matrix or SDK matrix.
 
 ---
 
-## Feature 5: Proto Version Sync Policy
+## Feature 5: Standard Temporal `GetSystemInfo`
 
-### Requirement 5.1: Proto version pinning
+### Requirement 23: Upstream message shape
 
-**User Story:** As a Tokeira maintainer, I want the Temporal proto version pinned in one place, so that all generated code and references use the same version.
-
-#### Acceptance Criteria
-
-1. THE Temporal proto version SHALL be pinned in `tokeira-build-info` as `TEMPORAL_PROTO_VERSION: &str` matching a tagged release of `temporalio/api`.
-2. THE pin SHALL correspond to a concrete commit of the vendored proto set at `tokeira-proto/proto/` (or the submodule path, whichever the design phase chooses).
-3. WHEN the pin is bumped, all regenerated Rust types in `tokeira-proto` SHALL be committed in the same change set. The build SHALL fail if the version constant and the generated code disagree.
-
-### Requirement 5.2: Proto bump workflow
-
-**User Story:** As a Tokeira maintainer, I want a documented PR workflow for bumping the Temporal proto version, so that upstream changes are reviewed systematically.
+**User Story:** As a Temporal SDK user, I want Tokeira’s Temporal handshake to use the upstream Temporal protobuf shape, so that standard SDKs and tools do not see a forked API.
 
 #### Acceptance Criteria
 
-1. A proto version bump PR SHALL include: the new version string, regenerated Rust types, an updated feature matrix covering any new RPCs or capability fields introduced by the upstream bump, and a passing build of the matrix completeness property test.
-2. A proto version bump PR that removes any previously-defined RPC SHALL be flagged for explicit maintainer review because it is a breaking wire change.
-3. A proto version bump PR SHALL NOT require a `TEMPORAL_SERVER_COMPAT` bump. The two values move independently: proto is wire compat; server compat is behavioural compat.
+1. THE vendored Temporal `GetSystemInfoRequest` SHALL exactly mirror the upstream Temporal proto.
+2. THE vendored Temporal `GetSystemInfoResponse` SHALL exactly mirror the upstream Temporal proto.
+3. THE vendored Temporal `Capabilities` message SHALL exactly mirror the upstream Temporal proto.
+4. THE system SHALL NOT add Tokeira-specific fields to upstream Temporal protobuf messages.
+5. THE system SHALL NOT reserve custom field ranges inside upstream Temporal protobuf messages.
+6. THE proto sync check SHALL fail if an upstream Temporal proto file is locally patched.
+7. THE standard Temporal `GetSystemInfo` handler SHALL return only fields defined by the upstream Temporal API.
+8. THE standard Temporal `GetSystemInfo` handler SHALL NOT use the Tokeira compatibility service response as its protobuf schema.
 
-### Requirement 5.3: Proto vs server compat decoupling
+### Requirement 24: Server version in handshake
 
-**User Story:** As a Tokeira maintainer, I want proto version and server compat alias managed independently, so that we can track upstream wire-format changes without implicitly claiming server behavioural parity.
-
-#### Acceptance Criteria
-
-1. THE `TEMPORAL_PROTO_VERSION` and `TEMPORAL_SERVER_COMPAT` constants SHALL be independent values, declared side-by-side in a single source file but not derived from each other.
-2. THE spec SHALL document: proto version is the wire-format contract; server compat is the behavioural claim. A tokeira release may ship with proto `v1.47.0` but server compat `1.27.0` if the upstream proto has advanced faster than tokeira's behavioural coverage.
-3. THE startup log (Req 1.5) and capability handshake (Req 4.1) SHALL expose both values separately.
-
-### Requirement 5.4: Proto version monotonicity
-
-**User Story:** As a Tokeira operator, I want the proto version to only go forward across tokeira releases, so that rollbacks don't introduce protocol-level regressions silently.
+**User Story:** As a Temporal SDK, I want `server_version` to be populated consistently, so that SDK-side feature logic has a stable signal.
 
 #### Acceptance Criteria
 
-1. A Dagger-backed local CI check, invoked via `tkr ci check` per Feature 10, SHALL compare the `TEMPORAL_PROTO_VERSION` between the tip commit and the last tagged tokeira release.
-2. IF the new version is older (semver-less), the check SHALL fail, requiring an explicit override commit message (`Proto-Downgrade: <reason>`). Downgrades are possible but never accidental.
-3. A `TEMPORAL_SERVER_COMPAT` downgrade SHALL similarly require an explicit override (`Server-Compat-Downgrade: <reason>`).
-4. GitHub Actions or other remote CI trigger wiring is OUT OF SCOPE for this spec. The Dagger pipeline underlying `tkr ci check` is the portable substrate; remote-trigger wiring is owned by the `pipeline-foundation` spec (backlog P16). Operators MUST run `tkr ci check` before push until `pipeline-foundation` lands; the pre-push step is documented in `AGENTS.md` per Req 9.3.
+1. WHEN standard `GetSystemInfo` is called, THE response SHALL set `server_version` to `TEMPORAL_SERVER_COMPAT`.
+2. THE value of `server_version` SHALL NOT be derived from `TEMPORAL_PROTO_VERSION`.
+3. THE value of `server_version` SHALL NOT be derived from `TOKEIRA_VERSION`.
+4. WHERE `TEMPORAL_SERVER_COMPAT` is empty, THE Dagger build SHALL fail before a runtime can be produced.
 
-### Requirement 5.5: Server compat bump protocol
+### Requirement 25: Upstream capability flags
 
-**User Story:** As a Tokeira maintainer, I want a documented, tool-driven protocol for bumping `TEMPORAL_SERVER_COMPAT`, so that the claim stays close to the upstream Temporal tip, matches a written audit trail, survives reviewer turnover, and is never blocked by feature-coverage gaps that the matrix already communicates honestly.
+**User Story:** As a Temporal SDK, I want upstream capability flags to reflect implemented SDK-visible behaviour, so that client behaviour remains safe.
 
 #### Acceptance Criteria
 
-1. THE bump protocol SHALL recognise three bump triggers, any of which is sufficient to initiate a bump:
-   - **Trigger 1**: Upstream adds behaviour tokeira already classifies `Implemented` or `Experimental` in the feature matrix. Typically a low-risk paperwork bump.
-   - **Trigger 2**: A matrix row moved to `Implemented` and doing so unblocks a claim on an upstream release that introduced the feature. The row move lands first, the bump follows (Req 5.5.4).
-   - **Trigger 3**: Calendar drift. Upstream is ≥6 releases ahead of tokeira's current claim for ≥3 months AND the upstream delta is entirely `Stubbed`/`Unsupported` features tokeira's matrix already documents. Trigger 3 is valid AND expected: it keeps the operator-visible claim close to upstream despite partial coverage, because the feature matrix (not `TEMPORAL_SERVER_COMPAT`) is the authoritative source of what tokeira actually does.
-2. BUMPS SHALL be driven exclusively by the `tkr compat bump --to <version>` CLI command per Feature 11. Hand-editing `crates/tokeira-build-info/src/pinned.rs` outside this command is a protocol violation; `tkr ci check` SHALL fail when `pinned.rs` changes in a commit whose message lacks the required `Server-Compat-Bump:` trailer (Req 5.5.5).
-3. A Server Compat Bump PR SHALL modify `crates/tokeira-build-info/src/pinned.rs` and its rationale comment, and no other file. Feature-matrix row changes and server-compat bumps SHALL NOT appear in the same PR.
-4. A Server Compat Bump PR body SHALL include:
-   - The chosen trigger (1, 2, or 3) with a one-sentence justification.
-   - The Upstream Releases table: one row per Temporal release between the old and new claim, with a link to the upstream release notes and a one-line verbatim quote from those notes.
-   - The Disposition Table: every upstream-introduced surface (new RPC, new field, new default, new message, new enum variant) between the old and new claim, each mapped to exactly one tokeira disposition (`Implemented`, `Experimental`, `Stubbed`, `Unsupported`, `Not wire-visible (internal)`) with the matching feature-matrix row where one exists.
-   - The Matrix Delta section: every feature-matrix row whose state changed since the previous `TEMPORAL_SERVER_COMPAT` commit. Trigger 1 bumps typically have an empty delta; trigger 2 bumps name the row that unblocked the bump; trigger 3 bumps typically have an empty delta and the PR body says so explicitly.
-   - The SDK Test-Suite Evidence section. Where `SdkMatrix.test_suite_ref` entries point at real suites that have been run against tokeirad at the new claim, the section SHALL cite the run. Where the suites are not yet running, the section SHALL say so and SHALL link the tracking issue. A bump SHALL NOT be blocked on the suites being absent (Req 5.5.7).
-5. EVERY commit landing a Server Compat Bump SHALL include a trailer line matching the regex `^Server-Compat-Bump: \d+\.\d+\.\d+ -> \d+\.\d+\.\d+, trigger: [123]$`. THE trailer's old version SHALL match `TEMPORAL_SERVER_COMPAT` at the commit's parent; THE trailer's new version SHALL match `TEMPORAL_SERVER_COMPAT` at the commit. `tkr ci check` enforces both invariants mechanically.
-6. A Server Compat Bump PR SHALL be approved by a `CODEOWNERS`-named reviewer before merge. THE `CODEOWNERS` file SHALL name `crates/tokeira-build-info/src/pinned.rs` as requiring an owner-team approval; Feature 10 covers the file's creation and wiring. Until GHA branch protection is wired by `pipeline-foundation`, the `CODEOWNERS` file is an informational record enforced by reviewer discipline and by the PR template's reviewer checklist.
-7. A Server Compat Bump PR SHALL NOT be blocked on 100% feature coverage of the claimed version. THE server-compat claim is deliberately permitted to run ahead of coverage; the authoritative record of what tokeira actually does is the feature matrix plus `tokeira_feature_states` in the capability handshake.
-8. THE `crates/tokeira-build-info/src/pinned.rs` rationale comment SHALL name the latest Server Compat Bump PR number and the trigger. Bump PRs SHALL amend this comment as part of the same commit.
-9. THE initial `TEMPORAL_SERVER_COMPAT = "1.27.0"` value predates this protocol. Landing Req 5.5 SHALL include a retroactive "Bump PR 0" task (tracked in tasks.md) that authors a fully-templated PR body for the current `1.27.0` value, establishing the baseline disposition table so future diffs have a starting point. Bump PR 0 MAY be a committed markdown file under `docs/compat-bumps/0-baseline.md` rather than an actual GitHub PR, because the value already exists in the tree; this exception SHALL be documented in the file itself.
-10. THE `AGENTS.md` "Working Agreements" section SHALL carry a "Server compat bump protocol" subsection summarising the triggers, the `tkr compat bump` command, the `Server-Compat-Bump:` trailer requirement, and the CODEOWNERS gate.
+1. WHEN standard `GetSystemInfo` is called, THE response SHALL populate upstream capability fields from the feature matrix.
+2. WHERE a feature is `Implemented` and maps to an upstream capability field, THE capability flag SHALL be `true`.
+3. WHERE a feature is `Stubbed` and maps to an upstream capability field, THE capability flag SHALL be `false`.
+4. WHERE a feature is `Unsupported` and maps to an upstream capability field, THE capability flag SHALL be `false`.
+5. WHERE a feature is `Experimental` and maps to an upstream capability field, THE default standard handshake SHALL return `false` unless the feature is globally enabled for standard SDK use.
+6. THE standard `GetSystemInfo` handler SHALL NOT expose namespace-specific capability differences.
+7. THE standard `GetSystemInfo` handler SHALL NOT include Tokeira build metadata.
+8. THE standard `GetSystemInfo` handler SHALL NOT include Tokeira feature-state maps.
+9. THE standard `GetSystemInfo` handler SHALL NOT include Tokeira SDK matrix data.
+
+### Requirement 26: Namespace-specific behaviour
+
+**User Story:** As an operator, I want namespace-specific feature gates to be enforced at request time, so that the global SDK handshake remains safe.
+
+#### Acceptance Criteria
+
+1. WHERE feature availability is namespace-specific, THE actual RPC handler SHALL enforce the namespace-specific gate.
+2. THE standard `GetSystemInfo` response SHALL be treated as global/default capability metadata.
+3. WHEN a namespace-specific feature is disabled, THE relevant RPC handler SHALL reject the request with a Temporal-compatible error.
+4. WHEN a namespace-specific feature is enabled, THE relevant RPC handler MAY proceed according to feature state and runtime dispatch.
+5. THE Tokeira compatibility service MAY expose namespace-specific effective feature state when the caller supplies a namespace.
+
+### Requirement 27: Handshake consistency property
+
+**User Story:** As a maintainer, I want every upstream capability flag intentionally mapped, so that SDK-visible claims are reviewed.
+
+#### Acceptance Criteria
+
+1. WHEN tests run, THE system SHALL enumerate every field in the upstream `Capabilities` message.
+2. FOR EACH upstream capability field, THE test suite SHALL assert that exactly one feature entry maps to it or that it is explicitly documented as intentionally unmapped.
+3. FOR EACH feature entry with a capability field, THE test suite SHALL assert that the field exists in the upstream `Capabilities` message.
+4. WHEN a capability field is added upstream, THE test suite SHALL fail until the feature matrix is updated.
+5. WHEN a capability field is removed upstream, THE test suite SHALL fail until the feature matrix is updated.
 
 ---
 
-## Feature 6: Build Provenance
+## Feature 6: Tokeira Compatibility Service
 
-### Requirement 6.1: Provenance supplied by `image-lifecycle`
+### Requirement 28: Service ownership
 
-**User Story:** As a Tokeira developer, I want the image build pipeline to supply git metadata to the tokeirad build, so that release images carry valid provenance.
-
-#### Acceptance Criteria
-
-1. THE Dagger pipeline owned by [`image-lifecycle`](../image-lifecycle/requirements.md) SHALL set the environment variables `TOKEIRA_GIT_SHA` and `TOKEIRA_SOURCE_TREE_HASH` on the build container before invoking `cargo build`.
-2. THE Dagger pipeline SHALL compute `TOKEIRA_GIT_SHA` using `git rev-parse --short=8 HEAD`, appending `-dirty` if `git status --porcelain` is non-empty.
-3. THE Dagger pipeline SHALL compute `TOKEIRA_SOURCE_TREE_HASH` per Req 1.3.3 and Req 1.3.4.
-4. THE Dagger pipeline SHALL fail if `TOKEIRA_GIT_SHA` cannot be resolved (e.g., the build is running outside a git checkout and no override is provided).
-
-### Requirement 6.2: Local developer workflow
-
-**User Story:** As a Tokeira developer, I want `cargo build` in a fresh clone without git to still succeed for debug builds, so that the developer loop is not blocked by CI-only policy.
+**User Story:** As a Tokeira operator, I want rich compatibility metadata without modifying Temporal’s standard API, so that operator tooling can be powerful while SDK compatibility remains clean.
 
 #### Acceptance Criteria
 
-1. WHEN a developer runs `cargo build` (debug) without setting environment variables, THE `build.rs` SHALL invoke `git rev-parse --short=8 HEAD` directly, and if that fails (no `.git`, no `git`), SHALL substitute the literal `dev`.
-2. WHEN a developer runs `cargo build --release` without `TOKEIRA_GIT_SHA` set and not in CI (no `CI` env var), THE `build.rs` SHALL warn via `cargo::warning=` but SHALL NOT fail. Release builds outside CI carry provenance `dev` and that is the developer's responsibility to notice.
-3. THE `tokeira-build-info` crate README SHALL document the exact environment variables a CI or hand-run release build must set.
+1. THE system SHALL define a Tokeira-owned compatibility service.
+2. THE service SHALL live outside the upstream Temporal proto namespace.
+3. THE service SHALL be generated with Buffa and connect-rust.
+4. THE service SHALL expose `GetCompatibility`.
+5. THE service MAY expose `ListCompatibilitySurfaces`.
+6. THE service MAY expose `GetFeature`.
+7. THE service MAY expose `GetSdkCompatibility`.
+8. THE service SHALL NOT be required by standard Temporal SDKs.
+9. THE service SHALL be consumed by `tkr compat show --remote`.
 
-### Requirement 6.3: Provenance is never truncated in logs
+### Requirement 29: `GetCompatibility` response
 
-**User Story:** As a Tokeira operator debugging a production issue, I want the full provenance to appear in every log entry that carries build-info fields, so that log scraping never loses precision.
+**User Story:** As an operator, I want `GetCompatibility` to return the full compatibility picture, so that I can diagnose a live deployment.
 
 #### Acceptance Criteria
 
-1. THE startup log (Req 1.5) SHALL emit every provenance field at full length, never truncated.
-2. THE capability handshake (Req 4.1.4) SHALL emit every provenance field at full length.
-3. `tokeirad --version` SHALL emit full-length values with no ellipsis.
+1. WHEN `GetCompatibility` is called, THE response SHALL include `BuildInfo`.
+2. WHEN `GetCompatibility` is called, THE response SHALL include `TEMPORAL_PROTO_VERSION`.
+3. WHEN `GetCompatibility` is called, THE response SHALL include `TEMPORAL_SERVER_COMPAT`.
+4. WHEN `GetCompatibility` is called, THE response SHALL include the feature matrix digest.
+5. WHEN `GetCompatibility` is called, THE response SHALL include the SDK matrix digest.
+6. WHEN `GetCompatibility` is called, THE response SHALL include feature IDs and states.
+7. WHEN `GetCompatibility` is called, THE response SHALL include SDK compatibility entries.
+8. WHEN `GetCompatibility` is called, THE response SHALL include known divergences.
+9. WHEN a namespace is supplied, THE response MAY include namespace-specific effective feature state.
+10. WHEN a namespace is not supplied, THE response SHALL report global/default feature state.
+
+### Requirement 30: Process coverage
+
+**User Story:** As an operator, I want every relevant Tokeira process to expose comparable metadata, so that mixed-version deployments are diagnosable.
+
+#### Acceptance Criteria
+
+1. WHEN `tokeirad` exposes Tokeira-owned compatibility metadata, THE service SHALL use Buffa and connect-rust.
+2. WHERE `tokeira-edge` or `tokeira-projection` are embedded in `tokeirad`, THE compatibility metadata SHALL be exposed through `tokeirad`'s compatibility service endpoint.
+3. WHEN `tokeira-controller` exposes Tokeira-owned compatibility metadata, THE service SHALL use Buffa and connect-rust.
+4. WHEN `tokeira-autoscaler` exposes Tokeira-owned compatibility metadata, THE service SHALL use Buffa and connect-rust.
+5. WHERE a process does not expose a network service, THE same metadata SHALL remain available through logs and local CLI/version output.
+6. THE compatibility service response SHALL include a `process_kind` or equivalent field.
+7. THE compatibility service response SHALL include a process-specific endpoint identity when available.
+
+### Requirement 31: Remote failure behaviour
+
+**User Story:** As a CLI user, I want `tkr compat show --remote` to fail clearly against older deployments, so that I understand whether metadata is missing or unhealthy.
+
+#### Acceptance Criteria
+
+1. WHEN `tkr compat show --remote` calls a deployment that does not implement the Tokeira compatibility service, THE CLI SHALL report that remote compatibility metadata is unavailable.
+2. WHEN standard Temporal `GetSystemInfo` succeeds but the Tokeira compatibility service fails, THE CLI SHALL print the standard Temporal server version and explain that Tokeira metadata could not be fetched.
+3. WHEN both standard `GetSystemInfo` and the Tokeira compatibility service fail, THE CLI SHALL return a non-zero exit code.
+4. WHEN remote metadata is unavailable, THE CLI SHALL NOT invent feature or SDK matrix data.
+5. WHEN remote metadata is unavailable, THE CLI MAY suggest upgrading the deployment.
 
 ---
 
-## Feature 7: `tkr compat show` CLI
+## Feature 7: Proto Version Sync Policy
 
-### Requirement 7.1: Subcommand surface
+### Requirement 32: Exact upstream Temporal mirror
 
-**User Story:** As a Tokeira operator, I want a single command to print all compatibility metadata, so that I can answer "what does this build support" without running the server.
-
-#### Acceptance Criteria
-
-1. THE `tkr` CLI SHALL expose a top-level `compat` subcommand with children: `show`, `diff`.
-2. `tkr compat show` SHALL print:
-   - Build-time metadata (Feature 1): version, git SHA, server compat, proto version, Rust toolchain, source tree hash, feature matrix digest, SDK matrix digest.
-   - Feature matrix: each feature name, state, and (if applicable) the dynamic-config key that enables it.
-   - SDK compatibility matrix: each language, min version, max tested version, known-incompatible versions.
-3. `tkr compat show --json` SHALL emit the same data as a single JSON object.
-4. `tkr compat show --remote <endpoint>` SHALL dial the gRPC endpoint, invoke `GetSystemInfo`, and print the response formatted identically to the local form. Dynamic-config-dependent `Experimental` state SHALL reflect the remote server's current state, not the local build's static classification.
-
-### Requirement 7.2: Local vs remote consistency
-
-**User Story:** As a Tokeira operator, I want `tkr compat show` (local) and `tkr compat show --remote` against the same tokeirad deployment to produce identical output for static fields, so that I can detect drift between the CLI binary and the server binary.
+**User Story:** As a maintainer, I want vendored Temporal protos to remain exact upstream mirrors, so that compatibility claims are trustworthy.
 
 #### Acceptance Criteria
 
-1. WHEN `tkr compat show` (local) and `tkr compat show --remote <endpoint>` are run against the same tokeirad build, the static fields (build-time metadata, feature matrix digest, SDK matrix digest) SHALL be byte-for-byte identical.
-2. WHEN the CLI and the server are built from different source trees, the static fields WILL differ — `tkr compat diff` (Req 7.3) highlights the differences.
+1. THE vendored Temporal proto directory SHALL contain only upstream Temporal proto files for the pinned `TEMPORAL_PROTO_VERSION`.
+2. THE vendored Temporal proto directory SHALL NOT contain Tokeira-specific modifications to upstream files.
+3. THE proto sync check SHALL compare vendored files against the upstream source for the pinned version.
+4. THE proto sync check SHALL fail on any local patch to an upstream proto file.
+5. Tokeira-owned proto files SHALL live outside the vendored upstream Temporal proto tree.
+6. Tokeira-owned proto files SHALL use Tokeira-owned package names.
+7. Tokeira-owned proto files SHALL be generated through the Buffa + connect-rust pipeline where they define RPC services or compatibility metadata.
 
-### Requirement 7.3: `tkr compat diff` subcommand
+### Requirement 33: Proto version pinning
 
-**User Story:** As a Tokeira operator, I want to diff two tokeirad deployments' compatibility surfaces, so that I can detect version skew in a cluster before scaling operations that assume uniformity.
+**User Story:** As a developer, I want the vendored proto version to be explicit, so that generated code is reproducible.
 
 #### Acceptance Criteria
 
-1. `tkr compat diff --a <endpoint-a> --b <endpoint-b>` SHALL invoke `GetSystemInfo` on both endpoints and print a unified diff of: build-time metadata, feature matrix, SDK matrix.
-2. `tkr compat diff` SHALL exit with status 0 if the two endpoints are fully identical on the compared fields, status 1 if any field differs.
-3. `tkr compat diff --local <endpoint>` SHALL compare the local CLI build's compatibility to a remote deployment, useful before an operator's `tkr infra apply` that expects a specific tokeirad version.
+1. THE repository SHALL declare `TEMPORAL_PROTO_VERSION` in exactly one checked-in source location.
+2. THE generated Temporal proto code SHALL be reproducible from the vendored Temporal proto files.
+3. THE generated Tokeira proto code SHALL be reproducible from Tokeira-owned proto files.
+4. THE proto generation task SHALL fail if generated files are stale.
+5. THE Dagger guardrail SHALL fail if `TEMPORAL_PROTO_VERSION` changes without required regenerated output.
+6. THE `tkr compat show` output SHALL display `TEMPORAL_PROTO_VERSION`.
+
+### Requirement 34: Proto bump workflow
+
+**User Story:** As a maintainer, I want proto bumps to be reviewable, so that upstream API changes are classified intentionally.
+
+#### Acceptance Criteria
+
+1. WHEN `TEMPORAL_PROTO_VERSION` changes, THE pull request SHALL include a compatibility-surface review.
+2. WHEN upstream adds an RPC, THE feature matrix SHALL classify it before CI passes.
+3. WHEN upstream removes an RPC, THE feature matrix SHALL remove or retire the corresponding surface before CI passes.
+4. WHEN upstream adds a request field, response field, enum variant, history event, command attribute, capability flag, or error detail, THE compatibility-surface review SHALL classify it.
+5. WHEN upstream changes generated code, THE pull request SHALL include regenerated code.
+6. THE proto bump workflow SHALL NOT automatically update `TEMPORAL_SERVER_COMPAT`.
+
+### Requirement 35: Version monotonicity
+
+**User Story:** As a maintainer, I want compatibility pins to avoid accidental downgrades, so that release history remains understandable.
+
+#### Acceptance Criteria
+
+1. WHEN `TEMPORAL_PROTO_VERSION` changes on a normal branch, THE new version SHALL be greater than or equal to the previous version.
+2. WHEN `TEMPORAL_SERVER_COMPAT` changes on a normal branch, THE new version SHALL be greater than or equal to the previous version.
+3. IF a downgrade is intentionally required, THEN the change SHALL include an explicit override file or commit trailer.
+4. IF a downgrade override is present, THEN Dagger CI SHALL require a human-readable reason.
+5. THE monotonicity check SHALL compare against the configured base branch.
+
+### Requirement 36: Server compatibility bump protocol
+
+**User Story:** As a compatibility owner, I want server compatibility claims to be bumped only with evidence, so that Tokeira does not mislead SDK users.
+
+#### Acceptance Criteria
+
+1. WHEN proposing a `TEMPORAL_SERVER_COMPAT` bump, THE pull request SHALL include the target Temporal server version.
+2. WHEN proposing a `TEMPORAL_SERVER_COMPAT` bump, THE pull request SHALL include the current `TEMPORAL_PROTO_VERSION`.
+3. WHEN proposing a `TEMPORAL_SERVER_COMPAT` bump, THE pull request SHALL include SDK matrix verification status.
+4. WHEN proposing a `TEMPORAL_SERVER_COMPAT` bump, THE pull request SHALL include known divergences.
+5. WHEN proposing a `TEMPORAL_SERVER_COMPAT` bump, THE pull request SHALL include conformance test evidence.
+6. WHEN conformance evidence is incomplete, THE pull request SHALL explain why the compatibility claim remains safe.
+7. THE bump protocol SHALL be manual in this specification.
+8. THE bump protocol SHALL NOT require `tkr compat bump`.
 
 ---
 
-## Feature 8: Correctness Properties
+## Feature 8: CLI Compatibility Commands
 
-### Requirement 8.1: Matrix completeness property
+### Requirement 37: `tkr compat show`
 
-**User Story:** As a Tokeira maintainer, I want the matrix to enumerate every Temporal RPC, so that no RPC can ship unclassified.
-
-#### Acceptance Criteria
-
-1. A property test SHALL enumerate every RPC name in the vendored Temporal proto (via generated code introspection or a generated RPC-name list) and assert that the feature matrix contains a classification for each. Covered by Req 2.3.
-2. THE test SHALL run as part of the default `cargo test` invocation.
-3. THE test SHALL use `proptest` or a generative approach only where it adds value; a deterministic assertion over the full RPC list is acceptable and preferred when the RPC count is bounded.
-
-### Requirement 8.2: Capability handshake consistency property
-
-**User Story:** As a Tokeira maintainer, I want every `capabilities.*` flag to trace back to a feature, so that handshake responses can never contain phantom capabilities.
+**User Story:** As an operator, I want a single command to show compatibility metadata, so that I can inspect local and remote Tokeira versions.
 
 #### Acceptance Criteria
 
-1. A property test SHALL enumerate every field in `GetSystemInfoResponse.Capabilities` and assert that a matching feature exists in the matrix. Covered by Req 4.2.
-2. A separate property test SHALL verify: for every feature in the matrix, its capability-flag-value matches the feature's state at default dynamic-config (Req 4.2.3).
+1. THE `tkr` CLI SHALL provide `tkr compat show`.
+2. WHEN run without `--remote`, THE command SHALL print local build metadata.
+3. WHEN run with `--remote`, THE command SHALL call the target deployment.
+4. WHEN run with `--remote`, THE command SHALL call standard Temporal `GetSystemInfo` where available.
+5. WHEN run with `--remote`, THE command SHALL call the Tokeira compatibility service where available.
+6. WHEN calling the Tokeira compatibility service, THE command SHALL use the connect-rust client.
+7. THE command SHALL support human-readable output.
+8. THE command SHALL support JSON output.
+9. THE command SHALL display `TOKEIRA_VERSION`.
+10. THE command SHALL display `TOKEIRA_GIT_SHA`.
+11. THE command SHALL display `TEMPORAL_PROTO_VERSION`.
+12. THE command SHALL display `TEMPORAL_SERVER_COMPAT`.
+13. THE command SHALL display `RUST_TOOLCHAIN`.
+14. THE command SHALL display `SOURCE_TREE_HASH`.
+15. THE command SHALL display feature matrix digest.
+16. THE command SHALL display SDK matrix digest.
+17. THE command SHALL display feature states when available.
+18. THE command SHALL display SDK compatibility entries when available.
+19. THE command SHALL display the build mode (`dev` or `versioned`) when that field is available.
 
-### Requirement 8.3: Proto version monotonicity property
+### Requirement 38: `tkr compat diff`
 
-**User Story:** As a Tokeira maintainer, I want accidental proto version downgrades to be caught locally before push, so that production binaries never silently revert wire protocol.
-
-#### Acceptance Criteria
-
-1. Covered by Req 5.4. A Dagger-backed local check (not a unit test; runs via `tkr ci check` per Feature 10) SHALL compare `TEMPORAL_PROTO_VERSION` across tagged commits and fail on downgrade unless an explicit override commit message is present.
-2. An analogous check SHALL apply to `TEMPORAL_SERVER_COMPAT`.
-3. Remote-trigger wiring (GitHub Actions, nightly scheduled runs, release pipelines) is OUT OF SCOPE for this spec per Req 5.4.4.
-
-### Requirement 8.4: SDK matrix round-trip property
-
-**User Story:** As a Tokeira maintainer, I want the SDK matrix JSON round-trip to be property-tested, so that refactors to the matrix struct don't accidentally change the wire shape operators parse.
-
-#### Acceptance Criteria
-
-1. Covered by Req 3.3. A property test SHALL serialise the `SdkMatrix` to JSON and re-parse, asserting structural equality.
-2. THE property test SHALL also assert the digest is stable across the round-trip.
-
-### Requirement 8.5: Build info deterministic output property
-
-**User Story:** As a Tokeira developer, I want `tokeirad --version` output to be deterministic for a given build, so that scripts parsing the output never see surprise variance.
+**User Story:** As an operator, I want to compare compatibility metadata between two deployments or artefacts, so that rolling upgrades are safer.
 
 #### Acceptance Criteria
 
-1. A unit test SHALL invoke the `--version` formatter with the same `BuildInfo` twice and assert byte-equal output.
-2. A unit test SHALL invoke the `--version --json` formatter with the same `BuildInfo` twice and assert byte-equal output.
-3. THE tests SHALL NOT execute a real `tokeirad` binary; they SHALL call the formatter functions directly, substituting a canonical `BuildInfo`.
+1. THE `tkr` CLI SHALL provide `tkr compat diff`.
+2. THE command SHALL compare two local JSON compatibility documents.
+3. THE command SHALL compare local metadata against remote metadata.
+4. THE command MAY compare two remote deployments.
+5. WHEN comparing remote deployments, THE command SHALL use the Tokeira compatibility service where available.
+6. THE diff SHALL highlight changed Tokeira versions.
+7. THE diff SHALL highlight changed Temporal proto versions.
+8. THE diff SHALL highlight changed Temporal server compatibility claims.
+9. THE diff SHALL highlight changed feature states.
+10. THE diff SHALL highlight changed SDK matrix entries.
+11. THE diff SHALL highlight changed source-tree hashes.
+12. THE diff SHALL return a non-zero exit code when an incompatible difference is detected and `--fail-on-incompatible` is supplied.
+
+### Requirement 39: No PR automation in MVP
+
+**User Story:** As a maintainer, I want the CLI MVP to stay focused, so that compatibility reporting lands before release automation.
+
+#### Acceptance Criteria
+
+1. THE `tkr compat` MVP SHALL NOT include GitHub PR creation.
+2. THE `tkr compat` MVP SHALL NOT include release-note scraping.
+3. THE `tkr compat` MVP SHALL NOT include automatic branch creation.
+4. THE `tkr compat` MVP SHALL NOT include automatic commit creation.
+5. THE `tkr compat` MVP MAY include local validation commands that future automation can reuse.
 
 ---
 
-## Feature 9: Cross-Cutting Requirements
+## Feature 9: Dagger Build and CI Substrate
 
-### Requirement 9.1: No wall-clock in binary
+### Requirement 40: Dagger as authoritative build substrate
 
-**User Story:** As a Tokeira maintainer, I want no part of the build to embed wall-clock time, so that reproducible builds are mechanically verifiable.
-
-#### Acceptance Criteria
-
-1. Covered by Req 1.6. A Dagger-backed local check (invoked via `tkr ci check` per Feature 10) SHALL scan `tokeira-build-info/build.rs` and the generated `build_info.rs` for references to `SystemTime`, `Utc::now`, `Local::now`, `OffsetDateTime::now_utc`, or other wall-clock calls. Any hit fails the check.
-2. THE check SHALL NOT flag `std::time::Instant` usage (monotonic, not wall-clock; not embedded anyway).
-3. Remote-trigger wiring (GitHub Actions, nightly scheduled runs) is OUT OF SCOPE for this spec. The Dagger pipeline underlying the check is the portable substrate; remote wiring is owned by the `pipeline-foundation` spec.
-
-### Requirement 9.2: Zero runtime deps for `tokeira-build-info`
-
-**User Story:** As a Tokeira maintainer, I want `tokeira-build-info` to be trivial to depend on, so that every crate (including the kernel's purity-constrained one) can consume it without pulling transitive dependencies.
+**User Story:** As a Tokeira maintainer, I want local and remote builds to execute through the same Dagger functions, so that developer machines, remote CI, and versioned builds do not drift.
 
 #### Acceptance Criteria
 
-1. THE `tokeira-build-info` crate SHALL have no runtime dependencies in `[dependencies]` — only `[build-dependencies]`. Its runtime API is pure constants and a small `BuildInfo` struct defined in `std`.
-2. THE crate SHALL be `no_std`-compatible where practical; if `no_std` conflicts with the `build.rs` ergonomics (e.g., `String` in `BuildInfo`), the runtime types SHALL use `&'static str` to stay no-alloc.
-3. `tokeira-kernel` SHALL be allowed to depend on `tokeira-build-info` without violating the kernel's purity rules (the crate has no I/O, no async, no storage).
+1. THE Dagger build substrate SHALL support two build modes: `dev` and `versioned`.
+2. THE `dev` build mode SHALL allow dirty repository state.
+3. THE `dev` build mode SHALL derive build metadata from repository state where available.
+4. THE `dev` build mode SHALL NOT require a clean git commit.
+5. THE `versioned` build mode SHALL require a clean git commit.
+6. THE `versioned` build mode SHALL reject dirty repository state.
+7. THE `versioned` build mode SHALL derive build metadata from repository state and checked-in configuration.
+8. THE `versioned` build mode SHALL verify embedded `BuildInfo` after build.
+9. THE `versioned` build mode SHALL reject non-deterministic source-tree hash results.
+10. THE repository SHALL define Dagger functions for compatibility checks.
+11. THE repository SHALL define Dagger functions for generated-code freshness validation.
+12. THE repository SHALL define Dagger functions for build metadata derivation.
+13. THE local `tkr ci check` command SHALL invoke the same Dagger check function intended for use by future remote CI.
+14. WHEN remote CI wiring exists, THE remote CI system SHALL invoke the same Dagger check function used by local development.
+15. NEITHER build mode SHALL depend on CI-supplied metadata environment variables.
 
-### Requirement 9.3: Documentation
+### Requirement 41: Dagger compatibility module
 
-**User Story:** As a Tokeira operator new to the project, I want the compatibility story documented in `README.md` and `AGENTS.md`, so that I can understand which Temporal behaviour tokeira claims without reading the spec.
+**User Story:** As a developer, I want compatibility checks to run through Dagger locally, so that local and remote CI use the same execution path.
 
 #### Acceptance Criteria
 
-1. THE root `README.md` SHALL include a "Temporal compatibility" section citing `TEMPORAL_SERVER_COMPAT`, `TEMPORAL_PROTO_VERSION`, a summary of the feature matrix by state, and a pointer at `tkr compat show` for full detail.
-2. THE root `AGENTS.md` SHALL reference the compatibility ordering rules from Feature 5 (proto bump workflow, server compat independence) and the pre-push `tkr ci check` gate from Feature 10.3.
-3. THE `tkr compat show --help` output SHALL be sufficient to understand the command without reading the spec.
-4. THE `tkr ci check --help` output SHALL be sufficient to understand the command without reading the spec.
+1. THE repository SHALL include a Dagger module for compatibility checks.
+2. THE Dagger module SHALL expose a `check` function.
+3. THE `check` function SHALL run build metadata tests.
+4. THE `check` function SHALL run source-tree hash tests.
+5. THE `check` function SHALL run feature matrix tests.
+6. THE `check` function SHALL run SDK matrix tests.
+7. THE `check` function SHALL run proto sync checks.
+8. THE `check` function SHALL run generated-code freshness checks.
+9. THE `check` function SHALL run Buffa-generated code freshness checks.
+10. THE `check` function SHALL run connect-rust-generated code freshness checks.
+11. THE `check` function SHALL run standard `GetSystemInfo` handshake tests.
+12. THE `check` function SHALL run Tokeira compatibility service tests.
+13. THE `check` function SHALL return a machine-readable verdict.
+
+### Requirement 42: Dagger versioned build
+
+**User Story:** As a release engineer, I want versioned builds to execute through Dagger, so that artefacts, metadata, and provenance are produced through one controlled graph.
+
+#### Acceptance Criteria
+
+1. THE repository SHALL include a Dagger function for versioned builds.
+2. WHEN the versioned build function runs, THE function SHALL derive build metadata from repository state and checked-in configuration.
+3. WHEN the versioned build function runs, THE function SHALL generate the build metadata manifest.
+4. WHEN the versioned build function runs, THE function SHALL invoke Cargo using the generated build metadata manifest.
+5. WHEN the versioned build function runs, THE function SHALL run required compatibility checks before producing artefacts.
+6. WHEN the versioned build function runs, THE function SHALL verify embedded `BuildInfo` after build.
+7. WHEN the versioned build function runs, THE function SHALL reject dirty repository state.
+8. WHEN the versioned build function runs, THE function SHALL reject missing git provenance.
+9. WHEN the versioned build function runs, THE function SHALL reject non-deterministic source-tree hash results.
+10. THE versioned build function SHALL NOT use ambient environment variables as metadata inputs.
+11. THE versioned build function SHALL produce machine-readable artefact metadata.
+
+### Requirement 43: Dagger lockfile policy
+
+**User Story:** As a maintainer, I want Dagger CI inputs to be locked, so that compatibility checks are reproducible.
+
+#### Acceptance Criteria
+
+1. THE repository SHALL commit `.dagger/lock`.
+2. THE repository SHALL commit Dagger module configuration.
+3. WHEN compatibility checks run in hardened CI, THE Dagger invocation SHALL use frozen lock mode.
+4. WHEN frozen lock mode is used, THE check SHALL fail if a Dagger dependency is not present in `.dagger/lock`.
+5. WHEN updating locked Dagger dependencies intentionally, THE maintainer SHALL run an explicit lock update workflow.
+6. WHEN a lock update changes `.dagger/lock`, THE pull request SHALL include the lockfile diff.
+7. THE compatibility CI SHALL NOT silently refresh lockfile entries during normal check execution.
+8. THE Dagger lockfile SHALL be treated as a reviewed supply-chain artefact.
+9. THE versioned build path SHALL use frozen lock mode unless running an explicit lock update workflow.
+
+### Requirement 44: Lock update workflow
+
+**User Story:** As a maintainer, I want dependency lock updates to be explicit, so that mutable CI inputs do not change unnoticed.
+
+#### Acceptance Criteria
+
+1. THE CLI SHALL provide a documented way to refresh Dagger locks.
+2. WHEN refreshing Dagger locks, THE workflow SHALL use Dagger’s lock update mechanism or an equivalent explicit live-resolution mode.
+3. WHEN refreshing Dagger locks, THE workflow SHALL run compatibility checks after the lockfile changes.
+4. WHEN refreshed locks change container images, THE pull request SHALL display the changed image references.
+5. WHEN refreshed locks change Git references, THE pull request SHALL display the changed Git references.
+6. WHEN refreshed locks change HTTP fetches, THE pull request SHALL display the changed fetch references.
+7. THE normal pre-push check SHALL NOT update `.dagger/lock`.
+8. THE versioned build path SHALL NOT update `.dagger/lock`.
+
+### Requirement 45: Dagger lockfile limitations
+
+**User Story:** As a CI owner, I want Dagger lockfiles to complement other reproducibility controls, so that mutable package indexes do not bypass the lock.
+
+#### Acceptance Criteria
+
+1. WHERE the Dagger module uses container base images, THE image references SHALL be pinned or resolved through `.dagger/lock`.
+2. WHERE the Dagger module installs OS packages, THE module SHALL use a pinned CI image or a package snapshot strategy.
+3. WHERE the Dagger module consumes Rust dependencies, THE check SHALL respect `Cargo.lock`.
+4. WHERE the Dagger module consumes Buffa or connect-rust codegen tools, THE check SHALL respect their pinned versions.
+5. WHERE the Dagger module consumes Node dependencies, THE check SHALL respect the relevant package-manager lockfile.
+6. WHERE the Dagger module consumes Go dependencies, THE check SHALL respect `go.sum`.
+7. THE compatibility checks SHALL NOT rely on floating package-manager state without an explicit exception.
+8. EACH exception to dependency pinning SHALL include a reason and an owner.
+
+### Requirement 46: `tkr ci check`
+
+**User Story:** As a developer, I want one local command to run the compatibility guardrails, so that I can validate before pushing.
+
+#### Acceptance Criteria
+
+1. THE `tkr` CLI SHALL provide `tkr ci check`.
+2. WHEN `tkr ci check` runs, THE command SHALL invoke the Dagger compatibility `check` function.
+3. BY DEFAULT, `tkr ci check` SHALL use frozen lock mode.
+4. WHEN the user supplies an explicit lock-update option, THE command MAY run the lock update workflow.
+5. WHEN Dagger is unavailable, THE command SHALL fail with a clear setup message.
+6. WHEN checks fail, THE command SHALL return a non-zero exit code.
+7. WHEN checks pass, THE command SHALL print a concise success summary.
+8. THE command SHALL provide JSON output for future CI integration.
+9. THE command SHALL NOT run an alternate non-Dagger compatibility check path.
+
+### Requirement 47: `tkr ci build`
+
+**User Story:** As a developer, I want one local command to run the same Dagger build path as remote CI, so that local build results match release and CI behaviour.
+
+#### Acceptance Criteria
+
+1. THE `tkr` CLI SHALL provide `tkr ci build`.
+2. WHEN `tkr ci build` runs without flags, THE command SHALL invoke the Dagger `dev` build function.
+3. WHEN `tkr ci build --versioned` runs, THE command SHALL invoke the Dagger versioned build function.
+4. WHEN `tkr ci build --versioned` runs, THE command SHALL derive build metadata inside Dagger.
+5. WHEN `tkr ci build --versioned` runs, THE command SHALL validate embedded `BuildInfo`.
+6. WHEN `tkr ci build --versioned` runs against a dirty repository, THE command SHALL fail.
+7. WHEN Dagger is unavailable, THE command SHALL fail with a clear setup message.
+8. THE command SHALL NOT use ambient environment variables as build metadata inputs.
+9. THE command SHALL provide JSON output for future CI integration.
+
 ---
 
-## Feature 10: Local CI via Dagger
+## Feature 10: Correctness Properties
 
-### Requirement 10.1: Dagger pipeline for compatibility checks
+### Requirement 48: Build metadata determinism
 
-**User Story:** As a Tokeira developer, I want to run every compatibility CI check on my laptop with a single command before I push, so that I get the same verdict a remote CI runner would eventually give — without waiting for a remote job.
-
-#### Acceptance Criteria
-
-1. THE spec SHALL deliver a Dagger-backed local CI pipeline in `crates/tokeira-build/src/pipelines/ci.rs` that runs two checks:
-   - **No-wallclock**: the `rg` invariant in Req 9.1.1 executed inside a deterministic container against the current workspace.
-   - **Proto monotonicity**: the semver comparison in Req 5.4 executed against `crates/tokeira-build-info/src/pinned.rs` versus the last tagged release.
-2. THE pipeline SHALL be invocable from Rust via a public function `pub fn run_ci_checks(request: &CiCheckRequest, dagger: &dyn DaggerClient) -> Result<CiCheckReport, BuildError>` that returns a structured report enumerating each check and its outcome.
-3. THE pipeline SHALL mount the workspace into the Dagger container using the exclude list established by `TOKEIRAD_WORKSPACE_EXCLUDES` (or a CI-specific subset thereof), so cold invocations do NOT upload the multi-GB `target/` tree — the invariant proven by the `tkr image build` work landed in commit `3082176`.
-4. THE pipeline SHALL use a small `debian:bookworm-slim` or equivalent image with `ripgrep` and `git` installed; it SHALL NOT depend on the full `tokeirad` build image.
-5. Individual check selection SHALL be supported via `CiCheckRequest { checks: Vec<CiCheck> }` where `CiCheck { NoWallclock, ProtoMonotonicity, ServerCompatMonotonicity, BumpTrailer }` is an enum; an empty `checks` vector means "run all checks".
-
-### Requirement 10.2: `tkr ci check` command
-
-**User Story:** As a Tokeira developer, I want a `tkr` subcommand that runs the Dagger pipeline with the same re-exec ergonomics as `tkr image build`, so that I don't have to remember `dagger run -- tkr ci check`.
+**User Story:** As a release engineer, I want build metadata to be deterministic, so that reproducibility regressions are caught.
 
 #### Acceptance Criteria
 
-1. THE `tkr` CLI SHALL expose a top-level `ci` command group with children: `check`.
-2. `tkr ci check` SHALL run all checks defined in Req 10.1.1 and print a human-readable summary.
-3. `tkr ci check <check-name>` SHALL run exactly one check and print the same summary format.
-4. `tkr ci check --json` SHALL emit the `CiCheckReport` as a single JSON object on stdout.
-5. WHEN `DAGGER_SESSION_PORT` and `DAGGER_SESSION_TOKEN` are absent from the environment, `tkr ci check` SHALL re-execute itself under `dagger run` using the re-exec pattern established in `apps/tkr/src/commands/image/mod.rs`. The operator does not need to remember `dagger run`.
-6. Exit status SHALL be 0 if all checks pass, 1 if any check fails, 2 on usage error.
+1. WHEN build metadata is derived twice from the same repository state and checked-in configuration, THE outputs SHALL be byte-identical.
+2. WHEN file ordering differs during source-tree hash computation, THE resulting hash SHALL remain identical.
+3. WHEN excluded files change, THE source-tree hash SHALL remain unchanged.
+4. WHEN included files change, THE source-tree hash SHALL change.
+5. WHEN a wall-clock timestamp is introduced into build metadata, THE test suite SHALL fail.
+6. WHEN ambient environment variables differ between two otherwise identical Dagger builds, THE derived build metadata SHALL remain unchanged.
+7. WHEN the embedded `BuildInfo` differs from the generated metadata manifest, THE check SHALL fail.
 
-### Requirement 10.3: Pre-push operator workflow
+### Requirement 49: Feature matrix digest stability
 
-**User Story:** As a Tokeira maintainer, I want the spec to document `tkr ci check` as the pre-push gate, so that contributors know the command is the canonical verdict before remote triggers exist.
-
-#### Acceptance Criteria
-
-1. `AGENTS.md` SHALL include `tkr ci check` in the enforced-commands list (alongside `cargo +nightly fmt --all --check`, `cargo lint`, etc.) as the gate for the compatibility invariants in Features 5, 9.
-2. THE spec's `README.md` / tasks doc SHALL document that remote-trigger wiring (e.g. GitHub Actions) is deferred to the `pipeline-foundation` spec (backlog P16) and that `pipeline-foundation` will invoke the same `run_ci_checks` function, so no behavioural divergence between local and remote verdicts is introduced.
-
-### Requirement 10.4: Forward compatibility with `pipeline-foundation`
-
-**User Story:** As a Tokeira maintainer, I want the local CI pipeline shaped so `pipeline-foundation` can re-use it without rewriting, so that we don't ship throwaway code.
+**User Story:** As a maintainer, I want feature matrix digests to be stable and reviewable, so that compatibility changes are visible.
 
 #### Acceptance Criteria
 
-1. THE `run_ci_checks` function SHALL take a Dagger client abstraction (the same `DaggerClient` trait as the existing image build/publish/mirror pipelines), so a `pipeline-foundation`-owned remote runner can pass a differently-configured client without changing the check implementations.
-2. THE `CiCheckReport` SHALL be `Serialize + Deserialize` via serde so `pipeline-foundation` can ship the report to an external system (artifact store, badge server) without re-serialising the check logic.
-3. Adding a new check SHALL be a one-function addition to `ci.rs` plus one variant on the `CiCheck` enum; it SHALL NOT require changes outside `crates/tokeira-build/` or `apps/tkr/src/commands/ci/`.
+1. WHEN the feature matrix is unchanged, THE digest SHALL be unchanged.
+2. WHEN a feature state changes, THE digest SHALL change.
+3. WHEN a feature ID changes, THE digest SHALL change.
+4. WHEN compatibility-significant evidence changes, THE digest SHALL change.
+5. WHEN entries are not sorted by feature ID, THE test suite SHALL fail.
+6. THE digest computation SHALL NOT require compile-time sorting.
+
+### Requirement 50: Compatibility surface completeness
+
+**User Story:** As a compatibility reviewer, I want important Temporal surfaces classified, so that compatibility work is not reduced to endpoint counting.
+
+#### Acceptance Criteria
+
+1. WHEN upstream RPCs are enumerated, THE RPC completeness property SHALL classify every RPC.
+2. WHEN upstream capability fields are enumerated, THE capability consistency property SHALL classify every capability field.
+3. WHEN a proto bump introduces new history event types, THE compatibility review process SHALL classify them.
+4. WHEN a proto bump introduces new command attributes, THE compatibility review process SHALL classify them.
+5. WHEN a proto bump introduces new enum variants that affect SDK behaviour, THE compatibility review process SHALL classify them.
+6. WHEN a proto bump introduces new error details that affect retryability or SDK handling, THE compatibility review process SHALL classify them.
+7. THE initial implementation MAY automate RPC and capability enumeration first.
+8. THE initial implementation SHALL document remaining surface kinds as manual review items until automation exists.
+
+### Requirement 51: Standard handshake wire-shape property
+
+**User Story:** As a maintainer, I want tests proving that Tokeira has not forked Temporal’s handshake, so that SDK compatibility remains clean.
+
+#### Acceptance Criteria
+
+1. WHEN tests run, THE descriptor for vendored `GetSystemInfoRequest` SHALL match upstream for the pinned proto version.
+2. WHEN tests run, THE descriptor for vendored `GetSystemInfoResponse` SHALL match upstream for the pinned proto version.
+3. WHEN tests run, THE descriptor for vendored `Capabilities` SHALL match upstream for the pinned proto version.
+4. IF any Tokeira-specific field appears in an upstream Temporal message, THEN the test suite SHALL fail.
+5. THE test failure SHALL name the message and field that diverged.
+
+### Requirement 52: Buffa/connect-rust service compatibility property
+
+**User Story:** As a maintainer, I want tests proving that Tokeira-owned compatibility RPCs are generated and served through the adopted stack, so that the control-plane RPC strategy remains consistent.
+
+#### Acceptance Criteria
+
+1. WHEN tests run, THE Tokeira compatibility proto generation SHALL use Buffa.
+2. WHEN tests run, THE Tokeira compatibility service generation SHALL use connect-rust.
+3. WHEN tests run, THE generated Tokeira compatibility message types SHALL be Buffa-generated types.
+4. WHEN tests run, THE generated Tokeira compatibility service traits and clients SHALL be connect-rust generated.
+5. IF Tokeira compatibility message types import from `prost`-generated modules, THEN the Dagger freshness check SHALL fail.
+6. IF Tokeira compatibility service code imports from `tonic`-generated modules, THEN the Dagger freshness check SHALL fail.
+7. IF generated code is stale, THEN the Dagger freshness check SHALL fail.
+
+### Requirement 53: SDK matrix round-trip
+
+**User Story:** As a CLI developer, I want SDK compatibility data to round-trip through JSON and protobuf, so that remote and local tooling share one format.
+
+#### Acceptance Criteria
+
+1. WHEN the SDK matrix is serialized to JSON, THE output SHALL deserialize into the owned SDK matrix type.
+2. WHEN the owned SDK matrix is serialized again, THE semantic content SHALL be unchanged.
+3. WHEN the digest is recomputed from the owned type, THE digest SHALL match the static SDK matrix digest.
+4. WHEN the SDK matrix is encoded through Buffa-generated compatibility messages, THE decoded semantic content SHALL match the source matrix.
+5. WHEN an SDK entry omits required evidence, THE test suite SHALL fail.
+6. WHEN a known incompatible SDK version omits a reason, THE test suite SHALL fail.
+
+### Requirement 54: Dagger frozen-lock check
+
+**User Story:** As a CI owner, I want CI to fail when Dagger dependencies are not locked, so that mutable dependencies cannot enter silently.
+
+#### Acceptance Criteria
+
+1. WHEN the Dagger compatibility check runs in hardened mode, THE invocation SHALL use frozen lock mode.
+2. WHEN a Dagger lookup is missing from `.dagger/lock`, THE check SHALL fail.
+3. WHEN `.dagger/lock` is modified during a normal check, THE check SHALL fail.
+4. WHEN `.dagger/lock` is modified during an explicit lock update, THE workflow SHALL require review of the diff.
+5. THE CI summary SHALL report whether frozen lock mode was used.
+
 ---
 
-## Feature 11: `tkr compat bump` — driven server-compat bumps
+## Feature 11: Documentation and Operator Guidance
 
-This feature operationalises the Req 5.5 bump protocol as a `tkr` CLI subcommand that walks the maintainer through a Server Compat Bump end-to-end: preflight, evidence gathering from the GitHub API, local commit with the required trailer, local `tkr ci check` validation, push, and PR opening.
+### Requirement 55: Compatibility contract documentation
 
-### Requirement 11.1: Command surface
-
-**User Story:** As a Tokeira maintainer, I want a single CLI command that drives the entire Server Compat Bump process, so that bumps remain protocol-compliant without me remembering every step.
+**User Story:** As a user, I want the compatibility promise explained plainly, so that I know what Tokeira does and does not claim.
 
 #### Acceptance Criteria
 
-1. THE `tkr` CLI SHALL expose a `compat bump` subcommand under the existing `tkr compat` group with the signature:
+1. THE repository SHALL document `TEMPORAL_PROTO_VERSION`.
+2. THE repository SHALL document `TEMPORAL_SERVER_COMPAT`.
+3. THE documentation SHALL explain that proto compatibility and server behavioural compatibility are separate.
+4. THE documentation SHALL explain feature states.
+5. THE documentation SHALL explain SDK verification states.
+6. THE documentation SHALL explain that Tokeira-specific metadata is not exposed through patched Temporal protos.
+7. THE documentation SHALL explain that Tokeira-specific metadata is exposed through Buffa + connect-rust services.
+8. THE documentation SHALL explain that build metadata is derived through Dagger.
+9. THE documentation SHALL explain that build metadata is not supplied through environment variables.
+10. THE documentation SHALL include examples of `tkr compat show`.
+11. THE documentation SHALL include examples of `tkr compat diff`.
 
-   ```
-   tkr compat bump --to <version>
-                   [--trigger 1|2|3]
-                   [--dry-run]
-                   [--derive-surfaces]
-                   [--no-open]
-                   [--resume | --reset]
-                   [--yes]
-                   [--json]
-   ```
+### Requirement 56: Buffa/connect-rust guidance
 
-2. `<version>` SHALL be a strict semver string (e.g. `1.29.0`, no `v` prefix to match the `TEMPORAL_SERVER_COMPAT` constant shape).
-3. `--trigger` SHALL be required in non-interactive mode (`--yes` or `--json`) and SHALL be interactively prompted otherwise. It SHALL accept only `1`, `2`, or `3`.
-4. `--dry-run` SHALL print the proposed PR body, branch name, commit message, and pinned.rs diff to stdout without performing any git mutations, network writes, or branch creation.
-5. `--derive-surfaces` SHALL enable the optional upstream proto-diff step described in Feature 11.5. When absent, the generated disposition table SHALL contain a single placeholder row the operator fills manually before pushing.
-6. `--no-open` SHALL stop after the local commit + push phases, producing a pushed branch but no GitHub PR. Useful for maintainers who prefer to open the PR via the GitHub web UI.
-7. `--resume` and `--reset` SHALL be mutually exclusive; both govern retry behaviour when a bump branch already exists locally (see Req 11.6).
-8. Exit status: 0 on success (PR opened or `--no-open` reached its natural end), 1 on any enumerated failure mode from §Failure Modes in design.md, 2 on usage error (enforced by clap).
-
-### Requirement 11.2: Phased execution
-
-**User Story:** As a Tokeira maintainer, I want the bump command's phases to be clearly separated between read-only, local-write, and network-write actions, so that interruptions leave the repository in a knowable state.
+**User Story:** As a contributor, I want clear guidance on the Tokeira-owned RPC stack, so that new metadata services do not fragment the architecture.
 
 #### Acceptance Criteria
 
-1. THE command SHALL execute the following phases in order and SHALL NOT advance past a phase boundary unless the prior phase succeeded:
-   - **Phase A — Preflight** (read-only): load `pinned.rs`, validate target version newer via semver, validate working tree clean, validate branch is `main` (or the configured default), validate GitHub credentials via a `GET /user` call.
-   - **Phase B — Evidence** (network reads, no writes): enumerate upstream Temporal releases between old and new via the GitHub REST API, fetch each release body, diff the feature matrix against the commit of the previous `Server-Compat-Bump:` trailer, optionally diff the `temporalio/api` proto tree when `--derive-surfaces` is active.
-   - **Phase C — Local Mutations** (git write, no network): create the bump branch, update `pinned.rs`, commit with the `Server-Compat-Bump:` trailer, run `tkr ci check` on the branch.
-   - **Phase D — Publish** (network writes): push the branch, open the GitHub PR, amend the commit to replace the PR-number placeholder in `pinned.rs` with the real number, force-with-lease re-push.
-2. Phase A failures SHALL produce no git or network side effects.
-3. Phase B failures SHALL produce no git side effects and SHALL leave no orphaned remote resources.
-4. Phase C failures SHALL leave the bump branch in place for debugging but SHALL NOT push it; the operator recovers via `--resume` or `git branch -D`.
-5. Phase D failures SHALL leave the pushed branch in place but SHALL NOT leave an orphaned open PR. If PR opening fails mid-step, the tool SHALL write the rendered PR body to a local file and name it in the error output so the operator can open the PR manually.
-6. Between Phase B and Phase C, IF not in `--yes` or `--json` mode, THE command SHALL present a confirmation prompt summarising the scope of the bump (count of upstream releases in range, count of upstream-introduced surfaces, count of matrix rows moved).
+1. THE repository SHALL document that Tokeira-owned build metadata RPCs use Buffa and connect-rust.
+2. THE repository SHALL document that Tokeira-owned capability metadata RPCs use Buffa and connect-rust.
+3. THE repository SHALL document that upstream Temporal protos remain separate.
+4. THE repository SHALL document when prost or tonic may still appear in upstream Temporal compatibility code.
+5. THE repository SHALL document how to regenerate Buffa and connect-rust code.
+6. THE repository SHALL document how generated-code freshness is checked.
+7. THE repository SHALL document how codegen tool versions are pinned.
 
-### Requirement 11.3: Trailer and templated content
+### Requirement 57: Dagger build and CI guidance
 
-**User Story:** As a Tokeira reviewer, I want every bump commit and PR body to follow the same machine-verifiable shape, so that review is fast and mechanical checks work.
+**User Story:** As a contributor, I want clear Dagger build and CI instructions, so that local and remote execution paths remain aligned.
 
 #### Acceptance Criteria
 
-1. THE commit created in Phase C SHALL carry a trailer line matching the regex in Req 5.5.5 exactly. THE trailer SHALL be appended using `git interpret-trailers` (not string concatenation) to handle existing trailers safely.
-2. THE PR title SHALL follow the pattern `Server compat bump: <old> -> <new> (trigger: <N>)`.
-3. THE PR body SHALL be rendered from a single Markdown template stored at `crates/tokeira-build/src/compat_bump/pr_template.md` (or equivalent workspace-relative path). Every placeholder SHALL be filled; rendering with any placeholder left unbound SHALL be an error.
-4. THE template SHALL carry, at minimum, the sections enumerated in Req 5.5.4: trigger justification, Upstream Releases table, Disposition Table, Matrix Delta, SDK Test-Suite Evidence, pinned.rs diff, and the reviewer checklist.
-5. THE rationale comment in `pinned.rs` SHALL be updated in Phase C with the new claim and a placeholder `PR #?` token; THE placeholder SHALL be replaced with the real PR number in Phase D.
+1. THE repository SHALL document `tkr ci check`.
+2. THE repository SHALL document `tkr ci build`.
+3. THE repository SHALL document the Dagger versioned build path.
+4. THE repository SHALL document the Dagger build metadata derivation path.
+5. THE repository SHALL document the generated build metadata manifest.
+6. THE repository SHALL document the Dagger lockfile policy.
+7. THE repository SHALL document how to refresh `.dagger/lock`.
+8. THE repository SHALL document when lockfile updates are appropriate.
+9. THE repository SHALL document why frozen lock mode is used for hardened checks.
+10. THE repository SHALL document the limitations of Dagger lockfiles.
+11. THE repository SHALL document package-manager lockfile expectations.
+12. THE repository SHALL document that ambient environment variables are not metadata authority.
 
-### Requirement 11.4: GitHub API integration
+### Requirement 58: Compatibility bump checklist
 
-**User Story:** As a Tokeira maintainer, I want the bump tool to handle GitHub authentication, pagination, and rate-limiting predictably, so that transient failures are clearly recoverable.
-
-#### Acceptance Criteria
-
-1. THE command SHALL read GitHub authentication in the following precedence: (a) `GH_TOKEN` environment variable (matches the `gh` CLI convention); (b) `~/.config/tokeira/github-token` file with mode 0600; (c) fail with a diagnostic naming both options and their installation steps.
-2. THE authentication token SHALL be validated in Phase A with a `GET /user` call. THE command SHALL verify the token carries at minimum `public_repo` and `pull_requests: write` scopes; missing scopes SHALL fail with an explicit scope list in the error.
-3. THE command SHALL use the `octocrab` crate for GitHub REST and GraphQL access. Direct `reqwest` calls to `https://api.github.com` are prohibited to keep one auth path and one rate-limit observer.
-4. GITHUB rate-limit responses (HTTP 429 or 403 with `X-RateLimit-Remaining: 0`) SHALL be surfaced with the reset time from `X-RateLimit-Reset` and a suggestion to retry with `--resume` when the window reopens.
-5. RELEASE enumeration SHALL paginate automatically via `octocrab::stream`; THE command SHALL cache release bodies locally under `target/tkr/compat-cache/<tag>` so `--resume` does not re-fetch.
-6. PR CREATION SHALL use `octocrab::issues()` / `octocrab::pulls()` typed methods. Raw JSON POSTs are prohibited.
-
-### Requirement 11.5: `--derive-surfaces` optional evidence
-
-**User Story:** As a Tokeira maintainer, I want an optional evidence step that produces a skeleton disposition table from the upstream proto diff, so that large bumps don't require manually enumerating every new RPC and field.
+**User Story:** As a reviewer, I want a checklist for compatibility bumps, so that review quality is consistent.
 
 #### Acceptance Criteria
 
-1. WHEN `--derive-surfaces` is passed, THE command SHALL resolve the `temporalio/api` proto tag pinned by each Temporal server release in range via `GET /repos/temporalio/temporal/contents/go.mod?ref=<tag>`, parsing the `go.mod` for the `go.temporal.io/api` pin.
-2. THE command SHALL shallow-clone `temporalio/api` at the two resolved tags into `target/tkr/compat-cache/api-<tag>/`. Clones SHALL reuse any cached clone and SHALL NOT re-download when the cache is warm.
-3. THE command SHALL diff the two proto trees and classify diff entries into: new RPC declarations (`rpc <Name>(`), new message fields (`= <n>;` numbered additions on existing messages), new messages, new enum variants.
-4. THE skeleton Disposition Table SHALL list every classified diff entry with the `Tokeira disposition` column blank and the `Matrix row` column auto-filled where a feature-matrix entry names the surface. Where no match exists, the `Matrix row` column SHALL read `—`.
-5. `--derive-surfaces` SHALL be best-effort: a clone failure, proto-tree mismatch, or GitHub 404 on the `go.mod` fetch SHALL produce a warning and fall through to the non-derived path, not fail the bump.
-6. `--derive-surfaces` is IMPLEMENTED IN TWO STAGES. Stage 1 (landed with the core Feature 11 work) produces the raw diff as a commented appendix in the PR body so the operator can cut-and-paste classifications. Stage 2 (follow-up task) produces the skeleton table structure described in this requirement. Stage 2 is deferred until the core command lands and is exercised in practice.
+1. THE repository SHALL include a `TEMPORAL_PROTO_VERSION` bump checklist.
+2. THE repository SHALL include a `TEMPORAL_SERVER_COMPAT` bump checklist.
+3. THE proto bump checklist SHALL require upstream version, generated-code status, and surface classification.
+4. THE server compatibility bump checklist SHALL require conformance evidence and SDK matrix impact.
+5. THE checklist SHALL require known divergences to be documented.
+6. THE checklist SHALL require feature matrix changes when upstream surfaces are added.
+7. THE checklist SHALL state that calendar drift alone is not sufficient for a server compatibility bump.
+8. THE checklist SHALL include Buffa/connect-rust generated-code impact where Tokeira-owned compatibility protos change.
+9. THE checklist SHALL require Dagger compatibility checks to pass.
+10. THE checklist SHALL require build metadata validation to pass.
 
-### Requirement 11.6: Idempotency and retry
+---
 
-**User Story:** As a Tokeira maintainer, I want `tkr compat bump` to be rerunnable after transient failures without leaving half-complete state, so that network flakes and local mistakes are recoverable without a destructive cleanup.
+## Implementation Notes
 
-#### Acceptance Criteria
+These notes are non-normative.
 
-1. RERUNNING `tkr compat bump --to <version>` when a local branch named `compat/server-compat-bump-<old>-<new>` already exists SHALL fail unless `--resume` or `--reset` is passed.
-2. `--resume` SHALL replay Phases C and D from the current branch tip, reusing the existing commit if its trailer matches the expected shape, and otherwise amending the commit to carry the correct trailer.
-3. `--reset` SHALL delete the local branch, remove any cached evidence from `target/tkr/compat-cache/`, and restart from Phase A.
-4. WHEN an open GitHub PR already exists for the same bump branch, `tkr compat bump` SHALL print the PR URL and exit 0 (no duplicate PR opened). `--reset` overrides this behaviour by closing the existing PR and opening a new one.
-5. THE command SHALL NOT create temporary commits that are later rewritten by a squash. Phase C creates exactly one commit; Phase D amends that same commit to replace the placeholder PR number.
+1. Keep `tokeira-build-info` dependency-free.
+2. Put JSON rendering in CLI or process crates.
+3. Put protobuf rendering in the Tokeira compatibility service crate.
+4. Generate Tokeira-owned compatibility messages with Buffa.
+5. Generate Tokeira-owned compatibility service clients and handlers with connect-rust.
+6. Keep standard Temporal SDK-facing protos boring and upstream-exact.
+7. Do not patch `GetSystemInfoResponse`.
+8. Do not use `GetSystemInfo` as a Tokeira metadata dumping ground.
+9. Use the Tokeira compatibility service for build provenance, feature state, SDK matrix, and capability evidence.
+10. Avoid compile-time sorting for matrix digests; require sorted input and test it.
+11. Treat `TEMPORAL_SERVER_COMPAT` as an evidence-backed claim.
+12. Use Dagger as the authoritative local and remote build/CI execution substrate.
+13. Derive build metadata inside the Dagger graph from repository state and checked-in configuration.
+14. Use a deterministic generated build metadata manifest for Cargo embedding.
+15. Do not use ambient environment variables as build metadata authority.
+16. Use Dagger lockfiles, but do not rely on them as the only supply-chain control.
+17. Defer `tkr compat bump` automation until metadata, generated-code checks, and conformance evidence are stable.
 
-### Requirement 11.7: Acceptance, testing, and failure-mode coverage
+---
 
-**User Story:** As a Tokeira maintainer, I want `tkr compat bump` to ship with tests that cover every failure mode and the happy path, so that a regression in the command does not break the bump protocol silently.
+## Deferred Work
 
-#### Acceptance Criteria
+The following work is intentionally deferred:
 
-1. A property test SHALL assert: for any valid `BumpContext` (old version, new version, release list, matrix delta, trigger), the rendered PR body contains every placeholder filled and contains the `Server-Compat-Bump:` trailer in the commit message section.
-2. A property test SHALL assert: the generated commit message is exactly byte-equal across repeated renderings with the same inputs (deterministic).
-3. A unit test SHALL assert: the `Server-Compat-Bump:` trailer regex in Req 5.5.5 accepts all well-formed trailers and rejects common malformations (missing trigger, non-semver versions, wrong arrow, wrong trigger digit).
-4. Integration tests against a mocked `octocrab` client SHALL exercise Phase A + Phase B + Phase D (the Phase C local-git mutations are exercised against a `tempfile::TempDir` fixture holding a fresh git repo).
-5. ONE integration test, gated behind the `integration-test` feature flag and the `--ignored` attribute, SHALL open a real PR against a fork of the tokeira repository and then close it. Running this test requires a test-scope `GH_TOKEN`; it is not part of the default `cargo test` set per AGENTS.md.
-6. EVERY failure mode enumerated in the design's §Failure Modes table SHALL have either a unit test (for pure-logic failures) or an integration test (for IO failures via mocked clients).
+1. `tkr compat bump`,
+2. GitHub API integration,
+3. automatic PR creation,
+4. automated release-note classification,
+5. automatic compatibility-surface derivation for every protobuf field kind,
+6. full SDK conformance orchestration,
+7. remote CI provider wiring,
+8. compatibility dashboards,
+9. automatic mixed-version fleet analysis,
+10. controller/autoscaler capability dashboards.
 
-### Requirement 11.8: Cross-references and forward compatibility
-
-**User Story:** As a Tokeira maintainer, I want `tkr compat bump` to integrate cleanly with the existing `tkr ci check` pipeline and with the forthcoming `pipeline-foundation` remote triggers, so that the bump process does not diverge between local and remote environments.
-
-#### Acceptance Criteria
-
-1. `tkr compat bump` Phase C SHALL invoke `tkr ci check` (the Feature 10 Dagger pipeline) on the bump branch tip before attempting Phase D. IF `tkr ci check` fails, THE bump SHALL abort and the operator SHALL be pointed at the failing check output; Phase D never runs on a red branch.
-2. THE `Server-Compat-Bump:` trailer check SHALL be added to `tkr ci check` as part of the proto-monotonicity / version-pin family (renamed from `run_proto_monotonicity` to `run_version_pin_checks` in the implementation per design). THE check SHALL fire only when `pinned.rs` changed in the tip commit.
-3. `pipeline-foundation` (backlog P16) SHALL re-use the `tkr ci check` version-pin family when wiring remote triggers for bump PRs. No separate CI logic lives in a GHA workflow.
-4. THE `CODEOWNERS` file created per Req 5.5.6 SHALL be honoured by `pipeline-foundation`'s eventual branch-protection rules without re-writing, by naming the `pinned.rs` path and the owner team with a portable syntax GH recognises directly.
+Each deferred item may consume the metadata, Dagger build functions, generated code, and RPC surfaces defined by this specification, but none is required for the MVP.

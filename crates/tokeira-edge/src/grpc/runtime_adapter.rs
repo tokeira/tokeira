@@ -3,16 +3,17 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use tokeira_kernel::{
-    CancelRequest, LoadedRun, NexusResolution, ResetRequest, SignalRequest, StartRequest,
-    TerminateRequest, WorkflowTaskCompletedRequest,
+    CancelRequest, Command, LoadedRun, NexusResolution, ResetRequest, SignalRequest, StartRequest,
+    TerminateRequest, UpdateActivityOptionsRequest as KernelUpdateActivityOptionsRequest,
+    WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    PendingUpdateTransport, QueryResult, ResetWorkflowResult, SignalWithStartResult,
-    StartWorkflowResult, StartedActivityTask, TokeiraRuntime, UpdateOutcome,
+    ActivityTokenResolutionError, PendingUpdateTransport, QueryResult, ResetWorkflowResult,
+    SignalWithStartResult, StartWorkflowResult, StartedActivityTask, TokeiraRuntime, UpdateOutcome,
     UpdateTransportResolution, UpdateWaitPolicy,
 };
 use tokeira_storage::{CommitResult, RunRepository};
-use tokeira_types::{ActivityTaskToken, ExecutionRef, Payload, Payloads, RequestContext};
+use tokeira_types::{ActivityTaskToken, ExecutionRef, Payload, Payloads, RequestContext, RunKey};
 
 use crate::workflow_service::{WorkflowMutationOutcome, WorkflowRuntimeApi};
 
@@ -143,8 +144,47 @@ where
             .await
     }
 
-    async fn record_activity_heartbeat(&self, token: ActivityTaskToken) -> Result<bool> {
-        self.runtime.record_activity_heartbeat(token).await
+    async fn cancel_activity_task(
+        &self,
+        token: ActivityTaskToken,
+        details: Option<Payloads>,
+        worker_identity: Option<tokeira_types::WorkerIdentity>,
+    ) -> Result<WorkflowMutationOutcome> {
+        let result = self
+            .runtime
+            .cancel_activity_task(token, details, worker_identity)
+            .await?;
+        commit_result_to_outcome(result)
+    }
+
+    async fn record_activity_heartbeat(
+        &self,
+        token: ActivityTaskToken,
+        details: Option<Payloads>,
+    ) -> Result<bool> {
+        self.runtime.record_activity_heartbeat(token, details).await
+    }
+
+    async fn resolve_activity_token(
+        &self,
+        run_key: RunKey,
+        activity_id: &str,
+    ) -> std::result::Result<ActivityTaskToken, ActivityTokenResolutionError> {
+        self.runtime
+            .resolve_activity_token(run_key, activity_id)
+            .await
+    }
+
+    async fn update_activity_options(
+        &self,
+        run_key: RunKey,
+        req: KernelUpdateActivityOptionsRequest,
+    ) -> Result<WorkflowMutationOutcome> {
+        let result = self
+            .runtime
+            .submit(run_key, Command::UpdateActivityOptions(req))
+            .await?;
+        commit_result_to_outcome(result)
     }
 
     async fn terminate_workflow(

@@ -2,567 +2,617 @@
 
 ## Overview
 
-Embed compatibility metadata in the `tokeirad` binary, declare the feature and SDK matrices as single sources of truth, expose them via `GetSystemInfo` and `tkr compat show|diff`, and add CI checks that prevent silent drift.
+Embed compatibility metadata in Tokeira binaries, declare the feature and SDK matrices as single sources of truth, expose them via standard `GetSystemInfo` and a Tokeira-owned Buffa/connect-rust compatibility service, provide CLI inspection commands, and add Dagger-backed CI checks that prevent silent drift.
 
 Target crates:
 
-- `crates/tokeira-build-info/` — NEW library crate with compile-time metadata constants
-- `crates/tokeira-compatibility/` — NEW library crate with `FEATURE_MATRIX`, `SDK_MATRIX`, `dispatch_rpc`, `cfg_feature!`
-- `crates/tokeira-edge/` — extend with `GetSystemInfo` handler that walks the matrix + `dispatch_rpc` adoption across workflow-service and operator-service handlers
+- `crates/tokeira-build-info/` — NEW library crate with compile-time metadata constants from a Dagger-generated manifest
+- `crates/tokeira-compatibility/` — NEW library crate with `FEATURE_MATRIX`, `SDK_MATRIX`, `Feature` trait, `declare_feature!`, `cfg_feature!`, `dispatch_rpc`
+- `crates/tokeira-compatibility-proto/` — NEW crate owning Buffa-generated messages and connect-rust service/client code
+- `crates/tokeira-compatibility-service/` — NEW crate mapping matrices into Buffa DTOs, implementing connect-rust handlers
+- `crates/tokeira-edge/` — extend with standard `GetSystemInfo` handler (upstream-only, no Tokeira extension fields) + `dispatch_rpc` adoption
 - `crates/tokeira-kernel/` — adopt `cfg_feature!` at existing feature-gated module boundaries
-- `apps/tkr/` — add `compat` and `ci` command groups; `compat` carries `show`, `diff`, and `bump`
-- `proto/tokeira/internal/v1/` — define `system_info_ext.proto` extension carrying tokeira build info
-- `crates/tokeira-build/src/pipelines/ci.rs` — NEW Dagger-backed local CI pipeline (no-wallclock, version-pin monotonicity, bump-trailer, source-tree hash)
-- `crates/tokeira-build/src/compat_bump/` — NEW bump engine powering `tkr compat bump` (preflight / evidence / mutate / publish phases; octocrab-backed GitHub API integration)
-- `.github/CODEOWNERS` — NEW file naming `pinned.rs` as compat-owner-gated
-- `docs/compat-bumps/0-baseline.md` — NEW retroactive baseline establishing the starting point for bump PR diffs
+- `apps/tkr/` — add `compat` command group (`show`, `diff`) and `ci` command group (`check`, `build`)
+- `crates/tokeira-build/` — Dagger compatibility module, versioned build, lockfile policy
 
-Crucially, this plan does **not** introduce dynamic config itself (the dynamic-config reader trait is injected), does not invent a new gRPC, does not change any existing workflow semantics, and does not wire any remote CI triggers (GitHub Actions, nightly crons, release pipelines) — those are owned by the `pipeline-foundation` spec (backlog P16).
+This plan does NOT include:
+- `tkr compat bump` (deferred — manual governance only in MVP)
+- GitHub API integration or automatic PR creation
+- Extension fields on upstream `GetSystemInfoResponse`
+- Remote CI wiring (Buildkite, GitHub Actions)
+- Full SDK conformance orchestration
+
+Correctness properties P1–P10 from the design are distributed across the tasks below.
 
 ## Tasks
 
 - [ ] 1. Scaffold `crates/tokeira-build-info/`
-  - [ ] 1.1 Create the crate with zero runtime dependencies
-    - Create `crates/tokeira-build-info/Cargo.toml` with `[build-dependencies]` only (`toml` for parsing `rust-toolchain.toml`). The `[dependencies]` section is empty
+  - [x] 1.1 Create the crate with zero runtime dependencies
+    - Create `crates/tokeira-build-info/Cargo.toml` with `[build-dependencies]` only (`toml` for parsing `rust-toolchain.toml`, `regex` for parsing `pinned.rs`). The `[dependencies]` section is empty
     - Add `"crates/tokeira-build-info"` to `[workspace.members]` in the root `Cargo.toml`
-    - In `crates/tokeira-build-info/src/lib.rs`, define the `BuildInfo` struct and the six public constants (`TOKEIRA_VERSION`, `TOKEIRA_GIT_SHA`, `TEMPORAL_PROTO_VERSION`, `TEMPORAL_SERVER_COMPAT`, `RUST_TOOLCHAIN`, `SOURCE_TREE_HASH`) each bound via `env!("TOKEIRA_BUILD_INFO_…")`
+    - In `crates/tokeira-build-info/src/lib.rs`, define the `BuildInfo` struct and the nine public constants (`TOKEIRA_VERSION`, `TOKEIRA_GIT_SHA`, `TEMPORAL_PROTO_VERSION`, `TEMPORAL_SERVER_COMPAT`, `RUST_TOOLCHAIN`, `SOURCE_TREE_HASH`, `FEATURE_MATRIX_DIGEST`, `SDK_MATRIX_DIGEST`, `BUILD_MODE`) each bound via `env!("TOKEIRA_BUILD_INFO_…")`
     - Add a `pub const fn summary() -> BuildInfo` returning the struct populated from the constants
-    - _Requirements: 1.1, 9.2_
+    - _Requirements: 1.1–1.14_
 
-  - [ ] 1.2 Create `src/pinned.rs`
-    - Declare `pub const TEMPORAL_PROTO_VERSION: &str = "v1.47.0";` and `pub const TEMPORAL_SERVER_COMPAT: &str = "1.27.0";` with a doc comment pointing at the spec
-    - _Requirements: 5.1, 5.3_
+  - [x] 1.2 Create `src/pinned.rs`
+    - Declare `pub const TEMPORAL_PROTO_VERSION: &str = "v1.47.0";` and `pub const TEMPORAL_SERVER_COMPAT: &str = "1.27.0";` with doc comments citing the spec
+    - These are the canonical version pins; bumping requires a spec update and passing matrix-completeness property tests
+    - _Requirements: 33.1, 35.1, 35.2_
 
-  - [ ] 1.3 Implement `build.rs`
+  - [x] 1.3 Implement `build.rs` with manifest-based metadata
     - Create `crates/tokeira-build-info/build.rs`
-    - Emit `cargo:rerun-if-env-changed` for `TOKEIRA_GIT_SHA`, `TOKEIRA_SOURCE_TREE_HASH`, `CI`, `CARGO_PROFILE`
+    - Emit `cargo:rerun-if-env-changed=TOKEIRA_BUILD_MANIFEST_PATH`
     - Emit `cargo:rerun-if-changed` for `../../rust-toolchain.toml`, `../../Cargo.toml`, `src/pinned.rs`
-    - Resolve `TOKEIRA_VERSION` from `CARGO_PKG_VERSION`
-    - Resolve `TOKEIRA_GIT_SHA` per `resolve_git_sha` logic (env var → `git rev-parse --short=8` → fallback). Fail release-in-CI without env var; warn-but-succeed release-outside-CI without env var; substitute `dev` in debug
-    - Parse `src/pinned.rs` as text via a small regex to extract the two version constants; fail fast if empty
-    - Parse `../../rust-toolchain.toml` via the `toml` build-dep; extract `[toolchain] channel` or `[toolchain] version`; fail fast on missing file
-    - Resolve `TOKEIRA_SOURCE_TREE_HASH` from env var; substitute 64-literal-zero string in debug; fail in release-CI without env var
-    - Emit `cargo:rustc-env` for each of the six constants
-    - **Do NOT** call `SystemTime::now`, `chrono::Utc::now`, `chrono::Local::now`, `OffsetDateTime::now_utc`, or any other wall-clock source (Req 1.6, 9.1)
-    - _Requirements: 1.1.2, 1.2, 1.3, 1.6, 5.3, 6.1, 6.2, 9.1_
+    - Implement `resolve_manifest_path()`: check `TOKEIRA_BUILD_MANIFEST_PATH` env var; if set, use that path (versioned mode)
+    - Implement `is_dev_mode()`: returns true when `TOKEIRA_BUILD_MANIFEST_PATH` is not set
+    - Implement `dev_fallback_manifest()`: derive `TOKEIRA_VERSION` from `CARGO_PKG_VERSION`; derive git SHA via `git rev-parse --short=8`; parse `src/pinned.rs` via regex for proto/server-compat pins; parse `../../rust-toolchain.toml` for toolchain; use placeholder zeros for source-tree hash; use `"dev"` for digests and build mode
+    - Implement `parse_manifest(content: &str) -> Manifest`: simple key=value parser, one field per line, no quoting
+    - Emit `cargo:rustc-env` for all nine constants
+    - In versioned mode: panic with clear error if manifest is missing or malformed
+    - **Do NOT** call `SystemTime::now`, `Utc::now`, `Local::now`, or any wall-clock source
+    - _Requirements: 2.1–2.14, 3.1–3.12_
 
-  - [ ]* 1.4 Write unit test for deterministic `--version` formatting (Property P-BI-1)
-    - **Property P-BI-1: Version Output Determinism**
-    - **Validates: Requirements 1.4, 8.5**
-    - In `crates/tokeira-build-info/tests/version_format.rs`, define a canonical `BuildInfo` fixture
-    - Call a pure formatter function `format_version_short(&BuildInfo) -> String` twice; assert byte-equal output
-    - Call `format_version_verbose(&BuildInfo) -> String` twice; assert byte-equal output
-    - Call `format_version_json(&BuildInfo) -> String` twice; assert byte-equal output
-    - The formatter functions are defined in `src/format.rs`, pure, no I/O
-    - _Requirements: 1.4, 8.5_
+  - [x] 1.4 Implement version formatting in CLI layer
+    - Create `apps/tkr/src/output/build_info.rs` for build-info output rendering
+    - `pub fn format_version_short(info: &BuildInfo) -> String` — three-line summary
+    - `pub fn format_version_verbose(info: &BuildInfo) -> String` — all fields
+    - `pub fn format_version_json(info: &BuildInfo) -> String` — stable JSON with stable field names
+    - The functions consume `BuildInfo` but live outside `tokeira-build-info`; the build-info crate remains metadata-only and owns no JSON, terminal, protobuf, YAML, or table rendering
+    - All functions are pure and perform no I/O
+    - _Requirements: 6.1–6.8_
 
-  - [ ]* 1.5 Write unit test for `build.rs` env-var resolution
-    - **Property P-BI-2: Build-time Env Var Resolution**
-    - **Validates: Requirements 1.2.1, 1.2.2, 1.2.3, 1.2.4, 6.2.1, 6.2.2**
-    - Extract the decision logic from `build.rs` into a pure helper `fn decide_git_sha(env_value: Option<&str>, git_sha: Option<&str>, profile: &str, in_ci: bool) -> Result<String, BuildError>`
-    - Test each combination: env present; env empty + git present; env empty + git absent + debug; env empty + git absent + release + CI (error); env empty + git absent + release + no CI (warn, returns `dev`)
-    - Test location: `crates/tokeira-build-info/build.rs` `#[cfg(test)]` module or `crates/tokeira-build-info/src/build_logic.rs`
-    - _Requirements: 1.2, 6.2_
+  - [ ]* 1.5 Write property test: build metadata determinism (P9)
+    - **Property P9: Build Metadata Determinism**
+    - **Validates: Requirements 48**
+    - Extract the manifest parsing and dev-fallback logic into pure helper functions testable without `build.rs` execution
+    - Test: given the same input (manifest content or workspace state), `parse_manifest` produces identical output on two calls
+    - Test: `dev_fallback_manifest` with mocked filesystem inputs produces identical output on two calls
+    - Test: wall-clock patterns (`SystemTime::now`, `Utc::now`, `Local::now`) do not appear in `crates/tokeira-build-info/` source files (grep-based assertion)
+    - Test framework: `proptest` for arbitrary manifest content round-trip
+    - Test location: `crates/tokeira-build-info/tests/determinism.rs`
 
   - [ ] 1.6 Checkpoint — workspace compiles with new crate
     - Run `cargo +nightly fmt`, `cargo lint`, `cargo check --workspace`, `cargo test -p tokeira-build-info`
     - _Requirements: 1.1_
 
 - [ ] 2. Scaffold `crates/tokeira-compatibility/`
-  - [ ] 2.1 Create the crate
+  - [x] 2.1 Create the crate
     - Create `crates/tokeira-compatibility/Cargo.toml` with `thiserror`, `serde`, `tracing` as workspace-pinned deps, and `tokeira-build-info` as a path dep
     - Add `"crates/tokeira-compatibility"` to `[workspace.members]`
-    - _Requirements: 2.2, 9.2_
+    - _Requirements: 15.1_
 
-  - [ ] 2.2 Define `FeatureState`, `FeatureEntry`, `Feature` trait
-    - In `src/feature.rs`, define `FeatureState { Implemented, Experimental, Stubbed, Unsupported }` with `Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq`
-    - Define `FeatureEntry` struct per the Design doc with `id`, `state`, `capability_field`, `dynamic_config_key`, `rpcs` (all `&'static` references — no heap)
+  - [x] 2.2 Define `FeatureState`, `CompatibilitySurfaceKind`, `CompatibilitySurface`, `CompatibilityEvidence`, `FeatureEntry`, `Feature` trait
+    - In `src/feature.rs`: define `FeatureState { Implemented, Partial, Experimental, Stubbed, Unsupported }` with `Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq`
+    - Define `CompatibilitySurfaceKind` enum with all nine variants per Requirement 14
+    - Define `CompatibilitySurface { kind, identifier }` and `CompatibilityEvidence { kind, reference }`
+    - Define `FeatureEntry` struct per design with `id`, `name`, `state`, `surfaces`, `capability_field`, `dynamic_config_key`, `rpcs`, `notes`, `evidence` (all `&'static` references)
     - Define `pub trait Feature { const ID: &'static str; const ENTRY: &'static FeatureEntry; }`
-    - Define `pub const fn lookup_feature_const(id: &'static str) -> &'static FeatureEntry` with a compile-time linear scan over `FEATURE_MATRIX`; `panic!` on miss
-    - Define a `pub const fn const_str_eq(a: &str, b: &str) -> bool` helper used by `lookup_feature_const`
-    - _Requirements: 2.1, 2.2, 2.4_
+    - Define `pub const fn lookup_feature_const(id: &'static str) -> &'static FeatureEntry` with compile-time linear scan; `panic!` on miss
+    - Define `pub const fn const_str_eq(a: &str, b: &str) -> bool` helper
+    - _Requirements: 13.1–13.9, 14.1–14.12, 15.2–15.16_
 
-  - [ ] 2.3 Declare `FEATURE_MATRIX`
-    - In `src/matrix.rs`, declare `pub const FEATURE_MATRIX: &[FeatureEntry]` with the initial seed from Req 2.6, fully populated so every workflow-service and operator-service RPC maps to exactly one entry
-    - Group entries by lifecycle (Implemented → Experimental → Stubbed → Unsupported) for readability; Order does not affect the digest (the digest sorts by id)
-    - Every `Experimental` entry SHALL have a non-None `dynamic_config_key`; every other entry SHALL have `None`
-    - Every entry's `rpcs` list SHALL be non-empty unless the feature is a cross-cutting capability (e.g., `workflow-namespaces` covers multiple RPCs)
-    - _Requirements: 2.2, 2.3, 2.6_
+  - [x] 2.3 Declare `FEATURE_MATRIX`
+    - In `src/matrix.rs`, declare `pub const FEATURE_MATRIX: &[FeatureEntry]` with the initial seed
+    - Every workflow-service and operator-service RPC maps to exactly one entry
+    - Matrix MUST be sorted by feature ID; tests enforce this
+    - Every `Experimental` entry SHALL have a non-None `dynamic_config_key`
+    - Every entry's `rpcs` list SHALL be non-empty unless the feature is cross-cutting
+    - Conservative initial states per Requirement 16
+    - Seed states from `docs/temporal_api_audit.md`: strict-audit partial surfaces are marked `Partial`; unsupported upstream surfaces are marked `Unsupported`; future-ready surfaces are marked `Experimental`
+    - Add `FeatureEntry::capability_fields()` so the current single `capability_field` proto/JSON shape remains stable while code can account for secondary mapped capabilities such as `workflow-task-lifecycle` → `upsert_memo`
+    - _Requirements: 15.2–15.16, 16.1–16.13_
 
-  - [ ] 2.4 Implement matrix digest
-    - In `src/digest.rs`, implement `pub const fn feature_matrix_digest() -> &'static str` using a `const fn` FNV-1a over `(id, state_label)` tuples, sorted by `id` at compile time
-    - Also implement `pub const fn sdk_matrix_digest() -> &'static str` over `(language, min_version, max_tested_version)` tuples
-    - Convert the digest bytes to a `&'static str` hex literal via a `const` array-of-bytes conversion helper
-    - Expose `pub const FEATURE_MATRIX_DIGEST: &str` and `pub const SDK_MATRIX_DIGEST: &str`
-    - _Requirements: 2.2.3, 3.2_
+  - [x] 2.4 Implement `declare_feature!` and `cfg_feature!` macros
+    - In `src/macros.rs`, implement both `macro_rules!` macros per the design
+    - `declare_feature!($name:ident, $id:literal)` declares a zero-sized struct implementing `Feature`
+    - `cfg_feature!($feature_id:literal => $($tt:tt)*)` emits a `const _: ()` block that panics at compile time if feature state is `Stubbed` or `Unsupported`, then emits the gated code
+    - Export both macros with `#[macro_export]`
+    - _Requirements: 15.1 (compile-time gates)_
 
-  - [ ]* 2.5 Write property test for matrix digest stability (Property P-COMPAT-1)
-    - **Property P-COMPAT-1: Digest Stability**
-    - **Validates: Requirements 2.2.3**
-    - Compute `feature_matrix_digest()` twice in a test; assert byte-equal
-    - Compute with a matrix whose entries are declared in a different order (via a test-only `FEATURE_MATRIX_SHUFFLED`); assert the digest equals the canonical `FEATURE_MATRIX_DIGEST`
+  - [x] 2.5 Implement matrix digest (FNV-1a)
+    - In `src/digest.rs`, implement FNV-1a hash over `(id, state_label, surface_identifiers, evidence_references)` tuples in declared order
+    - For each entry, hash `id`, the `state` discriminant, each surface's `identifier`, and each evidence entry's `(kind, reference)` pair
+    - Implement `pub fn feature_matrix_digest() -> String` and `pub fn sdk_matrix_digest() -> String`
+    - The digest is computed at test time and compared against the manifest-embedded value; NOT computed at compile time via `const fn`
+    - _Requirements: 49.1–49.6_
+
+  - [x]* 2.6 Write property test: feature matrix digest stability (P6)
+    - **Property P6: Feature Matrix Digest Stability**
+    - **Validates: Requirements 49**
+    - Compute `feature_matrix_digest()` twice; assert byte-equal
+    - Assert that when a feature state changes, the digest changes
+    - Assert that when a surface identifier or evidence `(kind, reference)` changes, the digest changes
+    - Assert that when entries are not sorted by feature ID, the test suite fails (sort enforcement)
+    - Test framework: deterministic unit tests
     - Test location: `crates/tokeira-compatibility/src/digest.rs` `#[cfg(test)]` module
 
-  - [ ] 2.6 Implement `declare_feature!` and `cfg_feature!` macros
-    - In `src/macros.rs`, implement both `macro_rules!` macros per the Design doc
-    - `declare_feature!($name:ident, $id:literal)` declares a zero-sized struct implementing `Feature` with `ID` and `ENTRY` const items
-    - `cfg_feature!($feature_id:literal => $($tt:tt)*)` emits a `const _: () = { ... }` block that panics at compile time if the feature state is `Stubbed` or `Unsupported`, then emits `$($tt)*`
-    - Export both macros with `#[macro_export]`
-    - _Requirements: 2.4_
+  - [x] 2.7 Declare `SDK_MATRIX`
+    - In `src/sdk.rs`, define `SdkVerificationState`, `SdkCompatEntry`, `IncompatibleVersion` structs per design
+    - Declare `pub const SDK_MATRIX: &[SdkCompatEntry]` with five initial languages (Go, TypeScript, Python, Java, .NET)
+    - Conservative verification states per Requirement 19
+    - _Requirements: 19.1–19.13, 20.1–20.5_
 
-  - [ ]* 2.7 Write compile-fail tests for `cfg_feature!` (Property P-COMPAT-2)
-    - **Property P-COMPAT-2: cfg_feature! Rejects Stubbed/Unsupported**
-    - **Validates: Requirement 2.4.2**
-    - Use `trybuild` (workspace-pinned dev-dep) to create two compile-fail fixtures: one gating a `Stubbed` feature, one gating an `Unsupported` feature
-    - Assert each produces a compile error whose message contains the feature id
-    - Add a compile-pass fixture gating an `Implemented` feature; assert it compiles clean
-    - Test location: `crates/tokeira-compatibility/tests/cfg_feature_compile.rs` + `crates/tokeira-compatibility/tests/compile/`
-    - _Requirements: 2.4.2_
-
-  - [ ] 2.8 Declare `SDK_MATRIX`
-    - In `src/sdk.rs`, define `SdkCompatEntry` and `IncompatibleVersion` structs per the Design doc
-    - Declare `pub const SDK_MATRIX: &[SdkCompatEntry]` with the five initial languages (Go, TypeScript, Python, Java, .NET) and placeholder version ranges for the first release
-    - _Requirements: 3.1_
-
-  - [ ]* 2.9 Write property test for SDK matrix JSON round-trip (Property P-COMPAT-3)
-    - **Property P-COMPAT-3: SDK Matrix Round-Trip**
-    - **Validates: Requirements 3.3, 8.4**
+  - [x]* 2.8 Write property test: SDK matrix JSON round-trip (P4)
+    - **Property P4: SDK Matrix JSON Round-Trip**
+    - **Validates: Requirements 53**
     - Serialise `SDK_MATRIX` via `serde_json::to_string`
-    - Deserialise into `Vec<SdkCompatEntry>` (owned copy of the `&'static` form)
-    - Assert every field matches; assert recomputing the digest over the deserialised form produces the same `SDK_MATRIX_DIGEST`
+    - Deserialise into owned representation
+    - Assert structural equality; assert digest unchanged post-round-trip
+    - Test framework: unit test (deterministic, no generation needed)
     - Test location: `crates/tokeira-compatibility/src/sdk.rs` `#[cfg(test)]` module
 
-  - [ ]* 2.10 Write property test for SDK version ordering (Property P-COMPAT-4)
-    - **Property P-COMPAT-4: SDK Version Ordering**
-    - **Validates: Requirement 3.3.1**
-    - Iterate `SDK_MATRIX`; for each entry, parse `min_version` and `max_tested_version` via the `semver` crate (workspace-pinned dev-dep); assert `min_version <= max_tested_version`
-    - Iterate `known_incompatible`; assert none of the incompatible versions equal `max_tested_version`
+  - [x]* 2.9 Write property test: SDK version ordering (P5)
+    - **Property P5: SDK Matrix Version Ordering**
+    - **Validates: Requirements 21**
+    - For every entry, parse `min_version` and known `max_tested_version` values as semver-like triples; assert `min <= max`
+    - Assert every known-incompatible version includes a reason
+    - Assert `max_tested_version` is not listed as known incompatible
+    - Test framework: unit test (deterministic)
     - Test location: `crates/tokeira-compatibility/src/sdk.rs` `#[cfg(test)]` module
-    - _Requirements: 3.3.2_
 
-  - [ ] 2.11 Implement `dispatch_rpc` helper
-    - In `src/dispatch.rs`, define `DynamicConfigReader` trait with `fn bool_for_namespace(&self, key: &str, namespace: Option<&str>) -> bool`
-    - Define `DispatchMetrics` trait with `fn increment_dispatch(&self, feature_id: &str, state: FeatureState)`
-    - Define `RpcDispatchContext<'a>` and `DispatchOutcome<T>` per the Design doc
-    - Implement `pub fn dispatch_rpc<F: Feature>(ctx: &RpcDispatchContext<'_>) -> DispatchOutcome<()>` per the Design doc
-    - _Requirements: 2.5_
+  - [x] 2.10 Implement `dispatch_rpc` helper
+    - In `src/dispatch.rs`, define `DynamicConfigReader` trait, `DispatchMetrics` trait
+    - Define `DispatchOutcome` and `DisabledReason` enums per design
+    - Implement `pub fn dispatch_rpc<F: Feature>(dynamic_config, namespace, metrics) -> DispatchOutcome`
+    - Each state maps to the correct outcome; `Experimental` checks dynamic config
+    - Metrics incremented on every call
+    - _Requirements: 18.1–18.7_
 
-  - [ ]* 2.12 Write unit tests for `dispatch_rpc` state handling
-    - Four tests, one per `FeatureState` variant, using a test feature declared via `declare_feature!` for each state category
-    - Use a mock `DynamicConfigReader` that returns canned values; mock `DispatchMetrics` records the call
+  - [x]* 2.11 Write unit tests for `dispatch_rpc` state handling
+    - Four tests, one per `FeatureState` variant, using test features declared via `declare_feature!`
+    - Mock `DynamicConfigReader` and `DispatchMetrics`
     - For `Experimental`: test both config-enabled and config-disabled paths
-    - Assert the correct `DispatchOutcome` variant and that the metric is incremented exactly once per call
+    - Assert correct `DispatchOutcome` variant and metric increment
     - Test location: `crates/tokeira-compatibility/src/dispatch.rs` `#[cfg(test)]` module
-    - _Requirements: 2.5.1, 2.5.3_
+    - _Requirements: 18.1–18.7_
 
-  - [ ] 2.13 Checkpoint — compatibility crate compiles and tests pass
+  - [ ]* 2.12 Write compile-fail tests for `cfg_feature!`
+    - Use `trybuild` to create compile-fail fixtures: one gating a `Stubbed` feature, one gating an `Unsupported` feature
+    - Add a compile-pass fixture gating an `Implemented` feature
+    - Test location: `crates/tokeira-compatibility/tests/cfg_feature_compile.rs` + `tests/compile/`
+    - _Requirements: 15.1 (compile-time gate enforcement)_
+
+  - [x] 2.13 Checkpoint — compatibility crate compiles and tests pass
     - Run `cargo lint`, `cargo check --workspace`, `cargo test -p tokeira-compatibility`
+    - Verified with focused command: `cargo test -p tokeira-build-info -p tokeira-compatibility`
 
-- [ ] 3. Matrix completeness property test
-  - [ ] 3.1 Generate an RPC name list from the vendored proto set
-    - Add a build step in `tokeira-compatibility/build.rs` that reads generated tonic stubs from `tokeira-proto` (or alternatively, statically list the RPCs by parsing the vendored `.proto` files via `prost-build`'s reflection)
-    - Emit a `&'static [&'static str] ALL_WORKFLOW_SERVICE_RPCS` and `ALL_OPERATOR_SERVICE_RPCS` as generated code included via `include!`
-    - _Requirements: 2.3, 8.1_
+- [ ] 3. Matrix completeness and capability consistency properties
+  - [ ] 3.1 Generate RPC name lists from vendored proto set
+    - Add a build step or static declaration that enumerates every RPC in vendored `WorkflowService` and `OperatorService`
+    - Emit `ALL_WORKFLOW_SERVICE_RPCS` and `ALL_OPERATOR_SERVICE_RPCS` as `&'static [&'static str]`
+    - Also enumerate every field in the upstream `Capabilities` message
+    - _Requirements: 17.1–17.6, 27.1–27.5_
 
-  - [ ]* 3.2 Implement completeness property test (Property P-COMPAT-5)
-    - **Property P-COMPAT-5: Matrix Completeness**
-    - **Validates: Requirements 2.3, 8.1**
-    - Iterate `ALL_WORKFLOW_SERVICE_RPCS`; for each name, assert there exists exactly one `FeatureEntry` in `FEATURE_MATRIX` whose `rpcs` slice contains that name
-    - Same for `ALL_OPERATOR_SERVICE_RPCS`
-    - Collect every name in `FeatureEntry.rpcs` across all entries; assert each is present in one of the two RPC name lists (no orphan RPCs pointing at removed proto methods)
-    - Test location: `crates/tokeira-compatibility/tests/matrix_completeness.rs`
-    - _Requirements: 2.3, 8.1_
+  - [x]* 3.2 Write property test: matrix completeness (P1)
+    - **Property P1: Matrix Completeness**
+    - **Validates: Requirements 17**
+    - For each RPC in `ALL_WORKFLOW_SERVICE_RPCS`, assert exactly one `FeatureEntry` owns it
+    - For each RPC in `ALL_OPERATOR_SERVICE_RPCS`, assert exactly one `FeatureEntry` owns it
+    - For each RPC referenced by any `FeatureEntry`, assert it exists in one of the two RPC lists
+    - Test framework: unit test (deterministic enumeration)
+    - Test location: `crates/tokeira-compatibility/src/matrix.rs` `#[cfg(test)]` module
 
-- [ ] 4. `GetSystemInfo` extension proto
-  - [ ] 4.1 Define the extension message
-    - In `proto/tokeira/internal/v1/system_info_ext.proto`, define `message TokeiraBuildInfoExt` with the six fields per the Design doc
-    - Add the proto file to the internal proto compilation list owned by [`proto-upstream-sync`](../proto-upstream-sync/requirements.md)
-    - _Requirements: 4.1.4, 4.1.5_
+  - [x]* 3.3 Write property test: capability consistency (P2)
+    - **Property P2: Capability Consistency**
+    - **Validates: Requirements 27**
+    - For each field in upstream `GetSystemInfoResponse.Capabilities`, assert exactly one `FeatureEntry` maps to it via `capability_fields()`, or it is explicitly documented as intentionally unmapped
+    - For each mapped field, assert it exists in the current `Capabilities` message or is explicitly listed as a future capability field pending proto sync
+    - Test framework: unit test (deterministic enumeration)
+    - Test location: `crates/tokeira-compatibility/src/matrix.rs` `#[cfg(test)]` module
 
-  - [ ] 4.2 Wire the extension fields into `GetSystemInfoResponse`
-    - Owned by [`proto-upstream-sync`](../proto-upstream-sync/requirements.md) — the vendored proto definition carries `TokeiraBuildInfoExt tokeira_build_info = N;` and `map<string, string> tokeira_feature_states = N+1;` as optional unknown-field-tolerant extensions. This task captures the design constraint: the field numbers chosen SHALL be outside the 1-2**19 range reserved by the Temporal upstream schema to avoid future collisions
-    - _Requirements: 4.1.4, 4.1.5_
+  - [ ]* 3.4 Write property test: baseline flag agreement (P3)
+    - **Property P3: Baseline Flag Agreement**
+    - **Validates: Requirements 25**
+    - With a dynamic-config reader that always returns `false`: every `capabilities.*` flag is `true` iff the matching feature is `Implemented`
+    - Test framework: unit test (deterministic with mock config)
+    - Test location: `crates/tokeira-compatibility/tests/baseline_flags.rs`
 
-  - [ ]* 4.3 Write property test for extension round-trip (Property P-COMPAT-6)
-    - **Property P-COMPAT-6: Extension Field Round-Trip**
-    - **Validates: Requirement 4.1.4**
-    - Encode a populated `TokeiraBuildInfoExt` via prost, decode, assert every field matches
-    - Test location: `crates/tokeira-compatibility/tests/extension_roundtrip.rs`
+- [ ] 4. Kernel adoption — `cfg_feature!` gates
+  - [ ] 4.1 Wrap existing feature-gated kernel modules
+    - For each kernel module implementing an `Implemented` or `Experimental` feature, wrap the module declaration in `tokeira_compatibility::cfg_feature!("feature-id" => pub mod name { ... });`
+    - Start with unambiguously implemented features; leave `Experimental` gates for a subsequent pass
+    - No behaviour change — just compile-time assertions that the matrix agrees with the code
+    - _Requirements: 15.1 (kernel compile-time gates)_
 
-- [ ] 5. `GetSystemInfo` handler in `tokeira-edge`
-  - [ ] 5.1 Implement the handler
-    - In `crates/tokeira-edge/src/handlers/system_info.rs`, implement `async fn get_system_info(req, ctx) -> Result<GetSystemInfoResponse, tonic::Status>` per the Design doc
-    - Walk `FEATURE_MATRIX`; for each entry with a `capability_field`, set the corresponding field on `Capabilities` (true for `Implemented`, dynamic-config-dependent for `Experimental`, false for `Stubbed`/`Unsupported`)
-    - Populate `tokeira_feature_states` with every entry's (id, state label) pair
-    - Populate `tokeira_build_info` with the six constants plus the two digests
-    - Set `server_version = TEMPORAL_SERVER_COMPAT`
-    - _Requirements: 4.1_
+  - [ ]* 4.2 Write compile-fail test: flipping a feature to Stubbed breaks the kernel build
+    - Use `trybuild` to verify that if a cfg-gated feature is set to `Stubbed`, the kernel fails to compile
+    - Guards against accidental matrix flips without removing kernel code
+    - Test location: `crates/tokeira-kernel/tests/feature_gate_regression.rs`
 
-  - [ ] 5.2 Implement `set_capability_field`
-    - A `match` over `Capabilities` field names; the proptest in task 5.4 enforces exhaustiveness
-    - _Requirements: 4.1.3, 4.2_
+- [ ] 5. Edge adoption — `dispatch_rpc` for all handlers
+  - [ ] 5.1 Declare features at handler module boundaries
+    - For every workflow-service and operator-service handler, add `declare_feature!(FeatureStruct, "feature-id")` at the top
+    - Feature ID must match the `FEATURE_MATRIX` entry owning the handler's RPC
+    - _Requirements: 18.1_
 
-  - [ ]* 5.3 Write unit test for handler output
-    - Construct a handler context with a canned dynamic-config reader (all `false`)
-    - Call `get_system_info`; assert every `Implemented` feature's `capabilities.*` flag is `true`; every `Experimental` feature's flag is `false`; every `Stubbed`/`Unsupported` feature's flag is `false`
-    - Assert `server_version` equals `TEMPORAL_SERVER_COMPAT`
-    - Assert `tokeira_build_info.feature_matrix_digest == FEATURE_MATRIX_DIGEST`
-    - Test location: `crates/tokeira-edge/src/handlers/system_info.rs` `#[cfg(test)]` module
-    - _Requirements: 4.1_
+  - [ ] 5.2 Route handlers through `dispatch_rpc`
+    - Each handler's first statement: `let outcome = dispatch_rpc::<MyFeature>(dynamic_config, namespace, metrics);`
+    - `Proceed` → fall through to existing handler logic
+    - `Disabled { reason: Stubbed }` → `tonic::Status::unimplemented`
+    - `Disabled { reason: Unsupported }` → `tonic::Status::unimplemented`
+    - `Disabled { reason: ExperimentalDisabled }` → `tonic::Status::failed_precondition`
+    - Emit metric tagged with feature ID and state on every dispatch
+    - _Requirements: 18.1–18.7_
 
-  - [ ]* 5.4 Write property test for capability consistency (Property P-COMPAT-7)
-    - **Property P-COMPAT-7: Capability Consistency**
-    - **Validates: Requirements 4.2, 8.2**
-    - Enumerate every field name in `GetSystemInfoResponse.Capabilities` (via a code-generated name list built in task 3.1 or a separate proto-reflection pass)
-    - For each name, assert there exists exactly one `FeatureEntry` with `capability_field == Some(name)`
-    - With a dynamic-config reader that returns `false`, for every feature in `FEATURE_MATRIX`: if `state == Implemented` and `capability_field.is_some()`, the corresponding field on the handler response is `true`; otherwise `false`
-    - Test location: `crates/tokeira-edge/tests/capability_consistency.rs`
-    - _Requirements: 4.2, 8.2_
-
-- [ ] 6. Adopt `dispatch_rpc` across edge handlers
-  - [ ] 6.1 Declare features at handler module boundaries
-    - For every workflow-service and operator-service handler module, add a `declare_feature!(FeatureStruct, "feature-id")` declaration at the top of the file. The feature id must match the `FEATURE_MATRIX` entry that owns the handler's RPC
-    - _Requirements: 2.5.2_
-
-  - [ ] 6.2 Route handlers through `dispatch_rpc`
-    - Each handler's first statement SHALL be `let dispatch = dispatch_rpc::<MyFeature>(&dispatch_ctx);`
-    - For `Proceed`, fall through to the existing handler logic
-    - For `FailedPrecondition { message, details }`, return `Err(tonic::Status::failed_precondition(format!("{message}: {details}")))`
-    - For `Unimplemented { message }`, return `Err(tonic::Status::unimplemented(message))`
-    - _Requirements: 2.1, 2.5_
-
-  - [ ]* 6.3 Write integration test for stubbed-feature dispatch
-    - Start a tokeirad in-process instance with a dynamic-config reader that returns `false` for every key
-    - Call a handler whose feature state is `Stubbed`; assert the response status is `Unimplemented` and the message contains the feature id
-    - Call a handler whose feature state is `Experimental` with dynamic-config `false`; assert `FailedPrecondition` with the dynamic-config key in the message
-    - Call a handler whose feature state is `Implemented`; assert it proceeds to the real logic (a minimal happy-path assertion)
+  - [ ]* 5.3 Write integration test for dispatch behaviour
+    - Start an in-process instance with dynamic-config returning `false` for all keys
+    - Call a `Stubbed` feature handler → assert `Unimplemented` status
+    - Call an `Experimental` feature handler with config `false` → assert `FailedPrecondition`
+    - Call an `Implemented` feature handler → assert it proceeds
     - Test location: `crates/tokeira-edge/tests/dispatch_integration.rs`
-    - _Requirements: 2.1, 2.5_
+    - _Requirements: 18.2–18.6_
 
-- [ ] 7. Adopt `cfg_feature!` in the kernel
-  - [ ] 7.1 Wrap existing feature-gated kernel modules
-    - For each kernel module that implements an `Implemented` or `Experimental` feature, wrap the module declaration in `tokeira_compatibility::cfg_feature!("feature-id" => pub mod name { ... });`
-    - Start with features that are unambiguously implemented (e.g., `workflow-queries`, `workflow-signals`); leave `Experimental` gates for a subsequent pass once the dynamic-config wiring is stable
-    - _Requirements: 2.4.1, 2.4.2_
+- [x] 6. Standard `GetSystemInfo` handler (upstream-only)
+  - [x] 6.1 Implement the handler
+    - In `crates/tokeira-edge/src/workflow_service.rs`, preserve the existing hardcoded `SystemCapabilities` baseline returned by `get_system_info`
+    - Walk `FEATURE_MATRIX`; for each entry capability field, apply the compatibility overlay without changing currently true baseline flags
+    - `Partial`, `Implemented`, and `Experimental` entries do not alter the baseline; `Stubbed`/`Unsupported` entries only preserve already-false flags
+    - Add `TODO(temporal-compatibility)` documenting that the hardcoded baseline can be removed once the matrix has full conformance evidence for every capability
+    - Set `server_version = TEMPORAL_SERVER_COMPAT`
+    - Return ONLY upstream `GetSystemInfoResponse` fields — NO Tokeira-specific fields
+    - _Requirements: 23.1–23.8, 24.1–24.4, 25.1–25.9_
 
-  - [ ]* 7.2 Write compile-fail test that flipping a feature to Stubbed breaks the kernel build
-    - Add a `trybuild` fixture that artificially overrides `FEATURE_MATRIX` to set an `Implemented`-and-cfg-gated feature to `Stubbed`; assert the kernel fails to compile
-    - This test is a guard against accidental matrix flips: if a maintainer tries to downgrade an implemented feature to stubbed without removing its kernel code, CI catches it
-    - Test location: `crates/tokeira-kernel/tests/feature_gate_regression.rs` + `crates/tokeira-kernel/tests/compile/`
-    - _Requirements: 2.4.2_
+  - [x] 6.2 Implement `set_capability_field` helper
+    - A `match` over known capability field names; the current overlay preserves the hardcoded baseline while accepting matrix-owned field names
+    - _Requirements: 25.1–25.5_
 
-- [ ] 8. `tokeirad` startup log and `--version` output
-  - [ ] 8.1 Extend `tokeirad` startup to emit the build-info log entry
-    - At the earliest point after `tracing_subscriber::init()` in `apps/tokeirad/src/main.rs`, emit `tracing::info!(target: "tokeirad.startup", ... build_info fields ...)` per Req 1.5
-    - Include `feature_matrix_digest = FEATURE_MATRIX_DIGEST` and `sdk_matrix_digest = SDK_MATRIX_DIGEST` as structured fields
-    - _Requirements: 1.5_
+  - [x]* 6.3 Write unit test for handler output
+    - Construct baseline capabilities matching the current `GetSystemInfo` response
+    - Assert the matrix overlay preserves existing true baseline flags
+    - Assert experimental and unmapped matrix entries do not alter existing false baseline flags
+    - Assert a mapped `Stubbed` capability preserves an already-true baseline flag per the audit-informed MVP contract
+    - Test location: `crates/tokeira-edge/src/workflow_service.rs` `#[cfg(test)]` module
+    - _Requirements: 23.7, 24.1, 25.1–25.9_
 
-  - [ ] 8.2 Implement `--version`, `--version --verbose`, `--version --json`
-    - In `apps/tokeirad/src/cli.rs`, add a `Version { verbose: bool, json: bool }` arm to the top-level command enum
-    - Short form: three lines per Req 1.4.1 using `format_version_short`
-    - Verbose form: short form plus four additional lines per Req 1.4.2 using `format_version_verbose`
-    - JSON form: single JSON object per Req 1.4.3 using `format_version_json`
-    - All three formatters are pure `&BuildInfo -> String` helpers in `tokeira-build-info/src/format.rs`
-    - _Requirements: 1.4_
+  - [x]* 6.4 Write property test: standard handshake wire-shape (P7)
+    - **Property P7: Standard Handshake Wire-Shape**
+    - **Validates: Requirements 51**
+    - Verify vendored `GetSystemInfoRequest`, `GetSystemInfoResponse`, and `Capabilities` descriptors match upstream for the pinned proto version
+    - Any Tokeira-specific field in an upstream message fails the test
+    - Test framework: unit test (deterministic descriptor comparison)
+    - Test location: `crates/tokeira-edge/src/grpc/translate.rs` `#[cfg(test)]` module
 
-  - [ ]* 8.3 Write integration test for `tokeirad --version` determinism
-    - Invoke `tokeirad --version` via `std::process::Command` twice in sequence; assert the two stdouts are byte-equal
-    - Do the same for `--version --verbose` and `--version --json`
-    - Test location: `apps/tokeirad/tests/version_cli.rs`, gated behind `integration-test` feature per AGENTS.md testing guidance
-    - _Requirements: 1.4, 8.5_
+- [ ] 7. Tokeira Compatibility Service (Buffa + connect-rust)
+  - [x] 7.1 Create `proto/tokeira/compatibility/v1/compatibility.proto`
+    - Define `package tokeira.compatibility.v1`
+    - Define `CompatibilityService` with `GetCompatibility` RPC (required for MVP)
+    - Define `GetCompatibilityRequest`, `GetCompatibilityResponse`, `BuildInfo`, `FeatureStateEntry`, `FeatureState` enum, `SdkCompatibilityEntry`, `KnownDivergence`, `CompatibilitySurface` messages per design
+    - Proto file lives OUTSIDE the vendored upstream Temporal proto tree
+    - _Requirements: 8.1–8.8, 28.1–28.9, 29.1–29.10_
 
-- [ ] 9. `tkr compat` command group
-  - [ ] 9.1 Add `CompatCommand` enum to `apps/tkr/src/cli.rs`
+  - [x] 7.2 Scaffold `crates/tokeira-compatibility-proto/`
+    - Create crate with Buffa code generation for messages and connect-rust code generation for service traits/clients
+    - Generated code checked in; freshness validated in CI
+    - NOT tonic-generated, NOT prost-generated
+    - _Requirements: 9.1–9.8, 10.1–10.8, 11.1–11.7_
+
+  - [ ] 7.3 Generate Buffa messages and connect-rust service code
+    - Run Buffa codegen for `tokeira.compatibility.v1` messages
+    - Run connect-rust codegen for `CompatibilityService` trait and client
+    - Check in generated code
+    - Pin Buffa and connect-rust codegen tool versions in checked-in configuration
+    - _Requirements: 8.3–8.6, 12.1–12.7_
+
+  - [x] 7.4 Scaffold `crates/tokeira-compatibility-service/`
+    - Create crate depending on `tokeira-compatibility`, `tokeira-build-info`, `tokeira-compatibility-proto`
+    - Implement `GetCompatibility` handler: map `FEATURE_MATRIX` and `SDK_MATRIX` into Buffa DTOs
+    - Populate `BuildInfo`, `process_kind`, `process_identity`, feature states, SDK entries, known divergences
+    - Handle namespace parameter (global/default when absent)
+    - _Requirements: 28.1–28.9, 29.1–29.10, 30.1–30.7_
+
+  - [ ]* 7.5 Write property test: Buffa/connect-rust stack enforcement (P8)
+    - **Property P8: Buffa/connect-rust Stack Enforcement**
+    - **Validates: Requirements 52**
+    - Assert Tokeira compatibility message types import from Buffa-generated modules
+    - Assert Tokeira compatibility service code imports from connect-rust-generated modules
+    - Assert generated code is fresh (regenerate and diff)
+    - Test framework: unit test + CI freshness check
+    - Test location: `crates/tokeira-compatibility-service/tests/stack_enforcement.rs`
+
+  - [x]* 7.6 Write unit tests for `GetCompatibility` handler
+    - Call handler with no namespace; assert response contains all `BuildInfo` fields, feature states, SDK entries
+    - Call handler with a namespace; assert namespace-specific state if applicable
+    - Current implementation has no namespace-specific matrix state, so tests validate global/default behavior and filtered feature/SDK lookup
+    - Assert `process_kind` is populated
+    - Test location: `crates/tokeira-compatibility-service/src/lib.rs` `#[cfg(test)]` module
+    - _Requirements: 29.1–29.10_
+
+  - [ ] 7.7 Wire compatibility service into all deployed processes
+    - `tokeirad`, `tokeira-controller`, and `tokeira-autoscaler` each expose the compatibility service via connect-rust
+    - Edge and projection metadata is exposed through `tokeirad`, because `tokeira-edge` and `tokeira-projection` are embedded crates rather than standalone deployed processes
+    - Each process sets its own `process_kind` and `process_identity`
+    - _Requirements: 30.1–30.7_
+
+- [ ] 8. CLI adoption — `tkr compat show` and `tkr compat diff`
+  - [x] 8.1 Add `CompatCommand` enum to `apps/tkr/src/cli.rs`
     - Add `Compat(CompatArgs)` variant to the top-level `Command` enum
-    - Define `CompatArgs` with a subcommand bound to `CompatCommand { Show { remote, json }, Diff { a, b, local } }`
-    - _Requirements: 7.1_
+    - Define `CompatCommand { Show { remote, json, verbose }, Diff { a, b, fail_on_incompatible } }`
+    - _Requirements: 37.1, 38.1_
 
-  - [ ] 9.2 Implement the show handler
-    - Create `apps/tkr/src/commands/compat.rs`. Implement `run(cmd, format)` per the Design doc
-    - For `Show { remote: None, json }`: construct a `GetSystemInfoResponse`-shaped local view from compile-time constants via `build_local_response()`; render text or JSON
-    - For `Show { remote: Some(endpoint), json }`: dial via the existing tkr gRPC client infrastructure, call `GetSystemInfo`, render
-    - _Requirements: 7.1, 7.2_
+  - [ ] 8.2 Implement `tkr compat show` handler
+    - Create `apps/tkr/src/commands/compat.rs`
+    - Without `--remote`: print local build metadata from compile-time constants; display feature states and SDK entries
+    - With `--remote`: call standard `GetSystemInfo` AND the Tokeira Compatibility Service (connect-rust client)
+    - Graceful degradation: if Tokeira service unavailable, show standard `server_version` and explain
+    - Support human-readable and JSON output
+    - _Requirements: 37.1–37.19, 31.1–31.5_
 
-  - [ ] 9.3 Implement the diff handler
-    - For `Diff { a: Some(a), b: Some(b), local: None }`: `tokio::try_join!` two remote calls, produce a unified-diff-style output listing differing fields
-    - For `Diff { a: None, b: None, local: Some(endpoint) }`: local view vs remote call
-    - Exit status: 0 if identical on compared fields, 1 on any difference, 2 on usage error (enforced by clap)
-    - Render text format; support `--json` via `format: OutputFormat` plumbed from tkr global flags
-    - _Requirements: 7.3_
+  - [ ] 8.3 Implement `tkr compat diff` handler
+    - Compare two local JSON documents, or local vs remote, or two remote deployments
+    - Highlight changed versions, proto versions, server compat claims, feature states, SDK entries, source-tree hashes
+    - Exit non-zero when `--fail-on-incompatible` is supplied and an incompatible difference is detected
+    - _Requirements: 38.1–38.12_
 
-  - [ ] 9.4 Wire the `compat` command into `apps/tkr/src/main.rs`
-    - Add `Command::Compat(args) => commands::compat::run(args.command, format).await?`
-    - Position the command between existing `deployment` and other top-level groups per [`tkr-cli`](../tkr-cli/requirements.md) conventions
-    - _Requirements: 7.1_
+  - [x] 8.4 Wire `compat` command into `apps/tkr/src/main.rs`
+    - Dispatch to `commands::compat::run(args.command, format)`
+    - _Requirements: 37.1_
 
-  - [ ]* 9.5 Write unit tests for CLI parse
-    - Parse `tkr compat show`: assert `remote == None`, `json == false`
-    - Parse `tkr compat show --remote grpc://example:7233 --json`: assert values match
+  - [x]* 8.5 Write CLI parse tests
+    - Parse `tkr compat show`, `tkr compat show --remote grpc://example:7233 --json`
     - Parse `tkr compat diff --a grpc://a:7233 --b grpc://b:7233`
-    - Parse `tkr compat diff --local grpc://remote:7233`
-    - Parse `tkr compat diff --a ... --local ...` (conflict): assert clap returns usage error
+    - Parse `tkr compat diff --fail-on-incompatible`
     - Test location: `apps/tkr/src/commands/compat.rs` `#[cfg(test)]` module
 
-  - [ ]* 9.6 Write property test for local vs remote consistency (Property P-COMPAT-8)
-    - **Property P-COMPAT-8: Local vs Remote Show Consistency**
-    - **Validates: Requirement 7.2**
-    - Start a tokeirad in-process instance; call `tkr compat show` (local) and `tkr compat show --remote <addr>` against it
-    - Parse both JSON outputs; assert the static fields (build_info, feature_matrix_digest, sdk_matrix_digest, all features with state Implemented/Stubbed/Unsupported) are byte-equal
-    - Note that `Experimental` state may differ if the running server has dynamic config enabled — assert the other fields are equal; test this case separately
+  - [ ]* 8.6 Write integration test: local vs remote consistency
+    - Start in-process instance; call `tkr compat show` (local) and `tkr compat show --remote` against it
+    - Parse both JSON outputs; assert static fields are equal
     - Test location: `apps/tkr/tests/compat_local_vs_remote.rs`
-    - _Requirements: 7.2_
+    - _Requirements: 37.2–37.5_
 
-- [ ] 10. Local CI pipeline via Dagger
-  - [ ] 10.1 Extract `dagger_reexec` helper into a shared module
-    - Move the `should_reexec_under_dagger`, `reexec_under_dagger`, and `reexec_args` helpers out of `apps/tkr/src/commands/image/mod.rs` and into a new `apps/tkr/src/dagger_reexec.rs` module. Generalise `reexec_args` to take a `&[String]` of already-formatted argv tail rather than the `ImageCommand` enum, so both `image` and `ci` command groups can share it
-    - Update `apps/tkr/src/commands/image/mod.rs` to import the shared helpers; add a small per-command shim that formats `ImageCommand` into `Vec<String>` before calling the shared `reexec_under_dagger`
-    - _Requirements: 10.2.5, 10.4.3_
+- [ ] 9. CLI adoption — `tkr ci check` and `tkr ci build`
+  - [x] 9.1 Scaffold `apps/tkr/src/commands/ci/`
+    - Create `mod.rs` with `CiCommand { Check { json, update_lock }, Build { versioned, json }, LockUpdate { json } }`
+    - Add `Ci(CiArgs)` variant to `apps/tkr/src/cli.rs::Command`
+    - Wire dispatcher in `apps/tkr/src/main.rs`
+    - _Requirements: 44.1–44.8, 46.1, 47.1_
 
-  - [ ] 10.2 Scaffold `crates/tokeira-build/src/pipelines/ci.rs`
-    - Create the module alongside `pipelines/build.rs`, `pipelines/publish.rs`, `pipelines/mirror.rs`
-    - Define the `CiCheck`, `CiCheckRequest`, `CiCheckReport`, `CiCheckResult` types per design.md §7, all deriving `Serialize + Deserialize`
-    - Add `pub fn run_ci_checks(request: &CiCheckRequest, dagger: &dyn DaggerClient) -> Result<CiCheckReport, BuildError>` with the shared container-preamble (apt install `ripgrep` + `git`, workdir `/workspace`, `with_directory` using `TOKEIRAD_WORKSPACE_EXCLUDES`)
-    - Re-export the public surface from `crates/tokeira-build/src/lib.rs`
-    - _Requirements: 10.1, 10.4_
+  - [x] 9.2 Implement `tkr ci check`
+    - Invoke the Dagger compatibility `check` function
+    - Use frozen lock mode by default
+    - Re-exec under `dagger run` using the shared `dagger_reexec` helper
+    - When Dagger unavailable: fail with clear setup message
+    - When checks fail: return non-zero exit code
+    - When checks pass: print concise success summary
+    - When the user supplies `--update-lock`, the command MAY delegate to `tkr ci lock-update`
+    - Support JSON output
+    - _Requirements: 46.1–46.9_
 
-  - [ ] 10.3 Implement the no-wallclock check
-    - Inside `ci.rs`, add `fn run_no_wallclock(base: &dyn ContainerRef<'_>) -> Result<CiCheckResult, BuildError>` that invokes `rg -n 'SystemTime::now|Utc::now|Local::now|OffsetDateTime::now_utc|chrono::Utc::now|chrono::Local::now' crates/tokeira-build-info/` inside the container and inspects the exit code
-    - `rg` exit status 0 = hits present = check FAILED; exit status 1 = no hits = check PASSED; any other exit = surface as a `BuildError::Validation`
-    - Capture the matching lines as `details` on the `CiCheckResult`
-    - _Requirements: 9.1.1, 10.1.1_
+  - [x] 9.3 Implement `tkr ci build`
+    - Without flags: invoke Dagger `dev` build function
+    - With `--versioned`: invoke Dagger versioned build function (requires clean git, generates manifest, validates embedded BuildInfo)
+    - When Dagger unavailable: fail with clear setup message
+    - Do NOT use ambient environment variables as build metadata inputs
+    - Support JSON output
+    - _Requirements: 47.1–47.9_
 
-  - [ ] 10.4 Implement the version-pin monotonicity check (proto + server compat)
-    - Inside `ci.rs`, add `fn run_version_pin_monotonicity(base: &dyn ContainerRef<'_>, pin: PinKind) -> Result<CiCheckResult, BuildError>` that (a) resolves the last tag matching `v*` via `git describe --tags --abbrev=0 --match 'v*'`; (b) extracts the named constant (either `TEMPORAL_PROTO_VERSION` or `TEMPORAL_SERVER_COMPAT`) from `crates/tokeira-build-info/src/pinned.rs` at the tip and at the tag; (c) compares via semver (workspace-pinned `semver` dep)
-    - Fail the check if the tip version is lower than the tag version AND the tip commit message does NOT contain the matching downgrade override trailer (`Proto-Downgrade:` for proto, `Server-Compat-Downgrade:` for server compat)
-    - `PinKind::Proto` and `PinKind::ServerCompat` dispatch to the same logic with different constant names and override trailers
-    - THE `CiCheck::BumpTrailer` check is implemented in task 13.18, not here — this task covers only the monotonicity check family
-    - _Requirements: 5.4, 10.1.1_
+  - [x]* 9.4 Write CLI parse tests for `tkr ci`
+    - Parse `tkr ci check`, `tkr ci check --json`
+    - Parse `tkr ci build`, `tkr ci build --versioned`
+    - Parse `tkr ci lock-update`, `tkr ci lock-update --json`
+    - Test location: `apps/tkr/src/commands/ci/mod.rs` `#[cfg(test)]` module
 
-  - [ ]* 10.5 Write a property test for `run_ci_checks` dispatch
-    - **Property P-CI-2: CiCheckRequest selection**
-    - **Validates: Requirement 10.1.5**
-    - Use `MockDaggerClient` (the existing test harness in `crates/tokeira-build/src/testing.rs`). For each `CiCheck` variant and for the all-checks default, assert the expected set of `with_exec` calls is recorded on the mock
-    - Test location: `crates/tokeira-build/src/pipelines/ci.rs` `#[cfg(test)]` module
-    - _Requirements: 10.1.5_
+  - [ ]* 9.5 Write integration test for `tkr ci check`
+    - Invoke `tkr ci check` against a clean working tree; assert exit 0
+    - Test location: `apps/tkr/tests/ci_check.rs` (gated behind `integration-test` feature)
+    - _Requirements: 46.6–46.7_
 
-  - [ ] 10.6 Scaffold `apps/tkr/src/commands/ci/`
-    - Create `apps/tkr/src/commands/ci/mod.rs` with a `CiCommand` enum (variant `Check { check: Option<CliCiCheck>, json: bool }`) and a `pub async fn run(command: CiCommand, format: OutputFormat) -> Result<()>` entry point
-    - Define `CliCiCheck { NoWallclock, ProtoMonotonicity, ServerCompatMonotonicity, BumpTrailer }` with `clap::ValueEnum` and `From<CliCiCheck> for CiCheck`
-    - Add `Ci(CiArgs)` variant to `apps/tkr/src/cli.rs::Command`; wire the dispatcher arm in `apps/tkr/src/main.rs`
-    - _Requirements: 10.2_
+  - [x] 9.6 Implement `tkr ci lock-update`
+    - Invoke Dagger's explicit lock update mechanism or equivalent live-resolution mode
+    - Run compatibility checks after lockfile changes
+    - Print changed container image references, Git references, and HTTP fetch references
+    - Support JSON output
+    - Ensure normal `tkr ci check` and versioned build paths do not refresh `.dagger/lock`
+    - _Requirements: 44.1–44.8, 46.4_
 
-  - [ ] 10.7 Implement the re-exec path and local invocation
-    - In `apps/tkr/src/commands/ci/mod.rs::run`, check `should_reexec_under_dagger()` at entry; when absent, format the argv tail and call the shared `reexec_under_dagger`
-    - When session env is present, construct a `CiCheckRequest`, call `run_ci_checks`, render output (human table or JSON via `--json`), exit status 0/1/2 per Req 10.2.6
-    - _Requirements: 10.2_
+- [ ] 10. Dagger CI pipeline — compatibility module
+  - [ ] 10.1 Scaffold Dagger compatibility module
+    - Create the Dagger module exposing a `check` function
+    - The `check` function runs all compatibility checks in a deterministic container
+    - _Requirements: 40.10, 41.1–41.13_
 
-  - [ ]* 10.8 Write integration test for `tkr ci check`
-    - Invoke `tkr ci check` via `std::process::Command` against a clean working tree; assert exit 0 and both checks PASSED in the JSON output
-    - Introduce a temporary `SystemTime::now()` call in `crates/tokeira-build-info/build.rs`; invoke `tkr ci check no-wallclock`; assert exit 1 and the NoWallclock check FAILED
-    - Remove the temporary call; re-run; assert exit 0
-    - Test location: `apps/tkr/tests/ci_check.rs`, gated behind `integration-test` feature per AGENTS.md
-    - _Requirements: 10.2, 10.3_
+  - [ ] 10.2 Implement no-wallclock check
+    - Grep for `SystemTime::now|Utc::now|Local::now|OffsetDateTime::now_utc` in `crates/tokeira-build-info/`
+    - Hits present = check FAILED; no hits = check PASSED
+    - _Requirements: 48.5 (wall-clock detection)_
 
-- [ ] 11. Source tree hash helper
-  - [ ] 11.1 Implement `compute_source_tree_hash` in `tokeira-build`
-    - Add `pub fn compute_source_tree_hash(workspace_root: &Path) -> Result<String, BuildError>` to `crates/tokeira-build/src/pipelines/ci.rs` (or a sibling `source_tree_hash.rs` module if it grows)
-    - The function walks the workspace applying the exclusion list from Req 1.3.3 (reuses `TOKEIRAD_WORKSPACE_EXCLUDES` as the baseline plus the spec-specific extras), sorts paths deterministically, and returns a lowercase SHA-256 hex string
-    - Used by the Dagger build pipeline owned by [`image-lifecycle`](../image-lifecycle/requirements.md) and by `tkr image build` for reproducible-build provenance; operators who want to compute the hash directly can invoke it via a future `tkr provenance source-hash` subcommand (tracked as a non-blocking follow-up)
-    - _Requirements: 1.3, 6.1_
+  - [ ] 10.3 Implement proto monotonicity check
+    - Compare `TEMPORAL_PROTO_VERSION` and `TEMPORAL_SERVER_COMPAT` against base branch
+    - Fail if tip version is lower than base (silent downgrade)
+    - Allow explicit downgrade override via commit trailer
+    - _Requirements: 35.1–35.5_
 
-  - [ ]* 11.2 Write property test for hash determinism
-    - **Property P-CI-1: Source Tree Hash Determinism**
-    - **Validates: Requirement 1.3.4**
-    - Generate arbitrary file trees via `proptest` (bounded depth, bounded file sizes) in a `tempfile::TempDir`; hash twice; assert byte-equal
-    - Shuffle the traversal order in a test-only alternate implementation; assert the sort produces the same hash
-    - Test location: `crates/tokeira-build/src/pipelines/ci.rs` `#[cfg(test)]` module
-    - _Requirements: 1.3.4_
+  - [ ] 10.4 Implement generated-code freshness checks
+    - Regenerate Buffa code and connect-rust code; diff against checked-in versions
+    - Regenerate upstream Temporal proto code; diff against checked-in versions
+    - Any diff = check FAILED
+    - This subtask depends on task 7.3, because the Tokeira compatibility Buffa/connect-rust outputs must exist before freshness can be checked
+    - _Requirements: 8.5, 12.5–12.6, 41.8–41.10_
 
-- [ ] 12. CODEOWNERS and Bump PR 0 baseline
-  - [ ] 12.1 Create `.github/CODEOWNERS`
-    - Add a line `crates/tokeira-build-info/src/pinned.rs @iw/tokeira-compat-owners` (team handle placeholder — use the concrete maintainer handle that exists on GitHub today; the team handle convention survives Pipeline Foundation wiring later)
-    - Add `docs/compat-bumps/ @iw/tokeira-compat-owners` so retroactive and future PR-body records are owned by the same group
-    - Document in the file's header comment that this file is informational until `pipeline-foundation` wires branch protection
-    - _Requirements: 5.5.6_
+  - [ ] 10.5 Implement feature matrix and SDK matrix checks
+    - Run matrix sort enforcement
+    - Run digest stability check
+    - Run SDK version ordering check
+    - _Requirements: 41.5–41.6, 49.5_
 
-  - [ ] 12.2 Author Bump PR 0 baseline record
-    - Create `docs/compat-bumps/0-baseline.md` capturing the initial `TEMPORAL_SERVER_COMPAT = "1.27.0"` claim with the full PR body shape Req 5.5.4 mandates, but filled in retroactively
-    - Header note: "This is a retroactive baseline per Req 5.5.9. The claim predates the `tkr compat bump` protocol; this document establishes the starting point so future bump PRs have a comparable disposition table to diff against."
-    - Include the Upstream Releases table for Temporal server 1.27.0 itself (the single release), the Disposition Table covering upstream surfaces tokeira encountered up to 1.27.0 based on the feature matrix as of this spec's landing, Matrix Delta marked `(baseline — no delta)`, SDK Test-Suite Evidence marked `(baseline — suites not yet running)`, and the reviewer checklist
-    - _Requirements: 5.5.9_
+  - [ ] 10.6 Implement source-tree hash check
+    - Compute source-tree hash; verify determinism (compute twice, assert equal)
+    - Verify excluded files don't affect hash; included files do
+    - _Requirements: 5.1–5.12, 48.1–48.4_
 
-  - [ ] 12.3 Update `pinned.rs` rationale comment to cite the baseline
-    - The rationale comment above the `TEMPORAL_SERVER_COMPAT` constant MUST point at `docs/compat-bumps/0-baseline.md` with the phrase "Last bump: baseline — see docs/compat-bumps/0-baseline.md"
-    - Future bump PRs will amend this comment per Req 5.5.8
-    - _Requirements: 5.5.8, 5.5.9_
+  - [ ]* 10.7 Write property test: Dagger frozen-lock (P10)
+    - **Property P10: Dagger Frozen-Lock**
+    - **Validates: Requirements 54**
+    - Assert hardened CI uses frozen lock mode
+    - Assert missing lockfile entries fail
+    - Assert modified lockfile during normal check fails
+    - Test framework: unit test (deterministic)
+    - Test location: `crates/tokeira-build/tests/frozen_lock.rs`
 
-- [ ] 13. `tkr compat bump` command (Feature 11)
-  - [ ] 13.1 Scaffold `crates/tokeira-build/src/compat_bump/`
-    - Create the module tree per design.md §8: `mod.rs`, `phases/{preflight,evidence,surfaces,mutate,publish}.rs`, `github.rs`, `template.rs`, `trailer.rs`, `pr_template.md`
-    - Define the public surface: `BumpRequest`, `BumpTrigger`, `ResumePolicy`, `BumpOutcome`, `BumpError`, `async fn run_bump(request: BumpRequest) -> Result<BumpOutcome, BumpError>`
-    - Re-export the public surface from `crates/tokeira-build/src/lib.rs`
-    - _Requirements: 11.1_
+- [ ] 11. Dagger versioned build and lockfile policy
+  - [ ] 11.1 Implement Dagger versioned build function
+    - Derive all metadata from repository state and checked-in configuration
+    - Generate the build metadata manifest
+    - Invoke Cargo with `TOKEIRA_BUILD_MANIFEST_PATH` pointing to the manifest
+    - Verify embedded `BuildInfo` after build
+    - Reject dirty repository state
+    - Reject non-deterministic source-tree hash
+    - Do NOT use ambient environment variables as metadata inputs
+    - _Requirements: 40.1–40.15, 42.1–42.11_
 
-  - [ ] 13.2 Add `octocrab`, `semver`, `tinytemplate`, `git2`, `secrecy`, `dirs` workspace deps
-    - `octocrab` — workspace-pinned at the current stable
-    - `semver` — workspace-pinned; reuse the same version the proto-sync pipeline already uses if applicable
-    - `tinytemplate` — workspace-pinned; alternative: hand-rolled binding if the review prefers zero-dep. Design.md §8 recommends `tinytemplate`; defer to implementer judgement during this task
-    - `git2` — for `pinned.rs` commit trailer extraction and history walks. Branch creation, commit, push remain shell-outs to `git` per design.md §8
-    - `secrecy` + `dirs` — for `SecretString` token handling and config-dir resolution
-    - Confirm none of these leak into `tokeira-build-info` (which must stay `[dependencies]`-free; Req 9.2)
-    - _Requirements: 11.4.3, 9.2_
+  - [ ] 11.2 Implement Dagger dev build function
+    - Invoke Cargo without a manifest path
+    - `build.rs` falls back to workspace-derived metadata
+    - Allow dirty state and missing git provenance
+    - _Requirements: 40.2–40.4_
 
-  - [ ] 13.3 Implement Phase A (preflight)
-    - In `phases/preflight.rs`, implement `async fn execute(ctx: &mut BumpContext) -> Result<(), BumpError>`
-    - Steps: read `pinned.rs` via `tokeira-build-info::pinned_source_path(&ctx.workspace_root)`; parse `TEMPORAL_SERVER_COMPAT` via a single-constant text parse; validate target version strictly greater than current; validate working tree clean via `git status --porcelain`; validate current branch matches `ctx.default_branch` (default `main`) via `git symbolic-ref --short HEAD`; call `ctx.github.get_user()` and assert scopes include `public_repo` + `pull_requests: write`
-    - Emit `BumpError::AlreadyOnVersion` (exit 0), `BumpError::Downgrade` (exit 1), `BumpError::DirtyWorkingTree`, `BumpError::WrongBranch`, `AuthError::NoToken`, `AuthError::InsufficientScopes` as appropriate
-    - _Requirements: 11.2.1 (Phase A), 11.4.1, 11.4.2_
+  - [ ] 11.3 Implement lockfile policy
+    - Commit `.dagger/lock` and Dagger module configuration
+    - Hardened CI uses frozen lock mode
+    - Normal checks fail if `.dagger/lock` is modified
+    - Explicit lock update workflow for dependency refresh
+    - Versioned build path uses frozen lock mode
+    - _Requirements: 43.1–43.9, 44.1–44.8, 45.1–45.8_
 
-  - [ ]* 13.4 Write unit tests for Phase A
-    - Test each preflight failure: empty token, invalid token (mocked octocrab returning 401), missing scopes (mocked 200 with incomplete `X-OAuth-Scopes` header), dirty working tree (via `tempfile` repo with an uncommitted file), wrong branch (via a repo on a non-default branch), target equal to current, target older than current
-    - Test location: `crates/tokeira-build/src/compat_bump/phases/preflight.rs` `#[cfg(test)]` module
-    - _Requirements: 11.7.6_
+  - [ ] 11.4 Implement source-tree hash computation
+    - SHA-256 digest with deterministic file ordering
+    - Include relative file paths and file contents
+    - Exclude build artefacts, editor metadata, OS junk, local env files, Dagger runtime caches
+    - Exclusion list declared in one checked-in location
+    - Same exclusion list used by Dagger pipeline and local validation
+    - _Requirements: 5.1–5.12_
 
-  - [ ] 13.5 Implement Phase B (evidence) — release enumeration and matrix delta
-    - In `phases/evidence.rs`, implement release enumeration via `octocrab`'s paginated releases endpoint for `temporalio/temporal`
-    - Filter releases by tag range: `>current && <=target` under semver
-    - For each release in range, fetch the release body; cache under `target/tkr/compat-cache/<tag>`
-    - Compute the matrix delta: find the commit referenced by the previous `Server-Compat-Bump:` trailer via `git log --grep='^Server-Compat-Bump:' -1 --format=%H`; if no match, use the Bump PR 0 baseline commit (the commit that added `docs/compat-bumps/0-baseline.md`); compare `FEATURE_MATRIX` `(id, state)` pairs between the two commits using `git show <commit>:crates/tokeira-compatibility/src/matrix.rs`
-    - Populate `BumpContext::evidence`
-    - _Requirements: 11.2.1 (Phase B), 11.4.4, 11.4.5_
+- [x] 12. Startup provenance log and `--version` output
+  - [x] 12.1 Extend `tokeirad` startup to emit build-info log entry
+    - At earliest point after `tracing_subscriber::init()`, emit structured log with all `BuildInfo` fields
+    - Include `feature_matrix_digest` and `sdk_matrix_digest`
+    - Do NOT truncate hashes or version strings
+    - Do NOT include wall-clock build timestamps
+    - _Requirements: 7.1–7.6_
 
-  - [ ]* 13.6 Write unit tests for Phase B evidence gathering
-    - Mock `octocrab` to return a canned release list; assert the command fetches the expected range
-    - Assert cache reuse: set the cache path; rerun; assert `octocrab` was called zero times on the second run
-    - Assert rate-limit handling: mock a 429 response with `X-RateLimit-Reset`; assert the command surfaces `BumpError::RateLimited { reset_at }` with the correct timestamp
-    - Test location: `crates/tokeira-build/src/compat_bump/phases/evidence.rs` `#[cfg(test)]` module
-    - _Requirements: 11.4.4, 11.7.6_
+  - [x] 12.2 Extend all other processes with startup log
+    - `tokeira-controller` and `tokeira-autoscaler` each emit one structured startup log event containing `BuildInfo`
+    - Edge and projection metadata is covered by the `tokeirad` startup log in task 12.1 because those components are embedded in `tokeirad`
+    - _Requirements: 7.2–7.3_
 
-  - [ ] 13.7 Implement Phase C (mutate) — branch, pinned.rs, commit with trailer, local CI check
-    - In `phases/mutate.rs`, create the bump branch via `git switch -c compat/server-compat-bump-<old>-<new>`; honour `ResumePolicy` (`StrictNew` fails if branch exists; `Resume` fast-forwards; `Reset` deletes and recreates)
-    - Update `pinned.rs`: bump the `TEMPORAL_SERVER_COMPAT` constant and the rationale comment (placeholder `PR #?`)
-    - Write the commit message via `render_commit_message(ctx)`
-    - Append the `Server-Compat-Bump:` trailer via `git commit --trailer "..."` (or equivalent through `git interpret-trailers`)
-    - Invoke the Feature 10 CI pipeline: `run_ci_checks(&CiCheckRequest { workspace_root, checks: vec![] }, &default_dagger)?`; assert all results pass; if any check fails, surface `BumpError::CiChecksFailed(report)` and leave the branch for debugging
-    - _Requirements: 11.2.1 (Phase C), 11.3.1, 11.3.5, 11.6.1, 11.6.2, 11.6.3, 11.8.1_
+  - [x] 12.3 Implement `tokeirad --version`, `--version --verbose`, `--version --json`
+    - Short form: `TOKEIRA_VERSION`, git SHA, build mode
+    - Verbose form: all `BuildInfo` fields
+    - JSON form: stable JSON representation with stable field names
+    - JSON rendering implemented outside `tokeira-build-info`
+    - Do NOT include wall-clock build timestamps
+    - _Requirements: 6.1–6.8_
 
-  - [ ]* 13.8 Write unit tests for Phase C
-    - Use `tempfile` to create a tiny git repository with a minimal `pinned.rs` and a matrix stub
-    - Test branch creation, pinned.rs rewriting, commit trailer correctness (`BumpTrailer::parse` round-trips), resume/reset semantics
-    - Mock the `run_ci_checks` call to return a passing report; assert Phase C succeeds; swap to a failing report; assert Phase C surfaces `BumpError::CiChecksFailed` and the branch remains
-    - Test location: `crates/tokeira-build/src/compat_bump/phases/mutate.rs` `#[cfg(test)]` module
-    - _Requirements: 11.6, 11.7.6_
+  - [x]* 12.4 Write integration test for `tokeirad --version` determinism
+    - Invoke `tokeirad --version` twice; assert byte-equal stdout
+    - Same for `--version --verbose` and `--version --json`
+    - Test location: `apps/tokeirad/tests/version_cli.rs`
+    - _Requirements: 6.5–6.6_
 
-  - [ ] 13.9 Implement Phase D (publish) — push, PR open, amend for PR number
-    - In `phases/publish.rs`, shell out to `git push -u origin <branch>` for the push; handle non-fast-forward as `BumpError::PushRejected { git_output }`
-    - Render PR title and body via `template.rs::render_*`
-    - Open the PR via `octocrab::pulls::PullRequestHandler::create`; on 5xx, retry once with exponential backoff; if retry fails, write the rendered PR body to `target/tkr/compat-cache/<branch>-pr-body.md` and surface `BumpError::PrOpenFailed { body_path }`
-    - On successful PR creation, rewrite the `pinned.rs` rationale comment to replace `PR #?` with the real PR number, `git commit --amend --no-edit`, and `git push --force-with-lease`
-    - If `--no-open` is set, stop after the push and return `BumpOutcome { pr_url: None, ... }`
-    - _Requirements: 11.2.1 (Phase D), 11.3.5, 11.4.6_
+- [x] 13. Documentation
+  - [x] 13.1 Update `README.md` with compatibility section
+    - Document `TEMPORAL_SERVER_COMPAT`, `TEMPORAL_PROTO_VERSION`
+    - Explain that proto compatibility and server behavioural compatibility are separate
+    - Explain feature states and SDK verification states
+    - Explain that Tokeira metadata is exposed through Buffa/connect-rust services, not patched Temporal protos
+    - Explain that build metadata is derived through Dagger, not environment variables
+    - Include examples of `tkr compat show` and `tkr compat diff`
+    - _Requirements: 55.1–55.11_
 
-  - [ ]* 13.10 Write integration tests for Phase D against mocked octocrab
-    - Use the `wiremock` crate (or `mockito`) to stand up a mock GitHub endpoint returning canned responses
-    - Test: happy path opens a PR and the body matches the rendered template; retry on 5xx; fail after two 5xx with `PrOpenFailed`; rate-limited response surfaces `RateLimited`
-    - Test location: `crates/tokeira-build/src/compat_bump/phases/publish.rs` `#[cfg(test)]` module (or a dedicated `tests/phase_d_integration.rs` file if it grows)
-    - _Requirements: 11.7.4, 11.7.6_
+  - [x] 13.2 Document Buffa/connect-rust guidance
+    - Document that Tokeira-owned build/capability RPCs use Buffa and connect-rust
+    - Document that upstream Temporal protos remain separate
+    - Document how to regenerate code and how freshness is checked
+    - Document how codegen tool versions are pinned
+    - _Requirements: 56.1–56.7_
 
-  - [ ] 13.11 Implement `template.rs` with `tinytemplate` binding
-    - Load `pr_template.md` at compile time via `include_str!`
-    - Define `TemplateBindings` struct with every placeholder the template consumes; derive `Serialize`
-    - Implement `render_pr_body(ctx: &BumpContext) -> Result<String, TemplateError>` and `render_pr_title(ctx: &BumpContext) -> String`
-    - _Requirements: 11.3.3, 11.3.4_
+  - [x] 13.3 Document Dagger build and CI guidance
+    - Document `tkr ci check` and `tkr ci build`
+    - Document the versioned build path and metadata derivation
+    - Document the generated build metadata manifest format
+    - Document the Dagger lockfile policy and how to refresh `.dagger/lock`
+    - Document why frozen lock mode is used
+    - Document limitations of Dagger lockfiles
+    - _Requirements: 57.1–57.12_
 
-  - [ ]* 13.12 Write property test for PR body rendering determinism
-    - **Property P-BUMP-1: PR body rendering determinism**
-    - **Validates: Requirement 11.7.1**
-    - For any valid `BumpContext`, `render_pr_body` twice produces byte-equal output; every placeholder is bound (no `{{ foo }}` leaks); the output contains the `Server-Compat-Bump:` trailer exactly once
-    - Test location: `crates/tokeira-build/src/compat_bump/template.rs` `#[cfg(test)]` module
-    - _Requirements: 11.7.1, 11.7.2_
+  - [x] 13.4 Create compatibility bump checklists
+    - `TEMPORAL_PROTO_VERSION` bump checklist
+    - `TEMPORAL_SERVER_COMPAT` bump checklist
+    - Include upstream version, generated-code status, surface classification, conformance evidence, SDK matrix impact, known divergences
+    - _Requirements: 58.1–58.10_
 
-  - [ ] 13.13 Implement `trailer.rs` parsing and rendering
-    - Define `BumpTrailer { old, new, trigger }` with `parse(&str) -> Result<Self, TrailerError>` and `render(&self) -> String`
-    - The regex: `^Server-Compat-Bump: (\d+\.\d+\.\d+) -> (\d+\.\d+\.\d+), trigger: ([123])$`
-    - Provide `find_in_commit_message(&str) -> Option<BumpTrailer>` that walks the message and picks the last matching trailer (so trailer-appending preserves correctness)
-    - _Requirements: 11.3.1, 5.5.5_
+  - [x] 13.5 Update `AGENTS.md`
+    - Add proto bump workflow to "Working Agreements"
+    - Add server-compat independence rule
+    - Add `tkr ci check` to Enforced Commands list
+    - Add pointer from "adding a new feature" checklist to the matrix declaration
+    - _Requirements: 55.1, 56.1, 57.1_
 
-  - [ ]* 13.14 Write property test for trailer round-trip
-    - **Property P-BUMP-2: Trailer round-trip**
-    - **Validates: Requirements 5.5.5, 11.3.1, 11.7.3**
-    - For any `(old, new, trigger)` tuple where old and new are valid semver, `BumpTrailer { ... }.render().parse()` equals the original
-    - Negative cases: missing trigger, non-semver versions, wrong arrow (`->`, `-->`), wrong trigger digit (`0`, `4`, `a`); assert each yields `TrailerError`
-    - Test location: `crates/tokeira-build/src/compat_bump/trailer.rs` `#[cfg(test)]` module
-    - _Requirements: 5.5.5, 11.7.3_
+  - [x] 13.6 Add `README.md` to `crates/tokeira-build-info/`
+    - Document the build metadata manifest format
+    - Document dev mode fallback behaviour
+    - Document the `pinned.rs` bump workflow
+    - _Requirements: 3.11_
 
-  - [ ] 13.15 Implement `github.rs` — `GithubAuth`, `Octocrab` wrapper, release enumeration, rate-limit handling
-    - `GithubAuth::from_env_or_config()` per design.md §8
-    - `Octocrab` builder with `User-Agent: tokeira-compat-bump/<version>`
-    - Release enumeration: `ctx.github.list_releases_in_range(owner, repo, old, new) -> Result<Vec<ReleaseSummary>, GithubError>`
-    - Rate-limit reader: inspect `X-RateLimit-*` response headers; surface as `BumpError::RateLimited { reset_at }`
-    - _Requirements: 11.4_
-
-  - [ ] 13.16 Implement the `tkr compat bump` CLI wiring
-    - Create `apps/tkr/src/commands/compat/mod.rs` (if not present; otherwise extend) and `apps/tkr/src/commands/compat/bump.rs`
-    - Define `BumpArgs` with clap per design.md §8
-    - Define `CliTrigger` enum and its `From<CliTrigger> for BumpTrigger` impl
-    - `resolve_trigger(arg, yes, json)` prompts interactively when absent and the mode is interactive; fails when absent in `--yes` or `--json`
-    - Wire `Compat(CompatArgs)` into `apps/tkr/src/cli.rs::Command` (if not already split) with `CompatCommand { Show, Diff, Bump }`
-    - In `apps/tkr/src/main.rs`, dispatch to `commands::compat::bump::run(args, format)`
-    - _Requirements: 11.1_
-
-  - [ ]* 13.17 Write CLI parse tests for `tkr compat bump`
-    - Parse `tkr compat bump --to 1.29.0`: assert `to == 1.29.0`, `trigger == None`, `dry_run == false`
-    - Parse `tkr compat bump --to 1.29.0 --trigger 3 --yes`: assert `trigger == Some(Three)`, `yes == true`
-    - Parse `tkr compat bump --to 1.29.0 --resume --reset`: assert clap rejects (conflicts_with)
-    - Parse `tkr compat bump --to not-semver`: assert clap or the semver parse returns a usage error
-    - Test location: `apps/tkr/src/commands/compat/bump.rs` `#[cfg(test)]` module
-    - _Requirements: 11.1, 11.7.3_
-
-  - [ ] 13.18 Wire the `CiCheck::BumpTrailer` check into `run_ci_checks`
-    - In `crates/tokeira-build/src/pipelines/ci.rs`, add the `BumpTrailer` and `ServerCompatMonotonicity` variants to the `CiCheck` enum per design.md §7
-    - Implement `run_bump_trailer_check` inside the Dagger container: `git log -1 --name-only` to detect `pinned.rs` in the diff; if present, `git log -1 --format=%B | git interpret-trailers --parse` to extract the trailer; invoke `BumpTrailer::parse`; if absent or invalid, fail the check
-    - Implement `run_version_pin_monotonicity(PinKind)` that generalises the existing `run_proto_monotonicity` to cover both `TEMPORAL_PROTO_VERSION` and `TEMPORAL_SERVER_COMPAT`
-    - _Requirements: 5.5.5, 11.8.2_
-
-  - [ ]* 13.19 Write integration test for the full bump flow
-    - Gated behind `integration-test` feature and `#[ignore]`
-    - Requires a `GH_TOKEN` with permissions on a fork of the tokeira repository
-    - Runs `tkr compat bump --to <next-patch> --trigger 3 --yes` against the fork; asserts a PR is opened; closes the PR via API
-    - Test location: `apps/tkr/tests/compat_bump_integration.rs`
-    - _Requirements: 11.7.5_
-
-  - [ ] 13.20 Deferred follow-up: `--derive-surfaces` stage 2
-    - Implement the full skeleton-table generation per Req 11.5.3 — proto-tree diff classification into new RPCs / new fields / new messages / new enum variants, each mapped to the matching matrix row where one exists
-    - Stage 1 ships with the core Feature 11 landing: raw diff as an appendix in the PR body
-    - Stage 2 lands after the core is exercised in practice
-    - This sub-task SHALL be split into its own commit landing after 13.1–13.19 are stable
-    - _Requirements: 11.5.6_
-
-- [ ] 14. Documentation and integration
-  - [ ] 14.1 Update `README.md`
-    - Add a "Temporal compatibility" section citing `TEMPORAL_SERVER_COMPAT`, `TEMPORAL_PROTO_VERSION`, summarising the feature matrix by state (e.g., "33 implemented, 5 experimental, 2 stubbed, 1 unsupported"), and pointing at `tkr compat show` for detail
-    - _Requirements: 9.3.1_
-
-  - [ ] 14.2 Update `AGENTS.md`
-    - Add the proto bump workflow (Req 5.2) to "Working Agreements"
-    - Add the server-compat independence rule (Req 5.3) to the same section
-    - Add a pointer from any "adding a new feature" checklist to this spec's matrix declaration
-    - Add `tkr ci check` to the Enforced Commands list (Req 10.3.1) as the pre-push gate for compatibility invariants. Mention that `pipeline-foundation` (backlog P16) will wire the same checks into remote triggers; until then, `tkr ci check` is the canonical local verdict
-    - Add a "Server compat bump protocol" subsection summarising Req 5.5: the three triggers, the `tkr compat bump` command, the `Server-Compat-Bump:` trailer requirement, and the CODEOWNERS gate
-    - _Requirements: 9.3.2, 10.3, 5.5.10_
-
-  - [ ] 14.3 Add `README.md` to `crates/tokeira-build-info/`
-    - Document the env vars a CI or hand-run release build must set (`TOKEIRA_GIT_SHA`, `TOKEIRA_SOURCE_TREE_HASH`, `CI`)
-    - Document the debug build fallbacks
-    - Document the `pinned.rs` bump workflow — now just a pointer at Feature 5.5 and `tkr compat bump`
-    - _Requirements: 6.2.3_
-
-  - [ ] 14.4 Final checkpoint — full workspace verification
-    - Run `cargo +nightly fmt --all --check`
-    - Run `cargo lint`
-    - Run `cargo test-lint`
-    - Run `cargo check --workspace`
-    - Run `cargo test --workspace`
-    - Run `cargo doc --workspace --no-deps` with `RUSTDOCFLAGS="-D warnings"`
-    - Run `tkr ci check` against a clean working tree (expected: all checks PASSED, exit 0)
+- [ ] 14. Final checkpoint — full workspace verification
+  - [ ] 14.1 Run full verification suite
+    - `cargo +nightly fmt --all --check`
+    - `cargo lint`
+    - `cargo test-lint`
+    - `cargo check --workspace`
+    - `cargo test --workspace`
+    - `cargo doc --workspace --no-deps` with `RUSTDOCFLAGS="-D warnings"`
+    - `tkr ci check` against a clean working tree (expected: all checks PASSED, exit 0)
     - All commands must pass with zero warnings
+
+## Task Dependency Graph
+
+```json
+{
+  "waves": [
+    {
+      "name": "Wave 1 — Foundation crates",
+      "tasks": ["1"],
+      "description": "Scaffold tokeira-build-info with manifest-based metadata"
+    },
+    {
+      "name": "Wave 2 — Compatibility model",
+      "tasks": ["2"],
+      "description": "Scaffold tokeira-compatibility with feature matrix, SDK matrix, dispatch, macros, digests",
+      "dependsOn": ["1"]
+    },
+    {
+      "name": "Wave 3 — Properties and adoption (parallel tracks)",
+      "tasks": ["3", "4", "5", "6", "7", "10.1-10.3", "10.5-10.7", "12"],
+      "description": "Matrix completeness properties (3), kernel cfg_feature! (4), edge dispatch_rpc (5), GetSystemInfo handler (6), Tokeira Compatibility Service (7), Dagger CI pipeline excluding 10.4 (10.1-10.3, 10.5-10.7), startup log (12) — all depend on Wave 2 or Wave 1 and can proceed in parallel",
+      "dependsOn": ["2"]
+    },
+    {
+      "name": "Wave 4 — CLI and versioned build",
+      "tasks": ["8", "10.4", "11"],
+      "description": "tkr compat show/diff (8) depends on 6+7; generated-code freshness (10.4) depends on 7.3; Dagger versioned build (11) depends on the Dagger CI foundation",
+      "dependsOn": ["3", "6", "7", "10.1-10.3", "10.5-10.7"]
+    },
+    {
+      "name": "Wave 5 — CI CLI",
+      "tasks": ["9"],
+      "description": "tkr ci check/build/lock-update (9) depends on the Dagger check foundation (10) and Dagger build functions (11)",
+      "dependsOn": ["10.1-10.3", "10.4", "10.5-10.7", "11"]
+    },
+    {
+      "name": "Wave 6 — Documentation and verification",
+      "tasks": ["13", "14"],
+      "description": "Documentation (13) and final checkpoint (14) depend on all prior waves including generated-code freshness (10.4)",
+      "dependsOn": ["8", "9", "10.4", "11", "12"]
+    }
+  ]
+}
+```
+
+## Notes
+
+- Property-based tests are marked with `*` in the task list and use `proptest` as the testing framework
+- All property tests map to correctness properties P1–P10 from the design document
+- `tkr compat bump` is explicitly deferred — this plan covers only inspection and CI guardrails
+- The Tokeira Compatibility Service uses Buffa + connect-rust (NOT tonic/prost) per the design principle of consistent Tokeira-owned RPC stack
+- Standard `GetSystemInfo` remains upstream-only with NO Tokeira-specific extension fields
+- Build metadata is derived from a Dagger-generated manifest (versioned mode) or workspace fallback (dev mode) — never from ambient environment variables

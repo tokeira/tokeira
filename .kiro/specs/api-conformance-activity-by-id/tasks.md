@@ -83,6 +83,7 @@ Implement six currently-stubbed activity RPCs in `tokeira-edge`, a new `cancel_a
 
   - [x] 3.3 Write property test for cancel delegation equivalence (P6)
     - **Property 6: ById-to-Token Delegation Equivalence (Cancel)** — for any valid cancellation request, verify runtime receives `ActivityResolution::Canceled { details }` with correct details
+    - Verify cancellation details are persisted into the resulting `ActivityTaskCanceled` history attributes rather than being dropped at the edge/runtime boundary
     - **Validates: Requirements 5.1, 6.1**
 
 - [x] 4. Checkpoint - Ensure all tests pass
@@ -128,6 +129,8 @@ Implement six currently-stubbed activity RPCs in `tokeira-edge`, a new `cancel_a
     - **Property 5: ById-to-Token Delegation Equivalence (Failure)** — verify runtime receives same `(token, failure, failure_error_type, is_non_retryable, worker_identity)` as token-based path
     - **Property 7: Heartbeat Delegation and Cancel Flag** — verify correctly constructed token and heartbeat details are passed, and `cancel_requested` flag matches runtime's heartbeat store
     - **Property 8: Identity Propagation** — generate random identity strings (empty and non-empty), verify propagation as `Some(WorkerIdentity(...))` or `None`
+    - Add terminal-state duplicate response cases that assert the correct gRPC error and no second terminal history event
+    - Add scheduled-but-not-started heartbeat cases that assert a successful response with `cancel_requested = false`
     - **Validates: Requirements 2.1, 2.2, 2.5, 2.6, 3.1, 4.1, 5.1, 9.1, 9.2**
 
 - [x] 7. Wire ById gRPC handlers

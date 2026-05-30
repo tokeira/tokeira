@@ -19,6 +19,22 @@ This is child spec #1 of the `api-conformance-tracker` umbrella.
 - **Activity_Resolution**: A kernel command that resolves a pending activity as Completed, Failed, or Canceled.
 - **UpdateActivityOptions**: A deprecated Temporal API that hot-patches timeout and routing options on a pending activity without canceling it.
 
+## Target State
+
+`ImplementedSubset`. ById activity completion/failure/cancel/heartbeat,
+token-based cancel, and single-id `UpdateActivityOptions` are implemented. Bulk
+`UpdateActivityOptions` targets (`type` and `match_all`) remain explicitly
+unsupported and keep this spec out of full `Implemented` status.
+
+## Terminal-State Error Policy
+
+| Condition | Expected behavior |
+|---|---|
+| Activity already completed/failed/canceled before ById resolve | `ActivityNotFound` or terminal-specific `FAILED_PRECONDITION`, matching token-path semantics |
+| Duplicate terminal token response | Preserve existing token-path idempotency/error behavior |
+| ById heartbeat for scheduled-but-not-started activity | Success with `cancel_requested = false`; compare against Temporal behavior in conformance tests |
+| Cancel details accepted | Details must be emitted in `ActivityTaskCanceled` history event |
+
 ## Requirements
 
 ### Requirement 1: Resolve Activity by ID

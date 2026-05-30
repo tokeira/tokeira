@@ -25,22 +25,38 @@
 
 | # | Spec | Status | RPCs | Target state |
 |---|------|--------|------|--------------|
-| 1 | `api-conformance-activity-by-id` | Not Started | 6 | Implemented |
-| 2 | `api-conformance-workflow-describe` | Not Started | 1 | Implemented |
-| 3 | `api-conformance-start-fields` | Not Started | 2 | Implemented |
-| 4 | `api-conformance-wft-completion` | Not Started | 1 | Implemented |
-| 5 | `api-conformance-activity-events` | Not Started | 2 | Implemented |
-| 6 | `api-conformance-update-lifecycle` | Not Started | 2 | Implemented |
-| 7 | `api-conformance-signal-headers` | Not Started | 1 | Implemented |
-| 8 | `api-conformance-schedule-fields` | Not Started | 8 | Implemented |
-| 9 | `api-conformance-namespace-full` | Not Started | 3 | Implemented |
-| 10 | `api-conformance-visibility-legacy` | Not Started | 5 | Implemented |
-| 11 | `api-conformance-nexus-admin` | Not Started | 5 | Implemented |
-| 12 | `api-conformance-remote-cluster` | Not Started | 3 | Implemented |
-| 13 | `api-conformance-multi-operation` | Not Started | 1 | Implemented |
-| 14 | `api-conformance-task-queue` | Not Started | 2 | Implemented |
-| 15 | `api-conformance-batch-fields` | Not Started | 4 | Implemented |
-| 16 | `api-conformance-workflow-options` | Not Started | 1 | Implemented |
+| 1 | `api-conformance-activity-by-id` | Completed | 6 | Implemented |
+| 2 | `api-conformance-workflow-describe` | Spec Draft | 1 | Implemented |
+| 3 | `api-conformance-start-fields` | Spec Draft | 2 | Implemented |
+| 4 | `api-conformance-wft-completion` | Spec Draft | 1 | Implemented |
+| 5 | `api-conformance-activity-events` | Spec Draft | 2 | Implemented |
+| 6 | `api-conformance-update-lifecycle` | Spec Draft | 2 | Implemented |
+| 7 | `api-conformance-signal-headers` | Spec Draft | 1 | Implemented |
+| 8 | `api-conformance-schedule-fields` | Spec Draft | 8 | Implemented |
+| 9 | `api-conformance-namespace-full` | Spec Draft | 3 | Implemented |
+| 10 | `api-conformance-visibility-legacy` | Spec Draft | 5 | Implemented |
+| 11 | `api-conformance-nexus-admin` | Spec Draft | 5 | Implemented |
+| 12 | `api-conformance-remote-cluster` | Spec Draft | 3 | Implemented |
+| 13 | `api-conformance-multi-operation` | Spec Draft | 1 | Implemented |
+| 14 | `api-conformance-task-queue` | Spec Draft | 2 | Implemented |
+| 15 | `api-conformance-batch-fields` | Spec Draft | 4 | Implemented |
+| 16 | `api-conformance-workflow-options` | Spec Draft | 1 | Implemented |
+
+---
+
+## Dependency Matrix
+
+| Area | Specs involved | Dependency rule |
+|---|---|---|
+| Request metadata (`headers`, `links`, `user_metadata`) | signal, start, schedule, batch, WFT completion | Use one shared field policy/helper; do not let specs diverge. |
+| Versioning and worker deployment fields | start, WFT completion, workflow options, task queue | Implement durable routing metadata and keep behavior consistent across all admission paths. |
+| Pending activity state | activity-events, activity-by-id, workflow-describe | Define one pending activity snapshot model and reuse it. |
+| Update lifecycle | update-lifecycle, workflow-describe, WFT completion | Persist enough update lifecycle state for restart-safe polling before describe consumes it. |
+| Schedule-start metadata | schedule-fields, start-fields, signal-headers | Schedule firing must reuse direct-start metadata validation and translation. |
+| Namespace deprecation | namespace-full, start, schedules, batch, multi-operation | Add one admission guard used by every start-like path. |
+| Broad mutations | batch-fields, multi-operation, namespace delete | Require validation-first and explicit runtime/storage transaction boundaries. |
+| Nexus | nexus-admin, workflow describe, Nexus task transport | Endpoint CRUD is admin registry work only; it does not complete Nexus task execution. |
+| Remote cluster | remote-cluster, namespace failover, replication | Registry APIs implement metadata CRUD but do not imply multi-cluster replication, failover, or remote routing. |
 
 ## Existing Backlog Specs (tracked here for coverage)
 

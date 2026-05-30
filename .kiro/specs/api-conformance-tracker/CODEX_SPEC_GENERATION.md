@@ -48,11 +48,28 @@ Follow this structure:
 # Requirements Document
 
 ## Introduction
-One paragraph: what RPCs this spec implements, current state (Stubbed/Partial), target state (Implemented).
+One paragraph: what RPCs this spec covers, current state (Stubbed/Partial), and target state using the tracker taxonomy.
 Reference the api-conformance-tracker umbrella.
 
 ## Glossary
 Define domain terms specific to this spec's scope.
+
+## Target State
+Declare one of: Implemented, ImplementedSubset, ExplicitlyUnsupported,
+Deferred, Experimental.
+
+## Evidence From Current Code
+- Proto files inspected:
+- Current handler methods:
+- Existing DTOs:
+- Existing runtime methods:
+- Existing kernel commands/state:
+- Existing unsupported-field entries:
+- Existing tests:
+
+## Field Policy
+| Proto field | Current state | Target policy | Error if unsupported | Persistence/history impact | Covered by tests |
+|---|---|---|---|---|---|
 
 ## Requirements
 
@@ -63,11 +80,13 @@ Define domain terms specific to this spec's scope.
 ```
 
 **Quality rules for requirements:**
-- Every proto field that the RPC accepts MUST be accounted for (either threaded or explicitly marked unsupported with expected error)
+- Every proto field that the RPC accepts MUST be accounted for and, when the spec target is `Implemented`, implemented through translation, durable state/history, runtime behavior, or query translation as appropriate
 - Every error condition MUST have a criterion (not found, invalid argument, failed precondition, unimplemented for unsupported variants)
-- If the proto has a oneof with multiple variants, each variant needs a criterion (implement or return UNIMPLEMENTED)
+- If the proto has a oneof with multiple variants, each variant needs a concrete criterion; an `Implemented` RPC may return `UNIMPLEMENTED` only for a specific variant that is owned by another named feature, never for the whole RPC
 - Non-empty string fields that need parsing (run_id, namespace) must specify validation behaviour
 - Identity propagation must be specified if the proto carries an `identity` field
+- Requirements MUST NOT use unresolved "implement X or return UNIMPLEMENTED" language; choose the implementation work or name the specific oneof variant/owning feature that remains outside the RPC's implemented subset
+- Any durable metadata, registry, progress, or lifecycle state MUST include restart/recovery acceptance criteria
 
 ### Step 3: Write design.md
 
@@ -81,6 +100,10 @@ What this implements and the approach.
 
 ## Architecture
 Mermaid diagram showing the handler flow. Keep it simple — show the edge → runtime → kernel path.
+
+## Dependencies and Non-Goals
+List owning specs, blockers, explicitly unsupported semantics, and surfaces this
+spec does not complete.
 
 ## Components and Interfaces
 - New/modified edge methods
@@ -113,7 +136,10 @@ Table: condition → error → gRPC status
 - ALWAYS distinguish the concrete runtime API (`CommitResult`) from the edge adapter API (`WorkflowMutationOutcome`)
 - ALWAYS use free translation functions (not `TryFrom`) — match existing pattern in `translate.rs`
 - ALWAYS check if the existing edge DTO already covers the RPC before defining a new one
-- If a field is in `UNSUPPORTED_FIELDS.md`, the spec must either implement it or add a criterion saying it returns UNIMPLEMENTED/is ignored with a TODO
+- If a field is in `UNSUPPORTED_FIELDS.md` and belongs to an RPC this spec moves to `Implemented`, the spec must include the kernel/runtime/storage/query work needed to implement it
+- Every design MUST define storage ownership for durable state and where restart recovery is tested
+- Admin registry specs MUST explicitly state whether they implement runtime behavior or only registry CRUD
+- Broad mutation specs MUST define the exact transaction boundary; do not keep an RPC explicitly unsupported when the tracker lists it as moving to `Implemented`
 
 ### Step 4: Write tasks.md
 
@@ -148,6 +174,8 @@ One paragraph summary.
 - Include gRPC error mapping in `grpc/errors.rs` explicitly
 - Include metrics mapping verification explicitly
 - Follow the existing free-function translation pattern
+- Tests must define generators, invariants, and expected failure modes, not just test names
+- Tasks that persist state must include restart/reload coverage
 
 ## Lessons from spec 1 (mistakes to avoid)
 
@@ -157,7 +185,7 @@ One paragraph summary.
 
 3. **Don't use `EdgeError::Internal` for expected errors.** Add specific variants (`ActivityNotFound`, `ActivityNotStarted`, etc.) that map to appropriate gRPC statuses.
 
-4. **Don't omit proto fields.** Read the actual proto definition. If a field exists in the request, the spec must account for it (thread it, or explicitly say it's unsupported with the expected behaviour).
+4. **Don't omit proto fields.** Read the actual proto definition. If a field exists in a request for an `Implemented` RPC, the spec must account for the implementation path that preserves or enforces it.
 
 5. **Don't mark property tests as optional.** These are externally-visible correctness contracts.
 

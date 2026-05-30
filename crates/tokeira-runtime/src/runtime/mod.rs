@@ -16,9 +16,10 @@ use smallvec::{SmallVec, smallvec};
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     ActivityOp, ActivityResolution, ActivityResolvedRequest, BasicKernel, Command, DispatchOp,
-    HistoryEvent, HistoryEventKind, LoadedRun, SignalRequest, SignalWithStartRequest, StartRequest,
-    StartWorkflowTaskRequest, TerminateRequest, Transition, UpdateRequest,
-    WorkflowIdConflictPolicy, WorkflowIdReusePolicy, WorkflowState, WorkflowTaskCompletedRequest,
+    HistoryEvent, HistoryEventKind, LoadedRun, PauseWorkflowRequest, SignalRequest,
+    SignalWithStartRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest, Transition,
+    UnpauseWorkflowRequest, UpdateRequest, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+    WorkflowState, WorkflowTaskCompletedRequest,
 };
 use tokeira_storage::{
     CommitResult, DispatchableActivityTask, DispatchableWorkflowTask, LeaseOutcome,

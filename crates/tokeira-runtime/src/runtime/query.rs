@@ -35,6 +35,19 @@ where
             }
         };
 
+        // A paused workflow rejects queries without dispatch, matching Temporal:
+        // the run is frozen, so there is no worker turn to evaluate the query
+        // against. The edge translates this into a `QueryRejected` response.
+        if state.status == tokeira_types::ExecutionStatus::Paused {
+            runtime_metrics::record_query_dispatch(
+                QueryDispatchPathLabel::Direct,
+                QueryDispatchOutcomeLabel::Rejected,
+            );
+            return Ok(QueryResult::Rejected {
+                status: tokeira_types::ExecutionStatus::Paused,
+            });
+        }
+
         let queue = QueueKey {
             namespace_id: state.namespace_id,
             task_queue: state.task_queue.clone(),

@@ -3,7 +3,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use time::{Duration, OffsetDateTime};
 
-use tokeira_kernel::{StartRequest, TerminateRequest, WorkflowTaskCompletedRequest};
+use tokeira_kernel::{
+    PauseWorkflowRequest, StartRequest, TerminateRequest, UnpauseWorkflowRequest,
+    WorkflowTaskCompletedRequest,
+};
 use tokeira_runtime::{
     BacklogConfig, LaneConfig, QueryResult, TimerScannerConfig, TokeiraRuntime,
     WorkflowTimeoutScannerConfig,
@@ -159,6 +162,172 @@ async fn closed_run_query_with_explicit_run_id_still_dispatches() -> Result<()> 
         }
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn pause_workflow_routes_through_submit_and_sets_paused() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = make_runtime(store.clone());
+    let namespace_id = NamespaceId::new();
+    let workflow_id = WorkflowId("pause-route".into());
+    let run_key = start_workflow(&runtime, namespace_id, workflow_id.clone()).await?;
+    quiesce_workflow(&runtime, namespace_id).await?;
+
+    let result = runtime
+        .pause_workflow(
+            ExecutionRef {
+                namespace_id,
+                workflow_id: workflow_id.clone(),
+                run_id: None,
+            },
+            pause_request("pause-1"),
+        )
+        .await?;
+    assert!(matches!(result, CommitResult::Applied { .. }));
+
+    let state = match store.load_run(run_key).await? {
+        tokeira_kernel::LoadedRun::Existing(state) => state,
+        tokeira_kernel::LoadedRun::Absent => panic!("run missing"),
+    };
+    assert_eq!(state.status, tokeira_types::ExecutionStatus::Paused);
+    Ok(())
+}
+
+#[tokio::test]
+async fn unpause_workflow_routes_through_submit_and_resumes() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = make_runtime(store.clone());
+    let namespace_id = NamespaceId::new();
+    let workflow_id = WorkflowId("unpause-route".into());
+    let run_key = start_workflow(&runtime, namespace_id, workflow_id.clone()).await?;
+    quiesce_workflow(&runtime, namespace_id).await?;
+
+    runtime
+        .pause_workflow(
+            ExecutionRef {
+                namespace_id,
+                workflow_id: workflow_id.clone(),
+                run_id: None,
+            },
+            pause_request("pause-2"),
+        )
+        .await?;
+
+    let result = runtime
+        .unpause_workflow(
+            ExecutionRef {
+                namespace_id,
+                workflow_id: workflow_id.clone(),
+                run_id: None,
+            },
+            unpause_request("unpause-2"),
+        )
+        .await?;
+    assert!(matches!(result, CommitResult::Applied { .. }));
+
+    let state = match store.load_run(run_key).await? {
+        tokeira_kernel::LoadedRun::Existing(state) => state,
+        tokeira_kernel::LoadedRun::Absent => panic!("run missing"),
+    };
+    assert_eq!(state.status, tokeira_types::ExecutionStatus::Running);
+    assert!(state.pause_info.is_none());
+
+    // Unpause schedules a workflow task that flows through the broker; a poll
+    // must find it, proving the post-commit dispatch op was published.
+    let started = runtime
+        .poll_workflow_task(
+            workflow_queue(namespace_id),
+            WorkerIdentity("worker-a".into()),
+            std::time::Duration::from_millis(100),
+        )
+        .await?;
+    assert!(
+        started.is_some(),
+        "unpause must publish a workflow task through the broker"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_paused_workflow_returns_rejected_without_broker_publication() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = make_runtime(store.clone());
+    let namespace_id = NamespaceId::new();
+    let workflow_id = WorkflowId("query-paused".into());
+    let _ = start_workflow(&runtime, namespace_id, workflow_id.clone()).await?;
+    quiesce_workflow(&runtime, namespace_id).await?;
+
+    runtime
+        .pause_workflow(
+            ExecutionRef {
+                namespace_id,
+                workflow_id: workflow_id.clone(),
+                run_id: None,
+            },
+            pause_request("pause-3"),
+        )
+        .await?;
+
+    let result = runtime
+        .query_workflow(
+            ExecutionRef {
+                namespace_id,
+                workflow_id,
+                run_id: None,
+            },
+            "describe".into(),
+            Payloads::default(),
+            Duration::milliseconds(100),
+        )
+        .await?;
+
+    assert_eq!(
+        result,
+        QueryResult::Rejected {
+            status: tokeira_types::ExecutionStatus::Paused
+        }
+    );
+
+    // No query task must have been published to the broker for a paused run.
+    let broker = runtime.broker();
+    let delivered = broker
+        .poll_query_task(
+            &workflow_queue(namespace_id),
+            &WorkerIdentity("worker-a".into()),
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+    assert!(
+        delivered.is_none(),
+        "paused query must not publish a query task to the broker"
+    );
+    Ok(())
+}
+
+fn pause_request(request_id: &str) -> PauseWorkflowRequest {
+    PauseWorkflowRequest {
+        identity: "operator".into(),
+        reason: "maintenance".into(),
+        request: RequestContext {
+            request_id: RequestId(request_id.into()),
+            caller_identity: Some("operator".into()),
+            received_at: OffsetDateTime::now_utc(),
+        },
+        now: OffsetDateTime::now_utc(),
+    }
+}
+
+fn unpause_request(request_id: &str) -> UnpauseWorkflowRequest {
+    UnpauseWorkflowRequest {
+        identity: "operator".into(),
+        reason: "resume".into(),
+        request: RequestContext {
+            request_id: RequestId(request_id.into()),
+            caller_identity: Some("operator".into()),
+            received_at: OffsetDateTime::now_utc(),
+        },
+        now: OffsetDateTime::now_utc(),
+    }
 }
 
 fn make_runtime(store: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {

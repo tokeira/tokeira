@@ -2493,6 +2493,24 @@ proptest! {
         prop_assert_eq!(conflicting, Err(tokeira_kernel::Reject::AlreadyPaused));
     }
 
+    // Paused workflows must suppress WFT scheduling on every kernel wakeup path,
+    // not just the signal/cancel/activity paths. The WFT-suppression invariant is
+    // enforced structurally at the `schedule_workflow_task()` chokepoint and the
+    // single direct `EnqueueWorkflowTask` site, both of which guard on paused
+    // state. This test asserts the invariant explicitly across the full set of
+    // wakeup-producing commands so a future refactor that bypasses the chokepoint
+    // cannot silently wake a paused workflow.
+    //
+    // Covered command variants (every path that can schedule a WFT, excluding
+    // `UnpauseWorkflow`, which intentionally transitions to `Running` first):
+    //   - Signal
+    //   - Cancel
+    //   - ActivityResolved
+    //   - TimerDue
+    //   - ChildResolved
+    //   - ExternalSignalResolved
+    //   - ExternalCancelResolved
+    //   - NexusOperationResolved (terminal)
     #[test]
     fn property_61_paused_workflows_suppress_wft_scheduling(
         signal_input in arb_payloads(),
@@ -2500,6 +2518,13 @@ proptest! {
     ) {
         let now = fixed_now();
         let paused = with_paused_status(make_open_state(now), now, "pause-req");
+
+        let no_wft = |transition: &tokeira_kernel::Transition| {
+            transition
+                .dispatch_ops
+                .iter()
+                .all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. }))
+        };
 
         let signal_transition = kernel().apply(
             LoadedRun::Existing(paused.clone()),
@@ -2510,7 +2535,7 @@ proptest! {
                 now,
             }),
         ).unwrap();
-        prop_assert_eq!(signal_transition.dispatch_ops.iter().all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. })), true);
+        prop_assert_eq!(no_wft(&signal_transition), true);
 
         let cancel_transition = kernel().apply(
             LoadedRun::Existing(paused.clone()),
@@ -2521,10 +2546,10 @@ proptest! {
                 now,
             }),
         ).unwrap();
-        prop_assert_eq!(cancel_transition.dispatch_ops.iter().all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. })), true);
+        prop_assert_eq!(no_wft(&cancel_transition), true);
 
         let activity_transition = kernel().apply(
-            LoadedRun::Existing(with_activity(paused, "activity-1")),
+            LoadedRun::Existing(with_activity(paused.clone(), "activity-1")),
             Command::ActivityResolved(ActivityResolvedRequest {
                 activity_id: "activity-1".into(),
                 resolution: ActivityResolution::Completed { result: completed },
@@ -2532,7 +2557,67 @@ proptest! {
                 now,
             }),
         ).unwrap();
-        prop_assert_eq!(activity_transition.dispatch_ops.iter().all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. })), true);
+        prop_assert_eq!(no_wft(&activity_transition), true);
+
+        let timer_transition = kernel().apply(
+            LoadedRun::Existing(with_timer(paused.clone(), "timer-1", now)),
+            Command::TimerDue(TimerDueRequest {
+                timer_id: "timer-1".into(),
+                fired_at: now,
+            }),
+        ).unwrap();
+        prop_assert_eq!(no_wft(&timer_transition), true);
+
+        let child_transition = kernel().apply(
+            LoadedRun::Existing(with_child(
+                paused.clone(),
+                "child-1",
+                21,
+                ParentClosePolicy::Terminate,
+                true,
+            )),
+            Command::ChildResolved(ChildResolvedRequest {
+                child_workflow_id: WorkflowId("child-1".into()),
+                resolution: ChildResolution::Completed {
+                    result: Payloads::default(),
+                },
+                now,
+            }),
+        ).unwrap();
+        prop_assert_eq!(no_wft(&child_transition), true);
+
+        let external_signal_transition = kernel().apply(
+            LoadedRun::Existing(with_pending_external_signal(paused.clone(), 60)),
+            Command::ExternalSignalResolved(ExternalSignalResolvedRequest {
+                initiated_event_id: 60,
+                result: ExternalSignalResult::Signaled,
+                now,
+            }),
+        ).unwrap();
+        prop_assert_eq!(no_wft(&external_signal_transition), true);
+
+        let external_cancel_transition = kernel().apply(
+            LoadedRun::Existing(with_pending_external_cancel(paused.clone(), 61)),
+            Command::ExternalCancelResolved(ExternalCancelResolvedRequest {
+                initiated_event_id: 61,
+                result: ExternalCancelResult::CancelRequested,
+                now,
+            }),
+        ).unwrap();
+        prop_assert_eq!(no_wft(&external_cancel_transition), true);
+
+        let nexus_transition = kernel().apply(
+            LoadedRun::Existing(with_pending_nexus_operation(paused, "nexus-op-1")),
+            Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                operation_id: "nexus-op-1".into(),
+                scheduled_event_id: 12,
+                resolution: NexusResolution::Completed {
+                    result: Payloads::default(),
+                },
+                now,
+            }),
+        ).unwrap();
+        prop_assert_eq!(no_wft(&nexus_transition), true);
     }
 
     #[test]

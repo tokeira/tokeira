@@ -950,6 +950,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paused_status_filter_matches_and_clears_on_unpause() {
+        let store = InMemoryVisibilityStore::default();
+        let ns = NamespaceId(Uuid::from_u128(1));
+
+        // Seed a paused execution.
+        let mut paused = row(42);
+        paused.status = ExecutionStatus::Paused;
+        store.upsert_execution(&paused).await.unwrap();
+
+        let status_filter = |status: ExecutionStatus| CompiledFilter {
+            expr: Some(FilterExpr::Compare {
+                field: FieldRef::System(SystemField::ExecutionStatus),
+                op: CompareOp::Eq,
+                value: FilterValue::Status(status),
+            }),
+        };
+
+        // ListWorkflowExecutions for ExecutionStatus = "Paused" returns the run.
+        let listed = store
+            .list_executions(
+                ns,
+                &status_filter(ExecutionStatus::Paused),
+                SortOrder::Default,
+                &page(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.rows.len(), 1);
+        assert_eq!(listed.rows[0].run_key, paused.run_key);
+
+        // CountWorkflowExecutions for the same predicate counts it.
+        let counted = store
+            .count_executions(ns, &status_filter(ExecutionStatus::Paused), None)
+            .await
+            .unwrap();
+        assert_eq!(counted.total_count, 1);
+
+        // Unpause projects a Running status update for the same run.
+        let mut running = paused.clone();
+        running.status = ExecutionStatus::Running;
+        store.upsert_execution(&running).await.unwrap();
+
+        // The run no longer matches "Paused".
+        let listed = store
+            .list_executions(
+                ns,
+                &status_filter(ExecutionStatus::Paused),
+                SortOrder::Default,
+                &page(),
+            )
+            .await
+            .unwrap();
+        assert!(listed.rows.is_empty());
+
+        // The run now matches "Running".
+        let listed = store
+            .list_executions(
+                ns,
+                &status_filter(ExecutionStatus::Running),
+                SortOrder::Default,
+                &page(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.rows.len(), 1);
+        assert_eq!(listed.rows[0].run_key, paused.run_key);
+    }
+
+    #[tokio::test]
     async fn text_filter_uses_normalized_token_matching() {
         let store = InMemoryVisibilityStore::default();
         let ns = NamespaceId(Uuid::from_u128(1));

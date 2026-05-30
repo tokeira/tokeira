@@ -189,6 +189,12 @@ pub fn query_response(
                 rejected_status: None,
             }
         }
+        tokeira_runtime::QueryResult::Rejected { status } => {
+            crate::translate::QueryWorkflowResponse {
+                result: None,
+                rejected_status: Some(status),
+            }
+        }
     }
 }
 

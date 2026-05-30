@@ -92,6 +92,9 @@ pub enum EdgeError {
         current_owner_node_id: Option<IncarnationId>,
     },
 
+    #[error("failed precondition: {0}")]
+    FailedPrecondition(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -122,6 +125,7 @@ impl EdgeError {
             EdgeError::LongPollAdmissionTimeout => StatusCode::REQUEST_TIMEOUT,
             EdgeError::RemoteRouteUnsupported { .. } => StatusCode::BAD_GATEWAY,
             EdgeError::NotShardOwner { .. } => StatusCode::CONFLICT,
+            EdgeError::FailedPrecondition(_) => StatusCode::PRECONDITION_FAILED,
             EdgeError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -145,6 +149,7 @@ impl EdgeError {
             EdgeError::LongPollAdmissionTimeout => "long_poll_admission_timeout",
             EdgeError::RemoteRouteUnsupported { .. } => "remote_route_unsupported",
             EdgeError::NotShardOwner { .. } => "not_shard_owner",
+            EdgeError::FailedPrecondition(_) => "failed_precondition",
             EdgeError::Internal(_) => "internal",
         }
     }
@@ -158,7 +163,21 @@ impl From<anyhow::Error> for EdgeError {
                 current_epoch: not_owner.current_epoch,
                 current_owner_node_id: not_owner.current_owner_node_id,
             },
-            Err(value) => Self::Internal(value.to_string()),
+            Err(value) => {
+                // Kernel rejections surface as stringified anyhow errors
+                // (`kernel rejected command: <Display of Reject>`) because the
+                // lane boundary does not preserve the typed `Reject`. Pause and
+                // unpause precondition failures must map to FAILED_PRECONDITION
+                // rather than the default INTERNAL classification.
+                let message = value.to_string();
+                if message.contains("workflow is already paused")
+                    || message.contains("workflow is not paused")
+                {
+                    Self::FailedPrecondition(message)
+                } else {
+                    Self::Internal(message)
+                }
+            }
         }
     }
 }

@@ -442,7 +442,7 @@ fn poll_request_to_proto(
 fn execution_status_to_proto(status: ExecutionStatus) -> i32 {
     match status {
         ExecutionStatus::Running => WorkflowExecutionStatus::Running as i32,
-        ExecutionStatus::Paused => WorkflowExecutionStatus::Unspecified as i32,
+        ExecutionStatus::Paused => WorkflowExecutionStatus::Paused as i32,
         ExecutionStatus::Completed => WorkflowExecutionStatus::Completed as i32,
         ExecutionStatus::Failed => WorkflowExecutionStatus::Failed as i32,
         ExecutionStatus::Cancelled => WorkflowExecutionStatus::Canceled as i32,
@@ -471,6 +471,7 @@ fn expected_code(err: &EdgeError) -> Code {
         EdgeError::LongPollAdmissionTimeout => Code::DeadlineExceeded,
         EdgeError::RemoteRouteUnsupported { .. } => Code::Unavailable,
         EdgeError::NotShardOwner { .. } => Code::Aborted,
+        EdgeError::FailedPrecondition(_) => Code::FailedPrecondition,
         EdgeError::Internal(_) => Code::Internal,
     }
 }
@@ -795,6 +796,7 @@ fn arb_description() -> impl Strategy<Value = WorkflowExecutionDescription> {
                 pending_activities,
                 pending_children,
                 pending_workflow_task,
+                pause_info: None,
             },
         )
 }

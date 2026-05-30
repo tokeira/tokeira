@@ -315,6 +315,7 @@ fn parse_value(input: &str) -> FilterValue {
 fn parse_status(input: &str) -> Result<ExecutionStatus> {
     match input {
         "Running" => Ok(ExecutionStatus::Running),
+        "Paused" => Ok(ExecutionStatus::Paused),
         "Completed" => Ok(ExecutionStatus::Completed),
         "Failed" => Ok(ExecutionStatus::Failed),
         "Cancelled" => Ok(ExecutionStatus::Cancelled),
@@ -537,5 +538,27 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("type mismatch"));
+    }
+
+    #[test]
+    fn parse_status_accepts_paused() {
+        assert_eq!(parse_status("Paused").unwrap(), ExecutionStatus::Paused);
+    }
+
+    #[tokio::test]
+    async fn compile_filter_resolves_paused_execution_status() {
+        let store = InMemoryVisibilityStore::default();
+        let namespace_id = NamespaceId(uuid::Uuid::from_u128(1));
+        let compiled = compile_filter(Some("ExecutionStatus = \"Paused\""), namespace_id, &store)
+            .await
+            .unwrap();
+        match compiled.expr.expect("expr") {
+            FilterExpr::Compare { field, op, value } => {
+                assert_eq!(field, FieldRef::System(SystemField::ExecutionStatus));
+                assert_eq!(op, CompareOp::Eq);
+                assert_eq!(value, FilterValue::Status(ExecutionStatus::Paused));
+            }
+            other => panic!("expected Compare, got {other:?}"),
+        }
     }
 }

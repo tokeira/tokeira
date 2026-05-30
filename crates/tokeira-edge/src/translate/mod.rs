@@ -209,6 +209,14 @@ pub struct WorkflowExecutionDescription {
     pub pending_activities: Vec<PendingActivityDescription>,
     pub pending_children: Vec<PendingChildDescription>,
     pub pending_workflow_task: Option<PendingWorkflowTaskDescription>,
+    pub pause_info: Option<PauseInfoDescription>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PauseInfoDescription {
+    pub identity: String,
+    pub paused_time: OffsetDateTime,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -441,6 +449,32 @@ pub struct TerminateWorkflowExecutionRequest {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TerminateWorkflowExecutionResponse;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PauseWorkflowExecutionRequest {
+    pub namespace: String,
+    pub workflow_id: String,
+    pub run_id: Option<String>,
+    pub identity: String,
+    pub reason: String,
+    pub request_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PauseWorkflowExecutionResponse;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnpauseWorkflowExecutionRequest {
+    pub namespace: String,
+    pub workflow_id: String,
+    pub run_id: Option<String>,
+    pub identity: String,
+    pub reason: String,
+    pub request_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnpauseWorkflowExecutionResponse;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RequestCancelWorkflowExecutionRequest {

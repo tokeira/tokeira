@@ -721,11 +721,27 @@ pub fn describe_response_to_proto(
         .as_ref()
         .map(pending_wft_to_proto);
 
+    // Temporal v1.31.0 surfaces pause metadata via
+    // DescribeWorkflowExecutionResponse.workflow_extended_info.pause_info,
+    // not on workflow_execution_info directly.
+    let workflow_extended_info =
+        resp.pause_info
+            .as_ref()
+            .map(|info| workflow::WorkflowExecutionExtendedInfo {
+                pause_info: Some(workflow::WorkflowExecutionPauseInfo {
+                    identity: info.identity.clone(),
+                    paused_time: Some(to_proto_timestamp(info.paused_time)),
+                    reason: info.reason.clone(),
+                }),
+                ..Default::default()
+            });
+
     workflowservice::DescribeWorkflowExecutionResponse {
         workflow_execution_info: Some(workflow_execution_info_from_description(resp)),
         pending_activities,
         pending_children,
         pending_workflow_task,
+        workflow_extended_info,
         ..Default::default()
     }
 }
@@ -887,7 +903,9 @@ pub fn namespace_to_proto(
                 reported_problems_search_attribute: namespace
                     .capabilities
                     .reported_problems_search_attribute,
-                workflow_pause: false,
+                // Workflow pause/unpause is implemented across the kernel,
+                // runtime, and edge; advertise it so SDKs surface the feature.
+                workflow_pause: true,
                 standalone_activities: false,
                 worker_poll_complete_on_shutdown: false,
                 poller_autoscaling: false,
@@ -2067,7 +2085,7 @@ fn execution_status_to_proto(value: ExecutionStatus) -> i32 {
 
     match value {
         ExecutionStatus::Running => Proto::Running as i32,
-        ExecutionStatus::Paused => Proto::Unspecified as i32,
+        ExecutionStatus::Paused => Proto::Paused as i32,
         ExecutionStatus::Completed => Proto::Completed as i32,
         ExecutionStatus::Failed => Proto::Failed as i32,
         ExecutionStatus::Cancelled => Proto::Canceled as i32,
@@ -2439,6 +2457,50 @@ pub fn terminate_request_to_edge(
 
 pub fn terminate_response_to_proto() -> workflowservice::TerminateWorkflowExecutionResponse {
     workflowservice::TerminateWorkflowExecutionResponse {}
+}
+
+pub fn pause_request_to_edge(
+    req: workflowservice::PauseWorkflowExecutionRequest,
+) -> Result<crate::translate::PauseWorkflowExecutionRequest, ProtoConversionError> {
+    if req.workflow_id.is_empty() {
+        return Err(ProtoConversionError::MissingField(
+            "PauseWorkflowExecutionRequest.workflow_id",
+        ));
+    }
+    Ok(crate::translate::PauseWorkflowExecutionRequest {
+        namespace: req.namespace,
+        workflow_id: req.workflow_id,
+        run_id: non_empty(req.run_id),
+        identity: req.identity,
+        reason: req.reason,
+        request_id: non_empty(req.request_id),
+    })
+}
+
+pub fn pause_response_to_proto() -> workflowservice::PauseWorkflowExecutionResponse {
+    workflowservice::PauseWorkflowExecutionResponse {}
+}
+
+pub fn unpause_request_to_edge(
+    req: workflowservice::UnpauseWorkflowExecutionRequest,
+) -> Result<crate::translate::UnpauseWorkflowExecutionRequest, ProtoConversionError> {
+    if req.workflow_id.is_empty() {
+        return Err(ProtoConversionError::MissingField(
+            "UnpauseWorkflowExecutionRequest.workflow_id",
+        ));
+    }
+    Ok(crate::translate::UnpauseWorkflowExecutionRequest {
+        namespace: req.namespace,
+        workflow_id: req.workflow_id,
+        run_id: non_empty(req.run_id),
+        identity: req.identity,
+        reason: req.reason,
+        request_id: non_empty(req.request_id),
+    })
+}
+
+pub fn unpause_response_to_proto() -> workflowservice::UnpauseWorkflowExecutionResponse {
+    workflowservice::UnpauseWorkflowExecutionResponse {}
 }
 
 pub fn cancel_request_to_edge(

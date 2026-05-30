@@ -232,6 +232,37 @@ where
         self.submit(run_key, Command::Cancel(request)).await
     }
 
+    /// Pause a workflow execution so no new workflow tasks are dispatched.
+    pub async fn pause_workflow(
+        &self,
+        execution: ExecutionRef,
+        request: PauseWorkflowRequest,
+    ) -> Result<CommitResult> {
+        let run_key = self
+            .repo
+            .resolve_execution(&execution)
+            .await?
+            .ok_or_else(|| anyhow!("execution not found"))?;
+        self.submit(run_key, Command::PauseWorkflow(request)).await
+    }
+
+    /// Resume a paused workflow execution. The committed transition carries the
+    /// wakeup workflow-task dispatch op, which flows through the standard
+    /// post-commit broker path like any other mutation.
+    pub async fn unpause_workflow(
+        &self,
+        execution: ExecutionRef,
+        request: UnpauseWorkflowRequest,
+    ) -> Result<CommitResult> {
+        let run_key = self
+            .repo
+            .resolve_execution(&execution)
+            .await?
+            .ok_or_else(|| anyhow!("execution not found"))?;
+        self.submit(run_key, Command::UnpauseWorkflow(request))
+            .await
+    }
+
     /// Reset a workflow execution and synchronously materialize the replayed successor.
     pub async fn reset_workflow(
         &self,

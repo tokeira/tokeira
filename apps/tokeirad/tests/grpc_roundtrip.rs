@@ -963,6 +963,13 @@ where
                         attempt: task.attempt,
                     }
                 }),
+                pause_info: state.pause_info.as_ref().map(|info| {
+                    tokeira_edge::translate::PauseInfoDescription {
+                        identity: info.identity.clone(),
+                        paused_time: info.pause_time,
+                        reason: info.reason.clone(),
+                    }
+                }),
             })),
             LoadedRun::Absent => Err(anyhow!("resolved run missing from storage: {:?}", run_key)),
         }

@@ -87,6 +87,7 @@ impl From<EdgeError> for Status {
                 }
                 status
             }
+            EdgeError::FailedPrecondition(message) => Status::failed_precondition(message),
             EdgeError::Internal(message) => Status::internal(message),
         }
     }
@@ -191,6 +192,10 @@ mod tests {
                     current_owner_node_id: None,
                 },
                 Code::Aborted,
+            ),
+            (
+                EdgeError::FailedPrecondition("workflow is already paused".to_string()),
+                Code::FailedPrecondition,
             ),
             (EdgeError::Internal("boom".to_string()), Code::Internal),
         ];

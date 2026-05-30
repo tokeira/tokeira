@@ -207,6 +207,26 @@ where
         commit_result_to_outcome(result)
     }
 
+    async fn pause_workflow(
+        &self,
+        run_key: tokeira_types::RunKey,
+        req: tokeira_kernel::PauseWorkflowRequest,
+    ) -> Result<WorkflowMutationOutcome> {
+        let execution = execution_for_run(self.runtime.as_ref(), run_key).await?;
+        let result = self.runtime.pause_workflow(execution, req).await?;
+        commit_result_to_outcome(result)
+    }
+
+    async fn unpause_workflow(
+        &self,
+        run_key: tokeira_types::RunKey,
+        req: tokeira_kernel::UnpauseWorkflowRequest,
+    ) -> Result<WorkflowMutationOutcome> {
+        let execution = execution_for_run(self.runtime.as_ref(), run_key).await?;
+        let result = self.runtime.unpause_workflow(execution, req).await?;
+        commit_result_to_outcome(result)
+    }
+
     async fn reset_workflow(
         &self,
         execution: ExecutionRef,

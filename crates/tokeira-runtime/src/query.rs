@@ -25,6 +25,11 @@ pub enum QueryResult {
     Completed { result: Payloads },
     /// Query evaluation failed at the worker.
     Failed { message: String },
+    /// Query was rejected without dispatch because the workflow's current
+    /// status does not permit queries (for example, a paused workflow).
+    Rejected {
+        status: tokeira_types::ExecutionStatus,
+    },
 }
 
 #[cfg(test)]

@@ -200,6 +200,22 @@ impl WorkflowRuntimeApi for RecordingRuntime {
         Ok(outcome())
     }
 
+    async fn pause_workflow(
+        &self,
+        _run_key: RunKey,
+        _req: tokeira_kernel::PauseWorkflowRequest,
+    ) -> Result<WorkflowMutationOutcome> {
+        Ok(outcome())
+    }
+
+    async fn unpause_workflow(
+        &self,
+        _run_key: RunKey,
+        _req: tokeira_kernel::UnpauseWorkflowRequest,
+    ) -> Result<WorkflowMutationOutcome> {
+        Ok(outcome())
+    }
+
     async fn reset_workflow(
         &self,
         execution: ExecutionRef,

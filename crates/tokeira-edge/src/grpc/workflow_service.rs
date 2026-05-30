@@ -1493,19 +1493,34 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     );
     // === End Worker Config block ===
 
-    // === Pause/Unpause Workflow — deferred to kernel-pause-workflow spec ===
-    deferred_unary!(
-        pause_workflow_execution,
-        PauseWorkflowExecutionRequest,
-        PauseWorkflowExecutionResponse,
-        "kernel-pause-workflow"
-    );
-    deferred_unary!(
-        unpause_workflow_execution,
-        UnpauseWorkflowExecutionRequest,
-        UnpauseWorkflowExecutionResponse,
-        "kernel-pause-workflow"
-    );
+    // === Pause/Unpause Workflow ===
+    async fn pause_workflow_execution(
+        &self,
+        request: Request<workflowservice::PauseWorkflowExecutionRequest>,
+    ) -> Result<Response<workflowservice::PauseWorkflowExecutionResponse>, Status> {
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::pause_request_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let _edge_resp = self
+            .inner
+            .pause_workflow_execution(&headers, edge_req)
+            .await?;
+        Ok(Response::new(translate::pause_response_to_proto()))
+    }
+
+    async fn unpause_workflow_execution(
+        &self,
+        request: Request<workflowservice::UnpauseWorkflowExecutionRequest>,
+    ) -> Result<Response<workflowservice::UnpauseWorkflowExecutionResponse>, Status> {
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::unpause_request_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let _edge_resp = self
+            .inner
+            .unpause_workflow_execution(&headers, edge_req)
+            .await?;
+        Ok(Response::new(translate::unpause_response_to_proto()))
+    }
     // === End Pause/Unpause Workflow block ===
 
     // === Activity Executions — deferred to activity-executions-first-class spec ===
@@ -2484,19 +2499,6 @@ mod tests {
             update_worker_config,
             UpdateWorkerConfigRequest,
             "worker-config-management"
-        );
-
-        assert_deferred_rpc!(
-            grpc,
-            pause_workflow_execution,
-            PauseWorkflowExecutionRequest,
-            "kernel-pause-workflow"
-        );
-        assert_deferred_rpc!(
-            grpc,
-            unpause_workflow_execution,
-            UnpauseWorkflowExecutionRequest,
-            "kernel-pause-workflow"
         );
 
         assert_deferred_rpc!(

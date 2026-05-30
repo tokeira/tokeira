@@ -120,6 +120,13 @@ impl ExecutionResolver for StoreExecutionResolver {
                         attempt: task.attempt,
                     }
                 }),
+                pause_info: state.pause_info.as_ref().map(|info| {
+                    tokeira_edge::translate::PauseInfoDescription {
+                        identity: info.identity.clone(),
+                        paused_time: info.pause_time,
+                        reason: info.reason.clone(),
+                    }
+                }),
             })),
             LoadedRun::Absent => Err(anyhow::anyhow!("resolved run missing")),
         }
@@ -461,4 +468,319 @@ async fn register_namespace_invalid_names_return_invalid_argument() {
             .expect_err("invalid namespace should fail");
         assert_eq!(err.code(), Code::InvalidArgument);
     }
+}
+
+/// Integration test: pause a running workflow, verify the
+/// describe surfaces PAUSED status (value 8) and nested pause
+/// info, then unpause and verify it returns to RUNNING.
+#[tokio::test]
+async fn pause_and_unpause_workflow_via_grpc() {
+    let store = Arc::new(InMemoryStore::default());
+    let grpc = build_grpc(store.clone()).await;
+
+    grpc.start_workflow_execution(Request::new(
+        workflowservice::StartWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_id: "pause-wf".to_string(),
+            workflow_type: Some(tokeira_proto::common::WorkflowType {
+                name: "test".to_string(),
+            }),
+            task_queue: Some(tokeira_proto::taskqueue::TaskQueue {
+                name: "q".to_string(),
+                ..Default::default()
+            }),
+            request_id: "req-pause-start".to_string(),
+            ..Default::default()
+        },
+    ))
+    .await
+    .expect("start should succeed");
+
+    grpc.pause_workflow_execution(Request::new(
+        workflowservice::PauseWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_id: "pause-wf".to_string(),
+            run_id: String::new(),
+            identity: "operator".to_string(),
+            reason: "maintenance".to_string(),
+            request_id: "req-pause-1".to_string(),
+        },
+    ))
+    .await
+    .expect("pause should succeed");
+
+    let describe = grpc
+        .describe_workflow_execution(Request::new(
+            workflowservice::DescribeWorkflowExecutionRequest {
+                namespace: "default".to_string(),
+                execution: Some(tokeira_proto::common::WorkflowExecution {
+                    workflow_id: "pause-wf".to_string(),
+                    run_id: String::new(),
+                    ..Default::default()
+                }),
+            },
+        ))
+        .await
+        .expect("describe should succeed")
+        .into_inner();
+
+    let info = describe
+        .workflow_execution_info
+        .as_ref()
+        .expect("execution info");
+    // WORKFLOW_EXECUTION_STATUS_PAUSED = 8
+    assert_eq!(info.status, 8);
+
+    let pause_info = describe
+        .workflow_extended_info
+        .as_ref()
+        .expect("extended info")
+        .pause_info
+        .as_ref()
+        .expect("pause info");
+    assert_eq!(pause_info.identity, "operator");
+    assert_eq!(pause_info.reason, "maintenance");
+    assert!(pause_info.paused_time.is_some());
+
+    grpc.unpause_workflow_execution(Request::new(
+        workflowservice::UnpauseWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_id: "pause-wf".to_string(),
+            run_id: String::new(),
+            identity: "operator".to_string(),
+            reason: "resume".to_string(),
+            request_id: "req-unpause-1".to_string(),
+        },
+    ))
+    .await
+    .expect("unpause should succeed");
+
+    let describe = grpc
+        .describe_workflow_execution(Request::new(
+            workflowservice::DescribeWorkflowExecutionRequest {
+                namespace: "default".to_string(),
+                execution: Some(tokeira_proto::common::WorkflowExecution {
+                    workflow_id: "pause-wf".to_string(),
+                    run_id: String::new(),
+                    ..Default::default()
+                }),
+            },
+        ))
+        .await
+        .expect("describe should succeed")
+        .into_inner();
+    let info = describe
+        .workflow_execution_info
+        .as_ref()
+        .expect("execution info");
+    // WORKFLOW_EXECUTION_STATUS_RUNNING = 1
+    assert_eq!(info.status, 1);
+    assert!(
+        describe
+            .workflow_extended_info
+            .and_then(|ext| ext.pause_info)
+            .is_none(),
+        "pause info must be cleared after unpause"
+    );
+}
+
+/// Pausing an already-paused workflow with a different request
+/// ID is rejected as FAILED_PRECONDITION; the same request ID is
+/// an idempotent no-op success.
+#[tokio::test]
+async fn pause_idempotency_and_conflict_via_grpc() {
+    let store = Arc::new(InMemoryStore::default());
+    let grpc = build_grpc(store.clone()).await;
+
+    grpc.start_workflow_execution(Request::new(
+        workflowservice::StartWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_id: "pause-idem-wf".to_string(),
+            workflow_type: Some(tokeira_proto::common::WorkflowType {
+                name: "test".to_string(),
+            }),
+            task_queue: Some(tokeira_proto::taskqueue::TaskQueue {
+                name: "q".to_string(),
+                ..Default::default()
+            }),
+            request_id: "req-idem-start".to_string(),
+            ..Default::default()
+        },
+    ))
+    .await
+    .expect("start should succeed");
+
+    let pause = |request_id: &str| {
+        let request_id = request_id.to_string();
+        workflowservice::PauseWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_id: "pause-idem-wf".to_string(),
+            run_id: String::new(),
+            identity: "operator".to_string(),
+            reason: "maintenance".to_string(),
+            request_id,
+        }
+    };
+
+    grpc.pause_workflow_execution(Request::new(pause("req-pause-a")))
+        .await
+        .expect("first pause should succeed");
+
+    grpc.pause_workflow_execution(Request::new(pause("req-pause-a")))
+        .await
+        .expect("same request id pause should be idempotent no-op");
+
+    let err = grpc
+        .pause_workflow_execution(Request::new(pause("req-pause-b")))
+        .await
+        .expect_err("different request id pause should conflict");
+    assert_eq!(err.code(), Code::FailedPrecondition);
+}
+
+/// Unpausing a workflow that is not paused is rejected as
+/// FAILED_PRECONDITION.
+#[tokio::test]
+async fn unpause_non_paused_returns_failed_precondition() {
+    let store = Arc::new(InMemoryStore::default());
+    let grpc = build_grpc(store.clone()).await;
+
+    grpc.start_workflow_execution(Request::new(
+        workflowservice::StartWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_id: "unpause-wf".to_string(),
+            workflow_type: Some(tokeira_proto::common::WorkflowType {
+                name: "test".to_string(),
+            }),
+            task_queue: Some(tokeira_proto::taskqueue::TaskQueue {
+                name: "q".to_string(),
+                ..Default::default()
+            }),
+            request_id: "req-unpause-start".to_string(),
+            ..Default::default()
+        },
+    ))
+    .await
+    .expect("start should succeed");
+
+    let err = grpc
+        .unpause_workflow_execution(Request::new(
+            workflowservice::UnpauseWorkflowExecutionRequest {
+                namespace: "default".to_string(),
+                workflow_id: "unpause-wf".to_string(),
+                run_id: String::new(),
+                identity: "operator".to_string(),
+                reason: "resume".to_string(),
+                request_id: "req-unpause-x".to_string(),
+            },
+        ))
+        .await
+        .expect_err("unpause of running workflow should fail");
+    assert_eq!(err.code(), Code::FailedPrecondition);
+}
+
+/// Pause/unpause with a missing workflow ID returns
+/// INVALID_ARGUMENT before any routing occurs.
+#[tokio::test]
+async fn pause_unpause_missing_workflow_id_returns_invalid_argument() {
+    let store = Arc::new(InMemoryStore::default());
+    let grpc = build_grpc(store).await;
+
+    let pause_err = grpc
+        .pause_workflow_execution(Request::new(
+            workflowservice::PauseWorkflowExecutionRequest {
+                namespace: "default".to_string(),
+                workflow_id: String::new(),
+                run_id: String::new(),
+                identity: "operator".to_string(),
+                reason: String::new(),
+                request_id: "req-x".to_string(),
+            },
+        ))
+        .await
+        .expect_err("missing workflow id should fail");
+    assert_eq!(pause_err.code(), Code::InvalidArgument);
+
+    let unpause_err = grpc
+        .unpause_workflow_execution(Request::new(
+            workflowservice::UnpauseWorkflowExecutionRequest {
+                namespace: "default".to_string(),
+                workflow_id: String::new(),
+                run_id: String::new(),
+                identity: "operator".to_string(),
+                reason: String::new(),
+                request_id: "req-y".to_string(),
+            },
+        ))
+        .await
+        .expect_err("missing workflow id should fail");
+    assert_eq!(unpause_err.code(), Code::InvalidArgument);
+}
+
+/// Querying a paused workflow returns a query rejection carrying
+/// the PAUSED status (value 8) instead of dispatching a query.
+#[tokio::test]
+async fn query_paused_workflow_returns_rejection_via_grpc() {
+    let store = Arc::new(InMemoryStore::default());
+    let grpc = build_grpc(store.clone()).await;
+
+    grpc.start_workflow_execution(Request::new(
+        workflowservice::StartWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_id: "query-paused-wf".to_string(),
+            workflow_type: Some(tokeira_proto::common::WorkflowType {
+                name: "test".to_string(),
+            }),
+            task_queue: Some(tokeira_proto::taskqueue::TaskQueue {
+                name: "q".to_string(),
+                ..Default::default()
+            }),
+            request_id: "req-query-start".to_string(),
+            ..Default::default()
+        },
+    ))
+    .await
+    .expect("start should succeed");
+
+    grpc.pause_workflow_execution(Request::new(
+        workflowservice::PauseWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_id: "query-paused-wf".to_string(),
+            run_id: String::new(),
+            identity: "operator".to_string(),
+            reason: "maintenance".to_string(),
+            request_id: "req-query-pause".to_string(),
+        },
+    ))
+    .await
+    .expect("pause should succeed");
+
+    let response = grpc
+        .query_workflow(Request::new(workflowservice::QueryWorkflowRequest {
+            namespace: "default".to_string(),
+            execution: Some(tokeira_proto::common::WorkflowExecution {
+                workflow_id: "query-paused-wf".to_string(),
+                run_id: String::new(),
+                ..Default::default()
+            }),
+            query: Some(
+                tokeira_proto::public::temporal::api::query::v1::WorkflowQuery {
+                    query_type: "state".to_string(),
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
+        }))
+        .await
+        .expect("query should return a response, not an error")
+        .into_inner();
+
+    let rejected = response
+        .query_rejected
+        .expect("paused query must be rejected");
+    // WORKFLOW_EXECUTION_STATUS_PAUSED = 8
+    assert_eq!(rejected.status, 8);
+    assert!(
+        response.query_result.is_none(),
+        "rejected query must not carry a result"
+    );
 }

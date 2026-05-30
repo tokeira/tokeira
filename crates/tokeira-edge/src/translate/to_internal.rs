@@ -275,6 +275,51 @@ pub fn terminate_request(
     }
 }
 
+pub fn pause_request(
+    req: crate::translate::PauseWorkflowExecutionRequest,
+    request_id: &RequestId,
+) -> tokeira_kernel::PauseWorkflowRequest {
+    let now = OffsetDateTime::now_utc();
+    // Prefer the client-supplied request_id so idempotent pause retries are
+    // recognised by the kernel's request-id-gated pause check; fall back to the
+    // edge-assigned request id when the client omits one.
+    let effective_request_id = req
+        .request_id
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| request_id.as_str().to_string());
+    tokeira_kernel::PauseWorkflowRequest {
+        identity: req.identity,
+        reason: req.reason,
+        request: RequestContext {
+            request_id: CoreRequestId(effective_request_id),
+            caller_identity: None,
+            received_at: now,
+        },
+        now,
+    }
+}
+
+pub fn unpause_request(
+    req: crate::translate::UnpauseWorkflowExecutionRequest,
+    request_id: &RequestId,
+) -> tokeira_kernel::UnpauseWorkflowRequest {
+    let now = OffsetDateTime::now_utc();
+    let effective_request_id = req
+        .request_id
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| request_id.as_str().to_string());
+    tokeira_kernel::UnpauseWorkflowRequest {
+        identity: req.identity,
+        reason: req.reason,
+        request: RequestContext {
+            request_id: CoreRequestId(effective_request_id),
+            caller_identity: None,
+            received_at: now,
+        },
+        now,
+    }
+}
+
 pub fn cancel_request(
     req: crate::translate::RequestCancelWorkflowExecutionRequest,
     request_id: &RequestId,

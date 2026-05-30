@@ -66,28 +66,30 @@ use crate::{
         DeleteWorkflowExecutionRequest, DescribeTaskQueueRequest, DescribeTaskQueueResponse,
         DescribeWorkflowExecutionRequest, ListNamespacesResponse as EdgeListNamespacesResponse,
         ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, NamespaceCapabilities,
-        NamespaceDescription, PollActivityTaskQueueRequest, PollActivityTaskQueueResponse,
-        PollWorkflowTaskQueueRequest, PollWorkflowTaskQueueResponse, ProtocolMessageDto,
-        QueryResultDto, QueryWorkflowRequest, QueryWorkflowResponse,
-        RecordActivityTaskHeartbeatByIdRequest, RecordActivityTaskHeartbeatByIdResponse,
-        RecordActivityTaskHeartbeatRequest, RecordActivityTaskHeartbeatResponse,
-        RegisterNamespaceRequest, RequestCancelWorkflowExecutionRequest,
-        RequestCancelWorkflowExecutionResponse, ResetWorkflowExecutionRequest,
-        ResetWorkflowExecutionResponse, RespondActivityTaskCanceledByIdRequest,
-        RespondActivityTaskCanceledByIdResponse, RespondActivityTaskCanceledRequest,
-        RespondActivityTaskCanceledResponse, RespondActivityTaskCompletedByIdRequest,
-        RespondActivityTaskCompletedByIdResponse, RespondActivityTaskCompletedRequest,
-        RespondActivityTaskCompletedResponse, RespondActivityTaskFailedByIdRequest,
-        RespondActivityTaskFailedByIdResponse, RespondActivityTaskFailedRequest,
-        RespondActivityTaskFailedResponse, RespondWorkflowTaskCompletedRequest,
-        RespondWorkflowTaskCompletedResponse, SignalWithStartWorkflowExecutionRequest,
-        SignalWithStartWorkflowExecutionResponse, SignalWorkflowExecutionRequest,
-        SignalWorkflowExecutionResponse, StartWorkflowExecutionRequest,
-        StartWorkflowExecutionResponse, SystemCapabilities, SystemInfo, TaskQueueConfig,
-        TerminateWorkflowExecutionRequest, TerminateWorkflowExecutionResponse,
-        UpdateActivityOptionsRequest, UpdateActivityOptionsResponse,
-        UpdateWorkflowExecutionRequest, UpdateWorkflowExecutionResponse,
-        WorkflowExecutionDescription, WorkflowQueryDto, from_internal, to_internal,
+        NamespaceDescription, PauseWorkflowExecutionRequest, PauseWorkflowExecutionResponse,
+        PollActivityTaskQueueRequest, PollActivityTaskQueueResponse, PollWorkflowTaskQueueRequest,
+        PollWorkflowTaskQueueResponse, ProtocolMessageDto, QueryResultDto, QueryWorkflowRequest,
+        QueryWorkflowResponse, RecordActivityTaskHeartbeatByIdRequest,
+        RecordActivityTaskHeartbeatByIdResponse, RecordActivityTaskHeartbeatRequest,
+        RecordActivityTaskHeartbeatResponse, RegisterNamespaceRequest,
+        RequestCancelWorkflowExecutionRequest, RequestCancelWorkflowExecutionResponse,
+        ResetWorkflowExecutionRequest, ResetWorkflowExecutionResponse,
+        RespondActivityTaskCanceledByIdRequest, RespondActivityTaskCanceledByIdResponse,
+        RespondActivityTaskCanceledRequest, RespondActivityTaskCanceledResponse,
+        RespondActivityTaskCompletedByIdRequest, RespondActivityTaskCompletedByIdResponse,
+        RespondActivityTaskCompletedRequest, RespondActivityTaskCompletedResponse,
+        RespondActivityTaskFailedByIdRequest, RespondActivityTaskFailedByIdResponse,
+        RespondActivityTaskFailedRequest, RespondActivityTaskFailedResponse,
+        RespondWorkflowTaskCompletedRequest, RespondWorkflowTaskCompletedResponse,
+        SignalWithStartWorkflowExecutionRequest, SignalWithStartWorkflowExecutionResponse,
+        SignalWorkflowExecutionRequest, SignalWorkflowExecutionResponse,
+        StartWorkflowExecutionRequest, StartWorkflowExecutionResponse, SystemCapabilities,
+        SystemInfo, TaskQueueConfig, TerminateWorkflowExecutionRequest,
+        TerminateWorkflowExecutionResponse, UnpauseWorkflowExecutionRequest,
+        UnpauseWorkflowExecutionResponse, UpdateActivityOptionsRequest,
+        UpdateActivityOptionsResponse, UpdateWorkflowExecutionRequest,
+        UpdateWorkflowExecutionResponse, WorkflowExecutionDescription, WorkflowQueryDto,
+        from_internal, to_internal,
     },
 };
 
@@ -340,6 +342,24 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         run_key: RunKey,
         req: CancelRequest,
     ) -> Result<WorkflowMutationOutcome>;
+
+    async fn pause_workflow(
+        &self,
+        run_key: RunKey,
+        req: tokeira_kernel::PauseWorkflowRequest,
+    ) -> Result<WorkflowMutationOutcome> {
+        let _ = (run_key, req);
+        Err(anyhow!("pause_workflow is not implemented"))
+    }
+
+    async fn unpause_workflow(
+        &self,
+        run_key: RunKey,
+        req: tokeira_kernel::UnpauseWorkflowRequest,
+    ) -> Result<WorkflowMutationOutcome> {
+        let _ = (run_key, req);
+        Err(anyhow!("unpause_workflow is not implemented"))
+    }
 
     async fn reset_workflow(
         &self,
@@ -3405,6 +3425,112 @@ impl WorkflowService {
         .await
     }
 
+    pub async fn pause_workflow_execution(
+        &self,
+        headers: &HeaderMap,
+        req: PauseWorkflowExecutionRequest,
+    ) -> EdgeResult<PauseWorkflowExecutionResponse> {
+        let namespace_label = req.namespace.clone();
+        self.observe_edge_call(
+            headers,
+            "pause_workflow_execution",
+            Some(namespace_label.as_str()),
+            None,
+            async move {
+                let ctx = self
+                    .interceptors
+                    .begin(
+                        headers,
+                        Some(&req.namespace),
+                        Action::PauseWorkflowExecution,
+                        false,
+                    )
+                    .await?;
+
+                if req.workflow_id.is_empty() {
+                    return Err(EdgeError::BadRequest(
+                        "pause_workflow_execution requires workflow_id".to_string(),
+                    ));
+                }
+
+                ensure_local(
+                    self.router
+                        .route_workflow(&req.namespace, &req.workflow_id)
+                        .await?,
+                )?;
+
+                let run_key = self
+                    .resolve_run_key(&req.namespace, &req.workflow_id)
+                    .await?;
+
+                let internal = to_internal::pause_request(req, &ctx.request_id);
+                let outcome = self
+                    .runtime
+                    .pause_workflow(run_key, internal)
+                    .await
+                    .map_err(EdgeError::from)?;
+                self.notify_history_run_key(run_key, outcome.last_event_id)
+                    .await;
+
+                Ok(PauseWorkflowExecutionResponse)
+            },
+        )
+        .await
+    }
+
+    pub async fn unpause_workflow_execution(
+        &self,
+        headers: &HeaderMap,
+        req: UnpauseWorkflowExecutionRequest,
+    ) -> EdgeResult<UnpauseWorkflowExecutionResponse> {
+        let namespace_label = req.namespace.clone();
+        self.observe_edge_call(
+            headers,
+            "unpause_workflow_execution",
+            Some(namespace_label.as_str()),
+            None,
+            async move {
+                let ctx = self
+                    .interceptors
+                    .begin(
+                        headers,
+                        Some(&req.namespace),
+                        Action::UnpauseWorkflowExecution,
+                        false,
+                    )
+                    .await?;
+
+                if req.workflow_id.is_empty() {
+                    return Err(EdgeError::BadRequest(
+                        "unpause_workflow_execution requires workflow_id".to_string(),
+                    ));
+                }
+
+                ensure_local(
+                    self.router
+                        .route_workflow(&req.namespace, &req.workflow_id)
+                        .await?,
+                )?;
+
+                let run_key = self
+                    .resolve_run_key(&req.namespace, &req.workflow_id)
+                    .await?;
+
+                let internal = to_internal::unpause_request(req, &ctx.request_id);
+                let outcome = self
+                    .runtime
+                    .unpause_workflow(run_key, internal)
+                    .await
+                    .map_err(EdgeError::from)?;
+                self.notify_history_run_key(run_key, outcome.last_event_id)
+                    .await;
+
+                Ok(UnpauseWorkflowExecutionResponse)
+            },
+        )
+        .await
+    }
+
     pub async fn request_cancel_workflow_execution(
         &self,
         headers: &HeaderMap,
@@ -4041,6 +4167,7 @@ fn grpc_error_code(error: &EdgeError) -> &'static str {
         EdgeError::LongPollAdmissionTimeout => "deadline_exceeded",
         EdgeError::RemoteRouteUnsupported { .. } => "unavailable",
         EdgeError::NotShardOwner { .. } => "aborted",
+        EdgeError::FailedPrecondition(_) => "failed_precondition",
         EdgeError::Internal(_) => "internal",
     }
 }

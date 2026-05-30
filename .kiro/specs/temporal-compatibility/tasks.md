@@ -35,7 +35,7 @@ Correctness properties P1–P10 from the design are distributed across the tasks
     - _Requirements: 1.1–1.14_
 
   - [x] 1.2 Create `src/pinned.rs`
-    - Declare `pub const TEMPORAL_PROTO_VERSION: &str = "v1.47.0";` and `pub const TEMPORAL_SERVER_COMPAT: &str = "1.27.0";` with doc comments citing the spec
+    - Declare `pub const TEMPORAL_PROTO_VERSION: &str = "v1.62.11";` and `pub const TEMPORAL_SERVER_COMPAT: &str = "1.31.0";` with doc comments citing the spec
     - These are the canonical version pins; bumping requires a spec update and passing matrix-completeness property tests
     - _Requirements: 33.1, 35.1, 35.2_
 

@@ -202,6 +202,8 @@ where
         parent_workflow_id: WorkflowId,
         parent_run_id: RunId,
         parent_namespace_id: NamespaceId,
+        parent_root_workflow_id: Option<WorkflowId>,
+        parent_root_run_id: Option<RunId>,
         initiated_event_id: i64,
     ) {
         let child_run_id = RunId::new();
@@ -234,6 +236,8 @@ where
             parent_run_id: Some(parent_run_id),
             parent_namespace_id: Some(parent_namespace_id),
             parent_initiated_event_id: initiated_event_id,
+            root_workflow_id: parent_root_workflow_id,
+            root_run_id: parent_root_run_id,
             original_execution_run_id: None,
             continued_failure: None,
             last_completion_result: None,
@@ -905,6 +909,8 @@ where
                     parent_workflow_id,
                     parent_run_id,
                     parent_namespace_id,
+                    parent_root_workflow_id,
+                    parent_root_run_id,
                     initiated_event_id,
                 } => {
                     let publisher = RuntimeDispatchPublisher::clone(self);
@@ -915,6 +921,8 @@ where
                     let parent_workflow_id = parent_workflow_id.clone();
                     let parent_run_id = *parent_run_id;
                     let parent_namespace_id = *parent_namespace_id;
+                    let parent_root_workflow_id = parent_root_workflow_id.clone();
+                    let parent_root_run_id = *parent_root_run_id;
                     let namespace_id = *namespace_id;
                     let parent_run_key = *parent_run_key;
                     let initiated_event_id = *initiated_event_id;
@@ -930,6 +938,8 @@ where
                                 parent_workflow_id,
                                 parent_run_id,
                                 parent_namespace_id,
+                                parent_root_workflow_id,
+                                parent_root_run_id,
                                 initiated_event_id,
                             )
                             .await;

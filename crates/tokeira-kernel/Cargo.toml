@@ -15,5 +15,6 @@ tokeira-types = { path = "../tokeira-types" }
 [dev-dependencies]
 prost = "0.12"
 proptest = "1.6"
+serde_json.workspace = true
 tokeira-proto = { path = "../tokeira-proto" }
 tokeira-types = { path = "../tokeira-types", features = ["test-support"] }

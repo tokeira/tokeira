@@ -19,9 +19,9 @@ use tokeira_edge::{
     },
     translate::{
         CountWorkflowExecutionsRequest, CountWorkflowExecutionsResponse,
-        DescribeWorkflowExecutionRequest, GroupCount, ListWorkflowExecutionsRequest,
-        ListWorkflowExecutionsResponse, PendingActivityDescription, PendingChildDescription,
-        PendingWorkflowTaskDescription, PollWorkflowTaskQueueRequest,
+        DescribeWorkflowExecutionRequest, ExecutionConfigDescription, GroupCount,
+        ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, PendingActivityDescription,
+        PendingChildDescription, PendingWorkflowTaskDescription, PollWorkflowTaskQueueRequest,
         PollWorkflowTaskQueueResponse, RespondWorkflowTaskCompletedResponse,
         SignalWorkflowExecutionRequest, StartWorkflowExecutionRequest,
         StartWorkflowExecutionResponse, WorkflowExecutionDescription, WorkflowExecutionSummary,
@@ -42,6 +42,7 @@ use tokeira_proto::{
 };
 use tokeira_types::{
     ExecutionStatus, Memo, Payload, Payloads, RunId, RunKey, SearchAttrValue, SearchAttributes,
+    WorkflowId,
 };
 use tonic::{Code, metadata::MetadataMap};
 use uuid::Uuid;
@@ -82,7 +83,7 @@ proptest! {
             namespace: edge.namespace.clone(),
             execution: Some(tokeira_proto::common::WorkflowExecution {
                 workflow_id: edge.workflow_id.clone(),
-                run_id: String::new(),
+                run_id: edge.run_id.clone().unwrap_or_default(),
                 ..Default::default()
             }),
         };
@@ -476,6 +477,21 @@ fn expected_code(err: &EdgeError) -> Code {
     }
 }
 
+#[test]
+fn describe_request_rejects_malformed_run_id() {
+    let status = proto_conversion_status(
+        describe_request_to_edge(workflowservice::DescribeWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            execution: Some(tokeira_proto::common::WorkflowExecution {
+                workflow_id: "workflow".to_string(),
+                run_id: "not-a-run-id".to_string(),
+            }),
+        })
+        .unwrap_err(),
+    );
+    assert_eq!(status.code(), Code::InvalidArgument);
+}
+
 fn arb_small_string() -> impl Strategy<Value = String> {
     prop::collection::vec(prop::char::range('a', 'z'), 1..8)
         .prop_map(|chars| chars.into_iter().collect())
@@ -620,12 +636,18 @@ fn arb_poll_request() -> impl Strategy<Value = PollWorkflowTaskQueueRequest> {
 }
 
 fn arb_describe_request() -> impl Strategy<Value = DescribeWorkflowExecutionRequest> {
-    (arb_small_string(), arb_small_string()).prop_map(|(namespace, workflow_id)| {
-        DescribeWorkflowExecutionRequest {
-            namespace,
-            workflow_id,
-        }
-    })
+    (
+        arb_small_string(),
+        arb_small_string(),
+        prop::option::of(any::<u128>()),
+    )
+        .prop_map(
+            |(namespace, workflow_id, run_id)| DescribeWorkflowExecutionRequest {
+                namespace,
+                workflow_id,
+                run_id: run_id.map(|value| Uuid::from_u128(value).to_string()),
+            },
+        )
 }
 
 fn arb_list_request() -> impl Strategy<Value = ListWorkflowExecutionsRequest> {
@@ -779,24 +801,48 @@ fn arb_description() -> impl Strategy<Value = WorkflowExecutionDescription> {
                 ),
             )| WorkflowExecutionDescription {
                 namespace,
-                workflow_id,
+                workflow_id: workflow_id.clone(),
                 run_key: RunKey(Uuid::from_u128(run_key)),
                 run_id: RunId(Uuid::from_u128(run_id)),
                 workflow_type,
-                task_queue,
+                task_queue: task_queue.clone(),
                 status,
                 start_time: start_time
                     .map(|secs| OffsetDateTime::from_unix_timestamp(secs).unwrap()),
                 close_time: close_time
                     .map(|secs| OffsetDateTime::from_unix_timestamp(secs).unwrap()),
+                execution_time: start_time
+                    .map(|secs| OffsetDateTime::from_unix_timestamp(secs).unwrap())
+                    .unwrap_or(OffsetDateTime::UNIX_EPOCH),
+                execution_config: ExecutionConfigDescription {
+                    task_queue: task_queue.clone(),
+                    workflow_execution_timeout: None,
+                    workflow_run_timeout: None,
+                    default_workflow_task_timeout: time::Duration::seconds(10),
+                    user_metadata: None,
+                },
                 history_length,
                 state_transition_count,
+                parent_namespace_id: None,
+                parent_workflow_id: None,
+                parent_run_id: None,
+                root_workflow_id: Some(WorkflowId(workflow_id.clone())),
+                root_run_id: Some(RunId(Uuid::from_u128(run_id))),
+                first_run_id: Some(RunId(Uuid::from_u128(run_id))),
                 memo,
                 search_attributes,
                 pending_activities,
                 pending_children,
                 pending_workflow_task,
+                callbacks: Vec::new(),
+                pending_nexus_operations: Vec::new(),
                 pause_info: None,
+                execution_expiration_time: None,
+                run_expiration_time: None,
+                cancel_requested: false,
+                original_start_time: start_time
+                    .map(|secs| OffsetDateTime::from_unix_timestamp(secs).unwrap())
+                    .unwrap_or(OffsetDateTime::UNIX_EPOCH),
             },
         )
 }
@@ -829,6 +875,9 @@ fn arb_pending_activity() -> impl Strategy<Value = PendingActivityDescription> {
                 scheduled_at: OffsetDateTime::from_unix_timestamp(scheduled_at).unwrap(),
                 started_at: started_at
                     .map(|secs| OffsetDateTime::from_unix_timestamp(secs).unwrap()),
+                last_failure: None,
+                paused: false,
+                pause_info: None,
             },
         )
 }

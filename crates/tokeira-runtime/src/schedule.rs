@@ -874,6 +874,8 @@ where
         parent_run_id: None,
         parent_namespace_id: None,
         parent_initiated_event_id: 0,
+        root_workflow_id: None,
+        root_run_id: None,
         original_execution_run_id: Some(run_id),
         continued_failure: None,
         last_completion_result: None,

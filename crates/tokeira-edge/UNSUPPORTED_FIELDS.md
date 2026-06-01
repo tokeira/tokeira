@@ -46,12 +46,16 @@ does not support or cannot yet populate, along with rationale.
 
 | Field | Status | Rationale |
 |---|---|---|
-| `execution_config` | Not populated | Requires new storage query for execution config |
-| `pending_activities` | Not populated | Requires new storage query for pending activity state |
-| `pending_children` | Not populated | Requires new storage query for pending child state |
-| `pending_workflow_task` | Not populated | Requires new storage query for pending WFT state |
-| `callbacks` | Not populated | Completion callbacks not implemented |
-| `pending_nexus_operations` | Not populated | Requires new storage query for pending Nexus state |
+| `execution_config.user_metadata` | Not populated | Start user metadata is not retained yet |
+| `workflow_execution_info.versioning_info`, worker deployment/build-id fields | Not populated | Worker deployment/versioning state is not retained yet |
+| `workflow_execution_info.auto_reset_points` | Not populated | Reset-point tracking is not retained yet |
+| `workflow_execution_info.priority` | Not populated | Workflow priority state is not modeled yet |
+| `workflow_execution_info.external_payload_size_bytes`, `external_payload_count` | Not populated | External payload accounting is not modeled yet |
+| `pending_activities.heartbeat_details`, heartbeat/retry timing fields | Not populated | Activity heartbeat and attempt timing state is not retained yet |
+| `pending_activities` worker deployment/build-id fields | Not populated | Deprecated worker versioning fields remain default until worker deployment state exists |
+| `callbacks` | Empty | Kernel callbacks are placeholders without representable callback URL, trigger, state, or timing data |
+| `pending_nexus_operations` attempt/cancellation/block-reason fields | Not populated | Nexus delivery attempt and cancellation tracking is not retained yet |
+| `workflow_extended_info.last_reset_time`, `reset_run_id`, `request_id_infos` | Not populated | Reset and request-id linkage state is not retained yet |
 
 ## PollActivityTaskQueueResponse
 

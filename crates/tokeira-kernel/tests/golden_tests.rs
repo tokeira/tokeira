@@ -97,6 +97,8 @@ fn make_start_request() -> StartRequest {
         parent_run_id: None,
         parent_namespace_id: None,
         parent_initiated_event_id: 0,
+        root_workflow_id: None,
+        root_run_id: None,
         original_execution_run_id: Some(run_id),
         continued_failure: None,
         last_completion_result: None,
@@ -136,6 +138,8 @@ fn make_signal_with_start_request() -> SignalWithStartRequest {
         parent_run_id: start.parent_run_id,
         parent_namespace_id: start.parent_namespace_id,
         parent_initiated_event_id: start.parent_initiated_event_id,
+        root_workflow_id: start.root_workflow_id,
+        root_run_id: start.root_run_id,
         original_execution_run_id: start.original_execution_run_id,
         continued_failure: start.continued_failure,
         last_completion_result: start.last_completion_result,
@@ -192,6 +196,7 @@ fn make_open_state() -> WorkflowState {
         workflow_task_attempt: 1,
         sticky: None,
         pause_info: None,
+        cancel_requested: false,
         wft_stamp: 0,
         memo: memo(),
         search_attributes: search_attributes(),
@@ -207,6 +212,8 @@ fn make_open_state() -> WorkflowState {
         parent_run_id: None,
         parent_namespace_id: None,
         parent_initiated_event_id: 0,
+        root_workflow_id: None,
+        root_run_id: None,
         last_completion_result: None,
         activities: BTreeMap::new(),
         timers: BTreeMap::new(),
@@ -257,6 +264,8 @@ fn replay_history_reconstructs_workflow_task_lifecycle() {
                 parent_run_id: start.parent_run_id,
                 parent_namespace_id: start.parent_namespace_id,
                 parent_initiated_event_id: start.parent_initiated_event_id,
+                root_workflow_id: start.root_workflow_id.clone(),
+                root_run_id: start.root_run_id,
                 original_execution_run_id: start.original_execution_run_id,
                 continued_failure: start.continued_failure.clone(),
                 last_completion_result: start.last_completion_result.clone(),
@@ -339,6 +348,8 @@ fn replay_history_reconstructs_activity_and_timer_state() {
                 parent_run_id: start.parent_run_id,
                 parent_namespace_id: start.parent_namespace_id,
                 parent_initiated_event_id: start.parent_initiated_event_id,
+                root_workflow_id: start.root_workflow_id.clone(),
+                root_run_id: start.root_run_id,
                 original_execution_run_id: start.original_execution_run_id,
                 continued_failure: start.continued_failure.clone(),
                 last_completion_result: start.last_completion_result.clone(),
@@ -424,6 +435,8 @@ fn replay_history_reconstructs_historical_execution_options_and_pause() {
                 parent_run_id: start.parent_run_id,
                 parent_namespace_id: start.parent_namespace_id,
                 parent_initiated_event_id: start.parent_initiated_event_id,
+                root_workflow_id: start.root_workflow_id.clone(),
+                root_run_id: start.root_run_id,
                 original_execution_run_id: start.original_execution_run_id,
                 continued_failure: start.continued_failure.clone(),
                 last_completion_result: start.last_completion_result.clone(),
@@ -939,7 +952,7 @@ fn cancel_with_no_pending_wft() {
             request_id,
             ..
         } if reason == &req.reason
-            && external_workflow_execution == &None
+            && external_workflow_execution.is_none()
             && request_id == "cancel-req"
     ));
     assert!(matches!(
@@ -2164,7 +2177,7 @@ fn continue_as_new_closes_run() {
             workflow_task_timeout,
             ..
         } => (
-            new_run_id.clone(),
+            *new_run_id,
             workflow_type.clone(),
             task_queue.clone(),
             input.clone(),

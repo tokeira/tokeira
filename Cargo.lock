@@ -6427,6 +6427,7 @@ dependencies = [
  "proptest",
  "prost 0.12.6",
  "serde",
+ "serde_json",
  "smallvec",
  "thiserror 2.0.18",
  "time",

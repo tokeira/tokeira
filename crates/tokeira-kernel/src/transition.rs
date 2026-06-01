@@ -111,6 +111,8 @@ pub enum DispatchOp {
         parent_workflow_id: WorkflowId,
         parent_run_id: RunId,
         parent_namespace_id: NamespaceId,
+        parent_root_workflow_id: Option<WorkflowId>,
+        parent_root_run_id: Option<RunId>,
         initiated_event_id: i64,
     },
     /// Forcibly terminate a child workflow (parent close

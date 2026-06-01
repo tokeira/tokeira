@@ -30,8 +30,8 @@ use tokeira_proto::{
             failure_to_payload, headers_from_domain, headers_to_domain, memo_from_domain,
             memo_to_domain, payload_from_domain, payload_to_domain, payload_to_failure,
             payloads_from_domain, payloads_to_domain, search_attributes_from_domain,
-            search_attributes_to_domain, task_queue_to_domain, to_proto_duration,
-            to_proto_timestamp, workflow_execution_from_ids,
+            search_attributes_to_domain, task_queue_from_domain, task_queue_to_domain,
+            to_proto_duration, to_proto_timestamp, workflow_execution_from_ids,
         },
     },
     enums,
@@ -48,7 +48,7 @@ use tokeira_runtime::{
 };
 use tokeira_types::{
     ActivityTaskToken, BuildId, DeploymentId, ExecutionStatus, NamespaceId, Payloads, RetryPolicy,
-    RunId, RunKey, TaskKind, WorkflowId, WorkflowType,
+    RunId, RunKey, TaskKind, TaskQueueName, WorkflowId, WorkflowType,
 };
 use uuid::Uuid;
 
@@ -537,9 +537,16 @@ pub fn describe_request_to_edge(
         .ok_or(ProtoConversionError::MissingField(
             "DescribeWorkflowExecutionRequest.execution",
         ))?;
+    let run_id = if execution.run_id.is_empty() {
+        None
+    } else {
+        parse_run_id(&execution.run_id)?;
+        Some(execution.run_id.clone())
+    };
     Ok(DescribeWorkflowExecutionRequest {
         namespace: req.namespace,
         workflow_id: execution.workflow_id.clone(),
+        run_id,
     })
 }
 
@@ -706,6 +713,7 @@ pub fn completed_response_to_proto(
 pub fn describe_response_to_proto(
     resp: WorkflowExecutionDescription,
 ) -> workflowservice::DescribeWorkflowExecutionResponse {
+    let execution_config = Some(execution_config_to_proto(&resp.execution_config));
     let pending_activities = resp
         .pending_activities
         .iter()
@@ -720,29 +728,41 @@ pub fn describe_response_to_proto(
         .pending_workflow_task
         .as_ref()
         .map(pending_wft_to_proto);
-
-    // Temporal v1.31.0 surfaces pause metadata via
-    // DescribeWorkflowExecutionResponse.workflow_extended_info.pause_info,
-    // not on workflow_execution_info directly.
-    let workflow_extended_info =
-        resp.pause_info
-            .as_ref()
-            .map(|info| workflow::WorkflowExecutionExtendedInfo {
-                pause_info: Some(workflow::WorkflowExecutionPauseInfo {
-                    identity: info.identity.clone(),
-                    paused_time: Some(to_proto_timestamp(info.paused_time)),
-                    reason: info.reason.clone(),
-                }),
-                ..Default::default()
-            });
+    let pending_nexus_operations = resp
+        .pending_nexus_operations
+        .iter()
+        .map(pending_nexus_operation_to_proto)
+        .collect();
+    let workflow_execution_info = Some(workflow_execution_info_from_description(&resp));
+    let workflow_extended_info = Some(workflow_extended_info_to_proto(&resp));
 
     workflowservice::DescribeWorkflowExecutionResponse {
-        workflow_execution_info: Some(workflow_execution_info_from_description(resp)),
+        execution_config,
+        workflow_execution_info,
         pending_activities,
         pending_children,
         pending_workflow_task,
+        callbacks: Vec::new(),
+        pending_nexus_operations,
         workflow_extended_info,
-        ..Default::default()
+    }
+}
+
+fn execution_config_to_proto(
+    config: &crate::translate::ExecutionConfigDescription,
+) -> workflow::WorkflowExecutionConfig {
+    workflow::WorkflowExecutionConfig {
+        task_queue: Some(task_queue_from_domain(&TaskQueueName(
+            config.task_queue.clone(),
+        ))),
+        workflow_execution_timeout: config.workflow_execution_timeout.map(to_proto_duration),
+        workflow_run_timeout: config.workflow_run_timeout.map(to_proto_duration),
+        default_workflow_task_timeout: Some(to_proto_duration(
+            config.default_workflow_task_timeout,
+        )),
+        // Start user metadata is not retained yet, so the DTO keeps it optional
+        // and describe leaves the proto field default until that start state exists.
+        user_metadata: None,
     }
 }
 
@@ -763,6 +783,21 @@ fn pending_activity_to_proto(
         maximum_attempts: act.maximum_attempts as i32,
         scheduled_time: Some(to_proto_timestamp(act.scheduled_at)),
         last_started_time: act.started_at.map(to_proto_timestamp),
+        last_failure: act.last_failure.as_ref().map(payload_to_failure),
+        paused: act.paused,
+        pause_info: act.pause_info.as_ref().map(|info| {
+            workflow::pending_activity_info::PauseInfo {
+                pause_time: Some(to_proto_timestamp(info.paused_time)),
+                paused_by: Some(
+                    workflow::pending_activity_info::pause_info::PausedBy::Manual(
+                        workflow::pending_activity_info::pause_info::Manual {
+                            identity: info.identity.clone(),
+                            reason: info.reason.clone(),
+                        },
+                    ),
+                ),
+            }
+        }),
         ..Default::default()
     }
 }
@@ -791,6 +826,28 @@ fn pending_wft_to_proto(
         scheduled_time: Some(to_proto_timestamp(wft.scheduled_at)),
         started_time: wft.started_at.map(to_proto_timestamp),
         attempt: wft.attempt as i32,
+        ..Default::default()
+    }
+}
+
+fn pending_nexus_operation_to_proto(
+    op: &crate::translate::PendingNexusOperationDescription,
+) -> workflow::PendingNexusOperationInfo {
+    let operation_token = op.operation_token.clone().unwrap_or_default();
+    workflow::PendingNexusOperationInfo {
+        endpoint: op.endpoint.clone(),
+        service: op.service.clone(),
+        operation: op.operation.clone(),
+        operation_id: operation_token.clone(),
+        schedule_to_close_timeout: op.schedule_to_close_timeout.map(to_proto_duration),
+        scheduled_time: Some(to_proto_timestamp(op.scheduled_time)),
+        state: if op.started {
+            enums::PendingNexusOperationState::Started as i32
+        } else {
+            enums::PendingNexusOperationState::Scheduled as i32
+        },
+        scheduled_event_id: op.scheduled_event_id,
+        operation_token,
         ..Default::default()
     }
 }
@@ -2033,25 +2090,67 @@ pub fn workflow_command_to_proto(
 }
 
 fn workflow_execution_info_from_description(
-    value: WorkflowExecutionDescription,
+    value: &WorkflowExecutionDescription,
 ) -> workflow::WorkflowExecutionInfo {
+    let execution_time = value.execution_time;
+    let execution_duration = value
+        .close_time
+        .map(|close_time| to_proto_duration(close_time - execution_time));
+    let fallback_root_workflow_id = WorkflowId(value.workflow_id.clone());
+    let root_workflow_id = value
+        .root_workflow_id
+        .as_ref()
+        .unwrap_or(&fallback_root_workflow_id);
+    let root_run_id = value.root_run_id.unwrap_or(value.run_id);
     workflow::WorkflowExecutionInfo {
         execution: Some(workflow_execution_from_ids(
-            &WorkflowId(value.workflow_id),
+            &WorkflowId(value.workflow_id.clone()),
             value.run_id,
         )),
         r#type: Some(tokeira_proto::common::WorkflowType {
-            name: value.workflow_type,
+            name: value.workflow_type.clone(),
         }),
-        task_queue: value.task_queue,
+        task_queue: value.task_queue.clone(),
         status: execution_status_to_proto(value.status),
         start_time: value.start_time.map(to_proto_timestamp),
-        execution_time: None,
+        execution_time: Some(to_proto_timestamp(execution_time)),
         close_time: value.close_time.map(to_proto_timestamp),
+        execution_duration,
         history_length: value.history_length,
         state_transition_count: value.state_transition_count,
+        parent_namespace_id: value.parent_namespace_id.clone().unwrap_or_default(),
+        parent_execution: value.parent_workflow_id.as_ref().map(|workflow_id| {
+            workflow_execution_from_ids(workflow_id, value.parent_run_id.unwrap_or_default())
+        }),
+        root_execution: Some(workflow_execution_from_ids(root_workflow_id, root_run_id)),
+        first_run_id: value
+            .first_run_id
+            .map(|run_id| run_id.0.to_string())
+            .unwrap_or_default(),
         memo: Some(memo_from_domain(&value.memo)),
         search_attributes: Some(search_attributes_from_domain(&value.search_attributes)),
+        ..Default::default()
+    }
+}
+
+fn workflow_extended_info_to_proto(
+    value: &WorkflowExecutionDescription,
+) -> workflow::WorkflowExecutionExtendedInfo {
+    workflow::WorkflowExecutionExtendedInfo {
+        execution_expiration_time: value.execution_expiration_time.map(to_proto_timestamp),
+        run_expiration_time: value.run_expiration_time.map(to_proto_timestamp),
+        cancel_requested: value.cancel_requested,
+        original_start_time: Some(to_proto_timestamp(value.original_start_time)),
+        // Reset/request-id history linkage is not retained yet, so those fields
+        // remain default rather than fabricating reset metadata.
+        pause_info: value
+            .pause_info
+            .as_ref()
+            .map(|info| workflow::WorkflowExecutionPauseInfo {
+                identity: info.identity.clone(),
+                paused_time: Some(to_proto_timestamp(info.paused_time)),
+                reason: info.reason.clone(),
+            }),
         ..Default::default()
     }
 }

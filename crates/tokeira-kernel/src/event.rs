@@ -62,6 +62,10 @@ pub enum HistoryEventKind {
         parent_run_id: Option<RunId>,
         parent_namespace_id: Option<NamespaceId>,
         parent_initiated_event_id: i64,
+        #[serde(default)]
+        root_workflow_id: Option<WorkflowId>,
+        #[serde(default)]
+        root_run_id: Option<RunId>,
         original_execution_run_id: Option<RunId>,
         continued_failure: Option<Payload>,
         last_completion_result: Option<Payloads>,

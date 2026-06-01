@@ -23,7 +23,7 @@ use tokeira_kernel::{
 };
 use tokeira_types::{
     ActivityTaskToken, BuildId, DeploymentId, ExecutionStatus, Headers, Memo, Payload, Payloads,
-    RetryPolicy, RunId, RunKey, SearchAttributes, TaskKind,
+    RetryPolicy, RunId, RunKey, SearchAttributes, TaskKind, WorkflowId,
 };
 
 pub mod batch;
@@ -189,6 +189,16 @@ pub struct RespondWorkflowTaskCompletedResponse {
 pub struct DescribeWorkflowExecutionRequest {
     pub namespace: String,
     pub workflow_id: String,
+    pub run_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExecutionConfigDescription {
+    pub task_queue: String,
+    pub workflow_execution_timeout: Option<time::Duration>,
+    pub workflow_run_timeout: Option<time::Duration>,
+    pub default_workflow_task_timeout: time::Duration,
+    pub user_metadata: Option<Payload>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -202,14 +212,30 @@ pub struct WorkflowExecutionDescription {
     pub status: ExecutionStatus,
     pub start_time: Option<OffsetDateTime>,
     pub close_time: Option<OffsetDateTime>,
+    pub execution_time: OffsetDateTime,
+    pub execution_config: ExecutionConfigDescription,
     pub history_length: i64,
     pub state_transition_count: i64,
+    pub parent_namespace_id: Option<String>,
+    pub parent_workflow_id: Option<WorkflowId>,
+    pub parent_run_id: Option<RunId>,
+    pub root_workflow_id: Option<WorkflowId>,
+    pub root_run_id: Option<RunId>,
+    pub first_run_id: Option<RunId>,
     pub memo: Memo,
     pub search_attributes: SearchAttributes,
     pub pending_activities: Vec<PendingActivityDescription>,
     pub pending_children: Vec<PendingChildDescription>,
     pub pending_workflow_task: Option<PendingWorkflowTaskDescription>,
+    /// Placeholder kernel callbacks have no URL, trigger, state, or timing to
+    /// render, so describe intentionally surfaces an empty callback list.
+    pub callbacks: Vec<()>,
+    pub pending_nexus_operations: Vec<PendingNexusOperationDescription>,
     pub pause_info: Option<PauseInfoDescription>,
+    pub execution_expiration_time: Option<OffsetDateTime>,
+    pub run_expiration_time: Option<OffsetDateTime>,
+    pub cancel_requested: bool,
+    pub original_start_time: OffsetDateTime,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -228,6 +254,9 @@ pub struct PendingActivityDescription {
     pub maximum_attempts: u32,
     pub scheduled_at: OffsetDateTime,
     pub started_at: Option<OffsetDateTime>,
+    pub last_failure: Option<Payload>,
+    pub paused: bool,
+    pub pause_info: Option<PauseInfoDescription>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -245,6 +274,18 @@ pub struct PendingWorkflowTaskDescription {
     pub scheduled_at: OffsetDateTime,
     pub started_at: Option<OffsetDateTime>,
     pub attempt: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingNexusOperationDescription {
+    pub endpoint: String,
+    pub service: String,
+    pub operation: String,
+    pub scheduled_time: OffsetDateTime,
+    pub scheduled_event_id: i64,
+    pub schedule_to_close_timeout: Option<time::Duration>,
+    pub started: bool,
+    pub operation_token: Option<String>,
 }
 
 // Visibility types re-exported from tokeira-projection (the authoritative owner).

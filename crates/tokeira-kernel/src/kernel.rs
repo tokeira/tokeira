@@ -152,6 +152,8 @@ impl BasicKernel {
             parent_run_id,
             parent_namespace_id,
             parent_initiated_event_id,
+            root_workflow_id,
+            root_run_id,
             last_completion_result,
             ..
         } = &first.kind
@@ -159,6 +161,10 @@ impl BasicKernel {
             return Err(Reject::InvalidReplayHistory);
         };
 
+        let canonical_root_workflow_id = root_workflow_id
+            .clone()
+            .unwrap_or_else(|| ctx.workflow_id.clone());
+        let canonical_root_run_id = root_run_id.unwrap_or(ctx.run_id);
         let mut state = WorkflowState {
             run_key: ctx.run_key,
             namespace_id: ctx.namespace_id,
@@ -177,6 +183,7 @@ impl BasicKernel {
             workflow_task_attempt: 1,
             sticky: None,
             pause_info: None,
+            cancel_requested: false,
             wft_stamp: 0,
             memo: memo.clone(),
             search_attributes: search_attributes.clone(),
@@ -192,6 +199,8 @@ impl BasicKernel {
             parent_run_id: *parent_run_id,
             parent_namespace_id: *parent_namespace_id,
             parent_initiated_event_id: *parent_initiated_event_id,
+            root_workflow_id: Some(canonical_root_workflow_id),
+            root_run_id: Some(canonical_root_run_id),
             last_completion_result: last_completion_result.clone(),
             activities: BTreeMap::new(),
             timers: BTreeMap::new(),
@@ -225,6 +234,13 @@ impl BasicKernel {
             return Err(Reject::RunAlreadyExists);
         }
 
+        let canonical_root_workflow_id = req
+            .root_workflow_id
+            .clone()
+            .unwrap_or_else(|| req.workflow_id.clone());
+        let canonical_root_run_id = req.root_run_id.unwrap_or(req.run_id);
+        let event_root_workflow_id = req.root_workflow_id.clone();
+        let event_root_run_id = req.root_run_id;
         let initial = WorkflowState {
             run_key: req.run_key,
             namespace_id: req.namespace_id,
@@ -243,6 +259,7 @@ impl BasicKernel {
             workflow_task_attempt: 1,
             sticky: None,
             pause_info: None,
+            cancel_requested: false,
             wft_stamp: 0,
             memo: req.memo.clone(),
             search_attributes: req.search_attributes.clone(),
@@ -258,6 +275,8 @@ impl BasicKernel {
             parent_run_id: req.parent_run_id,
             parent_namespace_id: req.parent_namespace_id,
             parent_initiated_event_id: req.parent_initiated_event_id,
+            root_workflow_id: Some(canonical_root_workflow_id),
+            root_run_id: Some(canonical_root_run_id),
             last_completion_result: req.last_completion_result.clone(),
             activities: BTreeMap::new(),
             timers: BTreeMap::new(),
@@ -300,6 +319,8 @@ impl BasicKernel {
             parent_run_id: req.parent_run_id,
             parent_namespace_id: req.parent_namespace_id,
             parent_initiated_event_id: req.parent_initiated_event_id,
+            root_workflow_id: event_root_workflow_id,
+            root_run_id: event_root_run_id,
             original_execution_run_id: req.original_execution_run_id.or(Some(req.run_id)),
             continued_failure: req.continued_failure,
             last_completion_result: req.last_completion_result,
@@ -328,6 +349,13 @@ impl BasicKernel {
             return Err(Reject::RunAlreadyExists);
         }
 
+        let canonical_root_workflow_id = req
+            .root_workflow_id
+            .clone()
+            .unwrap_or_else(|| req.workflow_id.clone());
+        let canonical_root_run_id = req.root_run_id.unwrap_or(req.run_id);
+        let event_root_workflow_id = req.root_workflow_id.clone();
+        let event_root_run_id = req.root_run_id;
         let initial = WorkflowState {
             run_key: req.run_key,
             namespace_id: req.namespace_id,
@@ -346,6 +374,7 @@ impl BasicKernel {
             workflow_task_attempt: 1,
             sticky: None,
             pause_info: None,
+            cancel_requested: false,
             wft_stamp: 0,
             memo: req.memo.clone(),
             search_attributes: req.search_attributes.clone(),
@@ -361,6 +390,8 @@ impl BasicKernel {
             parent_run_id: req.parent_run_id,
             parent_namespace_id: req.parent_namespace_id,
             parent_initiated_event_id: req.parent_initiated_event_id,
+            root_workflow_id: Some(canonical_root_workflow_id),
+            root_run_id: Some(canonical_root_run_id),
             last_completion_result: req.last_completion_result.clone(),
             activities: BTreeMap::new(),
             timers: BTreeMap::new(),
@@ -403,6 +434,8 @@ impl BasicKernel {
             parent_run_id: req.parent_run_id,
             parent_namespace_id: req.parent_namespace_id,
             parent_initiated_event_id: req.parent_initiated_event_id,
+            root_workflow_id: event_root_workflow_id,
+            root_run_id: event_root_run_id,
             original_execution_run_id: req.original_execution_run_id.or(Some(req.run_id)),
             continued_failure: req.continued_failure,
             last_completion_result: req.last_completion_result,
@@ -501,6 +534,7 @@ impl BasicKernel {
             identity: req.request.caller_identity.clone().unwrap_or_default(),
             request_id: req.request.request_id.0,
         });
+        builder.state.cancel_requested = true;
 
         if builder.state.pending_workflow_task.is_none() {
             builder.schedule_workflow_task();
@@ -1804,7 +1838,9 @@ impl BasicKernel {
         match &event.kind {
             HistoryEventKind::WorkflowExecutionStarted { .. } => {}
             HistoryEventKind::WorkflowExecutionSignaled { .. } => {}
-            HistoryEventKind::WorkflowExecutionCancelRequested { .. } => {}
+            HistoryEventKind::WorkflowExecutionCancelRequested { .. } => {
+                state.cancel_requested = true;
+            }
             HistoryEventKind::WorkflowExecutionPaused {
                 identity,
                 reason,
@@ -2579,6 +2615,8 @@ fn apply_workflow_command(
                 parent_workflow_id: builder.state.workflow_id.clone(),
                 parent_run_id: builder.state.run_id,
                 parent_namespace_id: builder.state.namespace_id,
+                parent_root_workflow_id: builder.state.root_workflow_id.clone(),
+                parent_root_run_id: builder.state.root_run_id,
                 initiated_event_id,
             });
             Ok(false)

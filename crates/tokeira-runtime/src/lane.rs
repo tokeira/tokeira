@@ -673,6 +673,14 @@ where
                                         &new_state.workflow_id,
                                         successor_run_id,
                                     );
+                                    let (root_workflow_id, root_run_id) = if new_state
+                                        .parent_run_key
+                                        .is_some()
+                                    {
+                                        (new_state.root_workflow_id.clone(), new_state.root_run_id)
+                                    } else {
+                                        (None, None)
+                                    };
                                     let start_request = StartRequest {
                                         run_key: successor_run_key,
                                         namespace_id: new_state.namespace_id,
@@ -707,6 +715,8 @@ where
                                         parent_run_id: None,
                                         parent_namespace_id: None,
                                         parent_initiated_event_id: 0,
+                                        root_workflow_id,
+                                        root_run_id,
                                         original_execution_run_id: Some(
                                             new_state
                                                 .original_execution_run_id
@@ -1884,6 +1894,7 @@ mod tests {
             workflow_task_attempt: 1,
             sticky: None,
             pause_info: None,
+            cancel_requested: false,
             wft_stamp: 0,
             memo: Memo::default(),
             search_attributes: SearchAttributes::default(),
@@ -1899,6 +1910,8 @@ mod tests {
             parent_run_id: None,
             parent_namespace_id: None,
             parent_initiated_event_id: 0,
+            root_workflow_id: None,
+            root_run_id: None,
             last_completion_result: None,
             activities: BTreeMap::<String, ActivityState>::new(),
             timers: BTreeMap::new(),

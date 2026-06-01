@@ -250,6 +250,11 @@ pub struct StartRequest {
     pub parent_namespace_id: Option<NamespaceId>,
     /// Event ID of the parent initiation event for child starts.
     pub parent_initiated_event_id: i64,
+    /// Root workflow ID authored onto the start event when the source run has
+    /// a parent; absent roots canonicalize to self during apply/replay.
+    pub root_workflow_id: Option<WorkflowId>,
+    /// Root run ID authored with `root_workflow_id`.
+    pub root_run_id: Option<RunId>,
     /// Run ID of the very first run in the execution chain.
     pub original_execution_run_id: Option<RunId>,
     /// Failure carried forward from the predecessor run.
@@ -298,6 +303,8 @@ pub struct SignalWithStartRequest {
     pub parent_run_id: Option<RunId>,
     pub parent_namespace_id: Option<NamespaceId>,
     pub parent_initiated_event_id: i64,
+    pub root_workflow_id: Option<WorkflowId>,
+    pub root_run_id: Option<RunId>,
     pub original_execution_run_id: Option<RunId>,
     pub continued_failure: Option<Payload>,
     pub last_completion_result: Option<Payloads>,

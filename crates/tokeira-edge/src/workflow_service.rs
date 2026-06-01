@@ -422,6 +422,7 @@ pub trait ExecutionResolver: Send + Sync + 'static {
         &self,
         namespace: &str,
         workflow_id: &str,
+        run_id: Option<RunId>,
     ) -> Result<Option<WorkflowExecutionDescription>>;
 }
 
@@ -433,6 +434,9 @@ pub struct InMemoryExecutionResolver {
     current: tokio::sync::RwLock<std::collections::HashMap<(String, String), RunKey>>,
     descriptions: tokio::sync::RwLock<
         std::collections::HashMap<(String, String), WorkflowExecutionDescription>,
+    >,
+    descriptions_by_run: tokio::sync::RwLock<
+        std::collections::HashMap<(String, String, String), WorkflowExecutionDescription>,
     >,
 }
 
@@ -454,10 +458,19 @@ impl InMemoryExecutionResolver {
     }
 
     pub async fn set_description(&self, description: WorkflowExecutionDescription) {
+        let run_id = description.run_id.0.to_string();
         self.descriptions.write().await.insert(
             (
                 description.namespace.clone(),
                 description.workflow_id.clone(),
+            ),
+            description.clone(),
+        );
+        self.descriptions_by_run.write().await.insert(
+            (
+                description.namespace.clone(),
+                description.workflow_id.clone(),
+                run_id,
             ),
             description,
         );
@@ -479,7 +492,20 @@ impl ExecutionResolver for InMemoryExecutionResolver {
         &self,
         namespace: &str,
         workflow_id: &str,
+        run_id: Option<RunId>,
     ) -> Result<Option<WorkflowExecutionDescription>> {
+        if let Some(run_id) = run_id {
+            return Ok(self
+                .descriptions_by_run
+                .read()
+                .await
+                .get(&(
+                    namespace.to_string(),
+                    workflow_id.to_string(),
+                    run_id.0.to_string(),
+                ))
+                .cloned());
+        }
         Ok(self
             .descriptions
             .read()
@@ -1610,6 +1636,8 @@ impl WorkflowService {
             parent_run_id: None,
             parent_namespace_id: None,
             parent_initiated_event_id: 0,
+            root_workflow_id: None,
+            root_run_id: None,
             original_execution_run_id: Some(run_id),
             continued_failure: None,
             last_completion_result: None,
@@ -2430,7 +2458,20 @@ impl WorkflowService {
                 )?;
 
                 self.resolver
-                    .describe_execution(&req.namespace, &req.workflow_id)
+                    .describe_execution(
+                        &req.namespace,
+                        &req.workflow_id,
+                        req.run_id
+                            .as_deref()
+                            .map(|value| Uuid::parse_str(value).map(RunId))
+                            .transpose()
+                            .map_err(|err| {
+                                EdgeError::BadRequest(format!(
+                                    "invalid run_id `{}`: {err}",
+                                    req.run_id.as_deref().unwrap_or_default()
+                                ))
+                            })?,
+                    )
                     .await
                     .map_err(EdgeError::from)?
                     .ok_or(EdgeError::WorkflowNotFound {

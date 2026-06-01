@@ -57,6 +57,10 @@ pub struct WorkflowState {
     pub sticky: Option<StickyAffinity>,
     /// Pause metadata when the workflow is paused.
     pub pause_info: Option<PauseInfo>,
+    /// True after a cooperative cancellation has been requested but before the
+    /// workflow has closed or ignored it.
+    #[serde(default)]
+    pub cancel_requested: bool,
     /// Monotonic stamp incremented on pause/unpause to
     /// invalidate in-flight workflow task deliveries.
     pub wft_stamp: u64,
@@ -89,6 +93,13 @@ pub struct WorkflowState {
     pub parent_namespace_id: Option<NamespaceId>,
     /// Parent initiation event ID if this execution is a child.
     pub parent_initiated_event_id: i64,
+    /// Canonical root workflow ID for this run, authored from the start event
+    /// when present and otherwise defaulted to this run's own execution.
+    #[serde(default)]
+    pub root_workflow_id: Option<WorkflowId>,
+    /// Canonical root run ID for this run.
+    #[serde(default)]
+    pub root_run_id: Option<RunId>,
     /// Last successful predecessor completion result.
     pub last_completion_result: Option<Payloads>,
     /// Open activities keyed by activity ID.

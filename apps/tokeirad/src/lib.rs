@@ -872,25 +872,29 @@ where
         &self,
         _namespace: &str,
         workflow_id: &str,
+        run_id: Option<tokeira_types::RunId>,
     ) -> Result<Option<WorkflowExecutionDescription>> {
         let run_key = match self
             .repo
             .resolve_execution(&ExecutionRef {
                 namespace_id: self.namespace_id,
                 workflow_id: WorkflowId(workflow_id.to_string()),
-                run_id: None,
+                run_id,
             })
             .await?
         {
             Some(rk) => rk,
-            None => match self
-                .repo
-                .find_latest_run(self.namespace_id, &WorkflowId(workflow_id.to_string()))
-                .await?
-            {
-                Some(rk) => rk,
-                None => return Ok(None),
-            },
+            None if run_id.is_none() => {
+                match self
+                    .repo
+                    .find_latest_run(self.namespace_id, &WorkflowId(workflow_id.to_string()))
+                    .await?
+                {
+                    Some(rk) => rk,
+                    None => return Ok(None),
+                }
+            }
+            None => return Ok(None),
         };
 
         match self.repo.load_run(run_key).await? {
@@ -900,12 +904,28 @@ where
                 run_key: state.run_key,
                 run_id: state.run_id,
                 workflow_type: state.workflow_type.0,
-                task_queue: state.task_queue.0,
+                task_queue: state.task_queue.0.clone(),
                 status: state.status,
                 start_time: Some(state.started_at),
                 close_time: state.closed_at,
+                execution_time: state.first_run_started_at.unwrap_or(state.started_at),
+                execution_config: tokeira_edge::translate::ExecutionConfigDescription {
+                    task_queue: state.task_queue.0.clone(),
+                    workflow_execution_timeout: state.workflow_execution_timeout,
+                    workflow_run_timeout: state.workflow_run_timeout,
+                    default_workflow_task_timeout: state.workflow_task_timeout,
+                    user_metadata: None,
+                },
                 history_length: state.last_event_id,
                 state_transition_count: state.transition_seq.0 as i64,
+                parent_namespace_id: state
+                    .parent_namespace_id
+                    .map(|namespace_id| namespace_id.0.to_string()),
+                parent_workflow_id: state.parent_workflow_id.clone(),
+                parent_run_id: state.parent_run_id,
+                root_workflow_id: state.root_workflow_id.clone(),
+                root_run_id: state.root_run_id,
+                first_run_id: state.first_execution_run_id,
                 memo: state.memo,
                 search_attributes: state.search_attributes,
                 pending_activities: state
@@ -924,6 +944,15 @@ where
                                 .unwrap_or_default(),
                             scheduled_at: activity.scheduled_at,
                             started_at: activity.started_at,
+                            last_failure: activity.last_failure.clone(),
+                            paused: activity.pause_info.is_some(),
+                            pause_info: activity.pause_info.as_ref().map(|info| {
+                                tokeira_edge::translate::PauseInfoDescription {
+                                    identity: info.identity.clone(),
+                                    paused_time: info.pause_time,
+                                    reason: info.reason.clone(),
+                                }
+                            }),
                         },
                     )
                     .collect(),
@@ -949,6 +978,25 @@ where
                         attempt: task.attempt,
                     }
                 }),
+                callbacks: Vec::new(),
+                pending_nexus_operations: state
+                    .pending_nexus_operations
+                    .values()
+                    .map(
+                        |operation| tokeira_edge::translate::PendingNexusOperationDescription {
+                            endpoint: operation.endpoint.clone(),
+                            service: operation.service.clone(),
+                            operation: operation.operation.clone(),
+                            scheduled_time: operation.scheduled_at,
+                            scheduled_event_id: operation.scheduled_event_id,
+                            schedule_to_close_timeout: operation.schedule_to_close_timeout,
+                            started: operation.started,
+                            operation_token: operation
+                                .started
+                                .then(|| operation.operation_id.clone()),
+                        },
+                    )
+                    .collect(),
                 pause_info: state.pause_info.as_ref().map(|info| {
                     tokeira_edge::translate::PauseInfoDescription {
                         identity: info.identity.clone(),
@@ -956,6 +1004,14 @@ where
                         reason: info.reason.clone(),
                     }
                 }),
+                execution_expiration_time: state.workflow_execution_timeout.map(|timeout| {
+                    state.first_run_started_at.unwrap_or(state.started_at) + timeout
+                }),
+                run_expiration_time: state
+                    .workflow_run_timeout
+                    .map(|timeout| state.started_at + timeout),
+                cancel_requested: state.cancel_requested,
+                original_start_time: state.first_run_started_at.unwrap_or(state.started_at),
             })),
             LoadedRun::Absent => Err(anyhow!("resolved run missing from storage: {:?}", run_key)),
         }

@@ -11,7 +11,7 @@ use tokeira_kernel::{
     ExternalSignalResult, ExternalWorkflowExecution, FieldChange, LoadedRun,
     NexusOperationResolvedRequest, NexusResolution, ParentClosePolicy, PauseActivityRequest,
     PauseInfo, PauseWorkflowRequest, PendingExternalCancel, PendingExternalSignal,
-    PendingNexusOperation, PendingUpdate, PendingWorkflowTask, RequestDedupeOp,
+    PendingNexusOperation, PendingUpdate, PendingWorkflowTask, ReplayContext, RequestDedupeOp,
     ResetActivityRequest, ResetRequest, RetryState, SignalRequest, StartRequest,
     StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerOp, TimerState,
     UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
@@ -91,6 +91,7 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         workflow_task_attempt: 1,
         sticky: None,
         pause_info: None,
+        cancel_requested: false,
         wft_stamp: 0,
         memo: memo_with("memo"),
         search_attributes: search_attrs_with("search"),
@@ -106,6 +107,8 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         parent_run_id: None,
         parent_namespace_id: None,
         parent_initiated_event_id: 0,
+        root_workflow_id: None,
+        root_run_id: None,
         last_completion_result: None,
         activities: BTreeMap::new(),
         timers: BTreeMap::new(),
@@ -303,6 +306,20 @@ fn with_pending_nexus_operation(mut state: WorkflowState, operation_id: &str) ->
         },
     );
     state
+}
+
+#[test]
+fn workflow_state_deserialize_defaults_describe_metadata() {
+    let mut value = serde_json::to_value(make_open_state(fixed_now())).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.remove("cancel_requested");
+    object.remove("root_workflow_id");
+    object.remove("root_run_id");
+
+    let restored: WorkflowState = serde_json::from_value(value).unwrap();
+    assert!(!restored.cancel_requested);
+    assert_eq!(restored.root_workflow_id, None);
+    assert_eq!(restored.root_run_id, None);
 }
 
 fn arb_open_state_for_reset(now: OffsetDateTime) -> impl Strategy<Value = WorkflowState> {
@@ -673,6 +690,8 @@ fn arb_start_request() -> impl Strategy<Value = StartRequest> {
                     parent_run_id: None,
                     parent_namespace_id: None,
                     parent_initiated_event_id: 0,
+                    root_workflow_id: None,
+                    root_run_id: None,
                     original_execution_run_id: Some(run_id),
                     continued_failure: None,
                     last_completion_result: None,
@@ -2053,10 +2072,118 @@ proptest! {
             Command::Cancel(req),
         ).unwrap();
         prop_assert_eq!(transition.next_state.status, ExecutionStatus::Running);
+        prop_assert!(transition.next_state.cancel_requested);
         prop_assert_eq!(transition.next_state.closed_at, None);
         prop_assert!(transition.projection_ops.is_empty());
         prop_assert!(transition.activity_ops.is_empty());
         prop_assert!(transition.timer_ops.is_empty());
+    }
+
+    #[test]
+    fn property_describe_cancel_requested_survives_live_apply_and_replay(
+        start in arb_start_request(),
+        cancel in arb_cancel_request(fixed_now()),
+    ) {
+        let kernel = kernel();
+        let start_transition = kernel
+            .apply(LoadedRun::Absent, Command::Start(start.clone()))
+            .unwrap();
+        prop_assert!(!start_transition.next_state.cancel_requested);
+
+        let cancel_transition = kernel
+            .apply(
+                LoadedRun::Existing(start_transition.next_state.clone()),
+                Command::Cancel(cancel),
+            )
+            .unwrap();
+        prop_assert!(cancel_transition.next_state.cancel_requested);
+
+        let mut history = start_transition.history_events;
+        history.extend(cancel_transition.history_events);
+        let replayed = kernel
+            .replay_history_prefix(
+                ReplayContext {
+                    run_key: start.run_key,
+                    namespace_id: start.namespace_id,
+                    workflow_id: start.workflow_id,
+                    run_id: start.run_id,
+                    deployment: start.deployment,
+                    build_id: start.build_id,
+                    parent_run_key: start.parent_run_key,
+                    parent_workflow_id: start.parent_workflow_id,
+                    first_run_started_at: start.first_run_started_at,
+                },
+                &history,
+            )
+            .unwrap();
+        prop_assert!(replayed.cancel_requested);
+    }
+
+    #[test]
+    fn property_describe_root_execution_event_or_self_survives_replay(
+        mut start in arb_start_request(),
+        authored_root in any::<bool>(),
+        parented in any::<bool>(),
+    ) {
+        let root_workflow_id = WorkflowId("root-workflow".to_string());
+        let root_run_id = RunId::new();
+        if authored_root {
+            start.root_workflow_id = Some(root_workflow_id.clone());
+            start.root_run_id = Some(root_run_id);
+        }
+        if parented {
+            start.parent_run_key = Some(RunKey::new());
+            start.parent_workflow_id = Some(WorkflowId("parent-workflow".to_string()));
+            start.parent_run_id = Some(RunId::new());
+            start.parent_namespace_id = Some(start.namespace_id);
+            start.parent_initiated_event_id = 7;
+        }
+
+        let kernel = kernel();
+        let transition = kernel
+            .apply(LoadedRun::Absent, Command::Start(start.clone()))
+            .unwrap();
+        let expected_workflow_id = start
+            .root_workflow_id
+            .clone()
+            .unwrap_or_else(|| start.workflow_id.clone());
+        let expected_run_id = start.root_run_id.unwrap_or(start.run_id);
+        prop_assert_eq!(
+            transition.next_state.root_workflow_id.as_ref(),
+            Some(&expected_workflow_id)
+        );
+        prop_assert_eq!(transition.next_state.root_run_id, Some(expected_run_id));
+
+        match &transition.history_events[0].kind {
+            HistoryEventKind::WorkflowExecutionStarted {
+                root_workflow_id,
+                root_run_id,
+                ..
+            } => {
+                prop_assert_eq!(root_workflow_id, &start.root_workflow_id);
+                prop_assert_eq!(root_run_id, &start.root_run_id);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let replayed = kernel
+            .replay_history_prefix(
+                ReplayContext {
+                    run_key: start.run_key,
+                    namespace_id: start.namespace_id,
+                    workflow_id: start.workflow_id,
+                    run_id: start.run_id,
+                    deployment: start.deployment,
+                    build_id: start.build_id,
+                    parent_run_key: start.parent_run_key,
+                    parent_workflow_id: start.parent_workflow_id,
+                    first_run_started_at: start.first_run_started_at,
+                },
+                &transition.history_events,
+            )
+            .unwrap();
+        prop_assert_eq!(replayed.root_workflow_id, Some(expected_workflow_id));
+        prop_assert_eq!(replayed.root_run_id, Some(expected_run_id));
     }
 
     #[test]

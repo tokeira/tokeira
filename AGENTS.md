@@ -6,6 +6,12 @@ Build a Temporal-compatible durable execution engine in Rust, specialized for Au
 
 This is a product-from-scratch. The architecture is informed by Temporal but the implementation is original. Do not port Temporal code.
 
+### Compatibility Target
+
+- **Temporal server compatibility: v1.31.0.** This is the release whose public API *behaviour* Tokeira claims to match. It is the authority for every API-behaviour question (see §8). Pinned as `TEMPORAL_SERVER_COMPAT` in `crates/tokeira-build-info/src/pinned.rs`.
+- **Temporal API: v1.62.11.** This is the vendored proto surface Tokeira builds against (`proto/upstream/`, mirrored by `proto/UPSTREAM_VERSION`). Pinned as `TEMPORAL_PROTO_VERSION`.
+- These pins are independent and tracked ahead on purpose: the vendored API `v1.62.11` is newer than the API version Temporal server `1.31.0` ships (`v1.62.8`). RPCs present only in `v1.62.11` (e.g. Nexus operation execution) are **not** part of the `1.31.0` behavioural claim and are tracked separately in the api-conformance tracker. Do not bump the server compatibility claim just because the vendored proto version moved.
+
 ---
 
 ## Non-Negotiable Rules
@@ -99,6 +105,22 @@ Benefits:
 
 `-m "short"` is acceptable only for terse single-line messages (under ~60 characters, no backticks, no angle brackets). Never use `-m` with a multi-line message via `\n` escapes — those route through the terminal's input buffer and hit the same truncation. Never use `cat <<'EOF' > file.txt` heredocs for commit messages — backticks inside the heredoc body can still hit the terminal cap.
 
+### 8. Temporal Behaviour Defers to the Targeted Release
+
+The targeted Temporal release is pinned by `TEMPORAL_SERVER_COMPAT` (currently `1.31.0`) and the vendored API by `TEMPORAL_PROTO_VERSION` (currently `v1.62.11`), both in `crates/tokeira-build-info/src/pinned.rs`.
+
+For any question about public API **behaviour** — field semantics, error/status mapping, defaulting, lifecycle ordering, inheritance rules — the contract is **whatever the targeted release does**, verified against ground truth in this order:
+
+1. **Vendored protos in `proto/upstream/`** for wire shape: messages, field numbers, enums, oneofs. NEVER read generated artifacts under `target/` — they can be stale; `proto/upstream/` is the source of truth.
+2. **Temporal server source at the matching tag** for runtime behaviour the proto does not specify: [`github.com/temporalio/temporal` at tag `v1.31.0`](https://github.com/temporalio/temporal/tree/v1.31.0) (matches `TEMPORAL_SERVER_COMPAT`). Read the actual code (e.g. `service/history/...`, `common/...`) — do not infer behaviour from proto doc comments, SDK docs, blog posts, or memory when the source is available. If you keep a local checkout, use it, but reference the pinned tag — never hardcode an absolute developer-machine path in specs, code, or docs.
+
+Rules:
+
+- When a behaviour question arises, resolve it against the targeted release **before** writing or amending a spec. A spec or requirement that contradicts the targeted release is wrong; fix the spec.
+- This is distinct from "Do not port Temporal code" in the Mission: **reading** Temporal source to determine the contract is required; **copying** its implementation is forbidden. Tokeira's implementation stays original; only the observable contract is shared.
+- Where a Tokeira mechanism has no exact Temporal analog (e.g. history replay reconstruction), the test of correctness is: *does Tokeira's response match what the targeted release would return for the same execution lineage?*
+- Cite the verifying source (proto path or server source path + tag) in the spec/PR when a behaviour decision is non-obvious, so reviewers can confirm against the same ground truth.
+
 ---
 
 ## Architecture
@@ -129,13 +151,25 @@ tokeira/
 │   ├── tokeira-runtime/          # Lanes, broker, sweepers, timers
 │   ├── tokeira-edge/             # Compatibility shell for public APIs
 │   ├── tokeira-projection/       # Projection workers + visibility API
+│   ├── tokeira-observability/    # Metrics/label definitions
+│   ├── tokeira-build-info/       # Compatibility pins (proto + server-compat)
+│   ├── tokeira-compatibility/    # Feature/SDK compatibility matrices
+│   ├── tokeira-compatibility-proto/    # Tokeira-owned compatibility wire types
+│   ├── tokeira-compatibility-service/  # Compatibility metadata service
 │   ├── tokeira-state/            # Deployment state (CAS store + S3 store)
 │   ├── tokeira-iac/              # IaC engine (plan/apply/destroy)
 │   ├── tokeira-deploy-engine/    # Service lifecycle engine
 │   ├── tokeira-config/           # Server config + generic TOML loader
 │   ├── tokeira-orchestrator/     # Deployment orchestration facade
 │   ├── tokeira-compose/          # Docker Compose provider (bollard)
-│   └── tokeira-aws/              # AWS resource implementations
+│   ├── tokeira-aws/              # AWS resource implementations
+│   ├── tokeira-build/            # Dagger image build recipes
+│   ├── tokeira-controller/       # Control-plane service
+│   ├── tokeira-autoscaler/       # Autoscaling service
+│   ├── tokeira-remote-workstation/     # Remote workstation support
+│   └── dagger-client/            # Dagger GraphQL client
+├── proto/
+│   └── upstream/                 # Vendored Temporal protos (authoritative; API v1.62.11)
 ├── platforms/
 │   ├── local/                    # Bare-process local platform
 │   └── compose/                  # Docker Compose platform with observability + DSQL module
@@ -155,6 +189,7 @@ tokeira/
 - `tokeira-iac` and `tokeira-deploy-engine` are provider-agnostic. Platform-specific resources and services live in platform crates.
 - Platform crates (`platforms/local`, `platforms/compose`) follow the deploy-eks `project` pattern: `config.rs`, `modules.rs`, `services.rs`, `compose.rs`.
 - `tokeira-config` owns both the server runtime config model (`TokeiraConfig`) and the generic TOML loader. These are in the same crate because there is currently one consumer.
+- `proto/upstream/` holds the vendored Temporal protos (API `v1.62.11`) and is the authoritative wire shape. `tokeira-proto` generates from it. Never treat generated output under `target/` as authoritative.
 
 ---
 
@@ -217,6 +252,7 @@ Use `cargo lint` to check if everything compiles without running tests. `cargo c
 
 ## Decision Process
 
+0. **For API-behaviour questions, resolve against the targeted Temporal release first.** See §8 — `proto/upstream/` for shape, Temporal server source at tag `v1.31.0` for behaviour. This tier sits above the spec: a spec that contradicts the targeted release is the thing that's wrong.
 1. **Check the spec first.** Requirements and design docs are in `.kiro/specs/`. They're the source of truth.
 2. **Check existing patterns.** Look at how similar things are done in the codebase before inventing a new approach.
 3. **Prefer boring solutions.** The simplest approach that satisfies the requirement is the right one.
@@ -237,7 +273,7 @@ Use `cargo lint` to check if everything compiles without running tests. `cargo c
 
 ### Temporal Compatibility Changes
 
-1. `TEMPORAL_PROTO_VERSION` and `TEMPORAL_SERVER_COMPAT` are independent pins in `crates/tokeira-build-info/src/pinned.rs`. Do not bump the server compatibility claim just because the vendored proto version changed.
+1. `TEMPORAL_PROTO_VERSION` (API surface, `v1.62.11`) and `TEMPORAL_SERVER_COMPAT` (behavioural target, `1.31.0`) are independent pins in `crates/tokeira-build-info/src/pinned.rs`. `TEMPORAL_SERVER_COMPAT` is the authority for every API-behaviour question (see §8). Do not bump the server compatibility claim just because the vendored proto version changed.
 2. New WorkflowService or OperatorService surfaces must be classified in `FEATURE_MATRIX` in `crates/tokeira-compatibility/src/matrix.rs`.
 3. New SDK claims must update `SDK_MATRIX` in `crates/tokeira-compatibility/src/sdk.rs` with evidence and verification state.
 4. Tokeira-owned compatibility metadata uses Buffa/connect-rust under `proto/tokeira/compatibility/v1/`; do not add Tokeira extension fields to upstream Temporal protos.
@@ -313,3 +349,5 @@ The six mirror images (Mimir, Loki, Grafana, Alloy, AWS CLI, BusyBox) are declar
 
 - `.kiro/specs/*/` — feature specs (requirements, design, tasks)
 - `docs/architecture/` — architecture design documents
+- `proto/upstream/` — vendored Temporal protos (API `v1.62.11`); authoritative wire shape
+- Temporal server source for behaviour: [`github.com/temporalio/temporal` at tag `v1.31.0`](https://github.com/temporalio/temporal/tree/v1.31.0) (the `TEMPORAL_SERVER_COMPAT` target) — see §8

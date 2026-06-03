@@ -10,15 +10,18 @@
 //! complete gap inventory.
 
 use prost::Message;
-use tokeira_kernel::event::{HistoryEvent, HistoryEventKind};
+use tokeira_kernel::{
+    event::{HistoryEvent, HistoryEventKind},
+    state::{VersioningBehavior, WorkerDeploymentVersionRef},
+};
 use tokeira_proto::{
     conversions::common::{
         headers_from_domain, memo_from_domain, payload_from_domain, payload_to_failure,
         payloads_from_domain, search_attributes_from_domain, task_queue_from_domain,
         to_opt_proto_duration, to_proto_duration, to_proto_timestamp,
     },
-    history,
-    public::temporal::api::update::v1 as proto_update,
+    enums, history,
+    public::temporal::api::{deployment::v1 as deployment_proto, update::v1 as proto_update},
 };
 
 /// Serialize a slice of kernel history events into
@@ -218,6 +221,8 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             continued_failure,
             last_completion_result,
             cron_schedule,
+            versioning_info: _,
+            worker_deployment_name: _,
         } => Attributes::WorkflowExecutionStartedEventAttributes(
             history::WorkflowExecutionStartedEventAttributes {
                 workflow_type: Some(proto_common::WorkflowType {
@@ -434,6 +439,9 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             identity,
             sdk_metadata,
             worker_version,
+            versioning_behavior,
+            deployment_version,
+            worker_deployment_name,
         } => Attributes::WorkflowTaskCompletedEventAttributes(
             history::WorkflowTaskCompletedEventAttributes {
                 scheduled_event_id: *scheduled_event_id,
@@ -448,6 +456,9 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                         ..Default::default()
                     }
                 }),
+                versioning_behavior: versioning_behavior_to_proto(*versioning_behavior),
+                deployment_version: deployment_version.as_ref().map(deployment_version_to_proto),
+                worker_deployment_name: worker_deployment_name.clone().unwrap_or_default(),
                 ..Default::default()
             },
         ),
@@ -1195,6 +1206,23 @@ fn retry_policy_to_proto(rp: &tokeira_types::RetryPolicy) -> proto_common::Retry
     }
 }
 
+fn versioning_behavior_to_proto(behavior: VersioningBehavior) -> i32 {
+    match behavior {
+        VersioningBehavior::Unspecified => enums::VersioningBehavior::Unspecified as i32,
+        VersioningBehavior::Pinned => enums::VersioningBehavior::Pinned as i32,
+        VersioningBehavior::AutoUpgrade => enums::VersioningBehavior::AutoUpgrade as i32,
+    }
+}
+
+fn deployment_version_to_proto(
+    version: &WorkerDeploymentVersionRef,
+) -> deployment_proto::WorkerDeploymentVersion {
+    deployment_proto::WorkerDeploymentVersion {
+        build_id: version.build_id.clone(),
+        deployment_name: version.deployment_name.clone(),
+    }
+}
+
 fn continue_as_new_initiator_i32(initiator: &ContinueAsNewInitiator) -> i32 {
     use tokeira_proto::enums::ContinueAsNewInitiator as I;
     match initiator {
@@ -1423,6 +1451,8 @@ mod tests {
                             continued_failure: None,
                             last_completion_result: None,
                             cron_schedule: None,
+                            versioning_info: None,
+                            worker_deployment_name: None,
                         }
                     }
                 ),
@@ -1487,6 +1517,9 @@ mod tests {
                     identity: WorkerIdentity("w".to_string()),
                     sdk_metadata: None,
                     worker_version: None,
+                    versioning_behavior: VersioningBehavior::Unspecified,
+                    deployment_version: None,
+                    worker_deployment_name: None,
                 }
             }),
             (
@@ -1753,6 +1786,8 @@ mod tests {
                 continued_failure: None,
                 last_completion_result: None,
                 cron_schedule: None,
+                versioning_info: None,
+                worker_deployment_name: None,
             },
         };
         let proto = history_event_to_proto(&event);
@@ -1802,6 +1837,8 @@ mod tests {
                 continued_failure: None,
                 last_completion_result: None,
                 cron_schedule: Some("schedule-a".to_string()),
+                versioning_info: None,
+                worker_deployment_name: None,
             },
         };
 
@@ -1844,6 +1881,8 @@ mod tests {
                 continued_failure: None,
                 last_completion_result: None,
                 cron_schedule: None,
+                versioning_info: None,
+                worker_deployment_name: None,
             },
         };
 
@@ -2429,6 +2468,8 @@ mod tests {
                 continued_failure,
                 last_completion_result,
                 cron_schedule: None,
+                versioning_info: None,
+                worker_deployment_name: None,
             },
         }
     }

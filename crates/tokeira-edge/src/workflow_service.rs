@@ -1628,6 +1628,7 @@ impl WorkflowService {
             reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
             deployment: None,
             build_id,
+            versioning_override: None,
             attempt: 1,
             continued_execution_run_id: None,
             first_execution_run_id: Some(run_id),

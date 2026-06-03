@@ -1,7 +1,9 @@
 use anyhow::Result;
 use time::OffsetDateTime;
 use tokeira_kernel::{
-    ResetRequest, SignalRequest, SignalWithStartRequest, StartRequest, WorkflowTaskCompletedRequest,
+    ResetRequest, SignalRequest, SignalWithStartRequest, StartRequest,
+    WorkflowTaskCompletedRequest,
+    state::{VersioningOverride as KernelVersioningOverride, WorkerDeploymentVersionRef},
 };
 use tokeira_runtime::VersioningRuleStore;
 use tokeira_types::{
@@ -79,6 +81,10 @@ pub fn start_request(
         reuse_policy: req.reuse_policy,
         deployment,
         build_id,
+        versioning_override: req
+            .versioning_override
+            .as_ref()
+            .map(versioning_override_to_kernel),
         attempt: 1,
         continued_execution_run_id: None,
         first_execution_run_id: Some(run_id),
@@ -134,6 +140,10 @@ pub fn signal_with_start_request(
         task_queue,
         deployment,
         build_id,
+        versioning_override: req
+            .versioning_override
+            .as_ref()
+            .map(versioning_override_to_kernel),
         input: req.input,
         memo: req.memo,
         search_attributes: req.search_attributes,
@@ -170,6 +180,21 @@ pub fn signal_with_start_request(
         now,
         signal_name: req.signal_name,
         signal_input: req.signal_input,
+    }
+}
+
+fn versioning_override_to_kernel(override_: &VersioningOverride) -> KernelVersioningOverride {
+    match override_ {
+        VersioningOverride::Pinned {
+            deployment_series,
+            build_id,
+        } => KernelVersioningOverride::Pinned {
+            version: WorkerDeploymentVersionRef {
+                deployment_name: deployment_series.clone(),
+                build_id: build_id.clone(),
+            },
+        },
+        VersioningOverride::AutoUpgrade => KernelVersioningOverride::AutoUpgrade,
     }
 }
 
@@ -239,6 +264,9 @@ pub fn workflow_task_completed_request(
         identity: WorkerIdentity(req.identity),
         sdk_metadata: req.sdk_metadata,
         worker_version: req.worker_version,
+        versioning_behavior: req.versioning_behavior,
+        deployment_version: req.deployment_version,
+        worker_deployment_name: req.worker_deployment_name,
         commands: req.commands,
         force_new_workflow_task: req.force_create_new_workflow_task,
         now: OffsetDateTime::now_utc(),
@@ -440,6 +468,9 @@ mod tests {
             identity: "worker-a".to_string(),
             sdk_metadata: None,
             worker_version: None,
+            versioning_behavior: tokeira_kernel::state::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
             client_discards_speculative_with_events: false,
             commands: Vec::new(),
             return_new_workflow_task: false,

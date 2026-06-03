@@ -429,6 +429,7 @@ async fn seed_workflow(
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             deployment: None,
             build_id: build_id.map(|value| BuildId(value.to_string())),
+            versioning_override: None,
             attempt: 1,
             continued_execution_run_id: None,
             first_execution_run_id: None,

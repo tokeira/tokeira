@@ -3396,6 +3396,7 @@ mod tests {
             task_queue: TaskQueueName("q".to_string()),
             deployment: None,
             build_id: None,
+            versioning_override: None,
             input: Payloads::default(),
             header: None,
             memo: Memo::default(),

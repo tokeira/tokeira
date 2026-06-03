@@ -22,7 +22,10 @@ use std::time::Duration;
 
 use prost::Message as _;
 use time::OffsetDateTime;
-use tokeira_kernel::WorkflowCommand;
+use tokeira_kernel::{
+    WorkflowCommand,
+    state::{VersioningBehavior, WorkerDeploymentVersionRef},
+};
 use tokeira_proto::{
     conversions::{
         ProtoConversionError,
@@ -37,9 +40,9 @@ use tokeira_proto::{
     enums,
     public::temporal::api::{
         activity::v1 as activity_proto, command::v1 as command, common::v1 as proto_common,
-        failure::v1 as failure_proto, namespace::v1 as namespace_proto,
-        replication::v1 as replication_proto, taskqueue::v1 as taskqueue_proto,
-        version::v1 as version_proto, workflow::v1 as workflow,
+        deployment::v1 as deployment_proto, failure::v1 as failure_proto,
+        namespace::v1 as namespace_proto, replication::v1 as replication_proto,
+        taskqueue::v1 as taskqueue_proto, version::v1 as version_proto, workflow::v1 as workflow,
     },
     workflowservice,
 };
@@ -356,6 +359,40 @@ pub fn poll_request_to_edge(
 /// `ProtocolMessage` command we pop the matching message and decode its body
 /// via `resolve_protocol_message_body`. Any messages not claimed by a command
 /// are passed through as-is for edge-layer processing.
+fn versioning_behavior_from_proto(value: i32) -> VersioningBehavior {
+    match enums::VersioningBehavior::try_from(value)
+        .unwrap_or(enums::VersioningBehavior::Unspecified)
+    {
+        enums::VersioningBehavior::Pinned => VersioningBehavior::Pinned,
+        enums::VersioningBehavior::AutoUpgrade => VersioningBehavior::AutoUpgrade,
+        enums::VersioningBehavior::Unspecified => VersioningBehavior::Unspecified,
+    }
+}
+
+fn worker_deployment_version_from_options(
+    options: Option<&deployment_proto::WorkerDeploymentOptions>,
+) -> Option<WorkerDeploymentVersionRef> {
+    let options = options?;
+    if enums::WorkerVersioningMode::try_from(options.worker_versioning_mode).ok()
+        != Some(enums::WorkerVersioningMode::Versioned)
+    {
+        return None;
+    }
+    if options.deployment_name.is_empty() || options.build_id.is_empty() {
+        return None;
+    }
+    Some(WorkerDeploymentVersionRef {
+        deployment_name: options.deployment_name.clone(),
+        build_id: options.build_id.clone(),
+    })
+}
+
+fn worker_deployment_name_from_options(
+    options: Option<&deployment_proto::WorkerDeploymentOptions>,
+) -> Option<String> {
+    worker_deployment_version_from_options(options).map(|version| version.deployment_name)
+}
+
 pub fn respond_completed_request_to_edge(
     req: workflowservice::RespondWorkflowTaskCompletedRequest,
 ) -> Result<RespondWorkflowTaskCompletedRequest, ProtoConversionError> {
@@ -413,12 +450,19 @@ pub fn respond_completed_request_to_edge(
             })
         })
         .collect::<Result<Vec<_>, ProtoConversionError>>()?;
+    let deployment_version =
+        worker_deployment_version_from_options(req.deployment_options.as_ref());
+    let worker_deployment_name =
+        worker_deployment_name_from_options(req.deployment_options.as_ref());
 
     Ok(RespondWorkflowTaskCompletedRequest {
         task_token: req.task_token,
         identity: req.identity,
         sdk_metadata: req.sdk_metadata.map(|metadata| metadata.encode_to_vec()),
         worker_version: req.worker_version_stamp.map(|stamp| stamp.build_id),
+        versioning_behavior: versioning_behavior_from_proto(req.versioning_behavior),
+        deployment_version,
+        worker_deployment_name,
         client_discards_speculative_with_events: req
             .capabilities
             .is_some_and(|capabilities| capabilities.discard_speculative_workflow_task_with_events),

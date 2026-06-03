@@ -4,7 +4,20 @@ This document is the intended entry point for machine-assisted
 contributions. It captures what has been built, what remains,
 and where to contribute safely.
 
-Last updated: 2026-05-21
+Last updated: 2026-06-02
+
+## Temporal compatibility target
+
+Behaviour is matched against **Temporal server v1.31.0**
+(`TEMPORAL_SERVER_COMPAT`), built against the vendored **API v1.62.11**
+(`TEMPORAL_PROTO_VERSION`) — both pinned in
+`crates/tokeira-build-info/src/pinned.rs`. For any API-behaviour question
+(field semantics, error/status mapping, defaulting, lifecycle ordering),
+the contract is whatever the targeted release does, verified against
+`proto/upstream/` for wire shape and the Temporal server source at tag
+`v1.31.0` for behaviour. See AGENTS.md §8. The two pins are independent and
+tracked ahead on purpose; do not bump the server-compat claim just because
+the vendored proto moved.
 
 ## Codebase snapshot
 
@@ -150,6 +163,46 @@ Ops trait (scale, logs, port-forward). CLI integration complete
 hello_world, message_passing, continue_as_new, child_workflows,
 timers, schedules — all running against tokeirad.
 
+### Scenario samples
+
+`scenarios/` holds end-to-end samples that exercise Tokeira's distinctive
+server-side machinery (not basic SDK usage, which the client SDK examples
+cover). Each is a standalone Cargo project, excluded from the workspace,
+building against the published Temporal Rust SDK like a downstream consumer.
+First scenario: `scenarios/worker-versioning/` (versioned workers + driver
+that sets current/ramping/promote and asserts the observed routing). The
+worker/starter client code is complete; its routing assertions go green once
+`worker-deployments` dispatch routing lands.
+
+## In progress
+
+### API conformance (umbrella) — active
+
+`.kiro/specs/api-conformance-tracker/` tracks bringing the 121-RPC Temporal
+v1.31.0 surface from Partial/Stubbed/Deferred to `Implemented`, split across
+16 child specs. Landed so far: `DescribeWorkflowExecution` conformance (root
+execution + cancel + pending state), `api-conformance-activity-by-id`
+(Completed). Specs revised to the `Implemented` target against v1.62.11:
+`api-conformance-start-fields`, `api-conformance-wft-completion`,
+`api-conformance-workflow-describe`. The remaining child specs are at Spec
+Draft. The tracker is the source of truth for per-RPC state.
+
+### `worker-deployments` (P10) — active, ~1/3 implemented
+
+Worker Deployment v2 surface (13 RPCs) plus ownership of worker-versioning
+**routing application**. Landed: durable `WorkerDeploymentRepository`
+(in-memory + DSQL, migration `V047`), per-run kernel versioning state
+(`WorkflowVersioningInfo` + pure transitions), and the runtime
+`DeploymentRegistry` scaffold with deployment/version CRUD and routing-config
+selection (tasks 1, 2, 4.1–4.4). Remaining: registry CAS/manager/poller-
+presence/compute-config/drainage guards (4.5–4.9), **dispatch routing
+integration** (task 6 — target-version resolution, transition start at
+task-start, activity-task transition rejection, apply-at-WFT-completion +
+eager routing), the 13 edge handlers + adapter, the describe versioning
+projection, and the compatibility-matrix flip. Three sibling api-conformance
+specs persist/thread the versioning fields and defer their *application* to
+this spec.
+
 ## Completion assessment
 
 | Plane | Estimate | Notes |
@@ -158,21 +211,27 @@ timers, schedules — all running against tokeirad.
 | Runtime & Storage | ~90% | Runtime complete. DSQL complete. Placement membership complete. |
 | Projection | ~75% | Working against in-memory and DSQL. Batched apply pending. |
 | Platform / Ops | ~60% | Local + Compose + ECS platforms. ECS has remaining test tasks. |
-| **Overall** | **~75%** | Core correctness works end-to-end. Remaining work is feature specs + production hardening. |
+| **Overall** | **~78%** | Core correctness works end-to-end. Active fronts: api-conformance umbrella (per-RPC v1.31.0 fidelity) and `worker-deployments` (versioning routing). Remaining work is feature specs + production hardening. |
 
 ## Backlog (priority order)
 
 Outstanding work only. Items higher in the list are the next to pick up.
+The `api-conformance-*` umbrella and `worker-deployments` are active — see
+the "In progress" section above.
 
 ### P1 — `temporal-compatibility`
 
-**Status:** spec complete (requirements, design, tasks). Ready for implementation.
+**Status:** spec complete; initial implementation landed (compatibility
+target pinned to v1.31.0 / v1.62.11, matrix + CLI scaffolding). Ongoing:
+classify remaining RPC/field surfaces in the feature matrix as the
+api-conformance child specs land.
 
 Temporal-server compatibility scope — the behaviours tokeirad must match beyond wire-compat, and the version metadata tokeirad surfaces to different consumers (`GetSystemInfo.server_version`, `tkr` CLI reporting, operator-facing metrics labels).
 
 ### P2 — `observability-production`
 
-**Status:** to spec.
+**Status:** Phase 1 implementation landed. Remaining phases: full export
+pipeline + remaining DSQL/trace metrics.
 
 Production-facing observability: export pipeline (Prometheus scrape, OTLP), OCC-conflict counters and retry histograms, migration events, connection-leak detection, DSQL-specific metrics (reservoir depth, rate-limiter tokens remaining, class-budget saturation), trace attributes surfacing the full gRPC → edge → runtime → kernel → storage path.
 
@@ -200,7 +259,8 @@ Split the broker into explicit sticky / live / backlog tiers. Local to `tokeira-
 
 ### P7 — `kernel-pause-workflow`
 
-**Status:** to spec.
+**Status:** implemented (PauseWorkflowExecution / UnpauseWorkflowExecution,
+v1.31.0 semantics). Remaining: any follow-on edge/projection surfacing.
 
 First-class workflow-execution pause: `PauseWorkflowExecution` and `UnpauseWorkflowExecution`.
 
@@ -218,7 +278,9 @@ Persist snapshot refs for recovery from snapshot + suffix instead of full histor
 
 ### P10 — `worker-deployments`
 
-**Status:** to spec.
+**Status:** active, ~1/3 implemented (storage + kernel state + registry CRUD
+landed; dispatch routing, edge handlers, describe projection pending). See
+the "In progress" section above.
 
 Named deployments, per-version ramping, task-queue routing by version.
 
@@ -246,6 +308,192 @@ Foundational CI/CD pipeline work.
 - **Admission control** — Architecture doc 055 exists. No spec.
 - **Dynamic placement** — Architecture doc 037 (draft). Deferred from shard-placement-membership MVP.
 - **16 architecture docs have unresolved review questions** — Only 045-autoscaling has resolved its review questions.
+
+## Prospective features (under evaluation, not yet specced)
+
+Three Temporal features evaluated against Tokeira's architecture. All target
+Temporal v1.31.0+ and are at early release stages; none is yet a committed spec.
+Verified against the Temporal docs (June 2026). Scoping captured here so the
+in/out-of-scope reasoning is not lost.
+
+### Standalone Activities — strong fit, highest value
+
+**What it is (Public Preview; CLI v1.7.0 / Server v1.31.0):** a top-level
+Activity Execution started directly by a client (`temporal activity
+start|execute|result|list|count|describe|cancel|terminate`) with **no
+Workflow**. A new *kind* of top-level execution with its **own ID space**,
+separate from Workflows — addressable, retryable, heartbeatable, cancelable,
+with conflict/reuse-policy dedup, priority/fairness, and visibility
+(`ListActivities` / `CountActivities` / `DescribeActivity`). The same Activity
+function runs standalone or inside a Workflow with no code changes.
+
+**Fit:** squarely in scope and aligned with the architecture. "History is
+authority" generalizes cleanly — a standalone activity is a top-level run whose
+authoritative per-run transition log records schedule → dispatch → start →
+heartbeat/checkpoint → result. DSQL persistence, lane execution, and the
+dispatch broker all apply.
+
+**Home:** the existing **`activity-executions-first-class` (P8)** placeholder is
+exactly this. Its placeholder text already says "Activity Executions as
+first-class durable objects ... eight Activity Executions RPCs ... kernel
+representation of pending activities as durable, addressable objects." Promote
+it to a full spec, framed as Standalone Activities (Temporal's job-queue
+primitive).
+
+**Hard part:** a *peer top-level execution kind* alongside workflow runs — its
+own start/dedup over an activity ID space, its own visibility records, and a
+`start_activity` / `execute_activity` / `get_activity_result` client surface.
+Kernel + storage + edge + projection feature, not an edge shim. Distinct from
+`api-conformance-activity-by-id` (Completed), which handled *workflow-scheduled*
+activities resolved by `(namespace, workflow_id, run_id, activity_id)`. PP
+limitations bound v1 scope: no pause/reset/update, no `TerminateExisting` /
+`TerminateIfRunning`.
+
+### Workflow Streams — no server work; conformance validation only
+
+**What it is (Public Preview):** a **Python SDK `contrib` library**
+(`temporalio.contrib.workflow_streams`), not a server feature. A durable,
+offset-addressed event channel hosted inside a Workflow, built **entirely** on
+existing primitives — batched **Signals** (publish), long-poll **Updates**
+(subscribe), and a **Query** (head offset). Wire handlers are ordinary calls:
+`__temporal_workflow_stream_publish` (Signal), `__temporal_workflow_stream_poll`
+(Update), `__temporal_workflow_stream_offset` (Query). Cross-language client
+support is roadmap; Python only today.
+
+**Fit:** **nothing to implement server-side.** If Tokeira conforms on Signal /
+Update (long-poll, `AcceptedUpdateCompletedWorkflow` surfacing,
+`WorkflowUpdateFailedError` on CAN-handoff validator rejection) / Query and
+Continue-As-New, the upstream Python library runs against tokeirad unmodified.
+It exercises hard: Update long-poll semantics, ~1 MB poll-response caps,
+per-Signal payload limits, and CAN offset carry-over.
+
+**Recommendation:** **do not spec a feature.** Treat it as a conformance target.
+The real surface is `api-conformance-update-lifecycle` (harden if needed). Add a
+`scenarios/workflow-streams/` sample once Update long-poll conformance is solid,
+proving the upstream Python contrib lib runs unmodified against tokeirad — high
+signal, low cost, matches what `scenarios/` exists for.
+
+### Serverless Workers — forward bet, large multi-spec epic, NOT a conformance obligation
+
+**What it is (Pre-release; select Temporal Cloud customers; experimental APIs):**
+Workers invoked on demand (AWS Lambda today) instead of running long-lived.
+Temporal *invokes* the worker when tasks arrive; it polls, processes, exits.
+
+**The mechanism — Worker Controller Instance (WCI):** a **system Workflow** that
+scales serverless workers per Task Queue conditions. One WCI per
+`(deployment_name, build_id)` Worker Deployment Version that has a **compute
+provider** configured; runs in namespace division
+`TemporalWorkerControllerInstance`; workflow ID
+`temporal-sys-worker-controller-instance:<deployment>:<build-id>`. Triggers:
+**sync-match failure** (Matching pushes a signal to the WCI when no worker is
+available — primary, low-latency path) and **Task Queue backlog** (metadata
+monitor). On trigger, the WCI runs an activity that calls the compute provider's
+invoke API (e.g. AWS Lambda `InvokeFunction` via an assumed IAM role).
+
+**Connection to `worker-deployments`:** this is the consumer of the
+`ComputeConfig` / `ComputeConfigScalingGroup` already being persisted there.
+worker-deployments deliberately persists + validates compute config
+(`ValidateWorkerDeploymentVersionComputeConfig` →
+`WorkerControllerInstanceClient.ValidateWorkerControllerInstanceSpec`, from
+`go.temporal.io/auto-scaled-workers/wci/client`) **without** building the
+controller that consumes it. Serverless Workers is that controller plus the
+invocation path.
+
+**Scope — a 3-layer dependency stack, bottom-up:**
+
+```
+worker-deployments (versions + ComputeConfig persistence)   ← in progress
+  └── worker-controller-instance (controller + Matching sync-match-failure push + backlog monitor)
+        └── serverless-workers-lambda (compute-provider invocation + worker packaging)
+```
+
+**Key scoping decisions / cautions:**
+
+- **NOT part of the v1.31.0 compatibility claim.** The WCI lives in a *separate
+  experimental module* (`go.temporal.io/auto-scaled-workers`), not core
+  `temporalio/temporal` at tag v1.31.0, and is Pre-release with backwards-
+  incompatible APIs expected. Building it is a forward *capability* bet, not a
+  conformance obligation under AGENTS.md §8. It competes for roadmap space on
+  product value, not on "match v1.31.0."
+- **Model the WCI as a Tokeira control-plane controller, NOT a ported system
+  Workflow.** Temporal implements it as a system workflow; porting that
+  reintroduces the exact tension `worker-deployments` avoided (control-plane
+  correctness weight on synthetic per-run history vs. "history is authority" for
+  user runs + the pure kernel). Tokeira already has `tokeira-controller`
+  (active-active placement) and `tokeira-autoscaler` (sync-match / backlog
+  pressure loops); a WCI plausibly becomes an **autoscaler mode** — "scale
+  serverless workers per deployment version by invoking a compute provider" —
+  reusing that machinery.
+- **New runtime wiring:** Matching/broker must emit a per-version scaling trigger
+  on sync-match failure (the broker already knows poller presence via
+  `WorkerRegistry`). The compute-provider invocation is a *runtime* AWS call
+  (`tokeira-aws` territory, but invocation not IaC), not the small part.
+- **Hard dependency:** gate on `worker-deployments` completing first.
+
+**Recommendation:** defer. When picked up, spec bottom-up as two new features
+(`worker-controller-instance`, then `serverless-workers-lambda`) with the
+"controller not system workflow" stance decided up front.
+
+### Firecracker worker compute (isolated ephemeral workers) — Tokeira-native compute provider
+
+**Motivation (Temporal Compute Team direction):** "Isolation for untrusted /
+dynamic code — we're exploring primitives like microVM-based sandboxes and
+ephemeral workers to run workload-scoped compute safely"
+([Temporal Compute Team](https://temporalio.notion.site/Join-Temporal-s-Compute-Team-598b6bca8bf84d3babf3e8e2a22c283c)).
+Tokeira should provide **Firecracker-based worker compute** as a first-class
+capability: per-invocation microVM sandboxes that run workload-scoped (and
+potentially untrusted / dynamically supplied) Activity and Workflow code with
+hardware-level isolation, scaled to zero between tasks.
+
+**Relationship to Serverless Workers / WCI:** this is the **self-hosted compute
+provider** counterpart to AWS Lambda in the Serverless Workers stack. Where
+Temporal's reference design invokes Lambda, Tokeira can own the whole loop:
+the WCI controller (above) reacts to sync-match-failure / backlog and invokes a
+**Firecracker compute provider** that boots an ephemeral microVM worker, which
+polls the version's task queue, processes, and exits. It slots into the same
+`ComputeConfig` / compute-provider abstraction — Firecracker becomes a provider
+type alongside Lambda, so most of the stack is shared.
+
+**Why this matters for Tokeira specifically:**
+
+- **Untrusted / dynamic code is the differentiator.** Lambda gives ephemerality
+  and scale-to-zero; a microVM gives *isolation strong enough to run code you
+  don't trust*. That is the capability the Compute Team direction calls out and
+  the reason to own the compute layer rather than only integrate a cloud
+  provider. AI-agent / dynamic-tool workloads (run arbitrary generated code as
+  an Activity) are the obvious driver.
+- **Tokeira already owns its deployment substrate.** Unlike the Lambda path
+  (Tokeira-as-client of a cloud API), Firecracker compute is Tokeira-as-host:
+  microVM lifecycle, snapshotting for fast cold-start, jailer/cgroup
+  confinement, and a per-VM Temporal client. This is new infrastructure
+  (`tokeira-aws` does not cover bare microVM orchestration), likely a new
+  platform/runtime crate.
+
+**Scope and cautions:**
+
+- **Dependency:** sits on top of the same stack as Serverless Workers —
+  `worker-deployments` (ComputeConfig) → `worker-controller-instance` (WCI
+  trigger + provider abstraction) → a `compute-provider-firecracker`
+  implementation peer to `serverless-workers-lambda`. Build the provider
+  abstraction once; Lambda and Firecracker are two implementations of it.
+- **Not a Temporal-conformance feature.** Like Serverless Workers, this is a
+  forward capability bet outside the v1.31.0 compatibility claim. Its value is
+  product differentiation (safe untrusted compute), not API parity.
+- **Security is the whole point — design it in, not on.** microVM boundary,
+  no host filesystem/network egress by default, per-workload credential scoping,
+  snapshot provenance, and resource caps are first-class requirements, not
+  hardening passes. Firecracker + jailer is the baseline; the threat model is
+  "the workload code is hostile."
+- **Heavy infra investment.** microVM image build/snapshot pipeline, a host
+  agent that boots/pools/reaps VMs, fast-restore for cold-start latency, and
+  observability across ephemeral instances. This is a large, multi-quarter
+  effort — capture the intent now; do not start until the WCI/provider
+  abstraction exists.
+
+**Recommendation:** record as a strategic direction. When the Serverless Workers
+stack is specced, define the compute-provider abstraction so Firecracker is a
+clean second implementation rather than a parallel stack. Spec
+`compute-provider-firecracker` only after `worker-controller-instance` lands.
 
 ## Invariants to preserve
 

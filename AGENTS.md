@@ -27,7 +27,7 @@ This is a product-from-scratch. The architecture is informed by Temporal but the
 - Typed extension bags (`HashMap<TypeId, Box<dyn Any + Send + Sync>>` keyed by `TypeId::of::<T>()`, accessed via a type-parameterised `extension::<T>()` helper) are the sanctioned exception. They exist in `ProvisionContext`, `ModuleContext`, `ServiceContext`, and `ImageContext` because the library crates holding these types (`tokeira-iac`, `tokeira-deploy-engine`) cannot depend on the platform crates that register handles into them. This keeps the platform boundary clean at the cost of one well-contained `Box<dyn Any>` per context type. New contexts SHALL NOT introduce additional `Box<dyn Any>` usage beyond this bounded set.
 - Prefer `&str` over `String` in function signatures where ownership isn't needed.
 - Use `tracing` for structured logging. No `println!` or `eprintln!` in library code.
-- Comments explain WHY, not WHAT. Do not add comments that restate type signatures or obvious control flow.
+- Comments and documentation follow the Code Documentation standard (§9). The bar is high: every module, public item, and non-obvious decision carries rationale. Comments explain WHY, never restate WHAT.
 - Do NOT put `use` statements in function scope. Always at the top of the file or module.
 - No explicit sleeps in test code. Use synchronization (channels, `tokio::sync::Notify`, condition variables) instead of `tokio::time::sleep` or `std::thread::sleep`.
 - Rust compilation takes time. Do not interrupt builds or tests unless they are taking more than 5 minutes.
@@ -112,7 +112,7 @@ The targeted Temporal release is pinned by `TEMPORAL_SERVER_COMPAT` (currently `
 For any question about public API **behaviour** — field semantics, error/status mapping, defaulting, lifecycle ordering, inheritance rules — the contract is **whatever the targeted release does**, verified against ground truth in this order:
 
 1. **Vendored protos in `proto/upstream/`** for wire shape: messages, field numbers, enums, oneofs. NEVER read generated artifacts under `target/` — they can be stale; `proto/upstream/` is the source of truth.
-2. **Temporal server source at the matching tag** for runtime behaviour the proto does not specify: [`github.com/temporalio/temporal` at tag `v1.31.0`](https://github.com/temporalio/temporal/tree/v1.31.0) (matches `TEMPORAL_SERVER_COMPAT`). Read the actual code (e.g. `service/history/...`, `common/...`) — do not infer behaviour from proto doc comments, SDK docs, blog posts, or memory when the source is available. If you keep a local checkout, use it, but reference the pinned tag — never hardcode an absolute developer-machine path in specs, code, or docs.
+2. **Temporal server source at the matching tag** for runtime behaviour the proto does not specify. **Read it from the local checkout** — there is a clone at `../temporal` (sibling of this repo) with the `v1.31.0` tag available. Use `git -C <temporal-checkout> show v1.31.0:<path>` and `git grep <pattern> v1.31.0 -- <path>` to read the exact tagged source offline; this is faster, pinned, and grep-able. Do NOT use web search/fetch for Temporal source when the local checkout is available. Read the actual code (e.g. `service/history/...`, `service/worker/...`, `common/...`) — do not infer behaviour from proto doc comments, SDK docs, blog posts, or memory. In specs/PRs, cite the source by repo-relative path + tag (e.g. `service/frontend/workflow_handler.go @ v1.31.0`, optionally linked as [`github.com/temporalio/temporal` tag `v1.31.0`](https://github.com/temporalio/temporal/tree/v1.31.0)). Never hardcode an absolute developer-machine path in committed specs, code, or docs.
 
 Rules:
 
@@ -120,6 +120,67 @@ Rules:
 - This is distinct from "Do not port Temporal code" in the Mission: **reading** Temporal source to determine the contract is required; **copying** its implementation is forbidden. Tokeira's implementation stays original; only the observable contract is shared.
 - Where a Tokeira mechanism has no exact Temporal analog (e.g. history replay reconstruction), the test of correctness is: *does Tokeira's response match what the targeted release would return for the same execution lineage?*
 - Cite the verifying source (proto path or server source path + tag) in the spec/PR when a behaviour decision is non-obvious, so reviewers can confirm against the same ground truth.
+
+### 9. Code Documentation
+
+Tokeira is a correctness-critical durable execution engine whose behaviour mirrors a
+specific external contract (Temporal v1.31.0). Code that is merely correct is not
+enough — the *reasoning* behind it must survive in the source, because the next reader
+(human or agent) cannot re-derive a concurrency invariant, an ordering subtlety, or a
+ground-truthed behaviour decision from the code alone. Comments are part of the
+deliverable, not an afterthought. A change that adds non-obvious logic without
+explaining why it is correct is incomplete.
+
+**The WHY-not-WHAT rule.** A comment must add information the code cannot. Restating a
+type signature, a variable name, or obvious control flow is noise — it is worse than no
+comment because it rots, misleads, and trains readers to skip comments. Delete such
+comments when you see them.
+
+```rust
+// BAD — restates the code:
+// increment the revision number
+info.revision_number += 1;
+
+// GOOD — explains why this is safe/necessary:
+// Bump the revision so any task dispatched against the prior routing decision
+// is fenced as stale at start time (recordworkflowtaskstarted/api.go @ v1.31.0).
+info.revision_number += 1;
+```
+
+**What MUST be documented:**
+
+- **Every module** carries a `//!` doc: what it owns, where it sits in the architecture
+  (which plane/crate boundary), and the key invariants it upholds. A reader landing in
+  the file cold should learn its purpose and its contract in the first screen.
+- **Every public item** (type, trait, function, field) carries a `///` doc stating its
+  contract: what it guarantees, what it assumes of callers, and any non-obvious failure
+  or edge behaviour. "Pub" means "someone else depends on this" — document the promise.
+- **Correctness-critical decisions** carry an inline WHY: concurrency hazards and the
+  invariant that makes the code race-free (lock ordering, TOCTOU windows, why an
+  operation is serialized); ordering and idempotency assumptions; CAS/OCC and fencing
+  semantics; why a value is computed live vs. stored; precedence rules; and anything a
+  future editor could plausibly "simplify" into a bug.
+- **Ground-truthed behaviour** cites its source. Where behaviour matches the targeted
+  Temporal release, cite the proto path or server source path + tag inline (e.g.
+  `service/history/workflow/util.go @ v1.31.0`), per §8. Never invent an anchor; only
+  cite what you have verified. This is what lets a reviewer confirm against ground truth
+  without re-investigating.
+- **Deliberate deviations and non-obvious tradeoffs** are stated explicitly, so they are
+  not mistaken for oversights and silently "fixed".
+
+**What must NOT be documented:** anything already obvious from the code. Do not narrate
+control flow, paraphrase the next line, or add ceremonial headers. When in doubt, ask
+"does this sentence tell the reader something the code does not?" — if no, omit it.
+
+**Tests.** Property-based tests carry a one-line statement of the invariant they prove
+(and a `// Feature: <name>, Property N` tag where a spec defines one). Do not comment
+obvious test scaffolding.
+
+**This is enforced like any other standard.** A pre-commit review (and any agent doing
+implementation) treats missing module docs, undocumented public items, and uncommented
+non-obvious logic as defects to fix before the change is complete — the same weight as a
+failing lint. Comment density is not the metric; comment *quality and coverage of the
+non-obvious* is.
 
 ---
 

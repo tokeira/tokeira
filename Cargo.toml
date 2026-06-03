@@ -36,7 +36,7 @@ members = [
     "crates/tokeira-build",
 ]
 exclude = [
-    "examples/hello-world",
+    "scenarios/worker-versioning",
     "tools/placement-sim",
     "spikes/connect-buffa",
 ]

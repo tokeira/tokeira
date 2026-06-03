@@ -1,3 +1,17 @@
+//! Workflow lifecycle methods of [`TokeiraRuntime`].
+//!
+//! This `impl` continuation owns the client-facing execution-lifecycle surface:
+//! starting runs (plain, policy-resolved, and signal-with-start), and the
+//! external mutations that steer a live run — signal, terminate, cancel,
+//! pause/unpause, and reset. Each public method resolves the target run and
+//! applies a single kernel command through [`submit`](TokeiraRuntime::submit),
+//! so history remains the authority and dispatch is a derived effect.
+//!
+//! The non-obvious weight here is WorkflowId conflict/reuse resolution: before
+//! a start is admitted, [`resolve_conflict`](TokeiraRuntime::resolve_conflict)
+//! decides whether to start fresh, reuse an existing run, terminate-then-start,
+//! or reject — matching Temporal's `WorkflowIdConflictPolicy` (against an
+//! *open* run) and `WorkflowIdReusePolicy` (against the *latest closed* run).
 use super::*;
 
 impl<R> TokeiraRuntime<R>
@@ -5,6 +19,14 @@ where
     R: RunRepository + 'static,
 {
     /// Start a new workflow execution.
+    ///
+    /// Before committing, this optimistically reserves a workflow-task poller so
+    /// that, on a successful start, the first workflow task can be handed
+    /// directly to a waiting worker (eager start) instead of round-tripping
+    /// through the broker. The reservation is returned to the broker on every
+    /// non-`Applied` outcome and on submit error, so a failed start never leaks
+    /// a parked poller. Execution/run timeout tracking is registered only after
+    /// the start is durably `Applied`.
     pub async fn start_workflow(&self, mut request: StartRequest) -> Result<CommitResult> {
         let reserved_poller = self.try_reserve_start_poller(&request).await;
         if let Some(reserved) = &reserved_poller {
@@ -51,6 +73,15 @@ where
         Ok(result)
     }
 
+    /// Start a workflow, first resolving any WorkflowId conflict/reuse policy.
+    ///
+    /// This is the policy-aware entry point behind StartWorkflowExecution. It
+    /// consults `resolve_conflict` and then either
+    /// starts a new run, returns the existing run (UseExisting), terminates the
+    /// running execution before starting (TerminateExisting), or rejects. A
+    /// `Duplicate` commit here is treated as a hard error rather than success:
+    /// conflict resolution already established that a fresh start was warranted,
+    /// so a dedupe hit indicates an unexpected racing start for the same run key.
     pub async fn start_workflow_with_policy(
         &self,
         request: StartRequest,
@@ -108,6 +139,15 @@ where
         }
     }
 
+    /// Signal a workflow, starting it first if it does not already exist.
+    ///
+    /// Resolves the WorkflowId conflict/reuse policy the same way as
+    /// [`start_workflow_with_policy`](Self::start_workflow_with_policy): an
+    /// absent-or-reusable target is signal-with-started atomically; an existing
+    /// open run is signalled in place (UseExisting); TerminateExisting
+    /// terminates then starts. Signalling an existing run tolerates a
+    /// `Duplicate` commit as success because the signal request may be retried,
+    /// whereas the start branches reject duplicates as unexpected.
     pub async fn signal_with_start_workflow(
         &self,
         request: SignalWithStartRequest,
@@ -295,6 +335,23 @@ where
         }
     }
 
+    /// Decide how a start/signal-with-start should proceed given the target
+    /// WorkflowId's current and historical runs.
+    ///
+    /// Two tiers, in order:
+    /// 1. If there is a *currently-open* run for this WorkflowId, the
+    ///    `WorkflowIdConflictPolicy` decides: Fail → Rejected, UseExisting →
+    ///    reuse it, TerminateExisting → terminate-then-start. Reuse policy never
+    ///    enters into it, because reuse only concerns *closed* runs.
+    /// 2. Otherwise the `WorkflowIdReusePolicy` is evaluated against the latest
+    ///    run: AllowDuplicate always permits, AllowDuplicateFailedOnly permits
+    ///    only when the prior run ended in a non-success terminal state
+    ///    (Failed/Cancelled/Terminated/TimedOut), and RejectDuplicate refuses.
+    ///
+    /// The open-run lookup uses the current-execution pointer while the reuse
+    /// check uses `find_latest_run`; both reload the run because the pointer can
+    /// race a just-closed run, and the status read must come from authoritative
+    /// state, not the index.
     async fn resolve_conflict(
         &self,
         namespace_id: NamespaceId,
@@ -375,6 +432,13 @@ where
         })
     }
 
+    /// Terminate the open run that a TerminateExisting conflict policy is
+    /// displacing, before a replacement start is committed.
+    ///
+    /// Resolves the live run id from durable state and issues a terminate
+    /// carrying a policy-derived reason/identity. A `Conflict` is surfaced as an
+    /// error so the caller does not start a replacement over a run that failed
+    /// to terminate; `Duplicate` is tolerated as already-terminated.
     async fn terminate_existing_for_conflict(
         &self,
         namespace_id: NamespaceId,

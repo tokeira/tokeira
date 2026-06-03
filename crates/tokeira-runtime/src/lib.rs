@@ -14,6 +14,7 @@ pub mod broker;
 pub mod buffered_queries;
 #[cfg(test)]
 mod bug_condition_exploration_tests;
+pub mod deployment_registry;
 pub mod drain;
 pub mod errors;
 pub mod fairness;
@@ -43,6 +44,7 @@ pub use backlog::*;
 pub use batch::*;
 pub use broker::*;
 pub use buffered_queries::*;
+pub use deployment_registry::*;
 pub use drain::*;
 pub use errors::*;
 pub use fairness::*;

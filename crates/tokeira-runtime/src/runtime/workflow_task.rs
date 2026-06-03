@@ -1,5 +1,185 @@
+//! Workflow-task poll and start path, including Worker Deployment routing.
+//!
+//! This `impl TokeiraRuntime` continuation owns the workflow-task half of
+//! delivery: long-polling the broker, resolving the deployment version a polled
+//! task should target, starting the version transition when a differing poller
+//! arrives, and driving the kernel `WorkflowTaskStarted`/`Completed`
+//! transitions. Routing decisions are derived effects of the durable deployment
+//! registry plus per-run versioning state — no correctness weight rests on the
+//! transient broker (per "history is authority").
+//!
+//! The versioning routing here mirrors Temporal server v1.31.0
+//! (`service/history/api/recordworkflowtaskstarted` and
+//! `service/history/workflow/util.go`); the inline comments cite the specific
+//! source for each non-obvious decision.
+
 use super::*;
+use tokeira_kernel::{VersioningBehavior, VersioningOverride, WorkerDeploymentVersionRef};
 use tokeira_observability::OutcomeLabel;
+use tokeira_storage::{
+    DeploymentKey, DeploymentName, StoredRoutingConfig, WorkerDeploymentVersionKey,
+};
+use tokeira_types::WorkflowId;
+
+use crate::versioning::deterministic_bucket;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedWorkflowTaskTarget {
+    pub deployment_version: Option<WorkerDeploymentVersionRef>,
+    pub revision_number: i64,
+    pub pinned: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PolledWorkflowTaskTarget {
+    resolved: ResolvedWorkflowTaskTarget,
+    deployment_transition: Option<WorkerDeploymentVersionRef>,
+}
+
+/// Resolve the deployment version a polled workflow task should target.
+///
+/// Precedence mirrors v1.31.0 `GetEffectiveDeployment`
+/// (`service/history/workflow/util.go @ v1.31.0`):
+/// version_transition > pinned override > auto-upgrade override > pinned
+/// behavior > SDK behavior + routing config. A pinned target (override or
+/// behavior) carries `pinned: true` so the caller never starts a transition
+/// for it. AUTO_UPGRADE / unversioned runs follow the deployment's routing
+/// config (current/ramping), so they pick up the deployment's revision number;
+/// pinned/transition targets carry the run's own revision number because their
+/// routing decision was already made and recorded on the run.
+pub(crate) fn resolve_workflow_task_target_version(
+    routing_config: &StoredRoutingConfig,
+    state: &WorkflowState,
+) -> ResolvedWorkflowTaskTarget {
+    let Some(info) = state.versioning_info.as_ref() else {
+        return ResolvedWorkflowTaskTarget {
+            deployment_version: routing_config_target(routing_config, &state.workflow_id),
+            revision_number: routing_config.revision_number,
+            pinned: false,
+        };
+    };
+
+    if let Some(transition) = &info.version_transition {
+        return ResolvedWorkflowTaskTarget {
+            deployment_version: Some(transition.clone()),
+            revision_number: info.revision_number,
+            pinned: false,
+        };
+    }
+
+    match &info.versioning_override {
+        Some(VersioningOverride::Pinned { version }) => ResolvedWorkflowTaskTarget {
+            deployment_version: Some(version.clone()),
+            revision_number: info.revision_number,
+            pinned: true,
+        },
+        Some(VersioningOverride::AutoUpgrade) => ResolvedWorkflowTaskTarget {
+            deployment_version: routing_config_target(routing_config, &state.workflow_id),
+            revision_number: routing_config.revision_number,
+            pinned: false,
+        },
+        None if info.behavior == VersioningBehavior::Pinned => ResolvedWorkflowTaskTarget {
+            deployment_version: info.deployment_version.clone(),
+            revision_number: info.revision_number,
+            pinned: true,
+        },
+        None => ResolvedWorkflowTaskTarget {
+            deployment_version: routing_config_target(routing_config, &state.workflow_id),
+            revision_number: routing_config.revision_number,
+            pinned: false,
+        },
+    }
+}
+
+/// Pick the routing target for AUTO_UPGRADE / unversioned traffic from a
+/// deployment's routing config, splitting by ramp percentage.
+///
+/// A nil current version means the deployment routes this traffic to
+/// unversioned workers (returns None). When a ramping version is set with a
+/// non-zero percentage, a deterministic fraction of workflow ids route to it;
+/// the rest stay on current. The split is keyed on workflow id (not random) so
+/// the same run always resolves to the same version across polls, which is
+/// required for replay determinism.
+///
+/// Bucketing: `deterministic_bucket` returns `[0, 9999]`, so the ramp
+/// percentage P is scaled to `P * 100` buckets — e.g. P=50 sends ids with
+/// bucket `< 5000` (half) to the ramping version. This gives 1/100-percent
+/// resolution matching the `float` percentage field.
+fn routing_config_target(
+    routing_config: &StoredRoutingConfig,
+    workflow_id: &WorkflowId,
+) -> Option<WorkerDeploymentVersionRef> {
+    let current = routing_config.current_version.as_ref()?;
+    if let Some(ramping) = routing_config.ramping_version.as_ref()
+        && routing_config.ramping_version_percentage > 0.0
+        && deterministic_bucket(&workflow_id.0)
+            < (f64::from(routing_config.ramping_version_percentage) * 100.0) as u64
+    {
+        return Some(version_key_to_ref(ramping));
+    }
+    Some(version_key_to_ref(current))
+}
+
+fn version_key_to_ref(version: &WorkerDeploymentVersionKey) -> WorkerDeploymentVersionRef {
+    WorkerDeploymentVersionRef {
+        deployment_name: version.deployment_name.0.clone(),
+        build_id: version.build_id.0.clone(),
+    }
+}
+
+fn poller_deployment_version(queue: &QueueKey) -> Option<WorkerDeploymentVersionRef> {
+    Some(WorkerDeploymentVersionRef {
+        deployment_name: queue.deployment.as_ref()?.0.clone(),
+        build_id: queue.build_id.as_ref()?.0.clone(),
+    })
+}
+
+/// Decide whether a polled workflow task should start a deployment-version
+/// transition toward the poller's version.
+///
+/// Mirrors v1.31.0 `recordworkflowtaskstarted/api.go @ v1.31.0`: a transition
+/// starts whenever the polling worker's deployment differs from the workflow's
+/// *effective* deployment (`!pollerDeployment.Equal(wfDeployment)`). We do NOT
+/// additionally require the poller to equal the freshly-resolved routing target
+/// — Matching already chose this poller when it dispatched the task, and
+/// re-deriving the routing target here would suppress a legitimate transition
+/// when the routing config advanced between dispatch and start (the staleness
+/// window the dispatch revision number guards). Pinned runs never transition;
+/// `start_version_transition` itself rejects them
+/// (`ErrPinnedWorkflowCannotTransition`), and we also short-circuit on the
+/// resolved-target pin so a pinned run is never offered a transition.
+fn transition_for_polled_workflow_task(
+    state: &WorkflowState,
+    target: &ResolvedWorkflowTaskTarget,
+    queue: &QueueKey,
+) -> Option<WorkerDeploymentVersionRef> {
+    if target.pinned {
+        return None;
+    }
+    let poller_version = poller_deployment_version(queue)?;
+    (state.effective_deployment() != Some(&poller_version)).then_some(poller_version)
+}
+
+fn routing_deployment_name(state: &WorkflowState, queue: &QueueKey) -> Option<DeploymentName> {
+    state
+        .worker_deployment_name
+        .as_ref()
+        .cloned()
+        .or_else(|| {
+            state
+                .versioning_info
+                .as_ref()
+                .and_then(|info| info.deployment_version.as_ref())
+                .map(|version| version.deployment_name.clone())
+        })
+        .or_else(|| {
+            queue
+                .deployment
+                .as_ref()
+                .map(|deployment| deployment.0.clone())
+        })
+        .map(DeploymentName)
+}
 
 impl<R> TokeiraRuntime<R>
 where
@@ -90,6 +270,54 @@ where
         }
     }
 
+    async fn resolve_polled_workflow_task_target(
+        &self,
+        offered: &DispatchableWorkflowTask,
+    ) -> Result<PolledWorkflowTaskTarget> {
+        let LoadedRun::Existing(state) = self.repo.load_run(offered.run_key).await? else {
+            return Ok(PolledWorkflowTaskTarget {
+                resolved: ResolvedWorkflowTaskTarget {
+                    deployment_version: None,
+                    revision_number: 0,
+                    pinned: false,
+                },
+                deployment_transition: None,
+            });
+        };
+        let routing_config = self
+            .load_worker_deployment_routing_config(&state, &offered.queue)
+            .await?;
+        let resolved = resolve_workflow_task_target_version(&routing_config, &state);
+        let deployment_transition =
+            transition_for_polled_workflow_task(&state, &resolved, &offered.queue);
+        Ok(PolledWorkflowTaskTarget {
+            resolved,
+            deployment_transition,
+        })
+    }
+
+    async fn load_worker_deployment_routing_config(
+        &self,
+        state: &WorkflowState,
+        queue: &QueueKey,
+    ) -> Result<StoredRoutingConfig> {
+        let Some(repository) = &self.worker_deployment_repository else {
+            return Ok(StoredRoutingConfig::default());
+        };
+        let Some(deployment_name) = routing_deployment_name(state, queue) else {
+            return Ok(StoredRoutingConfig::default());
+        };
+        let key = DeploymentKey {
+            namespace_id: state.namespace_id,
+            deployment_name,
+        };
+        Ok(repository
+            .load_deployment(&key)
+            .await?
+            .map(|record| record.routing_config)
+            .unwrap_or_default())
+    }
+
     /// Record the completion of a workflow task and
     /// apply any resulting commands.
     ///
@@ -128,6 +356,32 @@ where
         entered_at: tokio::time::Instant,
         worker_identity: WorkerIdentity,
     ) -> Result<StartedWorkflowTask> {
+        let target = self.resolve_polled_workflow_task_target(&offered).await?;
+        tracing::debug!(
+            run_key = %offered.run_key.0,
+            task_queue = %offered.queue.task_queue.0,
+            target_deployment = target
+                .resolved
+                .deployment_version
+                .as_ref()
+                .map(|version| version.deployment_name.as_str()),
+            target_build_id = target
+                .resolved
+                .deployment_version
+                .as_ref()
+                .map(|version| version.build_id.as_str()),
+            transition_deployment = target
+                .deployment_transition
+                .as_ref()
+                .map(|version| version.deployment_name.as_str()),
+            transition_build_id = target
+                .deployment_transition
+                .as_ref()
+                .map(|version| version.build_id.as_str()),
+            revision_number = target.resolved.revision_number,
+            pinned = target.resolved.pinned,
+            "resolved worker deployment target for polled workflow task"
+        );
         let now = OffsetDateTime::now_utc();
         let request = StartWorkflowTaskRequest {
             logical_seq: offered.logical_seq,
@@ -135,6 +389,11 @@ where
             request_id: uuid::Uuid::new_v4().to_string(),
             history_size_bytes: 0,
             suggest_continue_as_new: false,
+            deployment_transition: target.deployment_transition.clone(),
+            deployment_transition_revision_number: target
+                .deployment_transition
+                .as_ref()
+                .map(|_| target.resolved.revision_number),
             sticky_ttl: Some(Duration::seconds(30)),
             now,
         };
@@ -246,5 +505,366 @@ where
             started_time: started_at,
             token,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, HashSet};
+
+    use proptest::prelude::*;
+    use tokeira_kernel::{ContinueAsNewVersioningBehavior, WorkflowVersioningInfo};
+    use tokeira_storage::{BuildId as StorageBuildId, DeploymentName};
+    use tokeira_types::{
+        BuildId as RuntimeBuildId, DeploymentId, LogicalTaskSeq, Memo, SearchAttributes, TaskKind,
+        WorkflowType,
+    };
+
+    use super::*;
+
+    #[derive(Clone, Debug)]
+    enum VersioningCase {
+        Transition,
+        OverridePinned,
+        OverrideAutoUpgrade,
+        BehaviorPinned,
+        BehaviorAutoUpgrade,
+        Unversioned,
+    }
+
+    fn arb_versioning_case() -> impl Strategy<Value = VersioningCase> {
+        prop_oneof![
+            Just(VersioningCase::Transition),
+            Just(VersioningCase::OverridePinned),
+            Just(VersioningCase::OverrideAutoUpgrade),
+            Just(VersioningCase::BehaviorPinned),
+            Just(VersioningCase::BehaviorAutoUpgrade),
+            Just(VersioningCase::Unversioned),
+        ]
+    }
+
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp")
+    }
+
+    fn version_ref(deployment_name: &str, build_id: &str) -> WorkerDeploymentVersionRef {
+        WorkerDeploymentVersionRef {
+            deployment_name: deployment_name.into(),
+            build_id: build_id.into(),
+        }
+    }
+
+    fn version_key(deployment_name: &str, build_id: &str) -> WorkerDeploymentVersionKey {
+        WorkerDeploymentVersionKey {
+            deployment_name: DeploymentName(deployment_name.into()),
+            build_id: StorageBuildId(build_id.into()),
+        }
+    }
+
+    fn routing_config(
+        current: Option<WorkerDeploymentVersionKey>,
+        ramping: Option<WorkerDeploymentVersionKey>,
+        ramping_percentage: f32,
+    ) -> StoredRoutingConfig {
+        StoredRoutingConfig {
+            current_version: current,
+            ramping_version: ramping,
+            ramping_version_percentage: ramping_percentage,
+            current_version_changed_time: None,
+            ramping_version_changed_time: None,
+            ramping_version_percentage_changed_time: None,
+            revision_number: 100,
+        }
+    }
+
+    fn open_state(workflow_id: String, info: Option<WorkflowVersioningInfo>) -> WorkflowState {
+        WorkflowState {
+            run_key: RunKey::new(),
+            namespace_id: NamespaceId::new(),
+            workflow_id: WorkflowId(workflow_id),
+            run_id: RunId::new(),
+            workflow_type: WorkflowType("workflow-type".into()),
+            task_queue: TaskQueueName("workflow-task-queue".into()),
+            deployment: None,
+            build_id: None,
+            versioning_info: info,
+            worker_deployment_name: None,
+            status: ExecutionStatus::Running,
+            transition_seq: TransitionSeq(1),
+            last_event_id: 1,
+            next_workflow_task_seq: LogicalTaskSeq(1),
+            pending_workflow_task: None,
+            previous_started_event_id: 0,
+            workflow_task_attempt: 1,
+            sticky: None,
+            pause_info: None,
+            cancel_requested: false,
+            wft_stamp: 0,
+            memo: Memo(BTreeMap::new()),
+            search_attributes: SearchAttributes(BTreeMap::new()),
+            workflow_execution_timeout: Some(Duration::minutes(10)),
+            workflow_run_timeout: Some(Duration::minutes(5)),
+            workflow_task_timeout: Duration::seconds(10),
+            retry_policy: None,
+            attempt: 1,
+            first_execution_run_id: Some(RunId::new()),
+            original_execution_run_id: None,
+            parent_run_key: None,
+            parent_workflow_id: None,
+            parent_run_id: None,
+            parent_namespace_id: None,
+            parent_initiated_event_id: 0,
+            root_workflow_id: None,
+            root_run_id: None,
+            last_completion_result: None,
+            activities: BTreeMap::new(),
+            timers: BTreeMap::new(),
+            children: BTreeMap::new(),
+            pending_external_signals: BTreeMap::new(),
+            pending_external_cancels: BTreeMap::new(),
+            pending_updates: BTreeMap::new(),
+            admitted_updates: HashSet::new(),
+            pending_nexus_operations: BTreeMap::new(),
+            completion_callbacks: Vec::new(),
+            started_at: now(),
+            first_run_started_at: Some(now()),
+            closed_at: None,
+            close_result: None,
+            close_failure: None,
+        }
+    }
+
+    fn info_for_case(case: &VersioningCase) -> Option<WorkflowVersioningInfo> {
+        let behavior_version = version_ref("deployment", "behavior");
+        let override_version = version_ref("deployment", "override");
+        let transition_version = version_ref("deployment", "transition");
+        match case {
+            VersioningCase::Transition => Some(WorkflowVersioningInfo {
+                behavior: VersioningBehavior::AutoUpgrade,
+                deployment_version: Some(behavior_version),
+                versioning_override: Some(VersioningOverride::Pinned {
+                    version: override_version,
+                }),
+                version_transition: Some(transition_version),
+                revision_number: 7,
+                continue_as_new_initial_versioning_behavior:
+                    ContinueAsNewVersioningBehavior::Unspecified,
+            }),
+            VersioningCase::OverridePinned => Some(WorkflowVersioningInfo {
+                behavior: VersioningBehavior::AutoUpgrade,
+                deployment_version: Some(behavior_version),
+                versioning_override: Some(VersioningOverride::Pinned {
+                    version: override_version,
+                }),
+                version_transition: None,
+                revision_number: 8,
+                continue_as_new_initial_versioning_behavior:
+                    ContinueAsNewVersioningBehavior::Unspecified,
+            }),
+            VersioningCase::OverrideAutoUpgrade => Some(WorkflowVersioningInfo {
+                behavior: VersioningBehavior::Pinned,
+                deployment_version: Some(behavior_version),
+                versioning_override: Some(VersioningOverride::AutoUpgrade),
+                version_transition: None,
+                revision_number: 9,
+                continue_as_new_initial_versioning_behavior:
+                    ContinueAsNewVersioningBehavior::Unspecified,
+            }),
+            VersioningCase::BehaviorPinned => Some(WorkflowVersioningInfo {
+                behavior: VersioningBehavior::Pinned,
+                deployment_version: Some(behavior_version),
+                versioning_override: None,
+                version_transition: None,
+                revision_number: 10,
+                continue_as_new_initial_versioning_behavior:
+                    ContinueAsNewVersioningBehavior::Unspecified,
+            }),
+            VersioningCase::BehaviorAutoUpgrade => Some(WorkflowVersioningInfo {
+                behavior: VersioningBehavior::AutoUpgrade,
+                deployment_version: Some(behavior_version),
+                versioning_override: None,
+                version_transition: None,
+                revision_number: 11,
+                continue_as_new_initial_versioning_behavior:
+                    ContinueAsNewVersioningBehavior::Unspecified,
+            }),
+            VersioningCase::Unversioned => None,
+        }
+    }
+
+    fn expected_routing_target(
+        routing_config: &StoredRoutingConfig,
+        workflow_id: &WorkflowId,
+    ) -> Option<WorkerDeploymentVersionRef> {
+        let current = routing_config.current_version.as_ref()?;
+        if let Some(ramping) = routing_config.ramping_version.as_ref()
+            && routing_config.ramping_version_percentage > 0.0
+            && deterministic_bucket(&workflow_id.0)
+                < (f64::from(routing_config.ramping_version_percentage) * 100.0) as u64
+        {
+            return Some(version_key_to_ref(ramping));
+        }
+        Some(version_key_to_ref(current))
+    }
+
+    fn workflow_queue(deployment_name: Option<&str>, build_id: Option<&str>) -> QueueKey {
+        QueueKey {
+            namespace_id: NamespaceId::new(),
+            task_queue: TaskQueueName("workflow-task-queue".into()),
+            task_kind: TaskKind::Workflow,
+            deployment: deployment_name.map(|name| DeploymentId(name.to_string())),
+            build_id: build_id.map(|id| RuntimeBuildId(id.to_string())),
+        }
+    }
+
+    fn expected_for_case(
+        case: &VersioningCase,
+        routing_config: &StoredRoutingConfig,
+        workflow_id: &WorkflowId,
+    ) -> ResolvedWorkflowTaskTarget {
+        match case {
+            VersioningCase::Transition => ResolvedWorkflowTaskTarget {
+                deployment_version: Some(version_ref("deployment", "transition")),
+                revision_number: 7,
+                pinned: false,
+            },
+            VersioningCase::OverridePinned => ResolvedWorkflowTaskTarget {
+                deployment_version: Some(version_ref("deployment", "override")),
+                revision_number: 8,
+                pinned: true,
+            },
+            VersioningCase::BehaviorPinned => ResolvedWorkflowTaskTarget {
+                deployment_version: Some(version_ref("deployment", "behavior")),
+                revision_number: 10,
+                pinned: true,
+            },
+            VersioningCase::OverrideAutoUpgrade
+            | VersioningCase::BehaviorAutoUpgrade
+            | VersioningCase::Unversioned => ResolvedWorkflowTaskTarget {
+                deployment_version: expected_routing_target(routing_config, workflow_id),
+                revision_number: routing_config.revision_number,
+                pinned: false,
+            },
+        }
+    }
+
+    #[test]
+    fn transition_for_polled_workflow_task_starts_when_poller_differs_from_effective() {
+        let routing = routing_config(Some(version_key("deployment", "current")), None, 0.0);
+        let state = open_state("workflow".into(), None);
+        let target = resolve_workflow_task_target_version(&routing, &state);
+
+        // Unversioned run (effective deployment None): any versioned poller
+        // differs from the effective deployment and starts a transition toward
+        // the poller's version — matching v1.31.0's `!pollerDeployment.Equal(
+        // wfDeployment)`. This holds even when the poller is NOT the current
+        // routing target ("stale"): Matching already dispatched the task here,
+        // and re-checking against the routing config would suppress a
+        // legitimate transition.
+        assert_eq!(
+            transition_for_polled_workflow_task(
+                &state,
+                &target,
+                &workflow_queue(Some("deployment"), Some("current")),
+            ),
+            Some(version_ref("deployment", "current"))
+        );
+        assert_eq!(
+            transition_for_polled_workflow_task(
+                &state,
+                &target,
+                &workflow_queue(Some("deployment"), Some("stale")),
+            ),
+            Some(version_ref("deployment", "stale"))
+        );
+        // An unversioned poller (no deployment/build_id) cannot start a
+        // transition.
+        assert_eq!(
+            transition_for_polled_workflow_task(&state, &target, &workflow_queue(None, None)),
+            None
+        );
+
+        let already_effective = open_state(
+            "workflow".into(),
+            Some(WorkflowVersioningInfo {
+                behavior: VersioningBehavior::AutoUpgrade,
+                deployment_version: Some(version_ref("deployment", "current")),
+                versioning_override: None,
+                version_transition: None,
+                revision_number: 100,
+                continue_as_new_initial_versioning_behavior:
+                    ContinueAsNewVersioningBehavior::Unspecified,
+            }),
+        );
+        let target = resolve_workflow_task_target_version(&routing, &already_effective);
+        // Poller already equals the run's effective deployment: no transition.
+        assert_eq!(
+            transition_for_polled_workflow_task(
+                &already_effective,
+                &target,
+                &workflow_queue(Some("deployment"), Some("current")),
+            ),
+            None
+        );
+
+        let pinned = open_state(
+            "workflow".into(),
+            Some(WorkflowVersioningInfo {
+                behavior: VersioningBehavior::Pinned,
+                deployment_version: Some(version_ref("deployment", "current")),
+                versioning_override: None,
+                version_transition: None,
+                revision_number: 100,
+                continue_as_new_initial_versioning_behavior:
+                    ContinueAsNewVersioningBehavior::Unspecified,
+            }),
+        );
+        let target = resolve_workflow_task_target_version(&routing, &pinned);
+        // Pinned runs never transition, even when a differing poller arrives.
+        assert_eq!(
+            transition_for_polled_workflow_task(
+                &pinned,
+                &target,
+                &workflow_queue(Some("deployment"), Some("current")),
+            ),
+            None
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn property_routing_determinism_and_effective_version_precedence(
+            case in arb_versioning_case(),
+            workflow_suffix in 0u32..10_000,
+            current_present in any::<bool>(),
+            ramping_present in any::<bool>(),
+            ramping_percentage in prop_oneof![Just(0.0f32), Just(1.0), Just(25.0), Just(50.0), Just(75.0), Just(100.0)],
+        ) {
+            let routing = routing_config(
+                current_present.then(|| version_key("deployment", "current")),
+                ramping_present.then(|| version_key("deployment", "ramping")),
+                ramping_percentage,
+            );
+            let state = open_state(format!("workflow-{workflow_suffix}"), info_for_case(&case));
+
+            let resolved = resolve_workflow_task_target_version(&routing, &state);
+            let resolved_again = resolve_workflow_task_target_version(&routing, &state);
+            let expected = expected_for_case(&case, &routing, &state.workflow_id);
+
+            prop_assert_eq!(&resolved, &resolved_again);
+            prop_assert_eq!(&resolved, &expected);
+            if !current_present
+                && matches!(
+                    case,
+                    VersioningCase::OverrideAutoUpgrade
+                        | VersioningCase::BehaviorAutoUpgrade
+                        | VersioningCase::Unversioned
+                )
+            {
+                prop_assert!(resolved.deployment_version.is_none());
+            }
+        }
     }
 }

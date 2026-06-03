@@ -38,22 +38,42 @@ pub enum UpdateOutcome {
 /// How long the caller wants to wait.
 #[derive(Clone, Debug, PartialEq)]
 pub enum UpdateWaitPolicy {
+    /// Return as soon as the kernel admits the update; do not block on a worker
+    /// processing it. Callers using this policy are not entered into the
+    /// [`UpdateRegistry`].
     Accepted,
+    /// Block until the lane commits the update's final resolution
+    /// (completed/rejected). These callers hold a registry entry until notified.
     Completed,
 }
 
+/// A single admitted-but-unresolved update, surfaced to the worker so it can be
+/// (re)delivered.
+///
+/// The edge drains these from the [`UpdateRegistry`] when a worker needs the set
+/// of updates still awaiting processing for a run (for example after a worker
+/// reconnects), carrying the original caller-supplied name, input, and identity.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PendingUpdateTransport {
+    /// Caller-assigned update identifier, unique within the run.
     pub update_id: String,
+    /// Update handler name to invoke on the worker.
     pub update_name: String,
+    /// Serialized update arguments as supplied by the caller.
     pub input: Payloads,
+    /// Identity of the caller that issued the update.
     pub identity: String,
 }
 
+/// Worker-reported outcome of processing an update, fed back into the registry
+/// to resolve any [`UpdateWaitPolicy::Completed`] caller.
 #[derive(Clone, Debug, PartialEq)]
 pub enum UpdateTransportResolution {
+    /// The worker accepted the update; no terminal result yet.
     Accepted,
+    /// The update ran to completion with a result.
     Completed { result: Payloads },
+    /// Workflow code rejected the update.
     Rejected { failure: Payload },
 }
 
@@ -79,6 +99,8 @@ pub struct UpdateRegistry {
 }
 
 impl UpdateRegistry {
+    /// Create an empty registry. Entries are added as
+    /// [`UpdateWaitPolicy::Completed`] callers begin waiting.
     pub fn new() -> Self {
         Self::default()
     }
@@ -1028,6 +1050,7 @@ mod tests {
                 task_queue: TaskQueueName("q".into()),
                 deployment: None,
                 build_id: None,
+                versioning_override: None,
                 input: Payloads::default(),
                 header: None,
                 memo: Memo::default(),

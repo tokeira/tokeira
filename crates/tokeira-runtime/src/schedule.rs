@@ -122,6 +122,8 @@ impl Default for SchedulePolicies {
     }
 }
 
+/// How a schedule reacts when a new action comes due while a prior run from the
+/// same schedule is still executing. Mirrors Temporal's `ScheduleOverlapPolicy`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OverlapPolicy {
     Skip,
@@ -239,6 +241,13 @@ pub enum ScheduleError {
     InvalidArgument(String),
 }
 
+/// In-memory store of schedule definitions and their bookkeeping, keyed by
+/// `(namespace, schedule_id)`.
+///
+/// Concurrent edits are mediated by an optimistic conflict token (see
+/// [`Self::update`]) rather than locks held across awaits: a caller presents the
+/// token it last read, and the update is rejected if the stored token has since
+/// moved on.
 #[derive(Default)]
 pub struct ScheduleStore {
     schedules: DashMap<(NamespaceId, ScheduleId), ScheduleEntry>,
@@ -293,11 +302,17 @@ impl ScheduleStore {
             .schedules
             .get_mut(&(namespace_id, schedule_id.clone()))
             .ok_or(ScheduleError::NotFound)?;
+        // An empty token means the caller is not doing optimistic concurrency
+        // (e.g. internal engine bookkeeping), so skip the check. A non-empty
+        // token must match the stored one or the caller is acting on a stale
+        // read and is rejected.
         if !conflict_token.is_empty() && entry.conflict_token != conflict_token {
             return Err(ScheduleError::StaleConflictToken);
         }
         updater(&mut entry);
         entry.info.buffer_size = entry.info.buffered_actions.len() as i64;
+        // Every successful mutation advances the token so any concurrent holder
+        // of the previous token now reads as stale.
         entry.conflict_token = increment_token(&entry.conflict_token);
         Ok(entry.clone())
     }
@@ -382,6 +397,8 @@ impl ScheduleStore {
     }
 }
 
+/// Decision the engine acts on for a single due action, after evaluating the
+/// overlap policy against what is currently running and buffered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OverlapDecision {
     Allow,
@@ -391,6 +408,12 @@ pub enum OverlapDecision {
     TerminateOther(Vec<WorkflowExecution>),
 }
 
+/// Resolve an overlap policy into a concrete decision for one due action.
+///
+/// With nothing running, overlap is moot and the action always proceeds. The
+/// `BufferOne` arm is the subtle one: it buffers only while the buffer is empty
+/// and otherwise skips, which is what bounds the buffer to a single pending
+/// action rather than letting it grow.
 pub fn decide_overlap(
     policy: OverlapPolicy,
     running_workflows: &[WorkflowExecution],
@@ -412,6 +435,12 @@ pub fn decide_overlap(
     }
 }
 
+/// Derive the workflow id for a scheduled run.
+///
+/// Appending the nominal unix timestamp gives each firing a distinct id so
+/// successive runs do not collide under the workflow-id reuse policy. Schedules
+/// that opt into `keep_original` (e.g. to enforce a singleton run) keep the base
+/// id unchanged.
 pub fn schedule_workflow_id(
     base_workflow_id: &WorkflowId,
     nominal_time: OffsetDateTime,
@@ -427,6 +456,11 @@ pub fn schedule_workflow_id(
     ))
 }
 
+/// Compute the next `count` firing times at or after `now`.
+///
+/// Walks forward a day at a time rather than evaluating an unbounded range so
+/// sparse specs (e.g. "once a year") still terminate; the 366-day ceiling caps
+/// the search for specs that never match again.
 pub fn compute_next_times(
     spec: &ScheduleSpec,
     now: OffsetDateTime,
@@ -447,6 +481,13 @@ pub fn compute_next_times(
     out
 }
 
+/// Enumerate every firing time the spec matches within `[range_start,
+/// range_end]`.
+///
+/// This is the core firing oracle: the engine calls it each tick with the
+/// window since the last tick to find actions that came due. Calendar matching
+/// is done in the schedule's local timezone (so DST shifts track wall-clock
+/// intent), then per-firing jitter and exclude-calendar filtering are applied.
 pub fn compute_matching_times(
     spec: &ScheduleSpec,
     range_start: OffsetDateTime,
@@ -468,6 +509,9 @@ pub fn compute_matching_times(
 
     let mut times = interval_matches(spec, start, end);
     if !spec.structured_calendars.is_empty() {
+        // Calendar specs match on wall-clock fields, so scan second-by-second in
+        // the schedule's local time. Interval specs above are absolute and do
+        // not need this walk.
         let mut cursor = truncate_to_second(start);
         while cursor <= end {
             let local = to_schedule_local_time(cursor, &spec.timezone_name);
@@ -494,6 +538,8 @@ pub fn compute_matching_times(
     times
         .into_iter()
         .map(|time| apply_jitter(time, spec.jitter, schedule_id))
+        // Jitter can push a firing outside the requested window; drop those so
+        // a time is never reported for a range it no longer falls in.
         .filter(|time| *time >= range_start && *time <= range_end)
         .collect()
 }
@@ -568,6 +614,13 @@ fn to_schedule_local_time(time: OffsetDateTime, timezone_name: &str) -> OffsetDa
     time.to_offset(offset)
 }
 
+/// Offset a firing time deterministically within `[0, jitter]`.
+///
+/// The offset is hashed from the schedule id plus the nominal time rather than
+/// drawn randomly so the same firing always lands on the same jittered instant.
+/// That determinism matters because `compute_matching_times` is re-run every
+/// tick and for catchup/backfill: a random offset would make a firing's time
+/// shift between evaluations and risk double- or missed-firing.
 fn apply_jitter(
     time: OffsetDateTime,
     jitter: Option<Duration>,
@@ -617,6 +670,11 @@ fn div_floor(lhs: i128, rhs: i128) -> i128 {
     }
 }
 
+/// Spawn the schedule engine's tick loop.
+///
+/// Each tick evaluates the window `(last_tick, now]` so no firing between ticks
+/// is missed and none is evaluated twice; `last_tick` advances only after a tick
+/// completes.
 pub fn run_schedule_engine<R>(
     store: Arc<ScheduleStore>,
     runtime: Arc<TokeiraRuntime<R>>,
@@ -656,6 +714,11 @@ impl Default for ScheduleEngineConfig {
     }
 }
 
+/// Evaluate every active schedule for the elapsed tick window.
+///
+/// Running-workflow reconciliation happens first so that overlap decisions made
+/// below see an up-to-date view of what is still executing — otherwise a
+/// just-finished run could wrongly cause this tick's action to skip or buffer.
 pub async fn evaluate_all_schedules<R>(
     store: &ScheduleStore,
     runtime: &TokeiraRuntime<R>,
@@ -685,6 +748,12 @@ pub async fn evaluate_all_schedules<R>(
     }
 }
 
+/// Process one due (or buffered/triggered) action for a schedule.
+///
+/// Enforces, in order: the remaining-action limit, the catchup window (firings
+/// older than the window are counted as missed and dropped rather than run, so a
+/// long outage cannot unleash a backlog of stale starts), then the overlap
+/// policy decision.
 pub async fn handle_due_action<R>(
     store: &ScheduleStore,
     runtime: &TokeiraRuntime<R>,
@@ -734,6 +803,8 @@ pub async fn handle_due_action<R>(
         }
         OverlapDecision::Buffer => {
             let _ = store.update(namespace_id, schedule_id, &[], |current| {
+                // BufferOne keeps only the newest pending action: evict the
+                // existing one (counting it as dropped) before pushing this one.
                 if policy == OverlapPolicy::BufferOne && current.info.buffered_actions.len() >= 1 {
                     current.info.buffered_actions.pop_front();
                     current.info.buffer_dropped += 1;
@@ -745,12 +816,16 @@ pub async fn handle_due_action<R>(
             });
         }
         OverlapDecision::CancelOther(workflows) => {
+            // Cancel is best-effort and asynchronous: clear the running set and
+            // let the next action start once those runs actually wind down.
             cancel_workflows(runtime, &workflows, schedule_request_context(now)).await;
             let _ = store.update(namespace_id, schedule_id, &[], |current| {
                 current.info.running_workflows.clear();
             });
         }
         OverlapDecision::TerminateOther(workflows) => {
+            // Terminate is immediate, so unlike Cancel we start the new action
+            // in the same pass once the prior runs are torn down.
             terminate_workflows(runtime, &workflows, schedule_request_context(now)).await;
             let _ = store.update(namespace_id, schedule_id, &[], |current| {
                 current.info.running_workflows.clear();
@@ -769,6 +844,14 @@ pub async fn handle_due_action<R>(
     }
 }
 
+/// Refresh each schedule's running-workflow set against durable run state, then
+/// react to completions.
+///
+/// This is how the engine learns a scheduled run has ended: it loads each
+/// tracked run and keeps only those still `Running`. When a run completes it may
+/// trigger `pause_on_failure`, and if the schedule is now idle it releases one
+/// buffered action — buffered work is replayed on completion, not on the timer
+/// tick, so overlap guarantees hold.
 pub async fn reconcile_running_workflows<R>(store: &ScheduleStore, runtime: &TokeiraRuntime<R>)
 where
     R: RunRepository + 'static,
@@ -796,6 +879,8 @@ where
                 current.state.paused = true;
                 current.state.notes = "paused after scheduled workflow completed".to_string();
             }
+            // Only release a buffered action once the schedule is fully idle and
+            // not paused, so buffering never lets two runs overlap.
             if completed && current.info.running_workflows.is_empty() && !current.state.paused {
                 if let Some(buffered) = current.info.buffered_actions.pop_front() {
                     buffered_to_run.push(buffered);
@@ -818,6 +903,13 @@ where
     }
 }
 
+/// Start the workflow for one firing and record the outcome on the schedule.
+///
+/// Uses `conflict_policy = Fail` so a stale duplicate id does not silently
+/// attach to an existing run, and records the firing under the
+/// `Running`/`StartFailed` status so `reconcile_running_workflows` and the
+/// overlap policy track it correctly. `nominal_time` is the scheduled instant;
+/// `actual_time` is when the engine actually fired it (they differ on catchup).
 pub async fn trigger_schedule_action<R>(
     store: &ScheduleStore,
     runtime: &TokeiraRuntime<R>,
@@ -866,6 +958,7 @@ where
         reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
         deployment: None,
         build_id,
+        versioning_override: None,
         attempt: 1,
         continued_execution_run_id: None,
         first_execution_run_id: Some(run_id),
@@ -1007,6 +1100,9 @@ fn schedule_request_context(now: OffsetDateTime) -> RequestContext {
     }
 }
 
+// Conflict tokens and list page tokens are both opaque big-endian u64 cursors,
+// so they share one codec: a conflict token is just a monotonically advancing
+// version counter, and a page token is an offset into the sorted listing.
 fn encode_token(value: u64) -> Vec<u8> {
     value.to_be_bytes().to_vec()
 }

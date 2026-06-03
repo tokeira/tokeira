@@ -1,3 +1,21 @@
+//! Query and update dispatch methods of [`TokeiraRuntime`].
+//!
+//! This `impl` continuation owns the two read-adjacent worker interactions that
+//! must be ordered against a run's pending workflow task (WFT) rather than
+//! simply mutating it: consistent queries and synchronous updates. Both are
+//! transport-coordinated — the runtime parks a caller on a `oneshot` and the
+//! lane/transport layer resolves it — so the contract here is mostly about
+//! *when* a request is allowed to reach a worker and how the caller is woken.
+//!
+//! Key invariants:
+//! - A consistent query never observes stale state. While a WFT is in flight
+//!   the query is buffered behind a barrier (the run's `last_event_id` at query
+//!   time) and only released once the run advances past it; otherwise it is
+//!   dispatched directly because the run is quiescent.
+//! - Updates are two-phase (admit, then worker-accept). The wait policy decides
+//!   whether the caller returns at admission or blocks for the final
+//!   resolution. The caller registration is always cleaned up on every error
+//!   and timeout path so a failed update cannot leak a parked waiter.
 use super::*;
 use tokeira_observability::{QueryDispatchOutcomeLabel, QueryDispatchPathLabel};
 

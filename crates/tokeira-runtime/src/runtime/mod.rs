@@ -23,7 +23,7 @@ use tokeira_kernel::{
 };
 use tokeira_storage::{
     CommitResult, DispatchableActivityTask, DispatchableWorkflowTask, LeaseOutcome,
-    LeaseRepository, RunRepository,
+    LeaseRepository, RunRepository, WorkerDeploymentRepository,
 };
 use tokeira_types::{
     ActivityTaskToken, BuildId, DeploymentId, ExecutionRef, ExecutionStatus, Headers,
@@ -89,7 +89,7 @@ mod workflow_task;
 /// core server actions without dragging transport or
 /// authentication into the same crate.
 ///
-/// See [`docs/crates/runtime.md`] for the full
+/// See `docs/crates/runtime.md` for the full
 /// orchestration flow and module map.
 pub struct TokeiraRuntime<R> {
     /// Shared handle to the durable run repository.
@@ -138,6 +138,8 @@ pub struct TokeiraRuntime<R> {
     fairness_state: FairnessState,
     /// Shared worker-versioning rules used by edge handlers and dispatch.
     versioning_rule_store: Arc<VersioningRuleStore>,
+    /// Optional durable Worker Deployment registry used for v2 routing decisions.
+    worker_deployment_repository: Option<Arc<dyn WorkerDeploymentRepository>>,
     /// Background Nexus-timeout scanner task.
     nexus_timeout_scanner_handle: Option<tokio::task::JoinHandle<()>>,
     /// Cancellation token for the Nexus-timeout scanner.
@@ -209,6 +211,11 @@ pub enum SignalWithStartResult {
     Rejected { run_key: RunKey, run_id: RunId },
 }
 
+/// Aggregate runtime tuning passed to [`TokeiraRuntime`] at construction.
+///
+/// These are mechanical settings (lane count, scanner intervals, retry/drain
+/// bounds), not deployment-environment knobs: `tokeirad` builds this from
+/// `Default` rather than from TOML, leaving the values for auto-tune to own.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeConfig {
     pub lane_count: usize,
@@ -270,6 +277,12 @@ where
 {
     /// Create a new runtime with `lane_count` parallel
     /// lane executors backed by `repo`.
+    ///
+    /// This is the entry point of a constructor ladder: each `new_with_*`
+    /// overload fills in one more optional dependency (versioning, Nexus,
+    /// shard ownership, node endpoint) and delegates inward, so all paths
+    /// converge on `new_with_nexus_and_shards_and_endpoint`, the single place
+    /// that actually wires brokers, lanes, and scanners.
     pub fn new(
         repo: Arc<R>,
         lane_count: usize,
@@ -474,6 +487,10 @@ where
         let shard_count = shard_count.max(1);
         let shard_owner = Arc::new(RwLock::new(ShardOwner::new(shard_count)));
         let lane_count = lane_count.max(1);
+        // The publisher needs lane handles to route follow-up work (child
+        // resolutions, continue-as-new starts), but the lanes don't exist yet.
+        // Share a slot the publisher captures now and we backfill once the
+        // lanes are spawned, breaking the construction-order cycle.
         let shared_lanes = Arc::new(Mutex::new(Vec::with_capacity(lane_count)));
         let lanes: Vec<_> = (0..lane_count)
             .map(|lane_id| {
@@ -509,6 +526,10 @@ where
             .collect();
         *shared_lanes.lock().unwrap() = lanes.clone();
         if seed_default_shard {
+            // Single-node / no-controller deployments have no placement
+            // controller to grant shard ownership, so seed shard 0 as locally
+            // owned at the zero epoch. Controller-managed deployments pass
+            // `false` and acquire ownership through durable leases instead.
             let mut owner = shard_owner.write().unwrap();
             let shard_id = ShardId(0);
             let _ = owner.record_acquired(shard_id, ShardEpoch::ZERO);
@@ -629,7 +650,19 @@ where
             owner_identity,
             node_endpoint,
             versioning_rule_store,
+            worker_deployment_repository: None,
         }
+    }
+
+    /// Attach a durable Worker Deployment registry, enabling version-aware
+    /// (v2) task routing. Without it the runtime falls back to the legacy
+    /// versioning-rule path; routing must not depend on this being present.
+    pub fn with_worker_deployment_repository(
+        mut self,
+        repository: Arc<dyn WorkerDeploymentRepository>,
+    ) -> Self {
+        self.worker_deployment_repository = Some(repository);
+        self
     }
 
     /// Return a clone of the workflow-task broker.
@@ -779,6 +812,15 @@ where
         )
     }
 
+    /// Reject a workflow-task completion whose token was minted under a
+    /// superseded shard epoch.
+    ///
+    /// A worker may have polled a task while this node owned the shard, then
+    /// completed it after ownership moved (or this node's lease was fenced).
+    /// Comparing the token's epoch against the current local epoch ensures a
+    /// stale worker's completion can't be admitted on a shard we no longer own;
+    /// the authoritative fence is still the storage commit, this is the cheap
+    /// front-line check.
     pub(super) async fn validate_workflow_task_token(
         &self,
         token: &WorkflowTaskToken,
@@ -791,6 +833,11 @@ where
         Ok(())
     }
 
+    /// Route `run_key` to its owning lane.
+    ///
+    /// Routing is by run identity, not task queue: the workflow execution is
+    /// the serialization boundary, so the same run always lands on the same
+    /// lane and never executes concurrently with itself.
     pub(super) fn pick_lane(&self, run_key: RunKey) -> &LaneHandle {
         pick_lane_for_run_key(&self.lanes, self.lanes.len(), run_key)
     }
@@ -906,6 +953,11 @@ where
     /// Re-publishes up to `limit` dispatchable workflow
     /// tasks from durable storage into the in-memory
     /// broker.
+    ///
+    /// This is the sweeper contract that makes ephemeral-first delivery safe:
+    /// because the broker is never authoritative, lost in-memory offers can be
+    /// rebuilt from the durable dispatch backlog after a restart or shard
+    /// failover.
     pub async fn republish_queue(&self, queue: QueueKey, limit: usize) -> Result<usize> {
         let tasks = self
             .repo
@@ -937,6 +989,14 @@ where
     }
 }
 
+/// Whether a command originates from an external caller (client/edge) rather
+/// than from internal in-flight machinery (task completions, timer fires,
+/// child/nexus resolutions).
+///
+/// Used by drain admission: while a node is draining a shard it must stop
+/// accepting *new* external work but still let in-flight commands finish so
+/// runs can reach a clean handoff point. Misclassifying an in-flight command
+/// as external would deadlock the drain.
 fn is_externally_routed_command(command: &Command) -> bool {
     matches!(
         command,
@@ -1271,6 +1331,9 @@ mod tests {
             identity: WorkerIdentity("worker".to_owned()),
             sdk_metadata: None,
             worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
             commands: Vec::new(),
             force_new_workflow_task: false,
             now: OffsetDateTime::now_utc(),
@@ -2404,6 +2467,7 @@ mod tests {
             task_queue: TaskQueueName("workflow-q".to_string()),
             deployment: None,
             build_id: None,
+            versioning_override: None,
             input: Payloads::default(),
             header: None,
             memo: Memo::default(),

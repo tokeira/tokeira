@@ -36,6 +36,7 @@ fn sample_start_request(
         reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
         deployment: None,
         build_id: None,
+        versioning_override: None,
         attempt: 1,
         header: None,
         continued_execution_run_id: None,

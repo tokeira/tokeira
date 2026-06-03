@@ -1,3 +1,21 @@
+//! Activity-task lifecycle methods of [`TokeiraRuntime`].
+//!
+//! This `impl` continuation owns the worker-facing activity-task surface:
+//! long-poll / eager-claim delivery, the atomic poll→Started transition, and
+//! the completion / failure / cancel / heartbeat resolutions that feed an
+//! activity outcome back into its owning run. Every mutating path applies a
+//! kernel command on the run's owned shard via
+//! [`submit_for_owned_shard`](TokeiraRuntime::submit_for_owned_shard), so it is
+//! fenced by the run's shard epoch rather than trusting the in-memory broker.
+//!
+//! Invariants this slice upholds:
+//! - The broker and `activity_tracking` are delivery aids, never authority. A
+//!   task token is honoured only after its `(schedule_event_id, attempt,
+//!   shard_epoch)` identity is revalidated against durable state, so a stale
+//!   or replayed token cannot mutate a run.
+//! - Activity transitions reject-and-reschedule rather than block: a retryable
+//!   failure re-enqueues the next attempt, and an OCC conflict at start
+//!   republishes the offer instead of making the worker wait on a lock.
 use super::*;
 use tokeira_observability::OutcomeLabel;
 
@@ -31,6 +49,14 @@ where
             .await
     }
 
+    /// Eagerly claim a specific activity task by `(run_key, activity_id)`
+    /// without waiting in the long-poll queue, then start it.
+    ///
+    /// Returns `Ok(None)` when the broker has no matching offer (already
+    /// claimed by another poller, or not yet dispatched); the caller treats
+    /// that as "no work available" rather than an error. Used by the eager
+    /// dispatch path where a worker that just completed a task is handed the
+    /// next one directly, skipping a broker round-trip.
     pub async fn try_claim_activity_task(
         &self,
         queue: QueueKey,
@@ -161,6 +187,12 @@ where
         Ok(())
     }
 
+    /// Resolve an activity as cancelled and notify the owning workflow.
+    ///
+    /// `details` are the worker-reported cancellation payloads recorded on the
+    /// resolution. Like the other resolutions, the in-memory tracking entry is
+    /// only removed once the kernel actually applies the transition (Applied or
+    /// Duplicate); on a Conflict the entry is left so a retry can still resolve.
     pub async fn cancel_activity_task(
         &self,
         token: ActivityTaskToken,
@@ -190,6 +222,14 @@ where
         Ok(result)
     }
 
+    /// Record an activity heartbeat, returning whether cancellation has been
+    /// requested for this activity.
+    ///
+    /// `Ok(true)` tells the worker to begin cooperative cancellation. The
+    /// heartbeat only touches volatile liveness state, so it is validated
+    /// against the durable token but does not itself produce a transition;
+    /// `Ok(false)` is returned when the activity is unknown to the tracker
+    /// (e.g. already resolved), which the edge treats as "keep going".
     pub async fn record_activity_heartbeat(
         &self,
         token: ActivityTaskToken,
@@ -205,6 +245,16 @@ where
             .unwrap_or(false))
     }
 
+    /// Reconstruct an [`ActivityTaskToken`] for an already-started activity
+    /// from durable state.
+    ///
+    /// Used by RecordActivityTaskHeartbeatById / RespondActivityTask*ById,
+    /// where the caller addresses the activity by `(run_key, activity_id)`
+    /// instead of presenting a token. Stamps the token with the *live* shard
+    /// epoch so a token minted here is fenced identically to one handed out at
+    /// poll time. Fails with [`ActivityTokenResolutionError::ActivityNotStarted`]
+    /// if the activity has no `started_event_id`, because a not-yet-started
+    /// activity has no completion identity to address.
     pub async fn resolve_activity_token(
         &self,
         run_key: RunKey,
@@ -273,11 +323,17 @@ where
         }
     }
 
-    /// Atomically transition a polled workflow task into the Started state.
+    /// Atomically transition a polled activity task into the Started state,
+    /// emitting `ActivityTaskStarted` and returning the dispatchable task.
     ///
-    /// Sets a sticky TTL so subsequent tasks for this run are preferentially
-    /// routed back to the same worker, avoiding full-history replay when the
-    /// worker's cache is still warm.
+    /// The transition is guarded by an OCC loop: it reloads the run, re-checks
+    /// that the offer still matches the current `(attempt, schedule_event_id)`
+    /// and is not already started, then commits. A mismatch means the offer is
+    /// stale (run closed, activity already started/retried) and yields
+    /// `Ok(None)` so the poller simply sees no work. On commit conflict the
+    /// start is retried up to `max_occ_retries`; if that is exhausted the offer
+    /// is republished to the broker (reject-and-reschedule) rather than dropped,
+    /// so the task is not lost when contention is high.
     async fn start_activity_task(
         &self,
         task: &DispatchableActivityTask,
@@ -345,6 +401,12 @@ where
                 projection_ops: SmallVec::new(),
             };
 
+            // Mirror the lane's commit-epoch rule (see lane.rs): with no
+            // placement controller there is no durable lease to fence against,
+            // so commit at ZERO and skip the lease read. Under a controller the
+            // real local epoch must travel to storage so a superseded owner's
+            // write is rejected by lease fencing — the authoritative ownership
+            // check.
             let (bundle, commit_epoch) = {
                 let owner = self.shard_owner.read().unwrap();
                 let bundle_id = execution_home_bundle(
@@ -421,6 +483,16 @@ where
         }
     }
 
+    /// Revalidate a worker-presented activity token against durable state.
+    ///
+    /// This is the front-line fence for every activity completion path: a token
+    /// is honoured only if its `(schedule_event_id, attempt)` still match the
+    /// live activity AND its `shard_epoch` matches the shard's current epoch.
+    /// The epoch check rejects completions from a worker that polled while this
+    /// node owned the shard but is reporting after ownership moved, so a stale
+    /// owner cannot resolve an activity on a shard it no longer owns. Returns
+    /// the activity state plus the workflow-level retry policy (the fallback
+    /// when the activity has no policy of its own).
     async fn validate_activity_token(
         &self,
         token: &ActivityTaskToken,
@@ -443,6 +515,14 @@ where
         Ok((activity, state.retry_policy.clone()))
     }
 
+    /// Re-dispatch an activity at its next attempt after a retryable failure.
+    ///
+    /// Bumps the attempt, clears the started markers, and commits a transition
+    /// whose dispatch op re-enqueues the activity task — the reject-and-retry
+    /// half of activity failure handling. The reload-and-recheck OCC loop
+    /// guards against a concurrent resolution: if the token no longer matches
+    /// the current `(attempt, schedule_event_id)` the retry is abandoned with an
+    /// error, and a commit conflict is retried up to `max_occ_retries`.
     async fn retry_activity_task(
         &self,
         token: &ActivityTaskToken,
@@ -515,6 +595,9 @@ where
                 projection_ops: SmallVec::new(),
             };
 
+            // Same commit-epoch rule as start_activity_task: ZERO without a
+            // placement controller (no lease to fence), real local epoch under
+            // one so storage lease-fences a superseded owner's write.
             let (bundle, commit_epoch) = {
                 let owner = self.shard_owner.read().unwrap();
                 let bundle_id = execution_home_bundle(

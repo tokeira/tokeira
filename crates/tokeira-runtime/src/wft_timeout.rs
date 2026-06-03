@@ -1,4 +1,17 @@
 //! Workflow-task start-to-close timeout tracking and scanning.
+//!
+//! Owns the in-memory set of workflow tasks that have *started* on a worker and
+//! are waiting for completion, and the background scanner that fails any whose
+//! start-to-close deadline passes — the mechanism that reclaims a workflow task
+//! when a worker accepts it and then dies or stalls.
+//!
+//! This state is volatile and derived. The durable transition log is
+//! authoritative for which tasks are started and when; this map is a scan-time
+//! cache rebuilt from durable history by [`crate::recovery::sweep_shard`] on
+//! shard takeover, so a crash or failover costs only a rebuild. Entries carry
+//! their `ShardId` so a handoff evicts exactly the runs this node no longer owns.
+//! Keyed by `RunKey` (one started workflow task per run at a time), so completing
+//! a task simply removes its entry and the scanner never fires against it.
 
 use std::{
     collections::HashMap,
@@ -16,9 +29,14 @@ use crate::{
     lane::LaneHandle, metrics as runtime_metrics, scanner::pick_lane_for_run_key, shard::ShardOwner,
 };
 
+/// One started workflow task being watched for a start-to-close timeout.
+///
+/// `logical_seq` and `started_event_id` identify the exact attempt so the kernel
+/// can fence a timeout submitted against a task that has since been superseded.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WftTimeoutEntry {
     pub run_key: RunKey,
+    /// Owning shard, so a handoff can evict this node's entries selectively.
     pub shard_id: ShardId,
     pub logical_seq: LogicalTaskSeq,
     pub started_event_id: i64,
@@ -26,20 +44,30 @@ pub struct WftTimeoutEntry {
     pub workflow_task_timeout: Duration,
 }
 
+/// Shared in-memory tracking state for started workflow tasks.
+///
+/// Cloning shares the underlying map; lanes, the scanner, and shard recovery all
+/// see one set.
 #[derive(Clone, Default)]
 pub struct WftTimeoutTrackingState {
     inner: Arc<Mutex<HashMap<RunKey, WftTimeoutEntry>>>,
 }
 
 impl WftTimeoutTrackingState {
+    /// Begin tracking a started workflow task, replacing any prior entry for the
+    /// run.
     pub fn insert(&self, entry: WftTimeoutEntry) {
         self.inner.lock().unwrap().insert(entry.run_key, entry);
     }
 
+    /// Stop tracking a run's workflow task, called when it completes or times out
+    /// so a finished task is never scanned again.
     pub fn remove(&self, run_key: RunKey) {
         self.inner.lock().unwrap().remove(&run_key);
     }
 
+    /// Drop every entry for a shard on handoff; the new owner rebuilds them from
+    /// durable state during its sweep.
     pub fn remove_all_for_shard(&self, shard_id: ShardId) {
         self.inner
             .lock()
@@ -47,10 +75,13 @@ impl WftTimeoutTrackingState {
             .retain(|_, entry| entry.shard_id != shard_id);
     }
 
+    /// Snapshot all tracked entries; the scanner evaluates the copy without
+    /// holding the lock.
     pub fn snapshot(&self) -> Vec<WftTimeoutEntry> {
         self.inner.lock().unwrap().values().cloned().collect()
     }
 
+    /// Snapshot only the entries owned by `shard_id`, used by the per-shard scan.
     pub fn snapshot_for_shard(&self, shard_id: ShardId) -> Vec<WftTimeoutEntry> {
         self.inner
             .lock()
@@ -62,9 +93,13 @@ impl WftTimeoutTrackingState {
     }
 }
 
+/// Tuning for the workflow-task timeout scanner loop.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WftTimeoutScannerConfig {
+    /// Delay between scans of the tracking set.
     pub scan_interval: tokio::time::Duration,
+    /// Upper bound on timeouts submitted per scan, bounding the work one tick can
+    /// do when many tasks expire together.
     pub max_timeouts_per_scan: usize,
 }
 
@@ -77,11 +112,22 @@ impl Default for WftTimeoutScannerConfig {
     }
 }
 
+/// Whether a started workflow task has exceeded its start-to-close deadline at
+/// `now`.
+///
+/// A zero timeout is treated as immediately due once the task has started, rather
+/// than as "no timeout", matching the durable encoding of an instantly-expiring
+/// deadline.
 pub fn evaluate_wft_timeout(entry: &WftTimeoutEntry, now: OffsetDateTime) -> bool {
     now - entry.started_at > entry.workflow_task_timeout
         || entry.workflow_task_timeout.is_zero() && now >= entry.started_at
 }
 
+/// Evaluate the tracked set once and submit a workflow-task timeout for each
+/// expired entry, capped at `max_timeouts_per_scan`. Generic over the submit
+/// closure so the pass is testable without a live lane. An entry is removed only
+/// after the submit resolves (or is rejected as stale), so transient failures are
+/// retried on the next scan.
 pub(crate) async fn scan_wft_timeouts_once<F, Fut>(
     tracking: &WftTimeoutTrackingState,
     shard_id: Option<ShardId>,
@@ -113,6 +159,11 @@ pub(crate) async fn scan_wft_timeouts_once<F, Fut>(
             }
             Err(error) => {
                 let message = error.to_string();
+                // Kernel rejection means the started task this timeout targeted is
+                // no longer current (the worker completed it, or a newer attempt
+                // superseded it). The entry is stale, so drop it instead of
+                // retrying a command that can never apply. Other errors are
+                // transient, so the entry is retained for the next scan.
                 if message.contains("kernel rejected") {
                     runtime_metrics::record_workflow_task_timed_out(OutcomeLabel::Rejected);
                     tracing::debug!(
@@ -135,6 +186,14 @@ pub(crate) async fn scan_wft_timeouts_once<F, Fut>(
     }
 }
 
+/// Background loop: every `scan_interval`, fail any started workflow task that
+/// has timed out, for each shard this node currently owns.
+///
+/// The active-shard set is re-read each tick so ownership changes (handoff, fresh
+/// sweep) are picked up without restarting the task. Each firing routes by
+/// `run_key` to the owning lane, keeping all commands for a run serialized on one
+/// lane. The timeout carries `logical_seq` and `started_event_id` so the kernel
+/// fences it if the targeted attempt is no longer current.
 pub(crate) async fn run_wft_timeout_scanner(
     tracking: WftTimeoutTrackingState,
     lanes: Vec<LaneHandle>,

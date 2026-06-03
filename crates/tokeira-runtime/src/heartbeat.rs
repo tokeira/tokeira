@@ -1,3 +1,24 @@
+//! In-memory worker heartbeat store.
+//!
+//! Owns the runtime's view of which workers are alive: a process-local map of
+//! `(namespace, worker instance) -> latest heartbeat`, plus the background
+//! maintenance loop that ages entries out and emits observability metrics.
+//!
+//! This state is deliberately **volatile and non-authoritative**. Heartbeats
+//! describe transient worker liveness, not workflow history, so losing the
+//! whole map on restart is correct behaviour — workers re-announce on their
+//! next heartbeat. Nothing in the correctness path (dispatch, transitions,
+//! projection) may read this store to make a decision; it exists only to power
+//! operator-facing observability (worker listings, last-seen age, observed
+//! counts). Keeping it off the durable path is what lets it use a lock-free
+//! `DashMap` and drop entries freely under memory pressure.
+//!
+//! Two eviction forces keep the map bounded: TTL (entries older than the TTL
+//! are stale and removed) and capacity (a hard ceiling on total entries). See
+//! [`InMemoryHeartbeatStore::maintain`] for why capacity eviction additionally
+//! respects a minimum age, and [`InMemoryHeartbeatStore::insert`] for why
+//! `last_seen` is held monotonic under last-write-wins.
+
 use std::{collections::HashMap, sync::Arc};
 
 use dashmap::DashMap;
@@ -10,19 +31,41 @@ use tokio_util::sync::CancellationToken;
 
 use crate::metrics as runtime_metrics;
 
+/// Age past which a heartbeat is considered stale and TTL-evicted by
+/// [`maintain`](InMemoryHeartbeatStore::maintain). A day is generous on purpose:
+/// liveness churn is handled by frequent re-heartbeats, so the TTL only needs to
+/// reclaim workers that have genuinely disappeared.
 pub const DEFAULT_ENTRY_TTL: time::Duration = time::Duration::hours(24);
+/// Minimum age an entry must reach before it is eligible for *capacity* (not
+/// TTL) eviction. This protects freshly-seen workers from being dropped just
+/// because the map is momentarily over capacity — evicting an entry that is
+/// still actively heartbeating would make the worker flicker out of operator
+/// views and immediately reappear on its next heartbeat.
 pub const DEFAULT_MIN_EVICT_AGE: time::Duration = time::Duration::minutes(10);
+/// Hard ceiling on tracked entries. Bounds memory for an unbounded, untrusted
+/// population of worker instances; the store is observability state, so shedding
+/// the oldest entries past this cap is preferable to growing without limit.
 pub const DEFAULT_MAX_ENTRIES: usize = 1_000_000;
+/// Cadence of the background maintenance loop (TTL/capacity eviction plus metric
+/// emission). Short relative to the TTL so stale entries and metrics are never
+/// far behind reality.
 pub const DEFAULT_MAINTENANCE_INTERVAL: time::Duration = time::Duration::seconds(10);
 
 type WorkerHeartbeatKey = (NamespaceId, WorkerInstanceKey);
 
+/// Process-local [`HeartbeatStore`] backed by a lock-free map.
+///
+/// Holds the latest heartbeat per `(namespace, worker instance)`. It is volatile
+/// observability state — see the module docs — and never consulted on the
+/// correctness path. Bounded by the TTL and capacity policy applied in
+/// [`maintain`](Self::maintain).
 #[derive(Debug, Default)]
 pub struct InMemoryHeartbeatStore {
     entries: DashMap<WorkerHeartbeatKey, WorkerHeartbeat>,
 }
 
 impl InMemoryHeartbeatStore {
+    /// Create an empty store. Entries appear only as workers heartbeat in.
     pub fn new() -> Self {
         Self::default()
     }
@@ -45,6 +88,12 @@ impl HeartbeatStore for InMemoryHeartbeatStore {
             heartbeat.worker_instance_key.clone(),
         );
         match self.entries.get_mut(&key) {
+            // Last-write-wins on the body (status, build/SDK metadata) but
+            // monotonic on `last_seen`: heartbeats can arrive out of order
+            // (retries, multiplexed connections, clock skew across the worker
+            // fleet), and a later-delivered-but-older sample must not pull the
+            // observed liveness backwards. Adopt the new payload, keep the
+            // greatest `last_seen` seen so far so age never appears to increase.
             Some(mut existing) if existing.last_seen > heartbeat.last_seen => {
                 let last_seen = existing.last_seen;
                 *existing = heartbeat;
@@ -103,6 +152,13 @@ impl HeartbeatStore for InMemoryHeartbeatStore {
 
         let mut capacity_evicted = Vec::new();
         if self.entries.len() > max_entries {
+            // Capacity eviction only targets entries already older than
+            // `min_evict_age`. Evicting a still-fresh worker to honour the cap
+            // would drop someone actively heartbeating — they would vanish from
+            // operator views and reappear seconds later, churning metrics for no
+            // benefit. If every entry is fresh we accept a transient overshoot of
+            // the cap rather than evict live workers; TTL will reclaim them once
+            // they age out.
             let min_cutoff = now - min_evict_age;
             let mut candidates: Vec<_> = self
                 .entries
@@ -110,6 +166,8 @@ impl HeartbeatStore for InMemoryHeartbeatStore {
                 .filter(|entry| entry.last_seen <= min_cutoff)
                 .map(|entry| (entry.key().clone(), entry.last_seen))
                 .collect();
+            // Oldest-first, with key as a deterministic tiebreak so the report is
+            // reproducible regardless of DashMap iteration order.
             candidates.sort_by(|(left_key, left_seen), (right_key, right_seen)| {
                 left_seen
                     .cmp(right_seen)
@@ -149,6 +207,13 @@ impl HeartbeatStore for InMemoryHeartbeatStore {
     }
 }
 
+/// Spawn the background loop that periodically calls
+/// [`HeartbeatStore::maintain`] and publishes the resulting metrics.
+///
+/// Runs until `cancel` fires. Errors from a single maintenance tick are logged
+/// and the loop continues — a failed eviction pass degrades observability
+/// freshness but must never take down the runtime, since this state is not on
+/// the correctness path.
 pub fn spawn_heartbeat_maintenance(
     store: Arc<dyn HeartbeatStore>,
     cancel: CancellationToken,
@@ -175,6 +240,12 @@ pub fn spawn_heartbeat_maintenance(
     })
 }
 
+/// Translate an [`EvictionReport`] into observability metrics: per-worker
+/// last-heartbeat age and active flag for survivors, an inactive flag for
+/// everything evicted this pass, and per-namespace plus total observed counts.
+///
+/// `now` is threaded in (rather than read here) so the reported ages match the
+/// instant the maintenance pass used for its TTL/capacity decisions.
 pub fn record_maintenance_report(now: OffsetDateTime, report: EvictionReport) {
     for heartbeat in &report.live {
         runtime_metrics::record_worker_last_heartbeat_age(

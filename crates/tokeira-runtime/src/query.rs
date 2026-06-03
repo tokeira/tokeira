@@ -1,3 +1,20 @@
+//! Query dispatch types for the runtime's read-only query path.
+//!
+//! Defines the in-flight [`QueryTask`] handed to a worker and the
+//! [`QueryResult`] it returns. These are the wire between the edge's
+//! `QueryWorkflow` call and the worker that evaluates the query against its
+//! cached workflow state.
+//!
+//! The defining invariant of this path is that **a query must not advance
+//! history**. A query reads workflow state; it is not a state-changing request,
+//! so it produces no transition, no event, and no change to the run's
+//! `transition_seq`/`last_event_id`. Queries are therefore carried on transient,
+//! non-durable channels (the [`oneshot`] in [`QueryTask::response_tx`]) and never
+//! enter the authoritative transition log. A timed-out or dropped query simply
+//! abandons its channel — there is nothing durable to roll back. This is why the
+//! query path can run concurrently with, and independently of, the run's
+//! workflow-task lane without coordinating on history.
+
 use tokeira_types::{Payloads, QueueKey, RunKey, WorkerIdentity};
 use tokio::sync::oneshot;
 
@@ -73,6 +90,7 @@ mod tests {
             task_queue: TaskQueueName("q".into()),
             deployment: None,
             build_id: None,
+            versioning_override: None,
             input: Payloads::default(),
             header: None,
             memo: Memo::default(),
@@ -549,6 +567,9 @@ mod tests {
                 identity: WorkerIdentity("w".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands: Vec::new(),
                 force_new_workflow_task: false,
                 now: OffsetDateTime::now_utc(),

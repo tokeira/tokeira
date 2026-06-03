@@ -19,16 +19,27 @@ use tokio_util::sync::CancellationToken;
 
 use crate::metrics as runtime_metrics;
 
+// Drain-share bounds and per-tick clamps. `MAX_DRAIN_SHARE` is deliberately
+// below 1.0 so no single queue can ever claim the entire dispatch path —
+// anti-starvation by construction. `MAX_DELTA_PER_INTERVAL` caps how fast a
+// share can move per control tick, which damps oscillation when signals are
+// noisy.
 pub(crate) const DEFAULT_DRAIN_SHARE: f64 = 0.1;
 pub(crate) const MIN_DRAIN_SHARE: f64 = 0.0;
 pub(crate) const MAX_DRAIN_SHARE: f64 = 0.8;
 pub(crate) const MAX_DELTA_PER_INTERVAL: f64 = 0.10;
+// The control loop self-tunes its period within these bounds: faster when
+// shares are moving (volatile), slower when the system is settled, so a quiet
+// system does not pay for needless wakeups.
 pub(crate) const DEFAULT_CONTROL_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const MIN_CONTROL_INTERVAL: Duration = Duration::from_secs(2);
 pub(crate) const MAX_CONTROL_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_BUDGET: u32 = 10;
 const LATENCY_BUCKET_CAP_MS: usize = 60_000;
 
+/// Point-in-time delivery health for one queue, consumed by the fairness
+/// controller. All fields are derived from [`DeliveryMetrics`] counters at
+/// snapshot time.
 #[derive(Clone, Debug)]
 pub struct QueueMetricsSnapshot {
     pub latency_p50: Duration,
@@ -38,12 +49,19 @@ pub struct QueueMetricsSnapshot {
     pub backlog_age: Duration,
 }
 
+/// A consistent snapshot of every tracked queue's metrics, tagged with the
+/// instant it was taken.
 #[derive(Clone, Debug)]
 pub struct DeliveryMetricsSnapshot {
     pub queues: HashMap<QueueKey, QueueMetricsSnapshot>,
     pub taken_at: OffsetDateTime,
 }
 
+/// Live, concurrently-updated delivery counters, keyed by queue.
+///
+/// Recording is lock-free per queue (`DashMap`) because it sits on the hot
+/// delivery path; the controller periodically snapshots and resets these into
+/// a [`DeliveryMetricsSnapshot`].
 #[derive(Clone)]
 pub struct DeliveryMetrics {
     queues: Arc<DashMap<QueueKey, QueueCounters>>,
@@ -57,6 +75,9 @@ struct QueueCounters {
     backlog_age: Duration,
 }
 
+/// The controller's per-queue decision: what fraction of the dispatch path this
+/// queue may use (`drain_share`) and how much of that allowance is left this
+/// interval (`remaining_budget`).
 #[derive(Clone, Debug)]
 pub struct QueueFairnessState {
     pub drain_share: f64,
@@ -64,6 +85,8 @@ pub struct QueueFairnessState {
     pub last_adjusted_at: OffsetDateTime,
 }
 
+/// Shared, mutable fairness decisions read by the drain loop and written by the
+/// control loop.
 #[derive(Clone)]
 pub struct FairnessState {
     inner: Arc<Mutex<FairnessStateInner>>,
@@ -73,6 +96,12 @@ struct FairnessStateInner {
     queues: HashMap<QueueKey, QueueFairnessState>,
 }
 
+/// Two-bucket sliding-window success rate.
+///
+/// Keeping a `previous` bucket alongside the `current` one smooths the rate
+/// across an `advance()` boundary so it does not snap to zero the instant a new
+/// window opens. A window with no events reports `1.0` (healthy) so that a quiet
+/// queue is never penalised for lack of data — see [`Self::rate`].
 #[derive(Default)]
 pub(crate) struct SlidingWindowCounter {
     current_success: u64,
@@ -96,6 +125,7 @@ impl SlidingWindowCounter {
         self.current_total += 1;
     }
 
+    /// Roll the current window into the previous one and start a fresh window.
     pub(crate) fn advance(&mut self) {
         self.previous_success = self.current_success;
         self.previous_total = self.current_total;
@@ -106,6 +136,8 @@ impl SlidingWindowCounter {
     pub(crate) fn rate(&self) -> f64 {
         let total = self.current_total + self.previous_total;
         if total == 0 {
+            // No observations means no evidence of trouble. Reporting 1.0 keeps
+            // idle queues from being throttled as if they were failing.
             1.0
         } else {
             (self.current_success + self.previous_success) as f64 / total as f64
@@ -117,6 +149,12 @@ impl SlidingWindowCounter {
     }
 }
 
+/// Fixed-resolution latency histogram with one bucket per millisecond.
+///
+/// Buckets are capped at [`LATENCY_BUCKET_CAP_MS`]; anything slower lands in the
+/// top bucket. The flat per-ms layout trades memory for branch-free recording
+/// and exact percentile reads at the millisecond granularity the controller
+/// cares about.
 pub(crate) struct LatencyHistogram {
     buckets: Vec<u64>,
     count: u64,
@@ -223,10 +261,14 @@ impl DeliveryMetrics {
         self.queues.entry(queue.clone()).or_default().backlog_age = age;
     }
 
+    /// Snapshot every queue and reset the live counters, opening fresh windows.
+    /// This is what the control loop calls each tick.
     pub fn take_snapshot(&self) -> DeliveryMetricsSnapshot {
         self.take_snapshot_internal(true).0
     }
 
+    /// Snapshot without resetting — for observers (metrics scrape, debugging)
+    /// that must not perturb the control loop's window accounting.
     pub fn peek_snapshot(&self) -> DeliveryMetricsSnapshot {
         self.take_snapshot_internal(false).0
     }
@@ -297,6 +339,8 @@ impl FairnessState {
             .queues
             .get(queue)
             .map(|entry| entry.remaining_budget)
+            // A queue the controller has never adjusted gets a baseline budget
+            // so backlog draining can begin before the first control tick.
             .unwrap_or(DEFAULT_BUDGET)
     }
 
@@ -315,6 +359,13 @@ impl FairnessState {
         consumed
     }
 
+    /// Install freshly computed drain shares and re-seed each queue's budget for
+    /// the coming interval.
+    ///
+    /// Budget is `share * recent_poll_count`: a queue's allowance is scaled by
+    /// how much polling demand it actually saw, so a high share on a quiet queue
+    /// does not translate into a large unused budget that could later be spent
+    /// in a burst.
     pub fn apply_adjustment(
         &self,
         adjustments: HashMap<QueueKey, f64>,
@@ -341,20 +392,37 @@ impl FairnessState {
     }
 }
 
+/// Compute the next drain share for a queue from its current share and latest
+/// metrics.
+///
+/// The signals are additive nudges, not a setpoint controller: each condition
+/// contributes a small delta, the deltas sum, and the result is clamped to one
+/// step ([`MAX_DELTA_PER_INTERVAL`]) and to the global share bounds. Working in
+/// bounded increments is what keeps the loop from over-correcting on a single
+/// noisy sample.
 pub(crate) fn evaluate_drain_share(current: f64, metrics: &QueueMetricsSnapshot) -> f64 {
     let mut delta = 0.0f64;
 
+    // Backlog that has aged well past the queue's own serving latency is the
+    // primary starvation signal: give it more share, scaled by how far behind
+    // it is (capped so a pathological age cannot demand an unbounded jump).
     let age_threshold = metrics.latency_p99.saturating_mul(2);
     if metrics.backlog_age > age_threshold && age_threshold > Duration::ZERO {
         let pressure = (metrics.backlog_age.as_secs_f64() / age_threshold.as_secs_f64()).min(3.0);
         delta += 0.03 * pressure;
     }
 
+    // A low sync-match rate means work is landing in the backlog instead of
+    // handing straight to a waiting poller. Pull share *down* here: pushing
+    // more backlog drain at a queue that is not matching synchronously wastes
+    // dispatch capacity that other queues could use.
     if metrics.sync_match_rate < 0.5 {
         let degradation = 0.5 - metrics.sync_match_rate;
         delta -= 0.05 * (degradation / 0.5);
     }
 
+    // Polls timing out *while* a backlog exists means pollers are present but
+    // not being fed — nudge share up to close that gap.
     if metrics.poll_success_rate < 0.7 && metrics.backlog_age > Duration::ZERO {
         delta += 0.02;
     }
@@ -367,6 +435,13 @@ pub(crate) fn evaluate_drain_share(current: f64, metrics: &QueueMetricsSnapshot)
     (current + delta).clamp(MIN_DRAIN_SHARE, MAX_DRAIN_SHARE)
 }
 
+/// Run one control iteration and return how long to wait before the next one.
+///
+/// The returned interval is inversely proportional to the largest share change
+/// this tick: a volatile system is re-evaluated sooner (down to
+/// [`MIN_CONTROL_INTERVAL`]) while a settled one backs off (up to
+/// [`MAX_CONTROL_INTERVAL`]), so the controller spends effort only when shares
+/// are actually moving.
 pub(crate) fn control_loop_tick(metrics: &DeliveryMetrics, fairness: &FairnessState) -> Duration {
     let (snapshot, poll_counts) = metrics.take_snapshot_internal(true);
     let current = fairness.snapshot();
@@ -385,6 +460,8 @@ pub(crate) fn control_loop_tick(metrics: &DeliveryMetrics, fairness: &FairnessSt
 
     fairness.apply_adjustment(adjustments, &poll_counts, OffsetDateTime::now_utc());
 
+    // No tracked queues: nothing to tune, fall back to the default cadence
+    // instead of computing a volatility-based interval from an empty set.
     if snapshot.queues.is_empty() {
         return DEFAULT_CONTROL_INTERVAL;
     }

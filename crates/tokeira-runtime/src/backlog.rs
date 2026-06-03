@@ -1,3 +1,25 @@
+//! Durable backlog: the bridge between the in-memory brokers and storage.
+//!
+//! The brokers ([`InMemoryBroker`], [`InMemoryActivityBroker`]) are a derived
+//! delivery optimization; the durable backlog in storage is authoritative. This
+//! module owns the two background loops that keep those two views reconciled
+//! without making an idle system expensive:
+//!
+//! - The **grace scanner** (`scan_grace_once`) demotes tasks that have sat
+//!   unclaimed in a broker past their grace window into the durable backlog.
+//!   This caps how long delivery state lives only in memory: if no poller takes
+//!   a task promptly, it must not pin memory or be lost on process death, so it
+//!   moves to storage where it can be re-delivered later.
+//! - The **drain loop** (`drain_once`) re-hydrates the brokers from the
+//!   durable backlog, but only for queues that currently have waiting pollers.
+//!   Draining is demand-driven precisely so inactivity stays cheap — a backlog
+//!   with no listeners is never read.
+//!
+//! Because the durable backlog is the source of truth, a failed persist during
+//! grace scanning is recovered by re-publishing the tasks to the broker rather
+//! than dropping them: until storage accepts them, the in-memory copy is the
+//! only record that the work exists.
+
 use std::sync::Arc;
 
 use time::OffsetDateTime;
@@ -8,6 +30,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{DeliveryMetrics, FairnessState, InMemoryActivityBroker, InMemoryBroker};
 
+/// Timing and batching knobs for the backlog reconciliation loops.
+///
+/// The grace windows decide how long a task may live only in a broker before it
+/// is demoted to durable storage; longer windows favor low-latency re-delivery
+/// to a returning poller, shorter windows bound in-memory exposure to process
+/// loss. `drain_batch_limit` caps how much is re-hydrated per queue per pass so
+/// a deep backlog cannot starve other queues or flood a single drain tick.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BacklogConfig {
     pub workflow_grace_window: tokio::time::Duration,
@@ -29,6 +58,13 @@ impl Default for BacklogConfig {
     }
 }
 
+/// Demote broker tasks that have outlived their grace window into the durable
+/// backlog, in one pass.
+///
+/// A task only reaches here if it sat in a broker, unclaimed, longer than its
+/// grace window — the signal that no poller is currently interested. Moving it
+/// to storage frees the in-memory copy and ensures the work survives process
+/// loss. The drain loop will bring it back when a poller reappears.
 pub(crate) async fn scan_grace_once<R>(
     broker: &InMemoryBroker,
     activity_broker: &InMemoryActivityBroker,
@@ -51,6 +87,10 @@ pub(crate) async fn scan_grace_once<R>(
     entries.extend(expired_activity.iter().map(activity_to_backlog_entry));
 
     if let Err(error) = repo.persist_to_backlog(entries).await {
+        // The tasks were already removed from the brokers above. Until storage
+        // acknowledges them, the in-memory copy is the only record they exist,
+        // so re-publish rather than drop — losing them here would silently lose
+        // work the durable backlog never received.
         tracing::warn!(
             ?error,
             "failed to persist expired live-ready tasks to backlog"
@@ -90,6 +130,13 @@ pub(crate) async fn run_grace_scanner<R>(
     }
 }
 
+/// Re-hydrate the brokers from the durable backlog, in one pass.
+///
+/// Draining is demand-driven: only queues with waiting pollers are read, so an
+/// idle backlog with no listeners costs nothing to keep. Per queue, the amount
+/// pulled is the lesser of the fairness budget and `drain_batch_limit` — the
+/// budget is what prevents one hot queue from monopolising re-delivery and
+/// starving others.
 pub(crate) async fn drain_once<R>(
     broker: &InMemoryBroker,
     activity_broker: &InMemoryActivityBroker,
@@ -117,6 +164,10 @@ pub(crate) async fn drain_once<R>(
                     max_age = max_age.max(age);
                     match entry.payload {
                         BacklogPayload::Workflow { logical_seq } => {
+                            // Re-delivered tasks drop their sticky hint: the
+                            // original worker affinity is stale by the time work
+                            // has aged into the backlog, so let any poller take
+                            // it rather than wait again for a specific worker.
                             broker
                                 .publish_workflow_task(
                                     DispatchableWorkflowTask {
@@ -143,6 +194,9 @@ pub(crate) async fn drain_once<R>(
                     fairness.consume_budget(&queue, drained_count as u32);
                     metrics.set_backlog_age(&queue, max_age);
                 }
+                // A short read means the backlog is exhausted for this queue;
+                // reset the reported age to zero so fairness stops treating it
+                // as a pressured, aging backlog.
                 if drained_count < limit {
                     metrics.set_backlog_age(&queue, std::time::Duration::ZERO);
                 }
@@ -238,6 +292,8 @@ fn workflow_to_backlog_entry(task: &crate::broker::TimestampedWorkflowTask) -> B
             logical_seq: task.task.logical_seq,
         },
         scheduled_at: task.scheduled_at,
+        // Placeholder: storage assigns the authoritative monotonic insertion
+        // sequence on persist; the value supplied here is ignored.
         insertion_seq: 0,
     }
 }

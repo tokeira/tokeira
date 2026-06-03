@@ -1,4 +1,34 @@
-//! Shard recovery helpers: one-time sweep and lease renewal.
+//! Shard recovery: one-time volatile-state sweep and lease renewal.
+//!
+//! When this node takes ownership of a shard it must rebuild the *derived*
+//! delivery and timeout state that lives only in memory — republished workflow
+//! and activity tasks, due timers, and the workflow/WFT/activity/Nexus timeout
+//! tracking sets — from the durable transition log, which is the sole authority.
+//! [`sweep_shard`] performs that rebuild; [`run_lease_renewer`] keeps the shard's
+//! durable lease alive for as long as this node owns it.
+//!
+//! Crash-safety and idempotency. The sweep reads durable state and reconstructs
+//! in-memory derived state; it commits nothing new. Re-running it (after a crash,
+//! a failover, or a re-acquire) therefore reproduces the same in-memory state and
+//! cannot corrupt anything — republishing a task the previous owner already
+//! delivered is harmless because delivery is at-least-once and the kernel fences
+//! duplicates by sequence. This is why the sweep is allowed to run unconditionally
+//! on every takeover.
+//!
+//! Ordering. The sweep must complete before the shard is marked `Active` and
+//! starts admitting commands (see the `runtime::membership` client); admitting work
+//! against half-reconstructed in-memory state would dispatch against an incomplete
+//! view. The lease renewer is spawned alongside the sweep and signals loss through
+//! its `on_lost` channel, so a shard whose lease is fenced mid-sweep can be torn
+//! down rather than activated.
+//!
+//! Epoch / lease interaction. Lease acquisition yields a `ShardEpoch` that every
+//! subsequent commit for the shard carries; an older epoch is rejected at commit
+//! time. The renewer does not touch the epoch — it only refreshes the lease's
+//! expiry — so a `Rejected` outcome means another node fenced this one and the
+//! local shard must be relinquished. The sweep deliberately does not consult the
+//! epoch: it reconstructs derived state regardless, because correctness rests on
+//! commit-time fencing, not on the sweep.
 
 use std::sync::Arc;
 
@@ -21,6 +51,9 @@ use crate::{
 };
 
 /// Observability summary produced by a shard sweep.
+///
+/// Pure counters of what the sweep reconstructed; carries no correctness weight,
+/// it exists so callers can log and meter recovery work.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SweepResult {
     pub workflow_tasks_republished: usize,
@@ -33,7 +66,18 @@ pub struct SweepResult {
     pub expired_sticky_claims_cleared: usize,
 }
 
-/// Reconstruct volatile delivery state for a newly-owned shard.
+/// Reconstruct volatile delivery and timeout state for a newly-owned shard.
+///
+/// Reads the durable transition log for `shard_id` and rebuilds the in-memory
+/// derived state the runtime needs to dispatch: republishes dispatchable workflow
+/// and activity tasks to the brokers, injects timers that are already due, and
+/// repopulates the workflow/WFT/activity/Nexus timeout tracking sets. Returns a
+/// [`SweepResult`] tallying the work.
+///
+/// Idempotent and crash-safe: it commits nothing and only mirrors durable state
+/// into memory, so it is safe to run on every shard takeover and to re-run after
+/// a crash (see module docs). Must finish before the shard is marked `Active`, so
+/// no command is admitted against a partially-rebuilt view.
 pub async fn sweep_shard<R>(
     shard_id: ShardId,
     repo: &R,
@@ -56,6 +100,11 @@ where
         .list_dispatchable_workflow_tasks_for_shard(shard_id, usize::MAX)
         .await?
     {
+        // A sticky claim points at a specific worker on the previous owner. If it
+        // has already expired by sweep time, clear it so the task republishes to
+        // the general queue instead of waiting on a worker this node has no
+        // affinity with — otherwise recovery would strand the task until the dead
+        // claim lapsed again.
         if task
             .sticky_preferred
             .as_ref()
@@ -127,6 +176,11 @@ where
         .list_open_activities_for_shard(shard_id, usize::MAX)
         .await?
     {
+        // Heartbeat history is volatile and not durable: on rebuild the heartbeat
+        // clock restarts (`last_heartbeat_at: None`) and schedule-to-start is
+        // re-anchored at the original schedule time. Restarting the heartbeat
+        // clock from takeover avoids spuriously timing out an activity whose last
+        // heartbeat predated the failover.
         activity_tracking.insert(ActivityTrackingEntry {
             run_key: entry.run_key,
             shard_id,
@@ -158,7 +212,16 @@ where
     Ok(result)
 }
 
-/// Periodically renew a shard lease until cancelled or rejected.
+/// Periodically renew a shard lease until cancelled or fenced.
+///
+/// Loops on `interval`, calling `renew_bundle` to refresh the lease's expiry
+/// under the held `epoch`. A `Rejected` outcome means another node has taken the
+/// shard (this node is fenced), so it signals `on_lost` and stops immediately;
+/// transient renewal errors are tolerated up to `max_retries` consecutive
+/// failures before also signalling loss, so a brief storage blip does not
+/// surrender an otherwise-owned shard. `on_lost` is a one-shot, fired at most
+/// once; the caller uses it to tear the shard down. Cancelling `cancel` (e.g. on
+/// graceful relinquish) exits without signalling loss.
 pub async fn run_lease_renewer<R>(
     repo: Arc<R>,
     shard_id: ShardId,
@@ -322,7 +385,8 @@ mod tests {
             pending_updates: Default::default(),
             admitted_updates: Default::default(),
             pending_nexus_operations: Default::default(),
-            versioning_override: None,
+            versioning_info: None,
+            worker_deployment_name: None,
             completion_callbacks: Vec::new(),
             started_at: fixed_now(),
             first_run_started_at: None,

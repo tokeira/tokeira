@@ -105,6 +105,12 @@ struct WorkflowWaiter {
     response_tx: oneshot::Sender<Result<Option<StartedWorkflowTask>>>,
 }
 
+/// A workflow waiter that has been pulled off the wait queue so a producer can
+/// hand it a task directly (synchronous match), bypassing the ready queues.
+///
+/// Holding a `ReservedPoller` is a claim on that specific parked poll: if the
+/// producer cannot ultimately deliver, it must hand the reservation back via
+/// [`InMemoryBroker::return_reserved_poller`] so the poller is not stranded.
 #[derive(Debug)]
 pub struct ReservedPoller {
     queue: QueueKey,
@@ -117,11 +123,20 @@ impl ReservedPoller {
         &self.worker_identity
     }
 
+    /// Deliver a started task to the reserved poller. Returns `false` if the
+    /// poller already went away (timed out or cancelled), so the caller can
+    /// re-route the task instead of losing it.
     pub fn deliver(self, task: StartedWorkflowTask) -> bool {
         self.response_tx.send(Ok(Some(task))).is_ok()
     }
 }
 
+/// Outcome of a workflow poll.
+///
+/// `Queued` means a dispatchable task was taken from a ready queue and the
+/// caller must drive it to a started state. `Started` means the task was handed
+/// over already-started through the synchronous reservation path
+/// ([`ReservedPoller`]), so no further start work is needed.
 #[derive(Debug, PartialEq)]
 pub enum WorkflowPollResult {
     Queued(DispatchableWorkflowTask, Instant),
@@ -174,6 +189,12 @@ impl InMemoryBroker {
         runtime_metrics::set_queue_depth(queue, "general", general);
     }
 
+    /// Take a specific run's task out of the general tier by run key, if present.
+    ///
+    /// Used to pull a task for direct/eager dispatch to a run the caller is
+    /// already handling, rather than letting it flow through the normal poll
+    /// path. Only the general tier is searched — sticky tasks are owned by their
+    /// preferred worker and must not be claimed out from under it here.
     pub async fn try_claim_workflow_task(
         &self,
         queue: &QueueKey,
@@ -356,6 +377,11 @@ impl InMemoryBroker {
             .map(|(task, entered_at)| WorkflowPollResult::Queued(task, entered_at)))
     }
 
+    /// Pull one waiting poller off `queue`'s wait list for synchronous delivery.
+    ///
+    /// Skips waiters whose response channel has already closed (the poll timed
+    /// out or was cancelled) so a producer never reserves a dead poller. Returns
+    /// `None` when no live waiter is parked.
     pub async fn try_reserve_poller(&self, queue: &QueueKey) -> Option<ReservedPoller> {
         let mut inner = self.inner.lock().await;
         loop {
@@ -375,6 +401,11 @@ impl InMemoryBroker {
         }
     }
 
+    /// Return a previously reserved poller to the front of its wait list.
+    ///
+    /// Re-queued at the front (not the back) so a poller whose reservation could
+    /// not be fulfilled keeps its place in line rather than being penalised for
+    /// the failed synchronous-match attempt. A closed channel is dropped.
     pub async fn return_reserved_poller(&self, reserved: ReservedPoller) {
         if reserved.response_tx.is_closed() {
             return;
@@ -399,6 +430,10 @@ impl InMemoryBroker {
         self.wake.notify_waiters();
     }
 
+    /// Queues that currently have at least one parked poller.
+    ///
+    /// The backlog drain loop uses this to stay demand-driven — it only
+    /// re-hydrates queues someone is actually waiting on.
     pub async fn queues_with_waiters(&self) -> HashSet<QueueKey> {
         self.inner
             .lock()
@@ -430,6 +465,13 @@ impl InMemoryBroker {
         None
     }
 
+    /// Remove and return tasks that have sat in either tier longer than
+    /// `grace_window`, clearing their dedup keys.
+    ///
+    /// This is the grace scanner's hook: expired tasks leave the in-memory
+    /// broker here and are then persisted to the durable backlog. Clearing the
+    /// dedup keys is what lets the same logical task be re-published later
+    /// (e.g. when drained back from storage) without being suppressed.
     pub(crate) async fn take_expired(
         &self,
         grace_window: Duration,
@@ -645,6 +687,12 @@ impl InMemoryActivityBroker {
         runtime_metrics::set_queue_depth(queue, "general", depth);
     }
 
+    /// Take a specific activity out of the ready queue by run key and activity
+    /// id, if present.
+    ///
+    /// The direct-claim counterpart to [`InMemoryBroker::try_claim_workflow_task`],
+    /// for routing a known activity to a caller already handling it instead of
+    /// via the normal poll path.
     pub async fn try_claim_activity_task(
         &self,
         queue: &QueueKey,
@@ -808,6 +856,9 @@ impl InMemoryActivityBroker {
     }
 }
 
+/// Per-entry decision while scanning the sticky tier on a poll: hand the task to
+/// the polling worker (`Take`), demote a stale/unowned sticky task to the
+/// general tier (`Promote`), or leave it for its preferred worker (`Keep`).
 enum StickyAction {
     Keep,
     Promote,

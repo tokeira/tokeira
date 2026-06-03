@@ -330,7 +330,7 @@ fn assignment_applies(rule: &AssignmentRule, workflow_id: &WorkflowId) -> bool {
     deterministic_bucket(&workflow_id.0) < (f64::from(ramp) * 100.0) as u64
 }
 
-fn deterministic_bucket(value: &str) -> u64 {
+pub(crate) fn deterministic_bucket(value: &str) -> u64 {
     // FNV-1a is stable across processes, unlike DefaultHasher's seeded state.
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in value.as_bytes() {

@@ -51,6 +51,9 @@ async fn update_completed_notifies_waiting_caller() -> Result<()> {
             identity: WorkerIdentity("worker-a".into()),
             sdk_metadata: None,
             worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
             commands: vec![
                 WorkflowCommand::ProtocolMessage {
                     message_id: "msg-accept-update-1".into(),
@@ -117,6 +120,9 @@ async fn update_rejected_notifies_waiting_caller() -> Result<()> {
             identity: WorkerIdentity("worker-a".into()),
             sdk_metadata: None,
             worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
             commands: vec![
                 WorkflowCommand::ProtocolMessage {
                     message_id: "msg-accept-update-1".into(),
@@ -181,6 +187,9 @@ async fn update_timeout_does_not_block_late_completion_commit() -> Result<()> {
             identity: WorkerIdentity("worker-a".into()),
             sdk_metadata: None,
             worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
             commands: vec![
                 WorkflowCommand::ProtocolMessage {
                     message_id: "msg-accept-update-1".into(),
@@ -252,6 +261,9 @@ async fn run_close_notifies_waiting_update_callers() -> Result<()> {
             identity: WorkerIdentity("worker-a".into()),
             sdk_metadata: None,
             worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
             commands: vec![WorkflowCommand::CompleteWorkflow {
                 result: payloads("closed"),
             }],
@@ -329,6 +341,9 @@ async fn multiple_updates_resolved_in_single_wft() -> Result<()> {
             identity: WorkerIdentity("worker-a".into()),
             sdk_metadata: None,
             worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
             commands: vec![
                 WorkflowCommand::ProtocolMessage {
                     message_id: "msg-accept-update-1".into(),
@@ -414,6 +429,7 @@ async fn start_workflow(
             task_queue: TaskQueueName(task_queue.into()),
             deployment: None,
             build_id: None,
+            versioning_override: None,
             input: Payloads::default(),
             header: None,
             memo: Memo::default(),

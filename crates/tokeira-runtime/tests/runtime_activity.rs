@@ -573,6 +573,9 @@ async fn start_and_schedule_activity_with_version(
             identity: WorkerIdentity("worker-a".to_string()),
             sdk_metadata: None,
             worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
             commands: vec![WorkflowCommand::ScheduleActivity {
                 activity_id: activity_id.to_string(),
                 activity_type: "activity-type".to_string(),
@@ -621,6 +624,7 @@ fn start_request(
         reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
         deployment: None,
         build_id: None,
+        versioning_override: None,
         attempt: 1,
         continued_execution_run_id: None,
         first_execution_run_id: None,

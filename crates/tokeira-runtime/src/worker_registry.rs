@@ -64,6 +64,24 @@ impl WorkerRegistry {
                     .is_some_and(|last_seen| now - last_seen <= recent_window)
         })
     }
+
+    pub fn has_recent_poller_for_deployment_version(
+        &self,
+        namespace_id: NamespaceId,
+        deployment: &DeploymentId,
+        build_id: &BuildId,
+        now: OffsetDateTime,
+        recent_window: time::Duration,
+    ) -> bool {
+        self.inner.lock().unwrap().iter().any(|(key, metadata)| {
+            key.namespace_id == namespace_id
+                && metadata.deployment.as_ref() == Some(deployment)
+                && metadata.build_id.as_ref() == Some(build_id)
+                && metadata
+                    .last_seen_at
+                    .is_some_and(|last_seen| now - last_seen <= recent_window)
+        })
+    }
 }
 
 #[cfg(test)]

@@ -148,11 +148,22 @@ impl LaneMessage {
             command,
             reply_tx,
             enqueued_at: std::time::Instant::now(),
+            // Capture the submitter's trace context at enqueue time: crossing
+            // the lane channel is an async hop that severs span parentage, so
+            // the origin ids are carried explicitly to relink the processing
+            // span back to the caller.
             trace_context: ChannelTraceContext::capture_current(),
         }
     }
 }
 
+/// Lane-local cache of loaded run state.
+///
+/// This is an execution-locality optimization, never a source of truth: it
+/// lets consecutive commands on the same run skip a storage reload while the
+/// run is hot. Entries are evicted on OCC conflict (the cached base lost the
+/// commit race) and bounded by capacity and idle age so dormant runs don't
+/// pin memory.
 struct LaneCache {
     max_entries: usize,
     idle_timeout: std::time::Duration,
@@ -281,6 +292,10 @@ where
     let (tx, mut rx) = mpsc::channel::<LaneMessage>(1024);
     let requeue_tx = tx.clone();
     tokio::spawn(async move {
+        // One lane-local cache shared across activations: a run's loaded state
+        // survives between commands so repeated work on the same run avoids a
+        // storage reload. The cache is never authoritative — it is evicted on
+        // conflict and bounded by capacity/idle policy.
         let mut cache = LaneCache::new(&config);
         while let Some(message) = rx.recv().await {
             let buffered = run_activation_with_cache(
@@ -299,6 +314,9 @@ where
                 &mut cache,
             )
             .await;
+            // Commands for other runs that were pulled while draining the
+            // active run are requeued here so they land back in channel order
+            // and get routed to a fresh activation.
             for message in buffered {
                 if requeue_tx.send(message).await.is_err() {
                     break;
@@ -348,6 +366,18 @@ where
     .await
 }
 
+/// Process one activation for `first_message.run_key`: handle the triggering
+/// command, then opportunistically drain further commands for the *same* run
+/// from the channel without yielding the lane.
+///
+/// Coalescing same-run work into one activation is what makes bursty runs
+/// cheap (signal storms, rapid update/resolution traffic) — the run's state
+/// stays hot in the lane cache across the batch instead of being reloaded per
+/// command. Commands for *other* runs encountered while draining are returned
+/// in the `buffered` vec for the caller to requeue, so this lane never starts
+/// processing a second run mid-activation. The drain is bounded by
+/// [`LaneConfig::max_drain_per_activation`] to keep one hot run from starving
+/// the rest of the lane.
 async fn run_activation_with_cache<K, R, P>(
     kernel: &K,
     repo: &R,
@@ -444,6 +474,10 @@ where
                         }
                     }
                     if new_state.closed_at.is_some() {
+                        // The run is durably closed; tear down its in-memory
+                        // timeout/update tracking so background scanners can't
+                        // fire spurious timeouts or strand update waiters
+                        // against a run that can no longer transition.
                         workflow_timeout_tracking.remove(message.run_key);
                         wft_timeout_tracking.remove(message.run_key);
                         nexus_timeout_tracking.remove_all_for_run(message.run_key);
@@ -453,6 +487,11 @@ where
                         && let Some((successor_run_id, fork_event_id)) =
                             extract_reset_metadata(&history_events)
                     {
+                        // A reset closes the predecessor and forks a successor
+                        // run at `fork_event_id`. The successor is materialized
+                        // here rather than through the normal start path, so
+                        // its timeout tracking has to be re-seeded explicitly
+                        // below — nothing else will register it.
                         let successor_run_key = RunKey::derive(
                             new_state.namespace_id,
                             &new_state.workflow_id,
@@ -530,11 +569,17 @@ where
                     }
                 }
                 if reserved_start_has_direct_delivery(&committed_command) {
+                    // A start that reserved a waiting poller will hand the
+                    // first workflow task straight to that poller, so drop the
+                    // broker-enqueue op to avoid scheduling the same WFT twice.
                     dispatch_ops.retain(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. }));
                 }
                 if !dispatch_ops.is_empty()
                     && let Err(error) = publisher.publish(message.run_key, &dispatch_ops).await
                 {
+                    // Dispatch is a derived effect, not authority: a failed
+                    // publish is logged but not fatal because the sweeper
+                    // reconstructs dispatchable work from committed state.
                     tracing::warn!(?error, run_key = ?message.run_key, "failed to publish dispatch ops");
                 }
                 if let Some(error) = reset_materialization_error {
@@ -553,6 +598,10 @@ where
                             nexus_timeout_tracking.remove(message.run_key, &request.operation_id);
                         }
                         if new_state.closed_at.is_some() {
+                            // A child run closing must notify its parent so the
+                            // parent can resolve the pending child future. Skip
+                            // when the close is a reset fork (handled above) —
+                            // that is a new lineage, not a child completion.
                             if let Some(parent_run_key) = new_state.parent_run_key
                                 && extract_reset_metadata(&history_events).is_none()
                             {
@@ -600,11 +649,22 @@ where
                                     );
                                     let publisher = publisher.clone();
                                     let child_run_key = message.run_key;
+                                    // Deliver to the parent off this lane: the
+                                    // parent may hash to the very lane running
+                                    // this activation, and submitting inline
+                                    // would deadlock waiting on a lane that is
+                                    // busy with us. The spawned submit routes
+                                    // through the parent's own lane.
                                     tokio::spawn(async move {
                                         if let Err(error) =
                                             publisher.submit_to_run(parent_run_key, command).await
                                         {
                                             let error_message = error.to_string();
+                                            // A parent that already moved on
+                                            // (kernel rejects the resolution) or
+                                            // no longer exists is an expected
+                                            // race, not an operational fault —
+                                            // log it quietly.
                                             if error_message.contains("kernel rejected")
                                                 || error_message.contains("not found")
                                             {
@@ -658,6 +718,14 @@ where
                                     retry_policy,
                                 )) = successor_event
                                 {
+                                    // Carry the chain's origin forward: the
+                                    // successor inherits the first run's id and
+                                    // start time so execution-level timeouts and
+                                    // lineage queries span the whole
+                                    // continue-as-new chain, not just this hop.
+                                    // `unwrap_or(self)` seeds these on the first
+                                    // run, which has no predecessor to inherit
+                                    // from.
                                     let first_execution_run_id = Some(
                                         new_state
                                             .first_execution_run_id
@@ -673,6 +741,9 @@ where
                                         &new_state.workflow_id,
                                         successor_run_id,
                                     );
+                                    // Root identity only propagates within a
+                                    // child lineage; a top-level run is its own
+                                    // root, so the successor carries no root ref.
                                     let (root_workflow_id, root_run_id) = if new_state
                                         .parent_run_key
                                         .is_some()
@@ -695,6 +766,9 @@ where
                                         },
                                         deployment: new_state.deployment.clone(),
                                         build_id: new_state.build_id.clone(),
+                                        versioning_override: new_state
+                                            .versioning_override()
+                                            .cloned(),
                                         input,
                                         header: None,
                                         memo,
@@ -726,6 +800,11 @@ where
                                         last_completion_result: new_state.close_result.clone(),
                                         first_run_started_at,
                                         request: tokeira_types::RequestContext {
+                                            // Deterministic request id keyed on
+                                            // (predecessor, successor) so a
+                                            // replayed continue-as-new dedupes
+                                            // to the same successor start instead
+                                            // of forking a duplicate run.
                                             request_id: tokeira_types::RequestId(format!(
                                                 "continue-as-new:{}:{}",
                                                 new_state.run_id.0, successor_run_id.0
@@ -742,6 +821,12 @@ where
                                         workflow_timeout_tracking.clone();
                                     let predecessor_run_key = message.run_key;
                                     let shard_count = shard_owner.read().unwrap().shard_count();
+                                    // Start the successor off-lane for the same
+                                    // reason as child delivery: it may route to
+                                    // this lane, and an inline submit would
+                                    // self-deadlock. The successor's run timeout
+                                    // tracking is registered from the spawned
+                                    // task once its start commits.
                                     tokio::spawn(async move {
                                         match publisher
                                             .submit_to_run(
@@ -818,14 +903,22 @@ where
         let _ = message.reply_tx.send(reply);
         drained += 1;
 
+        // Stop the activation on error so a failing command doesn't drag the
+        // rest of the batch down, and honor the drain bound so one hot run
+        // can't monopolize the lane.
         if stop_draining || drained >= drain_limit {
             break;
         }
 
         match rx.try_recv() {
+            // Same run: keep draining within this activation so its state stays
+            // hot in the cache (the coalescing win for bursty runs).
             Ok(next) if next.run_key == active_run_key => {
                 current = Some(next);
             }
+            // Different run: hand it back to the caller to requeue rather than
+            // processing it here. Switching runs mid-activation would break the
+            // one-run-per-activation residency the cache relies on.
             Ok(other) => {
                 buffered.push(other);
                 break;
@@ -894,6 +987,14 @@ where
     .await
 }
 
+/// Run one command through the kernel and commit it, retrying the
+/// load → apply → commit cycle on OCC conflict up to `max_retries`.
+///
+/// The retry loop reloads state on each conflict because the kernel is pure:
+/// a correct transition must be recomputed against the state that actually
+/// won the previous commit race, never replayed blindly. Returns the dispatch
+/// ops and history events from the *committed* transition so the caller can
+/// publish derived effects only after durability is established.
 async fn handle_message_with_cache<K, R>(
     kernel: &K,
     repo: &R,
@@ -952,6 +1053,10 @@ where
                 transition.next_state.workflow_id.0.as_bytes(),
                 owner.shard_count(),
             );
+            // Fast local reject if we plainly don't hold the bundle. This is an
+            // optimization, not the safety boundary: a stale owner that still
+            // believes it owns the bundle is fenced by the epoch carried into
+            // the storage commit below, which is the only authoritative check.
             let Some(local_epoch) = owner.epoch_of(bundle_id) else {
                 return Ok((
                     CommitResult::Conflict {
@@ -961,6 +1066,10 @@ where
                     SmallVec::new(),
                 ));
             };
+            // With no placement controller there is no durable lease to fence
+            // against, so committing at ZERO skips the lease read. Under a
+            // controller the real epoch must travel to storage so a superseded
+            // owner's writes are rejected by lease fencing.
             let commit_epoch = if config.controller_managed_placement {
                 local_epoch
             } else {
@@ -1010,6 +1119,10 @@ where
                 return Ok((CommitResult::Duplicate, SmallVec::new(), SmallVec::new()));
             }
             CommitResult::Conflict { reason } => {
+                // A conflict means our loaded base state was stale relative to
+                // what storage committed. Evict so the retry reloads fresh
+                // state and re-runs the kernel against it — retrying against the
+                // cached (losing) base would just conflict again.
                 cache.evict(run_key);
                 runtime_metrics::record_occ_retry(RetryOutcomeLabel::Retry);
                 if attempts >= max_retries {
@@ -1078,6 +1191,9 @@ fn command_type_name(command: &Command) -> &'static str {
     }
 }
 
+/// True when a start reserved a waiting poller and will hand it the first
+/// workflow task directly, meaning the broker-enqueue dispatch op for that WFT
+/// would be a duplicate and must be suppressed.
 fn reserved_start_has_direct_delivery(command: &Command) -> bool {
     matches!(
         command,
@@ -1177,6 +1293,11 @@ fn history_event_type_name(event: &HistoryEvent) -> &'static str {
     }
 }
 
+/// Detect a reset from a committed close: a `WorkflowTaskFailed` carrying the
+/// `ResetWorkflow` cause names the successor run and the fork point. Returns
+/// `(new_run_id, fork_event_id)` so the lane can materialize the forked run.
+/// Distinguishes a reset close from an ordinary close (which delivers a child
+/// resolution to the parent instead).
 fn extract_reset_metadata(history_events: &[HistoryEvent]) -> Option<(tokeira_types::RunId, i64)> {
     history_events.iter().find_map(|event| match &event.kind {
         HistoryEventKind::WorkflowTaskFailed {
@@ -1921,7 +2042,8 @@ mod tests {
             pending_updates: BTreeMap::new(),
             admitted_updates: std::collections::HashSet::new(),
             pending_nexus_operations: BTreeMap::new(),
-            versioning_override: None,
+            versioning_info: None,
+            worker_deployment_name: None,
             completion_callbacks: Vec::new(),
             started_at: OffsetDateTime::now_utc(),
             first_run_started_at: None,

@@ -48,6 +48,9 @@ async fn child_workflow_happy_path_delivers_start_and_completion_back_to_parent(
             identity: WorkerIdentity("worker-parent".to_string()),
             sdk_metadata: None,
             worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
             commands: vec![WorkflowCommand::StartChildWorkflow {
                 child_workflow_id: child_workflow_id.clone(),
                 namespace_id,
@@ -97,6 +100,9 @@ async fn child_workflow_happy_path_delivers_start_and_completion_back_to_parent(
             identity: WorkerIdentity("worker-child".to_string()),
             sdk_metadata: None,
             worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
             commands: vec![WorkflowCommand::CompleteWorkflow {
                 result: payloads("child-result"),
             }],
@@ -171,6 +177,9 @@ async fn parent_close_policy_terminate_closes_started_child() -> Result<()> {
             identity: WorkerIdentity("worker-parent".to_string()),
             sdk_metadata: None,
             worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
             commands: vec![WorkflowCommand::CompleteWorkflow {
                 result: payloads("parent-done"),
             }],
@@ -233,6 +242,9 @@ async fn parent_close_policy_request_cancel_requests_cancel_on_child() -> Result
             identity: WorkerIdentity("worker-parent".to_string()),
             sdk_metadata: None,
             worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
             commands: vec![WorkflowCommand::CompleteWorkflow {
                 result: payloads("parent-done"),
             }],
@@ -298,6 +310,9 @@ async fn duplicate_child_start_delivers_failed_confirmation_to_parent() -> Resul
             identity: WorkerIdentity("worker-parent".to_string()),
             sdk_metadata: None,
             worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
             commands: vec![WorkflowCommand::StartChildWorkflow {
                 child_workflow_id: child_workflow_id.clone(),
                 namespace_id,
@@ -364,6 +379,9 @@ async fn start_parent_with_child(
             identity: WorkerIdentity("worker-parent".to_string()),
             sdk_metadata: None,
             worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
             commands: vec![WorkflowCommand::StartChildWorkflow {
                 child_workflow_id: child_workflow_id.clone(),
                 namespace_id,
@@ -470,6 +488,7 @@ fn start_request(
         reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
         deployment: None,
         build_id: None,
+        versioning_override: None,
         attempt: 1,
         continued_execution_run_id: None,
         first_execution_run_id: None,

@@ -1,8 +1,19 @@
 //! Background timer scanner and lane-routing helpers.
 //!
-//! Periodically scans durable storage for due timers and submits them
-//! to the appropriate lane for processing. Also provides the deterministic
-//! shard-based lane routing used across the runtime.
+//! Two responsibilities live here. First, the background timer scanner:
+//! periodically reads *durable* storage for timers that are due and submits a
+//! `TimerDue` command to the owning lane. The scanner holds no authoritative
+//! state of its own — storage is the source of truth for which timers are due —
+//! so a missed or duplicated tick is recovered on the next scan and is safe after
+//! crash or failover. Second, the deterministic run-to-lane routing
+//! (`lane_index_for_run_key`, `pick_lane_for_run_key`) used by every command
+//! submission path in the runtime, not just timers.
+//!
+//! Routing invariant: every command for a given `run_key` must land on the same
+//! lane, because a lane serializes the commands for the runs it owns and that
+//! serialization is what keeps per-run transitions ordered. The mapping is a pure
+//! function of the run key, so all producers (poll handlers, sweepers, the
+//! timeout scanners) agree on the lane without coordination.
 
 use std::sync::{Arc, RwLock};
 
@@ -40,6 +51,9 @@ pub(crate) fn lane_index_for(shard_id: ShardId, lane_count: usize) -> usize {
     (shard_id.0 as usize) % lane_count.max(1)
 }
 
+// Route by run key, not shard, so a run always maps to one lane regardless of how
+// shards are distributed across lanes. `dsql_spread_uuid` first diffuses the key
+// so adjacent run keys do not collide onto the same lane under the modulo.
 pub(crate) fn lane_index_for_run_key(run_key: RunKey, lane_count: usize) -> usize {
     let lane_key = dsql_spread_uuid(&[b"lane", run_key.0.as_bytes()]);
     (lane_key.as_u128() as usize) % lane_count.max(1)
@@ -149,6 +163,13 @@ pub(crate) async fn scan_due_timers_once_for_shard<R, F, Fut>(
     }
 }
 
+/// Background loop: every `scan_interval`, inject due timers for each shard this
+/// node currently owns.
+///
+/// The active-shard set is re-read each tick so ownership changes are picked up
+/// without restarting the task, and scanning is scoped per shard so a node only
+/// fires timers for runs it owns. Each due timer routes by `run_key` to the
+/// owning lane, keeping per-run command order intact.
 pub(crate) async fn run_timer_scanner<R>(
     repo: Arc<R>,
     lanes: Vec<LaneHandle>,

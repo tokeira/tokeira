@@ -1,8 +1,29 @@
-//! Runtime membership client primitives for placement-controller streams.
+//! Runtime side of the placement-controller membership stream.
 //!
-//! Uses connect-rust for the bidi streaming membership RPC. The controller
-//! sends directives (placement, budget, drain) and the runtime sends
-//! registration + periodic heartbeats.
+//! Owns the runtime node's relationship with the placement controller: it
+//! registers the node, sends periodic heartbeats describing owned bundles and
+//! lane pressure, and applies the directives the controller streams back
+//! (desired placement, connection budget, drain, routing). This is the runtime's
+//! only voice in cluster membership — the controller decides placement, this
+//! client enacts it locally.
+//!
+//! Uses connect-rust for the bidirectional streaming RPC. The stream is a single
+//! handle (no split/clone), so registration, heartbeat ticks, and inbound
+//! directives are all multiplexed through one `tokio::select!` loop in
+//! `MembershipClient::run_once`.
+//!
+//! Invariants this client upholds:
+//! - **The controller owns placement; bundle ownership is lease-gated.** Acquiring
+//!   or relinquishing a bundle is mediated by the [`LeaseRepository`]: local
+//!   [`ShardOwner`] state is only updated after the lease store confirms the
+//!   acquire/relinquish, so two nodes cannot both believe they own a bundle.
+//! - **Disconnects must not silently keep a stale connection budget.** A budget
+//!   directive carries an expiry; on reconnect, if the last budget has expired the
+//!   client resets to a safe minimal budget rather than continuing to honour a
+//!   directive the controller may no longer endorse.
+//! - **Reconnect backs off exponentially** between `reconnect_base_delay` and
+//!   `reconnect_max_delay` so a flapping controller does not amplify into a
+//!   reconnect storm.
 
 use std::{
     sync::{Arc, Mutex, RwLock},
@@ -26,24 +47,43 @@ use crate::{LaneHandle, RuntimeDrain, RuntimeDrainState, ShardOwner};
 /// Runtime-side placement-controller stream configuration.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MembershipConfig {
+    /// Controller endpoint the membership stream dials.
     pub controller_endpoint: String,
+    /// Interval between outbound heartbeats once the stream is up.
     pub heartbeat_interval: StdDuration,
+    /// First reconnect delay after a stream drop; doubles each attempt.
     pub reconnect_base_delay: StdDuration,
+    /// Ceiling on the exponential reconnect backoff.
     pub reconnect_max_delay: StdDuration,
+    /// This node's incarnation identity, used as the lease owner and reported in
+    /// registration/heartbeats so the controller can distinguish restarts.
     pub node_id: IncarnationId,
+    /// Network endpoint other nodes use to reach this runtime.
     pub node_endpoint: NodeEndpoint,
+    /// Optional availability zone, reported for zone-aware placement.
     pub zone: Option<String>,
+    /// Build/version strings reported to the controller for placement and
+    /// versioning decisions.
     pub version: String,
+    /// Build identifier reported to the controller.
     pub build_id: String,
 }
 
 impl MembershipConfig {
+    /// Lease owner string for this node — its incarnation id. Used when
+    /// acquiring/relinquishing bundle leases so ownership is attributable to a
+    /// specific node incarnation.
     pub fn owner_identity(&self) -> String {
         self.node_id.to_string()
     }
 }
 
-/// Runtime-owned dependencies used by directive handling.
+/// Client that drives the runtime's placement-controller membership stream.
+///
+/// Holds the runtime-owned dependencies directive handling needs: the lease
+/// repository (placement is lease-gated), the local [`ShardOwner`] view, the
+/// drain coordinator, and the connection-budget applier. Generic over the
+/// [`LeaseRepository`] so it can run against any storage backend.
 pub struct MembershipClient<R>
 where
     R: LeaseRepository + 'static,
@@ -93,6 +133,7 @@ impl<R> MembershipClient<R>
 where
     R: LeaseRepository + 'static,
 {
+    /// Construct a client. Does not open the stream — call [`run`](Self::run).
     pub fn new(
         config: MembershipConfig,
         leases: Arc<R>,
@@ -110,6 +151,12 @@ where
         }
     }
 
+    /// Run the membership stream until `shutdown` fires, reconnecting with
+    /// exponential backoff on transient stream failures.
+    ///
+    /// On reconnect, if the previously applied connection budget has expired the
+    /// client resets to a minimal safe budget — it must not keep honouring a
+    /// budget the controller can no longer confirm while the stream is down.
     pub async fn run(self, shutdown: CancellationToken) -> Result<()> {
         let mut backoff = self.config.reconnect_base_delay;
         loop {
@@ -187,6 +234,9 @@ where
         }
     }
 
+    /// Build the registration message sent as the first frame on a new stream,
+    /// announcing this node's identity, endpoint, zone, and build to the
+    /// controller.
     pub fn registration_message(&self) -> RuntimeRegistration {
         RuntimeRegistration {
             node_id: self.config.node_id.to_string(),
@@ -199,6 +249,9 @@ where
         }
     }
 
+    /// Build a heartbeat from current owned-bundle and drain state. Convenience
+    /// wrapper over [`heartbeat_message_with_inputs`](Self::heartbeat_message_with_inputs)
+    /// that snapshots inputs from the live [`ShardOwner`] and [`RuntimeDrain`].
     pub fn heartbeat_message(&self) -> RuntimeHeartbeat {
         self.heartbeat_message_with_inputs(HeartbeatInputs::from_shard_owner(
             &self.shard_owner.read().unwrap(),
@@ -206,6 +259,9 @@ where
         ))
     }
 
+    /// Build a heartbeat from explicitly supplied [`HeartbeatInputs`]. Separated
+    /// from input collection so callers (and tests) can report richer pressure
+    /// metrics without re-reading shared state.
     pub fn heartbeat_message_with_inputs(&self, inputs: HeartbeatInputs) -> RuntimeHeartbeat {
         use buffa::EnumValue;
         let drain_state = match inputs.drain_state {
@@ -244,28 +300,49 @@ where
     }
 }
 
+/// Snapshot of runtime load reported in a single heartbeat.
+///
+/// Decouples heartbeat *content* from how it is gathered, so the basic path
+/// (owned bundles + drain state) and the rich path (lane pressure, connection
+/// headroom) can both produce a heartbeat without the client re-reading shared
+/// state inline.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HeartbeatInputs {
+    /// Bundles this node currently owns.
     pub owned_bundles: Vec<ShardId>,
+    /// Total runnable transitions across lanes.
     pub runnable_transitions: u64,
+    /// Count of actors with work in flight.
     pub active_actor_count: u64,
+    /// Pending backlog depth.
     pub backlog_depth: u64,
+    /// Connections currently available to this node.
     pub available_connections: u32,
+    /// Fraction of the connection rate budget still unused (0.0–1.0).
     pub connection_rate_headroom: f32,
+    /// This node's drain state, so the controller knows whether it is safe to
+    /// terminate.
     pub drain_state: RuntimeDrainState,
+    /// Per-lane pressure detail.
     pub lane_pressures: Vec<HeartbeatLanePressure>,
 }
 
 /// Lane pressure data collected for heartbeat reporting.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HeartbeatLanePressure {
+    /// Index of the lane within the runtime's lane set.
     pub lane_id: u32,
+    /// Number of runnable items queued on the lane.
     pub runnable_depth: u64,
+    /// Number of actors actively executing on the lane.
     pub active_actors: u64,
+    /// Lane utilization in [0.0, 1.0].
     pub utilization: f32,
 }
 
 impl HeartbeatInputs {
+    /// Minimal inputs: owned bundles and drain state only, with load counters
+    /// zeroed. Used when richer per-lane metrics are not being collected.
     pub fn from_shard_owner(owner: &ShardOwner, drain_state: RuntimeDrainState) -> Self {
         let owned_bundles = owner.owned_shards().collect::<Vec<_>>();
         Self {
@@ -280,6 +357,9 @@ impl HeartbeatInputs {
         }
     }
 
+    /// Full inputs: derives per-lane pressure and aggregate runnable/active
+    /// counts from live lane handles, and folds in connection availability and
+    /// rate headroom. Used on the rich heartbeat path.
     pub fn from_runtime_components(
         owner: &ShardOwner,
         drain_state: RuntimeDrainState,
@@ -449,6 +529,12 @@ where
         )
     }
 
+    /// Whether the most recently applied connection budget has passed its
+    /// `valid_until` deadline.
+    ///
+    /// Returns `false` when no budget carried an expiry (the budget is open-ended).
+    /// An unparseable deadline is treated as expired (`true`) — failing safe by
+    /// re-requesting a budget rather than honouring an unreadable one.
     pub fn last_budget_expired(&self) -> bool {
         let guard = self.last_budget_valid_until.lock().unwrap();
         match &*guard {
@@ -484,7 +570,13 @@ where
 }
 
 /// Runtime boundary for controller-provided DSQL connection budgets.
+///
+/// Implemented by whatever component owns the connection reservoir/rate limiter.
+/// Keeping it a trait lets `membership` apply budgets without depending on the
+/// connection-management internals, and lets tests record applied budgets.
 pub trait ConnectionBudgetApplier: Send + Sync + std::fmt::Debug {
+    /// Apply a controller-issued budget: sustained `rate_per_second`, burst
+    /// `capacity`, and the maximum reservoir size to maintain.
     fn apply_budget(
         &self,
         rate_per_second: f64,
@@ -493,6 +585,12 @@ pub trait ConnectionBudgetApplier: Send + Sync + std::fmt::Debug {
     ) -> Result<()>;
 }
 
+/// Whether a `valid_until` Unix-second deadline lies in the past.
+///
+/// `None` means no expiry was set, so the budget is not expired. A deadline that
+/// cannot be represented as a timestamp is treated as expired — fail safe rather
+/// than trust an unreadable value. Free-function form for callers that hold only
+/// the raw seconds (e.g. directive parsing) rather than a [`MembershipClient`].
 pub fn budget_valid_until_expired(valid_until_seconds: Option<i64>) -> bool {
     let Some(seconds) = valid_until_seconds else {
         return false;

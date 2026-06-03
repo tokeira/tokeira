@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
     BuildId, DeploymentId, ExecutionStatus, Headers, LogicalTaskSeq, Memo, NamespaceId, Payload,
@@ -31,6 +32,12 @@ pub struct WorkflowState {
     pub deployment: Option<DeploymentId>,
     /// Optional build identifier for versioned task routing.
     pub build_id: Option<BuildId>,
+    /// Worker Deployment v2 versioning state for this execution.
+    #[serde(default)]
+    pub versioning_info: Option<WorkflowVersioningInfo>,
+    /// Deployment name that completed the most recent versioned workflow task.
+    #[serde(default)]
+    pub worker_deployment_name: Option<String>,
 
     /// Current lifecycle status (Running, Paused, or a
     /// terminal state).
@@ -124,8 +131,6 @@ pub struct WorkflowState {
     pub admitted_updates: std::collections::HashSet<String>,
     /// Pending Nexus operations keyed by operation ID.
     pub pending_nexus_operations: BTreeMap<String, PendingNexusOperation>,
-    /// Versioning override for this execution, if set.
-    pub versioning_override: Option<VersioningOverride>,
     /// Completion callbacks attached to this execution.
     pub completion_callbacks: Vec<CompletionCallback>,
 
@@ -149,6 +154,169 @@ impl WorkflowState {
     pub fn is_open(&self) -> bool {
         self.status.is_open()
     }
+
+    /// Return the execution-scoped versioning override, if one is set.
+    pub fn versioning_override(&self) -> Option<&VersioningOverride> {
+        self.versioning_info
+            .as_ref()
+            .and_then(|info| info.versioning_override.as_ref())
+    }
+
+    /// Resolve the deployment version that currently controls dispatch.
+    ///
+    /// Precedence (v1.31.0 `GetEffectiveDeployment`,
+    /// `service/history/workflow/util.go @ v1.31.0`): an in-flight transition
+    /// wins, then a pinned override, then the worker-reported deployment — but
+    /// only when the effective behavior is versioned. A run whose effective
+    /// behavior is UNSPECIFIED is unversioned, so its deployment is nil even if
+    /// a stale `deployment_version` lingers.
+    pub fn effective_deployment(&self) -> Option<&WorkerDeploymentVersionRef> {
+        let info = self.versioning_info.as_ref()?;
+        if let Some(transition) = &info.version_transition {
+            return Some(transition);
+        }
+        if let Some(VersioningOverride::Pinned { version }) = &info.versioning_override {
+            return Some(version);
+        }
+        (self.effective_behavior() != VersioningBehavior::Unspecified)
+            .then_some(info.deployment_version.as_ref())
+            .flatten()
+    }
+
+    /// Resolve the versioning behavior that currently controls dispatch.
+    ///
+    /// Precedence (v1.31.0 `GetEffectiveVersioningBehavior`,
+    /// `service/history/workflow/util.go @ v1.31.0`): an in-flight transition
+    /// always reads as AUTO_UPGRADE; otherwise an override wins over the
+    /// worker-reported behavior; otherwise the worker-reported behavior.
+    pub fn effective_behavior(&self) -> VersioningBehavior {
+        let Some(info) = self.versioning_info.as_ref() else {
+            return VersioningBehavior::Unspecified;
+        };
+        if info.version_transition.is_some() {
+            return VersioningBehavior::AutoUpgrade;
+        }
+        match &info.versioning_override {
+            Some(VersioningOverride::Pinned { .. }) => VersioningBehavior::Pinned,
+            Some(VersioningOverride::AutoUpgrade) => VersioningBehavior::AutoUpgrade,
+            None => info.behavior,
+        }
+    }
+
+    /// Start an in-flight transition toward a new Worker Deployment Version.
+    ///
+    /// Mirrors v1.31.0 `MutableState.StartDeploymentTransition`
+    /// (`service/history/workflow/mutable_state_impl.go @ v1.31.0`). Pinned runs
+    /// cannot transition — a pinned workflow must stay on its version, so a
+    /// differing poller's task is dropped by the caller rather than moved.
+    pub fn start_version_transition(
+        &mut self,
+        target: WorkerDeploymentVersionRef,
+        revision_number: i64,
+    ) -> Result<(), VersionTransitionError> {
+        if self.effective_behavior() == VersioningBehavior::Pinned {
+            return Err(VersionTransitionError::PinnedWorkflowCannotTransition);
+        }
+
+        let info = self
+            .versioning_info
+            .get_or_insert_with(WorkflowVersioningInfo::default);
+        info.version_transition = Some(target);
+        info.revision_number = revision_number;
+        // Clear sticky affinity and reschedule any not-yet-started pending WFT:
+        // the workflow's effective deployment just changed, so the pending task
+        // must be re-dispatched to a poller on the new target deployment rather
+        // than served from the old sticky queue. A WFT already started on the
+        // old deployment is left to finish (started_event_id set) — the
+        // transition completes when a task next completes on the target.
+        self.sticky = None;
+        if let Some(pending) = self.pending_workflow_task.as_mut()
+            && pending.started_event_id.is_none()
+        {
+            pending.started_at = None;
+            self.workflow_task_attempt = pending.attempt;
+        }
+        Ok(())
+    }
+
+    /// Apply worker-completed versioning fields from a workflow task completion.
+    ///
+    /// Mirrors v1.31.0 `afterAddWorkflowTaskCompletedEvent`
+    /// (`service/history/workflow/workflow_task_state_machine.go @ v1.31.0`).
+    pub fn apply_wft_versioning(
+        &mut self,
+        behavior: VersioningBehavior,
+        deployment_version: Option<WorkerDeploymentVersionRef>,
+        worker_deployment_name: Option<String>,
+    ) {
+        let info = self
+            .versioning_info
+            .get_or_insert_with(WorkflowVersioningInfo::default);
+        // Complete the transition only when this WFT actually completed on the
+        // transition's target deployment. A WFT that was already started when
+        // the transition began can complete on the *old* deployment; that does
+        // not finish the transition, and a fresh WFT is scheduled to drive it.
+        if info.version_transition.as_ref() == deployment_version.as_ref() {
+            info.version_transition = None;
+        }
+        info.behavior = behavior;
+        if behavior == VersioningBehavior::Unspecified {
+            // Unversioned workers do not carry a deployment version.
+            info.deployment_version = None;
+        } else {
+            info.deployment_version = deployment_version;
+        }
+        // WorkerDeploymentName tracks the most recent completion's deployment
+        // name regardless of behavior: v1.31.0 sets
+        // `executionInfo.WorkerDeploymentName = attrs.GetWorkerDeploymentName()`
+        // unconditionally, before the behavior branch
+        // (`afterAddWorkflowTaskCompletedEvent`,
+        // `service/history/workflow/workflow_task_state_machine.go @ v1.31.0`).
+        // An unversioned worker that reports a deployment name still records it.
+        self.worker_deployment_name = worker_deployment_name;
+        self.compact_versioning_info();
+    }
+
+    /// Update the execution-scoped versioning override while preserving any
+    /// other populated versioning fields.
+    pub fn set_versioning_override(&mut self, override_: Option<VersioningOverride>) {
+        match override_ {
+            Some(override_) => {
+                self.versioning_info
+                    .get_or_insert_with(WorkflowVersioningInfo::default)
+                    .versioning_override = Some(override_);
+            }
+            None => {
+                if let Some(info) = self.versioning_info.as_mut() {
+                    info.versioning_override = None;
+                    self.compact_versioning_info();
+                }
+            }
+        }
+    }
+
+    fn compact_versioning_info(&mut self) {
+        // Collapse an all-default versioning_info to None so unversioned runs
+        // carry no versioning state. worker_deployment_name is a standalone
+        // field (v1.31.0 `executionInfo.WorkerDeploymentName`) and is NOT
+        // cleared here: an unversioned worker that reported a deployment name
+        // retains it even when versioning_info compacts away.
+        if self
+            .versioning_info
+            .as_ref()
+            .is_some_and(WorkflowVersioningInfo::is_unversioned_default)
+        {
+            self.versioning_info = None;
+        }
+    }
+}
+
+/// Error returned by pure per-run versioning transitions.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum VersionTransitionError {
+    /// Pinned workflows cannot start deployment-version transitions.
+    #[error("pinned workflow cannot start a deployment-version transition")]
+    PinnedWorkflowCannotTransition,
 }
 
 /// Authoritative record of a pending workflow task.
@@ -371,12 +539,76 @@ pub struct PendingNexusOperation {
     pub started: bool,
 }
 
-/// Placeholder for worker versioning override configuration.
-///
-/// TODO(correctness): flesh out once versioning is
-/// implemented.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct VersioningOverride;
+/// Stored form of `WorkflowExecutionVersioningInfo` for one run.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowVersioningInfo {
+    /// SDK-declared behavior from the most recent completed workflow task.
+    pub behavior: VersioningBehavior,
+    /// Deployment version that completed the most recent workflow task.
+    pub deployment_version: Option<WorkerDeploymentVersionRef>,
+    /// Execution-scoped override with precedence over behavior.
+    pub versioning_override: Option<VersioningOverride>,
+    /// In-flight transition target while a task is moving to a new version.
+    pub version_transition: Option<WorkerDeploymentVersionRef>,
+    /// Monotonic routing-decision counter used as a dispatch staleness fence.
+    pub revision_number: i64,
+    /// Continue-as-new behavior for the first task of this run and retries.
+    pub continue_as_new_initial_versioning_behavior: ContinueAsNewVersioningBehavior,
+}
+
+impl WorkflowVersioningInfo {
+    fn is_unversioned_default(&self) -> bool {
+        self.behavior == VersioningBehavior::Unspecified
+            && self.deployment_version.is_none()
+            && self.versioning_override.is_none()
+            && self.version_transition.is_none()
+            && self.revision_number == 0
+            && self.continue_as_new_initial_versioning_behavior
+                == ContinueAsNewVersioningBehavior::Unspecified
+    }
+}
+
+/// Worker Deployment Version reference carried by per-run versioning state.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct WorkerDeploymentVersionRef {
+    /// Worker Deployment name.
+    pub deployment_name: String,
+    /// Build identifier within the deployment.
+    pub build_id: String,
+}
+
+/// Workflow versioning behavior stored for a run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VersioningBehavior {
+    /// Unversioned legacy execution.
+    #[default]
+    Unspecified,
+    /// Execution is pinned to its deployment version.
+    Pinned,
+    /// Execution automatically moves to the current target version.
+    AutoUpgrade,
+}
+
+/// Continue-as-new initial versioning behavior stored for a run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContinueAsNewVersioningBehavior {
+    /// No explicit continue-as-new behavior was supplied.
+    #[default]
+    Unspecified,
+    /// Start the new run with auto-upgrade behavior.
+    AutoUpgrade,
+    /// Start the new run using the ramping version.
+    UseRampingVersion,
+}
+
+/// Execution-scoped worker versioning override configuration.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VersioningOverride {
+    /// Pin the execution to a specific Worker Deployment Version.
+    Pinned { version: WorkerDeploymentVersionRef },
+    /// Force the execution into auto-upgrade behavior.
+    AutoUpgrade,
+}
 
 /// Placeholder for completion callback configuration.
 ///
@@ -393,4 +625,304 @@ pub enum LoadedRun {
     Absent,
     /// The run exists and carries its current durable state.
     Existing(WorkflowState),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, HashSet};
+
+    use serde_json::Value;
+    use tokeira_types::WorkerIdentity;
+
+    use super::*;
+
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp")
+    }
+
+    fn version(deployment_name: &str, build_id: &str) -> WorkerDeploymentVersionRef {
+        WorkerDeploymentVersionRef {
+            deployment_name: deployment_name.into(),
+            build_id: build_id.into(),
+        }
+    }
+
+    fn open_state() -> WorkflowState {
+        WorkflowState {
+            run_key: RunKey::new(),
+            namespace_id: NamespaceId::new(),
+            workflow_id: WorkflowId("workflow".into()),
+            run_id: RunId::new(),
+            workflow_type: WorkflowType("workflow-type".into()),
+            task_queue: TaskQueueName("workflow-task-queue".into()),
+            deployment: None,
+            build_id: None,
+            versioning_info: None,
+            worker_deployment_name: None,
+            status: ExecutionStatus::Running,
+            transition_seq: TransitionSeq(1),
+            last_event_id: 1,
+            next_workflow_task_seq: LogicalTaskSeq(1),
+            pending_workflow_task: None,
+            previous_started_event_id: 0,
+            workflow_task_attempt: 1,
+            sticky: None,
+            pause_info: None,
+            cancel_requested: false,
+            wft_stamp: 0,
+            memo: Memo(BTreeMap::new()),
+            search_attributes: SearchAttributes(BTreeMap::new()),
+            workflow_execution_timeout: Some(Duration::minutes(10)),
+            workflow_run_timeout: Some(Duration::minutes(5)),
+            workflow_task_timeout: Duration::seconds(10),
+            retry_policy: None,
+            attempt: 1,
+            first_execution_run_id: Some(RunId::new()),
+            original_execution_run_id: None,
+            parent_run_key: None,
+            parent_workflow_id: None,
+            parent_run_id: None,
+            parent_namespace_id: None,
+            parent_initiated_event_id: 0,
+            root_workflow_id: None,
+            root_run_id: None,
+            last_completion_result: None,
+            activities: BTreeMap::new(),
+            timers: BTreeMap::new(),
+            children: BTreeMap::new(),
+            pending_external_signals: BTreeMap::new(),
+            pending_external_cancels: BTreeMap::new(),
+            pending_updates: BTreeMap::new(),
+            admitted_updates: HashSet::new(),
+            pending_nexus_operations: BTreeMap::new(),
+            completion_callbacks: Vec::new(),
+            started_at: now(),
+            first_run_started_at: Some(now()),
+            closed_at: None,
+            close_result: None,
+            close_failure: None,
+        }
+    }
+
+    #[test]
+    fn effective_versioning_precedence_prefers_transition_then_override_then_behavior() {
+        let behavior_version = version("deployment", "behavior");
+        let override_version = version("deployment", "override");
+        let transition_version = version("deployment", "transition");
+        let mut state = open_state();
+        state.versioning_info = Some(WorkflowVersioningInfo {
+            behavior: VersioningBehavior::AutoUpgrade,
+            deployment_version: Some(behavior_version.clone()),
+            versioning_override: None,
+            version_transition: None,
+            revision_number: 7,
+            continue_as_new_initial_versioning_behavior:
+                ContinueAsNewVersioningBehavior::Unspecified,
+        });
+
+        assert_eq!(state.effective_behavior(), VersioningBehavior::AutoUpgrade);
+        assert_eq!(state.effective_deployment(), Some(&behavior_version));
+
+        state.set_versioning_override(Some(VersioningOverride::Pinned {
+            version: override_version.clone(),
+        }));
+        assert_eq!(state.effective_behavior(), VersioningBehavior::Pinned);
+        assert_eq!(state.effective_deployment(), Some(&override_version));
+
+        state
+            .versioning_info
+            .as_mut()
+            .expect("versioning info")
+            .version_transition = Some(transition_version.clone());
+        assert_eq!(state.effective_behavior(), VersioningBehavior::AutoUpgrade);
+        assert_eq!(state.effective_deployment(), Some(&transition_version));
+    }
+
+    #[test]
+    fn auto_upgrade_override_takes_precedence_over_pinned_behavior() {
+        let behavior_version = version("deployment", "behavior");
+        let mut state = open_state();
+        state.versioning_info = Some(WorkflowVersioningInfo {
+            behavior: VersioningBehavior::Pinned,
+            deployment_version: Some(behavior_version.clone()),
+            versioning_override: Some(VersioningOverride::AutoUpgrade),
+            version_transition: None,
+            revision_number: 3,
+            continue_as_new_initial_versioning_behavior:
+                ContinueAsNewVersioningBehavior::Unspecified,
+        });
+
+        assert_eq!(state.effective_behavior(), VersioningBehavior::AutoUpgrade);
+        assert_eq!(state.effective_deployment(), Some(&behavior_version));
+    }
+
+    #[test]
+    fn pinned_workflow_rejects_start_version_transition_without_mutation() {
+        let pinned_version = version("deployment", "pinned");
+        let target_version = version("deployment", "target");
+        let mut state = open_state();
+        state.versioning_info = Some(WorkflowVersioningInfo {
+            behavior: VersioningBehavior::Pinned,
+            deployment_version: Some(pinned_version),
+            versioning_override: None,
+            version_transition: None,
+            revision_number: 11,
+            continue_as_new_initial_versioning_behavior:
+                ContinueAsNewVersioningBehavior::Unspecified,
+        });
+        let before = state.clone();
+
+        let result = state.start_version_transition(target_version, 12);
+
+        assert_eq!(
+            result,
+            Err(VersionTransitionError::PinnedWorkflowCannotTransition)
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn start_version_transition_clears_sticky_and_reschedules_unstarted_wft() {
+        let target_version = version("deployment", "target");
+        let mut state = open_state();
+        state.sticky = Some(StickyAffinity {
+            worker_identity: WorkerIdentity("sticky-worker".into()),
+            expires_at: now() + Duration::seconds(30),
+        });
+        state.pending_workflow_task = Some(PendingWorkflowTask {
+            logical_seq: LogicalTaskSeq(2),
+            scheduled_event_id: 10,
+            scheduled_at: now(),
+            started_event_id: None,
+            started_at: None,
+            attempt: 4,
+        });
+        state.workflow_task_attempt = 5;
+
+        state
+            .start_version_transition(target_version.clone(), 42)
+            .expect("unpinned workflow can transition");
+
+        let info = state
+            .versioning_info
+            .expect("transition creates versioning info");
+        assert_eq!(info.version_transition, Some(target_version));
+        assert_eq!(info.revision_number, 42);
+        assert_eq!(state.sticky, None);
+        let pending = state.pending_workflow_task.expect("pending workflow task");
+        assert_eq!(pending.started_event_id, None);
+        assert_eq!(pending.started_at, None);
+        assert_eq!(state.workflow_task_attempt, pending.attempt);
+    }
+
+    #[test]
+    fn start_version_transition_leaves_started_wft_running() {
+        let target_version = version("deployment", "target");
+        let mut state = open_state();
+        state.pending_workflow_task = Some(PendingWorkflowTask {
+            logical_seq: LogicalTaskSeq(2),
+            scheduled_event_id: 10,
+            scheduled_at: now(),
+            started_event_id: Some(11),
+            started_at: Some(now()),
+            attempt: 4,
+        });
+        state.workflow_task_attempt = 5;
+
+        state
+            .start_version_transition(target_version.clone(), 42)
+            .expect("unpinned workflow can transition");
+
+        let pending = state.pending_workflow_task.expect("pending workflow task");
+        assert_eq!(pending.started_event_id, Some(11));
+        assert_eq!(pending.started_at, Some(now()));
+        assert_eq!(state.workflow_task_attempt, 5);
+    }
+
+    #[test]
+    fn apply_wft_versioning_unspecified_clears_deployment_version_but_keeps_name() {
+        let current_version = version("deployment", "current");
+        let reported_version = version("deployment", "reported");
+        let mut state = open_state();
+        state.worker_deployment_name = Some("deployment".into());
+        state.versioning_info = Some(WorkflowVersioningInfo {
+            behavior: VersioningBehavior::AutoUpgrade,
+            deployment_version: Some(current_version),
+            versioning_override: None,
+            version_transition: None,
+            revision_number: 6,
+            continue_as_new_initial_versioning_behavior:
+                ContinueAsNewVersioningBehavior::Unspecified,
+        });
+
+        state.apply_wft_versioning(
+            VersioningBehavior::Unspecified,
+            Some(reported_version),
+            Some("deployment".into()),
+        );
+
+        let info = state
+            .versioning_info
+            .expect("revision keeps info non-default");
+        assert_eq!(info.behavior, VersioningBehavior::Unspecified);
+        assert_eq!(info.deployment_version, None);
+        // v1.31.0 records the reported deployment name even for unversioned
+        // (UNSPECIFIED-behavior) completions.
+        assert_eq!(state.worker_deployment_name, Some("deployment".into()));
+    }
+
+    #[test]
+    fn apply_wft_versioning_clears_transition_only_on_matching_completion() {
+        let transition_version = version("deployment", "transition");
+        let other_version = version("deployment", "other");
+        let mut state = open_state();
+        state.versioning_info = Some(WorkflowVersioningInfo {
+            behavior: VersioningBehavior::AutoUpgrade,
+            deployment_version: None,
+            versioning_override: None,
+            version_transition: Some(transition_version.clone()),
+            revision_number: 9,
+            continue_as_new_initial_versioning_behavior:
+                ContinueAsNewVersioningBehavior::Unspecified,
+        });
+
+        state.apply_wft_versioning(
+            VersioningBehavior::AutoUpgrade,
+            Some(other_version.clone()),
+            Some("deployment".into()),
+        );
+        let info = state.versioning_info.as_ref().expect("versioning info");
+        assert_eq!(info.version_transition, Some(transition_version.clone()));
+        assert_eq!(info.deployment_version, Some(other_version));
+        assert_eq!(state.effective_deployment(), Some(&transition_version));
+
+        state.apply_wft_versioning(
+            VersioningBehavior::AutoUpgrade,
+            Some(transition_version.clone()),
+            Some("deployment".into()),
+        );
+        let info = state.versioning_info.expect("versioning info");
+        assert_eq!(info.version_transition, None);
+        assert_eq!(info.deployment_version, Some(transition_version));
+    }
+
+    #[test]
+    fn workflow_state_deserializes_without_versioning_fields_as_unversioned() {
+        let state = open_state();
+        let mut value = serde_json::to_value(&state).expect("serialize state");
+        let object = value.as_object_mut().expect("state serializes as object");
+        object.remove("versioning_info");
+        object.remove("worker_deployment_name");
+
+        let migrated: WorkflowState = serde_json::from_value(Value::Object(object.clone()))
+            .expect("missing versioning fields default");
+
+        assert_eq!(migrated.versioning_info, None);
+        assert_eq!(migrated.worker_deployment_name, None);
+        assert_eq!(
+            migrated.effective_behavior(),
+            VersioningBehavior::Unspecified
+        );
+        assert_eq!(migrated.effective_deployment(), None);
+    }
 }

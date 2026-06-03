@@ -10,7 +10,10 @@ use crate::{
         ContinueAsNewInitiator, ExternalWorkflowExecution, FieldChange, RetryState,
         WorkflowTaskFailedCause, WorkflowTaskTimeoutType, WorkflowTimeoutType,
     },
-    state::{CompletionCallback, ParentClosePolicy, VersioningOverride},
+    state::{
+        CompletionCallback, ParentClosePolicy, VersioningBehavior, VersioningOverride,
+        WorkerDeploymentVersionRef, WorkflowVersioningInfo,
+    },
 };
 
 /// Authoritative history event.
@@ -70,6 +73,10 @@ pub enum HistoryEventKind {
         continued_failure: Option<Payload>,
         last_completion_result: Option<Payloads>,
         cron_schedule: Option<String>,
+        #[serde(default)]
+        versioning_info: Option<WorkflowVersioningInfo>,
+        #[serde(default)]
+        worker_deployment_name: Option<String>,
     },
     /// An external signal was delivered to the workflow.
     WorkflowExecutionSignaled {
@@ -141,6 +148,12 @@ pub enum HistoryEventKind {
         identity: WorkerIdentity,
         sdk_metadata: Option<Vec<u8>>,
         worker_version: Option<String>,
+        #[serde(default)]
+        versioning_behavior: VersioningBehavior,
+        #[serde(default)]
+        deployment_version: Option<WorkerDeploymentVersionRef>,
+        #[serde(default)]
+        worker_deployment_name: Option<String>,
     },
     /// The workflow task failed (e.g. non-determinism error,
     /// bad command attributes, or a reset).

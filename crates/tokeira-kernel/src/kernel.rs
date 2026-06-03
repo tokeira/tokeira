@@ -35,7 +35,8 @@ use crate::{
     state::{
         ActivityPauseInfo, ActivityState, ChildWorkflowState, LoadedRun, ParentClosePolicy,
         PauseInfo, PendingExternalCancel, PendingExternalSignal, PendingNexusOperation,
-        PendingUpdate, PendingWorkflowTask, TimerState, WorkflowState,
+        PendingUpdate, PendingWorkflowTask, TimerState, VersioningOverride, WorkflowState,
+        WorkflowVersioningInfo,
     },
     transition::{ActivityOp, DispatchOp, ProjectionOp, RequestDedupeOp, TimerOp, Transition},
 };
@@ -155,6 +156,8 @@ impl BasicKernel {
             root_workflow_id,
             root_run_id,
             last_completion_result,
+            versioning_info,
+            worker_deployment_name,
             ..
         } = &first.kind
         else {
@@ -174,6 +177,8 @@ impl BasicKernel {
             task_queue: task_queue.clone(),
             deployment: ctx.deployment,
             build_id: ctx.build_id,
+            versioning_info: versioning_info.clone(),
+            worker_deployment_name: worker_deployment_name.clone(),
             status: ExecutionStatus::Running,
             transition_seq: TransitionSeq::ZERO,
             last_event_id: first.event_id,
@@ -210,7 +215,6 @@ impl BasicKernel {
             pending_updates: BTreeMap::new(),
             admitted_updates: std::collections::HashSet::new(),
             pending_nexus_operations: BTreeMap::new(),
-            versioning_override: None,
             completion_callbacks: Vec::new(),
             started_at: first.happened_at,
             first_run_started_at: ctx.first_run_started_at,
@@ -241,6 +245,7 @@ impl BasicKernel {
         let canonical_root_run_id = req.root_run_id.unwrap_or(req.run_id);
         let event_root_workflow_id = req.root_workflow_id.clone();
         let event_root_run_id = req.root_run_id;
+        let initial_versioning_info = initial_versioning_info(req.versioning_override.clone());
         let initial = WorkflowState {
             run_key: req.run_key,
             namespace_id: req.namespace_id,
@@ -250,6 +255,8 @@ impl BasicKernel {
             task_queue: req.task_queue.clone(),
             deployment: req.deployment.clone(),
             build_id: req.build_id.clone(),
+            versioning_info: initial_versioning_info.clone(),
+            worker_deployment_name: None,
             status: ExecutionStatus::Running,
             transition_seq: TransitionSeq::ZERO,
             last_event_id: 0,
@@ -286,7 +293,6 @@ impl BasicKernel {
             pending_updates: BTreeMap::new(),
             admitted_updates: std::collections::HashSet::new(),
             pending_nexus_operations: BTreeMap::new(),
-            versioning_override: None,
             completion_callbacks: Vec::new(),
             started_at: req.now,
             first_run_started_at: req.first_run_started_at,
@@ -325,6 +331,8 @@ impl BasicKernel {
             continued_failure: req.continued_failure,
             last_completion_result: req.last_completion_result,
             cron_schedule: req.cron_schedule,
+            versioning_info: initial_versioning_info,
+            worker_deployment_name: None,
         });
         builder.projection_ops.push(ProjectionOp::UpsertExecution {
             status: ExecutionStatus::Running,
@@ -356,6 +364,7 @@ impl BasicKernel {
         let canonical_root_run_id = req.root_run_id.unwrap_or(req.run_id);
         let event_root_workflow_id = req.root_workflow_id.clone();
         let event_root_run_id = req.root_run_id;
+        let initial_versioning_info = initial_versioning_info(req.versioning_override.clone());
         let initial = WorkflowState {
             run_key: req.run_key,
             namespace_id: req.namespace_id,
@@ -365,6 +374,8 @@ impl BasicKernel {
             task_queue: req.task_queue.clone(),
             deployment: req.deployment,
             build_id: req.build_id,
+            versioning_info: initial_versioning_info.clone(),
+            worker_deployment_name: None,
             status: ExecutionStatus::Running,
             transition_seq: TransitionSeq::ZERO,
             last_event_id: 0,
@@ -401,7 +412,6 @@ impl BasicKernel {
             pending_updates: BTreeMap::new(),
             admitted_updates: std::collections::HashSet::new(),
             pending_nexus_operations: BTreeMap::new(),
-            versioning_override: None,
             completion_callbacks: Vec::new(),
             started_at: req.now,
             first_run_started_at: req.first_run_started_at,
@@ -440,6 +450,8 @@ impl BasicKernel {
             continued_failure: req.continued_failure,
             last_completion_result: req.last_completion_result,
             cron_schedule: None,
+            versioning_info: initial_versioning_info,
+            worker_deployment_name: None,
         });
         builder.emit(HistoryEventKind::WorkflowExecutionSignaled {
             signal_name: req.signal_name,
@@ -990,10 +1002,12 @@ impl BasicKernel {
 
         match req.versioning_override {
             FieldChange::Set(versioning_override) => {
-                builder.state.versioning_override = Some(versioning_override);
+                builder
+                    .state
+                    .set_versioning_override(Some(versioning_override));
             }
             FieldChange::Clear => {
-                builder.state.versioning_override = None;
+                builder.state.set_versioning_override(None);
             }
             FieldChange::Unchanged => {}
         }
@@ -1097,6 +1111,21 @@ impl BasicKernel {
             });
         }
 
+        if let Some(target) = req.deployment_transition {
+            builder
+                .state
+                .start_version_transition(
+                    target,
+                    req.deployment_transition_revision_number
+                        .unwrap_or_default(),
+                )
+                .map_err(|error| match error {
+                    crate::state::VersionTransitionError::PinnedWorkflowCannotTransition => {
+                        Reject::PinnedWorkflowCannotTransition
+                    }
+                })?;
+        }
+
         Ok(builder.finish())
     }
 
@@ -1163,10 +1192,18 @@ impl BasicKernel {
             identity: req.identity,
             sdk_metadata: req.sdk_metadata,
             worker_version: req.worker_version,
+            versioning_behavior: req.versioning_behavior,
+            deployment_version: req.deployment_version.clone(),
+            worker_deployment_name: req.worker_deployment_name.clone(),
         });
         builder.state.previous_started_event_id = req.token.started_event_id;
         builder.state.workflow_task_attempt = 1;
         builder.state.pending_workflow_task = None;
+        builder.state.apply_wft_versioning(
+            req.versioning_behavior,
+            req.deployment_version,
+            req.worker_deployment_name,
+        );
 
         let mut closed = false;
         for (index, command) in req.commands.into_iter().enumerate() {
@@ -1905,11 +1942,20 @@ impl BasicKernel {
                 }
             }
             HistoryEventKind::WorkflowTaskCompleted {
-                started_event_id, ..
+                started_event_id,
+                versioning_behavior,
+                deployment_version,
+                worker_deployment_name,
+                ..
             } => {
                 state.previous_started_event_id = *started_event_id;
                 state.workflow_task_attempt = 1;
                 state.pending_workflow_task = None;
+                state.apply_wft_versioning(
+                    *versioning_behavior,
+                    deployment_version.clone(),
+                    worker_deployment_name.clone(),
+                );
             }
             HistoryEventKind::WorkflowTaskFailed {
                 logical_seq,
@@ -2212,10 +2258,10 @@ impl BasicKernel {
             } => {
                 match versioning_override {
                     FieldChange::Set(value) => {
-                        state.versioning_override = Some(value.clone());
+                        state.set_versioning_override(Some(value.clone()));
                     }
                     FieldChange::Clear => {
-                        state.versioning_override = None;
+                        state.set_versioning_override(None);
                     }
                     FieldChange::Unchanged => {}
                 }
@@ -2268,6 +2314,15 @@ fn close_replayed_run(
 
 /// Extract an open `WorkflowState` from a `LoadedRun`,
 /// rejecting absent or closed runs.
+fn initial_versioning_info(
+    versioning_override: Option<VersioningOverride>,
+) -> Option<WorkflowVersioningInfo> {
+    versioning_override.map(|versioning_override| WorkflowVersioningInfo {
+        versioning_override: Some(versioning_override),
+        ..WorkflowVersioningInfo::default()
+    })
+}
+
 fn expect_open(loaded: LoadedRun) -> Result<WorkflowState, Reject> {
     let state = match loaded {
         LoadedRun::Absent => return Err(Reject::MissingRun),
@@ -3123,6 +3178,9 @@ pub enum Reject {
     /// the pending WFT.
     #[error("workflow task sequence mismatch: expected {expected}, got {got}")]
     WorkflowTaskSeqMismatch { expected: u64, got: u64 },
+    /// A `WorkflowTaskStarted` transition attempted to move a pinned workflow.
+    #[error("pinned workflow cannot start a deployment-version transition")]
+    PinnedWorkflowCannotTransition,
     /// A `WorkflowTaskStarted` was issued but the pending WFT
     /// has already been started.
     #[error("workflow task already started: logical_seq={logical_seq}")]

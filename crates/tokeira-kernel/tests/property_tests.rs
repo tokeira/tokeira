@@ -6,19 +6,22 @@ use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     ActivityOp, ActivityPauseInfo, ActivityResolution, ActivityResolvedRequest, ActivityState,
     BasicKernel, CancelRequest, ChildResolution, ChildResolvedRequest, ChildStartConfirmedRequest,
-    ChildStartResult, ChildWorkflowState, Command, CompletionCallback, DispatchOp,
-    ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
-    ExternalSignalResult, ExternalWorkflowExecution, FieldChange, LoadedRun,
-    NexusOperationResolvedRequest, NexusResolution, ParentClosePolicy, PauseActivityRequest,
-    PauseInfo, PauseWorkflowRequest, PendingExternalCancel, PendingExternalSignal,
-    PendingNexusOperation, PendingUpdate, PendingWorkflowTask, ReplayContext, RequestDedupeOp,
-    ResetActivityRequest, ResetRequest, RetryState, SignalRequest, StartRequest,
-    StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerOp, TimerState,
-    UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
-    UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, VersioningOverride,
-    WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
+    ChildStartResult, ChildWorkflowState, Command, CompletionCallback,
+    ContinueAsNewVersioningBehavior, DispatchOp, ExternalCancelResolvedRequest,
+    ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult,
+    ExternalWorkflowExecution, FieldChange, LoadedRun, NexusOperationResolvedRequest,
+    NexusResolution, ParentClosePolicy, PauseActivityRequest, PauseInfo, PauseWorkflowRequest,
+    PendingExternalCancel, PendingExternalSignal, PendingNexusOperation, PendingUpdate,
+    PendingWorkflowTask, ReplayContext, RequestDedupeOp, ResetActivityRequest, ResetRequest,
+    RetryState, SignalRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest,
+    TimerDueRequest, TimerOp, TimerState, UnpauseActivityRequest, UnpauseWorkflowRequest,
+    UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest,
+    VersioningBehavior, VersioningOverride, WorkerDeploymentVersionRef, WorkflowCommand,
+    WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
     WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
-    WorkflowTaskTimeoutType, WorkflowTimeoutType, event::HistoryEventKind, kernel::Kernel,
+    WorkflowTaskTimeoutType, WorkflowTimeoutType, WorkflowVersioningInfo,
+    event::{HistoryEvent, HistoryEventKind},
+    kernel::Kernel,
 };
 use tokeira_types::{
     BuildId, DeploymentId, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads,
@@ -82,6 +85,8 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         task_queue: TaskQueueName("queue".into()),
         deployment: None,
         build_id: None,
+        versioning_info: None,
+        worker_deployment_name: None,
         status: ExecutionStatus::Running,
         transition_seq: TransitionSeq(7),
         last_event_id: 14,
@@ -118,7 +123,6 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         pending_updates: BTreeMap::new(),
         admitted_updates: std::collections::HashSet::new(),
         pending_nexus_operations: BTreeMap::new(),
-        versioning_override: None,
         completion_callbacks: Vec::new(),
         started_at: now - Duration::minutes(10),
         first_run_started_at: Some(now - Duration::minutes(10)),
@@ -286,7 +290,7 @@ fn with_pending_update(mut state: WorkflowState, update_id: &str) -> WorkflowSta
 }
 
 fn with_execution_options(mut state: WorkflowState, callbacks: usize) -> WorkflowState {
-    state.versioning_override = Some(VersioningOverride);
+    state.set_versioning_override(Some(VersioningOverride::AutoUpgrade));
     state.completion_callbacks = vec![CompletionCallback; callbacks];
     state
 }
@@ -592,7 +596,7 @@ fn arb_update_execution_options_request(
     now: OffsetDateTime,
 ) -> impl Strategy<Value = UpdateExecutionOptionsRequest> {
     (
-        arb_field_change(Just(VersioningOverride)),
+        arb_field_change(Just(VersioningOverride::AutoUpgrade)),
         arb_field_change(prop::collection::vec(Just(CompletionCallback), 0..3)),
         prop::option::of(arb_small_string()),
         arb_small_string(),
@@ -672,6 +676,7 @@ fn arb_start_request() -> impl Strategy<Value = StartRequest> {
                     task_queue: TaskQueueName("queue".into()),
                     deployment: None,
                     build_id: None,
+                    versioning_override: None,
                     input,
                     header: None,
                     memo,
@@ -703,6 +708,82 @@ fn arb_start_request() -> impl Strategy<Value = StartRequest> {
                 }
             },
         )
+}
+
+fn arb_worker_deployment_version_ref() -> impl Strategy<Value = WorkerDeploymentVersionRef> {
+    ("[a-z][a-z0-9-]{0,16}", "[a-z][a-z0-9-]{0,16}").prop_map(|(deployment_name, build_id)| {
+        WorkerDeploymentVersionRef {
+            deployment_name,
+            build_id,
+        }
+    })
+}
+
+fn arb_versioning_behavior() -> impl Strategy<Value = VersioningBehavior> {
+    prop_oneof![
+        Just(VersioningBehavior::Unspecified),
+        Just(VersioningBehavior::Pinned),
+        Just(VersioningBehavior::AutoUpgrade),
+    ]
+}
+
+fn arb_continue_as_new_versioning_behavior()
+-> impl Strategy<Value = ContinueAsNewVersioningBehavior> {
+    prop_oneof![
+        Just(ContinueAsNewVersioningBehavior::Unspecified),
+        Just(ContinueAsNewVersioningBehavior::AutoUpgrade),
+        Just(ContinueAsNewVersioningBehavior::UseRampingVersion),
+    ]
+}
+
+fn arb_versioning_override() -> impl Strategy<Value = VersioningOverride> {
+    prop_oneof![
+        arb_worker_deployment_version_ref()
+            .prop_map(|version| VersioningOverride::Pinned { version }),
+        Just(VersioningOverride::AutoUpgrade),
+    ]
+}
+
+fn arb_workflow_versioning_info() -> impl Strategy<Value = WorkflowVersioningInfo> {
+    (
+        arb_versioning_behavior(),
+        prop::option::of(arb_worker_deployment_version_ref()),
+        prop::option::of(arb_versioning_override()),
+        prop::option::of(arb_worker_deployment_version_ref()),
+        -1000i64..1000i64,
+        arb_continue_as_new_versioning_behavior(),
+    )
+        .prop_map(
+            |(
+                behavior,
+                deployment_version,
+                versioning_override,
+                version_transition,
+                revision_number,
+                continue_as_new_initial_versioning_behavior,
+            )| WorkflowVersioningInfo {
+                behavior,
+                deployment_version,
+                versioning_override,
+                version_transition,
+                revision_number,
+                continue_as_new_initial_versioning_behavior,
+            },
+        )
+}
+
+fn arb_wft_versioning_completion() -> impl Strategy<
+    Value = (
+        VersioningBehavior,
+        Option<WorkerDeploymentVersionRef>,
+        Option<String>,
+    ),
+> {
+    (
+        arb_versioning_behavior(),
+        prop::option::of(arb_worker_deployment_version_ref()),
+        prop::option::of("[a-z][a-z0-9-]{0,16}"),
+    )
 }
 
 fn arb_activity_resolution() -> impl Strategy<Value = ActivityResolution> {
@@ -1084,6 +1165,8 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 request_id: format!("start-wft-{logical_seq}"),
                 history_size_bytes: 0,
                 suggest_continue_as_new: false,
+                deployment_transition: None,
+                deployment_transition_revision_number: None,
                 sticky_ttl: Some(Duration::seconds(30)),
                 now,
             };
@@ -1170,6 +1253,9 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands,
                 force_new_workflow_task: false,
                 now,
@@ -1248,6 +1334,9 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands: vec![WorkflowCommand::CancelWorkflow],
                 force_new_workflow_task: false,
                 now,
@@ -1273,6 +1362,9 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands: vec![WorkflowCommand::RequestCancelActivity {
                     activity_id: "activity-1".into(),
                 }],
@@ -1301,6 +1393,9 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands: vec![WorkflowCommand::CancelTimer {
                     timer_id: "timer-1".into(),
                 }],
@@ -1328,6 +1423,9 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands: vec![WorkflowCommand::CancelNexusOperation {
                     scheduled_event_id: 12,
                 }],
@@ -1471,7 +1569,7 @@ proptest! {
         prop_assert_eq!(transition.next_state.transition_seq, transition.expected_seq.next());
         prop_assert!(transition.next_state.pending_updates.is_empty());
         prop_assert!(transition.next_state.pending_nexus_operations.is_empty());
-        prop_assert_eq!(transition.next_state.versioning_override, None);
+        prop_assert_eq!(transition.next_state.versioning_override().cloned(), None);
         prop_assert!(transition.next_state.completion_callbacks.is_empty());
         prop_assert_eq!(started.0, req.continued_execution_run_id);
         prop_assert_eq!(started.1, req.first_execution_run_id);
@@ -1584,6 +1682,9 @@ proptest! {
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands: vec![cmd.clone()],
                 force_new_workflow_task: false,
                 now,
@@ -1680,6 +1781,9 @@ proptest! {
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands: vec![WorkflowCommand::ScheduleActivity {
                     activity_id: "activity-1".into(),
                     activity_type: "activity-type".into(),
@@ -1949,6 +2053,9 @@ proptest! {
                     identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                     commands: vec![],
                     force_new_workflow_task: false,
                     now,
@@ -2117,6 +2224,136 @@ proptest! {
             )
             .unwrap();
         prop_assert!(replayed.cancel_requested);
+    }
+
+    #[test]
+    fn property_18_per_run_versioning_replay_round_trip(
+        initial_info in arb_workflow_versioning_info(),
+        initial_worker_deployment_name in prop::option::of("[a-z][a-z0-9-]{0,16}"),
+        completions in prop::collection::vec(arb_wft_versioning_completion(), 0..8),
+    ) {
+        let kernel = kernel();
+        let now = fixed_now();
+        let run_key = RunKey::new();
+        let namespace_id = NamespaceId::new();
+        let workflow_id = WorkflowId("workflow".to_string());
+        let run_id = RunId::new();
+        let ctx = ReplayContext {
+            run_key,
+            namespace_id,
+            workflow_id: workflow_id.clone(),
+            run_id,
+            deployment: None,
+            build_id: None,
+            parent_run_key: None,
+            parent_workflow_id: None,
+            first_run_started_at: Some(now),
+        };
+        let start_event = HistoryEvent {
+            event_id: 1,
+            happened_at: now,
+            kind: HistoryEventKind::WorkflowExecutionStarted {
+                workflow_type: WorkflowType("wf".to_string()),
+                task_queue: TaskQueueName("queue".to_string()),
+                input: Payloads::default(),
+                header: None,
+                memo: Memo::default(),
+                search_attributes: SearchAttributes::default(),
+                request_id: "versioning-start".to_string(),
+                identity: "tester".to_string(),
+                continued_execution_run_id: None,
+                first_execution_run_id: Some(run_id),
+                retry_policy: None,
+                attempt: 1,
+                workflow_execution_timeout: None,
+                workflow_run_timeout: None,
+                workflow_task_timeout: default_workflow_task_timeout(),
+                parent_workflow_id: None,
+                parent_run_id: None,
+                parent_namespace_id: None,
+                parent_initiated_event_id: 0,
+                root_workflow_id: None,
+                root_run_id: None,
+                original_execution_run_id: Some(run_id),
+                continued_failure: None,
+                last_completion_result: None,
+                cron_schedule: None,
+                versioning_info: Some(initial_info),
+                worker_deployment_name: initial_worker_deployment_name,
+            },
+        };
+        let mut history = vec![start_event.clone()];
+        let mut reference = kernel
+            .replay_history_prefix(ctx.clone(), &[start_event])
+            .unwrap();
+        let mut next_event_id = 2;
+
+        for (index, (behavior, deployment_version, worker_deployment_name)) in completions.into_iter().enumerate() {
+            let logical_seq = LogicalTaskSeq(index as u64 + 1);
+            let scheduled_event_id = next_event_id;
+            history.push(HistoryEvent {
+                event_id: scheduled_event_id,
+                happened_at: now,
+                kind: HistoryEventKind::WorkflowTaskScheduled {
+                    logical_seq,
+                    task_queue: TaskQueueName("queue".to_string()),
+                    workflow_task_timeout: default_workflow_task_timeout(),
+                    attempt: 1,
+                },
+            });
+            next_event_id += 1;
+
+            let started_event_id = next_event_id;
+            history.push(HistoryEvent {
+                event_id: started_event_id,
+                happened_at: now,
+                kind: HistoryEventKind::WorkflowTaskStarted {
+                    logical_seq,
+                    scheduled_event_id,
+                    attempt: 1,
+                    identity: WorkerIdentity("worker".to_string()),
+                    request_id: format!("wft-start-{index}"),
+                    history_size_bytes: 0,
+                    suggest_continue_as_new: false,
+                },
+            });
+            next_event_id += 1;
+
+            history.push(HistoryEvent {
+                event_id: next_event_id,
+                happened_at: now,
+                kind: HistoryEventKind::WorkflowTaskCompleted {
+                    logical_seq,
+                    scheduled_event_id,
+                    started_event_id,
+                    identity: WorkerIdentity("worker".to_string()),
+                    sdk_metadata: None,
+                    worker_version: None,
+                    versioning_behavior: behavior,
+                    deployment_version: deployment_version.clone(),
+                    worker_deployment_name: worker_deployment_name.clone(),
+                },
+            });
+            next_event_id += 1;
+
+            reference.apply_wft_versioning(behavior, deployment_version, worker_deployment_name);
+            reference.previous_started_event_id = started_event_id;
+            reference.workflow_task_attempt = 1;
+            reference.pending_workflow_task = None;
+        }
+
+        let replayed = kernel.replay_history_prefix(ctx, &history).unwrap();
+
+        prop_assert_eq!(&replayed.versioning_info, &reference.versioning_info);
+        prop_assert_eq!(
+            &replayed.worker_deployment_name,
+            &reference.worker_deployment_name
+        );
+        prop_assert_eq!(
+            replayed.effective_deployment().cloned(),
+            reference.effective_deployment().cloned()
+        );
+        prop_assert_eq!(replayed.effective_behavior(), reference.effective_behavior());
     }
 
     #[test]
@@ -2304,6 +2541,9 @@ proptest! {
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands: vec![cmd],
                 force_new_workflow_task: false,
                 now,
@@ -2333,6 +2573,9 @@ proptest! {
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands: vec![cmd.clone()],
                 force_new_workflow_task: false,
                 now,
@@ -2397,6 +2640,9 @@ proptest! {
                     identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                     commands: vec![cmd, WorkflowCommand::RequestNewWorkflowTask],
                     force_new_workflow_task: false,
                     now,
@@ -2508,6 +2754,9 @@ proptest! {
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands: vec![WorkflowCommand::FailWorkflow {
                     failure: payload("failed"),
                 }],
@@ -2899,6 +3148,9 @@ proptest! {
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands: vec![cmd.clone()],
                 force_new_workflow_task: false,
                 now,
@@ -2978,6 +3230,9 @@ fn property_23_request_cancel_activity_preserves_activity() {
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands: vec![WorkflowCommand::RequestCancelActivity {
                     activity_id: "activity-1".into(),
                 }],
@@ -3017,6 +3272,9 @@ fn property_24_cancel_timer_removes_timer() {
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands: vec![WorkflowCommand::CancelTimer {
                     timer_id: "timer-1".into(),
                 }],
@@ -3058,6 +3316,9 @@ proptest! {
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands: vec![WorkflowCommand::StartChildWorkflow {
                     child_workflow_id: WorkflowId(child_workflow_id.clone()),
                     namespace_id: NamespaceId::new(),
@@ -3134,6 +3395,9 @@ proptest! {
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands: vec![WorkflowCommand::SignalExternalWorkflowExecution {
                     target_namespace_id: state.namespace_id,
                     target_namespace: None,
@@ -3271,6 +3535,9 @@ fn property_42_parent_close_policy_all_paths() {
                         identity: WorkerIdentity("worker".into()),
                         sdk_metadata: None,
                         worker_version: None,
+                        versioning_behavior: VersioningBehavior::Unspecified,
+                        deployment_version: None,
+                        worker_deployment_name: None,
                         commands: vec![command],
                         force_new_workflow_task: false,
                         now,
@@ -3409,6 +3676,9 @@ proptest! {
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands: vec![completed_cmd],
                 force_new_workflow_task: false,
                 now,
@@ -3428,6 +3698,9 @@ proptest! {
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands: vec![rejected_cmd],
                 force_new_workflow_task: false,
                 now,
@@ -3457,6 +3730,9 @@ proptest! {
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands: vec![WorkflowCommand::ProtocolMessage {
                     message_id: "msg-1".into(),
                     body: UpdateProtocolBody::Accepted {
@@ -3485,6 +3761,9 @@ proptest! {
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands: vec![WorkflowCommand::ProtocolMessage {
                     message_id: "msg-2".into(),
                     body: UpdateProtocolBody::Completed {
@@ -3512,6 +3791,9 @@ proptest! {
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands: vec![WorkflowCommand::ProtocolMessage {
                     message_id: "msg-3".into(),
                     body: UpdateProtocolBody::Rejected {
@@ -3560,6 +3842,9 @@ fn property_57_close_clears_pending_updates() {
                     identity: WorkerIdentity("worker".into()),
                     sdk_metadata: None,
                     worker_version: None,
+                    versioning_behavior: VersioningBehavior::Unspecified,
+                    deployment_version: None,
+                    worker_deployment_name: None,
                     commands: vec![command],
                     force_new_workflow_task: false,
                     now,
@@ -3627,6 +3912,9 @@ proptest! {
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands: vec![cmd.clone()],
                 force_new_workflow_task: false,
                 now,
@@ -3668,6 +3956,9 @@ proptest! {
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands: vec![cmd],
                 force_new_workflow_task: false,
                 now,
@@ -3678,16 +3969,28 @@ proptest! {
         prop_assert_eq!(transition.projection_ops.len(), 0);
         prop_assert_eq!(transition.request_dedupe_ops.len(), 0);
         prop_assert!(transition.next_state.is_open());
-        prop_assert_eq!(transition.next_state.memo, state.memo);
-        prop_assert_eq!(transition.next_state.search_attributes, state.search_attributes);
-        prop_assert_eq!(transition.next_state.activities, state.activities);
-        prop_assert_eq!(transition.next_state.timers, state.timers);
-        prop_assert_eq!(transition.next_state.children, state.children);
-        prop_assert_eq!(transition.next_state.pending_external_signals, state.pending_external_signals);
-        prop_assert_eq!(transition.next_state.pending_external_cancels, state.pending_external_cancels);
-        prop_assert_eq!(transition.next_state.pending_updates, state.pending_updates);
-        prop_assert_eq!(transition.next_state.versioning_override, state.versioning_override);
-        prop_assert_eq!(transition.next_state.completion_callbacks, state.completion_callbacks);
+        prop_assert_eq!(&transition.next_state.memo, &state.memo);
+        prop_assert_eq!(&transition.next_state.search_attributes, &state.search_attributes);
+        prop_assert_eq!(&transition.next_state.activities, &state.activities);
+        prop_assert_eq!(&transition.next_state.timers, &state.timers);
+        prop_assert_eq!(&transition.next_state.children, &state.children);
+        prop_assert_eq!(
+            &transition.next_state.pending_external_signals,
+            &state.pending_external_signals
+        );
+        prop_assert_eq!(
+            &transition.next_state.pending_external_cancels,
+            &state.pending_external_cancels
+        );
+        prop_assert_eq!(&transition.next_state.pending_updates, &state.pending_updates);
+        prop_assert_eq!(
+            transition.next_state.versioning_override().cloned(),
+            state.versioning_override().cloned()
+        );
+        prop_assert_eq!(
+            &transition.next_state.completion_callbacks,
+            &state.completion_callbacks
+        );
     }
 
     #[test]
@@ -3725,7 +4028,7 @@ proptest! {
         ).unwrap();
 
         let expected_versioning_override = match req.versioning_override {
-            FieldChange::Unchanged => base.versioning_override,
+            FieldChange::Unchanged => base.versioning_override().cloned(),
             FieldChange::Set(versioning_override) => Some(versioning_override),
             FieldChange::Clear => None,
         };
@@ -3735,7 +4038,7 @@ proptest! {
             FieldChange::Clear => Vec::new(),
         };
 
-        prop_assert_eq!(transition.next_state.versioning_override, expected_versioning_override);
+        prop_assert_eq!(transition.next_state.versioning_override().cloned(), expected_versioning_override);
         prop_assert_eq!(transition.next_state.completion_callbacks, expected_completion_callbacks);
     }
 
@@ -3801,6 +4104,9 @@ fn property_63_close_preserves_execution_options() {
                     identity: WorkerIdentity("worker".into()),
                     sdk_metadata: None,
                     worker_version: None,
+                    versioning_behavior: VersioningBehavior::Unspecified,
+                    deployment_version: None,
+                    worker_deployment_name: None,
                     commands: vec![command],
                     force_new_workflow_task: false,
                     now,
@@ -3847,8 +4153,8 @@ fn property_63_close_preserves_execution_options() {
 
     for transition in transitions {
         assert_eq!(
-            transition.next_state.versioning_override,
-            Some(VersioningOverride)
+            transition.next_state.versioning_override().cloned(),
+            Some(VersioningOverride::AutoUpgrade)
         );
         assert_eq!(
             transition.next_state.completion_callbacks,
@@ -3875,6 +4181,9 @@ proptest! {
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands: vec![cmd.clone()],
                 force_new_workflow_task: false,
                 now,
@@ -3914,6 +4223,9 @@ proptest! {
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands: vec![WorkflowCommand::ScheduleNexusOperation {
                     operation_id: operation_id.clone(),
                     endpoint: "endpoint".into(),
@@ -3946,6 +4258,9 @@ proptest! {
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
                 worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
                 commands: vec![WorkflowCommand::CancelNexusOperation {
                     scheduled_event_id: 12,
                 }],
@@ -4074,6 +4389,9 @@ fn property_70_close_clears_pending_nexus_operations_without_dispatch_ops() {
                     identity: WorkerIdentity("worker".into()),
                     sdk_metadata: None,
                     worker_version: None,
+                    versioning_behavior: VersioningBehavior::Unspecified,
+                    deployment_version: None,
+                    worker_deployment_name: None,
                     commands: vec![command],
                     force_new_workflow_task: false,
                     now,

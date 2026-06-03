@@ -8,7 +8,10 @@ use tokeira_types::{
 
 use crate::{
     event::ActivityResolution,
-    state::{CompletionCallback, ParentClosePolicy, VersioningOverride},
+    state::{
+        CompletionCallback, ParentClosePolicy, VersioningBehavior, VersioningOverride,
+        WorkerDeploymentVersionRef,
+    },
 };
 
 /// Commands are authoritative things that the server has decided happened.
@@ -233,6 +236,8 @@ pub struct StartRequest {
     pub deployment: Option<DeploymentId>,
     /// Optional build identifier for versioned task routing.
     pub build_id: Option<BuildId>,
+    /// Versioning override applied at workflow start.
+    pub versioning_override: Option<VersioningOverride>,
     /// Current retry attempt number (1-based).
     pub attempt: u32,
     /// Run ID of the previous run if this is a continue-as-new
@@ -295,6 +300,7 @@ pub struct SignalWithStartRequest {
     pub reuse_policy: WorkflowIdReusePolicy,
     pub deployment: Option<DeploymentId>,
     pub build_id: Option<BuildId>,
+    pub versioning_override: Option<VersioningOverride>,
     pub attempt: u32,
     pub continued_execution_run_id: Option<RunId>,
     pub first_execution_run_id: Option<RunId>,
@@ -531,6 +537,10 @@ pub struct StartWorkflowTaskRequest {
     pub history_size_bytes: i64,
     /// Whether the runtime suggests continue-as-new soon.
     pub suggest_continue_as_new: bool,
+    /// If set, the worker's deployment version differs from the run's effective version.
+    pub deployment_transition: Option<WorkerDeploymentVersionRef>,
+    /// Routing revision attached to the deployment transition decision.
+    pub deployment_transition_revision_number: Option<i64>,
     /// If set, the worker requests sticky execution affinity
     /// for this duration.
     pub sticky_ttl: Option<Duration>,
@@ -550,6 +560,12 @@ pub struct WorkflowTaskCompletedRequest {
     pub sdk_metadata: Option<Vec<u8>>,
     /// Build ID from the worker version stamp, when reported by the SDK.
     pub worker_version: Option<String>,
+    /// Versioning behavior reported by the worker that completed this task.
+    pub versioning_behavior: VersioningBehavior,
+    /// Worker Deployment Version that completed this task.
+    pub deployment_version: Option<WorkerDeploymentVersionRef>,
+    /// Worker Deployment name that completed this task.
+    pub worker_deployment_name: Option<String>,
     /// Ordered list of workflow commands produced by the
     /// worker's replay/execution.
     pub commands: Vec<WorkflowCommand>,

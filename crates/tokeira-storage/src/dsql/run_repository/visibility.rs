@@ -1,6 +1,34 @@
 use super::*;
 
 impl DsqlRunRepository {
+    #[instrument(name = "dsql.has_open_pinned_workflows", skip(self), fields(namespace_id = %namespace_id.0, deployment_name = %version.deployment_name.0, build_id = %version.build_id.0))]
+    pub(super) async fn do_has_open_pinned_workflows(
+        &self,
+        namespace_id: NamespaceId,
+        version: &WorkerDeploymentVersionKey,
+    ) -> Result<bool> {
+        record_dsql_operation!(self, "has_open_pinned_workflows", None, {
+            let mut permit = self.director.acquire(DbClass::Read).await?;
+            let rows = sqlx::query_as::<_, (Vec<u8>,)>(
+                "SELECT state_data
+             FROM workflow_hot
+             WHERE namespace_id = $1",
+            )
+            .bind(namespace_id.0)
+            .fetch_all(permit.connection()?)
+            .await?;
+            metrics::record_dsql_rows_read("has_open_pinned_workflows", rows.len());
+
+            for (state_data,) in rows {
+                let state = codec::decode_workflow_state(&state_data)?;
+                if workflow_is_open_and_pinned_to_version(&state, namespace_id, version) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+    }
+
     #[instrument(name = "dsql.list_runs_with_workflow_timeouts_for_shard", skip(self), fields(shard_id = shard_id.0, limit))]
     pub(super) async fn do_list_runs_with_workflow_timeouts_for_shard(
         &self,

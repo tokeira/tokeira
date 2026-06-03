@@ -9,18 +9,20 @@
 //! caller's `TransitionSeq` against the durable value and returns `Conflict` on
 //! mismatch, so the runtime can reload and retry without distributed locks.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokeira_kernel::{
     ActivityOp, DispatchOp, HistoryEvent, LoadedRun, ProjectionOp, TimerOp, Transition,
-    WorkflowState,
+    WorkflowState, state::VersioningBehavior,
 };
 use tokeira_types::{
-    ExecutionRef, ExecutionStatus, GenerationCounter, NamespaceId, Payloads, ProjectionCursor,
-    QueueKey, RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskQueueName, TransitionSeq,
-    WorkerIdentity, WorkflowId, WorkflowType,
+    ExecutionRef, ExecutionStatus, GenerationCounter, NamespaceId, Payload, Payloads,
+    ProjectionCursor, QueueKey, RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskQueueName,
+    TransitionSeq, WorkerIdentity, WorkflowId, WorkflowType,
 };
 use uuid::Uuid;
 
@@ -41,6 +43,322 @@ pub enum CommitResult {
     /// A request with the same dedupe key was already
     /// committed. The caller can short-circuit.
     Duplicate,
+}
+
+/// Encoded byte length for Worker Deployment conflict tokens.
+pub const CONFLICT_TOKEN_BYTES: usize = 8;
+
+/// Namespace-scoped Worker Deployment name.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct DeploymentName(pub String);
+
+/// Worker Deployment Version build identifier.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct BuildId(pub String);
+
+/// Storage key for a Worker Deployment registry record.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DeploymentKey {
+    /// Namespace that owns the deployment.
+    pub namespace_id: NamespaceId,
+    /// Deployment name unique within the namespace.
+    pub deployment_name: DeploymentName,
+}
+
+/// Proto-shaped reference to one Worker Deployment Version.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct WorkerDeploymentVersionKey {
+    /// Deployment that owns the version.
+    pub deployment_name: DeploymentName,
+    /// Build identifier unique within the deployment.
+    pub build_id: BuildId,
+}
+
+/// Opaque optimistic-concurrency token for Worker Deployment records.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ConflictToken(pub [u8; CONFLICT_TOKEN_BYTES]);
+
+impl ConflictToken {
+    /// Encode a monotonic generation as an opaque token.
+    pub fn from_generation(generation: u64) -> Self {
+        Self(generation.to_be_bytes())
+    }
+
+    /// Decode the monotonic generation carried by this token.
+    pub fn generation(self) -> u64 {
+        u64::from_be_bytes(self.0)
+    }
+}
+
+/// CAS write result for Worker Deployment registry records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeploymentCasResult {
+    /// The write was applied and a fresh token was assigned.
+    Applied { token: ConflictToken },
+    /// The expected token did not match the stored token.
+    Conflict,
+    /// The existing-record operation targeted a missing record.
+    NotFound,
+    /// The create operation targeted an existing record.
+    AlreadyExists,
+}
+
+/// Stored form of `RoutingConfigUpdateState`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RoutingConfigUpdateState {
+    /// No routing propagation state has been assigned yet.
+    #[default]
+    Unspecified,
+    /// Routing propagation is still in progress.
+    InProgress,
+    /// Routing propagation has completed.
+    Completed,
+}
+
+/// Stored form of `WorkerDeploymentVersionStatus`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkerDeploymentVersionStatus {
+    /// No version status has been assigned yet.
+    #[default]
+    Unspecified,
+    /// Version exists but is not current, ramping, or draining.
+    Inactive,
+    /// Version is the deployment current version.
+    Current,
+    /// Version is the deployment ramping version.
+    Ramping,
+    /// Version is draining open pinned workflows.
+    Draining,
+    /// Version has drained open pinned workflows.
+    Drained,
+    /// Version was explicitly created before pollers appeared.
+    Created,
+}
+
+/// Stored form of `VersionDrainageStatus`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VersionDrainageStatus {
+    /// No drainage status has been assigned yet.
+    #[default]
+    Unspecified,
+    /// Version still has open pinned workflows.
+    Draining,
+    /// Version no longer has open pinned workflows.
+    Drained,
+}
+
+/// Stored form of `TaskQueueType`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum DeploymentTaskQueueType {
+    /// No task queue type has been assigned yet.
+    #[default]
+    Unspecified,
+    /// Workflow task queue.
+    Workflow,
+    /// Activity task queue.
+    Activity,
+    /// Nexus task queue.
+    Nexus,
+}
+
+/// Task queue ever polled by a Worker Deployment Version.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct VersionTaskQueue {
+    /// Task queue name.
+    pub name: String,
+    /// Task queue type.
+    pub task_queue_type: DeploymentTaskQueueType,
+}
+
+/// Stored form of `ComputeProvider`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComputeProvider {
+    /// Implementation-specific provider type.
+    pub provider_type: String,
+    /// Opaque provider-specific configuration.
+    pub details: Option<Payload>,
+    /// Optional Nexus endpoint for remote providers.
+    pub nexus_endpoint: String,
+}
+
+/// Stored form of `ComputeScaler`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComputeScaler {
+    /// Implementation-specific scaler type.
+    pub scaler_type: String,
+    /// Opaque scaler-specific configuration.
+    pub details: Option<Payload>,
+}
+
+/// Stored form of `ComputeConfigScalingGroup`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComputeConfigScalingGroup {
+    /// Task queue types served by this scaling group.
+    pub task_queue_types: Vec<DeploymentTaskQueueType>,
+    /// Worker lifecycle provider instructions.
+    pub provider: Option<ComputeProvider>,
+    /// Worker lifecycle scaling instructions.
+    pub scaler: Option<ComputeScaler>,
+}
+
+/// Stored form of `ComputeConfig`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComputeConfig {
+    /// Scaling groups keyed by caller-supplied group id.
+    pub scaling_groups: BTreeMap<String, ComputeConfigScalingGroup>,
+}
+
+/// Stored form of `VersionMetadata`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionMetadata {
+    /// User-defined opaque metadata values.
+    pub entries: BTreeMap<String, Payload>,
+}
+
+/// Stored form of `RoutingConfig`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StoredRoutingConfig {
+    /// Current version for auto-upgrade traffic; absent means unversioned.
+    pub current_version: Option<WorkerDeploymentVersionKey>,
+    /// Ramping version; absent means unversioned workers.
+    pub ramping_version: Option<WorkerDeploymentVersionKey>,
+    /// Percentage of eligible traffic shifted to the ramping version.
+    pub ramping_version_percentage: f32,
+    /// Last current-version change time.
+    pub current_version_changed_time: Option<OffsetDateTime>,
+    /// Last ramping-version change time.
+    pub ramping_version_changed_time: Option<OffsetDateTime>,
+    /// Last ramping percentage change time.
+    pub ramping_version_percentage_changed_time: Option<OffsetDateTime>,
+    /// Monotonic routing revision.
+    pub revision_number: i64,
+}
+
+impl Default for StoredRoutingConfig {
+    fn default() -> Self {
+        Self {
+            current_version: None,
+            ramping_version: None,
+            ramping_version_percentage: 0.0,
+            current_version_changed_time: None,
+            ramping_version_changed_time: None,
+            ramping_version_percentage_changed_time: None,
+            revision_number: 0,
+        }
+    }
+}
+
+/// Stored form of `VersionDrainageInfo`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrainageInfo {
+    /// Drainage lifecycle status.
+    pub status: VersionDrainageStatus,
+    /// Last status change time.
+    pub last_changed_time: OffsetDateTime,
+    /// Last drainage check time.
+    pub last_checked_time: OffsetDateTime,
+}
+
+/// Stored Worker Deployment Version record.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StoredVersion {
+    /// Build id of this version within its deployment.
+    pub build_id: BuildId,
+    /// Version lifecycle status.
+    pub status: WorkerDeploymentVersionStatus,
+    /// Version creation time.
+    pub create_time: OffsetDateTime,
+    /// Last current/ramping/ramp-percentage change time for this version.
+    pub routing_changed_time: Option<OffsetDateTime>,
+    /// Time this version most recently became current.
+    pub current_since_time: Option<OffsetDateTime>,
+    /// Time this version most recently became ramping.
+    pub ramping_since_time: Option<OffsetDateTime>,
+    /// First time this version became current or ramping.
+    pub first_activation_time: Option<OffsetDateTime>,
+    /// Last time this version became current.
+    pub last_current_time: Option<OffsetDateTime>,
+    /// Last time this version stopped being current or ramping.
+    pub last_deactivation_time: Option<OffsetDateTime>,
+    /// Current ramp percentage for this version.
+    pub ramp_percentage: f32,
+    /// Drainage information, absent while current or ramping.
+    pub drainage_info: Option<DrainageInfo>,
+    /// User-defined version metadata.
+    pub metadata: VersionMetadata,
+    /// Worker compute configuration.
+    pub compute_config: ComputeConfig,
+    /// Identity of the last caller that modified this version.
+    pub last_modifier_identity: String,
+    /// Task queues ever polled by this version.
+    pub polled_task_queues: BTreeSet<VersionTaskQueue>,
+    /// Create-version request ids accepted for this version.
+    pub create_request_ids: BTreeSet<String>,
+    /// Compute-config update request ids accepted for this version.
+    #[serde(default)]
+    pub compute_config_request_ids: BTreeSet<String>,
+}
+
+/// Stored Worker Deployment registry record.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StoredWorkerDeployment {
+    /// Namespace that owns this deployment.
+    pub namespace_id: NamespaceId,
+    /// Deployment name unique within the namespace.
+    pub name: DeploymentName,
+    /// Deployment creation time.
+    pub create_time: OffsetDateTime,
+    /// Routing configuration and revision.
+    pub routing_config: StoredRoutingConfig,
+    /// Identity of the last caller that modified deployment-level configuration.
+    pub last_modifier_identity: String,
+    /// Manager identity, absent when unset.
+    pub manager_identity: Option<String>,
+    /// Routing propagation state reported to callers.
+    pub routing_config_update_state: RoutingConfigUpdateState,
+    /// Versions keyed by build id so one CAS write covers routing and version state.
+    pub versions: BTreeMap<BuildId, StoredVersion>,
+    /// Current optimistic-concurrency token.
+    pub conflict_token: ConflictToken,
+    /// Create-deployment request ids accepted for this deployment.
+    pub create_request_ids: BTreeSet<String>,
+}
+
+#[async_trait]
+pub trait WorkerDeploymentRepository: Send + Sync {
+    /// Load a deployment registry record by namespace/name.
+    async fn load_deployment(&self, key: &DeploymentKey) -> Result<Option<StoredWorkerDeployment>>;
+
+    /// Conditionally write a deployment registry record.
+    ///
+    /// `expected == None` is the create path and requires the record to be absent.
+    /// `expected == Some(token)` requires the stored token to match before applying.
+    async fn put_deployment(
+        &self,
+        record: StoredWorkerDeployment,
+        expected: Option<ConflictToken>,
+    ) -> Result<DeploymentCasResult>;
+
+    /// Delete a deployment registry record only if its token matches `expected`.
+    async fn delete_deployment(
+        &self,
+        key: &DeploymentKey,
+        expected: ConflictToken,
+    ) -> Result<DeploymentCasResult>;
+
+    /// List deployment records in deterministic name order after an optional cursor.
+    async fn list_deployments(
+        &self,
+        namespace_id: NamespaceId,
+        after: Option<&DeploymentName>,
+        limit: usize,
+    ) -> Result<Vec<StoredWorkerDeployment>>;
+
+    /// Load every deployment record for restart recovery.
+    async fn list_all_for_namespace(
+        &self,
+        namespace_id: NamespaceId,
+    ) -> Result<Vec<StoredWorkerDeployment>>;
 }
 
 /// Durable request-dedupe record.
@@ -141,6 +459,16 @@ pub trait RunRepository: Send + Sync {
     /// in the main trait, moves behind a test-only feature, or becomes an admin
     /// API. It is extremely useful for semantic tests right now.
     async fn read_transition_audit(&self, run_key: RunKey) -> Result<Vec<TransitionAuditRecord>>;
+
+    /// Return whether any open execution is pinned to the given Worker
+    /// Deployment Version.
+    async fn has_open_pinned_workflows(
+        &self,
+        _namespace_id: NamespaceId,
+        _version: &WorkerDeploymentVersionKey,
+    ) -> Result<bool> {
+        Ok(false)
+    }
 
     /// Atomically persist a kernel-produced transition.
     ///
@@ -458,6 +786,21 @@ pub struct NexusSweepEntry {
     pub scheduled_at: OffsetDateTime,
 }
 
+pub fn workflow_is_open_and_pinned_to_version(
+    state: &WorkflowState,
+    namespace_id: NamespaceId,
+    version: &WorkerDeploymentVersionKey,
+) -> bool {
+    if !state.status.is_open() || state.namespace_id != namespace_id {
+        return false;
+    }
+    state.effective_behavior() == VersioningBehavior::Pinned
+        && state.effective_deployment().is_some_and(|effective| {
+            effective.deployment_name == version.deployment_name.0
+                && effective.build_id == version.build_id.0
+        })
+}
+
 /// Read-only interface for projection workers.
 ///
 /// Projection sinks consume a partitioned log of
@@ -722,6 +1065,16 @@ where
         (**self).read_transition_audit(run_key).await
     }
 
+    async fn has_open_pinned_workflows(
+        &self,
+        namespace_id: NamespaceId,
+        version: &WorkerDeploymentVersionKey,
+    ) -> Result<bool> {
+        (**self)
+            .has_open_pinned_workflows(namespace_id, version)
+            .await
+    }
+
     async fn commit_transition(
         &self,
         run_key: RunKey,
@@ -855,6 +1208,48 @@ where
         (**self)
             .list_pending_nexus_operations_for_shard(shard_id, limit)
             .await
+    }
+}
+
+#[async_trait]
+impl<T> WorkerDeploymentRepository for std::sync::Arc<T>
+where
+    T: WorkerDeploymentRepository + ?Sized,
+{
+    async fn load_deployment(&self, key: &DeploymentKey) -> Result<Option<StoredWorkerDeployment>> {
+        (**self).load_deployment(key).await
+    }
+
+    async fn put_deployment(
+        &self,
+        record: StoredWorkerDeployment,
+        expected: Option<ConflictToken>,
+    ) -> Result<DeploymentCasResult> {
+        (**self).put_deployment(record, expected).await
+    }
+
+    async fn delete_deployment(
+        &self,
+        key: &DeploymentKey,
+        expected: ConflictToken,
+    ) -> Result<DeploymentCasResult> {
+        (**self).delete_deployment(key, expected).await
+    }
+
+    async fn list_deployments(
+        &self,
+        namespace_id: NamespaceId,
+        after: Option<&DeploymentName>,
+        limit: usize,
+    ) -> Result<Vec<StoredWorkerDeployment>> {
+        (**self).list_deployments(namespace_id, after, limit).await
+    }
+
+    async fn list_all_for_namespace(
+        &self,
+        namespace_id: NamespaceId,
+    ) -> Result<Vec<StoredWorkerDeployment>> {
+        (**self).list_all_for_namespace(namespace_id).await
     }
 }
 

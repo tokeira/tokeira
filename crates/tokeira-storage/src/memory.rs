@@ -29,11 +29,14 @@ use tokio::sync::Mutex;
 use crate::{
     api::{
         ActivitySweepEntry, BacklogEntry, BudgetAllocationResult, BundleLease, CommitResult,
-        ConnectionDirector, ControlRepository, CurrentExecutionConflictPolicy, DbClass, DbPermit,
+        ConflictToken, ConnectionDirector, ControlRepository, CurrentExecutionConflictPolicy,
+        DbClass, DbPermit, DeploymentCasResult, DeploymentKey, DeploymentName,
         DispatchableActivityTask, DispatchableWorkflowTask, DueTimer, GenerationAdvanceResult,
         LeaseOutcome, LeaseRepository, NexusSweepEntry, ProjectionBatch, ProjectionContext,
-        ProjectionLog, ProjectionRecord, RequestRecord, RunRepository, TransitionAuditRecord,
-        WftTimeoutSweepEntry, WorkflowTimeoutSweepEntry,
+        ProjectionLog, ProjectionRecord, RequestRecord, RunRepository, StoredWorkerDeployment,
+        TransitionAuditRecord, WftTimeoutSweepEntry, WorkerDeploymentRepository,
+        WorkerDeploymentVersionKey, WorkflowTimeoutSweepEntry,
+        workflow_is_open_and_pinned_to_version,
     },
     metrics as storage_metrics,
 };
@@ -67,6 +70,8 @@ struct StoreState {
     execution_index: HashMap<(NamespaceId, String, RunId), RunKey>,
     /// Materialized hot state by run key.
     runs: HashMap<RunKey, WorkflowState>,
+    /// Worker Deployment registry records by namespace/name.
+    worker_deployments: HashMap<DeploymentKey, StoredWorkerDeployment>,
     /// Authoritative event stream by run key.
     history: HashMap<RunKey, Vec<tokeira_kernel::HistoryEvent>>,
     /// Workflow-scoped request dedupe records.
@@ -115,6 +120,10 @@ struct ActivityDispatchEntry {
 }
 
 impl InMemoryStore {
+    fn next_deployment_token(current: Option<ConflictToken>) -> ConflictToken {
+        ConflictToken::from_generation(current.map_or(1, |token| token.generation() + 1))
+    }
+
     /// Create a store with a configured shard count for
     /// shard-filtered queries.
     pub fn with_shard_count(shard_count: u32) -> Self {
@@ -263,7 +272,19 @@ impl RunRepository for InMemoryStore {
             .unwrap_or_default())
     }
 
-    #[tracing::instrument(name = "storage.commit_transition", skip(self, transition), fields(run_key = %run_key.0, epoch = epoch.0))]
+    async fn has_open_pinned_workflows(
+        &self,
+        namespace_id: NamespaceId,
+        version: &WorkerDeploymentVersionKey,
+    ) -> Result<bool> {
+        let store = self.inner.lock().await;
+        Ok(store
+            .runs
+            .values()
+            .any(|state| workflow_is_open_and_pinned_to_version(state, namespace_id, version)))
+    }
+
+    #[tracing::instrument(name = "storage.commit_transition", skip(self, transition), fields(run_key = %run_key.0, expected_seq = transition.expected_seq.0, epoch = epoch.0))]
     async fn commit_transition(
         &self,
         run_key: RunKey,
@@ -1025,6 +1046,97 @@ impl RunRepository for InMemoryStore {
 }
 
 #[async_trait]
+impl WorkerDeploymentRepository for InMemoryStore {
+    async fn load_deployment(&self, key: &DeploymentKey) -> Result<Option<StoredWorkerDeployment>> {
+        let store = self.inner.lock().await;
+        Ok(store.worker_deployments.get(key).cloned())
+    }
+
+    async fn put_deployment(
+        &self,
+        mut record: StoredWorkerDeployment,
+        expected: Option<ConflictToken>,
+    ) -> Result<DeploymentCasResult> {
+        let mut store = self.inner.lock().await;
+        let key = DeploymentKey {
+            namespace_id: record.namespace_id,
+            deployment_name: record.name.clone(),
+        };
+
+        match (store.worker_deployments.get(&key), expected) {
+            (Some(_), None) => Ok(DeploymentCasResult::AlreadyExists),
+            (None, None) => {
+                let token = Self::next_deployment_token(None);
+                record.conflict_token = token;
+                store.worker_deployments.insert(key, record);
+                Ok(DeploymentCasResult::Applied { token })
+            }
+            (None, Some(_)) => Ok(DeploymentCasResult::NotFound),
+            (Some(current), Some(expected)) if current.conflict_token != expected => {
+                Ok(DeploymentCasResult::Conflict)
+            }
+            (Some(current), Some(_)) => {
+                let token = Self::next_deployment_token(Some(current.conflict_token));
+                record.conflict_token = token;
+                store.worker_deployments.insert(key, record);
+                Ok(DeploymentCasResult::Applied { token })
+            }
+        }
+    }
+
+    async fn delete_deployment(
+        &self,
+        key: &DeploymentKey,
+        expected: ConflictToken,
+    ) -> Result<DeploymentCasResult> {
+        let mut store = self.inner.lock().await;
+        let Some(current) = store.worker_deployments.get(key) else {
+            return Ok(DeploymentCasResult::NotFound);
+        };
+        if current.conflict_token != expected {
+            return Ok(DeploymentCasResult::Conflict);
+        }
+        let token = Self::next_deployment_token(Some(current.conflict_token));
+        store.worker_deployments.remove(key);
+        Ok(DeploymentCasResult::Applied { token })
+    }
+
+    async fn list_deployments(
+        &self,
+        namespace_id: NamespaceId,
+        after: Option<&DeploymentName>,
+        limit: usize,
+    ) -> Result<Vec<StoredWorkerDeployment>> {
+        let store = self.inner.lock().await;
+        let mut records: Vec<_> = store
+            .worker_deployments
+            .values()
+            .filter(|record| record.namespace_id == namespace_id)
+            .filter(|record| after.is_none_or(|after| record.name > *after))
+            .cloned()
+            .collect();
+        records.sort_by(|left, right| left.name.cmp(&right.name));
+        records.truncate(limit);
+        Ok(records)
+    }
+
+    async fn list_all_for_namespace(
+        &self,
+        namespace_id: NamespaceId,
+    ) -> Result<Vec<StoredWorkerDeployment>> {
+        let store = self.inner.lock().await;
+        let mut records: Vec<_> = store
+            .worker_deployments
+            .values()
+            .filter(|record| record.namespace_id == namespace_id)
+            .cloned()
+            .collect();
+        records.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(records)
+    }
+}
+
+#[async_trait]
 impl ProjectionLog for InMemoryStore {
     async fn read_from(&self, cursor: &ProjectionCursor, limit: usize) -> Result<ProjectionBatch> {
         let store = self.inner.lock().await;
@@ -1256,6 +1368,8 @@ mod tests {
     // mechanics (transition_seq OCC, activity side-tables, timer side-tables,
     // workflow-id uniqueness) without a placement controller. Epoch fencing is
     // tested separately in the fencing-specific test suites.
+    use std::collections::{BTreeMap, BTreeSet};
+
     use proptest::prelude::*;
     use time::Duration;
     use tokeira_kernel::{
@@ -1277,7 +1391,9 @@ mod tests {
         registry::LookupSpan,
     };
 
-    use crate::api::RunRepository;
+    use crate::api::{
+        RoutingConfigUpdateState, RunRepository, StoredRoutingConfig, WorkerDeploymentRepository,
+    };
 
     use super::*;
 
@@ -1310,6 +1426,218 @@ mod tests {
             deployment: None,
             build_id: None,
         }
+    }
+
+    fn sample_deployment(namespace_id: NamespaceId, name: &str) -> StoredWorkerDeployment {
+        StoredWorkerDeployment {
+            namespace_id,
+            name: DeploymentName(name.to_owned()),
+            create_time: fixed_now(),
+            routing_config: StoredRoutingConfig::default(),
+            last_modifier_identity: "tester".to_owned(),
+            manager_identity: None,
+            routing_config_update_state: RoutingConfigUpdateState::default(),
+            versions: BTreeMap::new(),
+            conflict_token: ConflictToken::default(),
+            create_request_ids: BTreeSet::from([format!("create-{name}")]),
+        }
+    }
+
+    fn deployment_key(namespace_id: NamespaceId, name: &str) -> DeploymentKey {
+        DeploymentKey {
+            namespace_id,
+            deployment_name: DeploymentName(name.to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_deployment_create_on_existing_returns_already_exists_without_mutation() {
+        let store = InMemoryStore::default();
+        let namespace_id = NamespaceId::new();
+        let record = sample_deployment(namespace_id, "alpha");
+        let key = deployment_key(namespace_id, "alpha");
+
+        let applied = store.put_deployment(record.clone(), None).await.unwrap();
+        let DeploymentCasResult::Applied { token } = applied else {
+            panic!("fresh create should apply, got {applied:?}");
+        };
+        let duplicate = store.put_deployment(record, None).await.unwrap();
+
+        assert_eq!(duplicate, DeploymentCasResult::AlreadyExists);
+        let stored = store.load_deployment(&key).await.unwrap().unwrap();
+        assert_eq!(stored.conflict_token, token);
+        assert_eq!(stored.last_modifier_identity, "tester");
+    }
+
+    #[tokio::test]
+    async fn worker_deployment_stale_token_write_conflicts_and_preserves_state() {
+        let store = InMemoryStore::default();
+        let namespace_id = NamespaceId::new();
+        let key = deployment_key(namespace_id, "alpha");
+
+        let created = store
+            .put_deployment(sample_deployment(namespace_id, "alpha"), None)
+            .await
+            .unwrap();
+        let DeploymentCasResult::Applied {
+            token: create_token,
+        } = created
+        else {
+            panic!("fresh create should apply, got {created:?}");
+        };
+
+        let mut current_update = sample_deployment(namespace_id, "alpha");
+        current_update.last_modifier_identity = "current-writer".to_owned();
+        let updated = store
+            .put_deployment(current_update.clone(), Some(create_token))
+            .await
+            .unwrap();
+        let DeploymentCasResult::Applied {
+            token: update_token,
+        } = updated
+        else {
+            panic!("current-token update should apply, got {updated:?}");
+        };
+        assert!(update_token.generation() > create_token.generation());
+        current_update.conflict_token = update_token;
+
+        let mut stale_update = sample_deployment(namespace_id, "alpha");
+        stale_update.last_modifier_identity = "stale-writer".to_owned();
+        let stale = store
+            .put_deployment(stale_update, Some(create_token))
+            .await
+            .unwrap();
+
+        assert_eq!(stale, DeploymentCasResult::Conflict);
+        assert_eq!(
+            store.load_deployment(&key).await.unwrap(),
+            Some(current_update)
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_deployment_none_and_current_token_writes_advance_generation() {
+        let store = InMemoryStore::default();
+        let namespace_id = NamespaceId::new();
+        let key = deployment_key(namespace_id, "alpha");
+
+        let created = store
+            .put_deployment(sample_deployment(namespace_id, "alpha"), None)
+            .await
+            .unwrap();
+        let DeploymentCasResult::Applied {
+            token: create_token,
+        } = created
+        else {
+            panic!("none-token create should apply, got {created:?}");
+        };
+        assert_eq!(create_token.generation(), 1);
+
+        let mut updated_record = sample_deployment(namespace_id, "alpha");
+        updated_record.manager_identity = Some("manager".to_owned());
+        let updated = store
+            .put_deployment(updated_record.clone(), Some(create_token))
+            .await
+            .unwrap();
+        let DeploymentCasResult::Applied {
+            token: update_token,
+        } = updated
+        else {
+            panic!("current-token write should apply, got {updated:?}");
+        };
+
+        assert_eq!(update_token.generation(), create_token.generation() + 1);
+        updated_record.conflict_token = update_token;
+        assert_eq!(
+            store.load_deployment(&key).await.unwrap(),
+            Some(updated_record)
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_deployment_list_pages_every_record_once_until_empty_page() {
+        let store = InMemoryStore::default();
+        let namespace_id = NamespaceId::new();
+        let other_namespace_id = NamespaceId::new();
+        for name in ["gamma", "alpha", "epsilon", "beta", "delta"] {
+            let result = store
+                .put_deployment(sample_deployment(namespace_id, name), None)
+                .await
+                .unwrap();
+            assert!(matches!(result, DeploymentCasResult::Applied { .. }));
+        }
+        let other_result = store
+            .put_deployment(sample_deployment(other_namespace_id, "alpha"), None)
+            .await
+            .unwrap();
+        assert!(matches!(other_result, DeploymentCasResult::Applied { .. }));
+
+        let mut after = None;
+        let mut seen = Vec::new();
+        loop {
+            let page = store
+                .list_deployments(namespace_id, after.as_ref(), 2)
+                .await
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            after = page.last().map(|record| record.name.clone());
+            seen.extend(page.into_iter().map(|record| record.name.0));
+        }
+
+        assert_eq!(seen, ["alpha", "beta", "delta", "epsilon", "gamma"]);
+        assert_eq!(
+            store
+                .list_deployments(namespace_id, after.as_ref(), 2)
+                .await
+                .unwrap(),
+            Vec::<StoredWorkerDeployment>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_deployment_current_token_delete_applies_and_stale_delete_conflicts() {
+        let store = InMemoryStore::default();
+        let namespace_id = NamespaceId::new();
+        let key = deployment_key(namespace_id, "alpha");
+
+        let created = store
+            .put_deployment(sample_deployment(namespace_id, "alpha"), None)
+            .await
+            .unwrap();
+        let DeploymentCasResult::Applied {
+            token: create_token,
+        } = created
+        else {
+            panic!("fresh create should apply, got {created:?}");
+        };
+        let mut updated_record = sample_deployment(namespace_id, "alpha");
+        updated_record.last_modifier_identity = "current-writer".to_owned();
+        let updated = store
+            .put_deployment(updated_record, Some(create_token))
+            .await
+            .unwrap();
+        let DeploymentCasResult::Applied {
+            token: update_token,
+        } = updated
+        else {
+            panic!("current-token update should apply, got {updated:?}");
+        };
+
+        assert_eq!(
+            store.delete_deployment(&key, create_token).await.unwrap(),
+            DeploymentCasResult::Conflict
+        );
+        let deleted = store.delete_deployment(&key, update_token).await.unwrap();
+        let DeploymentCasResult::Applied {
+            token: delete_token,
+        } = deleted
+        else {
+            panic!("current-token delete should apply, got {deleted:?}");
+        };
+        assert_eq!(delete_token.generation(), update_token.generation() + 1);
+        assert_eq!(store.load_deployment(&key).await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -1503,7 +1831,8 @@ mod tests {
             pending_updates: Default::default(),
             admitted_updates: Default::default(),
             pending_nexus_operations: Default::default(),
-            versioning_override: None,
+            versioning_info: None,
+            worker_deployment_name: None,
             completion_callbacks: Vec::new(),
             started_at: fixed_now(),
             first_run_started_at: None,
@@ -2617,6 +2946,8 @@ mod tests {
                     continued_failure: None,
                     cron_schedule: None,
                     last_completion_result: base_state.last_completion_result.clone(),
+                    versioning_info: base_state.versioning_info.clone(),
+                    worker_deployment_name: base_state.worker_deployment_name.clone(),
                 },
             ),
             history_event(
@@ -2652,6 +2983,9 @@ mod tests {
                     identity: WorkerIdentity("worker".into()),
                     sdk_metadata: None,
                     worker_version: None,
+                    versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+                    deployment_version: None,
+                    worker_deployment_name: None,
                 },
             ),
             history_event(
@@ -2742,6 +3076,8 @@ mod tests {
                     continued_failure: None,
                     cron_schedule: None,
                     last_completion_result: base_state.last_completion_result.clone(),
+                    versioning_info: base_state.versioning_info.clone(),
+                    worker_deployment_name: base_state.worker_deployment_name.clone(),
                 },
             )],
         )
@@ -2805,6 +3141,8 @@ mod tests {
                         continued_failure: None,
                         cron_schedule: None,
                         last_completion_result: base_state.last_completion_result.clone(),
+                        versioning_info: base_state.versioning_info.clone(),
+                        worker_deployment_name: base_state.worker_deployment_name.clone(),
                     },
                 ),
                 history_event(
@@ -2901,6 +3239,8 @@ mod tests {
                             continued_failure: None,
                             cron_schedule: None,
                             last_completion_result: base_state.last_completion_result.clone(),
+                    versioning_info: base_state.versioning_info.clone(),
+                    worker_deployment_name: base_state.worker_deployment_name.clone(),
                         },
                     )],
                 )

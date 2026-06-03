@@ -25,6 +25,7 @@ pub mod reservoir;
 pub mod run_repository;
 pub mod slot_block_manager;
 pub mod validation;
+pub mod worker_deployment_repository;
 
 pub use config::*;
 pub use connection::*;
@@ -36,6 +37,7 @@ pub use reservoir::*;
 pub use run_repository::*;
 pub use slot_block_manager::*;
 pub use validation::*;
+pub use worker_deployment_repository::*;
 
 /// Production DSQL storage foundation.
 #[derive(Debug)]
@@ -48,6 +50,8 @@ pub struct DsqlStore {
     projection_log: projection_log::DsqlProjectionLog,
     /// Semantic run repository backed by DSQL tables.
     run_repository: run_repository::DsqlRunRepository,
+    /// Worker Deployment registry repository backed by DSQL.
+    worker_deployment_repository: worker_deployment_repository::DsqlWorkerDeploymentRepository,
 }
 
 impl DsqlStore {
@@ -143,11 +147,16 @@ impl DsqlStore {
             config.lease_duration,
         )?;
         let projection_log = projection_log::DsqlProjectionLog::new(Arc::clone(&director));
+        let worker_deployment_repository =
+            worker_deployment_repository::DsqlWorkerDeploymentRepository::new(Arc::clone(
+                &director,
+            ));
         Ok(Self {
             director,
             migration_runner,
             projection_log,
             run_repository,
+            worker_deployment_repository,
         })
     }
 
@@ -178,6 +187,13 @@ impl DsqlStore {
     /// Access the DSQL-backed projection log reader.
     pub fn projection_log(&self) -> &projection_log::DsqlProjectionLog {
         &self.projection_log
+    }
+
+    /// Access the DSQL-backed Worker Deployment registry repository.
+    pub fn worker_deployment_repository(
+        &self,
+    ) -> &worker_deployment_repository::DsqlWorkerDeploymentRepository {
+        &self.worker_deployment_repository
     }
 
     /// Decompose the facade into owned backend components.

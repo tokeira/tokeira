@@ -28,7 +28,8 @@ use crate::{
     ActivitySweepEntry, BacklogEntry, CommitResult, CurrentExecutionConflictPolicy, DbClass,
     DispatchableActivityTask, DispatchableWorkflowTask, DueTimer, NexusSweepEntry,
     ProjectionContext, RequestRecord, RunRepository, TransitionAuditRecord, WftTimeoutSweepEntry,
-    WorkflowTimeoutSweepEntry, metrics,
+    WorkerDeploymentVersionKey, WorkflowTimeoutSweepEntry, metrics,
+    workflow_is_open_and_pinned_to_version,
 };
 
 use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, codec, convert};
@@ -448,6 +449,15 @@ impl RunRepository for DsqlRunRepository {
 
     async fn read_transition_audit(&self, run_key: RunKey) -> Result<Vec<TransitionAuditRecord>> {
         self.do_read_transition_audit(run_key).await
+    }
+
+    async fn has_open_pinned_workflows(
+        &self,
+        namespace_id: NamespaceId,
+        version: &WorkerDeploymentVersionKey,
+    ) -> Result<bool> {
+        self.do_has_open_pinned_workflows(namespace_id, version)
+            .await
     }
 
     async fn commit_transition(
@@ -1580,7 +1590,8 @@ mod tests {
             pending_updates: Default::default(),
             admitted_updates: Default::default(),
             pending_nexus_operations: Default::default(),
-            versioning_override: None,
+            versioning_info: None,
+            worker_deployment_name: None,
             completion_callbacks: Vec::new(),
             started_at: fixed_now(),
             first_run_started_at: None,

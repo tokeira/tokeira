@@ -12,7 +12,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use tokeira_kernel::{ActivityState, HistoryEvent, ProjectionOp, TimerState, WorkflowState};
 use tokeira_types::{Payloads, ProjectionCursor};
 
-use crate::{BacklogPayload, ProjectionContext};
+use crate::{BacklogPayload, ProjectionContext, StoredWorkerDeployment};
 
 /// Encode a persisted value with postcard.
 ///
@@ -125,6 +125,16 @@ pub fn encode_projection_cursor(cursor: &ProjectionCursor) -> Result<Vec<u8>> {
 
 /// Deserialize projection cursors used by projector checkpoints.
 pub fn decode_projection_cursor(bytes: &[u8]) -> Result<ProjectionCursor> {
+    decode(bytes)
+}
+
+/// Serialize one Worker Deployment registry document.
+pub fn encode_worker_deployment(record: &StoredWorkerDeployment) -> Result<Vec<u8>> {
+    encode(record)
+}
+
+/// Deserialize one Worker Deployment registry document.
+pub fn decode_worker_deployment(bytes: &[u8]) -> Result<StoredWorkerDeployment> {
     decode(bytes)
 }
 

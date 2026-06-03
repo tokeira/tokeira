@@ -13,6 +13,8 @@
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
     use proptest::prelude::*;
     use time::{Duration, OffsetDateTime};
     use tokeira_kernel::{LoadedRun, PendingWorkflowTask, Transition, WorkflowState};
@@ -22,7 +24,13 @@ mod tests {
     };
 
     use crate::{
-        api::{CommitResult, LeaseOutcome, LeaseRepository, RunRepository},
+        api::{
+            BuildId, CommitResult, ComputeConfig, ConflictToken, DeploymentCasResult,
+            DeploymentName, DrainageInfo, LeaseOutcome, LeaseRepository, RoutingConfigUpdateState,
+            RunRepository, StoredRoutingConfig, StoredVersion, StoredWorkerDeployment,
+            VersionDrainageStatus, VersionMetadata, WorkerDeploymentRepository,
+            WorkerDeploymentVersionKey, WorkerDeploymentVersionStatus,
+        },
         memory::InMemoryStore,
     };
 
@@ -83,7 +91,8 @@ mod tests {
             pending_updates: Default::default(),
             admitted_updates: Default::default(),
             pending_nexus_operations: Default::default(),
-            versioning_override: None,
+            versioning_info: None,
+            worker_deployment_name: None,
             completion_callbacks: Vec::new(),
             started_at: fixed_now(),
             first_run_started_at: None,
@@ -505,6 +514,199 @@ mod tests {
                     "matching epoch in commit_transition_for_bundle should produce Applied, got {:?}",
                     result
                 );
+
+                Ok(())
+            }).unwrap();
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct DeploymentCase {
+        suffix: u16,
+        version_count: u8,
+        manager_set: bool,
+        routing_state: u8,
+    }
+
+    fn arb_deployment_case() -> impl Strategy<Value = DeploymentCase> {
+        (0u16..10_000, 0u8..5, proptest::bool::ANY, 0u8..3).prop_map(
+            |(suffix, version_count, manager_set, routing_state)| DeploymentCase {
+                suffix,
+                version_count,
+                manager_set,
+                routing_state,
+            },
+        )
+    }
+
+    fn build_deployment_record(
+        namespace_id: NamespaceId,
+        case_index: usize,
+        case: &DeploymentCase,
+    ) -> StoredWorkerDeployment {
+        let name = DeploymentName(format!("deployment-{case_index}-{}", case.suffix));
+        let create_time = fixed_now() + Duration::seconds(case_index as i64);
+        let mut versions = BTreeMap::new();
+        for version_index in 0..case.version_count as usize {
+            let build_id = BuildId(format!("build-{case_index}-{version_index}"));
+            let status = match version_index % 6 {
+                0 => WorkerDeploymentVersionStatus::Created,
+                1 => WorkerDeploymentVersionStatus::Inactive,
+                2 => WorkerDeploymentVersionStatus::Current,
+                3 => WorkerDeploymentVersionStatus::Ramping,
+                4 => WorkerDeploymentVersionStatus::Draining,
+                _ => WorkerDeploymentVersionStatus::Drained,
+            };
+            let drainage_info = matches!(
+                status,
+                WorkerDeploymentVersionStatus::Draining | WorkerDeploymentVersionStatus::Drained
+            )
+            .then(|| DrainageInfo {
+                status: if status == WorkerDeploymentVersionStatus::Drained {
+                    VersionDrainageStatus::Drained
+                } else {
+                    VersionDrainageStatus::Draining
+                },
+                last_changed_time: create_time + Duration::seconds(10),
+                last_checked_time: create_time + Duration::seconds(20),
+            });
+            versions.insert(
+                build_id.clone(),
+                StoredVersion {
+                    build_id,
+                    status,
+                    create_time: create_time + Duration::seconds(version_index as i64),
+                    routing_changed_time: Some(create_time + Duration::seconds(30)),
+                    current_since_time: (version_index == 0)
+                        .then(|| create_time + Duration::seconds(40)),
+                    ramping_since_time: (version_index == 1)
+                        .then(|| create_time + Duration::seconds(50)),
+                    first_activation_time: Some(create_time + Duration::seconds(60)),
+                    last_current_time: (version_index % 2 == 0)
+                        .then(|| create_time + Duration::seconds(70)),
+                    last_deactivation_time: (version_index > 1)
+                        .then(|| create_time + Duration::seconds(80)),
+                    ramp_percentage: if version_index == 1 { 25.0 } else { 0.0 },
+                    drainage_info,
+                    metadata: VersionMetadata::default(),
+                    compute_config: ComputeConfig::default(),
+                    last_modifier_identity: format!("version-writer-{case_index}-{version_index}"),
+                    polled_task_queues: BTreeSet::new(),
+                    create_request_ids: BTreeSet::from([format!(
+                        "create-version-{case_index}-{version_index}"
+                    )]),
+                    compute_config_request_ids: BTreeSet::new(),
+                },
+            );
+        }
+
+        let current_version = versions
+            .keys()
+            .next()
+            .map(|build_id| WorkerDeploymentVersionKey {
+                deployment_name: name.clone(),
+                build_id: build_id.clone(),
+            });
+        let ramping_version = versions
+            .keys()
+            .nth(1)
+            .map(|build_id| WorkerDeploymentVersionKey {
+                deployment_name: name.clone(),
+                build_id: build_id.clone(),
+            });
+        let routing_config_update_state = match case.routing_state {
+            0 => RoutingConfigUpdateState::Completed,
+            1 => RoutingConfigUpdateState::InProgress,
+            _ => RoutingConfigUpdateState::Unspecified,
+        };
+
+        StoredWorkerDeployment {
+            namespace_id,
+            name,
+            create_time,
+            routing_config: StoredRoutingConfig {
+                current_version,
+                ramping_version,
+                ramping_version_percentage: if case.version_count > 1 { 25.0 } else { 0.0 },
+                current_version_changed_time: Some(create_time + Duration::seconds(90)),
+                ramping_version_changed_time: Some(create_time + Duration::seconds(100)),
+                ramping_version_percentage_changed_time: Some(create_time + Duration::seconds(110)),
+                revision_number: i64::from(case.version_count) + case_index as i64,
+            },
+            last_modifier_identity: format!("deployment-writer-{case_index}"),
+            manager_identity: case.manager_set.then(|| format!("manager-{case_index}")),
+            routing_config_update_state,
+            versions,
+            conflict_token: ConflictToken::default(),
+            create_request_ids: BTreeSet::from([format!("create-deployment-{case_index}")]),
+        }
+    }
+
+    // ─── Property 17: Registry Restart-Recovery Round-Trip ─────────────────────
+    //
+    // **Validates: Requirements 13.1, 13.2, 13.3, 13.4**
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn property_worker_deployment_registry_restart_recovery_round_trip(
+            namespace_raw in any::<u128>(),
+            cases in proptest::collection::vec(arb_deployment_case(), 0..8),
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            rt.block_on(async {
+                let namespace_id = NamespaceId(uuid::Uuid::from_u128(namespace_raw));
+                let store = InMemoryStore::default();
+                let mut expected = Vec::new();
+
+                for (index, case) in cases.iter().enumerate() {
+                    let mut record = build_deployment_record(namespace_id, index, case);
+                    let applied = store
+                        .put_deployment(record.clone(), None)
+                        .await
+                        .unwrap();
+                    let DeploymentCasResult::Applied { token } = applied else {
+                        panic!("fresh deployment insert should apply, got {applied:?}");
+                    };
+                    record.conflict_token = token;
+                    expected.push(record);
+                }
+                expected.sort_by(|left, right| left.name.cmp(&right.name));
+
+                let recovered = store.list_all_for_namespace(namespace_id).await.unwrap();
+                prop_assert_eq!(&recovered, &expected);
+
+                if let Some(first) = recovered.first() {
+                    let pre_restart_token = first.conflict_token;
+                    let mut updated = first.clone();
+                    updated.last_modifier_identity.push_str("-after-restart");
+                    let applied = store
+                        .put_deployment(updated.clone(), Some(pre_restart_token))
+                        .await
+                        .unwrap();
+                    let DeploymentCasResult::Applied { token: post_restart_token } = applied else {
+                        panic!("current pre-restart token should apply after reload, got {applied:?}");
+                    };
+                    prop_assert_ne!(post_restart_token, pre_restart_token);
+
+                    updated.conflict_token = post_restart_token;
+                    let key = crate::DeploymentKey {
+                        namespace_id,
+                        deployment_name: updated.name.clone(),
+                    };
+                    prop_assert_eq!(store.load_deployment(&key).await.unwrap(), Some(updated.clone()));
+
+                    let stale = store
+                        .put_deployment(updated, Some(pre_restart_token))
+                        .await
+                        .unwrap();
+                    prop_assert_eq!(stale, DeploymentCasResult::Conflict);
+                }
 
                 Ok(())
             }).unwrap();

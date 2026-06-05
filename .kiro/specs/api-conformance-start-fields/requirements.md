@@ -18,7 +18,7 @@ fields remain `INVALID_ARGUMENT` for normal clients.
 
 ## Evidence From Current Code
 
-- Proto messages inspected against the vendored v1.62.11 surface (`proto/upstream/temporal/api/workflowservice/v1/request_response.proto`): `StartWorkflowExecutionRequest` (29 fields) and `SignalWithStartWorkflowExecutionRequest` (27 fields). Behaviour verified against Temporal server [tag `v1.31.0`](https://github.com/temporalio/temporal/tree/v1.31.0) per AGENTS.md §8.
+- Proto messages inspected against the vendored v1.62.11 surface (`proto/upstream/temporal/api/workflowservice/v1/request_response.proto`): `StartWorkflowExecutionRequest` (29 fields) and `SignalWithStartWorkflowExecutionRequest` (26 fields — field numbers run to 27 but number 21 is `reserved`). Behaviour verified against Temporal server [tag `v1.31.0`](https://github.com/temporalio/temporal/tree/v1.31.0) per AGENTS.md §8.
 - Current handlers: `start_workflow_execution`, `signal_with_start_workflow_execution`.
 - Existing translation: `to_internal::start_request` and signal-with-start helpers.
 - Unsupported-field entry: `StartWorkflowExecutionRequest` in `UNSUPPORTED_FIELDS.md` (currently missing the v1.62 additions `on_conflict_options`, `priority`, `eager_worker_deployment_options`, `time_skipping_config`; this spec re-anchors the accounting to the proto).

@@ -2,7 +2,7 @@
 
 ## Overview
 
-Activity poll and heartbeat conformance requires carrying heartbeat payloads and attempt timestamps through runtime tracking and storage-derived dispatch entries. The edge remains a translator; activity state and token validation stay in runtime/kernel.
+Activity poll and heartbeat conformance requires carrying heartbeat payloads and attempt timestamps through durable activity state. The edge remains a translator; activity token validation and heartbeat persistence stay in the runtime, and the kernel remains deterministic and heartbeat-free.
 
 ## Dependencies and Non-Goals
 
@@ -15,20 +15,23 @@ Activity poll and heartbeat conformance requires carrying heartbeat payloads and
 ```mermaid
 flowchart LR
     Worker --> Heartbeat["RecordActivityTaskHeartbeat"]
-    Heartbeat --> Runtime["activity_tracking"]
-    Runtime --> Store["Run/activity tracking state"]
+    Heartbeat --> Runtime["Runtime token validation"]
+    Runtime --> Store["ActivityState via commit_transition"]
     Worker --> Poll["PollActivityTaskQueue"]
     Poll --> Broker["Activity broker"]
+    Poll --> Store
     Broker --> Response["PollActivityTaskQueueResponse"]
 ```
 
 ## Components and Interfaces
 
 - `crates/tokeira-edge/src/grpc/translate.rs`: preserve heartbeat `details` and project poll response fields.
-- `crates/tokeira-runtime/src/runtime/activity.rs`: persist heartbeat details and authored started time.
-- `crates/tokeira-runtime/src/heartbeat.rs` or activity tracking module: extend tracking entries with latest details.
-- `crates/tokeira-storage/src/memory.rs` and DSQL dispatch reads: expose scheduled/start timing when known.
+- `crates/tokeira-runtime/src/runtime/activity.rs`: persist heartbeat details on `ActivityState` through the runtime's fenced `commit_transition` path with an empty history batch and `ActivityOp::Upsert`, matching the activity-start pattern.
+- `crates/tokeira-kernel/src/state.rs`: add durable `ActivityState` fields for latest heartbeat details and current-attempt schedule time. Heartbeat commands are not added to the kernel.
+- `crates/tokeira-storage/src/memory.rs` and DSQL dispatch reads: retain durable activity state so heartbeat details and scheduled/start timing survive restart.
 - `crates/tokeira-edge/src/translate/history_serializer.rs`: populate activity event linkage fields when present.
+
+Heartbeat lifecycle follows Temporal v1.31.0: `UpdateActivityProgress` persists `LastHeartbeatDetails` on mutable activity info without a history event (`service/history/workflow/mutable_state_impl.go:1956 @ v1.31.0`), the next activity start returns those details (`service/history/api/recordactivitytaskstarted/api.go:265 @ v1.31.0`), and normal retry preserves the details while `ResetHeartbeats` clears them (`service/history/workflow/activity.go:63 @ v1.31.0`). Tokeira implements the same boundary by writing `ActivityState.heartbeat_details` from the runtime; volatile activity tracking remains only for heartbeat timeout and cancellation liveness.
 
 ## Correctness Properties
 

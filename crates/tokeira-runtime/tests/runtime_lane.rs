@@ -1,16 +1,25 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use std::collections::BTreeMap;
 use time::{Duration, OffsetDateTime};
 
-use tokeira_kernel::{StartRequest, WorkflowTaskCompletedRequest};
+use tokeira_kernel::{
+    CallbackSpec, CallbackState, Command, CompletionCallback, HistoryEventKind, LoadedRun,
+    StartRequest, VersioningBehavior, VersioningOverride, WORKFLOW_START_DELAY_TIMER_ID,
+    WorkerDeploymentVersionRef, WorkflowCommand, WorkflowStartDelayElapsedRequest,
+    WorkflowTaskCompletedRequest,
+};
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
+    ActivityTimeoutScannerConfig, BacklogConfig, LaneConfig, NexusEndpointRegistry,
+    NexusTimeoutScannerConfig, NoopNexusHttpClient, TimerScannerConfig, TokeiraRuntime,
+    VersioningRuleStore, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
-    ExecutionRef, LogicalTaskSeq, Memo, NamespaceId, Payloads, QueueKey, RequestContext, RequestId,
-    SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
+    BuildId, DeploymentId, ExecutionRef, LogicalTaskSeq, Memo, NamespaceId, Payloads, QueueKey,
+    RequestContext, RequestId, RunKey, SearchAttributes, ShardId, TaskKind, TaskQueueName,
+    WorkerIdentity, WorkflowId, WorkflowType,
 };
 
 #[tokio::test]
@@ -52,10 +61,12 @@ async fn start_and_signal_publish_workflow_tasks() -> Result<()> {
             token: first_task.token,
             identity: WorkerIdentity("worker-a".to_string()),
             sdk_metadata: None,
+            metering_metadata: None,
             worker_version: None,
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
+            sticky_ttl: None,
             commands: Vec::new(),
             force_new_workflow_task: false,
             now: OffsetDateTime::now_utc(),
@@ -142,6 +153,500 @@ async fn occ_conflicts_are_retried_for_signals() -> Result<()> {
 }
 
 #[tokio::test]
+async fn delayed_start_persists_due_timer_without_publishing_wft() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = TokeiraRuntime::new(
+        store.clone(),
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
+    );
+    let namespace_id = NamespaceId::new();
+    let workflow_id = WorkflowId("delayed-workflow".to_string());
+    let queue = queue(namespace_id, "queue-a");
+    let mut request = start_request(namespace_id, workflow_id, "req-delayed-start");
+    let start_time = request.now;
+    request.workflow_start_delay = Some(Duration::seconds(30));
+
+    let result = runtime.start_workflow(request).await?;
+    let state = applied_state(&result);
+
+    let immediate = runtime
+        .poll_workflow_task(
+            queue,
+            WorkerIdentity("worker-a".to_string()),
+            tokio::time::Duration::ZERO,
+        )
+        .await?;
+    assert!(immediate.is_none());
+
+    let due_before = store
+        .list_due_timers(start_time + Duration::seconds(29), 10)
+        .await?;
+    assert!(due_before.is_empty());
+    let due_after = store
+        .list_due_timers(start_time + Duration::seconds(30), 10)
+        .await?;
+    assert_eq!(due_after.len(), 1);
+    assert_eq!(due_after[0].run_key, state.run_key);
+    assert_eq!(due_after[0].timer_id, WORKFLOW_START_DELAY_TIMER_ID);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_cron_start_uses_durable_first_wft_backoff() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = TokeiraRuntime::new(
+        store.clone(),
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
+    );
+    let namespace_id = NamespaceId::new();
+    let workflow_id = WorkflowId("cron-workflow".to_string());
+    let queue = queue(namespace_id, "queue-a");
+    let start_time = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+    let mut request = start_request(namespace_id, workflow_id, "req-cron-start");
+    request.now = start_time;
+    request.request.received_at = start_time;
+    request.client_cron_schedule = Some("* * * * *".to_string());
+    request.cron_schedule = Some("* * * * *".to_string());
+
+    let result = runtime.start_workflow(request).await?;
+    let state = applied_state(&result);
+
+    let immediate = runtime
+        .poll_workflow_task(
+            queue,
+            WorkerIdentity("worker-a".to_string()),
+            tokio::time::Duration::ZERO,
+        )
+        .await?;
+    assert!(immediate.is_none());
+
+    let due_before = store
+        .list_due_timers(start_time + Duration::seconds(39), 10)
+        .await?;
+    assert!(due_before.is_empty());
+    let due_after = store
+        .list_due_timers(start_time + Duration::seconds(40), 10)
+        .await?;
+    assert_eq!(due_after.len(), 1);
+    assert_eq!(due_after[0].run_key, state.run_key);
+    assert_eq!(due_after[0].timer_id, WORKFLOW_START_DELAY_TIMER_ID);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn cron_terminal_completion_authors_delayed_successor_run() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = TokeiraRuntime::new(
+        store.clone(),
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
+    );
+    let namespace_id = NamespaceId::new();
+    let workflow_id = WorkflowId("cron-successor-workflow".to_string());
+    let queue = queue(namespace_id, "queue-a");
+    let start_time = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+    let mut request = start_request(namespace_id, workflow_id.clone(), "req-cron-successor");
+    request.now = start_time;
+    request.request.received_at = start_time;
+    request.cron_schedule = Some("* * * * *".to_string());
+
+    let start = runtime.start_workflow(request).await?;
+    let predecessor = applied_state(&start);
+    let first_task = runtime
+        .poll_workflow_task(
+            queue.clone(),
+            WorkerIdentity("worker-a".to_string()),
+            tokio::time::Duration::from_millis(5),
+        )
+        .await?
+        .expect("cron run should publish its first WFT when no first-WFT backoff is set");
+
+    runtime
+        .complete_workflow_task(WorkflowTaskCompletedRequest {
+            token: first_task.token,
+            identity: WorkerIdentity("worker-a".to_string()),
+            sdk_metadata: None,
+            metering_metadata: None,
+            worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
+            sticky_ttl: None,
+            commands: vec![WorkflowCommand::CompleteWorkflow {
+                result: Payloads::default(),
+            }],
+            force_new_workflow_task: false,
+            now: start_time,
+        })
+        .await?;
+
+    let history = store.read_history(predecessor.run_key, 0, 16).await?;
+    let successor_run_id = history
+        .iter()
+        .find_map(|event| match &event.kind {
+            HistoryEventKind::WorkflowExecutionContinuedAsNew {
+                new_run_id,
+                initiator,
+                backoff_start_interval,
+                cron_schedule,
+                ..
+            } if *initiator == tokeira_kernel::ContinueAsNewInitiator::CronSchedule => {
+                assert_eq!(*backoff_start_interval, Some(Duration::seconds(40)));
+                assert_eq!(cron_schedule.as_deref(), Some("* * * * *"));
+                Some(*new_run_id)
+            }
+            _ => None,
+        })
+        .expect("cron completion should author a continue-as-new successor event");
+    let successor_key = RunKey::derive(namespace_id, &workflow_id, successor_run_id);
+
+    let successor = wait_for_existing_run(&store, successor_key).await?;
+    assert_eq!(successor.workflow_start_delay, Some(Duration::seconds(40)));
+    assert!(successor.timers.contains_key(WORKFLOW_START_DELAY_TIMER_ID));
+    let successor_history = store.read_history(successor_key, 0, 1).await?;
+    assert!(matches!(
+        successor_history.first().map(|event| &event.kind),
+        Some(HistoryEventKind::WorkflowExecutionStarted {
+            continued_execution_run_id,
+            cron_schedule,
+            workflow_start_delay,
+            ..
+        }) if *continued_execution_run_id == Some(predecessor.run_id)
+            && cron_schedule.as_deref() == Some("* * * * *")
+            && *workflow_start_delay == Some(Duration::seconds(40))
+    ));
+
+    let immediate = runtime
+        .poll_workflow_task(
+            queue,
+            WorkerIdentity("worker-a".to_string()),
+            tokio::time::Duration::ZERO,
+        )
+        .await?;
+    assert!(immediate.is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn restart_preserves_delayed_start_callbacks_and_versioning_route() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let namespace_id = NamespaceId::new();
+    let workflow_id = WorkflowId("restart-delayed-workflow".to_string());
+    let start_time = OffsetDateTime::now_utc();
+    let deployment = "payments-v2".to_string();
+    let build_id = "build-2026-06".to_string();
+    let mut request = start_request(namespace_id, workflow_id, "req-restart-delayed");
+    request.now = start_time;
+    request.request.received_at = start_time;
+    request.workflow_start_delay = Some(Duration::seconds(30));
+    request.completion_callbacks = vec![completion_callback("https://callback.example/closed")];
+    request.deployment = Some(DeploymentId(deployment.clone()));
+    request.build_id = Some(BuildId(build_id.clone()));
+    request.versioning_override = Some(VersioningOverride::Pinned {
+        version: WorkerDeploymentVersionRef {
+            deployment_name: deployment.clone(),
+            build_id: build_id.clone(),
+        },
+    });
+
+    let runtime_before_restart = runtime_with_store(store.clone());
+    let result = runtime_before_restart.start_workflow(request).await?;
+    let started = applied_state(&result);
+
+    let reloaded = wait_for_existing_run(&store, started.run_key).await?;
+    assert_eq!(reloaded.workflow_start_delay, Some(Duration::seconds(30)));
+    assert_eq!(reloaded.completion_callbacks.len(), 1);
+    assert_eq!(
+        reloaded.completion_callbacks[0].state,
+        CallbackState::Standby
+    );
+    assert_eq!(
+        reloaded.versioning_override(),
+        Some(&VersioningOverride::Pinned {
+            version: WorkerDeploymentVersionRef {
+                deployment_name: deployment.clone(),
+                build_id: build_id.clone(),
+            },
+        })
+    );
+    assert!(
+        store
+            .list_due_timers(start_time + Duration::seconds(30), 10)
+            .await?
+            .iter()
+            .any(|timer| timer.run_key == started.run_key
+                && timer.timer_id == WORKFLOW_START_DELAY_TIMER_ID)
+    );
+
+    let runtime_after_restart = runtime_with_store(store.clone());
+    let unversioned = runtime_after_restart
+        .poll_workflow_task(
+            queue(namespace_id, "queue-a"),
+            WorkerIdentity("worker-a".to_string()),
+            tokio::time::Duration::ZERO,
+        )
+        .await?;
+    assert!(unversioned.is_none());
+
+    runtime_after_restart
+        .submit(
+            started.run_key,
+            Command::WorkflowStartDelayElapsed(WorkflowStartDelayElapsedRequest {
+                fired_at: start_time + Duration::seconds(30),
+            }),
+        )
+        .await?;
+
+    let still_not_unversioned = runtime_after_restart
+        .poll_workflow_task(
+            queue(namespace_id, "queue-a"),
+            WorkerIdentity("worker-a".to_string()),
+            tokio::time::Duration::ZERO,
+        )
+        .await?;
+    assert!(still_not_unversioned.is_none());
+
+    let versioned_task = runtime_after_restart
+        .poll_workflow_task(
+            versioned_queue(namespace_id, "queue-a", &deployment, &build_id),
+            WorkerIdentity("worker-a".to_string()),
+            tokio::time::Duration::from_millis(5),
+        )
+        .await?
+        .expect("delayed start should route to the pinned worker deployment after reload");
+
+    runtime_after_restart
+        .complete_workflow_task(WorkflowTaskCompletedRequest {
+            token: versioned_task.token,
+            identity: WorkerIdentity("worker-a".to_string()),
+            sdk_metadata: None,
+            metering_metadata: None,
+            worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
+            sticky_ttl: None,
+            commands: vec![WorkflowCommand::CompleteWorkflow {
+                result: Payloads::default(),
+            }],
+            force_new_workflow_task: false,
+            now: start_time + Duration::seconds(31),
+        })
+        .await?;
+
+    let closed = wait_for_existing_run(&store, started.run_key).await?;
+    assert_eq!(closed.completion_callbacks.len(), 1);
+    assert_eq!(
+        closed.completion_callbacks[0].state,
+        CallbackState::Scheduled
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn restart_preserves_cron_state_before_terminal_successor() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let namespace_id = NamespaceId::new();
+    let workflow_id = WorkflowId("restart-cron-workflow".to_string());
+    let queue = queue(namespace_id, "queue-a");
+    let start_time = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+    let mut request = start_request(namespace_id, workflow_id.clone(), "req-restart-cron");
+    request.now = start_time;
+    request.request.received_at = start_time;
+    request.cron_schedule = Some("* * * * *".to_string());
+
+    let runtime_before_restart = runtime_with_store(store.clone());
+    let start = runtime_before_restart.start_workflow(request).await?;
+    let predecessor = applied_state(&start);
+
+    let runtime_after_restart = recovering_runtime_with_store(store.clone());
+    runtime_after_restart.acquire_shard(ShardId(0)).await?;
+    let first_task = runtime_after_restart
+        .poll_workflow_task(
+            queue.clone(),
+            WorkerIdentity("worker-a".to_string()),
+            tokio::time::Duration::from_millis(5),
+        )
+        .await?
+        .expect("cron run should still have its first WFT after runtime reload");
+
+    runtime_after_restart
+        .complete_workflow_task(WorkflowTaskCompletedRequest {
+            token: first_task.token,
+            identity: WorkerIdentity("worker-a".to_string()),
+            sdk_metadata: None,
+            metering_metadata: None,
+            worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
+            sticky_ttl: None,
+            commands: vec![WorkflowCommand::CompleteWorkflow {
+                result: Payloads::default(),
+            }],
+            force_new_workflow_task: false,
+            now: start_time,
+        })
+        .await?;
+
+    let history = store.read_history(predecessor.run_key, 0, 16).await?;
+    let successor_run_id = history
+        .iter()
+        .find_map(|event| match &event.kind {
+            HistoryEventKind::WorkflowExecutionContinuedAsNew {
+                new_run_id,
+                initiator,
+                backoff_start_interval,
+                cron_schedule,
+                ..
+            } if *initiator == tokeira_kernel::ContinueAsNewInitiator::CronSchedule => {
+                assert_eq!(*backoff_start_interval, Some(Duration::seconds(40)));
+                assert_eq!(cron_schedule.as_deref(), Some("* * * * *"));
+                Some(*new_run_id)
+            }
+            _ => None,
+        })
+        .expect("cron completion should author a successor after runtime reload");
+    let successor_key = RunKey::derive(namespace_id, &workflow_id, successor_run_id);
+    let successor = wait_for_existing_run(&store, successor_key).await?;
+    assert_eq!(successor.workflow_start_delay, Some(Duration::seconds(40)));
+    assert!(successor.timers.contains_key(WORKFLOW_START_DELAY_TIMER_ID));
+
+    let successor_history = store.read_history(successor_key, 0, 1).await?;
+    assert!(matches!(
+        successor_history.first().map(|event| &event.kind),
+        Some(HistoryEventKind::WorkflowExecutionStarted {
+            continued_execution_run_id,
+            cron_schedule,
+            workflow_start_delay,
+            ..
+        }) if *continued_execution_run_id == Some(predecessor.run_id)
+            && cron_schedule.as_deref() == Some("* * * * *")
+            && *workflow_start_delay == Some(Duration::seconds(40))
+    ));
+
+    let immediate = runtime_after_restart
+        .poll_workflow_task(
+            queue,
+            WorkerIdentity("worker-a".to_string()),
+            tokio::time::Duration::ZERO,
+        )
+        .await?;
+    assert!(immediate.is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn restart_preserves_wft_completion_routing_metadata() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let namespace_id = NamespaceId::new();
+    let workflow_id = WorkflowId("restart-completion-routing".to_string());
+    let deployment = "payments-v3".to_string();
+    let build_id = "build-2026-07".to_string();
+    let queue_name = "queue-a";
+    let start_time = OffsetDateTime::now_utc();
+    let runtime_before_restart = runtime_with_store(store.clone());
+
+    let start = runtime_before_restart
+        .start_workflow(start_request(
+            namespace_id,
+            workflow_id,
+            "req-restart-completion-routing",
+        ))
+        .await?;
+    let started = applied_state(&start);
+    let first_task = runtime_before_restart
+        .poll_workflow_task(
+            queue(namespace_id, queue_name),
+            WorkerIdentity("worker-a".to_string()),
+            tokio::time::Duration::from_millis(5),
+        )
+        .await?
+        .expect("start should publish the first WFT");
+
+    runtime_before_restart
+        .complete_workflow_task(WorkflowTaskCompletedRequest {
+            token: first_task.token,
+            identity: WorkerIdentity("worker-a".to_string()),
+            sdk_metadata: None,
+            metering_metadata: Some(b"metering-after-complete".to_vec()),
+            worker_version: None,
+            versioning_behavior: VersioningBehavior::Pinned,
+            deployment_version: Some(WorkerDeploymentVersionRef {
+                deployment_name: deployment.clone(),
+                build_id: build_id.clone(),
+            }),
+            worker_deployment_name: Some(deployment.clone()),
+            sticky_ttl: Some(Duration::seconds(60)),
+            commands: Vec::new(),
+            force_new_workflow_task: true,
+            now: start_time,
+        })
+        .await?;
+
+    let completed = wait_for_existing_run(&store, started.run_key).await?;
+    assert_eq!(
+        completed
+            .sticky
+            .as_ref()
+            .map(|sticky| &sticky.worker_identity),
+        Some(&WorkerIdentity("worker-a".to_string()))
+    );
+    assert_eq!(
+        completed.worker_deployment_name.as_deref(),
+        Some("payments-v3")
+    );
+    assert_eq!(
+        completed.effective_deployment(),
+        Some(&WorkerDeploymentVersionRef {
+            deployment_name: deployment.clone(),
+            build_id: build_id.clone(),
+        })
+    );
+
+    let runtime_after_restart = recovering_runtime_with_store(store.clone());
+    runtime_after_restart.acquire_shard(ShardId(0)).await?;
+
+    let wrong_worker = runtime_after_restart
+        .poll_workflow_task(
+            queue(namespace_id, queue_name),
+            WorkerIdentity("worker-b".to_string()),
+            tokio::time::Duration::ZERO,
+        )
+        .await?;
+    assert!(wrong_worker.is_none());
+
+    let sticky_task = runtime_after_restart
+        .poll_workflow_task(
+            queue(namespace_id, queue_name),
+            WorkerIdentity("worker-a".to_string()),
+            tokio::time::Duration::from_millis(5),
+        )
+        .await?
+        .expect("recovered pending WFT should retain sticky and versioned routing metadata");
+    assert_eq!(sticky_task.run_key, started.run_key);
+    assert!(sticky_task.is_sticky_match);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn burst_signals_produce_complete_history() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
     let runtime = Arc::new(TokeiraRuntime::new(
@@ -200,6 +705,49 @@ fn applied_state(result: &CommitResult) -> tokeira_kernel::WorkflowState {
     }
 }
 
+fn runtime_with_store(store: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {
+    TokeiraRuntime::new(
+        store,
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
+    )
+}
+
+fn recovering_runtime_with_store(store: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {
+    TokeiraRuntime::new_with_nexus_and_shards(
+        store,
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
+        ActivityTimeoutScannerConfig::default(),
+        NexusTimeoutScannerConfig::default(),
+        NexusEndpointRegistry::default(),
+        Arc::new(NoopNexusHttpClient),
+        1,
+        "restart-test-owner".to_string(),
+        false,
+        Arc::new(VersioningRuleStore::default()),
+    )
+}
+
+async fn wait_for_existing_run(
+    store: &Arc<InMemoryStore>,
+    run_key: RunKey,
+) -> Result<tokeira_kernel::WorkflowState> {
+    for _ in 0..100 {
+        if let LoadedRun::Existing(state) = store.load_run(run_key).await? {
+            return Ok(state);
+        }
+        tokio::task::yield_now().await;
+    }
+    anyhow::bail!("successor run was not materialized");
+}
+
 fn queue(namespace_id: NamespaceId, name: &str) -> QueueKey {
     QueueKey {
         namespace_id,
@@ -207,6 +755,36 @@ fn queue(namespace_id: NamespaceId, name: &str) -> QueueKey {
         task_kind: TaskKind::Workflow,
         deployment: None,
         build_id: None,
+    }
+}
+
+fn versioned_queue(
+    namespace_id: NamespaceId,
+    name: &str,
+    deployment: &str,
+    build_id: &str,
+) -> QueueKey {
+    QueueKey {
+        namespace_id,
+        task_queue: TaskQueueName(name.to_string()),
+        task_kind: TaskKind::Workflow,
+        deployment: Some(DeploymentId(deployment.to_string())),
+        build_id: Some(BuildId(build_id.to_string())),
+    }
+}
+
+fn completion_callback(url: &str) -> CompletionCallback {
+    CompletionCallback {
+        spec: CallbackSpec::Nexus {
+            url: url.to_string(),
+            header: BTreeMap::new(),
+        },
+        links: Vec::new(),
+        trigger: tokeira_kernel::CallbackTrigger::WorkflowClosed,
+        registration_time: None,
+        state: CallbackState::Standby,
+        attempt: 0,
+        last_attempt_failure: None,
     }
 }
 
@@ -236,6 +814,12 @@ fn start_request(
         deployment: None,
         build_id: None,
         versioning_override: None,
+        workflow_start_delay: None,
+        completion_callbacks: Vec::new(),
+        user_metadata: None,
+        links: Vec::new(),
+        on_conflict_options: None,
+        priority: None,
         attempt: 1,
         continued_execution_run_id: None,
         first_execution_run_id: None,
@@ -256,6 +840,7 @@ fn start_request(
             received_at: OffsetDateTime::now_utc(),
         },
         now: OffsetDateTime::now_utc(),
+        client_cron_schedule: None,
         cron_schedule: None,
         reserved_poller_identity: None,
     }

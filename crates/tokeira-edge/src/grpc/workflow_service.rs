@@ -18,7 +18,7 @@ use tokeira_runtime::{
     BuildIdReachabilityResult, ScheduleError, TaskQueueConfigEntry, TaskQueueReachability,
     VersioningError, compute_matching_times, compute_next_times, compute_reachability,
 };
-use tokeira_types::{BuildId, TaskQueueName, WorkerIdentity};
+use tokeira_types::{BuildId, NamespaceId, TaskQueueName, WorkerIdentity};
 
 use crate::{
     grpc::{errors::proto_conversion_status, metadata::metadata_to_header_map, translate},
@@ -27,6 +27,8 @@ use crate::{
 };
 
 const COMMIT_POLLER_RECENT_WINDOW: time::Duration = time::Duration::minutes(5);
+const DEPRECATED_DEPLOYMENTS_UNIMPLEMENTED: &str =
+    "Deployments are deprecated and no longer supported, use Worker Deployments instead";
 
 /// Tonic service implementation that bridges proto ↔ edge DTOs.
 ///
@@ -45,6 +47,13 @@ impl WorkflowServiceGrpc {
 
     pub fn into_service(self) -> WorkflowServiceServer<Self> {
         WorkflowServiceServer::new(self)
+    }
+
+    async fn resolve_namespace_id(&self, namespace: &str) -> Result<NamespaceId, Status> {
+        self.inner
+            .resolve_namespace_id(namespace)
+            .await
+            .map_err(namespace_resolution_status)
     }
 }
 
@@ -1070,41 +1079,31 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         &self,
         _request: Request<workflowservice::DescribeDeploymentRequest>,
     ) -> Result<Response<workflowservice::DescribeDeploymentResponse>, Status> {
-        Err(Status::unimplemented(
-            "Deployment management is not yet supported. Worker versioning via assignment and redirect rules is available.",
-        ))
+        Err(Status::unimplemented(DEPRECATED_DEPLOYMENTS_UNIMPLEMENTED))
     }
     async fn list_deployments(
         &self,
         _request: Request<workflowservice::ListDeploymentsRequest>,
     ) -> Result<Response<workflowservice::ListDeploymentsResponse>, Status> {
-        Err(Status::unimplemented(
-            "Deployment management is not yet supported. Worker versioning via assignment and redirect rules is available.",
-        ))
+        Err(Status::unimplemented(DEPRECATED_DEPLOYMENTS_UNIMPLEMENTED))
     }
     async fn get_deployment_reachability(
         &self,
         _request: Request<workflowservice::GetDeploymentReachabilityRequest>,
     ) -> Result<Response<workflowservice::GetDeploymentReachabilityResponse>, Status> {
-        Err(Status::unimplemented(
-            "Deployment management is not yet supported. Use GetWorkerTaskReachability for build ID reachability.",
-        ))
+        Err(Status::unimplemented(DEPRECATED_DEPLOYMENTS_UNIMPLEMENTED))
     }
     async fn get_current_deployment(
         &self,
         _request: Request<workflowservice::GetCurrentDeploymentRequest>,
     ) -> Result<Response<workflowservice::GetCurrentDeploymentResponse>, Status> {
-        Err(Status::unimplemented(
-            "Deployment management is not yet supported.",
-        ))
+        Err(Status::unimplemented(DEPRECATED_DEPLOYMENTS_UNIMPLEMENTED))
     }
     async fn set_current_deployment(
         &self,
         _request: Request<workflowservice::SetCurrentDeploymentRequest>,
     ) -> Result<Response<workflowservice::SetCurrentDeploymentResponse>, Status> {
-        Err(Status::unimplemented(
-            "Deployment management is not yet supported.",
-        ))
+        Err(Status::unimplemented(DEPRECATED_DEPLOYMENTS_UNIMPLEMENTED))
     }
     async fn poll_workflow_execution_update(
         &self,
@@ -1126,6 +1125,22 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             return Err(Status::invalid_argument("update_ref.update_id is required"));
         }
 
+        let wait_policy = match req
+            .wait_policy
+            .as_ref()
+            .map(|policy| policy.lifecycle_stage)
+        {
+            None | Some(0) => tokeira_runtime::UpdateWaitPolicy::Unspecified,
+            Some(1) => tokeira_runtime::UpdateWaitPolicy::Admitted,
+            Some(2) => tokeira_runtime::UpdateWaitPolicy::Accepted,
+            Some(3) => tokeira_runtime::UpdateWaitPolicy::Completed,
+            Some(_) => {
+                return Err(Status::invalid_argument(
+                    "invalid update wait lifecycle_stage",
+                ));
+            }
+        };
+
         let result = self
             .inner
             .poll_workflow_execution_update(
@@ -1134,70 +1149,47 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 execution.workflow_id.clone(),
                 execution.run_id.clone(),
                 update_id.clone(),
+                wait_policy,
             )
             .await?;
 
-        match result {
-            Some((outcome, _run_key)) => {
-                let (proto_outcome, stage) = match outcome {
-                    tokeira_runtime::UpdateOutcome::Completed { result, .. } => (
-                        Some(update::Outcome {
-                            value: Some(update::outcome::Value::Success(
-                                tokeira_proto::conversions::common::payloads_from_domain(&result),
-                            )),
-                        }),
-                        tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Completed
-                            as i32,
-                    ),
-                    tokeira_runtime::UpdateOutcome::Rejected { failure, .. } => (
-                        Some(update::Outcome {
-                            value: Some(update::outcome::Value::Failure(
-                                tokeira_proto::conversions::common::payload_to_failure(&failure),
-                            )),
-                        }),
-                        tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Completed
-                            as i32,
-                    ),
-                    tokeira_runtime::UpdateOutcome::Accepted { .. } => (
-                        None,
-                        tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Accepted
-                            as i32,
-                    ),
-                };
+        let (proto_outcome, stage) = match result.outcome {
+            Some(tokeira_runtime::UpdateOutcome::Completed { result, .. }) => (
+                Some(update::Outcome {
+                    value: Some(update::outcome::Value::Success(
+                        tokeira_proto::conversions::common::payloads_from_domain(&result),
+                    )),
+                }),
+                tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Completed as i32,
+            ),
+            Some(tokeira_runtime::UpdateOutcome::Rejected { failure, .. }) => (
+                Some(update::Outcome {
+                    value: Some(update::outcome::Value::Failure(
+                        tokeira_proto::conversions::common::payload_to_failure(&failure),
+                    )),
+                }),
+                tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Completed as i32,
+            ),
+            None => (None, update_lifecycle_stage_to_proto(result.stage)),
+        };
 
-                Ok(Response::new(
-                    workflowservice::PollWorkflowExecutionUpdateResponse {
-                        outcome: proto_outcome,
-                        stage,
-                        update_ref: Some(update::UpdateRef {
-                            workflow_execution: Some(tokeira_proto::common::WorkflowExecution {
-                                workflow_id: execution.workflow_id,
-                                run_id: execution.run_id,
-                            }),
-                            update_id,
-                        }),
-                    },
-                ))
-            }
-            None => {
-                // Timeout — return empty response so the SDK retries.
-                Ok(Response::new(
-                    workflowservice::PollWorkflowExecutionUpdateResponse {
-                        outcome: None,
-                        stage:
-                            tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Unspecified
-                                as i32,
-                        update_ref: Some(update::UpdateRef {
-                            workflow_execution: Some(tokeira_proto::common::WorkflowExecution {
-                                workflow_id: execution.workflow_id,
-                                run_id: execution.run_id,
-                            }),
-                            update_id,
-                        }),
-                    },
-                ))
-            }
-        }
+        Ok(Response::new(
+            workflowservice::PollWorkflowExecutionUpdateResponse {
+                outcome: proto_outcome,
+                stage,
+                update_ref: Some(update::UpdateRef {
+                    workflow_execution: Some(tokeira_proto::common::WorkflowExecution {
+                        workflow_id: result.workflow_execution.workflow_id.0,
+                        run_id: result
+                            .workflow_execution
+                            .run_id
+                            .map(|run_id| run_id.0.to_string())
+                            .unwrap_or_default(),
+                    }),
+                    update_id: result.update_id,
+                }),
+            },
+        ))
     }
     async fn start_batch_operation(
         &self,
@@ -1319,96 +1311,266 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             groups: Vec::new(),
         }))
     }
-    // === Worker Deployments — deferred to worker-deployments spec ===
-    deferred_unary!(
-        describe_worker_deployment_version,
-        DescribeWorkerDeploymentVersionRequest,
-        DescribeWorkerDeploymentVersionResponse,
-        "worker-deployments"
-    );
-    deferred_unary!(
-        set_worker_deployment_current_version,
-        SetWorkerDeploymentCurrentVersionRequest,
-        SetWorkerDeploymentCurrentVersionResponse,
-        "worker-deployments"
-    );
-    deferred_unary!(
-        describe_worker_deployment,
-        DescribeWorkerDeploymentRequest,
-        DescribeWorkerDeploymentResponse,
-        "worker-deployments"
-    );
-    deferred_unary!(
-        delete_worker_deployment,
-        DeleteWorkerDeploymentRequest,
-        DeleteWorkerDeploymentResponse,
-        "worker-deployments"
-    );
-    deferred_unary!(
-        delete_worker_deployment_version,
-        DeleteWorkerDeploymentVersionRequest,
-        DeleteWorkerDeploymentVersionResponse,
-        "worker-deployments"
-    );
-    deferred_unary!(
-        set_worker_deployment_ramping_version,
-        SetWorkerDeploymentRampingVersionRequest,
-        SetWorkerDeploymentRampingVersionResponse,
-        "worker-deployments"
-    );
-    deferred_unary!(
-        list_worker_deployments,
-        ListWorkerDeploymentsRequest,
-        ListWorkerDeploymentsResponse,
-        "worker-deployments"
-    );
-    deferred_unary!(
-        create_worker_deployment,
-        CreateWorkerDeploymentRequest,
-        CreateWorkerDeploymentResponse,
-        "worker-deployments"
-    );
-    deferred_unary!(
-        create_worker_deployment_version,
-        CreateWorkerDeploymentVersionRequest,
-        CreateWorkerDeploymentVersionResponse,
-        "worker-deployments"
-    );
-    deferred_unary!(
-        update_worker_deployment_version_compute_config,
-        UpdateWorkerDeploymentVersionComputeConfigRequest,
-        UpdateWorkerDeploymentVersionComputeConfigResponse,
-        "worker-deployments"
-    );
-    deferred_unary!(
-        validate_worker_deployment_version_compute_config,
-        ValidateWorkerDeploymentVersionComputeConfigRequest,
-        ValidateWorkerDeploymentVersionComputeConfigResponse,
-        "worker-deployments"
-    );
-    deferred_unary!(
-        update_worker_deployment_version_metadata,
-        UpdateWorkerDeploymentVersionMetadataRequest,
-        UpdateWorkerDeploymentVersionMetadataResponse,
-        "worker-deployments"
-    );
-    deferred_unary!(
-        set_worker_deployment_manager,
-        SetWorkerDeploymentManagerRequest,
-        SetWorkerDeploymentManagerResponse,
-        "worker-deployments"
-    );
+    // === Worker Deployments ===
+    async fn describe_worker_deployment_version(
+        &self,
+        request: Request<workflowservice::DescribeWorkerDeploymentVersionRequest>,
+    ) -> Result<Response<workflowservice::DescribeWorkerDeploymentVersionResponse>, Status> {
+        let req = request.into_inner();
+        let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+        let mut edge_req = translate::describe_worker_deployment_version_to_edge(req)
+            .map_err(proto_conversion_status)?;
+        edge_req.namespace_id = namespace_id;
+        let view = self
+            .inner
+            .worker_deployment_runtime()?
+            .describe_worker_deployment_version(edge_req)
+            .await?;
+        Ok(Response::new(
+            translate::describe_worker_deployment_version_response_from_edge(&view),
+        ))
+    }
+
+    async fn set_worker_deployment_current_version(
+        &self,
+        request: Request<workflowservice::SetWorkerDeploymentCurrentVersionRequest>,
+    ) -> Result<Response<workflowservice::SetWorkerDeploymentCurrentVersionResponse>, Status> {
+        let req = request.into_inner();
+        let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+        let mut edge_req = translate::set_worker_deployment_current_version_to_edge(req)
+            .map_err(proto_conversion_status)?;
+        edge_req.namespace_id = namespace_id;
+        let outcome = self
+            .inner
+            .worker_deployment_runtime()?
+            .set_worker_deployment_current_version(edge_req)
+            .await?;
+        Ok(Response::new(
+            translate::set_worker_deployment_current_version_response_from_edge(&outcome.view),
+        ))
+    }
+
+    async fn describe_worker_deployment(
+        &self,
+        request: Request<workflowservice::DescribeWorkerDeploymentRequest>,
+    ) -> Result<Response<workflowservice::DescribeWorkerDeploymentResponse>, Status> {
+        let req = request.into_inner();
+        let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+        let mut edge_req =
+            translate::describe_worker_deployment_to_edge(req).map_err(proto_conversion_status)?;
+        edge_req.namespace_id = namespace_id;
+        let view = self
+            .inner
+            .worker_deployment_runtime()?
+            .describe_worker_deployment(edge_req)
+            .await?;
+        Ok(Response::new(
+            translate::describe_worker_deployment_response_from_edge(&view),
+        ))
+    }
+
+    async fn delete_worker_deployment(
+        &self,
+        request: Request<workflowservice::DeleteWorkerDeploymentRequest>,
+    ) -> Result<Response<workflowservice::DeleteWorkerDeploymentResponse>, Status> {
+        let req = request.into_inner();
+        let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+        let mut edge_req =
+            translate::delete_worker_deployment_to_edge(req).map_err(proto_conversion_status)?;
+        edge_req.namespace_id = namespace_id;
+        self.inner
+            .worker_deployment_runtime()?
+            .delete_worker_deployment(edge_req)
+            .await?;
+        Ok(Response::new(
+            workflowservice::DeleteWorkerDeploymentResponse::default(),
+        ))
+    }
+
+    async fn delete_worker_deployment_version(
+        &self,
+        request: Request<workflowservice::DeleteWorkerDeploymentVersionRequest>,
+    ) -> Result<Response<workflowservice::DeleteWorkerDeploymentVersionResponse>, Status> {
+        let req = request.into_inner();
+        let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+        let mut edge_req = translate::delete_worker_deployment_version_to_edge(req)
+            .map_err(proto_conversion_status)?;
+        edge_req.namespace_id = namespace_id;
+        self.inner
+            .worker_deployment_runtime()?
+            .delete_worker_deployment_version(edge_req)
+            .await?;
+        Ok(Response::new(
+            workflowservice::DeleteWorkerDeploymentVersionResponse::default(),
+        ))
+    }
+
+    async fn set_worker_deployment_ramping_version(
+        &self,
+        request: Request<workflowservice::SetWorkerDeploymentRampingVersionRequest>,
+    ) -> Result<Response<workflowservice::SetWorkerDeploymentRampingVersionResponse>, Status> {
+        let req = request.into_inner();
+        let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+        let mut edge_req = translate::set_worker_deployment_ramping_version_to_edge(req)
+            .map_err(proto_conversion_status)?;
+        edge_req.namespace_id = namespace_id;
+        let outcome = self
+            .inner
+            .worker_deployment_runtime()?
+            .set_worker_deployment_ramping_version(edge_req)
+            .await?;
+        Ok(Response::new(
+            translate::set_worker_deployment_ramping_version_response_from_edge(&outcome.view),
+        ))
+    }
+
+    async fn list_worker_deployments(
+        &self,
+        request: Request<workflowservice::ListWorkerDeploymentsRequest>,
+    ) -> Result<Response<workflowservice::ListWorkerDeploymentsResponse>, Status> {
+        let req = request.into_inner();
+        let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+        let mut edge_req =
+            translate::list_worker_deployments_to_edge(req).map_err(proto_conversion_status)?;
+        edge_req.namespace_id = namespace_id;
+        let page = self
+            .inner
+            .worker_deployment_runtime()?
+            .list_worker_deployments(edge_req)
+            .await?;
+        Ok(Response::new(
+            translate::list_worker_deployments_response_from_edge(&page),
+        ))
+    }
+
+    async fn create_worker_deployment(
+        &self,
+        request: Request<workflowservice::CreateWorkerDeploymentRequest>,
+    ) -> Result<Response<workflowservice::CreateWorkerDeploymentResponse>, Status> {
+        let req = request.into_inner();
+        let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+        let mut edge_req =
+            translate::create_worker_deployment_to_edge(req).map_err(proto_conversion_status)?;
+        edge_req.namespace_id = namespace_id;
+        let outcome = self
+            .inner
+            .worker_deployment_runtime()?
+            .create_worker_deployment(edge_req)
+            .await?;
+        Ok(Response::new(
+            translate::create_worker_deployment_response_from_edge(outcome.conflict_token),
+        ))
+    }
+
+    async fn create_worker_deployment_version(
+        &self,
+        request: Request<workflowservice::CreateWorkerDeploymentVersionRequest>,
+    ) -> Result<Response<workflowservice::CreateWorkerDeploymentVersionResponse>, Status> {
+        let req = request.into_inner();
+        let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+        let mut edge_req = translate::create_worker_deployment_version_to_edge(req)
+            .map_err(proto_conversion_status)?;
+        edge_req.namespace_id = namespace_id;
+        self.inner
+            .worker_deployment_runtime()?
+            .create_worker_deployment_version(edge_req)
+            .await?;
+        Ok(Response::new(
+            workflowservice::CreateWorkerDeploymentVersionResponse::default(),
+        ))
+    }
+
+    async fn update_worker_deployment_version_compute_config(
+        &self,
+        request: Request<workflowservice::UpdateWorkerDeploymentVersionComputeConfigRequest>,
+    ) -> Result<Response<workflowservice::UpdateWorkerDeploymentVersionComputeConfigResponse>, Status>
+    {
+        let req = request.into_inner();
+        let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+        let edge_req = translate::update_worker_deployment_version_compute_config_to_edge(req)
+            .map_err(proto_conversion_status)?;
+        let mut edge_req = edge_req;
+        edge_req.namespace_id = namespace_id;
+        self.inner
+            .worker_deployment_runtime()?
+            .update_worker_deployment_version_compute_config(edge_req)
+            .await?;
+        Ok(Response::new(
+            workflowservice::UpdateWorkerDeploymentVersionComputeConfigResponse::default(),
+        ))
+    }
+
+    async fn validate_worker_deployment_version_compute_config(
+        &self,
+        request: Request<workflowservice::ValidateWorkerDeploymentVersionComputeConfigRequest>,
+    ) -> Result<
+        Response<workflowservice::ValidateWorkerDeploymentVersionComputeConfigResponse>,
+        Status,
+    > {
+        let req = request.into_inner();
+        let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+        let edge_req = translate::validate_worker_deployment_version_compute_config_to_edge(req)
+            .map_err(proto_conversion_status)?;
+        let mut edge_req = edge_req;
+        edge_req.namespace_id = namespace_id;
+        self.inner
+            .worker_deployment_runtime()?
+            .validate_worker_deployment_version_compute_config(edge_req)
+            .await?;
+        Ok(Response::new(
+            workflowservice::ValidateWorkerDeploymentVersionComputeConfigResponse::default(),
+        ))
+    }
+
+    async fn update_worker_deployment_version_metadata(
+        &self,
+        request: Request<workflowservice::UpdateWorkerDeploymentVersionMetadataRequest>,
+    ) -> Result<Response<workflowservice::UpdateWorkerDeploymentVersionMetadataResponse>, Status>
+    {
+        let req = request.into_inner();
+        let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+        let mut edge_req = translate::update_worker_deployment_version_metadata_to_edge(req)
+            .map_err(proto_conversion_status)?;
+        edge_req.namespace_id = namespace_id;
+        let metadata = self
+            .inner
+            .worker_deployment_runtime()?
+            .update_worker_deployment_version_metadata(edge_req)
+            .await?;
+        Ok(Response::new(
+            translate::update_worker_deployment_version_metadata_response_from_edge(&metadata),
+        ))
+    }
+
+    async fn set_worker_deployment_manager(
+        &self,
+        request: Request<workflowservice::SetWorkerDeploymentManagerRequest>,
+    ) -> Result<Response<workflowservice::SetWorkerDeploymentManagerResponse>, Status> {
+        let req = request.into_inner();
+        let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+        let mut edge_req = translate::set_worker_deployment_manager_to_edge(req)
+            .map_err(proto_conversion_status)?;
+        edge_req.namespace_id = namespace_id;
+        let outcome = self
+            .inner
+            .worker_deployment_runtime()?
+            .set_worker_deployment_manager(edge_req)
+            .await?;
+        Ok(Response::new(
+            translate::set_worker_deployment_manager_response_from_edge(&outcome.view),
+        ))
+    }
     deferred_unary!(
         describe_worker,
         DescribeWorkerRequest,
         DescribeWorkerResponse,
-        "worker-deployments"
+        "worker-config"
     );
     deferred_unary!(
         list_workers,
         ListWorkersRequest,
         ListWorkersResponse,
-        "worker-deployments"
+        "worker-config"
     );
     // === End Worker Deployments block ===
 
@@ -1663,6 +1825,23 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     }
 }
 
+fn update_lifecycle_stage_to_proto(stage: tokeira_runtime::UpdateLifecycleStage) -> i32 {
+    match stage {
+        tokeira_runtime::UpdateLifecycleStage::Unspecified => {
+            tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Unspecified as i32
+        }
+        tokeira_runtime::UpdateLifecycleStage::Admitted => {
+            tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Admitted as i32
+        }
+        tokeira_runtime::UpdateLifecycleStage::Accepted => {
+            tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Accepted as i32
+        }
+        tokeira_runtime::UpdateLifecycleStage::Completed => {
+            tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Completed as i32
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -1889,7 +2068,7 @@ mod tests {
             _request: tokeira_types::RequestContext,
             _timeout: std::time::Duration,
             _wait_policy: tokeira_runtime::UpdateWaitPolicy,
-        ) -> Result<tokeira_runtime::UpdateOutcome> {
+        ) -> Result<tokeira_runtime::UpdateLifecycleSnapshot> {
             unreachable!()
         }
 
@@ -2056,7 +2235,7 @@ mod tests {
             _request: tokeira_types::RequestContext,
             _timeout: std::time::Duration,
             _wait_policy: tokeira_runtime::UpdateWaitPolicy,
-        ) -> Result<tokeira_runtime::UpdateOutcome> {
+        ) -> Result<tokeira_runtime::UpdateLifecycleSnapshot> {
             unreachable!()
         }
 
@@ -2221,7 +2400,7 @@ mod tests {
             _request: tokeira_types::RequestContext,
             _timeout: std::time::Duration,
             _wait_policy: tokeira_runtime::UpdateWaitPolicy,
-        ) -> Result<tokeira_runtime::UpdateOutcome> {
+        ) -> Result<tokeira_runtime::UpdateLifecycleSnapshot> {
             unreachable!()
         }
 
@@ -2350,6 +2529,36 @@ mod tests {
         )
     }
 
+    fn worker_deployment_test_service() -> WorkflowServiceGrpc {
+        let cache: Arc<dyn NamespaceCache> = Arc::new(StaticNamespaceCache);
+        let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
+        let service =
+            WorkflowService::new_with_versioning_and_buffered_queries_and_history_wait_registry(
+                Arc::new(PollNoneRuntime),
+                Arc::new(NoopResolver),
+                Arc::new(EmptyVisibilityApi),
+                Arc::new(tokeira_storage::InMemoryStore::default()),
+                operator_api,
+                cache.clone(),
+                Arc::new(EdgeInterceptors::permissive(cache)),
+                PollerRegistry::default(),
+                crate::PendingQueryStore::default(),
+                tokeira_runtime::BufferedQueryRegistry::default(),
+                tokeira_runtime::InMemoryBroker::default(),
+                tokeira_runtime::NexusTaskBroker::default(),
+                LongPollGate::new(LongPollConfig::default()),
+                Arc::new(LocalOnlyRouter),
+                HistoryWaitRegistry::default(),
+                Arc::new(VersioningRuleStore::default()),
+                WorkerRegistry::default(),
+                Arc::new(tokeira_runtime::InMemoryHeartbeatStore::default()),
+                Arc::new(tokeira_runtime::ScheduleStore::default()),
+                Arc::new(tokeira_runtime::InMemoryTaskQueueConfigStore::default()),
+                Arc::new(tokeira_runtime::BatchOperationStore::default()),
+            );
+        WorkflowServiceGrpc::new(service)
+    }
+
     macro_rules! assert_deferred_rpc {
         ($grpc:expr, $method:ident, $request:ident, $spec:literal) => {{
             let status = $grpc
@@ -2374,89 +2583,11 @@ mod tests {
 
         assert_deferred_rpc!(
             grpc,
-            describe_worker_deployment_version,
-            DescribeWorkerDeploymentVersionRequest,
-            "worker-deployments"
-        );
-        assert_deferred_rpc!(
-            grpc,
-            set_worker_deployment_current_version,
-            SetWorkerDeploymentCurrentVersionRequest,
-            "worker-deployments"
-        );
-        assert_deferred_rpc!(
-            grpc,
-            describe_worker_deployment,
-            DescribeWorkerDeploymentRequest,
-            "worker-deployments"
-        );
-        assert_deferred_rpc!(
-            grpc,
-            delete_worker_deployment,
-            DeleteWorkerDeploymentRequest,
-            "worker-deployments"
-        );
-        assert_deferred_rpc!(
-            grpc,
-            delete_worker_deployment_version,
-            DeleteWorkerDeploymentVersionRequest,
-            "worker-deployments"
-        );
-        assert_deferred_rpc!(
-            grpc,
-            set_worker_deployment_ramping_version,
-            SetWorkerDeploymentRampingVersionRequest,
-            "worker-deployments"
-        );
-        assert_deferred_rpc!(
-            grpc,
-            list_worker_deployments,
-            ListWorkerDeploymentsRequest,
-            "worker-deployments"
-        );
-        assert_deferred_rpc!(
-            grpc,
-            create_worker_deployment,
-            CreateWorkerDeploymentRequest,
-            "worker-deployments"
-        );
-        assert_deferred_rpc!(
-            grpc,
-            create_worker_deployment_version,
-            CreateWorkerDeploymentVersionRequest,
-            "worker-deployments"
-        );
-        assert_deferred_rpc!(
-            grpc,
-            update_worker_deployment_version_compute_config,
-            UpdateWorkerDeploymentVersionComputeConfigRequest,
-            "worker-deployments"
-        );
-        assert_deferred_rpc!(
-            grpc,
-            validate_worker_deployment_version_compute_config,
-            ValidateWorkerDeploymentVersionComputeConfigRequest,
-            "worker-deployments"
-        );
-        assert_deferred_rpc!(
-            grpc,
-            update_worker_deployment_version_metadata,
-            UpdateWorkerDeploymentVersionMetadataRequest,
-            "worker-deployments"
-        );
-        assert_deferred_rpc!(
-            grpc,
-            set_worker_deployment_manager,
-            SetWorkerDeploymentManagerRequest,
-            "worker-deployments"
-        );
-        assert_deferred_rpc!(
-            grpc,
             describe_worker,
             DescribeWorkerRequest,
-            "worker-deployments"
+            "worker-config"
         );
-        assert_deferred_rpc!(grpc, list_workers, ListWorkersRequest, "worker-deployments");
+        assert_deferred_rpc!(grpc, list_workers, ListWorkersRequest, "worker-config");
 
         assert_deferred_rpc!(
             grpc,
@@ -2649,7 +2780,7 @@ mod tests {
             .await
             .expect_err("deployment describe should be unsupported");
         assert_eq!(describe.code(), tonic::Code::Unimplemented);
-        assert!(describe.message().contains("Deployment management"));
+        assert_eq!(describe.message(), DEPRECATED_DEPLOYMENTS_UNIMPLEMENTED);
 
         let list = grpc
             .list_deployments(Request::new(
@@ -2658,7 +2789,7 @@ mod tests {
             .await
             .expect_err("deployment list should be unsupported");
         assert_eq!(list.code(), tonic::Code::Unimplemented);
-        assert!(list.message().contains("Deployment management"));
+        assert_eq!(list.message(), DEPRECATED_DEPLOYMENTS_UNIMPLEMENTED);
 
         let reachability = grpc
             .get_deployment_reachability(Request::new(
@@ -2667,7 +2798,7 @@ mod tests {
             .await
             .expect_err("deployment reachability should be unsupported");
         assert_eq!(reachability.code(), tonic::Code::Unimplemented);
-        assert!(reachability.message().contains("GetWorkerTaskReachability"));
+        assert_eq!(reachability.message(), DEPRECATED_DEPLOYMENTS_UNIMPLEMENTED);
 
         let current = grpc
             .get_current_deployment(Request::new(
@@ -2676,6 +2807,7 @@ mod tests {
             .await
             .expect_err("current deployment should be unsupported");
         assert_eq!(current.code(), tonic::Code::Unimplemented);
+        assert_eq!(current.message(), DEPRECATED_DEPLOYMENTS_UNIMPLEMENTED);
 
         let set = grpc
             .set_current_deployment(Request::new(
@@ -2684,6 +2816,236 @@ mod tests {
             .await
             .expect_err("set current deployment should be unsupported");
         assert_eq!(set.code(), tonic::Code::Unimplemented);
+        assert_eq!(set.message(), DEPRECATED_DEPLOYMENTS_UNIMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn worker_deployment_handlers_validate_input_before_registry_access() {
+        let grpc = worker_deployment_test_service();
+
+        let create = grpc
+            .create_worker_deployment(Request::new(
+                workflowservice::CreateWorkerDeploymentRequest {
+                    namespace: "default".to_string(),
+                    deployment_name: String::new(),
+                    identity: "operator".to_string(),
+                    request_id: "request-1".to_string(),
+                },
+            ))
+            .await
+            .expect_err("empty deployment name should be invalid");
+        assert_eq!(create.code(), tonic::Code::InvalidArgument);
+
+        let create_version = grpc
+            .create_worker_deployment_version(Request::new(
+                workflowservice::CreateWorkerDeploymentVersionRequest {
+                    namespace: "default".to_string(),
+                    deployment_version: None,
+                    compute_config: None,
+                    identity: "operator".to_string(),
+                    request_id: "request-1".to_string(),
+                },
+            ))
+            .await
+            .expect_err("missing deployment version should be invalid");
+        assert_eq!(create_version.code(), tonic::Code::InvalidArgument);
+
+        let ramping = grpc
+            .set_worker_deployment_ramping_version(Request::new(
+                workflowservice::SetWorkerDeploymentRampingVersionRequest {
+                    namespace: "default".to_string(),
+                    deployment_name: "deployment-a".to_string(),
+                    build_id: "build-a".to_string(),
+                    percentage: 101.0,
+                    identity: "operator".to_string(),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect_err("out-of-range percentage should be invalid");
+        assert_eq!(ramping.code(), tonic::Code::InvalidArgument);
+
+        let manager = grpc
+            .set_worker_deployment_manager(Request::new(
+                workflowservice::SetWorkerDeploymentManagerRequest {
+                    namespace: "default".to_string(),
+                    deployment_name: "deployment-a".to_string(),
+                    identity: "operator".to_string(),
+                    new_manager_identity: None,
+                    conflict_token: Vec::new(),
+                },
+            ))
+            .await
+            .expect_err("unset manager identity oneof should be invalid");
+        assert_eq!(manager.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn worker_deployment_handlers_are_no_longer_deferred() {
+        let grpc = worker_deployment_test_service();
+        let version = || WorkerDeploymentVersion {
+            deployment_name: "deployment-a".to_string(),
+            build_id: "build-a".to_string(),
+        };
+
+        assert_worker_deployment_registry_missing(
+            grpc.describe_worker_deployment_version(Request::new(
+                workflowservice::DescribeWorkerDeploymentVersionRequest {
+                    namespace: "default".to_string(),
+                    deployment_version: Some(version()),
+                    report_task_queue_stats: false,
+                    ..Default::default()
+                },
+            ))
+            .await,
+        );
+        assert_worker_deployment_registry_missing(
+            grpc.set_worker_deployment_current_version(Request::new(
+                workflowservice::SetWorkerDeploymentCurrentVersionRequest {
+                    namespace: "default".to_string(),
+                    deployment_name: "deployment-a".to_string(),
+                    build_id: "build-a".to_string(),
+                    identity: "operator".to_string(),
+                    ..Default::default()
+                },
+            ))
+            .await,
+        );
+        assert_worker_deployment_registry_missing(
+            grpc.describe_worker_deployment(Request::new(
+                workflowservice::DescribeWorkerDeploymentRequest {
+                    namespace: "default".to_string(),
+                    deployment_name: "deployment-a".to_string(),
+                },
+            ))
+            .await,
+        );
+        assert_worker_deployment_registry_missing(
+            grpc.delete_worker_deployment(Request::new(
+                workflowservice::DeleteWorkerDeploymentRequest {
+                    namespace: "default".to_string(),
+                    deployment_name: "deployment-a".to_string(),
+                    identity: "operator".to_string(),
+                },
+            ))
+            .await,
+        );
+        assert_worker_deployment_registry_missing(
+            grpc.delete_worker_deployment_version(Request::new(
+                workflowservice::DeleteWorkerDeploymentVersionRequest {
+                    namespace: "default".to_string(),
+                    deployment_version: Some(version()),
+                    identity: "operator".to_string(),
+                    ..Default::default()
+                },
+            ))
+            .await,
+        );
+        assert_worker_deployment_registry_missing(
+            grpc.set_worker_deployment_ramping_version(Request::new(
+                workflowservice::SetWorkerDeploymentRampingVersionRequest {
+                    namespace: "default".to_string(),
+                    deployment_name: "deployment-a".to_string(),
+                    build_id: "build-a".to_string(),
+                    percentage: 10.0,
+                    identity: "operator".to_string(),
+                    ..Default::default()
+                },
+            ))
+            .await,
+        );
+        assert_worker_deployment_registry_missing(
+            grpc.list_worker_deployments(Request::new(
+                workflowservice::ListWorkerDeploymentsRequest {
+                    namespace: "default".to_string(),
+                    page_size: 10,
+                    next_page_token: Vec::new(),
+                },
+            ))
+            .await,
+        );
+        assert_worker_deployment_registry_missing(
+            grpc.create_worker_deployment(Request::new(
+                workflowservice::CreateWorkerDeploymentRequest {
+                    namespace: "default".to_string(),
+                    deployment_name: "deployment-a".to_string(),
+                    identity: "operator".to_string(),
+                    request_id: "request-1".to_string(),
+                },
+            ))
+            .await,
+        );
+        assert_worker_deployment_registry_missing(
+            grpc.create_worker_deployment_version(Request::new(
+                workflowservice::CreateWorkerDeploymentVersionRequest {
+                    namespace: "default".to_string(),
+                    deployment_version: Some(version()),
+                    compute_config: None,
+                    identity: "operator".to_string(),
+                    request_id: "request-1".to_string(),
+                },
+            ))
+            .await,
+        );
+        assert_worker_deployment_registry_missing(
+            grpc.update_worker_deployment_version_compute_config(Request::new(
+                workflowservice::UpdateWorkerDeploymentVersionComputeConfigRequest {
+                    namespace: "default".to_string(),
+                    deployment_version: Some(version()),
+                    identity: "operator".to_string(),
+                    request_id: "request-1".to_string(),
+                    ..Default::default()
+                },
+            ))
+            .await,
+        );
+        assert_worker_deployment_registry_missing(
+            grpc.validate_worker_deployment_version_compute_config(Request::new(
+                workflowservice::ValidateWorkerDeploymentVersionComputeConfigRequest {
+                    namespace: "default".to_string(),
+                    deployment_version: Some(version()),
+                    identity: "operator".to_string(),
+                    ..Default::default()
+                },
+            ))
+            .await,
+        );
+        assert_worker_deployment_registry_missing(
+            grpc.update_worker_deployment_version_metadata(Request::new(
+                workflowservice::UpdateWorkerDeploymentVersionMetadataRequest {
+                    namespace: "default".to_string(),
+                    deployment_version: Some(version()),
+                    identity: "operator".to_string(),
+                    ..Default::default()
+                },
+            ))
+            .await,
+        );
+        assert_worker_deployment_registry_missing(
+            grpc.set_worker_deployment_manager(Request::new(
+                workflowservice::SetWorkerDeploymentManagerRequest {
+                    namespace: "default".to_string(),
+                    deployment_name: "deployment-a".to_string(),
+                    identity: "operator".to_string(),
+                    new_manager_identity: Some(
+                        workflowservice::set_worker_deployment_manager_request::NewManagerIdentity::ManagerIdentity(
+                            "manager-a".to_string(),
+                        ),
+                    ),
+                    conflict_token: Vec::new(),
+                },
+            ))
+            .await,
+        );
+    }
+
+    fn assert_worker_deployment_registry_missing<T>(result: Result<Response<T>, Status>) {
+        let status = match result {
+            Ok(_) => panic!("service should stop at missing registry"),
+            Err(status) => status,
+        };
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("worker deployment registry"));
     }
 
     #[tokio::test]
@@ -3397,6 +3759,13 @@ mod tests {
             deployment: None,
             build_id: None,
             versioning_override: None,
+            workflow_start_delay: None,
+            client_cron_schedule: None,
+            completion_callbacks: Vec::new(),
+            user_metadata: None,
+            links: Vec::new(),
+            on_conflict_options: None,
+            priority: None,
             input: Payloads::default(),
             header: None,
             memo: Memo::default(),

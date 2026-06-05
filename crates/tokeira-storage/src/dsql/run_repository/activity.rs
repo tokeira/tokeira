@@ -10,6 +10,7 @@ pub(super) type ActivityDispatchRow = (
     Option<String>,
     i64,
     i32,
+    i64,
     Vec<u8>,
 );
 
@@ -31,7 +32,7 @@ impl DsqlRunRepository {
             let build_id = queue.build_id.as_ref().map(|value| value.0.as_str());
             let rows = sqlx::query_as::<_, ActivityDispatchRow>(
                 "SELECT run_key, activity_id, queue_namespace, queue_name, task_kind,
-                    deployment, build_id, schedule_event_id, attempt, input_data
+                    deployment, build_id, schedule_event_id, attempt, dispatch_revision, input_data
              FROM activity_dispatch
              WHERE queue_namespace = $1
                AND queue_name = $2
@@ -74,7 +75,7 @@ impl DsqlRunRepository {
                 let mut permit = self.director.acquire(DbClass::Read).await?;
                 let rows = sqlx::query_as::<_, ActivityDispatchRow>(
                     "SELECT run_key, activity_id, queue_namespace, queue_name, task_kind,
-                    deployment, build_id, schedule_event_id, attempt, input_data
+                    deployment, build_id, schedule_event_id, attempt, dispatch_revision, input_data
              FROM activity_dispatch
              WHERE shard_id = $1
              ORDER BY created_at ASC
@@ -137,6 +138,7 @@ pub(super) fn activity_dispatch_from_row(
         build_id,
         schedule_event_id,
         attempt,
+        dispatch_revision,
         input_data,
     ) = row;
     Ok(DispatchableActivityTask {
@@ -152,6 +154,7 @@ pub(super) fn activity_dispatch_from_row(
         input: codec::decode_payloads(&input_data)?,
         schedule_event_id,
         attempt: convert::u32_from_i32(attempt, "activity_dispatch.attempt")?,
+        dispatch_revision,
     })
 }
 

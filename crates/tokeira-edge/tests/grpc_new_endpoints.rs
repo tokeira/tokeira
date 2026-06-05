@@ -10,11 +10,19 @@ use tokeira_edge::{
     workflow_service::ExecutionResolver,
 };
 use tokeira_kernel::LoadedRun;
-use tokeira_proto::workflowservice::{self, workflow_service_server::WorkflowService as WfApi};
+use tokeira_proto::{
+    common::WorkerVersionCapabilities,
+    enums,
+    public::temporal::api::deployment::v1::{WorkerDeploymentOptions, WorkerDeploymentVersion},
+    workflowservice::{
+        self, PollWorkflowTaskQueueRequest, RespondWorkflowTaskCompletedRequest,
+        workflow_service_server::WorkflowService as WfApi,
+    },
+};
 use tokeira_runtime::{
     BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
-use tokeira_storage::{InMemoryStore, RunRepository};
+use tokeira_storage::{InMemoryStore, RunRepository, WorkerDeploymentRepository};
 use tokeira_types::{ExecutionRef, NamespaceId, WorkflowId};
 use tonic::{Code, Request};
 
@@ -165,7 +173,7 @@ impl StoreExecutionResolver {
                         attempt: task.attempt,
                     }
                 }),
-                callbacks: Vec::new(),
+                callbacks: state.completion_callbacks.clone(),
                 pending_nexus_operations: state
                     .pending_nexus_operations
                     .values()
@@ -199,6 +207,8 @@ impl StoreExecutionResolver {
                     .map(|timeout| state.started_at + timeout),
                 cancel_requested: state.cancel_requested,
                 original_start_time: state.first_run_started_at.unwrap_or(state.started_at),
+                versioning_info: state.versioning_info.clone(),
+                worker_deployment_name: state.worker_deployment_name.clone(),
             })),
             LoadedRun::Absent => Err(anyhow::anyhow!("resolved run missing")),
         }
@@ -214,14 +224,18 @@ async fn build_grpc_with_namespaces(
     namespaces_to_seed: Vec<ResolvedNamespace>,
 ) -> WorkflowServiceGrpc {
     let ns_id = namespace_id_for("default");
-    let runtime = Arc::new(TokeiraRuntime::new(
-        store.clone(),
-        4,
-        LaneConfig::default(),
-        TimerScannerConfig::default(),
-        WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
-    ));
+    let worker_deployments: Arc<dyn WorkerDeploymentRepository> = store.clone();
+    let runtime = Arc::new(
+        TokeiraRuntime::new(
+            store.clone(),
+            4,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        )
+        .with_worker_deployment_repository(worker_deployments),
+    );
 
     let namespaces = Arc::new(InMemoryNamespaceCache::new());
     for namespace in namespaces_to_seed {
@@ -238,7 +252,7 @@ async fn build_grpc_with_namespaces(
     let long_polls = LongPollGate::new(LongPollConfig::default());
 
     let service = WorkflowService::new(
-        runtime_adapter,
+        runtime_adapter.clone(),
         resolver,
         visibility,
         store.clone(),
@@ -250,9 +264,616 @@ async fn build_grpc_with_namespaces(
         workflow_broker,
         long_polls,
         router,
-    );
+    )
+    .with_worker_deployment_runtime(runtime_adapter);
 
     WorkflowServiceGrpc::new(service)
+}
+
+#[tokio::test]
+async fn respond_workflow_task_completed_returns_new_started_wft_after_durable_schedule() {
+    let store = Arc::new(InMemoryStore::default());
+    let grpc = build_grpc(store).await;
+
+    grpc.start_workflow_execution(Request::new(
+        workflowservice::StartWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_id: "return-new-wft".to_string(),
+            workflow_type: Some(tokeira_proto::common::WorkflowType {
+                name: "example".to_string(),
+            }),
+            task_queue: Some(tokeira_proto::taskqueue::TaskQueue {
+                name: "queue-return-new".to_string(),
+                ..Default::default()
+            }),
+            request_id: "start-return-new".to_string(),
+            ..Default::default()
+        },
+    ))
+    .await
+    .expect("start workflow");
+
+    let poll = grpc
+        .poll_workflow_task_queue(Request::new(PollWorkflowTaskQueueRequest {
+            namespace: "default".to_string(),
+            task_queue: Some(tokeira_proto::taskqueue::TaskQueue {
+                name: "queue-return-new".to_string(),
+                ..Default::default()
+            }),
+            identity: "worker-a".to_string(),
+            ..Default::default()
+        }))
+        .await
+        .expect("poll initial workflow task")
+        .into_inner();
+
+    let completed = grpc
+        .respond_workflow_task_completed(Request::new(RespondWorkflowTaskCompletedRequest {
+            task_token: poll.task_token,
+            identity: "worker-a".to_string(),
+            force_create_new_workflow_task: true,
+            return_new_workflow_task: true,
+            ..Default::default()
+        }))
+        .await
+        .expect("complete workflow task")
+        .into_inner();
+
+    let returned = completed
+        .workflow_task
+        .expect("return_new_workflow_task should return a real started WFT");
+    assert!(returned.started_event_id > 0);
+    assert!(!returned.task_token.is_empty());
+    assert!(
+        returned
+            .history
+            .as_ref()
+            .is_some_and(|history| !history.events.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn worker_deployment_registry_roundtrip_via_grpc() {
+    let store = Arc::new(InMemoryStore::default());
+    let grpc = build_grpc(store).await;
+
+    let create = grpc
+        .create_worker_deployment(Request::new(
+            workflowservice::CreateWorkerDeploymentRequest {
+                namespace: "default".to_string(),
+                deployment_name: "deployment-a".to_string(),
+                identity: "operator-a".to_string(),
+                request_id: "deployment-request".to_string(),
+            },
+        ))
+        .await
+        .expect("create deployment")
+        .into_inner();
+    assert!(!create.conflict_token.is_empty());
+
+    let describe = grpc
+        .describe_worker_deployment(Request::new(
+            workflowservice::DescribeWorkerDeploymentRequest {
+                namespace: "default".to_string(),
+                deployment_name: "deployment-a".to_string(),
+            },
+        ))
+        .await
+        .expect("describe deployment")
+        .into_inner();
+    let info = describe.worker_deployment_info.expect("deployment info");
+    assert_eq!(info.name, "deployment-a");
+    assert_eq!(info.last_modifier_identity, "operator-a");
+    assert!(info.version_summaries.is_empty());
+
+    for build_id in ["build-a", "build-b"] {
+        grpc.create_worker_deployment_version(Request::new(
+            workflowservice::CreateWorkerDeploymentVersionRequest {
+                namespace: "default".to_string(),
+                deployment_version: Some(deployment_version("deployment-a", build_id)),
+                identity: "operator-a".to_string(),
+                request_id: format!("version-{build_id}"),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("create deployment version");
+    }
+
+    grpc.set_worker_deployment_ramping_version(Request::new(
+        workflowservice::SetWorkerDeploymentRampingVersionRequest {
+            namespace: "default".to_string(),
+            deployment_name: "deployment-a".to_string(),
+            build_id: "build-b".to_string(),
+            percentage: 25.0,
+            identity: "operator-a".to_string(),
+            allow_no_pollers: true,
+            ignore_missing_task_queues: true,
+            ..Default::default()
+        },
+    ))
+    .await
+    .expect("set ramping version");
+
+    grpc.set_worker_deployment_current_version(Request::new(
+        workflowservice::SetWorkerDeploymentCurrentVersionRequest {
+            namespace: "default".to_string(),
+            deployment_name: "deployment-a".to_string(),
+            build_id: "build-b".to_string(),
+            identity: "operator-a".to_string(),
+            allow_no_pollers: true,
+            ignore_missing_task_queues: true,
+            ..Default::default()
+        },
+    ))
+    .await
+    .expect("set current version");
+
+    let describe = grpc
+        .describe_worker_deployment(Request::new(
+            workflowservice::DescribeWorkerDeploymentRequest {
+                namespace: "default".to_string(),
+                deployment_name: "deployment-a".to_string(),
+            },
+        ))
+        .await
+        .expect("describe after current")
+        .into_inner();
+    let routing = describe
+        .worker_deployment_info
+        .and_then(|info| info.routing_config)
+        .expect("routing config");
+    assert_eq!(
+        routing
+            .current_deployment_version
+            .as_ref()
+            .map(|version| version.build_id.as_str()),
+        Some("build-b")
+    );
+    assert!(routing.ramping_deployment_version.is_none());
+    assert_eq!(routing.ramping_version_percentage, 0.0);
+
+    grpc.set_worker_deployment_ramping_version(Request::new(
+        workflowservice::SetWorkerDeploymentRampingVersionRequest {
+            namespace: "default".to_string(),
+            deployment_name: "deployment-a".to_string(),
+            build_id: "build-a".to_string(),
+            percentage: 10.0,
+            identity: "operator-a".to_string(),
+            allow_no_pollers: true,
+            ignore_missing_task_queues: true,
+            ..Default::default()
+        },
+    ))
+    .await
+    .expect("set second ramping version");
+
+    grpc.set_worker_deployment_manager(Request::new(
+        workflowservice::SetWorkerDeploymentManagerRequest {
+            namespace: "default".to_string(),
+            deployment_name: "deployment-a".to_string(),
+            identity: "operator-a".to_string(),
+            new_manager_identity: Some(
+                workflowservice::set_worker_deployment_manager_request::NewManagerIdentity::Self_(
+                    true,
+                ),
+            ),
+            conflict_token: Vec::new(),
+        },
+    ))
+    .await
+    .expect("set manager");
+
+    let mismatch = grpc
+        .set_worker_deployment_current_version(Request::new(
+            workflowservice::SetWorkerDeploymentCurrentVersionRequest {
+                namespace: "default".to_string(),
+                deployment_name: "deployment-a".to_string(),
+                build_id: "build-a".to_string(),
+                identity: "operator-b".to_string(),
+                allow_no_pollers: true,
+                ignore_missing_task_queues: true,
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect_err("manager mismatch should reject routing mutation");
+    assert_eq!(mismatch.code(), Code::FailedPrecondition);
+
+    grpc.set_worker_deployment_current_version(Request::new(
+        workflowservice::SetWorkerDeploymentCurrentVersionRequest {
+            namespace: "default".to_string(),
+            deployment_name: "deployment-a".to_string(),
+            build_id: "build-a".to_string(),
+            identity: "operator-a".to_string(),
+            allow_no_pollers: true,
+            ignore_missing_task_queues: true,
+            ..Default::default()
+        },
+    ))
+    .await
+    .expect("manager can promote current");
+
+    let version = grpc
+        .describe_worker_deployment_version(Request::new(
+            workflowservice::DescribeWorkerDeploymentVersionRequest {
+                namespace: "default".to_string(),
+                deployment_version: Some(deployment_version("deployment-a", "build-b")),
+                report_task_queue_stats: false,
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("describe demoted version")
+        .into_inner()
+        .worker_deployment_version_info
+        .expect("version info");
+    let drainage = version.drainage_info.expect("drainage info");
+    assert_eq!(
+        drainage.status,
+        enums::VersionDrainageStatus::Drained as i32
+    );
+}
+
+#[tokio::test]
+async fn worker_deployment_registry_recovers_after_runtime_restart() {
+    let store = Arc::new(InMemoryStore::default());
+    let grpc = build_grpc(store.clone()).await;
+
+    grpc.create_worker_deployment(Request::new(
+        workflowservice::CreateWorkerDeploymentRequest {
+            namespace: "default".to_string(),
+            deployment_name: "deployment-restart".to_string(),
+            identity: "operator-a".to_string(),
+            request_id: "deployment-request".to_string(),
+        },
+    ))
+    .await
+    .expect("create deployment");
+    grpc.create_worker_deployment_version(Request::new(
+        workflowservice::CreateWorkerDeploymentVersionRequest {
+            namespace: "default".to_string(),
+            deployment_version: Some(deployment_version("deployment-restart", "build-a")),
+            identity: "operator-a".to_string(),
+            request_id: "version-request".to_string(),
+            ..Default::default()
+        },
+    ))
+    .await
+    .expect("create version");
+
+    let pre_restart = grpc
+        .describe_worker_deployment(Request::new(
+            workflowservice::DescribeWorkerDeploymentRequest {
+                namespace: "default".to_string(),
+                deployment_name: "deployment-restart".to_string(),
+            },
+        ))
+        .await
+        .expect("describe before restart")
+        .into_inner();
+    let pre_restart_token = pre_restart.conflict_token;
+    assert!(!pre_restart_token.is_empty());
+
+    let recovered_records = store
+        .list_all_for_namespace(namespace_id_for("default"))
+        .await
+        .expect("list all deployments for recovery");
+    assert_eq!(recovered_records.len(), 1);
+    drop(grpc);
+
+    let grpc = build_grpc(store).await;
+    let listed = grpc
+        .list_worker_deployments(Request::new(
+            workflowservice::ListWorkerDeploymentsRequest {
+                namespace: "default".to_string(),
+                page_size: 10,
+                next_page_token: Vec::new(),
+            },
+        ))
+        .await
+        .expect("list after restart")
+        .into_inner();
+    assert_eq!(listed.worker_deployments.len(), 1);
+    assert_eq!(listed.worker_deployments[0].name, "deployment-restart");
+
+    let described = grpc
+        .describe_worker_deployment(Request::new(
+            workflowservice::DescribeWorkerDeploymentRequest {
+                namespace: "default".to_string(),
+                deployment_name: "deployment-restart".to_string(),
+            },
+        ))
+        .await
+        .expect("describe after restart")
+        .into_inner()
+        .worker_deployment_info
+        .expect("deployment info");
+    assert_eq!(described.version_summaries.len(), 1);
+
+    grpc.set_worker_deployment_manager(Request::new(
+        workflowservice::SetWorkerDeploymentManagerRequest {
+            namespace: "default".to_string(),
+            deployment_name: "deployment-restart".to_string(),
+            identity: "operator-a".to_string(),
+            new_manager_identity: Some(
+                workflowservice::set_worker_deployment_manager_request::NewManagerIdentity::ManagerIdentity(
+                    "manager-a".to_string(),
+                ),
+            ),
+            conflict_token: pre_restart_token.clone(),
+        },
+    ))
+    .await
+    .expect("pre-restart conflict token should remain valid after restart");
+
+    let stale = grpc
+        .set_worker_deployment_manager(Request::new(
+            workflowservice::SetWorkerDeploymentManagerRequest {
+                namespace: "default".to_string(),
+                deployment_name: "deployment-restart".to_string(),
+                identity: "operator-a".to_string(),
+                new_manager_identity: Some(
+                    workflowservice::set_worker_deployment_manager_request::NewManagerIdentity::ManagerIdentity(
+                        "manager-b".to_string(),
+                    ),
+                ),
+                conflict_token: pre_restart_token,
+            },
+        ))
+        .await
+        .expect_err("stale pre-restart conflict token should be rejected");
+    assert_eq!(stale.code(), Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn worker_deployment_routing_cycle_projects_describe_versioning_info() {
+    let store = Arc::new(InMemoryStore::default());
+    let grpc = build_grpc(store.clone()).await;
+
+    grpc.create_worker_deployment(Request::new(
+        workflowservice::CreateWorkerDeploymentRequest {
+            namespace: "default".to_string(),
+            deployment_name: "deployment-routing".to_string(),
+            identity: "operator-a".to_string(),
+            request_id: "deployment-request".to_string(),
+        },
+    ))
+    .await
+    .expect("create deployment");
+    grpc.create_worker_deployment_version(Request::new(
+        workflowservice::CreateWorkerDeploymentVersionRequest {
+            namespace: "default".to_string(),
+            deployment_version: Some(deployment_version("deployment-routing", "build-a")),
+            identity: "operator-a".to_string(),
+            request_id: "version-request".to_string(),
+            ..Default::default()
+        },
+    ))
+    .await
+    .expect("create version");
+    grpc.set_worker_deployment_current_version(Request::new(
+        workflowservice::SetWorkerDeploymentCurrentVersionRequest {
+            namespace: "default".to_string(),
+            deployment_name: "deployment-routing".to_string(),
+            build_id: "build-a".to_string(),
+            identity: "operator-a".to_string(),
+            allow_no_pollers: true,
+            ignore_missing_task_queues: true,
+            ..Default::default()
+        },
+    ))
+    .await
+    .expect("set current");
+
+    let start = grpc
+        .start_workflow_execution(Request::new(
+            workflowservice::StartWorkflowExecutionRequest {
+                namespace: "default".to_string(),
+                workflow_id: "routing-wf".to_string(),
+                workflow_type: Some(tokeira_proto::common::WorkflowType {
+                    name: "example".to_string(),
+                }),
+                task_queue: Some(tokeira_proto::taskqueue::TaskQueue {
+                    name: "queue-routing".to_string(),
+                    ..Default::default()
+                }),
+                request_eager_execution: true,
+                eager_worker_deployment_options: Some(worker_deployment_options(
+                    "deployment-routing",
+                    "build-a",
+                )),
+                request_id: "start-request".to_string(),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("start workflow")
+        .into_inner();
+    let run_id = start.run_id;
+
+    let poll = grpc
+        .poll_workflow_task_queue(Request::new(PollWorkflowTaskQueueRequest {
+            namespace: "default".to_string(),
+            task_queue: Some(tokeira_proto::taskqueue::TaskQueue {
+                name: "queue-routing".to_string(),
+                ..Default::default()
+            }),
+            identity: "worker-a".to_string(),
+            worker_version_capabilities: Some(WorkerVersionCapabilities {
+                build_id: "build-a".to_string(),
+                use_versioning: true,
+                deployment_series_name: "deployment-routing".to_string(),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("poll workflow task")
+        .into_inner();
+    assert!(!poll.task_token.is_empty());
+
+    let run_key = store
+        .resolve_execution(&ExecutionRef {
+            namespace_id: namespace_id_for("default"),
+            workflow_id: WorkflowId("routing-wf".to_string()),
+            run_id: Some(tokeira_types::RunId(
+                uuid::Uuid::parse_str(&run_id).expect("valid run id"),
+            )),
+        })
+        .await
+        .expect("resolve execution")
+        .expect("run key");
+    let started = match store.load_run(run_key).await.expect("load started run") {
+        LoadedRun::Existing(state) => state,
+        LoadedRun::Absent => panic!("started run missing"),
+    };
+    let started_versioning = started.versioning_info.as_ref().expect("versioning info");
+    assert_eq!(started_versioning.revision_number, 1);
+    assert_eq!(
+        started_versioning
+            .version_transition
+            .as_ref()
+            .map(|version| (version.deployment_name.as_str(), version.build_id.as_str())),
+        Some(("deployment-routing", "build-a"))
+    );
+
+    grpc.respond_workflow_task_completed(Request::new(RespondWorkflowTaskCompletedRequest {
+        task_token: poll.task_token,
+        identity: "worker-a".to_string(),
+        versioning_behavior: enums::VersioningBehavior::AutoUpgrade as i32,
+        deployment_options: Some(worker_deployment_options("deployment-routing", "build-a")),
+        ..Default::default()
+    }))
+    .await
+    .expect("complete workflow task");
+
+    let completed = match store.load_run(run_key).await.expect("load completed run") {
+        LoadedRun::Existing(state) => state,
+        LoadedRun::Absent => panic!("completed run missing"),
+    };
+    let completed_versioning = completed
+        .versioning_info
+        .as_ref()
+        .expect("completed versioning info");
+    assert_eq!(completed_versioning.revision_number, 1);
+    assert!(completed_versioning.version_transition.is_none());
+    assert_eq!(
+        completed_versioning
+            .deployment_version
+            .as_ref()
+            .map(|version| (version.deployment_name.as_str(), version.build_id.as_str())),
+        Some(("deployment-routing", "build-a"))
+    );
+
+    let describe = grpc
+        .describe_workflow_execution(Request::new(
+            workflowservice::DescribeWorkflowExecutionRequest {
+                namespace: "default".to_string(),
+                execution: Some(tokeira_proto::common::WorkflowExecution {
+                    workflow_id: "routing-wf".to_string(),
+                    run_id,
+                }),
+            },
+        ))
+        .await
+        .expect("describe workflow")
+        .into_inner()
+        .workflow_execution_info
+        .expect("workflow info");
+    let info = describe.versioning_info.expect("versioning info");
+    assert_eq!(info.behavior, enums::VersioningBehavior::AutoUpgrade as i32);
+    assert_eq!(info.revision_number, 1);
+    assert!(info.version_transition.is_none());
+    assert_eq!(describe.worker_deployment_name, "deployment-routing");
+    assert_eq!(
+        info.deployment_version
+            .as_ref()
+            .map(|version| (version.deployment_name.as_str(), version.build_id.as_str())),
+        Some(("deployment-routing", "build-a"))
+    );
+}
+
+#[tokio::test]
+async fn describe_workflow_execution_returns_registered_completion_callbacks() {
+    let store = Arc::new(InMemoryStore::default());
+    let grpc = build_grpc(store).await;
+
+    let start = grpc
+        .start_workflow_execution(Request::new(
+            workflowservice::StartWorkflowExecutionRequest {
+                namespace: "default".to_string(),
+                workflow_id: "callback-wf".to_string(),
+                workflow_type: Some(tokeira_proto::common::WorkflowType {
+                    name: "example".to_string(),
+                }),
+                task_queue: Some(tokeira_proto::taskqueue::TaskQueue {
+                    name: "queue-callback".to_string(),
+                    ..Default::default()
+                }),
+                request_id: "callback-start".to_string(),
+                completion_callbacks: vec![tokeira_proto::common::Callback {
+                    variant: Some(tokeira_proto::common::callback::Variant::Nexus(
+                        tokeira_proto::common::callback::Nexus {
+                            url: "https://callback.example/workflow-closed".to_string(),
+                            header: [("x-callback".to_string(), "enabled".to_string())]
+                                .into_iter()
+                                .collect(),
+                        },
+                    )),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("start workflow")
+        .into_inner();
+
+    let describe = grpc
+        .describe_workflow_execution(Request::new(
+            workflowservice::DescribeWorkflowExecutionRequest {
+                namespace: "default".to_string(),
+                execution: Some(tokeira_proto::common::WorkflowExecution {
+                    workflow_id: "callback-wf".to_string(),
+                    run_id: start.run_id,
+                }),
+            },
+        ))
+        .await
+        .expect("describe workflow")
+        .into_inner();
+
+    assert_eq!(describe.callbacks.len(), 1);
+    let callback = &describe.callbacks[0];
+    assert!(callback.registration_time.is_some());
+    assert_eq!(callback.state, enums::CallbackState::Standby as i32);
+    assert!(callback.trigger.is_some());
+    let callback_target = callback.callback.as_ref().expect("callback target");
+    match callback_target.variant.as_ref().expect("callback variant") {
+        tokeira_proto::common::callback::Variant::Nexus(nexus) => {
+            assert_eq!(nexus.url, "https://callback.example/workflow-closed");
+            assert_eq!(
+                nexus.header.get("x-callback").map(String::as_str),
+                Some("enabled")
+            );
+        }
+        other => panic!("unexpected callback variant: {other:?}"),
+    }
+}
+
+fn deployment_version(deployment_name: &str, build_id: &str) -> WorkerDeploymentVersion {
+    WorkerDeploymentVersion {
+        deployment_name: deployment_name.to_string(),
+        build_id: build_id.to_string(),
+    }
+}
+
+fn worker_deployment_options(deployment_name: &str, build_id: &str) -> WorkerDeploymentOptions {
+    WorkerDeploymentOptions {
+        deployment_name: deployment_name.to_string(),
+        build_id: build_id.to_string(),
+        worker_versioning_mode: enums::WorkerVersioningMode::Versioned as i32,
+    }
 }
 
 /// Integration test: Start a workflow, then terminate it,

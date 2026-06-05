@@ -15,14 +15,35 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use tokeira_types::{Payload, Payloads, RunKey};
+use tokeira_types::{ExecutionRef, Payload, Payloads, RunKey};
 use tokio::sync::oneshot;
+
+/// Lifecycle position reported by the public update APIs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UpdateLifecycleStage {
+    /// No lifecycle state is known yet.
+    Unspecified,
+    /// The update is admitted to the runtime but not yet worker-accepted.
+    Admitted,
+    /// The worker accepted the update and an acceptance event is committed.
+    Accepted,
+    /// The update reached a terminal success or rejection outcome.
+    Completed,
+}
+
+/// Runtime-owned snapshot projected to update API responses.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateLifecycleSnapshot {
+    pub workflow_execution: ExecutionRef,
+    pub update_id: String,
+    pub update_name: String,
+    pub stage: UpdateLifecycleStage,
+    pub outcome: Option<UpdateOutcome>,
+}
 
 /// Caller-visible outcome of an update request.
 #[derive(Clone, Debug, PartialEq)]
 pub enum UpdateOutcome {
-    /// The update was accepted by the kernel.
-    Accepted { accepted_event_id: i64 },
     /// The update completed with a result.
     Completed {
         accepted_event_id: i64,
@@ -38,9 +59,12 @@ pub enum UpdateOutcome {
 /// How long the caller wants to wait.
 #[derive(Clone, Debug, PartialEq)]
 pub enum UpdateWaitPolicy {
-    /// Return as soon as the kernel admits the update; do not block on a worker
-    /// processing it. Callers using this policy are not entered into the
-    /// [`UpdateRegistry`].
+    /// Return the current lifecycle stage immediately.
+    Unspecified,
+    /// Return the current lifecycle stage immediately.
+    Admitted,
+    /// Block until the worker accepts the update and the acceptance event is
+    /// committed.
     Accepted,
     /// Block until the lane commits the update's final resolution
     /// (completed/rejected). These callers hold a registry entry until notified.
@@ -79,9 +103,16 @@ pub enum UpdateTransportResolution {
 
 #[derive(Debug)]
 pub(crate) enum UpdateResolution {
+    Accepted { accepted_event_id: i64 },
     Completed { result: Payloads },
     Rejected { failure: Payload },
     RunClosed,
+}
+
+#[derive(Debug)]
+pub(crate) struct UpdateWaiter {
+    pub wait_policy: UpdateWaitPolicy,
+    pub tx: oneshot::Sender<UpdateResolution>,
 }
 
 #[derive(Debug)]
@@ -89,7 +120,7 @@ pub(crate) struct UpdateRegistryEntry {
     pub update_name: String,
     pub input: Payloads,
     pub identity: String,
-    pub complete_tx: oneshot::Sender<UpdateResolution>,
+    pub waiter: Option<UpdateWaiter>,
 }
 
 /// In-memory registry of waiting update callers.
@@ -112,7 +143,8 @@ impl UpdateRegistry {
         update_name: String,
         input: Payloads,
         identity: String,
-        complete_tx: oneshot::Sender<UpdateResolution>,
+        wait_policy: UpdateWaitPolicy,
+        tx: oneshot::Sender<UpdateResolution>,
     ) {
         self.inner.lock().unwrap().insert(
             (run_key, update_id),
@@ -120,9 +152,40 @@ impl UpdateRegistry {
                 update_name,
                 input,
                 identity,
-                complete_tx,
+                waiter: Some(UpdateWaiter { wait_policy, tx }),
             },
         );
+    }
+
+    pub(crate) fn clear_waiter(&self, run_key: RunKey, update_id: &str) {
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .unwrap()
+            .get_mut(&(run_key, update_id.to_string()))
+        {
+            entry.waiter = None;
+        }
+    }
+
+    pub(crate) fn attach_waiter(
+        &self,
+        run_key: RunKey,
+        update_id: &str,
+        wait_policy: UpdateWaitPolicy,
+        tx: oneshot::Sender<UpdateResolution>,
+    ) -> bool {
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .unwrap()
+            .get_mut(&(run_key, update_id.to_string()))
+        {
+            entry.waiter = Some(UpdateWaiter { wait_policy, tx });
+            true
+        } else {
+            false
+        }
     }
 
     pub(crate) fn drain_pending_updates(
@@ -158,10 +221,55 @@ impl UpdateRegistry {
             .remove(&(run_key, update_id.to_string()));
         match entry {
             Some(entry) => {
-                let _ = entry.complete_tx.send(resolution);
-                true
+                if let Some(waiter) = entry.waiter {
+                    let _ = waiter.tx.send(resolution);
+                    true
+                } else {
+                    false
+                }
             }
             None => false,
+        }
+    }
+
+    pub(crate) fn notify_accepted(
+        &self,
+        run_key: RunKey,
+        update_id: &str,
+        accepted_event_id: i64,
+    ) -> bool {
+        let mut waiter_to_notify = None;
+        let mut remove_entry = false;
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(entry) = inner.get_mut(&(run_key, update_id.to_string())) {
+                match entry
+                    .waiter
+                    .as_ref()
+                    .map(|waiter| waiter.wait_policy.clone())
+                {
+                    Some(UpdateWaitPolicy::Accepted) => {
+                        waiter_to_notify = entry.waiter.take();
+                        remove_entry = true;
+                    }
+                    Some(UpdateWaitPolicy::Completed) => {}
+                    Some(UpdateWaitPolicy::Unspecified | UpdateWaitPolicy::Admitted) | None => {
+                        remove_entry = true;
+                    }
+                }
+            }
+            if remove_entry {
+                inner.remove(&(run_key, update_id.to_string()));
+            }
+        }
+
+        if let Some(waiter) = waiter_to_notify {
+            let _ = waiter
+                .tx
+                .send(UpdateResolution::Accepted { accepted_event_id });
+            true
+        } else {
+            false
         }
     }
 
@@ -189,7 +297,9 @@ impl UpdateRegistry {
         }
         let count = drained.len();
         for entry in drained {
-            let _ = entry.complete_tx.send(UpdateResolution::RunClosed);
+            if let Some(waiter) = entry.waiter {
+                let _ = waiter.tx.send(UpdateResolution::RunClosed);
+            }
         }
         count
     }
@@ -201,6 +311,13 @@ impl UpdateRegistry {
             .unwrap()
             .get(&(run_key, update_id.to_string()))
             .map(|entry| (entry.update_name.clone(), entry.input.clone()))
+    }
+
+    pub fn contains_registered_update(&self, run_key: RunKey, update_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .contains_key(&(run_key, update_id.to_string()))
     }
 
     #[cfg(test)]
@@ -254,6 +371,7 @@ mod tests {
             "name".into(),
             Payloads::default(),
             "worker".into(),
+            UpdateWaitPolicy::Completed,
             tx,
         );
         assert!(registry.contains(run_key, "update-1"));
@@ -282,6 +400,7 @@ mod tests {
             "name-1".into(),
             Payloads::default(),
             "worker".into(),
+            UpdateWaitPolicy::Completed,
             tx1,
         );
         registry.register(
@@ -290,6 +409,7 @@ mod tests {
             "name-2".into(),
             Payloads::default(),
             "worker".into(),
+            UpdateWaitPolicy::Completed,
             tx2,
         );
 
@@ -348,19 +468,11 @@ mod tests {
                     .await
                     .unwrap();
 
-                // Accepted returns immediately with
-                // accepted_event_id=0 (the actual event
-                // is written when the worker accepts).
-                match outcome {
-                    UpdateOutcome::Accepted {
-                        accepted_event_id,
-                    } => {
-                        prop_assert_eq!(accepted_event_id, 0);
-                    }
-                    other => panic!(
-                        "expected Accepted, got {other:?}"
-                    ),
-                };
+                prop_assert_eq!(
+                    outcome.stage,
+                    UpdateLifecycleStage::Admitted
+                );
+                prop_assert!(outcome.outcome.is_none());
 
                 // The update should be in admitted_updates,
                 // not pending_updates (no worker acceptance yet).
@@ -513,19 +625,11 @@ mod tests {
                     .await
                     .unwrap();
 
-                let eid = match outcome {
-                    UpdateOutcome::Accepted {
-                        accepted_event_id,
-                    } => accepted_event_id,
-                    other => panic!(
-                        "expected Accepted: {other:?}"
-                    ),
-                };
-
-                // With the new lifecycle, accepted_event_id is 0
-                // at admission time (the actual event is written
-                // when the worker sends Acceptance).
-                prop_assert_eq!(eid, 0);
+                prop_assert_eq!(
+                    outcome.stage,
+                    UpdateLifecycleStage::Admitted
+                );
+                prop_assert!(outcome.outcome.is_none());
 
                 let state = match store
                     .load_run(run_key)
@@ -586,6 +690,7 @@ mod tests {
                         format!("name-{i}"),
                         Payloads::default(),
                         format!("worker-{i}"),
+                        UpdateWaitPolicy::Completed,
                         tx,
                     );
                     receivers.push((uid, rx));
@@ -698,9 +803,10 @@ mod tests {
     // Feature: runtime-update-lifecycle
     // **Validates: Requirements 5.1, 5.3, 5.4**
     //
-    // Accept an update but don't complete it. Verify
-    // timeout error, registry cleanup, and kernel
-    // pending_updates preservation.
+    // Admit an update but don't let a worker accept it.
+    // Server soft timeout returns the reached stage
+    // without canceling the update or mutating kernel
+    // state.
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
 
@@ -719,7 +825,7 @@ mod tests {
                 )
                 .await;
 
-                let err = runtime
+                let snapshot = runtime
                     .update_workflow(
                         exec_ref(ns, &update_id),
                         update_id.clone(),
@@ -729,17 +835,18 @@ mod tests {
                         Duration::milliseconds(20),
                         UpdateWaitPolicy::Completed,
                     )
-                    .await;
-                prop_assert!(err.is_err());
-                let msg =
-                    err.unwrap_err().to_string();
-                prop_assert!(
-                    msg.contains("timed out"),
-                    "expected timeout: {msg}"
+                    .await
+                    .unwrap();
+                prop_assert_eq!(
+                    snapshot.stage,
+                    UpdateLifecycleStage::Admitted
                 );
+                prop_assert!(snapshot.outcome.is_none());
 
-                // Registry must be clean.
-                prop_assert!(!runtime
+                // The registry keeps transport payload
+                // after the caller returns, so the update
+                // can still be delivered to a worker.
+                prop_assert!(runtime
                     .update_registry()
                     .contains(
                         run_key, &update_id
@@ -795,6 +902,7 @@ mod tests {
                         format!("name-{i}"),
                         Payloads::default(),
                         format!("worker-{i}"),
+                        UpdateWaitPolicy::Completed,
                         tx,
                     );
                     receivers.push((uid, rx));
@@ -864,6 +972,7 @@ mod tests {
                         format!("name-{i}"),
                         Payloads::default(),
                         format!("worker-{i}"),
+                        UpdateWaitPolicy::Completed,
                         tx,
                     );
                     receivers.push((uid, rx));
@@ -919,6 +1028,7 @@ mod tests {
                 "name".into(),
                 Payloads::default(),
                 "worker".into(),
+                UpdateWaitPolicy::Completed,
                 tx,
             );
 
@@ -991,6 +1101,58 @@ mod tests {
         }
     }
 
+    // Feature: api-conformance-update-lifecycle, Property 4: stage monotonicity
+    // **Validates: Requirements 4.1, 4.3**
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn prop10_stage_ordering_and_rejection_terminality(
+            left in 0usize..4,
+            right in 0usize..4,
+            failure in arb_failure(),
+        ) {
+            let stages = [
+                UpdateLifecycleStage::Unspecified,
+                UpdateLifecycleStage::Admitted,
+                UpdateLifecycleStage::Accepted,
+                UpdateLifecycleStage::Completed,
+            ];
+
+            prop_assert_eq!(
+                stages[left] <= stages[right],
+                left <= right
+            );
+
+            let rejected = UpdateLifecycleSnapshot {
+                workflow_execution: ExecutionRef {
+                    namespace_id: NamespaceId::new(),
+                    workflow_id: WorkflowId("rejected-update".into()),
+                    run_id: None,
+                },
+                update_id: "update-rejected".into(),
+                update_name: "handler".into(),
+                stage: UpdateLifecycleStage::Completed,
+                outcome: Some(UpdateOutcome::Rejected {
+                    accepted_event_id: 7,
+                    failure: failure.clone(),
+                }),
+            };
+
+            prop_assert_eq!(
+                rejected.stage,
+                UpdateLifecycleStage::Completed
+            );
+            prop_assert_eq!(
+                rejected.outcome,
+                Some(UpdateOutcome::Rejected {
+                    accepted_event_id: 7,
+                    failure,
+                })
+            );
+        }
+    }
+
     // ── Test helpers ────────────────────────────────
 
     use std::sync::Arc;
@@ -1051,6 +1213,13 @@ mod tests {
                 deployment: None,
                 build_id: None,
                 versioning_override: None,
+                workflow_start_delay: None,
+                client_cron_schedule: None,
+                completion_callbacks: Vec::new(),
+                user_metadata: None,
+                links: Vec::new(),
+                on_conflict_options: None,
+                priority: None,
                 input: Payloads::default(),
                 header: None,
                 memo: Memo::default(),

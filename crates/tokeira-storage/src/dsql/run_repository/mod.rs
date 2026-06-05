@@ -1252,6 +1252,7 @@ mod tests {
             Some("build".to_owned()),
             42,
             3,
+            17,
             codec::encode_payloads(&payloads).unwrap(),
         );
 
@@ -1262,6 +1263,7 @@ mod tests {
         assert_eq!(task.input, payloads);
         assert_eq!(task.schedule_event_id, 42);
         assert_eq!(task.attempt, 3);
+        assert_eq!(task.dispatch_revision, 17);
         assert_eq!(task.queue.namespace_id, namespace_id);
         assert_eq!(task.queue.task_kind, TaskKind::Activity);
         assert_eq!(
@@ -1593,6 +1595,10 @@ mod tests {
             versioning_info: None,
             worker_deployment_name: None,
             completion_callbacks: Vec::new(),
+            user_metadata: None,
+            links: Vec::new(),
+            workflow_start_delay: None,
+            priority: None,
             started_at: fixed_now(),
             first_run_started_at: None,
             closed_at: None,
@@ -1626,6 +1632,7 @@ mod tests {
             input: Payloads::default(),
             header: None,
             last_failure: None,
+            heartbeat_details: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::seconds(30)),
@@ -1633,6 +1640,7 @@ mod tests {
             start_to_close_timeout: Some(Duration::seconds(20)),
             heartbeat_timeout: Some(Duration::seconds(5)),
             scheduled_at: fixed_now(),
+            current_attempt_scheduled_at: None,
             started_at: None,
             started_event_id: None,
             pause_info: None,

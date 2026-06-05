@@ -8,6 +8,9 @@ impl From<EdgeError> for Status {
         match err {
             EdgeError::BadRequest(message) => Status::invalid_argument(message),
             EdgeError::Unimplemented(message) => Status::unimplemented(message),
+            EdgeError::NotFound(message) => Status::not_found(message),
+            EdgeError::AlreadyExists(message) => Status::already_exists(message),
+            EdgeError::ResourceExhausted(message) => Status::resource_exhausted(message),
             EdgeError::Unauthorized(message) => Status::unauthenticated(message),
             EdgeError::Forbidden { action, namespace } => {
                 let message = match namespace {
@@ -122,6 +125,15 @@ mod tests {
             (
                 EdgeError::Unimplemented("todo".to_string()),
                 Code::Unimplemented,
+            ),
+            (EdgeError::NotFound("missing".to_string()), Code::NotFound),
+            (
+                EdgeError::AlreadyExists("duplicate".to_string()),
+                Code::AlreadyExists,
+            ),
+            (
+                EdgeError::ResourceExhausted("full".to_string()),
+                Code::ResourceExhausted,
             ),
             (
                 EdgeError::Unauthorized("nope".to_string()),

@@ -457,6 +457,9 @@ fn expected_code(err: &EdgeError) -> Code {
     match err {
         EdgeError::BadRequest(_) => Code::InvalidArgument,
         EdgeError::Unimplemented(_) => Code::Unimplemented,
+        EdgeError::NotFound(_) => Code::NotFound,
+        EdgeError::AlreadyExists(_) => Code::AlreadyExists,
+        EdgeError::ResourceExhausted(_) => Code::ResourceExhausted,
         EdgeError::Unauthorized(_) => Code::Unauthenticated,
         EdgeError::Forbidden { .. } => Code::PermissionDenied,
         EdgeError::NamespaceNotFound(_)
@@ -581,6 +584,11 @@ fn arb_start_request() -> impl Strategy<Value = StartWorkflowExecutionRequest> {
                 search_attributes,
                 identity: None,
                 request_eager_execution,
+                workflow_start_delay: None,
+                completion_callbacks: Vec::new(),
+                user_metadata: None,
+                links: Vec::new(),
+                eager_worker_deployment_options: None,
                 workflow_execution_timeout: None,
                 workflow_run_timeout: None,
                 workflow_task_timeout: None,
@@ -589,6 +597,9 @@ fn arb_start_request() -> impl Strategy<Value = StartWorkflowExecutionRequest> {
                 reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
                 header: None,
                 versioning_override: None,
+                on_conflict_options: None,
+                priority: None,
+                cron_schedule: None,
                 run_key: None,
                 run_id: None,
                 now: None,
@@ -843,6 +854,8 @@ fn arb_description() -> impl Strategy<Value = WorkflowExecutionDescription> {
                 original_start_time: start_time
                     .map(|secs| OffsetDateTime::from_unix_timestamp(secs).unwrap())
                     .unwrap_or(OffsetDateTime::UNIX_EPOCH),
+                versioning_info: None,
+                worker_deployment_name: None,
             },
         )
 }
@@ -1233,8 +1246,8 @@ use tokeira_edge::{
     translate::{
         PollActivityTaskQueueRequest, PollActivityTaskQueueResponse, QueryWorkflowRequest,
         QueryWorkflowResponse, RequestCancelWorkflowExecutionRequest,
-        TerminateWorkflowExecutionRequest, UpdateOutcomeDto, UpdateWaitPolicyDto,
-        UpdateWorkflowExecutionRequest, UpdateWorkflowExecutionResponse,
+        TerminateWorkflowExecutionRequest, UpdateLifecycleStageDto, UpdateOutcomeDto, UpdateRefDto,
+        UpdateWaitPolicyDto, UpdateWorkflowExecutionRequest, UpdateWorkflowExecutionResponse,
     },
 };
 use tokeira_types::{ActivityTaskToken, ShardEpoch};
@@ -1292,6 +1305,10 @@ fn arb_poll_activity_response() -> impl Strategy<Value = PollActivityTaskQueueRe
                     run_key: RunKey(Uuid::from_u128(run_key)),
                     header: None,
                     retry_policy: None,
+                    heartbeat_details: None,
+                    scheduled_time: None,
+                    current_attempt_scheduled_time: None,
+                    started_time: None,
                     schedule_to_close_timeout: None,
                     start_to_close_timeout: None,
                     heartbeat_timeout: None,
@@ -1495,12 +1512,13 @@ proptest! {
         } else {
             UpdateWaitPolicyDto::Accepted
         };
-        let stage = if use_completed { 3 } else { 1 };
+        let stage = if use_completed { 3 } else { 2 };
 
         let edge = UpdateWorkflowExecutionRequest {
             namespace: namespace.clone(),
             workflow_id: workflow_id.clone(),
             run_id: None,
+            first_execution_run_id: None,
             update_id: update_id.clone(),
             update_name: update_name.clone(),
             input: input.clone(),
@@ -1546,23 +1564,27 @@ proptest! {
         accepted_event_id in 1i64..1000i64,
         result in arb_payloads(),
         failure in arb_small_string(),
-        variant in 0u8..3u8,
+        rejected in any::<bool>(),
     ) {
-        let outcome = match variant {
-            0 => UpdateOutcomeDto::Accepted {
-                accepted_event_id,
-            },
-            1 => UpdateOutcomeDto::Completed {
-                accepted_event_id,
-                result: result.clone(),
-            },
-            _ => UpdateOutcomeDto::Rejected {
+        let outcome = if rejected {
+            UpdateOutcomeDto::Rejected {
                 accepted_event_id,
                 failure: Payload::new(failure.clone().into_bytes()),
-            },
+            }
+        } else {
+            UpdateOutcomeDto::Completed {
+                accepted_event_id,
+                result: result.clone(),
+            }
         };
         let edge = UpdateWorkflowExecutionResponse {
-            outcome: outcome.clone(),
+            update_ref: UpdateRefDto {
+                workflow_id: "workflow".to_string(),
+                run_id: "00000000-0000-0000-0000-000000000001".to_string(),
+                update_id: "update".to_string(),
+            },
+            stage: UpdateLifecycleStageDto::Completed,
+            outcome: Some(outcome),
         };
         let _proto = update_response_to_proto(edge);
         // The upstream response type has different fields (update_ref, outcome, stage)

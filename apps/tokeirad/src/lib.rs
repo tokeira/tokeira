@@ -609,7 +609,7 @@ where
 
     let workflow_service =
         WorkflowService::new_with_versioning_and_buffered_queries_and_history_wait_registry(
-            runtime_adapter,
+            runtime_adapter.clone(),
             resolver,
             visibility,
             repo.clone(),
@@ -630,7 +630,8 @@ where
             schedule_store,
             task_queue_config_store,
             Arc::new(tokeira_runtime::BatchOperationStore::default()),
-        );
+        )
+        .with_worker_deployment_runtime(runtime_adapter);
     let operator_service = OperatorService::new(operator_api, interceptors);
 
     let workflow_grpc = WorkflowServiceGrpc::new(workflow_service);
@@ -978,7 +979,7 @@ where
                         attempt: task.attempt,
                     }
                 }),
-                callbacks: Vec::new(),
+                callbacks: state.completion_callbacks.clone(),
                 pending_nexus_operations: state
                     .pending_nexus_operations
                     .values()
@@ -1012,6 +1013,8 @@ where
                     .map(|timeout| state.started_at + timeout),
                 cancel_requested: state.cancel_requested,
                 original_start_time: state.first_run_started_at.unwrap_or(state.started_at),
+                versioning_info: state.versioning_info.clone(),
+                worker_deployment_name: state.worker_deployment_name.clone(),
             })),
             LoadedRun::Absent => Err(anyhow!("resolved run missing from storage: {:?}", run_key)),
         }

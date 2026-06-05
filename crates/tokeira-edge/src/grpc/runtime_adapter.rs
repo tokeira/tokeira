@@ -8,14 +8,24 @@ use tokeira_kernel::{
     WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    ActivityTokenResolutionError, PendingUpdateTransport, QueryResult, ResetWorkflowResult,
-    SignalWithStartResult, StartWorkflowResult, StartedActivityTask, TokeiraRuntime, UpdateOutcome,
-    UpdateTransportResolution, UpdateWaitPolicy,
+    ActivityTokenResolutionError, CreateDeployment, CreateVersion, DeleteDeployment, DeleteVersion,
+    DeploymentPage, DeploymentRegistry, DeploymentView, DescribeVersion, ListDeployments,
+    PendingUpdateTransport, QueryResult, RegistryError, ResetWorkflowResult, SetCurrent,
+    SetCurrentOutcome, SetManager, SetManagerOutcome, SetRamping, SetRampingOutcome,
+    SignalWithStartResult, StartWorkflowResult, StartedActivityTask, TokeiraRuntime,
+    UpdateComputeConfig, UpdateLifecycleSnapshot, UpdateMetadata, UpdateTransportResolution,
+    UpdateWaitPolicy, ValidateComputeConfig, VersionMetadataView, VersionView,
 };
-use tokeira_storage::{CommitResult, RunRepository};
+use tokeira_storage::{CommitResult, ConflictToken, DeploymentKey, RunRepository};
 use tokeira_types::{ActivityTaskToken, ExecutionRef, Payload, Payloads, RequestContext, RunKey};
 
-use crate::workflow_service::{WorkflowMutationOutcome, WorkflowRuntimeApi};
+use crate::{
+    errors::{EdgeError, EdgeResult},
+    workflow_service::{
+        DeploymentMutationOutcome, WorkerDeploymentRuntimeApi, WorkflowMutationOutcome,
+        WorkflowRuntimeApi,
+    },
+};
 
 #[derive(Clone)]
 pub struct RuntimeAdapter<R> {
@@ -25,6 +35,17 @@ pub struct RuntimeAdapter<R> {
 impl<R> RuntimeAdapter<R> {
     pub fn new(runtime: Arc<TokeiraRuntime<R>>) -> Self {
         Self { runtime }
+    }
+
+    fn worker_deployment_registry(&self) -> EdgeResult<DeploymentRegistry>
+    where
+        R: RunRepository + 'static,
+    {
+        self.runtime.deployment_registry().ok_or_else(|| {
+            EdgeError::FailedPrecondition(
+                "worker deployment registry is not configured for this runtime".to_string(),
+            )
+        })
     }
 }
 
@@ -258,7 +279,7 @@ where
         request: RequestContext,
         timeout: std::time::Duration,
         wait_policy: UpdateWaitPolicy,
-    ) -> Result<UpdateOutcome> {
+    ) -> Result<UpdateLifecycleSnapshot> {
         let timeout: time::Duration =
             time::Duration::try_from(timeout).map_err(|_| anyhow!("invalid timeout"))?;
         self.runtime
@@ -271,6 +292,20 @@ where
                 timeout,
                 wait_policy,
             )
+            .await
+    }
+
+    async fn poll_workflow_update(
+        &self,
+        execution: ExecutionRef,
+        update_id: String,
+        wait_policy: UpdateWaitPolicy,
+        timeout: std::time::Duration,
+    ) -> Result<UpdateLifecycleSnapshot> {
+        let timeout: time::Duration =
+            time::Duration::try_from(timeout).map_err(|_| anyhow!("invalid timeout"))?;
+        self.runtime
+            .poll_workflow_update(execution, update_id, wait_policy, timeout)
             .await
     }
 
@@ -313,6 +348,159 @@ where
         self.runtime
             .resolve_nexus_operation(run_key, operation_id, scheduled_event_id, resolution)
             .await
+    }
+}
+
+#[async_trait]
+impl<R> WorkerDeploymentRuntimeApi for RuntimeAdapter<R>
+where
+    R: RunRepository + 'static,
+{
+    async fn create_worker_deployment(
+        &self,
+        req: CreateDeployment,
+    ) -> EdgeResult<DeploymentMutationOutcome<DeploymentView>> {
+        let registry = self.worker_deployment_registry()?;
+        let view = registry
+            .create_deployment(req)
+            .await
+            .map_err(registry_error_to_edge)?;
+        Ok(deployment_mutation_outcome(view.conflict_token, view))
+    }
+
+    async fn describe_worker_deployment(&self, key: DeploymentKey) -> EdgeResult<DeploymentView> {
+        self.worker_deployment_registry()?
+            .describe_deployment(key)
+            .await
+            .map_err(registry_error_to_edge)
+    }
+
+    async fn delete_worker_deployment(&self, req: DeleteDeployment) -> EdgeResult<()> {
+        self.worker_deployment_registry()?
+            .delete_deployment(req)
+            .await
+            .map_err(registry_error_to_edge)
+    }
+
+    async fn list_worker_deployments(&self, req: ListDeployments) -> EdgeResult<DeploymentPage> {
+        self.worker_deployment_registry()?
+            .list_deployments(req)
+            .await
+            .map_err(registry_error_to_edge)
+    }
+
+    async fn create_worker_deployment_version(&self, req: CreateVersion) -> EdgeResult<()> {
+        self.worker_deployment_registry()?
+            .create_version(req)
+            .await
+            .map_err(registry_error_to_edge)
+    }
+
+    async fn describe_worker_deployment_version(
+        &self,
+        req: DescribeVersion,
+    ) -> EdgeResult<VersionView> {
+        self.worker_deployment_registry()?
+            .describe_version(req)
+            .await
+            .map_err(registry_error_to_edge)
+    }
+
+    async fn delete_worker_deployment_version(&self, req: DeleteVersion) -> EdgeResult<()> {
+        self.worker_deployment_registry()?
+            .delete_version(req)
+            .await
+            .map_err(registry_error_to_edge)
+    }
+
+    async fn set_worker_deployment_current_version(
+        &self,
+        req: SetCurrent,
+    ) -> EdgeResult<DeploymentMutationOutcome<SetCurrentOutcome>> {
+        let view = self
+            .worker_deployment_registry()?
+            .set_current_version(req)
+            .await
+            .map_err(registry_error_to_edge)?;
+        Ok(deployment_mutation_outcome(view.conflict_token, view))
+    }
+
+    async fn set_worker_deployment_ramping_version(
+        &self,
+        req: SetRamping,
+    ) -> EdgeResult<DeploymentMutationOutcome<SetRampingOutcome>> {
+        let view = self
+            .worker_deployment_registry()?
+            .set_ramping_version(req)
+            .await
+            .map_err(registry_error_to_edge)?;
+        Ok(deployment_mutation_outcome(view.conflict_token, view))
+    }
+
+    async fn update_worker_deployment_version_compute_config(
+        &self,
+        req: UpdateComputeConfig,
+    ) -> EdgeResult<()> {
+        self.worker_deployment_registry()?
+            .update_compute_config(req)
+            .await
+            .map_err(registry_error_to_edge)
+    }
+
+    async fn validate_worker_deployment_version_compute_config(
+        &self,
+        req: ValidateComputeConfig,
+    ) -> EdgeResult<()> {
+        self.worker_deployment_registry()?
+            .validate_compute_config(req)
+            .await
+            .map_err(registry_error_to_edge)
+    }
+
+    async fn update_worker_deployment_version_metadata(
+        &self,
+        req: UpdateMetadata,
+    ) -> EdgeResult<VersionMetadataView> {
+        self.worker_deployment_registry()?
+            .update_version_metadata(req)
+            .await
+            .map_err(registry_error_to_edge)
+    }
+
+    async fn set_worker_deployment_manager(
+        &self,
+        req: SetManager,
+    ) -> EdgeResult<DeploymentMutationOutcome<SetManagerOutcome>> {
+        let view = self
+            .worker_deployment_registry()?
+            .set_manager(req)
+            .await
+            .map_err(registry_error_to_edge)?;
+        Ok(deployment_mutation_outcome(view.conflict_token, view))
+    }
+}
+
+fn deployment_mutation_outcome<T>(
+    conflict_token: ConflictToken,
+    view: T,
+) -> DeploymentMutationOutcome<T> {
+    DeploymentMutationOutcome {
+        conflict_token,
+        view,
+    }
+}
+
+fn registry_error_to_edge(error: RegistryError) -> EdgeError {
+    match error {
+        RegistryError::AlreadyExists => {
+            EdgeError::AlreadyExists("worker deployment already exists".to_string())
+        }
+        RegistryError::NotFound => EdgeError::NotFound("worker deployment not found".to_string()),
+        RegistryError::FailedPrecondition(message) => EdgeError::FailedPrecondition(message),
+        RegistryError::ResourceExhausted => EdgeError::ResourceExhausted(
+            "worker deployment registry resource exhausted".to_string(),
+        ),
+        RegistryError::InvalidArgument(message) => EdgeError::BadRequest(message),
     }
 }
 

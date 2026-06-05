@@ -444,6 +444,15 @@ where
                             | HistoryEventKind::ActivityTaskCanceled { activity_id, .. } => {
                                 activity_tracking.remove(message.run_key, activity_id)
                             }
+                            HistoryEventKind::WorkflowExecutionUpdateAccepted {
+                                update_id, ..
+                            } => {
+                                update_registry.notify_accepted(
+                                    message.run_key,
+                                    update_id,
+                                    event.event_id,
+                                );
+                            }
                             HistoryEventKind::WorkflowExecutionUpdateCompleted {
                                 update_id,
                                 result,
@@ -690,6 +699,8 @@ where
                                             workflow_run_timeout,
                                             workflow_task_timeout,
                                             retry_policy,
+                                            backoff_start_interval,
+                                            cron_schedule,
                                             ..
                                         } => Some((
                                             *new_run_id,
@@ -702,6 +713,8 @@ where
                                             *workflow_run_timeout,
                                             *workflow_task_timeout,
                                             retry_policy.clone(),
+                                            *backoff_start_interval,
+                                            cron_schedule.clone(),
                                         )),
                                         _ => None,
                                     });
@@ -716,6 +729,8 @@ where
                                     workflow_run_timeout,
                                     workflow_task_timeout,
                                     retry_policy,
+                                    backoff_start_interval,
+                                    cron_schedule,
                                 )) = successor_event
                                 {
                                     // Carry the chain's origin forward: the
@@ -769,6 +784,19 @@ where
                                         versioning_override: new_state
                                             .versioning_override()
                                             .cloned(),
+                                        workflow_start_delay: backoff_start_interval,
+                                        // Temporal carries completion callbacks
+                                        // and priority into continue-as-new start
+                                        // requests so run-chain completion and
+                                        // scheduling intent survive the hop
+                                        // (`service/history/workflow/mutable_state_impl.go:2480,2573 @ v1.31.0`).
+                                        completion_callbacks: new_state
+                                            .completion_callbacks
+                                            .clone(),
+                                        user_metadata: new_state.user_metadata.clone(),
+                                        links: Vec::new(),
+                                        on_conflict_options: None,
+                                        priority: new_state.priority.clone(),
                                         input,
                                         header: None,
                                         memo,
@@ -813,7 +841,8 @@ where
                                             received_at: OffsetDateTime::now_utc(),
                                         },
                                         now: OffsetDateTime::now_utc(),
-                                        cron_schedule: None,
+                                        client_cron_schedule: None,
+                                        cron_schedule,
                                         reserved_poller_identity: None,
                                     };
                                     let publisher = publisher.clone();
@@ -1177,7 +1206,10 @@ fn command_type_name(command: &Command) -> &'static str {
         Command::UpdateExecutionOptions(_) => "UpdateExecutionOptions",
         Command::WorkflowExecutionTimedOut(_) => "WorkflowExecutionTimedOut",
         Command::WorkflowTaskStarted(_) => "WorkflowTaskStarted",
-        Command::WorkflowTaskCompleted(_) => "WorkflowTaskCompleted",
+        Command::StartDeploymentTransition(_) => "StartDeploymentTransition",
+        Command::WorkflowTaskCompleted(_) | Command::WorkflowTaskCompletedWithCron { .. } => {
+            "WorkflowTaskCompleted"
+        }
         Command::WorkflowTaskFailed(_) => "WorkflowTaskFailed",
         Command::WorkflowTaskTimedOut(_) => "WorkflowTaskTimedOut",
         Command::ActivityResolved(_) => "ActivityResolved",
@@ -1187,6 +1219,7 @@ fn command_type_name(command: &Command) -> &'static str {
         Command::ExternalCancelResolved(_) => "ExternalCancelResolved",
         Command::NexusOperationResolved(_) => "NexusOperationResolved",
         Command::TimerDue(_) => "TimerDue",
+        Command::WorkflowStartDelayElapsed(_) => "WorkflowStartDelayElapsed",
         Command::ScheduleQueryTask(_) => "ScheduleQueryTask",
     }
 }
@@ -1927,6 +1960,8 @@ mod tests {
                         initiator: tokeira_kernel::ContinueAsNewInitiator::Workflow,
                         failure: None,
                         last_completion_result: None,
+                        backoff_start_interval: None,
+                        cron_schedule: None,
                         workflow_task_completed_event_id: 0,
                     },
                 }]
@@ -2045,6 +2080,10 @@ mod tests {
             versioning_info: None,
             worker_deployment_name: None,
             completion_callbacks: Vec::new(),
+            user_metadata: None,
+            links: Vec::new(),
+            workflow_start_delay: None,
+            priority: None,
             started_at: OffsetDateTime::now_utc(),
             first_run_started_at: None,
             closed_at: None,

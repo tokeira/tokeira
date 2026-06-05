@@ -7,17 +7,19 @@ does not support or cannot yet populate, along with rationale.
 
 | Field | Status | Rationale |
 |---|---|---|
-| `workflow_id_reuse_policy` | Not supported | Tokeira uses simple ID-based dedup |
-| `workflow_id_conflict_policy` | Not supported | Tokeira uses simple ID-based dedup |
 | `cron_schedule` | Server-managed | Populated for schedule-triggered runs; client-supplied cron starts are still not accepted |
 | `request_eager_execution` | Supported | Used for eager workflow-task dispatch on start |
 | `continued_failure` | Not supported | Server-internal field for schedules |
 | `last_completion_result` | Not supported | Server-internal field for schedules |
-| `workflow_start_delay` | Not supported | Start delay not implemented |
-| `completion_callbacks` | Not supported | Completion callbacks not implemented at start |
-| `user_metadata` | Not supported | SDK user metadata not threaded |
-| `links` | Not supported | Link tracking not implemented |
-| `versioning_override` | Not supported | Versioning override not implemented |
+| `workflow_start_delay` | Supported | Delays first WFT dispatch with a durable internal timer |
+| `completion_callbacks` | Partially supported | Registration and describe rendering are implemented; terminal dispatch is pending |
+| `user_metadata` | Supported | Threaded into start history |
+| `links` | Supported | Threaded into start history |
+| `versioning_override` | Supported | Translated into kernel versioning override and routed through WFT dispatch |
+| `on_conflict_options` | Supported | Applies request id, callbacks, and links to the running workflow under `USE_EXISTING` |
+| `priority` | Supported | Persisted and rendered through describe/history |
+| `eager_worker_deployment_options` | Supported | Worker-deployment routing option used only when eager execution is requested |
+| `time_skipping_config` | Rejected | Test-server feature; behavioural requests return `INVALID_ARGUMENT` |
 
 ## Schedule Transport
 
@@ -33,14 +35,19 @@ does not support or cannot yet populate, along with rationale.
 
 | Field | Status | Rationale |
 |---|---|---|
-| `sticky_attributes` | Not supported | Sticky task queues partially implemented |
-| `return_new_workflow_task` | Partially supported | Used for inline query WFT return and eager activity dispatch; full upstream semantics are not implemented |
-| `binary_checksum` | Deprecated | Superseded by worker versioning |
-| `worker_version_stamp` | Deprecated | Superseded by deployment-based versioning |
-| `sdk_metadata` | Not supported | SDK metadata not threaded |
-| `metering_metadata` | Not supported | Metering not implemented |
-| `deployment` | Not supported | Deployment-based versioning not implemented |
-| `versioning_behavior` | Not supported | Versioning behavior not implemented |
+| `sticky_attributes` | Supported | Validated and translated into sticky affinity TTL on WFT completion |
+| `return_new_workflow_task` | Supported | Returns only a real durably scheduled and started WFT, or query-only WFT when the run is quiescent |
+| `binary_checksum` | Deprecated | Accepted for back-compat only; superseded by worker versioning |
+| `worker_version_stamp` | Deprecated | Accepted for back-compat and preserved as worker version metadata |
+| `sdk_metadata` | Supported | Preserved on `WorkflowTaskCompleted` history |
+| `metering_metadata` | Supported | Preserved on `WorkflowTaskCompleted` history |
+| `deployment` | Deprecated | Accepted as fallback deployment metadata when current `deployment_options` is absent |
+| `deployment_options` | Supported | Current worker deployment/versioning metadata |
+| `resource_id` | Supported | Preserved as routing envelope metadata |
+| `worker_instance_key` | Supported | Preserved as worker lifecycle envelope metadata |
+| `worker_control_task_queue` | Supported | Preserved as worker lifecycle envelope metadata |
+| `capabilities` | Supported | `discard_speculative_workflow_task_with_events` is preserved for speculative-WFT handling |
+| `versioning_behavior` | Supported | Validated and preserved on WFT completion |
 
 ## DescribeWorkflowExecutionResponse
 
@@ -56,15 +63,6 @@ does not support or cannot yet populate, along with rationale.
 | `callbacks` | Empty | Kernel callbacks are placeholders without representable callback URL, trigger, state, or timing data |
 | `pending_nexus_operations` attempt/cancellation/block-reason fields | Not populated | Nexus delivery attempt and cancellation tracking is not retained yet |
 | `workflow_extended_info.last_reset_time`, `reset_run_id`, `request_id_infos` | Not populated | Reset and request-id linkage state is not retained yet |
-
-## PollActivityTaskQueueResponse
-
-| Field | Status | Rationale |
-|---|---|---|
-| `heartbeat_details` | Not populated | Heartbeat state not threaded to poll response |
-| `scheduled_time` | Not populated | Requires activity scheduled event timestamp |
-| `current_attempt_scheduled_time` | Not populated | Requires retry state tracking |
-| `started_time` | Not populated | Could be set to poll time |
 
 ## SignalWorkflowExecutionRequest
 
@@ -82,14 +80,6 @@ does not support or cannot yet populate, along with rationale.
 | `BatchOperationReset.reset_reapply_type` | Not supported | Reset reapply semantics are not modeled by kernel reset |
 | `BatchOperationReset.options.current_run_only` | Not supported | Batch reset resolves only within the exact execution reference being processed |
 | `BatchOperationReset.options.reset_reapply_exclude_types` | Not supported | Reset reapply exclusion semantics are not modeled by kernel reset |
-
-## History Event Attributes — Activity Events
-
-Activity completion/failure/timeout/cancel events have `scheduled_event_id` and
-`started_event_id` fields in the proto that link back to the scheduling and start
-events. The kernel tracks activities by `activity_id` rather than event ID, so
-these linkage fields cannot be populated until the kernel maintains an
-`activity_id → event_id` mapping.
 
 ## History Event Attributes — WorkflowExecutionOptionsUpdated
 

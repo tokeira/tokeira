@@ -21,15 +21,16 @@ use crate::{
     command::{
         ActivityResolvedRequest, CancelRequest, ChildResolution, ChildResolvedRequest,
         ChildStartConfirmedRequest, ChildStartResult, Command, ContinueAsNewInitiator,
-        ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
-        ExternalSignalResult, FieldChange, NexusOperationResolvedRequest, NexusResolution,
-        PauseActivityRequest, PauseWorkflowRequest, ResetActivityRequest, ResetRequest, RetryState,
-        ScheduleQueryTaskRequest, SignalRequest, SignalWithStartRequest, StartRequest,
-        StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, UnpauseActivityRequest,
-        UnpauseWorkflowRequest, UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest,
-        UpdateProtocolBody, UpdateRequest, WorkflowCommand, WorkflowExecutionTimedOutRequest,
-        WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
-        WorkflowTaskTimedOutRequest,
+        CronContinuation, ExternalCancelResolvedRequest, ExternalCancelResult,
+        ExternalSignalResolvedRequest, ExternalSignalResult, FieldChange,
+        NexusOperationResolvedRequest, NexusResolution, PauseActivityRequest, PauseWorkflowRequest,
+        ResetActivityRequest, ResetRequest, RetryState, ScheduleQueryTaskRequest, SignalRequest,
+        SignalWithStartRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest,
+        TimerDueRequest, UnpauseActivityRequest, UnpauseWorkflowRequest,
+        UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody,
+        UpdateRequest, WorkflowCommand, WorkflowExecutionTimedOutRequest,
+        WorkflowStartDelayElapsedRequest, WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
+        WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
     },
     event::{ActivityResolution, HistoryEvent, HistoryEventKind},
     state::{
@@ -40,6 +41,23 @@ use crate::{
     },
     transition::{ActivityOp, DispatchOp, ProjectionOp, RequestDedupeOp, TimerOp, Transition},
 };
+
+fn stamp_callback_registration_times(
+    callbacks: &mut [crate::state::CompletionCallback],
+    registration_time: OffsetDateTime,
+) {
+    for callback in callbacks {
+        if callback.registration_time.is_none() {
+            callback.registration_time = Some(registration_time);
+        }
+    }
+}
+
+pub const WORKFLOW_START_DELAY_TIMER_ID: &str = "__tokeira_workflow_start_delay";
+
+fn positive_start_delay(delay: Option<time::Duration>) -> Option<time::Duration> {
+    delay.filter(|delay| *delay > time::Duration::ZERO)
+}
 
 /// Pure transition engine.
 ///
@@ -105,7 +123,16 @@ impl Kernel for BasicKernel {
                 self.apply_workflow_execution_timed_out(loaded, req)
             }
             Command::WorkflowTaskStarted(req) => self.apply_workflow_task_started(loaded, req),
-            Command::WorkflowTaskCompleted(req) => self.apply_workflow_task_completed(loaded, req),
+            Command::StartDeploymentTransition(req) => {
+                self.apply_start_deployment_transition(loaded, req)
+            }
+            Command::WorkflowTaskCompleted(req) => {
+                self.apply_workflow_task_completed(loaded, req, None)
+            }
+            Command::WorkflowTaskCompletedWithCron {
+                request,
+                cron_continuation,
+            } => self.apply_workflow_task_completed(loaded, request, Some(cron_continuation)),
             Command::WorkflowTaskFailed(req) => self.apply_workflow_task_failed(loaded, req),
             Command::WorkflowTaskTimedOut(req) => self.apply_workflow_task_timed_out(loaded, req),
             Command::ActivityResolved(req) => self.apply_activity_resolved(loaded, req),
@@ -121,6 +148,9 @@ impl Kernel for BasicKernel {
                 self.apply_nexus_operation_resolved(loaded, req)
             }
             Command::TimerDue(req) => self.apply_timer_due(loaded, req),
+            Command::WorkflowStartDelayElapsed(req) => {
+                self.apply_workflow_start_delay_elapsed(loaded, req)
+            }
             Command::ScheduleQueryTask(req) => self.apply_schedule_query_task(loaded, req),
         }
     }
@@ -156,6 +186,11 @@ impl BasicKernel {
             root_workflow_id,
             root_run_id,
             last_completion_result,
+            workflow_start_delay,
+            completion_callbacks,
+            user_metadata,
+            links,
+            priority,
             versioning_info,
             worker_deployment_name,
             ..
@@ -215,13 +250,25 @@ impl BasicKernel {
             pending_updates: BTreeMap::new(),
             admitted_updates: std::collections::HashSet::new(),
             pending_nexus_operations: BTreeMap::new(),
-            completion_callbacks: Vec::new(),
+            completion_callbacks: completion_callbacks.clone(),
+            user_metadata: user_metadata.clone(),
+            links: links.clone(),
+            workflow_start_delay: *workflow_start_delay,
+            priority: priority.clone(),
             started_at: first.happened_at,
             first_run_started_at: ctx.first_run_started_at,
             closed_at: None,
             close_result: None,
             close_failure: None,
         };
+        if let Some(delay) = positive_start_delay(*workflow_start_delay) {
+            let timer = TimerState {
+                timer_id: WORKFLOW_START_DELAY_TIMER_ID.to_string(),
+                started_event_id: 0,
+                fire_at: first.happened_at + delay,
+            };
+            state.timers.insert(timer.timer_id.clone(), timer);
+        }
 
         for event in events {
             state.last_event_id = event.event_id;
@@ -246,6 +293,8 @@ impl BasicKernel {
         let event_root_workflow_id = req.root_workflow_id.clone();
         let event_root_run_id = req.root_run_id;
         let initial_versioning_info = initial_versioning_info(req.versioning_override.clone());
+        let mut completion_callbacks = req.completion_callbacks.clone();
+        stamp_callback_registration_times(&mut completion_callbacks, req.now);
         let initial = WorkflowState {
             run_key: req.run_key,
             namespace_id: req.namespace_id,
@@ -293,7 +342,11 @@ impl BasicKernel {
             pending_updates: BTreeMap::new(),
             admitted_updates: std::collections::HashSet::new(),
             pending_nexus_operations: BTreeMap::new(),
-            completion_callbacks: Vec::new(),
+            completion_callbacks: completion_callbacks.clone(),
+            user_metadata: req.user_metadata.clone(),
+            links: req.links.clone(),
+            workflow_start_delay: req.workflow_start_delay,
+            priority: req.priority.clone(),
             started_at: req.now,
             first_run_started_at: req.first_run_started_at,
             closed_at: None,
@@ -331,6 +384,11 @@ impl BasicKernel {
             continued_failure: req.continued_failure,
             last_completion_result: req.last_completion_result,
             cron_schedule: req.cron_schedule,
+            workflow_start_delay: req.workflow_start_delay,
+            completion_callbacks,
+            user_metadata: req.user_metadata,
+            links: req.links,
+            priority: req.priority,
             versioning_info: initial_versioning_info,
             worker_deployment_name: None,
         });
@@ -339,9 +397,22 @@ impl BasicKernel {
             memo_patch: req.memo,
             search_attr_patch: req.search_attributes,
         });
-        builder.schedule_workflow_task();
-        if let Some(identity) = req.reserved_poller_identity {
-            builder.start_pending_workflow_task(identity);
+        if let Some(delay) = positive_start_delay(req.workflow_start_delay) {
+            let timer = TimerState {
+                timer_id: WORKFLOW_START_DELAY_TIMER_ID.to_string(),
+                started_event_id: 0,
+                fire_at: req.now + delay,
+            };
+            builder
+                .state
+                .timers
+                .insert(timer.timer_id.clone(), timer.clone());
+            builder.timer_ops.push(TimerOp::Upsert(timer));
+        } else {
+            builder.schedule_workflow_task();
+            if let Some(identity) = req.reserved_poller_identity {
+                builder.start_pending_workflow_task(identity);
+            }
         }
         Ok(builder.finish())
     }
@@ -413,6 +484,10 @@ impl BasicKernel {
             admitted_updates: std::collections::HashSet::new(),
             pending_nexus_operations: BTreeMap::new(),
             completion_callbacks: Vec::new(),
+            user_metadata: req.user_metadata.clone(),
+            links: req.links.clone(),
+            workflow_start_delay: req.workflow_start_delay,
+            priority: req.priority.clone(),
             started_at: req.now,
             first_run_started_at: req.first_run_started_at,
             closed_at: None,
@@ -449,14 +524,19 @@ impl BasicKernel {
             original_execution_run_id: req.original_execution_run_id.or(Some(req.run_id)),
             continued_failure: req.continued_failure,
             last_completion_result: req.last_completion_result,
-            cron_schedule: None,
+            cron_schedule: req.cron_schedule,
+            workflow_start_delay: req.workflow_start_delay,
+            completion_callbacks: Vec::new(),
+            user_metadata: req.user_metadata,
+            links: req.links,
+            priority: req.priority,
             versioning_info: initial_versioning_info,
             worker_deployment_name: None,
         });
         builder.emit(HistoryEventKind::WorkflowExecutionSignaled {
             signal_name: req.signal_name,
             input: req.signal_input,
-            header: None,
+            header: req.header,
             request_id: req.request.request_id.0,
             identity: req.request.caller_identity,
         });
@@ -465,7 +545,20 @@ impl BasicKernel {
             memo_patch: req.memo,
             search_attr_patch: req.search_attributes,
         });
-        builder.schedule_workflow_task();
+        if let Some(delay) = positive_start_delay(req.workflow_start_delay) {
+            let timer = TimerState {
+                timer_id: WORKFLOW_START_DELAY_TIMER_ID.to_string(),
+                started_event_id: 0,
+                fire_at: req.now + delay,
+            };
+            builder
+                .state
+                .timers
+                .insert(timer.timer_id.clone(), timer.clone());
+            builder.timer_ops.push(TimerOp::Upsert(timer));
+        } else {
+            builder.schedule_workflow_task();
+        }
         Ok(builder.finish())
     }
 
@@ -704,6 +797,12 @@ impl BasicKernel {
                 input: snapshot.input.clone(),
                 schedule_event_id: snapshot.schedule_event_id,
                 attempt: snapshot.attempt,
+                dispatch_revision: builder
+                    .state
+                    .versioning_info
+                    .as_ref()
+                    .map(|info| info.revision_number)
+                    .unwrap_or_default(),
                 schedule_to_close_timeout: snapshot.schedule_to_close_timeout,
                 schedule_to_start_timeout: snapshot.schedule_to_start_timeout,
                 start_to_close_timeout: snapshot.start_to_close_timeout,
@@ -856,6 +955,12 @@ impl BasicKernel {
                 input: snapshot.input.clone(),
                 schedule_event_id: snapshot.schedule_event_id,
                 attempt: snapshot.attempt,
+                dispatch_revision: builder
+                    .state
+                    .versioning_info
+                    .as_ref()
+                    .map(|info| info.revision_number)
+                    .unwrap_or_default(),
                 schedule_to_close_timeout: snapshot.schedule_to_close_timeout,
                 schedule_to_start_timeout: snapshot.schedule_to_start_timeout,
                 start_to_close_timeout: snapshot.start_to_close_timeout,
@@ -884,7 +989,9 @@ impl BasicKernel {
                 .activities
                 .get_mut(&req.activity_id)
                 .ok_or_else(|| Reject::UnknownActivity(req.activity_id.clone()))?;
-            let _ = req.reset_heartbeat;
+            if req.reset_heartbeat {
+                activity.heartbeat_details = None;
+            }
             activity.attempt = 1;
             activity.stamp += 1;
             activity.clone()
@@ -908,6 +1015,12 @@ impl BasicKernel {
                 input: snapshot.input.clone(),
                 schedule_event_id: snapshot.schedule_event_id,
                 attempt: snapshot.attempt,
+                dispatch_revision: builder
+                    .state
+                    .versioning_info
+                    .as_ref()
+                    .map(|info| info.revision_number)
+                    .unwrap_or_default(),
                 schedule_to_close_timeout: snapshot.schedule_to_close_timeout,
                 schedule_to_start_timeout: snapshot.schedule_to_start_timeout,
                 start_to_close_timeout: snapshot.start_to_close_timeout,
@@ -990,13 +1103,21 @@ impl BasicKernel {
         req: UpdateExecutionOptionsRequest,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
+        let mut completion_callbacks = req.completion_callbacks;
+        if let FieldChange::Set(callbacks) = &mut completion_callbacks {
+            stamp_callback_registration_times(callbacks, req.now);
+        }
+        let mut attached_completion_callbacks = req.attached_completion_callbacks;
+        stamp_callback_registration_times(&mut attached_completion_callbacks, req.now);
         let mut builder = TransitionBuilder::new(state, req.now);
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
         builder.emit(HistoryEventKind::WorkflowExecutionOptionsUpdated {
             versioning_override: req.versioning_override.clone(),
-            completion_callbacks: req.completion_callbacks.clone(),
+            completion_callbacks: completion_callbacks.clone(),
+            attached_completion_callbacks: attached_completion_callbacks.clone(),
+            attached_links: req.attached_links.clone(),
             attached_request_id: req.attached_request_id,
         });
 
@@ -1012,15 +1133,20 @@ impl BasicKernel {
             FieldChange::Unchanged => {}
         }
 
-        match req.completion_callbacks {
-            FieldChange::Set(completion_callbacks) => {
-                builder.state.completion_callbacks = completion_callbacks;
+        match completion_callbacks {
+            FieldChange::Set(callbacks) => {
+                builder.state.completion_callbacks = callbacks;
             }
             FieldChange::Clear => {
                 builder.state.completion_callbacks.clear();
             }
             FieldChange::Unchanged => {}
         }
+        builder
+            .state
+            .completion_callbacks
+            .extend(attached_completion_callbacks);
+        builder.state.links.extend(req.attached_links);
 
         Ok(builder.finish())
     }
@@ -1129,6 +1255,37 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Start a Worker Deployment transition and ensure a WFT exists to observe it.
+    ///
+    /// This mirrors the activity-start coupling in Temporal v1.31.0
+    /// `service/history/api/recordactivitytaskstarted/api.go:75`, where a
+    /// transition-triggering activity start mutates mutable state and requests
+    /// `CreateWorkflowTask`, and
+    /// `service/history/workflow/mutable_state_impl.go:9060`, where
+    /// `StartDeploymentTransition` reschedules pending WFTs. The runtime owns
+    /// the live routing decision; this command only applies that decision in the
+    /// deterministic kernel.
+    fn apply_start_deployment_transition(
+        &self,
+        loaded: LoadedRun,
+        req: crate::command::StartDeploymentTransitionRequest,
+    ) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+        let mut builder = TransitionBuilder::new(state, req.now);
+        builder
+            .state
+            .start_version_transition(req.target, req.revision_number)
+            .map_err(|error| match error {
+                crate::state::VersionTransitionError::PinnedWorkflowCannotTransition => {
+                    Reject::PinnedWorkflowCannotTransition
+                }
+            })?;
+        if builder.state.pending_workflow_task.is_none() {
+            builder.schedule_workflow_task();
+        }
+        Ok(builder.finish())
+    }
+
     /// Complete a workflow task and apply the worker's command batch.
     ///
     /// This is the most complex transition because it bridges the
@@ -1156,6 +1313,7 @@ impl BasicKernel {
         &self,
         loaded: LoadedRun,
         req: WorkflowTaskCompletedRequest,
+        cron_continuation: Option<CronContinuation>,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
         let pending = state
@@ -1189,8 +1347,9 @@ impl BasicKernel {
             logical_seq: req.token.logical_seq,
             scheduled_event_id: pending.scheduled_event_id,
             started_event_id: req.token.started_event_id,
-            identity: req.identity,
+            identity: req.identity.clone(),
             sdk_metadata: req.sdk_metadata,
+            metering_metadata: req.metering_metadata,
             worker_version: req.worker_version,
             versioning_behavior: req.versioning_behavior,
             deployment_version: req.deployment_version.clone(),
@@ -1204,13 +1363,22 @@ impl BasicKernel {
             req.deployment_version,
             req.worker_deployment_name,
         );
+        builder.state.sticky = req.sticky_ttl.map(|ttl| StickyAffinity {
+            worker_identity: req.identity,
+            expires_at: req.now + ttl,
+        });
 
         let mut closed = false;
         for (index, command) in req.commands.into_iter().enumerate() {
             if closed {
                 return Err(Reject::CommandsAfterClose { index });
             }
-            closed = apply_workflow_command(&mut builder, command, wft_completed_event_id)?;
+            closed = apply_workflow_command(
+                &mut builder,
+                command,
+                wft_completed_event_id,
+                cron_continuation.as_ref(),
+            )?;
         }
 
         // Schedule a new WFT when the worker explicitly requests one
@@ -1849,6 +2017,32 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    fn apply_workflow_start_delay_elapsed(
+        &self,
+        loaded: LoadedRun,
+        req: WorkflowStartDelayElapsedRequest,
+    ) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+        let mut builder = TransitionBuilder::new(state, req.fired_at);
+        if builder
+            .state
+            .timers
+            .remove(WORKFLOW_START_DELAY_TIMER_ID)
+            .is_none()
+        {
+            return Ok(builder.finish());
+        }
+        builder.timer_ops.push(TimerOp::Delete {
+            timer_id: WORKFLOW_START_DELAY_TIMER_ID.to_string(),
+        });
+
+        if builder.state.pending_workflow_task.is_none() {
+            builder.schedule_workflow_task();
+        }
+
+        Ok(builder.finish())
+    }
+
     /// Ensure a WFT is pending so that an incoming query has a task
     /// to piggyback on. If a WFT is already in flight, the query will
     /// be delivered alongside it — no extra scheduling needed.
@@ -1906,6 +2100,7 @@ impl BasicKernel {
                 attempt,
                 ..
             } => {
+                state.timers.remove(WORKFLOW_START_DELAY_TIMER_ID);
                 state.pending_workflow_task = Some(PendingWorkflowTask {
                     logical_seq: *logical_seq,
                     scheduled_event_id: event.event_id,
@@ -2048,9 +2243,11 @@ impl BasicKernel {
                         start_to_close_timeout: *start_to_close_timeout,
                         heartbeat_timeout: *heartbeat_timeout,
                         scheduled_at: event.happened_at,
+                        current_attempt_scheduled_at: Some(event.happened_at),
                         started_at: None,
                         started_event_id: None,
                         last_failure: None,
+                        heartbeat_details: None,
                         pause_info: None,
                         stamp: 0,
                     },
@@ -2254,6 +2451,8 @@ impl BasicKernel {
             HistoryEventKind::WorkflowExecutionOptionsUpdated {
                 versioning_override,
                 completion_callbacks,
+                attached_completion_callbacks,
+                attached_links,
                 ..
             } => {
                 match versioning_override {
@@ -2274,6 +2473,10 @@ impl BasicKernel {
                     }
                     FieldChange::Unchanged => {}
                 }
+                state
+                    .completion_callbacks
+                    .extend(attached_completion_callbacks.clone());
+                state.links.extend(attached_links.clone());
             }
             HistoryEventKind::WorkflowExecutionCompleted { result, .. } => {
                 close_replayed_run(state, ExecutionStatus::Completed, event.happened_at);
@@ -2341,10 +2544,45 @@ fn expect_open(loaded: LoadedRun) -> Result<WorkflowState, Reject> {
 /// and side-effect ops. Returns `true` if the command closed the
 /// run, which tells the caller to reject any subsequent commands
 /// in the batch.
+fn emit_cron_continue_as_new(
+    builder: &mut TransitionBuilder,
+    workflow_task_completed_event_id: i64,
+    cron: &CronContinuation,
+    failure: Option<tokeira_types::Payload>,
+    last_completion_result: Option<tokeira_types::Payloads>,
+) {
+    // Temporal creates cron successors through the continue-as-new path and
+    // records the first-WFT backoff on that successor start
+    // (`service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:1383`,
+    // `service/history/workflow/mutable_state_impl.go:2601 @ v1.31.0`).
+    // Runtime computes the calendar delay; the kernel makes the successor
+    // identity and delay authoritative by writing them into history.
+    builder.emit(HistoryEventKind::WorkflowExecutionContinuedAsNew {
+        workflow_task_completed_event_id,
+        new_run_id: cron.new_run_id,
+        workflow_type: builder.state.workflow_type.clone(),
+        task_queue: builder.state.task_queue.clone(),
+        input: cron.input.clone(),
+        memo: builder.state.memo.clone(),
+        search_attributes: builder.state.search_attributes.clone(),
+        workflow_execution_timeout: builder.state.workflow_execution_timeout,
+        workflow_run_timeout: builder.state.workflow_run_timeout,
+        workflow_task_timeout: builder.state.workflow_task_timeout,
+        retry_policy: builder.state.retry_policy.clone(),
+        initiator: ContinueAsNewInitiator::CronSchedule,
+        failure,
+        last_completion_result,
+        backoff_start_interval: Some(cron.first_workflow_task_backoff),
+        cron_schedule: Some(cron.cron_schedule.clone()),
+    });
+    builder.close(ExecutionStatus::ContinuedAsNew);
+}
+
 fn apply_workflow_command(
     builder: &mut TransitionBuilder,
     command: WorkflowCommand,
     workflow_task_completed_event_id: i64,
+    cron_continuation: Option<&CronContinuation>,
 ) -> Result<bool, Reject> {
     match command {
         WorkflowCommand::ScheduleActivity {
@@ -2398,9 +2636,11 @@ fn apply_workflow_command(
                 start_to_close_timeout,
                 heartbeat_timeout,
                 scheduled_at: builder.now,
+                current_attempt_scheduled_at: Some(builder.now),
                 started_at: None,
                 started_event_id: None,
                 last_failure: None,
+                heartbeat_details: None,
                 pause_info: None,
                 stamp: 0,
             };
@@ -2423,6 +2663,12 @@ fn apply_workflow_command(
                 input,
                 schedule_event_id,
                 attempt: 1,
+                dispatch_revision: builder
+                    .state
+                    .versioning_info
+                    .as_ref()
+                    .map(|info| info.revision_number)
+                    .unwrap_or_default(),
                 schedule_to_close_timeout,
                 schedule_to_start_timeout,
                 start_to_close_timeout,
@@ -2482,12 +2728,23 @@ fn apply_workflow_command(
             Ok(false)
         }
         WorkflowCommand::CompleteWorkflow { result } => {
-            builder.state.close_result = Some(result.clone());
-            builder.emit(HistoryEventKind::WorkflowExecutionCompleted {
-                workflow_task_completed_event_id,
-                result,
-            });
-            builder.close(ExecutionStatus::Completed);
+            if let Some(cron) = cron_continuation {
+                builder.state.close_result = Some(result.clone());
+                emit_cron_continue_as_new(
+                    builder,
+                    workflow_task_completed_event_id,
+                    cron,
+                    None,
+                    Some(result),
+                );
+            } else {
+                builder.state.close_result = Some(result.clone());
+                builder.emit(HistoryEventKind::WorkflowExecutionCompleted {
+                    workflow_task_completed_event_id,
+                    result,
+                });
+                builder.close(ExecutionStatus::Completed);
+            }
             builder.apply_parent_close_policy();
             Ok(true)
         }
@@ -2499,13 +2756,25 @@ fn apply_workflow_command(
                 RetryState::RetryPolicyNotSet
             };
             let attempt = builder.state.attempt;
-            builder.emit(HistoryEventKind::WorkflowExecutionFailed {
-                workflow_task_completed_event_id,
-                failure,
-                retry_state,
-                attempt,
-            });
-            builder.close(ExecutionStatus::Failed);
+            if let Some(cron) = cron_continuation
+                && builder.state.retry_policy.is_none()
+            {
+                emit_cron_continue_as_new(
+                    builder,
+                    workflow_task_completed_event_id,
+                    cron,
+                    Some(failure),
+                    None,
+                );
+            } else {
+                builder.emit(HistoryEventKind::WorkflowExecutionFailed {
+                    workflow_task_completed_event_id,
+                    failure,
+                    retry_state,
+                    attempt,
+                });
+                builder.close(ExecutionStatus::Failed);
+            }
             builder.apply_parent_close_policy();
             Ok(true)
         }
@@ -2538,6 +2807,8 @@ fn apply_workflow_command(
                 initiator: ContinueAsNewInitiator::Workflow,
                 failure: None,
                 last_completion_result: None,
+                backoff_start_interval: None,
+                cron_schedule: None,
             });
             builder.close(ExecutionStatus::ContinuedAsNew);
             builder.apply_parent_close_policy();
@@ -3086,6 +3357,7 @@ impl TransitionBuilder {
     fn close(&mut self, status: ExecutionStatus) {
         self.state.status = status;
         self.state.closed_at = Some(self.now);
+        self.schedule_completion_callbacks();
         self.state.pending_workflow_task = None;
         self.state.sticky = None;
         self.state.pause_info = None;
@@ -3098,6 +3370,23 @@ impl TransitionBuilder {
             status,
             closed_at: self.now,
         });
+    }
+
+    fn schedule_completion_callbacks(&mut self) {
+        for (callback_index, callback) in self.state.completion_callbacks.iter_mut().enumerate() {
+            if callback.trigger != crate::state::CallbackTrigger::WorkflowClosed
+                || callback.state != crate::state::CallbackState::Standby
+            {
+                continue;
+            }
+
+            callback.state = crate::state::CallbackState::Scheduled;
+            self.dispatch_ops
+                .push(DispatchOp::DispatchCompletionCallback {
+                    callback_index,
+                    callback: callback.clone(),
+                });
+        }
     }
 
     /// Apply parent close policy to all open child workflows.

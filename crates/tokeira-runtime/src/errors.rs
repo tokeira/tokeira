@@ -71,3 +71,11 @@ pub enum ActivityTokenResolutionError {
     #[error("activity token resolution failed: {0}")]
     Runtime(String),
 }
+
+/// Runtime could not resolve a requested workflow update.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum UpdateLifecycleError {
+    /// No update lifecycle state exists for the requested run and update id.
+    #[error("update not found while resolving lifecycle: {run_key:?}/{update_id}")]
+    UpdateNotFound { run_key: RunKey, update_id: String },
+}

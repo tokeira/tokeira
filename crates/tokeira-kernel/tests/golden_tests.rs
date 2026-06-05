@@ -3,21 +3,22 @@ use std::collections::BTreeMap;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     ActivityOp, ActivityPauseInfo, ActivityResolvedRequest, ActivityState, BasicKernel,
-    CancelRequest, ChildResolution, ChildResolvedRequest, ChildStartConfirmedRequest,
-    ChildStartResult, ChildWorkflowState, Command, CompletionCallback, DispatchOp,
-    ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
-    ExternalSignalResult, ExternalWorkflowExecution, FieldChange, LoadedRun,
-    NexusOperationResolvedRequest, NexusResolution, ParentClosePolicy, PauseActivityRequest,
-    PauseInfo, PauseWorkflowRequest, PendingExternalCancel, PendingExternalSignal,
-    PendingNexusOperation, PendingUpdate, PendingWorkflowTask, ProjectionOp, Reject, ReplayContext,
-    ResetActivityRequest, ResetRequest, RetryState, SignalRequest, SignalWithStartRequest,
-    StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerState,
+    CallbackSpec, CallbackState, CallbackTrigger, CancelRequest, ChildResolution,
+    ChildResolvedRequest, ChildStartConfirmedRequest, ChildStartResult, ChildWorkflowState,
+    Command, CompletionCallback, DispatchOp, ExternalCancelResolvedRequest, ExternalCancelResult,
+    ExternalSignalResolvedRequest, ExternalSignalResult, ExternalWorkflowExecution, FieldChange,
+    LoadedRun, NexusOperationResolvedRequest, NexusResolution, ParentClosePolicy,
+    PauseActivityRequest, PauseInfo, PauseWorkflowRequest, PendingExternalCancel,
+    PendingExternalSignal, PendingNexusOperation, PendingUpdate, PendingWorkflowTask, ProjectionOp,
+    Reject, ReplayContext, ResetActivityRequest, ResetRequest, RetryState, SignalRequest,
+    SignalWithStartRequest, StartDeploymentTransitionRequest, StartRequest,
+    StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerState,
     UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
     UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, VersioningBehavior,
-    VersioningOverride, WorkerDeploymentVersionRef, WorkflowCommand,
-    WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
-    WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
-    WorkflowTaskTimeoutType, WorkflowTimeoutType,
+    VersioningOverride, WORKFLOW_START_DELAY_TIMER_ID, WorkerDeploymentVersionRef, WorkflowCommand,
+    WorkflowExecutionTimedOutRequest, WorkflowStartDelayElapsedRequest, WorkflowState,
+    WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
+    WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType, WorkflowTimeoutType,
     event::{HistoryEvent, HistoryEventKind},
     kernel::Kernel,
 };
@@ -61,6 +62,21 @@ fn retry_policy() -> RetryPolicy {
     }
 }
 
+fn completion_callback() -> CompletionCallback {
+    CompletionCallback {
+        spec: CallbackSpec::Nexus {
+            url: "https://callback.example/run".into(),
+            header: BTreeMap::new(),
+        },
+        links: Vec::new(),
+        trigger: CallbackTrigger::WorkflowClosed,
+        registration_time: None,
+        state: CallbackState::Standby,
+        attempt: 0,
+        last_attempt_failure: None,
+    }
+}
+
 fn request_context(id: &str) -> RequestContext {
     RequestContext {
         request_id: RequestId(id.into()),
@@ -81,6 +97,12 @@ fn make_start_request() -> StartRequest {
         deployment: None,
         build_id: None,
         versioning_override: None,
+        workflow_start_delay: None,
+        completion_callbacks: Vec::new(),
+        user_metadata: None,
+        links: Vec::new(),
+        on_conflict_options: None,
+        priority: None,
         input: payloads("start-input"),
         header: None,
         memo: memo(),
@@ -107,6 +129,7 @@ fn make_start_request() -> StartRequest {
         first_run_started_at: Some(now()),
         request: request_context("start-req"),
         now: now(),
+        client_cron_schedule: None,
         cron_schedule: None,
         reserved_poller_identity: None,
     }
@@ -124,6 +147,13 @@ fn make_signal_with_start_request() -> SignalWithStartRequest {
         deployment: start.deployment,
         build_id: start.build_id,
         versioning_override: start.versioning_override,
+        header: start.header,
+        workflow_start_delay: start.workflow_start_delay,
+        user_metadata: start.user_metadata,
+        links: start.links,
+        priority: start.priority,
+        client_cron_schedule: start.client_cron_schedule,
+        cron_schedule: start.cron_schedule,
         input: start.input,
         memo: start.memo,
         search_attributes: start.search_attributes,
@@ -229,6 +259,10 @@ fn make_open_state() -> WorkflowState {
         admitted_updates: std::collections::HashSet::new(),
         pending_nexus_operations: BTreeMap::new(),
         completion_callbacks: Vec::new(),
+        user_metadata: None,
+        links: Vec::new(),
+        workflow_start_delay: None,
+        priority: None,
         started_at: now() - Duration::minutes(3),
         first_run_started_at: Some(now() - Duration::minutes(3)),
         closed_at: None,
@@ -256,6 +290,10 @@ fn replay_history_reconstructs_workflow_task_lifecycle() {
                 search_attributes: start.search_attributes.clone(),
                 request_id: start.request.request_id.0.clone(),
                 header: start.header.clone(),
+                workflow_start_delay: start.workflow_start_delay,
+                completion_callbacks: start.completion_callbacks.clone(),
+                user_metadata: start.user_metadata.clone(),
+                links: start.links.clone(),
                 identity: start.request.caller_identity.clone().unwrap_or_default(),
                 continued_execution_run_id: start.continued_execution_run_id,
                 first_execution_run_id: start.first_execution_run_id,
@@ -276,6 +314,7 @@ fn replay_history_reconstructs_workflow_task_lifecycle() {
                 cron_schedule: start.cron_schedule.clone(),
                 versioning_info: None,
                 worker_deployment_name: None,
+                priority: start.priority.clone(),
             },
         ),
         history_event(
@@ -310,6 +349,7 @@ fn replay_history_reconstructs_workflow_task_lifecycle() {
                 started_event_id: 3,
                 identity: worker,
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
@@ -345,6 +385,10 @@ fn replay_history_reconstructs_activity_and_timer_state() {
                 search_attributes: start.search_attributes.clone(),
                 request_id: start.request.request_id.0.clone(),
                 header: start.header.clone(),
+                workflow_start_delay: start.workflow_start_delay,
+                completion_callbacks: start.completion_callbacks.clone(),
+                user_metadata: start.user_metadata.clone(),
+                links: start.links.clone(),
                 identity: start.request.caller_identity.clone().unwrap_or_default(),
                 continued_execution_run_id: start.continued_execution_run_id,
                 first_execution_run_id: start.first_execution_run_id,
@@ -365,6 +409,7 @@ fn replay_history_reconstructs_activity_and_timer_state() {
                 cron_schedule: start.cron_schedule.clone(),
                 versioning_info: None,
                 worker_deployment_name: None,
+                priority: start.priority.clone(),
             },
         ),
         history_event(
@@ -434,6 +479,10 @@ fn replay_history_reconstructs_historical_execution_options_and_pause() {
                 search_attributes: start.search_attributes.clone(),
                 request_id: start.request.request_id.0.clone(),
                 header: start.header.clone(),
+                workflow_start_delay: start.workflow_start_delay,
+                completion_callbacks: start.completion_callbacks.clone(),
+                user_metadata: start.user_metadata.clone(),
+                links: start.links.clone(),
                 identity: start.request.caller_identity.clone().unwrap_or_default(),
                 continued_execution_run_id: start.continued_execution_run_id,
                 first_execution_run_id: start.first_execution_run_id,
@@ -454,6 +503,7 @@ fn replay_history_reconstructs_historical_execution_options_and_pause() {
                 cron_schedule: start.cron_schedule.clone(),
                 versioning_info: None,
                 worker_deployment_name: None,
+                priority: start.priority.clone(),
             },
         ),
         history_event(
@@ -461,7 +511,9 @@ fn replay_history_reconstructs_historical_execution_options_and_pause() {
             t0,
             HistoryEventKind::WorkflowExecutionOptionsUpdated {
                 versioning_override: FieldChange::Set(VersioningOverride::AutoUpgrade),
-                completion_callbacks: FieldChange::Set(vec![CompletionCallback]),
+                completion_callbacks: FieldChange::Set(vec![completion_callback()]),
+                attached_completion_callbacks: Vec::new(),
+                attached_links: Vec::new(),
                 attached_request_id: Some("options-req".into()),
             },
         ),
@@ -484,7 +536,7 @@ fn replay_history_reconstructs_historical_execution_options_and_pause() {
         state.versioning_override().cloned(),
         Some(VersioningOverride::AutoUpgrade)
     );
-    assert_eq!(state.completion_callbacks, vec![CompletionCallback]);
+    assert_eq!(state.completion_callbacks, vec![completion_callback()]);
     assert_eq!(state.sticky, None);
     assert_eq!(state.wft_stamp, 0);
 }
@@ -576,6 +628,7 @@ fn make_paused_state_with_activity(id: &str) -> WorkflowState {
             input: Payloads::default(),
             header: None,
             last_failure: None,
+            heartbeat_details: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
@@ -583,6 +636,7 @@ fn make_paused_state_with_activity(id: &str) -> WorkflowState {
             start_to_close_timeout: Some(Duration::minutes(1)),
             heartbeat_timeout: Some(Duration::seconds(20)),
             scheduled_at: OffsetDateTime::UNIX_EPOCH,
+            current_attempt_scheduled_at: None,
             started_at: None,
             started_event_id: None,
             pause_info: None,
@@ -606,6 +660,7 @@ fn make_open_state_with_activity(id: &str) -> WorkflowState {
             input: Payloads::default(),
             header: None,
             last_failure: None,
+            heartbeat_details: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
@@ -613,6 +668,7 @@ fn make_open_state_with_activity(id: &str) -> WorkflowState {
             start_to_close_timeout: Some(Duration::minutes(1)),
             heartbeat_timeout: Some(Duration::seconds(20)),
             scheduled_at: OffsetDateTime::UNIX_EPOCH,
+            current_attempt_scheduled_at: None,
             started_at: None,
             started_event_id: None,
             pause_info: None,
@@ -730,6 +786,22 @@ fn make_reset_activity_request(activity_id: &str) -> ResetActivityRequest {
     }
 }
 
+fn make_reset_activity_request_with_heartbeat_policy(
+    activity_id: &str,
+    reset_heartbeat: bool,
+) -> ResetActivityRequest {
+    ResetActivityRequest {
+        activity_id: activity_id.into(),
+        reset_heartbeat,
+        request: request_context(if reset_heartbeat {
+            "reset-activity-clear-heartbeat"
+        } else {
+            "reset-activity-keep-heartbeat"
+        }),
+        now: now(),
+    }
+}
+
 fn make_timeout_request() -> WorkflowExecutionTimedOutRequest {
     WorkflowExecutionTimedOutRequest {
         timeout_type: WorkflowTimeoutType::RunTimeout,
@@ -762,7 +834,7 @@ fn make_closed_state() -> WorkflowState {
 
 fn with_execution_options(mut state: WorkflowState) -> WorkflowState {
     state.set_versioning_override(Some(VersioningOverride::AutoUpgrade));
-    state.completion_callbacks = vec![CompletionCallback];
+    state.completion_callbacks = vec![completion_callback()];
     state
 }
 
@@ -841,6 +913,132 @@ fn start_from_absent() {
     );
     assert_eq!(transition.dispatch_ops.len(), 1);
     assert!(transition.next_state.pending_workflow_task.is_some());
+}
+
+#[test]
+fn delayed_start_commits_without_initial_wft_and_records_internal_timer() {
+    let mut req = make_start_request();
+    req.workflow_start_delay = Some(Duration::seconds(30));
+    let transition = kernel()
+        .apply(LoadedRun::Absent, Command::Start(req.clone()))
+        .unwrap();
+
+    assert_eq!(transition.history_events.len(), 1);
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::WorkflowExecutionStarted { .. }
+    ));
+    assert!(transition.next_state.pending_workflow_task.is_none());
+    assert!(transition.dispatch_ops.is_empty());
+    assert_eq!(transition.timer_ops.len(), 1);
+    match &transition.timer_ops[0] {
+        tokeira_kernel::TimerOp::Upsert(timer) => {
+            assert_eq!(timer.timer_id, WORKFLOW_START_DELAY_TIMER_ID);
+            assert_eq!(timer.started_event_id, 0);
+            assert_eq!(timer.fire_at, req.now + Duration::seconds(30));
+        }
+        other => panic!("unexpected timer op: {other:?}"),
+    }
+}
+
+#[test]
+fn start_delay_elapsed_schedules_first_wft_without_timer_fired_history() {
+    let mut req = make_start_request();
+    req.workflow_start_delay = Some(Duration::seconds(30));
+    let start = kernel()
+        .apply(LoadedRun::Absent, Command::Start(req))
+        .unwrap();
+
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(start.next_state),
+            Command::WorkflowStartDelayElapsed(WorkflowStartDelayElapsedRequest {
+                fired_at: now(),
+            }),
+        )
+        .unwrap();
+
+    assert!(transition.next_state.pending_workflow_task.is_some());
+    assert!(
+        transition
+            .history_events
+            .iter()
+            .any(|event| matches!(event.kind, HistoryEventKind::WorkflowTaskScheduled { .. }))
+    );
+    assert!(
+        !transition
+            .history_events
+            .iter()
+            .any(|event| matches!(event.kind, HistoryEventKind::TimerFired { .. }))
+    );
+    assert!(matches!(
+        transition.timer_ops.as_slice(),
+        [tokeira_kernel::TimerOp::Delete { timer_id }] if timer_id == WORKFLOW_START_DELAY_TIMER_ID
+    ));
+}
+
+#[test]
+fn duplicate_start_delay_elapsed_without_timer_is_noop() {
+    let req = make_start_request();
+    let start = kernel()
+        .apply(LoadedRun::Absent, Command::Start(req))
+        .unwrap();
+
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(start.next_state),
+            Command::WorkflowStartDelayElapsed(WorkflowStartDelayElapsedRequest {
+                fired_at: now(),
+            }),
+        )
+        .unwrap();
+
+    assert!(transition.history_events.is_empty());
+    assert!(transition.dispatch_ops.is_empty());
+    assert!(transition.timer_ops.is_empty());
+}
+
+#[test]
+fn delayed_start_replay_reconstructs_timer_until_wft_is_scheduled() {
+    let kernel = kernel();
+    let mut req = make_start_request();
+    req.workflow_start_delay = Some(Duration::seconds(30));
+    let start = kernel
+        .apply(LoadedRun::Absent, Command::Start(req.clone()))
+        .unwrap();
+    let ctx = replay_context_from_start(&req);
+
+    let replayed_start = kernel
+        .replay_history_prefix(ctx.clone(), &start.history_events)
+        .unwrap();
+    assert!(
+        replayed_start
+            .timers
+            .contains_key(WORKFLOW_START_DELAY_TIMER_ID)
+    );
+    assert!(replayed_start.pending_workflow_task.is_none());
+
+    let elapsed = kernel
+        .apply(
+            LoadedRun::Existing(start.next_state),
+            Command::WorkflowStartDelayElapsed(WorkflowStartDelayElapsedRequest {
+                fired_at: now(),
+            }),
+        )
+        .unwrap();
+    let history = start
+        .history_events
+        .iter()
+        .chain(elapsed.history_events.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let replayed_elapsed = kernel.replay_history_prefix(ctx, &history).unwrap();
+    assert!(
+        !replayed_elapsed
+            .timers
+            .contains_key(WORKFLOW_START_DELAY_TIMER_ID)
+    );
+    assert!(replayed_elapsed.pending_workflow_task.is_some());
 }
 
 #[test]
@@ -1075,6 +1273,7 @@ fn terminate_with_activities_and_timers() {
             input: Payloads::default(),
             header: None,
             last_failure: None,
+            heartbeat_details: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
@@ -1082,6 +1281,7 @@ fn terminate_with_activities_and_timers() {
             start_to_close_timeout: Some(Duration::minutes(1)),
             heartbeat_timeout: Some(Duration::seconds(20)),
             scheduled_at: OffsetDateTime::UNIX_EPOCH,
+            current_attempt_scheduled_at: None,
             started_at: None,
             started_event_id: None,
             pause_info: None,
@@ -1241,6 +1441,7 @@ fn reset_cleans_up_activities_and_timers() {
             input: Payloads::default(),
             header: None,
             last_failure: None,
+            heartbeat_details: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
@@ -1248,6 +1449,7 @@ fn reset_cleans_up_activities_and_timers() {
             start_to_close_timeout: Some(Duration::minutes(1)),
             heartbeat_timeout: Some(Duration::seconds(20)),
             scheduled_at: OffsetDateTime::UNIX_EPOCH,
+            current_attempt_scheduled_at: None,
             started_at: None,
             started_event_id: None,
             pause_info: None,
@@ -1396,6 +1598,7 @@ fn pause_workflow_happy_path() {
             input: Payloads::default(),
             header: None,
             last_failure: None,
+            heartbeat_details: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
@@ -1403,6 +1606,7 @@ fn pause_workflow_happy_path() {
             start_to_close_timeout: Some(Duration::minutes(1)),
             heartbeat_timeout: Some(Duration::seconds(20)),
             scheduled_at: OffsetDateTime::UNIX_EPOCH,
+            current_attempt_scheduled_at: None,
             started_at: None,
             started_event_id: None,
             pause_info: None,
@@ -1522,6 +1726,7 @@ fn unpause_workflow_happy_path() {
             input: Payloads::default(),
             header: None,
             last_failure: None,
+            heartbeat_details: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
@@ -1529,6 +1734,7 @@ fn unpause_workflow_happy_path() {
             start_to_close_timeout: Some(Duration::minutes(1)),
             heartbeat_timeout: Some(Duration::seconds(20)),
             scheduled_at: OffsetDateTime::UNIX_EPOCH,
+            current_attempt_scheduled_at: None,
             started_at: None,
             started_event_id: None,
             pause_info: None,
@@ -1786,10 +1992,12 @@ fn wft_completed_paused_workflow_no_force_wft() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![],
                 force_new_workflow_task: true,
                 now: now(),
@@ -1818,10 +2026,12 @@ fn wft_completion_tracks_previous_started_event_id() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![],
                 force_new_workflow_task: false,
                 now: now(),
@@ -1944,6 +2154,7 @@ fn reset_activity_happy_path() {
     let mut state = make_open_state_with_activity("activity-1");
     if let Some(activity) = state.activities.get_mut("activity-1") {
         activity.attempt = 5;
+        activity.heartbeat_details = Some(Payloads::default());
     }
     let transition = kernel()
         .apply(
@@ -1954,8 +2165,34 @@ fn reset_activity_happy_path() {
     let activity = transition.next_state.activities.get("activity-1").unwrap();
     assert_eq!(activity.attempt, 1);
     assert_eq!(activity.stamp, 1);
+    assert!(activity.heartbeat_details.is_none());
     assert_eq!(transition.dispatch_ops.len(), 1);
     assert!(transition.history_events.is_empty());
+}
+
+#[test]
+fn reset_activity_preserves_heartbeat_without_reset_flag() {
+    let mut state = make_open_state_with_activity("activity-1");
+    let heartbeat = Payloads(vec![Payload {
+        data: b"progress".to_vec(),
+        metadata: BTreeMap::new(),
+    }]);
+    if let Some(activity) = state.activities.get_mut("activity-1") {
+        activity.attempt = 5;
+        activity.heartbeat_details = Some(heartbeat.clone());
+    }
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::ResetActivity(make_reset_activity_request_with_heartbeat_policy(
+                "activity-1",
+                false,
+            )),
+        )
+        .unwrap();
+    let activity = transition.next_state.activities.get("activity-1").unwrap();
+    assert_eq!(activity.attempt, 1);
+    assert_eq!(activity.heartbeat_details, Some(heartbeat));
 }
 
 #[test]
@@ -2035,6 +2272,108 @@ fn workflow_task_started_with_deployment_transition_keeps_started_wft_running() 
 }
 
 #[test]
+fn start_deployment_transition_schedules_wft_when_missing() {
+    let target = WorkerDeploymentVersionRef {
+        deployment_name: "deployment".into(),
+        build_id: "build-a".into(),
+    };
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(make_open_state()),
+            Command::StartDeploymentTransition(StartDeploymentTransitionRequest {
+                target: target.clone(),
+                revision_number: 42,
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::WorkflowTaskScheduled { .. }
+    ));
+    assert_eq!(transition.dispatch_ops.len(), 1);
+    let pending = transition
+        .next_state
+        .pending_workflow_task
+        .expect("transition schedules a workflow task");
+    assert_eq!(pending.logical_seq, LogicalTaskSeq(4));
+    let info = transition.next_state.versioning_info.unwrap();
+    assert_eq!(info.version_transition, Some(target));
+    assert_eq!(info.revision_number, 42);
+}
+
+#[test]
+fn start_deployment_transition_reuses_pending_wft_without_double_schedule() {
+    let target = WorkerDeploymentVersionRef {
+        deployment_name: "deployment".into(),
+        build_id: "build-a".into(),
+    };
+    let mut state = make_open_state_with_pending_wft();
+    state.sticky = Some(StickyAffinity {
+        worker_identity: WorkerIdentity("sticky".into()),
+        expires_at: now() + Duration::seconds(30),
+    });
+
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::StartDeploymentTransition(StartDeploymentTransitionRequest {
+                target: target.clone(),
+                revision_number: 43,
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert!(transition.history_events.is_empty());
+    assert!(transition.dispatch_ops.is_empty());
+    assert_eq!(transition.next_state.sticky, None);
+    let pending = transition.next_state.pending_workflow_task.unwrap();
+    assert_eq!(pending.logical_seq, LogicalTaskSeq(3));
+    assert_eq!(pending.started_event_id, None);
+    let info = transition.next_state.versioning_info.unwrap();
+    assert_eq!(info.version_transition, Some(target));
+    assert_eq!(info.revision_number, 43);
+}
+
+#[test]
+fn start_deployment_transition_rejects_pinned_workflow() {
+    let target = WorkerDeploymentVersionRef {
+        deployment_name: "deployment".into(),
+        build_id: "build-a".into(),
+    };
+    let mut state = make_open_state();
+    state.versioning_info = Some(tokeira_kernel::WorkflowVersioningInfo {
+        behavior: VersioningBehavior::Pinned,
+        deployment_version: Some(WorkerDeploymentVersionRef {
+            deployment_name: "deployment".into(),
+            build_id: "pinned".into(),
+        }),
+        versioning_override: None,
+        version_transition: None,
+        revision_number: 7,
+        continue_as_new_initial_versioning_behavior:
+            tokeira_kernel::ContinueAsNewVersioningBehavior::Unspecified,
+    });
+    let before = state.clone();
+
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::StartDeploymentTransition(StartDeploymentTransitionRequest {
+                target,
+                revision_number: 44,
+                now: now(),
+            }),
+        )
+        .unwrap_err();
+
+    assert_eq!(reject, Reject::PinnedWorkflowCannotTransition);
+    assert_eq!(before.versioning_info.unwrap().revision_number, 7);
+}
+
+#[test]
 fn workflow_task_completed_with_activity_and_timer() {
     let state = make_open_state_with_started_wft();
     let transition = kernel()
@@ -2050,10 +2389,12 @@ fn workflow_task_completed_with_activity_and_timer() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![
                     WorkflowCommand::ScheduleActivity {
                         activity_id: "activity-1".into(),
@@ -2136,10 +2477,12 @@ fn workflow_task_completed_with_complete_workflow() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::CompleteWorkflow {
                     result: payloads("done"),
                 }],
@@ -2182,10 +2525,12 @@ fn workflow_task_completed_with_fail_workflow() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::FailWorkflow {
                     failure: payload("nope"),
                 }],
@@ -2268,10 +2613,12 @@ fn continue_as_new_closes_run() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![command.clone()],
                 force_new_workflow_task: false,
                 now: now(),
@@ -2328,10 +2675,12 @@ fn continue_as_new_then_another_command() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![
                     make_continue_as_new_command(),
                     WorkflowCommand::RequestNewWorkflowTask,
@@ -2386,6 +2735,7 @@ fn workflow_execution_timed_out_with_entities() {
             input: Payloads::default(),
             header: None,
             last_failure: None,
+            heartbeat_details: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
@@ -2393,6 +2743,7 @@ fn workflow_execution_timed_out_with_entities() {
             start_to_close_timeout: Some(Duration::minutes(1)),
             heartbeat_timeout: Some(Duration::seconds(20)),
             scheduled_at: OffsetDateTime::UNIX_EPOCH,
+            current_attempt_scheduled_at: None,
             started_at: None,
             started_event_id: None,
             pause_info: None,
@@ -2477,10 +2828,12 @@ fn fail_workflow_with_retry_policy() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::FailWorkflow {
                     failure: payload("nope"),
                 }],
@@ -2517,10 +2870,12 @@ fn fail_workflow_without_retry_policy() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::FailWorkflow {
                     failure: payload("nope"),
                 }],
@@ -3002,10 +3357,12 @@ fn reject_wft_completed_no_pending() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![],
                 force_new_workflow_task: false,
                 now: now(),
@@ -3030,10 +3387,12 @@ fn reject_wft_completed_not_started() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![],
                 force_new_workflow_task: false,
                 now: now(),
@@ -3059,10 +3418,12 @@ fn reject_wft_completed_seq_mismatch() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![],
                 force_new_workflow_task: false,
                 now: now(),
@@ -3091,10 +3452,12 @@ fn reject_wft_completed_token_mismatch() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![],
                 force_new_workflow_task: false,
                 now: now(),
@@ -3120,6 +3483,7 @@ fn reject_duplicate_activity_id() {
             input: Payloads::default(),
             header: None,
             last_failure: None,
+            heartbeat_details: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: None,
@@ -3127,6 +3491,7 @@ fn reject_duplicate_activity_id() {
             start_to_close_timeout: None,
             heartbeat_timeout: None,
             scheduled_at: OffsetDateTime::UNIX_EPOCH,
+            current_attempt_scheduled_at: None,
             started_at: None,
             started_event_id: None,
             pause_info: None,
@@ -3146,10 +3511,12 @@ fn reject_duplicate_activity_id() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::ScheduleActivity {
                     activity_id: "dup".into(),
                     activity_type: "activity-type".into(),
@@ -3198,10 +3565,12 @@ fn reject_duplicate_timer_id() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::StartTimer {
                     timer_id: "dup".into(),
                     fire_at: now()
@@ -3472,10 +3841,12 @@ fn reject_commands_after_close() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![
                     WorkflowCommand::CompleteWorkflow {
                         result: payloads("done")
@@ -3506,10 +3877,12 @@ fn cancel_workflow_command() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::CancelWorkflow],
                 force_new_workflow_task: false,
                 now: now(),
@@ -3557,10 +3930,12 @@ fn cancel_workflow_then_another_command() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![
                     WorkflowCommand::CancelWorkflow,
                     WorkflowCommand::RequestNewWorkflowTask,
@@ -3589,10 +3964,12 @@ fn request_cancel_activity() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::RequestCancelActivity {
                     activity_id: "activity-1".into(),
                 }],
@@ -3626,10 +4003,12 @@ fn request_cancel_activity_unknown() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::RequestCancelActivity {
                     activity_id: "missing".into(),
                 }],
@@ -3657,10 +4036,12 @@ fn cancel_timer() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::CancelTimer {
                     timer_id: "timer-1".into(),
                 }],
@@ -3697,10 +4078,12 @@ fn cancel_timer_unknown() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::CancelTimer {
                     timer_id: "missing".into(),
                 }],
@@ -3728,10 +4111,12 @@ fn request_cancel_activity_then_resolved_canceled() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::RequestCancelActivity {
                     activity_id: "activity-1".into(),
                 }],
@@ -3821,10 +4206,12 @@ fn cancel_then_cancel_workflow_e2e() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::CancelWorkflow],
                 force_new_workflow_task: false,
                 now: now(),
@@ -3852,6 +4239,7 @@ fn with_pending_activity_started_wft() -> WorkflowState {
             input: Payloads::default(),
             header: None,
             last_failure: None,
+            heartbeat_details: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
@@ -3859,6 +4247,7 @@ fn with_pending_activity_started_wft() -> WorkflowState {
             start_to_close_timeout: Some(Duration::minutes(1)),
             heartbeat_timeout: Some(Duration::seconds(20)),
             scheduled_at: OffsetDateTime::UNIX_EPOCH,
+            current_attempt_scheduled_at: None,
             started_at: None,
             started_event_id: None,
             pause_info: None,
@@ -3972,10 +4361,12 @@ fn start_child_workflow_happy_path() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::StartChildWorkflow {
                     child_workflow_id: child_workflow_id.clone(),
                     namespace_id: NamespaceId::new(),
@@ -4141,10 +4532,12 @@ fn signal_external_workflow_happy_path() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::SignalExternalWorkflowExecution {
                     target_namespace_id: state.namespace_id,
                     target_namespace: None,
@@ -4214,10 +4607,12 @@ fn request_cancel_external_workflow_happy_path() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::RequestCancelExternalWorkflowExecution {
                     target_namespace_id: state.namespace_id,
                     target_namespace: None,
@@ -4409,10 +4804,12 @@ fn update_completed_happy_path() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::UpdateCompleted {
                     update_id: "update-1".into(),
                     result: payloads("done"),
@@ -4452,10 +4849,12 @@ fn update_rejected_happy_path() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::UpdateRejected {
                     update_id: "update-1".into(),
                     failure: payload("nope"),
@@ -4495,10 +4894,12 @@ fn update_completed_unknown_update() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::UpdateCompleted {
                     update_id: "missing".into(),
                     result: payloads("done"),
@@ -4528,10 +4929,12 @@ fn update_rejected_unknown_update() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::UpdateRejected {
                     update_id: "missing".into(),
                     failure: payload("nope"),
@@ -4561,10 +4964,12 @@ fn protocol_message_accepted_body() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::ProtocolMessage {
                     message_id: "msg-1".into(),
                     body: UpdateProtocolBody::Accepted {
@@ -4608,10 +5013,12 @@ fn protocol_message_completed_body() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::ProtocolMessage {
                     message_id: "msg-2".into(),
                     body: UpdateProtocolBody::Completed {
@@ -4653,10 +5060,12 @@ fn protocol_message_rejected_body() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::ProtocolMessage {
                     message_id: "msg-3".into(),
                     body: UpdateProtocolBody::Rejected {
@@ -4710,10 +5119,12 @@ fn complete_workflow_clears_pending_updates() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::CompleteWorkflow {
                     result: payloads("done"),
                 }],
@@ -4744,10 +5155,12 @@ fn record_marker_happy_path() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::RecordMarker {
                     marker_name: "marker".into(),
                     details: details.clone(),
@@ -4794,10 +5207,12 @@ fn record_marker_after_close_rejected() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![
                     WorkflowCommand::CompleteWorkflow {
                         result: payloads("done"),
@@ -4823,7 +5238,9 @@ fn update_execution_options_happy_path() {
     let state = make_open_state();
     let req = UpdateExecutionOptionsRequest {
         versioning_override: FieldChange::Set(VersioningOverride::AutoUpgrade),
-        completion_callbacks: FieldChange::Set(vec![CompletionCallback]),
+        completion_callbacks: FieldChange::Set(vec![completion_callback()]),
+        attached_completion_callbacks: Vec::new(),
+        attached_links: Vec::new(),
         attached_request_id: Some("attached-1".into()),
         request: request_context("options-req"),
         now: now(),
@@ -4834,6 +5251,9 @@ fn update_execution_options_happy_path() {
             Command::UpdateExecutionOptions(req.clone()),
         )
         .unwrap();
+    let mut expected_callback = completion_callback();
+    expected_callback.registration_time = Some(req.now);
+    let expected_callbacks = vec![expected_callback];
 
     assert_eq!(transition.request_dedupe_ops.len(), 1);
     assert!(matches!(
@@ -4841,9 +5261,13 @@ fn update_execution_options_happy_path() {
         HistoryEventKind::WorkflowExecutionOptionsUpdated {
             versioning_override,
             completion_callbacks,
+            attached_completion_callbacks,
+            attached_links,
             attached_request_id,
         } if versioning_override == &req.versioning_override
-            && completion_callbacks == &req.completion_callbacks
+            && completion_callbacks == &FieldChange::Set(expected_callbacks.clone())
+            && attached_completion_callbacks == &req.attached_completion_callbacks
+            && attached_links == &req.attached_links
             && attached_request_id == &req.attached_request_id
     ));
     assert_eq!(
@@ -4852,7 +5276,7 @@ fn update_execution_options_happy_path() {
     );
     assert_eq!(
         transition.next_state.completion_callbacks,
-        vec![CompletionCallback]
+        expected_callbacks
     );
     assert!(transition.dispatch_ops.is_empty());
     assert!(transition.next_state.is_open());
@@ -4867,6 +5291,8 @@ fn update_execution_options_clear_versioning() {
             Command::UpdateExecutionOptions(UpdateExecutionOptionsRequest {
                 versioning_override: FieldChange::Clear,
                 completion_callbacks: FieldChange::Unchanged,
+                attached_completion_callbacks: Vec::new(),
+                attached_links: Vec::new(),
                 attached_request_id: None,
                 request: request_context("options-clear"),
                 now: now(),
@@ -4877,8 +5303,9 @@ fn update_execution_options_clear_versioning() {
     assert_eq!(transition.next_state.versioning_override().cloned(), None);
     assert_eq!(
         transition.next_state.completion_callbacks,
-        vec![CompletionCallback]
+        vec![completion_callback()]
     );
+    assert!(transition.dispatch_ops.is_empty());
 }
 
 #[test]
@@ -4889,6 +5316,8 @@ fn update_execution_options_missing_run() {
             Command::UpdateExecutionOptions(UpdateExecutionOptionsRequest {
                 versioning_override: FieldChange::Unchanged,
                 completion_callbacks: FieldChange::Unchanged,
+                attached_completion_callbacks: Vec::new(),
+                attached_links: Vec::new(),
                 attached_request_id: None,
                 request: request_context("options-missing"),
                 now: now(),
@@ -4907,6 +5336,8 @@ fn update_execution_options_closed_run() {
             Command::UpdateExecutionOptions(UpdateExecutionOptionsRequest {
                 versioning_override: FieldChange::Unchanged,
                 completion_callbacks: FieldChange::Unchanged,
+                attached_completion_callbacks: Vec::new(),
+                attached_links: Vec::new(),
                 attached_request_id: None,
                 request: request_context("options-closed"),
                 now: now(),
@@ -4931,9 +5362,19 @@ fn close_preserves_execution_options() {
         transition.next_state.versioning_override().cloned(),
         Some(VersioningOverride::AutoUpgrade)
     );
+    let mut scheduled_callback = completion_callback();
+    scheduled_callback.state = CallbackState::Scheduled;
     assert_eq!(
         transition.next_state.completion_callbacks,
-        vec![CompletionCallback]
+        vec![scheduled_callback]
+    );
+    assert_eq!(
+        transition
+            .dispatch_ops
+            .iter()
+            .filter(|op| matches!(op, DispatchOp::DispatchCompletionCallback { .. }))
+            .count(),
+        1
     );
 }
 
@@ -4954,10 +5395,12 @@ fn schedule_nexus_operation_happy_path() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::ScheduleNexusOperation {
                     operation_id: "op-1".into(),
                     endpoint: "endpoint".into(),
@@ -5007,10 +5450,12 @@ fn schedule_nexus_operation_duplicate_rejected() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::ScheduleNexusOperation {
                     operation_id: "op-1".into(),
                     endpoint: "endpoint".into(),
@@ -5045,10 +5490,12 @@ fn cancel_nexus_operation_happy_path() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::CancelNexusOperation {
                     scheduled_event_id: 12,
                 }],
@@ -5102,10 +5549,12 @@ fn cancel_nexus_operation_unknown() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::CancelNexusOperation {
                     scheduled_event_id: 12,
                 }],
@@ -5422,10 +5871,12 @@ fn close_via_complete_clears_pending_nexus_operations() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::CompleteWorkflow {
                     result: payloads("done"),
                 }],

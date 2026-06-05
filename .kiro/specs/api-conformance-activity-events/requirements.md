@@ -28,7 +28,7 @@ default and are not fabricated.
 | Response field | Current state | Target policy | Source | Tests |
 |---|---|---|---|---|
 | token/execution/id/type/input/header/attempt | Supported | Preserve | Dispatch snapshot | Regression |
-| `heartbeat_details` | Not populated | Populate latest persisted heartbeat details | Activity tracking/storage | Restart |
+| `heartbeat_details` | Not populated | Populate latest persisted heartbeat details | Durable activity state | Restart |
 | `scheduled_time` | Not populated | Populate when schedule event time is known | History/activity state | Property |
 | `current_attempt_scheduled_time` | Not populated | Populate from current attempt state | Activity retry state | Property |
 | `started_time` | Not populated | Populate server-authored poll/start time | Activity start state | Property |
@@ -36,8 +36,8 @@ default and are not fabricated.
 ## Heartbeat Storage Policy
 
 Heartbeat details must survive runtime restart for retry/resume semantics. Store
-them in the same durable activity tracking/state path used to reconstruct
-dispatchable activity attempts.
+them on durable `ActivityState`; volatile heartbeat tracking remains only for
+timeout and cancellation liveness.
 
 ## Requirements
 
@@ -60,7 +60,7 @@ dispatchable activity attempts.
 
 #### Acceptance Criteria
 
-1. WHEN `RecordActivityTaskHeartbeat` includes `details`, THE runtime SHALL persist them in activity tracking state.
+1. WHEN `RecordActivityTaskHeartbeat` includes `details`, THE runtime SHALL persist them on durable `ActivityState`.
 2. WHEN the same activity is retried or repolled according to Temporal semantics, THE latest heartbeat details SHALL be returned in poll response.
 3. WHEN heartbeat token validation fails, THE Edge SHALL return `INVALID_ARGUMENT` or the existing token validation error.
 4. WHEN cancellation is requested, THE heartbeat response SHALL preserve the existing `cancel_requested` behavior.

@@ -200,15 +200,104 @@ impl InMemoryBroker {
         queue: &QueueKey,
         run_key: RunKey,
     ) -> Option<(DispatchableWorkflowTask, Instant)> {
+        self.try_claim_workflow_task_for_worker(queue, run_key, None)
+            .await
+    }
+
+    /// Take a specific run's task for direct/eager dispatch, allowing a sticky
+    /// claim only when the caller is the sticky owner.
+    ///
+    /// Eager WFT return is allowed to bypass a normal poll only when it can
+    /// prove the returned task belongs to the completing worker. That keeps
+    /// sticky cache ownership intact while still letting non-sticky tasks take
+    /// the existing direct-claim path.
+    pub async fn try_claim_workflow_task_for_worker(
+        &self,
+        queue: &QueueKey,
+        run_key: RunKey,
+        worker: Option<&WorkerIdentity>,
+    ) -> Option<(DispatchableWorkflowTask, Instant)> {
         let mut inner = self.inner.lock().await;
-        let ready = inner.general_ready.get_mut(queue)?;
-        let index = ready.iter().position(|task| task.task.run_key == run_key)?;
-        let removed = ready.remove(index)?;
-        inner
-            .enqueued
-            .remove(&(removed.task.run_key, removed.task.logical_seq));
+        if let Some(worker) = worker {
+            if inner.denied_workers.contains(&(
+                queue.namespace_id,
+                queue.task_queue.clone(),
+                worker.clone(),
+            )) {
+                return None;
+            }
+        }
+
+        let now = OffsetDateTime::now_utc();
+        let mut promote_to_general = Vec::new();
+        let mut matched = None;
+
+        if let Some(sticky) = inner.sticky_ready.get_mut(queue) {
+            let mut idx = 0;
+            while idx < sticky.len() {
+                let action = match sticky.get(idx) {
+                    Some(task)
+                        if task.task.run_key == run_key
+                            && worker.is_some()
+                            && task.task.sticky_preferred.as_ref() == worker =>
+                    {
+                        StickyAction::Take
+                    }
+                    Some(task)
+                        if task
+                            .task
+                            .sticky_expires_at
+                            .is_some_and(|expires_at| expires_at <= now) =>
+                    {
+                        StickyAction::Promote
+                    }
+                    Some(task) if task.task.sticky_preferred.is_none() => StickyAction::Promote,
+                    Some(_) => StickyAction::Keep,
+                    None => break,
+                };
+
+                match action {
+                    StickyAction::Take => {
+                        matched = sticky.remove(idx);
+                        break;
+                    }
+                    StickyAction::Promote => {
+                        if let Some(mut task) = sticky.remove(idx) {
+                            task.task.sticky_preferred = None;
+                            task.task.sticky_expires_at = None;
+                            promote_to_general.push(task);
+                        }
+                    }
+                    StickyAction::Keep => {
+                        idx += 1;
+                    }
+                }
+            }
+        }
+
+        if !promote_to_general.is_empty() {
+            let general = inner.general_ready.entry(queue.clone()).or_default();
+            for task in promote_to_general {
+                general.push_back(task);
+            }
+        }
+
+        let matched = matched.or_else(|| {
+            let ready = inner.general_ready.get_mut(queue)?;
+            let index = ready.iter().position(|task| task.task.run_key == run_key)?;
+            ready.remove(index)
+        });
+
+        if let Some(removed) = matched {
+            inner
+                .enqueued
+                .remove(&(removed.task.run_key, removed.task.logical_seq));
+            Self::emit_queue_depths(&inner, queue);
+            return Some((removed.task, removed.entered_at));
+        }
+
         Self::emit_queue_depths(&inner, queue);
-        Some((removed.task, removed.entered_at))
+        None
     }
 
     /// Publish a query task without deduplication or backlog participation.
@@ -898,6 +987,7 @@ mod tests {
             input: Payloads::default(),
             schedule_event_id: 7,
             attempt: 1,
+            dispatch_revision: 0,
         }
     }
 

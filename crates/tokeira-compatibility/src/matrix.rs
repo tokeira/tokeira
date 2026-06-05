@@ -8,6 +8,21 @@ const START_EVIDENCE: &[CompatibilityEvidence] = &[CompatibilityEvidence {
     reference: "apps/tokeirad/tests/grpc_roundtrip.rs",
 }];
 
+const WORKER_DEPLOYMENT_EVIDENCE: &[CompatibilityEvidence] = &[
+    CompatibilityEvidence {
+        kind: crate::CompatibilityEvidenceKind::Test,
+        reference: "crates/tokeira-edge/src/grpc/workflow_service.rs::worker_deployment_handlers_are_no_longer_deferred",
+    },
+    CompatibilityEvidence {
+        kind: crate::CompatibilityEvidenceKind::Test,
+        reference: "crates/tokeira-edge/src/grpc/workflow_service.rs::deployment_handlers_return_unimplemented_messages",
+    },
+    CompatibilityEvidence {
+        kind: crate::CompatibilityEvidenceKind::Test,
+        reference: "crates/tokeira-runtime/src/runtime/activity.rs::activity_deployment_transition_lifecycle",
+    },
+];
+
 const ACTIVITY_EXECUTION_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurface {
     kind: CompatibilitySurfaceKind::Rpc,
     identifier: "WorkflowService.ActivityExecutionManagement",
@@ -513,13 +528,13 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
     FeatureEntry {
         id: "worker-deployments",
         name: "Worker deployments",
-        state: FeatureState::Unsupported,
+        state: FeatureState::Implemented,
         surfaces: WORKER_DEPLOYMENT_SURFACES,
         capability_field: None,
         dynamic_config_key: None,
         rpcs: WORKER_DEPLOYMENT_RPCS,
-        notes: "Worker deployment APIs remain unsupported until the worker-deployments spec provides conformance evidence.",
-        evidence: &[],
+        notes: "The v2 worker-deployment RPCs are implemented. Deprecated deployment companions are counted conformant because Temporal v1.31.0 returns UNIMPLEMENTED with the worker-deployments replacement message.",
+        evidence: WORKER_DEPLOYMENT_EVIDENCE,
     },
     FeatureEntry {
         id: "worker-heartbeats",

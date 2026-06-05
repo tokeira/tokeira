@@ -132,7 +132,23 @@ pub struct WorkflowState {
     /// Pending Nexus operations keyed by operation ID.
     pub pending_nexus_operations: BTreeMap<String, PendingNexusOperation>,
     /// Completion callbacks attached to this execution.
+    #[serde(default)]
     pub completion_callbacks: Vec<CompletionCallback>,
+    /// SDK-authored summary/details metadata captured at start.
+    #[serde(default)]
+    pub user_metadata: Option<UserMetadata>,
+    /// Links associated with the workflow start event.
+    #[serde(default)]
+    pub links: Vec<Link>,
+    /// Start delay requested by the client. The runtime uses this to defer
+    /// initial WFT dispatch; the kernel records it so replay and snapshots keep
+    /// the accepted start contract durable.
+    #[serde(default)]
+    pub workflow_start_delay: Option<Duration>,
+    /// Priority metadata inherited by workflow tasks unless a child command
+    /// overrides it.
+    #[serde(default)]
+    pub priority: Option<Priority>,
 
     /// Timestamp when the first event was recorded.
     pub started_at: OffsetDateTime,
@@ -384,6 +400,13 @@ pub struct ActivityState {
     pub heartbeat_timeout: Option<Duration>,
     /// When the activity was originally scheduled.
     pub scheduled_at: OffsetDateTime,
+    /// When the currently pending attempt was scheduled.
+    ///
+    /// Temporal returns this separately from the original schedule time on
+    /// activity poll. Keeping it beside the durable activity info lets retries
+    /// resume after restart without trusting the transient dispatch queue.
+    #[serde(default)]
+    pub current_attempt_scheduled_at: Option<OffsetDateTime>,
     /// When the activity was started by a worker, if it
     /// has started.
     pub started_at: Option<OffsetDateTime>,
@@ -393,6 +416,15 @@ pub struct ActivityState {
     /// Failure from the previous attempt, surfaced on the next
     /// `ActivityTaskStarted` event when the activity retries.
     pub last_failure: Option<Payload>,
+    /// Latest worker heartbeat progress for this activity.
+    ///
+    /// Temporal stores this on mutable activity info and returns it on the next
+    /// activity task start (`mutable_state_impl.go:1956`,
+    /// `recordactivitytaskstarted/api.go:265 @ v1.31.0`). Keeping it on
+    /// `ActivityState` makes heartbeat progress part of the durable run state
+    /// rather than volatile timeout tracking.
+    #[serde(default)]
+    pub heartbeat_details: Option<Payloads>,
     /// Pause metadata when the activity is individually
     /// paused.
     pub pause_info: Option<ActivityPauseInfo>,
@@ -610,12 +642,135 @@ pub enum VersioningOverride {
     AutoUpgrade,
 }
 
-/// Placeholder for completion callback configuration.
-///
-/// TODO(correctness): flesh out once completion callbacks are
-/// implemented.
+/// SDK-authored summary/details metadata retained with the run.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserMetadata {
+    /// Short UI-facing summary payload.
+    #[serde(default)]
+    pub summary: Option<Payload>,
+    /// Longer UI-facing details payload.
+    #[serde(default)]
+    pub details: Option<Payload>,
+}
+
+/// Link metadata attached to a workflow start or signal event.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Link {
+    /// Reference to another workflow event.
+    WorkflowEvent {
+        namespace: String,
+        workflow_id: String,
+        run_id: String,
+        reference: Option<LinkWorkflowEventReference>,
+    },
+    /// Reference to a batch job.
+    BatchJob { job_id: String },
+    /// Reference to an activity.
+    Activity {
+        namespace: String,
+        activity_id: String,
+        run_id: String,
+    },
+    /// Reference to a standalone Nexus operation.
+    NexusOperation {
+        namespace: String,
+        operation_id: String,
+        run_id: String,
+    },
+}
+
+/// Optional discriminator for workflow-event links.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LinkWorkflowEventReference {
+    /// Direct reference to a history event ID and type.
+    Event { event_id: i64, event_type: i32 },
+    /// Indirect reference through the request ID that authored an event.
+    RequestId { request_id: String, event_type: i32 },
+}
+
+/// Completion callback configuration attached at workflow start.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionCallback {
+    /// Callback target and request headers.
+    pub spec: CallbackSpec,
+    /// Links associated with the callback itself.
+    #[serde(default)]
+    pub links: Vec<Link>,
+    /// Event that triggers callback dispatch.
+    #[serde(default)]
+    pub trigger: CallbackTrigger,
+    /// Time the callback was registered on the workflow.
+    #[serde(default)]
+    pub registration_time: Option<OffsetDateTime>,
+    /// Durable callback lifecycle state.
+    #[serde(default)]
+    pub state: CallbackState,
+    /// Number of dispatch attempts already made.
+    #[serde(default)]
+    pub attempt: u32,
+    /// Last failure payload observed while dispatching this callback.
+    #[serde(default)]
+    pub last_attempt_failure: Option<Payload>,
+}
+
+/// Public callback target.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CallbackSpec {
+    /// Nexus callback URL with caller-supplied headers.
+    Nexus {
+        url: String,
+        #[serde(default)]
+        header: BTreeMap<String, String>,
+    },
+}
+
+/// Callback trigger condition.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CallbackTrigger {
+    /// Dispatch when the workflow reaches any terminal state.
+    #[default]
+    WorkflowClosed,
+}
+
+/// Durable callback lifecycle state.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CallbackState {
+    /// Callback is registered and waiting for the trigger.
+    #[default]
+    Standby,
+    /// Callback has been queued or is currently executing.
+    Scheduled,
+    /// Callback failed with a retryable error and is backing off.
+    BackingOff,
+    /// Callback failed permanently.
+    Failed,
+    /// Callback completed successfully.
+    Succeeded,
+    /// Callback is blocked by server-side admission.
+    Blocked,
+}
+
+/// Workflow priority metadata.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CompletionCallback;
+pub struct Priority {
+    /// Lower values are higher priority; zero means server default.
+    pub priority_key: i32,
+    /// Fairness key used by matching when queues are backed up.
+    pub fairness_key: String,
+    /// Relative fairness weight for `fairness_key`.
+    pub fairness_weight: f32,
+}
+
+/// Options to apply when a start targets an existing running workflow.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnConflictOptions {
+    /// Attach the start request ID to the running workflow.
+    pub attach_request_id: bool,
+    /// Attach supplied completion callbacks to the running workflow.
+    pub attach_completion_callbacks: bool,
+    /// Attach supplied links to the options-updated event.
+    pub attach_links: bool,
+}
 
 /// Either the run does not yet exist or it already has durable state.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -696,6 +851,10 @@ mod tests {
             admitted_updates: HashSet::new(),
             pending_nexus_operations: BTreeMap::new(),
             completion_callbacks: Vec::new(),
+            user_metadata: None,
+            links: Vec::new(),
+            workflow_start_delay: None,
+            priority: None,
             started_at: now(),
             first_run_started_at: Some(now()),
             closed_at: None,
@@ -904,6 +1063,11 @@ mod tests {
         let info = state.versioning_info.expect("versioning info");
         assert_eq!(info.version_transition, None);
         assert_eq!(info.deployment_version, Some(transition_version));
+        // v1.31.0 completion updates behavior/deployment and clears a matching
+        // transition, but it does not assign `RevisionNumber`; that field is
+        // set at transition start (`mutable_state_impl.go:9108`) or inherited
+        // at start (`mutable_state_impl.go:2963`).
+        assert_eq!(info.revision_number, 9);
     }
 
     #[test]

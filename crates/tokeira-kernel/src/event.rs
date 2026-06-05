@@ -11,8 +11,8 @@ use crate::{
         WorkflowTaskFailedCause, WorkflowTaskTimeoutType, WorkflowTimeoutType,
     },
     state::{
-        CompletionCallback, ParentClosePolicy, VersioningBehavior, VersioningOverride,
-        WorkerDeploymentVersionRef, WorkflowVersioningInfo,
+        CompletionCallback, Link, ParentClosePolicy, Priority, UserMetadata, VersioningBehavior,
+        VersioningOverride, WorkerDeploymentVersionRef, WorkflowVersioningInfo,
     },
 };
 
@@ -73,6 +73,16 @@ pub enum HistoryEventKind {
         continued_failure: Option<Payload>,
         last_completion_result: Option<Payloads>,
         cron_schedule: Option<String>,
+        #[serde(default)]
+        workflow_start_delay: Option<Duration>,
+        #[serde(default)]
+        completion_callbacks: Vec<CompletionCallback>,
+        #[serde(default)]
+        user_metadata: Option<UserMetadata>,
+        #[serde(default)]
+        links: Vec<Link>,
+        #[serde(default)]
+        priority: Option<Priority>,
         #[serde(default)]
         versioning_info: Option<WorkflowVersioningInfo>,
         #[serde(default)]
@@ -147,6 +157,8 @@ pub enum HistoryEventKind {
         started_event_id: i64,
         identity: WorkerIdentity,
         sdk_metadata: Option<Vec<u8>>,
+        #[serde(default)]
+        metering_metadata: Option<Vec<u8>>,
         worker_version: Option<String>,
         #[serde(default)]
         versioning_behavior: VersioningBehavior,
@@ -480,6 +492,8 @@ pub enum HistoryEventKind {
     WorkflowExecutionOptionsUpdated {
         versioning_override: FieldChange<VersioningOverride>,
         completion_callbacks: FieldChange<Vec<CompletionCallback>>,
+        attached_completion_callbacks: Vec<CompletionCallback>,
+        attached_links: Vec<Link>,
         attached_request_id: Option<String>,
     },
     /// The workflow returned a successful result.
@@ -511,6 +525,10 @@ pub enum HistoryEventKind {
         initiator: ContinueAsNewInitiator,
         failure: Option<Payload>,
         last_completion_result: Option<Payloads>,
+        #[serde(default)]
+        backoff_start_interval: Option<Duration>,
+        #[serde(default)]
+        cron_schedule: Option<String>,
     },
     /// The workflow was canceled via a `CancelWorkflow`
     /// workflow command (cooperative cancellation completed).

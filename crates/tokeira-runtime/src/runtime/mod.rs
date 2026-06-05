@@ -15,11 +15,12 @@ use anyhow::{Result, anyhow};
 use smallvec::{SmallVec, smallvec};
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    ActivityOp, ActivityResolution, ActivityResolvedRequest, BasicKernel, Command, DispatchOp,
-    HistoryEvent, HistoryEventKind, LoadedRun, PauseWorkflowRequest, SignalRequest,
-    SignalWithStartRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest, Transition,
-    UnpauseWorkflowRequest, UpdateRequest, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
-    WorkflowState, WorkflowTaskCompletedRequest,
+    ActivityOp, ActivityResolution, ActivityResolvedRequest, BasicKernel, Command,
+    CronContinuation, DispatchOp, FieldChange, HistoryEvent, HistoryEventKind, LoadedRun,
+    PauseWorkflowRequest, SignalRequest, SignalWithStartRequest, StartRequest,
+    StartWorkflowTaskRequest, TerminateRequest, Transition, UnpauseWorkflowRequest,
+    UpdateExecutionOptionsRequest, UpdateRequest, WorkflowCommand, WorkflowIdConflictPolicy,
+    WorkflowIdReusePolicy, WorkflowState, WorkflowTaskCompletedRequest,
 };
 use tokeira_storage::{
     CommitResult, DispatchableActivityTask, DispatchableWorkflowTask, LeaseOutcome,
@@ -42,6 +43,7 @@ use crate::{
     backlog::{BacklogConfig, run_drain_loop, run_grace_scanner},
     broker::{InMemoryActivityBroker, InMemoryBroker, ReservedPoller, WorkflowPollResult},
     buffered_queries::{BufferedQuery, BufferedQueryRegistry},
+    deployment_registry::DeploymentRegistry,
     drain::RuntimeDrain,
     errors::{ActivityTokenResolutionError, NotShardOwner},
     fairness::{DeliveryMetrics, FairnessState, run_control_loop},
@@ -60,14 +62,15 @@ use crate::{
     scanner::{
         TimerScannerConfig, lane_index_for_run_key, pick_lane_for_run_key, run_timer_scanner,
     },
+    schedule::cron_initial_backoff,
     shard::{ShardOwner, shard_for},
     timeout::{
         WorkflowTimeoutEntry, WorkflowTimeoutScannerConfig, WorkflowTimeoutTrackingState,
         run_workflow_timeout_scanner,
     },
     update::{
-        PendingUpdateTransport, UpdateOutcome, UpdateRegistry, UpdateResolution,
-        UpdateTransportResolution, UpdateWaitPolicy,
+        PendingUpdateTransport, UpdateLifecycleSnapshot, UpdateLifecycleStage, UpdateOutcome,
+        UpdateRegistry, UpdateResolution, UpdateTransportResolution, UpdateWaitPolicy,
     },
     versioning::VersioningRuleStore,
     wft_timeout::{
@@ -738,6 +741,26 @@ where
         self.worker_registry.clone()
     }
 
+    /// Build the Worker Deployment registry view used by transport adapters.
+    ///
+    /// The registry object is cheap to assemble because it only clones repository
+    /// handles. Keeping construction here ensures edge code never reaches directly
+    /// into runtime-owned storage fields.
+    pub fn deployment_registry(&self) -> Option<DeploymentRegistry>
+    where
+        R: 'static,
+    {
+        self.worker_deployment_repository
+            .as_ref()
+            .map(|repository| {
+                DeploymentRegistry::with_repositories(
+                    repository.clone(),
+                    self.repo.clone(),
+                    self.worker_registry.clone(),
+                )
+            })
+    }
+
     pub fn heartbeat_store(&self) -> Arc<dyn HeartbeatStore> {
         self.heartbeat_store.clone()
     }
@@ -1074,6 +1097,14 @@ pub struct StartedActivityTask {
     pub header: Option<Headers>,
     /// Retry policy attached to the activity.
     pub retry_policy: Option<RetryPolicy>,
+    /// Latest durable heartbeat progress for this activity.
+    pub heartbeat_details: Option<Payloads>,
+    /// Original activity schedule timestamp.
+    pub scheduled_time: OffsetDateTime,
+    /// Schedule timestamp for the current attempt, when known.
+    pub current_attempt_scheduled_time: Option<OffsetDateTime>,
+    /// Server-authored start timestamp for this attempt.
+    pub started_time: OffsetDateTime,
     /// Maximum time from schedule to close.
     pub schedule_to_close_timeout: Option<Duration>,
     /// Maximum time from start to close.
@@ -1115,10 +1146,13 @@ mod tests {
         versioning::{RedirectRule, VersioningMutation},
     };
     use std::collections::HashMap;
-    use tokeira_kernel::RetryState;
+    use tokeira_kernel::{
+        CallbackSpec, CallbackState, CallbackTrigger, CompletionCallback, Link, OnConflictOptions,
+        RetryState,
+    };
     use tokeira_storage::{
         BacklogEntry, CommitResult, DispatchableWorkflowTask, InMemoryStore, RequestRecord,
-        TransitionAuditRecord,
+        RunRepository, TransitionAuditRecord,
     };
     use tokeira_types::{
         ExecutionRef, LogicalTaskSeq, Memo, NamespaceId, Payloads, RequestContext, RequestId,
@@ -1214,6 +1248,86 @@ mod tests {
             history.get(2).map(|event| &event.kind),
             Some(HistoryEventKind::WorkflowTaskStarted { identity, .. }) if identity == &worker
         ));
+    }
+
+    #[tokio::test]
+    async fn start_use_existing_applies_on_conflict_attachments() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        );
+        let first = sample_start_request(None, None);
+        let started = runtime
+            .start_workflow_with_policy(first.clone())
+            .await
+            .unwrap();
+        assert!(matches!(started, StartWorkflowResult::Started { .. }));
+
+        let callback = CompletionCallback {
+            spec: CallbackSpec::Nexus {
+                url: "https://callback.example/run".to_string(),
+                header: Default::default(),
+            },
+            links: Vec::new(),
+            trigger: CallbackTrigger::WorkflowClosed,
+            registration_time: None,
+            state: CallbackState::Standby,
+            attempt: 0,
+            last_attempt_failure: None,
+        };
+        let link = Link::BatchJob {
+            job_id: "batch-1".to_string(),
+        };
+        let mut second = sample_start_request(None, None);
+        second.namespace_id = first.namespace_id;
+        second.workflow_id = first.workflow_id.clone();
+        second.conflict_policy = WorkflowIdConflictPolicy::UseExisting;
+        second.completion_callbacks = vec![callback.clone()];
+        second.links = vec![link.clone()];
+        second.on_conflict_options = Some(OnConflictOptions {
+            attach_request_id: true,
+            attach_completion_callbacks: true,
+            attach_links: true,
+        });
+        second.request.request_id = RequestId("attach-req".to_string());
+
+        let reused = runtime.start_workflow_with_policy(second).await.unwrap();
+        assert_eq!(
+            reused,
+            StartWorkflowResult::UsedExisting {
+                run_key: first.run_key,
+                run_id: first.run_id
+            }
+        );
+
+        let LoadedRun::Existing(state) = repo.load_run(first.run_key).await.unwrap() else {
+            panic!("started run should still exist");
+        };
+        assert_eq!(state.completion_callbacks.len(), 1);
+        assert_eq!(state.completion_callbacks[0].spec, callback.spec);
+        assert_eq!(state.completion_callbacks[0].links, callback.links);
+        assert_eq!(state.completion_callbacks[0].trigger, callback.trigger);
+        assert!(state.completion_callbacks[0].registration_time.is_some());
+        assert_eq!(state.completion_callbacks[0].state, callback.state);
+        assert_eq!(state.completion_callbacks[0].attempt, callback.attempt);
+        assert_eq!(
+            state.completion_callbacks[0].last_attempt_failure,
+            callback.last_attempt_failure
+        );
+        assert_eq!(state.links, vec![link]);
+        let history = repo.read_history(first.run_key, 0, 10).await.unwrap();
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            HistoryEventKind::WorkflowExecutionOptionsUpdated {
+                attached_request_id: Some(id),
+                ..
+            } if id == "attach-req"
+        )));
     }
 
     #[test]
@@ -1330,10 +1444,12 @@ mod tests {
             },
             identity: WorkerIdentity("worker".to_owned()),
             sdk_metadata: None,
+            metering_metadata: None,
             worker_version: None,
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
+            sticky_ttl: None,
             commands: Vec::new(),
             force_new_workflow_task: false,
             now: OffsetDateTime::now_utc(),
@@ -1462,6 +1578,7 @@ mod tests {
                     input: Payloads::default(),
                     schedule_event_id: 11,
                     attempt: 2,
+                    dispatch_revision: 0,
                     schedule_to_close_timeout: None,
                     schedule_to_start_timeout: None,
                     start_to_close_timeout: None,
@@ -2468,6 +2585,13 @@ mod tests {
             deployment: None,
             build_id: None,
             versioning_override: None,
+            workflow_start_delay: None,
+            client_cron_schedule: None,
+            completion_callbacks: Vec::new(),
+            user_metadata: None,
+            links: Vec::new(),
+            on_conflict_options: None,
+            priority: None,
             input: Payloads::default(),
             header: None,
             memo: Memo::default(),

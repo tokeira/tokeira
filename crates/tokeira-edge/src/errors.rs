@@ -23,6 +23,15 @@ pub enum EdgeError {
     #[error("unimplemented: {0}")]
     Unimplemented(String),
 
+    #[error("not found: {0}")]
+    NotFound(String),
+
+    #[error("already exists: {0}")]
+    AlreadyExists(String),
+
+    #[error("resource exhausted: {0}")]
+    ResourceExhausted(String),
+
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 
@@ -110,6 +119,9 @@ impl EdgeError {
         match self {
             EdgeError::BadRequest(_) => StatusCode::BAD_REQUEST,
             EdgeError::Unimplemented(_) => StatusCode::NOT_IMPLEMENTED,
+            EdgeError::NotFound(_) => StatusCode::NOT_FOUND,
+            EdgeError::AlreadyExists(_) => StatusCode::CONFLICT,
+            EdgeError::ResourceExhausted(_) => StatusCode::TOO_MANY_REQUESTS,
             EdgeError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             EdgeError::Forbidden { .. } => StatusCode::FORBIDDEN,
             EdgeError::NamespaceNotFound(_)
@@ -134,6 +146,9 @@ impl EdgeError {
         match self {
             EdgeError::BadRequest(_) => "bad_request",
             EdgeError::Unimplemented(_) => "unimplemented",
+            EdgeError::NotFound(_) => "not_found",
+            EdgeError::AlreadyExists(_) => "already_exists",
+            EdgeError::ResourceExhausted(_) => "resource_exhausted",
             EdgeError::Unauthorized(_) => "unauthorized",
             EdgeError::Forbidden { .. } => "forbidden",
             EdgeError::NamespaceNotFound(_) => "namespace_not_found",

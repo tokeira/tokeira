@@ -17,7 +17,52 @@
 //!   failure re-enqueues the next attempt, and an OCC conflict at start
 //!   republishes the offer instead of making the worker wait on a lock.
 use super::*;
+use crate::runtime::workflow_task::{
+    ResolvedWorkflowTaskTarget, poller_deployment_version, resolve_workflow_task_target_version,
+};
 use tokeira_observability::OutcomeLabel;
+use tokeira_types::TaskKind;
+
+/// Decide whether an activity-start poller should move the workflow deployment.
+///
+/// Activity starts are stricter than workflow-task starts. Temporal v1.31.0
+/// allows independently-versioned activities, so a differing activity poller
+/// starts a workflow transition only when it is the same deployment the WFT
+/// would currently target, or when it is in that deployment and was dispatched
+/// at a revision strictly newer than the WFT target
+/// (`service/history/api/recordactivitytaskstarted/api.go:188, :283 @
+/// v1.31.0`). Equal revision is intentionally not enough: it represents a
+/// non-backlogged activity whose deployment choice should not pull the workflow
+/// away from its current effective deployment.
+fn transition_for_polled_activity_task(
+    state: &WorkflowState,
+    wft_target: &ResolvedWorkflowTaskTarget,
+    queue: &QueueKey,
+    dispatch_revision: i64,
+) -> Option<tokeira_kernel::WorkerDeploymentVersionRef> {
+    if state.effective_behavior() == tokeira_kernel::VersioningBehavior::Pinned {
+        return None;
+    }
+
+    let poller_version = poller_deployment_version(queue)?;
+    if state.effective_deployment() == Some(&poller_version) {
+        return None;
+    }
+
+    let wft_version = wft_target.deployment_version.as_ref()?;
+    let same_deployment = poller_version.deployment_name == wft_version.deployment_name;
+    let ahead_of_wft_revision = dispatch_revision > wft_target.revision_number;
+    (poller_version == *wft_version || (same_deployment && ahead_of_wft_revision))
+        .then_some(poller_version)
+}
+
+fn activity_start_rejected_by_in_flight_transition(state: &WorkflowState) -> bool {
+    state
+        .versioning_info
+        .as_ref()
+        .and_then(|info| info.version_transition.as_ref())
+        .is_some()
+}
 
 impl<R> TokeiraRuntime<R>
 where
@@ -226,23 +271,98 @@ where
     /// requested for this activity.
     ///
     /// `Ok(true)` tells the worker to begin cooperative cancellation. The
-    /// heartbeat only touches volatile liveness state, so it is validated
-    /// against the durable token but does not itself produce a transition;
-    /// `Ok(false)` is returned when the activity is unknown to the tracker
-    /// (e.g. already resolved), which the edge treats as "keep going".
+    /// heartbeat persists progress on durable activity state without emitting
+    /// history, matching Temporal's mutable activity-info update
+    /// (`service/history/workflow/mutable_state_impl.go:1956 @ v1.31.0`).
+    /// Volatile tracking remains responsible only for timeout and cooperative
+    /// cancellation liveness.
     pub async fn record_activity_heartbeat(
         &self,
         token: ActivityTaskToken,
         details: Option<Payloads>,
     ) -> Result<bool> {
-        // Heartbeat details cross the runtime boundary for API parity, but the
-        // current in-memory tracker only stores liveness/cancel state.
-        let _ = details;
-        self.validate_activity_token(&token).await?;
-        Ok(self
-            .activity_tracking
-            .record_heartbeat(token.run_key, &token.activity_id, OffsetDateTime::now_utc())
-            .unwrap_or(false))
+        let mut attempts = 0u32;
+        loop {
+            let LoadedRun::Existing(state) = self.repo.load_run(token.run_key).await? else {
+                return Err(anyhow!("run not found for activity heartbeat"));
+            };
+            let Some(current) = state.activities.get(&token.activity_id).cloned() else {
+                return Err(anyhow!("activity not found for heartbeat"));
+            };
+            if current.schedule_event_id != token.schedule_event_id {
+                return Err(anyhow!("activity heartbeat schedule_event_id mismatch"));
+            }
+            if current.attempt != token.attempt {
+                return Err(anyhow!("activity heartbeat attempt mismatch"));
+            }
+            if current.started_event_id.is_none() {
+                return Err(anyhow!(
+                    "activity heartbeat for activity that has not started"
+                ));
+            }
+            if token.shard_epoch != self.shard_epoch_for_completion(token.run_key).await? {
+                return Err(anyhow!("activity heartbeat shard epoch mismatch"));
+            }
+
+            let mut next_state = state.clone();
+            next_state.transition_seq = state.transition_seq.next();
+            let mut next_activity = current;
+            next_activity.heartbeat_details = details.clone();
+            next_state
+                .activities
+                .insert(token.activity_id.clone(), next_activity.clone());
+
+            let transition = Transition {
+                expected_seq: state.transition_seq,
+                next_state,
+                history_events: SmallVec::new(),
+                request_dedupe_ops: SmallVec::new(),
+                activity_ops: smallvec![ActivityOp::Upsert(next_activity)],
+                timer_ops: SmallVec::new(),
+                dispatch_ops: SmallVec::new(),
+                projection_ops: SmallVec::new(),
+            };
+
+            let (bundle, commit_epoch) = {
+                let owner = self.shard_owner.read().unwrap();
+                let bundle_id = execution_home_bundle(
+                    state.namespace_id.0.as_bytes(),
+                    state.workflow_id.0.as_bytes(),
+                    owner.shard_count(),
+                );
+                let local_epoch = owner.epoch_of(bundle_id).unwrap_or(ShardEpoch::ZERO);
+                let epoch = if self.config.controller_managed_placement {
+                    local_epoch
+                } else {
+                    ShardEpoch::ZERO
+                };
+                (bundle_id, epoch)
+            };
+
+            match self
+                .repo
+                .commit_transition_for_bundle(token.run_key, bundle, transition, commit_epoch)
+                .await?
+            {
+                CommitResult::Applied { .. } | CommitResult::Duplicate => {
+                    let cancel_requested = self
+                        .activity_tracking
+                        .record_heartbeat(
+                            token.run_key,
+                            &token.activity_id,
+                            OffsetDateTime::now_utc(),
+                        )
+                        .unwrap_or(false);
+                    return Ok(cancel_requested);
+                }
+                CommitResult::Conflict { .. } => {
+                    if attempts >= self.config.max_occ_retries {
+                        return Err(anyhow!("activity heartbeat OCC exhausted"));
+                    }
+                    attempts += 1;
+                }
+            }
+        }
     }
 
     /// Reconstruct an [`ActivityTaskToken`] for an already-started activity
@@ -360,6 +480,68 @@ where
                 return Ok(None);
             }
 
+            if activity_start_rejected_by_in_flight_transition(&state) {
+                self.republish_rejected_activity_task(task).await;
+                return Ok(None);
+            }
+
+            // The activity poller is on an activity task queue, but the
+            // transition question is "where would the workflow task route now?"
+            // Temporal reads workflow-task routing when evaluating an activity
+            // start transition (`getDeploymentVersionAndRevisionNumberForWorkflowID`,
+            // recordactivitytaskstarted/api.go:283 @ v1.31.0).
+            let workflow_queue = QueueKey {
+                namespace_id: state.namespace_id,
+                task_queue: state.task_queue.clone(),
+                task_kind: TaskKind::Workflow,
+                deployment: state.deployment.clone(),
+                build_id: state.build_id.clone(),
+            };
+            let routing_config = self
+                .load_worker_deployment_routing_config(&state, &workflow_queue)
+                .await?;
+            let wft_target = resolve_workflow_task_target_version(&routing_config, &state);
+            if let Some(target) = transition_for_polled_activity_task(
+                &state,
+                &wft_target,
+                &task.queue,
+                task.dispatch_revision,
+            ) {
+                // Temporal v1.31.0 `recordactivitytaskstarted/api.go:188`
+                // rejects activity starts during/for deployment transitions.
+                // The matching mutable-state path starts the transition and
+                // requests `CreateWorkflowTask`; this kernel command applies
+                // the same transition and schedules a WFT when needed.
+                let result = self
+                    .submit_for_owned_shard(
+                        task.run_key,
+                        Command::StartDeploymentTransition(
+                            tokeira_kernel::StartDeploymentTransitionRequest {
+                                target,
+                                revision_number: task.dispatch_revision,
+                                now: OffsetDateTime::now_utc(),
+                            },
+                        ),
+                    )
+                    .await;
+                match result {
+                    Ok(_) => self.republish_rejected_activity_task(task).await,
+                    Err(error)
+                        if error.to_string().contains(
+                            "pinned workflow cannot start a deployment-version transition",
+                        ) =>
+                    {
+                        // A concurrent update can pin the run after the runtime
+                        // made its routing decision. The kernel is the final
+                        // authority; once it rejects, this poll is stale and
+                        // must not start the activity against the old premise.
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
+                }
+                return Ok(None);
+            }
+
             let mut next_state = state.clone();
             next_state.transition_seq = state.transition_seq.next();
             let mut next_activity = current.clone();
@@ -456,6 +638,10 @@ where
                         workflow_namespace: state.namespace_id.0.to_string(),
                         header: next_activity.header.clone(),
                         retry_policy: next_activity.retry_policy.clone(),
+                        heartbeat_details: next_activity.heartbeat_details.clone(),
+                        scheduled_time: next_activity.scheduled_at,
+                        current_attempt_scheduled_time: next_activity.current_attempt_scheduled_at,
+                        started_time: now,
                         schedule_to_close_timeout: next_activity.schedule_to_close_timeout,
                         start_to_close_timeout: next_activity.start_to_close_timeout,
                         heartbeat_timeout: next_activity.heartbeat_timeout,
@@ -480,6 +666,21 @@ where
                     return Ok(None);
                 }
             }
+        }
+    }
+
+    async fn republish_rejected_activity_task(&self, task: &DispatchableActivityTask) {
+        if let Err(error) = self
+            .activity_broker
+            .publish_activity_task(task.clone(), Some(&self.delivery_metrics))
+            .await
+        {
+            tracing::warn!(
+                ?error,
+                run_key = ?task.run_key,
+                activity_id = task.activity_id,
+                "failed to republish activity task rejected during worker-deployment transition"
+            );
         }
     }
 
@@ -549,6 +750,7 @@ where
             next_activity.stamp += 1;
             next_activity.started_at = None;
             next_activity.started_event_id = None;
+            next_activity.current_attempt_scheduled_at = Some(OffsetDateTime::now_utc());
             next_state
                 .activities
                 .insert(token.activity_id.clone(), next_activity.clone());
@@ -573,6 +775,11 @@ where
                 input: next_activity.input.clone(),
                 schedule_event_id: next_activity.schedule_event_id,
                 attempt: next_activity.attempt,
+                dispatch_revision: state
+                    .versioning_info
+                    .as_ref()
+                    .map(|info| info.revision_number)
+                    .unwrap_or_default(),
             };
             let transition = Transition {
                 expected_seq: state.transition_seq,
@@ -587,6 +794,11 @@ where
                     input: next_activity.input.clone(),
                     schedule_event_id: next_activity.schedule_event_id,
                     attempt: next_activity.attempt,
+                    dispatch_revision: state
+                        .versioning_info
+                        .as_ref()
+                        .map(|info| info.revision_number)
+                        .unwrap_or_default(),
                     schedule_to_close_timeout: next_activity.schedule_to_close_timeout,
                     schedule_to_start_timeout: next_activity.schedule_to_start_timeout,
                     start_to_close_timeout: next_activity.start_to_close_timeout,
@@ -641,6 +853,434 @@ where
                     attempts += 1;
                 }
                 CommitResult::Duplicate => return Ok(()),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::{BTreeMap, HashSet},
+        sync::Arc,
+    };
+
+    use proptest::prelude::*;
+    use time::{Duration, OffsetDateTime};
+    use tokeira_kernel::{
+        ContinueAsNewVersioningBehavior, VersioningBehavior, VersioningOverride,
+        WorkerDeploymentVersionRef, WorkflowVersioningInfo,
+    };
+    use tokeira_storage::InMemoryStore;
+    use tokeira_types::{
+        BuildId as RuntimeBuildId, DeploymentId, LogicalTaskSeq, Memo, NamespaceId, Payload,
+        SearchAttributes, TaskKind, TaskQueueName, WorkflowId, WorkflowType,
+    };
+
+    use super::*;
+
+    #[derive(Clone, Debug)]
+    enum ActivityTransitionCase {
+        DeploymentEquality,
+        NameAheadRevision,
+        EqualRevision,
+        Pinned,
+        UnversionedPoller,
+        InFlightTransition,
+    }
+
+    fn arb_activity_transition_case() -> impl Strategy<Value = ActivityTransitionCase> {
+        prop_oneof![
+            Just(ActivityTransitionCase::DeploymentEquality),
+            Just(ActivityTransitionCase::NameAheadRevision),
+            Just(ActivityTransitionCase::EqualRevision),
+            Just(ActivityTransitionCase::Pinned),
+            Just(ActivityTransitionCase::UnversionedPoller),
+            Just(ActivityTransitionCase::InFlightTransition),
+        ]
+    }
+
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp")
+    }
+
+    fn version_ref(deployment_name: &str, build_id: &str) -> WorkerDeploymentVersionRef {
+        WorkerDeploymentVersionRef {
+            deployment_name: deployment_name.into(),
+            build_id: build_id.into(),
+        }
+    }
+
+    fn activity_queue(deployment_name: Option<&str>, build_id: Option<&str>) -> QueueKey {
+        QueueKey {
+            namespace_id: NamespaceId::new(),
+            task_queue: TaskQueueName("activity-task-queue".into()),
+            task_kind: TaskKind::Activity,
+            deployment: deployment_name.map(|name| DeploymentId(name.to_string())),
+            build_id: build_id.map(|id| RuntimeBuildId(id.to_string())),
+        }
+    }
+
+    fn wft_target(
+        deployment_name: Option<&str>,
+        build_id: Option<&str>,
+        revision_number: i64,
+        pinned: bool,
+    ) -> ResolvedWorkflowTaskTarget {
+        ResolvedWorkflowTaskTarget {
+            deployment_version: deployment_name
+                .zip(build_id)
+                .map(|(deployment_name, build_id)| version_ref(deployment_name, build_id)),
+            revision_number,
+            pinned,
+        }
+    }
+
+    fn open_state(info: Option<WorkflowVersioningInfo>) -> WorkflowState {
+        WorkflowState {
+            run_key: RunKey::new(),
+            namespace_id: NamespaceId::new(),
+            workflow_id: WorkflowId("workflow".into()),
+            run_id: RunId::new(),
+            workflow_type: WorkflowType("workflow-type".into()),
+            task_queue: TaskQueueName("workflow-task-queue".into()),
+            deployment: None,
+            build_id: None,
+            versioning_info: info,
+            worker_deployment_name: None,
+            status: ExecutionStatus::Running,
+            transition_seq: TransitionSeq(1),
+            last_event_id: 1,
+            next_workflow_task_seq: LogicalTaskSeq(1),
+            pending_workflow_task: None,
+            previous_started_event_id: 0,
+            workflow_task_attempt: 1,
+            sticky: None,
+            pause_info: None,
+            cancel_requested: false,
+            wft_stamp: 0,
+            memo: Memo(BTreeMap::new()),
+            search_attributes: SearchAttributes(BTreeMap::new()),
+            workflow_execution_timeout: Some(Duration::minutes(10)),
+            workflow_run_timeout: Some(Duration::minutes(5)),
+            workflow_task_timeout: Duration::seconds(10),
+            retry_policy: None,
+            attempt: 1,
+            first_execution_run_id: Some(RunId::new()),
+            original_execution_run_id: None,
+            parent_run_key: None,
+            parent_workflow_id: None,
+            parent_run_id: None,
+            parent_namespace_id: None,
+            parent_initiated_event_id: 0,
+            root_workflow_id: None,
+            root_run_id: None,
+            last_completion_result: None,
+            activities: BTreeMap::new(),
+            timers: BTreeMap::new(),
+            children: BTreeMap::new(),
+            pending_external_signals: BTreeMap::new(),
+            pending_external_cancels: BTreeMap::new(),
+            pending_updates: BTreeMap::new(),
+            admitted_updates: HashSet::new(),
+            pending_nexus_operations: BTreeMap::new(),
+            completion_callbacks: Vec::new(),
+            user_metadata: None,
+            links: Vec::new(),
+            workflow_start_delay: None,
+            priority: None,
+            started_at: now(),
+            first_run_started_at: Some(now()),
+            closed_at: None,
+            close_result: None,
+            close_failure: None,
+        }
+    }
+
+    fn auto_upgrade_state(effective_build: &str) -> WorkflowState {
+        open_state(Some(WorkflowVersioningInfo {
+            behavior: VersioningBehavior::AutoUpgrade,
+            deployment_version: Some(version_ref("deployment", effective_build)),
+            versioning_override: None,
+            version_transition: None,
+            revision_number: 10,
+            continue_as_new_initial_versioning_behavior:
+                ContinueAsNewVersioningBehavior::Unspecified,
+        }))
+    }
+
+    fn pinned_state() -> WorkflowState {
+        open_state(Some(WorkflowVersioningInfo {
+            behavior: VersioningBehavior::Pinned,
+            deployment_version: Some(version_ref("deployment", "pinned")),
+            versioning_override: None,
+            version_transition: None,
+            revision_number: 10,
+            continue_as_new_initial_versioning_behavior:
+                ContinueAsNewVersioningBehavior::Unspecified,
+        }))
+    }
+
+    fn transitioning_state() -> WorkflowState {
+        open_state(Some(WorkflowVersioningInfo {
+            behavior: VersioningBehavior::AutoUpgrade,
+            deployment_version: Some(version_ref("deployment", "current")),
+            versioning_override: Some(VersioningOverride::AutoUpgrade),
+            version_transition: Some(version_ref("deployment", "transition")),
+            revision_number: 10,
+            continue_as_new_initial_versioning_behavior:
+                ContinueAsNewVersioningBehavior::Unspecified,
+        }))
+    }
+
+    fn payloads(bytes: &[u8]) -> Payloads {
+        Payloads(vec![Payload {
+            data: bytes.to_vec(),
+            metadata: BTreeMap::new(),
+        }])
+    }
+
+    fn payload(bytes: &[u8]) -> Payload {
+        Payload {
+            data: bytes.to_vec(),
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    fn retry_policy() -> RetryPolicy {
+        RetryPolicy {
+            initial_interval: Duration::seconds(1),
+            backoff_coefficient: 2.0,
+            maximum_interval: Some(Duration::seconds(10)),
+            maximum_attempts: 3,
+            non_retryable_error_types: Vec::new(),
+        }
+    }
+
+    async fn seed_started_activity(
+        runtime: &TokeiraRuntime<InMemoryStore>,
+        repo: &InMemoryStore,
+        details: Option<Payloads>,
+    ) -> (WorkflowState, ActivityTaskToken, QueueKey) {
+        let mut state = open_state(None);
+        let run_key = state.run_key;
+        let scheduled_at = now();
+        let started_at = scheduled_at + Duration::seconds(1);
+        let activity = tokeira_kernel::ActivityState {
+            activity_id: "activity-1".to_string(),
+            activity_type: "activity-type".to_string(),
+            schedule_event_id: 7,
+            task_queue: TaskQueueName("activity-q".to_string()),
+            deployment: None,
+            build_id: None,
+            input: payloads(b"input"),
+            header: None,
+            attempt: 1,
+            retry_policy: Some(retry_policy()),
+            schedule_to_close_timeout: Some(Duration::minutes(5)),
+            schedule_to_start_timeout: Some(Duration::seconds(30)),
+            start_to_close_timeout: Some(Duration::minutes(1)),
+            heartbeat_timeout: Some(Duration::seconds(10)),
+            scheduled_at,
+            current_attempt_scheduled_at: Some(scheduled_at),
+            started_at: Some(started_at),
+            started_event_id: Some(8),
+            last_failure: None,
+            heartbeat_details: details,
+            pause_info: None,
+            stamp: 0,
+        };
+        state
+            .activities
+            .insert(activity.activity_id.clone(), activity.clone());
+        let queue = QueueKey {
+            namespace_id: state.namespace_id,
+            task_queue: activity.task_queue.clone(),
+            task_kind: TaskKind::Activity,
+            deployment: None,
+            build_id: None,
+        };
+        let transition = Transition {
+            expected_seq: TransitionSeq::ZERO,
+            next_state: state.clone(),
+            history_events: SmallVec::new(),
+            request_dedupe_ops: SmallVec::new(),
+            activity_ops: smallvec![ActivityOp::Upsert(activity.clone())],
+            timer_ops: SmallVec::new(),
+            dispatch_ops: SmallVec::new(),
+            projection_ops: SmallVec::new(),
+        };
+        repo.commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .await
+            .expect("seed activity state");
+        let token = ActivityTaskToken {
+            run_key,
+            activity_id: activity.activity_id,
+            schedule_event_id: activity.schedule_event_id,
+            attempt: activity.attempt,
+            shard_epoch: runtime
+                .shard_epoch_for_completion(run_key)
+                .await
+                .expect("runtime owns seeded run"),
+        };
+        (state, token, queue)
+    }
+
+    #[tokio::test]
+    async fn heartbeat_details_persist_and_return_on_retry_poll() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        );
+        let (_state, token, queue) = seed_started_activity(&runtime, &repo, None).await;
+        let details = payloads(b"checkpoint-1");
+
+        let cancel_requested = runtime
+            .record_activity_heartbeat(token.clone(), Some(details.clone()))
+            .await
+            .expect("heartbeat should persist");
+        assert!(!cancel_requested);
+        let LoadedRun::Existing(after_heartbeat) = repo.load_run(token.run_key).await.unwrap()
+        else {
+            panic!("seeded run should exist");
+        };
+        assert_eq!(
+            after_heartbeat.activities["activity-1"].heartbeat_details,
+            Some(details.clone())
+        );
+
+        runtime
+            .fail_activity_task(token, payload(b"retryable"), None, false, None)
+            .await
+            .expect("retryable failure should re-dispatch activity");
+        let LoadedRun::Existing(after_retry) =
+            repo.load_run(after_heartbeat.run_key).await.unwrap()
+        else {
+            panic!("seeded run should exist after retry");
+        };
+        let retried = after_retry.activities.get("activity-1").unwrap();
+        assert_eq!(retried.attempt, 2);
+        assert_eq!(retried.heartbeat_details, Some(details.clone()));
+        assert!(retried.current_attempt_scheduled_at.is_some());
+
+        let started = runtime
+            .poll_activity_task(
+                queue,
+                WorkerIdentity("activity-worker".to_string()),
+                tokio::time::Duration::from_secs(1),
+            )
+            .await
+            .expect("poll should not fail")
+            .expect("retried activity should be available");
+        assert_eq!(started.attempt, 2);
+        assert_eq!(started.heartbeat_details, Some(details));
+        assert_eq!(started.scheduled_time, retried.scheduled_at);
+        assert_eq!(
+            started.current_attempt_scheduled_time,
+            retried.current_attempt_scheduled_at
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        // Feature: worker-deployments, Property 13: deployment-version transition lifecycle
+        // **Validates: Requirements 9.2, 9.5, 9.6**
+        #[test]
+        fn property_activity_start_transition_lifecycle(
+            case in arb_activity_transition_case(),
+            wft_revision in 1i64..10_000,
+        ) {
+            match case {
+                ActivityTransitionCase::DeploymentEquality => {
+                    let state = auto_upgrade_state("current");
+                    let target = wft_target(Some("deployment"), Some("target"), wft_revision, false);
+                    let queue = activity_queue(Some("deployment"), Some("target"));
+
+                    prop_assert!(!activity_start_rejected_by_in_flight_transition(&state));
+                    prop_assert_eq!(
+                        transition_for_polled_activity_task(
+                            &state,
+                            &target,
+                            &queue,
+                            wft_revision,
+                        ),
+                        Some(version_ref("deployment", "target"))
+                    );
+                }
+                ActivityTransitionCase::NameAheadRevision => {
+                    let state = auto_upgrade_state("current");
+                    let target = wft_target(Some("deployment"), Some("target"), wft_revision, false);
+                    let queue = activity_queue(Some("deployment"), Some("ahead"));
+
+                    prop_assert!(!activity_start_rejected_by_in_flight_transition(&state));
+                    prop_assert_eq!(
+                        transition_for_polled_activity_task(
+                            &state,
+                            &target,
+                            &queue,
+                            wft_revision + 1,
+                        ),
+                        Some(version_ref("deployment", "ahead"))
+                    );
+                }
+                ActivityTransitionCase::EqualRevision => {
+                    let state = auto_upgrade_state("current");
+                    let target = wft_target(Some("deployment"), Some("target"), wft_revision, false);
+                    let queue = activity_queue(Some("deployment"), Some("ahead"));
+
+                    prop_assert!(!activity_start_rejected_by_in_flight_transition(&state));
+                    prop_assert_eq!(
+                        transition_for_polled_activity_task(
+                            &state,
+                            &target,
+                            &queue,
+                            wft_revision,
+                        ),
+                        None
+                    );
+                }
+                ActivityTransitionCase::Pinned => {
+                    let state = pinned_state();
+                    let target = wft_target(Some("deployment"), Some("target"), wft_revision, true);
+                    let queue = activity_queue(Some("deployment"), Some("target"));
+
+                    prop_assert!(!activity_start_rejected_by_in_flight_transition(&state));
+                    prop_assert_eq!(
+                        transition_for_polled_activity_task(
+                            &state,
+                            &target,
+                            &queue,
+                            wft_revision + 1,
+                        ),
+                        None
+                    );
+                }
+                ActivityTransitionCase::UnversionedPoller => {
+                    let state = auto_upgrade_state("current");
+                    let target = wft_target(Some("deployment"), Some("target"), wft_revision, false);
+                    let queue = activity_queue(None, None);
+
+                    prop_assert!(!activity_start_rejected_by_in_flight_transition(&state));
+                    prop_assert_eq!(
+                        transition_for_polled_activity_task(
+                            &state,
+                            &target,
+                            &queue,
+                            wft_revision + 1,
+                        ),
+                        None
+                    );
+                }
+                ActivityTransitionCase::InFlightTransition => {
+                    let state = transitioning_state();
+                    prop_assert!(activity_start_rejected_by_in_flight_transition(&state));
+                }
             }
         }
     }

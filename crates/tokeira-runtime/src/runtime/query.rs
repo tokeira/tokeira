@@ -17,6 +17,7 @@
 //!   resolution. The caller registration is always cleaned up on every error
 //!   and timeout path so a failed update cannot leak a parked waiter.
 use super::*;
+use crate::errors::UpdateLifecycleError;
 use tokeira_observability::{QueryDispatchOutcomeLabel, QueryDispatchPathLabel};
 
 impl<R> TokeiraRuntime<R>
@@ -164,26 +165,23 @@ where
         request: RequestContext,
         timeout_after: Duration,
         wait_policy: UpdateWaitPolicy,
-    ) -> Result<UpdateOutcome> {
+    ) -> Result<UpdateLifecycleSnapshot> {
         let run_key = self
             .repo
             .resolve_execution(&execution)
             .await?
             .ok_or_else(|| anyhow!("execution not found"))?;
 
-        let mut complete_rx = None;
-        if wait_policy == UpdateWaitPolicy::Completed {
-            let (complete_tx, rx) = oneshot::channel::<UpdateResolution>();
-            self.update_registry.register(
-                run_key,
-                update_id.clone(),
-                update_name.clone(),
-                input.clone(),
-                request.caller_identity.clone().unwrap_or_default(),
-                complete_tx,
-            );
-            complete_rx = Some(rx);
-        }
+        let (wait_tx, wait_rx) = oneshot::channel::<UpdateResolution>();
+        self.update_registry.register(
+            run_key,
+            update_id.clone(),
+            update_name.clone(),
+            input.clone(),
+            request.caller_identity.clone().unwrap_or_default(),
+            wait_policy.clone(),
+            wait_tx,
+        );
 
         let command = Command::Update(UpdateRequest {
             update_id: update_id.clone(),
@@ -197,9 +195,7 @@ where
         let commit_result = match submit_result {
             Ok(result) => result,
             Err(error) => {
-                if wait_policy == UpdateWaitPolicy::Completed {
-                    self.update_registry.remove(run_key, &update_id);
-                }
+                self.update_registry.remove(run_key, &update_id);
                 return Err(error);
             }
         };
@@ -211,49 +207,317 @@ where
         match commit_result {
             CommitResult::Applied { .. } => {}
             CommitResult::Duplicate => {
-                if wait_policy == UpdateWaitPolicy::Completed {
-                    self.update_registry.remove(run_key, &update_id);
-                }
-                return Ok(UpdateOutcome::Accepted {
-                    accepted_event_id: 0,
-                });
+                self.update_registry.remove(run_key, &update_id);
+                return self
+                    .wait_for_update_stage(
+                        run_key,
+                        execution,
+                        update_id,
+                        wait_policy,
+                        timeout_after,
+                    )
+                    .await;
             }
             CommitResult::Conflict { reason } => {
-                if wait_policy == UpdateWaitPolicy::Completed {
-                    self.update_registry.remove(run_key, &update_id);
-                }
+                self.update_registry.remove(run_key, &update_id);
                 return Err(anyhow!("update commit conflicted: {reason}"));
             }
         };
 
-        if wait_policy == UpdateWaitPolicy::Accepted {
-            return Ok(UpdateOutcome::Accepted {
-                accepted_event_id: 0,
-            });
+        self.wait_for_update_stage_with_receiver(
+            run_key,
+            execution,
+            update_id,
+            wait_policy,
+            timeout_after,
+            wait_rx,
+        )
+        .await
+    }
+
+    pub async fn poll_workflow_update(
+        &self,
+        execution: ExecutionRef,
+        update_id: String,
+        wait_policy: UpdateWaitPolicy,
+        timeout_after: Duration,
+    ) -> Result<UpdateLifecycleSnapshot> {
+        let run_key = self
+            .repo
+            .resolve_execution(&execution)
+            .await?
+            .ok_or_else(|| anyhow!("execution not found"))?;
+
+        self.wait_for_update_stage(run_key, execution, update_id, wait_policy, timeout_after)
+            .await
+    }
+
+    async fn wait_for_update_stage(
+        &self,
+        run_key: RunKey,
+        execution: ExecutionRef,
+        update_id: String,
+        wait_policy: UpdateWaitPolicy,
+        timeout_after: Duration,
+    ) -> Result<UpdateLifecycleSnapshot> {
+        let (tx, rx) = oneshot::channel::<UpdateResolution>();
+        let snapshot = self
+            .update_lifecycle_snapshot(run_key, execution.clone(), &update_id)
+            .await?
+            .ok_or_else(|| UpdateLifecycleError::UpdateNotFound {
+                run_key,
+                update_id: update_id.clone(),
+            })?;
+        let requested = requested_stage(wait_policy.clone());
+        if requested <= UpdateLifecycleStage::Admitted || snapshot.stage >= requested {
+            return Ok(snapshot);
+        }
+
+        if matches!(
+            wait_policy,
+            UpdateWaitPolicy::Accepted | UpdateWaitPolicy::Completed
+        ) && self
+            .update_registry
+            .contains_registered_update(run_key, &update_id)
+        {
+            if self
+                .update_registry
+                .attach_waiter(run_key, &update_id, wait_policy.clone(), tx)
+            {
+                return self
+                    .wait_for_update_stage_with_receiver(
+                        run_key,
+                        execution,
+                        update_id,
+                        wait_policy,
+                        timeout_after,
+                        rx,
+                    )
+                    .await;
+            }
+        }
+
+        self.wait_for_history_stage(
+            run_key,
+            execution,
+            update_id,
+            requested,
+            timeout_after,
+            snapshot,
+        )
+        .await
+    }
+
+    async fn wait_for_update_stage_with_receiver(
+        &self,
+        run_key: RunKey,
+        execution: ExecutionRef,
+        update_id: String,
+        wait_policy: UpdateWaitPolicy,
+        timeout_after: Duration,
+        response_rx: oneshot::Receiver<UpdateResolution>,
+    ) -> Result<UpdateLifecycleSnapshot> {
+        let requested = requested_stage(wait_policy.clone());
+        if requested <= UpdateLifecycleStage::Admitted {
+            return self
+                .snapshot_or_update_not_found(run_key, execution, &update_id)
+                .await;
+        }
+
+        if let Some(snapshot) = self
+            .update_lifecycle_snapshot(run_key, execution.clone(), &update_id)
+            .await?
+            .filter(|snapshot| snapshot.stage >= requested)
+        {
+            return Ok(snapshot);
         }
 
         let timeout_after: std::time::Duration = timeout_after
             .try_into()
             .map_err(|_| anyhow!("update timeout must be non-negative"))?;
-        let complete_rx = complete_rx.expect("completion receiver should exist");
 
-        match tokio::time::timeout(timeout_after, complete_rx).await {
-            Ok(Ok(UpdateResolution::Completed { result })) => Ok(UpdateOutcome::Completed {
-                accepted_event_id: 0,
-                result,
-            }),
-            Ok(Ok(UpdateResolution::Rejected { failure })) => Ok(UpdateOutcome::Rejected {
-                accepted_event_id: 0,
-                failure,
-            }),
+        match tokio::time::timeout(timeout_after, response_rx).await {
+            Ok(Ok(UpdateResolution::Accepted { accepted_event_id })) => {
+                let _ = accepted_event_id;
+                self.snapshot_or_update_not_found(run_key, execution, &update_id)
+                    .await
+            }
+            Ok(Ok(UpdateResolution::Completed { result })) => {
+                let _ = result;
+                self.snapshot_or_update_not_found(run_key, execution, &update_id)
+                    .await
+            }
+            Ok(Ok(UpdateResolution::Rejected { failure })) => {
+                let _ = failure;
+                self.snapshot_or_update_not_found(run_key, execution, &update_id)
+                    .await
+            }
             Ok(Ok(UpdateResolution::RunClosed)) => {
                 Err(anyhow!("run closed before update completed"))
             }
             Ok(Err(_)) => Err(anyhow!("update response channel closed")),
             Err(_) => {
-                self.update_registry.remove(run_key, &update_id);
-                Err(anyhow!("update timed out"))
+                self.update_registry.clear_waiter(run_key, &update_id);
+                self.snapshot_or_update_not_found(run_key, execution, &update_id)
+                    .await
             }
         }
+    }
+
+    async fn snapshot_or_update_not_found(
+        &self,
+        run_key: RunKey,
+        execution: ExecutionRef,
+        update_id: &str,
+    ) -> Result<UpdateLifecycleSnapshot> {
+        self.update_lifecycle_snapshot(run_key, execution, update_id)
+            .await?
+            .ok_or_else(|| {
+                UpdateLifecycleError::UpdateNotFound {
+                    run_key,
+                    update_id: update_id.to_string(),
+                }
+                .into()
+            })
+    }
+
+    async fn update_lifecycle_snapshot(
+        &self,
+        run_key: RunKey,
+        execution: ExecutionRef,
+        update_id: &str,
+    ) -> Result<Option<UpdateLifecycleSnapshot>> {
+        let state = match self.repo.load_run(run_key).await? {
+            LoadedRun::Existing(state) => state,
+            LoadedRun::Absent => return Ok(None),
+        };
+        let workflow_execution = ExecutionRef {
+            run_id: Some(state.run_id),
+            ..execution
+        };
+        let history = self.repo.read_history(run_key, 0, usize::MAX).await?;
+
+        let mut accepted = None;
+        for event in history {
+            match event.kind {
+                HistoryEventKind::WorkflowExecutionUpdateAccepted {
+                    update_id: event_update_id,
+                    update_name,
+                    ..
+                } if event_update_id == update_id => {
+                    accepted = Some((event.event_id, update_name));
+                }
+                HistoryEventKind::WorkflowExecutionUpdateCompleted {
+                    update_id: event_update_id,
+                    accepted_event_id,
+                    result,
+                } if event_update_id == update_id => {
+                    return Ok(Some(UpdateLifecycleSnapshot {
+                        workflow_execution: workflow_execution.clone(),
+                        update_id: update_id.to_string(),
+                        update_name: accepted
+                            .as_ref()
+                            .map(|(_, name)| name.clone())
+                            .unwrap_or_default(),
+                        stage: UpdateLifecycleStage::Completed,
+                        outcome: Some(UpdateOutcome::Completed {
+                            accepted_event_id,
+                            result,
+                        }),
+                    }));
+                }
+                HistoryEventKind::WorkflowExecutionUpdateRejected {
+                    update_id: event_update_id,
+                    failure,
+                    rejected_request_sequencing_event_id,
+                    ..
+                } if event_update_id == update_id => {
+                    return Ok(Some(UpdateLifecycleSnapshot {
+                        workflow_execution: workflow_execution.clone(),
+                        update_id: update_id.to_string(),
+                        update_name: accepted
+                            .as_ref()
+                            .map(|(_, name)| name.clone())
+                            .unwrap_or_default(),
+                        stage: UpdateLifecycleStage::Completed,
+                        outcome: Some(UpdateOutcome::Rejected {
+                            accepted_event_id: rejected_request_sequencing_event_id,
+                            failure,
+                        }),
+                    }));
+                }
+                _ => {}
+            }
+        }
+
+        if let Some((_accepted_event_id, update_name)) = accepted {
+            return Ok(Some(UpdateLifecycleSnapshot {
+                workflow_execution: workflow_execution.clone(),
+                update_id: update_id.to_string(),
+                update_name,
+                stage: UpdateLifecycleStage::Accepted,
+                outcome: None,
+            }));
+        }
+
+        if state.admitted_updates.contains(update_id)
+            || self
+                .update_registry
+                .contains_registered_update(run_key, update_id)
+        {
+            let (update_name, _) = self
+                .update_registry
+                .peek_update_info(run_key, update_id)
+                .unwrap_or_default();
+            return Ok(Some(UpdateLifecycleSnapshot {
+                workflow_execution: workflow_execution.clone(),
+                update_id: update_id.to_string(),
+                update_name,
+                stage: UpdateLifecycleStage::Admitted,
+                outcome: None,
+            }));
+        }
+
+        Ok(None)
+    }
+
+    async fn wait_for_history_stage(
+        &self,
+        run_key: RunKey,
+        execution: ExecutionRef,
+        update_id: String,
+        requested: UpdateLifecycleStage,
+        timeout_after: Duration,
+        mut latest: UpdateLifecycleSnapshot,
+    ) -> Result<UpdateLifecycleSnapshot> {
+        let timeout_after: std::time::Duration = timeout_after
+            .try_into()
+            .map_err(|_| anyhow!("update timeout must be non-negative"))?;
+        let deadline = tokio::time::Instant::now() + timeout_after;
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(50));
+
+        while tokio::time::Instant::now() < deadline {
+            interval.tick().await;
+            if let Some(snapshot) = self
+                .update_lifecycle_snapshot(run_key, execution.clone(), &update_id)
+                .await?
+            {
+                if snapshot.stage >= requested {
+                    return Ok(snapshot);
+                }
+                latest = snapshot;
+            }
+        }
+
+        Ok(latest)
+    }
+}
+
+fn requested_stage(wait_policy: UpdateWaitPolicy) -> UpdateLifecycleStage {
+    match wait_policy {
+        UpdateWaitPolicy::Unspecified => UpdateLifecycleStage::Unspecified,
+        UpdateWaitPolicy::Admitted => UpdateLifecycleStage::Admitted,
+        UpdateWaitPolicy::Accepted => UpdateLifecycleStage::Accepted,
+        UpdateWaitPolicy::Completed => UpdateLifecycleStage::Completed,
     }
 }

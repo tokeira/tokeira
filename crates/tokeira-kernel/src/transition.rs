@@ -8,7 +8,7 @@ use tokeira_types::{
 
 use crate::{
     event::HistoryEvent,
-    state::{ActivityState, TimerState, WorkflowState},
+    state::{ActivityState, CompletionCallback, TimerState, WorkflowState},
 };
 
 /// The full result of one authoritative transition.
@@ -95,6 +95,14 @@ pub enum DispatchOp {
         input: Payloads,
         schedule_event_id: i64,
         attempt: u32,
+        /// Worker Deployment routing revision captured when the activity was enqueued.
+        ///
+        /// The activity-start path compares this dispatch-time revision with
+        /// the workflow task target's live revision. A strict `>` comparison is
+        /// what separates backlog caught up to a newer deployment from a
+        /// same-revision independent activity that must not drag the workflow
+        /// into a transition (`recordactivitytaskstarted/api.go:188 @ v1.31.0`).
+        dispatch_revision: i64,
         schedule_to_close_timeout: Option<Duration>,
         schedule_to_start_timeout: Option<Duration>,
         start_to_close_timeout: Option<Duration>,
@@ -172,6 +180,15 @@ pub enum DispatchOp {
         operation_id: String,
         endpoint: String,
         service: String,
+    },
+    /// Dispatch a completion callback after the terminal transition commits.
+    ///
+    /// Callback delivery is external I/O, so the kernel only records the
+    /// durable scheduling decision and returns this derived effect. The runtime
+    /// owns the actual delivery attempt after storage accepts the transition.
+    DispatchCompletionCallback {
+        callback_index: usize,
+        callback: CompletionCallback,
     },
 }
 

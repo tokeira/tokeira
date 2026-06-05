@@ -9,8 +9,8 @@ use tokeira_types::{
 use crate::{
     event::ActivityResolution,
     state::{
-        CompletionCallback, ParentClosePolicy, VersioningBehavior, VersioningOverride,
-        WorkerDeploymentVersionRef,
+        CompletionCallback, Link, OnConflictOptions, ParentClosePolicy, Priority, UserMetadata,
+        VersioningBehavior, VersioningOverride, WorkerDeploymentVersionRef,
     },
 };
 
@@ -53,8 +53,18 @@ pub enum Command {
     WorkflowExecutionTimedOut(WorkflowExecutionTimedOutRequest),
     /// A worker picked up a workflow task.
     WorkflowTaskStarted(StartWorkflowTaskRequest),
+    /// Start a Worker Deployment transition decided outside the WFT-start path.
+    StartDeploymentTransition(StartDeploymentTransitionRequest),
     /// A worker completed a workflow task with commands.
     WorkflowTaskCompleted(WorkflowTaskCompletedRequest),
+    /// A worker completed a cron-enabled workflow task whose terminal command
+    /// should author a cron continue-as-new successor.
+    WorkflowTaskCompletedWithCron {
+        /// Normal workflow-task completion request.
+        request: WorkflowTaskCompletedRequest,
+        /// Runtime-computed cron successor metadata.
+        cron_continuation: CronContinuation,
+    },
     /// A workflow task failed (non-determinism, bad commands).
     WorkflowTaskFailed(WorkflowTaskFailedRequest),
     /// A workflow task exceeded its start-to-close timeout.
@@ -73,6 +83,8 @@ pub enum Command {
     NexusOperationResolved(NexusOperationResolvedRequest),
     /// A timer's deadline was reached.
     TimerDue(TimerDueRequest),
+    /// The internal first-workflow-task delay elapsed.
+    WorkflowStartDelayElapsed(WorkflowStartDelayElapsedRequest),
     /// Schedule a WFT so that a pending query can be delivered
     /// to a worker. Only schedules if no WFT is already pending.
     ScheduleQueryTask(ScheduleQueryTaskRequest),
@@ -238,6 +250,18 @@ pub struct StartRequest {
     pub build_id: Option<BuildId>,
     /// Versioning override applied at workflow start.
     pub versioning_override: Option<VersioningOverride>,
+    /// Delay before the first workflow task may be dispatched.
+    pub workflow_start_delay: Option<Duration>,
+    /// Completion callbacks registered by the start request.
+    pub completion_callbacks: Vec<CompletionCallback>,
+    /// UI-facing metadata registered at start.
+    pub user_metadata: Option<UserMetadata>,
+    /// Links attached to the start event.
+    pub links: Vec<Link>,
+    /// Options applied when this start resolves to an existing running workflow.
+    pub on_conflict_options: Option<OnConflictOptions>,
+    /// Matching priority metadata for tasks derived from this workflow.
+    pub priority: Option<Priority>,
     /// Current retry attempt number (1-based).
     pub attempt: u32,
     /// Run ID of the previous run if this is a continue-as-new
@@ -273,6 +297,12 @@ pub struct StartRequest {
     pub request: RequestContext,
     /// Wall-clock time the command was accepted.
     pub now: OffsetDateTime,
+    /// Client-authored cron expression used to compute the first WFT backoff.
+    ///
+    /// This is distinct from `cron_schedule` below because Tokeira's schedule
+    /// engine also uses the serialized `cron_schedule` marker for
+    /// schedule-originated runs. Only client cron should delay the first WFT.
+    pub client_cron_schedule: Option<String>,
     /// Schedule ID that triggered this start, if any. This is serialized as
     /// Temporal's legacy `cron_schedule` marker for schedule-originated runs.
     pub cron_schedule: Option<String>,
@@ -298,9 +328,15 @@ pub struct SignalWithStartRequest {
     pub retry_policy: Option<RetryPolicy>,
     pub conflict_policy: WorkflowIdConflictPolicy,
     pub reuse_policy: WorkflowIdReusePolicy,
+    pub header: Option<Headers>,
     pub deployment: Option<DeploymentId>,
     pub build_id: Option<BuildId>,
     pub versioning_override: Option<VersioningOverride>,
+    pub workflow_start_delay: Option<Duration>,
+    pub user_metadata: Option<UserMetadata>,
+    pub links: Vec<Link>,
+    pub priority: Option<Priority>,
+    pub cron_schedule: Option<String>,
     pub attempt: u32,
     pub continued_execution_run_id: Option<RunId>,
     pub first_execution_run_id: Option<RunId>,
@@ -317,6 +353,7 @@ pub struct SignalWithStartRequest {
     pub first_run_started_at: Option<OffsetDateTime>,
     pub request: RequestContext,
     pub now: OffsetDateTime,
+    pub client_cron_schedule: Option<String>,
     pub signal_name: String,
     pub signal_input: Payloads,
 }
@@ -515,6 +552,10 @@ pub struct UpdateExecutionOptionsRequest {
     pub versioning_override: FieldChange<VersioningOverride>,
     /// Completion callbacks change.
     pub completion_callbacks: FieldChange<Vec<CompletionCallback>>,
+    /// Completion callbacks to append without replacing existing registrations.
+    pub attached_completion_callbacks: Vec<CompletionCallback>,
+    /// Links to append without replacing existing start/event links.
+    pub attached_links: Vec<Link>,
     /// Optional request ID to attach for correlation.
     pub attached_request_id: Option<String>,
     /// Caller-supplied request context for dedupe and tracing.
@@ -548,6 +589,49 @@ pub struct StartWorkflowTaskRequest {
     pub now: OffsetDateTime,
 }
 
+/// Request to apply an already-decided Worker Deployment transition.
+///
+/// The runtime computes whether an activity-start poller should move the
+/// workflow toward a different deployment by reading live routing config. The
+/// kernel only receives the resulting target and revision, then performs the
+/// authoritative state mutation in one fenced transition. This keeps the
+/// activity-start path aligned with Temporal's mutable-state contract without
+/// letting runtime code mutate per-run correctness state directly
+/// (`service/history/api/recordactivitytaskstarted/api.go:75 @ v1.31.0`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StartDeploymentTransitionRequest {
+    /// Target Worker Deployment Version chosen by runtime routing.
+    pub target: WorkerDeploymentVersionRef,
+    /// Routing revision that justified this transition.
+    ///
+    /// This is the activity dispatch revision, not a freshly-loaded registry
+    /// revision. Temporal uses the dispatch-time revision to distinguish a
+    /// non-backlogged activity from one that is ahead of the workflow-task
+    /// target (`service/history/api/recordactivitytaskstarted/api.go:188 @
+    /// v1.31.0`).
+    pub revision_number: i64,
+    /// Wall-clock time the command was accepted.
+    pub now: OffsetDateTime,
+}
+
+/// Runtime-supplied cron continue-as-new successor metadata.
+///
+/// Cron parsing and wall-clock calendar math stay in runtime. The kernel only
+/// records the already-decided successor identity and first-WFT delay in
+/// history, matching Temporal's cron continuation handoff
+/// (`service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:1383 @ v1.31.0`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CronContinuation {
+    /// Run ID authored into the closing run's continue-as-new event.
+    pub new_run_id: RunId,
+    /// Concrete delay before the successor's first workflow task may fire.
+    pub first_workflow_task_backoff: Duration,
+    /// Original workflow input to feed into the cron successor.
+    pub input: Payloads,
+    /// Client-authored cron expression preserved on the successor start event.
+    pub cron_schedule: String,
+}
+
 /// Request from a worker that has finished processing a
 /// workflow task and is returning a batch of commands.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -557,15 +641,31 @@ pub struct WorkflowTaskCompletedRequest {
     /// Identity of the completing worker.
     pub identity: WorkerIdentity,
     /// Raw encoded Temporal SDK metadata from the completion request.
+    #[serde(default)]
     pub sdk_metadata: Option<Vec<u8>>,
+    /// Raw encoded Temporal metering metadata from the completion request.
+    #[serde(default)]
+    pub metering_metadata: Option<Vec<u8>>,
     /// Build ID from the worker version stamp, when reported by the SDK.
+    #[serde(default)]
     pub worker_version: Option<String>,
     /// Versioning behavior reported by the worker that completed this task.
+    #[serde(default)]
     pub versioning_behavior: VersioningBehavior,
     /// Worker Deployment Version that completed this task.
+    #[serde(default)]
     pub deployment_version: Option<WorkerDeploymentVersionRef>,
     /// Worker Deployment name that completed this task.
+    #[serde(default)]
     pub worker_deployment_name: Option<String>,
+    /// Sticky execution TTL requested by the completing worker.
+    ///
+    /// Temporal's wire field names a sticky task queue, but Tokeira's current
+    /// matching model keys sticky delivery by the completing worker identity.
+    /// The TTL is the durable compatibility signal needed to update that
+    /// existing affinity without introducing worker-lifecycle semantics here.
+    #[serde(default)]
+    pub sticky_ttl: Option<Duration>,
     /// Ordered list of workflow commands produced by the
     /// worker's replay/execution.
     pub commands: Vec<WorkflowCommand>,
@@ -788,6 +888,14 @@ pub struct TimerDueRequest {
     /// Timer that fired.
     pub timer_id: String,
     /// Wall-clock time the timer was observed as due.
+    pub fired_at: OffsetDateTime,
+}
+
+/// Request from the timer scanner when a delayed workflow start is ready
+/// to publish its first workflow task.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowStartDelayElapsedRequest {
+    /// Wall-clock time the delayed start was observed as due.
     pub fired_at: OffsetDateTime,
 }
 

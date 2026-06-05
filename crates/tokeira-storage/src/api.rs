@@ -637,6 +637,12 @@ pub struct DispatchableActivityTask {
     pub schedule_event_id: i64,
     /// Current retry attempt (starts at 1).
     pub attempt: u32,
+    /// Worker Deployment routing revision stamped when this activity was dispatched.
+    ///
+    /// Activity start compares this dispatch-time value against the live WFT
+    /// target revision. Persisting the stamp keeps backlog replay from
+    /// reinterpreting an old dispatch under a newer routing config.
+    pub dispatch_revision: i64,
 }
 
 /// Durable payload stored for one backlog task.
@@ -657,6 +663,14 @@ pub enum BacklogPayload {
         schedule_event_id: i64,
         /// Current retry attempt.
         attempt: u32,
+        /// Worker Deployment routing revision stamped when this activity was dispatched.
+        ///
+        /// Defaults to zero for backlog rows written before Worker Deployment
+        /// routing began stamping activity tasks; zero can never be "ahead" of
+        /// a real routing revision, so legacy entries do not spuriously start
+        /// workflow deployment transitions.
+        #[serde(default)]
+        dispatch_revision: i64,
     },
 }
 

@@ -28,6 +28,7 @@ where
     /// a parked poller. Execution/run timeout tracking is registered only after
     /// the start is durably `Applied`.
     pub async fn start_workflow(&self, mut request: StartRequest) -> Result<CommitResult> {
+        apply_client_cron_start_backoff(&mut request)?;
         let reserved_poller = self.try_reserve_start_poller(&request).await;
         if let Some(reserved) = &reserved_poller {
             request.reserved_poller_identity = Some(reserved.worker_identity().clone());
@@ -110,6 +111,8 @@ where
                 }
             }
             ConflictResolution::UseExisting { run_key, run_id } => {
+                self.apply_start_on_conflict_options(run_key, &request)
+                    .await?;
                 Ok(StartWorkflowResult::UsedExisting { run_key, run_id })
             }
             ConflictResolution::TerminateAndStart { run_key } => {
@@ -139,6 +142,55 @@ where
         }
     }
 
+    async fn apply_start_on_conflict_options(
+        &self,
+        run_key: RunKey,
+        request: &StartRequest,
+    ) -> Result<()> {
+        let Some(options) = &request.on_conflict_options else {
+            return Ok(());
+        };
+        let attached_request_id = options
+            .attach_request_id
+            .then(|| request.request.request_id.0.clone());
+        let attached_completion_callbacks = if options.attach_completion_callbacks {
+            request.completion_callbacks.clone()
+        } else {
+            Vec::new()
+        };
+        let attached_links = if options.attach_links {
+            request.links.clone()
+        } else {
+            Vec::new()
+        };
+        if attached_request_id.is_none()
+            && attached_completion_callbacks.is_empty()
+            && attached_links.is_empty()
+        {
+            return Ok(());
+        }
+
+        // Temporal applies `OnConflictOptions` to the already-running
+        // execution instead of rewriting the original start. Keeping that as a
+        // kernel command preserves Tokeira's "history is authority" rule.
+        let update = UpdateExecutionOptionsRequest {
+            versioning_override: FieldChange::Unchanged,
+            completion_callbacks: FieldChange::Unchanged,
+            attached_completion_callbacks,
+            attached_links,
+            attached_request_id,
+            request: request.request.clone(),
+            now: request.now,
+        };
+        match self
+            .submit(run_key, Command::UpdateExecutionOptions(update))
+            .await?
+        {
+            CommitResult::Applied { .. } | CommitResult::Duplicate => Ok(()),
+            CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
+        }
+    }
+
     /// Signal a workflow, starting it first if it does not already exist.
     ///
     /// Resolves the WorkflowId conflict/reuse policy the same way as
@@ -150,8 +202,9 @@ where
     /// whereas the start branches reject duplicates as unexpected.
     pub async fn signal_with_start_workflow(
         &self,
-        request: SignalWithStartRequest,
+        mut request: SignalWithStartRequest,
     ) -> Result<SignalWithStartResult> {
+        apply_client_cron_signal_backoff(&mut request)?;
         let resolution = self
             .resolve_conflict(
                 request.namespace_id,
@@ -478,4 +531,30 @@ where
             CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
         }
     }
+}
+
+fn apply_client_cron_start_backoff(request: &mut StartRequest) -> Result<()> {
+    let Some(cron_schedule) = request.client_cron_schedule.as_deref() else {
+        return Ok(());
+    };
+    if request.workflow_start_delay.is_some() {
+        return Err(anyhow!(
+            "CronSchedule and WorkflowStartDelay may not be used together."
+        ));
+    }
+    request.workflow_start_delay = Some(cron_initial_backoff(cron_schedule, request.now)?);
+    Ok(())
+}
+
+fn apply_client_cron_signal_backoff(request: &mut SignalWithStartRequest) -> Result<()> {
+    let Some(cron_schedule) = request.client_cron_schedule.as_deref() else {
+        return Ok(());
+    };
+    if request.workflow_start_delay.is_some() {
+        return Err(anyhow!(
+            "CronSchedule and WorkflowStartDelay may not be used together."
+        ));
+    }
+    request.workflow_start_delay = Some(cron_initial_backoff(cron_schedule, request.now)?);
+    Ok(())
 }

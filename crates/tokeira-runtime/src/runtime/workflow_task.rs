@@ -23,10 +23,19 @@ use tokeira_types::WorkflowId;
 
 use crate::versioning::deterministic_bucket;
 
+/// Workflow-task routing target computed from durable run state plus registry config.
+///
+/// The value is shared with activity-start transition checks because Temporal
+/// decides whether an activity poller should transition the workflow by asking
+/// where the workflow task would route now
+/// (`service/history/api/recordactivitytaskstarted/api.go:283 @ v1.31.0`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ResolvedWorkflowTaskTarget {
+    /// Deployment version selected for the workflow task, or `None` for unversioned routing.
     pub deployment_version: Option<WorkerDeploymentVersionRef>,
+    /// Registry/run revision that produced `deployment_version`.
     pub revision_number: i64,
+    /// Whether the target is pinned and therefore cannot initiate a transition.
     pub pinned: bool,
 }
 
@@ -127,7 +136,11 @@ fn version_key_to_ref(version: &WorkerDeploymentVersionKey) -> WorkerDeploymentV
     }
 }
 
-fn poller_deployment_version(queue: &QueueKey) -> Option<WorkerDeploymentVersionRef> {
+/// Reconstruct the worker deployment version from the Matching queue key.
+///
+/// Unversioned pollers intentionally return `None`; they may start work but
+/// cannot prove a target deployment for a version transition.
+pub(super) fn poller_deployment_version(queue: &QueueKey) -> Option<WorkerDeploymentVersionRef> {
     Some(WorkerDeploymentVersionRef {
         deployment_name: queue.deployment.as_ref()?.0.clone(),
         build_id: queue.build_id.as_ref()?.0.clone(),
@@ -254,7 +267,11 @@ where
         run_key: RunKey,
         worker_identity: WorkerIdentity,
     ) -> Result<Option<StartedWorkflowTask>> {
-        let Some(offered) = self.broker.try_claim_workflow_task(&queue, run_key).await else {
+        let Some(offered) = self
+            .broker
+            .try_claim_workflow_task_for_worker(&queue, run_key, Some(&worker_identity))
+            .await
+        else {
             return Ok(None);
         };
         self.delivery_metrics.record_poll_success(&queue);
@@ -296,7 +313,7 @@ where
         })
     }
 
-    async fn load_worker_deployment_routing_config(
+    pub(super) async fn load_worker_deployment_routing_config(
         &self,
         state: &WorkflowState,
         queue: &QueueKey,
@@ -335,9 +352,15 @@ where
             return Err(error);
         }
         let run_key = req.token.run_key;
-        let result = self
-            .submit_for_owned_shard(run_key, Command::WorkflowTaskCompleted(req))
-            .await;
+        let cron_continuation = self.cron_continuation_for_completion(run_key, &req).await?;
+        let command = match cron_continuation {
+            Some(cron_continuation) => Command::WorkflowTaskCompletedWithCron {
+                request: req,
+                cron_continuation,
+            },
+            None => Command::WorkflowTaskCompleted(req),
+        };
+        let result = self.submit_for_owned_shard(run_key, command).await;
         match &result {
             Ok(CommitResult::Applied { .. } | CommitResult::Duplicate) => {
                 runtime_metrics::record_workflow_task_completed(OutcomeLabel::Success);
@@ -347,6 +370,58 @@ where
             }
         }
         result
+    }
+
+    async fn cron_continuation_for_completion(
+        &self,
+        run_key: RunKey,
+        req: &WorkflowTaskCompletedRequest,
+    ) -> Result<Option<CronContinuation>> {
+        let closes_for_cron = req.commands.iter().any(|command| {
+            matches!(command, WorkflowCommand::CompleteWorkflow { .. })
+                || matches!(command, WorkflowCommand::FailWorkflow { .. })
+        });
+        if !closes_for_cron {
+            return Ok(None);
+        }
+
+        let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
+            return Ok(None);
+        };
+        if state.retry_policy.is_some()
+            && req
+                .commands
+                .iter()
+                .any(|command| matches!(command, WorkflowCommand::FailWorkflow { .. }))
+        {
+            return Ok(None);
+        }
+
+        let start_event = self.repo.read_history(run_key, 0, 1).await?;
+        let Some(HistoryEventKind::WorkflowExecutionStarted {
+            input,
+            cron_schedule: Some(cron_schedule),
+            ..
+        }) = start_event.first().map(|event| &event.kind)
+        else {
+            return Ok(None);
+        };
+        if cron_schedule.is_empty() {
+            return Ok(None);
+        }
+
+        // Temporal's cron close path creates the successor immediately but
+        // records a first-WFT backoff on that successor
+        // (`service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:1383`,
+        // `service/history/workflow/mutable_state_impl.go:2601 @ v1.31.0`).
+        // Runtime owns the wall-clock cron calculation; kernel owns the
+        // durable event that makes the successor replayable.
+        Ok(Some(CronContinuation {
+            new_run_id: RunId::new(),
+            first_workflow_task_backoff: cron_initial_backoff(cron_schedule, req.now)?,
+            input: input.clone(),
+            cron_schedule: cron_schedule.clone(),
+        }))
     }
 
     /// Atomically transition a polled workflow task into the Started state.
@@ -626,6 +701,10 @@ mod tests {
             admitted_updates: HashSet::new(),
             pending_nexus_operations: BTreeMap::new(),
             completion_callbacks: Vec::new(),
+            user_metadata: None,
+            links: Vec::new(),
+            workflow_start_delay: None,
+            priority: None,
             started_at: now(),
             first_run_started_at: Some(now()),
             closed_at: None,

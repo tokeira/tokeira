@@ -27,8 +27,9 @@ use tokeira_runtime::{
     BatchOperationStore, BatchOperationType, BatchProgressCounters, BatchResetTarget,
     BufferedQueryRegistry, InMemoryBroker, JobId, LaneConfig, PendingUpdateTransport, QueryResult,
     ResetWorkflowResult, ScheduleStore, SignalWithStartResult, StartWorkflowResult,
-    TimerScannerConfig, TokeiraRuntime, UpdateOutcome, UpdateTransportResolution, UpdateWaitPolicy,
-    VersioningRuleStore, WorkerRegistry, WorkflowExecutionRef, WorkflowTimeoutScannerConfig,
+    TimerScannerConfig, TokeiraRuntime, UpdateLifecycleSnapshot, UpdateTransportResolution,
+    UpdateWaitPolicy, VersioningRuleStore, WorkerRegistry, WorkflowExecutionRef,
+    WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::InMemoryStore;
 use tokeira_types::{
@@ -252,7 +253,7 @@ impl WorkflowRuntimeApi for RecordingRuntime {
         _request: RequestContext,
         _timeout: Duration,
         _wait_policy: UpdateWaitPolicy,
-    ) -> Result<UpdateOutcome> {
+    ) -> Result<UpdateLifecycleSnapshot> {
         unreachable!()
     }
 
@@ -430,6 +431,13 @@ async fn seed_workflow(
             deployment: None,
             build_id: build_id.map(|value| BuildId(value.to_string())),
             versioning_override: None,
+            workflow_start_delay: None,
+            client_cron_schedule: None,
+            completion_callbacks: Vec::new(),
+            user_metadata: None,
+            links: Vec::new(),
+            on_conflict_options: None,
+            priority: None,
             attempt: 1,
             continued_execution_run_id: None,
             first_execution_run_id: None,

@@ -19,7 +19,9 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use time::OffsetDateTime;
-use tokeira_kernel::{Command, TimerDueRequest};
+use tokeira_kernel::{
+    Command, TimerDueRequest, WORKFLOW_START_DELAY_TIMER_ID, WorkflowStartDelayElapsedRequest,
+};
 use tokeira_storage::{DueTimer, RunRepository};
 use tokeira_types::{RunKey, ShardId, dsql_spread_uuid};
 use tokio_util::sync::CancellationToken;
@@ -67,6 +69,17 @@ pub(crate) fn pick_lane_for_run_key(
     debug_assert!(!lanes.is_empty());
     debug_assert_eq!(lanes.len(), lane_count.max(1));
     &lanes[lane_index_for_run_key(run_key, lane_count.max(1)) % lanes.len()]
+}
+
+fn command_for_due_timer(due: DueTimer, fired_at: OffsetDateTime) -> Command {
+    if due.timer_id == WORKFLOW_START_DELAY_TIMER_ID {
+        Command::WorkflowStartDelayElapsed(WorkflowStartDelayElapsedRequest { fired_at })
+    } else {
+        Command::TimerDue(TimerDueRequest {
+            timer_id: due.timer_id,
+            fired_at,
+        })
+    }
 }
 
 #[allow(dead_code)]
@@ -193,15 +206,10 @@ pub(crate) async fn run_timer_scanner<R>(
                 runtime_metrics::record_scanner_dispatched("timer", shard_id.0);
                 let lane = pick_lane_for_run_key(&lanes, lane_count, due.run_key).clone();
                 async move {
-                    lane.submit(
-                        due.run_key,
-                        Command::TimerDue(TimerDueRequest {
-                            timer_id: due.timer_id,
-                            fired_at,
-                        }),
-                    )
-                    .await
-                    .map(|_| ())
+                    let run_key = due.run_key;
+                    lane.submit(run_key, command_for_due_timer(due, fired_at))
+                        .await
+                        .map(|_| ())
                 }
             })
             .await;
@@ -257,6 +265,34 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         assert_eq!(lanes.len(), lane_count);
+    }
+
+    #[test]
+    fn delayed_start_timer_routes_to_internal_start_delay_command() {
+        let fired_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let run_key = RunKey::new();
+        let delayed = DueTimer {
+            run_key,
+            timer_id: WORKFLOW_START_DELAY_TIMER_ID.to_string(),
+        };
+        let user_timer = DueTimer {
+            run_key,
+            timer_id: "timer-1".to_string(),
+        };
+
+        assert!(matches!(
+            command_for_due_timer(delayed, fired_at),
+            Command::WorkflowStartDelayElapsed(WorkflowStartDelayElapsedRequest {
+                fired_at: observed
+            }) if observed == fired_at
+        ));
+        assert!(matches!(
+            command_for_due_timer(user_timer, fired_at),
+            Command::TimerDue(TimerDueRequest {
+                timer_id,
+                fired_at: observed
+            }) if timer_id == "timer-1" && observed == fired_at
+        ));
     }
 
     proptest! {

@@ -91,6 +91,13 @@ mod tests {
             deployment: None,
             build_id: None,
             versioning_override: None,
+            workflow_start_delay: None,
+            client_cron_schedule: None,
+            completion_callbacks: Vec::new(),
+            user_metadata: None,
+            links: Vec::new(),
+            on_conflict_options: None,
+            priority: None,
             input: Payloads::default(),
             header: None,
             memo: Memo::default(),
@@ -298,7 +305,7 @@ mod tests {
         let _ = runtime.start_workflow(req).await.unwrap();
         quiesce_workflow(&runtime, ns).await;
 
-        // After quiesce, the worker "w" has sticky affinity.
+        // Completing with sticky attrs keeps worker "w" as the query affinity target.
         // The query should carry that sticky hint.
         let broker = runtime.broker();
         let q = queue_for(ns);
@@ -566,10 +573,12 @@ mod tests {
                 token: started.token,
                 identity: WorkerIdentity("w".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: Some(time::Duration::seconds(30)),
                 commands: Vec::new(),
                 force_new_workflow_task: false,
                 now: OffsetDateTime::now_utc(),

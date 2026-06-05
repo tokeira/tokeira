@@ -42,6 +42,8 @@ pub fn history_event_to_proto(event: &HistoryEvent) -> history::HistoryEvent {
         event_time: Some(to_proto_timestamp(event.happened_at)),
         event_type: event_type_for_kind(&event.kind),
         attributes: Some(attributes_for_kind(event)),
+        user_metadata: event_user_metadata(event),
+        links: event_links(event),
         ..Default::default()
     }
 }
@@ -52,6 +54,124 @@ fn opt_run_id(r: &Option<tokeira_types::RunId>) -> String {
 
 fn opt_string(s: &Option<String>) -> String {
     s.clone().unwrap_or_default()
+}
+
+fn event_user_metadata(event: &HistoryEvent) -> Option<proto_sdk::UserMetadata> {
+    match &event.kind {
+        HistoryEventKind::WorkflowExecutionStarted { user_metadata, .. } => {
+            user_metadata.as_ref().map(user_metadata_to_proto)
+        }
+        _ => None,
+    }
+}
+
+fn event_links(event: &HistoryEvent) -> Vec<proto_common::Link> {
+    match &event.kind {
+        HistoryEventKind::WorkflowExecutionStarted { links, .. } => {
+            links.iter().map(link_to_proto).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn user_metadata_to_proto(metadata: &UserMetadata) -> proto_sdk::UserMetadata {
+    proto_sdk::UserMetadata {
+        summary: metadata.summary.as_ref().map(payload_from_domain),
+        details: metadata.details.as_ref().map(payload_from_domain),
+    }
+}
+
+fn link_to_proto(link: &Link) -> proto_common::Link {
+    use proto_common::link::Variant;
+    match link {
+        Link::WorkflowEvent {
+            namespace,
+            workflow_id,
+            run_id,
+            reference,
+        } => proto_common::Link {
+            variant: Some(Variant::WorkflowEvent(proto_common::link::WorkflowEvent {
+                namespace: namespace.clone(),
+                workflow_id: workflow_id.clone(),
+                run_id: run_id.clone(),
+                reference: reference.as_ref().map(link_reference_to_proto),
+            })),
+        },
+        Link::BatchJob { job_id } => proto_common::Link {
+            variant: Some(Variant::BatchJob(proto_common::link::BatchJob {
+                job_id: job_id.clone(),
+            })),
+        },
+        Link::Activity {
+            namespace,
+            activity_id,
+            run_id,
+        } => proto_common::Link {
+            variant: Some(Variant::Activity(proto_common::link::Activity {
+                namespace: namespace.clone(),
+                activity_id: activity_id.clone(),
+                run_id: run_id.clone(),
+            })),
+        },
+        Link::NexusOperation {
+            namespace,
+            operation_id,
+            run_id,
+        } => proto_common::Link {
+            variant: Some(Variant::NexusOperation(
+                proto_common::link::NexusOperation {
+                    namespace: namespace.clone(),
+                    operation_id: operation_id.clone(),
+                    run_id: run_id.clone(),
+                },
+            )),
+        },
+    }
+}
+
+fn link_reference_to_proto(
+    reference: &LinkWorkflowEventReference,
+) -> proto_common::link::workflow_event::Reference {
+    use proto_common::link::workflow_event::{EventReference, Reference, RequestIdReference};
+    match reference {
+        LinkWorkflowEventReference::Event {
+            event_id,
+            event_type,
+        } => Reference::EventRef(EventReference {
+            event_id: *event_id,
+            event_type: *event_type,
+        }),
+        LinkWorkflowEventReference::RequestId {
+            request_id,
+            event_type,
+        } => Reference::RequestIdRef(RequestIdReference {
+            request_id: request_id.clone(),
+            event_type: *event_type,
+        }),
+    }
+}
+
+fn completion_callback_to_proto(callback: &CompletionCallback) -> proto_common::Callback {
+    let variant = match &callback.spec {
+        CallbackSpec::Nexus { url, header } => Some(proto_common::callback::Variant::Nexus(
+            proto_common::callback::Nexus {
+                url: url.clone(),
+                header: header.clone(),
+            },
+        )),
+    };
+    proto_common::Callback {
+        variant,
+        links: callback.links.iter().map(link_to_proto).collect(),
+    }
+}
+
+fn priority_to_proto(priority: &Priority) -> proto_common::Priority {
+    proto_common::Priority {
+        priority_key: priority.priority_key,
+        fairness_key: priority.fairness_key.clone(),
+        fairness_weight: priority.fairness_weight,
+    }
 }
 
 fn marker_detail(value: &str) -> tokeira_types::Payloads {
@@ -173,10 +293,13 @@ use tokeira_kernel::{
     command::{
         ContinueAsNewInitiator, RetryState, WorkflowTaskFailedCause, WorkflowTaskTimeoutType,
     },
-    state::ParentClosePolicy,
+    state::{
+        CallbackSpec, CompletionCallback, Link, LinkWorkflowEventReference, ParentClosePolicy,
+        Priority, UserMetadata,
+    },
 };
 use tokeira_proto::public::temporal::api::{
-    common::v1 as proto_common, failure::v1 as proto_failure,
+    common::v1 as proto_common, failure::v1 as proto_failure, sdk::v1 as proto_sdk,
 };
 
 #[allow(clippy::too_many_lines)]
@@ -200,6 +323,10 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             task_queue,
             input,
             header,
+            workflow_start_delay,
+            completion_callbacks,
+            user_metadata: _,
+            links: _,
             memo,
             search_attributes,
             request_id: _,
@@ -223,6 +350,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             cron_schedule,
             versioning_info: _,
             worker_deployment_name: _,
+            priority,
         } => Attributes::WorkflowExecutionStartedEventAttributes(
             history::WorkflowExecutionStartedEventAttributes {
                 workflow_type: Some(proto_common::WorkflowType {
@@ -255,6 +383,12 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 workflow_task_timeout: Some(to_proto_duration(*workflow_task_timeout)),
                 identity: identity.clone(),
                 header: header.as_ref().map(headers_from_domain),
+                first_workflow_task_backoff: to_opt_proto_duration(*workflow_start_delay),
+                completion_callbacks: completion_callbacks
+                    .iter()
+                    .map(completion_callback_to_proto)
+                    .collect(),
+                priority: priority.as_ref().map(priority_to_proto),
                 ..Default::default()
             },
         ),
@@ -357,6 +491,8 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             initiator,
             failure,
             last_completion_result,
+            backoff_start_interval,
+            cron_schedule: _,
             workflow_task_completed_event_id,
         } => Attributes::WorkflowExecutionContinuedAsNewEventAttributes(
             history::WorkflowExecutionContinuedAsNewEventAttributes {
@@ -373,6 +509,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 initiator: continue_as_new_initiator_i32(initiator),
                 failure: failure.as_ref().map(payload_to_failure),
                 last_completion_result: last_completion_result.as_ref().map(payloads_from_domain),
+                backoff_start_interval: to_opt_proto_duration(*backoff_start_interval),
                 workflow_task_completed_event_id: *workflow_task_completed_event_id,
                 ..Default::default()
             },
@@ -438,6 +575,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             started_event_id,
             identity,
             sdk_metadata,
+            metering_metadata,
             worker_version,
             versioning_behavior,
             deployment_version,
@@ -450,6 +588,9 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 sdk_metadata: sdk_metadata.as_ref().and_then(|bytes| {
                     tokeira_proto::public::temporal::api::sdk::v1::WorkflowTaskCompletedMetadata::decode(bytes.as_slice()).ok()
                 }),
+                metering_metadata: metering_metadata
+                    .as_ref()
+                    .and_then(|bytes| proto_common::MeteringMetadata::decode(bytes.as_slice()).ok()),
                 worker_version: worker_version.as_ref().map(|build_id| {
                     proto_common::WorkerVersionStamp {
                         build_id: build_id.clone(),
@@ -1176,15 +1317,19 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
         HistoryEventKind::WorkflowExecutionOptionsUpdated {
             versioning_override,
             completion_callbacks,
+            attached_completion_callbacks,
+            attached_links,
             attached_request_id,
         } => {
             // The upstream proto only has `versioning_override`. `completion_callbacks`
-            // and `attached_request_id` are internal kernel fields with no proto
-            // representation. `VersioningOverride` is a placeholder type so we can't
-            // populate the proto field yet either.
+            // plus on-conflict attachment fields are internal kernel fields with
+            // no proto representation. `VersioningOverride` is a placeholder type
+            // so we can't populate the proto field yet either.
             let _ = (
                 versioning_override,
                 completion_callbacks,
+                attached_completion_callbacks,
+                attached_links,
                 attached_request_id,
             );
             Attributes::WorkflowExecutionOptionsUpdatedEventAttributes(
@@ -1328,6 +1473,8 @@ fn cancel_external_workflow_failed_cause_i32(cause: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use proptest::prelude::*;
     use prost::Message;
@@ -1335,7 +1482,7 @@ mod tests {
     use tokeira_kernel::{
         command::{ContinueAsNewInitiator, RetryState},
         event::{HistoryEvent, HistoryEventKind},
-        state::ParentClosePolicy,
+        state::{CallbackState, CallbackTrigger, ParentClosePolicy},
     };
     use tokeira_proto::conversions::common::failure_to_payload;
     use tokeira_types::{
@@ -1430,6 +1577,10 @@ mod tests {
                             task_queue: TaskQueueName(tq),
                             input,
                             header: None,
+                            workflow_start_delay: None,
+                            completion_callbacks: Vec::new(),
+                            user_metadata: None,
+                            links: Vec::new(),
                             memo: Memo::default(),
                             search_attributes: SearchAttributes::default(),
                             request_id: rid,
@@ -1453,6 +1604,7 @@ mod tests {
                             cron_schedule: None,
                             versioning_info: None,
                             worker_deployment_name: None,
+                            priority: None,
                         }
                     }
                 ),
@@ -1516,6 +1668,7 @@ mod tests {
                     started_event_id: started,
                     identity: WorkerIdentity("w".to_string()),
                     sdk_metadata: None,
+                    metering_metadata: None,
                     worker_version: None,
                     versioning_behavior: VersioningBehavior::Unspecified,
                     deployment_version: None,
@@ -1756,6 +1909,36 @@ mod tests {
     }
 
     #[test]
+    fn workflow_task_completed_serializes_metering_metadata() {
+        let metering = proto_common::MeteringMetadata {
+            nonfirst_local_activity_execution_attempts: 4,
+        };
+        let event = HistoryEvent {
+            event_id: 1,
+            happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
+            kind: HistoryEventKind::WorkflowTaskCompleted {
+                logical_seq: LogicalTaskSeq(1),
+                scheduled_event_id: 2,
+                started_event_id: 3,
+                identity: WorkerIdentity("worker".to_string()),
+                sdk_metadata: None,
+                metering_metadata: Some(metering.encode_to_vec()),
+                worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
+            },
+        };
+
+        match history_event_to_proto(&event).attributes.unwrap() {
+            Attributes::WorkflowTaskCompletedEventAttributes(attrs) => {
+                assert_eq!(attrs.metering_metadata, Some(metering));
+            }
+            other => panic!("unexpected attributes: {other:?}"),
+        }
+    }
+
+    #[test]
     fn workflow_started_golden_example() {
         let event = HistoryEvent {
             event_id: 1,
@@ -1765,6 +1948,10 @@ mod tests {
                 task_queue: TaskQueueName("default".to_string()),
                 input: Payloads::default(),
                 header: None,
+                workflow_start_delay: None,
+                completion_callbacks: Vec::new(),
+                user_metadata: None,
+                links: Vec::new(),
                 memo: Memo::default(),
                 search_attributes: SearchAttributes::default(),
                 request_id: "req-1".to_string(),
@@ -1788,6 +1975,7 @@ mod tests {
                 cron_schedule: None,
                 versioning_info: None,
                 worker_deployment_name: None,
+                priority: None,
             },
         };
         let proto = history_event_to_proto(&event);
@@ -1807,6 +1995,104 @@ mod tests {
     }
 
     #[test]
+    fn workflow_started_serializes_start_metadata_fields() {
+        let mut callback_header = BTreeMap::new();
+        callback_header.insert("x-callback".to_string(), "value".to_string());
+        let event = HistoryEvent {
+            event_id: 1,
+            happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
+            kind: HistoryEventKind::WorkflowExecutionStarted {
+                workflow_type: WorkflowType("MyWorkflow".to_string()),
+                task_queue: TaskQueueName("default".to_string()),
+                input: Payloads::default(),
+                header: None,
+                workflow_start_delay: Some(time::Duration::seconds(9)),
+                completion_callbacks: vec![CompletionCallback {
+                    spec: CallbackSpec::Nexus {
+                        url: "https://callback.example/run".to_string(),
+                        header: callback_header,
+                    },
+                    links: vec![Link::BatchJob {
+                        job_id: "batch-1".to_string(),
+                    }],
+                    trigger: CallbackTrigger::WorkflowClosed,
+                    registration_time: None,
+                    state: CallbackState::Standby,
+                    attempt: 0,
+                    last_attempt_failure: None,
+                }],
+                user_metadata: Some(UserMetadata {
+                    summary: Some(Payload::new(b"summary".to_vec())),
+                    details: Some(Payload::new(b"details".to_vec())),
+                }),
+                links: vec![Link::Activity {
+                    namespace: "default".to_string(),
+                    activity_id: "activity-1".to_string(),
+                    run_id: "run-1".to_string(),
+                }],
+                memo: Memo::default(),
+                search_attributes: SearchAttributes::default(),
+                request_id: "req-1".to_string(),
+                identity: "client".to_string(),
+                continued_execution_run_id: None,
+                first_execution_run_id: None,
+                retry_policy: None,
+                attempt: 1,
+                workflow_execution_timeout: None,
+                workflow_run_timeout: None,
+                workflow_task_timeout: time::Duration::seconds(10),
+                parent_workflow_id: None,
+                parent_run_id: None,
+                parent_namespace_id: None,
+                parent_initiated_event_id: 0,
+                root_workflow_id: None,
+                root_run_id: None,
+                original_execution_run_id: None,
+                continued_failure: None,
+                last_completion_result: None,
+                cron_schedule: None,
+                versioning_info: None,
+                worker_deployment_name: None,
+                priority: Some(Priority {
+                    priority_key: 2,
+                    fairness_key: "tenant-a".to_string(),
+                    fairness_weight: 1.5,
+                }),
+            },
+        };
+
+        let proto = history_event_to_proto(&event);
+        assert_eq!(
+            proto
+                .user_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.summary.as_ref())
+                .map(|payload| payload.data.as_slice()),
+            Some(&b"summary"[..])
+        );
+        assert_eq!(proto.links.len(), 1);
+        match proto.attributes.unwrap() {
+            Attributes::WorkflowExecutionStartedEventAttributes(attrs) => {
+                assert_eq!(attrs.first_workflow_task_backoff.unwrap().seconds, 9);
+                assert_eq!(attrs.completion_callbacks.len(), 1);
+                assert_eq!(
+                    attrs.completion_callbacks[0]
+                        .links
+                        .first()
+                        .and_then(|link| link.variant.as_ref())
+                        .is_some(),
+                    true
+                );
+                let priority = attrs.priority.unwrap();
+                assert_eq!(priority.priority_key, 2);
+                assert_eq!(priority.fairness_key, "tenant-a");
+                assert_eq!(priority.fairness_weight, 1.5);
+            }
+            other => panic!("unexpected attributes: {other:?}"),
+        }
+    }
+
+    #[test]
     fn cron_schedule_field_set() {
         let event = HistoryEvent {
             event_id: 1,
@@ -1816,6 +2102,10 @@ mod tests {
                 task_queue: TaskQueueName("default".to_string()),
                 input: Payloads::default(),
                 header: None,
+                workflow_start_delay: None,
+                completion_callbacks: Vec::new(),
+                user_metadata: None,
+                links: Vec::new(),
                 memo: Memo::default(),
                 search_attributes: SearchAttributes::default(),
                 request_id: "req-1".to_string(),
@@ -1839,6 +2129,7 @@ mod tests {
                 cron_schedule: Some("schedule-a".to_string()),
                 versioning_info: None,
                 worker_deployment_name: None,
+                priority: None,
             },
         };
 
@@ -1860,6 +2151,10 @@ mod tests {
                 task_queue: TaskQueueName("default".to_string()),
                 input: Payloads::default(),
                 header: None,
+                workflow_start_delay: None,
+                completion_callbacks: Vec::new(),
+                user_metadata: None,
+                links: Vec::new(),
                 memo: Memo::default(),
                 search_attributes: SearchAttributes::default(),
                 request_id: "req-1".to_string(),
@@ -1883,6 +2178,7 @@ mod tests {
                 cron_schedule: None,
                 versioning_info: None,
                 worker_deployment_name: None,
+                priority: None,
             },
         };
 
@@ -2447,6 +2743,10 @@ mod tests {
                 task_queue: TaskQueueName("q".to_string()),
                 input: Payloads::default(),
                 header: None,
+                workflow_start_delay: None,
+                completion_callbacks: Vec::new(),
+                user_metadata: None,
+                links: Vec::new(),
                 memo: Memo::default(),
                 search_attributes: SearchAttributes::default(),
                 request_id: "r".to_string(),
@@ -2470,6 +2770,7 @@ mod tests {
                 cron_schedule: None,
                 versioning_info: None,
                 worker_deployment_name: None,
+                priority: None,
             },
         }
     }
@@ -2593,6 +2894,8 @@ mod tests {
                     initiator: ContinueAsNewInitiator::Workflow,
                     failure: failure.clone(),
                     last_completion_result: last_result.clone(),
+                    backoff_start_interval: None,
+                    cron_schedule: None,
                 },
             };
             let proto = history_event_to_proto(&event);

@@ -97,6 +97,10 @@ pub fn poll_activity_response(
         run_key: started.run_key,
         header: started.header,
         retry_policy: started.retry_policy,
+        heartbeat_details: started.heartbeat_details,
+        scheduled_time: Some(started.scheduled_time),
+        current_attempt_scheduled_time: started.current_attempt_scheduled_time,
+        started_time: Some(started.started_time),
         schedule_to_close_timeout: started
             .schedule_to_close_timeout
             .and_then(|d| d.try_into().ok()),
@@ -199,12 +203,9 @@ pub fn query_response(
 }
 
 pub fn update_response(
-    outcome: tokeira_runtime::UpdateOutcome,
+    snapshot: tokeira_runtime::UpdateLifecycleSnapshot,
 ) -> crate::translate::UpdateWorkflowExecutionResponse {
-    let dto = match outcome {
-        tokeira_runtime::UpdateOutcome::Accepted { accepted_event_id } => {
-            crate::translate::UpdateOutcomeDto::Accepted { accepted_event_id }
-        }
+    let outcome = snapshot.outcome.map(|outcome| match outcome {
         tokeira_runtime::UpdateOutcome::Completed {
             accepted_event_id,
             result,
@@ -219,6 +220,31 @@ pub fn update_response(
             accepted_event_id,
             failure,
         },
-    };
-    crate::translate::UpdateWorkflowExecutionResponse { outcome: dto }
+    });
+    crate::translate::UpdateWorkflowExecutionResponse {
+        update_ref: crate::translate::UpdateRefDto {
+            workflow_id: snapshot.workflow_execution.workflow_id.0,
+            run_id: snapshot
+                .workflow_execution
+                .run_id
+                .map(|run_id| run_id.0.to_string())
+                .unwrap_or_default(),
+            update_id: snapshot.update_id,
+        },
+        stage: match snapshot.stage {
+            tokeira_runtime::UpdateLifecycleStage::Unspecified => {
+                crate::translate::UpdateLifecycleStageDto::Unspecified
+            }
+            tokeira_runtime::UpdateLifecycleStage::Admitted => {
+                crate::translate::UpdateLifecycleStageDto::Admitted
+            }
+            tokeira_runtime::UpdateLifecycleStage::Accepted => {
+                crate::translate::UpdateLifecycleStageDto::Accepted
+            }
+            tokeira_runtime::UpdateLifecycleStage::Completed => {
+                crate::translate::UpdateLifecycleStageDto::Completed
+            }
+        },
+        outcome,
+    }
 }

@@ -481,6 +481,141 @@ pub fn compute_next_times(
     out
 }
 
+/// Compute the first-WFT delay for a client-authored cron start.
+///
+/// Temporal converts `StartWorkflowExecutionRequest.cron_schedule` into
+/// `FirstWorkflowTaskBackoff` before history is written
+/// (`common/util.go:550 @ v1.31.0`). Tokeira uses the same observable shape by
+/// feeding this delay into the existing durable delayed-start timer path.
+pub fn cron_initial_backoff(cron: &str, now: OffsetDateTime) -> Result<Duration, ScheduleError> {
+    let spec = compile_standard_cron(cron)?;
+    let next_minute = now.unix_timestamp() - i64::from(now.second()) + 60;
+    let mut candidate = OffsetDateTime::from_unix_timestamp(next_minute)
+        .map_err(|_| ScheduleError::InvalidArgument("invalid CronSchedule.".to_string()))?;
+    let end = now + Duration::days(366);
+    while candidate <= end {
+        if calendar_matches(&spec, candidate) {
+            return Ok(candidate - now);
+        }
+        candidate += Duration::minutes(1);
+    }
+    Err(ScheduleError::InvalidArgument(
+        "invalid CronSchedule, no time can be found to satisfy the schedule".to_string(),
+    ))
+}
+
+fn compile_standard_cron(cron: &str) -> Result<StructuredCalendarSpec, ScheduleError> {
+    let fields: Vec<_> = cron
+        .split('#')
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .collect();
+    let fields = match fields.as_slice() {
+        ["@hourly"] => vec!["0", "0", "*", "*", "*", "*", "*"],
+        ["@daily"] => vec!["0", "0", "0", "*", "*", "*", "*"],
+        ["@weekly"] => vec!["0", "0", "0", "*", "*", "0", "*"],
+        ["@monthly"] => vec!["0", "0", "0", "1", "*", "*", "*"],
+        ["@yearly"] | ["@annually"] => vec!["0", "0", "0", "1", "1", "*", "*"],
+        [minute, hour, day_of_month, month, day_of_week] => {
+            vec![
+                "0",
+                *minute,
+                *hour,
+                *day_of_month,
+                *month,
+                *day_of_week,
+                "*",
+            ]
+        }
+        _ => {
+            return Err(ScheduleError::InvalidArgument(
+                "invalid CronSchedule.".to_string(),
+            ));
+        }
+    };
+    Ok(StructuredCalendarSpec {
+        second: parse_cron_field(fields[0], 0, 59)?,
+        minute: parse_cron_field(fields[1], 0, 59)?,
+        hour: parse_cron_field(fields[2], 0, 23)?,
+        day_of_month: parse_cron_field(fields[3], 1, 31)?,
+        month: parse_cron_field(fields[4], 1, 12)?,
+        day_of_week: parse_cron_field(fields[5], 0, 6)?,
+        year: parse_cron_field(fields[6], 1970, 9999)?,
+        comment: cron.to_string(),
+    })
+}
+
+fn parse_cron_field(value: &str, min: i32, max: i32) -> Result<Vec<Range>, ScheduleError> {
+    if value == "*" {
+        return Ok(vec![Range {
+            start: min,
+            end: max,
+            step: 1,
+        }]);
+    }
+    value
+        .split(',')
+        .map(|part| {
+            let (base, step) = match part.split_once('/') {
+                Some((base, step)) => {
+                    let step = step.parse::<i32>().map_err(|_| {
+                        ScheduleError::InvalidArgument("invalid CronSchedule.".to_string())
+                    })?;
+                    if step <= 0 {
+                        return Err(ScheduleError::InvalidArgument(
+                            "invalid CronSchedule.".to_string(),
+                        ));
+                    }
+                    (base, step)
+                }
+                None => (part, 1),
+            };
+            let (start, end) = match base.split_once('-') {
+                Some((start, end)) => (parse_cron_value(start)?, parse_cron_value(end)?),
+                None if base == "*" => (min, max),
+                None => {
+                    let value = parse_cron_value(base)?;
+                    (value, value)
+                }
+            };
+            if start < min || end > max || start > end {
+                return Err(ScheduleError::InvalidArgument(
+                    "invalid CronSchedule.".to_string(),
+                ));
+            }
+            Ok(Range { start, end, step })
+        })
+        .collect()
+}
+
+fn parse_cron_value(value: &str) -> Result<i32, ScheduleError> {
+    match value.to_ascii_lowercase().as_str() {
+        "sun" | "sunday" => Ok(0),
+        "mon" | "monday" => Ok(1),
+        "tue" | "tuesday" => Ok(2),
+        "wed" | "wednesday" => Ok(3),
+        "thu" | "thursday" => Ok(4),
+        "fri" | "friday" => Ok(5),
+        "sat" | "saturday" => Ok(6),
+        "jan" | "january" => Ok(1),
+        "feb" | "february" => Ok(2),
+        "mar" | "march" => Ok(3),
+        "apr" | "april" => Ok(4),
+        "may" => Ok(5),
+        "jun" | "june" => Ok(6),
+        "jul" | "july" => Ok(7),
+        "aug" | "august" => Ok(8),
+        "sep" | "september" => Ok(9),
+        "oct" | "october" => Ok(10),
+        "nov" | "november" => Ok(11),
+        "dec" | "december" => Ok(12),
+        other => other
+            .parse()
+            .map_err(|_| ScheduleError::InvalidArgument("invalid CronSchedule.".to_string())),
+    }
+}
+
 /// Enumerate every firing time the spec matches within `[range_start,
 /// range_end]`.
 ///
@@ -959,6 +1094,12 @@ where
         deployment: None,
         build_id,
         versioning_override: None,
+        workflow_start_delay: None,
+        completion_callbacks: Vec::new(),
+        user_metadata: None,
+        links: Vec::new(),
+        on_conflict_options: None,
+        priority: None,
         attempt: 1,
         continued_execution_run_id: None,
         first_execution_run_id: Some(run_id),
@@ -979,6 +1120,7 @@ where
             received_at: actual_time,
         },
         now: actual_time,
+        client_cron_schedule: None,
         cron_schedule: Some(schedule_id.0.clone()),
         reserved_poller_identity: None,
     };
@@ -1294,6 +1436,34 @@ mod tests {
         );
 
         assert!(times.is_empty());
+    }
+
+    #[test]
+    fn client_cron_initial_backoff_targets_next_matching_minute() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let every_minute = cron_initial_backoff("* * * * *", now).unwrap();
+        assert_eq!(
+            now + every_minute,
+            OffsetDateTime::from_unix_timestamp(1_700_000_040).unwrap()
+        );
+
+        let hourly = cron_initial_backoff("@hourly", now).unwrap();
+        assert_eq!(
+            now + hourly,
+            OffsetDateTime::from_unix_timestamp(1_700_002_800).unwrap()
+        );
+    }
+
+    #[test]
+    fn client_cron_initial_backoff_rejects_invalid_or_unsatisfiable_specs() {
+        assert!(matches!(
+            cron_initial_backoff("invalid-cron-spec", OffsetDateTime::UNIX_EPOCH),
+            Err(ScheduleError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            cron_initial_backoff("0 0 31 2 *", OffsetDateTime::UNIX_EPOCH),
+            Err(ScheduleError::InvalidArgument(_))
+        ));
     }
 
     #[test]

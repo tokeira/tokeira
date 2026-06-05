@@ -6,8 +6,8 @@ use tokeira_kernel::{
     StartRequest, UpdateProtocolBody, WorkflowCommand, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, UpdateOutcome, UpdateWaitPolicy,
-    WorkflowTimeoutScannerConfig,
+    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, UpdateLifecycleError,
+    UpdateLifecycleStage, UpdateOutcome, UpdateWaitPolicy, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -50,10 +50,12 @@ async fn update_completed_notifies_waiting_caller() -> Result<()> {
             token: task.token,
             identity: WorkerIdentity("worker-a".into()),
             sdk_metadata: None,
+            metering_metadata: None,
             worker_version: None,
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
+            sticky_ttl: None,
             commands: vec![
                 WorkflowCommand::ProtocolMessage {
                     message_id: "msg-accept-update-1".into(),
@@ -74,12 +76,13 @@ async fn update_completed_notifies_waiting_caller() -> Result<()> {
         .await?;
 
     let outcome = caller.await.unwrap()?;
+    assert_eq!(outcome.stage, UpdateLifecycleStage::Completed);
     assert_eq!(
-        outcome,
-        UpdateOutcome::Completed {
-            accepted_event_id: 0,
+        outcome.outcome,
+        Some(UpdateOutcome::Completed {
+            accepted_event_id: 5,
             result: payloads("done"),
-        }
+        })
     );
     Ok(())
 }
@@ -119,10 +122,12 @@ async fn update_rejected_notifies_waiting_caller() -> Result<()> {
             token: task.token,
             identity: WorkerIdentity("worker-a".into()),
             sdk_metadata: None,
+            metering_metadata: None,
             worker_version: None,
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
+            sticky_ttl: None,
             commands: vec![
                 WorkflowCommand::ProtocolMessage {
                     message_id: "msg-accept-update-1".into(),
@@ -143,13 +148,389 @@ async fn update_rejected_notifies_waiting_caller() -> Result<()> {
         .await?;
 
     let outcome = caller.await.unwrap()?;
+    assert_eq!(outcome.stage, UpdateLifecycleStage::Completed);
     assert_eq!(
-        outcome,
-        UpdateOutcome::Rejected {
+        outcome.outcome,
+        Some(UpdateOutcome::Rejected {
             accepted_event_id: 0,
             failure: payload("nope"),
-        }
+        })
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_accepted_wait_returns_stage_without_outcome() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = Arc::new(make_runtime(store.clone()));
+    let namespace_id = NamespaceId::new();
+    let workflow_id = WorkflowId("update-accepted".into());
+    let run_key = start_workflow(&runtime, namespace_id, workflow_id.clone(), "queue-a").await?;
+
+    let runtime_for_update = runtime.clone();
+    let workflow_id_for_update = workflow_id.clone();
+    let caller = tokio::spawn(async move {
+        runtime_for_update
+            .update_workflow(
+                ExecutionRef {
+                    namespace_id,
+                    workflow_id: workflow_id_for_update,
+                    run_id: None,
+                },
+                "update-1".into(),
+                "accept-only".into(),
+                payloads("input"),
+                request_context("update-1"),
+                Duration::milliseconds(200),
+                UpdateWaitPolicy::Accepted,
+            )
+            .await
+    });
+
+    wait_for_pending_update(&*store, run_key, "update-1").await?;
+    let task = poll_wft(&runtime, workflow_queue(namespace_id, "queue-a")).await?;
+    runtime
+        .complete_workflow_task(WorkflowTaskCompletedRequest {
+            token: task.token,
+            identity: WorkerIdentity("worker-a".into()),
+            sdk_metadata: None,
+            metering_metadata: None,
+            worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
+            sticky_ttl: None,
+            commands: vec![WorkflowCommand::ProtocolMessage {
+                message_id: "msg-accept-update-1".into(),
+                body: UpdateProtocolBody::Accepted {
+                    update_id: "update-1".into(),
+                    update_name: "accept-only".into(),
+                    input: payloads("input"),
+                },
+            }],
+            force_new_workflow_task: false,
+            now: OffsetDateTime::now_utc(),
+        })
+        .await?;
+
+    let snapshot = caller.await.unwrap()?;
+    let state = match store.load_run(run_key).await? {
+        tokeira_kernel::LoadedRun::Existing(state) => state,
+        tokeira_kernel::LoadedRun::Absent => anyhow::bail!("run disappeared"),
+    };
+    assert_eq!(snapshot.stage, UpdateLifecycleStage::Accepted);
+    assert!(snapshot.outcome.is_none());
+    assert_eq!(snapshot.update_id, "update-1");
+    assert_eq!(snapshot.update_name, "accept-only");
+    assert_eq!(snapshot.workflow_execution.run_id, Some(state.run_id));
+    Ok(())
+}
+
+#[tokio::test]
+async fn poll_update_reports_current_stage_and_unknown_not_found() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = make_runtime(store.clone());
+    let namespace_id = NamespaceId::new();
+    let workflow_id = WorkflowId("update-poll-current".into());
+    let run_key = start_workflow(&runtime, namespace_id, workflow_id.clone(), "queue-a").await?;
+
+    let admitted = runtime
+        .update_workflow(
+            ExecutionRef {
+                namespace_id,
+                workflow_id: workflow_id.clone(),
+                run_id: None,
+            },
+            "update-1".into(),
+            "current-stage".into(),
+            payloads("input"),
+            request_context("update-1"),
+            Duration::milliseconds(200),
+            UpdateWaitPolicy::Admitted,
+        )
+        .await?;
+    assert_eq!(admitted.stage, UpdateLifecycleStage::Admitted);
+
+    let unspecified = runtime
+        .poll_workflow_update(
+            admitted.workflow_execution.clone(),
+            "update-1".into(),
+            UpdateWaitPolicy::Unspecified,
+            Duration::milliseconds(200),
+        )
+        .await?;
+    assert_eq!(unspecified.stage, UpdateLifecycleStage::Admitted);
+
+    let admitted_poll = runtime
+        .poll_workflow_update(
+            admitted.workflow_execution.clone(),
+            "update-1".into(),
+            UpdateWaitPolicy::Admitted,
+            Duration::milliseconds(200),
+        )
+        .await?;
+    assert_eq!(admitted_poll.stage, UpdateLifecycleStage::Admitted);
+
+    let error = runtime
+        .poll_workflow_update(
+            admitted.workflow_execution,
+            "missing-update".into(),
+            UpdateWaitPolicy::Unspecified,
+            Duration::milliseconds(200),
+        )
+        .await
+        .expect_err("unknown update should be reported as not found");
+    let lifecycle_error = error
+        .downcast_ref::<UpdateLifecycleError>()
+        .expect("unknown update should use lifecycle error");
+    assert!(matches!(
+        lifecycle_error,
+        UpdateLifecycleError::UpdateNotFound { run_key: key, update_id }
+            if *key == run_key && update_id == "missing-update"
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn poll_update_waits_for_history_stage_or_returns_reached_stage() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = Arc::new(make_runtime(store.clone()));
+    let namespace_id = NamespaceId::new();
+    let workflow_id = WorkflowId("update-poll-history".into());
+    let run_key = start_workflow(&runtime, namespace_id, workflow_id.clone(), "queue-a").await?;
+
+    let runtime_for_update = runtime.clone();
+    let workflow_id_for_update = workflow_id.clone();
+    let caller = tokio::spawn(async move {
+        runtime_for_update
+            .update_workflow(
+                ExecutionRef {
+                    namespace_id,
+                    workflow_id: workflow_id_for_update,
+                    run_id: None,
+                },
+                "update-1".into(),
+                "history-stage".into(),
+                payloads("input"),
+                request_context("update-1"),
+                Duration::milliseconds(200),
+                UpdateWaitPolicy::Accepted,
+            )
+            .await
+    });
+
+    wait_for_pending_update(&*store, run_key, "update-1").await?;
+    let task = poll_wft(&runtime, workflow_queue(namespace_id, "queue-a")).await?;
+    runtime
+        .complete_workflow_task(WorkflowTaskCompletedRequest {
+            token: task.token,
+            identity: WorkerIdentity("worker-a".into()),
+            sdk_metadata: None,
+            metering_metadata: None,
+            worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
+            sticky_ttl: None,
+            commands: vec![WorkflowCommand::ProtocolMessage {
+                message_id: "msg-accept-update-1".into(),
+                body: UpdateProtocolBody::Accepted {
+                    update_id: "update-1".into(),
+                    update_name: "history-stage".into(),
+                    input: payloads("input"),
+                },
+            }],
+            force_new_workflow_task: false,
+            now: OffsetDateTime::now_utc(),
+        })
+        .await?;
+
+    let accepted = caller.await.unwrap()?;
+    let accepted_poll = runtime
+        .poll_workflow_update(
+            accepted.workflow_execution.clone(),
+            "update-1".into(),
+            UpdateWaitPolicy::Accepted,
+            Duration::milliseconds(200),
+        )
+        .await?;
+    assert_eq!(accepted_poll.stage, UpdateLifecycleStage::Accepted);
+
+    let completed_poll = runtime
+        .poll_workflow_update(
+            accepted.workflow_execution,
+            "update-1".into(),
+            UpdateWaitPolicy::Completed,
+            Duration::milliseconds(1),
+        )
+        .await?;
+    assert_eq!(completed_poll.stage, UpdateLifecycleStage::Accepted);
+    assert!(completed_poll.outcome.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_update_outcome_survives_runtime_recreation() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = Arc::new(make_runtime(store.clone()));
+    let namespace_id = NamespaceId::new();
+    let workflow_id = WorkflowId("update-restart-outcome".into());
+    let run_key = start_workflow(&runtime, namespace_id, workflow_id.clone(), "queue-a").await?;
+
+    let admitted = runtime
+        .update_workflow(
+            ExecutionRef {
+                namespace_id,
+                workflow_id: workflow_id.clone(),
+                run_id: None,
+            },
+            "update-1".into(),
+            "restart-success".into(),
+            payloads("input"),
+            request_context("update-1"),
+            Duration::milliseconds(200),
+            UpdateWaitPolicy::Admitted,
+        )
+        .await?;
+    assert_eq!(admitted.stage, UpdateLifecycleStage::Admitted);
+
+    let task = poll_wft(&runtime, workflow_queue(namespace_id, "queue-a")).await?;
+    runtime
+        .complete_workflow_task(WorkflowTaskCompletedRequest {
+            token: task.token,
+            identity: WorkerIdentity("worker-a".into()),
+            sdk_metadata: None,
+            metering_metadata: None,
+            worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
+            sticky_ttl: None,
+            commands: vec![
+                WorkflowCommand::ProtocolMessage {
+                    message_id: "msg-accept-update-1".into(),
+                    body: UpdateProtocolBody::Accepted {
+                        update_id: "update-1".into(),
+                        update_name: "restart-success".into(),
+                        input: payloads("input"),
+                    },
+                },
+                WorkflowCommand::UpdateCompleted {
+                    update_id: "update-1".into(),
+                    result: payloads("survived"),
+                },
+            ],
+            force_new_workflow_task: false,
+            now: OffsetDateTime::now_utc(),
+        })
+        .await?;
+
+    let before_restart = runtime
+        .poll_workflow_update(
+            admitted.workflow_execution.clone(),
+            "update-1".into(),
+            UpdateWaitPolicy::Completed,
+            Duration::milliseconds(200),
+        )
+        .await?;
+    let restarted_runtime = make_runtime(store.clone());
+    let after_restart = restarted_runtime
+        .poll_workflow_update(
+            admitted.workflow_execution,
+            "update-1".into(),
+            UpdateWaitPolicy::Completed,
+            Duration::milliseconds(200),
+        )
+        .await?;
+    assert_eq!(after_restart, before_restart);
+    assert_eq!(
+        after_restart.outcome,
+        Some(UpdateOutcome::Completed {
+            accepted_event_id: 5,
+            result: payloads("survived"),
+        })
+    );
+
+    let history = store.read_history(run_key, 0, usize::MAX).await?;
+    let terminal_events = history
+        .iter()
+        .filter(|event| {
+            matches!(
+                &event.kind,
+                tokeira_kernel::HistoryEventKind::WorkflowExecutionUpdateCompleted {
+                    update_id,
+                    ..
+                } if update_id == "update-1"
+            )
+        })
+        .count();
+    assert_eq!(terminal_events, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn poll_update_is_read_only_for_known_and_unknown_updates() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = make_runtime(store.clone());
+    let namespace_id = NamespaceId::new();
+    let workflow_id = WorkflowId("update-poll-read-only".into());
+    let run_key = start_workflow(&runtime, namespace_id, workflow_id.clone(), "queue-a").await?;
+
+    let admitted = runtime
+        .update_workflow(
+            ExecutionRef {
+                namespace_id,
+                workflow_id,
+                run_id: None,
+            },
+            "update-1".into(),
+            "read-only".into(),
+            payloads("input"),
+            request_context("update-1"),
+            Duration::milliseconds(200),
+            UpdateWaitPolicy::Admitted,
+        )
+        .await?;
+    assert_eq!(admitted.stage, UpdateLifecycleStage::Admitted);
+
+    let before_state = match store.load_run(run_key).await? {
+        tokeira_kernel::LoadedRun::Existing(state) => state,
+        tokeira_kernel::LoadedRun::Absent => anyhow::bail!("run disappeared"),
+    };
+    let before_history = store.read_history(run_key, 0, usize::MAX).await?;
+
+    let current = runtime
+        .poll_workflow_update(
+            admitted.workflow_execution.clone(),
+            "update-1".into(),
+            UpdateWaitPolicy::Unspecified,
+            Duration::milliseconds(200),
+        )
+        .await?;
+    assert_eq!(current.stage, UpdateLifecycleStage::Admitted);
+
+    let unknown_error = runtime
+        .poll_workflow_update(
+            admitted.workflow_execution,
+            "missing-update".into(),
+            UpdateWaitPolicy::Unspecified,
+            Duration::milliseconds(200),
+        )
+        .await
+        .expect_err("unknown update should be not found");
+    assert!(matches!(
+        unknown_error.downcast_ref::<UpdateLifecycleError>(),
+        Some(UpdateLifecycleError::UpdateNotFound { update_id, .. })
+            if update_id == "missing-update"
+    ));
+
+    let after_state = match store.load_run(run_key).await? {
+        tokeira_kernel::LoadedRun::Existing(state) => state,
+        tokeira_kernel::LoadedRun::Absent => anyhow::bail!("run disappeared"),
+    };
+    let after_history = store.read_history(run_key, 0, usize::MAX).await?;
+    assert_eq!(after_state, before_state);
+    assert_eq!(after_history, before_history);
     Ok(())
 }
 
@@ -161,7 +542,7 @@ async fn update_timeout_does_not_block_late_completion_commit() -> Result<()> {
     let workflow_id = WorkflowId("update-timeout".into());
     let run_key = start_workflow(&runtime, namespace_id, workflow_id.clone(), "queue-a").await?;
 
-    let error = runtime
+    let snapshot = runtime
         .update_workflow(
             ExecutionRef {
                 namespace_id,
@@ -176,8 +557,9 @@ async fn update_timeout_does_not_block_late_completion_commit() -> Result<()> {
             UpdateWaitPolicy::Completed,
         )
         .await
-        .expect_err("update should time out");
-    assert!(error.to_string().contains("timed out"));
+        .expect("server soft timeout should return the reached stage");
+    assert_eq!(snapshot.stage, UpdateLifecycleStage::Admitted);
+    assert!(snapshot.outcome.is_none());
 
     wait_for_pending_update(&*store, run_key, "update-1").await?;
     let task = poll_wft(&runtime, workflow_queue(namespace_id, "queue-a")).await?;
@@ -186,10 +568,12 @@ async fn update_timeout_does_not_block_late_completion_commit() -> Result<()> {
             token: task.token,
             identity: WorkerIdentity("worker-a".into()),
             sdk_metadata: None,
+            metering_metadata: None,
             worker_version: None,
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
+            sticky_ttl: None,
             commands: vec![
                 WorkflowCommand::ProtocolMessage {
                     message_id: "msg-accept-update-1".into(),
@@ -260,10 +644,12 @@ async fn run_close_notifies_waiting_update_callers() -> Result<()> {
             token: task.token,
             identity: WorkerIdentity("worker-a".into()),
             sdk_metadata: None,
+            metering_metadata: None,
             worker_version: None,
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
+            sticky_ttl: None,
             commands: vec![WorkflowCommand::CompleteWorkflow {
                 result: payloads("closed"),
             }],
@@ -340,10 +726,12 @@ async fn multiple_updates_resolved_in_single_wft() -> Result<()> {
             token: task.token,
             identity: WorkerIdentity("worker-a".into()),
             sdk_metadata: None,
+            metering_metadata: None,
             worker_version: None,
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
+            sticky_ttl: None,
             commands: vec![
                 WorkflowCommand::ProtocolMessage {
                     message_id: "msg-accept-update-1".into(),
@@ -380,8 +768,9 @@ async fn multiple_updates_resolved_in_single_wft() -> Result<()> {
 
     // Both callers should receive their respective
     // results independently.
-    match outcome1 {
-        UpdateOutcome::Completed { result, .. } => {
+    assert_eq!(outcome1.stage, UpdateLifecycleStage::Completed);
+    match outcome1.outcome {
+        Some(UpdateOutcome::Completed { result, .. }) => {
             assert_eq!(result, payloads("result-1"));
         }
         other => panic!(
@@ -389,8 +778,9 @@ async fn multiple_updates_resolved_in_single_wft() -> Result<()> {
              {other:?}"
         ),
     }
-    match outcome2 {
-        UpdateOutcome::Completed { result, .. } => {
+    assert_eq!(outcome2.stage, UpdateLifecycleStage::Completed);
+    match outcome2.outcome {
+        Some(UpdateOutcome::Completed { result, .. }) => {
             assert_eq!(result, payloads("result-2"));
         }
         other => panic!(
@@ -430,6 +820,13 @@ async fn start_workflow(
             deployment: None,
             build_id: None,
             versioning_override: None,
+            workflow_start_delay: None,
+            client_cron_schedule: None,
+            completion_callbacks: Vec::new(),
+            user_metadata: None,
+            links: Vec::new(),
+            on_conflict_options: None,
+            priority: None,
             input: Payloads::default(),
             header: None,
             memo: Memo::default(),

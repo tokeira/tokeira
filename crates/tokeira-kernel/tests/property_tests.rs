@@ -5,17 +5,18 @@ use prost::Message;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     ActivityOp, ActivityPauseInfo, ActivityResolution, ActivityResolvedRequest, ActivityState,
-    BasicKernel, CancelRequest, ChildResolution, ChildResolvedRequest, ChildStartConfirmedRequest,
-    ChildStartResult, ChildWorkflowState, Command, CompletionCallback,
-    ContinueAsNewVersioningBehavior, DispatchOp, ExternalCancelResolvedRequest,
-    ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult,
-    ExternalWorkflowExecution, FieldChange, LoadedRun, NexusOperationResolvedRequest,
-    NexusResolution, ParentClosePolicy, PauseActivityRequest, PauseInfo, PauseWorkflowRequest,
-    PendingExternalCancel, PendingExternalSignal, PendingNexusOperation, PendingUpdate,
-    PendingWorkflowTask, ReplayContext, RequestDedupeOp, ResetActivityRequest, ResetRequest,
-    RetryState, SignalRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest,
-    TimerDueRequest, TimerOp, TimerState, UnpauseActivityRequest, UnpauseWorkflowRequest,
-    UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest,
+    BasicKernel, CallbackSpec, CallbackState, CallbackTrigger, CancelRequest, ChildResolution,
+    ChildResolvedRequest, ChildStartConfirmedRequest, ChildStartResult, ChildWorkflowState,
+    Command, CompletionCallback, ContinueAsNewVersioningBehavior, DispatchOp,
+    ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
+    ExternalSignalResult, ExternalWorkflowExecution, FieldChange, Link, LoadedRun,
+    NexusOperationResolvedRequest, NexusResolution, ParentClosePolicy, PauseActivityRequest,
+    PauseInfo, PauseWorkflowRequest, PendingExternalCancel, PendingExternalSignal,
+    PendingNexusOperation, PendingUpdate, PendingWorkflowTask, Priority, ReplayContext,
+    RequestDedupeOp, ResetActivityRequest, ResetRequest, RetryState, SignalRequest, StartRequest,
+    StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerOp, TimerState,
+    UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
+    UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, UserMetadata,
     VersioningBehavior, VersioningOverride, WorkerDeploymentVersionRef, WorkflowCommand,
     WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
     WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
@@ -75,6 +76,47 @@ fn sample_retry_policy() -> RetryPolicy {
     }
 }
 
+fn completion_callback() -> CompletionCallback {
+    CompletionCallback {
+        spec: CallbackSpec::Nexus {
+            url: "https://callback.example/run".into(),
+            header: BTreeMap::new(),
+        },
+        links: Vec::new(),
+        trigger: CallbackTrigger::WorkflowClosed,
+        registration_time: None,
+        state: CallbackState::Standby,
+        attempt: 0,
+        last_attempt_failure: None,
+    }
+}
+
+fn stamp_callbacks(
+    callbacks: impl IntoIterator<Item = CompletionCallback>,
+    now: OffsetDateTime,
+) -> Vec<CompletionCallback> {
+    callbacks
+        .into_iter()
+        .map(|mut callback| {
+            if callback.registration_time.is_none() {
+                callback.registration_time = Some(now);
+            }
+            callback
+        })
+        .collect()
+}
+
+fn stamp_callback_field_change(
+    change: &FieldChange<Vec<CompletionCallback>>,
+    now: OffsetDateTime,
+) -> FieldChange<Vec<CompletionCallback>> {
+    match change {
+        FieldChange::Unchanged => FieldChange::Unchanged,
+        FieldChange::Clear => FieldChange::Clear,
+        FieldChange::Set(callbacks) => FieldChange::Set(stamp_callbacks(callbacks.clone(), now)),
+    }
+}
+
 fn make_open_state(now: OffsetDateTime) -> WorkflowState {
     WorkflowState {
         run_key: RunKey::new(),
@@ -124,6 +166,10 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         admitted_updates: std::collections::HashSet::new(),
         pending_nexus_operations: BTreeMap::new(),
         completion_callbacks: Vec::new(),
+        user_metadata: None,
+        links: Vec::new(),
+        workflow_start_delay: None,
+        priority: None,
         started_at: now - Duration::minutes(10),
         first_run_started_at: Some(now - Duration::minutes(10)),
         closed_at: None,
@@ -191,6 +237,7 @@ fn with_activity(mut state: WorkflowState, activity_id: &str) -> WorkflowState {
             input: Payloads::default(),
             header: None,
             last_failure: None,
+            heartbeat_details: None,
             attempt: 1,
             retry_policy: None,
             schedule_to_close_timeout: Some(Duration::minutes(2)),
@@ -198,6 +245,7 @@ fn with_activity(mut state: WorkflowState, activity_id: &str) -> WorkflowState {
             start_to_close_timeout: Some(Duration::minutes(1)),
             heartbeat_timeout: Some(Duration::seconds(20)),
             scheduled_at: OffsetDateTime::UNIX_EPOCH,
+            current_attempt_scheduled_at: None,
             started_at: None,
             started_event_id: None,
             pause_info: None,
@@ -291,7 +339,7 @@ fn with_pending_update(mut state: WorkflowState, update_id: &str) -> WorkflowSta
 
 fn with_execution_options(mut state: WorkflowState, callbacks: usize) -> WorkflowState {
     state.set_versioning_override(Some(VersioningOverride::AutoUpgrade));
-    state.completion_callbacks = vec![CompletionCallback; callbacks];
+    state.completion_callbacks = vec![completion_callback(); callbacks];
     state
 }
 
@@ -597,7 +645,7 @@ fn arb_update_execution_options_request(
 ) -> impl Strategy<Value = UpdateExecutionOptionsRequest> {
     (
         arb_field_change(Just(VersioningOverride::AutoUpgrade)),
-        arb_field_change(prop::collection::vec(Just(CompletionCallback), 0..3)),
+        arb_field_change(prop::collection::vec(Just(completion_callback()), 0..3)),
         prop::option::of(arb_small_string()),
         arb_small_string(),
     )
@@ -606,6 +654,8 @@ fn arb_update_execution_options_request(
                 UpdateExecutionOptionsRequest {
                     versioning_override,
                     completion_callbacks,
+                    attached_completion_callbacks: Vec::new(),
+                    attached_links: Vec::new(),
                     attached_request_id,
                     request: request_context(&request_id, now),
                     now,
@@ -677,6 +727,12 @@ fn arb_start_request() -> impl Strategy<Value = StartRequest> {
                     deployment: None,
                     build_id: None,
                     versioning_override: None,
+                    workflow_start_delay: None,
+                    completion_callbacks: Vec::new(),
+                    user_metadata: None,
+                    links: Vec::new(),
+                    on_conflict_options: None,
+                    priority: None,
                     input,
                     header: None,
                     memo,
@@ -703,6 +759,7 @@ fn arb_start_request() -> impl Strategy<Value = StartRequest> {
                     first_run_started_at,
                     request: request_context("prop-start", now),
                     now,
+                    client_cron_schedule: None,
                     cron_schedule: None,
                     reserved_poller_identity: None,
                 }
@@ -742,6 +799,33 @@ fn arb_versioning_override() -> impl Strategy<Value = VersioningOverride> {
             .prop_map(|version| VersioningOverride::Pinned { version }),
         Just(VersioningOverride::AutoUpgrade),
     ]
+}
+
+fn arb_user_metadata() -> impl Strategy<Value = Option<UserMetadata>> {
+    prop::option::of(
+        (
+            prop::option::of(arb_payload()),
+            prop::option::of(arb_payload()),
+        )
+            .prop_map(|(summary, details)| UserMetadata { summary, details }),
+    )
+}
+
+fn arb_links() -> impl Strategy<Value = Vec<Link>> {
+    prop::collection::vec(
+        arb_small_string().prop_map(|job_id| Link::BatchJob { job_id }),
+        0..3,
+    )
+}
+
+fn arb_priority() -> impl Strategy<Value = Option<Priority>> {
+    prop::option::of((0i32..100, arb_small_string(), 0.1f32..10.0).prop_map(
+        |(priority_key, fairness_key, fairness_weight)| Priority {
+            priority_key,
+            fairness_key,
+            fairness_weight,
+        },
+    ))
 }
 
 fn arb_workflow_versioning_info() -> impl Strategy<Value = WorkflowVersioningInfo> {
@@ -1252,10 +1336,12 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands,
                 force_new_workflow_task: false,
                 now,
@@ -1333,10 +1419,12 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::CancelWorkflow],
                 force_new_workflow_task: false,
                 now,
@@ -1361,10 +1449,12 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::RequestCancelActivity {
                     activity_id: "activity-1".into(),
                 }],
@@ -1392,10 +1482,12 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::CancelTimer {
                     timer_id: "timer-1".into(),
                 }],
@@ -1422,10 +1514,12 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::CancelNexusOperation {
                     scheduled_event_id: 12,
                 }],
@@ -1581,6 +1675,94 @@ proptest! {
     }
 
     #[test]
+    fn property_durable_start_metadata(
+        mut req in arb_start_request(),
+        workflow_start_delay in prop::option::of(arb_duration()),
+        callbacks in prop::collection::vec(Just(completion_callback()), 0..3),
+        user_metadata in arb_user_metadata(),
+        links in arb_links(),
+        versioning_override in prop::option::of(arb_versioning_override()),
+        priority in arb_priority(),
+        cron_schedule in prop::option::of(arb_small_string()),
+    ) {
+        // Feature: api-conformance-start-fields, Property 3: Durable Start Metadata.
+        // **Validates: Requirements 3.1, 3.2**
+        req.workflow_start_delay = workflow_start_delay;
+        req.completion_callbacks = callbacks;
+        req.user_metadata = user_metadata;
+        req.links = links;
+        req.versioning_override = versioning_override;
+        req.priority = priority;
+        req.cron_schedule = cron_schedule;
+
+        let expected_callbacks = stamp_callbacks(req.completion_callbacks.clone(), req.now);
+        let transition = kernel().apply(LoadedRun::Absent, Command::Start(req.clone())).unwrap();
+
+        let (
+            event_workflow_start_delay,
+            event_completion_callbacks,
+            event_user_metadata,
+            event_links,
+            event_priority,
+            event_cron_schedule,
+            event_versioning_override,
+        ) = match &transition.history_events[0].kind {
+            HistoryEventKind::WorkflowExecutionStarted {
+                workflow_start_delay,
+                completion_callbacks,
+                user_metadata,
+                links,
+                priority,
+                cron_schedule,
+                versioning_info,
+                ..
+            } => (
+                *workflow_start_delay,
+                completion_callbacks.clone(),
+                user_metadata.clone(),
+                links.clone(),
+                priority.clone(),
+                cron_schedule.clone(),
+                versioning_info
+                    .as_ref()
+                    .and_then(|info| info.versioning_override.clone()),
+            ),
+            other => panic!("unexpected first event: {other:?}"),
+        };
+
+        prop_assert_eq!(transition.next_state.workflow_start_delay, req.workflow_start_delay);
+        prop_assert_eq!(event_workflow_start_delay, req.workflow_start_delay);
+        prop_assert_eq!(&transition.next_state.completion_callbacks, &expected_callbacks);
+        prop_assert_eq!(&event_completion_callbacks, &transition.next_state.completion_callbacks);
+        prop_assert_eq!(&transition.next_state.user_metadata, &req.user_metadata);
+        prop_assert_eq!(&event_user_metadata, &req.user_metadata);
+        prop_assert_eq!(&transition.next_state.links, &req.links);
+        prop_assert_eq!(&event_links, &req.links);
+        prop_assert_eq!(&transition.next_state.priority, &req.priority);
+        prop_assert_eq!(&event_priority, &req.priority);
+        prop_assert_eq!(&event_cron_schedule, &req.cron_schedule);
+        let state_versioning_override = transition.next_state.versioning_override().cloned();
+        prop_assert_eq!(&state_versioning_override, &req.versioning_override);
+        prop_assert_eq!(&event_versioning_override, &req.versioning_override);
+
+        if let Some(delay) = req.workflow_start_delay.filter(|delay| delay > &Duration::ZERO) {
+            let timer = transition
+                .next_state
+                .timers
+                .get(tokeira_kernel::WORKFLOW_START_DELAY_TIMER_ID)
+                .expect("delayed starts must persist the first-WFT timer");
+            prop_assert_eq!(timer.fire_at, req.now + delay);
+            prop_assert!(transition
+                .timer_ops
+                .iter()
+                .any(|op| matches!(
+                    op,
+                    TimerOp::Upsert(timer) if timer.timer_id == tokeira_kernel::WORKFLOW_START_DELAY_TIMER_ID
+                )));
+        }
+    }
+
+    #[test]
     fn reserved_start_combines_schedule_and_started_events(mut req in arb_start_request(), worker in "\\PC{1,64}") {
         req.reserved_poller_identity = Some(WorkerIdentity(worker.clone()));
 
@@ -1681,10 +1863,12 @@ proptest! {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![cmd.clone()],
                 force_new_workflow_task: false,
                 now,
@@ -1729,6 +1913,55 @@ proptest! {
         prop_assert_eq!(dispatch.2, expected_s2s);
         prop_assert_eq!(dispatch.3, expected_stc);
         prop_assert_eq!(dispatch.4, expected_hb);
+    }
+
+    #[test]
+    fn property_wft_completion_preserves_metering_metadata_and_sticky_ttl(
+        metering_metadata in prop::collection::vec(any::<u8>(), 0..32),
+        sticky_ttl_secs in 1i64..120,
+    ) {
+        // Feature: api-conformance-wft-completion, Property: completion metadata and sticky routing.
+        // Temporal records completion metering metadata on the completed event and applies sticky
+        // attrs during the same transition; see event_factory.go:150-180 and api.go:200-345 @ v1.31.0.
+        // **Validates: Requirements 1.2, 2.1**
+        let now = fixed_now();
+        let state = with_pending_wft(make_open_state(now), 30, Some(13), 1);
+        let sticky_ttl = Duration::seconds(sticky_ttl_secs);
+        let transition = kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(30),
+                    started_event_id: 13,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                metering_metadata: Some(metering_metadata.clone()),
+                worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
+                sticky_ttl: Some(sticky_ttl),
+                commands: Vec::new(),
+                force_new_workflow_task: false,
+                now,
+            }),
+        ).unwrap();
+
+        let completed = transition.history_events.iter().find_map(|event| match &event.kind {
+            HistoryEventKind::WorkflowTaskCompleted {
+                metering_metadata, ..
+            } => Some(metering_metadata),
+            _ => None,
+        }).expect("workflow task completed event");
+        prop_assert_eq!(completed, &Some(metering_metadata));
+
+        let sticky = transition.next_state.sticky.as_ref().expect("sticky affinity");
+        prop_assert_eq!(sticky.worker_identity.0.as_str(), "worker");
+        prop_assert_eq!(sticky.expires_at, now + sticky_ttl);
     }
 
     #[test]
@@ -1780,10 +2013,12 @@ proptest! {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::ScheduleActivity {
                     activity_id: "activity-1".into(),
                     activity_type: "activity-type".into(),
@@ -2052,10 +2287,12 @@ proptest! {
                     },
                     identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                     commands: vec![],
                     force_new_workflow_task: false,
                     now,
@@ -2257,6 +2494,10 @@ proptest! {
                 task_queue: TaskQueueName("queue".to_string()),
                 input: Payloads::default(),
                 header: None,
+                workflow_start_delay: None,
+                completion_callbacks: Vec::new(),
+                user_metadata: None,
+                links: Vec::new(),
                 memo: Memo::default(),
                 search_attributes: SearchAttributes::default(),
                 request_id: "versioning-start".to_string(),
@@ -2280,6 +2521,7 @@ proptest! {
                 cron_schedule: None,
                 versioning_info: Some(initial_info),
                 worker_deployment_name: initial_worker_deployment_name,
+                priority: None,
             },
         };
         let mut history = vec![start_event.clone()];
@@ -2328,6 +2570,7 @@ proptest! {
                     started_event_id,
                     identity: WorkerIdentity("worker".to_string()),
                     sdk_metadata: None,
+                metering_metadata: None,
                     worker_version: None,
                     versioning_behavior: behavior,
                     deployment_version: deployment_version.clone(),
@@ -2495,6 +2738,7 @@ proptest! {
                 input: Payloads::default(),
                 header: None,
                 last_failure: None,
+                heartbeat_details: None,
                 attempt: 1,
                 retry_policy: None,
                 schedule_to_close_timeout: Some(Duration::minutes(2)),
@@ -2502,6 +2746,7 @@ proptest! {
                 start_to_close_timeout: Some(Duration::minutes(1)),
                 heartbeat_timeout: Some(Duration::seconds(20)),
                 scheduled_at: OffsetDateTime::UNIX_EPOCH,
+                current_attempt_scheduled_at: None,
                 started_at: None,
                 started_event_id: None,
                 pause_info: None,
@@ -2540,10 +2785,12 @@ proptest! {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![cmd],
                 force_new_workflow_task: false,
                 now,
@@ -2572,10 +2819,12 @@ proptest! {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![cmd.clone()],
                 force_new_workflow_task: false,
                 now,
@@ -2639,10 +2888,12 @@ proptest! {
                     },
                     identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                     commands: vec![cmd, WorkflowCommand::RequestNewWorkflowTask],
                     force_new_workflow_task: false,
                     now,
@@ -2686,6 +2937,7 @@ proptest! {
                 input: Payloads::default(),
                 header: None,
                 last_failure: None,
+                heartbeat_details: None,
                 attempt: 1,
                 retry_policy: None,
                 schedule_to_close_timeout: Some(Duration::minutes(2)),
@@ -2693,6 +2945,7 @@ proptest! {
                 start_to_close_timeout: Some(Duration::minutes(1)),
                 heartbeat_timeout: Some(Duration::seconds(20)),
                 scheduled_at: OffsetDateTime::UNIX_EPOCH,
+                current_attempt_scheduled_at: None,
                 started_at: None,
                 started_event_id: None,
                 pause_info: None,
@@ -2753,10 +3006,12 @@ proptest! {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::FailWorkflow {
                     failure: payload("failed"),
                 }],
@@ -3147,10 +3402,12 @@ proptest! {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![cmd.clone()],
                 force_new_workflow_task: false,
                 now,
@@ -3229,10 +3486,12 @@ fn property_23_request_cancel_activity_preserves_activity() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::RequestCancelActivity {
                     activity_id: "activity-1".into(),
                 }],
@@ -3271,10 +3530,12 @@ fn property_24_cancel_timer_removes_timer() {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::CancelTimer {
                     timer_id: "timer-1".into(),
                 }],
@@ -3315,10 +3576,12 @@ proptest! {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::StartChildWorkflow {
                     child_workflow_id: WorkflowId(child_workflow_id.clone()),
                     namespace_id: NamespaceId::new(),
@@ -3394,10 +3657,12 @@ proptest! {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::SignalExternalWorkflowExecution {
                     target_namespace_id: state.namespace_id,
                     target_namespace: None,
@@ -3534,10 +3799,12 @@ fn property_42_parent_close_policy_all_paths() {
                         },
                         identity: WorkerIdentity("worker".into()),
                         sdk_metadata: None,
+                        metering_metadata: None,
                         worker_version: None,
                         versioning_behavior: VersioningBehavior::Unspecified,
                         deployment_version: None,
                         worker_deployment_name: None,
+                        sticky_ttl: None,
                         commands: vec![command],
                         force_new_workflow_task: false,
                         now,
@@ -3675,10 +3942,12 @@ proptest! {
                 token: token.clone(),
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![completed_cmd],
                 force_new_workflow_task: false,
                 now,
@@ -3697,10 +3966,12 @@ proptest! {
                 token,
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![rejected_cmd],
                 force_new_workflow_task: false,
                 now,
@@ -3729,10 +4000,12 @@ proptest! {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::ProtocolMessage {
                     message_id: "msg-1".into(),
                     body: UpdateProtocolBody::Accepted {
@@ -3760,10 +4033,12 @@ proptest! {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::ProtocolMessage {
                     message_id: "msg-2".into(),
                     body: UpdateProtocolBody::Completed {
@@ -3790,10 +4065,12 @@ proptest! {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::ProtocolMessage {
                     message_id: "msg-3".into(),
                     body: UpdateProtocolBody::Rejected {
@@ -3841,10 +4118,12 @@ fn property_57_close_clears_pending_updates() {
                     },
                     identity: WorkerIdentity("worker".into()),
                     sdk_metadata: None,
+                    metering_metadata: None,
                     worker_version: None,
                     versioning_behavior: VersioningBehavior::Unspecified,
                     deployment_version: None,
                     worker_deployment_name: None,
+                    sticky_ttl: None,
                     commands: vec![command],
                     force_new_workflow_task: false,
                     now,
@@ -3911,10 +4190,12 @@ proptest! {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![cmd.clone()],
                 force_new_workflow_task: false,
                 now,
@@ -3955,10 +4236,12 @@ proptest! {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![cmd],
                 force_new_workflow_task: false,
                 now,
@@ -4008,10 +4291,20 @@ proptest! {
             HistoryEventKind::WorkflowExecutionOptionsUpdated {
                 versioning_override,
                 completion_callbacks,
+                attached_completion_callbacks,
+                attached_links,
                 attached_request_id,
             } => {
                 prop_assert_eq!(versioning_override, &req.versioning_override);
-                prop_assert_eq!(completion_callbacks, &req.completion_callbacks);
+                prop_assert_eq!(
+                    completion_callbacks,
+                    &stamp_callback_field_change(&req.completion_callbacks, req.now)
+                );
+                prop_assert_eq!(
+                    attached_completion_callbacks,
+                    &stamp_callbacks(req.attached_completion_callbacks.clone(), req.now)
+                );
+                prop_assert_eq!(attached_links, &req.attached_links);
                 prop_assert_eq!(attached_request_id, &req.attached_request_id);
             }
             other => panic!("unexpected event: {other:?}"),
@@ -4034,9 +4327,13 @@ proptest! {
         };
         let expected_completion_callbacks = match req.completion_callbacks {
             FieldChange::Unchanged => base.completion_callbacks,
-            FieldChange::Set(completion_callbacks) => completion_callbacks,
+            FieldChange::Set(completion_callbacks) => stamp_callbacks(completion_callbacks, req.now),
             FieldChange::Clear => Vec::new(),
         };
+        let expected_completion_callbacks = expected_completion_callbacks
+            .into_iter()
+            .chain(stamp_callbacks(req.attached_completion_callbacks, req.now))
+            .collect::<Vec<_>>();
 
         prop_assert_eq!(transition.next_state.versioning_override().cloned(), expected_versioning_override);
         prop_assert_eq!(transition.next_state.completion_callbacks, expected_completion_callbacks);
@@ -4103,10 +4400,12 @@ fn property_63_close_preserves_execution_options() {
                     },
                     identity: WorkerIdentity("worker".into()),
                     sdk_metadata: None,
+                    metering_metadata: None,
                     worker_version: None,
                     versioning_behavior: VersioningBehavior::Unspecified,
                     deployment_version: None,
                     worker_deployment_name: None,
+                    sticky_ttl: None,
                     commands: vec![command],
                     force_new_workflow_task: false,
                     now,
@@ -4156,14 +4455,100 @@ fn property_63_close_preserves_execution_options() {
             transition.next_state.versioning_override().cloned(),
             Some(VersioningOverride::AutoUpgrade)
         );
+        let mut scheduled_callback = completion_callback();
+        scheduled_callback.state = CallbackState::Scheduled;
         assert_eq!(
             transition.next_state.completion_callbacks,
-            vec![CompletionCallback, CompletionCallback]
+            vec![scheduled_callback.clone(), scheduled_callback]
+        );
+        assert_eq!(
+            transition
+                .dispatch_ops
+                .iter()
+                .filter(|op| matches!(op, DispatchOp::DispatchCompletionCallback { .. }))
+                .count(),
+            2
         );
     }
 }
 
 proptest! {
+    #[test]
+    fn property_completion_callbacks_schedule_once_on_terminal_close(
+        standby_flags in prop::collection::vec(any::<bool>(), 0..5)
+    ) {
+        // Feature: api-conformance-start-fields, Property: terminal callbacks dispatch exactly once.
+        // **Validates: Requirements 1.4, 3.4, 4.1**
+        let now = fixed_now();
+        let mut state = with_pending_wft(make_open_state(now), 90, Some(40), 1);
+        state.completion_callbacks = standby_flags
+            .iter()
+            .map(|standby| {
+                let mut callback = completion_callback();
+                callback.registration_time = Some(now);
+                if !standby {
+                    callback.state = CallbackState::Scheduled;
+                }
+                callback
+            })
+            .collect();
+
+        let transition = kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(90),
+                    started_event_id: 40,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                metering_metadata: None,
+                worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
+                sticky_ttl: None,
+                commands: vec![WorkflowCommand::CompleteWorkflow {
+                    result: payloads("done"),
+                }],
+                force_new_workflow_task: false,
+                now,
+            }),
+        ).unwrap();
+
+        let callback_dispatches: Vec<_> = transition
+            .dispatch_ops
+            .iter()
+            .filter_map(|op| match op {
+                DispatchOp::DispatchCompletionCallback {
+                    callback_index,
+                    callback,
+                } => Some((*callback_index, callback.clone())),
+                _ => None,
+            })
+            .collect();
+        let expected_dispatch_count = standby_flags.iter().filter(|standby| **standby).count();
+        prop_assert_eq!(callback_dispatches.len(), expected_dispatch_count);
+
+        for (index, callback) in transition.next_state.completion_callbacks.iter().enumerate() {
+            if standby_flags[index] {
+                prop_assert_eq!(&callback.state, &CallbackState::Scheduled);
+                prop_assert!(callback_dispatches.iter().any(
+                    |(callback_index, dispatched)| *callback_index == index
+                        && dispatched.state == CallbackState::Scheduled
+                ));
+            } else {
+                prop_assert_eq!(&callback.state, &CallbackState::Scheduled);
+                prop_assert!(!callback_dispatches
+                    .iter()
+                    .any(|(callback_index, _)| *callback_index == index));
+            }
+        }
+    }
+
     #[test]
     fn property_64_schedule_nexus_operation_event_and_state_pass_through(cmd in arb_schedule_nexus_operation_command()) {
         let now = fixed_now();
@@ -4180,10 +4565,12 @@ proptest! {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![cmd.clone()],
                 force_new_workflow_task: false,
                 now,
@@ -4222,10 +4609,12 @@ proptest! {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::ScheduleNexusOperation {
                     operation_id: operation_id.clone(),
                     endpoint: "endpoint".into(),
@@ -4257,10 +4646,12 @@ proptest! {
                 },
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
+                metering_metadata: None,
                 worker_version: None,
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
+                sticky_ttl: None,
                 commands: vec![WorkflowCommand::CancelNexusOperation {
                     scheduled_event_id: 12,
                 }],
@@ -4388,10 +4779,12 @@ fn property_70_close_clears_pending_nexus_operations_without_dispatch_ops() {
                     },
                     identity: WorkerIdentity("worker".into()),
                     sdk_metadata: None,
+                    metering_metadata: None,
                     worker_version: None,
                     versioning_behavior: VersioningBehavior::Unspecified,
                     deployment_version: None,
                     worker_deployment_name: None,
+                    sticky_ttl: None,
                     commands: vec![command],
                     force_new_workflow_task: false,
                     now,

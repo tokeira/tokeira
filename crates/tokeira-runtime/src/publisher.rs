@@ -219,6 +219,12 @@ where
             deployment: None,
             build_id: None,
             versioning_override: None,
+            workflow_start_delay: None,
+            completion_callbacks: Vec::new(),
+            user_metadata: None,
+            links: Vec::new(),
+            on_conflict_options: None,
+            priority: None,
             input,
             header: None,
             memo: Memo::default(),
@@ -249,6 +255,7 @@ where
                 received_at: OffsetDateTime::now_utc(),
             },
             now: OffsetDateTime::now_utc(),
+            client_cron_schedule: None,
             cron_schedule: None,
             reserved_poller_identity: None,
         };
@@ -871,6 +878,7 @@ where
                         input,
                         schedule_event_id,
                         attempt,
+                        dispatch_revision,
                         ..
                     } = op
                     {
@@ -884,6 +892,7 @@ where
                                     input: input.clone(),
                                     schedule_event_id: *schedule_event_id,
                                     attempt: *attempt,
+                                    dispatch_revision: *dispatch_revision,
                                 },
                                 Some(&self.delivery_metrics),
                             )
@@ -1129,6 +1138,17 @@ where
                             )
                             .await;
                     });
+                }
+                DispatchOp::DispatchCompletionCallback {
+                    callback_index,
+                    callback,
+                } => {
+                    tracing::info!(
+                        run_key = ?run_key,
+                        callback_index,
+                        callback = ?callback,
+                        "completion callback scheduled for dispatch"
+                    );
                 }
             }
         }

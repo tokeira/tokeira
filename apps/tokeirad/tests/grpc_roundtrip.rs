@@ -989,7 +989,7 @@ where
                         attempt: task.attempt,
                     }
                 }),
-                callbacks: Vec::new(),
+                callbacks: state.completion_callbacks.clone(),
                 pending_nexus_operations: state
                     .pending_nexus_operations
                     .values()
@@ -1023,6 +1023,8 @@ where
                     .map(|timeout| state.started_at + timeout),
                 cancel_requested: state.cancel_requested,
                 original_start_time: state.first_run_started_at.unwrap_or(state.started_at),
+                versioning_info: state.versioning_info.clone(),
+                worker_deployment_name: state.worker_deployment_name.clone(),
             })),
             LoadedRun::Absent => Err(anyhow!("resolved run missing from storage: {:?}", run_key)),
         }

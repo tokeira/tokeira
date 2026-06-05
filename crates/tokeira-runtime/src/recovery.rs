@@ -388,6 +388,10 @@ mod tests {
             versioning_info: None,
             worker_deployment_name: None,
             completion_callbacks: Vec::new(),
+            user_metadata: None,
+            links: Vec::new(),
+            workflow_start_delay: None,
+            priority: None,
             started_at: fixed_now(),
             first_run_started_at: None,
             closed_at: None,
@@ -654,6 +658,7 @@ mod tests {
                             input: Payloads::default(),
                             schedule_event_id: idx as i64,
                             attempt: 1,
+                            dispatch_revision: 0,
                             schedule_to_close_timeout: None,
                             schedule_to_start_timeout: None,
                             start_to_close_timeout: None,
@@ -988,6 +993,7 @@ mod tests {
                     input: Payloads::default(),
                     header: None,
                     last_failure: None,
+                    heartbeat_details: None,
                     attempt: 2,
                     retry_policy: None,
                     schedule_to_close_timeout: Some(
@@ -1003,6 +1009,7 @@ mod tests {
                         Duration::seconds(5),
                     ),
                     scheduled_at: fixed_now(),
+                    current_attempt_scheduled_at: None,
                     started_at: Some(
                         fixed_now()
                             + Duration::seconds(2),

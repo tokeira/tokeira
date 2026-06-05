@@ -217,6 +217,7 @@ pub(crate) async fn drain_once<R>(
                             input,
                             schedule_event_id,
                             attempt,
+                            dispatch_revision,
                         } => {
                             if let Err(error) = activity_broker
                                 .publish_activity_task(
@@ -227,6 +228,7 @@ pub(crate) async fn drain_once<R>(
                                         input,
                                         schedule_event_id,
                                         attempt,
+                                        dispatch_revision,
                                     },
                                     Some(metrics),
                                 )
@@ -307,6 +309,7 @@ fn activity_to_backlog_entry(task: &crate::broker::TimestampedActivityTask) -> B
             input: task.task.input.clone(),
             schedule_event_id: task.task.schedule_event_id,
             attempt: task.task.attempt,
+            dispatch_revision: task.task.dispatch_revision,
         },
         scheduled_at: task.scheduled_at,
         insertion_seq: 0,
@@ -733,6 +736,7 @@ mod tests {
                             input: tokeira_types::Payloads::default(),
                             schedule_event_id: 42,
                             attempt,
+                            dispatch_revision: 0,
                         },
                         scheduled_at: OffsetDateTime::now_utc(),
                         insertion_seq: 1,

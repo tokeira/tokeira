@@ -18,8 +18,9 @@ use std::{
 use time::OffsetDateTime;
 
 use tokeira_kernel::{
-    WorkflowCommand, WorkflowIdConflictPolicy, WorkflowIdReusePolicy, event::HistoryEvent,
-    state::ParentClosePolicy,
+    WorkflowCommand, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+    event::HistoryEvent,
+    state::{ParentClosePolicy, WorkflowVersioningInfo},
 };
 use tokeira_types::{
     ActivityTaskToken, BuildId, DeploymentId, ExecutionStatus, Headers, Memo, Payload, Payloads,
@@ -48,6 +49,82 @@ pub enum VersioningOverride {
     AutoUpgrade,
 }
 
+/// User-facing summary/details metadata authored when a workflow starts.
+///
+/// Temporal stores this as SDK metadata, but the edge keeps it proto-free so
+/// history and describe rendering can use the same deterministic payload model
+/// as memo/header fields.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UserMetadata {
+    /// Short UI-facing summary payload.
+    pub summary: Option<Payload>,
+    /// Longer UI-facing details payload.
+    pub details: Option<Payload>,
+}
+
+/// Link metadata attached to workflow start or signal events.
+///
+/// Links are wire-level references to related Temporal entities. They are
+/// preserved as domain data rather than interpreted by the server because their
+/// meaning belongs to SDKs, UI, and audit tooling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Link {
+    WorkflowEvent {
+        namespace: String,
+        workflow_id: String,
+        run_id: String,
+        reference: Option<LinkWorkflowEventReference>,
+    },
+    BatchJob {
+        job_id: String,
+    },
+    Activity {
+        namespace: String,
+        activity_id: String,
+        run_id: String,
+    },
+    NexusOperation {
+        namespace: String,
+        operation_id: String,
+        run_id: String,
+    },
+}
+
+/// Event reference carried by a workflow-event link.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkWorkflowEventReference {
+    Event { event_id: i64, event_type: i32 },
+    RequestId { request_id: String, event_type: i32 },
+}
+
+/// Client-authored completion callback registration.
+///
+/// Public starts may register Nexus callbacks. Internal callbacks are rejected
+/// before this DTO is built because Temporal exposes them only for replication
+/// of already-authored history, not for external client authorship.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletionCallback {
+    pub url: String,
+    pub header: BTreeMap<String, String>,
+    pub links: Vec<Link>,
+}
+
+/// Start priority metadata used by Temporal matching fairness.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Priority {
+    pub priority_key: i32,
+    pub fairness_key: String,
+    pub fairness_weight: f32,
+}
+
+/// Options applied when a start resolves to an existing running workflow.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OnConflictOptions {
+    pub attach_request_id: bool,
+    pub attach_completion_callbacks: bool,
+    pub attach_links: bool,
+}
+
 /// Edge-facing request for `StartWorkflowExecution`.
 ///
 /// This is intentionally close to the client-facing contract rather than the
@@ -65,6 +142,16 @@ pub struct StartWorkflowExecutionRequest {
     pub search_attributes: SearchAttributes,
     pub identity: Option<String>,
     pub request_eager_execution: bool,
+    pub workflow_start_delay: Option<time::Duration>,
+    pub completion_callbacks: Vec<CompletionCallback>,
+    pub user_metadata: Option<UserMetadata>,
+    pub links: Vec<Link>,
+    /// Worker deployment requested for the eagerly returned first WFT.
+    ///
+    /// This field has routing effect only when `request_eager_execution` is
+    /// true. Keeping that gate at the DTO boundary preserves Temporal's
+    /// contract that non-eager starts ignore eager-only deployment options.
+    pub eager_worker_deployment_options: Option<tokeira_kernel::state::WorkerDeploymentVersionRef>,
     pub workflow_execution_timeout: Option<time::Duration>,
     pub workflow_run_timeout: Option<time::Duration>,
     pub workflow_task_timeout: Option<time::Duration>,
@@ -73,6 +160,9 @@ pub struct StartWorkflowExecutionRequest {
     pub reuse_policy: WorkflowIdReusePolicy,
     pub header: Option<Headers>,
     pub versioning_override: Option<VersioningOverride>,
+    pub on_conflict_options: Option<OnConflictOptions>,
+    pub priority: Option<Priority>,
+    pub cron_schedule: Option<String>,
     pub run_key: Option<RunKey>,
     pub run_id: Option<RunId>,
     pub now: Option<OffsetDateTime>,
@@ -146,10 +236,15 @@ pub struct RespondWorkflowTaskCompletedRequest {
     /// Decoded at the edge; downstream behaviour belongs to the `speculative-wft` spec.
     pub client_discards_speculative_with_events: bool,
     pub sdk_metadata: Option<Vec<u8>>,
+    pub metering_metadata: Option<Vec<u8>>,
     pub worker_version: Option<String>,
     pub versioning_behavior: tokeira_kernel::state::VersioningBehavior,
     pub deployment_version: Option<tokeira_kernel::state::WorkerDeploymentVersionRef>,
     pub worker_deployment_name: Option<String>,
+    pub sticky_ttl: Option<time::Duration>,
+    pub resource_id: String,
+    pub worker_instance_key: String,
+    pub worker_control_task_queue: String,
     pub commands: Vec<WorkflowCommand>,
     pub return_new_workflow_task: bool,
     pub force_create_new_workflow_task: bool,
@@ -230,15 +325,15 @@ pub struct WorkflowExecutionDescription {
     pub pending_activities: Vec<PendingActivityDescription>,
     pub pending_children: Vec<PendingChildDescription>,
     pub pending_workflow_task: Option<PendingWorkflowTaskDescription>,
-    /// Placeholder kernel callbacks have no URL, trigger, state, or timing to
-    /// render, so describe intentionally surfaces an empty callback list.
-    pub callbacks: Vec<()>,
+    pub callbacks: Vec<tokeira_kernel::state::CompletionCallback>,
     pub pending_nexus_operations: Vec<PendingNexusOperationDescription>,
     pub pause_info: Option<PauseInfoDescription>,
     pub execution_expiration_time: Option<OffsetDateTime>,
     pub run_expiration_time: Option<OffsetDateTime>,
     pub cancel_requested: bool,
     pub original_start_time: OffsetDateTime,
+    pub versioning_info: Option<WorkflowVersioningInfo>,
+    pub worker_deployment_name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -374,6 +469,10 @@ pub struct PollActivityTaskQueueResponse {
     pub run_key: RunKey,
     pub header: Option<Headers>,
     pub retry_policy: Option<RetryPolicy>,
+    pub heartbeat_details: Option<Payloads>,
+    pub scheduled_time: Option<OffsetDateTime>,
+    pub current_attempt_scheduled_time: Option<OffsetDateTime>,
+    pub started_time: Option<OffsetDateTime>,
     pub schedule_to_close_timeout: Option<Duration>,
     pub start_to_close_timeout: Option<Duration>,
     pub heartbeat_timeout: Option<Duration>,
@@ -553,6 +652,7 @@ pub struct UpdateWorkflowExecutionRequest {
     pub namespace: String,
     pub workflow_id: String,
     pub run_id: Option<String>,
+    pub first_execution_run_id: Option<String>,
     pub update_id: String,
     pub update_name: String,
     pub input: Payloads,
@@ -562,15 +662,29 @@ pub struct UpdateWorkflowExecutionRequest {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum UpdateWaitPolicyDto {
+    Unspecified,
+    Admitted,
     Accepted,
     Completed,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub enum UpdateLifecycleStageDto {
+    Unspecified,
+    Admitted,
+    Accepted,
+    Completed,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateRefDto {
+    pub workflow_id: String,
+    pub run_id: String,
+    pub update_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum UpdateOutcomeDto {
-    Accepted {
-        accepted_event_id: i64,
-    },
     Completed {
         accepted_event_id: i64,
         result: Payloads,
@@ -583,7 +697,9 @@ pub enum UpdateOutcomeDto {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct UpdateWorkflowExecutionResponse {
-    pub outcome: UpdateOutcomeDto,
+    pub update_ref: UpdateRefDto,
+    pub stage: UpdateLifecycleStageDto,
+    pub outcome: Option<UpdateOutcomeDto>,
 }
 
 // ── GetWorkflowExecutionHistory DTOs ──
@@ -660,7 +776,12 @@ pub struct SignalWithStartWorkflowExecutionRequest {
     pub conflict_policy: WorkflowIdConflictPolicy,
     pub reuse_policy: WorkflowIdReusePolicy,
     pub header: Option<Headers>,
+    pub workflow_start_delay: Option<time::Duration>,
+    pub user_metadata: Option<UserMetadata>,
+    pub links: Vec<Link>,
     pub versioning_override: Option<VersioningOverride>,
+    pub priority: Option<Priority>,
+    pub cron_schedule: Option<String>,
     pub signal_name: String,
     pub signal_input: Payloads,
 }

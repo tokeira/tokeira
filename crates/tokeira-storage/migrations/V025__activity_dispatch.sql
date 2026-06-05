@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS activity_dispatch (
     schedule_event_id BIGINT NOT NULL,
     attempt INTEGER NOT NULL,
     input_data BYTEA NOT NULL,
+    dispatch_revision BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (key)
 );

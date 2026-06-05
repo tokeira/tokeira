@@ -319,6 +319,18 @@ Use `cargo lint` to check if everything compiles without running tests. `cargo c
 3. **Prefer boring solutions.** The simplest approach that satisfies the requirement is the right one.
 4. **Ask if unsure.** If a decision has architectural implications, surface it rather than guessing.
 
+### Crate-local AGENTS.md (read before editing a high-risk crate)
+
+Some crates carry their own `AGENTS.md` that refines this root file for that crate. When editing under one of these paths, read its `AGENTS.md` first and treat it as binding; on conflict with this root file, the crate-local (stricter) rule wins. This applies to every agent, not only Codex — do not rely on automatic nested-file loading; open it explicitly.
+
+| Crate | Concentrates |
+|-------|--------------|
+| `crates/tokeira-kernel/AGENTS.md` | Purity: no I/O/async/storage/metrics, no side-effecting commands, no non-determinism. |
+| `crates/tokeira-storage/AGENTS.md` | DSQL migrations (forward-only / build-phase no-ALTER / DDL subset) and the `max_idle_conns == max_conns` invariant. |
+| `crates/tokeira-runtime/AGENTS.md` | History is authority; queues are disposable; durable state via fenced `commit_transition`. |
+| `crates/tokeira-edge/AGENTS.md` | Thin translation only; public-API behaviour ground-truthed to the targeted release (§8). |
+| `crates/tokeira-state/AGENTS.md` | CAS-not-force-overwrite; immutable snapshots; tolerate a missing store on load. |
+
 ### Change Classification
 
 | Change Type | Examples | Required |

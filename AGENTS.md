@@ -373,6 +373,15 @@ Use `cargo lint` to check if everything compiles without running tests. `cargo c
 5. Add property-test coverage if `desired_ref` or `writeback_targets` logic is non-trivial.
 6. If the image needs a new build recipe, add a free function to `tokeira-build` with its own hardcoded Dagger pipeline.
 
+### Adding or Changing a DSQL Migration
+
+DSQL migrations live in `crates/tokeira-storage/migrations/` as `VNNN__snake_case.sql`, one statement per file. `build.rs` embeds them at compile time; the runner (`crates/tokeira-storage/src/dsql/migration.rs`) is forward-only, checksum-verified, and rejects version gaps and duplicates.
+
+- **Initial build phase (now): no `ALTER TABLE`.** There is no baseline schema to preserve, so a new column/constraint MUST be folded into the table's base `CREATE TABLE` migration rather than added as a follow-up `ALTER`. Editing an already-embedded migration is fine — its checksum simply changes and the schema is recreated from scratch. Keep versions contiguous (no gaps); deleting the highest migration is acceptable.
+- **After a baseline is cut, this flips to strictly forward-only.** Once any environment has applied the migrations, an embedded migration MUST NOT be edited — the runner rejects a changed checksum for an applied version. From that point every schema change is a new `VNNN` migration (including `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`), never an in-place edit of an existing one. Removing the build-phase "fold into base / no ALTER" rule is itself the signal that the baseline has been cut.
+- DSQL DDL constraints still apply at all times: one statement per file, secondary indexes created `ASYNC`, no `CHECK` constraints (validate in the application), no `BIGSERIAL` (generate IDs in-app). The `DdlValidator` enforces the DSQL-safe subset.
+- There is no historical hand-maintained schema dump — the migrations directory is the single authoritative schema source.
+
 ---
 
 ## Observability Stack (Compose Platform)

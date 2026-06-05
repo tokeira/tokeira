@@ -1,9 +1,0 @@
-[package]
-name = "tokeira-replay"
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-version.workspace = true
-
-[dependencies]
-anyhow.workspace = true

@@ -1,6 +1,0 @@
-[package]
-name = "tokeira-stateright-spec"
-edition = "2021"
-version = "0.1.0"
-
-[dependencies]

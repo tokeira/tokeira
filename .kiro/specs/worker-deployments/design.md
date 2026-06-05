@@ -142,7 +142,7 @@ flowchart TD
         D5 -->|no| D7["dispatch to effective version"]
     end
     subgraph Complete["RespondWorkflowTaskCompleted (wft-completion persists behavior+options)"]
-        C1["WFT completes on target version"] --> C2["kernel.apply_wft_versioning:<br/>set behavior, deployment_version,<br/>worker_deployment_name; clear transition<br/>if target matches; bump revision_number"]
+        C1["WFT completes on target version"] --> C2["kernel.apply_wft_versioning:<br/>set behavior, deployment_version,<br/>worker_deployment_name; clear transition<br/>if target matches (does NOT touch revision_number)"]
     end
     Start --> Dispatch --> Complete
     C2 -.-> Describe["DescribeWorkflowExecution projects versioning_info"]
@@ -396,9 +396,17 @@ queue from the deployment registry's routing config:
   version and the workflow is not pinned, call `start_version_transition` gated on the
   dispatch `revision_number` (the activity path additionally gates on
   `revision_number > wft_dispatch_revision` matching
-  `recordactivitytaskstarted/api.go @ v1.31.0`);
-- on WFT completion call `apply_wft_versioning`, then `revision_number` is incremented
-  when the run routes to a new deployment version.
+  `recordactivitytaskstarted/api.go @ v1.31.0`); `start_version_transition` **sets** the
+  run's `revision_number` to the task's dispatch revision (it is set, never incremented);
+- on WFT completion call `apply_wft_versioning`, which updates `behavior`,
+  `deployment_version`, and `worker_deployment_name` and clears the transition on target
+  match. It does **not** touch the run's `revision_number`: in v1.31.0 the run's
+  `WorkflowExecutionVersioningInfo.revision_number` is set only at transition-start
+  (`mutable_state_impl.go:9108` via `req.TaskDispatchRevisionNumber`) and on start-time
+  inheritance (`mutable_state_impl.go:2963`); `afterAddWorkflowTaskCompletedEvent`
+  (`workflow_task_state_machine.go:1283-1396 @ v1.31.0`) never assigns it. (The
+  registry-level `RoutingConfig.revision_number` is a separate counter, bumped on every
+  set-current / set-ramping mutation — see the routing-config state machine above.)
 
 Routing decisions are derived effects of durable registry + per-run state; no
 correctness weight rests on transient queues (Requirement 13.6).
@@ -704,10 +712,13 @@ dropped for later reschedule; if a transition is already in flight, activity sta
 rejected; pinned-workflow independent activities do not transition; and when a workflow
 task completes carrying a versioning behavior and deployment, the run's effective
 `behavior`, `deployment_version`, and `worker_deployment_name` are updated (an
-UNSPECIFIED behavior clears the deployment version to unversioned), the transition is
-cleared when its target matches the completing version, and routing to a new deployment
-version increments `revision_number` (`recordactivitytaskstarted/api.go:188 @
-v1.31.0`).
+UNSPECIFIED behavior clears the deployment version to unversioned) and the transition is
+cleared when its target matches the completing version. The run's `revision_number` is
+**set** to the task's dispatch revision at transition-start and is **not** mutated at WFT
+completion: in v1.31.0 it is assigned only in `StartDeploymentTransition`
+(`mutable_state_impl.go:9108 @ v1.31.0`) and on start-time inheritance
+(`mutable_state_impl.go:2963 @ v1.31.0`); `afterAddWorkflowTaskCompletedEvent`
+(`workflow_task_state_machine.go:1283-1396 @ v1.31.0`) never assigns it.
 
 **Validates: Requirements 9.2, 9.5, 9.6**
 

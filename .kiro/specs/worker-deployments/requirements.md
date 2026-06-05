@@ -726,8 +726,18 @@ their version and AutoUpgrade workflows follow the Current Version.
    completion; if a transition is already in flight, the activity start is also rejected.
    Pinned-workflow independent activities do not trigger the transition
    (`service/history/api/recordactivitytaskstarted/api.go:188 @ v1.31.0`).
-6. WHEN a workflow execution routes to a new Deployment Version, THE runtime SHALL
-   increment the run's `WorkflowExecutionVersioningInfo.revision_number`.
+6. WHEN a workflow task is started by a poller whose Deployment Version differs from the
+   run's effective Deployment Version (and the run is unpinned), THE runtime SHALL **set**
+   the run's `WorkflowExecutionVersioningInfo.revision_number` to that task's dispatch
+   revision number as part of starting the transition. The run's `revision_number` is set
+   only at transition-start and on start-time auto-upgrade inheritance; it is never
+   incremented at workflow-task completion. (In v1.31.0 the run revision is assigned only
+   in `StartDeploymentTransition` (`mutable_state_impl.go:9108 @ v1.31.0`, from
+   `req.TaskDispatchRevisionNumber`) and on inheritance (`mutable_state_impl.go:2963`);
+   `afterAddWorkflowTaskCompletedEvent` (`workflow_task_state_machine.go:1283-1396 @
+   v1.31.0`) does not touch it.) This is distinct from the registry-level
+   `RoutingConfig.revision_number`, which is incremented on every set-current /
+   set-ramping mutation (Requirements 3.1, 4.1).
 7. WHERE `StartWorkflowExecution.eager_worker_deployment_options` is present AND
    `request_eager_execution` is true, THE runtime SHALL route the eager workflow task per
    those deployment options; otherwise THE field SHALL have no routing effect.

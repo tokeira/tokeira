@@ -175,89 +175,97 @@ each placed in the crate the design specifies.
   - Run `cargo test -p tokeira-runtime`.
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 6. Runtime: dispatch routing integration
+- [x] 6. Runtime: dispatch routing integration
   - [x] 6.1 Resolve the target version from routing config in `crates/tokeira-runtime/src/runtime/workflow_task.rs`
     - At task-start, resolve the workflow's target version from the deployment registry routing config: AUTO_UPGRADE / unversioned traffic follows `current_deployment_version`, with `ramping_version_percentage`% bucketed deterministically by workflow id (reuse the FNV-1a `deterministic_bucket` in `crates/tokeira-runtime/src/versioning.rs`) routed to `ramping_deployment_version`; PINNED runs (or PINNED override) resolve to their pinned version regardless of routing config; a nil Current routes AUTO_UPGRADE/unversioned traffic to unversioned workers.
     - _Requirements: 9.1, 9.3, 9.4, 9.8_
   - [x] 6.2 Start the version transition at workflow-task start in `crates/tokeira-runtime/src/runtime/workflow_task.rs`
     - When the polling worker's deployment version differs from the workflow's effective version and the run is not pinned, call `start_version_transition` gated on the dispatch `revision_number` (task-start by a differing poller, matching `recordworkflowtaskstarted/api.go @ v1.31.0`); pinned runs do not transition.
     - _Requirements: 9.5, 9.6_
-  - [ ] 6.3 Reject transition-triggering activity-task starts in `crates/tokeira-runtime/src/runtime/activity.rs`
-    - Apply the differing-poller transition trigger with the `revision_number > wft_dispatch_revision` gate; when activity start triggers a transition, reject/drop the activity task for later reschedule, and reject activity starts while a transition is already in flight; pinned-workflow independent activities do not transition (matching `recordactivitytaskstarted/api.go:188 @ v1.31.0`).
+  - [x] 6.3a Add a kernel command to start a deployment-version transition independently of WFT-start, in `crates/tokeira-kernel/src/command.rs` and `kernel.rs`
+    - Add `Command::StartDeploymentTransition(StartDeploymentTransitionRequest { target: WorkerDeploymentVersionRef, revision_number: i64 })`. This is the design resolution for 6.3: the only existing path that calls `state.start_version_transition` is `Command::WorkflowTaskStarted`, which requires an existing `pending_workflow_task` (else `Reject::NoPendingWorkflowTask`); the activity-start path has no such pending WFT. A dedicated command keeps transition-initiation authoritative in the kernel (AGENTS.md §2/§3) rather than mutating per-run state from the runtime.
+    - Kernel handler: load the open run; if effective behavior is PINNED → `Reject::PinnedWorkflowCannotTransition` (reuse existing reject). Otherwise call `state.start_version_transition(target, revision_number)` (existing pure transition — sets `version_transition`, clears sticky, marks an existing pending WFT for reschedule). **If there is no pending WFT**, additionally call the existing private `schedule_workflow_task()` so a WFT exists to drive the transition; if one is already pending, do not double-schedule. This composes two existing kernel primitives — nothing new is invented.
+    - This is the faithful analog of v1.31.0 `recordactivitytaskstarted/api.go:75 @ v1.31.0`, which returns `UpdateWorkflowAction{ CreateWorkflowTask: rejectCode == rejectCodeStartedTransition }` after `StartDeploymentTransition` (`mutable_state_impl.go @ v1.31.0`): start the transition and ensure a WFT exists to drive it, in one authoritative mutation. Author event-sourced and replay-safe; cite the anchors in the command doc comment per §8/§9.
+    - Unit tests: pinned-run reject; no-pending-WFT schedules a WFT; existing-pending-WFT does not double-schedule; `version_transition` and `revision_number` set correctly.
     - _Requirements: 9.5, 9.6_
-  - [ ] 6.4 Apply versioning at WFT completion and route eager tasks in `crates/tokeira-runtime/src/runtime/workflow_task.rs` and `crates/tokeira-runtime/src/publisher.rs`
-    - On WFT completion call `apply_wft_versioning` and increment `revision_number` when the run routes to a new deployment version; when `eager_worker_deployment_options` is present and `request_eager_execution` is true, route the eager first task per those deployment options, otherwise no routing effect. Routing decisions remain derived effects of durable registry + per-run state (no correctness weight on transient queues).
+  - [x] 6.3 Reject transition-triggering activity-task starts in `crates/tokeira-runtime/src/runtime/activity.rs`
+    - Apply the differing-poller transition trigger with the `revision_number > wft_dispatch_revision` gate; when activity start triggers a transition, start it by submitting `Command::StartDeploymentTransition` (6.3a) on the run's owned shard, then reject/drop the activity task for later reschedule; reject activity starts while a transition is already in flight; pinned-workflow independent activities do not transition (matching `recordactivitytaskstarted/api.go:188 @ v1.31.0`). The WFT-target version + revision operands are computed live from the routing config (reuse `resolve_workflow_task_target_version` / `load_worker_deployment_routing_config` from `workflow_task.rs`); the activity dispatch revision is threaded through `DispatchableActivityTask` / `DispatchOp::EnqueueActivityTask` (serde-default). Do NOT store a revision on `ActivityState`.
+    - Depends on 6.3a.
+    - _Requirements: 9.5, 9.6_
+  - [x] 6.4 Apply versioning at WFT completion and route eager tasks in `crates/tokeira-runtime/src/runtime/workflow_task.rs` and `crates/tokeira-runtime/src/publisher.rs`
+    - On WFT completion call `apply_wft_versioning` to update the run's `behavior`, `deployment_version`, and `worker_deployment_name` and clear the in-flight transition when the completing version matches the transition target. Do **NOT** touch the run's `revision_number` here. CORRECTION (verified against v1.31.0): the run's `WorkflowExecutionVersioningInfo.revision_number` is **set** only at transition-start (`mutable_state_impl.go:9108 @ v1.31.0`, from the task's `TaskDispatchRevisionNumber`) and on start-time auto-upgrade inheritance (`mutable_state_impl.go:2963 @ v1.31.0`); `afterAddWorkflowTaskCompletedEvent` (`workflow_task_state_machine.go:1283-1396 @ v1.31.0`) never assigns `RevisionNumber`. The kernel's `apply_wft_versioning` in `state.rs` already does not touch `revision_number` — keep it that way. (The earlier "increment `revision_number` when the run routes to a new deployment version" instruction conflated the run revision with the registry-level `RoutingConfig.revision_number`, which IS bumped per set-current/set-ramping in 4.4 — that registry counter is unrelated to this task.)
+    - When `eager_worker_deployment_options` is present and `request_eager_execution` is true, route the eager first task per those deployment options, otherwise no routing effect. Routing decisions remain derived effects of durable registry + per-run state (no correctness weight on transient queues).
     - _Requirements: 9.2, 9.6, 9.7, 13.6_
   - [x] 6.5 Property test: routing determinism and effective-version precedence
     - In a routing module under `crates/tokeira-runtime/src/` `#[cfg(test)]` with `proptest` (≥100 iterations).
     - **Property 12: Routing determinism and effective-version precedence**
     - Generator: routing configs, per-run versioning state, and workflow ids. Invariant: deterministic target; precedence transition > override > behavior + deployment_version; ramp fraction split by id; nil Current → unversioned.
     - **Validates: Requirements 9.1, 9.3, 9.4, 9.8**
-  - [ ] 6.6 Property test: deployment-version transition lifecycle
+  - [x] 6.6 Property test: deployment-version transition lifecycle
     - In a routing/dispatch module under `crates/tokeira-runtime/src/` `#[cfg(test)]` with `proptest` (≥100 iterations).
     - **Property 13: Deployment-version transition lifecycle**
-    - Generator: runs and workflow/activity task-starts by pollers with differing deployment versions, plus WFT completions. Invariant: unpinned WFT starts start a revision-gated transition; transition-triggering activity starts are rejected/dropped and later rescheduled; activity starts during an in-flight transition are rejected; pinned-workflow independent activities do not transition; WFT completion updates effective behavior/deployment/`worker_deployment_name` (UNSPECIFIED → unversioned), clears the transition on target match, and bumps `revision_number` when routing to a new version.
+    - Generator: runs and workflow/activity task-starts by pollers with differing deployment versions, plus WFT completions. Invariant: unpinned WFT starts start a revision-gated transition that **sets** the run's `revision_number` to the task's dispatch revision; transition-triggering activity starts are rejected/dropped and later rescheduled; activity starts during an in-flight transition are rejected; pinned-workflow independent activities do not transition; WFT completion updates effective behavior/deployment/`worker_deployment_name` (UNSPECIFIED → unversioned) and clears the transition on target match **without modifying the run's `revision_number`** (per v1.31.0 `afterAddWorkflowTaskCompletedEvent`, which never assigns `RevisionNumber`).
     - **Validates: Requirements 9.2, 9.5, 9.6**
 
-- [ ] 7. Edge: adapter, errors, and translation
-  - [ ] 7.1 Add the `WorkerDeploymentRuntimeApi` adapter trait and outcome type
+- [x] 7. Edge: adapter, errors, and translation
+  - [x] 7.1 Add the `WorkerDeploymentRuntimeApi` adapter trait and outcome type
     - Define `WorkerDeploymentRuntimeApi` in `crates/tokeira-edge/src/workflow_service.rs` (analogous to `WorkflowRuntimeApi`) with one async method per v2 RPC taking translated request DTOs and returning view DTOs or `EdgeError`; define the edge-adapter outcome `DeploymentMutationOutcome { conflict_token, view }`, distinct from the concrete runtime `CommitResult` (mirroring `WorkflowMutationOutcome` vs `CommitResult`).
     - Implement the trait on `RuntimeAdapter` in `crates/tokeira-edge/src/grpc/runtime_adapter.rs`, delegating to `DeploymentRegistry`; the edge never touches storage or runtime internals directly.
     - _Requirements: 12.4, 13.1_
-  - [ ] 7.2 Add new `EdgeError` variants in `crates/tokeira-edge/src/errors.rs`
+  - [x] 7.2 Add new `EdgeError` variants in `crates/tokeira-edge/src/errors.rs`
     - Add `AlreadyExists` and `ResourceExhausted` with `status_code` + `action_name`; reuse `FailedPrecondition`, `NamespaceNotFound`, and the existing not-found/invalid-argument variants. Do not use `EdgeError::Internal` for any of these user-facing conditions.
     - _Requirements: 1.2, 2.4, 2.5_
-  - [ ] 7.3 Wire the new variants in `crates/tokeira-edge/src/grpc/errors.rs`
+  - [x] 7.3 Wire the new variants in `crates/tokeira-edge/src/grpc/errors.rs`
     - Map `AlreadyExists` → tonic `ALREADY_EXISTS`, `ResourceExhausted` → `RESOURCE_EXHAUSTED`, and confirm `FailedPrecondition`/`NamespaceNotFound`/not-found/invalid-argument map to `FAILED_PRECONDITION`/`NOT_FOUND`/`NOT_FOUND`/`INVALID_ARGUMENT`; confirm `grpc_error_code` emits the matching labels.
     - _Requirements: 1.2, 1.11, 2.4, 2.5, 12.2_
-  - [ ] 7.4 Add free translation functions for the deployment DTOs in `crates/tokeira-edge/src/grpc/translate.rs`
+  - [x] 7.4 Add free translation functions for the deployment DTOs in `crates/tokeira-edge/src/grpc/translate.rs`
     - Add request→DTO and view→proto free functions (matching the `respond_activity_completed_to_edge` pattern; no `TryFrom`) for `WorkerDeploymentInfo`, `WorkerDeploymentSummary`, `WorkerDeploymentVersionInfo`, `VersionTaskQueue`, `RoutingConfig`, `VersionDrainageInfo`, `VersionMetadata`, `ComputeConfig`, and the set-current/ramping/manager responses incl. the deprecated `previous_*` fields.
     - _Requirements: 1.4, 1.5, 2.7, 2.8, 3.7, 4.8, 6.4, 7.7, 8.6_
-  - [ ] 7.5 Replace the 13 `deferred_unary!("worker-deployments")` handlers with real handlers in `crates/tokeira-edge/src/grpc/workflow_service.rs`
+  - [x] 7.5 Replace the 13 `deferred_unary!("worker-deployments")` handlers with real handlers in `crates/tokeira-edge/src/grpc/workflow_service.rs`
     - Implement `create_worker_deployment`, `describe_worker_deployment`, `delete_worker_deployment`, `list_worker_deployments`, `create_worker_deployment_version`, `describe_worker_deployment_version`, `delete_worker_deployment_version`, `set_worker_deployment_current_version`, `set_worker_deployment_ramping_version`, `update_worker_deployment_version_compute_config`, `validate_worker_deployment_version_compute_config`, `update_worker_deployment_version_metadata`, `set_worker_deployment_manager`. Each handler resolves the namespace via `resolve_namespace_id` (→ `NOT_FOUND`), validates required identifiers where v1.31.0 does so (`deployment_name`, `build_id`, legacy `version` string, percentage range, oneof set, non-empty identity) → `INVALID_ARGUMENT` before any mutation, lets list `page_size` clamp rather than error, lets validate-compute skip version-existence lookup, calls the adapter, and translates the view with the free functions. None of the 13 returns `UNIMPLEMENTED`.
     - _Requirements: 1.1, 1.4, 1.5, 1.6, 1.8, 1.11, 2.1, 2.7, 2.8, 2.14, 3.1, 3.2, 4.1, 4.3, 5.8, 5.9, 6.1, 7.4, 7.8, 12.2, 12.3, 12.5_
-  - [ ] 7.6 Replace the 5 deprecated `Deployment` companion handlers in `crates/tokeira-edge/src/grpc/workflow_service.rs`
+  - [x] 7.6 Replace the 5 deprecated `Deployment` companion handlers in `crates/tokeira-edge/src/grpc/workflow_service.rs`
     - Make `describe_deployment`, `list_deployments`, `get_deployment_reachability`, `get_current_deployment`, `set_current_deployment` each return `Status::unimplemented("Deployments are deprecated and no longer supported, use Worker Deployments instead")` (the exact v1.31.0 message) before any state access; they do not route through the adapter.
     - _Requirements: 11.1, 11.2, 11.3, 11.4, 11.5, 11.6, 11.7_
-  - [ ] 7.7 Unit tests for edge validation and deprecated-companion messages in `crates/tokeira-edge/src/grpc/workflow_service.rs`
+  - [x] 7.7 Unit tests for edge validation and deprecated-companion messages in `crates/tokeira-edge/src/grpc/workflow_service.rs`
     - Cover: each deprecated companion returns the exact `UNIMPLEMENTED` message and touches no registry state; empty `deployment_name` / unset oneof / empty identity / unresolvable version → `INVALID_ARGUMENT`; namespace-not-found → `NOT_FOUND`; exceeding max-versions → `RESOURCE_EXHAUSTED`; overlapping upsert/remove and update/remove → `INVALID_ARGUMENT`; `eager_worker_deployment_options` applied iff `request_eager_execution`; all 13 v2 RPCs accept valid input without `UNIMPLEMENTED`.
     - _Requirements: 1.8, 2.5, 2.14, 5.3, 6.3, 7.4, 7.8, 9.7, 11.1, 11.2, 11.3, 11.4, 11.5, 11.6, 12.2, 12.5_
 
-- [ ] 8. Edge: describe versioning-info projection
-  - [ ] 8.1 Fill `versioning_info` + `worker_deployment_name` in the describe projection in `crates/tokeira-edge/src/grpc/translate.rs`
+- [x] 8. Edge: describe versioning-info projection
+  - [x] 8.1 Fill `versioning_info` + `worker_deployment_name` in the describe projection in `crates/tokeira-edge/src/grpc/translate.rs`
     - Populate `WorkflowExecutionInfo.versioning_info` (behavior, deployment_version, versioning_override, version_transition, revision_number, continue_as_new_initial_versioning_behavior) and `worker_deployment_name` from the per-run `WorkflowVersioningInfo` (the seam `api-conformance-workflow-describe` leaves default), using the same run snapshot; leave deprecated `assigned_build_id` / `inherited_build_id` / `most_recent_worker_version_stamp` default; absent versioning state ⇒ leave `versioning_info` and `worker_deployment_name` default with no fabricated placeholders.
     - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5_
-  - [ ] 8.2 Property test: versioning-info projection fidelity
+  - [x] 8.2 Property test: versioning-info projection fidelity
     - In `crates/tokeira-edge/src/grpc/translate.rs` `#[cfg(test)]` with `proptest` (≥100 iterations).
     - **Property 14: Versioning-info projection fidelity**
     - Generator: arbitrary per-run versioning state incl. the absent case. Invariant: `DescribeWorkflowExecution` projects `versioning_info` + `worker_deployment_name` exactly, leaves the deprecated build-id/version-stamp fields default, and leaves both default (no placeholders) when there is no versioning state.
     - **Validates: Requirements 10.1, 10.2, 10.3, 10.4**
 
-- [ ] 9. Cleanup: re-point mis-grouped worker-observability RPCs
-  - [ ] 9.1 Move `describe_worker` / `list_workers` out of the `worker-deployments` block in `crates/tokeira-edge/src/grpc/workflow_service.rs`
+- [x] 9. Cleanup: re-point mis-grouped worker-observability RPCs
+  - [x] 9.1 Move `describe_worker` / `list_workers` out of the `worker-deployments` block in `crates/tokeira-edge/src/grpc/workflow_service.rs`
     - Re-point `describe_worker` and `list_workers` from the `deferred_unary!("worker-deployments")` block to their owning worker-observability feature key (they are NOT deployment RPCs), and update the `deferred_handler_blocks_return_tracked_unimplemented_messages` test (and the `assert_deferred_rpc!` usages) so the two RPCs are asserted under their correct owning feature rather than `worker-deployments`.
     - _Requirements: 12.5_
 
-- [ ] 10. Compatibility matrix
-  - [ ] 10.1 Move the `worker-deployments` `FeatureEntry` off `Unsupported` in `crates/tokeira-compatibility/src/matrix.rs`
+- [x] 10. Compatibility matrix
+  - [x] 10.1 Move the `worker-deployments` `FeatureEntry` off `Unsupported` in `crates/tokeira-compatibility/src/matrix.rs`
     - Set the `worker-deployments` entry (id `"worker-deployments"`) to its supported state with evidence (13 v2 RPCs implemented; the 5 deprecated companions counted conformant via their v1.31.0 `UNIMPLEMENTED` behavior); keep `WORKER_DEPLOYMENT_RPCS` accurate.
     - _Requirements: 11.7, 12.5_
-  - [ ] 10.2 Update the deferred-RPC edge test for the 13 v2 RPCs in `crates/tokeira-edge/src/grpc/workflow_service.rs`
+  - [x] 10.2 Update the deferred-RPC edge test for the 13 v2 RPCs in `crates/tokeira-edge/src/grpc/workflow_service.rs`
     - Update `deferred_handler_blocks_return_tracked_unimplemented_messages` so the 13 v2 RPCs are no longer asserted as deferred placeholders (they now have real handlers) and the 5 deprecated companions assert the exact v1.31.0 `UNIMPLEMENTED` message.
     - _Requirements: 11.1, 11.2, 11.3, 11.4, 11.5, 12.5_
 
-- [ ] 11. Integration tests
-  - [ ] 11.1 Edge → adapter → registry → storage integration in `crates/tokeira-edge/tests/`
+- [x] 11. Integration tests
+  - [x] 11.1 Edge → adapter → registry → storage integration in `crates/tokeira-edge/tests/`
     - Exercise the full path for a representative RPC of each family: create/describe deployment, create version, set-current with ramp-unset, set-ramping, manager mismatch, drainage describe; assert responses and durable state.
     - _Requirements: 1.1, 1.4, 2.1, 3.1, 3.3, 4.1, 7.5, 8.6_
-  - [ ] 11.2 Restart-recovery integration in `crates/tokeira-edge/tests/` (or `crates/tokeira-runtime/tests/`)
+  - [x] 11.2 Restart-recovery integration in `crates/tokeira-edge/tests/` (or `crates/tokeira-runtime/tests/`)
     - Mutate the registry, drop the in-memory runtime, reload from the store via `list_all_for_namespace`, and assert describe/list return the pre-restart state and a pre-restart conflict token is evaluated with identical CAS semantics.
     - _Requirements: 13.1, 13.2, 13.3, 13.4_
-  - [ ] 11.3 Routing cycle integration in `crates/tokeira-runtime/tests/` (or `apps/tokeirad/tests/`)
-    - Drive a start → dispatch → WFT-completion → describe cycle: confirm the version transition is started by a differing poller, applied at WFT completion, `revision_number` advances on routing to a new version, and the projected `versioning_info` / `worker_deployment_name` reflect the completed routing.
+  - [x] 11.3 Routing cycle integration in `crates/tokeira-runtime/tests/` (or `apps/tokeirad/tests/`)
+    - Drive a start → dispatch → WFT-completion → describe cycle: confirm the version transition is started by a differing poller, the run's `revision_number` is **set** to the task's dispatch revision at transition-start (it is set there, never incremented at WFT completion — see task 6.4 and `mutable_state_impl.go:9108 @ v1.31.0`), the transition is applied/cleared at WFT completion **without** mutating `revision_number` (`afterAddWorkflowTaskCompletedEvent`, `workflow_task_state_machine.go:1283-1396 @ v1.31.0` never assigns it), and the projected `versioning_info` / `worker_deployment_name` reflect the completed routing.
     - _Requirements: 9.1, 9.2, 9.5, 9.6, 10.1, 10.2_
 
-- [ ] 12. Final checkpoint
+- [x] 12. Final checkpoint
   - Run `cargo +nightly fmt --all --check`.
   - Run `cargo lint` and `cargo test-lint`.
   - Run `cargo check --workspace` and `cargo test --workspace`.

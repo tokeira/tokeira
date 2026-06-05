@@ -14,7 +14,7 @@ name = "broker_sim"
 path = "src/lib.rs"
 
 [dependencies]
-sim-harness = { path = "../sim-harness" }
+sim-engine = { path = "../engine" }
 
 [dev-dependencies]
 proptest = "1"

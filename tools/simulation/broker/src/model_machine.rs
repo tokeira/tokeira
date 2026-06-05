@@ -10,7 +10,7 @@
 
 use std::collections::VecDeque;
 
-use sim_harness::{SignalCounters, SimCtx, StressModel};
+use sim_engine::{SignalCounters, SimCtx, StressModel};
 
 use crate::{
     bug::InjectedBug,

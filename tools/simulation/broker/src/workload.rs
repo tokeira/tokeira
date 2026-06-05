@@ -5,7 +5,7 @@
 //! activity tasks across a small set of runs/queues/partitions and interleaves
 //! polls, direct claims, queries, and the adversarial faults the spec requires.
 
-use sim_harness::SimCtx;
+use sim_engine::SimCtx;
 
 use crate::{
     events::{act_id, activity_queue, wft_id, wft_queue, BrokerEvent, BrokerEventKind},

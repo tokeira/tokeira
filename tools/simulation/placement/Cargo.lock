@@ -36,14 +36,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "84d7ced0ae9557296835c32bf1b1e02b44c746701f898460fb000d7eaa84f00a"
 
 [[package]]
-name = "broker-sim"
-version = "0.1.0"
-dependencies = [
- "proptest",
- "sim-harness",
-]
-
-[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -197,6 +189,14 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "placement-sim"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "sim-engine",
+]
 
 [[package]]
 name = "ppv-lite86"
@@ -390,7 +390,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sim-harness"
+name = "sim-engine"
 version = "0.1.0"
 
 [[package]]

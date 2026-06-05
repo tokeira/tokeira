@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "sim-harness"
+name = "sim-engine"
 version = "0.1.0"

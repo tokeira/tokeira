@@ -6,12 +6,12 @@ Tokeira's delivery broker design
 in [`crates/tokeira-runtime/src/broker.rs`](../../crates/tokeira-runtime/src/broker.rs))
 and the [delivery-broker-simulator spec](../../.kiro/specs/delivery-broker-simulator/).
 
-Like [`tools/placement-sim`](../placement-sim/), this is not a proof. It is a
+Like [`tools/simulation/placement`](../placement/), this is not a proof. It is a
 deterministic, adversarial simulator that repeatedly tries to break the broker's
 central correctness claim under injected faults, then checks that the invariants
 still hold after every event.
 
-It is built on the shared [`tools/sim-harness`](../sim-harness/) library — the
+It is built on the shared [`tools/simulation/engine`](../engine/) library — the
 reusable event-queue, RNG, invariant-registry, fault-injection, bounded-exhaustive
 enumerator, reporting, and CLI machinery generalised from `placement-sim`. The
 broker model imports neither `tokeira-runtime` nor `tokio`; it **re-models** the
@@ -112,7 +112,7 @@ When `--bug` is set, a falsification is the **expected** outcome (reported as
 ## Usage
 
 ```bash
-cd tools/broker-sim
+cd tools/simulation/broker
 cargo run --release
 
 # Stress only, more seeds
@@ -127,7 +127,7 @@ cargo run --release -- --bug=token-before-commit
 
 ### CLI flags
 
-Shared with the simulator family (via `sim-harness`): `--seeds` (250), `--ops`
+Shared with the simulator family (via `sim-engine`): `--seeds` (250), `--ops`
 (800), `--time-ms` (6000), `--verbose`, `--exhaustive-depth` (12),
 `--random-only`, `--exhaustive-only`. Broker-specific: `--bug=<name>`.
 

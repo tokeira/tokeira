@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 
 use broker_sim::{invariants, model::BrokerCfg, model_machine::BrokerModel};
-use sim_harness::{run_seed, Report};
+use sim_engine::{run_seed, Report};
 
 /// Run `seeds` of the clean (bug-free) broker through the stress loop and
 /// return the aggregate report — the exact construction `main.rs` performs.

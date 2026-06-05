@@ -1,14 +1,14 @@
-//! Delivery-broker simulator entry point.
+//! Placement/membership simulator entry point.
 //!
-//! Parses the shared `placement-sim` CLI vocabulary plus a `--bug=<name>` flag,
-//! then runs the bounded-exhaustive checker and/or the seeded stress simulator,
-//! aggregating into a harness `Report`. Exits non-zero on any failure. See
-//! `.kiro/specs/delivery-broker-simulator/` for the design and invariants.
+//! Parses the shared simulator CLI vocabulary plus a `--bug=<name>` flag, then
+//! runs the bounded-exhaustive checker and/or the seeded stress simulator,
+//! aggregating into an engine `Report`. Exits non-zero on any unexpected
+//! failure. See architecture doc 035 for the design this falsifies.
 
-use sim_harness::{cli, run_seed, CliSpec, Report};
+use sim_engine::{cli, run_seed, CliSpec, Report};
 
-use broker_sim::{
-    bug::InjectedBug, exhaustive, invariants, model::BrokerCfg, model_machine::BrokerModel,
+use placement_sim::{
+    bug::InjectedBug, exhaustive, invariants, model::PlacementCfg, model_machine::PlacementModel,
 };
 
 fn main() {
@@ -22,9 +22,7 @@ fn main() {
         .get("bug")
         .and_then(|v| InjectedBug::from_flag(v));
     if args.values.contains_key("bug") && bug.is_none() {
-        eprintln!(
-            "unknown --bug value; expected token-before-commit | drop-expired-sticky | no-dedup-on-republish"
-        );
+        eprintln!("unknown --bug value; expected buggy-start-routing");
         std::process::exit(2);
     }
 
@@ -55,10 +53,17 @@ fn main() {
     }
 
     if args.run_stress {
+        let mut cfg = PlacementCfg {
+            ops_per_seed: args.ops,
+            max_time_ms: args.time_ms,
+            ..PlacementCfg::default()
+        };
+        cfg.buggy_start_routing = bug == Some(InjectedBug::BuggyStartRouting);
+
         let registry = invariants::registry();
         let mut report = Report::new(registry.initial_outcomes());
         for seed in 1..=args.seeds {
-            let model = BrokerModel::new(BrokerCfg::default(), args.ops, args.time_ms, bug);
+            let model = PlacementModel::new(cfg.clone());
             let seed_report = run_seed(model, seed, args.time_ms, &registry, args.verbose);
             report.add_seed(seed_report);
         }

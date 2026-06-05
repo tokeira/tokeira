@@ -9,7 +9,7 @@
 //! unrelated model would stop compiling or stop passing, catching the leak
 //! before a real second consumer is built.
 
-use sim_harness::{
+use sim_engine::{
     run_bounded_exhaustive, run_seed, Invariant, InvariantClass, InvariantRegistry, Report,
     SignalCounters, SimCtx, StressModel,
 };
@@ -152,7 +152,7 @@ enum Op {
     Refill,
 }
 
-impl sim_harness::ExhaustiveModel for MiniBucket {
+impl sim_engine::ExhaustiveModel for MiniBucket {
     type Action = Op;
 
     fn initial() -> Self {

@@ -5,7 +5,7 @@
 //! the quiescent point. The falsification conditions match design.md Properties
 //! 1–11.
 
-use sim_harness::{Invariant, InvariantClass, InvariantRegistry};
+use sim_engine::{Invariant, InvariantClass, InvariantRegistry};
 
 use crate::model_machine::BrokerModel;
 

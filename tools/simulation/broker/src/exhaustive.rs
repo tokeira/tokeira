@@ -7,7 +7,7 @@
 //! shape bug — including an injected one — surfaces at shallow depth. This is
 //! the broker analog of placement-sim's mini exhaustive checker.
 
-use sim_harness::ExhaustiveModel;
+use sim_engine::ExhaustiveModel;
 
 use crate::bug::InjectedBug;
 
@@ -194,19 +194,19 @@ impl ExhaustiveModel for BrokerActionModel {
 pub fn run_with_bug(
     bug: Option<InjectedBug>,
     max_depth: usize,
-) -> Result<sim_harness::EnumReport, sim_harness::Counterexample<BrokerAction>> {
+) -> Result<sim_engine::EnumReport, sim_engine::Counterexample<BrokerAction>> {
     match bug {
-        None => sim_harness::run_bounded_exhaustive::<BrokerActionModel>(max_depth),
+        None => sim_engine::run_bounded_exhaustive::<BrokerActionModel>(max_depth),
         Some(InjectedBug::TokenBeforeCommit) => {
-            sim_harness::run_bounded_exhaustive::<BuggyTokenModel>(max_depth)
+            sim_engine::run_bounded_exhaustive::<BuggyTokenModel>(max_depth)
         }
         Some(InjectedBug::DropExpiredSticky) => {
-            sim_harness::run_bounded_exhaustive::<BuggyStickyModel>(max_depth)
+            sim_engine::run_bounded_exhaustive::<BuggyStickyModel>(max_depth)
         }
         Some(InjectedBug::NoDedupOnRepublish) => {
             // The dedup bug is a stress-mode concern (republish path); the tiny
             // model does not republish, so exploration completes cleanly here.
-            sim_harness::run_bounded_exhaustive::<BrokerActionModel>(max_depth)
+            sim_engine::run_bounded_exhaustive::<BrokerActionModel>(max_depth)
         }
     }
 }

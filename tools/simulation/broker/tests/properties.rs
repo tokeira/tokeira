@@ -11,7 +11,7 @@ use broker_sim::{
     exhaustive::{BrokerAction, BrokerActionModel},
 };
 use proptest::prelude::*;
-use sim_harness::ExhaustiveModel;
+use sim_engine::ExhaustiveModel;
 
 fn arb_action() -> impl Strategy<Value = BrokerAction> {
     prop_oneof![

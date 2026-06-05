@@ -1,16 +1,16 @@
 # Requirements Document
 
-Delivery Broker Simulator and Shared Simulation Harness
+Delivery Broker Simulator and Shared Simulation Engine
 
 ## Introduction
 
-Tokeira has exactly one discrete-event simulator today: `tools/placement-sim`, which falsifies the safety invariants of the placement/membership design ([035-placement-and-membership](../../../docs/architecture/035-placement-and-membership.md)). It is a single self-contained binary that injects adversarial faults — stale routing, concurrent OCC commits, lease expiry, drain races — and checks that six named invariants still hold after every event. This spec extends that single tool into the first two members of a **family of service simulators** that build confidence in Tokeira's design and implementation choices.
+Tokeira has exactly one discrete-event simulator today: `tools/simulation/placement`, which falsifies the safety invariants of the placement/membership design ([035-placement-and-membership](../../../docs/architecture/035-placement-and-membership.md)). It is a single self-contained binary that injects adversarial faults — stale routing, concurrent OCC commits, lease expiry, drain races — and checks that six named invariants still hold after every event. This spec extends that single tool into the first two members of a **family of service simulators** that build confidence in Tokeira's design and implementation choices.
 
 This spec has **two deliverables**:
 
-- **Deliverable A — Shared simulation harness.** The reusable mechanics that `placement-sim` invented inline (a deterministic seeded event-queue + RNG core, a per-event invariant-check loop, a named-invariant registry with PASS/FAIL aggregation, a fault-injection framework, a bounded-exhaustive state-space enumerator, aggregate reporting, and CLI scaffolding) are extracted into a reusable library. The harness is general enough to serve the future admission-control ([055-admission-control](../../../docs/architecture/055-admission-control.md)) and connection-management ([060-connection-management](../../../docs/architecture/060-connection-management.md)) simulators **without modification**, so later simulators are cheap to build and keep the invariant discipline uniform across the family.
+- **Deliverable A — Shared simulation engine.** The reusable mechanics that `placement-sim` invented inline (a deterministic seeded event-queue + RNG core, a per-event invariant-check loop, a named-invariant registry with PASS/FAIL aggregation, a fault-injection framework, a bounded-exhaustive state-space enumerator, aggregate reporting, and CLI scaffolding) are extracted into a reusable library. The engine is general enough to serve the future admission-control ([055-admission-control](../../../docs/architecture/055-admission-control.md)) and connection-management ([060-connection-management](../../../docs/architecture/060-connection-management.md)) simulators **without modification**, so later simulators are cheap to build and keep the invariant discipline uniform across the family.
 
-- **Deliverable B — Delivery-broker simulator.** The first consumer of the harness. It models the real Tokeira delivery broker ([040-delivery-broker](../../../docs/architecture/040-delivery-broker.md), implemented in `crates/tokeira-runtime/src/broker.rs`) as a pure deterministic state machine and falsifies the broker's central correctness claim under adversarial schedules.
+- **Deliverable B — Delivery-broker simulator.** The first consumer of the engine. It models the real Tokeira delivery broker ([040-delivery-broker](../../../docs/architecture/040-delivery-broker.md), implemented in `crates/tokeira-runtime/src/broker.rs`) as a pure deterministic state machine and falsifies the broker's central correctness claim under adversarial schedules.
 
 The delivery broker is built first because it is the highest-scale hot path, is actively being built, and its core correctness claim is safety-shaped and worth falsifying.
 
@@ -20,7 +20,7 @@ Doc 040 ("Why this is safe" + "Sweeper contract") states that authoritative pend
 
 ### What this spec is NOT
 
-This is a simulator plus a harness for design and implementation confidence. It is not the broker implementation (that is `crates/tokeira-runtime/src/broker.rs`). The simulator **re-models** broker semantics as a pure state machine; it does not import the async broker. This is the same modeling-vs-importing choice `placement-sim` made for DSQL and the runtime.
+This is a simulator plus an engine for design and implementation confidence. It is not the broker implementation (that is `crates/tokeira-runtime/src/broker.rs`). The simulator **re-models** broker semantics as a pure state machine; it does not import the async broker. This is the same modeling-vs-importing choice `placement-sim` made for DSQL and the runtime.
 
 ### Sources of truth
 
@@ -28,7 +28,7 @@ The model is grounded in three authoritative sources, cited by repo-relative pat
 
 - **`docs/architecture/040-delivery-broker.md`** — the design contract: three-tier delivery, reservation-based sync matching, sticky-first/not-sticky-only, fairness-belongs-to-backlog, sweeper contract, long-polls-stay-out-of-storage.
 - **`crates/tokeira-runtime/src/broker.rs`** — the actual implementation: `sticky_ready`/`general_ready` tiers per `QueueKey`, dedup keys `(RunKey, LogicalTaskSeq)` and `(RunKey, activity_id, attempt)`, `ReservedPoller` with `deliver()`/`return_reserved_poller`, the grace-scanner spill to durable backlog, the `denied_workers` set, and memory-only pollers.
-- **`tools/placement-sim/`** (binary + `README.md`) — the established simulator **pattern** this work generalises: two verification modes, named invariants checked after every event, a fault→invariant table, an injectable known bug caught by the exhaustive checker, and an aggregate report describing what a healthy run looks like.
+- **`tools/simulation/placement/`** (binary + `README.md`) — the established simulator **pattern** this work generalises: two verification modes, named invariants checked after every event, a fault→invariant table, an injectable known bug caught by the exhaustive checker, and an aggregate report describing what a healthy run looks like.
 
 This spec deliberately does NOT cite Temporal v1.31.0 server source: this is internal Tokeira design validation, not public-API-conformance behaviour. It is unrelated to the worker-deployments / api-conformance work.
 
@@ -42,18 +42,18 @@ The requirements use this mapping explicitly so the model is unambiguous:
 
 ## Glossary
 
-- **Harness**: The reusable simulation library (Deliverable A). Provides the deterministic event-queue + seeded RNG core, the invariant registry and per-event check hook, the fault-injection framework, the bounded-exhaustive enumerator, aggregate reporting, and CLI scaffolding. Contains no broker-specific or placement-specific logic.
-- **Broker_Model**: The pure deterministic re-model of Tokeira's delivery broker semantics (Deliverable B), built on the Harness. Models tiers, sticky promotion, dedup, reservations, the grace scanner, denied workers, the authoritative per-run pending state, and the sweeper. Does NOT import `tokeira-runtime`.
-- **Simulator**: The delivery-broker tool as a whole — the Broker_Model driven by the Harness in either verification mode.
+- **Engine**: The reusable simulation library (Deliverable A). Provides the deterministic event-queue + seeded RNG core, the invariant registry and per-event check hook, the fault-injection framework, the bounded-exhaustive enumerator, aggregate reporting, and CLI scaffolding. Contains no broker-specific or placement-specific logic.
+- **Broker_Model**: The pure deterministic re-model of Tokeira's delivery broker semantics (Deliverable B), built on the Engine. Models tiers, sticky promotion, dedup, reservations, the grace scanner, denied workers, the authoritative per-run pending state, and the sweeper. Does NOT import `tokeira-runtime`.
+- **Simulator**: The delivery-broker tool as a whole — the Broker_Model driven by the Engine in either verification mode.
 - **Stress_Mode**: The seeded stress verification mode. Randomised discrete-event simulation over configurable seeds, op counts, and a simulated time range. Deterministic and reproducible per seed.
 - **Exhaustive_Mode**: The bounded-exhaustive verification mode. Enumerates all reachable interleavings up to a configurable depth over a tiny model, closer to model checking than simulation.
 - **Event_Queue**: The deterministic priority queue of scheduled events ordered by simulated timestamp (and a deterministic tie-breaker), driving the state machine forward. No real wall-clock time.
 - **Seeded_RNG**: The deterministic pseudo-random number generator seeded per run, used for all randomised choices so that one seed produces exactly one event sequence.
-- **Invariant**: A named correctness property registered with the Harness and evaluated against model state. Classified as safety (must hold under all adversarial schedules) or liveness (holds under healthy / bounded-adversary conditions).
-- **Invariant_Registry**: The Harness component holding registered invariants by name, evaluating them via the per-event check hook, and aggregating PASS/FAIL per invariant across a run.
+- **Invariant**: A named correctness property registered with the Engine and evaluated against model state. Classified as safety (must hold under all adversarial schedules) or liveness (holds under healthy / bounded-adversary conditions).
+- **Invariant_Registry**: The Engine component holding registered invariants by name, evaluating them via the per-event check hook, and aggregating PASS/FAIL per invariant across a run.
 - **Falsification_Condition**: The measurable predicate whose truth means a given invariant has been violated. Each invariant requirement states one.
-- **Fault_Injector**: The Harness framework that introduces adversarial events (crashes, expiries, races, duplicates, storms) according to the active fault configuration.
-- **Reporter**: The Harness component that aggregates signal counts and per-invariant PASS/FAIL across seeds into a single report.
+- **Fault_Injector**: The Engine framework that introduces adversarial events (crashes, expiries, races, duplicates, storms) according to the active fault configuration.
+- **Reporter**: The Engine component that aggregates signal counts and per-invariant PASS/FAIL across seeds into a single report.
 - **Delivery_Broker**: The Tokeira subsystem that handles worker polling, sync matching, sticky routing, and durable backlog without being a source of truth (doc 040). The thing being modelled.
 - **QueueKey**: The broker's keying unit for ready tasks and waiters (`crates/tokeira-runtime/src/broker.rs`). The simulator's queue-family identity for delivery decisions.
 - **Tier_A_Inline**: Synchronous `ReservedPoller` match at publish time (see mapping above).
@@ -83,9 +83,9 @@ The requirements use this mapping explicitly so the model is unambiguous:
 
 ---
 
-## Deliverable A: Shared Simulation Harness
+## Deliverable A: Shared Simulation Engine
 
-The Harness is the reusable substrate. It MUST contain no broker-specific or placement-specific logic so that the future admission-control (055) and connection-management (060) simulators can consume it unchanged.
+The Engine is the reusable substrate. It MUST contain no broker-specific or placement-specific logic so that the future admission-control (055) and connection-management (060) simulators can consume it unchanged.
 
 ### Requirement 1: Deterministic Event-Queue and Seeded RNG Core
 
@@ -93,13 +93,13 @@ The Harness is the reusable substrate. It MUST contain no broker-specific or pla
 
 #### Acceptance Criteria
 
-1. THE Harness SHALL provide an Event_Queue that orders scheduled events by simulated timestamp using a deterministic tie-breaker for events sharing a timestamp.
-2. THE Harness SHALL advance simulated time only by draining the Event_Queue, without reading any wall-clock source.
-3. THE Harness SHALL provide a Seeded_RNG initialised from a single seed value supplied at run start.
-4. WHEN two runs are executed with the same seed, the same initial model, and the same fault configuration, THE Harness SHALL produce an identical ordered sequence of events.
-5. WHERE a model schedules a future event, THE Harness SHALL accept a non-negative simulated-time delay and enqueue the event at the current simulated time plus that delay.
-6. THE Harness SHALL expose the current simulated timestamp to the model during event handling.
-7. THE Harness SHALL be free of `tokio`, real-time clocks, and real I/O in its event-driving core.
+1. THE Engine SHALL provide an Event_Queue that orders scheduled events by simulated timestamp using a deterministic tie-breaker for events sharing a timestamp.
+2. THE Engine SHALL advance simulated time only by draining the Event_Queue, without reading any wall-clock source.
+3. THE Engine SHALL provide a Seeded_RNG initialised from a single seed value supplied at run start.
+4. WHEN two runs are executed with the same seed, the same initial model, and the same fault configuration, THE Engine SHALL produce an identical ordered sequence of events.
+5. WHERE a model schedules a future event, THE Engine SHALL accept a non-negative simulated-time delay and enqueue the event at the current simulated time plus that delay.
+6. THE Engine SHALL expose the current simulated timestamp to the model during event handling.
+7. THE Engine SHALL be free of `tokio`, real-time clocks, and real I/O in its event-driving core.
 
 ### Requirement 2: Generic Per-Event Invariant-Check Hook and Named-Invariant Registry
 
@@ -108,10 +108,10 @@ The Harness is the reusable substrate. It MUST contain no broker-specific or pla
 #### Acceptance Criteria
 
 1. THE Invariant_Registry SHALL accept invariants registered under a unique string name together with a classification of safety or liveness.
-2. WHEN an event has been applied to the model, THE Harness SHALL evaluate every registered invariant whose evaluation conditions are met against the resulting model state.
-3. IF a registered invariant's Falsification_Condition holds after an event, THEN THE Harness SHALL record that invariant as FAILED for the current run and retain the violating context for reporting.
+2. WHEN an event has been applied to the model, THE Engine SHALL evaluate every registered invariant whose evaluation conditions are met against the resulting model state.
+3. IF a registered invariant's Falsification_Condition holds after an event, THEN THE Engine SHALL record that invariant as FAILED for the current run and retain the violating context for reporting.
 4. THE Invariant_Registry SHALL aggregate, per invariant name, a PASS or FAIL result across all events in a run.
-5. WHERE an invariant is classified as liveness, THE Harness SHALL allow that invariant to be evaluated at run completion or at a model-signalled quiescent point rather than after every event.
+5. WHERE an invariant is classified as liveness, THE Engine SHALL allow that invariant to be evaluated at run completion or at a model-signalled quiescent point rather than after every event.
 6. THE Invariant_Registry SHALL be parameterised over the model type so that any consuming simulator supplies its own state and its own invariants.
 
 ### Requirement 3: Fault-Injection Framework
@@ -123,8 +123,8 @@ The Harness is the reusable substrate. It MUST contain no broker-specific or pla
 1. THE Fault_Injector SHALL allow a consuming simulator to register named faults that produce adversarial events.
 2. WHILE Stress_Mode is active, THE Fault_Injector SHALL select and schedule faults using only the Seeded_RNG so that fault timing is reproducible per seed.
 3. THE Fault_Injector SHALL accept a fault configuration that enables or disables individual faults for a run.
-4. THE Harness SHALL record, per run, a count of how many times each named fault was injected.
-5. THE Fault_Injector SHALL be parameterised over the model type so that fault definitions live in the consuming simulator, not in the Harness.
+4. THE Engine SHALL record, per run, a count of how many times each named fault was injected.
+5. THE Fault_Injector SHALL be parameterised over the model type so that fault definitions live in the consuming simulator, not in the Engine.
 
 ### Requirement 4: Bounded-Exhaustive State-Space Enumerator
 
@@ -132,7 +132,7 @@ The Harness is the reusable substrate. It MUST contain no broker-specific or pla
 
 #### Acceptance Criteria
 
-1. THE Harness SHALL provide an enumerator that explores reachable model states by applying every applicable transition at each step.
+1. THE Engine SHALL provide an enumerator that explores reachable model states by applying every applicable transition at each step.
 2. THE enumerator SHALL accept a configurable maximum depth and SHALL NOT expand states beyond that depth.
 3. WHEN a registered safety invariant's Falsification_Condition holds at any enumerated state, THE enumerator SHALL report the violating state together with the shortest transition path that reaches it.
 4. THE enumerator SHALL be parameterised over the model type, its transition set, and its invariants so that it carries no broker-specific or placement-specific logic.
@@ -148,7 +148,7 @@ The Harness is the reusable substrate. It MUST contain no broker-specific or pla
 2. THE Reporter SHALL present a PASS or FAIL line per registered invariant name across the whole run.
 3. IF any safety invariant is recorded as FAILED in any seed, THEN THE Reporter SHALL report the overall run as FAILED.
 4. WHEN a seed produces an invariant failure, THE Reporter SHALL include the failing seed and the violating context in the report.
-5. THE Reporter SHALL accept model-defined signal names so the Harness holds no broker-specific or placement-specific counter definitions.
+5. THE Reporter SHALL accept model-defined signal names so the Engine holds no broker-specific or placement-specific counter definitions.
 
 ### Requirement 6: CLI Scaffolding
 
@@ -156,29 +156,29 @@ The Harness is the reusable substrate. It MUST contain no broker-specific or pla
 
 #### Acceptance Criteria
 
-1. THE Harness SHALL provide CLI scaffolding that parses, at minimum, the flags `--seeds`, `--ops`, `--time-ms`, `--verbose`, `--exhaustive-depth`, `--random-only`, and `--exhaustive-only`, matching the `placement-sim` vocabulary where sensible.
+1. THE Engine SHALL provide CLI scaffolding that parses, at minimum, the flags `--seeds`, `--ops`, `--time-ms`, `--verbose`, `--exhaustive-depth`, `--random-only`, and `--exhaustive-only`, matching the `placement-sim` vocabulary where sensible.
 2. THE CLI scaffolding SHALL allow a consuming simulator to register additional simulator-specific flags, including a buggy-mode flag.
-3. WHEN `--seeds N` is provided, THE Harness SHALL run Stress_Mode over N distinct deterministic seeds.
-4. WHERE `--verbose` is set, THE Harness SHALL emit a per-event trace for the run.
-5. WHERE `--random-only` is set, THE Harness SHALL run Stress_Mode and skip Exhaustive_Mode; WHERE `--exhaustive-only` is set, THE Harness SHALL run Exhaustive_Mode and skip Stress_Mode.
-6. THE Harness SHALL NOT require `proptest` or any workspace property-testing dependency, supplying its own RNG and enumerator as `placement-sim` does.
+3. WHEN `--seeds N` is provided, THE Engine SHALL run Stress_Mode over N distinct deterministic seeds.
+4. WHERE `--verbose` is set, THE Engine SHALL emit a per-event trace for the run.
+5. WHERE `--random-only` is set, THE Engine SHALL run Stress_Mode and skip Exhaustive_Mode; WHERE `--exhaustive-only` is set, THE Engine SHALL run Exhaustive_Mode and skip Stress_Mode.
+6. THE Engine SHALL NOT require `proptest` or any workspace property-testing dependency, supplying its own RNG and enumerator as `placement-sim` does.
 
-### Requirement 7: Harness Reusability Boundary
+### Requirement 7: Engine Reusability Boundary
 
-**User Story:** As the owner of the simulator family, I want the Harness abstraction boundary validated against the next two consumers, so that admission-control (055) and connection-management (060) simulators can be built on it without modification.
+**User Story:** As the owner of the simulator family, I want the Engine abstraction boundary validated against the next two consumers, so that admission-control (055) and connection-management (060) simulators can be built on it without modification.
 
 #### Acceptance Criteria
 
-1. THE Harness SHALL expose its event-queue core, invariant registry, fault framework, enumerator, reporter, and CLI scaffolding as a library API consumable by a separate simulator crate.
-2. THE Harness SHALL NOT name, import, or depend on any delivery-broker, placement, admission-control, or connection-management type.
-3. THE delivery-broker Simulator SHALL be the first consumer of the Harness and SHALL depend on the Harness as a library.
-4. THE Harness API SHALL be general enough that the admission-control (055) and connection-management (060) simulators are realisable as additional consumers without changing the Harness library.
+1. THE Engine SHALL expose its event-queue core, invariant registry, fault framework, enumerator, reporter, and CLI scaffolding as a library API consumable by a separate simulator crate.
+2. THE Engine SHALL NOT name, import, or depend on any delivery-broker, placement, admission-control, or connection-management type.
+3. THE delivery-broker Simulator SHALL be the first consumer of the Engine and SHALL depend on the Engine as a library.
+4. THE Engine API SHALL be general enough that the admission-control (055) and connection-management (060) simulators are realisable as additional consumers without changing the Engine library.
 
 ---
 
 ## Deliverable B: Delivery-Broker Model
 
-This deliverable re-models the real Tokeira delivery broker as a pure deterministic state machine on top of the Harness. The model is grounded in `docs/architecture/040-delivery-broker.md` and `crates/tokeira-runtime/src/broker.rs`.
+This deliverable re-models the real Tokeira delivery broker as a pure deterministic state machine on top of the Engine. The model is grounded in `docs/architecture/040-delivery-broker.md` and `crates/tokeira-runtime/src/broker.rs`.
 
 ### Requirement 8: Pure Deterministic Re-Model of Broker Semantics
 
@@ -186,7 +186,7 @@ This deliverable re-models the real Tokeira delivery broker as a pure determinis
 
 #### Acceptance Criteria
 
-1. THE Broker_Model SHALL implement broker behaviour as a pure deterministic state machine driven by the Harness Event_Queue, with no `tokio`, no real time, and no real I/O.
+1. THE Broker_Model SHALL implement broker behaviour as a pure deterministic state machine driven by the Engine Event_Queue, with no `tokio`, no real time, and no real I/O.
 2. THE Broker_Model SHALL re-model broker semantics rather than import `crates/tokeira-runtime/src/broker.rs`, mirroring the modeling choice `placement-sim` made for DSQL and the runtime.
 3. THE Broker_Model SHALL key ready tasks and waiters by QueueKey, consistent with `crates/tokeira-runtime/src/broker.rs`.
 4. THE Broker_Model SHALL hold Authoritative_Pending_State per run separately from broker queue state, so that broker state can be discarded without losing authoritative pending tasks.
@@ -586,26 +586,26 @@ The simulator MUST provide two verification modes, mirroring `placement-sim`.
 
 ### Requirement 40: Placement and Tooling Constraints
 
-**User Story:** As a Tokeira maintainer, I want the simulator and harness to live where `placement-sim` lives and depend on nothing live, so that they fit the established tooling pattern and run in CI without external services.
+**User Story:** As a Tokeira maintainer, I want the simulator and engine to live where `placement-sim` lives and depend on nothing live, so that they fit the established tooling pattern and run in CI without external services.
 
 #### Acceptance Criteria
 
-1. THE Harness and the Simulator SHALL live under `tools/` as standalone tool crates, as `tools/placement-sim` does.
-2. THE Harness and the Simulator crates SHALL set `publish = false`.
-3. THE Harness SHALL be a library crate and the delivery-broker Simulator SHALL be a binary crate that consumes the Harness library.
-4. THE Harness and the Simulator SHALL NOT depend on live AWS, Docker, or any network service.
-5. THE Harness and the Simulator SHALL NOT require `proptest` or any workspace property-testing dependency, supplying their own RNG and enumerator as `placement-sim` does.
+1. THE Engine and the Simulator SHALL live under `tools/` as standalone tool crates, as `tools/simulation/placement` does.
+2. THE Engine and the Simulator crates SHALL set `publish = false`.
+3. THE Engine SHALL be a library crate and the delivery-broker Simulator SHALL be a binary crate that consumes the Engine library.
+4. THE Engine and the Simulator SHALL NOT depend on live AWS, Docker, or any network service.
+5. THE Engine and the Simulator SHALL NOT require `proptest` or any workspace property-testing dependency, supplying their own RNG and enumerator as `placement-sim` does.
 6. THE Simulator SHALL be deterministic and reproducible from a seed.
 
 ### Requirement 41: Scope and Non-Goals
 
-**User Story:** As a Tokeira maintainer, I want scope and non-goals stated explicitly, so that the simulator is not mistaken for the broker implementation and the harness boundary stays correct.
+**User Story:** As a Tokeira maintainer, I want scope and non-goals stated explicitly, so that the simulator is not mistaken for the broker implementation and the engine boundary stays correct.
 
 #### Acceptance Criteria
 
 1. THE Simulator SHALL model broker semantics for design and implementation confidence and SHALL NOT be or replace the broker implementation in `crates/tokeira-runtime/src/broker.rs`.
 2. THE Simulator SHALL NOT import the async production broker.
-3. THE Harness SHALL be general enough to serve the admission-control (055) and connection-management (060) simulators as future consumers, which are out of scope to implement in this spec.
+3. THE Engine SHALL be general enough to serve the admission-control (055) and connection-management (060) simulators as future consumers, which are out of scope to implement in this spec.
 4. THE Simulator SHALL document, as out-of-scope limitations mirroring `placement-sim`, that it does not model real DSQL transaction-isolation fidelity, network partitions, or multi-cell placement.
 5. THE Simulator SHALL NOT cite Temporal v1.31.0 server source, since this is internal Tokeira design validation rather than public-API-conformance behaviour.
 
@@ -615,7 +615,7 @@ The simulator MUST provide two verification modes, mirroring `placement-sim`.
 
 The following are recorded for resolution in the design phase, not fixed here:
 
-1. **Crate layout.** An external reviewer suggested a `crates/tokeira-simulation/` location; the user's decision is `tools/` (the `placement-sim` sibling location). Within `tools/`, the specific layout — one harness library crate plus one broker binary crate, versus a single crate with a harness module and a broker binary — is a design-phase decision.
+1. **Crate layout.** An external reviewer suggested a `crates/tokeira-simulation/` location; the user's decision is `tools/` (the `placement-sim` sibling location). Within `tools/`, the specific layout — one engine library crate plus one broker binary crate, versus a single crate with an engine module and a broker binary — is a design-phase decision.
 2. **Sticky-vs-general internal structure.** Whether the model mirrors `broker.rs`'s separate `sticky_ready` / `general_ready` maps exactly or uses an equivalent unified structure with a sticky flag is a design-phase decision, provided the observable sticky/promotion semantics (Requirement 11) are preserved.
 3. **Grace-window and max-waiting-poller defaults.** Concrete default values for the grace window (Requirement 13) and the maximum waiting pollers (Requirement 31) are design-phase decisions.
 4. **Partition count and queue-family granularity.** How many partitions per logical queue the tiny exhaustive model and the stress model use (Requirement 20), and how QueueKey granularity maps onto partitions, are design-phase decisions.

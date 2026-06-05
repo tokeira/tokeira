@@ -37,9 +37,9 @@ members = [
 ]
 exclude = [
     "scenarios/worker-versioning",
-    "tools/placement-sim",
-    "tools/sim-harness",
-    "tools/broker-sim",
+    "tools/simulation/engine",
+    "tools/simulation/broker",
+    "tools/simulation/placement",
     "spikes/connect-buffa",
 ]
 

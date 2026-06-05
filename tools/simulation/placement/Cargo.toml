@@ -8,3 +8,13 @@ description = "Discrete-event simulator for Tokeira placement/membership invaria
 [[bin]]
 name = "placement-sim"
 path = "src/main.rs"
+
+[lib]
+name = "placement_sim"
+path = "src/lib.rs"
+
+[dependencies]
+sim-engine = { path = "../engine" }
+
+[dev-dependencies]
+proptest = "1"

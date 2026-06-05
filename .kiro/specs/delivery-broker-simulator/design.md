@@ -1,24 +1,24 @@
-# Design Document: Delivery Broker Simulator and Shared Simulation Harness
+# Design Document: Delivery Broker Simulator and Shared Simulation Engine
 
 ## Overview
 
 This design delivers two things, in dependency order:
 
-- **Deliverable A — a shared simulation harness** (`tools/sim-harness`, a library crate): the
-  reusable mechanics that `tools/placement-sim` currently hand-rolls inline — a deterministic
+- **Deliverable A — a shared simulation engine** (`tools/simulation/engine`, a library crate): the
+  reusable mechanics that `tools/simulation/placement` originally hand-rolled inline — a deterministic
   seeded event queue, an `XorShift64` RNG, a per-event invariant-check loop, a named-invariant
   registry with PASS/FAIL aggregation, a fault-injection framework, a bounded-exhaustive
   state-space enumerator, aggregate reporting, and CLI scaffolding — generalised behind small
   traits so any model can drive them.
-- **Deliverable B — the delivery-broker simulator** (`tools/broker-sim`, a binary crate): a pure
+- **Deliverable B — the delivery-broker simulator** (`tools/simulation/broker`, a binary crate): a pure
   deterministic re-model of Tokeira's delivery broker
   (`docs/architecture/040-delivery-broker.md`, `crates/tokeira-runtime/src/broker.rs`) built on
-  the harness, exercising the three-tier delivery model, reservation-based matching, sticky
+  the engine, exercising the three-tier delivery model, reservation-based matching, sticky
   promotion, dedup, the grace scanner, denied workers, the sweeper, the broker control loop, and
   delivery-quality signals — and falsifying the broker's central correctness claim under
   adversarial schedules.
 
-The harness boundary is validated by the broker simulator now and is general enough to host the
+The engine boundary is validated by the broker simulator now and is general enough to host the
 future admission-control (`055-admission-control.md`) and connection-management
 (`060-connection-management.md`) simulators as additional consumers without modification
 (Requirement 7).
@@ -35,30 +35,30 @@ obligation to keep the two aligned. The simulator is a *confidence instrument*, 
 
 ### What stays faithful to `placement-sim`
 
-The harness is a strict generalisation of `placement-sim`'s proven shape, not a redesign:
+The engine is a strict generalisation of `placement-sim`'s original proven shape, not a redesign:
 
-| `placement-sim` (inline) | Harness (generic) |
+| `placement-sim` (originally inline) | Engine (generic) |
 |---|---|
-| `XorShift64` | `harness::Rng` (same algorithm, same `range` semantics) |
-| `BinaryHeap<Event>`, `Event { at_ms, seq, kind }`, reverse-ordered `Ord` | `harness::EventQueue<E>`, `Scheduled<E> { at_ms, seq, event }` |
+| `XorShift64` | `sim_engine::Rng` (same algorithm, same `range` semantics) |
+| `BinaryHeap<Event>`, `Event { at_ms, seq, kind }`, reverse-ordered `Ord` | `sim_engine::EventQueue<E>`, `Scheduled<E> { at_ms, seq, event }` |
 | `Sim::handle` + `check_invariants` after every pop | `StressRunner` driving `StressModel::handle` then the `InvariantRegistry` |
 | hardcoded fault arms in `schedule_workload` | `FaultInjector` with model-registered faults |
 | `run_bounded_exhaustive` + `MiniState`/`MiniAction` + `best_remaining_by_state` dedup | `BoundedExhaustiveChecker` over `ExhaustiveModel` |
-| `AggregateReport` | `harness::Report` with model-defined signal counters |
-| inline `env::args` parsing | `harness::Cli` parsing shared flags + model flags |
-| `SimError` / `CounterExample` Display | `harness::Failure` / `Counterexample` Display |
+| `AggregateReport` | `sim_engine::Report` with model-defined signal counters |
+| inline `env::args` parsing | `sim_engine::Cli` parsing shared flags + model flags |
+| `SimError` / `CounterExample` Display | `sim_engine::Failure` / `Counterexample` Display |
 
 ## Architecture
 
-Two crates under `tools/`, plus the existing `placement-sim` left in place (it may later be
-refactored onto the harness, but that is out of scope here).
+Two crates under `tools/simulation/`, alongside `placement` (which has since been refactored onto
+this engine; that rebase was out of scope for this spec and is tracked separately).
 
 ```mermaid
 flowchart TD
     subgraph tools["tools/"]
-        H["sim-harness (lib)\nRng · EventQueue · InvariantRegistry\nFaultInjector · Enumerator · Report · Cli"]
+        H["sim-engine (lib)\nRng · EventQueue · InvariantRegistry\nFaultInjector · Enumerator · Report · Cli"]
         B["broker-sim (bin)\nBrokerModel · BrokerEvent · BrokerAction\nfaults · invariants · injectable bug"]
-        P["placement-sim (bin, unchanged)"]
+        P["placement-sim (bin, since rebased onto the engine)"]
         FA["future: admission-sim"]
         FC["future: connection-sim"]
     end
@@ -99,7 +99,7 @@ invariants at the quiescent point. No wall-clock, no async, no I/O (Requirements
 
 ## Components and Interfaces
 
-### Deliverable A — `tools/sim-harness`
+### Deliverable A — `tools/simulation/engine`
 
 #### Rng (Requirement 1.3, 1.4)
 
@@ -204,7 +204,7 @@ pub struct FaultConfig { enabled: HashMap<&'static str, bool> }  // Requirement 
 pub struct FaultInjector<E> { faults: Vec<Fault<E>>, config: FaultConfig, counts: HashMap<&'static str, u64> }
 ```
 
-Faults are model-defined (Requirement 3.5); the harness only schedules them and counts injections
+Faults are model-defined (Requirement 3.5); the engine only schedules them and counts injections
 (Requirement 3.4). The broker model registers its fault set (Requirement 34) into this injector
 during `bootstrap`.
 
@@ -239,7 +239,7 @@ every transition; the first violation returns the accumulated `path` (Requiremen
 #### Report (Requirement 5, 39)
 
 ```rust
-/// Model-defined named counters. The harness holds no broker/placement-specific names.
+/// Model-defined named counters. The engine holds no broker/placement-specific names.
 pub struct SignalCounters { counts: BTreeMap<&'static str, u64> }
 impl SignalCounters { pub fn incr(&mut self, name: &'static str); pub fn add(&mut self, name: &'static str, n: u64); pub fn get(&self, name: &'static str) -> u64; }
 
@@ -274,10 +274,10 @@ pub struct CliArgs {
 pub fn parse(spec: &CliSpec) -> CliArgs;
 ```
 
-The harness supplies its own RNG and enumerator and pulls in no `proptest` (Requirements 6.6,
+The engine supplies its own RNG and enumerator and pulls in no `proptest` (Requirements 6.6,
 34.5).
 
-### Deliverable B — `tools/broker-sim`
+### Deliverable B — `tools/simulation/broker`
 
 #### Domain identifiers (mirroring `crates/tokeira-runtime/src/broker.rs` and `tokeira-types`)
 
@@ -581,24 +581,24 @@ permanently starving a cold one, or fairness machinery blocking fresh sync-match
 
 ### Model-Level Property Tests (proptest, in the broker-sim crate)
 
-The harness forbids `proptest` in its own core (Requirement 6.6), but the broker-sim crate uses
+The engine forbids `proptest` in its own core (Requirement 6.6), but the broker-sim crate uses
 the workspace `proptest` for focused property tests of the *model's* pure transitions (tier
 selection determinism, dedup, sticky promotion, budget monotonicity), complementing the
 simulation modes. Minimum 100 iterations, each tagged.
 
 ## Error Handling
 
-- **Stress failure** (`harness::Failure`): mirrors `placement-sim`'s `SimError` — carries seed,
+- **Stress failure** (`sim_engine::Failure`): mirrors `placement-sim`'s `SimError` — carries seed,
   `now_ms`, the violated invariant name + reason, and a recent-event tail; `Display` prints it;
   the runner exits non-zero (Requirements 30.3, 33.4).
 - **Exhaustive counterexample** (`Counterexample`): carries depth, reason, and the shortest action
   path; `Display` prints the numbered path and final state (Requirement 4.3, 31.3).
 - **CLI misuse**: unknown flags panic with a message, as `placement-sim` does.
-- The harness never panics on model state; only invariant violations and CLI misuse terminate.
+- The engine never panics on model state; only invariant violations and CLI misuse terminate.
 
 ## Testing Strategy
 
-- **Harness unit tests** (`tools/sim-harness`): RNG determinism (same seed → same stream),
+- **Engine unit tests** (`tools/simulation/engine`): RNG determinism (same seed → same stream),
   event-queue ordering and tie-break, registry PASS/FAIL aggregation, enumerator visited-state
   pruning and shortest-path reporting, report aggregation, CLI parsing of shared + extra flags.
   Property test: same `(seed, model, fault-config)` → identical event sequence (Requirement
@@ -611,10 +611,10 @@ simulation modes. Minimum 100 iterations, each tagged.
 - **Determinism test**: stress mode run twice with identical flags yields byte-identical reports
   (Requirement 30.4/32.1).
 - **Reusability check** (Requirement 7.4): a throwaway trivial second model (a few lines, e.g. a
-  counter with one invariant) compiles against the harness in a `#[cfg(test)]` to prove the
-  harness API carries no broker-specific assumptions — the lightweight stand-in for the future
+  counter with one invariant) compiles against the engine in a `#[cfg(test)]` to prove the
+  engine API carries no broker-specific assumptions — the lightweight stand-in for the future
   admission/connection consumers.
-- No test requires AWS, Docker, or the network (Requirement 34.4); `cargo test -p sim-harness` and
+- No test requires AWS, Docker, or the network (Requirement 34.4); `cargo test -p sim-engine` and
   `cargo test -p broker-sim` run in CI.
 
 ## Crate Layout (Deferred Question 1 resolution)
@@ -622,12 +622,12 @@ simulation modes. Minimum 100 iterations, each tagged.
 Two crates under `tools/` (the user's confirmed location; the reviewer-suggested
 `crates/tokeira-simulation/` is explicitly not used now):
 
-- `tools/sim-harness/` — `lib.rs` exposing `rng`, `event`, `invariant`, `fault`, `enumerate`,
+- `tools/simulation/engine/` — `lib.rs` exposing `rng`, `event`, `invariant`, `fault`, `enumerate`,
   `report`, `cli` modules. `publish = false`. No dependency on any Tokeira crate.
-- `tools/broker-sim/` — `main.rs` (CLI wiring), `model.rs` (`BrokerModel` + `BrokerState` +
+- `tools/simulation/broker/` — `main.rs` (CLI wiring), `model.rs` (`BrokerModel` + `BrokerState` +
   `AuthoritativePendingState`), `events.rs`, `invariants.rs`, `faults.rs`, `exhaustive.rs`
-  (`BrokerActionModel`), `bug.rs`. `publish = false`. Depends on `sim-harness` and `proptest`
+  (`BrokerActionModel`), `bug.rs`. `publish = false`. Depends on `sim-engine` and `proptest`
   (dev-dependency) only.
 
-`placement-sim` is left untouched; a future change could rebase it onto `sim-harness`, but that is
-out of scope here.
+`placement-sim` was left untouched by this spec; it has since been rebased onto `sim-engine` as a
+follow-on, tracked separately.

@@ -1,0 +1,10 @@
+[package]
+name = "sim-engine"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Reusable discrete-event simulation engine for the Tokeira simulator family"
+
+[lib]
+name = "sim_engine"
+path = "src/lib.rs"

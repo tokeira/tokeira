@@ -1,12 +1,12 @@
-//! Reusable discrete-event simulation harness for the Tokeira simulator family.
+//! Reusable discrete-event simulation engine for the Tokeira simulator family.
 //!
-//! This crate generalises the mechanics `tools/placement-sim` invented inline so
-//! that each service simulator — the delivery-broker simulator first, the
-//! admission-control and connection-management simulators later — can be built
+//! This crate generalises the mechanics `tools/simulation/placement` invented
+//! inline so that each service simulator — the delivery broker, placement, and
+//! the future admission-control and connection-management models — can be built
 //! on a shared, uniformly-disciplined substrate rather than re-deriving an event
 //! loop, an RNG, and an invariant checker each time.
 //!
-//! The harness deliberately holds **no domain logic**: it knows nothing about
+//! The engine deliberately holds **no domain logic**: it knows nothing about
 //! brokers, placement, admission, or connections. A consuming simulator supplies
 //! its own model state, event type, invariants, faults, and signal names, and
 //! drives them through these generic pieces:

@@ -1,0 +1,20 @@
+[package]
+name = "broker-sim"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Discrete-event simulator for the Tokeira delivery broker design"
+
+[[bin]]
+name = "broker-sim"
+path = "src/main.rs"
+
+[lib]
+name = "broker_sim"
+path = "src/lib.rs"
+
+[dependencies]
+sim-harness = { path = "../sim-harness" }
+
+[dev-dependencies]
+proptest = "1"

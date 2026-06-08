@@ -18,7 +18,7 @@ This is a product-from-scratch. The architecture is informed by Temporal but the
 
 ### 1. Rust Standards
 
-- Edition 2024, stable toolchain pinned to 1.95.
+- Edition 2024, stable toolchain pinned to 1.96.
 - `cargo clippy --workspace --all-targets` must pass. No suppressed warnings without a comment explaining why.
 - `cargo +nightly fmt` for formatting (some settings require nightly). Just run it — don't check first.
 - Error handling: `thiserror` in library crates, `anyhow` in binary crates. No `.unwrap()` outside tests.

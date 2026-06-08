@@ -1,4 +1,4 @@
-use crate::{Feature, FeatureState};
+use crate::{Feature, FeatureEntry, FeatureState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchOutcome {
@@ -64,6 +64,28 @@ pub fn dispatch_rpc<F: Feature>(
     let entry = F::ENTRY;
     metrics.increment_dispatch(entry.id, entry.state);
 
+    dispatch_outcome_for(entry, dynamic_config, namespace)
+}
+
+/// The single state→outcome decision behind both the compile-time-keyed
+/// [`dispatch_rpc`] and the coverage [`expected_outcome`](crate::coverage::expected::expected_outcome)
+/// projection.
+///
+/// `dispatch_rpc` is generic over [`Feature`] for compile-time keying, which makes it
+/// unusable from a runtime context that only holds a `&FeatureEntry`. Factoring the actual
+/// policy here — operating on a borrowed entry rather than a type parameter — lets the
+/// runtime expected-outcome projection reuse the *exact same* decision instead of mirroring
+/// the `match` independently. This is the single-source-of-truth guarantee the design calls
+/// for: "one policy, two views" holds by construction, not by manual synchronisation.
+///
+/// `metrics` is deliberately not taken here: incrementing a dispatch counter is a side effect
+/// of an actual dispatch, not of asking what the expected outcome would be, so it stays in
+/// [`dispatch_rpc`].
+pub fn dispatch_outcome_for(
+    entry: &FeatureEntry,
+    dynamic_config: &dyn DynamicConfigReader,
+    namespace: Option<&str>,
+) -> DispatchOutcome {
     match entry.state {
         FeatureState::Implemented | FeatureState::Partial => DispatchOutcome::Proceed,
         FeatureState::Experimental => match entry.dynamic_config_key {

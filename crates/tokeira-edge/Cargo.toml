@@ -20,11 +20,13 @@ serde_json = "1"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
 tokio = { version = "1", features = ["sync", "time", "macros", "rt", "test-util"] }
+tower = "0.4"
 tokio-stream.workspace = true
 tokio-util = { version = "0.7", features = ["rt"] }
 tonic.workspace = true
 tracing = "0.1"
 tracing-opentelemetry.workspace = true
+tokeira-build-info.workspace = true
 tokeira-compatibility.workspace = true
 uuid = { version = "1", features = ["v4", "serde"] }
 

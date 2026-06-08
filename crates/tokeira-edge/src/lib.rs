@@ -7,6 +7,7 @@
 //! `tokeira-kernel`, `tokeira-runtime`, or `tokeira-storage` instead.
 
 pub mod batch_engine;
+pub mod conformance;
 pub mod errors;
 pub mod grpc;
 pub mod health_service;
@@ -26,6 +27,7 @@ pub mod translate;
 pub mod workflow_service;
 
 pub use batch_engine::*;
+pub use conformance::*;
 pub use errors::*;
 pub use grpc::*;
 pub use health_service::*;

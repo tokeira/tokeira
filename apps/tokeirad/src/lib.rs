@@ -15,7 +15,12 @@
 
 #![deny(rust_2018_idioms)]
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -41,6 +46,7 @@ use tokeira_edge::{
     HistoryWaitRegistry, InMemoryNamespaceCache, InMemoryOperatorApi, LocalOnlyRouter,
     LongPollConfig, LongPollGate, NamespaceCache, OperatorService, PendingQueryStore,
     PollerRegistry, ResolvedNamespace, RoutingCache, WorkflowExecutionDescription, WorkflowService,
+    conformance::{WireCoverageLayer, WireCoverageRecorder},
     grpc::{
         operator_service::OperatorServiceGrpc, runtime_adapter::RuntimeAdapter,
         workflow_service::WorkflowServiceGrpc,
@@ -138,7 +144,7 @@ impl TokeiradHandle {
     /// in-memory storage path.
     pub async fn start_in_memory(addr: SocketAddr) -> Result<Self> {
         let effective_config = Arc::new(TokeiraConfig::default());
-        let (server_task, bound_addr, shutdown_tx, background_cancel, log_broadcast) =
+        let (server_task, bound_addr, shutdown_tx, background_cancel, log_broadcast, _recorder) =
             build_and_serve(addr, effective_config).await?;
         Ok(Self {
             bound_addr,
@@ -294,14 +300,64 @@ pub async fn run_from_cli(cli: Cli) -> Result<()> {
         })?;
     info!(config_source, "loaded tokeirad configuration");
 
-    let (server_task, bound_addr, _shutdown_tx, _background_cancel, _log_broadcast) =
+    let (server_task, bound_addr, _shutdown_tx, _background_cancel, _log_broadcast, wire_recorder) =
         build_and_serve(addr, effective_config).await?;
     readiness.mark_started();
     info!("tokeirad gRPC server listening on {bound_addr}");
-    server_task
+    let serve_result = server_task
         .await
         .context("tokeirad server task panicked")?
-        .context("tokeirad server task returned an error")?;
+        .context("tokeirad server task returned an error");
+
+    // Tier-2 conformance evidence export. When the wire-coverage recorder is present (the
+    // conformance flag was set), snapshot the observed `(wire_method, status_code)` set
+    // after the server has stopped serving and write it as pretty JSON for the Rust report
+    // (see `.kiro/specs/temporal-functional-conformance`, task 9.x). This runs regardless
+    // of how the server exited so a clean shutdown after a run still produces evidence; a
+    // failed export is logged but MUST NOT mask the server's own exit status, so the
+    // server result is returned after the export attempt. When the recorder is `None`
+    // nothing is written and there is zero behavioural change.
+    if let Some(recorder) = wire_recorder {
+        let out_path = wire_coverage_out_path();
+        if let Err(error) = export_wire_coverage(recorder.as_ref(), &out_path) {
+            tracing::warn!(
+                path = %out_path.display(),
+                ?error,
+                "failed to export conformance wire-coverage evidence"
+            );
+        }
+    }
+
+    serve_result?;
+    Ok(())
+}
+
+/// Snapshot the recorder and write the wire-coverage record to `path` as pretty JSON.
+///
+/// Pretty (rather than compact) JSON is deliberate: the evidence file is read by humans
+/// triaging conformance runs and is diffed across runs, so a stable, line-oriented layout
+/// is worth the few extra bytes. The recorder's `snapshot()` already sorts rows
+/// deterministically, so two runs observing the same calls produce byte-identical output.
+///
+/// Errors are surfaced with context rather than panicking: a failed export is a loss of
+/// *evidence*, never a correctness fault, and the caller logs it without disturbing the
+/// server's exit status.
+fn export_wire_coverage(recorder: &WireCoverageRecorder, path: &Path) -> Result<()> {
+    let record = recorder.snapshot();
+    let row_count = record.rows.len();
+    let json = serde_json::to_string_pretty(&record)
+        .context("failed to serialize wire-coverage record to JSON")?;
+    std::fs::write(path, json).with_context(|| {
+        format!(
+            "failed to write wire-coverage evidence to {}",
+            path.display()
+        )
+    })?;
+    info!(
+        path = %path.display(),
+        rows = row_count,
+        "wrote conformance wire-coverage evidence"
+    );
     Ok(())
 }
 
@@ -360,6 +416,24 @@ fn render_build_info(verbose: bool, json: bool) -> String {
     )
 }
 
+/// What [`build_and_serve`] (and [`build_and_serve_with_storage`]) hand back to the
+/// caller after the gRPC stack is spawned.
+///
+/// The final element — the optional `Arc<WireCoverageRecorder>` — is the Tier-2
+/// conformance recorder handle. It is `Some` only when the conformance flag is set (see
+/// [`wire_coverage_enabled`]); the caller snapshots it after the server task completes to
+/// export wire-coverage evidence. It is carried as a tuple element rather than threaded
+/// into [`TokeiradHandle`] because only the CLI entrypoint exports the evidence — the
+/// in-memory test facade ignores it.
+type ServerStack = (
+    JoinHandle<Result<()>>,
+    SocketAddr,
+    oneshot::Sender<()>,
+    CancellationToken,
+    broadcast::Sender<LogEvent>,
+    Option<Arc<WireCoverageRecorder>>,
+);
+
 /// Build the full server stack and start serving on the given address.
 ///
 /// Storage selection is driven only by `infrastructure.storage`: endpoint
@@ -372,13 +446,7 @@ fn render_build_info(verbose: bool, json: bool) -> String {
 async fn build_and_serve(
     addr: SocketAddr,
     effective_config: Arc<TokeiraConfig>,
-) -> Result<(
-    JoinHandle<Result<()>>,
-    SocketAddr,
-    oneshot::Sender<()>,
-    CancellationToken,
-    broadcast::Sender<LogEvent>,
-)> {
+) -> Result<ServerStack> {
     match effective_config.infrastructure.storage {
         ConfigStorageKind::InMemory => {
             let store = InMemoryStore::default();
@@ -432,13 +500,7 @@ async fn build_and_serve_with_storage<R, L, S, V, F>(
     visibility_query_store: V,
     projection_sink: F,
     dsql_endpoint: Option<String>,
-) -> Result<(
-    JoinHandle<Result<()>>,
-    SocketAddr,
-    oneshot::Sender<()>,
-    CancellationToken,
-    broadcast::Sender<LogEvent>,
-)>
+) -> Result<ServerStack>
 where
     R: LeaseRepository + RunRepository + 'static,
     L: ProjectionLog + Clone + 'static,
@@ -660,19 +722,58 @@ where
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let log_broadcast = broadcast::Sender::<LogEvent>::new(LOG_BROADCAST_CAPACITY);
 
+    // Tier-2 functional conformance (see `.kiro/specs/temporal-functional-conformance`)
+    // captures every served `(wire_method, status_code)` at the transport boundary. The
+    // capturing tower layer is mounted ONLY when the conformance flag is set, so a normal
+    // production server never installs it and pays zero per-call cost.
+    //
+    // The recorder is constructed here, BEFORE the server task is spawned, and an
+    // `Arc::clone` is moved into the task for the layer while the original handle is
+    // returned to the caller. This is what lets the caller snapshot the observed coverage
+    // after the server has shut down (the layer's clone is dropped with the task, but the
+    // returned `Arc` keeps the counts alive) and export it as JSON evidence — see
+    // [`run_from_cli`]. When the flag is off the handle is `None`: nothing is mounted,
+    // nothing is snapshotted, and there is zero behavioural change.
+    let wire_coverage_recorder = wire_coverage_enabled().then(|| {
+        info!("conformance wire-coverage recorder enabled");
+        Arc::new(WireCoverageRecorder::new())
+    });
+    let server_recorder = wire_coverage_recorder.clone();
+
     let server_task = tokio::spawn(async move {
-        Server::builder()
-            .accept_http1(true)
-            .layer(CorsLayer::permissive())
-            .layer(GrpcWebLayer::new())
-            .add_service(workflow_grpc.into_service())
-            .add_service(operator_grpc.into_service())
-            .add_service(reflection)
-            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
-                let _ = shutdown_rx.await;
-            })
-            .await
-            .with_context(|| format!("failed to serve gRPC transport on {bound_addr}"))?;
+        let shutdown_signal = async move {
+            let _ = shutdown_rx.await;
+        };
+
+        // The conformance layer changes the server's tower-stack type, so the flagged and
+        // unflagged paths are distinct server builds rather than a conditionally-mutated
+        // builder. They are otherwise identical; only the extra `.layer()` differs.
+        match server_recorder {
+            Some(recorder) => {
+                Server::builder()
+                    .accept_http1(true)
+                    .layer(CorsLayer::permissive())
+                    .layer(GrpcWebLayer::new())
+                    .layer(WireCoverageLayer::new(recorder))
+                    .add_service(workflow_grpc.into_service())
+                    .add_service(operator_grpc.into_service())
+                    .add_service(reflection)
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown_signal)
+                    .await
+            }
+            None => {
+                Server::builder()
+                    .accept_http1(true)
+                    .layer(CorsLayer::permissive())
+                    .layer(GrpcWebLayer::new())
+                    .add_service(workflow_grpc.into_service())
+                    .add_service(operator_grpc.into_service())
+                    .add_service(reflection)
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown_signal)
+                    .await
+            }
+        }
+        .with_context(|| format!("failed to serve gRPC transport on {bound_addr}"))?;
         Ok::<(), anyhow::Error>(())
     });
 
@@ -682,6 +783,7 @@ where
         shutdown_tx,
         background_cancel,
         log_broadcast,
+        wire_coverage_recorder,
     ))
 }
 
@@ -690,6 +792,64 @@ where
 /// Dimensioned so a slow consumer does not drop observation events under
 /// typical integration-test cadence (one RPC per worker tick at ~30s).
 const LOG_BROADCAST_CAPACITY: usize = 256;
+
+/// Environment flag selecting the Tier-2 wire-coverage capture layer.
+///
+/// Set during a functional-conformance run (see
+/// `.kiro/specs/temporal-functional-conformance`) so the gRPC server mounts the
+/// `WireCoverageLayer`. Read as a single env var rather than threaded through
+/// `TokeiraConfig` because this is a conformance-harness concern, not a server-config
+/// surface, and must add nothing to the production config schema.
+const WIRE_COVERAGE_ENV: &str = "TOKEIRA_CONFORMANCE_WIRE_COVERAGE";
+
+/// Environment variable naming the file the wire-coverage evidence is written to.
+///
+/// Read only when the wire-coverage layer is active (see [`WIRE_COVERAGE_ENV`]). Kept a
+/// separate var from the enable flag so an operator can leave the output location pinned
+/// across runs while toggling capture on and off, and so the default path is never
+/// silently inferred from the enable value. Like [`WIRE_COVERAGE_ENV`] it is read as a
+/// single env var rather than threaded through `TokeiraConfig`, because the export path is
+/// a conformance-harness concern, not a production server-config surface.
+const WIRE_COVERAGE_OUT_ENV: &str = "TOKEIRA_CONFORMANCE_WIRE_COVERAGE_OUT";
+
+/// Default wire-coverage evidence path used when capture is on but
+/// [`WIRE_COVERAGE_OUT_ENV`] is unset.
+///
+/// A repo-relative `./wire-coverage.json` is chosen so an operator who enables capture
+/// without naming a path still gets evidence in the working directory rather than nothing;
+/// the report can then be pointed at the default. It is never used when capture is off.
+const WIRE_COVERAGE_DEFAULT_OUT: &str = "./wire-coverage.json";
+
+/// Whether the Tier-2 wire-coverage layer should be mounted.
+///
+/// True only when [`WIRE_COVERAGE_ENV`] is present and not one of the empty/false-y
+/// values, so an accidentally-exported empty variable does not silently enable capture in
+/// production. Any other value (e.g. `1`, `true`, `on`) enables it.
+fn wire_coverage_enabled() -> bool {
+    match std::env::var(WIRE_COVERAGE_ENV) {
+        Ok(value) => {
+            let trimmed = value.trim();
+            !trimmed.is_empty()
+                && !trimmed.eq_ignore_ascii_case("0")
+                && !trimmed.eq_ignore_ascii_case("false")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Resolve the path the wire-coverage evidence is written to.
+///
+/// Returns the value of [`WIRE_COVERAGE_OUT_ENV`] when it is set to a non-empty value,
+/// otherwise [`WIRE_COVERAGE_DEFAULT_OUT`]. An empty or whitespace-only override is
+/// treated as unset rather than as a request to write to a blank path, mirroring the
+/// false-y handling in [`wire_coverage_enabled`] so an accidentally-exported empty
+/// variable falls back to the documented default instead of erroring.
+fn wire_coverage_out_path() -> PathBuf {
+    match std::env::var(WIRE_COVERAGE_OUT_ENV) {
+        Ok(value) if !value.trim().is_empty() => PathBuf::from(value.trim()),
+        _ => PathBuf::from(WIRE_COVERAGE_DEFAULT_OUT),
+    }
+}
 
 async fn build_nexus_endpoint_registry(
     namespaces: &dyn NamespaceCache,
@@ -1149,5 +1309,53 @@ mod tests {
 
         assert_eq!(pool_config.shard_count, 32);
         assert_eq!(pool_config.projection_partition_count, 4);
+    }
+
+    #[test]
+    fn wire_coverage_out_path_prefers_env_override_then_falls_back_to_default() {
+        // Exercised in one test because all cases mutate the same process-global env var;
+        // splitting them risks cross-test interference under the parallel test runner.
+
+        // Unset: the documented default path is used.
+        unsafe { std::env::remove_var(WIRE_COVERAGE_OUT_ENV) };
+        assert_eq!(
+            wire_coverage_out_path(),
+            PathBuf::from(WIRE_COVERAGE_DEFAULT_OUT)
+        );
+
+        // A real path is honoured verbatim (after trimming).
+        unsafe { std::env::set_var(WIRE_COVERAGE_OUT_ENV, "  /tmp/cov.json  ") };
+        assert_eq!(wire_coverage_out_path(), PathBuf::from("/tmp/cov.json"));
+
+        // An empty/whitespace override is treated as unset, not as a blank path.
+        unsafe { std::env::set_var(WIRE_COVERAGE_OUT_ENV, "   ") };
+        assert_eq!(
+            wire_coverage_out_path(),
+            PathBuf::from(WIRE_COVERAGE_DEFAULT_OUT)
+        );
+
+        unsafe { std::env::remove_var(WIRE_COVERAGE_OUT_ENV) };
+    }
+
+    #[test]
+    fn export_wire_coverage_writes_pretty_json_snapshot() {
+        let recorder = WireCoverageRecorder::new();
+        recorder.record(
+            "/temporal.api.workflowservice.v1.WorkflowService/StartWorkflowExecution",
+            0,
+        );
+
+        let dir = std::env::temp_dir().join(format!("tokeirad-cov-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("wire-coverage.json");
+
+        export_wire_coverage(&recorder, &path).expect("export succeeds");
+
+        let written = std::fs::read_to_string(&path).expect("evidence file readable");
+        assert!(written.contains("StartWorkflowExecution"));
+        // Pretty JSON is multi-line; a compact encoding would be a single line.
+        assert!(written.contains('\n'));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

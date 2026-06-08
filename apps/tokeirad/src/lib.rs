@@ -207,21 +207,24 @@ fn dsql_auth_config(config: &TokeiraConfig) -> Result<DsqlAuthConfig> {
 fn dsql_pool_config_with_client(
     config: &TokeiraConfig,
     ddb_client: aws_sdk_dynamodb::Client,
-) -> DsqlPoolConfig {
+) -> (DsqlPoolConfig, aws_sdk_dynamodb::Client) {
     let (rate_limiter_table, conn_lease_table) = dsql_coordination_table_names(config);
-    DsqlPoolConfig {
+    let pool_config = DsqlPoolConfig {
         coordination: DsqlCoordinationConfig {
             rate_limiter_table,
             conn_lease_table,
-            ddb_client,
         },
         shard_count: config.infrastructure.placement.shard_count,
         projection_partition_count: config.infrastructure.placement.partition_count,
         ..DsqlPoolConfig::default()
-    }
+    };
+    (pool_config, ddb_client)
 }
 
-async fn dsql_pool_config(config: &TokeiraConfig, auth: &DsqlAuthConfig) -> Result<DsqlPoolConfig> {
+async fn dsql_pool_config(
+    config: &TokeiraConfig,
+    auth: &DsqlAuthConfig,
+) -> Result<(DsqlPoolConfig, aws_sdk_dynamodb::Client)> {
     let region = auth
         .resolved_region()
         .ok_or_else(|| anyhow!("dsql region must be configured or derivable from endpoint"))?;
@@ -397,8 +400,8 @@ async fn build_and_serve(
         ConfigStorageKind::Dsql => {
             let auth = dsql_auth_config(&effective_config)?;
             let endpoint = auth.endpoint.clone();
-            let pool_config = dsql_pool_config(&effective_config, &auth).await?;
-            let dsql_store = DsqlStore::connect(auth, pool_config)
+            let (pool_config, ddb_client) = dsql_pool_config(&effective_config, &auth).await?;
+            let dsql_store = DsqlStore::connect(auth, pool_config, ddb_client)
                 .await
                 .context("failed to connect DSQL storage backend")?;
             let (director, run_repository, projection_log, _migration_runner) =
@@ -1141,8 +1144,8 @@ mod tests {
         config.infrastructure.placement.shard_count = 32;
         config.infrastructure.placement.partition_count = 4;
 
-        let pool_config =
-            dsql_pool_config_with_client(&config, DsqlCoordinationConfig::default().ddb_client);
+        let (pool_config, _ddb_client) =
+            dsql_pool_config_with_client(&config, tokeira_storage::dsql::offline_ddb_client());
 
         assert_eq!(pool_config.shard_count, 32);
         assert_eq!(pool_config.projection_partition_count, 4);

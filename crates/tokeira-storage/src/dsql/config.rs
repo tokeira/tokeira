@@ -257,30 +257,38 @@ pub fn detect_region_from_endpoint(endpoint: &str) -> Option<String> {
 /// block rows that represent cluster-wide connection capacity. Keeping them
 /// separate lets each table use a narrow key shape and independent IAM/TTL
 /// policies.
-#[derive(Clone, Debug)]
+///
+/// This is pure configuration data: it holds table names only. The live
+/// `aws_sdk_dynamodb::Client` is a runtime resource, not config, and is
+/// injected into [`crate::dsql::DsqlStore::connect`] explicitly. Keeping the
+/// client out of config defaults is deliberate — a `Default` that builds an SDK
+/// client would eagerly construct the default HTTPS/TLS stack (reading OS trust
+/// roots) for a value that may be discarded by struct-update or only used in
+/// tests.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DsqlCoordinationConfig {
     /// DynamoDB table containing the distributed connection-creation bucket.
+    #[serde(default = "default_rate_limiter_table")]
     pub rate_limiter_table: String,
     /// DynamoDB table containing connection slot block leases.
+    #[serde(default = "default_conn_lease_table")]
     pub conn_lease_table: String,
-    /// AWS SDK client constructed from the effective server deployment config.
-    ///
-    /// Tests may use a dummy client only through explicitly test-only local
-    /// constructors. Production startup validates table reachability before the
-    /// reservoir is allowed to warm.
-    pub ddb_client: aws_sdk_dynamodb::Client,
+}
+
+fn default_rate_limiter_table() -> String {
+    "tokeira-dsql-rate-limiter".to_owned()
+}
+
+fn default_conn_lease_table() -> String {
+    "tokeira-dsql-conn-lease".to_owned()
 }
 
 impl Default for DsqlCoordinationConfig {
     fn default() -> Self {
-        let config = aws_sdk_dynamodb::Config::builder()
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
-            .region(aws_sdk_dynamodb::config::Region::new("us-east-1"))
-            .build();
         Self {
-            rate_limiter_table: "tokeira-dsql-rate-limiter".to_owned(),
-            conn_lease_table: "tokeira-dsql-conn-lease".to_owned(),
-            ddb_client: aws_sdk_dynamodb::Client::from_conf(config),
+            rate_limiter_table: default_rate_limiter_table(),
+            conn_lease_table: default_conn_lease_table(),
         }
     }
 }
@@ -372,6 +380,16 @@ mod tests {
 
     #[test]
     fn defaults_validate() {
+        DsqlPoolConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn coordination_default_is_pure_and_panic_free() {
+        // Regression guard for the original native-roots `debug_assert!`:
+        // defaulting coordination config must not construct an SDK/TLS client.
+        let coordination = DsqlCoordinationConfig::default();
+        assert_eq!(coordination.rate_limiter_table, "tokeira-dsql-rate-limiter");
+        assert_eq!(coordination.conn_lease_table, "tokeira-dsql-conn-lease");
         DsqlPoolConfig::default().validate().unwrap();
     }
 

@@ -69,12 +69,8 @@ impl SlotBlockManager {
 
     #[cfg(any(test, feature = "dsql-integration"))]
     pub fn local_for_tests(total_slots: usize) -> Arc<Self> {
-        let config = aws_sdk_dynamodb::Config::builder()
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
-            .region(aws_sdk_dynamodb::config::Region::new("us-east-1"))
-            .build();
         Arc::new(Self {
-            client: Client::from_conf(config),
+            client: crate::dsql::aws_http::offline_ddb_client(),
             table_name: "local-test".to_owned(),
             owner_id: "local-test".to_owned(),
             owned_blocks: RwLock::new(HashSet::new()),

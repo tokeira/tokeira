@@ -6647,6 +6647,7 @@ dependencies = [
  "aurora-dsql-sqlx-connector",
  "aws-config",
  "aws-sdk-dynamodb",
+ "aws-smithy-runtime-api",
  "metrics",
  "metrics-util",
  "postcard",

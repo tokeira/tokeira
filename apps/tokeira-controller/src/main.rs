@@ -328,12 +328,11 @@ async fn build_repositories(
         coordination: DsqlCoordinationConfig {
             rate_limiter_table: format!("{}-dsql-rate-limiter", config.cluster_name),
             conn_lease_table: format!("{}-dsql-conn-lease", config.cluster_name),
-            ddb_client,
         },
         ..DsqlPoolConfig::default()
     };
 
-    let dsql_store = DsqlStore::connect(auth, pool_config)
+    let dsql_store = DsqlStore::connect(auth, pool_config, ddb_client)
         .await
         .context("failed to connect DSQL storage backend")?;
 

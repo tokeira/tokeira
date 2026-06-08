@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+pub mod aws_http;
 pub mod codec;
 pub mod config;
 pub mod connection;
@@ -27,6 +28,7 @@ pub mod slot_block_manager;
 pub mod validation;
 pub mod worker_deployment_repository;
 
+pub use aws_http::offline_ddb_client;
 pub use config::*;
 pub use connection::*;
 pub use connection_factory::*;
@@ -62,6 +64,7 @@ impl DsqlStore {
     pub async fn connect(
         auth: config::DsqlAuthConfig,
         config: config::DsqlPoolConfig,
+        ddb_client: aws_sdk_dynamodb::Client,
     ) -> anyhow::Result<Self> {
         config.validate()?;
         auth.validate()?;
@@ -77,9 +80,11 @@ impl DsqlStore {
         )?);
         // DynamoDB coordination is mandatory in production DSQL mode. There is
         // no local fallback here because uncoordinated refillers can overshoot
-        // DSQL connection limits when more than one node starts.
+        // DSQL connection limits when more than one node starts. The client is
+        // injected by the caller (a runtime resource, not config) so config
+        // defaults never construct an SDK/TLS stack.
         let bucket = Arc::new(distributed_bucket::DistributedTokenBucket::new(
-            config.coordination.ddb_client.clone(),
+            ddb_client.clone(),
             config.coordination.rate_limiter_table.clone(),
             auth.endpoint.clone(),
             config.connection_rate_per_second,
@@ -87,7 +92,7 @@ impl DsqlStore {
         ));
         bucket.validate_table().await?;
         let slot_manager = slot_block_manager::SlotBlockManager::start(
-            config.coordination.ddb_client.clone(),
+            ddb_client,
             config.coordination.conn_lease_table.clone(),
             auth.endpoint.clone(),
         )
@@ -242,7 +247,11 @@ mod tests {
             ..config::DsqlPoolConfig::default()
         };
 
-        assert!(DsqlStore::connect(auth, config).await.is_err());
+        assert!(
+            DsqlStore::connect(auth, config, aws_http::offline_ddb_client())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -256,6 +265,10 @@ mod tests {
             ..config::DsqlPoolConfig::default()
         };
 
-        assert!(DsqlStore::connect(auth, config).await.is_err());
+        assert!(
+            DsqlStore::connect(auth, config, aws_http::offline_ddb_client())
+                .await
+                .is_err()
+        );
     }
 }

@@ -23,7 +23,7 @@ use tokeira_kernel::{
     kernel::Kernel,
 };
 use tokeira_types::{
-    ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RequestContext,
+    ExecutionStatus, Headers, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RequestContext,
     RequestId, RetryPolicy, RunId, RunKey, SearchAttrValue, SearchAttributes, ShardEpoch,
     StickyAffinity, TaskQueueName, TransitionSeq, WorkerIdentity, WorkflowId, WorkflowTaskToken,
     WorkflowType,
@@ -1043,7 +1043,14 @@ fn delayed_start_replay_reconstructs_timer_until_wft_is_scheduled() {
 
 #[test]
 fn signal_with_start_from_absent() {
-    let req = make_signal_with_start_request();
+    let mut req = make_signal_with_start_request();
+    let mut header = BTreeMap::new();
+    header.insert("x-signal".to_string(), Payload::new(b"metadata".to_vec()));
+    let links = vec![tokeira_kernel::state::Link::BatchJob {
+        job_id: "batch-1".to_string(),
+    }];
+    req.header = Some(Headers(header.clone()));
+    req.links = links.clone();
     let transition = kernel()
         .apply(LoadedRun::Absent, Command::SignalWithStart(req.clone()))
         .unwrap();
@@ -1061,6 +1068,28 @@ fn signal_with_start_from_absent() {
         transition.history_events[2].kind,
         HistoryEventKind::WorkflowTaskScheduled { .. }
     ));
+    match &transition.history_events[0].kind {
+        HistoryEventKind::WorkflowExecutionStarted {
+            header: actual_header,
+            links: actual_links,
+            ..
+        } => {
+            assert_eq!(actual_header, &Some(Headers(header.clone())));
+            assert_eq!(actual_links, &links);
+        }
+        other => panic!("expected started event, got {other:?}"),
+    }
+    match &transition.history_events[1].kind {
+        HistoryEventKind::WorkflowExecutionSignaled {
+            header: actual_header,
+            links: actual_links,
+            ..
+        } => {
+            assert_eq!(actual_header, &Some(Headers(header)));
+            assert_eq!(actual_links, &links);
+        }
+        other => panic!("expected signaled event, got {other:?}"),
+    }
     assert_eq!(transition.request_dedupe_ops.len(), 1);
     assert_eq!(transition.projection_ops.len(), 1);
     assert!(
@@ -1092,6 +1121,8 @@ fn signal_with_no_pending_wft() {
             Command::Signal(SignalRequest {
                 signal_name: "sig".into(),
                 input: payloads("signal"),
+                header: None,
+                links: Vec::new(),
                 request: request_context("signal-req"),
                 now: now(),
             }),
@@ -1117,6 +1148,40 @@ fn signal_with_no_pending_wft() {
 }
 
 #[test]
+fn signal_preserves_header_and_links_in_history() {
+    let mut header = BTreeMap::new();
+    header.insert("x-signal".to_string(), Payload::new(b"metadata".to_vec()));
+    let links = vec![tokeira_kernel::state::Link::BatchJob {
+        job_id: "batch-1".to_string(),
+    }];
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(make_open_state()),
+            Command::Signal(SignalRequest {
+                signal_name: "sig".into(),
+                input: payloads("signal"),
+                header: Some(Headers(header.clone())),
+                links: links.clone(),
+                request: request_context("signal-req"),
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    match &transition.history_events[0].kind {
+        HistoryEventKind::WorkflowExecutionSignaled {
+            header: actual_header,
+            links: actual_links,
+            ..
+        } => {
+            assert_eq!(actual_header, &Some(Headers(header)));
+            assert_eq!(actual_links, &links);
+        }
+        other => panic!("expected signal event, got {other:?}"),
+    }
+}
+
+#[test]
 fn signal_with_pending_wft() {
     let state = make_open_state_with_pending_wft();
     let pending = state.pending_workflow_task.clone().unwrap();
@@ -1126,6 +1191,8 @@ fn signal_with_pending_wft() {
             Command::Signal(SignalRequest {
                 signal_name: "sig".into(),
                 input: payloads("signal"),
+                header: None,
+                links: Vec::new(),
                 request: request_context("signal-req"),
                 now: now(),
             }),
@@ -1811,6 +1878,8 @@ fn signal_paused_workflow_no_wft() {
             Command::Signal(SignalRequest {
                 signal_name: "sig".into(),
                 input: payloads("signal"),
+                header: None,
+                links: Vec::new(),
                 request: request_context("paused-signal"),
                 now: now(),
             }),
@@ -3205,6 +3274,8 @@ fn reject_signal_on_absent_run() {
             Command::Signal(SignalRequest {
                 signal_name: "sig".into(),
                 input: payloads("signal"),
+                header: None,
+                links: Vec::new(),
                 request: request_context("signal"),
                 now: now(),
             })
@@ -3221,6 +3292,8 @@ fn reject_signal_on_closed_run() {
             Command::Signal(SignalRequest {
                 signal_name: "sig".into(),
                 input: payloads("signal"),
+                header: None,
+                links: Vec::new(),
                 request: request_context("signal"),
                 now: now(),
             })

@@ -93,6 +93,8 @@ pub enum HistoryEventKind {
         signal_name: String,
         input: Payloads,
         header: Option<Headers>,
+        #[serde(default)]
+        links: Vec<Link>,
         request_id: String,
         identity: Option<String>,
     },

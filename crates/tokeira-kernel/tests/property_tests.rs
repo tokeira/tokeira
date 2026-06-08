@@ -1163,6 +1163,8 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
             let req = SignalRequest {
                 signal_name: "sig".into(),
                 input,
+                header: None,
+                links: Vec::new(),
                 request: request_context("prop-signal", now),
                 now,
             };
@@ -1985,6 +1987,8 @@ proptest! {
             Command::Signal(SignalRequest {
                 signal_name: "sig".into(),
                 input: Payloads::default(),
+                header: None,
+                links: Vec::new(),
                 request: request_context("versioned-signal", now),
                 now,
             }),
@@ -2083,6 +2087,8 @@ proptest! {
             Command::Signal(SignalRequest {
                 signal_name: "sig".into(),
                 input: signal_input,
+                header: None,
+                links: Vec::new(),
                 request: request_context("signal", now),
                 now,
             }),
@@ -3162,6 +3168,8 @@ proptest! {
             Command::Signal(SignalRequest {
                 signal_name: "sig".into(),
                 input: signal_input,
+                header: None,
+                links: Vec::new(),
                 request: request_context("sig-req", now),
                 now,
             }),

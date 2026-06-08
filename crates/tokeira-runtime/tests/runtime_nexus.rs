@@ -317,6 +317,8 @@ async fn nexus_cancel_success_delivers_canceled_resolution() -> Result<()> {
             SignalRequest {
                 signal_name: "poke".to_string(),
                 input: Payloads::default(),
+                header: None,
+                links: Vec::new(),
                 request: RequestContext {
                     request_id: RequestId("req-signal".to_string()),
                     caller_identity: None,
@@ -569,6 +571,8 @@ async fn worker_targeted_nexus_cancel_publishes_to_broker() -> Result<()> {
             SignalRequest {
                 signal_name: "poke".to_string(),
                 input: Payloads::default(),
+                header: None,
+                links: Vec::new(),
                 request: RequestContext {
                     request_id: RequestId("req-signal".to_string()),
                     caller_identity: None,
@@ -745,6 +749,8 @@ proptest! {
                     SignalRequest {
                         signal_name: "poke".to_string(),
                         input: Payloads::default(),
+                        header: None,
+                        links: Vec::new(),
                         request: RequestContext {
                             request_id: RequestId("req-signal".to_string()),
                             caller_identity: None,

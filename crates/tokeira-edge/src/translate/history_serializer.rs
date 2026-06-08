@@ -70,6 +70,13 @@ fn event_links(event: &HistoryEvent) -> Vec<proto_common::Link> {
         HistoryEventKind::WorkflowExecutionStarted { links, .. } => {
             links.iter().map(link_to_proto).collect()
         }
+        HistoryEventKind::WorkflowExecutionSignaled { links, .. } => {
+            // Signal links are top-level history metadata, not signaled-event
+            // attributes. This mirrors Temporal's event factory and the
+            // vendored `HistoryEvent.links = 302` field
+            // (`service/history/historybuilder/event_factory.go @ v1.31.0`).
+            links.iter().map(link_to_proto).collect()
+        }
         _ => Vec::new(),
     }
 }
@@ -518,6 +525,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             signal_name,
             input,
             header,
+            links: _,
             request_id: _,
             identity,
         } => Attributes::WorkflowExecutionSignaledEventAttributes(
@@ -1486,8 +1494,8 @@ mod tests {
     };
     use tokeira_proto::conversions::common::failure_to_payload;
     use tokeira_types::{
-        LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RetryPolicy, RunId, SearchAttributes,
-        TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
+        Headers, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RetryPolicy, RunId,
+        SearchAttributes, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
     };
     use uuid::Uuid;
 
@@ -1638,6 +1646,7 @@ mod tests {
                     signal_name: sn,
                     input,
                     header: None,
+                    links: Vec::new(),
                     request_id: rid,
                     identity: None,
                 }
@@ -1898,6 +1907,7 @@ mod tests {
             prop_assert_eq!(proto.event_time, decoded.event_time);
             prop_assert_eq!(proto.event_type, decoded.event_type);
             prop_assert_eq!(proto.attributes, decoded.attributes);
+            prop_assert_eq!(proto.links, decoded.links);
         }
     }
 
@@ -1989,6 +1999,36 @@ mod tests {
                 assert_eq!(attrs.workflow_type.unwrap().name, "MyWorkflow");
                 let timeout = attrs.workflow_task_timeout.unwrap();
                 assert_eq!(timeout.seconds, 10);
+            }
+            other => panic!("unexpected attributes: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workflow_signaled_serializes_header_and_outer_links() {
+        let mut header = BTreeMap::new();
+        header.insert("x-signal".to_string(), Payload::new(b"metadata".to_vec()));
+        let event = HistoryEvent {
+            event_id: 1,
+            happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
+            kind: HistoryEventKind::WorkflowExecutionSignaled {
+                signal_name: "poke".to_string(),
+                input: Payloads::default(),
+                header: Some(Headers(header)),
+                links: vec![tokeira_kernel::state::Link::BatchJob {
+                    job_id: "batch-1".to_string(),
+                }],
+                request_id: "signal-req".to_string(),
+                identity: Some("client".to_string()),
+            },
+        };
+
+        let proto = history_event_to_proto(&event);
+        assert_eq!(proto.links.len(), 1);
+        match proto.attributes.unwrap() {
+            Attributes::WorkflowExecutionSignaledEventAttributes(attrs) => {
+                assert!(attrs.header.is_some());
+                assert_eq!(attrs.signal_name, "poke");
             }
             other => panic!("unexpected attributes: {other:?}"),
         }

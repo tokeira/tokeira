@@ -242,6 +242,8 @@ where
                         SignalRequest {
                             signal_name: request.signal_name,
                             input: request.signal_input,
+                            header: request.header,
+                            links: request.links,
                             request: request.request,
                             now: request.now,
                         },

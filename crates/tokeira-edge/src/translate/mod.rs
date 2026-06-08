@@ -182,8 +182,11 @@ pub struct StartWorkflowExecutionResponse {
 pub struct SignalWorkflowExecutionRequest {
     pub namespace: String,
     pub workflow_id: String,
+    pub run_id: Option<String>,
     pub signal_name: String,
     pub input: Payloads,
+    pub header: Option<Headers>,
+    pub links: Vec<Link>,
     pub request_id: Option<String>,
     pub identity: Option<String>,
     pub now: Option<OffsetDateTime>,

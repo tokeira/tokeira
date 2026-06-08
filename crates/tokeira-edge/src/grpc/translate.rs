@@ -512,12 +512,15 @@ pub fn signal_request_to_edge(
     Ok(SignalWorkflowExecutionRequest {
         namespace: req.namespace,
         workflow_id: execution.workflow_id.clone(),
+        run_id: non_empty(execution.run_id.clone()),
         signal_name: req.signal_name,
         input: req
             .input
             .as_ref()
             .map(payloads_to_domain)
             .unwrap_or_default(),
+        header: req.header.as_ref().map(headers_to_domain),
+        links: links_to_edge(&req.links)?,
         request_id: non_empty(req.request_id),
         identity: non_empty(req.identity),
         now: None,

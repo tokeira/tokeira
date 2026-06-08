@@ -365,6 +365,14 @@ pub struct SignalRequest {
     pub signal_name: String,
     /// Payload arguments for the signal handler.
     pub input: Payloads,
+    /// SDK-authored metadata delivered with the signal.
+    pub header: Option<Headers>,
+    /// History-event links associated with this signal.
+    ///
+    /// Temporal stores signal links on the outer `HistoryEvent.links`, not in
+    /// `WorkflowExecutionSignaledEventAttributes`
+    /// (`service/history/historybuilder/event_factory.go @ v1.31.0`).
+    pub links: Vec<Link>,
     /// Caller-supplied request context for dedupe and tracing.
     pub request: RequestContext,
     /// Wall-clock time the command was accepted.

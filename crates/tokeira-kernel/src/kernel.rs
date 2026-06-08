@@ -503,7 +503,7 @@ impl BasicKernel {
             workflow_type: req.workflow_type,
             task_queue: req.task_queue,
             input: req.input,
-            header: None,
+            header: req.header.clone(),
             memo: req.memo.clone(),
             search_attributes: req.search_attributes.clone(),
             request_id: req.request.request_id.0.clone(),
@@ -528,7 +528,7 @@ impl BasicKernel {
             workflow_start_delay: req.workflow_start_delay,
             completion_callbacks: Vec::new(),
             user_metadata: req.user_metadata,
-            links: req.links,
+            links: req.links.clone(),
             priority: req.priority,
             versioning_info: initial_versioning_info,
             worker_deployment_name: None,
@@ -537,6 +537,7 @@ impl BasicKernel {
             signal_name: req.signal_name,
             input: req.signal_input,
             header: req.header,
+            links: req.links,
             request_id: req.request.request_id.0,
             identity: req.request.caller_identity,
         });
@@ -575,7 +576,8 @@ impl BasicKernel {
         builder.emit(HistoryEventKind::WorkflowExecutionSignaled {
             signal_name: req.signal_name,
             input: req.input,
-            header: None,
+            header: req.header,
+            links: req.links,
             request_id: req.request.request_id.0,
             identity: req.request.caller_identity,
         });

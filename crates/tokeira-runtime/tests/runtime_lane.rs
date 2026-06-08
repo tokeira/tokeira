@@ -6,9 +6,9 @@ use time::{Duration, OffsetDateTime};
 
 use tokeira_kernel::{
     CallbackSpec, CallbackState, Command, CompletionCallback, HistoryEventKind, LoadedRun,
-    StartRequest, VersioningBehavior, VersioningOverride, WORKFLOW_START_DELAY_TIMER_ID,
-    WorkerDeploymentVersionRef, WorkflowCommand, WorkflowStartDelayElapsedRequest,
-    WorkflowTaskCompletedRequest,
+    SignalWithStartRequest, StartRequest, VersioningBehavior, VersioningOverride,
+    WORKFLOW_START_DELAY_TIMER_ID, WorkerDeploymentVersionRef, WorkflowCommand,
+    WorkflowStartDelayElapsedRequest, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
     ActivityTimeoutScannerConfig, BacklogConfig, LaneConfig, NexusEndpointRegistry,
@@ -17,9 +17,9 @@ use tokeira_runtime::{
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
-    BuildId, DeploymentId, ExecutionRef, LogicalTaskSeq, Memo, NamespaceId, Payloads, QueueKey,
-    RequestContext, RequestId, RunKey, SearchAttributes, ShardId, TaskKind, TaskQueueName,
-    WorkerIdentity, WorkflowId, WorkflowType,
+    BuildId, DeploymentId, ExecutionRef, Headers, LogicalTaskSeq, Memo, NamespaceId, Payload,
+    Payloads, QueueKey, RequestContext, RequestId, RunKey, SearchAttributes, ShardId, TaskKind,
+    TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
 };
 
 #[tokio::test]
@@ -94,6 +94,59 @@ async fn start_and_signal_publish_workflow_tasks() -> Result<()> {
         .expect("signal should publish a new workflow task");
     assert_eq!(signaled_task.run_key, started_state.run_key);
     assert_eq!(signaled_task.token.logical_seq, LogicalTaskSeq(2));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn signal_with_start_existing_run_preserves_signal_metadata() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = TokeiraRuntime::new(
+        store.clone(),
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
+    );
+    let namespace_id = NamespaceId::new();
+    let workflow_id = WorkflowId("workflow-signal-with-start-existing".to_string());
+    let started = runtime
+        .start_workflow(start_request(
+            namespace_id,
+            workflow_id.clone(),
+            "req-start",
+        ))
+        .await?;
+    let run_key = applied_state(&started).run_key;
+    let mut header = BTreeMap::new();
+    header.insert("x-signal".to_string(), Payload::new(b"metadata".to_vec()));
+    let links = vec![tokeira_kernel::state::Link::BatchJob {
+        job_id: "batch-1".to_string(),
+    }];
+    let mut request = signal_with_start_request(namespace_id, workflow_id, "req-signal-with-start");
+    request.conflict_policy = tokeira_kernel::WorkflowIdConflictPolicy::UseExisting;
+    request.header = Some(Headers(header.clone()));
+    request.links = links.clone();
+
+    let result = runtime.signal_with_start_workflow(request).await?;
+    assert!(matches!(
+        result,
+        tokeira_runtime::SignalWithStartResult::Signaled { .. }
+    ));
+    let history = store.read_history(run_key, 0, 64).await?;
+    let signaled = history
+        .iter()
+        .rev()
+        .find_map(|event| match &event.kind {
+            HistoryEventKind::WorkflowExecutionSignaled { header, links, .. } => {
+                Some((header, links))
+            }
+            _ => None,
+        })
+        .expect("signal-with-start existing path should append a signal event");
+    assert_eq!(signaled.0, &Some(Headers(header)));
+    assert_eq!(signaled.1, &links);
 
     Ok(())
 }
@@ -846,10 +899,65 @@ fn start_request(
     }
 }
 
+fn signal_with_start_request(
+    namespace_id: NamespaceId,
+    workflow_id: WorkflowId,
+    request_id: &str,
+) -> SignalWithStartRequest {
+    let start = start_request(namespace_id, workflow_id, request_id);
+    SignalWithStartRequest {
+        run_key: start.run_key,
+        namespace_id: start.namespace_id,
+        workflow_id: start.workflow_id,
+        run_id: start.run_id,
+        workflow_type: start.workflow_type,
+        task_queue: start.task_queue,
+        input: start.input,
+        memo: start.memo,
+        search_attributes: start.search_attributes,
+        workflow_execution_timeout: start.workflow_execution_timeout,
+        workflow_run_timeout: start.workflow_run_timeout,
+        workflow_task_timeout: start.workflow_task_timeout,
+        retry_policy: start.retry_policy,
+        conflict_policy: start.conflict_policy,
+        reuse_policy: start.reuse_policy,
+        header: start.header,
+        deployment: start.deployment,
+        build_id: start.build_id,
+        versioning_override: start.versioning_override,
+        workflow_start_delay: start.workflow_start_delay,
+        user_metadata: start.user_metadata,
+        links: start.links,
+        priority: start.priority,
+        cron_schedule: start.cron_schedule,
+        attempt: start.attempt,
+        continued_execution_run_id: start.continued_execution_run_id,
+        first_execution_run_id: start.first_execution_run_id,
+        parent_run_key: start.parent_run_key,
+        parent_workflow_id: start.parent_workflow_id,
+        parent_run_id: start.parent_run_id,
+        parent_namespace_id: start.parent_namespace_id,
+        parent_initiated_event_id: start.parent_initiated_event_id,
+        root_workflow_id: start.root_workflow_id,
+        root_run_id: start.root_run_id,
+        original_execution_run_id: start.original_execution_run_id,
+        continued_failure: start.continued_failure,
+        last_completion_result: start.last_completion_result,
+        first_run_started_at: start.first_run_started_at,
+        request: start.request,
+        now: start.now,
+        client_cron_schedule: start.client_cron_schedule,
+        signal_name: "sig".to_string(),
+        signal_input: Payloads::default(),
+    }
+}
+
 fn signal_request(request_id: &str) -> tokeira_kernel::SignalRequest {
     tokeira_kernel::SignalRequest {
         signal_name: "sig".to_string(),
         input: Payloads::default(),
+        header: None,
+        links: Vec::new(),
         request: RequestContext {
             request_id: RequestId(request_id.to_string()),
             caller_identity: None,

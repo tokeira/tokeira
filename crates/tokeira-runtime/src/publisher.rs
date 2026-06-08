@@ -463,6 +463,8 @@ where
                 let command = Command::Signal(SignalRequest {
                     signal_name,
                     input,
+                    header: None,
+                    links: Vec::new(),
                     request: RequestContext {
                         request_id: RequestId(format!(
                             "ext-signal-{originator_run_key:?}-{initiated_event_id}"

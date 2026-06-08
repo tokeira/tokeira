@@ -1615,6 +1615,7 @@ mod tests {
                 signal_name: format!("signal-{event_id}"),
                 input: Payloads::default(),
                 header: None,
+                links: Vec::new(),
                 request_id: format!("request-{event_id}"),
                 identity: Some("tester".to_owned()),
             },

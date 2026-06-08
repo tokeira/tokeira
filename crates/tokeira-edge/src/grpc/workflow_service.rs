@@ -3821,6 +3821,8 @@ mod tests {
                 Command::Signal(SignalRequest {
                     signal_name: "sig".to_string(),
                     input: Payloads::default(),
+                    header: None,
+                    links: Vec::new(),
                     request: RequestContext {
                         request_id: RequestId("sig-1".to_string()),
                         caller_identity: None,

@@ -19,7 +19,7 @@ use tokeira_edge::{
     },
     translate::{
         CountWorkflowExecutionsRequest, CountWorkflowExecutionsResponse,
-        DescribeWorkflowExecutionRequest, ExecutionConfigDescription, GroupCount,
+        DescribeWorkflowExecutionRequest, ExecutionConfigDescription, GroupCount, Link,
         ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, PendingActivityDescription,
         PendingChildDescription, PendingWorkflowTaskDescription, PollWorkflowTaskQueueRequest,
         PollWorkflowTaskQueueResponse, RespondWorkflowTaskCompletedResponse,
@@ -33,16 +33,16 @@ use tokeira_kernel::{
 };
 use tokeira_proto::{
     conversions::common::{
-        failure_to_payload, memo_from_domain, payload_to_failure, payloads_from_domain,
-        search_attributes_from_domain,
+        failure_to_payload, headers_from_domain, memo_from_domain, payload_to_failure,
+        payloads_from_domain, search_attributes_from_domain,
     },
     enums::WorkflowExecutionStatus,
     public::temporal::api::failure::v1 as failure_proto,
     workflowservice,
 };
 use tokeira_types::{
-    ExecutionStatus, Memo, Payload, Payloads, RunId, RunKey, SearchAttrValue, SearchAttributes,
-    WorkflowId,
+    ExecutionStatus, Headers, Memo, Payload, Payloads, RunId, RunKey, SearchAttrValue,
+    SearchAttributes, WorkflowId,
 };
 use tonic::{Code, metadata::MetadataMap};
 use uuid::Uuid;
@@ -386,6 +386,29 @@ fn property_proto_conversion_status_maps_to_invalid_argument() {
     assert_eq!(status.code(), Code::InvalidArgument);
 }
 
+#[test]
+fn signal_request_rejects_link_without_variant() {
+    let mut proto = signal_request_to_proto(&SignalWorkflowExecutionRequest {
+        namespace: "default".to_string(),
+        workflow_id: "workflow-a".to_string(),
+        run_id: None,
+        signal_name: "poke".to_string(),
+        input: Payloads::default(),
+        header: None,
+        links: Vec::new(),
+        request_id: Some("signal-1".to_string()),
+        identity: Some("tester".to_string()),
+        now: None,
+    });
+    proto
+        .links
+        .push(tokeira_proto::common::Link { variant: None });
+
+    let error = signal_request_to_edge(proto).expect_err("unset Link.variant is invalid");
+    let status = proto_conversion_status(error);
+    assert_eq!(status.code(), Code::InvalidArgument);
+}
+
 fn start_request_to_proto(
     edge: &StartWorkflowExecutionRequest,
 ) -> workflowservice::StartWorkflowExecutionRequest {
@@ -415,14 +438,34 @@ fn signal_request_to_proto(
         namespace: edge.namespace.clone(),
         workflow_execution: Some(tokeira_proto::common::WorkflowExecution {
             workflow_id: edge.workflow_id.clone(),
-            run_id: String::new(),
+            run_id: edge.run_id.clone().unwrap_or_default(),
             ..Default::default()
         }),
         signal_name: edge.signal_name.clone(),
         input: Some(payloads_from_domain(&edge.input)),
+        header: edge.header.as_ref().map(headers_from_domain),
+        links: edge.links.iter().map(edge_link_to_proto).collect(),
         request_id: edge.request_id.clone().unwrap_or_default(),
         identity: edge.identity.clone().unwrap_or_default(),
         ..Default::default()
+    }
+}
+
+fn edge_link_to_proto(link: &Link) -> tokeira_proto::common::Link {
+    use tokeira_proto::common::link::Variant;
+
+    match link {
+        Link::BatchJob { job_id } => tokeira_proto::common::Link {
+            variant: Some(Variant::BatchJob(tokeira_proto::common::link::BatchJob {
+                job_id: job_id.clone(),
+            })),
+        },
+        Link::WorkflowEvent { .. } | Link::Activity { .. } | Link::NexusOperation { .. } => {
+            // The signal property generator currently uses batch links because
+            // this test only needs to prove the gRPC signal path does not drop
+            // the repeated `links` field.
+            unreachable!("signal property generator only emits batch links")
+        }
     }
 }
 
@@ -527,6 +570,17 @@ fn arb_payloads() -> impl Strategy<Value = Payloads> {
     prop::collection::vec(arb_payload(), 0..4).prop_map(Payloads)
 }
 
+fn arb_headers() -> impl Strategy<Value = Headers> {
+    prop::collection::btree_map(arb_small_string(), arb_payload(), 0..3).prop_map(Headers)
+}
+
+fn arb_signal_links() -> impl Strategy<Value = Vec<Link>> {
+    prop::collection::vec(
+        arb_small_string().prop_map(|job_id| Link::BatchJob { job_id }),
+        0..3,
+    )
+}
+
 fn arb_memo() -> impl Strategy<Value = Memo> {
     prop::collection::btree_map(arb_small_string(), arb_payload(), 0..3).prop_map(Memo)
 }
@@ -612,17 +666,35 @@ fn arb_signal_request() -> impl Strategy<Value = SignalWorkflowExecutionRequest>
         arb_small_string(),
         arb_small_string(),
         arb_small_string(),
+        prop::option::of(
+            "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}".prop_map(|s| s),
+        ),
         arb_payloads(),
+        prop::option::of(arb_headers()),
+        arb_signal_links(),
         prop::option::of(arb_small_string()),
         prop::option::of(arb_small_string()),
     )
         .prop_map(
-            |(namespace, workflow_id, signal_name, input, request_id, identity)| {
+            |(
+                namespace,
+                workflow_id,
+                signal_name,
+                run_id,
+                input,
+                header,
+                links,
+                request_id,
+                identity,
+            )| {
                 SignalWorkflowExecutionRequest {
                     namespace,
                     workflow_id,
+                    run_id,
                     signal_name,
                     input,
+                    header,
+                    links,
                     request_id,
                     identity,
                     now: None,

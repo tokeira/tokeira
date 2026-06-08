@@ -1396,6 +1396,8 @@ impl WorkflowService {
                 SignalRequest {
                     signal_name,
                     input,
+                    header: None,
+                    links: Vec::new(),
                     request: batch_request_context(ctx),
                     now: OffsetDateTime::now_utc(),
                 },
@@ -2122,17 +2124,18 @@ impl WorkflowService {
                         .await?,
                 )?;
 
-                let Some(run_key) = self
-                    .resolver
-                    .current_run_key(&req.namespace, &req.workflow_id)
-                    .await
-                    .map_err(EdgeError::from)?
-                else {
-                    return Err(EdgeError::WorkflowNotFound {
-                        namespace: req.namespace,
-                        workflow_id: req.workflow_id,
-                    });
-                };
+                // Temporal keys SignalWorkflowExecution by the caller-supplied
+                // workflow ID and run ID when present
+                // (`service/history/api/signalworkflow/api.go @ v1.31.0`).
+                // Empty run_id keeps the SDK-compatible current-run fallback;
+                // a non-empty malformed run_id must fail before lookup.
+                let run_key = self
+                    .resolve_execution_run_key(
+                        &req.namespace,
+                        &req.workflow_id,
+                        req.run_id.as_deref(),
+                    )
+                    .await?;
 
                 let internal = to_internal::signal_request(req, &ctx.request_id);
                 let outcome = self
@@ -4650,8 +4653,8 @@ mod tests {
         routing::LocalOnlyRouter,
         to_internal::namespace_id_for,
         translate::{
-            ActivityOptions, SystemCapabilities, UpdateActivityOptionsRequest, UpdateWaitPolicyDto,
-            UpdateWorkflowExecutionRequest,
+            ActivityOptions, SignalWorkflowExecutionRequest, SystemCapabilities,
+            UpdateActivityOptionsRequest, UpdateWaitPolicyDto, UpdateWorkflowExecutionRequest,
         },
     };
 
@@ -4850,6 +4853,98 @@ mod tests {
             wait_policy,
             timeout: std::time::Duration::from_millis(20),
         }
+    }
+
+    fn signal_request(
+        workflow_id: &WorkflowId,
+        run_id: Option<String>,
+    ) -> SignalWorkflowExecutionRequest {
+        signal_request_with_request_id(workflow_id, run_id, "signal-1")
+    }
+
+    fn signal_request_with_request_id(
+        workflow_id: &WorkflowId,
+        run_id: Option<String>,
+        request_id: &str,
+    ) -> SignalWorkflowExecutionRequest {
+        SignalWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_id: workflow_id.0.clone(),
+            run_id,
+            signal_name: "poke".to_string(),
+            input: Payloads::default(),
+            header: None,
+            links: Vec::new(),
+            request_id: Some(request_id.to_string()),
+            identity: Some("tester".to_string()),
+            now: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_path_rejects_malformed_run_id_before_lookup() -> Result<()> {
+        let (service, _runtime, _namespace_id, workflow_id, _run_id) =
+            update_test_service().await?;
+        let error = service
+            .signal_workflow_execution(
+                &HeaderMap::new(),
+                signal_request(&workflow_id, Some("not-a-uuid".to_string())),
+            )
+            .await
+            .expect_err("malformed run_id must not be silently ignored");
+
+        assert!(matches!(error, EdgeError::BadRequest(_)));
+        assert_eq!(error.status_code(), http::StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signal_path_missing_execution_returns_not_found() -> Result<()> {
+        let (service, _runtime, _namespace_id, _workflow_id, _run_id) =
+            update_test_service().await?;
+        let missing = WorkflowId("missing-workflow".to_string());
+        let error = service
+            .signal_workflow_execution(&HeaderMap::new(), signal_request(&missing, None))
+            .await
+            .expect_err("missing execution must map to NOT_FOUND");
+
+        assert!(matches!(error, EdgeError::WorkflowNotFound { .. }));
+        assert_eq!(error.status_code(), http::StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signal_path_targets_exact_or_current_run() -> Result<()> {
+        let (service, _runtime, _namespace_id, workflow_id, run_id) = update_test_service().await?;
+
+        let current_response = service
+            .signal_workflow_execution(&HeaderMap::new(), signal_request(&workflow_id, None))
+            .await?;
+        assert!(current_response.accepted);
+
+        let exact_response = service
+            .signal_workflow_execution(
+                &HeaderMap::new(),
+                signal_request_with_request_id(
+                    &workflow_id,
+                    Some(run_id.0.to_string()),
+                    "signal-2",
+                ),
+            )
+            .await?;
+        assert!(exact_response.accepted);
+
+        let missing_run = RunId::new();
+        let error = service
+            .signal_workflow_execution(
+                &HeaderMap::new(),
+                signal_request(&workflow_id, Some(missing_run.0.to_string())),
+            )
+            .await
+            .expect_err("valid but unknown run_id must not fall back to current");
+        assert!(matches!(error, EdgeError::WorkflowNotFound { .. }));
+        assert_eq!(error.status_code(), http::StatusCode::NOT_FOUND);
+        Ok(())
     }
 
     #[tokio::test]

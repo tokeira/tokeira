@@ -1514,6 +1514,7 @@ mod tests {
                         signal_name: "test".to_string(),
                         input: Payloads::default(),
                         header: None,
+                        links: Vec::new(),
                         request_id: "req".to_string(),
                         identity: None,
                     },
@@ -2096,6 +2097,8 @@ mod tests {
         Command::Signal(tokeira_kernel::SignalRequest {
             signal_name: label.to_string(),
             input: Payloads::default(),
+            header: None,
+            links: Vec::new(),
             request: RequestContext {
                 request_id: RequestId(format!("req-{label}")),
                 caller_identity: None,

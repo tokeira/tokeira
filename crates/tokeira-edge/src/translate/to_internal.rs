@@ -364,6 +364,8 @@ pub fn signal_request(
     SignalRequest {
         signal_name: req.signal_name,
         input: req.input,
+        header: req.header,
+        links: req.links.into_iter().map(link_to_kernel).collect(),
         request: RequestContext {
             request_id: CoreRequestId(
                 req.request_id
@@ -1049,6 +1051,32 @@ mod tests {
                 fairness_weight: 1.5,
             })
         );
+    }
+
+    #[test]
+    fn signal_request_preserves_header_and_links() {
+        let mut header = BTreeMap::new();
+        header.insert("x-signal".to_string(), Payload::new(b"metadata".to_vec()));
+        let dto = SignalWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_id: "workflow-a".to_string(),
+            run_id: None,
+            signal_name: "poke".to_string(),
+            input: Payloads::default(),
+            header: Some(Headers(header.clone())),
+            links: vec![EdgeLink::BatchJob {
+                job_id: "batch-1".to_string(),
+            }],
+            request_id: Some("signal-request".to_string()),
+            identity: Some("tester".to_string()),
+            now: Some(OffsetDateTime::UNIX_EPOCH),
+        };
+
+        let internal = signal_request(dto, &RequestId::new("fallback"));
+
+        assert_eq!(internal.header, Some(Headers(header)));
+        assert_eq!(internal.links.len(), 1);
+        assert_eq!(internal.request.request_id.0, "signal-request");
     }
 
     proptest! {

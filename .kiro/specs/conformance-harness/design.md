@@ -64,6 +64,9 @@ existing `apps/tokeirad/tests/grpc_roundtrip.rs` round-trip test it generalizes.
 - Does not port Temporal code. Temporal's `taskpoller` / `historyrequire` are *conceptual* references
   for shape and ergonomics only (AGENTS.md Mission, §8).
 - Does not own the field-threading roadmap; that stays in the (advisory) tracker.
+- Does not run Temporal's own functional test suite against `tokeirad`. Replaying Temporal's
+  server-grade Go test corpus over the real wire (Tier 2) is owned by the sibling
+  `temporal-functional-conformance` spec; this harness is the hermetic, in-process, per-RPC Tier 1.
 - Does not own axis K. The authoritative axis-K declaration is the `temporal-compatibility-surface`
   spec's `FEATURE_MATRIX`; the harness consumes it (today via a thin local overlay, see Decision-4 seam)
   and machine-proves it, but does not define it.

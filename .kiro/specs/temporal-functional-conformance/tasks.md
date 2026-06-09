@@ -179,7 +179,7 @@ through the seam* (task 6) **before** attempting the full corpus or large files 
     - Every test that ran produces exactly one classified ledger entry in the report
     - _Requirements: 3.2, 3.4_
 
-  - [ ] 9.3 Derive the `out-of-public-scope` internal-client surface from the wire observation
+  - [x] 9.3 Derive the `out-of-public-scope` internal-client surface from the wire observation
     - When a test's call set hits a beyond-claim / `UnknownToMatrix` surface (`AdminClient`,
       `OperatorClient` beyond the claimed subset, `HistoryClient`, `MatchingClient`, dynamic-config
       client, internal task-poller/cluster hooks), record which surface it touched — mechanical, from

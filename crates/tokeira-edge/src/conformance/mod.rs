@@ -23,6 +23,10 @@
 //! - [`test_report`] — the per-test classified report: joins the run's per-test
 //!   outcomes (the task-8.2 distiller document) against the authored [`ledger`],
 //!   producing one classified row per test for the report gates (task 9.2).
+//! - [`scope`] — the out-of-public-scope surface derivation: mechanically buckets the
+//!   `unknown-to-matrix` wire observations into the internal client surfaces they
+//!   touched (AdminClient, HistoryClient, …), so an `OutOfPublicScope` classification
+//!   cites a recorder-observed fact rather than hand-judgement (task 9.3).
 //! - [`pin`] — the pin-consistency gate: the fail-fast check that the fork's conformance
 //!   branch is pinned at the Temporal tag matching `TEMPORAL_SERVER_COMPAT` and is not the
 //!   fork's `main`, so the corpus can never be run against a release newer than the claim.
@@ -33,6 +37,7 @@ pub mod pin;
 pub mod record;
 pub mod recorder;
 pub mod report;
+pub mod scope;
 pub mod test_report;
 
 pub use layer::*;
@@ -41,4 +46,5 @@ pub use pin::*;
 pub use record::*;
 pub use recorder::*;
 pub use report::*;
+pub use scope::*;
 pub use test_report::*;

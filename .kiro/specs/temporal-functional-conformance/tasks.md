@@ -175,7 +175,7 @@ through the seam* (task 6) **before** attempting the full corpus or large files 
       API (commit 0a4ff6f) — do not re-implement wire↔matrix matching
     - _Requirements: 5.3, 5.4, 5.5, 5.6_
 
-  - [ ] 9.2 Join the per-test ledger into the report and classify each test
+  - [x] 9.2 Join the per-test ledger into the report and classify each test
     - Every test that ran produces exactly one classified ledger entry in the report
     - _Requirements: 3.2, 3.4_
 

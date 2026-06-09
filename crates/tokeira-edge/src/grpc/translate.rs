@@ -81,7 +81,7 @@ use crate::translate::{
     DescribeTaskQueueResponse as EdgeDescribeTaskQueueResponse, DescribeWorkflowExecutionRequest,
     Link as EdgeLink, LinkWorkflowEventReference,
     ListNamespacesResponse as EdgeListNamespacesResponse, ListWorkflowExecutionsRequest,
-    ListWorkflowExecutionsResponse, NamespaceDescription,
+    ListWorkflowExecutionsResponse, NamespaceDescription, NamespaceStateUpdate,
     OnConflictOptions as EdgeOnConflictOptions, PollWorkflowTaskQueueRequest,
     PollWorkflowTaskQueueResponse, Priority as EdgePriority, ProtocolMessageDto, QueryResultDto,
     RegisterNamespaceRequest as EdgeRegisterNamespaceRequest,
@@ -91,7 +91,8 @@ use crate::translate::{
     SignalWithStartWorkflowExecutionRequest as EdgeSignalWithStartWorkflowExecutionRequest,
     SignalWithStartWorkflowExecutionResponse as EdgeSignalWithStartWorkflowExecutionResponse,
     SignalWorkflowExecutionRequest, SignalWorkflowExecutionResponse, StartWorkflowExecutionRequest,
-    StartWorkflowExecutionResponse, SystemInfo, TaskQueueConfig, UserMetadata, VersioningOverride,
+    StartWorkflowExecutionResponse, SystemInfo, TaskQueueConfig,
+    UpdateNamespaceRequest as EdgeUpdateNamespaceRequest, UserMetadata, VersioningOverride,
     WorkflowExecutionDescription, WorkflowExecutionSummary, to_internal::namespace_id_for,
 };
 use tokeira_kernel::state::ParentClosePolicy;
@@ -1716,6 +1717,57 @@ pub fn register_namespace_request_to_edge(
     Ok(EdgeRegisterNamespaceRequest {
         namespace: req.namespace,
     })
+}
+
+/// Translate `UpdateNamespaceRequest` proto into the edge DTO.
+///
+/// `update_info` is optional on the wire; when absent the request changes
+/// nothing, which maps to `NamespaceStateUpdate::Unspecified` with no
+/// description change (v1.31.0 `validateStateUpdate` treats `UpdateInfo == nil`
+/// as "no change"). An empty `description` string is the proto default and is
+/// treated as "leave unchanged" rather than "set to empty".
+pub fn update_namespace_request_to_edge(
+    req: workflowservice::UpdateNamespaceRequest,
+) -> Result<EdgeUpdateNamespaceRequest, ProtoConversionError> {
+    let (state, description) = match req.update_info {
+        Some(info) => {
+            let state = match enums::NamespaceState::try_from(info.state).map_err(|_| {
+                ProtoConversionError::MissingField("UpdateNamespaceRequest.update_info.state")
+            })? {
+                enums::NamespaceState::Unspecified => NamespaceStateUpdate::Unspecified,
+                enums::NamespaceState::Registered => NamespaceStateUpdate::Registered,
+                enums::NamespaceState::Deprecated => NamespaceStateUpdate::Deprecated,
+                enums::NamespaceState::Deleted => NamespaceStateUpdate::Deleted,
+            };
+            (state, non_empty(info.description))
+        }
+        None => (NamespaceStateUpdate::Unspecified, None),
+    };
+    Ok(EdgeUpdateNamespaceRequest {
+        namespace: req.namespace,
+        state,
+        description,
+    })
+}
+
+/// Build the `UpdateNamespaceResponse` proto from the updated namespace.
+///
+/// v1.31.0 echoes the (possibly-updated) namespace info, config, and
+/// replication config (`service/frontend/namespace_handler.go @ v1.31.0`,
+/// response construction). We reuse [`namespace_to_proto`] to render the same
+/// `NamespaceInfo`/`NamespaceConfig`/`NamespaceReplicationConfig` shapes used by
+/// `DescribeNamespace`, then project them onto the update response.
+pub fn update_namespace_response_to_proto(
+    namespace: NamespaceDescription,
+) -> workflowservice::UpdateNamespaceResponse {
+    let described = namespace_to_proto(namespace);
+    workflowservice::UpdateNamespaceResponse {
+        namespace_info: described.namespace_info,
+        config: described.config,
+        replication_config: described.replication_config,
+        failover_version: described.failover_version,
+        is_global_namespace: described.is_global_namespace,
+    }
 }
 
 pub fn start_response_to_proto(

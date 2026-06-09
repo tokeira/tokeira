@@ -70,30 +70,30 @@ use crate::{
         DeleteWorkflowExecutionRequest, DescribeTaskQueueRequest, DescribeTaskQueueResponse,
         DescribeWorkflowExecutionRequest, ListNamespacesResponse as EdgeListNamespacesResponse,
         ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, NamespaceCapabilities,
-        NamespaceDescription, PauseWorkflowExecutionRequest, PauseWorkflowExecutionResponse,
-        PollActivityTaskQueueRequest, PollActivityTaskQueueResponse, PollWorkflowTaskQueueRequest,
-        PollWorkflowTaskQueueResponse, ProtocolMessageDto, QueryResultDto, QueryWorkflowRequest,
-        QueryWorkflowResponse, RecordActivityTaskHeartbeatByIdRequest,
-        RecordActivityTaskHeartbeatByIdResponse, RecordActivityTaskHeartbeatRequest,
-        RecordActivityTaskHeartbeatResponse, RegisterNamespaceRequest,
-        RequestCancelWorkflowExecutionRequest, RequestCancelWorkflowExecutionResponse,
-        ResetWorkflowExecutionRequest, ResetWorkflowExecutionResponse,
-        RespondActivityTaskCanceledByIdRequest, RespondActivityTaskCanceledByIdResponse,
-        RespondActivityTaskCanceledRequest, RespondActivityTaskCanceledResponse,
-        RespondActivityTaskCompletedByIdRequest, RespondActivityTaskCompletedByIdResponse,
-        RespondActivityTaskCompletedRequest, RespondActivityTaskCompletedResponse,
-        RespondActivityTaskFailedByIdRequest, RespondActivityTaskFailedByIdResponse,
-        RespondActivityTaskFailedRequest, RespondActivityTaskFailedResponse,
-        RespondWorkflowTaskCompletedRequest, RespondWorkflowTaskCompletedResponse,
-        SignalWithStartWorkflowExecutionRequest, SignalWithStartWorkflowExecutionResponse,
-        SignalWorkflowExecutionRequest, SignalWorkflowExecutionResponse,
-        StartWorkflowExecutionRequest, StartWorkflowExecutionResponse, SystemCapabilities,
-        SystemInfo, TaskQueueConfig, TerminateWorkflowExecutionRequest,
-        TerminateWorkflowExecutionResponse, UnpauseWorkflowExecutionRequest,
-        UnpauseWorkflowExecutionResponse, UpdateActivityOptionsRequest,
-        UpdateActivityOptionsResponse, UpdateWorkflowExecutionRequest,
-        UpdateWorkflowExecutionResponse, WorkflowExecutionDescription, WorkflowQueryDto,
-        from_internal, to_internal,
+        NamespaceDescription, NamespaceStateUpdate, PauseWorkflowExecutionRequest,
+        PauseWorkflowExecutionResponse, PollActivityTaskQueueRequest,
+        PollActivityTaskQueueResponse, PollWorkflowTaskQueueRequest, PollWorkflowTaskQueueResponse,
+        ProtocolMessageDto, QueryResultDto, QueryWorkflowRequest, QueryWorkflowResponse,
+        RecordActivityTaskHeartbeatByIdRequest, RecordActivityTaskHeartbeatByIdResponse,
+        RecordActivityTaskHeartbeatRequest, RecordActivityTaskHeartbeatResponse,
+        RegisterNamespaceRequest, RequestCancelWorkflowExecutionRequest,
+        RequestCancelWorkflowExecutionResponse, ResetWorkflowExecutionRequest,
+        ResetWorkflowExecutionResponse, RespondActivityTaskCanceledByIdRequest,
+        RespondActivityTaskCanceledByIdResponse, RespondActivityTaskCanceledRequest,
+        RespondActivityTaskCanceledResponse, RespondActivityTaskCompletedByIdRequest,
+        RespondActivityTaskCompletedByIdResponse, RespondActivityTaskCompletedRequest,
+        RespondActivityTaskCompletedResponse, RespondActivityTaskFailedByIdRequest,
+        RespondActivityTaskFailedByIdResponse, RespondActivityTaskFailedRequest,
+        RespondActivityTaskFailedResponse, RespondWorkflowTaskCompletedRequest,
+        RespondWorkflowTaskCompletedResponse, SignalWithStartWorkflowExecutionRequest,
+        SignalWithStartWorkflowExecutionResponse, SignalWorkflowExecutionRequest,
+        SignalWorkflowExecutionResponse, StartWorkflowExecutionRequest,
+        StartWorkflowExecutionResponse, SystemCapabilities, SystemInfo, TaskQueueConfig,
+        TerminateWorkflowExecutionRequest, TerminateWorkflowExecutionResponse,
+        UnpauseWorkflowExecutionRequest, UnpauseWorkflowExecutionResponse,
+        UpdateActivityOptionsRequest, UpdateActivityOptionsResponse, UpdateNamespaceRequest,
+        UpdateWorkflowExecutionRequest, UpdateWorkflowExecutionResponse,
+        WorkflowExecutionDescription, WorkflowQueryDto, from_internal, to_internal,
     },
 };
 
@@ -2848,6 +2848,68 @@ impl WorkflowService {
         .await
     }
 
+    /// Update a namespace's lifecycle state and/or description.
+    ///
+    /// Tokeira runs a single non-global cluster, so the replication, config,
+    /// and security-token request fields are accepted at the wire layer but
+    /// ignored here. Only the state transition and description are honoured.
+    ///
+    /// State-transition validity mirrors v1.31.0 `validateStateUpdate`
+    /// (`service/frontend/namespace_handler.go @ v1.31.0`): `Unspecified` or a
+    /// same-state target is a no-op; `Registered → {Deleted, Deprecated}` and
+    /// `Deprecated → Deleted` are allowed; every other transition (notably any
+    /// transition out of `Deleted`) is rejected with `INVALID_ARGUMENT`.
+    pub async fn update_namespace(
+        &self,
+        headers: &HeaderMap,
+        req: UpdateNamespaceRequest,
+    ) -> EdgeResult<NamespaceDescription> {
+        let namespace_label = req.namespace.clone();
+        self.observe_edge_call(
+            headers,
+            "update_namespace",
+            Some(namespace_label.as_str()),
+            None,
+            async move {
+                // Resolve before `interceptors.begin`: begin() rejects a deleted
+                // namespace with NamespaceDeleted, but UpdateNamespace is the very
+                // RPC operators use to manage already-deleted namespaces. We must
+                // observe the current (possibly deleted) state to validate the
+                // transition rather than fail the lookup outright.
+                let _ctx = self
+                    .interceptors
+                    .begin(headers, None, Action::UpdateNamespace, false)
+                    .await?;
+
+                let mut namespace = self
+                    .namespaces
+                    .get(&req.namespace)
+                    .await
+                    .map_err(EdgeError::from)?
+                    .ok_or_else(|| EdgeError::NamespaceNotFound(req.namespace.clone()))?;
+
+                validate_namespace_state_update(namespace.deleted, req.state)?;
+
+                if matches!(req.state, NamespaceStateUpdate::Deleted) {
+                    namespace.deleted = true;
+                }
+
+                let mut description = namespace_to_description(namespace.clone());
+                if let Some(new_description) = req.description {
+                    description.description = new_description;
+                }
+
+                self.namespaces
+                    .insert(namespace)
+                    .await
+                    .map_err(EdgeError::from)?;
+
+                Ok(description)
+            },
+        )
+        .await
+    }
+
     pub async fn describe_task_queue(
         &self,
         headers: &HeaderMap,
@@ -4512,6 +4574,32 @@ async fn read_last_event_id(repo: &dyn RunRepository, run_key: RunKey) -> Result
         .unwrap_or(0))
 }
 
+/// Validate a namespace state transition against the v1.31.0 rules.
+///
+/// Tokeira's scoped namespace model only tracks a boolean `deleted` flag, so
+/// the live states reduce to `Registered` (not deleted) and `Deleted`. The
+/// `Deprecated` intermediate state is accepted as a request target but, since
+/// it is not persisted, behaves as a no-op against a live namespace. The
+/// rejection surface still matches v1.31.0 `validateStateUpdate`
+/// (`service/frontend/namespace_handler.go @ v1.31.0`): any transition out of
+/// `Deleted` is rejected, and `Unspecified`/same-state targets are no-ops.
+fn validate_namespace_state_update(deleted: bool, target: NamespaceStateUpdate) -> EdgeResult<()> {
+    match (deleted, target) {
+        // No state change requested.
+        (_, NamespaceStateUpdate::Unspecified) => Ok(()),
+        // A deleted namespace cannot transition to any other state. This also
+        // covers the same-state `Deleted → Deleted` no-op, which is harmless.
+        (true, NamespaceStateUpdate::Deleted) => Ok(()),
+        (true, _) => Err(EdgeError::BadRequest(
+            "invalid namespace state update: namespace is deleted".to_string(),
+        )),
+        // Registered (live) → {Registered, Deprecated, Deleted} are all
+        // permitted: Registered is a same-state no-op, Deprecated is accepted
+        // but not persisted, and Deleted is the real transition operators use.
+        (false, _) => Ok(()),
+    }
+}
+
 fn namespace_to_description(namespace: ResolvedNamespace) -> NamespaceDescription {
     NamespaceDescription {
         name: namespace.name,
@@ -4661,6 +4749,34 @@ mod tests {
     fn arb_small_string() -> impl Strategy<Value = String> {
         prop::collection::vec(prop::char::range('a', 'z'), 1..8)
             .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    #[test]
+    fn namespace_state_update_matches_v1_31_0_rules() {
+        use super::validate_namespace_state_update;
+        use crate::translate::NamespaceStateUpdate;
+
+        // Unspecified is always a no-op, regardless of current state.
+        assert!(validate_namespace_state_update(false, NamespaceStateUpdate::Unspecified).is_ok());
+        assert!(validate_namespace_state_update(true, NamespaceStateUpdate::Unspecified).is_ok());
+
+        // Registered (live) → {Registered, Deprecated, Deleted} all permitted.
+        assert!(validate_namespace_state_update(false, NamespaceStateUpdate::Registered).is_ok());
+        assert!(validate_namespace_state_update(false, NamespaceStateUpdate::Deprecated).is_ok());
+        assert!(validate_namespace_state_update(false, NamespaceStateUpdate::Deleted).is_ok());
+
+        // Deleted → Deleted is a harmless same-state no-op.
+        assert!(validate_namespace_state_update(true, NamespaceStateUpdate::Deleted).is_ok());
+
+        // Any other transition out of Deleted is rejected (INVALID_ARGUMENT).
+        assert!(matches!(
+            validate_namespace_state_update(true, NamespaceStateUpdate::Registered),
+            Err(EdgeError::BadRequest(_))
+        ));
+        assert!(matches!(
+            validate_namespace_state_update(true, NamespaceStateUpdate::Deprecated),
+            Err(EdgeError::BadRequest(_))
+        ));
     }
 
     fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {

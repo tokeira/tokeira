@@ -469,9 +469,15 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     }
     async fn update_namespace(
         &self,
-        _request: Request<workflowservice::UpdateNamespaceRequest>,
+        request: Request<workflowservice::UpdateNamespaceRequest>,
     ) -> Result<Response<workflowservice::UpdateNamespaceResponse>, Status> {
-        Err(Status::unimplemented("update_namespace"))
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::update_namespace_request_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let edge_resp = self.inner.update_namespace(&headers, edge_req).await?;
+        Ok(Response::new(
+            translate::update_namespace_response_to_proto(edge_resp),
+        ))
     }
     async fn deprecate_namespace(
         &self,

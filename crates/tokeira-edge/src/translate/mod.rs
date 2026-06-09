@@ -443,6 +443,37 @@ pub struct RegisterNamespaceRequest {
     pub namespace: String,
 }
 
+/// Target namespace lifecycle state for an [`UpdateNamespaceRequest`].
+///
+/// The edge stays proto-free: the gRPC layer maps Temporal's `NamespaceState`
+/// enum onto this small set. `Unspecified` means "do not change state" (the
+/// proto default), matching v1.31.0 `validateStateUpdate`
+/// (`service/frontend/namespace_handler.go @ v1.31.0`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum NamespaceStateUpdate {
+    /// No state change requested (proto default / `NAMESPACE_STATE_UNSPECIFIED`).
+    #[default]
+    Unspecified,
+    Registered,
+    Deprecated,
+    Deleted,
+}
+
+/// Edge representation of `UpdateNamespaceRequest`.
+///
+/// Only the fields Tokeira's scoped namespace model can honour are carried: the
+/// target name, an optional state transition, and an optional description update.
+/// Replication, config, and security-token fields are accepted at the wire layer
+/// but not modelled here — Tokeira runs a single non-global cluster.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdateNamespaceRequest {
+    pub namespace: String,
+    /// Requested new lifecycle state. `Unspecified` leaves the state unchanged.
+    pub state: NamespaceStateUpdate,
+    /// Optional new description; `None` leaves it unchanged.
+    pub description: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListNamespacesResponse {
     pub namespaces: Vec<NamespaceDescription>,

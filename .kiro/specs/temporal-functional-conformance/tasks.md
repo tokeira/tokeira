@@ -85,8 +85,8 @@ through the seam* (task 6) **before** attempting the full corpus or large files 
 - [ ] 3. Checkpoint
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 4. Fork-side onebox seam override (Go — fork: ../temporal @ tokeira/conformance-v1.31.0)
-  - [ ] 4.1 Implement the `Start()` short-circuit under `TOKEIRA_CONFORMANCE_FRONTEND_ADDR`
+- [x] 4. Fork-side onebox seam override (Go — fork: ../temporal @ tokeira/conformance-v1.31.0)
+  - [x] 4.1 Implement the `Start()` short-circuit under `TOKEIRA_CONFORMANCE_FRONTEND_ADDR`
     - In `tests/testcore/onebox.go` (`Start()` @ onebox.go:244): when the env var is set, skip
       `startMatching`/`startHistory`/`startFrontend`/`startWorker` (startFrontend @ onebox.go:353) and
       skip `createSystemNamespace()` (tokeirad owns namespace bootstrap)
@@ -94,22 +94,22 @@ through the seam* (task 6) **before** attempting the full corpus or large files 
       env var is absent; requires no `tokeirad` binary change beyond the task-2 recorder
     - _Requirements: 2.1, 2.5, 2.6_
 
-  - [ ] 4.2 Resolve `FrontendClient()` / `FrontendGRPCAddress()` to the external `tokeirad`
+  - [x] 4.2 Resolve `FrontendClient()` / `FrontendGRPCAddress()` to the external `tokeirad`
     - Record the external address into `hostsByProtocolByService[grpc][FrontendService]` and build
       `frontendClient = NewWorkflowServiceClient(dial(externalAddr))` (connection seam @ onebox.go:442–443,
       `FrontendGRPCAddress` @ onebox.go:290, `FrontendClient` @ onebox.go:306); nothing downstream of
       `FrontendClient()` changes
     - _Requirements: 2.2_
 
-- [ ] 5. Fork-side `tokeirad` subprocess lifecycle glue (Go — fork: ../temporal @ tokeira/conformance-v1.31.0)
-  - [ ] 5.1 Implement the health-wait as a trivial `WorkflowService` RPC poll
+- [x] 5. Fork-side `tokeirad` subprocess lifecycle glue (Go — fork: ../temporal @ tokeira/conformance-v1.31.0)
+  - [x] 5.1 Implement the health-wait as a trivial `WorkflowService` RPC poll
     - **Resolve design caveat 1 first:** do NOT assume the standard gRPC Health Checking Protocol
       (`grpc.health.v1.Health/Check`) is served on the frontend port. Poll a trivial `WorkflowService`
       RPC (e.g. `GetSystemInfo`/`GetClusterInfo`) until it succeeds; do this early so the lifecycle glue
       does not assume an endpoint shape that is not served
     - _Requirements: 2.3_
 
-  - [ ] 5.2 Start `tokeirad` as a subprocess (in-memory storage default), inject address, teardown
+  - [x] 5.2 Start `tokeirad` as a subprocess (in-memory storage default), inject address, teardown
     - Boot `tokeirad` with in-memory storage before the test cluster, wait via 5.1, inject the address
       into the onebox override, and terminate the subprocess when the run completes; fail fast and tear
       down if health-wait never passes (never silently green)
@@ -119,16 +119,35 @@ through the seam* (task 6) **before** attempting the full corpus or large files 
     - DSQL run is selectable but is NOT part of the default gate
     - _Requirements: 2.7_
 
-- [ ] 6. First milestone — one trivial `WorkflowService` lifecycle test E2E (Go — fork: ../temporal @ tokeira/conformance-v1.31.0)
-  - [ ] 6.1 Wire and run a single basic workflow-lifecycle test against `tokeirad` through the seam
+- [x] 6. First milestone — one trivial `WorkflowService` lifecycle test E2E (Go — fork: ../temporal @ tokeira/conformance-v1.31.0)
+  - [x] 6.1 Wire and run a single basic workflow-lifecycle test against `tokeirad` through the seam
     - Prove the seam (tasks 4 + 5) end-to-end on one high-signal lifecycle test **before** the full
-      corpus or large files like `versioning_3_test.go`; this is the honest first milestone
+      corpus or large files like `versioning_3_test.go`; this is the honest first milestone.
+    - **Standalone, NOT `FunctionalTestBase`:** the standard base registers its namespace via a direct
+      `MetadataManager` write (see task 8.0 finding), which tokeirad never sees. So this milestone test
+      is self-contained: start tokeirad via the harness (task 5), set the seam env, register a namespace
+      through the frontend `RegisterNamespace` RPC, then run start→poll→complete via `FrontendClient()`.
     - _Requirements: 2.1, 2.2, 2.3, 2.4_
 
-- [ ] 7. Checkpoint
+- [x] 7. Checkpoint
   - Ensure all tests pass, ask the user if questions arise.
 
 - [ ] 8. Run-all harness (Go — fork: ../temporal @ tokeira/conformance-v1.31.0)
+  - [ ] 8.0 Adapt `FunctionalTestBase` setup for the conformance seam (namespace via frontend RPC)
+    - **Finding (verified, blocks the corpus):** `FunctionalTestBase.setupCluster` registers its
+      namespace by writing **directly to `testCluster.testBase.MetadataManager.CreateNamespace`**
+      (`functional_test_base.go:466` `RegisterNamespace`), Temporal's own persistence layer — not a
+      gRPC call. Under Shape-2 the onebox boots no Temporal persistence (tokeirad is the backend over
+      the wire), so the standard setup writes a namespace tokeirad never sees, and every test relying
+      on `s.Namespace()` fails with not-found at the frontend even when the workflow logic is fine.
+    - When the conformance seam env is set, `setupCluster` MUST register the namespace through
+      tokeirad's frontend `RegisterNamespace` RPC (a WorkflowService surface tokeirad serves; matrix
+      group namespace-management) instead of the direct `MetadataManager` write. This is the higher-impact,
+      shared-setup change that makes the corpus runnable; it is deliberately NOT in the task-6 milestone.
+    - Tests that additionally poke `testBase`/persistence directly in their bodies remain
+      out-of-public-scope by construction and are classified as such in the report (not run-blockers).
+    - _Requirements: 2.1, 3.1_
+
   - [ ] 8.1 Execute the entire pinned corpus; never exclude a test from running
     - Operator-invokable (manual initially, R2.8); classification is a report concern, never a run-time
       exclusion — every test in `tests/` executes

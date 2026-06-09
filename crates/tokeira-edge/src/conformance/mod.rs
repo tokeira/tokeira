@@ -27,10 +27,14 @@
 //!   `unknown-to-matrix` wire observations into the internal client surfaces they
 //!   touched (AdminClient, HistoryClient, …), so an `OutOfPublicScope` classification
 //!   cites a recorder-observed fact rather than hand-judgement (task 9.3).
+//! - [`gates`] — the Tier-2 report gates: ledger totality (10.1), no silent scope
+//!   inflation (10.3), and real-gap monotonicity (10.5), each a pure check over the
+//!   [`test_report`] producing a structured pass/violations outcome (task 10).
 //! - [`pin`] — the pin-consistency gate: the fail-fast check that the fork's conformance
 //!   branch is pinned at the Temporal tag matching `TEMPORAL_SERVER_COMPAT` and is not the
 //!   fork's `main`, so the corpus can never be run against a release newer than the claim.
 
+pub mod gates;
 pub mod layer;
 pub mod ledger;
 pub mod pin;
@@ -40,6 +44,7 @@ pub mod report;
 pub mod scope;
 pub mod test_report;
 
+pub use gates::*;
 pub use layer::*;
 pub use ledger::*;
 pub use pin::*;

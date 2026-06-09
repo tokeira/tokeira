@@ -191,7 +191,7 @@ through the seam* (task 6) **before** attempting the full corpus or large files 
     - **Validates: Requirements 5.5, 5.6**
 
 - [ ] 10. Report gates (Rust report consuming the Go ledger, this workspace)
-  - [ ] 10.1 Implement the ledger-totality gate
+  - [x] 10.1 Implement the ledger-totality gate
     - An unclassified non-passing test fails the Tier 2 gate
     - _Requirements: 3.5_
 
@@ -199,7 +199,7 @@ through the seam* (task 6) **before** attempting the full corpus or large files 
     - **Property 3: Ledger totality**
     - **Validates: Requirements 3.1, 3.2, 3.5**
 
-  - [ ] 10.3 Implement the no-silent-scope-inflation gate
+  - [x] 10.3 Implement the no-silent-scope-inflation gate
     - `out-of-public-scope` must cite the internal client surface (9.3); `deliberate-deviation` must
       cite a spec/PR rationale; `real-gap` must link a tracking issue
     - _Requirements: 3.6, 3.7, 3.8_
@@ -208,7 +208,7 @@ through the seam* (task 6) **before** attempting the full corpus or large files 
     - **Property 4: No silent scope inflation**
     - **Validates: Requirements 3.6, 3.7, 3.8**
 
-  - [ ] 10.5 Implement the real-gap monotonicity gate
+  - [x] 10.5 Implement the real-gap monotonicity gate
     - A test classified `real-gap` (expect-fail) that begins passing must flip to a required pass;
       passing while still marked expect-fail fails the gate (stale ledger)
     - _Requirements: 4.1, 4.2_

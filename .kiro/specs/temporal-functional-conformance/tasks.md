@@ -133,7 +133,7 @@ through the seam* (task 6) **before** attempting the full corpus or large files 
   - Ensure all tests pass, ask the user if questions arise.
 
 - [ ] 8. Run-all harness (Go — fork: ../temporal @ tokeira/conformance-v1.31.0)
-  - [ ] 8.0 Adapt `FunctionalTestBase` setup for the conformance seam (namespace via frontend RPC)
+  - [x] 8.0 Adapt `FunctionalTestBase` setup for the conformance seam (namespace via frontend RPC)
     - **Finding (verified, blocks the corpus):** `FunctionalTestBase.setupCluster` registers its
       namespace by writing **directly to `testCluster.testBase.MetadataManager.CreateNamespace`**
       (`functional_test_base.go:466` `RegisterNamespace`), Temporal's own persistence layer — not a
@@ -148,12 +148,12 @@ through the seam* (task 6) **before** attempting the full corpus or large files 
       out-of-public-scope by construction and are classified as such in the report (not run-blockers).
     - _Requirements: 2.1, 3.1_
 
-  - [ ] 8.1 Execute the entire pinned corpus; never exclude a test from running
+  - [x] 8.1 Execute the entire pinned corpus; never exclude a test from running
     - Operator-invokable (manual initially, R2.8); classification is a report concern, never a run-time
       exclusion — every test in `tests/` executes
     - _Requirements: 3.1, 3.3, 2.8_
 
-  - [ ] 8.2 Capture per-test outcomes (including `t.Run` sub-tests) into the ledger shape (task 1.2)
+  - [x] 8.2 Capture per-test outcomes (including `t.Run` sub-tests) into the ledger shape (task 1.2)
     - _Requirements: 3.4_
 
   - [ ]* 8.3 Write meta-test for full-corpus execution
@@ -166,7 +166,7 @@ through the seam* (task 6) **before** attempting the full corpus or large files 
     - **Validates: Requirements 1.2, 2.1**
 
 - [ ] 9. Coverage report generator (Rust, this workspace)
-  - [ ] 9.1 Join recorder observations through `coverage::resolve` against the matrix claim
+  - [x] 9.1 Join recorder observations through `coverage::resolve` against the matrix claim
     - For each observed RPC, mark `agrees` | `contradicts` | `uncovered` | `unknown-to-matrix` from the
       three-way join (matrix `state`+`expected` via `resolve`, observed `(wire_method, status_code)`,
       Tier-1 evidence); `unknown-to-matrix` is surfaced, never dropped; `uncovered` when claimed

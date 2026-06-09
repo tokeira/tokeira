@@ -17,6 +17,9 @@
 //!   `tokeirad` only under the conformance flag.
 //! - [`ledger`] — the per-test ledger: each test's classified outcome and its
 //!   category-keyed evidence.
+//! - [`report`] — the wire-coverage report: joins the [`record`] observations against
+//!   the compatibility matrix via `tokeira_compatibility::coverage::resolve`, marking
+//!   each RPC `agrees` / `contradicts` / `uncovered` / `unknown-to-matrix` (task 9.1).
 //! - [`pin`] — the pin-consistency gate: the fail-fast check that the fork's conformance
 //!   branch is pinned at the Temporal tag matching `TEMPORAL_SERVER_COMPAT` and is not the
 //!   fork's `main`, so the corpus can never be run against a release newer than the claim.
@@ -26,9 +29,11 @@ pub mod ledger;
 pub mod pin;
 pub mod record;
 pub mod recorder;
+pub mod report;
 
 pub use layer::*;
 pub use ledger::*;
 pub use pin::*;
 pub use record::*;
 pub use recorder::*;
+pub use report::*;

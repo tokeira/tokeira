@@ -632,6 +632,7 @@ mod tests {
                 current_version,
                 ramping_version,
                 ramping_version_percentage: if case.version_count > 1 { 25.0 } else { 0.0 },
+                ramping_to_unversioned: false,
                 current_version_changed_time: Some(create_time + Duration::seconds(90)),
                 ramping_version_changed_time: Some(create_time + Duration::seconds(100)),
                 ramping_version_percentage_changed_time: Some(create_time + Duration::seconds(110)),

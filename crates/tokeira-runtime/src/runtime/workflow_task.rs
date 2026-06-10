@@ -645,6 +645,7 @@ mod tests {
             current_version: current,
             ramping_version: ramping,
             ramping_version_percentage: ramping_percentage,
+            ramping_to_unversioned: false,
             current_version_changed_time: None,
             ramping_version_changed_time: None,
             ramping_version_percentage_changed_time: None,

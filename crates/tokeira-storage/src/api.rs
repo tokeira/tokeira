@@ -224,6 +224,13 @@ pub struct StoredRoutingConfig {
     pub ramping_version: Option<WorkerDeploymentVersionKey>,
     /// Percentage of eligible traffic shifted to the ramping version.
     pub ramping_version_percentage: f32,
+    /// Whether the ramp targets unversioned workers (nil ramping version) at a
+    /// non-zero percentage. Distinguishes "ramping to unversioned" from "no ramp":
+    /// both leave `ramping_version` nil, but v1.31.0 renders the deprecated
+    /// `ramping_version` string as `__unversioned__` only for the former
+    /// (`ExternalWorkerDeploymentVersionToStringV31` of nil, gated on a real ramp).
+    #[serde(default)]
+    pub ramping_to_unversioned: bool,
     /// Last current-version change time.
     pub current_version_changed_time: Option<OffsetDateTime>,
     /// Last ramping-version change time.
@@ -240,6 +247,7 @@ impl Default for StoredRoutingConfig {
             current_version: None,
             ramping_version: None,
             ramping_version_percentage: 0.0,
+            ramping_to_unversioned: false,
             current_version_changed_time: None,
             ramping_version_changed_time: None,
             ramping_version_percentage_changed_time: None,

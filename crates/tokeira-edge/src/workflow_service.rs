@@ -40,11 +40,11 @@ use tokeira_runtime::{
     ResetWorkflowResult, ScheduleActionResult, SchedulePatch, ScheduleStore, SetCurrent,
     SetCurrentOutcome, SetManager, SetManagerOutcome, SetRamping, SetRampingOutcome,
     SignalWithStartResult, StartWorkflowResult, StartedActivityTask, StartedWorkflowTask,
-    TaskQueueConfigEntry, TaskQueueConfigStore, UpdateComputeConfig, UpdateLifecycleError,
-    UpdateLifecycleSnapshot, UpdateMetadata, UpdateTransportResolution, UpdateWaitPolicy,
-    ValidateComputeConfig, VersionMetadataView, VersionView, VersioningRuleStore, WorkerRegistry,
-    WorkflowExecution, WorkflowExecutionStatus, compute_matching_times, decide_overlap,
-    schedule_workflow_id,
+    TaskQueueConfigEntry, TaskQueueConfigStore, TaskQueueVersioningView, UpdateComputeConfig,
+    UpdateLifecycleError, UpdateLifecycleSnapshot, UpdateMetadata, UpdateTransportResolution,
+    UpdateWaitPolicy, ValidateComputeConfig, VersionMetadataView, VersionView, VersioningRuleStore,
+    WorkerRegistry, WorkflowExecution, WorkflowExecutionStatus, compute_matching_times,
+    decide_overlap, schedule_workflow_id,
 };
 use tokeira_storage::{
     ConflictToken, DeploymentKey, DeploymentName, DeploymentTaskQueueType, RunRepository,
@@ -504,6 +504,25 @@ pub trait WorkerDeploymentRuntimeApi: Send + Sync + 'static {
     /// Lazily register the deployment/version implied by a versioned worker poll.
     /// A no-op for unversioned polls. Idempotent.
     async fn register_polled_deployment(&self, req: RegisterPolledDeployment) -> EdgeResult<()>;
+
+    /// Apply a `sync-drainage-status` signal addressed to a version entity
+    /// workflow onto the registry. No-op for an absent deployment/version or a
+    /// version that is currently Current/Ramping.
+    async fn apply_version_drainage(
+        &self,
+        namespace_id: tokeira_types::NamespaceId,
+        deployment_name: DeploymentName,
+        build_id: tokeira_storage::BuildId,
+        status: tokeira_storage::VersionDrainageStatus,
+    ) -> EdgeResult<()>;
+
+    /// Resolve the Worker Deployment versioning view for one task queue, for
+    /// `DescribeTaskQueue.versioning_info`. `None` when no version polls it.
+    async fn task_queue_versioning(
+        &self,
+        namespace_id: tokeira_types::NamespaceId,
+        task_queue: String,
+    ) -> EdgeResult<Option<TaskQueueVersioningView>>;
 }
 
 #[async_trait]
@@ -2125,6 +2144,53 @@ impl WorkflowService {
                     )
                     .await?;
 
+                // Worker Deployment entity-workflow surface: a `sync-drainage-status`
+                // signal addressed to `temporal-sys-worker-deployment-version:<name>:<build>`
+                // drives registry drainage state rather than a per-run workflow (Tokeira
+                // backs the entity-workflow surface with the registry; see
+                // `deployment_registry`). Mirrors the version entity workflow's signal
+                // handler (`version_workflow.go:119 @ v1.31.0`). A `force-continue-as-new`
+                // signal to either the version or deployment entity is a no-op success:
+                // tokeira holds the registry as durable state, so there is no per-run
+                // history to continue-as-new. Other signals to these ids fall through to
+                // normal routing (and surface NotFound).
+                if req.signal_name == crate::grpc::translate::SYNC_DRAINAGE_SIGNAL_NAME
+                    && let Some((deployment_name, build_id)) =
+                        crate::grpc::translate::parse_worker_deployment_version_workflow_id(
+                            &req.workflow_id,
+                        )
+                {
+                    if let Some(worker_deployments) = self.worker_deployments.as_ref() {
+                        let status =
+                            crate::grpc::translate::decode_version_drainage_status(&req.input)
+                                .map_err(|error| EdgeError::BadRequest(error.to_string()))?;
+                        worker_deployments
+                            .apply_version_drainage(
+                                to_internal::namespace_id_for(&req.namespace),
+                                tokeira_storage::DeploymentName(deployment_name),
+                                tokeira_storage::BuildId(build_id),
+                                status,
+                            )
+                            .await?;
+                    }
+                    return Ok(SignalWorkflowExecutionResponse {
+                        accepted: true,
+                        transition_seq: 0,
+                        last_event_id: 0,
+                    });
+                }
+                if req.signal_name == crate::grpc::translate::FORCE_CAN_SIGNAL_NAME
+                    && crate::grpc::translate::is_worker_deployment_entity_workflow_id(
+                        &req.workflow_id,
+                    )
+                {
+                    return Ok(SignalWorkflowExecutionResponse {
+                        accepted: true,
+                        transition_seq: 0,
+                        last_event_id: 0,
+                    });
+                }
+
                 ensure_local(
                     self.router
                         .route_workflow(&req.namespace, &req.workflow_id)
@@ -2983,6 +3049,19 @@ impl WorkflowService {
                     .map(task_queue_config_to_edge)
                     .unwrap_or_default();
 
+                // Surface Worker Deployment versioning for this task queue (current /
+                // ramping version) the way Temporal's matching layer does from synced
+                // task-queue user data (`task_queue_partition_manager.go:976 @ v1.31.0`).
+                // Derived from the registry; absent when no deployment version has
+                // polled the queue or when the registry is not configured.
+                let versioning_info = match self.worker_deployments.as_ref() {
+                    Some(worker_deployments) => worker_deployments
+                        .task_queue_versioning(namespace_id, req.task_queue.clone())
+                        .await?
+                        .map(task_queue_versioning_view_to_edge),
+                    None => None,
+                };
+
                 Ok(DescribeTaskQueueResponse {
                     pollers: self
                         .poller_registry
@@ -2992,6 +3071,7 @@ impl WorkflowService {
                         .collect(),
                     backlog_count_hint: req.include_status.then_some(0),
                     config,
+                    versioning_info,
                 })
             },
         )
@@ -4737,6 +4817,27 @@ fn task_queue_config_to_edge(entry: TaskQueueConfigEntry) -> TaskQueueConfig {
         queue_rate_limit: entry.queue_rate_limit,
         fairness_key_rate_limit_default: entry.fairness_key_rate_limit_default,
         fairness_weight_overrides: entry.fairness_weight_overrides,
+    }
+}
+
+/// Map the registry's task-queue versioning view onto the edge DTO. The storage
+/// `WorkerDeploymentVersionKey` becomes a proto-free `(deployment_name, build_id)`
+/// pair; the deprecated string fields are derived later in the gRPC layer.
+fn task_queue_versioning_view_to_edge(
+    view: TaskQueueVersioningView,
+) -> crate::translate::TaskQueueVersioningInfo {
+    let to_id = |version: tokeira_storage::WorkerDeploymentVersionKey| {
+        crate::translate::WorkerDeploymentVersionId {
+            deployment_name: version.deployment_name.0,
+            build_id: version.build_id.0,
+        }
+    };
+    crate::translate::TaskQueueVersioningInfo {
+        current_deployment_version: view.current_version.map(to_id),
+        ramping_deployment_version: view.ramping_version.map(to_id),
+        ramping_to_unversioned: view.ramping_to_unversioned,
+        ramping_version_percentage: view.ramping_percentage,
+        update_time: view.update_time,
     }
 }
 

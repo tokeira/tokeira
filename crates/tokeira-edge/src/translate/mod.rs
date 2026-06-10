@@ -846,6 +846,35 @@ pub struct DescribeTaskQueueResponse {
     pub pollers: Vec<PollerInfo>,
     pub backlog_count_hint: Option<i64>,
     pub config: TaskQueueConfig,
+    /// Worker Deployment versioning for this task queue, when any deployment
+    /// version has polled it. `None` renders no `versioning_info` on the wire,
+    /// matching a task queue with no deployment association.
+    pub versioning_info: Option<TaskQueueVersioningInfo>,
+}
+
+/// A `(deployment_name, build_id)` reference to one Worker Deployment Version,
+/// edge-side and proto-free.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerDeploymentVersionId {
+    pub deployment_name: String,
+    pub build_id: String,
+}
+
+/// Edge view of `TaskQueueVersioningInfo`. Carries only the structured version
+/// refs, percentage, and update time; the gRPC layer derives the deprecated
+/// `current_version`/`ramping_version` strings (a nil current renders as
+/// `__unversioned__`, a nil ramping as empty) per
+/// `task_queue_partition_manager.go:976 @ v1.31.0`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaskQueueVersioningInfo {
+    pub current_deployment_version: Option<WorkerDeploymentVersionId>,
+    pub ramping_deployment_version: Option<WorkerDeploymentVersionId>,
+    /// Whether the ramp targets unversioned workers (nil ramping version at a
+    /// non-zero percentage); renders the deprecated `ramping_version` string as
+    /// `__unversioned__` rather than empty.
+    pub ramping_to_unversioned: bool,
+    pub ramping_version_percentage: f32,
+    pub update_time: Option<OffsetDateTime>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

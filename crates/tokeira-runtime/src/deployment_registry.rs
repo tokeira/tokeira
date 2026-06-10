@@ -240,9 +240,19 @@ impl DeploymentRegistry {
                     let mut next = record.clone();
                     match next.versions.get_mut(&cmd.build_id) {
                         Some(version) => {
-                            // Record the freshly-polled task queue; everything else is
-                            // already present, so an existing task queue is a no-op.
+                            // A poller arriving at a version created via the API
+                            // (CREATED, no poller yet) promotes it to INACTIVE; record
+                            // the freshly-polled task queue. Everything else already
+                            // present is a no-op.
+                            let mut changed = false;
+                            if version.status == WorkerDeploymentVersionStatus::Created {
+                                version.status = WorkerDeploymentVersionStatus::Inactive;
+                                changed = true;
+                            }
                             if version.polled_task_queues.insert(task_queue) {
+                                changed = true;
+                            }
+                            if changed {
                                 Ok(RegistryMutation::Put(next, ()))
                             } else {
                                 Ok(RegistryMutation::Unchanged(()))
@@ -264,6 +274,173 @@ impl DeploymentRegistry {
         })
         .await
         .map(|_| ())
+    }
+
+    /// Apply a drainage-status update for one version, mirroring the
+    /// `sync-drainage-status` signal handled by Temporal's version entity
+    /// workflow (`service/worker/workerdeployment/version_workflow.go:119 @ v1.31.0`).
+    ///
+    /// Tokeira presents the version entity-workflow *surface* (callers can signal
+    /// `temporal-sys-worker-deployment-version:<name>.<build>`), but backs it with
+    /// registry state rather than a per-run workflow. The signal semantics are
+    /// preserved here: a drainage update for a version that is currently Current or
+    /// Ramping is ignored (it cannot be draining), and a `Drained` status also moves
+    /// the version's lifecycle status to `Drained`. Absent deployment/version is a
+    /// no-op, matching the signal's fire-and-forget delivery.
+    pub async fn apply_version_drainage(
+        &self,
+        namespace_id: NamespaceId,
+        deployment_name: DeploymentName,
+        build_id: BuildId,
+        status: VersionDrainageStatus,
+    ) -> Result<(), RegistryError> {
+        let key = DeploymentKey {
+            namespace_id,
+            deployment_name,
+        };
+        self.mutate_deployment(&key, |loaded, now| {
+            let Some(record) = loaded else {
+                return Ok(RegistryMutation::Unchanged(()));
+            };
+            if !record.versions.contains_key(&build_id) {
+                return Ok(RegistryMutation::Unchanged(()));
+            }
+            // A Current or Ramping version cannot be draining; the entity workflow
+            // drops a late drainage signal in that case (`version_workflow.go:127`).
+            let is_routing = matches!(
+                &record.routing_config.current_version,
+                Some(version) if version.build_id == build_id
+            ) || matches!(
+                &record.routing_config.ramping_version,
+                Some(version) if version.build_id == build_id
+            );
+            if is_routing {
+                return Ok(RegistryMutation::Unchanged(()));
+            }
+
+            let mut next = record.clone();
+            let version = next
+                .versions
+                .get_mut(&build_id)
+                .expect("version presence checked above");
+            let unchanged = version
+                .drainage_info
+                .as_ref()
+                .is_some_and(|info| info.status == status);
+            if unchanged {
+                return Ok(RegistryMutation::Unchanged(()));
+            }
+            version.drainage_info = Some(DrainageInfo {
+                status,
+                last_changed_time: now,
+                last_checked_time: now,
+            });
+            if status == VersionDrainageStatus::Drained {
+                version.status = WorkerDeploymentVersionStatus::Drained;
+            }
+            Ok(RegistryMutation::Put(next, ()))
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// Resolve the Worker Deployment versioning view for one task queue, as
+    /// surfaced by `DescribeTaskQueue.versioning_info`.
+    ///
+    /// Temporal stores this on per-task-queue user data synced from the owning
+    /// deployment and recomputes it via `CalculateTaskQueueVersioningInfo`
+    /// (`service/matching/task_queue_partition_manager.go:976 @ v1.31.0`). Tokeira
+    /// derives the same answer from the registry: a task queue's current/ramping
+    /// version is its deployment's current/ramping version *iff that version has
+    /// actually polled this task queue*. A current/ramping version that does not
+    /// include the task queue routes it to unversioned workers, so it is reported
+    /// as nil (which the edge renders as `__unversioned__` for the deprecated
+    /// string field). Returns `None` when no deployment version has ever polled
+    /// the task queue.
+    pub async fn task_queue_versioning(
+        &self,
+        namespace_id: NamespaceId,
+        task_queue: &str,
+    ) -> Result<Option<TaskQueueVersioningView>, RegistryError> {
+        let deployments = self
+            .repository
+            .list_all_for_namespace(namespace_id)
+            .await
+            .map_err(RegistryError::from_storage_error)?;
+        // Deterministic order: a task queue is normally owned by a single
+        // deployment, but if more than one references it we resolve against the
+        // lexicographically-first deployment so the answer is stable across calls.
+        let mut deployments = deployments;
+        deployments.sort_by(|left, right| left.name.cmp(&right.name));
+
+        for record in &deployments {
+            let version_polls_queue = |version: &WorkerDeploymentVersionKey| {
+                record
+                    .versions
+                    .get(&version.build_id)
+                    .is_some_and(|stored| {
+                        stored
+                            .polled_task_queues
+                            .iter()
+                            .any(|polled| polled.name == task_queue)
+                    })
+            };
+            let any_version_polls = record.versions.values().any(|stored| {
+                stored
+                    .polled_task_queues
+                    .iter()
+                    .any(|polled| polled.name == task_queue)
+            });
+            if !any_version_polls {
+                continue;
+            }
+
+            let current_version = record
+                .routing_config
+                .current_version
+                .as_ref()
+                .filter(|version| version_polls_queue(version))
+                .cloned();
+            let ramping_version = record
+                .routing_config
+                .ramping_version
+                .as_ref()
+                .filter(|version| version_polls_queue(version))
+                .cloned();
+            // An unversioned ramp diverts traffic from the current version to
+            // unversioned workers, so it applies to the task queues served by the
+            // current version. Surface it on this queue when the current version
+            // polls it.
+            let ramping_to_unversioned = record.routing_config.ramping_to_unversioned
+                && record
+                    .routing_config
+                    .current_version
+                    .as_ref()
+                    .is_some_and(|version| version_polls_queue(version));
+            let ramping_active = ramping_version.is_some() || ramping_to_unversioned;
+            let ramping_percentage = if ramping_active {
+                record.routing_config.ramping_version_percentage
+            } else {
+                0.0
+            };
+            let update_time = [
+                record.routing_config.current_version_changed_time,
+                ramping_active
+                    .then_some(record.routing_config.ramping_version_changed_time)
+                    .flatten(),
+            ]
+            .into_iter()
+            .flatten()
+            .max();
+            return Ok(Some(TaskQueueVersioningView {
+                current_version,
+                ramping_version,
+                ramping_to_unversioned,
+                ramping_percentage,
+                update_time,
+            }));
+        }
+        Ok(None)
     }
 
     pub async fn describe_deployment(
@@ -503,11 +680,33 @@ impl DeploymentRegistry {
         };
         let commit = self
             .mutate_deployment(&key, |loaded, now| {
-                let Some(record) = loaded else {
-                    return Err(RegistryError::NotFound);
+                let synthesized;
+                let record = match loaded {
+                    Some(record) => {
+                        validate_supplied_conflict_token(
+                            cmd.conflict_token,
+                            record.conflict_token,
+                        )?;
+                        validate_manager_identity(record, &cmd.identity)?;
+                        record
+                    }
+                    None => {
+                        if !cmd.allow_no_pollers {
+                            return Err(RegistryError::NotFoundMessage(format!(
+                                "no Worker Deployment found with name '{}'; \
+                                 does your Worker Deployment have pollers?",
+                                cmd.deployment_name.0
+                            )));
+                        }
+                        synthesized = synthesized_no_pollers_deployment(
+                            cmd.namespace_id,
+                            &cmd.deployment_name,
+                            &cmd.identity,
+                            now,
+                        );
+                        &synthesized
+                    }
                 };
-                validate_supplied_conflict_token(cmd.conflict_token, record.conflict_token)?;
-                validate_manager_identity(record, &cmd.identity)?;
 
                 let target = routing_version_key(&cmd.deployment_name, cmd.build_id.as_ref())?;
                 let previous_current = record.routing_config.current_version.clone();
@@ -540,9 +739,12 @@ impl DeploymentRegistry {
                 // Promoting the version that is currently ramping to Current implicitly
                 // unsets the ramp: a version cannot be both Current and Ramping. Required
                 // side effect per the `SetWorkerDeploymentCurrentVersion` RPC doc comment
-                // and v1.31.0.
-                if next.routing_config.ramping_version == target {
+                // and v1.31.0. Guard on `target.is_some()` so setting an *unversioned*
+                // current (target None) with no existing ramp does not spuriously match
+                // `None == None` and stamp the ramp-changed timestamps.
+                if target.is_some() && next.routing_config.ramping_version == target {
                     next.routing_config.ramping_version = None;
+                    next.routing_config.ramping_to_unversioned = false;
                     next.routing_config.ramping_version_percentage = 0.0;
                     next.routing_config.ramping_version_changed_time = Some(now);
                     next.routing_config.ramping_version_percentage_changed_time = Some(now);
@@ -555,11 +757,13 @@ impl DeploymentRegistry {
             })
             .await?;
 
-        // Recompute drainage after the routing commit: a version demoted out of
-        // Current/Ramping by this change may now be draining, and that depends on open
-        // pinned workflows read from the run repository (an effect that cannot run inside
-        // the pure validate closure).
-        self.refresh_deployment_drainage(&key).await?;
+        // Do NOT synchronously recompute drainage here. A version demoted out of
+        // Current/Ramping is marked `Draining` by `refresh_version_routing_state`;
+        // v1.31.0 only transitions `Draining → Drained` later, via the version entity
+        // workflow's delayed drainage check / `sync-drainage-status` signal
+        // (`version_workflow.go:119 @ v1.31.0`), never synchronously at the routing
+        // change. Recomputing here (with no open-pinned workflows just after demotion)
+        // would prematurely report `Drained`.
         let deployment = self.describe_deployment(key).await?;
         let (previous_current_version, previous_ramping_version) = commit.value;
         Ok(SetCurrentOutcome {
@@ -586,20 +790,57 @@ impl DeploymentRegistry {
         };
         let commit = self
             .mutate_deployment(&key, |loaded, now| {
-                let Some(record) = loaded else {
-                    return Err(RegistryError::NotFound);
+                let synthesized;
+                let record = match loaded {
+                    Some(record) => {
+                        validate_supplied_conflict_token(
+                            cmd.conflict_token,
+                            record.conflict_token,
+                        )?;
+                        validate_manager_identity(record, &cmd.identity)?;
+                        record
+                    }
+                    None => {
+                        if !cmd.allow_no_pollers {
+                            return Err(RegistryError::NotFoundMessage(format!(
+                                "no Worker Deployment found with name '{}'; \
+                                 does your Worker Deployment have pollers?",
+                                cmd.deployment_name.0
+                            )));
+                        }
+                        synthesized = synthesized_no_pollers_deployment(
+                            cmd.namespace_id,
+                            &cmd.deployment_name,
+                            &cmd.identity,
+                            now,
+                        );
+                        &synthesized
+                    }
                 };
-                validate_supplied_conflict_token(cmd.conflict_token, record.conflict_token)?;
-                validate_manager_identity(record, &cmd.identity)?;
 
                 let target = routing_version_key(&cmd.deployment_name, cmd.build_id.as_ref())?;
-                // A non-nil ramping version must differ from Current; both nil is fine
-                // (that is "no ramp"). v1.31.0 rejects ramp == current with
-                // FAILED_PRECONDITION.
+                // A nil target with a non-zero percentage is a ramp to *unversioned*
+                // workers (distinct from "no ramp", which is a nil target at 0%). v1.31.0
+                // derives this from an empty build id + percentage > 0
+                // (`workflow_handler.go:4018 @ v1.31.0`).
+                let to_unversioned = target.is_none() && cmd.ramping_percentage > 0.0;
+                // A ramping version must differ from Current. v1.31.0 rejects ramp ==
+                // current with FAILED_PRECONDITION (`workflow.go:764 @ v1.31.0`), naming
+                // the version; unversioned ramp collides with an unversioned (nil) current.
                 if target.is_some() && target == record.routing_config.current_version {
-                    return Err(RegistryError::FailedPrecondition(
-                        "ramping version cannot equal current version".to_string(),
-                    ));
+                    let version = target.as_ref().expect("target is Some in this branch");
+                    return Err(RegistryError::FailedPrecondition(format!(
+                        "requested ramping version {} is already current",
+                        format_legacy_version_string(
+                            &version.deployment_name,
+                            &version.build_id
+                        )
+                    )));
+                }
+                if to_unversioned && record.routing_config.current_version.is_none() {
+                    return Err(RegistryError::FailedPrecondition(format!(
+                        "requested ramping version {UNVERSIONED_VERSION_SENTINEL} is already current"
+                    )));
                 }
 
                 let previous_ramping_version = record
@@ -610,7 +851,8 @@ impl DeploymentRegistry {
                 let previous_ramping_percentage = record.routing_config.ramping_version_percentage;
 
                 let mut next = record.clone();
-                let ramping_changed = next.routing_config.ramping_version != target;
+                let ramping_changed = next.routing_config.ramping_version != target
+                    || next.routing_config.ramping_to_unversioned != to_unversioned;
                 if let Some(target) = &target {
                     ensure_version_available(
                         &mut next,
@@ -638,6 +880,7 @@ impl DeploymentRegistry {
                 let percentage_changed =
                     next.routing_config.ramping_version_percentage != cmd.ramping_percentage;
                 next.routing_config.ramping_version = target;
+                next.routing_config.ramping_to_unversioned = to_unversioned;
                 next.routing_config.ramping_version_percentage = cmd.ramping_percentage;
                 if ramping_changed {
                     next.routing_config.ramping_version_changed_time = Some(now);
@@ -654,7 +897,9 @@ impl DeploymentRegistry {
             })
             .await?;
 
-        self.refresh_deployment_drainage(&key).await?;
+        // See the note in `set_current_version`: drainage transitions to `Drained`
+        // are delayed (entity-workflow drainage check / `sync-drainage-status` signal),
+        // never synchronous at the routing change. A demoted version stays `Draining`.
         let deployment = self.describe_deployment(key).await?;
         let (previous_ramping_version, previous_ramping_percentage) = commit.value;
         Ok(SetRampingOutcome {
@@ -845,25 +1090,6 @@ impl DeploymentRegistry {
             })
             .await?;
         Ok(commit.value)
-    }
-
-    async fn refresh_deployment_drainage(&self, key: &DeploymentKey) -> Result<(), RegistryError> {
-        let Some(record) = self
-            .repository
-            .load_deployment(key)
-            .await
-            .map_err(RegistryError::from_storage_error)?
-        else {
-            return Ok(());
-        };
-        let build_ids = record
-            .versions
-            .values()
-            .filter(|version| should_recompute_drainage(version))
-            .map(|version| version.build_id.clone())
-            .collect();
-        self.refresh_deployment_drainage_for_versions(key, build_ids)
-            .await
     }
 
     async fn refresh_deployment_drainage_for_versions(
@@ -1065,6 +1291,29 @@ impl RegisterPolledDeployment {
             deployment_name: self.deployment_name.clone(),
         }
     }
+}
+
+/// Worker Deployment versioning view for a single task queue, surfaced by
+/// `DescribeTaskQueue.versioning_info`.
+///
+/// `current_version`/`ramping_version` are `None` when the task queue routes to
+/// unversioned workers (no current/ramping version includes it); the edge renders
+/// the deprecated string form of a nil current as `__unversioned__` and a nil
+/// ramping as empty, matching `task_queue_partition_manager.go:976 @ v1.31.0`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaskQueueVersioningView {
+    /// Current version routing this task queue, or `None` for unversioned.
+    pub current_version: Option<WorkerDeploymentVersionKey>,
+    /// Ramping version routing a portion of this task queue, or `None`.
+    pub ramping_version: Option<WorkerDeploymentVersionKey>,
+    /// Whether the ramp on this task queue targets unversioned workers (nil
+    /// ramping version at a non-zero percentage). Renders the deprecated ramping
+    /// string as `__unversioned__` rather than empty.
+    pub ramping_to_unversioned: bool,
+    /// Percentage of traffic shifted to `ramping_version` (0.0 when not ramping).
+    pub ramping_percentage: f32,
+    /// Most recent current/ramping routing change time for this task queue.
+    pub update_time: Option<OffsetDateTime>,
 }
 
 /// Delete a Worker Deployment.
@@ -1299,6 +1548,9 @@ pub enum RegistryError {
     AlreadyExistsAutoCreated,
     #[error("worker deployment not found")]
     NotFound,
+    /// NotFound with a v1.31.0-faithful message carrying the deployment name.
+    #[error("{0}")]
+    NotFoundMessage(String),
     #[error("worker deployment precondition failed: {0}")]
     FailedPrecondition(String),
     #[error("worker deployment resource exhausted")]
@@ -1585,18 +1837,6 @@ fn mark_version_draining(version: &mut StoredVersion, now: OffsetDateTime) {
             last_checked_time: now,
         });
     }
-}
-
-/// True when a version still needs its drainage recomputed: it is no longer accepting
-/// new workflows (not Current/Ramping) but is or was draining. Versions that are
-/// Current/Ramping are excluded — their drainage is always cleared, not recomputed.
-fn should_recompute_drainage(version: &StoredVersion) -> bool {
-    !version_is_accepting_new_workflows(version)
-        && (version.drainage_info.is_some()
-            || matches!(
-                version.status,
-                WorkerDeploymentVersionStatus::Draining | WorkerDeploymentVersionStatus::Drained
-            ))
 }
 
 fn version_is_accepting_new_workflows(version: &StoredVersion) -> bool {
@@ -1906,6 +2146,34 @@ fn is_auto_created(record: &StoredWorkerDeployment) -> bool {
 
 /// Build the `StoredVersion` for a version auto-created by a poll, seeded with the
 /// task queue the worker just polled and the auto-create request id.
+/// Build an empty deployment record synthesized on-demand by a
+/// set-current/set-ramping call that carries `allow_no_pollers` against a
+/// deployment that does not exist yet. v1.31.0 creates the deployment (and the
+/// target version) via update-with-start in this case (`client.go:384 @ v1.31.0`),
+/// so the caller is not required to have an existing deployment or pollers.
+fn synthesized_no_pollers_deployment(
+    namespace_id: NamespaceId,
+    deployment_name: &DeploymentName,
+    identity: &str,
+    now: OffsetDateTime,
+) -> StoredWorkerDeployment {
+    StoredWorkerDeployment {
+        namespace_id,
+        name: deployment_name.clone(),
+        create_time: now,
+        routing_config: StoredRoutingConfig::default(),
+        last_modifier_identity: identity.to_string(),
+        manager_identity: None,
+        routing_config_update_state: RoutingConfigUpdateState::Completed,
+        versions: BTreeMap::new(),
+        conflict_token: ConflictToken::default(),
+        create_request_ids: BTreeSet::from([format!(
+            "{AUTO_CREATE_REQUEST_ID_PREFIX}{}",
+            deployment_name.0
+        )]),
+    }
+}
+
 fn auto_polled_version(
     cmd: &RegisterPolledDeployment,
     now: OffsetDateTime,
@@ -1914,7 +2182,10 @@ fn auto_polled_version(
 ) -> StoredVersion {
     StoredVersion {
         build_id: cmd.build_id.clone(),
-        status: WorkerDeploymentVersionStatus::Created,
+        // A poller has arrived, so the version is INACTIVE (exists, has pollers, not
+        // routing), not CREATED (which means "created via API, no poller seen yet")
+        // — `WorkerDeploymentVersionStatus` doc @ API v1.62.11.
+        status: WorkerDeploymentVersionStatus::Inactive,
         create_time: now,
         routing_changed_time: None,
         current_since_time: None,
@@ -1990,7 +2261,11 @@ fn validate_manager_identity(
         .is_some_and(|manager| manager != identity)
     {
         Err(RegistryError::FailedPrecondition(format!(
-            "manager identity {:?} does not match caller identity {:?}",
+            // v1.31.0 `ErrManagerIdentityMismatch` (`util.go:101`), asserted via Contains
+            // in the SetManagerIdentity tests.
+            "ManagerIdentity '{}' is set and does not match user identity '{}'; \
+             to proceed, set your own identity as the ManagerIdentity, remove the \
+             ManagerIdentity, or wait for the other client to do so",
             deployment.manager_identity.as_deref().unwrap_or_default(),
             identity
         )))
@@ -2759,6 +3034,7 @@ mod tests {
             RegistryError::AlreadyExists => RegistryErrorKind::AlreadyExists,
             RegistryError::AlreadyExistsAutoCreated => RegistryErrorKind::AlreadyExists,
             RegistryError::NotFound => RegistryErrorKind::NotFound,
+            RegistryError::NotFoundMessage(_) => RegistryErrorKind::NotFound,
             RegistryError::FailedPrecondition(_) => RegistryErrorKind::FailedPrecondition,
             RegistryError::ResourceExhausted => RegistryErrorKind::ResourceExhausted,
             RegistryError::InvalidArgument(_) => RegistryErrorKind::InvalidArgument,
@@ -3209,12 +3485,13 @@ mod tests {
                     .iter()
                     .find(|version| version.build_id == BuildId("build-a".to_string()))
                     .unwrap();
-                let expected_status = if has_open_pinned {
+                // Demotion is synchronously Draining regardless of open pinned
+                // workflows; the Draining→Drained transition only happens on the
+                // explicit drainage refresh below, not at the routing change.
+                prop_assert_eq!(
+                    old.record.drainage_info.as_ref().unwrap().status,
                     VersionDrainageStatus::Draining
-                } else {
-                    VersionDrainageStatus::Drained
-                };
-                prop_assert_eq!(old.record.drainage_info.as_ref().unwrap().status, expected_status);
+                );
                 prop_assert!(!matches!(
                     old.record.status,
                     WorkerDeploymentVersionStatus::Current | WorkerDeploymentVersionStatus::Ramping
@@ -4011,7 +4288,13 @@ mod tests {
                             );
                             current = target.clone();
                             revision += 1;
-                            if ramping == target {
+                            // Promoting a versioned target equal to the current ramping
+                            // version unsets the ramp. An unversioned current (target
+                            // None) never matches and leaves an unversioned ramp
+                            // (ramping_version None at percentage > 0) intact, so the
+                            // model must guard on `target.is_some()` to mirror
+                            // `set_current_version` (workflow.go @ v1.31.0).
+                            if target.is_some() && ramping == target {
                                 ramping = None;
                                 ramp_percentage = 0.0;
                             }
@@ -4064,6 +4347,19 @@ mod tests {
                                 continue;
                             }
                             if target.is_some() && target == current {
+                                let error = result.unwrap_err();
+                                prop_assert_eq!(
+                                    registry_error_kind(&error),
+                                    RegistryErrorKind::FailedPrecondition
+                                );
+                                continue;
+                            }
+                            // A nil target with percentage > 0 ramps to *unversioned*
+                            // workers (distinct from a nil target at 0%, which clears the
+                            // ramp). It collides with an unversioned (nil) current and is
+                            // rejected with FAILED_PRECONDITION (workflow.go @ v1.31.0).
+                            let to_unversioned = target.is_none() && percentage > 0.0;
+                            if to_unversioned && current.is_none() {
                                 let error = result.unwrap_err();
                                 prop_assert_eq!(
                                     registry_error_kind(&error),
@@ -5123,13 +5419,16 @@ mod tests {
             .iter()
             .find(|version| version.build_id == BuildId("build-b".to_string()))
             .unwrap();
+        // A version demoted out of Current is Draining immediately; the
+        // Draining→Drained transition is delayed (entity-workflow drainage check /
+        // sync-drainage signal), not synchronous at the routing change.
         assert_eq!(
             drained.record.status,
-            WorkerDeploymentVersionStatus::Drained
+            WorkerDeploymentVersionStatus::Draining
         );
         assert_eq!(
             drained.record.drainage_info.as_ref().unwrap().status,
-            VersionDrainageStatus::Drained
+            VersionDrainageStatus::Draining
         );
     }
 

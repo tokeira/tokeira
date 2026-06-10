@@ -13,9 +13,9 @@ use tokeira_runtime::{
     PendingUpdateTransport, QueryResult, RegisterPolledDeployment, RegistryError,
     ResetWorkflowResult, SetCurrent, SetCurrentOutcome, SetManager, SetManagerOutcome, SetRamping,
     SetRampingOutcome, SignalWithStartResult, StartWorkflowResult, StartedActivityTask,
-    TokeiraRuntime, UpdateComputeConfig, UpdateLifecycleSnapshot, UpdateMetadata,
-    UpdateTransportResolution, UpdateWaitPolicy, ValidateComputeConfig, VersionMetadataView,
-    VersionView,
+    TaskQueueVersioningView, TokeiraRuntime, UpdateComputeConfig, UpdateLifecycleSnapshot,
+    UpdateMetadata, UpdateTransportResolution, UpdateWaitPolicy, ValidateComputeConfig,
+    VersionMetadataView, VersionView,
 };
 use tokeira_storage::{CommitResult, ConflictToken, DeploymentKey, RunRepository};
 use tokeira_types::{ActivityTaskToken, ExecutionRef, Payload, Payloads, RequestContext, RunKey};
@@ -496,6 +496,30 @@ where
             .await
             .map_err(registry_error_to_edge)
     }
+
+    async fn apply_version_drainage(
+        &self,
+        namespace_id: tokeira_types::NamespaceId,
+        deployment_name: tokeira_storage::DeploymentName,
+        build_id: tokeira_storage::BuildId,
+        status: tokeira_storage::VersionDrainageStatus,
+    ) -> EdgeResult<()> {
+        self.worker_deployment_registry()?
+            .apply_version_drainage(namespace_id, deployment_name, build_id, status)
+            .await
+            .map_err(registry_error_to_edge)
+    }
+
+    async fn task_queue_versioning(
+        &self,
+        namespace_id: tokeira_types::NamespaceId,
+        task_queue: String,
+    ) -> EdgeResult<Option<TaskQueueVersioningView>> {
+        self.worker_deployment_registry()?
+            .task_queue_versioning(namespace_id, &task_queue)
+            .await
+            .map_err(registry_error_to_edge)
+    }
 }
 
 fn deployment_mutation_outcome<T>(
@@ -517,6 +541,7 @@ fn registry_error_to_edge(error: RegistryError) -> EdgeError {
             "worker deployment already exists (auto-created from worker polls)".to_string(),
         ),
         RegistryError::NotFound => EdgeError::NotFound("worker deployment not found".to_string()),
+        RegistryError::NotFoundMessage(message) => EdgeError::NotFound(message),
         RegistryError::FailedPrecondition(message) => EdgeError::FailedPrecondition(message),
         RegistryError::ResourceExhausted => EdgeError::ResourceExhausted(
             "worker deployment registry resource exhausted".to_string(),

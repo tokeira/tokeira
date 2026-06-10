@@ -867,6 +867,36 @@ pub fn delete_worker_deployment_version_to_edge(
     })
 }
 
+/// Resolve the target build id for `SetWorkerDeploymentCurrentVersion` /
+/// `SetWorkerDeploymentRampingVersion` from the (deprecated) `version` string and
+/// the `build_id` field, mirroring v1.31.0
+/// (`workflow_handler.go:3967,4012 @ v1.31.0`): the deprecated `version` string
+/// takes precedence, then `build_id`. `__unversioned__` or an empty result
+/// resolves to unversioned (`None`). The V31 version string is
+/// `<deployment_name>.<build_id>`; deployment names cannot contain '.', so the
+/// first '.' splits the parts.
+fn resolve_set_target_build_id(
+    deployment_name: &str,
+    version: &str,
+    build_id: &str,
+) -> Option<DeploymentBuildId> {
+    let version_string = if !version.is_empty() {
+        version.to_string()
+    } else if !build_id.is_empty() {
+        format!("{deployment_name}.{build_id}")
+    } else {
+        return None;
+    };
+    if version_string == UNVERSIONED_VERSION_ID {
+        return None;
+    }
+    version_string
+        .split_once('.')
+        .map(|(_, build)| DeploymentBuildId(build.to_string()))
+        .filter(|build| !build.0.is_empty())
+}
+
+#[allow(deprecated)]
 pub fn set_worker_deployment_current_version_to_edge(
     req: workflowservice::SetWorkerDeploymentCurrentVersionRequest,
 ) -> Result<SetCurrent, ProtoConversionError> {
@@ -874,10 +904,11 @@ pub fn set_worker_deployment_current_version_to_edge(
         &req.deployment_name,
         "SetWorkerDeploymentCurrentVersionRequest.deployment_name",
     )?;
+    let build_id = resolve_set_target_build_id(&req.deployment_name, &req.version, &req.build_id);
     Ok(SetCurrent {
         namespace_id: namespace_id_for(&req.namespace),
         deployment_name: DeploymentName(req.deployment_name),
-        build_id: non_empty(req.build_id).map(DeploymentBuildId),
+        build_id,
         conflict_token: conflict_token_from_proto(req.conflict_token)?,
         identity: req.identity,
         allow_no_pollers: req.allow_no_pollers,
@@ -885,6 +916,7 @@ pub fn set_worker_deployment_current_version_to_edge(
     })
 }
 
+#[allow(deprecated)]
 pub fn set_worker_deployment_ramping_version_to_edge(
     req: workflowservice::SetWorkerDeploymentRampingVersionRequest,
 ) -> Result<SetRamping, ProtoConversionError> {
@@ -897,10 +929,11 @@ pub fn set_worker_deployment_ramping_version_to_edge(
             "SetWorkerDeploymentRampingVersionRequest.percentage",
         ));
     }
+    let build_id = resolve_set_target_build_id(&req.deployment_name, &req.version, &req.build_id);
     Ok(SetRamping {
         namespace_id: namespace_id_for(&req.namespace),
         deployment_name: DeploymentName(req.deployment_name),
-        build_id: non_empty(req.build_id).map(DeploymentBuildId),
+        build_id,
         ramping_percentage: req.percentage,
         conflict_token: conflict_token_from_proto(req.conflict_token)?,
         identity: req.identity,
@@ -1106,11 +1139,26 @@ pub fn worker_deployment_info_from_edge(
 ) -> deployment_proto::WorkerDeploymentInfo {
     deployment_proto::WorkerDeploymentInfo {
         name: view.name.0.clone(),
-        version_summaries: view
-            .versions
-            .iter()
-            .map(worker_deployment_version_summary_from_edge)
-            .collect(),
+        version_summaries: {
+            // DescribeWorkerDeployment returns version summaries sorted by
+            // create_time descending (newest first), matching v1.31.0
+            // `client.go:1784 @ v1.31.0` (`sort.Slice(... CreateTime.After ...)`).
+            // The registry hands them back in build-id order, so re-sort here on
+            // the source records (their `OffsetDateTime` create_time is ordered;
+            // the proto timestamp is not) before mapping.
+            let mut ordered: Vec<_> = view.versions.iter().collect();
+            ordered.sort_by(|left, right| {
+                right
+                    .record
+                    .create_time
+                    .cmp(&left.record.create_time)
+                    .then_with(|| left.build_id.0.cmp(&right.build_id.0))
+            });
+            ordered
+                .into_iter()
+                .map(worker_deployment_version_summary_from_edge)
+                .collect()
+        },
         create_time: Some(to_proto_timestamp(view.create_time)),
         routing_config: Some(routing_config_from_edge(&view.routing_config)),
         last_modifier_identity: view.last_modifier_identity.clone(),
@@ -1168,16 +1216,23 @@ pub fn routing_config_from_edge(config: &StoredRoutingConfig) -> deployment_prot
             .current_version
             .as_ref()
             .map(worker_deployment_version_string_from_key)
-            .unwrap_or_default(),
+            .unwrap_or_else(|| UNVERSIONED_VERSION_ID.to_string()),
         ramping_deployment_version: config
             .ramping_version
             .as_ref()
             .map(worker_deployment_version_key_from_edge),
-        ramping_version: config
-            .ramping_version
-            .as_ref()
-            .map(worker_deployment_version_string_from_key)
-            .unwrap_or_default(),
+        ramping_version: if config.ramping_to_unversioned {
+            // A ramp to unversioned workers carries a nil structured version but the
+            // `__unversioned__` sentinel in the deprecated string field
+            // (`ExternalWorkerDeploymentVersionToStringV31` of nil @ v1.31.0).
+            UNVERSIONED_VERSION_ID.to_string()
+        } else {
+            config
+                .ramping_version
+                .as_ref()
+                .map(worker_deployment_version_string_from_key)
+                .unwrap_or_default()
+        },
         ramping_version_percentage: config.ramping_version_percentage,
         current_version_changed_time: config.current_version_changed_time.map(to_proto_timestamp),
         ramping_version_changed_time: config.ramping_version_changed_time.map(to_proto_timestamp),
@@ -1237,12 +1292,84 @@ fn require_non_empty(value: &str, field: &'static str) -> Result<(), ProtoConver
 /// constant rather than dynamic config: it is a behavioural limit, not a
 /// deployment-environment policy.
 const MAX_ID_LENGTH_LIMIT: usize = 1000;
-
 /// Fixed overhead of a worker-deployment version workflow id
 /// (`WorkerDeploymentVersionWorkflowIDInitialSize = 39`,
 /// `common/worker_versioning/worker_versioning.go:59 @ v1.31.0`). The deployment
 /// name and build id share the remaining budget, halved between them.
 const WORKER_DEPLOYMENT_VERSION_WORKFLOW_ID_INITIAL_SIZE: usize = 39;
+
+/// Sentinel version string Temporal returns for "no current version" / an
+/// unversioned worker (`worker_versioning.UnversionedVersionId = "__unversioned__"`,
+/// `common/worker_versioning/worker_versioning.go:42 @ v1.31.0`). The deprecated
+/// `RoutingConfig.current_version` string carries this when no current version is
+/// set, while the structured `current_deployment_version` stays nil
+/// (`client.go:735` + `workflow.go:245 @ v1.31.0`).
+const UNVERSIONED_VERSION_ID: &str = "__unversioned__";
+
+/// Workflow-id prefix of the Worker Deployment Version entity workflow
+/// (`GenerateVersionWorkflowID`, `service/worker/workerdeployment/util.go:159 @ v1.31.0`):
+/// `temporal-sys-worker-deployment-version:<deployment_name>:<build_id>`. Note the
+/// version string here uses the `:` `WorkerDeploymentVersionDelimiter`
+/// (`ExternalWorkerDeploymentVersionToString`), not the V31 `.` delimiter.
+const WORKER_DEPLOYMENT_VERSION_WORKFLOW_ID_PREFIX: &str =
+    "temporal-sys-worker-deployment-version:";
+
+/// Workflow-id prefix of the Worker Deployment entity workflow
+/// (`GenerateDeploymentWorkflowID`, `service/worker/workerdeployment/util.go:153 @ v1.31.0`):
+/// `temporal-sys-worker-deployment:<deployment_name>`.
+const WORKER_DEPLOYMENT_WORKFLOW_ID_PREFIX: &str = "temporal-sys-worker-deployment:";
+
+/// Signal name the version entity workflow listens on for drainage updates
+/// (`SyncDrainageSignalName`, `service/worker/workerdeployment/util.go:63 @ v1.31.0`).
+pub const SYNC_DRAINAGE_SIGNAL_NAME: &str = "sync-drainage-status";
+
+/// Signal name both the deployment and version entity workflows accept to force a
+/// continue-as-new (`ForceCANSignalName`, `util.go:62 @ v1.31.0`). Tokeira backs
+/// these entities with registry state, so a forced CAN has no durable effect and
+/// is acknowledged as a no-op.
+pub const FORCE_CAN_SIGNAL_NAME: &str = "force-continue-as-new";
+
+/// Whether a workflow id addresses a Worker Deployment or Version entity workflow.
+pub fn is_worker_deployment_entity_workflow_id(workflow_id: &str) -> bool {
+    workflow_id.starts_with(WORKER_DEPLOYMENT_VERSION_WORKFLOW_ID_PREFIX)
+        || workflow_id.starts_with(WORKER_DEPLOYMENT_WORKFLOW_ID_PREFIX)
+}
+
+/// Parse a Worker Deployment Version entity-workflow id into its
+/// `(deployment_name, build_id)`, or `None` if the id is not a version entity
+/// workflow. The suffix after the prefix is `<name>:<build_id>` (the `:`
+/// `WorkerDeploymentVersionDelimiter`); deployment names cannot contain ':'
+/// (enforced by [`validate_deployment_name`]), so the first ':' splits the parts.
+pub fn parse_worker_deployment_version_workflow_id(workflow_id: &str) -> Option<(String, String)> {
+    let rest = workflow_id.strip_prefix(WORKER_DEPLOYMENT_VERSION_WORKFLOW_ID_PREFIX)?;
+    let (deployment_name, build_id) = rest.split_once(':')?;
+    if deployment_name.is_empty() || build_id.is_empty() {
+        return None;
+    }
+    Some((deployment_name.to_string(), build_id.to_string()))
+}
+
+/// Decode the `VersionDrainageStatus` carried by a `sync-drainage-status` signal
+/// payload (a `binary/protobuf`-encoded `VersionDrainageInfo`,
+/// `service/worker/workerdeployment/version_workflow.go:124 @ v1.31.0`).
+pub fn decode_version_drainage_status(
+    input: &Payloads,
+) -> Result<VersionDrainageStatus, ProtoConversionError> {
+    let payload = input.0.first().ok_or(ProtoConversionError::MissingField(
+        "sync-drainage-status signal input",
+    ))?;
+    let info = deployment_proto::VersionDrainageInfo::decode(payload.data.as_slice())
+        .map_err(|_| ProtoConversionError::MissingField("VersionDrainageInfo"))?;
+    Ok(
+        match enums::VersionDrainageStatus::try_from(info.status)
+            .unwrap_or(enums::VersionDrainageStatus::Unspecified)
+        {
+            enums::VersionDrainageStatus::Draining => VersionDrainageStatus::Draining,
+            enums::VersionDrainageStatus::Drained => VersionDrainageStatus::Drained,
+            enums::VersionDrainageStatus::Unspecified => VersionDrainageStatus::Unspecified,
+        },
+    )
+}
 
 /// Maximum worker-deployment name length: the per-field budget v1.31.0 derives as
 /// `(maxIDLength - versionWorkflowIDInitialSize) / 2`
@@ -1299,10 +1426,17 @@ fn conflict_token_from_proto(
     if value.is_empty() {
         return Ok(None);
     }
-    let bytes: [u8; tokeira_storage::CONFLICT_TOKEN_BYTES] = value
-        .try_into()
-        .map_err(|_| ProtoConversionError::MissingField("conflict_token length"))?;
-    Ok(Some(ConflictToken(bytes)))
+    // v1.31.0 treats the conflict token as opaque bytes compared with
+    // `bytes.Equal` (`workflow.go:756/1181/1235 @ v1.31.0`): a token of any shape
+    // that does not equal the stored one is a mismatch, not a malformed request.
+    // Tokeira stores an 8-byte generation token; a supplied token that is not
+    // exactly 8 bytes can never equal it, so we map it to a sentinel that will
+    // never match a real generation rather than rejecting the request — letting
+    // the registry surface "conflict token mismatch".
+    match <[u8; tokeira_storage::CONFLICT_TOKEN_BYTES]>::try_from(value.as_slice()) {
+        Ok(bytes) => Ok(Some(ConflictToken(bytes))),
+        Err(_) => Ok(Some(ConflictToken::from_generation(u64::MAX))),
+    }
 }
 
 fn conflict_token_to_proto(value: ConflictToken) -> Vec<u8> {
@@ -2881,8 +3015,11 @@ pub fn describe_task_queue_request_to_edge(
 pub fn describe_task_queue_response_to_proto(
     resp: EdgeDescribeTaskQueueResponse,
 ) -> workflowservice::DescribeTaskQueueResponse {
-    // Tokeira does not yet publish worker-version capabilities or queue-level
-    // versions info on the DescribeTaskQueue surface, so those remain absent.
+    // Worker-version capabilities are still absent, but queue-level Worker
+    // Deployment versioning is published when the queue is owned by a deployment.
+    let versioning_info = resp
+        .versioning_info
+        .map(task_queue_versioning_info_to_proto);
     workflowservice::DescribeTaskQueueResponse {
         pollers: resp
             .pollers
@@ -2899,7 +3036,7 @@ pub fn describe_task_queue_response_to_proto(
             .collect(),
         stats: None,
         stats_by_priority_key: Default::default(),
-        versioning_info: None,
+        versioning_info,
         config: Some(task_queue_config_to_proto(resp.config)),
         effective_rate_limit: None,
         task_queue_status: resp.backlog_count_hint.map(|backlog_count_hint| {
@@ -2909,6 +3046,54 @@ pub fn describe_task_queue_response_to_proto(
             }
         }),
         versions_info: Default::default(),
+    }
+}
+
+/// Map the edge task-queue versioning DTO onto the proto message. The deprecated
+/// string fields follow v1.31.0's matching layer
+/// (`task_queue_partition_manager.go:976 @ v1.31.0`): the current-version string is
+/// `WorkerDeploymentVersionToStringV31` (a nil current renders `__unversioned__`),
+/// while the ramping string/struct are populated only when actually ramping (a nil
+/// ramping renders as empty string / nil struct, not `__unversioned__`).
+#[allow(deprecated)]
+fn task_queue_versioning_info_to_proto(
+    info: crate::translate::TaskQueueVersioningInfo,
+) -> taskqueue_proto::TaskQueueVersioningInfo {
+    fn version_struct(
+        id: &crate::translate::WorkerDeploymentVersionId,
+    ) -> deployment_proto::WorkerDeploymentVersion {
+        deployment_proto::WorkerDeploymentVersion {
+            deployment_name: id.deployment_name.clone(),
+            build_id: id.build_id.clone(),
+        }
+    }
+    fn version_string(id: &crate::translate::WorkerDeploymentVersionId) -> String {
+        format!("{}.{}", id.deployment_name, id.build_id)
+    }
+
+    let current_version = info
+        .current_deployment_version
+        .as_ref()
+        .map(version_string)
+        .unwrap_or_else(|| UNVERSIONED_VERSION_ID.to_string());
+    let ramping_version = if info.ramping_to_unversioned {
+        // Ramp to unversioned workers: nil structured version, `__unversioned__`
+        // in the deprecated string field (`ExternalWorkerDeploymentVersionToStringV31`
+        // of nil @ v1.31.0).
+        UNVERSIONED_VERSION_ID.to_string()
+    } else {
+        info.ramping_deployment_version
+            .as_ref()
+            .map(version_string)
+            .unwrap_or_default()
+    };
+    taskqueue_proto::TaskQueueVersioningInfo {
+        current_deployment_version: info.current_deployment_version.as_ref().map(version_struct),
+        current_version,
+        ramping_deployment_version: info.ramping_deployment_version.as_ref().map(version_struct),
+        ramping_version,
+        ramping_version_percentage: info.ramping_version_percentage,
+        update_time: info.update_time.map(to_proto_timestamp),
     }
 }
 

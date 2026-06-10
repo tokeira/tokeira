@@ -293,6 +293,17 @@ The engine distinguishes **desired** resources (what should exist) from **known*
   - Service dependency graph is a DAG (no cycles, no missing deps).
   - State CAS: two concurrent saves from the same version — at most one succeeds.
 
+### Functional conformance harness (Tier 2)
+
+Behavioural conformance against Temporal is validated separately from `cargo test`
+by replaying Temporal's functional Go corpus (pinned at `TEMPORAL_SERVER_COMPAT`)
+over the real gRPC wire against a running `tokeirad`. It is operator-invoked and
+lives in the sibling Temporal fork, not the default test suite. Do not assume it
+runs under `cargo test`. See `docs/testing/functional-conformance-harness.md` for
+what it proves, how it works, and the conventions binding any fix derived from a
+run (v1.31.0 ground truth, no kernel additions, config-as-constant, feature modes
+as independent runs, raise ambiguity).
+
 ## Enforced Commands
 
 The following commands are enforced for each pull request:

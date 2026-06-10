@@ -73,6 +73,32 @@ existing `apps/tokeirad/tests/grpc_roundtrip.rs` round-trip test it generalizes.
 - An `axis-T` `ProtoOnly` RPC (in the vendored proto but not in the 1.31.0 behavioural claim) is exempt
   from the gate until it enters the claim — it carries no axis-K obligation.
 
+## Relationship to Tier 2 (`temporal-functional-conformance`)
+
+This harness is **Tier 1** of Tokeira's conformance model. Tier 2 is owned by the sibling
+`temporal-functional-conformance` spec. The two are **complementary, not duplicative**, and this
+subsection records the boundary so the harnesses cannot drift into contradiction.
+
+| | Tier 1 — this harness | Tier 2 — `temporal-functional-conformance` |
+|---|---|---|
+| **What runs** | Tokeira-authored per-RPC flows | Temporal's own Go functional corpus, unmodified, pinned at `v1.31.0` |
+| **Where** | In-process, hermetic (`cargo test`) | External `tokeirad` over the real gRPC wire (forked onebox seam) |
+| **Granularity** | One RPC flow at a time, shape + axis-K gate | Whole-suite behavioural assertions (server-grade `historyrequire`) |
+| **Posture** | Pass/fail gate on the served surface | Run-all, classify-in-report (failures are data) |
+| **Shared spine** | Consumes `FEATURE_MATRIX` (axis K) | Joins observed wire traffic against the *same* `FEATURE_MATRIX` via `tokeira_compatibility::coverage::resolve` |
+
+**Why they do not contradict:** both tiers resolve observed behaviour against the single authoritative
+axis-K declaration (`temporal-compatibility-surface`'s `FEATURE_MATRIX`). Neither tier defines the
+claim; both prove against it. A Tier-1 per-RPC gate failure and a Tier-2 corpus failure for the same
+RPC are therefore two views of one claim, never competing claims. Tier 1 answers "does this RPC, in
+isolation, behave as the matrix says?"; Tier 2 answers "does Temporal's own end-to-end suite agree
+when driven over the wire?". Tier 1 is the fast hermetic gate that must stay green; Tier 2 is the
+broader signal whose failures are triaged and classified in its own report, not gated here.
+
+**Non-overlap guarantee:** this harness does not run, import, or mirror Temporal's `tests/` corpus
+(see Non-Goals above), and Tier 2 does not re-implement per-RPC shape gates — it reuses the matrix
+join. Each tier owns exactly one mechanism; the only shared artifact is the read-only matrix.
+
 ---
 
 # Part I — High-Level Design

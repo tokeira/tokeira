@@ -217,8 +217,8 @@ through the seam* (task 6) **before** attempting the full corpus or large files 
     - **Property 5: Real-gap monotonicity**
     - **Validates: Requirements 4.1, 4.2**
 
-- [ ] 11. Tier boundary wiring (Rust/docs, this workspace)
-  - [ ] 11.1 Reference this spec from the Tier 1 `conformance-harness` design as functional-suite owner
+- [x] 11. Tier boundary wiring (Rust/docs, this workspace)
+  - [x] 11.1 Reference this spec from the Tier 1 `conformance-harness` design as functional-suite owner
     - Record the complementary (not duplicative) relationship so the two harnesses do not contradict
     - _Requirements: 6.1, 6.2, 6.3_
 

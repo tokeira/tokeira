@@ -56,6 +56,15 @@ provenance.
 See `docs/compatibility.md` for the feature matrix, SDK matrix,
 Buffa/connect-rust service, Dagger check, and compatibility bump workflow.
 
+### Functional conformance (Tier 2)
+
+Beyond the matrix, Tokeira's behavioural conformance is validated by replaying
+Temporal's own functional Go test corpus, unmodified and pinned at the
+`TEMPORAL_SERVER_COMPAT` tag, over the real gRPC wire against a running
+`tokeirad`. This is an operator-invoked harness, not part of `cargo test`. See
+`docs/testing/functional-conformance-harness.md` for what it proves, how it
+works, and how to run and interpret a conformance run.
+
 ## Architecture
 
 Tokeira is organized into three planes:

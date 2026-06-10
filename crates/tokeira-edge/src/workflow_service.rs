@@ -61,7 +61,7 @@ use crate::{
     long_poll::LongPollGate,
     metrics as edge_metrics,
     namespace_cache::{NamespaceCache, ResolvedNamespace},
-    operator_service::{ClusterInfo, OperatorApi},
+    operator_service::{ClusterInfo, OperatorApi, SearchAttributeDefinition},
     pending_queries::{LEGACY_QUERY_ID, PendingQueryStore},
     poller_registry::{ActivePoller, PollerRegistry},
     routing::{EdgeRouter, ensure_local},
@@ -2960,6 +2960,30 @@ impl WorkflowService {
                 })
             },
         )
+        .await
+    }
+
+    /// Reads the custom search-attribute catalog for WorkflowService callers.
+    ///
+    /// Temporal exposes this catalog on WorkflowService even though custom
+    /// attribute mutation lives on OperatorService. The edge therefore
+    /// authorizes it as an operator read and delegates to the same catalog
+    /// source instead of creating a second registry.
+    pub async fn get_search_attributes(
+        &self,
+        headers: &HeaderMap,
+    ) -> EdgeResult<Vec<SearchAttributeDefinition>> {
+        self.observe_edge_call(headers, "get_search_attributes", None, None, async move {
+            let _ctx = self
+                .interceptors
+                .begin(headers, None, Action::OperatorRead, false)
+                .await?;
+
+            self.operator_api
+                .list_search_attributes(None)
+                .await
+                .map_err(EdgeError::from)
+        })
         .await
     }
 

@@ -100,6 +100,11 @@ use tokeira_kernel::state::ParentClosePolicy;
 const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_STICKY_TTL: Duration = Duration::from_secs(30);
 const NON_RETRYABLE_ACTIVITY_SENTINEL: &str = "__tokeira_non_retryable__";
+// These are Temporal's v1.31.0 admission defaults, not deployment tuning:
+// `common/dynamicconfig/constants.go:988 @ v1.31.0`.
+const CALLBACK_URL_MAX_LENGTH: usize = 1000;
+const CALLBACK_HEADER_MAX_SIZE: usize = 8 * 1024;
+const MAX_CALLBACKS_PER_WORKFLOW: usize = 32;
 
 fn proto_duration_to_time(value: Option<&prost_types::Duration>) -> Option<time::Duration> {
     value.map(|duration| {
@@ -212,7 +217,11 @@ fn callback_to_edge(
     match callback.variant.as_ref() {
         Some(Variant::Nexus(nexus)) => Ok(EdgeCompletionCallback {
             url: nexus.url.clone(),
-            header: nexus.header.clone().into_iter().collect(),
+            header: nexus
+                .header
+                .iter()
+                .map(|(key, value)| (key.to_ascii_lowercase(), value.clone()))
+                .collect(),
             links: links_to_edge(&callback.links)?,
         }),
         // Temporal exposes the internal callback variant for replication of
@@ -225,6 +234,73 @@ fn callback_to_edge(
             "StartWorkflowExecutionRequest.completion_callbacks.variant",
         )),
     }
+}
+
+fn validate_completion_callbacks(
+    callbacks: &[proto_common::Callback],
+) -> Result<(), ProtoConversionError> {
+    // Temporal performs callback admission at the frontend before history is
+    // written (`service/frontend/workflow_handler.go:6299 @ v1.31.0`). Keeping
+    // this in the edge preserves that validation order without making callback
+    // policy part of workflow semantics.
+    if callbacks.len() > MAX_CALLBACKS_PER_WORKFLOW {
+        return Err(ProtoConversionError::InvalidArgument(format!(
+            "cannot attach more than {MAX_CALLBACKS_PER_WORKFLOW} callbacks to a workflow"
+        )));
+    }
+    for callback in callbacks {
+        if let Some(proto_common::callback::Variant::Nexus(nexus)) = callback.variant.as_ref() {
+            validate_callback_url(&nexus.url)?;
+            let header_size: usize = nexus
+                .header
+                .iter()
+                .map(|(key, value)| key.len() + value.len())
+                .sum();
+            if header_size > CALLBACK_HEADER_MAX_SIZE {
+                return Err(ProtoConversionError::InvalidArgument(format!(
+                    "invalid header: header size longer than max allowed size of {CALLBACK_HEADER_MAX_SIZE}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_callback_url(raw_url: &str) -> Result<(), ProtoConversionError> {
+    if raw_url.len() > CALLBACK_URL_MAX_LENGTH {
+        return Err(ProtoConversionError::InvalidArgument(format!(
+            "invalid url: url length longer than max length allowed of {CALLBACK_URL_MAX_LENGTH}"
+        )));
+    }
+    let Some(rest) = raw_url
+        .strip_prefix("http://")
+        .or_else(|| raw_url.strip_prefix("https://"))
+    else {
+        return Err(ProtoConversionError::InvalidArgument(format!(
+            "invalid url: unknown scheme: {raw_url}"
+        )));
+    };
+    let host_end = rest
+        .find(|ch| ['/', '?', '#'].contains(&ch))
+        .unwrap_or(rest.len());
+    if rest[..host_end].is_empty() {
+        return Err(ProtoConversionError::InvalidArgument(
+            "invalid url: missing host".to_string(),
+        ));
+    }
+    let uri = raw_url.parse::<http::Uri>().map_err(|err| {
+        ProtoConversionError::InvalidArgument(format!("invalid callback url: {err}"))
+    })?;
+    if uri.host().is_none_or(str::is_empty) {
+        return Err(ProtoConversionError::InvalidArgument(
+            "invalid url: missing host".to_string(),
+        ));
+    }
+    // Temporal also evaluates dynamic address allow-list policy after URL
+    // shape validation. Tokeira has no callback address-policy config surface
+    // yet, so hard-coding that deployment policy here would make admission
+    // stricter than the configured server rather than more compatible.
+    Ok(())
 }
 
 fn callbacks_to_edge(
@@ -452,6 +528,7 @@ pub fn start_request_to_edge(
         cron_schedule.as_deref(),
         "StartWorkflowExecutionRequest.cron_schedule",
     )?;
+    validate_completion_callbacks(&req.completion_callbacks)?;
 
     Ok(StartWorkflowExecutionRequest {
         namespace: req.namespace,
@@ -1701,6 +1778,218 @@ pub fn list_request_to_edge(
     })
 }
 
+/// Translates the deprecated open-visibility request into the modern query DTO.
+pub fn list_open_request_to_edge(
+    req: workflowservice::ListOpenWorkflowExecutionsRequest,
+) -> Result<ListWorkflowExecutionsRequest, ProtoConversionError> {
+    // v1.31.0 implements legacy visibility by constructing a modern query:
+    // open lists force `ExecutionStatus = Running`, while closed lists force
+    // `ExecutionStatus != Running` (`service/frontend/workflow_handler.go:2492`
+    // and `:2593 @ v1.31.0`). The edge mirrors that wrapper instead of adding
+    // a separate projection API.
+    legacy_list_request_to_edge(
+        req.namespace,
+        req.maximum_page_size,
+        req.next_page_token,
+        "ExecutionStatus = 'Running'",
+        legacy_start_time_query(req.start_time_filter.as_ref(), "StartTime")?,
+        legacy_open_filter_query(req.filters.as_ref()),
+    )
+}
+
+/// Translates the deprecated closed-visibility request into the modern query DTO.
+pub fn list_closed_request_to_edge(
+    req: workflowservice::ListClosedWorkflowExecutionsRequest,
+) -> Result<ListWorkflowExecutionsRequest, ProtoConversionError> {
+    legacy_list_request_to_edge(
+        req.namespace,
+        req.maximum_page_size,
+        req.next_page_token,
+        "ExecutionStatus != 'Running'",
+        legacy_start_time_query(req.start_time_filter.as_ref(), "CloseTime")?,
+        legacy_closed_filter_query(req.filters.as_ref())?,
+    )
+}
+
+/// Translates archived listing as a compatibility wrapper over modern visibility.
+pub fn list_archived_request_to_edge(
+    req: workflowservice::ListArchivedWorkflowExecutionsRequest,
+) -> Result<ListWorkflowExecutionsRequest, ProtoConversionError> {
+    Ok(ListWorkflowExecutionsRequest {
+        namespace: req.namespace,
+        query: non_empty(req.query),
+        page_size: req.page_size.max(0) as usize,
+        next_page_token: bytes_page_token(req.next_page_token),
+    })
+}
+
+/// Translates deprecated scan listing as a compatibility wrapper over modern visibility.
+pub fn scan_request_to_edge(
+    req: workflowservice::ScanWorkflowExecutionsRequest,
+) -> Result<ListWorkflowExecutionsRequest, ProtoConversionError> {
+    Ok(ListWorkflowExecutionsRequest {
+        namespace: req.namespace,
+        query: non_empty(req.query),
+        page_size: req.page_size.max(0) as usize,
+        next_page_token: bytes_page_token(req.next_page_token),
+    })
+}
+
+fn legacy_list_request_to_edge(
+    namespace: String,
+    page_size: i32,
+    next_page_token: Vec<u8>,
+    status_query: &str,
+    time_query: Option<String>,
+    filter_query: Option<String>,
+) -> Result<ListWorkflowExecutionsRequest, ProtoConversionError> {
+    let mut clauses = vec![status_query.to_string()];
+    clauses.extend(time_query);
+    clauses.extend(filter_query);
+    Ok(ListWorkflowExecutionsRequest {
+        namespace,
+        query: Some(clauses.join(" AND ")),
+        page_size: legacy_page_size(page_size),
+        next_page_token: bytes_page_token(next_page_token),
+    })
+}
+
+fn legacy_page_size(page_size: i32) -> usize {
+    if page_size <= 0 {
+        tokeira_projection::MAX_PAGE_SIZE
+    } else {
+        (page_size as usize).min(tokeira_projection::MAX_PAGE_SIZE)
+    }
+}
+
+fn bytes_page_token(value: Vec<u8>) -> Option<String> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&value).into_owned())
+    }
+}
+
+fn legacy_start_time_query(
+    filter: Option<&tokeira_proto::public::temporal::api::filter::v1::StartTimeFilter>,
+    field: &str,
+) -> Result<Option<String>, ProtoConversionError> {
+    let Some(filter) = filter else {
+        return Ok(None);
+    };
+    let earliest = filter
+        .earliest_time
+        .as_ref()
+        .map(proto_timestamp_to_offset)
+        .transpose()?;
+    let latest = filter
+        .latest_time
+        .as_ref()
+        .map(proto_timestamp_to_offset)
+        .transpose()?;
+    match (earliest, latest) {
+        (Some(earliest), Some(latest)) if earliest > latest => {
+            Err(ProtoConversionError::InvalidArgument(
+                "EarliestTime is greater than LatestTime.".to_string(),
+            ))
+        }
+        (Some(earliest), Some(latest)) if earliest == latest => Ok(Some(format!(
+            "{field} = '{}'",
+            format_visibility_time(earliest)?
+        ))),
+        (Some(earliest), Some(latest)) => Ok(Some(format!(
+            "{field} BETWEEN '{}' AND '{}'",
+            format_visibility_time(earliest)?,
+            format_visibility_time(latest)?
+        ))),
+        (Some(earliest), None) => Ok(Some(format!(
+            "{field} >= '{}'",
+            format_visibility_time(earliest)?
+        ))),
+        (None, Some(latest)) => Ok(Some(format!(
+            "{field} <= '{}'",
+            format_visibility_time(latest)?
+        ))),
+        (None, None) => Ok(None),
+    }
+}
+
+fn legacy_open_filter_query(
+    filter: Option<&workflowservice::list_open_workflow_executions_request::Filters>,
+) -> Option<String> {
+    use workflowservice::list_open_workflow_executions_request::Filters;
+    match filter {
+        Some(Filters::ExecutionFilter(filter)) => Some(format!(
+            "WorkflowId = '{}'",
+            quote_visibility_value(&filter.workflow_id)
+        )),
+        Some(Filters::TypeFilter(filter)) => Some(format!(
+            "WorkflowType = '{}'",
+            quote_visibility_value(&filter.name)
+        )),
+        None => None,
+    }
+}
+
+fn legacy_closed_filter_query(
+    filter: Option<&workflowservice::list_closed_workflow_executions_request::Filters>,
+) -> Result<Option<String>, ProtoConversionError> {
+    use workflowservice::list_closed_workflow_executions_request::Filters;
+    match filter {
+        Some(Filters::ExecutionFilter(filter)) => Ok(Some(format!(
+            "WorkflowId = '{}'",
+            quote_visibility_value(&filter.workflow_id)
+        ))),
+        Some(Filters::TypeFilter(filter)) => Ok(Some(format!(
+            "WorkflowType = '{}'",
+            quote_visibility_value(&filter.name)
+        ))),
+        Some(Filters::StatusFilter(filter)) => {
+            let status = enums::WorkflowExecutionStatus::try_from(filter.status)
+                .unwrap_or(enums::WorkflowExecutionStatus::Unspecified);
+            let Some(status_name) = visibility_status_name(status) else {
+                return Err(ProtoConversionError::InvalidArgument(
+                    "StatusFilter must be specified and must be not Running.".to_string(),
+                ));
+            };
+            Ok(Some(format!("ExecutionStatus = '{status_name}'")))
+        }
+        None => Ok(None),
+    }
+}
+
+fn visibility_status_name(status: enums::WorkflowExecutionStatus) -> Option<&'static str> {
+    use enums::WorkflowExecutionStatus as Status;
+    match status {
+        Status::Completed => Some("Completed"),
+        Status::Failed => Some("Failed"),
+        Status::Canceled => Some("Cancelled"),
+        Status::Terminated => Some("Terminated"),
+        Status::ContinuedAsNew => Some("ContinuedAsNew"),
+        Status::TimedOut => Some("TimedOut"),
+        Status::Paused => Some("Paused"),
+        Status::Unspecified | Status::Running => None,
+    }
+}
+
+fn proto_timestamp_to_offset(
+    value: &prost_types::Timestamp,
+) -> Result<OffsetDateTime, ProtoConversionError> {
+    OffsetDateTime::from_unix_timestamp(value.seconds)
+        .and_then(|time| time.replace_nanosecond(value.nanos as u32))
+        .map_err(|err| ProtoConversionError::InvalidTimestamp(err.to_string()))
+}
+
+fn format_visibility_time(value: OffsetDateTime) -> Result<String, ProtoConversionError> {
+    value
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|err| ProtoConversionError::InvalidTimestamp(err.to_string()))
+}
+
+fn quote_visibility_value(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
 pub fn count_request_to_edge(
     req: workflowservice::CountWorkflowExecutionsRequest,
 ) -> Result<CountWorkflowExecutionsRequest, ProtoConversionError> {
@@ -2174,6 +2463,74 @@ pub fn list_response_to_proto(
     resp: ListWorkflowExecutionsResponse,
 ) -> workflowservice::ListWorkflowExecutionsResponse {
     workflowservice::ListWorkflowExecutionsResponse {
+        executions: resp
+            .executions
+            .into_iter()
+            .map(workflow_execution_info_from_summary)
+            .collect(),
+        next_page_token: resp
+            .next_page_token
+            .map(|token| token.into_bytes())
+            .unwrap_or_default(),
+    }
+}
+
+/// Renders modern visibility results into the deprecated open-list response.
+pub fn list_open_response_to_proto(
+    resp: ListWorkflowExecutionsResponse,
+) -> workflowservice::ListOpenWorkflowExecutionsResponse {
+    workflowservice::ListOpenWorkflowExecutionsResponse {
+        executions: resp
+            .executions
+            .into_iter()
+            .map(workflow_execution_info_from_summary)
+            .collect(),
+        next_page_token: resp
+            .next_page_token
+            .map(|token| token.into_bytes())
+            .unwrap_or_default(),
+    }
+}
+
+/// Renders modern visibility results into the deprecated closed-list response.
+pub fn list_closed_response_to_proto(
+    resp: ListWorkflowExecutionsResponse,
+) -> workflowservice::ListClosedWorkflowExecutionsResponse {
+    workflowservice::ListClosedWorkflowExecutionsResponse {
+        executions: resp
+            .executions
+            .into_iter()
+            .map(workflow_execution_info_from_summary)
+            .collect(),
+        next_page_token: resp
+            .next_page_token
+            .map(|token| token.into_bytes())
+            .unwrap_or_default(),
+    }
+}
+
+/// Renders modern visibility results into the archived-list compatibility response.
+pub fn list_archived_response_to_proto(
+    resp: ListWorkflowExecutionsResponse,
+) -> workflowservice::ListArchivedWorkflowExecutionsResponse {
+    workflowservice::ListArchivedWorkflowExecutionsResponse {
+        executions: resp
+            .executions
+            .into_iter()
+            .map(workflow_execution_info_from_summary)
+            .collect(),
+        next_page_token: resp
+            .next_page_token
+            .map(|token| token.into_bytes())
+            .unwrap_or_default(),
+    }
+}
+
+/// Renders modern visibility results into the deprecated scan response.
+pub fn scan_response_to_proto(
+    resp: ListWorkflowExecutionsResponse,
+) -> workflowservice::ScanWorkflowExecutionsResponse {
+    workflowservice::ScanWorkflowExecutionsResponse {
         executions: resp
             .executions
             .into_iter()
@@ -4226,7 +4583,7 @@ mod tests {
     };
     use proptest::prelude::*;
     use tokeira_kernel::state::WorkflowVersioningInfo;
-    use tokeira_proto::public::temporal::api::taskqueue::v1 as taskqueue;
+    use tokeira_proto::public::temporal::api::{filter::v1 as filter, taskqueue::v1 as taskqueue};
     use tokeira_runtime::{RedirectRule, VersioningRules};
 
     #[test]
@@ -4272,6 +4629,21 @@ mod tests {
                 ..Default::default()
             }),
             ..Default::default()
+        }
+    }
+
+    fn nexus_callback(url: &str, header: &[(&str, &str)]) -> proto_common::Callback {
+        proto_common::Callback {
+            variant: Some(proto_common::callback::Variant::Nexus(
+                proto_common::callback::Nexus {
+                    url: url.to_string(),
+                    header: header
+                        .iter()
+                        .map(|(key, value)| (key.to_string(), value.to_string()))
+                        .collect(),
+                },
+            )),
+            links: Vec::new(),
         }
     }
 
@@ -4338,6 +4710,10 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
 
         let mut req = minimal_start_proto();
+        req.cron_schedule = "@every 5s".to_string();
+        assert!(start_request_to_edge(req).is_ok());
+
+        let mut req = minimal_start_proto();
         req.on_conflict_options = Some(workflow::OnConflictOptions {
             attach_request_id: false,
             attach_completion_callbacks: true,
@@ -4345,6 +4721,185 @@ mod tests {
         });
         let status = proto_conversion_status(start_request_to_edge(req).unwrap_err());
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn start_request_validates_completion_callbacks() {
+        let mut req = minimal_start_proto();
+        req.completion_callbacks = vec![nexus_callback("ftp://callback.example/run", &[])];
+        let status = proto_conversion_status(start_request_to_edge(req).unwrap_err());
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            status.message(),
+            "invalid url: unknown scheme: ftp://callback.example/run"
+        );
+
+        let mut req = minimal_start_proto();
+        req.completion_callbacks = vec![nexus_callback("https://", &[])];
+        let status = proto_conversion_status(start_request_to_edge(req).unwrap_err());
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(status.message(), "invalid url: missing host");
+
+        let mut req = minimal_start_proto();
+        req.completion_callbacks = vec![nexus_callback(
+            &format!("https://{}.example", "a".repeat(CALLBACK_URL_MAX_LENGTH)),
+            &[],
+        )];
+        let status = proto_conversion_status(start_request_to_edge(req).unwrap_err());
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            status.message(),
+            "invalid url: url length longer than max length allowed of 1000"
+        );
+
+        let mut req = minimal_start_proto();
+        req.completion_callbacks = vec![nexus_callback(
+            "https://callback.example/run",
+            &[("x", &"v".repeat(CALLBACK_HEADER_MAX_SIZE))],
+        )];
+        let status = proto_conversion_status(start_request_to_edge(req).unwrap_err());
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            status.message(),
+            "invalid header: header size longer than max allowed size of 8192"
+        );
+
+        let mut req = minimal_start_proto();
+        req.completion_callbacks = vec![
+            nexus_callback("https://callback.example/run", &[]);
+            MAX_CALLBACKS_PER_WORKFLOW + 1
+        ];
+        let status = proto_conversion_status(start_request_to_edge(req).unwrap_err());
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            status.message(),
+            "cannot attach more than 32 callbacks to a workflow"
+        );
+    }
+
+    #[test]
+    fn start_request_lowercases_completion_callback_headers() {
+        let mut req = minimal_start_proto();
+        req.completion_callbacks = vec![nexus_callback(
+            "https://callback.example/run",
+            &[("X-Tokeira", "value")],
+        )];
+
+        let edge = start_request_to_edge(req).expect("callback should convert");
+
+        assert_eq!(
+            edge.completion_callbacks[0].header.get("x-tokeira"),
+            Some(&"value".to_string())
+        );
+        assert!(
+            !edge.completion_callbacks[0]
+                .header
+                .contains_key("X-Tokeira")
+        );
+    }
+
+    #[test]
+    fn legacy_open_visibility_translates_to_running_query() {
+        let req = workflowservice::ListOpenWorkflowExecutionsRequest {
+            namespace: "default".to_string(),
+            maximum_page_size: 25,
+            next_page_token: b"page".to_vec(),
+            start_time_filter: Some(filter::StartTimeFilter {
+                earliest_time: Some(prost_types::Timestamp {
+                    seconds: 1_700_000_000,
+                    nanos: 0,
+                }),
+                latest_time: Some(prost_types::Timestamp {
+                    seconds: 1_700_000_060,
+                    nanos: 0,
+                }),
+            }),
+            filters: Some(
+                workflowservice::list_open_workflow_executions_request::Filters::TypeFilter(
+                    filter::WorkflowTypeFilter {
+                        name: "ExampleWorkflow".to_string(),
+                    },
+                ),
+            ),
+        };
+
+        let edge = list_open_request_to_edge(req).expect("legacy open list");
+
+        assert_eq!(edge.namespace, "default");
+        assert_eq!(edge.page_size, 25);
+        assert_eq!(edge.next_page_token.as_deref(), Some("page"));
+        let query = edge.query.expect("query");
+        assert!(query.contains("ExecutionStatus = 'Running'"));
+        assert!(query.contains("StartTime BETWEEN"));
+        assert!(query.contains("WorkflowType = 'ExampleWorkflow'"));
+    }
+
+    #[test]
+    fn legacy_closed_visibility_rejects_running_status_filter() {
+        let req = workflowservice::ListClosedWorkflowExecutionsRequest {
+            namespace: "default".to_string(),
+            filters: Some(
+                workflowservice::list_closed_workflow_executions_request::Filters::StatusFilter(
+                    filter::StatusFilter {
+                        status: enums::WorkflowExecutionStatus::Running as i32,
+                    },
+                ),
+            ),
+            ..Default::default()
+        };
+
+        let status = proto_conversion_status(list_closed_request_to_edge(req).unwrap_err());
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            status.message(),
+            "StatusFilter must be specified and must be not Running."
+        );
+    }
+
+    #[test]
+    fn legacy_closed_visibility_maps_status_filter_to_closed_query() {
+        let req = workflowservice::ListClosedWorkflowExecutionsRequest {
+            namespace: "default".to_string(),
+            filters: Some(
+                workflowservice::list_closed_workflow_executions_request::Filters::StatusFilter(
+                    filter::StatusFilter {
+                        status: enums::WorkflowExecutionStatus::Canceled as i32,
+                    },
+                ),
+            ),
+            ..Default::default()
+        };
+
+        let edge = list_closed_request_to_edge(req).expect("legacy closed list");
+
+        let query = edge.query.expect("query");
+        assert!(query.contains("ExecutionStatus != 'Running'"));
+        assert!(query.contains("ExecutionStatus = 'Cancelled'"));
+    }
+
+    #[test]
+    fn archived_and_scan_visibility_wrap_modern_queries() {
+        let archived =
+            list_archived_request_to_edge(workflowservice::ListArchivedWorkflowExecutionsRequest {
+                namespace: "default".to_string(),
+                page_size: 12,
+                next_page_token: b"archived-page".to_vec(),
+                query: "WorkflowType = 'A'".to_string(),
+            })
+            .expect("archived wrapper");
+        let scanned = scan_request_to_edge(workflowservice::ScanWorkflowExecutionsRequest {
+            namespace: "default".to_string(),
+            page_size: 13,
+            next_page_token: b"scan-page".to_vec(),
+            query: "WorkflowType = 'B'".to_string(),
+        })
+        .expect("scan wrapper");
+
+        assert_eq!(archived.query.as_deref(), Some("WorkflowType = 'A'"));
+        assert_eq!(archived.next_page_token.as_deref(), Some("archived-page"));
+        assert_eq!(scanned.query.as_deref(), Some("WorkflowType = 'B'"));
+        assert_eq!(scanned.next_page_token.as_deref(), Some("scan-page"));
     }
 
     #[test]
@@ -4366,6 +4921,10 @@ mod tests {
         req.cron_schedule = "invalid-cron-spec".to_string();
         let status = proto_conversion_status(signal_with_start_request_to_edge(req).unwrap_err());
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+        let mut req = minimal_signal_with_start_proto();
+        req.cron_schedule = "@every 3s".to_string();
+        assert!(signal_with_start_request_to_edge(req).is_ok());
     }
 
     #[test]

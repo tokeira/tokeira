@@ -67,6 +67,7 @@ use tokeira_runtime::{
 };
 use tokeira_storage::{
     InMemoryStore, LeaseOutcome, LeaseRepository, ProjectionLog, RunRepository,
+    WorkerDeploymentRepository,
     dsql::{DsqlAuthConfig, DsqlCoordinationConfig, DsqlPoolConfig, DsqlStore},
 };
 use tokeira_types::{
@@ -451,10 +452,13 @@ async fn build_and_serve(
         ConfigStorageKind::InMemory => {
             let store = InMemoryStore::default();
             let visibility_store = InMemoryVisibilityStore::default();
+            let worker_deployment_repository: Arc<dyn WorkerDeploymentRepository> =
+                Arc::new(store.clone());
             build_and_serve_with_storage(
                 addr,
                 effective_config,
                 Arc::new(store.clone()),
+                worker_deployment_repository,
                 store,
                 visibility_store.clone(),
                 {
@@ -472,13 +476,21 @@ async fn build_and_serve(
             let dsql_store = DsqlStore::connect(auth, pool_config, ddb_client)
                 .await
                 .context("failed to connect DSQL storage backend")?;
-            let (director, run_repository, projection_log, _migration_runner) =
-                dsql_store.into_parts();
+            let (
+                director,
+                run_repository,
+                projection_log,
+                worker_deployment_repository,
+                _migration_runner,
+            ) = dsql_store.into_parts();
             let visibility_store = DsqlVisibilityStore::new(director);
+            let worker_deployment_repository: Arc<dyn WorkerDeploymentRepository> =
+                Arc::new(worker_deployment_repository);
             build_and_serve_with_storage(
                 addr,
                 effective_config,
                 Arc::new(run_repository),
+                worker_deployment_repository,
                 projection_log,
                 visibility_store.clone(),
                 {
@@ -496,6 +508,7 @@ async fn build_and_serve_with_storage<R, L, S, V, F>(
     addr: SocketAddr,
     effective_config: Arc<TokeiraConfig>,
     run_repository: Arc<R>,
+    worker_deployment_repository: Arc<dyn WorkerDeploymentRepository>,
     projection_log: L,
     visibility_query_store: V,
     projection_sink: F,
@@ -546,23 +559,29 @@ where
             .placement
             .controller_endpoint
             .is_none();
-    let runtime = Arc::new(TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
-        repo.clone(),
-        runtime_config.lane_count,
-        runtime_config.lane,
-        runtime_config.timer_scanner,
-        runtime_config.workflow_timeout_scanner,
-        runtime_config.backlog,
-        runtime_config.activity_timeout_scanner,
-        runtime_config.nexus_timeout_scanner,
-        nexus_registry,
-        Arc::new(NoopNexusHttpClient),
-        effective_config.infrastructure.placement.shard_count,
-        node_id.to_string(),
-        node_endpoint.as_authority(),
-        seed_default_shard,
-        versioning_rule_store.clone(),
-    ));
+    let runtime = Arc::new(
+        TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
+            repo.clone(),
+            runtime_config.lane_count,
+            runtime_config.lane,
+            runtime_config.timer_scanner,
+            runtime_config.workflow_timeout_scanner,
+            runtime_config.backlog,
+            runtime_config.activity_timeout_scanner,
+            runtime_config.nexus_timeout_scanner,
+            nexus_registry,
+            Arc::new(NoopNexusHttpClient),
+            effective_config.infrastructure.placement.shard_count,
+            node_id.to_string(),
+            node_endpoint.as_authority(),
+            seed_default_shard,
+            versioning_rule_store.clone(),
+        )
+        // The edge always exposes Worker Deployment v2 RPCs. Wiring the
+        // repository here keeps their registry durable for both in-memory and
+        // DSQL backends instead of falling back to a detached test registry.
+        .with_worker_deployment_repository(worker_deployment_repository),
+    );
 
     if dsql_endpoint.is_some()
         && effective_config

@@ -6,13 +6,20 @@
 //! layer owns field mapping and the edge `WorkflowService` owns
 //! orchestration.
 
+use std::collections::BTreeMap;
+
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
 use time::OffsetDateTime;
-use tokeira_proto::workflowservice::{
-    self,
-    workflow_service_server::{WorkflowService as WorkflowServiceGrpcApi, WorkflowServiceServer},
+use tokeira_proto::{
+    enums::IndexedValueType,
+    workflowservice::{
+        self,
+        workflow_service_server::{
+            WorkflowService as WorkflowServiceGrpcApi, WorkflowServiceServer,
+        },
+    },
 };
 use tokeira_runtime::{
     BuildIdReachabilityResult, ScheduleError, TaskQueueConfigEntry, TaskQueueReachability,
@@ -29,6 +36,45 @@ use crate::{
 const COMMIT_POLLER_RECENT_WINDOW: time::Duration = time::Duration::minutes(5);
 const DEPRECATED_DEPLOYMENTS_UNIMPLEMENTED: &str =
     "Deployments are deprecated and no longer supported, use Worker Deployments instead";
+
+fn standard_search_attributes() -> BTreeMap<String, i32> {
+    // Temporal exposes system visibility attributes through
+    // `GetSearchAttributes` even though clients do not register them
+    // (`service/frontend/workflow_handler.go:2874 @ v1.31.0`).
+    // These names match the projection system fields plus the external payload
+    // counter surfaced by the v1.31.0 visibility tests.
+    [
+        ("WorkflowId", IndexedValueType::Keyword),
+        ("RunId", IndexedValueType::Keyword),
+        ("WorkflowType", IndexedValueType::Keyword),
+        ("TaskQueue", IndexedValueType::Keyword),
+        ("ExecutionStatus", IndexedValueType::Keyword),
+        ("StartTime", IndexedValueType::Datetime),
+        ("CloseTime", IndexedValueType::Datetime),
+        ("ExecutionTime", IndexedValueType::Datetime),
+        ("HistoryLength", IndexedValueType::Int),
+        ("StateTransitionCount", IndexedValueType::Int),
+        ("TemporalExternalPayloadCount", IndexedValueType::Int),
+    ]
+    .into_iter()
+    .map(|(name, attr_type)| (name.to_string(), attr_type as i32))
+    .collect()
+}
+
+fn indexed_value_type_from_edge(value: &str) -> Result<IndexedValueType, Status> {
+    match value {
+        "keyword" | "INDEXED_VALUE_TYPE_KEYWORD" => Ok(IndexedValueType::Keyword),
+        "keyword_list" | "INDEXED_VALUE_TYPE_KEYWORD_LIST" => Ok(IndexedValueType::KeywordList),
+        "int" | "INDEXED_VALUE_TYPE_INT" => Ok(IndexedValueType::Int),
+        "bool" | "INDEXED_VALUE_TYPE_BOOL" => Ok(IndexedValueType::Bool),
+        "double" | "INDEXED_VALUE_TYPE_DOUBLE" => Ok(IndexedValueType::Double),
+        "datetime" | "INDEXED_VALUE_TYPE_DATETIME" => Ok(IndexedValueType::Datetime),
+        "text" | "INDEXED_VALUE_TYPE_TEXT" => Ok(IndexedValueType::Text),
+        other => Err(Status::internal(format!(
+            "unsupported search attribute type `{other}`"
+        ))),
+    }
+}
 
 /// Tonic service implementation that bridges proto ↔ edge DTOs.
 ///
@@ -641,33 +687,78 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     }
     async fn list_open_workflow_executions(
         &self,
-        _request: Request<workflowservice::ListOpenWorkflowExecutionsRequest>,
+        request: Request<workflowservice::ListOpenWorkflowExecutionsRequest>,
     ) -> Result<Response<workflowservice::ListOpenWorkflowExecutionsResponse>, Status> {
-        Err(Status::unimplemented("list_open_workflow_executions"))
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::list_open_request_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let edge_resp = self
+            .inner
+            .list_workflow_executions(&headers, edge_req)
+            .await?;
+        Ok(Response::new(translate::list_open_response_to_proto(
+            edge_resp,
+        )))
     }
     async fn list_closed_workflow_executions(
         &self,
-        _request: Request<workflowservice::ListClosedWorkflowExecutionsRequest>,
+        request: Request<workflowservice::ListClosedWorkflowExecutionsRequest>,
     ) -> Result<Response<workflowservice::ListClosedWorkflowExecutionsResponse>, Status> {
-        Err(Status::unimplemented("list_closed_workflow_executions"))
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::list_closed_request_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let edge_resp = self
+            .inner
+            .list_workflow_executions(&headers, edge_req)
+            .await?;
+        Ok(Response::new(translate::list_closed_response_to_proto(
+            edge_resp,
+        )))
     }
     async fn list_archived_workflow_executions(
         &self,
-        _request: Request<workflowservice::ListArchivedWorkflowExecutionsRequest>,
+        request: Request<workflowservice::ListArchivedWorkflowExecutionsRequest>,
     ) -> Result<Response<workflowservice::ListArchivedWorkflowExecutionsResponse>, Status> {
-        Err(Status::unimplemented("list_archived_workflow_executions"))
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::list_archived_request_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let edge_resp = self
+            .inner
+            .list_workflow_executions(&headers, edge_req)
+            .await?;
+        Ok(Response::new(translate::list_archived_response_to_proto(
+            edge_resp,
+        )))
     }
     async fn scan_workflow_executions(
         &self,
-        _request: Request<workflowservice::ScanWorkflowExecutionsRequest>,
+        request: Request<workflowservice::ScanWorkflowExecutionsRequest>,
     ) -> Result<Response<workflowservice::ScanWorkflowExecutionsResponse>, Status> {
-        Err(Status::unimplemented("scan_workflow_executions"))
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::scan_request_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let edge_resp = self
+            .inner
+            .list_workflow_executions(&headers, edge_req)
+            .await?;
+        Ok(Response::new(translate::scan_response_to_proto(edge_resp)))
     }
     async fn get_search_attributes(
         &self,
-        _request: Request<workflowservice::GetSearchAttributesRequest>,
+        request: Request<workflowservice::GetSearchAttributesRequest>,
     ) -> Result<Response<workflowservice::GetSearchAttributesResponse>, Status> {
-        Err(Status::unimplemented("get_search_attributes"))
+        let headers = metadata_to_header_map(request.metadata());
+        let attrs = self.inner.get_search_attributes(&headers).await?;
+        let mut keys = standard_search_attributes();
+        for attr in attrs {
+            keys.insert(
+                attr.name,
+                indexed_value_type_from_edge(&attr.attr_type)? as i32,
+            );
+        }
+        Ok(Response::new(
+            workflowservice::GetSearchAttributesResponse { keys },
+        ))
     }
     async fn respond_query_task_completed(
         &self,
@@ -2563,6 +2654,26 @@ mod tests {
                 Arc::new(tokeira_runtime::BatchOperationStore::default()),
             );
         WorkflowServiceGrpc::new(service)
+    }
+
+    #[tokio::test]
+    async fn get_search_attributes_exposes_system_visibility_keys() {
+        let (grpc, _, _, _) = versioning_test_service();
+
+        let response = grpc
+            .get_search_attributes(Request::new(workflowservice::GetSearchAttributesRequest {}))
+            .await
+            .expect("get search attributes")
+            .into_inner();
+
+        assert_eq!(
+            response.keys.get("ExecutionStatus").copied(),
+            Some(IndexedValueType::Keyword as i32)
+        );
+        assert_eq!(
+            response.keys.get("TemporalExternalPayloadCount").copied(),
+            Some(IndexedValueType::Int as i32)
+        );
     }
 
     macro_rules! assert_deferred_rpc {

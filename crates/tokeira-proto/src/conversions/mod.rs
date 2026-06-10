@@ -18,6 +18,11 @@ pub enum ProtoConversionError {
     #[error("invalid timestamp nanos: {0}")]
     InvalidTimestamp(String),
 
+    /// Preserves externally-specified admission text when Temporal clients
+    /// assert exact `INVALID_ARGUMENT` messages.
+    #[error("{0}")]
+    InvalidArgument(String),
+
     #[error("missing required field: {0}")]
     MissingField(&'static str),
 }

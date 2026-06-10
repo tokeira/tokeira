@@ -210,7 +210,8 @@ async fn build_lease_repository(
         .await
         .context("failed to connect DSQL storage backend for lease repository")?;
 
-    let (_director, run_repository, _projection_log, _migration_runner) = dsql_store.into_parts();
+    let (_director, run_repository, _projection_log, _worker_deployments, _migration_runner) =
+        dsql_store.into_parts();
 
     Ok(Arc::new(run_repository))
 }

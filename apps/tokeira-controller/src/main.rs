@@ -336,7 +336,8 @@ async fn build_repositories(
         .await
         .context("failed to connect DSQL storage backend")?;
 
-    let (_director, run_repository, _projection_log, _migration_runner) = dsql_store.into_parts();
+    let (_director, run_repository, _projection_log, _worker_deployments, _migration_runner) =
+        dsql_store.into_parts();
 
     // DsqlRunRepository implements both LeaseRepository and ControlRepository.
     let repo = Arc::new(run_repository);

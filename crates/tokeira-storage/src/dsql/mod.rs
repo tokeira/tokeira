@@ -212,12 +212,14 @@ impl DsqlStore {
         Arc<connection::DsqlConnectionDirector>,
         run_repository::DsqlRunRepository,
         projection_log::DsqlProjectionLog,
+        worker_deployment_repository::DsqlWorkerDeploymentRepository,
         migration::MigrationRunner,
     ) {
         (
             self.director,
             self.run_repository,
             self.projection_log,
+            self.worker_deployment_repository,
             self.migration_runner,
         )
     }

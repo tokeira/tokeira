@@ -488,6 +488,9 @@ pub fn compute_next_times(
 /// (`common/util.go:550 @ v1.31.0`). Tokeira uses the same observable shape by
 /// feeding this delay into the existing durable delayed-start timer path.
 pub fn cron_initial_backoff(cron: &str, now: OffsetDateTime) -> Result<Duration, ScheduleError> {
+    if let Some(interval) = parse_every_descriptor(cron)? {
+        return Ok(interval);
+    }
     let spec = compile_standard_cron(cron)?;
     let next_minute = now.unix_timestamp() - i64::from(now.second()) + 60;
     let mut candidate = OffsetDateTime::from_unix_timestamp(next_minute)
@@ -502,6 +505,68 @@ pub fn cron_initial_backoff(cron: &str, now: OffsetDateTime) -> Result<Duration,
     Err(ScheduleError::InvalidArgument(
         "invalid CronSchedule, no time can be found to satisfy the schedule".to_string(),
     ))
+}
+
+fn parse_every_descriptor(cron: &str) -> Result<Option<Duration>, ScheduleError> {
+    let fields: Vec<_> = cron.split_whitespace().collect();
+    if fields.first().copied() != Some("@every") {
+        return Ok(None);
+    }
+    if fields.len() != 2 {
+        return Err(ScheduleError::InvalidArgument(
+            "invalid CronSchedule.".to_string(),
+        ));
+    }
+    // Workflow cron uses robfig's `ParseStandard`, whose descriptors include
+    // `@every <duration>` (`common/backoff/cron.go:14 @ v1.31.0`). The runtime
+    // records a concrete first-WFT delay, so the interval is reduced to a
+    // deterministic duration here rather than stored as parser state.
+    parse_go_duration(fields[1]).map(Some)
+}
+
+fn parse_go_duration(value: &str) -> Result<Duration, ScheduleError> {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    let mut total = Duration::ZERO;
+    while index < bytes.len() {
+        let start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        if start == index {
+            return Err(ScheduleError::InvalidArgument(
+                "invalid CronSchedule.".to_string(),
+            ));
+        }
+        let amount: i64 = value[start..index]
+            .parse()
+            .map_err(|_| ScheduleError::InvalidArgument("invalid CronSchedule.".to_string()))?;
+        let unit_start = index;
+        while index < bytes.len() && !bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        let unit = &value[unit_start..index];
+        let part = match unit {
+            "ns" => Duration::nanoseconds(amount),
+            "us" | "µs" => Duration::microseconds(amount),
+            "ms" => Duration::milliseconds(amount),
+            "s" => Duration::seconds(amount),
+            "m" => Duration::minutes(amount),
+            "h" => Duration::hours(amount),
+            _ => {
+                return Err(ScheduleError::InvalidArgument(
+                    "invalid CronSchedule.".to_string(),
+                ));
+            }
+        };
+        total += part;
+    }
+    if total <= Duration::ZERO {
+        return Err(ScheduleError::InvalidArgument(
+            "invalid CronSchedule.".to_string(),
+        ));
+    }
+    Ok(total)
 }
 
 fn compile_standard_cron(cron: &str) -> Result<StructuredCalendarSpec, ScheduleError> {
@@ -1451,6 +1516,15 @@ mod tests {
         assert_eq!(
             now + hourly,
             OffsetDateTime::from_unix_timestamp(1_700_002_800).unwrap()
+        );
+
+        assert_eq!(
+            cron_initial_backoff("@every 5s", now).unwrap(),
+            Duration::seconds(5)
+        );
+        assert_eq!(
+            cron_initial_backoff("@every 1h30m", now).unwrap(),
+            Duration::minutes(90)
         );
     }
 

@@ -101,6 +101,7 @@ pub fn memo_to_domain(value: &common::Memo) -> Memo {
         value
             .fields
             .iter()
+            .filter(|(_name, payload)| !is_temporal_nil_payload(payload))
             .map(|(k, v)| (k.clone(), payload_to_domain(v)))
             .collect(),
     )
@@ -123,9 +124,18 @@ pub fn search_attributes_to_domain(
         value
             .indexed_fields
             .iter()
+            .filter(|(_name, payload)| !is_temporal_nil_payload(payload))
             .map(|(name, val)| Ok((name.clone(), search_attr_payload_to_domain(val)?)))
             .collect::<Result<_, ProtoConversionError>>()?,
     ))
+}
+
+fn is_temporal_nil_payload(value: &common::Payload) -> bool {
+    let encoding = value.metadata.get("encoding").map(Vec::as_slice);
+    // Temporal filters JSON null and empty-list payloads from memo/search
+    // attributes before writing start history, so client-side nil values do not
+    // become validation errors (`common/payload/payload.go:94 @ v1.31.0`).
+    matches!(encoding, Some(b"json/plain")) && matches!(value.data.as_slice(), b"null" | b"[]")
 }
 
 fn search_attr_value_to_payload(value: &SearchAttrValue) -> common::Payload {
@@ -200,4 +210,58 @@ pub fn to_proto_duration(value: time::Duration) -> ProtoDuration {
 
 pub fn to_opt_proto_duration(value: Option<time::Duration>) -> Option<ProtoDuration> {
     value.map(to_proto_duration)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    fn json_payload(data: &[u8]) -> common::Payload {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("encoding".to_string(), b"json/plain".to_vec());
+        common::Payload {
+            metadata,
+            data: data.to_vec(),
+            external_payloads: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn memo_conversion_filters_temporal_nil_payloads() {
+        let memo = common::Memo {
+            fields: BTreeMap::from([
+                ("nil".to_string(), json_payload(b"null")),
+                ("empty".to_string(), json_payload(b"[]")),
+                ("kept".to_string(), json_payload(br#""value""#)),
+            ]),
+        };
+
+        let converted = memo_to_domain(&memo);
+
+        assert!(!converted.0.contains_key("nil"));
+        assert!(!converted.0.contains_key("empty"));
+        assert!(converted.0.contains_key("kept"));
+    }
+
+    #[test]
+    fn search_attribute_conversion_filters_temporal_nil_payloads() {
+        let attributes = common::SearchAttributes {
+            indexed_fields: BTreeMap::from([
+                ("nil".to_string(), json_payload(b"null")),
+                ("empty".to_string(), json_payload(b"[]")),
+                (
+                    "kept".to_string(),
+                    search_attr_value_to_payload(&SearchAttrValue::Keyword("value".to_string())),
+                ),
+            ]),
+        };
+
+        let converted = search_attributes_to_domain(&attributes).expect("search attributes");
+
+        assert!(!converted.0.contains_key("nil"));
+        assert!(!converted.0.contains_key("empty"));
+        assert!(converted.0.contains_key("kept"));
+    }
 }

@@ -33,8 +33,8 @@ use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 use tokeira_storage::{
     BuildId, ComputeConfig, ComputeConfigScalingGroup, ComputeProvider, ComputeScaler,
-    ConflictToken, DeploymentCasResult, DeploymentKey, DeploymentName, DrainageInfo,
-    RoutingConfigUpdateState, RunRepository, StoredRoutingConfig, StoredVersion,
+    ConflictToken, DeploymentCasResult, DeploymentKey, DeploymentName, DeploymentTaskQueueType,
+    DrainageInfo, RoutingConfigUpdateState, RunRepository, StoredRoutingConfig, StoredVersion,
     StoredWorkerDeployment, VersionDrainageStatus, VersionMetadata, VersionTaskQueue,
     WorkerDeploymentRepository, WorkerDeploymentVersionKey, WorkerDeploymentVersionStatus,
 };
@@ -50,6 +50,15 @@ const ACTIVE_POLLER_WINDOW: Duration = Duration::minutes(5);
 /// (or empty) resolves to a nil Version rather than a real `(deployment, build_id)`
 /// pair (`common/worker_versioning/worker_versioning.go:1103 @ v1.31.0`).
 const UNVERSIONED_VERSION_SENTINEL: &str = "__unversioned__";
+
+/// Request-id prefix stamped on deployments and versions created lazily by a
+/// versioned worker poll (rather than an explicit `CreateWorkerDeployment`).
+///
+/// v1.31.0 uses this prefix so a later explicit create that collides with an
+/// auto-created deployment can report the "(auto-created from worker polls)"
+/// provenance (`service/worker/workerdeployment/util.go:108` +
+/// `client.go:1230 @ v1.31.0`).
+const AUTO_CREATE_REQUEST_ID_PREFIX: &str = "_auto_create_";
 
 /// Clock used by the registry to stamp caller-visible state transitions.
 pub trait RegistryClock: Send + Sync {
@@ -145,6 +154,12 @@ impl DeploymentRegistry {
                 if request_id_matches(&record.create_request_ids, &cmd.request_id) {
                     return Ok(RegistryMutation::Unchanged(()));
                 }
+                // A collision against a deployment that a versioned poll auto-created
+                // reports distinct provenance, mirroring
+                // `ensureWorkerDeploymentDoesNotExist` (`client.go:1228 @ v1.31.0`).
+                if is_auto_created(record) {
+                    return Err(RegistryError::AlreadyExistsAutoCreated);
+                }
                 return Err(RegistryError::AlreadyExists);
             }
 
@@ -167,6 +182,88 @@ impl DeploymentRegistry {
         .await?;
 
         self.describe_deployment(key).await
+    }
+
+    /// Lazily register the deployment and version implied by a versioned worker
+    /// poll, idempotently.
+    ///
+    /// v1.31.0 creates a Worker Deployment (and its Version) the first time a
+    /// versioned worker polls a task queue: matching forwards the poll to the
+    /// deployment/version entity workflows, which are created on demand with a
+    /// create request id carrying [`AUTO_CREATE_REQUEST_ID_PREFIX`]
+    /// (`service/worker/workerdeployment/client.go:1230 @ v1.31.0`). Tokeira holds
+    /// the registry as durable single-document state rather than entity workflows
+    /// (see module docs), so this method performs the same lazy registration over
+    /// the CAS-guarded record. A re-poll that finds the deployment, version, and
+    /// task queue already present is an `Unchanged` no-op so steady-state polling
+    /// does not churn the conflict token.
+    ///
+    /// An unversioned poll (empty deployment name or build id) registers nothing.
+    pub async fn register_polled_deployment(
+        &self,
+        cmd: RegisterPolledDeployment,
+    ) -> Result<(), RegistryError> {
+        if cmd.deployment_name.0.is_empty() || cmd.build_id.0.is_empty() {
+            return Ok(());
+        }
+        let key = cmd.key();
+        let auto_request_id = format!("{AUTO_CREATE_REQUEST_ID_PREFIX}{}", cmd.deployment_name.0);
+        self.mutate_deployment(&key, |loaded, now| {
+            let task_queue = VersionTaskQueue {
+                name: cmd.task_queue.clone(),
+                task_queue_type: cmd.task_queue_type,
+            };
+            match loaded {
+                None => {
+                    let mut versions = BTreeMap::new();
+                    versions.insert(
+                        cmd.build_id.clone(),
+                        auto_polled_version(&cmd, now, task_queue, &auto_request_id),
+                    );
+                    Ok(RegistryMutation::Put(
+                        StoredWorkerDeployment {
+                            namespace_id: cmd.namespace_id,
+                            name: cmd.deployment_name.clone(),
+                            create_time: now,
+                            routing_config: StoredRoutingConfig::default(),
+                            last_modifier_identity: cmd.identity.clone(),
+                            manager_identity: None,
+                            routing_config_update_state: RoutingConfigUpdateState::Completed,
+                            versions,
+                            conflict_token: ConflictToken::default(),
+                            create_request_ids: BTreeSet::from([auto_request_id.clone()]),
+                        },
+                        (),
+                    ))
+                }
+                Some(record) => {
+                    let mut next = record.clone();
+                    match next.versions.get_mut(&cmd.build_id) {
+                        Some(version) => {
+                            // Record the freshly-polled task queue; everything else is
+                            // already present, so an existing task queue is a no-op.
+                            if version.polled_task_queues.insert(task_queue) {
+                                Ok(RegistryMutation::Put(next, ()))
+                            } else {
+                                Ok(RegistryMutation::Unchanged(()))
+                            }
+                        }
+                        None => {
+                            if next.versions.len() >= MAX_VERSIONS_PER_DEPLOYMENT {
+                                return Err(RegistryError::ResourceExhausted);
+                            }
+                            next.versions.insert(
+                                cmd.build_id.clone(),
+                                auto_polled_version(&cmd, now, task_queue, &auto_request_id),
+                            );
+                            Ok(RegistryMutation::Put(next, ()))
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .map(|_| ())
     }
 
     pub async fn describe_deployment(
@@ -950,6 +1047,26 @@ impl CreateDeployment {
     }
 }
 
+/// Lazily register the deployment/version implied by a versioned worker poll.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegisterPolledDeployment {
+    pub namespace_id: NamespaceId,
+    pub deployment_name: DeploymentName,
+    pub build_id: BuildId,
+    pub task_queue: String,
+    pub task_queue_type: DeploymentTaskQueueType,
+    pub identity: String,
+}
+
+impl RegisterPolledDeployment {
+    fn key(&self) -> DeploymentKey {
+        DeploymentKey {
+            namespace_id: self.namespace_id,
+            deployment_name: self.deployment_name.clone(),
+        }
+    }
+}
+
 /// Delete a Worker Deployment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeleteDeployment {
@@ -1178,6 +1295,8 @@ pub struct VersionMetadataView {
 pub enum RegistryError {
     #[error("worker deployment already exists")]
     AlreadyExists,
+    #[error("worker deployment already exists (auto-created from worker polls)")]
+    AlreadyExistsAutoCreated,
     #[error("worker deployment not found")]
     NotFound,
     #[error("worker deployment precondition failed: {0}")]
@@ -1771,6 +1890,46 @@ fn effective_request_id(request_id: &str) -> String {
         uuid::Uuid::new_v4().to_string()
     } else {
         request_id.to_string()
+    }
+}
+
+/// Whether a deployment record was created lazily by a versioned worker poll
+/// rather than an explicit `CreateWorkerDeployment`. v1.31.0 keys this off the
+/// stored create request id carrying [`AUTO_CREATE_REQUEST_ID_PREFIX`]
+/// (`client.go:1228 @ v1.31.0`).
+fn is_auto_created(record: &StoredWorkerDeployment) -> bool {
+    record
+        .create_request_ids
+        .iter()
+        .any(|id| id.starts_with(AUTO_CREATE_REQUEST_ID_PREFIX))
+}
+
+/// Build the `StoredVersion` for a version auto-created by a poll, seeded with the
+/// task queue the worker just polled and the auto-create request id.
+fn auto_polled_version(
+    cmd: &RegisterPolledDeployment,
+    now: OffsetDateTime,
+    task_queue: VersionTaskQueue,
+    auto_request_id: &str,
+) -> StoredVersion {
+    StoredVersion {
+        build_id: cmd.build_id.clone(),
+        status: WorkerDeploymentVersionStatus::Created,
+        create_time: now,
+        routing_changed_time: None,
+        current_since_time: None,
+        ramping_since_time: None,
+        first_activation_time: None,
+        last_current_time: None,
+        last_deactivation_time: None,
+        ramp_percentage: 0.0,
+        drainage_info: None,
+        metadata: VersionMetadata::default(),
+        compute_config: ComputeConfig::default(),
+        last_modifier_identity: cmd.identity.clone(),
+        polled_task_queues: BTreeSet::from([task_queue]),
+        create_request_ids: BTreeSet::from([auto_request_id.to_string()]),
+        compute_config_request_ids: BTreeSet::new(),
     }
 }
 
@@ -2598,6 +2757,7 @@ mod tests {
     fn registry_error_kind(error: &RegistryError) -> RegistryErrorKind {
         match error {
             RegistryError::AlreadyExists => RegistryErrorKind::AlreadyExists,
+            RegistryError::AlreadyExistsAutoCreated => RegistryErrorKind::AlreadyExists,
             RegistryError::NotFound => RegistryErrorKind::NotFound,
             RegistryError::FailedPrecondition(_) => RegistryErrorKind::FailedPrecondition,
             RegistryError::ResourceExhausted => RegistryErrorKind::ResourceExhausted,

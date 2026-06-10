@@ -33,8 +33,31 @@ impl DsqlWorkerDeploymentRepository {
         }
     }
 
-    fn next_token(current: Option<ConflictToken>) -> ConflictToken {
-        ConflictToken::from_generation(current.map_or(1, |token| token.generation() + 1))
+    /// Advance and read the persistent conflict-token generation for `key`.
+    ///
+    /// The generation lives in `worker_deployment_token_seq`, which is never
+    /// deleted, so it survives delete-then-recreate of the deployment row. This
+    /// is what guarantees a recreated deployment never reuses a prior token —
+    /// mirroring v1.31.0's strictly-increasing timestamp token
+    /// (`service/worker/workerdeployment/workflow.go:248,502 @ v1.31.0`).
+    async fn advance_token_generation(
+        tx: &mut sqlx::PgConnection,
+        namespace_id: NamespaceId,
+        deployment_name: &str,
+    ) -> Result<ConflictToken> {
+        let row = sqlx::query(
+            "INSERT INTO worker_deployment_token_seq (namespace_id, deployment_name, generation)
+             VALUES ($1, $2, 1)
+             ON CONFLICT (namespace_id, deployment_name) DO UPDATE SET
+                 generation = worker_deployment_token_seq.generation + 1
+             RETURNING generation",
+        )
+        .bind(namespace_id.0)
+        .bind(deployment_name)
+        .fetch_one(&mut *tx)
+        .await?;
+        let generation: i64 = row.try_get("generation")?;
+        Ok(ConflictToken::from_generation(generation as u64))
     }
 
     fn token_from_bytes(bytes: Vec<u8>) -> Result<ConflictToken> {
@@ -105,8 +128,10 @@ impl WorkerDeploymentRepository for DsqlWorkerDeploymentRepository {
                 tx.rollback().await?;
                 Ok(DeploymentCasResult::Conflict)
             }
-            (current, _) => {
-                let token = Self::next_token(current);
+            _ => {
+                let token =
+                    Self::advance_token_generation(&mut tx, record.namespace_id, &record.name.0)
+                        .await?;
                 record.conflict_token = token;
                 let record_data = codec::encode_worker_deployment(&record)?;
                 let write = sqlx::query(
@@ -173,7 +198,9 @@ impl WorkerDeploymentRepository for DsqlWorkerDeploymentRepository {
             return Ok(DeploymentCasResult::Conflict);
         }
 
-        let token = Self::next_token(Some(current));
+        let token =
+            Self::advance_token_generation(&mut tx, key.namespace_id, &key.deployment_name.0)
+                .await?;
         let write = sqlx::query(
             "DELETE FROM worker_deployments
              WHERE namespace_id = $1 AND deployment_name = $2",
@@ -334,6 +361,16 @@ mod tests {
                 conflict_token  BYTEA       NOT NULL,
                 record_data     BYTEA       NOT NULL,
                 updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (namespace_id, deployment_name)
+            )",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS worker_deployment_token_seq (
+                namespace_id    UUID   NOT NULL,
+                deployment_name TEXT   NOT NULL,
+                generation      BIGINT NOT NULL,
                 PRIMARY KEY (namespace_id, deployment_name)
             )",
         )

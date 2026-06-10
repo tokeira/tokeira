@@ -36,16 +36,19 @@ use tokeira_runtime::{
     BatchProgressCounters, BatchResetTarget, BufferedQueryRegistry, CreateDeployment,
     CreateVersion, DeleteDeployment, DeleteVersion, DeploymentPage, DeploymentView,
     DescribeVersion, InMemoryBroker, ListDeployments, NexusTaskBroker, NexusTaskToken,
-    OverlapDecision, OverlapPolicy, PendingUpdateTransport, QueryResult, ResetWorkflowResult,
-    ScheduleActionResult, SchedulePatch, ScheduleStore, SetCurrent, SetCurrentOutcome, SetManager,
-    SetManagerOutcome, SetRamping, SetRampingOutcome, SignalWithStartResult, StartWorkflowResult,
-    StartedActivityTask, StartedWorkflowTask, TaskQueueConfigEntry, TaskQueueConfigStore,
-    UpdateComputeConfig, UpdateLifecycleError, UpdateLifecycleSnapshot, UpdateMetadata,
-    UpdateTransportResolution, UpdateWaitPolicy, ValidateComputeConfig, VersionMetadataView,
-    VersionView, VersioningRuleStore, WorkerRegistry, WorkflowExecution, WorkflowExecutionStatus,
-    compute_matching_times, decide_overlap, schedule_workflow_id,
+    OverlapDecision, OverlapPolicy, PendingUpdateTransport, QueryResult, RegisterPolledDeployment,
+    ResetWorkflowResult, ScheduleActionResult, SchedulePatch, ScheduleStore, SetCurrent,
+    SetCurrentOutcome, SetManager, SetManagerOutcome, SetRamping, SetRampingOutcome,
+    SignalWithStartResult, StartWorkflowResult, StartedActivityTask, StartedWorkflowTask,
+    TaskQueueConfigEntry, TaskQueueConfigStore, UpdateComputeConfig, UpdateLifecycleError,
+    UpdateLifecycleSnapshot, UpdateMetadata, UpdateTransportResolution, UpdateWaitPolicy,
+    ValidateComputeConfig, VersionMetadataView, VersionView, VersioningRuleStore, WorkerRegistry,
+    WorkflowExecution, WorkflowExecutionStatus, compute_matching_times, decide_overlap,
+    schedule_workflow_id,
 };
-use tokeira_storage::{ConflictToken, DeploymentKey, RunRepository};
+use tokeira_storage::{
+    ConflictToken, DeploymentKey, DeploymentName, DeploymentTaskQueueType, RunRepository,
+};
 use tokeira_types::{
     ActivityTaskToken, ExecutionRef, ExecutionStatus, HeartbeatStore, Payload, Payloads, QueueKey,
     RequestContext, RequestId, RunId, RunKey, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId,
@@ -497,6 +500,10 @@ pub trait WorkerDeploymentRuntimeApi: Send + Sync + 'static {
         &self,
         req: SetManager,
     ) -> EdgeResult<DeploymentMutationOutcome<SetManagerOutcome>>;
+
+    /// Lazily register the deployment/version implied by a versioned worker poll.
+    /// A no-op for unversioned polls. Idempotent.
+    async fn register_polled_deployment(&self, req: RegisterPolledDeployment) -> EdgeResult<()>;
 }
 
 #[async_trait]
@@ -2209,6 +2216,34 @@ impl WorkflowService {
                     ),
                     WorkerIdentity(req.worker_identity.clone()),
                 );
+                // A versioned worker poll lazily registers its deployment and version,
+                // matching v1.31.0's matching-driven auto-create
+                // (`service/worker/workerdeployment/client.go:1230 @ v1.31.0`). This is
+                // best-effort bookkeeping on the control plane: a registry hiccup must
+                // not fail the poll itself, so failures are logged rather than
+                // propagated. Unversioned polls carry no deployment/build id and skip it.
+                if let (Some(worker_deployments), Some(deployment), Some(build_id)) = (
+                    self.worker_deployments.as_ref(),
+                    req.deployment.as_ref(),
+                    req.build_id.as_ref(),
+                ) && let Err(error) = worker_deployments
+                    .register_polled_deployment(RegisterPolledDeployment {
+                        namespace_id: to_internal::namespace_id_for(&req.namespace),
+                        deployment_name: DeploymentName(deployment.0.clone()),
+                        build_id: tokeira_storage::BuildId(build_id.0.clone()),
+                        task_queue: req.task_queue.clone(),
+                        task_queue_type: DeploymentTaskQueueType::Workflow,
+                        identity: req.worker_identity.clone(),
+                    })
+                    .await
+                {
+                    tracing::warn!(
+                        %error,
+                        deployment = %deployment.0,
+                        build_id = %build_id.0,
+                        "failed to auto-register polled worker deployment"
+                    );
+                }
                 let internal = to_internal::poll_request(req);
                 let started = self
                     .runtime

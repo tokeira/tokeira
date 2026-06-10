@@ -72,6 +72,17 @@ struct StoreState {
     runs: HashMap<RunKey, WorkflowState>,
     /// Worker Deployment registry records by namespace/name.
     worker_deployments: HashMap<DeploymentKey, StoredWorkerDeployment>,
+    /// Per-deployment conflict-token high-water-mark.
+    ///
+    /// The conflict token must increase monotonically across the entire
+    /// lifetime of a deployment *name*, including delete-then-recreate. In
+    /// v1.31.0 the token is `workflow.Now(ctx).MarshalBinary()` of the
+    /// deployment entity workflow (`service/worker/workerdeployment/workflow.go:248,502
+    /// @ v1.31.0`); a recreated deployment runs a fresh entity workflow and so
+    /// observes a strictly later time. We model that with a monotonic
+    /// generation that survives record deletion — keyed by `DeploymentKey` and
+    /// never reset — so a recreated deployment never reuses a prior token.
+    deployment_token_hwm: HashMap<DeploymentKey, u64>,
     /// Authoritative event stream by run key.
     history: HashMap<RunKey, Vec<tokeira_kernel::HistoryEvent>>,
     /// Workflow-scoped request dedupe records.
@@ -119,11 +130,20 @@ struct ActivityDispatchEntry {
     heartbeat_timeout: Option<time::Duration>,
 }
 
-impl InMemoryStore {
-    fn next_deployment_token(current: Option<ConflictToken>) -> ConflictToken {
-        ConflictToken::from_generation(current.map_or(1, |token| token.generation() + 1))
+impl StoreState {
+    /// Allocate the next conflict token for `key`, advancing the per-key
+    /// high-water-mark. The generation is monotonic for the lifetime of the
+    /// deployment name and never resets on delete-then-recreate, mirroring the
+    /// strictly-increasing timestamp token of v1.31.0's deployment entity
+    /// workflow (`service/worker/workerdeployment/workflow.go:248,502 @ v1.31.0`).
+    fn allocate_deployment_token(&mut self, key: &DeploymentKey) -> ConflictToken {
+        let generation = self.deployment_token_hwm.entry(key.clone()).or_insert(0);
+        *generation += 1;
+        ConflictToken::from_generation(*generation)
     }
+}
 
+impl InMemoryStore {
     /// Create a store with a configured shard count for
     /// shard-filtered queries.
     pub fn with_shard_count(shard_count: u32) -> Self {
@@ -1068,7 +1088,7 @@ impl WorkerDeploymentRepository for InMemoryStore {
         match (store.worker_deployments.get(&key), expected) {
             (Some(_), None) => Ok(DeploymentCasResult::AlreadyExists),
             (None, None) => {
-                let token = Self::next_deployment_token(None);
+                let token = store.allocate_deployment_token(&key);
                 record.conflict_token = token;
                 store.worker_deployments.insert(key, record);
                 Ok(DeploymentCasResult::Applied { token })
@@ -1077,8 +1097,8 @@ impl WorkerDeploymentRepository for InMemoryStore {
             (Some(current), Some(expected)) if current.conflict_token != expected => {
                 Ok(DeploymentCasResult::Conflict)
             }
-            (Some(current), Some(_)) => {
-                let token = Self::next_deployment_token(Some(current.conflict_token));
+            (Some(_), Some(_)) => {
+                let token = store.allocate_deployment_token(&key);
                 record.conflict_token = token;
                 store.worker_deployments.insert(key, record);
                 Ok(DeploymentCasResult::Applied { token })
@@ -1098,7 +1118,7 @@ impl WorkerDeploymentRepository for InMemoryStore {
         if current.conflict_token != expected {
             return Ok(DeploymentCasResult::Conflict);
         }
-        let token = Self::next_deployment_token(Some(current.conflict_token));
+        let token = store.allocate_deployment_token(key);
         store.worker_deployments.remove(key);
         Ok(DeploymentCasResult::Applied { token })
     }
@@ -1640,6 +1660,48 @@ mod tests {
         };
         assert_eq!(delete_token.generation(), update_token.generation() + 1);
         assert_eq!(store.load_deployment(&key).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn worker_deployment_recreate_after_delete_issues_distinct_token() {
+        // v1.31.0 derives the conflict token from the deployment entity
+        // workflow's clock (`service/worker/workerdeployment/workflow.go:248,502
+        // @ v1.31.0`), so a recreated deployment never reuses a prior token. The
+        // per-name high-water-mark must not reset to 1 on delete-then-recreate.
+        // Conformance: tests/worker_deployment_test.go
+        // TestCreateWorkerDeployment_AfterDelete_CanRecreate @ v1.31.0.
+        let store = InMemoryStore::default();
+        let namespace_id = NamespaceId::new();
+        let key = deployment_key(namespace_id, "alpha");
+
+        let created = store
+            .put_deployment(sample_deployment(namespace_id, "alpha"), None)
+            .await
+            .unwrap();
+        let DeploymentCasResult::Applied { token: first_token } = created else {
+            panic!("fresh create should apply, got {created:?}");
+        };
+        store.delete_deployment(&key, first_token).await.unwrap();
+
+        let recreated = store
+            .put_deployment(sample_deployment(namespace_id, "alpha"), None)
+            .await
+            .unwrap();
+        let DeploymentCasResult::Applied {
+            token: second_token,
+        } = recreated
+        else {
+            panic!("recreate after delete should apply, got {recreated:?}");
+        };
+
+        assert_ne!(
+            first_token, second_token,
+            "recreated deployment must not reuse the prior conflict token"
+        );
+        assert!(
+            second_token.generation() > first_token.generation(),
+            "recreated token generation must advance monotonically"
+        );
     }
 
     #[tokio::test]

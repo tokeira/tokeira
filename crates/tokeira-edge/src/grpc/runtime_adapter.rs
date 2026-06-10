@@ -10,11 +10,12 @@ use tokeira_kernel::{
 use tokeira_runtime::{
     ActivityTokenResolutionError, CreateDeployment, CreateVersion, DeleteDeployment, DeleteVersion,
     DeploymentPage, DeploymentRegistry, DeploymentView, DescribeVersion, ListDeployments,
-    PendingUpdateTransport, QueryResult, RegistryError, ResetWorkflowResult, SetCurrent,
-    SetCurrentOutcome, SetManager, SetManagerOutcome, SetRamping, SetRampingOutcome,
-    SignalWithStartResult, StartWorkflowResult, StartedActivityTask, TokeiraRuntime,
-    UpdateComputeConfig, UpdateLifecycleSnapshot, UpdateMetadata, UpdateTransportResolution,
-    UpdateWaitPolicy, ValidateComputeConfig, VersionMetadataView, VersionView,
+    PendingUpdateTransport, QueryResult, RegisterPolledDeployment, RegistryError,
+    ResetWorkflowResult, SetCurrent, SetCurrentOutcome, SetManager, SetManagerOutcome, SetRamping,
+    SetRampingOutcome, SignalWithStartResult, StartWorkflowResult, StartedActivityTask,
+    TokeiraRuntime, UpdateComputeConfig, UpdateLifecycleSnapshot, UpdateMetadata,
+    UpdateTransportResolution, UpdateWaitPolicy, ValidateComputeConfig, VersionMetadataView,
+    VersionView,
 };
 use tokeira_storage::{CommitResult, ConflictToken, DeploymentKey, RunRepository};
 use tokeira_types::{ActivityTaskToken, ExecutionRef, Payload, Payloads, RequestContext, RunKey};
@@ -361,10 +362,20 @@ where
         req: CreateDeployment,
     ) -> EdgeResult<DeploymentMutationOutcome<DeploymentView>> {
         let registry = self.worker_deployment_registry()?;
-        let view = registry
-            .create_deployment(req)
-            .await
-            .map_err(registry_error_to_edge)?;
+        // Capture the name before `req` is consumed: an explicit create collision must
+        // name the deployment in the error, matching v1.31.0
+        // `ErrWorkerDeploymentAlreadyExists = "Worker Deployment with name %q already exists"`
+        // (`service/worker/workerdeployment/util.go:105 @ v1.31.0`).
+        let deployment_name = req.deployment_name.0.clone();
+        let view = registry.create_deployment(req).await.map_err(|error| match error {
+            RegistryError::AlreadyExists => EdgeError::AlreadyExists(format!(
+                "Worker Deployment with name {deployment_name:?} already exists"
+            )),
+            RegistryError::AlreadyExistsAutoCreated => EdgeError::AlreadyExists(format!(
+                "Worker Deployment with name {deployment_name:?} already exists (auto-created from worker polls)"
+            )),
+            other => registry_error_to_edge(other),
+        })?;
         Ok(deployment_mutation_outcome(view.conflict_token, view))
     }
 
@@ -478,6 +489,13 @@ where
             .map_err(registry_error_to_edge)?;
         Ok(deployment_mutation_outcome(view.conflict_token, view))
     }
+
+    async fn register_polled_deployment(&self, req: RegisterPolledDeployment) -> EdgeResult<()> {
+        self.worker_deployment_registry()?
+            .register_polled_deployment(req)
+            .await
+            .map_err(registry_error_to_edge)
+    }
 }
 
 fn deployment_mutation_outcome<T>(
@@ -495,6 +513,9 @@ fn registry_error_to_edge(error: RegistryError) -> EdgeError {
         RegistryError::AlreadyExists => {
             EdgeError::AlreadyExists("worker deployment already exists".to_string())
         }
+        RegistryError::AlreadyExistsAutoCreated => EdgeError::AlreadyExists(
+            "worker deployment already exists (auto-created from worker polls)".to_string(),
+        ),
         RegistryError::NotFound => EdgeError::NotFound("worker deployment not found".to_string()),
         RegistryError::FailedPrecondition(message) => EdgeError::FailedPrecondition(message),
         RegistryError::ResourceExhausted => EdgeError::ResourceExhausted(

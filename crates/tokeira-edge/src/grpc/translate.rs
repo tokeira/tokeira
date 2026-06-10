@@ -620,13 +620,33 @@ pub fn poll_request_to_edge(
         ))?;
 
     let (deployment, build_id) = req
-        .worker_version_capabilities
+        .deployment_options
         .as_ref()
-        .filter(|caps| caps.use_versioning)
-        .map(|caps| {
-            let deployment = non_empty(caps.deployment_series_name.clone()).map(DeploymentId);
-            let build_id = non_empty(caps.build_id.clone()).map(BuildId);
-            (deployment, build_id)
+        .and_then(|options| {
+            // Only a versioned worker auto-registers and routes by deployment; an
+            // unversioned `deployment_options` carries no `(deployment, build_id)`
+            // identity (`worker_versioning.go` versioning-mode gate @ v1.31.0).
+            let mode =
+                enums::WorkerVersioningMode::try_from(options.worker_versioning_mode).ok()?;
+            if mode != enums::WorkerVersioningMode::Versioned {
+                return None;
+            }
+            let deployment = non_empty(options.deployment_name.clone()).map(DeploymentId);
+            let build_id = non_empty(options.build_id.clone()).map(BuildId);
+            Some((deployment, build_id))
+        })
+        .or_else(|| {
+            // Fall back to the deprecated capabilities for v0.4-era SDK workers that
+            // predate `deployment_options`.
+            req.worker_version_capabilities
+                .as_ref()
+                .filter(|caps| caps.use_versioning)
+                .map(|caps| {
+                    let deployment =
+                        non_empty(caps.deployment_series_name.clone()).map(DeploymentId);
+                    let build_id = non_empty(caps.build_id.clone()).map(BuildId);
+                    (deployment, build_id)
+                })
         })
         .unwrap_or((None, None));
 
@@ -742,10 +762,7 @@ fn sticky_ttl_from_attributes(
 pub fn create_worker_deployment_to_edge(
     req: workflowservice::CreateWorkerDeploymentRequest,
 ) -> Result<CreateDeployment, ProtoConversionError> {
-    require_non_empty(
-        &req.deployment_name,
-        "CreateWorkerDeploymentRequest.deployment_name",
-    )?;
+    validate_deployment_name(&req.deployment_name)?;
     Ok(CreateDeployment {
         namespace_id: namespace_id_for(&req.namespace),
         deployment_name: DeploymentName(req.deployment_name),
@@ -1211,6 +1228,67 @@ fn worker_deployment_version_to_domain(
 fn require_non_empty(value: &str, field: &'static str) -> Result<(), ProtoConversionError> {
     if value.trim().is_empty() {
         return Err(ProtoConversionError::MissingField(field));
+    }
+    Ok(())
+}
+
+/// Maximum length of various server-side IDs (`limit.maxIDLength` default,
+/// `common/dynamicconfig/constants.go:423 @ v1.31.0`). Tokeira holds this as a
+/// constant rather than dynamic config: it is a behavioural limit, not a
+/// deployment-environment policy.
+const MAX_ID_LENGTH_LIMIT: usize = 1000;
+
+/// Fixed overhead of a worker-deployment version workflow id
+/// (`WorkerDeploymentVersionWorkflowIDInitialSize = 39`,
+/// `common/worker_versioning/worker_versioning.go:59 @ v1.31.0`). The deployment
+/// name and build id share the remaining budget, halved between them.
+const WORKER_DEPLOYMENT_VERSION_WORKFLOW_ID_INITIAL_SIZE: usize = 39;
+
+/// Maximum worker-deployment name length: the per-field budget v1.31.0 derives as
+/// `(maxIDLength - versionWorkflowIDInitialSize) / 2`
+/// (`ValidateDeploymentVersionFields`, `worker_versioning.go:563 @ v1.31.0`).
+const WORKER_DEPLOYMENT_NAME_MAX_LEN: usize =
+    (MAX_ID_LENGTH_LIMIT - WORKER_DEPLOYMENT_VERSION_WORKFLOW_ID_INITIAL_SIZE) / 2;
+
+/// Validate a worker-deployment name against the v1.31.0 contract.
+///
+/// Mirrors the effective `CreateWorkerDeployment` validation order: the handler
+/// rejects an empty name with a bespoke message before the shared field validator
+/// runs (`service/frontend/workflow_handler.go:4154 @ v1.31.0`), then
+/// `ValidateDeploymentVersionFields` checks length, the `.`/`:` version-string
+/// delimiters, and the reserved `__` prefix
+/// (`common/worker_versioning/worker_versioning.go:555 @ v1.31.0`). Messages are
+/// reproduced verbatim because the corpus asserts on them
+/// (`tests/worker_deployment_test.go` `TestCreateWorkerDeployment_InvalidDeploymentName`).
+fn validate_deployment_name(name: &str) -> Result<(), ProtoConversionError> {
+    if name.is_empty() {
+        return Err(ProtoConversionError::InvalidArgument(
+            "deployment name cannot be empty".to_string(),
+        ));
+    }
+    if name.len() > WORKER_DEPLOYMENT_NAME_MAX_LEN {
+        return Err(ProtoConversionError::InvalidArgument(
+            "size of WorkerDeploymentName larger than the maximum allowed".to_string(),
+        ));
+    }
+    // `.` is the v3.1 version-id delimiter; a deployment name carrying it would be
+    // ambiguous with a `<name>.<build_id>` version string.
+    if name.contains('.') {
+        return Err(ProtoConversionError::InvalidArgument(
+            "worker deployment name cannot contain '.'".to_string(),
+        ));
+    }
+    // `:` is the version delimiter, banned in names for the same reason.
+    if name.contains(':') {
+        return Err(ProtoConversionError::InvalidArgument(
+            "worker deployment name cannot contain ':'".to_string(),
+        ));
+    }
+    // `__` is reserved for server-internal identifiers.
+    if name.starts_with("__") {
+        return Err(ProtoConversionError::InvalidArgument(
+            "WorkerDeploymentName cannot start with '__'".to_string(),
+        ));
     }
     Ok(())
 }
@@ -4585,6 +4663,43 @@ mod tests {
     use tokeira_kernel::state::WorkflowVersioningInfo;
     use tokeira_proto::public::temporal::api::{filter::v1 as filter, taskqueue::v1 as taskqueue};
     use tokeira_runtime::{RedirectRule, VersioningRules};
+
+    #[test]
+    fn validate_deployment_name_matches_v131_messages_and_order() {
+        // Messages and order ground-truthed to v1.31.0: empty (bespoke,
+        // service/frontend/workflow_handler.go:4154) precedes the shared field
+        // validator's length / '.' / ':' / '__' checks
+        // (common/worker_versioning/worker_versioning.go:555). The corpus asserts
+        // on these strings via Contains
+        // (tests/worker_deployment_test.go TestCreateWorkerDeployment_InvalidDeploymentName).
+        let cases = [
+            ("", "deployment name cannot be empty"),
+            ("a.b", "worker deployment name cannot contain '.'"),
+            ("a:b", "worker deployment name cannot contain ':'"),
+            ("__reserved", "WorkerDeploymentName cannot start with '__'"),
+        ];
+        for (name, expected) in cases {
+            let err = validate_deployment_name(name).expect_err("name should be rejected");
+            let ProtoConversionError::InvalidArgument(message) = err else {
+                panic!("expected InvalidArgument, got {err:?}");
+            };
+            assert_eq!(message, expected, "message mismatch for {name:?}");
+        }
+
+        let too_long = "a".repeat(WORKER_DEPLOYMENT_NAME_MAX_LEN + 1);
+        let err = validate_deployment_name(&too_long).expect_err("over-long name should reject");
+        let ProtoConversionError::InvalidArgument(message) = err else {
+            panic!("expected InvalidArgument, got {err:?}");
+        };
+        assert_eq!(
+            message,
+            "size of WorkerDeploymentName larger than the maximum allowed"
+        );
+
+        validate_deployment_name(&"a".repeat(WORKER_DEPLOYMENT_NAME_MAX_LEN))
+            .expect("max-length name is accepted");
+        validate_deployment_name("prod-deployment").expect("ordinary name is accepted");
+    }
 
     #[test]
     fn start_request_preserves_eager_worker_deployment_options() {

@@ -253,9 +253,16 @@ Server-backed worker configuration: `FetchWorkerConfig` and `UpdateWorkerConfig`
 
 ### P6 — `runtime-broker-tiered-delivery`
 
-**Status:** to spec.
+**Status:** specced — ready for implementation. See `.kiro/specs/runtime-broker-tiered-delivery/`
+(requirements + design + tasks).
 
-Split the broker into explicit sticky / live / backlog tiers. Local to `tokeira-runtime/`.
+Split the broker into explicit sticky / live / backlog tiers. Local to `tokeira-runtime/`
+(+ `tokeira-edge` for the poll/response wiring). **Priority first slice:** deliver queries to
+quiescent workflows on the `PollWorkflowTaskQueue` path — today a query to an idle workflow is
+stranded in the broker's separate `query_ready` channel (drained only by `poll_query_task`, which the
+Temporal SDK never calls), so it times out. This blocks the `agentic-orchestration` OpenAI sandbox
+sample. Ground-truthed to `queryworkflow/api.go` + `matching_engine.go` @ v1.31.0 in the design.
+The related update-redelivery defect is already fixed (commit `2565975`); do not re-open it.
 
 ### P7 — `kernel-pause-workflow`
 

@@ -121,6 +121,17 @@ pub(crate) struct UpdateRegistryEntry {
     pub input: Payloads,
     pub identity: String,
     pub waiter: Option<UpdateWaiter>,
+    /// True once the worker has accepted this update (the kernel moved it from
+    /// `admitted_updates` to `pending_updates`). An accepted update has left the
+    /// sendable set: it must not be re-offered as a fresh request message on a
+    /// later workflow task — the worker resumes the in-flight update via history
+    /// replay. v1.31.0 gates sending on `stateAdmitted`/`stateSent` only and never
+    /// re-sends an accepted update (`needToSend`/`Send`/`onAcceptanceMsg`,
+    /// service/history/workflow/update/update.go:404-540 @ v1.31.0). Re-offering it
+    /// would make the worker re-accept and trip the kernel's `DuplicateUpdateId`
+    /// guard, which is exactly the failure seen running the OpenAI sandbox agent's
+    /// blocking `pause` update.
+    pub accepted: bool,
 }
 
 /// In-memory registry of waiting update callers.
@@ -153,6 +164,7 @@ impl UpdateRegistry {
                 input,
                 identity,
                 waiter: Some(UpdateWaiter { wait_policy, tx }),
+                accepted: false,
             },
         );
     }
@@ -196,7 +208,7 @@ impl UpdateRegistry {
             .lock()
             .unwrap()
             .iter()
-            .filter(|((entry_run_key, _), _)| *entry_run_key == run_key)
+            .filter(|((entry_run_key, _), entry)| *entry_run_key == run_key && !entry.accepted)
             .map(|((_entry_run_key, update_id), entry)| {
                 (
                     update_id.clone(),
@@ -243,6 +255,10 @@ impl UpdateRegistry {
         {
             let mut inner = self.inner.lock().unwrap();
             if let Some(entry) = inner.get_mut(&(run_key, update_id.to_string())) {
+                // The worker has accepted the update; it leaves the sendable set so
+                // a subsequent workflow task does not re-offer it (which would make
+                // the worker re-accept and trip the kernel's DuplicateUpdateId guard).
+                entry.accepted = true;
                 match entry
                     .waiter
                     .as_ref()
@@ -385,6 +401,57 @@ mod tests {
         ));
         assert!(!registry.contains(run_key, "update-1"));
         assert!(matches!(rx.await, Ok(UpdateResolution::Completed { .. })));
+    }
+
+    // Feature: agentic-orchestration (OpenAI sandbox demo). Property: once the
+    // worker has accepted an update, it MUST NOT be re-offered as a fresh request
+    // message on a later workflow task. v1.31.0 sends an update request only while
+    // it is Admitted/Sent; on acceptance it leaves the sendable set and the worker
+    // resumes it via history replay, never a re-sent request
+    // (`needToSend`/`Send`/`onAcceptanceMsg`, service/history/workflow/update/update.go:404-540 @ v1.31.0).
+    // Re-offering an accepted update makes the worker re-accept it, which the kernel
+    // rejects as `DuplicateUpdateId` — the failure observed running the OpenAI sandbox
+    // agent's blocking `pause` update against tokeirad.
+    #[tokio::test]
+    async fn accepted_update_is_not_redelivered_as_pending_transport() {
+        let registry = UpdateRegistry::new();
+        let run_key = RunKey::new();
+        let (tx, _rx) = oneshot::channel();
+
+        registry.register(
+            run_key,
+            "update-1".into(),
+            "pause".into(),
+            Payloads::default(),
+            "worker".into(),
+            UpdateWaitPolicy::Completed,
+            tx,
+        );
+
+        // While Admitted (not yet accepted), the update must be offered to the worker.
+        assert_eq!(
+            registry.drain_pending_updates(run_key).len(),
+            1,
+            "an admitted update should be offered to the worker"
+        );
+
+        // The worker accepts the update on its first workflow task. A Completed-policy
+        // caller stays registered so it can still receive the terminal result.
+        assert!(
+            !registry.notify_accepted(run_key, "update-1", 7),
+            "a Completed-policy waiter is not resolved on acceptance"
+        );
+        assert!(
+            registry.contains(run_key, "update-1"),
+            "the Completed waiter must remain registered after acceptance"
+        );
+
+        // REGRESSION: an accepted update must not be re-offered on a subsequent WFT.
+        // Today this returns the update, causing a double-accept → DuplicateUpdateId.
+        assert!(
+            registry.drain_pending_updates(run_key).is_empty(),
+            "an accepted update must not be re-offered as a pending transport"
+        );
     }
 
     #[tokio::test]

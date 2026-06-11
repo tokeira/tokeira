@@ -93,7 +93,7 @@ mod tests {
                 ExecutionRow {
                     run_key: RunKey(Uuid::from_u128(rk)),
                     namespace_id: ns,
-                    workflow_id: WorkflowId(wf_id),
+                    workflow_id: WorkflowId(wf_id.clone()),
                     run_id: RunId(Uuid::from_u128(run_id)),
                     workflow_type: WorkflowType(wf_type),
                     task_queue: TaskQueueName(tq),
@@ -102,7 +102,13 @@ mod tests {
                     execution_time: None,
                     close_time: None,
                     history_length: 1,
+                    execution_duration: None,
                     state_transition_count: 1,
+                    history_size_bytes: 0,
+                    parent_workflow_id: None,
+                    parent_run_id: None,
+                    root_workflow_id: WorkflowId(wf_id),
+                    root_run_id: RunId(Uuid::from_u128(run_id)),
                     memo: Memo::default(),
                     search_attr_version: 0,
                 }

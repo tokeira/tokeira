@@ -280,7 +280,13 @@ mod tests {
                 execution_time: None,
                 close_time: None,
                 history_length: 1,
+                execution_duration: None,
                 state_transition_count: 1,
+                history_size_bytes: 0,
+                parent_workflow_id: None,
+                parent_run_id: None,
+                root_workflow_id: Some(WorkflowId("wf".to_string())),
+                root_run_id: Some(RunId(Uuid::from_u128(2))),
             },
             ops: vec![ProjectionOp::UpsertExecution {
                 status: ExecutionStatus::Running,
@@ -379,7 +385,17 @@ mod tests {
                     execution_time: record.context.execution_time,
                     close_time: record.context.close_time,
                     history_length: record.context.history_length,
+                    execution_duration: record.context.execution_duration,
                     state_transition_count: record.context.state_transition_count,
+                    history_size_bytes: record.context.history_size_bytes,
+                    parent_workflow_id: record.context.parent_workflow_id.clone(),
+                    parent_run_id: record.context.parent_run_id,
+                    root_workflow_id: record
+                        .context
+                        .root_workflow_id
+                        .clone()
+                        .unwrap_or_else(|| record.context.workflow_id.clone()),
+                    root_run_id: record.context.root_run_id.unwrap_or(record.context.run_id),
                     memo: Memo::default(),
                     search_attr_version: 0,
                 })

@@ -141,9 +141,16 @@ async fn parse_group_by<S: VisibilityStore>(
         "WorkflowId" => Some(SystemField::WorkflowId),
         "RunId" => Some(SystemField::RunId),
         "StartTime" => Some(SystemField::StartTime),
+        "ExecutionTime" => Some(SystemField::ExecutionTime),
         "CloseTime" => Some(SystemField::CloseTime),
         "HistoryLength" => Some(SystemField::HistoryLength),
+        "ExecutionDuration" => Some(SystemField::ExecutionDuration),
         "StateTransitionCount" => Some(SystemField::StateTransitionCount),
+        "HistorySizeBytes" => Some(SystemField::HistorySizeBytes),
+        "ParentWorkflowId" => Some(SystemField::ParentWorkflowId),
+        "ParentRunId" => Some(SystemField::ParentRunId),
+        "RootWorkflowId" => Some(SystemField::RootWorkflowId),
+        "RootRunId" => Some(SystemField::RootRunId),
         _ => None,
     };
     if let Some(field) = system {
@@ -225,7 +232,13 @@ mod tests {
                 execution_time: None,
                 close_time,
                 history_length: 10,
+                execution_duration: None,
                 state_transition_count: 20,
+                history_size_bytes: 0,
+                parent_workflow_id: None,
+                parent_run_id: None,
+                root_workflow_id: Some(WorkflowId(workflow_id.to_string())),
+                root_run_id: Some(RunId(Uuid::from_u128(run_key.0.as_u128() + 100))),
             },
             ops: vec![ProjectionOp::UpsertExecution {
                 status: if close_time.is_some() {
@@ -311,7 +324,7 @@ mod tests {
                     crate::types::ExecutionRow {
                         run_key: RunKey(Uuid::from_u128(rk)),
                         namespace_id: NamespaceId(Uuid::from_u128(ns)),
-                        workflow_id: WorkflowId(wf_id),
+                        workflow_id: WorkflowId(wf_id.clone()),
                         run_id: RunId(Uuid::from_u128(run_id)),
                         workflow_type: WorkflowType(wf_type),
                         task_queue: TaskQueueName(tq),
@@ -321,7 +334,13 @@ mod tests {
                         close_time: close
                             .map(|c| time::OffsetDateTime::from_unix_timestamp(c).unwrap()),
                         history_length: hl,
+                        execution_duration: close.map(|c| (c - start) * 1_000_000_000),
                         state_transition_count: stc,
+                        history_size_bytes: 0,
+                        parent_workflow_id: None,
+                        parent_run_id: None,
+                        root_workflow_id: WorkflowId(wf_id),
+                        root_run_id: RunId(Uuid::from_u128(run_id)),
                         memo: Memo::default(),
                         search_attr_version: 0,
                     }

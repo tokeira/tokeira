@@ -269,9 +269,16 @@ async fn resolve_field<S: VisibilityStore + ?Sized>(
         "TaskQueue" => Some(SystemField::TaskQueue),
         "ExecutionStatus" => Some(SystemField::ExecutionStatus),
         "StartTime" => Some(SystemField::StartTime),
+        "ExecutionTime" => Some(SystemField::ExecutionTime),
         "CloseTime" => Some(SystemField::CloseTime),
         "HistoryLength" => Some(SystemField::HistoryLength),
+        "ExecutionDuration" => Some(SystemField::ExecutionDuration),
         "StateTransitionCount" => Some(SystemField::StateTransitionCount),
+        "HistorySizeBytes" => Some(SystemField::HistorySizeBytes),
+        "ParentWorkflowId" => Some(SystemField::ParentWorkflowId),
+        "ParentRunId" => Some(SystemField::ParentRunId),
+        "RootWorkflowId" => Some(SystemField::RootWorkflowId),
+        "RootRunId" => Some(SystemField::RootRunId),
         _ => None,
     };
     if let Some(system) = system {
@@ -368,17 +375,25 @@ fn ensure_value_type(field: &FieldRef, value: &FilterValue) -> Result<()> {
         FieldRef::System(SystemField::WorkflowId)
         | FieldRef::System(SystemField::RunId)
         | FieldRef::System(SystemField::WorkflowType)
-        | FieldRef::System(SystemField::TaskQueue) => {
+        | FieldRef::System(SystemField::TaskQueue)
+        | FieldRef::System(SystemField::ParentWorkflowId)
+        | FieldRef::System(SystemField::ParentRunId)
+        | FieldRef::System(SystemField::RootWorkflowId)
+        | FieldRef::System(SystemField::RootRunId) => {
             matches!(value, FilterValue::String(_))
         }
         FieldRef::System(SystemField::ExecutionStatus) => {
             matches!(value, FilterValue::Status(_))
         }
-        FieldRef::System(SystemField::StartTime) | FieldRef::System(SystemField::CloseTime) => {
+        FieldRef::System(SystemField::StartTime)
+        | FieldRef::System(SystemField::ExecutionTime)
+        | FieldRef::System(SystemField::CloseTime) => {
             matches!(value, FilterValue::Datetime(_))
         }
         FieldRef::System(SystemField::HistoryLength)
-        | FieldRef::System(SystemField::StateTransitionCount) => {
+        | FieldRef::System(SystemField::ExecutionDuration)
+        | FieldRef::System(SystemField::StateTransitionCount)
+        | FieldRef::System(SystemField::HistorySizeBytes) => {
             matches!(value, FilterValue::Int(_))
         }
         FieldRef::Custom { attr_type, .. } => match attr_type {
@@ -405,6 +420,10 @@ fn ensure_starts_with_field(field: &FieldRef) -> Result<()> {
         | FieldRef::System(SystemField::RunId)
         | FieldRef::System(SystemField::WorkflowType)
         | FieldRef::System(SystemField::TaskQueue)
+        | FieldRef::System(SystemField::ParentWorkflowId)
+        | FieldRef::System(SystemField::ParentRunId)
+        | FieldRef::System(SystemField::RootWorkflowId)
+        | FieldRef::System(SystemField::RootRunId)
         | FieldRef::Custom {
             attr_type: SearchAttrType::Keyword | SearchAttrType::KeywordList | SearchAttrType::Text,
             ..

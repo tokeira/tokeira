@@ -207,7 +207,13 @@ impl VisibilityStore for DsqlVisibilityStore {
                 execution_time,
                 close_time,
                 history_length,
+                execution_duration,
                 state_transition_count,
+                history_size_bytes,
+                parent_workflow_id,
+                parent_run_id,
+                root_workflow_id,
+                root_run_id,
                 memo
             FROM vis_execution
             WHERE namespace_id = $1
@@ -492,7 +498,17 @@ impl ProjectionSink for DsqlVisibilityStore {
             execution_time: record.context.execution_time,
             close_time: record.context.close_time,
             history_length: record.context.history_length,
+            execution_duration: record.context.execution_duration,
             state_transition_count: record.context.state_transition_count,
+            history_size_bytes: record.context.history_size_bytes,
+            parent_workflow_id: record.context.parent_workflow_id.clone(),
+            parent_run_id: record.context.parent_run_id,
+            root_workflow_id: record
+                .context
+                .root_workflow_id
+                .clone()
+                .unwrap_or_else(|| record.context.workflow_id.clone()),
+            root_run_id: record.context.root_run_id.unwrap_or(record.context.run_id),
             memo: Memo::default(),
             search_attr_version: 0,
         });
@@ -506,7 +522,17 @@ impl ProjectionSink for DsqlVisibilityStore {
         row.start_time = record.context.start_time;
         row.execution_time = record.context.execution_time;
         row.history_length = record.context.history_length;
+        row.execution_duration = record.context.execution_duration;
         row.state_transition_count = record.context.state_transition_count;
+        row.history_size_bytes = record.context.history_size_bytes;
+        row.parent_workflow_id = record.context.parent_workflow_id.clone();
+        row.parent_run_id = record.context.parent_run_id;
+        row.root_workflow_id = record
+            .context
+            .root_workflow_id
+            .clone()
+            .unwrap_or_else(|| record.context.workflow_id.clone());
+        row.root_run_id = record.context.root_run_id.unwrap_or(record.context.run_id);
 
         for op in &record.ops {
             match op {
@@ -669,16 +695,28 @@ async fn upsert_execution_row(
             execution_time,
             close_time,
             history_length,
+            execution_duration,
             state_transition_count,
+            history_size_bytes,
+            parent_workflow_id,
+            parent_run_id,
+            root_workflow_id,
+            root_run_id,
             memo
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
         ON CONFLICT (run_key) DO UPDATE
         SET execution_status = EXCLUDED.execution_status,
             execution_time = EXCLUDED.execution_time,
             close_time = EXCLUDED.close_time,
             history_length = EXCLUDED.history_length,
+            execution_duration = EXCLUDED.execution_duration,
             state_transition_count = EXCLUDED.state_transition_count,
+            history_size_bytes = EXCLUDED.history_size_bytes,
+            parent_workflow_id = EXCLUDED.parent_workflow_id,
+            parent_run_id = EXCLUDED.parent_run_id,
+            root_workflow_id = EXCLUDED.root_workflow_id,
+            root_run_id = EXCLUDED.root_run_id,
             memo = COALESCE(EXCLUDED.memo, vis_execution.memo)
         "#,
     )
@@ -693,7 +731,13 @@ async fn upsert_execution_row(
     .bind(row.execution_time)
     .bind(row.close_time)
     .bind(row.history_length)
+    .bind(row.execution_duration)
     .bind(row.state_transition_count)
+    .bind(row.history_size_bytes)
+    .bind(row.parent_workflow_id.as_ref().map(|value| value.0.as_str()))
+    .bind(row.parent_run_id.map(|value| value.0))
+    .bind(&row.root_workflow_id.0)
+    .bind(row.root_run_id.0)
     .bind(memo)
     .execute(connection)
     .await?;
@@ -1466,9 +1510,16 @@ fn system_column(field: SystemField) -> &'static str {
         SystemField::TaskQueue => "task_queue",
         SystemField::ExecutionStatus => "execution_status",
         SystemField::StartTime => "start_time",
+        SystemField::ExecutionTime => "execution_time",
         SystemField::CloseTime => "close_time",
         SystemField::HistoryLength => "history_length",
+        SystemField::ExecutionDuration => "execution_duration",
         SystemField::StateTransitionCount => "state_transition_count",
+        SystemField::HistorySizeBytes => "history_size_bytes",
+        SystemField::ParentWorkflowId => "parent_workflow_id",
+        SystemField::ParentRunId => "parent_run_id::TEXT",
+        SystemField::RootWorkflowId => "root_workflow_id",
+        SystemField::RootRunId => "root_run_id::TEXT",
     }
 }
 
@@ -1682,11 +1733,14 @@ fn system_group_value(field: SystemField, row: &PgRow) -> Result<String> {
             let value: i16 = row.try_get("group_value")?;
             format!("{:?}", ExecutionStatus::try_from(value)?)
         }
-        SystemField::StartTime | SystemField::CloseTime => row
+        SystemField::StartTime | SystemField::ExecutionTime | SystemField::CloseTime => row
             .try_get::<Option<time::OffsetDateTime>, _>("group_value")?
             .map(|value| value.to_string())
             .unwrap_or_default(),
-        SystemField::HistoryLength | SystemField::StateTransitionCount => row
+        SystemField::HistoryLength
+        | SystemField::ExecutionDuration
+        | SystemField::StateTransitionCount
+        | SystemField::HistorySizeBytes => row
             .try_get::<Option<i64>, _>("group_value")?
             .map(|value| value.to_string())
             .unwrap_or_default(),
@@ -1758,7 +1812,13 @@ async fn get_execution_row(
             execution_time,
             close_time,
             history_length,
+            execution_duration,
             state_transition_count,
+            history_size_bytes,
+            parent_workflow_id,
+            parent_run_id,
+            root_workflow_id,
+            root_run_id,
             memo
         FROM vis_execution
         WHERE run_key = $1
@@ -1786,7 +1846,17 @@ fn row_to_execution(row: sqlx::postgres::PgRow) -> Result<ExecutionRow> {
         execution_time: row.try_get("execution_time")?,
         close_time: row.try_get("close_time")?,
         history_length: row.try_get("history_length")?,
+        execution_duration: row.try_get("execution_duration")?,
         state_transition_count: row.try_get("state_transition_count")?,
+        history_size_bytes: row.try_get("history_size_bytes")?,
+        parent_workflow_id: row
+            .try_get::<Option<String>, _>("parent_workflow_id")?
+            .map(tokeira_types::WorkflowId),
+        parent_run_id: row
+            .try_get::<Option<Uuid>, _>("parent_run_id")?
+            .map(tokeira_types::RunId),
+        root_workflow_id: tokeira_types::WorkflowId(row.try_get("root_workflow_id")?),
+        root_run_id: tokeira_types::RunId(row.try_get::<Uuid, _>("root_run_id")?),
         memo,
         search_attr_version: 0,
     })
@@ -1845,7 +1915,16 @@ fn resolve_final_vis_state(
         execution_time: context.execution_time,
         close_time: context.close_time,
         history_length: context.history_length,
+        execution_duration: context.execution_duration,
         state_transition_count: context.state_transition_count,
+        history_size_bytes: context.history_size_bytes,
+        parent_workflow_id: context.parent_workflow_id.clone(),
+        parent_run_id: context.parent_run_id,
+        root_workflow_id: context
+            .root_workflow_id
+            .clone()
+            .unwrap_or_else(|| context.workflow_id.clone()),
+        root_run_id: context.root_run_id.unwrap_or(context.run_id),
         memo: Memo::default(),
         search_attr_version: 0,
     };
@@ -2151,7 +2230,13 @@ mod tests {
             execution_time: None,
             close_time: None,
             history_length: 1,
+            execution_duration: None,
             state_transition_count: 1,
+            history_size_bytes: 0,
+            parent_workflow_id: None,
+            parent_run_id: None,
+            root_workflow_id: Some(WorkflowId("workflow".to_owned())),
+            root_run_id: Some(RunId(uuid_from_u128(2))),
         }
     }
 

@@ -168,7 +168,17 @@ where
                 execution_time: record.context.execution_time,
                 close_time: record.context.close_time,
                 history_length: record.context.history_length,
+                execution_duration: record.context.execution_duration,
                 state_transition_count: record.context.state_transition_count,
+                history_size_bytes: record.context.history_size_bytes,
+                parent_workflow_id: record.context.parent_workflow_id.clone(),
+                parent_run_id: record.context.parent_run_id,
+                root_workflow_id: record
+                    .context
+                    .root_workflow_id
+                    .clone()
+                    .unwrap_or_else(|| record.context.workflow_id.clone()),
+                root_run_id: record.context.root_run_id.unwrap_or(record.context.run_id),
                 memo: Memo::default(),
                 search_attr_version: 0,
             });
@@ -183,7 +193,17 @@ where
         row.start_time = record.context.start_time;
         row.execution_time = record.context.execution_time;
         row.history_length = record.context.history_length;
+        row.execution_duration = record.context.execution_duration;
         row.state_transition_count = record.context.state_transition_count;
+        row.history_size_bytes = record.context.history_size_bytes;
+        row.parent_workflow_id = record.context.parent_workflow_id.clone();
+        row.parent_run_id = record.context.parent_run_id;
+        row.root_workflow_id = record
+            .context
+            .root_workflow_id
+            .clone()
+            .unwrap_or_else(|| record.context.workflow_id.clone());
+        row.root_run_id = record.context.root_run_id.unwrap_or(record.context.run_id);
 
         for op in &record.ops {
             match op {
@@ -283,7 +303,13 @@ mod tests {
             execution_time: Some(OffsetDateTime::from_unix_timestamp(11).unwrap()),
             close_time: None,
             history_length: 3,
+            execution_duration: None,
             state_transition_count: 4,
+            history_size_bytes: 0,
+            parent_workflow_id: None,
+            parent_run_id: None,
+            root_workflow_id: Some(WorkflowId("wf-1".to_string())),
+            root_run_id: Some(RunId(Uuid::from_u128(2))),
         }
     }
 
@@ -342,7 +368,7 @@ mod tests {
             .prop_map(
                 move |(status, wf_id, run_id, wf_type, tq, start, hl, stc)| ProjectionContext {
                     namespace_id: ns,
-                    workflow_id: WorkflowId(wf_id),
+                    workflow_id: WorkflowId(wf_id.clone()),
                     run_id: RunId(Uuid::from_u128(run_id)),
                     workflow_type: WorkflowType(wf_type),
                     task_queue: TaskQueueName(tq),
@@ -351,7 +377,13 @@ mod tests {
                     execution_time: None,
                     close_time: None,
                     history_length: hl,
+                    execution_duration: None,
                     state_transition_count: stc,
+                    history_size_bytes: 0,
+                    parent_workflow_id: None,
+                    parent_run_id: None,
+                    root_workflow_id: Some(WorkflowId(wf_id)),
+                    root_run_id: Some(RunId(Uuid::from_u128(run_id))),
                 },
             )
     }

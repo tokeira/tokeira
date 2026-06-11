@@ -264,7 +264,13 @@ mod tests {
             execution_time in proptest::option::of(arb_timestamp()),
             close_time in proptest::option::of(arb_timestamp()),
             history_length in 0i64..10_000,
+            execution_duration in proptest::option::of(0i64..10_000),
             state_transition_count in 0i64..10_000,
+            history_size_bytes in 0i64..10_000,
+            parent_workflow in proptest::option::of("[a-z][a-z0-9-]{0,24}"),
+            parent_run in proptest::option::of(any::<u128>()),
+            root_workflow in proptest::option::of("[a-z][a-z0-9-]{0,24}"),
+            root_run in proptest::option::of(any::<u128>()),
         ) -> ProjectionContext {
             ProjectionContext {
                 namespace_id: NamespaceId(Uuid::from_u128(namespace)),
@@ -277,7 +283,13 @@ mod tests {
                 execution_time,
                 close_time,
                 history_length,
+                execution_duration,
                 state_transition_count,
+                history_size_bytes,
+                parent_workflow_id: parent_workflow.map(WorkflowId),
+                parent_run_id: parent_run.map(|run_id| RunId(Uuid::from_u128(run_id))),
+                root_workflow_id: root_workflow.map(WorkflowId),
+                root_run_id: root_run.map(|run_id| RunId(Uuid::from_u128(run_id))),
             }
         }
     }

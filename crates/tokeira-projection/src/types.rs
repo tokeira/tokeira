@@ -87,7 +87,13 @@ pub struct ExecutionRow {
     pub execution_time: Option<OffsetDateTime>,
     pub close_time: Option<OffsetDateTime>,
     pub history_length: i64,
+    pub execution_duration: Option<i64>,
     pub state_transition_count: i64,
+    pub history_size_bytes: i64,
+    pub parent_workflow_id: Option<WorkflowId>,
+    pub parent_run_id: Option<RunId>,
+    pub root_workflow_id: WorkflowId,
+    pub root_run_id: RunId,
     pub memo: Memo,
     pub search_attr_version: u64,
 }
@@ -134,9 +140,16 @@ pub enum SystemField {
     TaskQueue,
     ExecutionStatus,
     StartTime,
+    ExecutionTime,
     CloseTime,
     HistoryLength,
+    ExecutionDuration,
     StateTransitionCount,
+    HistorySizeBytes,
+    ParentWorkflowId,
+    ParentRunId,
+    RootWorkflowId,
+    RootRunId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

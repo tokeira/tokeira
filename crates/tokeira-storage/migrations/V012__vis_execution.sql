@@ -10,7 +10,13 @@ CREATE TABLE IF NOT EXISTS vis_execution (
     execution_time         TIMESTAMPTZ,
     close_time             TIMESTAMPTZ,
     history_length         BIGINT      NOT NULL DEFAULT 0,
+    execution_duration     BIGINT,
     state_transition_count BIGINT      NOT NULL DEFAULT 0,
+    history_size_bytes     BIGINT      NOT NULL DEFAULT 0,
+    parent_workflow_id     TEXT,
+    parent_run_id          UUID,
+    root_workflow_id       TEXT        NOT NULL,
+    root_run_id            UUID        NOT NULL,
     memo                   BYTEA,
     PRIMARY KEY (run_key)
 );

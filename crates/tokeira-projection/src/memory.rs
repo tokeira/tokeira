@@ -692,10 +692,32 @@ fn field_value(
         }
         FieldRef::System(SystemField::ExecutionStatus) => Some(FilterValue::Status(row.status)),
         FieldRef::System(SystemField::StartTime) => Some(FilterValue::Datetime(row.start_time)),
+        FieldRef::System(SystemField::ExecutionTime) => {
+            row.execution_time.map(FilterValue::Datetime)
+        }
         FieldRef::System(SystemField::CloseTime) => row.close_time.map(FilterValue::Datetime),
         FieldRef::System(SystemField::HistoryLength) => Some(FilterValue::Int(row.history_length)),
+        FieldRef::System(SystemField::ExecutionDuration) => {
+            row.execution_duration.map(FilterValue::Int)
+        }
         FieldRef::System(SystemField::StateTransitionCount) => {
             Some(FilterValue::Int(row.state_transition_count))
+        }
+        FieldRef::System(SystemField::HistorySizeBytes) => {
+            Some(FilterValue::Int(row.history_size_bytes))
+        }
+        FieldRef::System(SystemField::ParentWorkflowId) => row
+            .parent_workflow_id
+            .as_ref()
+            .map(|value| FilterValue::String(value.0.clone())),
+        FieldRef::System(SystemField::ParentRunId) => row
+            .parent_run_id
+            .map(|value| FilterValue::String(value.0.to_string())),
+        FieldRef::System(SystemField::RootWorkflowId) => {
+            Some(FilterValue::String(row.root_workflow_id.0.clone()))
+        }
+        FieldRef::System(SystemField::RootRunId) => {
+            Some(FilterValue::String(row.root_run_id.0.to_string()))
         }
         FieldRef::Custom { attr_id, .. } => inner
             .sa_current
@@ -767,11 +789,28 @@ fn group_value(
         GroupByField::System(SystemField::WorkflowId) => Some(row.workflow_id.0.clone()),
         GroupByField::System(SystemField::RunId) => Some(row.run_id.0.to_string()),
         GroupByField::System(SystemField::StartTime) => Some(row.start_time.to_string()),
+        GroupByField::System(SystemField::ExecutionTime) => {
+            row.execution_time.map(|v| v.to_string())
+        }
         GroupByField::System(SystemField::CloseTime) => row.close_time.map(|v| v.to_string()),
         GroupByField::System(SystemField::HistoryLength) => Some(row.history_length.to_string()),
+        GroupByField::System(SystemField::ExecutionDuration) => {
+            row.execution_duration.map(|v| v.to_string())
+        }
         GroupByField::System(SystemField::StateTransitionCount) => {
             Some(row.state_transition_count.to_string())
         }
+        GroupByField::System(SystemField::HistorySizeBytes) => {
+            Some(row.history_size_bytes.to_string())
+        }
+        GroupByField::System(SystemField::ParentWorkflowId) => {
+            row.parent_workflow_id.as_ref().map(|v| v.0.clone())
+        }
+        GroupByField::System(SystemField::ParentRunId) => {
+            row.parent_run_id.map(|v| v.0.to_string())
+        }
+        GroupByField::System(SystemField::RootWorkflowId) => Some(row.root_workflow_id.0.clone()),
+        GroupByField::System(SystemField::RootRunId) => Some(row.root_run_id.0.to_string()),
         GroupByField::Custom { attr_id, .. } => {
             inner
                 .sa_current
@@ -845,7 +884,7 @@ mod tests {
                     ExecutionRow {
                         run_key: RunKey(Uuid::from_u128(rk)),
                         namespace_id: ns,
-                        workflow_id: WorkflowId(wf_id),
+                        workflow_id: WorkflowId(wf_id.clone()),
                         run_id: RunId(Uuid::from_u128(run_id)),
                         workflow_type: WorkflowType(wf_type),
                         task_queue: TaskQueueName(tq),
@@ -854,7 +893,13 @@ mod tests {
                         execution_time: None,
                         close_time: close.map(|c| OffsetDateTime::from_unix_timestamp(c).unwrap()),
                         history_length: hl,
+                        execution_duration: close.map(|c| (c - start) * 1_000_000_000),
                         state_transition_count: stc,
+                        history_size_bytes: 0,
+                        parent_workflow_id: None,
+                        parent_run_id: None,
+                        root_workflow_id: WorkflowId(wf_id.clone()),
+                        root_run_id: RunId(Uuid::from_u128(run_id)),
                         memo: Memo::default(),
                         search_attr_version: 0,
                     }
@@ -875,7 +920,13 @@ mod tests {
             execution_time: None,
             close_time: None,
             history_length: 1,
+            execution_duration: None,
             state_transition_count: 1,
+            history_size_bytes: 0,
+            parent_workflow_id: None,
+            parent_run_id: None,
+            root_workflow_id: WorkflowId(format!("wf-{run_key}")),
+            root_run_id: RunId(Uuid::from_u128(run_key + 100)),
             memo: Memo::default(),
             search_attr_version: 0,
         }

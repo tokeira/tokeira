@@ -1666,10 +1666,19 @@ mod tests {
             task_queue: state.task_queue.clone(),
             execution_status: state.status,
             start_time: state.started_at,
-            execution_time: None,
+            execution_time: Some(state.started_at),
             close_time: state.closed_at,
             history_length: state.last_event_id,
+            execution_duration: None,
             state_transition_count: state.transition_seq.0 as i64,
+            history_size_bytes: 0,
+            parent_workflow_id: state.parent_workflow_id.clone(),
+            parent_run_id: state.parent_run_id,
+            root_workflow_id: state
+                .root_workflow_id
+                .clone()
+                .or_else(|| Some(state.workflow_id.clone())),
+            root_run_id: state.root_run_id.or(Some(state.run_id)),
         }
     }
 

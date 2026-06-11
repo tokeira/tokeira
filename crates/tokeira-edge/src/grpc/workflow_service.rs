@@ -12,6 +12,7 @@ use tonic::{Request, Response, Status};
 use tracing::debug;
 
 use time::OffsetDateTime;
+use tokeira_projection::{STANDARD_SEARCH_ATTRIBUTES, SearchAttrType};
 use tokeira_proto::{
     enums::IndexedValueType,
     workflowservice::{
@@ -38,27 +39,32 @@ const DEPRECATED_DEPLOYMENTS_UNIMPLEMENTED: &str =
     "Deployments are deprecated and no longer supported, use Worker Deployments instead";
 
 fn standard_search_attributes() -> BTreeMap<String, i32> {
-    // Temporal exposes system visibility attributes through
-    // `GetSearchAttributes` even though clients do not register them
-    // (`service/frontend/workflow_handler.go:2874 @ v1.31.0`).
-    // These names match the projection system fields plus the external payload
-    // counter surfaced by the v1.31.0 visibility tests.
-    [
-        ("WorkflowId", IndexedValueType::Keyword),
-        ("RunId", IndexedValueType::Keyword),
-        ("WorkflowType", IndexedValueType::Keyword),
-        ("TaskQueue", IndexedValueType::Keyword),
-        ("ExecutionStatus", IndexedValueType::Keyword),
-        ("StartTime", IndexedValueType::Datetime),
-        ("CloseTime", IndexedValueType::Datetime),
-        ("ExecutionTime", IndexedValueType::Datetime),
-        ("HistoryLength", IndexedValueType::Int),
-        ("StateTransitionCount", IndexedValueType::Int),
-        ("TemporalExternalPayloadCount", IndexedValueType::Int),
-    ]
-    .into_iter()
-    .map(|(name, attr_type)| (name.to_string(), attr_type as i32))
-    .collect()
+    // Temporal returns `NameTypeMap.All()` from WorkflowService
+    // `GetSearchAttributes`, which includes `sadefs.System()` and
+    // `sadefs.Predefined()` before custom attributes
+    // (`service/frontend/workflow_handler.go:2874` and
+    // `common/searchattribute/name_type_map.go @ v1.31.0`).
+    STANDARD_SEARCH_ATTRIBUTES
+        .iter()
+        .map(|attr| {
+            (
+                attr.name.to_owned(),
+                indexed_value_type_from_projection(attr.attr_type) as i32,
+            )
+        })
+        .collect()
+}
+
+fn indexed_value_type_from_projection(value: SearchAttrType) -> IndexedValueType {
+    match value {
+        SearchAttrType::Keyword => IndexedValueType::Keyword,
+        SearchAttrType::KeywordList => IndexedValueType::KeywordList,
+        SearchAttrType::Int => IndexedValueType::Int,
+        SearchAttrType::Bool => IndexedValueType::Bool,
+        SearchAttrType::Double => IndexedValueType::Double,
+        SearchAttrType::Datetime => IndexedValueType::Datetime,
+        SearchAttrType::Text => IndexedValueType::Text,
+    }
 }
 
 fn indexed_value_type_from_edge(value: &str) -> Result<IndexedValueType, Status> {
@@ -2671,8 +2677,27 @@ mod tests {
             Some(IndexedValueType::Keyword as i32)
         );
         assert_eq!(
+            response.keys.get("ParentWorkflowId").copied(),
+            Some(IndexedValueType::Keyword as i32)
+        );
+        assert_eq!(
+            response.keys.get("RootRunId").copied(),
+            Some(IndexedValueType::Keyword as i32)
+        );
+        assert_eq!(
+            response.keys.get("ExecutionDuration").copied(),
+            Some(IndexedValueType::Int as i32)
+        );
+        assert_eq!(
             response.keys.get("TemporalExternalPayloadCount").copied(),
             Some(IndexedValueType::Int as i32)
+        );
+        assert_eq!(
+            response
+                .keys
+                .get("TemporalUsedWorkerDeploymentVersions")
+                .copied(),
+            Some(IndexedValueType::KeywordList as i32)
         );
     }
 

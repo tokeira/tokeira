@@ -51,13 +51,14 @@ use tokeira_edge::{
         operator_service::OperatorServiceGrpc, runtime_adapter::RuntimeAdapter,
         workflow_service::WorkflowServiceGrpc,
     },
+    operator_service::{ClusterInfo, OperatorApi, SearchAttributeDefinition},
     run_routing_subscription,
     translate::to_internal::namespace_id_for,
     workflow_service::ExecutionResolver,
 };
 use tokeira_kernel::LoadedRun;
 use tokeira_projection::{
-    DsqlVisibilityStore, InMemoryVisibilityStore, ProjectionSink, ProjectionWorker,
+    DsqlVisibilityStore, InMemoryVisibilityStore, ProjectionSink, ProjectionWorker, SearchAttrType,
     VisibilityQueryService, VisibilitySink, VisibilityStore,
 };
 use tokeira_runtime::{
@@ -88,6 +89,73 @@ pub enum BootstrapNexusEndpointTarget {
         namespace_name: String,
         task_queue: String,
     },
+}
+
+#[derive(Debug)]
+struct VisibilityRegistryOperatorApi<V> {
+    inner: InMemoryOperatorApi,
+    visibility_store: V,
+}
+
+impl<V> VisibilityRegistryOperatorApi<V> {
+    fn new(inner: InMemoryOperatorApi, visibility_store: V) -> Self {
+        Self {
+            inner,
+            visibility_store,
+        }
+    }
+}
+
+#[async_trait]
+impl<V> OperatorApi for VisibilityRegistryOperatorApi<V>
+where
+    V: VisibilityStore + Clone + 'static,
+{
+    async fn cluster_info(&self) -> Result<ClusterInfo> {
+        self.inner.cluster_info().await
+    }
+
+    async fn list_search_attributes(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<Vec<SearchAttributeDefinition>> {
+        self.inner.list_search_attributes(namespace).await
+    }
+
+    async fn upsert_search_attribute(
+        &self,
+        namespace: &str,
+        attr: SearchAttributeDefinition,
+    ) -> Result<()> {
+        let attr_type = visibility_search_attr_type(&attr.attr_type)?;
+        // OperatorService mutates the user-visible catalog, but projection is
+        // the authority that makes a field queryable. Register first so a
+        // successful AddSearchAttributes response cannot expose an attribute
+        // that the visibility compiler still rejects.
+        self.visibility_store
+            .register_attr(namespace_id_for(namespace), attr.name.clone(), attr_type)
+            .await?;
+        self.inner.upsert_search_attribute(namespace, attr).await
+    }
+
+    async fn remove_search_attribute(&self, namespace: &str, attr_name: &str) -> Result<()> {
+        self.inner
+            .remove_search_attribute(namespace, attr_name)
+            .await
+    }
+}
+
+fn visibility_search_attr_type(value: &str) -> Result<SearchAttrType> {
+    match value {
+        "keyword" => Ok(SearchAttrType::Keyword),
+        "keyword_list" => Ok(SearchAttrType::KeywordList),
+        "int" => Ok(SearchAttrType::Int),
+        "bool" => Ok(SearchAttrType::Bool),
+        "double" => Ok(SearchAttrType::Double),
+        "datetime" => Ok(SearchAttrType::Datetime),
+        "text" => Ok(SearchAttrType::Text),
+        other => Err(anyhow!("unsupported search attribute type `{other}`")),
+    }
 }
 
 /// Companion to [`BootstrapNexusEndpointTarget`] carrying per-endpoint config
@@ -518,7 +586,7 @@ where
     R: LeaseRepository + RunRepository + 'static,
     L: ProjectionLog + Clone + 'static,
     S: ProjectionSink + VisibilityStore + 'static,
-    V: VisibilityStore + 'static,
+    V: VisibilityStore + Clone + 'static,
     F: Fn(String) -> S + Clone + Send + Sync + 'static,
 {
     // Build the authoritative store first, then wrap it with the
@@ -666,9 +734,19 @@ where
         repo.clone(),
         default_namespace_id,
     ));
+    tokeira_projection::seed_predefined_search_attributes(
+        &visibility_query_store,
+        default_namespace_id,
+    )
+    .await
+    .context("failed to seed Temporal predefined search attributes")?;
+    let operator_visibility_store = visibility_query_store.clone();
     let visibility = Arc::new(VisibilityQueryService::new(visibility_query_store));
     let long_polls = LongPollGate::new(LongPollConfig::default());
-    let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
+    let operator_api = Arc::new(VisibilityRegistryOperatorApi::new(
+        InMemoryOperatorApi::new("tokeira-local"),
+        operator_visibility_store,
+    ));
 
     for partition_id in 0..effective_config.infrastructure.placement.partition_count {
         let projection_worker = ProjectionWorker {

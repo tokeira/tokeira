@@ -860,8 +860,31 @@ pub struct ProjectionContext {
     pub close_time: Option<OffsetDateTime>,
     /// Durable history length after the transition.
     pub history_length: i64,
+    /// Closed-run duration in nanoseconds, matching Temporal's integer
+    /// visibility representation of `ExecutionDuration`.
+    #[serde(default)]
+    pub execution_duration: Option<i64>,
     /// Number of state transitions after this transition.
     pub state_transition_count: i64,
+    /// Approximate serialized history size in bytes.
+    ///
+    /// Tokeira does not yet maintain Temporal's exact byte accounting, but the
+    /// field must exist so visibility queries over `HistorySizeBytes` compile
+    /// against the v1.31.0 system search-attribute surface.
+    #[serde(default)]
+    pub history_size_bytes: i64,
+    /// Parent workflow ID for child executions.
+    #[serde(default)]
+    pub parent_workflow_id: Option<WorkflowId>,
+    /// Parent run ID for child executions.
+    #[serde(default)]
+    pub parent_run_id: Option<RunId>,
+    /// Canonical root workflow ID for this execution.
+    #[serde(default)]
+    pub root_workflow_id: Option<WorkflowId>,
+    /// Canonical root run ID for this execution.
+    #[serde(default)]
+    pub root_run_id: Option<RunId>,
 }
 
 /// One row in the projection log, grouping all

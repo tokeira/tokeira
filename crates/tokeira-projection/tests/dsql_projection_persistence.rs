@@ -358,10 +358,11 @@ impl ProjectionFixture {
 }
 
 fn sample_context(run_key: RunKey) -> ProjectionContext {
+    let run_id = RunId(Uuid::new_v4());
     ProjectionContext {
         namespace_id: NamespaceId(Uuid::from_u128(1)),
         workflow_id: WorkflowId(format!("workflow-{}", run_key.0)),
-        run_id: RunId(Uuid::new_v4()),
+        run_id,
         workflow_type: WorkflowType("workflow-type".to_owned()),
         task_queue: TaskQueueName("queue".to_owned()),
         execution_status: ExecutionStatus::Running,
@@ -369,7 +370,13 @@ fn sample_context(run_key: RunKey) -> ProjectionContext {
         execution_time: None,
         close_time: None,
         history_length: 1,
+        execution_duration: None,
         state_transition_count: 1,
+        history_size_bytes: 0,
+        parent_workflow_id: None,
+        parent_run_id: None,
+        root_workflow_id: Some(WorkflowId(format!("workflow-{}", run_key.0))),
+        root_run_id: Some(run_id),
     }
 }
 

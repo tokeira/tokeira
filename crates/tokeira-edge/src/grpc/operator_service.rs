@@ -1,5 +1,6 @@
 use tonic::{Request, Response, Status};
 
+use tokeira_projection::{STANDARD_SEARCH_ATTRIBUTES, SearchAttrType};
 use tokeira_proto::{
     enums::IndexedValueType,
     operatorservice::{
@@ -79,7 +80,15 @@ impl OperatorServiceGrpcApi for OperatorServiceGrpc {
 
         Ok(Response::new(
             operatorservice::ListSearchAttributesResponse {
-                system_attributes: Default::default(),
+                system_attributes: STANDARD_SEARCH_ATTRIBUTES
+                    .iter()
+                    .map(|attr| {
+                        (
+                            attr.name.to_owned(),
+                            indexed_value_type_from_projection(attr.attr_type) as i32,
+                        )
+                    })
+                    .collect(),
                 custom_attributes: attrs
                     .into_iter()
                     .map(|attr| {
@@ -155,6 +164,18 @@ impl OperatorServiceGrpcApi for OperatorServiceGrpc {
         _request: Request<operatorservice::ListNexusEndpointsRequest>,
     ) -> Result<Response<operatorservice::ListNexusEndpointsResponse>, Status> {
         Err(Status::unimplemented("list_nexus_endpoints"))
+    }
+}
+
+fn indexed_value_type_from_projection(value: SearchAttrType) -> IndexedValueType {
+    match value {
+        SearchAttrType::Keyword => IndexedValueType::Keyword,
+        SearchAttrType::KeywordList => IndexedValueType::KeywordList,
+        SearchAttrType::Int => IndexedValueType::Int,
+        SearchAttrType::Bool => IndexedValueType::Bool,
+        SearchAttrType::Double => IndexedValueType::Double,
+        SearchAttrType::Datetime => IndexedValueType::Datetime,
+        SearchAttrType::Text => IndexedValueType::Text,
     }
 }
 
@@ -249,5 +270,35 @@ mod tests {
                 .iter()
                 .any(|attr| attr.name == "CustomInt" && attr.attr_type == "int")
         );
+    }
+
+    #[tokio::test]
+    async fn list_search_attributes_exposes_standard_system_catalog() {
+        let namespaces = Arc::new(InMemoryNamespaceCache::new());
+        namespaces
+            .insert(crate::namespace_cache::ResolvedNamespace::active("default"))
+            .await
+            .unwrap();
+        let api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
+        let service = OperatorService::new(api, Arc::new(EdgeInterceptors::permissive(namespaces)));
+        let grpc = OperatorServiceGrpc::new(service);
+
+        let response = grpc
+            .list_search_attributes(Request::new(operatorservice::ListSearchAttributesRequest {
+                namespace: "default".to_string(),
+            }))
+            .await
+            .expect("list search attributes")
+            .into_inner();
+
+        assert_eq!(
+            response.system_attributes.get("ExecutionDuration").copied(),
+            Some(IndexedValueType::Int as i32)
+        );
+        assert_eq!(
+            response.system_attributes.get("TemporalPauseInfo").copied(),
+            Some(IndexedValueType::KeywordList as i32)
+        );
+        assert!(response.custom_attributes.is_empty());
     }
 }

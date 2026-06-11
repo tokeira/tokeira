@@ -160,12 +160,18 @@ to host the demo, mapped to the conformance work already underway.
 
 ## 9. Open decisions
 
-1. **Name** — Conductor? something else?
+1. **Name** — Conductor? something else? ⚠️ "Conductor" is taken in this space (conductor.build, a
+   macOS multi-agent orchestrator — noted in `reference/cockpit.md` prior art); pick a different
+   spine name. The cockpit is named **Tokeira Kairo**.
 2. **Roles** — is the ChatGPT/Kiro/Codex division above right, or do you want a dedicated reviewer
    role / Kiro-as-coordinator vs Kiro-as-executor?
 3. **Sandbox provider for the skeleton** — Docker-local first (no cloud keys), then which remote
    (E2B / Daytona / Modal / Bedrock AgentCore)?
-4. **Cockpit form factor** — start as a TUI (like the demo) and graduate to web, or web from day one?
+4. **Cockpit form factor** — ✅ resolved (see `reference/cockpit.md`): the cockpit is **Tokeira Kairo**,
+   a **standalone GPUI app** (not a Zed fork, not ACP) integrated with a supervised `tokeirad`; TUI
+   for the walking skeleton first; git worktrees now with DeltaDB behind a workspace/memory seam
+   later; Figma Make as the design source; phased licensing (permissive Phase 1 → optional GPL-derived
+   Phase 2).
 5. **Project-memory schema** — minimal DSQL key/value keyed by spec, deferring retrieval?
 
 ## 10. References

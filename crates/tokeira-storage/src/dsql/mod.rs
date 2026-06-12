@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 pub mod aws_http;
+pub mod chasm_node;
 pub mod codec;
 pub mod config;
 pub mod connection;
@@ -29,6 +30,7 @@ pub mod validation;
 pub mod worker_deployment_repository;
 
 pub use aws_http::offline_ddb_client;
+pub use chasm_node::*;
 pub use config::*;
 pub use connection::*;
 pub use connection_factory::*;
@@ -187,6 +189,13 @@ impl DsqlStore {
     /// Access the DSQL-backed run repository.
     pub fn run_repository(&self) -> &run_repository::DsqlRunRepository {
         &self.run_repository
+    }
+
+    /// Construct a DSQL-backed CHASM node store over the shared connection
+    /// director. The repository is stateless (it only holds the director handle),
+    /// so it is built on demand rather than stored as a facade field.
+    pub fn chasm_node_repository(&self) -> chasm_node::DsqlChasmNodeRepository {
+        chasm_node::DsqlChasmNodeRepository::new(Arc::clone(&self.director))
     }
 
     /// Access the DSQL-backed projection log reader.

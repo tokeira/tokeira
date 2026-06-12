@@ -6167,6 +6167,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokeira-chasm"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "prost 0.12.6",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokeira-proto",
+ "tokeira-types",
+]
+
+[[package]]
+name = "tokeira-chasm-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "tokeira-compatibility"
 version = "0.1.0"
 dependencies = [

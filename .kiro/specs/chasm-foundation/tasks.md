@@ -27,44 +27,44 @@ verify against `../temporal @ v1.31.0` before finalizing.
 
 ### Layer 1 — Substrate (`tokeira-chasm` + `tokeira-chasm-derive`)
 
-- [ ] 1. Scaffold the substrate crates and wire them into the workspace
-  - [ ] 1.1 Scaffold the `tokeira-chasm` pure crate
+- [x] 1. Scaffold the substrate crates and wire them into the workspace
+  - [x] 1.1 Scaffold the `tokeira-chasm` pure crate
     - Add `crates/tokeira-chasm` as a workspace member; `Cargo.toml` depends only on `tokeira-types`
       and `tokeira-proto` (plus `serde`, `prost`, `thiserror`); no async/I/O/storage/metrics deps
     - Add the crate `//!` module doc placing it as a peer of `tokeira-kernel` (no kernel dependency)
     - Define the `ChasmError` taxonomy with `thiserror` (`IllegalTransition`, `StaleStamp`,
       `StaleReference`, `Validation`, plus engine-surfaced variants); no `unwrap`/`expect` in lib code
     - _Requirements: 1.1, 1.2, 1.5, 1.6, 6.8_
-  - [ ] 1.2 Scaffold the `tokeira-chasm-derive` proc-macro crate
+  - [x] 1.2 Scaffold the `tokeira-chasm-derive` proc-macro crate
     - Add `crates/tokeira-chasm-derive` as a workspace member; `Cargo.toml` sets `proc-macro = true`
       and depends only on `syn`, `quote`, `proc-macro2`
     - Stub the `#[derive(Component)]` entry point with module docs; emit no `unsafe`
     - _Requirements: 1.3, 1.6, 3.6_
 
-- [ ] 2. Implement the component model, lifecycle, and field types in `tokeira-chasm`
-  - [ ] 2.1 Implement `LifecycleState`, the `Component`/`RootComponent` traits, and the
+- [x] 2. Implement the component model, lifecycle, and field types in `tokeira-chasm`
+  - [x] 2.1 Implement `LifecycleState`, the `Component`/`RootComponent` traits, and the
     `Context`/`MutableContext` traits
     - `LifecycleState { Running, Completed, Failed }` with `is_closed()`; `Component` (assoc `Data`,
       `FQN`, `lifecycle_state`, `fields`); `RootComponent` (`terminate`, `context_metadata`)
     - Object-safe `Context` (read-only) and `MutableContext: Context` (adds `add_task` + field
       mutation), returning `Result<_, ChasmError>`
     - _Requirements: 2.1, 2.2, 2.9, 6.3_
-  - [ ] 2.2 Implement the field types and the field-registry contract
+  - [x] 2.2 Implement the field types and the field-registry contract
     - `Field<T>`, `Map<K, T>`, `ParentPtr<T>` (lazy value resolution against the tree); the
       `ParentPtr` ancestry walk skips map nodes
     - `FieldDescriptor`, `FieldKind { Data, Component, Map, Parent, Transient }`, `FieldRegistry<'a>`
       consumed by `Component::fields()`
     - _Requirements: 2.5, 2.6, 2.7, 2.8_
 
-- [ ] 3. Implement the `VersionedTransition` clock
-  - [ ] 3.1 Implement `VersionedTransition`, `Staleness`, `staleness_check`, and wire encode/decode
+- [x] 3. Implement the `VersionedTransition` clock
+  - [x] 3.1 Implement `VersionedTransition`, `Staleness`, `staleness_check`, and wire encode/decode
     - `{ namespace_failover_version: i64, transition_count: i64 }`; `staleness_check` yields exactly
       one of `Advanced`/`Same`/`Behind`, comparing failover first then `transition_count`
     - Lossless wire round-trip (ground-truth shape against `hsm.proto:114 @ v1.31.0`)
     - _Requirements: 5.4, 5.5, 5.6_
 
-- [ ] 4. Implement the path encoder
-  - [ ] 4.1 Implement `Path_Encoder` (tokeira-owned)
+- [x] 4. Implement the path encoder
+  - [x] 4.1 Implement `Path_Encoder` (tokeira-owned)
     - Encode node paths with `$` introducing a child field and `#` introducing a collection child;
       order separators below normal path-segment bytes so a prefix range is exactly a subtree
     - **Ground-truth**: verify the exact separator bytes and sort contract against
@@ -77,12 +77,12 @@ verify against `../temporal @ v1.31.0` before finalizing.
       ≥100 iterations; `// Feature: chasm-foundation, Property 8` tag
     - _Requirements: 12.3_
 
-- [ ] 5. Implement the node, node tree, and atomic transition close
-  - [ ] 5.1 Implement `Node`, `ExecutionKey`, the node tree, and node (de)serialization
+- [x] 5. Implement the node, node tree, and atomic transition close
+  - [x] 5.1 Implement `Node`, `ExecutionKey`, the node tree, and node (de)serialization
     - `ExecutionKey { namespace_id, business_id, run_id }`; `ChasmNode { metadata, data }`; tree keyed
       by encoded path; each `Field`/`Map` child is its own node; `metadata` always present
     - _Requirements: 4.1, 2.7_
-  - [ ] 5.2 Implement `close_transaction` (dirty tracking + VT stamping) in the pure crate
+  - [x] 5.2 Implement `close_transaction` (dirty tracking + VT stamping) in the pure crate
     - Track nodes mutated during a transition; on close, stamp every dirty node with a new VT and
       return the dirty-node set plus the transition result; field writes and task schedules are
       committed/rolled-back together (atomic unit returned to the engine)
@@ -100,14 +100,14 @@ verify against `../temporal @ v1.31.0` before finalizing.
       `vt_{i+1}.staleness_check(vt_i) == Advanced`; ≥100 iterations; Property 3 tag
     - _Requirements: 12.3_
 
-- [ ] 6. Implement the registry and library
-  - [ ] 6.1 Implement `Registry`, `Library`, and `RegistryBuilder`
+- [x] 6. Implement the registry and library
+  - [x] 6.1 Implement `Registry`, `Library`, and `RegistryBuilder`
     - Index components by FQN, by `u32` type id (fingerprint of FQN), and by Rust `TypeId`; reserve
       archetype id `0` for legacy Workflow; build once via builder, immutable thereafter
     - _Requirements: 8.1, 8.2, 8.3_
 
-- [ ] 7. Implement `ComponentRef`
-  - [ ] 7.1 Implement the `ComponentRef` wire type with encode/decode and staleness
+- [x] 7. Implement `ComponentRef`
+  - [x] 7.1 Implement the `ComponentRef` wire type with encode/decode and staleness
     - Carry `execution_key`, `archetype_id`, `execution_versioned_transition`, `component_path[]`,
       `component_initial_versioned_transition`; node identity = `(path, initial_vt)`; staleness via
       `execution_versioned_transition`; lossless wire round-trip (ground-truth `ref.go:16 @ v1.31.0`)
@@ -119,13 +119,13 @@ verify against `../temporal @ v1.31.0` before finalizing.
       stale; ≥100 iterations; Property 9 tag
     - _Requirements: 12.3_
 
-- [ ] 8. Implement the task model and outbox close semantics
-  - [ ] 8.1 Implement `Task`, `TaskValidator`, `TaskKind`, `TaskValidity`, and the node outbox
+- [x] 8. Implement the task model and outbox close semantics
+  - [x] 8.1 Implement `Task`, `TaskValidator`, `TaskKind`, `TaskValidity`, and the node outbox
     - `TaskKind { Pure, SideEffect }`; `Task` with `KIND` + `fire_at()`; `TaskValidator::validate`;
       persist tasks in the owning node's `pure_tasks[]` / `side_effect_tasks[]` with `(VT, offset)`
       identity
     - _Requirements: 7.1, 7.2_
-  - [ ] 8.2 Implement outbox re-validation on dirty close
+  - [x] 8.2 Implement outbox re-validation on dirty close
     - On every dirty close, re-validate every outbox task; drop `Drop` results without executing;
       retain `Valid` tasks with stable `(VT, offset)`; compute the single earliest surviving pure-task
       deadline tree-wide and the surviving side-effect tasks, returned from `close_transaction`
@@ -137,8 +137,8 @@ verify against `../temporal @ v1.31.0` before finalizing.
       ≥100 iterations; Property 5 tag
     - _Requirements: 12.3_
 
-- [ ] 9. Implement the `#[derive(Component)]` macro
-  - [ ] 9.1 Generate the static field registry and enforce the four compile-time rules
+- [x] 9. Implement the `#[derive(Component)]` macro
+  - [x] 9.1 Generate the static field registry and enforce the four compile-time rules
     - Classify each field as `Field`/`Map`/`ParentPtr`/transient from syntactic types; emit
       `Component::fields()`; enforce: (1) exactly one `#[chasm(data)]` proto field, (2) persistent
       fields are `Field`/`Map`/`ParentPtr` not bare pointers, (3) `Map<K,T>` value bound, (4)
@@ -149,7 +149,7 @@ verify against `../temporal @ v1.31.0` before finalizing.
       assert each fails with a clear `compile_error!`
     - _Requirements: 3.2, 3.3, 3.4, 3.5_
 
-- [ ] 10. Checkpoint — Layer 1 substrate
+- [x] 10. Checkpoint — Layer 1 substrate
   - Ensure `cargo +nightly fmt --all --check`, `cargo lint`, and `cargo test` pass for
     `tokeira-chasm` and `tokeira-chasm-derive`. Ensure all tests pass, ask the user if questions arise.
 

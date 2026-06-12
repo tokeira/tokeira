@@ -9,6 +9,8 @@ members = [
     "crates/tokeira-types",
     "crates/tokeira-proto",
     "crates/tokeira-kernel",
+    "crates/tokeira-chasm-derive",
+    "crates/tokeira-chasm",
     "crates/tokeira-state",
     "crates/tokeira-iac",
     "crates/tokeira-deploy-engine",

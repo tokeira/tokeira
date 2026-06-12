@@ -56,10 +56,10 @@ use tokeira_proto::{
 use tokeira_runtime::{
     AssignmentRule, ComputeConfigScalingGroupUpdate, CreateDeployment, CreateVersion,
     DeleteDeployment, DeleteVersion, DeploymentPage, DeploymentView, DescribeVersion,
-    ListDeployments, NewManagerIdentity, RedirectRule, SetCurrent, SetCurrentOutcome, SetManager,
-    SetManagerOutcome, SetRamping, SetRampingOutcome, TaskReachabilityType, UpdateComputeConfig,
-    UpdateMetadata, ValidateComputeConfig, VersionMetadataView, VersionView, VersioningMutation,
-    VersioningRules, cron_initial_backoff,
+    ListDeployments, NewManagerIdentity, RedirectRule, ScheduleError, SetCurrent,
+    SetCurrentOutcome, SetManager, SetManagerOutcome, SetRamping, SetRampingOutcome,
+    TaskReachabilityType, UpdateComputeConfig, UpdateMetadata, ValidateComputeConfig,
+    VersionMetadataView, VersionView, VersioningMutation, VersioningRules, cron_initial_backoff,
 };
 use tokeira_storage::{
     BuildId as DeploymentBuildId, ComputeConfig, ComputeConfigScalingGroup, ComputeProvider,
@@ -143,13 +143,22 @@ fn reject_behavioral_time_skipping(
     Ok(())
 }
 
-fn validate_client_cron_schedule(
-    cron_schedule: Option<&str>,
-    field: &'static str,
-) -> Result<(), ProtoConversionError> {
+fn validate_client_cron_schedule(cron_schedule: Option<&str>) -> Result<(), ProtoConversionError> {
     if let Some(cron_schedule) = cron_schedule {
-        cron_initial_backoff(cron_schedule, OffsetDateTime::now_utc())
-            .map_err(|_| ProtoConversionError::MissingField(field))?;
+        // Mirror `backoff.ValidateSchedule @ v1.31.0`: an unparseable or
+        // unsatisfiable cron is rejected with `InvalidArgument` and the verbatim
+        // message "invalid CronSchedule." (or "…, no time can be found to satisfy
+        // the schedule"). `cron_initial_backoff` already produces that exact text,
+        // so surface it rather than masking a valid-but-rejected cron as a missing
+        // field (`common/backoff/cron.go:14 @ v1.31.0`).
+        cron_initial_backoff(cron_schedule, OffsetDateTime::now_utc()).map_err(
+            |err| match err {
+                ScheduleError::InvalidArgument(message) => {
+                    ProtoConversionError::InvalidArgument(message)
+                }
+                other => ProtoConversionError::InvalidArgument(other.to_string()),
+            },
+        )?;
     }
     Ok(())
 }
@@ -524,10 +533,7 @@ pub fn start_request_to_edge(
     );
 
     let cron_schedule = non_empty(req.cron_schedule);
-    validate_client_cron_schedule(
-        cron_schedule.as_deref(),
-        "StartWorkflowExecutionRequest.cron_schedule",
-    )?;
+    validate_client_cron_schedule(cron_schedule.as_deref())?;
     validate_completion_callbacks(&req.completion_callbacks)?;
 
     Ok(StartWorkflowExecutionRequest {
@@ -3235,10 +3241,7 @@ pub fn signal_with_start_request_to_edge(
     );
 
     let cron_schedule = non_empty(req.cron_schedule);
-    validate_client_cron_schedule(
-        cron_schedule.as_deref(),
-        "SignalWithStartWorkflowExecutionRequest.cron_schedule",
-    )?;
+    validate_client_cron_schedule(cron_schedule.as_deref())?;
 
     Ok(EdgeSignalWithStartWorkflowExecutionRequest {
         namespace: req.namespace,
@@ -4855,6 +4858,43 @@ mod tests {
     use tokeira_kernel::state::WorkflowVersioningInfo;
     use tokeira_proto::public::temporal::api::{filter::v1 as filter, taskqueue::v1 as taskqueue};
     use tokeira_runtime::{RedirectRule, VersioningRules};
+
+    #[test]
+    fn validate_client_cron_schedule_matches_v131_messages() {
+        // Descriptors the cron suite relies on must be accepted (tests/cron_test.go
+        // uses "@every 5s"/"@every 3s"); "@midnight" is a robfig `ParseStandard`
+        // alias; a plain 5-field spec is the standard case.
+        for ok in ["@every 5s", "@midnight", "0 * * * *"] {
+            validate_client_cron_schedule(Some(ok))
+                .unwrap_or_else(|err| panic!("expected {ok:?} to be accepted, got {err:?}"));
+        }
+        // No cron requested is accepted.
+        validate_client_cron_schedule(None).unwrap();
+
+        // An unparseable cron is rejected with the verbatim v1.31.0 message and
+        // gRPC InvalidArgument — not the old "missing required field" masking
+        // (`backoff.ValidateSchedule @ v1.31.0`).
+        let err = validate_client_cron_schedule(Some("not-a-cron"))
+            .expect_err("invalid cron should be rejected");
+        let ProtoConversionError::InvalidArgument(ref message) = err else {
+            panic!("expected InvalidArgument, got {err:?}");
+        };
+        assert_eq!(message, "invalid CronSchedule.");
+        let status = proto_conversion_status(err);
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(status.message(), "invalid CronSchedule.");
+
+        // A parseable-but-unsatisfiable cron carries the longer v1.31.0 message.
+        let err = validate_client_cron_schedule(Some("0 0 31 2 *"))
+            .expect_err("unsatisfiable cron should be rejected");
+        let ProtoConversionError::InvalidArgument(message) = err else {
+            panic!("expected InvalidArgument, got {err:?}");
+        };
+        assert_eq!(
+            message,
+            "invalid CronSchedule, no time can be found to satisfy the schedule"
+        );
+    }
 
     #[test]
     fn validate_deployment_name_matches_v131_messages_and_order() {

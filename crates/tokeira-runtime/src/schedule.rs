@@ -578,7 +578,7 @@ fn compile_standard_cron(cron: &str) -> Result<StructuredCalendarSpec, ScheduleE
         .collect();
     let fields = match fields.as_slice() {
         ["@hourly"] => vec!["0", "0", "*", "*", "*", "*", "*"],
-        ["@daily"] => vec!["0", "0", "0", "*", "*", "*", "*"],
+        ["@daily"] | ["@midnight"] => vec!["0", "0", "0", "*", "*", "*", "*"],
         ["@weekly"] => vec!["0", "0", "0", "*", "*", "0", "*"],
         ["@monthly"] => vec!["0", "0", "0", "1", "*", "*", "*"],
         ["@yearly"] | ["@annually"] => vec!["0", "0", "0", "1", "1", "*", "*"],
@@ -1538,6 +1538,17 @@ mod tests {
             cron_initial_backoff("0 0 31 2 *", OffsetDateTime::UNIX_EPOCH),
             Err(ScheduleError::InvalidArgument(_))
         ));
+    }
+
+    #[test]
+    fn client_cron_initial_backoff_accepts_midnight_alias() {
+        // robfig's `ParseStandard` treats `@midnight` as an alias of `@daily`
+        // (`common/backoff/cron.go:14 @ v1.31.0` -> `cron.ParseStandard`), so the
+        // two must validate and resolve to the same first-WFT backoff.
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let midnight = cron_initial_backoff("@midnight", now).unwrap();
+        let daily = cron_initial_backoff("@daily", now).unwrap();
+        assert_eq!(midnight, daily);
     }
 
     #[test]

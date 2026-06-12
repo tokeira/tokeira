@@ -29,6 +29,16 @@ The ultimate acceptance is an **operator-run live demo** (boot, drive a turn, ki
 mid-turn, resume) — not a unit test. Requirements below distinguish automated verification from
 operator-run acceptance where the distinction matters.
 
+> **Status — live acceptance PASSED (2026-06-12).** Requirements 1–6 and the Requirement 4
+> durability proof were demonstrated end-to-end against `tokeirad` (in-memory store) with the
+> unmodified OpenAI plugin worker on the `local` (unix) backend: a turn ran to completion, and a hard
+> `kill -9` of the worker mid-turn resumed from history (no restart), surfaced the crash-induced
+> activity timeout correctly, and completed coherently — run executed under a `SessionManagerWorkflow`
+> parent, beyond the standalone floor. Evidence and caveats in
+> `../agentic-orchestration/reference/openai-sandbox-gap.md` (Next actions). Open: server-restart
+> durability (Req 8 / DSQL) is a separate proof; reconcile the Req 1.2 backend wording (`local` vs
+> Docker).
+
 ## Glossary
 
 - **Tokeirad**: The tokeira server binary (`apps/tokeirad`) exposing the Temporal-compatible gRPC

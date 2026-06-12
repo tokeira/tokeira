@@ -136,11 +136,37 @@ A custom `pydantic_data_converter` is used — irrelevant to the server (payload
 - [x] `tokeirad` serves a usable **default namespace** without `RegisterNamespace` — verified:
       `ResolvedNamespace::active("default")` is inserted into the namespace cache at startup
       (`apps/tokeirad/src/lib.rs:533`), before serving.
-- [ ] **Walking-skeleton milestone (live):** boot `tokeirad`, run the OpenAI plugin worker
-      (`temporal_sandbox_agent.py worker`, local Docker backend) + a client, drive a turn end-to-end,
-      kill+resume to prove durability. This is the real proof; the verifications above remove all the
-      a-priori risk.
-- [ ] Carve the walking-skeleton spec (requirements/design/tasks) from NORTH-STAR §8.
+- [x] **Walking-skeleton milestone (live) — ACHIEVED 2026-06-12.** Booted `tokeirad` (in-memory
+      store), ran the unmodified OpenAI plugin worker (`temporal_sandbox_agent.py worker`, **`local`
+      (unix) backend**, manifest root `/tmp/tkr-agent-ws`) + the TUI, and drove turns end-to-end. A
+      turn completed cleanly (LLM `invoke_model_activity` + sandbox `local-sandbox_session_exec`
+      activities, `get_turn_state` query polling working). **This validated the runtime-broker
+      query-delivery fix on real wire** — `get_turn_state` against a quiescent workflow resolves
+      instead of timing out.
+- [x] **Durability proof (Requirement 4) — PASSED 2026-06-12.** Hard `kill -9` of the worker
+      (`uv run` + `python3` group) mid-turn, during an in-flight `sleep 60`
+      `local-sandbox_session_exec`. Observed, all against `tokeirad` left running:
+      1. **Worker-absent query timeout is correct** — with no worker, `get_turn_state` timed out
+         (a query needs a live worker to run its handler; matches Temporal `QueryWorkflow` with no
+         poller). `tokeirad` held the execution open (did not lose it).
+      2. **Resumed from history, no restart** — on worker restart the workflow continued the
+         in-flight turn (run `sandbox-agent-99e446fe…`, **144 events / 97 state transitions**,
+         **Parent Workflow `session-manager`** — i.e. the run executed under a `SessionManagerWorkflow`
+         child path, *beyond* the leaner standalone skeleton floor).
+      3. **Crash-induced activity timeout surfaced correctly** — the in-flight `sleep 60` exec
+         recorded `ActivityTaskTimedOut` (demo activities have no heartbeat → server waited
+         `start_to_close`); the **subsequent exec ran to completion** and the turn finished coherently.
+      Scope caveat: `tokeirad` was on the **in-memory store**, so this proves **worker**-restart
+      durability (Req 4), NOT **server**-restart durability (Req 8 / DSQL) — that remains a separate
+      DSQL-tier proof.
+- [x] Carve the walking-skeleton spec (requirements/design/tasks) from NORTH-STAR §8 — requirements
+      landed (`.kiro/specs/agentic-walking-skeleton/`, commit `598a304`); design/tasks to follow.
+- [ ] **Reconcile backend in the walking-skeleton requirements** — the live proof used the `local`
+      (unix) backend; Requirement 1.2 currently says "local Docker backend." Update to the backend
+      actually exercised (or generalise to "a local sandbox backend").
+- [ ] **Lock in the runtime-broker fix** — the query-delivery change that made the live run work is
+      still uncommitted WIP in `tokeira-edge`/`tokeira-runtime`; finish `runtime-broker-tiered-delivery`
+      tasks 5–8 (fmt/lint/tests) and commit.
 
 ## Verification provenance
 

@@ -12,7 +12,7 @@ The strategic posture is **(A) Conform-and-host** (NORTH-STAR §2): the EXISTING
 sandbox harness (`AgentWorkflow` + the Temporal plugin worker + TUI client, from
 `openai-agents-python/examples/sandbox/extensions/temporal/`) runs against `tokeirad` **unmodified**.
 `tokeira` is the durable orchestration spine; the agent harness (OpenAI Agents SDK, Python) and the
-sandbox runtime (local Docker) are adopted, not rebuilt. This spec covers the **integration, spine
+sandbox runtime (a local sandbox backend) are adopted, not rebuilt. This spec covers the **integration, spine
 configuration, and minimal cockpit** required to host the demo and prove durability — it does NOT
 reimplement Temporal RPC primitives.
 
@@ -36,8 +36,7 @@ operator-run acceptance where the distinction matters.
 > activity timeout correctly, and completed coherently — run executed under a `SessionManagerWorkflow`
 > parent, beyond the standalone floor. Evidence and caveats in
 > `../agentic-orchestration/reference/openai-sandbox-gap.md` (Next actions). Open: server-restart
-> durability (Req 8 / DSQL) is a separate proof; reconcile the Req 1.2 backend wording (`local` vs
-> Docker).
+> durability (Req 8 / DSQL) is a separate proof.
 
 ## Glossary
 
@@ -49,8 +48,10 @@ operator-run acceptance where the distinction matters.
 - **Agent_Workflow**: The long-lived `AgentWorkflow` execution — a durable idle loop driven by
   signals, polled by queries, that runs one agent turn at a time. The standalone (non-SessionManager)
   path per the gap ledger.
-- **Sandbox_Runtime**: The local Docker sandbox backend that the Agent_Harness uses to execute
-  shell/file operations for an agent turn, isolated to one worktree.
+- **Sandbox_Runtime**: A local sandbox backend the Agent_Harness uses to execute shell/file
+  operations for an agent turn, isolated to one worktree. The skeleton uses the demo's `local`
+  (unix process) backend — the one exercised in the live proof; Docker is an equivalent local-class
+  option the demo also offers.
 - **Cockpit**: The minimal operator-facing read/intervene surface for the skeleton. TUI form factor
   (the demo ships a TUI). Reads workflow state via queries/visibility; writes interventions via
   signals/updates. NOT Loom.
@@ -72,14 +73,15 @@ operator-run acceptance where the distinction matters.
 ### Requirement 1: Host the unmodified OpenAI sandbox demo on Tokeirad
 
 **User Story:** As an Operator, I want to run the unmodified OpenAI sandbox coding-agent harness
-against Tokeirad with the local Docker backend, so that tokeira is proven as a drop-in durable spine
+against Tokeirad with a local sandbox backend, so that tokeira is proven as a drop-in durable spine
 for the standard ecosystem harness.
 
 #### Acceptance Criteria
 
 1. THE Agent_Harness SHALL connect to Tokeirad at `localhost:7233` using the standard
    `Client.connect` path without any source modification to the demo.
-2. THE Agent_Harness SHALL use the local Docker Sandbox_Runtime backend for sandbox operations.
+2. THE Agent_Harness SHALL use a local Sandbox_Runtime backend for sandbox operations — the demo's
+   `local` (unix process) backend by default; Docker is an equivalent local-class option.
 3. WHEN the Operator starts the Agent_Harness worker against a running Tokeirad, THE Agent_Harness
    SHALL register and poll the `AgentWorkflow` workflow type and its activities on the configured
    task queue.
@@ -225,8 +227,9 @@ demo is reproducible by anyone.
 #### Acceptance Criteria
 
 1. THE skeleton SHALL document the ordered procedure to boot Tokeirad, start the Agent_Harness worker
-   with the local Docker backend, and launch the Cockpit.
-2. THE run procedure SHALL state the prerequisites required before the live demo (Docker available,
-   the Broker_Query_Fix landed, and the configured Persistence_Store).
+   with the configured local sandbox backend, and launch the Cockpit.
+2. THE run procedure SHALL state the prerequisites required before the live demo (the chosen local
+   sandbox backend available — nothing beyond the host for the `local`/unix backend, or Docker if the
+   Docker backend is selected; the Broker_Query_Fix landed; and the configured Persistence_Store).
 3. THE run procedure SHALL describe the kill-and-resume durability step and the expected observable
    outcome.

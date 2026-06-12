@@ -161,9 +161,9 @@ A custom `pydantic_data_converter` is used — irrelevant to the server (payload
       DSQL-tier proof.
 - [x] Carve the walking-skeleton spec (requirements/design/tasks) from NORTH-STAR §8 — requirements
       landed (`.kiro/specs/agentic-walking-skeleton/`, commit `598a304`); design/tasks to follow.
-- [ ] **Reconcile backend in the walking-skeleton requirements** — the live proof used the `local`
-      (unix) backend; Requirement 1.2 currently says "local Docker backend." Update to the backend
-      actually exercised (or generalise to "a local sandbox backend").
+- [x] **Reconcile backend in the walking-skeleton requirements** — done: Req 1.2, the glossary,
+      Req 1 user story, and Req 10 now say a *local sandbox backend* (the `local`/unix backend used in
+      the proof; Docker noted as an equivalent local-class option) instead of pinning "local Docker."
 - [ ] **Lock in the runtime-broker fix** — the query-delivery change that made the live run work is
       still uncommitted WIP in `tokeira-edge`/`tokeira-runtime`; finish `runtime-broker-tiered-delivery`
       tasks 5–8 (fmt/lint/tests) and commit.

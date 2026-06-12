@@ -1070,6 +1070,32 @@ pub struct StartedWorkflowTask {
     pub token: WorkflowTaskToken,
 }
 
+/// Work returned from the Temporal-compatible workflow poll path.
+///
+/// Temporal v1.31.0 matches direct legacy queries through the same worker poll
+/// RPC as workflow tasks (`service/matching/matching_engine.go:1084 @
+/// v1.31.0`). Keeping this as an explicit enum prevents query-only activations
+/// from being mistaken for started workflow tasks that advanced history.
+#[derive(Debug)]
+pub enum WorkflowActivation {
+    /// A history-advancing workflow task has been started and must be completed
+    /// through `RespondWorkflowTaskCompleted`.
+    WorkflowTask(StartedWorkflowTask),
+    /// A read-only legacy query task must be answered through
+    /// `RespondQueryTaskCompleted`.
+    QueryTask(QueryTask),
+}
+
+impl WorkflowActivation {
+    /// Borrow the started workflow task when this activation advanced history.
+    pub fn workflow_task(&self) -> Option<&StartedWorkflowTask> {
+        match self {
+            Self::WorkflowTask(task) => Some(task),
+            Self::QueryTask(_) => None,
+        }
+    }
+}
+
 /// An activity task that has been polled and started.
 #[derive(Clone, Debug)]
 pub struct StartedActivityTask {

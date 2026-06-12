@@ -228,6 +228,12 @@ pub struct PollWorkflowTaskQueueResponse {
     pub scheduled_time: Option<OffsetDateTime>,
     pub started_time: Option<OffsetDateTime>,
     pub payload: WorkflowTaskPayloadDto,
+    /// Legacy single query delivered as a query task on the workflow-task poll path.
+    ///
+    /// This is distinct from `queries`: `query` is answered with
+    /// `RespondQueryTaskCompleted`, while `queries` is the consistent-query map
+    /// answered inside `RespondWorkflowTaskCompleted.query_results`.
+    pub query: Option<WorkflowQueryDto>,
     pub queries: HashMap<String, WorkflowQueryDto>,
     pub messages: Vec<ProtocolMessageDto>,
 }

@@ -258,6 +258,54 @@ where
                 Ok(Some(started))
             }
             WorkflowPollResult::Started(started) => Ok(Some(started)),
+            // The workflow-task-only API calls the WFT-only broker method, so
+            // this arm is defensive. If a future refactor routes it through
+            // the unified poll, do not consume direct query work here: callers
+            // of this method are not prepared to register a query waiter.
+            WorkflowPollResult::Query(_) => Ok(None),
+        }
+    }
+
+    /// Poll the workflow task queue for either a workflow task or a direct query.
+    ///
+    /// This is the public-api path used by `PollWorkflowTaskQueue`: Temporal
+    /// delivers legacy direct queries as matched workflow poll tasks rather
+    /// than through a separate query-poll RPC
+    /// (`service/matching/matching_engine.go:1084 @ v1.31.0`). The older
+    /// [`Self::poll_workflow_task`] method remains workflow-task-only for
+    /// internal eager-claim paths that cannot safely consume query work.
+    pub async fn poll_workflow_activation(
+        &self,
+        queue: QueueKey,
+        worker_identity: WorkerIdentity,
+        timeout_after: tokio::time::Duration,
+    ) -> Result<Option<WorkflowActivation>> {
+        let polled = match self
+            .broker
+            .poll_workflow_activation(&queue, &worker_identity, timeout_after)
+            .await?
+        {
+            Some(polled) => {
+                self.delivery_metrics.record_poll_success(&queue);
+                polled
+            }
+            None => {
+                self.delivery_metrics.record_poll_timeout(&queue);
+                return Ok(None);
+            }
+        };
+
+        match polled {
+            WorkflowPollResult::Queued(offered, entered_at) => {
+                let started = self
+                    .start_polled_workflow_task(offered, entered_at, worker_identity)
+                    .await?;
+                Ok(Some(WorkflowActivation::WorkflowTask(started)))
+            }
+            WorkflowPollResult::Started(started) => {
+                Ok(Some(WorkflowActivation::WorkflowTask(started)))
+            }
+            WorkflowPollResult::Query(query) => Ok(Some(WorkflowActivation::QueryTask(query))),
         }
     }
 

@@ -55,6 +55,7 @@ pub async fn poll_response(
             task_queue: started.task_queue.0,
             history,
         },
+        query: None,
         queries: HashMap::new(),
         messages: Vec::new(),
     })

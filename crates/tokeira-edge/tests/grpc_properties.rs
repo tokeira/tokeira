@@ -839,6 +839,7 @@ fn arb_poll_response() -> impl Strategy<Value = PollWorkflowTaskQueueResponse> {
                     task_queue,
                     history: Vec::new(),
                 },
+                query: None,
                 queries: Default::default(),
                 messages: Vec::new(),
             },

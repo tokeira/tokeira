@@ -43,8 +43,8 @@ use tokeira_runtime::{
     TaskQueueConfigEntry, TaskQueueConfigStore, TaskQueueVersioningView, UpdateComputeConfig,
     UpdateLifecycleError, UpdateLifecycleSnapshot, UpdateMetadata, UpdateTransportResolution,
     UpdateWaitPolicy, ValidateComputeConfig, VersionMetadataView, VersionView, VersioningRuleStore,
-    WorkerRegistry, WorkflowExecution, WorkflowExecutionStatus, compute_matching_times,
-    decide_overlap, schedule_workflow_id,
+    WorkerRegistry, WorkflowActivation, WorkflowExecution, WorkflowExecutionStatus,
+    compute_matching_times, decide_overlap, schedule_workflow_id,
 };
 use tokeira_storage::{
     ConflictToken, DeploymentKey, DeploymentName, DeploymentTaskQueueType, RunRepository,
@@ -266,6 +266,24 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         worker_identity: tokeira_types::WorkerIdentity,
         timeout: std::time::Duration,
     ) -> Result<Option<StartedWorkflowTask>>;
+
+    /// Poll the worker-facing workflow queue for either a started WFT or a direct query.
+    ///
+    /// The default keeps older test doubles workflow-task-only. The real
+    /// runtime adapter overrides this because Temporal-compatible workers
+    /// receive legacy direct queries through `PollWorkflowTaskQueue`, not a
+    /// separate query-poll RPC (`service/matching/matching_engine.go:1084 @
+    /// v1.31.0`).
+    async fn poll_workflow_activation(
+        &self,
+        queue: tokeira_types::QueueKey,
+        worker_identity: tokeira_types::WorkerIdentity,
+        timeout: std::time::Duration,
+    ) -> Result<Option<WorkflowActivation>> {
+        self.poll_workflow_task(queue, worker_identity, timeout)
+            .await
+            .map(|task| task.map(WorkflowActivation::WorkflowTask))
+    }
 
     async fn try_claim_workflow_task(
         &self,
@@ -1938,6 +1956,15 @@ impl WorkflowService {
         let sticky_preferred = state.sticky.as_ref().and_then(|affinity| {
             (affinity.expires_at > now).then_some(affinity.worker_identity.clone())
         });
+        let sticky_deadline = state
+            .sticky
+            .as_ref()
+            // The kernel stores the SDK sticky
+            // `schedule_to_start_timeout` as the affinity expiry. Buffered
+            // queries released after WFT completion use that same concrete
+            // deadline for sticky-first direct query fallback
+            // (`service/history/api/queryworkflow/api.go:350-410 @ v1.31.0`).
+            .and_then(|affinity| (affinity.expires_at > now).then_some(affinity.expires_at));
         let queue = QueueKey {
             namespace_id: state.namespace_id,
             task_queue: state.task_queue.clone(),
@@ -1954,6 +1981,7 @@ impl WorkflowService {
                     query_args: query.query_args,
                     queue: queue.clone(),
                     sticky_preferred: sticky_preferred.clone(),
+                    sticky_deadline,
                     response_tx: query.response_tx,
                 })
                 .await;
@@ -2004,6 +2032,7 @@ impl WorkflowService {
                 task_queue: state.task_queue.0.clone(),
                 history: Vec::new(),
             },
+            query: None,
             queries: std::collections::HashMap::new(),
             messages: Vec::new(),
         };
@@ -2023,6 +2052,77 @@ impl WorkflowService {
         }
 
         Some(response)
+    }
+
+    async fn build_direct_query_poll_response(
+        &self,
+        query: tokeira_runtime::QueryTask,
+        worker: &WorkerIdentity,
+    ) -> EdgeResult<PollWorkflowTaskQueueResponse> {
+        let state = match self
+            .repo
+            .load_run(query.run_key)
+            .await
+            .map_err(EdgeError::from)?
+        {
+            LoadedRun::Existing(state) => state,
+            LoadedRun::Absent => {
+                return Err(EdgeError::WorkflowNotFound {
+                    namespace: query.queue.namespace_id.0.to_string(),
+                    workflow_id: query.run_key.0.to_string(),
+                });
+            }
+        };
+        let sticky_match = query.sticky_preferred.as_ref() == Some(worker);
+        let history_after_event_id = if sticky_match && state.previous_started_event_id > 0 {
+            state.previous_started_event_id
+        } else {
+            0
+        };
+        let history = self
+            .repo
+            .read_history(query.run_key, history_after_event_id, usize::MAX)
+            .await
+            .map_err(EdgeError::from)?;
+
+        // Temporal returns direct queries as workflow-poll tasks with
+        // `started_event_id = 0` and a query task token, because no history
+        // event is authored for the read-only query
+        // (`proto/upstream/temporal/api/workflowservice/v1/request_response.proto`,
+        // `service/matching/matching_engine.go:1084 @ v1.31.0`). The token is
+        // opaque to the SDK; the edge keys it to the parked caller in
+        // `PendingQueryStore` and resolves it via `RespondQueryTaskCompleted`.
+        let task_token = format!(
+            "query-task:{}:{}:{}",
+            query.queue.namespace_id.0,
+            query.queue.task_queue.0,
+            Uuid::new_v4()
+        )
+        .into_bytes();
+        self.pending_queries
+            .insert(&task_token, LEGACY_QUERY_ID.to_string(), query.response_tx)
+            .await;
+
+        Ok(PollWorkflowTaskQueueResponse {
+            task_token,
+            started_event_id: 0,
+            previous_started_event_id: state.previous_started_event_id,
+            attempt: 1,
+            scheduled_time: None,
+            started_time: None,
+            payload: crate::translate::WorkflowTaskPayloadDto {
+                workflow_id: state.workflow_id.0,
+                run_key: state.run_key,
+                task_queue: state.task_queue.0,
+                history,
+            },
+            query: Some(WorkflowQueryDto {
+                query_type: query.query_type,
+                query_args: query.query_args,
+            }),
+            queries: std::collections::HashMap::new(),
+            messages: Vec::new(),
+        })
     }
 
     pub async fn start_workflow_execution(
@@ -2311,9 +2411,9 @@ impl WorkflowService {
                     );
                 }
                 let internal = to_internal::poll_request(req);
-                let started = self
+                let activation = self
                     .runtime
-                    .poll_workflow_task(
+                    .poll_workflow_activation(
                         internal.queue,
                         internal.worker_identity.clone(),
                         internal.timeout,
@@ -2321,8 +2421,8 @@ impl WorkflowService {
                     .await
                     .map_err(EdgeError::from)?;
 
-                match started {
-                    Some(started) => {
+                match activation {
+                    Some(WorkflowActivation::WorkflowTask(started)) => {
                         let mut response =
                             from_internal::poll_response(started.clone(), self.repo.as_ref())
                                 .await
@@ -2332,6 +2432,10 @@ impl WorkflowService {
 
                         Ok(Some(response))
                     }
+                    Some(WorkflowActivation::QueryTask(query)) => Ok(Some(
+                        self.build_direct_query_poll_response(query, &internal.worker_identity)
+                            .await?,
+                    )),
                     None => Ok(None),
                 }
             },

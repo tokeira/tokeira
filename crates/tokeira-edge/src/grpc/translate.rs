@@ -2329,6 +2329,13 @@ pub fn poll_response_to_proto(
         started_event_id: resp.started_event_id,
         attempt: resp.attempt as i32,
         history,
+        query: resp
+            .query
+            .map(|query| tokeira_proto::public::temporal::api::query::v1::WorkflowQuery {
+                query_type: query.query_type,
+                query_args: Some(payloads_from_domain(&query.query_args)),
+                header: None,
+            }),
         scheduled_time: resp.scheduled_time.map(to_proto_timestamp),
         started_time: resp.started_time.map(to_proto_timestamp),
         workflow_execution_task_queue: Some(
@@ -6001,6 +6008,46 @@ mod tests {
             Some(to_proto_timestamp(current_attempt))
         );
         assert_eq!(proto.started_time, Some(to_proto_timestamp(started)));
+    }
+
+    #[test]
+    fn workflow_poll_response_projects_legacy_query_field() {
+        let payloads = Payloads(vec![tokeira_types::Payload {
+            data: b"input".to_vec(),
+            metadata: Default::default(),
+        }]);
+        let proto = poll_response_to_proto(crate::translate::PollWorkflowTaskQueueResponse {
+            task_token: b"query-token".to_vec(),
+            started_event_id: 0,
+            previous_started_event_id: 12,
+            attempt: 1,
+            scheduled_time: None,
+            started_time: None,
+            payload: crate::translate::WorkflowTaskPayloadDto {
+                workflow_id: "workflow-a".to_string(),
+                run_key: RunKey(Uuid::from_u128(1)),
+                task_queue: "main".to_string(),
+                history: Vec::new(),
+            },
+            query: Some(crate::translate::WorkflowQueryDto {
+                query_type: "state".to_string(),
+                query_args: payloads.clone(),
+            }),
+            queries: Default::default(),
+            messages: Vec::new(),
+        });
+
+        let query = proto.query.expect("legacy query field should be set");
+        assert_eq!(proto.task_token, b"query-token".to_vec());
+        assert_eq!(proto.started_event_id, 0);
+        assert_eq!(query.query_type, "state");
+        assert_eq!(
+            query.query_args,
+            Some(tokeira_proto::conversions::common::payloads_from_domain(
+                &payloads
+            ))
+        );
+        assert!(proto.queries.is_empty());
     }
 
     #[test]

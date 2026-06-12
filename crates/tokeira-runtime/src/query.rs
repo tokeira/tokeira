@@ -31,6 +31,15 @@ pub struct QueryTask {
     pub queue: QueueKey,
     /// Sticky worker hint when one is currently active.
     pub sticky_preferred: Option<WorkerIdentity>,
+    /// Deadline after which a sticky-only query becomes live-deliverable.
+    ///
+    /// Temporal v1.31.0 first attempts a direct query on the sticky task queue
+    /// using `StickyTaskQueueScheduleToStartTimeout`, then falls back to the
+    /// normal task queue when that sticky attempt times out
+    /// (`service/history/api/queryworkflow/api.go:350-410 @ v1.31.0`). The
+    /// broker stores the concrete deadline so the timeout decision stays local
+    /// to transient delivery and never becomes workflow correctness state.
+    pub sticky_deadline: Option<time::OffsetDateTime>,
     /// One-shot response channel back to the caller.
     pub response_tx: oneshot::Sender<QueryResult>,
 }
@@ -293,6 +302,56 @@ mod tests {
         worker.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn quiescent_query_is_delivered_by_workflow_task_poll() {
+        let store = Arc::new(InMemoryStore::default());
+        let runtime = Arc::new(make_runtime(store.clone()));
+        let ns = NamespaceId::new();
+        let req = start_request(ns, "poll-query");
+        let run_key = match runtime.start_workflow(req).await.unwrap() {
+            CommitResult::Applied { new_state } => new_state.run_key,
+            other => panic!("unexpected: {other:?}"),
+        };
+        quiesce_workflow(runtime.as_ref(), ns).await;
+
+        let worker_runtime = runtime.clone();
+        let queue = queue_for(ns);
+        let worker = tokio::spawn(async move {
+            match worker_runtime
+                .poll_workflow_activation(
+                    queue,
+                    WorkerIdentity("w".into()),
+                    std::time::Duration::from_millis(100),
+                )
+                .await
+                .unwrap()
+                .expect("workflow poll should deliver the query")
+            {
+                crate::WorkflowActivation::QueryTask(task) => {
+                    assert_eq!(task.run_key, run_key);
+                    assert_eq!(task.query_type, "direct-query");
+                    let _ = task.response_tx.send(QueryResult::Completed {
+                        result: Payloads::default(),
+                    });
+                }
+                other => panic!("unexpected activation: {other:?}"),
+            }
+        });
+
+        let result = runtime
+            .query_workflow(
+                exec_ref(ns, "poll-query"),
+                "direct-query".into(),
+                Payloads::default(),
+                Duration::milliseconds(200),
+            )
+            .await
+            .unwrap();
+        worker.await.unwrap();
+
+        assert!(matches!(result, QueryResult::Completed { .. }));
+    }
+
     // ── Property 3: Sticky affinity correctly reflected
     // Feature: runtime-query-dispatch
     // Validates: Requirements 3.1, 3.2, 3.3
@@ -449,6 +508,7 @@ mod tests {
                             query_args: Payloads::default(),
                             queue: queue.clone(),
                             sticky_preferred: None,
+                            sticky_deadline: None,
                             response_tx: tx,
                         })
                         .await;

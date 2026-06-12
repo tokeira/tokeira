@@ -92,6 +92,17 @@ where
             .await
     }
 
+    async fn poll_workflow_activation(
+        &self,
+        queue: tokeira_types::QueueKey,
+        worker_identity: tokeira_types::WorkerIdentity,
+        timeout: std::time::Duration,
+    ) -> Result<Option<tokeira_runtime::WorkflowActivation>> {
+        self.runtime
+            .poll_workflow_activation(queue, worker_identity, timeout)
+            .await
+    }
+
     async fn try_claim_workflow_task(
         &self,
         queue: tokeira_types::QueueKey,

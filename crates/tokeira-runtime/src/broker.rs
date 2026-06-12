@@ -6,18 +6,16 @@
 //! loss or prolonged absence of pollers, that responsibility moves to the
 //! durable backlog and scanner paths elsewhere in the runtime.
 //!
-//! Query delivery is kept separate from workflow-task delivery: queries may
-//! need sticky affinity and long-poll wakeups, but they should not advance
-//! history or masquerade as durable workflow tasks.
+//! ## Sticky / live / backlog tier model
 //!
-//! ## Sticky / general tier model
-//!
-//! Workflow tasks enter the *sticky* tier when the run has a preferred worker
-//! (set by the sticky TTL during `start_polled_workflow_task`). Only the
-//! matching worker may take a sticky task; if the TTL expires before that
-//! worker polls, the task is promoted to the *general* tier where any poller
-//! can claim it. This avoids full-history replays when the worker's cache is
-//! warm, while still guaranteeing progress when a worker disappears.
+//! Workflow tasks and direct query tasks share the same poll wake path because
+//! Temporal SDKs only poll `PollWorkflowTaskQueue` for both surfaces
+//! (`service/matching/matching_engine.go:1084 @ v1.31.0`). Work enters a
+//! *sticky* tier when a worker owns cache affinity. If that worker does not
+//! take the item before the item-specific sticky deadline, it is promoted to
+//! the *live* tier where any matching poller can claim it. Durable backlog
+//! scanning remains outside this broker: the broker is a disposable delivery
+//! optimizer, never the source of correctness.
 //!
 //! ## Deduplication
 //!
@@ -57,10 +55,6 @@ use crate::{DeliveryMetrics, QueryTask, StartedWorkflowTask, metrics as runtime_
 /// - sticky preference is honored when possible,
 /// - stale sticky hints are allowed to decay into general readiness,
 /// - duplicate publications are suppressed by logical task identity.
-///
-/// TODO(perf): split this into explicit sticky/live/backlog tiers once the
-/// surrounding runtime grows. This starter keeps the semantic points visible
-/// without trying to be production-smart too early.
 #[derive(Default, Clone)]
 pub struct InMemoryBroker {
     inner: Arc<Mutex<BrokerState>>,
@@ -137,24 +131,46 @@ impl ReservedPoller {
 /// caller must drive it to a started state. `Started` means the task was handed
 /// over already-started through the synchronous reservation path
 /// ([`ReservedPoller`]), so no further start work is needed.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum WorkflowPollResult {
     Queued(DispatchableWorkflowTask, Instant),
     Started(StartedWorkflowTask),
+    Query(QueryTask),
+}
+
+impl PartialEq for WorkflowPollResult {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Queued(left, _), Self::Queued(right, _)) => left == right,
+            (Self::Started(left), Self::Started(right)) => left == right,
+            (Self::Query(left), Self::Query(right)) => {
+                // The waiter channel is transport state, not delivery identity.
+                // Equality exists for broker tests that compare poll outcomes;
+                // matching correctness is determined by the query metadata.
+                left.run_key == right.run_key
+                    && left.query_type == right.query_type
+                    && left.query_args == right.query_args
+                    && left.queue == right.queue
+                    && left.sticky_preferred == right.sticky_preferred
+                    && left.sticky_deadline == right.sticky_deadline
+            }
+            _ => false,
+        }
+    }
 }
 
 impl WorkflowPollResult {
     pub fn into_queued(self) -> Option<(DispatchableWorkflowTask, Instant)> {
         match self {
             Self::Queued(task, entered_at) => Some((task, entered_at)),
-            Self::Started(_) => None,
+            Self::Started(_) | Self::Query(_) => None,
         }
     }
 
     pub fn queued_task(&self) -> Option<&DispatchableWorkflowTask> {
         match self {
             Self::Queued(task, _) => Some(task),
-            Self::Started(_) => None,
+            Self::Started(_) | Self::Query(_) => None,
         }
     }
 }
@@ -309,6 +325,11 @@ impl InMemoryBroker {
             .or_default()
             .push_back(task);
         drop(inner);
+        // Direct queries are matched by workflow-task polls in Temporal
+        // (`service/matching/matching_engine.go:1084 @ v1.31.0`). Wake both
+        // legacy query waiters and workflow pollers while the old side-channel
+        // remains available for focused runtime tests.
+        self.wake.notify_waiters();
         self.query_wake.notify_waiters();
     }
 
@@ -328,14 +349,84 @@ impl InMemoryBroker {
         }
 
         self.increment_query_waiter(queue).await;
+        let wait_for = self
+            .query_fallback_wait(queue)
+            .await
+            .unwrap_or(wait_for)
+            .min(wait_for);
         let notified = timeout(wait_for, self.query_wake.notified()).await;
         self.decrement_query_waiter(queue).await;
 
-        if notified.is_err() {
-            return None;
+        let _ = notified;
+        self.try_take_query(queue, worker).await
+    }
+
+    /// Long-poll for the next workflow activation on `queue`.
+    ///
+    /// This is the Temporal-compatible poll path: a worker polling
+    /// `PollWorkflowTaskQueue` can receive either a history-advancing workflow
+    /// task or a legacy direct query task. Workflow tasks still win when both
+    /// are ready so state-changing progress is not delayed by read-only work.
+    pub async fn poll_workflow_activation(
+        &self,
+        queue: &QueueKey,
+        worker: &WorkerIdentity,
+        wait_for: Duration,
+    ) -> Result<Option<WorkflowPollResult>> {
+        if self.is_denied(queue, worker).await {
+            return Ok(None);
+        }
+        if let Some(task) = self.try_take(queue, worker).await? {
+            return Ok(Some(WorkflowPollResult::Queued(task.0, task.1)));
+        }
+        if let Some(task) = self.try_take_query(queue, worker).await {
+            return Ok(Some(WorkflowPollResult::Query(task)));
         }
 
-        self.try_take_query(queue, worker).await
+        let (response_tx, response_rx) = oneshot::channel();
+        let waiter_id = self
+            .insert_workflow_waiter(queue, worker.clone(), response_tx)
+            .await;
+
+        let notified = self.wake.notified();
+        if let Some(task) = self.try_take(queue, worker).await? {
+            self.remove_workflow_waiter(queue, waiter_id).await;
+            return Ok(Some(WorkflowPollResult::Queued(task.0, task.1)));
+        }
+        if let Some(task) = self.try_take_query(queue, worker).await {
+            self.remove_workflow_waiter(queue, waiter_id).await;
+            return Ok(Some(WorkflowPollResult::Query(task)));
+        }
+
+        let wait_for = self
+            .query_fallback_wait(queue)
+            .await
+            .unwrap_or(wait_for)
+            .min(wait_for);
+        tokio::select! {
+            response = response_rx => {
+                self.remove_workflow_waiter(queue, waiter_id).await;
+                return match response {
+                    Ok(result) => result.map(|task| task.map(WorkflowPollResult::Started)),
+                    Err(_) => Ok(None),
+                };
+            }
+            _ = notified => {}
+            _ = tokio::time::sleep(wait_for) => {}
+        }
+
+        self.remove_workflow_waiter(queue, waiter_id).await;
+
+        if self.is_denied(queue, worker).await {
+            return Ok(None);
+        }
+        if let Some(task) = self.try_take(queue, worker).await? {
+            return Ok(Some(WorkflowPollResult::Queued(task.0, task.1)));
+        }
+        Ok(self
+            .try_take_query(queue, worker)
+            .await
+            .map(WorkflowPollResult::Query))
     }
 
     /// Enqueue a workflow task for delivery.
@@ -544,6 +635,14 @@ impl InMemoryBroker {
             return ready.remove(idx);
         }
 
+        let now = OffsetDateTime::now_utc();
+        for task in ready.iter_mut() {
+            if task.sticky_deadline.is_some_and(|deadline| deadline <= now) {
+                task.sticky_preferred = None;
+                task.sticky_deadline = None;
+            }
+        }
+
         if let Some(idx) = ready
             .iter()
             .position(|task| task.sticky_preferred.is_none())
@@ -552,6 +651,33 @@ impl InMemoryBroker {
         }
 
         None
+    }
+
+    /// Return the next sticky-query fallback interval for `queue`.
+    ///
+    /// A query's sticky deadline is not durable state; it is the in-memory
+    /// equivalent of Temporal's sticky query attempt context deadline
+    /// (`service/history/api/queryworkflow/api.go:350-410 @ v1.31.0`). Pollers
+    /// include this interval in their wait so a live worker can take the same
+    /// query as soon as the sticky-only window expires, even if no new work is
+    /// published to wake the broker.
+    async fn query_fallback_wait(&self, queue: &QueueKey) -> Option<Duration> {
+        let inner = self.inner.lock().await;
+        let now = OffsetDateTime::now_utc();
+        inner
+            .query_ready
+            .get(queue)?
+            .iter()
+            .filter(|task| task.sticky_preferred.is_some())
+            .filter_map(|task| task.sticky_deadline)
+            .min()
+            .map(|deadline| {
+                if deadline <= now {
+                    Duration::ZERO
+                } else {
+                    (deadline - now).try_into().unwrap_or(Duration::ZERO)
+                }
+            })
     }
 
     /// Remove and return tasks that have sat in either tier longer than
@@ -1279,6 +1405,7 @@ mod tests {
                     query_args: Payloads::default(),
                     queue: queue.clone(),
                     sticky_preferred: None,
+                    sticky_deadline: None,
                     response_tx: tx,
                 })
                 .await;
@@ -1317,6 +1444,7 @@ mod tests {
                 query_args: Payloads::default(),
                 queue: queue.clone(),
                 sticky_preferred: Some(WorkerIdentity("worker-a".into())),
+                sticky_deadline: None,
                 response_tx: sticky_tx,
             })
             .await;
@@ -1328,6 +1456,7 @@ mod tests {
                 query_args: Payloads::default(),
                 queue: queue.clone(),
                 sticky_preferred: None,
+                sticky_deadline: None,
                 response_tx: general_tx,
             })
             .await;
@@ -1351,6 +1480,111 @@ mod tests {
 
         assert_eq!(wrong_worker.query_type, "general");
         assert_eq!(sticky_worker.query_type, "sticky");
+    }
+
+    #[tokio::test]
+    async fn workflow_poll_delivers_direct_query_task() {
+        let broker = InMemoryBroker::default();
+        let queue = workflow_queue("queue-a", None, None);
+        let (tx, _rx) = oneshot::channel();
+        broker
+            .publish_query_task(QueryTask {
+                run_key: RunKey::new(),
+                query_type: "direct".into(),
+                query_args: Payloads::default(),
+                queue: queue.clone(),
+                sticky_preferred: None,
+                sticky_deadline: None,
+                response_tx: tx,
+            })
+            .await;
+
+        let polled = broker
+            .poll_workflow_activation(
+                &queue,
+                &WorkerIdentity("worker-a".into()),
+                std::time::Duration::from_millis(5),
+            )
+            .await
+            .unwrap()
+            .expect("workflow poll should deliver direct query");
+
+        match polled {
+            WorkflowPollResult::Query(task) => assert_eq!(task.query_type, "direct"),
+            other => panic!("unexpected workflow poll result: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_poll_promotes_expired_sticky_query_to_live() {
+        let broker = InMemoryBroker::default();
+        let queue = workflow_queue("queue-a", None, None);
+        let (tx, _rx) = oneshot::channel();
+        broker
+            .publish_query_task(QueryTask {
+                run_key: RunKey::new(),
+                query_type: "sticky-expired".into(),
+                query_args: Payloads::default(),
+                queue: queue.clone(),
+                sticky_preferred: Some(WorkerIdentity("worker-a".into())),
+                sticky_deadline: Some(OffsetDateTime::UNIX_EPOCH),
+                response_tx: tx,
+            })
+            .await;
+
+        let polled = broker
+            .poll_workflow_activation(
+                &queue,
+                &WorkerIdentity("worker-b".into()),
+                std::time::Duration::from_millis(5),
+            )
+            .await
+            .unwrap()
+            .expect("expired sticky query should fall back to live delivery");
+
+        match polled {
+            WorkflowPollResult::Query(task) => {
+                assert_eq!(task.query_type, "sticky-expired");
+                assert_eq!(task.sticky_preferred, None);
+            }
+            other => panic!("unexpected workflow poll result: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_poll_falls_back_when_sticky_query_deadline_elapses() {
+        let broker = InMemoryBroker::default();
+        let queue = workflow_queue("queue-a", None, None);
+        let (tx, _rx) = oneshot::channel();
+        broker
+            .publish_query_task(QueryTask {
+                run_key: RunKey::new(),
+                query_type: "sticky-waits".into(),
+                query_args: Payloads::default(),
+                queue: queue.clone(),
+                sticky_preferred: Some(WorkerIdentity("worker-a".into())),
+                sticky_deadline: Some(OffsetDateTime::now_utc() + TimeDuration::milliseconds(1)),
+                response_tx: tx,
+            })
+            .await;
+
+        let polled = broker
+            .poll_workflow_activation(
+                &queue,
+                &WorkerIdentity("worker-b".into()),
+                std::time::Duration::from_millis(50),
+            )
+            .await
+            .unwrap()
+            .expect("live worker should receive query after sticky fallback deadline");
+
+        match polled {
+            WorkflowPollResult::Query(task) => {
+                assert_eq!(task.query_type, "sticky-waits");
+                assert_eq!(task.sticky_preferred, None);
+            }
+            other => panic!("unexpected workflow poll result: {other:?}"),
+        }
     }
 
     proptest! {

@@ -79,6 +79,15 @@ where
         let sticky_preferred = state.sticky.as_ref().and_then(|affinity| {
             (affinity.expires_at > now).then_some(affinity.worker_identity.clone())
         });
+        let sticky_deadline = state
+            .sticky
+            .as_ref()
+            // Tokeira stores Temporal's sticky
+            // `schedule_to_start_timeout` as the run's sticky expiry when a
+            // worker completes a WFT with sticky attributes. Direct queries
+            // reuse that same deadline for sticky-first fallback
+            // (`service/history/api/queryworkflow/api.go:350-410 @ v1.31.0`).
+            .and_then(|affinity| (affinity.expires_at > now).then_some(affinity.expires_at));
         let required_barrier = state.last_event_id;
 
         let (response_tx, response_rx) = oneshot::channel();
@@ -117,6 +126,7 @@ where
                     query_args,
                     queue,
                     sticky_preferred,
+                    sticky_deadline,
                     response_tx,
                 })
                 .await;

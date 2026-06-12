@@ -6180,6 +6180,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokeira-chasm-activity"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "proptest",
+ "prost 0.12.6",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokeira-chasm",
+ "tokeira-chasm-derive",
+ "tokeira-proto",
+ "tokeira-types",
+]
+
+[[package]]
 name = "tokeira-chasm-derive"
 version = "0.1.0"
 dependencies = [

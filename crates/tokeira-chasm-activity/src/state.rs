@@ -1,0 +1,190 @@
+//! The activity state proto, status enum, and lifecycle mapping.
+//!
+//! Ground truth: `chasm/lib/activity/proto/v1/activity_state.proto` (states) and
+//! `chasm/lib/activity/activity.go:90` (lifecycle mapping) `@ v1.31.0`.
+//!
+//! [`ActivityState`] is the single `#[chasm(data)]` payload of the activity root
+//! component (see the crate MVP note). It is a tokeira-owned proto — activity state
+//! is internal engine state, never on the public SDK wire — so the field numbering
+//! is ours; only the *behaviour* (states, lifecycle mapping, stamp semantics)
+//! tracks the targeted release.
+
+use serde::{Deserialize, Serialize};
+use tokeira_chasm::LifecycleState;
+
+/// The eight activity execution states (`activity_state.proto @ v1.31.0`), plus the
+/// `Unspecified` zero value a freshly constructed state carries before its first
+/// `Scheduled` transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ActivityStatus {
+    /// No status assigned yet (pre-`Scheduled`). prost uses this 0-discriminant
+    /// variant as the enum's `Default`.
+    Unspecified = 0,
+    /// Scheduled and awaiting dispatch to a worker.
+    Scheduled = 1,
+    /// Picked up by a worker.
+    Started = 2,
+    /// A cancel has been requested but not yet acknowledged.
+    CancelRequested = 3,
+    /// Completed successfully (terminal).
+    Completed = 4,
+    /// Failed (terminal).
+    Failed = 5,
+    /// Canceled (terminal).
+    Canceled = 6,
+    /// Terminated by an operator (terminal).
+    Terminated = 7,
+    /// Timed out (terminal).
+    TimedOut = 8,
+}
+
+impl ActivityStatus {
+    /// True for the terminal states (`Completed`/`Failed`/`Canceled`/`Terminated`/
+    /// `TimedOut`).
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            ActivityStatus::Completed
+                | ActivityStatus::Failed
+                | ActivityStatus::Canceled
+                | ActivityStatus::Terminated
+                | ActivityStatus::TimedOut
+        )
+    }
+}
+
+/// Map an activity status to the component [`LifecycleState`]
+/// (`activity.go:90 @ v1.31.0`): `COMPLETED → Completed`;
+/// `FAILED | CANCELED | TERMINATED | TIMED_OUT → Failed`; everything else
+/// (`UNSPECIFIED`, `SCHEDULED`, `STARTED`, `CANCEL_REQUESTED`) `→ Running`
+/// (Requirement 11.3).
+pub fn lifecycle_for(status: ActivityStatus) -> LifecycleState {
+    match status {
+        ActivityStatus::Completed => LifecycleState::Completed,
+        ActivityStatus::Failed
+        | ActivityStatus::Canceled
+        | ActivityStatus::Terminated
+        | ActivityStatus::TimedOut => LifecycleState::Failed,
+        ActivityStatus::Unspecified
+        | ActivityStatus::Scheduled
+        | ActivityStatus::Started
+        | ActivityStatus::CancelRequested => LifecycleState::Running,
+    }
+}
+
+/// The persisted activity state — the activity component's single data field.
+///
+/// Carries the status, the current attempt and its fencing `stamp` (the per-attempt
+/// token transitions and timers validate against — Requirement 11.6), the
+/// identifying fields and task queue, the normalized timeouts (in Unix-nanosecond
+/// durations; `0` means unset), the retry bound, and the input/result/failure
+/// payloads. Durations are nanos rather than a proto `Duration` so the type stays a
+/// plain prost message; the edge/runtime convert at their boundary.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ActivityState {
+    /// Current status.
+    #[prost(enumeration = "ActivityStatus", tag = "1")]
+    pub status: i32,
+    /// Current attempt count (1-based once scheduled).
+    #[prost(int32, tag = "2")]
+    pub attempt: i32,
+    /// The per-attempt fencing stamp; bumped on each (re)schedule (Requirement
+    /// 11.6).
+    #[prost(int64, tag = "3")]
+    pub stamp: i64,
+    /// User-defined task queue (required).
+    #[prost(string, tag = "4")]
+    pub task_queue: String,
+    /// Application-level activity id.
+    #[prost(string, tag = "5")]
+    pub activity_id: String,
+    /// Application-level activity type.
+    #[prost(string, tag = "6")]
+    pub activity_type: String,
+    /// Schedule-to-start timeout in nanoseconds (`0` = unset).
+    #[prost(int64, tag = "7")]
+    pub schedule_to_start_nanos: i64,
+    /// Schedule-to-close timeout in nanoseconds (`0` = unset).
+    #[prost(int64, tag = "8")]
+    pub schedule_to_close_nanos: i64,
+    /// Start-to-close timeout in nanoseconds (`0` = unset).
+    #[prost(int64, tag = "9")]
+    pub start_to_close_nanos: i64,
+    /// Heartbeat timeout in nanoseconds (`0` = unset).
+    #[prost(int64, tag = "10")]
+    pub heartbeat_nanos: i64,
+    /// Serialized activity input payload.
+    #[prost(bytes = "vec", tag = "11")]
+    pub input: Vec<u8>,
+    /// Serialized activity result payload (set on `Completed`).
+    #[prost(bytes = "vec", tag = "12")]
+    pub result: Vec<u8>,
+    /// Failure message (set on `Failed`/`Terminated`/`TimedOut`).
+    #[prost(string, tag = "13")]
+    pub failure: String,
+    /// Maximum attempts from the retry policy (`0` = unlimited).
+    #[prost(int32, tag = "14")]
+    pub maximum_attempts: i32,
+    /// Last scheduled time in Unix nanoseconds.
+    #[prost(int64, tag = "15")]
+    pub scheduled_time_nanos: i64,
+    /// Last started time in Unix nanoseconds (`0` = not started).
+    #[prost(int64, tag = "16")]
+    pub started_time_nanos: i64,
+}
+
+// `status()` and `set_status()` accessors for the `status` enumeration field are
+// generated by the `prost::Message` derive, so they are not defined by hand here.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_mapping_matches_v1_31_0() {
+        assert_eq!(
+            lifecycle_for(ActivityStatus::Completed),
+            LifecycleState::Completed
+        );
+        for failed in [
+            ActivityStatus::Failed,
+            ActivityStatus::Canceled,
+            ActivityStatus::Terminated,
+            ActivityStatus::TimedOut,
+        ] {
+            assert_eq!(lifecycle_for(failed), LifecycleState::Failed);
+        }
+        for running in [
+            ActivityStatus::Unspecified,
+            ActivityStatus::Scheduled,
+            ActivityStatus::Started,
+            ActivityStatus::CancelRequested,
+        ] {
+            assert_eq!(lifecycle_for(running), LifecycleState::Running);
+        }
+    }
+
+    #[test]
+    fn terminal_classification() {
+        assert!(ActivityStatus::Completed.is_terminal());
+        assert!(!ActivityStatus::Scheduled.is_terminal());
+        assert!(!ActivityStatus::CancelRequested.is_terminal());
+    }
+
+    #[test]
+    fn status_round_trips_through_proto_int() {
+        let mut state = ActivityState::default();
+        state.set_status(ActivityStatus::Started);
+        assert_eq!(state.status(), ActivityStatus::Started);
+        let bytes = {
+            use prost::Message as _;
+            state.encode_to_vec()
+        };
+        let back = {
+            use prost::Message as _;
+            ActivityState::decode(bytes.as_slice()).expect("decode")
+        };
+        assert_eq!(back.status(), ActivityStatus::Started);
+    }
+}

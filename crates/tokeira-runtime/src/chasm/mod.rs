@@ -34,9 +34,12 @@ mod typed;
 
 pub use engine::{
     ChasmEngine, ChasmEngineConfig, CollectingDispatchSink, CollectingVisibilitySink, DispatchSink,
-    ROOT_PATH, SearchAttributeProvider, SearchAttributes, VisibilitySink,
+    ROOT_PATH, VisibilitySink,
 };
 pub use typed::TypedEngine;
+// Re-exported from the pure crate: these are component-level contracts, not engine
+// internals, so component crates depend on `tokeira-chasm` for them (Requirement 1.4).
+pub use tokeira_chasm::{EngineComponent, SearchAttributeProvider, SearchAttributes};
 
 use async_trait::async_trait;
 use tokeira_chasm::{ChasmError, ComponentRef, ExecutionKey, LifecycleState, VersionedTransition};
@@ -191,19 +194,4 @@ pub trait Engine: Send + Sync {
         key: &ExecutionKey,
         event: NotifyEvent,
     ) -> Result<(), ChasmError>;
-}
-
-/// Bridges a CHASM [`Component`](tokeira_chasm::Component) to and from its root
-/// data node so the engine can materialize it (MVP: a component is reconstructed
-/// from its single `#[chasm(data)]` field; see the module doc).
-///
-/// A component library implements this trivially: `from_data` wraps the proto in
-/// the component struct, `into_data` returns it. It is the explicit seam where the
-/// engine's type-erased node bytes meet the typed component the closure mutates.
-pub trait EngineComponent: tokeira_chasm::Component {
-    /// Reconstruct the component from its persisted root data.
-    fn from_data(data: Self::Data) -> Self;
-
-    /// Extract the component's root data for persistence.
-    fn into_data(self) -> Self::Data;
 }

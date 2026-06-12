@@ -254,20 +254,20 @@ verify against `../temporal @ v1.31.0` before finalizing.
 
 ### Layer 3 — Activity component (`tokeira-chasm-activity`) + edge wiring
 
-- [ ] 17. Scaffold and model the activity component
-  - [ ] 17.1 Scaffold the `tokeira-chasm-activity` crate
+- [x] 17. Scaffold and model the activity component
+  - [x] 17.1 Scaffold the `tokeira-chasm-activity` crate
     - Add `crates/tokeira-chasm-activity` as a workspace member depending on `tokeira-chasm`,
       `tokeira-chasm-derive`, `tokeira-types`, `tokeira-proto`; no engine internals
     - _Requirements: 1.4_
-  - [ ] 17.2 Implement the `ActivityExecution` root component and lifecycle mapping
+  - [x] 17.2 Implement the `ActivityExecution` root component and lifecycle mapping
     - `#[derive(Component)]` with `#[chasm(fqn = "activity.activity")]`, one `#[chasm(data)]`
       `ActivityStateProto` (status + attempt `stamp`), input/timeouts/retry/result data fields; register
       under library `activity`; `ActivityStatus` enum (8 states); lifecycle mapping
       (`COMPLETED→Completed`; `FAILED|CANCELED|TERMINATED|TIMED_OUT→Failed`; else `Running`)
     - _Requirements: 11.1, 11.2, 11.3_
 
-- [ ] 18. Implement the activity transition table
-  - [ ] 18.1 Implement `apply()` with stamp fencing
+- [x] 18. Implement the activity transition table
+  - [x] 18.1 Implement `apply()` with stamp fencing
     - Legal transitions per `statemachine.go @ v1.31.0` (Scheduled/Rescheduled/Started/Completed/
       Failed/CancelRequested/Canceled/Terminated/TimedOut); illegal `(from, event)` →
       `Err(IllegalTransition)` leaving state unchanged; stamp mismatch → superseded (no-op); on
@@ -280,29 +280,29 @@ verify against `../temporal @ v1.31.0` before finalizing.
     - `prop_transition_legality`: random event sequences never reach an illegal state; illegal events
       rejected and leave state unchanged; ≥100 iterations; Property 2 tag
     - _Requirements: 12.3_
-  - [ ]* 18.3 Write unit tests for lifecycle mapping and stamp supersession
+  - [x]* 18.3 Write unit tests for lifecycle mapping and stamp supersession
     - Cover the lifecycle mapping for every `ActivityStatus` and stamp-mismatch supersession
     - _Requirements: 11.3, 11.6_
 
-- [ ] 19. Implement the activity tasks
-  - [ ] 19.1 Implement the `dispatch` side-effect task and its validator
+- [x] 19. Implement the activity tasks
+  - [x] 19.1 Implement the `dispatch` side-effect task and its validator
     - `TaskKind::SideEffect`; post-commit enqueue to matching (`AddActivityTask`); validator drops if
       the attempt advanced or the activity already started/closed; stamp-fenced
     - _Requirements: 11.7_
-  - [ ] 19.2 Implement the pure timer tasks and their validators
+  - [x] 19.2 Implement the pure timer tasks and their validators
     - `scheduleToStart`, `scheduleToClose`, `startToClose`, `heartbeat` as `TaskKind::Pure`; each
       `fire_at()` from normalized timeouts; each validator drops on stamp mismatch or terminal state;
       firing produces a `TimedOut` (or reschedule) transition
     - _Requirements: 11.7_
 
-- [ ] 20. Implement activity validation and configuration
-  - [ ] 20.1 Implement request validation
+- [x] 20. Implement activity validation and configuration
+  - [x] 20.1 Implement request validation
     - Require a user-defined task queue; require `activityId`/`activityType` non-empty and within
       `MaxIDLengthLimit`; retry-policy defaulting; timeout normalization (schedule-to-start /
       schedule-to-close / start-to-close capped to run timeout; heartbeat ≤ start-to-close)
     - **Ground-truth**: reproduce the rules against `validator.go @ v1.31.0` (do not invent)
     - _Requirements: 11.9_
-  - [ ] 20.2 Implement the activity config (config-as-constant)
+  - [x] 20.2 Implement the activity config (config-as-constant)
     - `{ enable_standalone: bool = false (per-namespace), long_poll_timeout = 20s, long_poll_buffer =
       1s }`; `serde(deny_unknown_fields)`; no env vars (`AGENTS` Configuration)
     - _Requirements: 11.11, 11.12_
@@ -312,7 +312,7 @@ verify against `../temporal @ v1.31.0` before finalizing.
     - `prop_activity_config_roundtrip`: config round-trips without loss; unknown fields rejected; ≥100
       iterations; Property 10 tag
     - _Requirements: 12.3_
-  - [ ]* 20.4 Write unit tests for validation edge cases
+  - [x]* 20.4 Write unit tests for validation edge cases
     - Missing task queue, over-length id, timeout normalization incl. heartbeat ≤ start-to-close and
       cap-to-run-timeout
     - _Requirements: 11.9_
@@ -329,7 +329,7 @@ verify against `../temporal @ v1.31.0` before finalizing.
     - **Ground-truth**: resolve the exact disabled-feature gRPC status against `frontend.go @ v1.31.0`
       (likely `FAILED_PRECONDITION`/`UNIMPLEMENTED`) before finalizing — verify against v1.31.0
     - _Requirements: 11.10_
-  - [ ] 21.3 Contribute the activity search attributes
+  - [x] 21.3 Contribute the activity search attributes
     - Declare `ActivityType`, `ExecutionStatus`, `TaskQueue` through the visibility hook (task 14.1) so
       they flow to projection
     - _Requirements: 10.4_

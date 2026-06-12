@@ -1,0 +1,24 @@
+[package]
+name = "tokeira-chasm-activity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The standalone-activity archetype: CHASM component #1. A pure library — state
+# enum, transition table, task definitions, validation, config — depending only
+# on the substrate (`tokeira-chasm` + the derive macro) and value/wire types. It
+# contains NO engine internals (Requirement 1.4): the runtime engine drives it,
+# but this crate does not depend on the runtime.
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+prost = "0.12"
+postcard = { version = "1.0", features = ["alloc"] }
+tokeira-chasm = { path = "../tokeira-chasm" }
+tokeira-chasm-derive = { path = "../tokeira-chasm-derive" }
+tokeira-types = { path = "../tokeira-types" }
+tokeira-proto = { path = "../tokeira-proto" }
+
+[dev-dependencies]
+proptest = "1.6"
+serde_json.workspace = true

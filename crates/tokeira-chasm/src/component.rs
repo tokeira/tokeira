@@ -151,6 +151,23 @@ pub trait RootComponent: Component {
     fn context_metadata(&self) -> &ContextMetadata;
 }
 
+/// Bridges a [`Component`] to and from its root data node so an engine can
+/// materialize it.
+///
+/// MVP materialization reconstructs a component from its single `#[chasm(data)]`
+/// field: `from_data` wraps the persisted proto, `into_data` extracts it. This is a
+/// **pure** component ↔ data contract with no engine dependency, so a component
+/// crate (e.g. `tokeira-chasm-activity`) implements it without depending on the
+/// runtime (Requirement 1.4). The runtime's typed engine uses it at the node
+/// boundary; richer multi-node materialization, when needed, supersedes it.
+pub trait EngineComponent: Component {
+    /// Reconstruct the component from its persisted root data.
+    fn from_data(data: Self::Data) -> Self;
+
+    /// Extract the component's root data for persistence.
+    fn into_data(self) -> Self::Data;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

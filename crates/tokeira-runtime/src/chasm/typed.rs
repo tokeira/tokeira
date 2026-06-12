@@ -15,13 +15,13 @@ use std::marker::PhantomData;
 
 use prost::Message as _;
 use tokeira_chasm::{
-    ChasmError, ComponentRef, Context, ExecutionKey, MutableContext, RootComponent,
-    VersionedTransition,
+    ChasmError, ComponentRef, Context, EngineComponent, ExecutionKey, MutableContext,
+    RootComponent, SearchAttributeProvider, VersionedTransition,
 };
 
 use super::{
-    CommitOutcome, Engine, EngineComponent, StartRequest, UpdateOutcome, UpdateRequest,
-    engine::{ChasmEngine, SearchAttributeProvider, TransitionContext},
+    CommitOutcome, Engine, StartRequest, UpdateOutcome, UpdateRequest,
+    engine::{ChasmEngine, TransitionContext},
 };
 
 /// A component-typed view over a [`ChasmEngine`].
@@ -175,7 +175,8 @@ mod tests {
 
     use tokeira_chasm::{
         ChasmError, Component, Context, ContextMetadata, ExecutionKey, FieldRegistry, Lifecycle,
-        LifecycleState, MutableContext, Registry, RootComponent, TaskKind, TerminateReason,
+        LifecycleState, MutableContext, Registry, RootComponent, SearchAttributeProvider,
+        SearchAttributes, TaskKind, TerminateReason,
     };
     use tokeira_storage::InMemoryChasmNodeStore;
 
@@ -184,7 +185,6 @@ mod tests {
         Engine, PollOutcome, PollRequest,
         engine::{
             ChasmEngine, ChasmEngineConfig, CollectingDispatchSink, CollectingVisibilitySink,
-            SearchAttributeProvider, SearchAttributes,
         },
     };
 

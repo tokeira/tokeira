@@ -19,8 +19,8 @@ use std::{
 use async_trait::async_trait;
 use tokeira_chasm::{
     ChasmError, Context, DispatchableTask, ExecutionInfo, ExecutionKey, LifecycleState,
-    MutableContext, NodeTree, Registry, RetainAllValidator, Staleness, TransitionResult,
-    VersionedTransition,
+    MutableContext, NodeTree, Registry, RetainAllValidator, SearchAttributes, Staleness,
+    TransitionResult, VersionedTransition,
 };
 use tokeira_storage::{ChasmNodeRepository, ExpectedVersion, NodePersistOutcome, NodeWrite};
 use tokio::sync::Notify;
@@ -34,20 +34,6 @@ use super::{
 /// component from this single node (see the module doc); it is the empty key, so a
 /// whole-execution range scan begins at it.
 pub const ROOT_PATH: &[u8] = b"";
-
-/// Component-contributed search attributes, emitted to visibility on transition
-/// close (Requirement 10). Kept as string pairs for the MVP; richer typed values
-/// ride the existing search-attribute work in projection.
-pub type SearchAttributes = Vec<(String, String)>;
-
-/// A component's declaration of the search attributes it contributes — the
-/// provider half of CHASM's built-in visibility (design "Visibility as a Built-in
-/// Component"; Requirement 10.1, 10.2). The engine collects these on transition
-/// close and hands them to the [`VisibilitySink`].
-pub trait SearchAttributeProvider {
-    /// The search attributes this component currently contributes.
-    fn search_attributes(&self) -> SearchAttributes;
-}
 
 /// The sink for post-commit side-effect dispatch (Requirement 7.6, 7.8). The real
 /// implementation enqueues to matching; the engine only hands it the surviving

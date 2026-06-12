@@ -11,6 +11,7 @@ members = [
     "crates/tokeira-kernel",
     "crates/tokeira-chasm-derive",
     "crates/tokeira-chasm",
+    "crates/tokeira-chasm-activity",
     "crates/tokeira-state",
     "crates/tokeira-iac",
     "crates/tokeira-deploy-engine",

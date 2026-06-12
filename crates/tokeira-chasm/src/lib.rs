@@ -58,9 +58,11 @@ pub mod path;
 pub mod registry;
 pub mod task;
 pub mod versioned_transition;
+pub mod visibility;
 
 pub use component::{
-    Component, ContextMetadata, Lifecycle, LifecycleState, RootComponent, TerminateReason,
+    Component, ContextMetadata, EngineComponent, Lifecycle, LifecycleState, RootComponent,
+    TerminateReason,
 };
 pub use component_ref::ComponentRef;
 pub use context::{Context, MutableContext};
@@ -80,3 +82,4 @@ pub use task::{
     TaskValidator, TaskValidity,
 };
 pub use versioned_transition::{Staleness, VersionedTransition};
+pub use visibility::{SearchAttributeProvider, SearchAttributes};

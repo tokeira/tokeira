@@ -105,6 +105,11 @@ const NON_RETRYABLE_ACTIVITY_SENTINEL: &str = "__tokeira_non_retryable__";
 const CALLBACK_URL_MAX_LENGTH: usize = 1000;
 const CALLBACK_HEADER_MAX_SIZE: usize = 8 * 1024;
 const MAX_CALLBACKS_PER_WORKFLOW: usize = 32;
+// `frontend.maxlinksPerRequest` / `frontend.linkMaxSize` defaults
+// (`common/dynamicconfig/constants.go:1010,1015 @ v1.31.0`). Behavioural limits,
+// so source-cited constants per the callback-validation decision note.
+const MAX_LINKS_PER_REQUEST: usize = 10;
+const LINK_MAX_SIZE: usize = 4000;
 
 fn proto_duration_to_time(value: Option<&prost_types::Duration>) -> Option<time::Duration> {
     value.map(|duration| {
@@ -269,6 +274,104 @@ fn validate_completion_callbacks(
                 return Err(ProtoConversionError::InvalidArgument(format!(
                     "invalid header: header size longer than max allowed size of {CALLBACK_HEADER_MAX_SIZE}"
                 )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Builds the link set v1.31.0 validates on admission: the request's own links
+/// (with any that exactly match a Nexus-callback link removed) followed by every
+/// callback's links. Mirrors `dedupLinksFromCallbacks` + the `allLinks`
+/// assembly in `StartWorkflowExecution` (`service/frontend/workflow_handler.go:6230,675 @ v1.31.0`).
+fn collect_admission_links(
+    links: &[proto_common::Link],
+    callbacks: &[proto_common::Callback],
+) -> Vec<proto_common::Link> {
+    let nexus_callback_links: Vec<&proto_common::Link> = callbacks
+        .iter()
+        .filter(|cb| {
+            matches!(
+                cb.variant.as_ref(),
+                Some(proto_common::callback::Variant::Nexus(_))
+            )
+        })
+        .flat_map(|cb| cb.links.iter())
+        .collect();
+    // Dedup is by proto equality, only against Nexus-callback links; prost types
+    // derive structural `PartialEq`, which is the wire-equality v1.31.0 uses.
+    let mut combined: Vec<proto_common::Link> = links
+        .iter()
+        .filter(|link| !nexus_callback_links.iter().any(|cb_link| *cb_link == *link))
+        .cloned()
+        .collect();
+    for callback in callbacks {
+        combined.extend(callback.links.iter().cloned());
+    }
+    combined
+}
+
+fn validate_links(links: &[proto_common::Link]) -> Result<(), ProtoConversionError> {
+    // Mirror `WorkflowHandler.validateLinks` (`service/frontend/workflow_handler.go:6260 @ v1.31.0`):
+    // bound the combined link set by count and per-link serialized size, admit
+    // only WorkflowEvent and BatchJob variants, and require their identity
+    // fields. Messages match v1.31.0 verbatim (the corpus asserts on err text).
+    if links.len() > MAX_LINKS_PER_REQUEST {
+        return Err(ProtoConversionError::InvalidArgument(format!(
+            "cannot attach more than {MAX_LINKS_PER_REQUEST} links per request, got {}",
+            links.len()
+        )));
+    }
+    for link in links {
+        let size = link.encoded_len();
+        if size > LINK_MAX_SIZE {
+            return Err(ProtoConversionError::InvalidArgument(format!(
+                "link exceeds allowed size of {LINK_MAX_SIZE}, got {size}"
+            )));
+        }
+        match link.variant.as_ref() {
+            Some(proto_common::link::Variant::WorkflowEvent(event)) => {
+                if event.namespace.is_empty() {
+                    return Err(ProtoConversionError::InvalidArgument(
+                        "workflow event link must not have an empty namespace field".to_string(),
+                    ));
+                }
+                if event.workflow_id.is_empty() {
+                    return Err(ProtoConversionError::InvalidArgument(
+                        "workflow event link must not have an empty workflow ID field".to_string(),
+                    ));
+                }
+                if event.run_id.is_empty() {
+                    return Err(ProtoConversionError::InvalidArgument(
+                        "workflow event link must not have an empty run ID field".to_string(),
+                    ));
+                }
+                // EVENT_TYPE_UNSPECIFIED == 0; an event ref that names an id but
+                // not a type is rejected (`workflow_handler.go:6285 @ v1.31.0`).
+                if let Some(proto_common::link::workflow_event::Reference::EventRef(event_ref)) =
+                    event.reference.as_ref()
+                    && event_ref.event_type == 0
+                    && event_ref.event_id != 0
+                {
+                    return Err(ProtoConversionError::InvalidArgument(
+                        "workflow event link ref cannot have an unspecified event type and a non-zero event ID"
+                            .to_string(),
+                    ));
+                }
+            }
+            Some(proto_common::link::Variant::BatchJob(job)) => {
+                if job.job_id.is_empty() {
+                    return Err(ProtoConversionError::InvalidArgument(
+                        "batch job link must not have an empty job ID".to_string(),
+                    ));
+                }
+            }
+            // v1.31.0 admits only WorkflowEvent and BatchJob on these paths;
+            // Activity / NexusOperation / unset variants are rejected.
+            _ => {
+                return Err(ProtoConversionError::InvalidArgument(
+                    "unsupported link variant".to_string(),
+                ));
             }
         }
     }
@@ -535,6 +638,10 @@ pub fn start_request_to_edge(
     let cron_schedule = non_empty(req.cron_schedule);
     validate_client_cron_schedule(cron_schedule.as_deref())?;
     validate_completion_callbacks(&req.completion_callbacks)?;
+    validate_links(&collect_admission_links(
+        &req.links,
+        &req.completion_callbacks,
+    ))?;
 
     Ok(StartWorkflowExecutionRequest {
         namespace: req.namespace,
@@ -4893,6 +5000,98 @@ mod tests {
         assert_eq!(
             message,
             "invalid CronSchedule, no time can be found to satisfy the schedule"
+        );
+    }
+
+    #[test]
+    fn start_request_validates_links() {
+        fn workflow_event_link(ns: &str, wid: &str, rid: &str) -> proto_common::Link {
+            proto_common::Link {
+                variant: Some(proto_common::link::Variant::WorkflowEvent(
+                    proto_common::link::WorkflowEvent {
+                        namespace: ns.to_string(),
+                        workflow_id: wid.to_string(),
+                        run_id: rid.to_string(),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }
+        }
+
+        // A well-formed WorkflowEvent link is accepted.
+        let mut req = minimal_start_proto();
+        req.links = vec![workflow_event_link("ns", "wid", "rid")];
+        start_request_to_edge(req).expect("a valid workflow-event link is accepted");
+
+        // Count cap (10): the 11th link is rejected with the verbatim message.
+        let mut req = minimal_start_proto();
+        req.links = vec![workflow_event_link("ns", "wid", "rid"); MAX_LINKS_PER_REQUEST + 1];
+        let status = proto_conversion_status(start_request_to_edge(req).unwrap_err());
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            status.message(),
+            "cannot attach more than 10 links per request, got 11"
+        );
+
+        // WorkflowEvent identity fields are required.
+        let mut req = minimal_start_proto();
+        req.links = vec![workflow_event_link("ns", "wid", "")];
+        let status = proto_conversion_status(start_request_to_edge(req).unwrap_err());
+        assert_eq!(
+            status.message(),
+            "workflow event link must not have an empty run ID field"
+        );
+
+        // BatchJob job ID is required.
+        let mut req = minimal_start_proto();
+        req.links = vec![proto_common::Link {
+            variant: Some(proto_common::link::Variant::BatchJob(
+                proto_common::link::BatchJob::default(),
+            )),
+            ..Default::default()
+        }];
+        let status = proto_conversion_status(start_request_to_edge(req).unwrap_err());
+        assert_eq!(
+            status.message(),
+            "batch job link must not have an empty job ID"
+        );
+
+        // Activity links are an unsupported variant on the start path (v1.31.0
+        // admits only WorkflowEvent and BatchJob).
+        let mut req = minimal_start_proto();
+        req.links = vec![proto_common::Link {
+            variant: Some(proto_common::link::Variant::Activity(
+                proto_common::link::Activity::default(),
+            )),
+            ..Default::default()
+        }];
+        let status = proto_conversion_status(start_request_to_edge(req).unwrap_err());
+        assert_eq!(status.message(), "unsupported link variant");
+
+        // An event ref that names an id but not a type is rejected.
+        let mut req = minimal_start_proto();
+        req.links = vec![proto_common::Link {
+            variant: Some(proto_common::link::Variant::WorkflowEvent(
+                proto_common::link::WorkflowEvent {
+                    namespace: "ns".to_string(),
+                    workflow_id: "wid".to_string(),
+                    run_id: "rid".to_string(),
+                    reference: Some(proto_common::link::workflow_event::Reference::EventRef(
+                        proto_common::link::workflow_event::EventReference {
+                            event_id: 5,
+                            event_type: 0,
+                            ..Default::default()
+                        },
+                    )),
+                },
+            )),
+            ..Default::default()
+        }];
+        let status = proto_conversion_status(start_request_to_edge(req).unwrap_err());
+        assert_eq!(
+            status.message(),
+            "workflow event link ref cannot have an unspecified event type and a non-zero event ID"
         );
     }
 

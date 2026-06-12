@@ -700,6 +700,7 @@ pub fn signal_request_to_edge(
         .ok_or(ProtoConversionError::MissingField(
             "SignalWorkflowExecutionRequest.workflow_execution",
         ))?;
+    validate_links(&req.links)?;
     Ok(SignalWorkflowExecutionRequest {
         namespace: req.namespace,
         workflow_id: execution.workflow_id.clone(),
@@ -3318,6 +3319,7 @@ pub fn signal_with_start_request_to_edge(
         .ok_or(ProtoConversionError::MissingField(
             "SignalWithStartWorkflowExecutionRequest.task_queue",
         ))?;
+    validate_links(&req.links)?;
 
     if matches!(
         enums::WorkflowIdConflictPolicy::try_from(req.workflow_id_conflict_policy).ok(),
@@ -4728,6 +4730,7 @@ pub fn terminate_request_to_edge(
         .ok_or(ProtoConversionError::MissingField(
             "TerminateWorkflowExecutionRequest.workflow_execution",
         ))?;
+    validate_links(&req.links)?;
     Ok(crate::translate::TerminateWorkflowExecutionRequest {
         namespace: req.namespace,
         workflow_id: execution.workflow_id.clone(),
@@ -4795,6 +4798,7 @@ pub fn cancel_request_to_edge(
         .ok_or(ProtoConversionError::MissingField(
             "RequestCancelWorkflowExecutionRequest.workflow_execution",
         ))?;
+    validate_links(&req.links)?;
     Ok(crate::translate::RequestCancelWorkflowExecutionRequest {
         namespace: req.namespace,
         workflow_id: execution.workflow_id.clone(),
@@ -5092,6 +5096,81 @@ mod tests {
         assert_eq!(
             status.message(),
             "workflow event link ref cannot have an unspecified event type and a non-zero event ID"
+        );
+    }
+
+    #[test]
+    fn signal_cancel_terminate_paths_validate_links() {
+        // The same v1.31.0 link admission runs on Signal / RequestCancel /
+        // Terminate / SignalWithStart (`workflow_handler.go:2183,2228,2356,2433 @
+        // v1.31.0`), each over the request's own links (no callback combination).
+        let unsupported = || proto_common::Link {
+            variant: Some(proto_common::link::Variant::Activity(
+                proto_common::link::Activity::default(),
+            )),
+            ..Default::default()
+        };
+        let execution = || {
+            Some(tokeira_proto::common::WorkflowExecution {
+                workflow_id: "wid".to_string(),
+                run_id: String::new(),
+            })
+        };
+
+        let signal = workflowservice::SignalWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_execution: execution(),
+            signal_name: "sig".to_string(),
+            links: vec![unsupported()],
+            ..Default::default()
+        };
+        assert_eq!(
+            proto_conversion_status(signal_request_to_edge(signal).unwrap_err()).message(),
+            "unsupported link variant"
+        );
+
+        let cancel = workflowservice::RequestCancelWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_execution: execution(),
+            links: vec![unsupported()],
+            ..Default::default()
+        };
+        assert_eq!(
+            proto_conversion_status(cancel_request_to_edge(cancel).unwrap_err()).message(),
+            "unsupported link variant"
+        );
+
+        let terminate = workflowservice::TerminateWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_execution: execution(),
+            links: vec![unsupported()],
+            ..Default::default()
+        };
+        assert_eq!(
+            proto_conversion_status(terminate_request_to_edge(terminate).unwrap_err()).message(),
+            "unsupported link variant"
+        );
+
+        let signal_with_start = workflowservice::SignalWithStartWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_id: "wid".to_string(),
+            workflow_type: Some(tokeira_proto::common::WorkflowType {
+                name: "wt".to_string(),
+            }),
+            task_queue: Some(taskqueue::TaskQueue {
+                name: "q".to_string(),
+                ..Default::default()
+            }),
+            signal_name: "sig".to_string(),
+            links: vec![unsupported()],
+            ..Default::default()
+        };
+        assert_eq!(
+            proto_conversion_status(
+                signal_with_start_request_to_edge(signal_with_start).unwrap_err()
+            )
+            .message(),
+            "unsupported link variant"
         );
     }
 

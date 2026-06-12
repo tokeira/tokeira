@@ -14,6 +14,7 @@ pub mod broker;
 pub mod buffered_queries;
 #[cfg(test)]
 mod bug_condition_exploration_tests;
+pub mod chasm;
 pub mod deployment_registry;
 pub mod drain;
 pub mod errors;

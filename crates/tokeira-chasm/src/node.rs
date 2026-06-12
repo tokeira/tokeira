@@ -124,7 +124,7 @@ impl NodeMetadata {
     /// Construct metadata for a freshly created node. Both VT stamps are left at
     /// the supplied `initial_vt` placeholder; [`NodeTree::close_transaction`]
     /// re-stamps them with the committing transition's VT.
-    fn new(
+    pub fn new(
         component_type_id: u32,
         lifecycle_state: Option<LifecycleState>,
         initial_vt: VersionedTransition,

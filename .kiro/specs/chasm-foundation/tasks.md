@@ -155,19 +155,19 @@ verify against `../temporal @ v1.31.0` before finalizing.
 
 ### Layer 2 — Engine + storage (`tokeira-runtime` engine + `tokeira-storage` node table)
 
-- [ ] 11. Implement node storage on DSQL
-  - [ ] 11.1 Add the node table migration
+- [x] 11. Implement node storage on DSQL
+  - [x] 11.1 Add the node table migration
     - Single base `CREATE TABLE chasm_node` migration keyed by `(namespace_id, business_id, run_id,
       encoded_path)` carrying VT stamp, initial VT, `metadata`, nullable `data`; DSQL-safe subset (one
       statement per file, no `CHECK`, no `BIGSERIAL`, secondary indexes `ASYNC`); no `ALTER` (build
       phase). Read `crates/tokeira-storage/AGENTS.md` first.
     - _Requirements: 9.1, 9.7, 9.8_
-  - [ ] 11.2 Implement the node store: write-only-dirty-nodes with OCC/CAS fencing
+  - [x] 11.2 Implement the node store: write-only-dirty-nodes with OCC/CAS fencing
     - Persist exactly the dirty-node set; condition each write on the node's stored VT matching the VT
       read (compare-and-set); on conflict, reload + re-run the transition (no force-overwrite); store
       task outboxes inside `metadata`
     - _Requirements: 9.3, 9.4, 9.5, 9.6_
-  - [ ] 11.3 Implement encoded-path prefix range-scan loads
+  - [x] 11.3 Implement encoded-path prefix range-scan loads
     - Load a subtree, a collection, or an ancestor chain as a single prefix range scan over
       `encoded_path` within one execution
     - _Requirements: 4.4_
@@ -184,25 +184,25 @@ verify against `../temporal @ v1.31.0` before finalizing.
       ≥100 iterations; Property 8 tag
     - _Requirements: 12.3_
 
-- [ ] 12. Implement the engine surface in `tokeira-runtime`
-  - [ ] 12.1 Implement the `Engine` trait, request/outcome types, and `Context`/`MutableContext` impls
+- [x] 12. Implement the engine surface in `tokeira-runtime`
+  - [x] 12.1 Implement the `Engine` trait, request/outcome types, and `Context`/`MutableContext` impls
     - Async `Engine` trait with all seven operations; explicit engine handle (no ambient injection);
       runtime `Context`/`MutableContext` impls; `MutableContext` only inside a transition. Read
       `crates/tokeira-runtime/AGENTS.md` first.
     - _Requirements: 6.1, 6.3, 6.4, 6.7_
-  - [ ] 12.2 Implement `StartExecution`, `UpdateWithStartExecution`, `UpdateComponent`, `ReadComponent`
+  - [x] 12.2 Implement `StartExecution`, `UpdateWithStartExecution`, `UpdateComponent`, `ReadComponent`
     - Drive transitions through tokeira's fenced `commit_transition`; `UpdateWithStart` starts-if-
       absent then updates in one transition honouring the business-id reuse/conflict policy; `Read` is
       a snapshot load with no dirty nodes/tasks
     - _Requirements: 6.1, 6.2, 5.3_
-  - [ ] 12.3 Implement the `TypedEngine<C>` wrappers
+  - [x] 12.3 Implement the `TypedEngine<C>` wrappers
     - Generic monomorphized `start`/`update`/`read` over a concrete `Component` (no runtime dispatch)
     - _Requirements: 6.1, 6.7_
-  - [ ] 12.4 Implement execution close on root lifecycle + reject mutations on a closed execution
+  - [x] 12.4 Implement execution close on root lifecycle + reject mutations on a closed execution
     - When the root `lifecycle_state()` is closed, close the Execution; reject any further mutating
       transition on a closed execution
     - _Requirements: 2.3, 2.4_
-  - [ ] 12.5 Implement `DeleteExecution` (range delete) and `NotifyExecution`
+  - [x] 12.5 Implement `DeleteExecution` (range delete) and `NotifyExecution`
     - Range-delete the node subtree; notify hook to wake pollers / re-evaluate tasks
     - _Requirements: 6.1_
   - [ ]* 12.6 Write property test for lifecycle implies execution close
@@ -212,12 +212,12 @@ verify against `../temporal @ v1.31.0` before finalizing.
       transition is admitted (uses a minimal test root component); ≥100 iterations; Property 11 tag
     - _Requirements: 12.3_
 
-- [ ] 13. Implement long-poll, side-effect dispatch, and the physical timer
-  - [ ] 13.1 Implement `PollComponent` monotonic long-poll
+- [x] 13. Implement long-poll, side-effect dispatch, and the physical timer
+  - [x] 13.1 Implement `PollComponent` monotonic long-poll
     - Block on a notify keyed by execution VT; resolve when the component VT advances past the caller's
       token; return empty when the deadline minus `longPollBuffer` elapses without advancing
     - _Requirements: 6.5, 6.6_
-  - [ ] 13.2 Implement post-commit side-effect dispatch and single physical timer arming
+  - [x] 13.2 Implement post-commit side-effect dispatch and single physical timer arming
     - Dispatch surviving side-effect tasks only post-commit; arm at most one physical timer per
       execution tree at the earliest valid pure-task `fire_at()` tree-wide; hold `physical_task_status`
       as engine-local, non-replicated state that never bumps the VT
@@ -235,19 +235,19 @@ verify against `../temporal @ v1.31.0` before finalizing.
       tree-wide; ≥100 iterations; Property 6 tag
     - _Requirements: 12.3_
 
-- [ ] 14. Implement the visibility hook
-  - [ ] 14.1 Implement the search-attribute provider hook → projection sink
+- [x] 14. Implement the visibility hook
+  - [x] 14.1 Implement the search-attribute provider hook → projection sink
     - On transition close, collect the contributing component's declared search attributes and emit
       them as derived projection writes to `tokeira-projection`, off the correctness path
     - _Requirements: 10.1, 10.2, 10.3_
 
-- [ ] 15. Engine integration tests
-  - [ ]* 15.1 Write engine integration tests over the in-memory store
+- [x] 15. Engine integration tests
+  - [x]* 15.1 Write engine integration tests over the in-memory store
     - Drive start/update/read/delete and the OCC reload-and-rerun path; use synchronization primitives,
       no sleeps (`AGENTS §1`)
     - _Requirements: 6.1, 9.5_
 
-- [ ] 16. Checkpoint — Layer 2 engine + storage
+- [x] 16. Checkpoint — Layer 2 engine + storage
   - Ensure `cargo +nightly fmt --all --check`, `cargo lint`, and `cargo test` pass for the new
     `tokeira-runtime` and `tokeira-storage` surfaces. Ensure all tests pass, ask the user if questions
     arise.

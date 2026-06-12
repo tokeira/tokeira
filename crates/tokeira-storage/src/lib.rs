@@ -17,6 +17,7 @@
 pub mod api;
 #[cfg(test)]
 mod bug_condition_exploration_tests;
+pub mod chasm;
 #[cfg(feature = "dsql")]
 pub mod dsql;
 pub mod memory;
@@ -25,5 +26,6 @@ pub mod metrics;
 mod preservation_property_tests;
 
 pub use api::*;
+pub use chasm::*;
 pub use memory::*;
 pub use metrics::*;

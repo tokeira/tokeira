@@ -35,6 +35,8 @@ tokeira-projection = { path = "../tokeira-projection" }
 tokeira-proto = { path = "../tokeira-proto" }
 tokeira-storage = { path = "../tokeira-storage" }
 tokeira-types = { path = "../tokeira-types" }
+tokeira-chasm = { path = "../tokeira-chasm" }
+prost = "0.12"
 
 [dev-dependencies]
 metrics-util.workspace = true

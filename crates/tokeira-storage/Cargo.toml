@@ -25,6 +25,7 @@ tracing.workspace = true
 tokeira-kernel = { path = "../tokeira-kernel" }
 tokeira-observability = { path = "../tokeira-observability" }
 tokeira-types = { path = "../tokeira-types" }
+tokeira-chasm = { path = "../tokeira-chasm" }
 uuid.workspace = true
 
 [features]

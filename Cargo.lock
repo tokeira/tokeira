@@ -6753,6 +6753,8 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokeira-build-info",
+ "tokeira-chasm",
+ "tokeira-chasm-activity",
  "tokeira-config",
  "tokeira-edge",
  "tokeira-kernel",

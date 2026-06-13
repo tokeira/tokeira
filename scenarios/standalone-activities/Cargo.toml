@@ -1,0 +1,29 @@
+[package]
+name = "tokeira-scenario-standalone-activities"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Standalone scenario project, excluded from the workspace (see the root Cargo.toml
+# `exclude` list). Unlike the worker-versioning scenario, this one cannot build
+# against the published Temporal Rust SDK: standalone-activity RPCs
+# (StartActivityExecution / PollActivityExecution / the SA worker path) do not exist
+# in any published SDK yet — their vendored protos predate the surface. So it drives
+# the server through Tokeira's own generated tonic client (`tokeira-proto`, vendored
+# API v1.62.11), which is still a genuine over-the-wire gRPC consumer. See README.md
+# for the flow and run steps.
+[dependencies]
+tokeira-proto = { path = "../../crates/tokeira-proto" }
+tonic = { version = "0.11", features = ["transport"] }
+prost = "0.12"
+prost-types = "0.12"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+
+# The scenario driver: starts a standalone activity, acts as the worker that polls
+# and responds, then describes the execution and asserts the observable outcome at
+# each stage (completed / failed / terminated).
+[[bin]]
+name = "driver"
+path = "src/driver.rs"

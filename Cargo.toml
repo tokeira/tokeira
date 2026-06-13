@@ -40,6 +40,7 @@ members = [
 ]
 exclude = [
     "scenarios/worker-versioning",
+    "scenarios/standalone-activities",
     "tools/simulation/engine",
     "tools/simulation/broker",
     "tools/simulation/placement",

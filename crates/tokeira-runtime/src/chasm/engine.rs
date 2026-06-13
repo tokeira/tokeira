@@ -40,8 +40,16 @@ pub const ROOT_PATH: &[u8] = b"";
 /// tasks **after** the commit lands, so dispatch stays a derived effect.
 #[async_trait]
 pub trait DispatchSink: Send + Sync {
-    /// Dispatch the surviving side-effect tasks of a committed transition.
-    async fn dispatch(&self, tasks: Vec<DispatchableTask>) -> anyhow::Result<()>;
+    /// Dispatch the surviving side-effect tasks of a committed transition for the
+    /// given execution. The `key` identifies which execution the tasks belong to —
+    /// a [`DispatchableTask`] carries only its owning node path, so the sink needs
+    /// the key to route the task (e.g. onto a per-execution or per-task-queue
+    /// queue) and to build a worker task token that addresses the execution.
+    async fn dispatch(
+        &self,
+        key: &ExecutionKey,
+        tasks: Vec<DispatchableTask>,
+    ) -> anyhow::Result<()>;
 }
 
 /// The sink for derived visibility writes (Requirement 10.3). The real
@@ -55,17 +63,24 @@ pub trait VisibilitySink: Send + Sync {
 /// A [`DispatchSink`] that collects dispatched tasks in memory for tests.
 #[derive(Debug, Default)]
 pub struct CollectingDispatchSink {
-    /// Every batch handed to the sink, in dispatch order.
-    pub dispatched: Mutex<Vec<DispatchableTask>>,
+    /// Every `(execution, task)` handed to the sink, in dispatch order.
+    pub dispatched: Mutex<Vec<(ExecutionKey, DispatchableTask)>>,
 }
 
 #[async_trait]
 impl DispatchSink for CollectingDispatchSink {
-    async fn dispatch(&self, tasks: Vec<DispatchableTask>) -> anyhow::Result<()> {
-        self.dispatched
+    async fn dispatch(
+        &self,
+        key: &ExecutionKey,
+        tasks: Vec<DispatchableTask>,
+    ) -> anyhow::Result<()> {
+        let mut guard = self
+            .dispatched
             .lock()
-            .map_err(|_| anyhow::anyhow!("dispatch sink mutex poisoned"))?
-            .extend(tasks);
+            .map_err(|_| anyhow::anyhow!("dispatch sink mutex poisoned"))?;
+        for task in tasks {
+            guard.push((key.clone(), task));
+        }
         Ok(())
     }
 }
@@ -84,6 +99,24 @@ impl VisibilitySink for CollectingVisibilitySink {
             .lock()
             .map_err(|_| anyhow::anyhow!("visibility sink mutex poisoned"))?
             .push((key.clone(), attributes));
+        Ok(())
+    }
+}
+
+/// A [`VisibilitySink`] that drops everything. For deployments that do not yet
+/// project CHASM component search attributes — the projection plane is off the
+/// correctness path, so discarding is safe (visibility is a derived read model
+/// that can be rebuilt from authoritative history).
+#[derive(Debug, Default)]
+pub struct NoopVisibilitySink;
+
+#[async_trait]
+impl VisibilitySink for NoopVisibilitySink {
+    async fn record(
+        &self,
+        _key: &ExecutionKey,
+        _attributes: SearchAttributes,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -334,7 +367,7 @@ impl ChasmEngine {
     ) -> Result<(), ChasmError> {
         if !result.side_effect_tasks.is_empty() {
             self.dispatch
-                .dispatch(result.side_effect_tasks)
+                .dispatch(key, result.side_effect_tasks)
                 .await
                 .map_err(|e| ChasmError::Internal(format!("dispatch side-effect tasks: {e}")))?;
         }

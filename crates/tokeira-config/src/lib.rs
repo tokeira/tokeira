@@ -217,6 +217,26 @@ pub struct PolicyConfig {
     pub namespace_creation: NamespaceCreationPolicy,
     #[serde(default)]
     pub quotas: QuotasConfig,
+    #[serde(default)]
+    pub compatibility: CompatibilityConfig,
+}
+
+/// Operator overrides that intentionally diverge from the pinned Temporal
+/// behavioural baseline (`TEMPORAL_SERVER_COMPAT`).
+///
+/// Each flag, when set, turns on a feature that sits *ahead* of the baseline
+/// behavioural claim. They default off so an unconfigured server matches the
+/// baseline exactly; enabling one is a declared deviation that the compatibility
+/// report surfaces rather than hides.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompatibilityConfig {
+    /// Enable standalone (CHASM) activities — the public `*ActivityExecution`
+    /// RPCs. Off by default: the baseline (`v1.31.0`) gates them off and answers
+    /// `UNIMPLEMENTED` (`chasm/lib/activity/frontend.go @ v1.31.0`). When `true`,
+    /// tokeira serves them — a deliberate deviation ahead of the baseline.
+    #[serde(default)]
+    pub enable_standalone_activities: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -383,6 +403,7 @@ impl Default for PolicyConfig {
             default_retention_days: default_retention_days(),
             namespace_creation: NamespaceCreationPolicy::Open,
             quotas: QuotasConfig::default(),
+            compatibility: CompatibilityConfig::default(),
         }
     }
 }

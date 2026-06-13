@@ -263,7 +263,10 @@ fn schedule_attempt_timers(
         )?;
     }
     // The dispatch side-effect task enqueues the attempt to matching post-commit.
-    let dispatch = DispatchTask { stamp: state.stamp };
+    let dispatch = DispatchTask {
+        stamp: state.stamp,
+        task_queue: state.task_queue.clone(),
+    };
     ctx.add_task(
         TaskKind::SideEffect,
         DISPATCH_TASK_ID,

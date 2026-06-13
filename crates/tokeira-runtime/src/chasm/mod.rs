@@ -34,7 +34,7 @@ mod typed;
 
 pub use engine::{
     ChasmEngine, ChasmEngineConfig, CollectingDispatchSink, CollectingVisibilitySink, DispatchSink,
-    ROOT_PATH, VisibilitySink,
+    NoopVisibilitySink, ROOT_PATH, VisibilitySink,
 };
 pub use typed::TypedEngine;
 // Re-exported from the pure crate: these are component-level contracts, not engine

@@ -1,0 +1,13 @@
+# Minimal tokeirad config that enables standalone (CHASM) activities for the
+# standalone-activities scenario. Pass it explicitly — tokeirad resolves config from
+# `--config <path>`, then the TOKEIRA_CONFIG env var, then built-in defaults; it does
+# not auto-discover this file:
+#
+#   cargo run -p tokeirad -- --config scenarios/standalone-activities/standalone-activities.toml
+#
+# Every other section takes its default (in-memory storage, local addresses), so this
+# one section is sufficient. Standalone activities sit ahead of the v1.31.0 baseline,
+# so they are off by default and an unconfigured server answers UNIMPLEMENTED; setting
+# this flag is the declared deviation the compatibility report surfaces.
+[policy.compatibility]
+enable_standalone_activities = true

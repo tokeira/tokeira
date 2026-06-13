@@ -7,7 +7,9 @@
 //! orchestration.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use prost::Message as _;
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
@@ -27,6 +29,9 @@ use tokeira_runtime::{
     VersioningError, compute_matching_times, compute_next_times, compute_reachability,
 };
 use tokeira_types::{BuildId, NamespaceId, TaskQueueName, WorkerIdentity};
+
+use tokeira_chasm_activity::ActivityStatus;
+use tokeira_proto::public::temporal::api::activity::v1 as activity_v1;
 
 use crate::{
     grpc::{errors::proto_conversion_status, metadata::metadata_to_header_map, translate},
@@ -90,11 +95,29 @@ fn indexed_value_type_from_edge(value: &str) -> Result<IndexedValueType, Status>
 #[derive(Clone)]
 pub struct WorkflowServiceGrpc {
     inner: WorkflowService,
+    /// Optional standalone-activity bridge. Present only once `tokeirad` has
+    /// constructed a CHASM engine and attached it via [`Self::with_chasm_activity`].
+    /// When absent, the `*ActivityExecution` RPCs answer `UNIMPLEMENTED` (deferred),
+    /// distinct from the per-namespace enable gate the bridge itself enforces.
+    chasm_activity: Option<Arc<crate::chasm_activity::ActivityBridge>>,
 }
 
 impl WorkflowServiceGrpc {
     pub fn new(inner: WorkflowService) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            chasm_activity: None,
+        }
+    }
+
+    /// Attach the standalone-activity bridge. Builder form so `tokeirad` wires the
+    /// CHASM engine in at bootstrap without threading it through every call site.
+    pub fn with_chasm_activity(
+        mut self,
+        bridge: Arc<crate::chasm_activity::ActivityBridge>,
+    ) -> Self {
+        self.chasm_activity = Some(bridge);
+        self
     }
 
     pub fn into_service(self) -> WorkflowServiceServer<Self> {
@@ -106,6 +129,33 @@ impl WorkflowServiceGrpc {
             .resolve_namespace_id(namespace)
             .await
             .map_err(namespace_resolution_status)
+    }
+
+    /// Build a CHASM [`tokeira_chasm::ExecutionKey`] for a standalone-activity
+    /// cancel/terminate/delete operation.
+    ///
+    /// MVP deviation: the public proto allows an empty `run_id` to mean "the
+    /// latest run", but the CHASM bridge addresses an execution by its exact key
+    /// and no latest-run index exists yet. An empty `run_id` is therefore
+    /// rejected with `INVALID_ARGUMENT` rather than silently targeting the wrong
+    /// run; clients pass the `run_id` returned by `StartActivityExecution`.
+    async fn activity_execution_key(
+        &self,
+        namespace: &str,
+        activity_id: String,
+        run_id: String,
+    ) -> Result<tokeira_chasm::ExecutionKey, Status> {
+        if run_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "run_id is required for standalone activity cancel/terminate/delete",
+            ));
+        }
+        let namespace_id = self.resolve_namespace_id(namespace).await?;
+        Ok(tokeira_chasm::ExecutionKey::new(
+            namespace_id.0.to_string(),
+            activity_id,
+            run_id,
+        ))
     }
 }
 
@@ -159,6 +209,197 @@ fn proto_timestamp_to_time(value: &prost_types::Timestamp) -> Option<OffsetDateT
     OffsetDateTime::from_unix_timestamp(value.seconds)
         .ok()
         .map(|time| time + time::Duration::nanoseconds(i64::from(value.nanos)))
+}
+
+/// Convert an optional proto `Duration` to whole nanoseconds, treating an absent
+/// value as `0` (the bridge's "unset" sentinel; normalization applies the real
+/// defaults). Saturating arithmetic keeps a hostile or overflowing duration from
+/// panicking the handler.
+fn proto_duration_to_nanos(value: Option<&prost_types::Duration>) -> i64 {
+    match value {
+        Some(duration) => duration
+            .seconds
+            .saturating_mul(1_000_000_000)
+            .saturating_add(i64::from(duration.nanos)),
+        None => 0,
+    }
+}
+
+/// Build a `PollActivityTaskQueueResponse` for a standalone-activity task served
+/// from the CHASM bridge. Only the fields meaningful for a standalone activity are
+/// populated; `activity_run_id` carries the run id (field 20, "only set for
+/// standalone activities"), and the stored input is decoded back into the
+/// `Payloads` envelope the start request carried.
+fn chasm_activity_poll_response(
+    namespace: &str,
+    task: crate::chasm_activity::PolledActivityTask,
+) -> workflowservice::PollActivityTaskQueueResponse {
+    workflowservice::PollActivityTaskQueueResponse {
+        task_token: task.task_token,
+        workflow_namespace: namespace.to_owned(),
+        activity_type: Some(tokeira_proto::common::ActivityType {
+            name: task.activity_type,
+        }),
+        activity_id: task.activity_id,
+        input: tokeira_proto::common::Payloads::decode(task.input.as_slice()).ok(),
+        attempt: task.attempt,
+        activity_run_id: task.run_id,
+        ..Default::default()
+    }
+}
+
+/// Map an internal activity status to the public `ActivityExecutionStatus`
+/// (`enums/v1/activity.proto @ v1.31.0`): the three running sub-states collapse to
+/// `RUNNING` (their breakdown rides `run_state`), and each terminal maps to its
+/// matching status.
+fn activity_execution_status(
+    status: ActivityStatus,
+) -> tokeira_proto::enums::ActivityExecutionStatus {
+    use tokeira_proto::enums::ActivityExecutionStatus as Status;
+    match status {
+        ActivityStatus::Unspecified => Status::Unspecified,
+        ActivityStatus::Scheduled
+        | ActivityStatus::Started
+        | ActivityStatus::CancelRequested => Status::Running,
+        ActivityStatus::Completed => Status::Completed,
+        ActivityStatus::Failed => Status::Failed,
+        ActivityStatus::Canceled => Status::Canceled,
+        ActivityStatus::Terminated => Status::Terminated,
+        ActivityStatus::TimedOut => Status::TimedOut,
+    }
+}
+
+/// The `RUNNING` breakdown (`PendingActivityState`) for a non-terminal activity;
+/// `Unspecified` for the terminal and pre-scheduled states.
+fn pending_activity_state(status: ActivityStatus) -> tokeira_proto::enums::PendingActivityState {
+    use tokeira_proto::enums::PendingActivityState as State;
+    match status {
+        ActivityStatus::Scheduled => State::Scheduled,
+        ActivityStatus::Started => State::Started,
+        ActivityStatus::CancelRequested => State::CancelRequested,
+        _ => State::Unspecified,
+    }
+}
+
+/// Convert whole nanoseconds to an optional proto `Duration`; `None` for unset
+/// (`<= 0`).
+fn nanos_to_proto_duration(nanos: i64) -> Option<prost_types::Duration> {
+    (nanos > 0).then(|| prost_types::Duration {
+        seconds: nanos / 1_000_000_000,
+        nanos: (nanos % 1_000_000_000) as i32,
+    })
+}
+
+/// Convert whole nanoseconds to an optional proto `Timestamp`; `None` for unset
+/// (`<= 0`).
+fn nanos_to_proto_timestamp(nanos: i64) -> Option<prost_types::Timestamp> {
+    (nanos > 0).then(|| prost_types::Timestamp {
+        seconds: nanos / 1_000_000_000,
+        nanos: (nanos % 1_000_000_000) as i32,
+    })
+}
+
+/// The terminal outcome (`ActivityExecutionOutcome`) for a closed activity, or
+/// `None` while it is still running. A completed activity carries its result
+/// `Payloads`; any other terminal carries a failure with the recorded message.
+fn chasm_activity_outcome(
+    description: &crate::chasm_activity::ActivityDescription,
+) -> Option<activity_v1::ActivityExecutionOutcome> {
+    use activity_v1::activity_execution_outcome::Value;
+    let value = match description.status {
+        ActivityStatus::Completed => Value::Result(
+            tokeira_proto::common::Payloads::decode(description.result.as_slice())
+                .unwrap_or_default(),
+        ),
+        ActivityStatus::Failed
+        | ActivityStatus::Canceled
+        | ActivityStatus::Terminated
+        | ActivityStatus::TimedOut => Value::Failure(tokeira_proto::failure::Failure {
+            message: description.failure.clone(),
+            ..Default::default()
+        }),
+        _ => return None,
+    };
+    Some(activity_v1::ActivityExecutionOutcome { value: Some(value) })
+}
+
+/// Build the `ActivityExecutionInfo` projection of an activity description.
+fn chasm_activity_info(
+    activity_id: String,
+    run_id: String,
+    description: &crate::chasm_activity::ActivityDescription,
+) -> activity_v1::ActivityExecutionInfo {
+    activity_v1::ActivityExecutionInfo {
+        activity_id,
+        run_id,
+        activity_type: Some(tokeira_proto::common::ActivityType {
+            name: description.activity_type.clone(),
+        }),
+        status: activity_execution_status(description.status) as i32,
+        run_state: pending_activity_state(description.status) as i32,
+        task_queue: description.task_queue.clone(),
+        schedule_to_close_timeout: nanos_to_proto_duration(description.schedule_to_close_nanos),
+        schedule_to_start_timeout: nanos_to_proto_duration(description.schedule_to_start_nanos),
+        start_to_close_timeout: nanos_to_proto_duration(description.start_to_close_nanos),
+        heartbeat_timeout: nanos_to_proto_duration(description.heartbeat_nanos),
+        attempt: description.attempt,
+        schedule_time: nanos_to_proto_timestamp(description.scheduled_time_nanos),
+        last_started_time: nanos_to_proto_timestamp(description.started_time_nanos),
+        last_failure: (!description.failure.is_empty()).then(|| tokeira_proto::failure::Failure {
+            message: description.failure.clone(),
+            ..Default::default()
+        }),
+        state_transition_count: description.execution_vt.transition_count,
+        ..Default::default()
+    }
+}
+
+/// Build a `DescribeActivityExecutionResponse`. The long-poll token is the current
+/// execution VT (so a follow-on describe blocks until the next change), and is
+/// absent once the activity is terminal (proto: "Absent only if the activity is
+/// complete"). `input`/`outcome` are populated only when the request asked for
+/// them.
+fn chasm_describe_response(
+    activity_id: String,
+    run_id: String,
+    include_input: bool,
+    include_outcome: bool,
+    description: crate::chasm_activity::ActivityDescription,
+) -> workflowservice::DescribeActivityExecutionResponse {
+    let terminal = description.status.is_terminal();
+    let input = include_input
+        .then(|| tokeira_proto::common::Payloads::decode(description.input.as_slice()).ok())
+        .flatten();
+    let outcome = if include_outcome {
+        chasm_activity_outcome(&description)
+    } else {
+        None
+    };
+    let long_poll_token = if terminal {
+        Vec::new()
+    } else {
+        description.execution_vt.encode()
+    };
+    let info = chasm_activity_info(activity_id, run_id.clone(), &description);
+    workflowservice::DescribeActivityExecutionResponse {
+        run_id,
+        info: Some(info),
+        input,
+        outcome,
+        long_poll_token,
+        callbacks: Vec::new(),
+    }
+}
+
+/// Build a `PollActivityExecutionResponse` from a (typically terminal) description.
+fn chasm_poll_response(
+    run_id: String,
+    description: crate::chasm_activity::ActivityDescription,
+) -> workflowservice::PollActivityExecutionResponse {
+    workflowservice::PollActivityExecutionResponse {
+        run_id,
+        outcome: chasm_activity_outcome(&description),
+    }
 }
 
 macro_rules! deferred_unary {
@@ -330,8 +571,28 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         request: Request<workflowservice::PollActivityTaskQueueRequest>,
     ) -> Result<Response<workflowservice::PollActivityTaskQueueResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
-        let edge_req = translate::poll_activity_request_to_edge(request.into_inner())
-            .map_err(proto_conversion_status)?;
+        let req = request.into_inner();
+        // CHASM-first: serve a queued standalone-activity task if one is waiting on
+        // this task queue, before falling through to the workflow-activity path
+        // (the two share this RPC).
+        if let Some(bridge) = &self.chasm_activity
+            && bridge.is_enabled()
+        {
+            let task_queue = req
+                .task_queue
+                .as_ref()
+                .map(|q| q.name.clone())
+                .unwrap_or_default();
+            if let Some(task) = bridge.poll_activity_task(&task_queue).await? {
+                debug!(%task_queue, "poll_activity_task_queue served standalone activity");
+                return Ok(Response::new(chasm_activity_poll_response(
+                    &req.namespace,
+                    task,
+                )));
+            }
+        }
+        let edge_req =
+            translate::poll_activity_request_to_edge(req).map_err(proto_conversion_status)?;
         debug!(task_queue = %edge_req.task_queue, "poll_activity_task_queue");
         let edge_resp = self
             .inner
@@ -351,7 +612,22 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         request: Request<workflowservice::RespondActivityTaskCompletedRequest>,
     ) -> Result<Response<workflowservice::RespondActivityTaskCompletedResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
-        let edge_req = translate::respond_activity_completed_to_edge(request.into_inner())
+        let req = request.into_inner();
+        // Route to the CHASM path only when the token is one the bridge issued; a
+        // workflow-activity token falls through unchanged.
+        if let Some(bridge) = &self.chasm_activity
+            && bridge.owns_task_token(&req.task_token)
+        {
+            let result = req.result.map(|p| p.encode_to_vec()).unwrap_or_default();
+            bridge
+                .respond_activity_task_completed(&req.task_token, result)
+                .await?;
+            debug!("respond_activity_task_completed (standalone) success");
+            return Ok(Response::new(
+                translate::respond_activity_completed_to_proto(),
+            ));
+        }
+        let edge_req = translate::respond_activity_completed_to_edge(req)
             .map_err(proto_conversion_status)?;
         debug!("respond_activity_task_completed");
         let _edge_resp = self
@@ -369,7 +645,21 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         request: Request<workflowservice::RespondActivityTaskFailedRequest>,
     ) -> Result<Response<workflowservice::RespondActivityTaskFailedResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
-        let edge_req = translate::respond_activity_failed_to_edge(request.into_inner())
+        let req = request.into_inner();
+        if let Some(bridge) = &self.chasm_activity
+            && bridge.owns_task_token(&req.task_token)
+        {
+            let failure = req
+                .failure
+                .as_ref()
+                .map(|f| f.message.clone())
+                .unwrap_or_default();
+            bridge
+                .respond_activity_task_failed(&req.task_token, failure)
+                .await?;
+            return Ok(Response::new(translate::respond_activity_failed_to_proto()));
+        }
+        let edge_req = translate::respond_activity_failed_to_edge(req)
             .map_err(proto_conversion_status)?;
         let _edge_resp = self
             .inner
@@ -1788,25 +2078,107 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     }
     // === End Pause/Unpause Workflow block ===
 
-    // === Activity Executions — deferred to activity-executions-first-class spec ===
-    deferred_unary!(
-        start_activity_execution,
-        StartActivityExecutionRequest,
-        StartActivityExecutionResponse,
-        "activity-executions-first-class"
-    );
-    deferred_unary!(
-        describe_activity_execution,
-        DescribeActivityExecutionRequest,
-        DescribeActivityExecutionResponse,
-        "activity-executions-first-class"
-    );
-    deferred_unary!(
-        poll_activity_execution,
-        PollActivityExecutionRequest,
-        PollActivityExecutionResponse,
-        "activity-executions-first-class"
-    );
+    // === Activity Executions (standalone) ===
+    //
+    // Start/cancel/terminate/delete are served live through the CHASM
+    // [`ActivityBridge`] when attached; the bridge applies the per-namespace
+    // enable gate (off → `UNIMPLEMENTED`, ground-truthed to
+    // `chasm/lib/activity/frontend.go:36 @ v1.31.0`). Describe/poll/list/count
+    // stay deferred until the read-side proto mapping (`ActivityExecutionInfo` /
+    // `ActivityExecutionOutcome`) lands.
+    async fn start_activity_execution(
+        &self,
+        request: Request<workflowservice::StartActivityExecutionRequest>,
+    ) -> Result<Response<workflowservice::StartActivityExecutionResponse>, Status> {
+        let Some(bridge) = &self.chasm_activity else {
+            return Err(Status::unimplemented(
+                "start_activity_execution is not implemented; tracked in spec activity-executions-first-class",
+            ));
+        };
+        let req = request.into_inner();
+        let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+        // The run id names this instance; the start request carries none, so the
+        // server mints it (UUIDv4), mirroring run-id assignment for workflows.
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let start = crate::chasm_activity::StartActivity {
+            namespace_id: namespace_id.0.to_string(),
+            activity_id: req.activity_id,
+            run_id,
+            activity_type: req.activity_type.map(|t| t.name).unwrap_or_default(),
+            task_queue: req.task_queue.map(|q| q.name).unwrap_or_default(),
+            // The activity input is opaque to the edge; carry the encoded
+            // `Payloads` envelope through to the component verbatim.
+            input: req.input.map(|p| p.encode_to_vec()).unwrap_or_default(),
+            schedule_to_start_nanos: proto_duration_to_nanos(req.schedule_to_start_timeout.as_ref()),
+            schedule_to_close_nanos: proto_duration_to_nanos(req.schedule_to_close_timeout.as_ref()),
+            start_to_close_nanos: proto_duration_to_nanos(req.start_to_close_timeout.as_ref()),
+            heartbeat_nanos: proto_duration_to_nanos(req.heartbeat_timeout.as_ref()),
+            // Standalone activities have no enclosing run; schedule-to-close is the
+            // outer cap, applied during normalization.
+            run_timeout_nanos: 0,
+            request_id: (!req.request_id.is_empty()).then_some(req.request_id),
+        };
+        let reference = bridge.start(start).await?;
+        Ok(Response::new(
+            workflowservice::StartActivityExecutionResponse {
+                run_id: reference.execution_key.run_id,
+                started: true,
+                link: None,
+            },
+        ))
+    }
+    async fn describe_activity_execution(
+        &self,
+        request: Request<workflowservice::DescribeActivityExecutionRequest>,
+    ) -> Result<Response<workflowservice::DescribeActivityExecutionResponse>, Status> {
+        let Some(bridge) = &self.chasm_activity else {
+            return Err(Status::unimplemented(
+                "describe_activity_execution is not implemented; tracked in spec activity-executions-first-class",
+            ));
+        };
+        let req = request.into_inner();
+        let key = self
+            .activity_execution_key(&req.namespace, req.activity_id.clone(), req.run_id.clone())
+            .await?;
+        // A present long_poll_token turns this into a long-poll for any state change
+        // (`frontend.go @ v1.31.0`: "optionally as a long-poll that waits for any
+        // state change"); absent, it returns the current state immediately.
+        let description = if req.long_poll_token.is_empty() {
+            bridge.describe(key).await?
+        } else {
+            let since = tokeira_chasm::VersionedTransition::decode(&req.long_poll_token)
+                .map_err(|_| Status::invalid_argument("malformed long_poll_token"))?;
+            match bridge.poll(key.clone(), since).await? {
+                Some(advanced) => advanced,
+                // No change within the long-poll budget; return current state so the
+                // caller can resubmit with the same token.
+                None => bridge.describe(key).await?,
+            }
+        };
+        Ok(Response::new(chasm_describe_response(
+            req.activity_id,
+            req.run_id,
+            req.include_input,
+            req.include_outcome,
+            description,
+        )))
+    }
+    async fn poll_activity_execution(
+        &self,
+        request: Request<workflowservice::PollActivityExecutionRequest>,
+    ) -> Result<Response<workflowservice::PollActivityExecutionResponse>, Status> {
+        let Some(bridge) = &self.chasm_activity else {
+            return Err(Status::unimplemented(
+                "poll_activity_execution is not implemented; tracked in spec activity-executions-first-class",
+            ));
+        };
+        let req = request.into_inner();
+        let key = self
+            .activity_execution_key(&req.namespace, req.activity_id.clone(), req.run_id.clone())
+            .await?;
+        let description = bridge.poll_outcome(key).await?;
+        Ok(Response::new(chasm_poll_response(req.run_id, description)))
+    }
     deferred_unary!(
         list_activity_executions,
         ListActivityExecutionsRequest,
@@ -1819,24 +2191,54 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         CountActivityExecutionsResponse,
         "activity-executions-first-class"
     );
-    deferred_unary!(
-        request_cancel_activity_execution,
-        RequestCancelActivityExecutionRequest,
-        RequestCancelActivityExecutionResponse,
-        "activity-executions-first-class"
-    );
-    deferred_unary!(
-        terminate_activity_execution,
-        TerminateActivityExecutionRequest,
-        TerminateActivityExecutionResponse,
-        "activity-executions-first-class"
-    );
-    deferred_unary!(
-        delete_activity_execution,
-        DeleteActivityExecutionRequest,
-        DeleteActivityExecutionResponse,
-        "activity-executions-first-class"
-    );
+    async fn request_cancel_activity_execution(
+        &self,
+        request: Request<workflowservice::RequestCancelActivityExecutionRequest>,
+    ) -> Result<Response<workflowservice::RequestCancelActivityExecutionResponse>, Status> {
+        let Some(bridge) = &self.chasm_activity else {
+            return Err(Status::unimplemented(
+                "request_cancel_activity_execution is not implemented; tracked in spec activity-executions-first-class",
+            ));
+        };
+        let req = request.into_inner();
+        let key = self.activity_execution_key(&req.namespace, req.activity_id, req.run_id).await?;
+        bridge.request_cancel(key, req.identity).await?;
+        Ok(Response::new(
+            workflowservice::RequestCancelActivityExecutionResponse {},
+        ))
+    }
+    async fn terminate_activity_execution(
+        &self,
+        request: Request<workflowservice::TerminateActivityExecutionRequest>,
+    ) -> Result<Response<workflowservice::TerminateActivityExecutionResponse>, Status> {
+        let Some(bridge) = &self.chasm_activity else {
+            return Err(Status::unimplemented(
+                "terminate_activity_execution is not implemented; tracked in spec activity-executions-first-class",
+            ));
+        };
+        let req = request.into_inner();
+        let key = self.activity_execution_key(&req.namespace, req.activity_id, req.run_id).await?;
+        bridge.terminate(key, req.reason).await?;
+        Ok(Response::new(
+            workflowservice::TerminateActivityExecutionResponse {},
+        ))
+    }
+    async fn delete_activity_execution(
+        &self,
+        request: Request<workflowservice::DeleteActivityExecutionRequest>,
+    ) -> Result<Response<workflowservice::DeleteActivityExecutionResponse>, Status> {
+        let Some(bridge) = &self.chasm_activity else {
+            return Err(Status::unimplemented(
+                "delete_activity_execution is not implemented; tracked in spec activity-executions-first-class",
+            ));
+        };
+        let req = request.into_inner();
+        let key = self.activity_execution_key(&req.namespace, req.activity_id, req.run_id).await?;
+        bridge.delete(key).await?;
+        Ok(Response::new(
+            workflowservice::DeleteActivityExecutionResponse {},
+        ))
+    }
     // === End Activity Executions block ===
 
     deferred_unary!(

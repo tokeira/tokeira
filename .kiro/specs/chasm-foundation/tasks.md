@@ -317,14 +317,14 @@ verify against `../temporal @ v1.31.0` before finalizing.
       cap-to-run-timeout
     - _Requirements: 11.9_
 
-- [ ] 21. Wire the edge bridge
-  - [ ] 21.1 Translate the public `*ActivityExecution` RPCs to engine calls
+- [x] 21. Wire the edge bridge
+  - [x] 21.1 Translate the public `*ActivityExecution` RPCs to engine calls
     - Map `Start→StartExecution`, `RequestCancel`/`Terminate→UpdateComponent`, `Describe→ReadComponent`,
       `Poll→PollComponent`, `Delete→DeleteExecution`; validate per task 20.1 before admitting; route
       `ListActivityExecutions`/`CountActivityExecutions` to the projection plane. Read
       `crates/tokeira-edge/AGENTS.md` first.
     - _Requirements: 11.8_
-  - [ ] 21.2 Implement the `activity.enableStandalone` per-namespace gate
+  - [x] 21.2 Implement the `activity.enableStandalone` per-namespace gate
     - When disabled for a namespace, do not admit the request and return the targeted-release status
     - **Ground-truth**: resolve the exact disabled-feature gRPC status against `frontend.go @ v1.31.0`
       (likely `FAILED_PRECONDITION`/`UNIMPLEMENTED`) before finalizing — verify against v1.31.0

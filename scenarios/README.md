@@ -41,6 +41,7 @@ cargo build --manifest-path scenarios/<name>/Cargo.toml
 | Scenario | Exercises | Status |
 |----------|-----------|--------|
 | `worker-versioning/` | Worker Deployment routing: current/ramping versions, pinned vs auto-upgrade behaviour, version transition, drainage | Design / scaffold — gated on the `worker-deployments` spec landing |
+| `standalone-activities/` | Standalone-activity lifecycle (CHASM component #1): start → worker poll/respond → describe, across completed / failed / terminated outcomes | Runnable against a `tokeirad` with `enable_standalone_activities = true` |
 
 ## Adding a scenario
 

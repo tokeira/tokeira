@@ -41,6 +41,7 @@ pub mod correlation_format;
 pub mod observability;
 
 use tokeira_config::{Cli, ConfigStorageKind, TokeiraConfig};
+use tokeira_chasm::Library as _;
 use tokeira_edge::{
     CacheBackedRouter, EdgeInterceptors, EdgeRoutingConfig, HistoryNotifyingRepository,
     HistoryWaitRegistry, InMemoryNamespaceCache, InMemoryOperatorApi, LocalOnlyRouter,
@@ -512,6 +513,11 @@ type ServerStack = (
 /// Factored out so both the CLI entrypoint and the in-memory facade share one
 /// bootstrap path. Deliberately long and sequential: each block mirrors the
 /// startup dependency order.
+/// Default maximum identifier length for standalone-activity ids, mirroring
+/// Temporal's `MaxIDLengthLimit` default of `1000` (`common/dynamicconfig` @
+/// v1.31.0). Used to validate standalone-activity ids at the edge.
+const DEFAULT_MAX_ID_LENGTH: usize = 1000;
+
 async fn build_and_serve(
     addr: SocketAddr,
     effective_config: Arc<TokeiraConfig>,
@@ -534,6 +540,7 @@ async fn build_and_serve(
                     move |sink_id| VisibilitySink::new(visibility_store.clone(), sink_id)
                 },
                 None,
+                Arc::new(tokeira_storage::InMemoryChasmNodeStore::new()),
             )
             .await
         }
@@ -551,6 +558,11 @@ async fn build_and_serve(
                 worker_deployment_repository,
                 _migration_runner,
             ) = dsql_store.into_parts();
+            // The CHASM node store shares the same connection director as the rest
+            // of the DSQL backend, so standalone-activity node state is durable on
+            // the same cluster.
+            let chasm_node_repo =
+                Arc::new(tokeira_storage::dsql::DsqlChasmNodeRepository::new(director.clone()));
             let visibility_store = DsqlVisibilityStore::new(director);
             let worker_deployment_repository: Arc<dyn WorkerDeploymentRepository> =
                 Arc::new(worker_deployment_repository);
@@ -566,6 +578,7 @@ async fn build_and_serve(
                     move |_sink_id| visibility_store.clone()
                 },
                 Some(endpoint),
+                chasm_node_repo,
             )
             .await
         }
@@ -581,6 +594,7 @@ async fn build_and_serve_with_storage<R, L, S, V, F>(
     visibility_query_store: V,
     projection_sink: F,
     dsql_endpoint: Option<String>,
+    chasm_node_repo: Arc<dyn tokeira_storage::ChasmNodeRepository>,
 ) -> Result<ServerStack>
 where
     R: LeaseRepository + RunRepository + 'static,
@@ -796,7 +810,41 @@ where
         .with_worker_deployment_runtime(runtime_adapter);
     let operator_service = OperatorService::new(operator_api, interceptors);
 
-    let workflow_grpc = WorkflowServiceGrpc::new(workflow_service);
+    // Wire the standalone-activity (CHASM) bridge onto the gRPC adapter: a CHASM
+    // engine over the backend's node repository, an activity-library registry, and
+    // a shared dispatch queue the engine routes committed dispatch tasks into and a
+    // worker poll drains. The enable gate is operator config — off by default, so an
+    // unconfigured server matches the `v1.31.0` baseline (RPCs answer
+    // `UNIMPLEMENTED`); enabling it is a declared deviation (`AGENTS §8`).
+    let workflow_grpc = {
+        let mut registry_builder = tokeira_chasm::Registry::builder();
+        tokeira_chasm_activity::ActivityLibrary::register(&mut registry_builder)
+            .context("failed to register the activity CHASM library")?;
+        let registry = Arc::new(registry_builder.build());
+        let dispatch_queue = Arc::new(tokeira_edge::chasm_activity::ActivityDispatchQueue::new());
+        let chasm_engine = Arc::new(tokeira_runtime::chasm::ChasmEngine::new(
+            chasm_node_repo,
+            registry,
+            dispatch_queue.clone(),
+            Arc::new(tokeira_runtime::chasm::NoopVisibilitySink),
+        ));
+        let activity_config = tokeira_chasm_activity::ActivityConfig {
+            enable_standalone: effective_config
+                .policy
+                .compatibility
+                .enable_standalone_activities,
+            ..tokeira_chasm_activity::ActivityConfig::default()
+        };
+        let activity_bridge = Arc::new(
+            tokeira_edge::chasm_activity::ActivityBridge::new(
+                chasm_engine,
+                activity_config,
+                DEFAULT_MAX_ID_LENGTH,
+            )
+            .with_dispatch_queue(dispatch_queue),
+        );
+        WorkflowServiceGrpc::new(workflow_service).with_chasm_activity(activity_bridge)
+    };
     let operator_grpc = OperatorServiceGrpc::new(operator_service);
 
     let reflection = tonic_reflection::server::Builder::configure()

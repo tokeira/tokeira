@@ -19,7 +19,7 @@
 //! `MutableContext::add_task`; the activity library owns this small id space.
 
 use serde::{Deserialize, Serialize};
-use tokeira_chasm::{Context, Task, TaskKind, TaskValidator, TaskValidity};
+use tokeira_chasm::{ChasmError, Context, Task, TaskKind, TaskValidator, TaskValidity};
 
 use crate::{component::ActivityExecution, state::ActivityStatus};
 
@@ -41,12 +41,28 @@ pub const HEARTBEAT_TASK_ID: u32 = 5;
 pub struct DispatchTask {
     /// The attempt stamp this dispatch was scheduled for.
     pub stamp: i64,
+    /// The task queue the attempt is enqueued on, so the dispatch sink can route it
+    /// to the matching per-task-queue FIFO a worker polls. Carried on the task (not
+    /// re-read from state) so the sink stays a pure consumer of the committed task.
+    pub task_queue: String,
 }
 
 impl Task for DispatchTask {
     const KIND: TaskKind = TaskKind::SideEffect;
     fn fire_at(&self) -> Option<i64> {
         None
+    }
+}
+
+impl DispatchTask {
+    /// Decode a dispatch-task payload handed to the engine's dispatch sink. The
+    /// payload is the postcard encoding the state machine produced via
+    /// `MutableContext::add_task`; this is the inverse, exposed so a sink outside
+    /// this crate (the edge's activity dispatch queue) can recover the routing
+    /// `task_queue` and fencing `stamp` without depending on postcard directly.
+    pub fn decode(bytes: &[u8]) -> Result<Self, ChasmError> {
+        postcard::from_bytes(bytes)
+            .map_err(|e| ChasmError::Validation(format!("decode dispatch task: {e}")))
     }
 }
 

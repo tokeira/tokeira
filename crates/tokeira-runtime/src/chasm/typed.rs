@@ -346,7 +346,7 @@ mod tests {
             .unwrap();
         let dispatched = fx.dispatch.dispatched.lock().unwrap();
         assert_eq!(dispatched.len(), 1);
-        assert_eq!(dispatched[0].task.task_type_id, 11);
+        assert_eq!(dispatched[0].1.task.task_type_id, 11);
     }
 
     #[tokio::test]

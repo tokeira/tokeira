@@ -3045,7 +3045,10 @@ impl WorkflowService {
                 }
 
                 self.namespaces
-                    .insert(ResolvedNamespace::active(req.namespace))
+                    .insert(ResolvedNamespace {
+                        retention: req.retention,
+                        ..ResolvedNamespace::active(req.namespace)
+                    })
                     .await
                     .map_err(EdgeError::from)
             },
@@ -4858,6 +4861,7 @@ fn namespace_to_description(namespace: ResolvedNamespace) -> NamespaceDescriptio
             worker_heartbeats: true,
             reported_problems_search_attribute: false,
         },
+        retention: namespace.retention,
     }
 }
 

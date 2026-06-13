@@ -2329,8 +2329,23 @@ pub fn count_request_to_edge(
 pub fn register_namespace_request_to_edge(
     req: workflowservice::RegisterNamespaceRequest,
 ) -> Result<EdgeRegisterNamespaceRequest, ProtoConversionError> {
+    // Carry the client's requested retention through to the namespace model; a
+    // missing or non-positive value falls back to the scoped-model default so the
+    // field is always present (Temporal clients/UI require it).
+    let retention = req
+        .workflow_execution_retention_period
+        .map(|d| {
+            time::Duration::seconds(d.seconds) + time::Duration::nanoseconds(i64::from(d.nanos))
+        })
+        .filter(|d| d.is_positive())
+        .unwrap_or_else(|| {
+            time::Duration::seconds(
+                crate::namespace_cache::DEFAULT_NAMESPACE_RETENTION_SECONDS,
+            )
+        });
     Ok(EdgeRegisterNamespaceRequest {
         namespace: req.namespace,
+        retention,
     })
 }
 
@@ -2979,7 +2994,13 @@ pub fn namespace_to_proto(
             supports_schedules: false,
         }),
         config: Some(namespace_proto::NamespaceConfig {
-            workflow_execution_retention_ttl: None,
+            // Echo the namespace's stored retention. Always present (the register
+            // path defaults it when omitted), so the Temporal UI's unconditional
+            // `.toString()` on this field never sees `undefined`.
+            workflow_execution_retention_ttl: Some(prost_types::Duration {
+                seconds: namespace.retention.whole_seconds(),
+                nanos: namespace.retention.subsec_nanoseconds(),
+            }),
             bad_binaries: None,
             history_archival_state: enums::ArchivalState::Disabled as i32,
             history_archival_uri: String::new(),
@@ -5791,9 +5812,19 @@ mod tests {
                 worker_heartbeats: true,
                 reported_problems_search_attribute: false,
             },
+            retention: time::Duration::hours(24),
         });
 
         let config = proto.config.expect("config");
+        // Retention is echoed (regression: a `None` here renders as `undefined`
+        // and crashes the Temporal UI's `.toString()` on the field).
+        assert_eq!(
+            config.workflow_execution_retention_ttl,
+            Some(prost_types::Duration {
+                seconds: 24 * 60 * 60,
+                nanos: 0,
+            })
+        );
         assert_eq!(
             config.history_archival_state,
             enums::ArchivalState::Disabled as i32
@@ -5820,6 +5851,7 @@ mod tests {
                 worker_heartbeats: true,
                 reported_problems_search_attribute: false,
             },
+            retention: time::Duration::hours(24),
         });
 
         let replication = proto.replication_config.expect("replication");

@@ -4,6 +4,13 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
+/// Default per-namespace workflow-execution retention, in seconds (24h). Tokeira's
+/// scoped namespace model applies this when a `RegisterNamespace` request omits a
+/// positive retention, and to pre-seeded namespaces, so the value is always present
+/// on the wire (Temporal clients/UI treat `NamespaceConfig.workflow_execution_retention_ttl`
+/// as always set).
+pub const DEFAULT_NAMESPACE_RETENTION_SECONDS: i64 = 24 * 60 * 60;
+
 /// Namespace metadata resolved at the edge.
 ///
 /// The runtime should not need to rediscover obvious namespace facts such as
@@ -16,6 +23,10 @@ pub struct ResolvedNamespace {
     pub is_global: bool,
     pub visibility_enabled: bool,
     pub deleted: bool,
+    /// Workflow-execution retention period for this namespace, echoed on
+    /// `DescribeNamespace`/`ListNamespaces`. Set from the `RegisterNamespace`
+    /// request (or [`DEFAULT_NAMESPACE_RETENTION_SECONDS`] when omitted).
+    pub retention: time::Duration,
 }
 
 impl ResolvedNamespace {
@@ -26,6 +37,7 @@ impl ResolvedNamespace {
             is_global: false,
             visibility_enabled: true,
             deleted: false,
+            retention: time::Duration::seconds(DEFAULT_NAMESPACE_RETENTION_SECONDS),
         }
     }
 }

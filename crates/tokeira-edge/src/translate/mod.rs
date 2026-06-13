@@ -442,11 +442,17 @@ pub struct NamespaceDescription {
     pub cluster_name: String,
     pub custom_search_attribute_aliases: BTreeMap<String, String>,
     pub capabilities: NamespaceCapabilities,
+    /// Workflow-execution retention period, echoed as
+    /// `NamespaceConfig.workflow_execution_retention_ttl`.
+    pub retention: time::Duration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegisterNamespaceRequest {
     pub namespace: String,
+    /// Requested workflow-execution retention period (defaulted by the gRPC
+    /// translator when the request omits a positive value).
+    pub retention: time::Duration,
 }
 
 /// Target namespace lifecycle state for an [`UpdateNamespaceRequest`].

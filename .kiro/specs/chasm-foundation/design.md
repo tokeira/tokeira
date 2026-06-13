@@ -380,6 +380,135 @@ projection writes** to `tokeira-projection`, never on the correctness path (`AGE
 search-attribute registration rides the existing C3 SA work. The substrate provides the *hook* (a
 component can contribute SAs); projection owns the *sink*.
 
+## Visibility Generalization: One Logical Index for All Archetypes
+
+> Added after design review (workflow + ChatGPT). Supersedes the implicit "activities reuse the
+> workflow-shaped projection" assumption: workflows and CHASM components share **one logical
+> visibility model**, discriminated by a first-class `archetype`. This section is the authoritative
+> contract for the visibility work; the older paragraphs above describe only the substrate *hook*.
+
+### The projection contract
+
+Visibility is **not** "a hook that emits search attributes." Visibility is an **archetype-neutral,
+versioned execution snapshot derived from an authoritative transition**, applied monotonically and
+idempotently, and queried as a pure function of the projected rows — never of projection-log order.
+That contract is what makes a single shared index robust rather than merely convenient.
+
+Why one index (not per-kind tables): listing must not N-way-merge across heterogeneous indexes
+(pagination tokens, global sort, and rollups would become cross-index reconciliation). Temporal
+reaches the same conclusion but discriminates via the `TemporalNamespaceDivision` search attribute —
+a retrofit onto its legacy mutable-state workflow path. Tokeira is greenfield, so it makes execution
+kind a **first-class column** instead.
+
+### Soundness of one log, two producers (C2, sharpened)
+
+"Producers are disjoint" is **necessary but not sufficient**. The correctness proof is:
+
+1. **One immutable authority per execution run.** A `(namespace_id, archetype_id, run_key)` has exactly
+   one authority. A future workflow→CHASM migration that changes a workflow's authority MUST bump an
+   `authority_epoch` fence so the old and new producers cannot both update the projected row.
+2. **Every visibility record carries a per-execution version** — `(authority_epoch, source_transition_seq)`.
+3. **Apply is monotonic + idempotent per execution**: a record is applied only if its
+   `(authority_epoch, source_transition_seq)` is strictly newer than the stored one. This prevents a
+   retried or out-of-order record from reviving a closed execution or regressing status.
+4. **Queries are functions of the current projected rows, not of log order.**
+
+Therefore arbitrary interleaving of producers affects only *freshness*, never *eventual correctness*.
+
+### Records are versioned snapshots, not deltas
+
+The projection record carries the **complete post-transition visibility image** (status, lifecycle,
+timestamps, type, task queue, transition count, typed search attributes, memo) plus its version. This
+replaces the current workflow `ProjectionOp::Upsert/Close` *delta* emission — the workflow producer is
+migrated to emit snapshots too (decided in design review). Snapshots make "last valid version wins"
+trivial under retries, out-of-order application, and schema evolution; the sink stops folding deltas
+and becomes "upsert iff newer version."
+
+### Transition-derived / repairable (C2.5, not full C3)
+
+The projection stream is a **transition-derived outbox**, never an independent fact that can be lost
+relative to history: a committed transition MUST NOT be able to exist permanently without a
+reconstructible visibility projection. Mechanism may be an outbox row written in the authoritative
+commit, a view over transition rows carrying a visibility envelope, or a **repair scanner** that finds
+transitions whose visibility version has not been projected. Full C3 ("visibility = fold(history)") and
+R4 ("workflow is just another archetype") are the **trajectory**, not this milestone — the snapshot +
+version + archetype contract is the incremental, non-throwaway path toward them.
+
+### Record shape (logical)
+
+`execution_visibility_current`, keyed `(namespace_id, archetype_id, run_key)`:
+
+| Field | Notes |
+|-------|-------|
+| `archetype_id` | First-class, **non-null**; `workflow` is an explicit value (never null-as-workflow). |
+| `business_id` | workflow_id / activity_id / schedule_id / … |
+| `run_id` | meaningful per kind; non-null. |
+| `authority_epoch`, `source_transition_seq` | the version; apply-iff-newer fence. |
+| `status_keyword` | generic low-cardinality keyword; value-set interpreted per archetype. **No** workflow-typed status enum. |
+| `lifecycle_state` | `OPEN`/`CLOSED`/`DELETED` (distinct from status: schedule `Paused` is OPEN, workflow `Completed` is CLOSED). |
+| `start_time`, `update_time`, `close_time` | generic lifecycle timestamps. |
+| `execution_type`, `task_queue` | generic system fields (nullable where N/A). |
+| `transition_count` | generic; maps to `history_length` (workflow) / `state_transition_count` (activity) at the edge. |
+| `memo_blob`, `search_attr_generation` | memo + the current typed-attr generation pointer. |
+
+Status is **logically a system search attribute** (so the query surface is uniform and Temporal-
+compatible) but **physically a column** — status values like `Running`/`Completed` are hot and
+low-cardinality, want native composite indexes (`(namespace_id, archetype_id, status_keyword,
+start_time DESC, run_key)`) and native rollup dimensions, and should not be forced through the EAV
+attribute table.
+
+### DSQL crash-safety: the generation pattern
+
+DSQL has no cross-table transactions, so row + typed-attr rows are made consistent by a **generation
+pointer**: write the new attribute rows at `generation = N`, then flip
+`execution_visibility_current.search_attr_generation = N`; queries join only the current generation;
+old generations are GC'd. Orphaned new-generation rows are never visible until the pointer flips, so a
+crash mid-write is survivable.
+
+### Idempotent rollups
+
+Counts (by status/type/task-queue, archetype-scoped) come from **striped** counters
+(`(namespace_id, archetype_id, dimension, value, stripe)`, `stripe = hash(run_key)`) guarded by an
+applied-version so a retry cannot double-count, with a `rollup_delta` keyed by version when an atomic
+multi-row update is not possible. Rollups are derived and rebuildable from `current`.
+
+### Pipeline, checkpoints, isolation
+
+One projection *protocol* and one logical index — **not** one global checkpoint. Checkpoints are
+partitioned (`projection_checkpoint(partition, last_applied_version)`), processing partitioned by
+source shard / run-key hash, so high-volume activity churn cannot starve workflow visibility.
+Per-archetype operational controls (retention, projection priority/concurrency, rollup striping,
+search-attribute quotas, default UI inclusion) are first-class.
+
+### Archetype scoping at the edge
+
+`ListWorkflowExecutions`/`CountWorkflowExecutions` **force** `archetype = workflow`;
+`ListActivityExecutions`/`CountActivityExecutions` force `archetype = activity`. A caller cannot escape
+its endpoint's scope. Temporal's `TemporalNamespaceDivision` is accepted in query syntax as a **virtual
+system search attribute that compiles to `archetype_id`** (compatibility shim), but is never stored as a
+generic string SA. `archetype`, `status`, `lifecycle_state`, `namespace`, `run_id`, `business_id` are
+**reserved** — user search attributes cannot spoof them.
+
+### The component contribution interface (replaces the thin hook)
+
+The CHASM engine's visibility hook is widened from `record(key, Vec<(String,String)>)` to a typed
+**`VisibilitySnapshot`** the component produces on transition close: `archetype`, `business_id`,
+`run_id`, `status`, `lifecycle`, timestamps, `execution_type`/`task_queue`, **typed** search attributes
+(not strings — range/order/parse correctness needs types), and memo. The adapter holds the engine +
+registry, reads the component state by `ExecutionKey` on close, and writes the snapshot to the shared
+visibility store (post-commit, off the correctness path).
+
+### Delivery stages
+
+1. **Generalize the store + record + sink** to the versioned-snapshot / archetype / status_keyword /
+   lifecycle shape (generation pattern, striped rollups, partitioned checkpoints); migrate the workflow
+   producer onto snapshots (drop delta-fold). Workflow visibility stays green throughout.
+2. **CHASM `VisibilitySnapshot` contract + engine→projection adapter + bootstrap wiring** (replace
+   `NoopVisibilitySink`); standalone activities flow into the shared index.
+3. **Edge `ListActivityExecutions`/`CountActivityExecutions`** + `TemporalNamespaceDivision` virtual SA +
+   `standalone_activities` capability flag + translate to `ActivityExecutionListInfo`.
+4. **Hardening (follow):** repair scanner / outbox-in-commit; trajectory notes toward C3/R4.
+
 ## Storage Design
 
 The substrate adds **one new storage surface**: a node table, keyed by encoded path, living in

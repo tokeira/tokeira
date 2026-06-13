@@ -16,8 +16,13 @@ with the **standalone-activity** archetype as component #1.
 
 Scope is deliberately staged: the substrate plus the activity component only. Re-expressing the
 existing Workflow engine as a CHASM component is **out of scope** (a future, separately-designed
-migration). Where this document references behaviour, it defers to the targeted Temporal release per
-`AGENTS §8`; a requirement that contradicts `v1.31.0` is wrong and is to be corrected.
+migration). One deliberate exception reaches into the workflow path: visibility is generalized into a
+single archetype-neutral, versioned-snapshot plane shared by workflows and CHASM components, which
+requires migrating the workflow producer's *projection emission* from deltas to versioned snapshots
+(Requirement 10). This changes how the workflow path feeds visibility; it does **not** change workflow
+execution semantics, history, or replay, and workflow list/count/UI behaviour is preserved. Where this
+document references behaviour, it defers to the targeted Temporal release per `AGENTS §8`; a requirement
+that contradicts `v1.31.0` is wrong and is to be corrected.
 
 Because the `v1.31.0` functional corpus cannot enable this feature through the out-of-process
 conformance harness (it relies on an in-process `OverrideDynamicConfig` seam — foundation §7),
@@ -79,8 +84,14 @@ bidirectional.
 - **Component_Ref**: A serialized return-address to a specific component node, as of a specific
   execution VT (`ref.go:16 @ v1.31.0`).
 - **Node_Store**: The new node table in `tokeira-storage`, keyed by encoded path on Aurora DSQL.
-- **Visibility_Component**: A built-in child component contributing search attributes to the
-  projection plane (`visibility.go @ v1.31.0`).
+- **Visibility_Plane**: The single logical, archetype-neutral execution index in `tokeira-projection`,
+  keyed by `(namespace_id, archetype_id, run_key)`, fed by versioned snapshots and queried as a pure
+  function of projected rows.
+- **VisibilitySnapshot**: The typed, complete post-transition visibility image a component (or the
+  workflow producer) contributes on transition close, versioned by `(authority_epoch,
+  source_transition_seq)` and applied iff strictly newer.
+- **Lifecycle_State (visibility)**: `OPEN` / `CLOSED` / `DELETED`, distinct from `status_keyword`, so
+  terminal/retention logic never parses status strings.
 - **Edge_Bridge**: The `tokeira-edge` translation of the public `*ActivityExecution` RPCs to CHASM
   engine calls, gated by `activity.enableStandalone`.
 - **Activity_Component**: The standalone-activity root component; library `activity`, archetype
@@ -297,22 +308,58 @@ amplification and conflict surface stay small.
 8. WHILE the initial build phase is in effect, THE Node_Store SHALL define the node table as a single
    base `CREATE TABLE` migration without `ALTER TABLE`.
 
-### Requirement 10: Visibility as a built-in component
+### Requirement 10: Visibility as an archetype-neutral, versioned-snapshot plane
 
-**User Story:** As an operator, I want activity executions to contribute search attributes to
-visibility through a built-in component, so that they are discoverable without putting visibility on
-the correctness path.
+**User Story:** As an operator, I want every execution — workflow or CHASM component — discoverable
+through one logical visibility index fed by versioned, archetype-neutral snapshots applied
+monotonically, so that listing, counting, and the UI work uniformly across archetypes without putting
+visibility on the correctness path and without N-way-merging heterogeneous indexes.
 
 #### Acceptance Criteria
 
-1. THE Visibility_Component SHALL be a built-in child component through which a component declares the
-   search attributes it contributes (`visibility.go @ v1.31.0`).
-2. WHEN a Transition closes, THE CHASM_Engine SHALL collect the contributing component's declared search
-   attributes for projection.
-3. THE Visibility_Component SHALL emit its outputs as derived projection writes to `tokeira-projection`
-   and SHALL NOT place them on the correctness path.
+1. THE Visibility plane SHALL maintain one logical execution index keyed by `(namespace_id,
+   archetype_id, run_key)`, in which `archetype_id` is a first-class **non-null** value and Workflow is
+   an explicit archetype value (never represented as null-as-workflow).
+2. WHEN a Transition closes, THE CHASM_Engine SHALL contribute a typed `VisibilitySnapshot` carrying the
+   complete post-transition visibility image (archetype, business id, run id, status, lifecycle state,
+   lifecycle timestamps, execution type, task queue, transition count, typed search attributes, and
+   memo) versioned by `(authority_epoch, source_transition_seq)`, rather than emitting field-level
+   deltas.
+3. WHEN applying a snapshot, THE Visibility plane SHALL apply it only if its `(authority_epoch,
+   source_transition_seq)` is strictly newer than the stored version for that execution, so that
+   retried or out-of-order snapshots never regress status nor revive a closed execution (monotonic,
+   idempotent apply).
 4. THE Activity_Component SHALL contribute the search attributes `ActivityType`, `ExecutionStatus`, and
    `TaskQueue` (foundation §5).
+5. THE Visibility plane SHALL store status as a generic low-cardinality `status_keyword` column whose
+   value-set is interpreted per archetype, and SHALL NOT use a workflow-typed status enum in the shared
+   model.
+6. THE Visibility plane SHALL maintain a `lifecycle_state` of `OPEN`, `CLOSED`, or `DELETED` distinct
+   from status, so that retention and terminal logic never parse status strings.
+7. WHERE typed search-attribute rows accompany a snapshot, THE Visibility plane SHALL make the
+   execution row and its attribute rows consistent without a cross-table transaction by writing the
+   attribute rows at a new generation and then flipping the row's `search_attr_generation` pointer, so
+   that a crash mid-write leaves no visible partial state.
+8. THE Visibility plane SHALL compute aggregate counts from striped, archetype-scoped rollup counters
+   (stripe = `hash(run_key)`) guarded by an applied-version so that a retry cannot double-count, and the
+   rollups SHALL be rebuildable from the current index.
+9. THE Visibility plane SHALL checkpoint projection progress per partition (partitioned by source shard
+   / run-key hash) rather than as a single global checkpoint, so that high-volume activity churn cannot
+   starve workflow visibility.
+10. THE Visibility plane SHALL reserve the system fields `archetype`, `status`, `lifecycle_state`,
+    `namespace`, `run_id`, and `business_id`, so that user-defined search attributes cannot spoof them.
+11. THE Visibility plane SHALL guarantee that a committed authoritative transition cannot permanently
+    lack a reconstructible visibility projection (a transition-derived, repairable outbox — C2.5).
+12. THE Visibility plane SHALL answer list and count queries as pure functions of the current projected
+    rows, never of projection-log order.
+13. THE existing workflow visibility producer SHALL emit versioned snapshots through this same contract
+    rather than `ProjectionOp` deltas, AND workflow list/count/UI behaviour SHALL remain unchanged
+    across the migration.
+14. THE generic `transition_count` SHALL be mapped to the archetype's wire field at the edge
+    (`history_length` for workflow, `state_transition_count` for activity) and SHALL NOT be stored as an
+    archetype-specific field.
+15. THE Visibility plane SHALL NOT place snapshot contribution or projection application on the
+    correctness path (`AGENTS §3`).
 
 ### Requirement 11: Standalone-activity archetype (component #1)
 
@@ -368,3 +415,25 @@ rather than the Go corpus, so that this feature is verifiable despite the out-of
    in-process `OverrideDynamicConfig` override (foundation §7).
 3. THE CHASM Foundation SHALL implement each named correctness property as a `proptest` property test
    running at least 100 iterations and carrying a `// Feature: chasm-foundation, Property N` tag.
+
+### Requirement 13: Activity discovery and archetype scoping at the edge
+
+**User Story:** As a user of standalone activities, I want `ListActivityExecutions` /
+`CountActivityExecutions` to return only activity executions and to render in the targeted-release wire
+shape, with the namespace capability reported truthfully, so that activity discovery is correct,
+scoped, and SDK/UI-compatible.
+
+#### Acceptance Criteria
+
+1. THE Edge_Bridge SHALL route `ListActivityExecutions` and `CountActivityExecutions` to the visibility
+   plane with the archetype forced to `activity`, AND SHALL force the archetype to `workflow` for
+   `ListWorkflowExecutions` / `CountWorkflowExecutions`, such that a caller cannot widen its endpoint's
+   archetype scope.
+2. WHERE a visibility query references `TemporalNamespaceDivision`, THE Edge_Bridge SHALL treat it as a
+   virtual system search attribute that compiles to `archetype_id`, AND SHALL NOT store or resolve it as
+   a generic string search attribute.
+3. THE Edge_Bridge SHALL translate projected activity rows into the `ActivityExecutionListInfo` wire
+   shape the targeted release returns.
+4. THE namespace capability `standalone_activities` SHALL be reported from the effective
+   `activity.enableStandalone` setting (server-uniform), rather than hardcoded
+   (`namespace_handler.go:868 @ v1.31.0`).

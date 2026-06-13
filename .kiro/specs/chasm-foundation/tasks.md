@@ -3,7 +3,7 @@
 ## Overview
 
 This plan converts the CHASM Foundation design into a series of incremental coding steps for a
-code-generation LLM. It is organized into the three delivery layers the design defines, each
+code-generation LLM. It is organized into the four delivery layers the design defines, each
 independently buildable and testable before the next:
 
 1. **Layer 1 — Substrate**: the `tokeira-chasm` pure crate and `tokeira-chasm-derive` proc-macro.
@@ -11,6 +11,9 @@ independently buildable and testable before the next:
    `tokeira-storage`.
 3. **Layer 3 — Activity component + edge**: `tokeira-chasm-activity` (component #1) and the
    `tokeira-edge` `*ActivityExecution` bridge.
+4. **Layer 4 — Visibility generalization + activity discovery**: one archetype-neutral, versioned-
+   snapshot visibility plane shared by workflows and CHASM components (Requirement 10), the workflow
+   producer migrated to snapshots, and edge `List`/`CountActivityExecutions` (Requirement 13).
 
 Each task builds on prior tasks and ends by wiring new code into an integrated, testable surface — no
 orphaned code. Property-based tests use `proptest`, run ≥100 iterations, and carry a
@@ -347,7 +350,117 @@ verify against `../temporal @ v1.31.0` before finalizing.
       matches the targeted-release contract
     - _Requirements: 11.10, 11.8_
 
-- [ ] 23. Final checkpoint — full feature
+### Layer 4 — Visibility generalization + activity discovery (`tokeira-projection`, `tokeira-storage`, kernel emission, `tokeira-runtime` adapter, `tokeira-edge`)
+
+> Implements Requirement 10 (archetype-neutral versioned-snapshot plane) and Requirement 13 (activity
+> discovery + scoping). Sequencing decision (confirmed): the workflow producer migrates to versioned
+> snapshots **now**, in Stage 1 — no throwaway delta-fold. The authoritative design is design.md
+> "Visibility Generalization: One Logical Index for All Archetypes". Each stage compiles + tests; the
+> workflow list/count/UI stays green throughout.
+
+- [ ] 23. Stage 1 — Generalize the visibility store, record, and sink; migrate the workflow producer to snapshots
+  - [ ] 23.1 Generalize the projection record + store model to the versioned-snapshot / archetype shape
+    - Replace the delta `ProjectionOp` contract with a versioned `VisibilitySnapshot` record carrying
+      `(namespace_id, archetype_id, run_key, authority_epoch, source_transition_seq)` plus the full
+      post-transition image; introduce first-class non-null `archetype_id`, `status_keyword`,
+      `lifecycle_state` (OPEN/CLOSED/DELETED), generic lifecycle timestamps, `execution_type`,
+      `task_queue`, generic `transition_count`, `memo_blob`, `search_attr_generation`. Touches
+      `tokeira-projection/src/{types.rs,store.rs,visibility_api.rs}` and
+      `tokeira-storage/src/api.rs` (`ProjectionContext`/`ProjectionRecord`). Read
+      `crates/tokeira-storage/AGENTS.md` first.
+    - _Requirements: 10.1, 10.2, 10.5, 10.6_
+  - [ ] 23.2 Add the generalized visibility DSQL migrations
+    - Single base `CREATE TABLE execution_visibility_current` keyed `(namespace_id, archetype_id,
+      run_key)` with composite index `(namespace_id, archetype_id, status_keyword, start_time DESC,
+      run_key)` created `ASYNC`; typed attr-index table carrying `generation`; striped rollup table
+      `(namespace_id, archetype_id, dimension, value, stripe)`; `projection_checkpoint(partition,
+      last_applied_version)`. DSQL-safe subset (one statement per file, no `CHECK`, no `BIGSERIAL`,
+      indexes `ASYNC`); no `ALTER` (build phase).
+    - _Requirements: 10.7, 10.8, 10.9_
+  - [ ] 23.3 Make the sink monotonic + idempotent (upsert-iff-newer) with the generation pattern
+    - Apply a snapshot only when its `(authority_epoch, source_transition_seq)` is strictly newer than
+      the stored version; write typed-attr rows at generation N then flip `search_attr_generation = N`
+      and GC old generations; reserve system fields (`archetype`/`status`/`lifecycle_state`/
+      `namespace`/`run_id`/`business_id`); striped rollups guarded by applied-version and rebuildable
+      from current; partitioned checkpoints. Replaces the delta-fold in `visibility_sink.rs`.
+    - _Requirements: 10.3, 10.7, 10.8, 10.10, 10.12_
+  - [ ] 23.4 Migrate the workflow producer to versioned snapshots
+    - Change the kernel projection emission from `ProjectionOp::UpsertExecution`/`CloseExecution`
+      deltas to a full versioned `VisibilitySnapshot` (archetype = workflow; `status_keyword` +
+      `lifecycle_state` derived from workflow `ExecutionStatus`), stamped with the workflow transition
+      seq as `source_transition_seq` and the run's authority as `authority_epoch`. Drop the sink's
+      delta-fold path. Workflow list/count/UI behaviour is preserved.
+    - **Ground-truth**: the workflow `ExecutionStatus` → `status_keyword`/`lifecycle_state` mapping must
+      keep `v1.31.0` list/count semantics (OPEN vs CLOSED, terminal statuses).
+    - _Requirements: 10.13, 10.2, 10.14_
+  - [ ]* 23.5 Write property test for monotonic idempotent snapshot apply
+    - **Property 12: Monotonic snapshot apply**
+    - **Validates: Requirements 10.3**
+    - `prop_monotonic_snapshot_apply`: arbitrary interleaving/retry/out-of-order of snapshots converges
+      to the newest-version image and never regresses status nor revives a closed execution; ≥100
+      iterations; `// Feature: chasm-foundation, Property 12` tag
+    - _Requirements: 12.3_
+  - [ ]* 23.6 Write property test for rollup idempotence + rebuildability
+    - **Property 13: Idempotent rollups**
+    - **Validates: Requirements 10.8**
+    - `prop_rollup_idempotent_rebuildable`: replayed snapshots never double-count; striped rollups equal
+      a fresh rebuild from `current`; ≥100 iterations; `// Feature: chasm-foundation, Property 13` tag
+    - _Requirements: 12.3_
+
+- [ ] 24. Stage 2 — CHASM `VisibilitySnapshot` contract + engine→projection adapter + bootstrap wiring
+  - [ ] 24.1 Define the typed `VisibilitySnapshot` contribution interface in `tokeira-chasm`
+    - Replace the thin `record(key, Vec<(String, String)>)` hook with a typed `VisibilitySnapshot`
+      (archetype, business_id, run_id, status, lifecycle, lifecycle timestamps, execution_type/
+      task_queue, **typed** search attributes, memo) a component produces on transition close; reserved
+      system fields cannot be spoofed by component-declared SAs.
+    - _Requirements: 10.2, 10.10_
+  - [ ] 24.2 Implement the engine→projection adapter and replace `NoopVisibilitySink` at bootstrap
+    - Adapter holds the engine + registry, reads component state by `ExecutionKey` on close, builds the
+      snapshot, and writes it post-commit (off the correctness path). Wire it into `tokeirad` bootstrap
+      (`apps/tokeirad/src/lib.rs`) in place of `NoopVisibilitySink`. Read
+      `crates/tokeira-runtime/AGENTS.md` first.
+    - _Requirements: 10.2, 10.11, 10.15_
+  - [ ] 24.3 Implement the activity component's `VisibilitySnapshot` contribution
+    - Contribute `ActivityType`/`ExecutionStatus`/`TaskQueue` plus status/lifecycle/timestamps/
+      transition_count; `status_keyword` from `ActivityStatus`, `lifecycle_state` from the LifecycleState
+      mapping. Standalone activities now flow into the shared index.
+    - _Requirements: 10.4_
+
+- [ ] 25. Stage 3 — Edge `ListActivityExecutions`/`CountActivityExecutions` + scoping + capability flag
+  - [ ] 25.1 Implement archetype-scoped activity List/Count at the edge
+    - Route `ListActivityExecutions`/`CountActivityExecutions` to the visibility plane forcing
+      `archetype = activity`; force `archetype = workflow` on the workflow endpoints; no caller escape.
+      Read `crates/tokeira-edge/AGENTS.md` first.
+    - _Requirements: 13.1_
+  - [ ] 25.2 Implement `TemporalNamespaceDivision` as a virtual system SA compiling to `archetype_id`
+    - Accept it in visibility query syntax and compile it to `archetype_id`; never store or resolve it
+      as a generic string search attribute.
+    - _Requirements: 13.2_
+  - [ ] 25.3 Translate projected rows to `ActivityExecutionListInfo`
+    - Map generic `transition_count` → `state_transition_count`; build the targeted-release wire shape.
+    - **Ground-truth**: `ActivityExecutionListInfo` shape and field semantics @ v1.31.0.
+    - _Requirements: 13.3, 10.14_
+  - [ ] 25.4 Report the `standalone_activities` capability from `enableStandalone`
+    - `namespace_to_proto` sets `standalone_activities` from the effective `activity.enableStandalone`
+      (server-uniform), not hardcoded `false`.
+    - **Ground-truth**: `namespace_handler.go:868 @ v1.31.0`.
+    - _Requirements: 13.4_
+
+- [ ] 26. Stage 4 — Hardening: repair scanner / outbox-in-commit
+  - [ ] 26.1 Guarantee a committed transition cannot permanently lack a projection
+    - Provide an outbox row written in the authoritative commit, or a repair scanner that finds
+      committed transitions whose visibility version is unprojected and re-emits the snapshot
+      (transition-derived, repairable — C2.5).
+    - _Requirements: 10.11_
+  - [ ]* 26.2 Write property test for repair convergence
+    - **Property 14: Repair convergence**
+    - **Validates: Requirements 10.11**
+    - `prop_repair_convergence`: after arbitrary dropped projections, repair drives the index to the
+      fold of the latest committed snapshots; ≥100 iterations; `// Feature: chasm-foundation, Property
+      14` tag
+    - _Requirements: 12.3_
+
+- [ ] 27. Final checkpoint — full feature
   - Ensure `cargo +nightly fmt --all --check`, `cargo lint`, `cargo test-lint`, and
     `cargo test --workspace` pass across all three new crates and the touched runtime/storage/edge/
     projection surfaces. Ensure all tests pass, ask the user if questions arise.
@@ -358,14 +471,16 @@ verify against `../temporal @ v1.31.0` before finalizing.
   implementation tasks are never optional.
 - Each task references specific requirement sub-clauses for traceability; property-test tasks also
   reference Requirement 12.3 (the `proptest` ≥100-iteration + tag posture).
-- Property tests validate the design's universal correctness properties (Properties 1–11); unit tests
+- Property tests validate the design's universal correctness properties (Properties 1–14); unit tests
   validate specific examples and edge cases; integration tests exercise end-to-end flows.
 - Verification is gated by tokeira's own unit + property tests, not the Temporal Go corpus (Requirement
   12.1, 12.2), because the out-of-process harness cannot deliver the in-process override (foundation §7).
 - **Ground-truth** callouts mark details the design defers to implementation: the exact path-encoder
   separator bytes/sort (4.1), the `ComponentRef`/VT wire shapes (3.1, 7.1), the activity validation
-  rules (20.1), and the disabled-feature gRPC status (21.2) — each verified against `../temporal @
-  v1.31.0` per `AGENTS §8` before finalizing.
+  rules (20.1), the disabled-feature gRPC status (21.2), the workflow `ExecutionStatus` →
+  `status_keyword`/`lifecycle_state` mapping (23.4), the `ActivityExecutionListInfo` wire shape (25.3),
+  and the `standalone_activities` namespace-capability source (25.4) — each verified against
+  `../temporal @ v1.31.0` per `AGENTS §8` before finalizing.
 
 ## Task Dependency Graph
 
@@ -392,7 +507,16 @@ verify against `../temporal @ v1.31.0` before finalizing.
     { "id": 17, "tasks": ["18.2", "18.3", "19.2", "20.3", "20.4"] },
     { "id": 18, "tasks": ["21.1", "21.3"] },
     { "id": 19, "tasks": ["21.2"] },
-    { "id": 20, "tasks": ["22.1", "22.2", "22.3"] }
+    { "id": 20, "tasks": ["22.1", "22.2", "22.3"] },
+    { "id": 21, "tasks": ["23.1", "23.2"] },
+    { "id": 22, "tasks": ["23.3", "23.4"] },
+    { "id": 23, "tasks": ["23.5", "23.6"] },
+    { "id": 24, "tasks": ["24.1"] },
+    { "id": 25, "tasks": ["24.2", "24.3"] },
+    { "id": 26, "tasks": ["25.1", "25.2", "25.4"] },
+    { "id": 27, "tasks": ["25.3"] },
+    { "id": 28, "tasks": ["26.1"] },
+    { "id": 29, "tasks": ["26.2"] }
   ]
 }
 ```

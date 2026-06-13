@@ -7,6 +7,7 @@
 //! `tokeira-kernel`, `tokeira-runtime`, or `tokeira-storage` instead.
 
 pub mod batch_engine;
+pub mod chasm_activity;
 pub mod conformance;
 pub mod errors;
 pub mod grpc;

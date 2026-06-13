@@ -39,6 +39,12 @@ path = "../tokeira-proto"
 [dependencies.tokeira-runtime]
 path = "../tokeira-runtime"
 
+[dependencies.tokeira-chasm]
+path = "../tokeira-chasm"
+
+[dependencies.tokeira-chasm-activity]
+path = "../tokeira-chasm-activity"
+
 [dependencies.tokeira-storage]
 path = "../tokeira-storage"
 

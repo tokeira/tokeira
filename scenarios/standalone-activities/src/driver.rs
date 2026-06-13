@@ -287,6 +287,7 @@ fn payloads(data: &[u8]) -> common::Payloads {
         payloads: vec![common::Payload {
             metadata: Default::default(),
             data: data.to_vec(),
+            ..Default::default()
         }],
     }
 }

@@ -352,13 +352,16 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
     FeatureEntry {
         id: "activity-executions",
         name: "Activity execution management",
-        state: FeatureState::Unsupported,
+        state: FeatureState::Experimental,
         surfaces: ACTIVITY_EXECUTION_SURFACES,
         capability_field: None,
-        dynamic_config_key: None,
+        dynamic_config_key: Some("activity.enableStandalone"),
         rpcs: ACTIVITY_EXECUTION_RPCS,
-        notes: "First-class activity execution RPCs are tracked separately from normal activity task completion and are not part of the current compatibility claim.",
-        evidence: &[],
+        notes: "Standalone (CHASM) activity execution — the first CHASM component. A v1.31.0 feature gated per-namespace by `activity.enableStandalone` (default off); disabled it answers UNIMPLEMENTED (`chasm/lib/activity/frontend.go:36 @ v1.31.0`), enabled it is served, so default conformance is preserved. Tokeira's enable is a server-start config (`policy.compatibility.enable_standalone_activities`), server-uniform and not runtime-injectable: the functional harness's dynamic-config override path is unsupported, so SA functional tests run under the server's start-time setting.",
+        evidence: &[CompatibilityEvidence {
+            kind: crate::CompatibilityEvidenceKind::ManualReview,
+            reference: "chasm-foundation spec; ground-truthed to chasm/lib/activity/{frontend.go,statemachine.go,config.go} @ v1.31.0",
+        }],
     },
     FeatureEntry {
         id: "activity-task-lifecycle",

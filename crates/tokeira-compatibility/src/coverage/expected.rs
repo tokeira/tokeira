@@ -43,8 +43,10 @@ use super::ExpectedOutcome;
 ///   6.2) — but a `Partial` feature is expected to answer its RPCs successfully, so for the
 ///   pass/fail decision it is indistinguishable from `Implemented`.
 /// - `Experimental` with its dynamic-config gate enabled for `namespace` ⟹
-///   [`ExpectedOutcome::OkWhenEnabled`]; gate disabled, or no gate key at all ⟹
-///   [`ExpectedOutcome::DisabledPrecondition`].
+///   [`ExpectedOutcome::OkWhenEnabled`]; gate disabled with a `FAILED_PRECONDITION`
+///   disabled-contract ⟹ [`ExpectedOutcome::DisabledPrecondition`]; gate disabled
+///   with an `UNIMPLEMENTED` disabled-contract (e.g. standalone activities) ⟹
+///   [`ExpectedOutcome::Unimplemented`].
 /// - `Stubbed` / `Unsupported` ⟹ [`ExpectedOutcome::Unimplemented`].
 pub fn expected_outcome(
     entry: &FeatureEntry,
@@ -64,7 +66,10 @@ pub fn expected_outcome(
             ..
         } => ExpectedOutcome::DisabledPrecondition,
         DispatchOutcome::Disabled {
-            reason: DisabledReason::Stubbed | DisabledReason::Unsupported,
+            reason:
+                DisabledReason::ExperimentalUnimplemented
+                | DisabledReason::Stubbed
+                | DisabledReason::Unsupported,
             ..
         } => ExpectedOutcome::Unimplemented,
     }
@@ -123,14 +128,17 @@ mod tests {
                     ),
                     (
                         DispatchOutcome::Disabled {
-                            reason: DisabledReason::Stubbed | DisabledReason::Unsupported,
+                            reason:
+                                DisabledReason::ExperimentalUnimplemented
+                                | DisabledReason::Stubbed
+                                | DisabledReason::Unsupported,
                             ..
                         },
                         _,
                     ) => assert_eq!(
                         expected,
                         ExpectedOutcome::Unimplemented,
-                        "Stubbed/Unsupported ({}) must project to Unimplemented",
+                        "ExperimentalUnimplemented/Stubbed/Unsupported ({}) must project to Unimplemented",
                         entry.id
                     ),
                 }

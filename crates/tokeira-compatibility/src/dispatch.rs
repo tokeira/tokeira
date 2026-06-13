@@ -11,7 +11,15 @@ pub enum DispatchOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisabledReason {
+    /// An experimental feature whose gate is off and whose disabled contract is
+    /// `FAILED_PRECONDITION` (the common case — e.g. batch operations, schedules).
     ExperimentalDisabled,
+    /// An experimental feature whose gate is off and whose disabled contract is
+    /// `UNIMPLEMENTED`. This mirrors a targeted-release feature that answers
+    /// `UNIMPLEMENTED` while gated rather than `FAILED_PRECONDITION` — standalone
+    /// activities are the canonical case (`chasm/lib/activity/frontend.go:36 @
+    /// v1.31.0`: `serviceerror.NewUnimplemented("Standalone activity is disabled")`).
+    ExperimentalUnimplemented,
     Stubbed,
     Unsupported,
 }
@@ -94,7 +102,7 @@ pub fn dispatch_outcome_for(
             }
             Some(_) | None => DispatchOutcome::Disabled {
                 feature_id: entry.id,
-                reason: DisabledReason::ExperimentalDisabled,
+                reason: experimental_disabled_reason(entry.id),
             },
         },
         FeatureState::Stubbed => DispatchOutcome::Disabled {
@@ -105,6 +113,26 @@ pub fn dispatch_outcome_for(
             feature_id: entry.id,
             reason: DisabledReason::Unsupported,
         },
+    }
+}
+
+/// The disabled contract an `Experimental` feature presents when its gate is off.
+///
+/// Temporal does not gate every experimental feature the same way: most answer
+/// `FAILED_PRECONDITION` while disabled, but a few answer `UNIMPLEMENTED`. The
+/// disabled contract is therefore a per-feature property, resolved here by id
+/// (mirroring the localized `secondary_capability_fields` pattern) rather than
+/// carried as a field on every `FeatureEntry` literal. The default is the common
+/// `FAILED_PRECONDITION` contract; only features that mirror a targeted-release
+/// `UNIMPLEMENTED`-while-gated behaviour are listed.
+///
+/// - `activity-executions`: standalone activities are gated per-namespace by
+///   `activity.enableStandalone` and answer `UNIMPLEMENTED` when off
+///   (`chasm/lib/activity/frontend.go:36 @ v1.31.0`).
+fn experimental_disabled_reason(feature_id: &str) -> DisabledReason {
+    match feature_id {
+        "activity-executions" => DisabledReason::ExperimentalUnimplemented,
+        _ => DisabledReason::ExperimentalDisabled,
     }
 }
 

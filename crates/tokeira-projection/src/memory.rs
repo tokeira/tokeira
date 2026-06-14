@@ -172,10 +172,7 @@ impl VisibilityStore for InMemoryVisibilityStore {
         }
 
         for (dimension, value) in [
-            (
-                RollupDimension::ExecutionStatus,
-                format!("{:?}", row.status),
-            ),
+            (RollupDimension::ExecutionStatus, row.status_keyword.clone()),
             (RollupDimension::WorkflowType, row.workflow_type.0),
             (RollupDimension::TaskQueue, row.task_queue.0),
         ] {
@@ -714,7 +711,11 @@ fn field_value(
         FieldRef::System(SystemField::TaskQueue) => {
             Some(FilterValue::String(row.task_queue.0.clone()))
         }
-        FieldRef::System(SystemField::ExecutionStatus) => Some(FilterValue::Status(row.status)),
+        // Status is filtered as the generic `status_keyword` string, not the
+        // workflow `ExecutionStatus` enum (Requirement 10.5).
+        FieldRef::System(SystemField::ExecutionStatus) => {
+            Some(FilterValue::String(row.status_keyword.clone()))
+        }
         FieldRef::System(SystemField::StartTime) => Some(FilterValue::Datetime(row.start_time)),
         FieldRef::System(SystemField::ExecutionTime) => {
             row.execution_time.map(FilterValue::Datetime)
@@ -807,7 +808,7 @@ fn group_value(
     field: &GroupByField,
 ) -> Option<String> {
     match field {
-        GroupByField::System(SystemField::ExecutionStatus) => Some(format!("{:?}", row.status)),
+        GroupByField::System(SystemField::ExecutionStatus) => Some(row.status_keyword.clone()),
         GroupByField::System(SystemField::WorkflowType) => Some(row.workflow_type.0.clone()),
         GroupByField::System(SystemField::TaskQueue) => Some(row.task_queue.0.clone()),
         GroupByField::System(SystemField::WorkflowId) => Some(row.workflow_id.0.clone()),
@@ -1051,16 +1052,18 @@ mod tests {
         let store = InMemoryVisibilityStore::default();
         let ns = NamespaceId(Uuid::from_u128(1));
 
-        // Seed a paused execution.
+        // Seed a paused execution. Status is queried via `status_keyword`, so it
+        // must stay consistent with the typed `status` on a manual mutation.
         let mut paused = row(42);
         paused.status = ExecutionStatus::Paused;
+        paused.status_keyword = crate::types::workflow_status_keyword(ExecutionStatus::Paused);
         store.upsert_execution(&paused).await.unwrap();
 
         let status_filter = |status: ExecutionStatus| CompiledFilter {
             expr: Some(FilterExpr::Compare {
                 field: FieldRef::System(SystemField::ExecutionStatus),
                 op: CompareOp::Eq,
-                value: FilterValue::Status(status),
+                value: FilterValue::String(crate::types::workflow_status_keyword(status)),
             }),
         };
 
@@ -1087,6 +1090,7 @@ mod tests {
         // Unpause projects a Running status update for the same run.
         let mut running = paused.clone();
         running.status = ExecutionStatus::Running;
+        running.status_keyword = crate::types::workflow_status_keyword(ExecutionStatus::Running);
         store.upsert_execution(&running).await.unwrap();
 
         // The run no longer matches "Paused".

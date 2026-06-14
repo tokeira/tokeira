@@ -20,15 +20,19 @@ pub fn compute_rollup_deltas(
     let mut out = Vec::new();
 
     for (dimension, next_value) in [
+        // The status dimension keys off the generic `status_keyword` (archetype-
+        // interpreted), not the workflow-typed `status` enum, so non-workflow
+        // archetypes whose status has no `ExecutionStatus` variant roll up too
+        // (Requirement 10.5; see reference/DECISION-visibility-status-keyword.md).
         (
             RollupDimension::ExecutionStatus,
-            format!("{:?}", next.status),
+            next.status_keyword.clone(),
         ),
         (RollupDimension::WorkflowType, next.workflow_type.0.clone()),
         (RollupDimension::TaskQueue, next.task_queue.0.clone()),
     ] {
         let previous_value = previous.map(|row| match dimension {
-            RollupDimension::ExecutionStatus => format!("{:?}", row.status),
+            RollupDimension::ExecutionStatus => row.status_keyword.clone(),
             RollupDimension::WorkflowType => row.workflow_type.0.clone(),
             RollupDimension::TaskQueue => row.task_queue.0.clone(),
         });

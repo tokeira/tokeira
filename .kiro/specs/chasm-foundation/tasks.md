@@ -358,7 +358,7 @@ verify against `../temporal @ v1.31.0` before finalizing.
 > "Visibility Generalization: One Logical Index for All Archetypes". Each stage compiles + tests; the
 > workflow list/count/UI stays green throughout.
 
-- [x] 23. Stage 1 — Generalize the visibility store, record, and sink; migrate the workflow producer to snapshots
+- [ ] 23. Stage 1 — Generalize the visibility store, record, and sink; migrate the workflow producer to snapshots
   - [x] 23.1 Generalize the projection record + store model to the versioned-snapshot / archetype shape
     - Replace the delta `ProjectionOp` contract with a versioned `VisibilitySnapshot` record carrying
       `(namespace_id, archetype_id, run_key, authority_epoch, source_transition_seq)` plus the full
@@ -406,6 +406,18 @@ verify against `../temporal @ v1.31.0` before finalizing.
     - `prop_rollup_idempotent_rebuildable`: replayed snapshots never double-count; striped rollups equal
       a fresh rebuild from `current`; ≥100 iterations; `// Feature: chasm-foundation, Property 13` tag
     - _Requirements: 12.3_
+  - [ ] 23.7 Migrate the projection read paths off the workflow status enum onto `status_keyword`
+    - The store/record/sink were generalized in 23.1/23.3, but the in-memory and DSQL **query**
+      layer still keys status off the workflow-typed `ExecutionStatus` enum (the `ExecutionStatus`
+      list filter via `FilterValue::Status(row.status)`, the `group_by` value, and the rollup
+      dimension all read `format!("{:?}", row.status)`). Migrate them to the generic, archetype-
+      scoped `status_keyword` column so a non-workflow archetype (activity) whose status has no
+      `ExecutionStatus` variant can be listed/counted/rolled-up. The typed `ExecutionRow.status`
+      becomes workflow-internal only (or is removed) and is no longer the index query key. Workflow
+      List/Count/UI behaviour stays unchanged (existing edge/projection tests + Properties 12/13).
+    - **Ground-truth**: status is a low-cardinality keyword SA in `v1.31.0`, not an enum column;
+      see `reference/DECISION-visibility-status-keyword.md` (`activity.go:40,594,932 @ v1.31.0`).
+    - _Requirements: 10.5, 10.13_
 
 - [ ] 24. Stage 2 — CHASM `VisibilitySnapshot` contract + engine→projection adapter + bootstrap wiring
   - [ ] 24.1 Define the typed `VisibilitySnapshot` contribution interface in `tokeira-chasm`

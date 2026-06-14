@@ -9,7 +9,7 @@
 use anyhow::{Result, anyhow};
 use async_recursion::async_recursion;
 use time::OffsetDateTime;
-use tokeira_types::{ExecutionStatus, NamespaceId, SearchAttrValue, SearchAttributes};
+use tokeira_types::{NamespaceId, SearchAttrValue, SearchAttributes};
 
 use crate::{
     store::VisibilityStore,
@@ -302,9 +302,9 @@ fn parse_value(input: &str) -> FilterValue {
     if trimmed.eq_ignore_ascii_case("false") {
         return FilterValue::Bool(false);
     }
-    if let Ok(status) = parse_status(trimmed) {
-        return FilterValue::Status(status);
-    }
+    // ExecutionStatus is no longer a distinct value type: it is queried as a
+    // generic keyword string compared against the `status_keyword` column, so a
+    // status name like "Running" parses as a plain string below (Requirement 10.5).
     if let Ok(value) = trimmed.parse::<i64>() {
         return FilterValue::Int(value);
     }
@@ -317,20 +317,6 @@ fn parse_value(input: &str) -> FilterValue {
         return FilterValue::Datetime(value);
     }
     FilterValue::String(trimmed.to_string())
-}
-
-fn parse_status(input: &str) -> Result<ExecutionStatus> {
-    match input {
-        "Running" => Ok(ExecutionStatus::Running),
-        "Paused" => Ok(ExecutionStatus::Paused),
-        "Completed" => Ok(ExecutionStatus::Completed),
-        "Failed" => Ok(ExecutionStatus::Failed),
-        "Cancelled" => Ok(ExecutionStatus::Cancelled),
-        "Terminated" => Ok(ExecutionStatus::Terminated),
-        "ContinuedAsNew" => Ok(ExecutionStatus::ContinuedAsNew),
-        "TimedOut" => Ok(ExecutionStatus::TimedOut),
-        _ => Err(anyhow!("not a status")),
-    }
 }
 
 fn split_top_level<'a>(input: &'a str, needle: &str) -> Option<(&'a str, &'a str)> {
@@ -376,14 +362,12 @@ fn ensure_value_type(field: &FieldRef, value: &FilterValue) -> Result<()> {
         | FieldRef::System(SystemField::RunId)
         | FieldRef::System(SystemField::WorkflowType)
         | FieldRef::System(SystemField::TaskQueue)
+        | FieldRef::System(SystemField::ExecutionStatus)
         | FieldRef::System(SystemField::ParentWorkflowId)
         | FieldRef::System(SystemField::ParentRunId)
         | FieldRef::System(SystemField::RootWorkflowId)
         | FieldRef::System(SystemField::RootRunId) => {
             matches!(value, FilterValue::String(_))
-        }
-        FieldRef::System(SystemField::ExecutionStatus) => {
-            matches!(value, FilterValue::Status(_))
         }
         FieldRef::System(SystemField::StartTime)
         | FieldRef::System(SystemField::ExecutionTime)
@@ -559,11 +543,6 @@ mod tests {
         assert!(error.to_string().contains("type mismatch"));
     }
 
-    #[test]
-    fn parse_status_accepts_paused() {
-        assert_eq!(parse_status("Paused").unwrap(), ExecutionStatus::Paused);
-    }
-
     #[tokio::test]
     async fn compile_filter_resolves_paused_execution_status() {
         let store = InMemoryVisibilityStore::default();
@@ -575,7 +554,7 @@ mod tests {
             FilterExpr::Compare { field, op, value } => {
                 assert_eq!(field, FieldRef::System(SystemField::ExecutionStatus));
                 assert_eq!(op, CompareOp::Eq);
-                assert_eq!(value, FilterValue::Status(ExecutionStatus::Paused));
+                assert_eq!(value, FilterValue::String("Paused".to_string()));
             }
             other => panic!("expected Compare, got {other:?}"),
         }

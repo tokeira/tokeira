@@ -1,10 +1,13 @@
 //! Visibility data model for the projection plane.
 //!
-//! `ExecutionRow` is the materialised view of one workflow run, indexed for
-//! list and count queries. `FilterExpr` is the compiled representation of a
-//! user-supplied visibility query, and `SearchAttrType` defines the typed
-//! dimensions that custom search attributes can occupy. Together these types
-//! form the contract between the projection sink and the query path.
+//! `VisibilitySnapshot` is the archetype-neutral post-transition image the
+//! projection sink applies monotonically. `ExecutionRow` remains the workflow
+//! compatibility view consumed by existing Temporal list/count translation
+//! while workflows migrate onto the snapshot protocol. `FilterExpr` is the
+//! compiled representation of a user-supplied visibility query, and
+//! `SearchAttrType` defines the typed dimensions that custom search attributes
+//! can occupy. Together these types form the contract between the projection
+//! sink and the query path.
 
 use anyhow::{Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -12,8 +15,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
 use tokeira_types::{
-    ExecutionStatus, Memo, NamespaceId, ProjectionCursor, RunId, RunKey, SearchAttrValue,
-    TaskQueueName, WorkflowId, WorkflowType,
+    ArchetypeId, ExecutionStatus, Memo, NamespaceId, ProjectionCursor, RunId, RunKey,
+    SearchAttrValue, SearchAttributes, TaskQueueName, TransitionSeq, VisibilityLifecycleState,
+    WorkflowId, WorkflowType,
 };
 use uuid::Uuid;
 
@@ -74,28 +78,259 @@ pub struct AttrDescriptor {
     pub attr_type: SearchAttrType,
 }
 
+/// Complete post-transition visibility image for one execution.
+///
+/// This is the archetype-neutral contract between correctness producers and
+/// the projection plane. It intentionally carries a full row image rather than
+/// deltas: the sink can then apply "newest version wins" per
+/// `(namespace_id, archetype_id, run_key)` and safely ignore retried or
+/// out-of-order projection records.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VisibilitySnapshot {
+    /// Namespace owning the projected execution.
+    pub namespace_id: NamespaceId,
+    /// Execution archetype; `0` is the legacy workflow engine.
+    pub archetype_id: ArchetypeId,
+    /// Durable storage key for the execution.
+    pub run_key: RunKey,
+    /// User/business identifier for the archetype (`workflow_id`, `activity_id`, etc.).
+    pub business_id: String,
+    /// User-visible run identifier.
+    pub run_id: RunId,
+    /// Producer authority fence. A future authority migration bumps this value
+    /// so older producers cannot regress the same projected row.
+    pub authority_epoch: i64,
+    /// Source transition sequence that produced this image.
+    pub source_transition_seq: TransitionSeq,
+    /// Archetype-specific status string used by compatibility queries.
+    pub status_keyword: String,
+    /// Cross-archetype open/closed/deleted discriminator.
+    pub lifecycle_state: VisibilityLifecycleState,
+    /// Execution start timestamp.
+    pub start_time: OffsetDateTime,
+    /// Last update timestamp represented by this snapshot.
+    pub update_time: OffsetDateTime,
+    /// Close timestamp when the execution is terminal.
+    pub close_time: Option<OffsetDateTime>,
+    /// Archetype-specific execution type, if one exists.
+    pub execution_type: Option<String>,
+    /// Task queue associated with the execution, if any.
+    pub task_queue: Option<TaskQueueName>,
+    /// Generic transition counter exposed through archetype-specific wire fields.
+    pub transition_count: i64,
+    /// Approximate serialized history/state size in bytes.
+    pub history_size_bytes: i64,
+    /// Memo values stored with the execution.
+    pub memo: Memo,
+    /// Complete typed search attributes for the current generation.
+    pub search_attributes: SearchAttributes,
+    /// Current search-attribute generation pointer.
+    pub search_attr_generation: u64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionRow {
+    /// Durable storage key for the projected workflow run.
     pub run_key: RunKey,
+    /// Namespace that owns the workflow execution.
     pub namespace_id: NamespaceId,
+    /// Archetype discriminator in the shared visibility index.
+    ///
+    /// Existing workflow rows always carry [`ArchetypeId::WORKFLOW`]. Keeping
+    /// the field on the compatibility row prevents workflow visibility from
+    /// depending on null-as-workflow conventions while CHASM activity rows are
+    /// introduced beside it.
+    pub archetype_id: ArchetypeId,
+    /// Generic business identifier mirrored from `workflow_id` for workflow rows.
+    pub business_id: String,
+    /// Workflow identifier exposed through Temporal workflow list APIs.
     pub workflow_id: WorkflowId,
+    /// User-visible run identifier.
     pub run_id: RunId,
+    /// Projection authority fence for this row.
+    ///
+    /// The initial workflow producer uses epoch 0. A future workflow-to-CHASM
+    /// migration must bump this value so a retired producer cannot overwrite
+    /// rows emitted by the new authority.
+    pub authority_epoch: i64,
+    /// Transition sequence that produced the stored row image.
+    pub source_transition_seq: TransitionSeq,
+    /// Generic status keyword used by the shared visibility plane.
+    pub status_keyword: String,
+    /// Cross-archetype open/closed/deleted lifecycle state.
+    pub lifecycle_state: VisibilityLifecycleState,
+    /// Workflow type used by existing workflow visibility responses.
     pub workflow_type: WorkflowType,
+    /// Workflow task queue used by existing workflow visibility filters.
     pub task_queue: TaskQueueName,
+    /// Workflow-typed status retained for Temporal workflow API translation.
     pub status: ExecutionStatus,
+    /// Workflow start timestamp.
     pub start_time: OffsetDateTime,
+    /// Last projected update timestamp for the generic snapshot row.
+    pub update_time: OffsetDateTime,
+    /// Scheduled execution timestamp when distinct from start time.
     pub execution_time: Option<OffsetDateTime>,
+    /// Close timestamp for terminal workflow rows.
     pub close_time: Option<OffsetDateTime>,
+    /// Durable history length after the source transition.
     pub history_length: i64,
+    /// Closed-run duration in nanoseconds, matching Temporal visibility shape.
     pub execution_duration: Option<i64>,
+    /// Number of committed workflow transitions after the source transition.
     pub state_transition_count: i64,
+    /// Approximate serialized history size in bytes.
     pub history_size_bytes: i64,
+    /// Parent workflow id for child workflow rows.
     pub parent_workflow_id: Option<WorkflowId>,
+    /// Parent run id for child workflow rows.
     pub parent_run_id: Option<RunId>,
+    /// Canonical root workflow id for describe/list metadata.
     pub root_workflow_id: WorkflowId,
+    /// Canonical root run id for describe/list metadata.
     pub root_run_id: RunId,
+    /// Memo values attached to the workflow row.
     pub memo: Memo,
+    /// Complete search-attribute image for the current generation.
+    ///
+    /// The old sink applied search attributes as patches. Task 23 moves toward
+    /// full snapshots; retaining the image here lets the compatibility row
+    /// participate in generation-based application without rereading index rows.
+    pub search_attributes: SearchAttributes,
+    /// Generic transition counter exposed through archetype-specific fields.
+    pub transition_count: i64,
+    /// Search-attribute generation pointer for the snapshot protocol.
+    pub search_attr_generation: u64,
+    /// Legacy search-attribute mutation counter used by existing tests.
     pub search_attr_version: u64,
+}
+
+impl ExecutionRow {
+    /// Mirror a workflow visibility snapshot into the legacy workflow query row.
+    ///
+    /// During task 23 the storage contract moves to archetype-neutral
+    /// snapshots before the workflow edge is fully generalized. This conversion
+    /// is intentionally workflow-only: activity snapshots stay in the generic
+    /// snapshot index until task 25 adds their dedicated list/count surface.
+    pub fn from_workflow_snapshot(snapshot: &VisibilitySnapshot) -> Option<Self> {
+        if snapshot.archetype_id != ArchetypeId::WORKFLOW {
+            return None;
+        }
+        let status = workflow_status_from_keyword(&snapshot.status_keyword)?;
+        let workflow_id = WorkflowId(snapshot.business_id.clone());
+        let workflow_type = WorkflowType(snapshot.execution_type.clone().unwrap_or_default());
+        let task_queue = snapshot
+            .task_queue
+            .clone()
+            .unwrap_or_else(|| TaskQueueName(String::new()));
+        Some(Self {
+            run_key: snapshot.run_key,
+            namespace_id: snapshot.namespace_id,
+            archetype_id: snapshot.archetype_id,
+            business_id: snapshot.business_id.clone(),
+            workflow_id,
+            run_id: snapshot.run_id,
+            authority_epoch: snapshot.authority_epoch,
+            source_transition_seq: snapshot.source_transition_seq,
+            status_keyword: snapshot.status_keyword.clone(),
+            lifecycle_state: snapshot.lifecycle_state,
+            workflow_type,
+            task_queue,
+            status,
+            start_time: snapshot.start_time,
+            update_time: snapshot.update_time,
+            execution_time: Some(snapshot.start_time),
+            close_time: snapshot.close_time,
+            history_length: snapshot.transition_count,
+            execution_duration: None,
+            state_transition_count: snapshot.transition_count,
+            history_size_bytes: snapshot.history_size_bytes,
+            parent_workflow_id: None,
+            parent_run_id: None,
+            root_workflow_id: WorkflowId(snapshot.business_id.clone()),
+            root_run_id: snapshot.run_id,
+            memo: snapshot.memo.clone(),
+            search_attributes: snapshot.search_attributes.clone(),
+            transition_count: snapshot.transition_count,
+            search_attr_generation: snapshot.search_attr_generation,
+            search_attr_version: snapshot.search_attr_generation,
+        })
+    }
+
+    /// Build the generic snapshot for this workflow row.
+    ///
+    /// The workflow-specific fields remain available for existing Temporal
+    /// list/count translation, while the sink can reason over the
+    /// archetype-neutral `VisibilitySnapshot` contract introduced for CHASM.
+    pub fn to_snapshot(&self) -> VisibilitySnapshot {
+        VisibilitySnapshot {
+            namespace_id: self.namespace_id,
+            archetype_id: self.archetype_id,
+            run_key: self.run_key,
+            business_id: self.business_id.clone(),
+            run_id: self.run_id,
+            authority_epoch: self.authority_epoch,
+            source_transition_seq: self.source_transition_seq,
+            status_keyword: self.status_keyword.clone(),
+            lifecycle_state: self.lifecycle_state,
+            start_time: self.start_time,
+            update_time: self.update_time,
+            close_time: self.close_time,
+            execution_type: Some(self.workflow_type.0.clone()),
+            task_queue: Some(self.task_queue.clone()),
+            transition_count: self.transition_count,
+            history_size_bytes: self.history_size_bytes,
+            memo: self.memo.clone(),
+            search_attributes: self.search_attributes.clone(),
+            search_attr_generation: self.search_attr_generation,
+        }
+    }
+}
+
+/// Return true when an incoming visibility version can replace `current`.
+///
+/// Projection workers may retry or observe records out of order. Comparing the
+/// authority epoch first and source transition second enforces the design rule
+/// that a retired producer cannot regress a row owned by a newer authority, and
+/// that duplicate records from the same authority are idempotent no-ops.
+pub fn visibility_version_is_newer(
+    current: Option<&ExecutionRow>,
+    authority_epoch: i64,
+    source_transition_seq: TransitionSeq,
+) -> bool {
+    current.is_none_or(|row| {
+        (authority_epoch, source_transition_seq.0)
+            > (row.authority_epoch, row.source_transition_seq.0)
+    })
+}
+
+/// Return the canonical workflow status keyword stored in generic visibility.
+pub fn workflow_status_keyword(status: ExecutionStatus) -> String {
+    format!("{status:?}")
+}
+
+/// Decode a workflow status keyword produced by [`workflow_status_keyword`].
+pub fn workflow_status_from_keyword(value: &str) -> Option<ExecutionStatus> {
+    match value {
+        "Running" => Some(ExecutionStatus::Running),
+        "Paused" => Some(ExecutionStatus::Paused),
+        "Completed" => Some(ExecutionStatus::Completed),
+        "Failed" => Some(ExecutionStatus::Failed),
+        "Cancelled" => Some(ExecutionStatus::Cancelled),
+        "Terminated" => Some(ExecutionStatus::Terminated),
+        "ContinuedAsNew" => Some(ExecutionStatus::ContinuedAsNew),
+        "TimedOut" => Some(ExecutionStatus::TimedOut),
+        _ => None,
+    }
+}
+
+/// Map workflow terminal/open status into the archetype-neutral lifecycle column.
+pub fn workflow_lifecycle_state(status: ExecutionStatus) -> VisibilityLifecycleState {
+    if status.is_open() {
+        VisibilityLifecycleState::Open
+    } else {
+        VisibilityLifecycleState::Closed
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

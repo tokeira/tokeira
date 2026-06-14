@@ -20,9 +20,10 @@ use tokeira_kernel::{
     WorkflowState, state::VersioningBehavior,
 };
 use tokeira_types::{
-    ExecutionRef, ExecutionStatus, GenerationCounter, NamespaceId, Payload, Payloads,
-    ProjectionCursor, QueueKey, RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskQueueName,
-    TransitionSeq, WorkerIdentity, WorkflowId, WorkflowType,
+    ArchetypeId, ExecutionRef, ExecutionStatus, GenerationCounter, Memo, NamespaceId, Payload,
+    Payloads, ProjectionCursor, QueueKey, RequestId, RunId, RunKey, SearchAttributes, ShardEpoch,
+    ShardId, TaskQueueName, TransitionSeq, VisibilityLifecycleState, WorkerIdentity, WorkflowId,
+    WorkflowType,
 };
 use uuid::Uuid;
 
@@ -825,9 +826,10 @@ pub fn workflow_is_open_and_pinned_to_version(
 
 /// Read-only interface for projection workers.
 ///
-/// Projection sinks consume a partitioned log of
-/// [`ProjectionOp`](tokeira_kernel::ProjectionOp)s
-/// to maintain visibility and search-attribute tables.
+/// Projection sinks consume a partitioned log of complete post-transition
+/// visibility snapshots. The log remains partitioned by run so workers can
+/// checkpoint incrementally, but each record is self-contained and does not
+/// require replaying prior projection deltas.
 #[async_trait]
 pub trait ProjectionLog: Send + Sync {
     /// Read projection records from `cursor` forward,
@@ -840,8 +842,35 @@ pub trait ProjectionLog: Send + Sync {
 /// projection ops from a single transition.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProjectionContext {
+    /// Execution archetype for the shared visibility row.
+    ///
+    /// Workflow transitions use [`ArchetypeId::WORKFLOW`]. CHASM components use
+    /// registry-assigned non-zero ids so the projection plane never relies on a
+    /// nullable workflow discriminator.
+    #[serde(default = "workflow_archetype_id")]
+    pub archetype_id: ArchetypeId,
     /// Namespace owning the workflow execution.
     pub namespace_id: NamespaceId,
+    /// Generic business identifier for the archetype.
+    ///
+    /// This mirrors `workflow_id` for workflow records. Activity and other
+    /// CHASM archetypes use their own stable execution id here, allowing the
+    /// shared current table to serve heterogeneous list/count APIs.
+    #[serde(default)]
+    pub business_id: String,
+    /// Projection producer authority fence.
+    ///
+    /// The existing workflow producer starts at zero. A future authority
+    /// migration must bump this value so stale producers cannot overwrite rows
+    /// from the new owner of the same execution.
+    #[serde(default)]
+    pub authority_epoch: i64,
+    /// Generic status keyword interpreted by the row's archetype.
+    #[serde(default)]
+    pub status_keyword: String,
+    /// Generic open/closed/deleted lifecycle discriminator.
+    #[serde(default = "open_lifecycle_state")]
+    pub lifecycle_state: VisibilityLifecycleState,
     /// Workflow identifier visible to operators and SDKs.
     pub workflow_id: WorkflowId,
     /// Run identifier visible through the Temporal compatibility surface.
@@ -854,6 +883,9 @@ pub struct ProjectionContext {
     pub execution_status: ExecutionStatus,
     /// Workflow start timestamp.
     pub start_time: OffsetDateTime,
+    /// Last-update timestamp represented by this projection context.
+    #[serde(default = "unix_epoch")]
+    pub update_time: OffsetDateTime,
     /// Scheduled execution timestamp when distinct from start time.
     pub execution_time: Option<OffsetDateTime>,
     /// Close timestamp for terminal transitions.
@@ -866,6 +898,9 @@ pub struct ProjectionContext {
     pub execution_duration: Option<i64>,
     /// Number of state transitions after this transition.
     pub state_transition_count: i64,
+    /// Generic transition counter for archetype-neutral visibility.
+    #[serde(default)]
+    pub transition_count: i64,
     /// Approximate serialized history size in bytes.
     ///
     /// Tokeira does not yet maintain Temporal's exact byte accounting, but the
@@ -885,10 +920,38 @@ pub struct ProjectionContext {
     /// Canonical root run ID for this execution.
     #[serde(default)]
     pub root_run_id: Option<RunId>,
+    /// Search-attribute generation pointer for snapshot application.
+    #[serde(default)]
+    pub search_attr_generation: u64,
+    /// Full memo image after the transition.
+    ///
+    /// The old projection contract emitted memo patches through
+    /// `ProjectionOp`. Snapshots carry the complete image so applying a later
+    /// version does not depend on seeing every earlier delta in order.
+    #[serde(default)]
+    pub memo: Memo,
+    /// Full search-attribute image after the transition.
+    ///
+    /// The sink writes this image as one generation. That makes projection
+    /// retries and out-of-order delivery idempotent because the newest snapshot
+    /// replaces the visible generation instead of incrementally folding patches.
+    #[serde(default)]
+    pub search_attributes: SearchAttributes,
 }
 
-/// One row in the projection log, grouping all
-/// projection ops from a single transition.
+fn workflow_archetype_id() -> ArchetypeId {
+    ArchetypeId::WORKFLOW
+}
+
+fn open_lifecycle_state() -> VisibilityLifecycleState {
+    VisibilityLifecycleState::Open
+}
+
+fn unix_epoch() -> OffsetDateTime {
+    OffsetDateTime::UNIX_EPOCH
+}
+
+/// One row in the projection log, carrying the complete visibility image for a transition.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProjectionRecord {
     /// Hash-based partition for fan-out distribution.
@@ -897,12 +960,15 @@ pub struct ProjectionRecord {
     pub fanout: u16,
     /// Durable storage key for the source run.
     pub run_key: RunKey,
-    /// Transition that produced these ops.
+    /// Transition that produced this snapshot.
     pub transition_seq: tokeira_types::TransitionSeq,
     /// Execution metadata snapshot for visibility sinks.
+    ///
+    /// Projection consumers intentionally receive a full post-transition image
+    /// rather than kernel delta operations. That makes the visibility plane
+    /// idempotent under retry and out-of-order delivery: newer versions replace
+    /// older images instead of replaying a partial patch stream.
     pub context: ProjectionContext,
-    /// The projection operations to apply.
-    pub ops: Vec<tokeira_kernel::ProjectionOp>,
 }
 
 /// A page of projection records returned by

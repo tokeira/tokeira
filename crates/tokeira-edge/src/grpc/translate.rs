@@ -2339,9 +2339,7 @@ pub fn register_namespace_request_to_edge(
         })
         .filter(|d| d.is_positive())
         .unwrap_or_else(|| {
-            time::Duration::seconds(
-                crate::namespace_cache::DEFAULT_NAMESPACE_RETENTION_SECONDS,
-            )
+            time::Duration::seconds(crate::namespace_cache::DEFAULT_NAMESPACE_RETENTION_SECONDS)
         });
     Ok(EdgeRegisterNamespaceRequest {
         namespace: req.namespace,

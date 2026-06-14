@@ -190,7 +190,6 @@ mod tests {
         memory::InMemoryVisibilityStore, sink::ProjectionSink, visibility_sink::VisibilitySink,
     };
     use time::OffsetDateTime;
-    use tokeira_kernel::ProjectionOp;
     use tokeira_storage::{ProjectionContext, ProjectionRecord};
     use tokeira_types::{
         ExecutionStatus, Memo, NamespaceId, RunId, RunKey, SearchAttrValue, SearchAttributes,
@@ -217,7 +216,20 @@ mod tests {
             run_key,
             transition_seq: TransitionSeq(1),
             context: ProjectionContext {
+                archetype_id: tokeira_types::ArchetypeId::WORKFLOW,
                 namespace_id,
+                business_id: workflow_id.to_string(),
+                authority_epoch: 0,
+                status_keyword: if close_time.is_some() {
+                    "Completed".to_string()
+                } else {
+                    "Running".to_string()
+                },
+                lifecycle_state: if close_time.is_some() {
+                    tokeira_types::VisibilityLifecycleState::Closed
+                } else {
+                    tokeira_types::VisibilityLifecycleState::Open
+                },
                 workflow_id: WorkflowId(workflow_id.to_string()),
                 run_id: RunId(Uuid::from_u128(run_key.0.as_u128() + 100)),
                 workflow_type: WorkflowType("Workflow".to_string()),
@@ -229,26 +241,24 @@ mod tests {
                 },
                 start_time: OffsetDateTime::from_unix_timestamp(run_key.0.as_u128() as i64)
                     .unwrap(),
+                update_time: close_time.unwrap_or_else(|| {
+                    OffsetDateTime::from_unix_timestamp(run_key.0.as_u128() as i64).unwrap()
+                }),
                 execution_time: None,
                 close_time,
                 history_length: 10,
                 execution_duration: None,
                 state_transition_count: 20,
+                transition_count: 20,
                 history_size_bytes: 0,
                 parent_workflow_id: None,
                 parent_run_id: None,
                 root_workflow_id: Some(WorkflowId(workflow_id.to_string())),
                 root_run_id: Some(RunId(Uuid::from_u128(run_key.0.as_u128() + 100))),
+                search_attr_generation: 1,
+                memo: Memo::default(),
+                search_attributes: search_attr_patch,
             },
-            ops: vec![ProjectionOp::UpsertExecution {
-                status: if close_time.is_some() {
-                    ExecutionStatus::Completed
-                } else {
-                    ExecutionStatus::Running
-                },
-                memo_patch: Memo::default(),
-                search_attr_patch,
-            }],
         }
     }
 
@@ -324,12 +334,23 @@ mod tests {
                     crate::types::ExecutionRow {
                         run_key: RunKey(Uuid::from_u128(rk)),
                         namespace_id: NamespaceId(Uuid::from_u128(ns)),
+                        archetype_id: tokeira_types::ArchetypeId::WORKFLOW,
+                        business_id: wf_id.clone(),
                         workflow_id: WorkflowId(wf_id.clone()),
                         run_id: RunId(Uuid::from_u128(run_id)),
+                        authority_epoch: 0,
+                        source_transition_seq: TransitionSeq(stc as u64),
+                        status_keyword: crate::types::workflow_status_keyword(status),
+                        lifecycle_state: crate::types::workflow_lifecycle_state(status),
                         workflow_type: WorkflowType(wf_type),
                         task_queue: TaskQueueName(tq),
                         status,
                         start_time: time::OffsetDateTime::from_unix_timestamp(start).unwrap(),
+                        update_time: close
+                            .map(|c| time::OffsetDateTime::from_unix_timestamp(c).unwrap())
+                            .unwrap_or_else(|| {
+                                time::OffsetDateTime::from_unix_timestamp(start).unwrap()
+                            }),
                         execution_time: None,
                         close_time: close
                             .map(|c| time::OffsetDateTime::from_unix_timestamp(c).unwrap()),
@@ -342,6 +363,9 @@ mod tests {
                         root_workflow_id: WorkflowId(wf_id),
                         root_run_id: RunId(Uuid::from_u128(run_id)),
                         memo: Memo::default(),
+                        search_attributes: SearchAttributes::default(),
+                        transition_count: stc,
+                        search_attr_generation: 0,
                         search_attr_version: 0,
                     }
                 },

@@ -40,8 +40,8 @@ use tracing::info;
 pub mod correlation_format;
 pub mod observability;
 
-use tokeira_config::{Cli, ConfigStorageKind, TokeiraConfig};
 use tokeira_chasm::Library as _;
+use tokeira_config::{Cli, ConfigStorageKind, TokeiraConfig};
 use tokeira_edge::{
     CacheBackedRouter, EdgeInterceptors, EdgeRoutingConfig, HistoryNotifyingRepository,
     HistoryWaitRegistry, InMemoryNamespaceCache, InMemoryOperatorApi, LocalOnlyRouter,
@@ -561,8 +561,9 @@ async fn build_and_serve(
             // The CHASM node store shares the same connection director as the rest
             // of the DSQL backend, so standalone-activity node state is durable on
             // the same cluster.
-            let chasm_node_repo =
-                Arc::new(tokeira_storage::dsql::DsqlChasmNodeRepository::new(director.clone()));
+            let chasm_node_repo = Arc::new(tokeira_storage::dsql::DsqlChasmNodeRepository::new(
+                director.clone(),
+            ));
             let visibility_store = DsqlVisibilityStore::new(director);
             let worker_deployment_repository: Arc<dyn WorkerDeploymentRepository> =
                 Arc::new(worker_deployment_repository);

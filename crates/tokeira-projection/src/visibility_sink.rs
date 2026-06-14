@@ -1,9 +1,9 @@
-//! Projection sink that applies kernel `ProjectionOp`s to the visibility store.
+//! Projection sink that materializes post-transition visibility snapshots.
 //!
 //! The sink is the write-side of the CQRS projection plane. It receives
-//! `ProjectionRecord`s (each wrapping one or more `ProjectionOp`s) from the
-//! projection worker, resolves search-attribute schemas, computes rollup
-//! deltas, and persists the results through the [`VisibilityStore`] trait.
+//! `ProjectionRecord`s from the projection worker, resolves search-attribute
+//! schemas, computes rollup deltas, and persists the results through the
+//! [`VisibilityStore`] trait.
 //!
 //! Rollup deltas are computed by [`compute_rollup_deltas`] so that aggregate
 //! counts (by status, workflow type, task queue) stay consistent without
@@ -11,9 +11,7 @@
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use tokeira_kernel::ProjectionOp;
 use tokeira_storage::ProjectionRecord;
-use tokeira_types::{Memo, SearchAttributes};
 
 use crate::{
     metrics as projection_metrics,
@@ -23,7 +21,7 @@ use crate::{
     types::{
         AttrDescriptor, AttrId, CompiledFilter, CountResult, ExecutionRow, GroupByField,
         ListResult, PageBounds, RollupDelta, RollupDimension, SearchAttrType, SortOrder,
-        search_attr_type_of,
+        VisibilitySnapshot, search_attr_type_of, visibility_version_is_newer,
     },
 };
 
@@ -50,6 +48,9 @@ impl<S> VisibilityStore for VisibilitySink<S>
 where
     S: VisibilityStore,
 {
+    async fn upsert_snapshot(&self, snapshot: &VisibilitySnapshot) -> Result<()> {
+        self.store.upsert_snapshot(snapshot).await
+    }
     async fn upsert_execution(&self, row: &ExecutionRow) -> Result<()> {
         self.store.upsert_execution(row).await
     }
@@ -152,49 +153,70 @@ where
 {
     async fn apply(&self, record: &ProjectionRecord, _partition_id: u32) -> Result<()> {
         let started = std::time::Instant::now();
-        let mut row = self
-            .store
-            .get_row(record.run_key)
-            .await
-            .unwrap_or(ExecutionRow {
-                run_key: record.run_key,
-                namespace_id: record.context.namespace_id,
-                workflow_id: record.context.workflow_id.clone(),
-                run_id: record.context.run_id,
-                workflow_type: record.context.workflow_type.clone(),
-                task_queue: record.context.task_queue.clone(),
-                status: record.context.execution_status,
-                start_time: record.context.start_time,
-                execution_time: record.context.execution_time,
-                close_time: record.context.close_time,
-                history_length: record.context.history_length,
-                execution_duration: record.context.execution_duration,
-                state_transition_count: record.context.state_transition_count,
-                history_size_bytes: record.context.history_size_bytes,
-                parent_workflow_id: record.context.parent_workflow_id.clone(),
-                parent_run_id: record.context.parent_run_id,
-                root_workflow_id: record
-                    .context
-                    .root_workflow_id
-                    .clone()
-                    .unwrap_or_else(|| record.context.workflow_id.clone()),
-                root_run_id: record.context.root_run_id.unwrap_or(record.context.run_id),
-                memo: Memo::default(),
-                search_attr_version: 0,
-            });
-        let previous = Some(row.clone());
-        let mut search_patch = SearchAttributes::default();
+        let previous = self.store.get_row(record.run_key).await;
+        if !visibility_version_is_newer(
+            previous.as_ref(),
+            record.context.authority_epoch,
+            record.transition_seq,
+        ) {
+            return Ok(());
+        }
+        let mut row = previous.clone().unwrap_or(ExecutionRow {
+            run_key: record.run_key,
+            namespace_id: record.context.namespace_id,
+            archetype_id: record.context.archetype_id,
+            business_id: record.context.business_id.clone(),
+            workflow_id: record.context.workflow_id.clone(),
+            run_id: record.context.run_id,
+            authority_epoch: record.context.authority_epoch,
+            source_transition_seq: record.transition_seq,
+            status_keyword: record.context.status_keyword.clone(),
+            lifecycle_state: record.context.lifecycle_state,
+            workflow_type: record.context.workflow_type.clone(),
+            task_queue: record.context.task_queue.clone(),
+            status: record.context.execution_status,
+            start_time: record.context.start_time,
+            update_time: record.context.update_time,
+            execution_time: record.context.execution_time,
+            close_time: record.context.close_time,
+            history_length: record.context.history_length,
+            execution_duration: record.context.execution_duration,
+            state_transition_count: record.context.state_transition_count,
+            history_size_bytes: record.context.history_size_bytes,
+            parent_workflow_id: record.context.parent_workflow_id.clone(),
+            parent_run_id: record.context.parent_run_id,
+            root_workflow_id: record
+                .context
+                .root_workflow_id
+                .clone()
+                .unwrap_or_else(|| record.context.workflow_id.clone()),
+            root_run_id: record.context.root_run_id.unwrap_or(record.context.run_id),
+            memo: record.context.memo.clone(),
+            search_attributes: record.context.search_attributes.clone(),
+            transition_count: record.context.transition_count,
+            search_attr_generation: record.context.search_attr_generation,
+            search_attr_version: 0,
+        });
+        let search_patch = record.context.search_attributes.clone();
 
         row.namespace_id = record.context.namespace_id;
+        row.archetype_id = record.context.archetype_id;
+        row.business_id = record.context.business_id.clone();
         row.workflow_id = record.context.workflow_id.clone();
         row.run_id = record.context.run_id;
+        row.authority_epoch = record.context.authority_epoch;
+        row.source_transition_seq = record.transition_seq;
         row.workflow_type = record.context.workflow_type.clone();
         row.task_queue = record.context.task_queue.clone();
+        row.status_keyword = record.context.status_keyword.clone();
+        row.lifecycle_state = record.context.lifecycle_state;
         row.start_time = record.context.start_time;
+        row.update_time = record.context.update_time;
         row.execution_time = record.context.execution_time;
         row.history_length = record.context.history_length;
         row.execution_duration = record.context.execution_duration;
         row.state_transition_count = record.context.state_transition_count;
+        row.transition_count = record.context.transition_count;
         row.history_size_bytes = record.context.history_size_bytes;
         row.parent_workflow_id = record.context.parent_workflow_id.clone();
         row.parent_run_id = record.context.parent_run_id;
@@ -204,26 +226,34 @@ where
             .clone()
             .unwrap_or_else(|| record.context.workflow_id.clone());
         row.root_run_id = record.context.root_run_id.unwrap_or(record.context.run_id);
-
-        for op in &record.ops {
-            match op {
-                ProjectionOp::UpsertExecution {
-                    status,
-                    memo_patch,
-                    search_attr_patch,
-                } => {
-                    row.status = *status;
-                    row.memo.0.extend(memo_patch.0.clone());
-                    search_patch.0.extend(search_attr_patch.0.clone());
-                }
-                ProjectionOp::CloseExecution { status, closed_at } => {
-                    row.status = *status;
-                    row.close_time = Some(*closed_at);
-                }
-            }
-        }
+        row.memo = record.context.memo.clone();
+        row.search_attributes = record.context.search_attributes.clone();
+        row.search_attr_generation = record.context.search_attr_generation;
+        row.search_attr_version = 0;
 
         self.store.upsert_execution(&row).await?;
+        if let Some(previous) = previous.as_ref() {
+            for (name, previous_value) in &previous.search_attributes.0 {
+                if search_patch.0.contains_key(name) {
+                    continue;
+                }
+                let Some(attr) = self
+                    .store
+                    .resolve_attr(record.context.namespace_id, name)
+                    .await?
+                else {
+                    continue;
+                };
+                self.store
+                    .remove_search_attr_index(
+                        record.run_key,
+                        record.context.namespace_id,
+                        attr.attr_id,
+                        search_attr_type_of(previous_value),
+                    )
+                    .await?;
+            }
+        }
         for (name, value) in &search_patch.0 {
             let Some(attr) = self
                 .store
@@ -266,6 +296,7 @@ where
                     value,
                 )
                 .await?;
+            row.search_attributes.0.insert(name.clone(), value.clone());
             row.search_attr_version += 1;
         }
         self.store.upsert_execution(&row).await?;
@@ -281,11 +312,11 @@ mod tests {
     use super::*;
     use crate::memory::InMemoryVisibilityStore;
     use time::OffsetDateTime;
-    use tokeira_kernel::ProjectionOp;
     use tokeira_storage::ProjectionContext;
     use tokeira_types::{
-        ExecutionStatus, NamespaceId, Payload, RunId, RunKey, SearchAttrValue, TaskQueueName,
-        TransitionSeq, WorkflowId, WorkflowType,
+        ArchetypeId, ExecutionStatus, Memo, NamespaceId, Payload, RunId, RunKey, SearchAttrValue,
+        SearchAttributes, TaskQueueName, TransitionSeq, VisibilityLifecycleState, WorkflowId,
+        WorkflowType,
     };
     use uuid::Uuid;
 
@@ -293,23 +324,33 @@ mod tests {
 
     fn context(namespace_id: NamespaceId) -> ProjectionContext {
         ProjectionContext {
+            archetype_id: ArchetypeId::WORKFLOW,
             namespace_id,
+            business_id: "wf-1".to_string(),
+            authority_epoch: 0,
+            status_keyword: "Running".to_string(),
+            lifecycle_state: VisibilityLifecycleState::Open,
             workflow_id: WorkflowId("wf-1".to_string()),
             run_id: RunId(Uuid::from_u128(2)),
             workflow_type: WorkflowType("Workflow".to_string()),
             task_queue: TaskQueueName("queue-a".to_string()),
             execution_status: ExecutionStatus::Running,
             start_time: OffsetDateTime::from_unix_timestamp(10).unwrap(),
+            update_time: OffsetDateTime::from_unix_timestamp(10).unwrap(),
             execution_time: Some(OffsetDateTime::from_unix_timestamp(11).unwrap()),
             close_time: None,
             history_length: 3,
             execution_duration: None,
             state_transition_count: 4,
+            transition_count: 4,
             history_size_bytes: 0,
             parent_workflow_id: None,
             parent_run_id: None,
             root_workflow_id: Some(WorkflowId("wf-1".to_string())),
             root_run_id: Some(RunId(Uuid::from_u128(2))),
+            search_attr_generation: 0,
+            memo: Memo::default(),
+            search_attributes: SearchAttributes::default(),
         }
     }
 
@@ -326,17 +367,16 @@ mod tests {
             .0
             .insert("CustomKeyword".to_string(), value);
 
+        let mut context = context(namespace_id);
+        context.memo = memo_patch;
+        context.search_attributes = search_attr_patch;
+
         ProjectionRecord {
             partition_id: 0,
             fanout: 1,
             run_key: RunKey(Uuid::from_u128(3)),
             transition_seq: TransitionSeq(1),
-            context: context(namespace_id),
-            ops: vec![ProjectionOp::UpsertExecution {
-                status: ExecutionStatus::Running,
-                memo_patch,
-                search_attr_patch,
-            }],
+            context,
         }
     }
 
@@ -367,41 +407,44 @@ mod tests {
         )
             .prop_map(
                 move |(status, wf_id, run_id, wf_type, tq, start, hl, stc)| ProjectionContext {
+                    archetype_id: ArchetypeId::WORKFLOW,
                     namespace_id: ns,
+                    business_id: wf_id.clone(),
+                    authority_epoch: 0,
+                    status_keyword: crate::types::workflow_status_keyword(status),
+                    lifecycle_state: crate::types::workflow_lifecycle_state(status),
                     workflow_id: WorkflowId(wf_id.clone()),
                     run_id: RunId(Uuid::from_u128(run_id)),
                     workflow_type: WorkflowType(wf_type),
                     task_queue: TaskQueueName(tq),
                     execution_status: status,
                     start_time: OffsetDateTime::from_unix_timestamp(start).unwrap(),
+                    update_time: OffsetDateTime::from_unix_timestamp(start).unwrap(),
                     execution_time: None,
                     close_time: None,
                     history_length: hl,
                     execution_duration: None,
                     state_transition_count: stc,
+                    transition_count: stc,
                     history_size_bytes: 0,
                     parent_workflow_id: None,
                     parent_run_id: None,
                     root_workflow_id: Some(WorkflowId(wf_id)),
                     root_run_id: Some(RunId(Uuid::from_u128(run_id))),
+                    search_attr_generation: stc as u64,
+                    memo: Memo::default(),
+                    search_attributes: SearchAttributes::default(),
                 },
             )
     }
 
     fn arb_record(ns: NamespaceId) -> impl Strategy<Value = ProjectionRecord> {
-        (any::<u128>(), arb_context(ns), arb_status()).prop_map(|(rk, ctx, status)| {
-            ProjectionRecord {
-                partition_id: 0,
-                fanout: 1,
-                run_key: RunKey(Uuid::from_u128(rk)),
-                transition_seq: TransitionSeq(1),
-                context: ctx,
-                ops: vec![ProjectionOp::UpsertExecution {
-                    status,
-                    memo_patch: Memo::default(),
-                    search_attr_patch: SearchAttributes::default(),
-                }],
-            }
+        (any::<u128>(), arb_context(ns)).prop_map(|(rk, ctx)| ProjectionRecord {
+            partition_id: 0,
+            fanout: 1,
+            run_key: RunKey(Uuid::from_u128(rk)),
+            transition_seq: TransitionSeq(1),
+            context: ctx,
         })
     }
 
@@ -462,13 +505,9 @@ mod tests {
                     row.state_transition_count,
                     record.context.state_transition_count
                 );
-                // Status comes from the op, not context
-                if let ProjectionOp::UpsertExecution {
-                    status, ..
-                } = &record.ops[0]
-                {
-                    prop_assert_eq!(row.status, *status);
-                }
+                // Snapshot application is intentionally self-contained; the
+                // context is the post-transition image produced by storage.
+                prop_assert_eq!(row.status, record.context.execution_status);
                 Ok(())
             })?;
         }
@@ -634,5 +673,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn newer_snapshot_removes_omitted_search_attributes() {
+        let namespace_id = NamespaceId(Uuid::from_u128(1));
+        let store = InMemoryVisibilityStore::default();
+        store
+            .register_attr(
+                namespace_id,
+                "CustomKeyword".to_string(),
+                SearchAttrType::Keyword,
+            )
+            .await
+            .unwrap();
+        let sink = VisibilitySink::new(store.clone(), "sink");
+        let first =
+            record_with_search_attr(namespace_id, SearchAttrValue::Keyword("blue".to_string()));
+        let mut second_context = context(namespace_id);
+        second_context.search_attr_generation = 2;
+        let second = ProjectionRecord {
+            partition_id: first.partition_id,
+            fanout: first.fanout,
+            run_key: first.run_key,
+            transition_seq: TransitionSeq(2),
+            context: second_context,
+        };
+
+        sink.apply(&first, 0).await.unwrap();
+        sink.apply(&second, 0).await.unwrap();
+
+        let filter = CompiledFilter {
+            expr: Some(FilterExpr::Compare {
+                field: FieldRef::Custom {
+                    name: "CustomKeyword".to_string(),
+                    attr_id: AttrId(1),
+                    attr_type: SearchAttrType::Keyword,
+                },
+                op: crate::types::CompareOp::Eq,
+                value: crate::types::FilterValue::String("blue".to_string()),
+            }),
+        };
+        let result = store
+            .list_executions(
+                namespace_id,
+                &filter,
+                SortOrder::Default,
+                &PageBounds {
+                    limit: 10,
+                    after: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result.rows.is_empty());
     }
 }

@@ -21,8 +21,9 @@ use tokeira_kernel::{
     WorkflowState,
 };
 use tokeira_types::{
-    ExecutionRef, ExecutionStatus, GenerationCounter, NamespaceId, ProjectionCursor, QueueKey,
-    RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskKind, WorkflowId,
+    ArchetypeId, ExecutionRef, ExecutionStatus, GenerationCounter, NamespaceId, ProjectionCursor,
+    QueueKey, RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskKind, VisibilityLifecycleState,
+    WorkflowId,
 };
 use tokio::sync::Mutex;
 
@@ -594,37 +595,63 @@ impl RunRepository for InMemoryStore {
             store.current_open.remove(&workflow_key);
         }
 
-        if !transition.projection_ops.is_empty() {
-            store.projection_log.push(ProjectionRecord {
-                partition_id: partition_for(run_key),
-                fanout: 1,
-                run_key,
-                transition_seq: state.transition_seq,
-                context: ProjectionContext {
-                    namespace_id: state.namespace_id,
-                    workflow_id: state.workflow_id.clone(),
-                    run_id: state.run_id,
-                    workflow_type: state.workflow_type.clone(),
-                    task_queue: state.task_queue.clone(),
-                    execution_status: state.status,
-                    start_time: state.started_at,
-                    execution_time: Some(state.started_at),
-                    close_time: state.closed_at,
-                    history_length: state.last_event_id,
-                    execution_duration: projection_execution_duration(&state),
-                    state_transition_count: state.transition_seq.0 as i64,
-                    history_size_bytes: 0,
-                    parent_workflow_id: state.parent_workflow_id.clone(),
-                    parent_run_id: state.parent_run_id,
-                    root_workflow_id: state
-                        .root_workflow_id
-                        .clone()
-                        .or_else(|| Some(state.workflow_id.clone())),
-                    root_run_id: state.root_run_id.or(Some(state.run_id)),
+        // The projection log carries a complete post-transition visibility
+        // image. Emitting a row for every committed transition keeps the
+        // in-memory reference store aligned with DSQL and prevents visibility
+        // freshness from depending on whether the kernel emitted a legacy delta.
+        store.projection_log.push(ProjectionRecord {
+            partition_id: partition_for(run_key),
+            fanout: 1,
+            run_key,
+            transition_seq: state.transition_seq,
+            context: ProjectionContext {
+                archetype_id: ArchetypeId::WORKFLOW,
+                namespace_id: state.namespace_id,
+                business_id: state.workflow_id.0.clone(),
+                // Mirror the DSQL producer's visibility encoding so the in-memory
+                // reference store stays byte-aligned with it (see
+                // `dsql::run_repository::commit::insert_projection_log` for the full
+                // rationale): `authority_epoch` is a constant 0 because the workflow
+                // path carries no namespace failover version, leaving
+                // `source_transition_seq` as the monotonic ordering key; and the
+                // `status_keyword` Debug name must stay in lockstep with
+                // `tokeira_projection::types::workflow_status_from_keyword` (no shared
+                // helper — `tokeira-projection` depends on this crate). `lifecycle_state`
+                // is OPEN iff non-terminal, CLOSED for the six terminal statuses, per
+                // v1.31.0 OPEN-vs-CLOSED list/count semantics.
+                authority_epoch: 0,
+                status_keyword: format!("{:?}", state.status),
+                lifecycle_state: if state.status.is_open() {
+                    VisibilityLifecycleState::Open
+                } else {
+                    VisibilityLifecycleState::Closed
                 },
-                ops: transition.projection_ops.iter().cloned().collect(),
-            });
-        }
+                workflow_id: state.workflow_id.clone(),
+                run_id: state.run_id,
+                workflow_type: state.workflow_type.clone(),
+                task_queue: state.task_queue.clone(),
+                execution_status: state.status,
+                start_time: state.started_at,
+                update_time: state.closed_at.unwrap_or(state.started_at),
+                execution_time: Some(state.started_at),
+                close_time: state.closed_at,
+                history_length: state.last_event_id,
+                execution_duration: projection_execution_duration(&state),
+                state_transition_count: state.transition_seq.0 as i64,
+                transition_count: state.transition_seq.0 as i64,
+                history_size_bytes: 0,
+                parent_workflow_id: state.parent_workflow_id.clone(),
+                parent_run_id: state.parent_run_id,
+                root_workflow_id: state
+                    .root_workflow_id
+                    .clone()
+                    .or_else(|| Some(state.workflow_id.clone())),
+                root_run_id: state.root_run_id.or(Some(state.run_id)),
+                search_attr_generation: state.transition_seq.0,
+                memo: state.memo.clone(),
+                search_attributes: state.search_attributes.clone(),
+            },
+        });
 
         if transition.expected_seq == tokeira_types::TransitionSeq::ZERO {
             let shard_id = shard_for_run_key(run_key, Self::effective_shard_count(&store));

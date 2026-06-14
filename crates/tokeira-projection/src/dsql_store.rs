@@ -14,15 +14,14 @@ use sqlx::{
     postgres::{PgArguments, PgRow},
     query::Query,
 };
-use tokeira_kernel::ProjectionOp;
 use tokeira_storage::{
     ConnectionDirector, DbClass, ProjectionRecord,
     dsql::{DsqlConnectionDirector, codec},
     metrics as storage_metrics,
 };
 use tokeira_types::{
-    ExecutionStatus, Memo, NamespaceId, ProjectionCursor, RunKey, SearchAttrValue,
-    SearchAttributes, dsql_spread_uuid,
+    ArchetypeId, ExecutionStatus, Memo, NamespaceId, ProjectionCursor, RunKey, SearchAttrValue,
+    SearchAttributes, TransitionSeq, VisibilityLifecycleState, dsql_spread_uuid,
 };
 use tracing::{instrument, warn};
 use uuid::Uuid;
@@ -34,7 +33,8 @@ use crate::{
         AttrDescriptor, AttrId, CompareOp, CompiledFilter, CountResult, ExecutionRow, FieldRef,
         FilterExpr, FilterValue, GroupByField, ListResult, PageBounds, PageToken, RollupCounter,
         RollupDelta, RollupDimension, SearchAttrType, SortOrder, SystemField, search_attr_type_of,
-        text_search_tokens,
+        text_search_tokens, visibility_version_is_newer, workflow_lifecycle_state,
+        workflow_status_keyword,
     },
 };
 
@@ -486,15 +486,29 @@ impl ProjectionSink for DsqlVisibilityStore {
     async fn apply(&self, record: &ProjectionRecord, partition_id: u32) -> Result<()> {
         let sink_started = Instant::now();
         let previous = self.get_row(record.run_key).await;
+        if !visibility_version_is_newer(
+            previous.as_ref(),
+            record.context.authority_epoch,
+            record.transition_seq,
+        ) {
+            return Ok(());
+        }
         let mut row = previous.clone().unwrap_or_else(|| ExecutionRow {
             run_key: record.run_key,
             namespace_id: record.context.namespace_id,
+            archetype_id: record.context.archetype_id,
+            business_id: record.context.business_id.clone(),
             workflow_id: record.context.workflow_id.clone(),
             run_id: record.context.run_id,
+            authority_epoch: record.context.authority_epoch,
+            source_transition_seq: record.transition_seq,
+            status_keyword: record.context.status_keyword.clone(),
+            lifecycle_state: record.context.lifecycle_state,
             workflow_type: record.context.workflow_type.clone(),
             task_queue: record.context.task_queue.clone(),
             status: record.context.execution_status,
             start_time: record.context.start_time,
+            update_time: record.context.update_time,
             execution_time: record.context.execution_time,
             close_time: record.context.close_time,
             history_length: record.context.history_length,
@@ -509,21 +523,32 @@ impl ProjectionSink for DsqlVisibilityStore {
                 .clone()
                 .unwrap_or_else(|| record.context.workflow_id.clone()),
             root_run_id: record.context.root_run_id.unwrap_or(record.context.run_id),
-            memo: Memo::default(),
+            memo: record.context.memo.clone(),
+            search_attributes: record.context.search_attributes.clone(),
+            transition_count: record.context.transition_count,
+            search_attr_generation: record.context.search_attr_generation,
             search_attr_version: 0,
         });
-        let mut search_patch = SearchAttributes::default();
+        let search_patch = record.context.search_attributes.clone();
 
         row.namespace_id = record.context.namespace_id;
+        row.archetype_id = record.context.archetype_id;
+        row.business_id = record.context.business_id.clone();
         row.workflow_id = record.context.workflow_id.clone();
         row.run_id = record.context.run_id;
+        row.authority_epoch = record.context.authority_epoch;
+        row.source_transition_seq = record.transition_seq;
+        row.status_keyword = record.context.status_keyword.clone();
+        row.lifecycle_state = record.context.lifecycle_state;
         row.workflow_type = record.context.workflow_type.clone();
         row.task_queue = record.context.task_queue.clone();
         row.start_time = record.context.start_time;
+        row.update_time = record.context.update_time;
         row.execution_time = record.context.execution_time;
         row.history_length = record.context.history_length;
         row.execution_duration = record.context.execution_duration;
         row.state_transition_count = record.context.state_transition_count;
+        row.transition_count = record.context.transition_count;
         row.history_size_bytes = record.context.history_size_bytes;
         row.parent_workflow_id = record.context.parent_workflow_id.clone();
         row.parent_run_id = record.context.parent_run_id;
@@ -533,24 +558,10 @@ impl ProjectionSink for DsqlVisibilityStore {
             .clone()
             .unwrap_or_else(|| record.context.workflow_id.clone());
         row.root_run_id = record.context.root_run_id.unwrap_or(record.context.run_id);
-
-        for op in &record.ops {
-            match op {
-                ProjectionOp::UpsertExecution {
-                    status,
-                    memo_patch,
-                    search_attr_patch,
-                } => {
-                    row.status = *status;
-                    row.memo.0.extend(memo_patch.0.clone());
-                    search_patch.0.extend(search_attr_patch.0.clone());
-                }
-                ProjectionOp::CloseExecution { status, closed_at } => {
-                    row.status = *status;
-                    row.close_time = Some(*closed_at);
-                }
-            }
-        }
+        row.memo = record.context.memo.clone();
+        row.search_attributes = record.context.search_attributes.clone();
+        row.search_attr_generation = record.context.search_attr_generation;
+        row.search_attr_version = 0;
 
         let mut resolved_search_attrs = Vec::new();
         for (name, value) in &search_patch.0 {
@@ -574,6 +585,7 @@ impl ProjectionSink for DsqlVisibilityStore {
                 );
             }
             resolved_search_attrs.push((attr, value));
+            row.search_attributes.0.insert(name.clone(), value.clone());
             row.search_attr_version += 1;
         }
 
@@ -592,15 +604,9 @@ impl ProjectionSink for DsqlVisibilityStore {
                     started.elapsed(),
                 );
 
-                for (attr, value) in &resolved_search_attrs {
-                    remove_search_attr_index_row(
-                        &mut *tx,
-                        record.run_key,
-                        record.context.namespace_id,
-                        attr.attr_id,
-                        attr.attr_type,
-                    )
+                clear_search_attr_index_rows(&mut *tx, record.run_key, record.context.namespace_id)
                     .await?;
+                for (attr, value) in &resolved_search_attrs {
                     let started = Instant::now();
                     upsert_search_attr_index_row(
                         &mut *tx,
@@ -741,6 +747,37 @@ async fn upsert_execution_row(
     .bind(memo)
     .execute(connection)
     .await?;
+    Ok(())
+}
+
+async fn clear_search_attr_index_rows(
+    connection: &mut PgConnection,
+    run_key: RunKey,
+    namespace_id: NamespaceId,
+) -> Result<()> {
+    // Snapshot application replaces the visible search-attribute generation.
+    // Clearing all old rows first prevents a removed attribute from remaining
+    // queryable after a newer snapshot omits it.
+    for table in [
+        "sa_keyword_idx",
+        "sa_keyword_list_idx",
+        "sa_int_idx",
+        "sa_bool_idx",
+        "sa_double_idx",
+        "sa_datetime_idx",
+        "sa_text_token_idx",
+    ] {
+        let sql = format!("DELETE FROM {table} WHERE namespace_id = $1 AND run_key = $2");
+        sqlx::query(&sql)
+            .bind(namespace_id.0)
+            .bind(run_key.0)
+            .execute(&mut *connection)
+            .await?;
+    }
+    sqlx::query("DELETE FROM sa_current WHERE run_key = $1")
+        .bind(run_key.0)
+        .execute(&mut *connection)
+        .await?;
     Ok(())
 }
 
@@ -1834,20 +1871,32 @@ async fn get_execution_row(
 fn row_to_execution(row: sqlx::postgres::PgRow) -> Result<ExecutionRow> {
     let memo = decode_optional_memo(row.try_get("memo")?)?.unwrap_or_default();
     let status: i16 = row.try_get("execution_status")?;
+    let status = ExecutionStatus::try_from(status)?;
+    let workflow_id: String = row.try_get("workflow_id")?;
+    let start_time = row.try_get("start_time")?;
+    let close_time = row.try_get("close_time")?;
+    let state_transition_count = row.try_get("state_transition_count")?;
     Ok(ExecutionRow {
         run_key: RunKey(row.try_get::<Uuid, _>("run_key")?),
         namespace_id: NamespaceId(row.try_get::<Uuid, _>("namespace_id")?),
-        workflow_id: tokeira_types::WorkflowId(row.try_get("workflow_id")?),
+        archetype_id: ArchetypeId::WORKFLOW,
+        business_id: workflow_id.clone(),
+        workflow_id: tokeira_types::WorkflowId(workflow_id.clone()),
         run_id: tokeira_types::RunId(row.try_get::<Uuid, _>("run_id")?),
+        authority_epoch: 0,
+        source_transition_seq: TransitionSeq(state_transition_count as u64),
+        status_keyword: workflow_status_keyword(status),
+        lifecycle_state: workflow_lifecycle_state(status),
         workflow_type: tokeira_types::WorkflowType(row.try_get("workflow_type")?),
         task_queue: tokeira_types::TaskQueueName(row.try_get("task_queue")?),
-        status: ExecutionStatus::try_from(status)?,
-        start_time: row.try_get("start_time")?,
+        status,
+        start_time,
+        update_time: close_time.unwrap_or(start_time),
         execution_time: row.try_get("execution_time")?,
-        close_time: row.try_get("close_time")?,
+        close_time,
         history_length: row.try_get("history_length")?,
         execution_duration: row.try_get("execution_duration")?,
-        state_transition_count: row.try_get("state_transition_count")?,
+        state_transition_count,
         history_size_bytes: row.try_get("history_size_bytes")?,
         parent_workflow_id: row
             .try_get::<Option<String>, _>("parent_workflow_id")?
@@ -1858,6 +1907,9 @@ fn row_to_execution(row: sqlx::postgres::PgRow) -> Result<ExecutionRow> {
         root_workflow_id: tokeira_types::WorkflowId(row.try_get("root_workflow_id")?),
         root_run_id: tokeira_types::RunId(row.try_get::<Uuid, _>("root_run_id")?),
         memo,
+        search_attributes: SearchAttributes::default(),
+        transition_count: state_transition_count,
+        search_attr_generation: 0,
         search_attr_version: 0,
     })
 }
@@ -1901,17 +1953,23 @@ fn merge_memo(existing: Option<Memo>, patch: &Memo) -> Memo {
 fn resolve_final_vis_state(
     context: &tokeira_storage::ProjectionContext,
     run_key: RunKey,
-    ops: &[ProjectionOp],
 ) -> ExecutionRow {
-    let mut row = ExecutionRow {
+    ExecutionRow {
         run_key,
         namespace_id: context.namespace_id,
+        archetype_id: context.archetype_id,
+        business_id: context.business_id.clone(),
         workflow_id: context.workflow_id.clone(),
         run_id: context.run_id,
+        authority_epoch: context.authority_epoch,
+        source_transition_seq: TransitionSeq(context.state_transition_count as u64),
+        status_keyword: context.status_keyword.clone(),
+        lifecycle_state: context.lifecycle_state,
         workflow_type: context.workflow_type.clone(),
         task_queue: context.task_queue.clone(),
         status: context.execution_status,
         start_time: context.start_time,
+        update_time: context.update_time,
         execution_time: context.execution_time,
         close_time: context.close_time,
         history_length: context.history_length,
@@ -1925,24 +1983,12 @@ fn resolve_final_vis_state(
             .clone()
             .unwrap_or_else(|| context.workflow_id.clone()),
         root_run_id: context.root_run_id.unwrap_or(context.run_id),
-        memo: Memo::default(),
+        memo: context.memo.clone(),
+        search_attributes: context.search_attributes.clone(),
+        transition_count: context.transition_count,
+        search_attr_generation: context.search_attr_generation,
         search_attr_version: 0,
-    };
-    for op in ops {
-        match op {
-            ProjectionOp::UpsertExecution {
-                status, memo_patch, ..
-            } => {
-                row.status = *status;
-                row.memo.0.extend(memo_patch.0.clone());
-            }
-            ProjectionOp::CloseExecution { status, closed_at } => {
-                row.status = *status;
-                row.close_time = Some(*closed_at);
-            }
-        }
     }
-    row
 }
 
 fn i16_from_u16(value: u16, field: &str) -> Result<i16> {
@@ -2006,43 +2052,31 @@ mod tests {
     }
 
     #[test]
-    fn projection_apply_decision_logic_preserves_operation_order() {
+    fn projection_apply_uses_snapshot_context() {
         let context = test_projection_context(ExecutionStatus::Running);
         let run_key = RunKey(uuid_from_u128(10));
-        let closed_at = OffsetDateTime::from_unix_timestamp(200).unwrap();
-        let ops = vec![
-            ProjectionOp::UpsertExecution {
-                status: ExecutionStatus::Paused,
-                memo_patch: Memo::default(),
-                search_attr_patch: SearchAttributes::default(),
-            },
-            ProjectionOp::CloseExecution {
-                status: ExecutionStatus::Completed,
-                closed_at,
-            },
-        ];
 
-        let row = resolve_final_vis_state(&context, run_key, &ops);
+        let row = resolve_final_vis_state(&context, run_key);
 
-        assert_eq!(row.status, ExecutionStatus::Completed);
-        assert_eq!(row.close_time, Some(closed_at));
+        assert_eq!(row.status, ExecutionStatus::Running);
+        assert_eq!(row.close_time, None);
         assert_eq!(
             row.status.to_db_smallint(),
-            ExecutionStatus::Completed.to_db_smallint()
+            ExecutionStatus::Running.to_db_smallint()
         );
     }
 
     #[test]
-    fn close_execution_without_prior_upsert_produces_complete_row() {
-        let context = test_projection_context(ExecutionStatus::Running);
+    fn snapshot_context_produces_complete_closed_row_without_legacy_ops() {
+        let mut context = test_projection_context(ExecutionStatus::Failed);
         let run_key = RunKey(uuid_from_u128(11));
         let closed_at = OffsetDateTime::from_unix_timestamp(300).unwrap();
-        let ops = [ProjectionOp::CloseExecution {
-            status: ExecutionStatus::Failed,
-            closed_at,
-        }];
+        context.close_time = Some(closed_at);
+        context.update_time = closed_at;
+        context.status_keyword = workflow_status_keyword(ExecutionStatus::Failed);
+        context.lifecycle_state = VisibilityLifecycleState::Closed;
 
-        let row = resolve_final_vis_state(&context, run_key, &ops);
+        let row = resolve_final_vis_state(&context, run_key);
 
         assert_eq!(row.run_key, run_key);
         assert_eq!(row.namespace_id, context.namespace_id);
@@ -2193,24 +2227,16 @@ mod tests {
         }
 
         #[test]
-        fn visibility_operation_ordering_matches_last_semantic_op(
-            ops in arb_projection_ops(),
+        fn visibility_snapshot_context_is_authoritative(
+            snapshot_status in arb_execution_status(),
             run_key in any::<u128>(),
         ) {
-            let context = test_projection_context(ExecutionStatus::Running);
-            let row = resolve_final_vis_state(&context, RunKey(uuid_from_u128(run_key)), &ops);
-            let last = ops.last().unwrap();
+            let context = test_projection_context(snapshot_status);
 
-            match last {
-                ProjectionOp::UpsertExecution { status, .. } => {
-                    prop_assert_eq!(row.status, *status);
-                    prop_assert_eq!(row.close_time, None);
-                }
-                ProjectionOp::CloseExecution { status, closed_at } => {
-                    prop_assert_eq!(row.status, *status);
-                    prop_assert_eq!(row.close_time, Some(*closed_at));
-                }
-            }
+            let row = resolve_final_vis_state(&context, RunKey(uuid_from_u128(run_key)));
+
+            prop_assert_eq!(row.status, snapshot_status);
+            prop_assert_eq!(row.close_time, context.close_time);
         }
     }
 
@@ -2220,23 +2246,33 @@ mod tests {
 
     fn test_projection_context(status: ExecutionStatus) -> ProjectionContext {
         ProjectionContext {
+            archetype_id: ArchetypeId::WORKFLOW,
             namespace_id: NamespaceId(uuid_from_u128(1)),
+            business_id: "workflow".to_owned(),
+            authority_epoch: 0,
+            status_keyword: workflow_status_keyword(status),
+            lifecycle_state: workflow_lifecycle_state(status),
             workflow_id: WorkflowId("workflow".to_owned()),
             run_id: RunId(uuid_from_u128(2)),
             workflow_type: WorkflowType("workflow_type".to_owned()),
             task_queue: TaskQueueName("queue".to_owned()),
             execution_status: status,
             start_time: OffsetDateTime::from_unix_timestamp(100).unwrap(),
+            update_time: OffsetDateTime::from_unix_timestamp(100).unwrap(),
             execution_time: None,
             close_time: None,
             history_length: 1,
             execution_duration: None,
             state_transition_count: 1,
+            transition_count: 1,
             history_size_bytes: 0,
             parent_workflow_id: None,
             parent_run_id: None,
             root_workflow_id: Some(WorkflowId("workflow".to_owned())),
             root_run_id: Some(RunId(uuid_from_u128(2))),
+            search_attr_generation: 0,
+            memo: Memo::default(),
+            search_attributes: SearchAttributes::default(),
         }
     }
 
@@ -2251,31 +2287,5 @@ mod tests {
             Just(ExecutionStatus::ContinuedAsNew),
             Just(ExecutionStatus::TimedOut),
         ]
-    }
-
-    prop_compose! {
-        fn arb_closed_at()(seconds in 1_000i64..1_000_000) -> OffsetDateTime {
-            OffsetDateTime::from_unix_timestamp(seconds).unwrap()
-        }
-    }
-
-    prop_compose! {
-        fn arb_projection_ops()(
-            upsert_statuses in proptest::collection::vec(arb_execution_status(), 1..4),
-            terminal in proptest::option::of((arb_execution_status(), arb_closed_at())),
-        ) -> Vec<ProjectionOp> {
-            let mut ops = upsert_statuses
-                .into_iter()
-                .map(|status| ProjectionOp::UpsertExecution {
-                    status,
-                    memo_patch: Memo::default(),
-                    search_attr_patch: SearchAttributes::default(),
-                })
-                .collect::<Vec<_>>();
-            if let Some((status, closed_at)) = terminal {
-                ops.push(ProjectionOp::CloseExecution { status, closed_at });
-            }
-            ops
-        }
     }
 }

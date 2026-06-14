@@ -144,9 +144,12 @@ fn decode_projection_rows(
     rows: Vec<(Uuid, i64, Vec<u8>, Vec<u8>)>,
 ) -> Result<Vec<ProjectionRecord>> {
     rows.into_iter()
-        .map(|(run_key, transition_seq, context_data, ops_data)| {
+        .map(|(run_key, transition_seq, context_data, _ops_data)| {
             let context: ProjectionContext = codec::decode_projection_context(&context_data)?;
-            let ops = codec::decode_projection_ops(&ops_data)?;
+            // `ops_data` remains in the DSQL projection log for build-phase
+            // compatibility with existing rows, but the CHASM visibility
+            // contract is snapshot-only. Decoding it here would re-expose the
+            // retired delta surface to projection consumers.
             Ok(ProjectionRecord {
                 partition_id,
                 fanout,
@@ -156,7 +159,6 @@ fn decode_projection_rows(
                     "projection_log.transition_seq",
                 )?),
                 context,
-                ops,
             })
         })
         .collect()

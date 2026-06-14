@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
-use tokeira_types::{NamespaceId, ProjectionCursor, RunKey, SearchAttrValue};
+use tokeira_types::{ArchetypeId, NamespaceId, ProjectionCursor, RunKey, SearchAttrValue};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -20,7 +20,8 @@ use crate::{
     types::{
         AttrDescriptor, AttrId, CompareOp, CompiledFilter, CountResult, ExecutionRow, FieldRef,
         FilterExpr, FilterValue, GroupByField, ListResult, PageBounds, PageToken, RollupCounter,
-        RollupDelta, RollupDimension, SearchAttrType, SortOrder, SystemField, text_search_tokens,
+        RollupDelta, RollupDimension, SearchAttrType, SortOrder, SystemField, VisibilitySnapshot,
+        text_search_tokens,
     },
 };
 
@@ -32,6 +33,7 @@ pub struct InMemoryVisibilityStore {
 #[derive(Default)]
 struct VisibilityState {
     rows: HashMap<RunKey, ExecutionRow>,
+    snapshots: HashMap<(NamespaceId, ArchetypeId, RunKey), VisibilitySnapshot>,
     sa_current: HashMap<(RunKey, AttrId), SearchAttrValue>,
     sa_keyword_idx: HashMap<(NamespaceId, AttrId, String), HashSet<RunKey>>,
     sa_keyword_list_idx: HashMap<(NamespaceId, AttrId, String), HashSet<RunKey>>,
@@ -54,12 +56,34 @@ impl InMemoryVisibilityStore {
 
 #[async_trait]
 impl VisibilityStore for InMemoryVisibilityStore {
+    async fn upsert_snapshot(&self, snapshot: &VisibilitySnapshot) -> Result<()> {
+        let mut inner = self.inner.lock().await;
+        inner.snapshots.insert(
+            (
+                snapshot.namespace_id,
+                snapshot.archetype_id,
+                snapshot.run_key,
+            ),
+            snapshot.clone(),
+        );
+        if let Some(row) = ExecutionRow::from_workflow_snapshot(snapshot) {
+            inner.rows.insert(row.run_key, row);
+        }
+        Ok(())
+    }
+
     async fn upsert_execution(&self, row: &ExecutionRow) -> Result<()> {
-        self.inner
-            .lock()
-            .await
-            .rows
-            .insert(row.run_key, row.clone());
+        let mut inner = self.inner.lock().await;
+        inner.rows.insert(row.run_key, row.clone());
+        let snapshot = row.to_snapshot();
+        inner.snapshots.insert(
+            (
+                snapshot.namespace_id,
+                snapshot.archetype_id,
+                snapshot.run_key,
+            ),
+            snapshot,
+        );
         Ok(())
     }
 
@@ -834,8 +858,8 @@ mod tests {
     use proptest::prelude::*;
     use time::OffsetDateTime;
     use tokeira_types::{
-        ExecutionStatus, Memo, RunId, RunKey, TaskQueueName, TransitionSeq, WorkflowId,
-        WorkflowType,
+        ArchetypeId, ExecutionStatus, Memo, RunId, RunKey, SearchAttributes, TaskQueueName,
+        TransitionSeq, WorkflowId, WorkflowType,
     };
     use uuid::Uuid;
 
@@ -884,12 +908,21 @@ mod tests {
                     ExecutionRow {
                         run_key: RunKey(Uuid::from_u128(rk)),
                         namespace_id: ns,
+                        archetype_id: ArchetypeId::WORKFLOW,
+                        business_id: wf_id.clone(),
                         workflow_id: WorkflowId(wf_id.clone()),
                         run_id: RunId(Uuid::from_u128(run_id)),
+                        authority_epoch: 0,
+                        source_transition_seq: TransitionSeq(stc as u64),
+                        status_keyword: crate::types::workflow_status_keyword(status),
+                        lifecycle_state: crate::types::workflow_lifecycle_state(status),
                         workflow_type: WorkflowType(wf_type),
                         task_queue: TaskQueueName(tq),
                         status,
                         start_time: OffsetDateTime::from_unix_timestamp(start).unwrap(),
+                        update_time: close
+                            .map(|c| OffsetDateTime::from_unix_timestamp(c).unwrap())
+                            .unwrap_or_else(|| OffsetDateTime::from_unix_timestamp(start).unwrap()),
                         execution_time: None,
                         close_time: close.map(|c| OffsetDateTime::from_unix_timestamp(c).unwrap()),
                         history_length: hl,
@@ -901,6 +934,9 @@ mod tests {
                         root_workflow_id: WorkflowId(wf_id.clone()),
                         root_run_id: RunId(Uuid::from_u128(run_id)),
                         memo: Memo::default(),
+                        search_attributes: SearchAttributes::default(),
+                        transition_count: stc,
+                        search_attr_generation: 0,
                         search_attr_version: 0,
                     }
                 },
@@ -911,12 +947,19 @@ mod tests {
         ExecutionRow {
             run_key: RunKey(Uuid::from_u128(run_key)),
             namespace_id: NamespaceId(Uuid::from_u128(1)),
+            archetype_id: ArchetypeId::WORKFLOW,
+            business_id: format!("wf-{run_key}"),
             workflow_id: WorkflowId(format!("wf-{run_key}")),
             run_id: RunId(Uuid::from_u128(run_key + 100)),
+            authority_epoch: 0,
+            source_transition_seq: TransitionSeq(1),
+            status_keyword: crate::types::workflow_status_keyword(ExecutionStatus::Running),
+            lifecycle_state: crate::types::workflow_lifecycle_state(ExecutionStatus::Running),
             workflow_type: WorkflowType("Example".to_owned()),
             task_queue: tokeira_types::TaskQueueName("main".to_owned()),
             status: ExecutionStatus::Running,
             start_time: OffsetDateTime::from_unix_timestamp(1).unwrap(),
+            update_time: OffsetDateTime::from_unix_timestamp(1).unwrap(),
             execution_time: None,
             close_time: None,
             history_length: 1,
@@ -928,6 +971,9 @@ mod tests {
             root_workflow_id: WorkflowId(format!("wf-{run_key}")),
             root_run_id: RunId(Uuid::from_u128(run_key + 100)),
             memo: Memo::default(),
+            search_attributes: SearchAttributes::default(),
+            transition_count: 1,
+            search_attr_generation: 0,
             search_attr_version: 0,
         }
     }

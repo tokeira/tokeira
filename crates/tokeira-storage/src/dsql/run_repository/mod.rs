@@ -17,9 +17,9 @@ use tokeira_kernel::{
     TimerOp, Transition, WorkflowState,
 };
 use tokeira_types::{
-    BuildId, DeploymentId, ExecutionRef, ExecutionStatus, NamespaceId, Payloads, QueueKey,
-    RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskKind, TaskQueueName, TransitionSeq,
-    WorkerIdentity, WorkflowId, dsql_spread_uuid,
+    ArchetypeId, BuildId, DeploymentId, ExecutionRef, ExecutionStatus, NamespaceId, Payloads,
+    QueueKey, RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskKind, TaskQueueName,
+    TransitionSeq, VisibilityLifecycleState, WorkerIdentity, WorkflowId, dsql_spread_uuid,
 };
 use tracing::{Instrument, instrument};
 use uuid::Uuid;
@@ -1659,18 +1659,29 @@ mod tests {
 
     fn sample_projection_context(state: &WorkflowState) -> ProjectionContext {
         ProjectionContext {
+            archetype_id: ArchetypeId::WORKFLOW,
             namespace_id: state.namespace_id,
+            business_id: state.workflow_id.0.clone(),
+            authority_epoch: 0,
+            status_keyword: format!("{:?}", state.status),
+            lifecycle_state: if state.status.is_open() {
+                VisibilityLifecycleState::Open
+            } else {
+                VisibilityLifecycleState::Closed
+            },
             workflow_id: state.workflow_id.clone(),
             run_id: state.run_id,
             workflow_type: state.workflow_type.clone(),
             task_queue: state.task_queue.clone(),
             execution_status: state.status,
             start_time: state.started_at,
+            update_time: state.closed_at.unwrap_or(state.started_at),
             execution_time: Some(state.started_at),
             close_time: state.closed_at,
             history_length: state.last_event_id,
             execution_duration: None,
             state_transition_count: state.transition_seq.0 as i64,
+            transition_count: state.transition_seq.0 as i64,
             history_size_bytes: 0,
             parent_workflow_id: state.parent_workflow_id.clone(),
             parent_run_id: state.parent_run_id,
@@ -1679,6 +1690,9 @@ mod tests {
                 .clone()
                 .or_else(|| Some(state.workflow_id.clone())),
             root_run_id: state.root_run_id.or(Some(state.run_id)),
+            search_attr_generation: state.transition_seq.0,
+            memo: state.memo.clone(),
+            search_attributes: state.search_attributes.clone(),
         }
     }
 

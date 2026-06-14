@@ -3,15 +3,17 @@
 use anyhow::Result;
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use time::OffsetDateTime;
-use tokeira_kernel::ProjectionOp;
-use tokeira_projection::{DsqlVisibilityStore, ProjectionSink, VisibilityStore};
+use tokeira_projection::{
+    DsqlVisibilityStore, ProjectionSink, VisibilityStore, workflow_status_keyword,
+};
 use tokeira_storage::{
     ProjectionContext, ProjectionLog, ProjectionRecord,
     dsql::{DsqlPoolConfig, DsqlStore, codec},
 };
 use tokeira_types::{
-    ExecutionStatus, Memo, NamespaceId, Payload, ProjectionCursor, RunId, RunKey, SearchAttributes,
-    TaskQueueName, TransitionSeq, WorkflowId, WorkflowType,
+    ArchetypeId, ExecutionStatus, Memo, NamespaceId, Payload, ProjectionCursor, RunId, RunKey,
+    SearchAttributes, TaskQueueName, TransitionSeq, VisibilityLifecycleState, WorkflowId,
+    WorkflowType,
 };
 use uuid::Uuid;
 
@@ -99,11 +101,6 @@ async fn visibility_sink_materializes_open_and_closed_execution_rows() -> Result
             run_key,
             transition_seq: TransitionSeq(1),
             context: projection_context.clone(),
-            ops: vec![ProjectionOp::UpsertExecution {
-                status: ExecutionStatus::Running,
-                memo_patch: Memo::default(),
-                search_attr_patch: SearchAttributes::default(),
-            }],
         })
         .await?;
     let open = context.read_visibility_row(run_key).await?.unwrap();
@@ -111,17 +108,18 @@ async fn visibility_sink_materializes_open_and_closed_execution_rows() -> Result
     assert!(open.1.is_none());
 
     let closed_at = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+    let closed_context = context_with_status(
+        projection_context,
+        ExecutionStatus::Completed,
+        Some(closed_at),
+    );
     store
         .apply(&ProjectionRecord {
             partition_id: 0,
             fanout: 1,
             run_key,
             transition_seq: TransitionSeq(2),
-            context: projection_context,
-            ops: vec![ProjectionOp::CloseExecution {
-                status: ExecutionStatus::Completed,
-                closed_at,
-            }],
+            context: closed_context,
         })
         .await?;
     let closed = context.read_visibility_row(run_key).await?.unwrap();
@@ -146,11 +144,11 @@ async fn close_execution_can_insert_catch_up_visibility_row() -> Result<()> {
             fanout: 1,
             run_key,
             transition_seq: TransitionSeq(1),
-            context: sample_context(run_key),
-            ops: vec![ProjectionOp::CloseExecution {
-                status: ExecutionStatus::Failed,
-                closed_at,
-            }],
+            context: context_with_status(
+                sample_context(run_key),
+                ExecutionStatus::Failed,
+                Some(closed_at),
+            ),
         })
         .await?;
 
@@ -168,7 +166,11 @@ async fn memo_merge_persists_across_visibility_updates() -> Result<()> {
     let store = context.visibility_store().await?;
     let run_key = RunKey(Uuid::new_v4());
     context.clear_visibility_rows(&[run_key]).await?;
-    let projection_context = sample_context(run_key);
+    let mut first_context = sample_context(run_key);
+    first_context.memo = memo_entries(&[("key_a", "payload_a")]);
+    let mut second_context = sample_context(run_key);
+    second_context.memo = memo_entries(&[("key_a", "payload_a"), ("key_b", "payload_b")]);
+    let third_context = second_context.clone();
 
     store
         .apply(&ProjectionRecord {
@@ -176,12 +178,7 @@ async fn memo_merge_persists_across_visibility_updates() -> Result<()> {
             fanout: 1,
             run_key,
             transition_seq: TransitionSeq(1),
-            context: projection_context.clone(),
-            ops: vec![ProjectionOp::UpsertExecution {
-                status: ExecutionStatus::Running,
-                memo_patch: memo_entry("key_a", "payload_a"),
-                search_attr_patch: SearchAttributes::default(),
-            }],
+            context: first_context,
         })
         .await?;
     store
@@ -190,12 +187,7 @@ async fn memo_merge_persists_across_visibility_updates() -> Result<()> {
             fanout: 1,
             run_key,
             transition_seq: TransitionSeq(2),
-            context: projection_context.clone(),
-            ops: vec![ProjectionOp::UpsertExecution {
-                status: ExecutionStatus::Running,
-                memo_patch: memo_entry("key_b", "payload_b"),
-                search_attr_patch: SearchAttributes::default(),
-            }],
+            context: second_context,
         })
         .await?;
     store
@@ -204,12 +196,7 @@ async fn memo_merge_persists_across_visibility_updates() -> Result<()> {
             fanout: 1,
             run_key,
             transition_seq: TransitionSeq(3),
-            context: projection_context,
-            ops: vec![ProjectionOp::UpsertExecution {
-                status: ExecutionStatus::Running,
-                memo_patch: Memo::default(),
-                search_attr_patch: SearchAttributes::default(),
-            }],
+            context: third_context,
         })
         .await?;
 
@@ -296,13 +283,7 @@ impl TestContext {
             .bind(run_key.0)
             .bind((index + 1) as i64)
             .bind(codec::encode_projection_context(&sample_context(*run_key))?)
-            .bind(codec::encode_projection_ops(&[
-                ProjectionOp::UpsertExecution {
-                    status: ExecutionStatus::Running,
-                    memo_patch: Memo::default(),
-                    search_attr_patch: SearchAttributes::default(),
-                },
-            ])?)
+            .bind(codec::encode_projection_ops(&[])?)
             .execute(&self.pool)
             .await?;
         }
@@ -359,30 +340,60 @@ impl ProjectionFixture {
 
 fn sample_context(run_key: RunKey) -> ProjectionContext {
     let run_id = RunId(Uuid::new_v4());
+    let workflow_id = format!("workflow-{}", run_key.0);
     ProjectionContext {
+        archetype_id: ArchetypeId::WORKFLOW,
         namespace_id: NamespaceId(Uuid::from_u128(1)),
-        workflow_id: WorkflowId(format!("workflow-{}", run_key.0)),
+        business_id: workflow_id.clone(),
+        authority_epoch: 0,
+        status_keyword: "Running".to_owned(),
+        lifecycle_state: VisibilityLifecycleState::Open,
+        workflow_id: WorkflowId(workflow_id.clone()),
         run_id,
         workflow_type: WorkflowType("workflow-type".to_owned()),
         task_queue: TaskQueueName("queue".to_owned()),
         execution_status: ExecutionStatus::Running,
         start_time: OffsetDateTime::from_unix_timestamp(100).unwrap(),
+        update_time: OffsetDateTime::from_unix_timestamp(100).unwrap(),
         execution_time: None,
         close_time: None,
         history_length: 1,
         execution_duration: None,
         state_transition_count: 1,
+        transition_count: 1,
         history_size_bytes: 0,
         parent_workflow_id: None,
         parent_run_id: None,
-        root_workflow_id: Some(WorkflowId(format!("workflow-{}", run_key.0))),
+        root_workflow_id: Some(WorkflowId(workflow_id)),
         root_run_id: Some(run_id),
+        search_attr_generation: 0,
+        memo: Memo::default(),
+        search_attributes: SearchAttributes::default(),
     }
 }
 
-fn memo_entry(key: &str, value: &str) -> Memo {
+fn context_with_status(
+    mut context: ProjectionContext,
+    status: ExecutionStatus,
+    close_time: Option<OffsetDateTime>,
+) -> ProjectionContext {
+    context.execution_status = status;
+    context.status_keyword = workflow_status_keyword(status);
+    context.lifecycle_state = if close_time.is_some() {
+        VisibilityLifecycleState::Closed
+    } else {
+        VisibilityLifecycleState::Open
+    };
+    context.close_time = close_time;
+    context.update_time = close_time.unwrap_or(context.update_time);
+    context
+}
+
+fn memo_entries(entries: &[(&str, &str)]) -> Memo {
     let mut memo = Memo::default();
-    memo.0
-        .insert(key.to_owned(), Payload::new(value.as_bytes().to_vec()));
+    for (key, value) in entries {
+        memo.0
+            .insert((*key).to_owned(), Payload::new(value.as_bytes().to_vec()));
+    }
     memo
 }

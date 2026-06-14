@@ -4,11 +4,24 @@ use tokeira_types::{NamespaceId, ProjectionCursor, RunKey, SearchAttrValue};
 
 use crate::types::{
     AttrDescriptor, AttrId, CompiledFilter, CountResult, ExecutionRow, GroupByField, ListResult,
-    PageBounds, RollupDelta, RollupDimension, SearchAttrType, SortOrder,
+    PageBounds, RollupDelta, RollupDimension, SearchAttrType, SortOrder, VisibilitySnapshot,
 };
 
 #[async_trait]
 pub trait VisibilityStore: Send + Sync {
+    /// Apply a complete versioned visibility image.
+    ///
+    /// Stores that understand the generalized CHASM visibility schema should
+    /// persist the snapshot directly and enforce `(authority_epoch,
+    /// source_transition_seq)` monotonicity. The default mirrors workflow
+    /// snapshots into the legacy workflow row shape so older stores remain
+    /// usable while task 23 migrates them.
+    async fn upsert_snapshot(&self, snapshot: &VisibilitySnapshot) -> Result<()> {
+        if let Some(row) = ExecutionRow::from_workflow_snapshot(snapshot) {
+            self.upsert_execution(&row).await?;
+        }
+        Ok(())
+    }
     async fn upsert_execution(&self, row: &ExecutionRow) -> Result<()>;
     async fn delete_execution(&self, run_key: RunKey) -> Result<()>;
     async fn upsert_search_attr_index(

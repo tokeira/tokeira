@@ -359,7 +359,7 @@ verify against `../temporal @ v1.31.0` before finalizing.
 > workflow list/count/UI stays green throughout.
 
 - [ ] 23. Stage 1 — Generalize the visibility store, record, and sink; migrate the workflow producer to snapshots
-  - [ ] 23.1 Generalize the projection record + store model to the versioned-snapshot / archetype shape
+  - [x] 23.1 Generalize the projection record + store model to the versioned-snapshot / archetype shape
     - Replace the delta `ProjectionOp` contract with a versioned `VisibilitySnapshot` record carrying
       `(namespace_id, archetype_id, run_key, authority_epoch, source_transition_seq)` plus the full
       post-transition image; introduce first-class non-null `archetype_id`, `status_keyword`,
@@ -369,7 +369,7 @@ verify against `../temporal @ v1.31.0` before finalizing.
       `tokeira-storage/src/api.rs` (`ProjectionContext`/`ProjectionRecord`). Read
       `crates/tokeira-storage/AGENTS.md` first.
     - _Requirements: 10.1, 10.2, 10.5, 10.6_
-  - [ ] 23.2 Add the generalized visibility DSQL migrations
+  - [x] 23.2 Add the generalized visibility DSQL migrations
     - Single base `CREATE TABLE execution_visibility_current` keyed `(namespace_id, archetype_id,
       run_key)` with composite index `(namespace_id, archetype_id, status_keyword, start_time DESC,
       run_key)` created `ASYNC`; typed attr-index table carrying `generation`; striped rollup table
@@ -377,14 +377,14 @@ verify against `../temporal @ v1.31.0` before finalizing.
       last_applied_version)`. DSQL-safe subset (one statement per file, no `CHECK`, no `BIGSERIAL`,
       indexes `ASYNC`); no `ALTER` (build phase).
     - _Requirements: 10.7, 10.8, 10.9_
-  - [ ] 23.3 Make the sink monotonic + idempotent (upsert-iff-newer) with the generation pattern
+  - [x] 23.3 Make the sink monotonic + idempotent (upsert-iff-newer) with the generation pattern
     - Apply a snapshot only when its `(authority_epoch, source_transition_seq)` is strictly newer than
       the stored version; write typed-attr rows at generation N then flip `search_attr_generation = N`
       and GC old generations; reserve system fields (`archetype`/`status`/`lifecycle_state`/
       `namespace`/`run_id`/`business_id`); striped rollups guarded by applied-version and rebuildable
       from current; partitioned checkpoints. Replaces the delta-fold in `visibility_sink.rs`.
     - _Requirements: 10.3, 10.7, 10.8, 10.10, 10.12_
-  - [ ] 23.4 Migrate the workflow producer to versioned snapshots
+  - [x] 23.4 Migrate the workflow producer to versioned snapshots
     - Change the kernel projection emission from `ProjectionOp::UpsertExecution`/`CloseExecution`
       deltas to a full versioned `VisibilitySnapshot` (archetype = workflow; `status_keyword` +
       `lifecycle_state` derived from workflow `ExecutionStatus`), stamped with the workflow transition

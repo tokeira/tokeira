@@ -63,7 +63,8 @@ mod tests {
     use proptest::prelude::*;
     use time::OffsetDateTime;
     use tokeira_types::{
-        ExecutionStatus, Memo, NamespaceId, RunId, RunKey, TaskQueueName, WorkflowId, WorkflowType,
+        ArchetypeId, ExecutionStatus, Memo, NamespaceId, RunId, RunKey, SearchAttributes,
+        TaskQueueName, TransitionSeq, WorkflowId, WorkflowType,
     };
     use uuid::Uuid;
 
@@ -93,12 +94,19 @@ mod tests {
                 ExecutionRow {
                     run_key: RunKey(Uuid::from_u128(rk)),
                     namespace_id: ns,
+                    archetype_id: ArchetypeId::WORKFLOW,
+                    business_id: wf_id.clone(),
                     workflow_id: WorkflowId(wf_id.clone()),
                     run_id: RunId(Uuid::from_u128(run_id)),
+                    authority_epoch: 0,
+                    source_transition_seq: TransitionSeq(1),
+                    status_keyword: crate::types::workflow_status_keyword(status),
+                    lifecycle_state: crate::types::workflow_lifecycle_state(status),
                     workflow_type: WorkflowType(wf_type),
                     task_queue: TaskQueueName(tq),
                     status,
                     start_time: OffsetDateTime::from_unix_timestamp(start).unwrap(),
+                    update_time: OffsetDateTime::from_unix_timestamp(start).unwrap(),
                     execution_time: None,
                     close_time: None,
                     history_length: 1,
@@ -110,6 +118,9 @@ mod tests {
                     root_workflow_id: WorkflowId(wf_id),
                     root_run_id: RunId(Uuid::from_u128(run_id)),
                     memo: Memo::default(),
+                    search_attributes: SearchAttributes::default(),
+                    transition_count: 1,
+                    search_attr_generation: 0,
                     search_attr_version: 0,
                 }
             })

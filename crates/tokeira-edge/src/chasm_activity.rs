@@ -31,8 +31,10 @@
 //!   [`record_completed`](ActivityBridge::record_completed),
 //!   [`record_failed`](ActivityBridge::record_failed).
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{Arc, Mutex},
+};
 
 use prost::Message as _;
 use serde::{Deserialize, Serialize};

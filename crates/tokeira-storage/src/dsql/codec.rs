@@ -145,8 +145,9 @@ mod tests {
     use proptest::prelude::*;
     use time::OffsetDateTime;
     use tokeira_types::{
-        ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, ProjectionCursor, RunId,
-        RunKey, SearchAttributes, TaskQueueName, TransitionSeq, WorkflowId, WorkflowType,
+        ArchetypeId, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, ProjectionCursor,
+        RunId, RunKey, SearchAttributes, TaskQueueName, TransitionSeq, VisibilityLifecycleState,
+        WorkflowId, WorkflowType,
     };
     use uuid::Uuid;
 
@@ -273,23 +274,37 @@ mod tests {
             root_run in proptest::option::of(any::<u128>()),
         ) -> ProjectionContext {
             ProjectionContext {
+                archetype_id: ArchetypeId::WORKFLOW,
                 namespace_id: NamespaceId(Uuid::from_u128(namespace)),
+                business_id: workflow.clone(),
+                authority_epoch: 0,
+                status_keyword: format!("{execution_status:?}"),
+                lifecycle_state: if execution_status.is_open() {
+                    VisibilityLifecycleState::Open
+                } else {
+                    VisibilityLifecycleState::Closed
+                },
                 workflow_id: WorkflowId(workflow),
                 run_id: RunId(Uuid::from_u128(run_id)),
                 workflow_type: WorkflowType(workflow_type),
                 task_queue: TaskQueueName(task_queue),
                 execution_status,
                 start_time,
+                update_time: close_time.unwrap_or(start_time),
                 execution_time,
                 close_time,
                 history_length,
                 execution_duration,
                 state_transition_count,
+                transition_count: state_transition_count,
                 history_size_bytes,
                 parent_workflow_id: parent_workflow.map(WorkflowId),
                 parent_run_id: parent_run.map(|run_id| RunId(Uuid::from_u128(run_id))),
                 root_workflow_id: root_workflow.map(WorkflowId),
                 root_run_id: root_run.map(|run_id| RunId(Uuid::from_u128(run_id))),
+                search_attr_generation: state_transition_count as u64,
+                memo: Memo::default(),
+                search_attributes: SearchAttributes::default(),
             }
         }
     }

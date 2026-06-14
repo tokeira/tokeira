@@ -1,0 +1,21 @@
+CREATE TABLE IF NOT EXISTS execution_visibility_current (
+    namespace_id           UUID        NOT NULL,
+    archetype_id           BIGINT      NOT NULL,
+    run_key                UUID        NOT NULL,
+    business_id            TEXT        NOT NULL,
+    run_id                 UUID        NOT NULL,
+    authority_epoch        BIGINT      NOT NULL,
+    source_transition_seq  BIGINT      NOT NULL,
+    status_keyword         TEXT        NOT NULL,
+    lifecycle_state        SMALLINT    NOT NULL,
+    start_time             TIMESTAMPTZ NOT NULL,
+    update_time            TIMESTAMPTZ NOT NULL,
+    close_time             TIMESTAMPTZ,
+    execution_type         TEXT,
+    task_queue             TEXT,
+    transition_count       BIGINT      NOT NULL DEFAULT 0,
+    history_size_bytes     BIGINT      NOT NULL DEFAULT 0,
+    memo_blob              BYTEA,
+    search_attr_generation BIGINT      NOT NULL DEFAULT 0,
+    PRIMARY KEY (namespace_id, archetype_id, run_key)
+);

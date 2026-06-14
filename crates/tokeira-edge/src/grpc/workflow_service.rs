@@ -6,8 +6,7 @@
 //! layer owns field mapping and the edge `WorkflowService` owns
 //! orchestration.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use prost::Message as _;
 use tonic::{Request, Response, Status};
@@ -258,9 +257,9 @@ fn activity_execution_status(
     use tokeira_proto::enums::ActivityExecutionStatus as Status;
     match status {
         ActivityStatus::Unspecified => Status::Unspecified,
-        ActivityStatus::Scheduled
-        | ActivityStatus::Started
-        | ActivityStatus::CancelRequested => Status::Running,
+        ActivityStatus::Scheduled | ActivityStatus::Started | ActivityStatus::CancelRequested => {
+            Status::Running
+        }
         ActivityStatus::Completed => Status::Completed,
         ActivityStatus::Failed => Status::Failed,
         ActivityStatus::Canceled => Status::Canceled,
@@ -627,8 +626,8 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 translate::respond_activity_completed_to_proto(),
             ));
         }
-        let edge_req = translate::respond_activity_completed_to_edge(req)
-            .map_err(proto_conversion_status)?;
+        let edge_req =
+            translate::respond_activity_completed_to_edge(req).map_err(proto_conversion_status)?;
         debug!("respond_activity_task_completed");
         let _edge_resp = self
             .inner
@@ -659,8 +658,8 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 .await?;
             return Ok(Response::new(translate::respond_activity_failed_to_proto()));
         }
-        let edge_req = translate::respond_activity_failed_to_edge(req)
-            .map_err(proto_conversion_status)?;
+        let edge_req =
+            translate::respond_activity_failed_to_edge(req).map_err(proto_conversion_status)?;
         let _edge_resp = self
             .inner
             .respond_activity_task_failed(&headers, edge_req)
@@ -2109,8 +2108,12 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             // The activity input is opaque to the edge; carry the encoded
             // `Payloads` envelope through to the component verbatim.
             input: req.input.map(|p| p.encode_to_vec()).unwrap_or_default(),
-            schedule_to_start_nanos: proto_duration_to_nanos(req.schedule_to_start_timeout.as_ref()),
-            schedule_to_close_nanos: proto_duration_to_nanos(req.schedule_to_close_timeout.as_ref()),
+            schedule_to_start_nanos: proto_duration_to_nanos(
+                req.schedule_to_start_timeout.as_ref(),
+            ),
+            schedule_to_close_nanos: proto_duration_to_nanos(
+                req.schedule_to_close_timeout.as_ref(),
+            ),
             start_to_close_nanos: proto_duration_to_nanos(req.start_to_close_timeout.as_ref()),
             heartbeat_nanos: proto_duration_to_nanos(req.heartbeat_timeout.as_ref()),
             // Standalone activities have no enclosing run; schedule-to-close is the
@@ -2201,7 +2204,9 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             ));
         };
         let req = request.into_inner();
-        let key = self.activity_execution_key(&req.namespace, req.activity_id, req.run_id).await?;
+        let key = self
+            .activity_execution_key(&req.namespace, req.activity_id, req.run_id)
+            .await?;
         bridge.request_cancel(key, req.identity).await?;
         Ok(Response::new(
             workflowservice::RequestCancelActivityExecutionResponse {},
@@ -2217,7 +2222,9 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             ));
         };
         let req = request.into_inner();
-        let key = self.activity_execution_key(&req.namespace, req.activity_id, req.run_id).await?;
+        let key = self
+            .activity_execution_key(&req.namespace, req.activity_id, req.run_id)
+            .await?;
         bridge.terminate(key, req.reason).await?;
         Ok(Response::new(
             workflowservice::TerminateActivityExecutionResponse {},
@@ -2233,7 +2240,9 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             ));
         };
         let req = request.into_inner();
-        let key = self.activity_execution_key(&req.namespace, req.activity_id, req.run_id).await?;
+        let key = self
+            .activity_execution_key(&req.namespace, req.activity_id, req.run_id)
+            .await?;
         bridge.delete(key).await?;
         Ok(Response::new(
             workflowservice::DeleteActivityExecutionResponse {},

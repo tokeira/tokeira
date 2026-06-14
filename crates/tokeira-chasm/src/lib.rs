@@ -82,4 +82,6 @@ pub use task::{
     TaskValidator, TaskValidity,
 };
 pub use versioned_transition::{Staleness, VersionedTransition};
-pub use visibility::{SearchAttributeProvider, SearchAttributes};
+pub use visibility::{
+    SearchAttributeProvider, SearchAttributes, VisibilityContributor, VisibilitySnapshot,
+};

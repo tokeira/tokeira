@@ -14,7 +14,7 @@
 use tokeira_chasm::{
     ChasmError, Context, ContextMetadata, EngineComponent, Field, Library, Lifecycle,
     LifecycleState, MutableContext, RegistryBuilder, RootComponent, SearchAttributeProvider,
-    SearchAttributes, TerminateReason,
+    SearchAttributes, TerminateReason, VisibilityContributor, VisibilitySnapshot,
 };
 use tokeira_chasm_derive::Component;
 
@@ -125,6 +125,32 @@ impl SearchAttributeProvider for ActivityExecution {
     }
 }
 
+impl VisibilityContributor for ActivityExecution {
+    fn visibility_snapshot(&self) -> Option<VisibilitySnapshot> {
+        let state = self.activity_state()?;
+        let status = state.status();
+        Some(VisibilitySnapshot {
+            // `ExecutionStatus`/`ActivityType`/`TaskQueue` (Requirement 10.4) are
+            // contributed as system fields, not user search attributes: status is a
+            // column (`status_keyword`), and the activity type / task queue are the
+            // generic `execution_type`/`task_queue` columns the edge exposes under
+            // those SA names (design "Record shape"). `search_attributes` therefore
+            // carries no user EAV rows for this archetype.
+            status_keyword: execution_status_name(status).to_owned(),
+            lifecycle_state: lifecycle_for(status),
+            execution_type: (!state.activity_type.is_empty()).then(|| state.activity_type.clone()),
+            task_queue: (!state.task_queue.is_empty()).then(|| state.task_queue.clone()),
+            // The activity persists no close timestamp; the adapter stamps the
+            // transition time when the lifecycle closes.
+            start_time_unix_nanos: (state.scheduled_time_nanos != 0)
+                .then_some(state.scheduled_time_nanos),
+            close_time_unix_nanos: None,
+            search_attributes: Default::default(),
+            memo: Default::default(),
+        })
+    }
+}
+
 /// The visibility `ExecutionStatus` string for an activity status, matching the
 /// names the targeted release surfaces.
 fn execution_status_name(status: ActivityStatus) -> &'static str {
@@ -209,5 +235,27 @@ mod tests {
         assert!(sas.contains(&("ActivityType".to_owned(), "PaymentActivity".to_owned())));
         assert!(sas.contains(&("TaskQueue".to_owned(), "payments".to_owned())));
         assert!(sas.contains(&("ExecutionStatus".to_owned(), "Scheduled".to_owned())));
+    }
+
+    #[test]
+    fn visibility_snapshot_contributes_system_fields() {
+        let mut state = ActivityState {
+            activity_type: "PaymentActivity".to_owned(),
+            task_queue: "payments".to_owned(),
+            scheduled_time_nanos: 42,
+            ..ActivityState::default()
+        };
+        state.set_status(ActivityStatus::Completed);
+        let snap = ActivityExecution::new(state)
+            .visibility_snapshot()
+            .expect("a materialized activity contributes a snapshot");
+        // Status/type/task-queue are system fields, not user search attributes.
+        assert_eq!(snap.status_keyword, "Completed");
+        assert_eq!(snap.lifecycle_state, LifecycleState::Completed);
+        assert_eq!(snap.execution_type.as_deref(), Some("PaymentActivity"));
+        assert_eq!(snap.task_queue.as_deref(), Some("payments"));
+        assert_eq!(snap.start_time_unix_nanos, Some(42));
+        assert_eq!(snap.close_time_unix_nanos, None);
+        assert!(snap.search_attributes.0.is_empty());
     }
 }

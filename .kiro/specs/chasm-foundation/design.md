@@ -459,18 +459,43 @@ attribute table.
 
 ### DSQL crash-safety: the generation pattern
 
-DSQL has no cross-table transactions, so row + typed-attr rows are made consistent by a **generation
-pointer**: write the new attribute rows at `generation = N`, then flip
-`execution_visibility_current.search_attr_generation = N`; queries join only the current generation;
-old generations are GC'd. Orphaned new-generation rows are never visible until the pointer flips, so a
-crash mid-write is survivable.
+DSQL **does** support multi-table transactions (one workflow transition is one fenced multi-table
+commit — `050-dsql-storage.md`), so the generation pointer is not a workaround for a missing cross-table
+transaction. Its purpose is **hot-path conflict-surface narrowing**: under OCC, every row in the fenced
+apply transaction widens its write set and its conflict/retry probability on the hottest path.
+Replacing an execution's whole typed-attr set inline (delete-old + insert-new) on every transition
+inflates that set; instead the attribute rows are written in a **prior** narrow transaction and the
+fenced commit advances a single pointer. This is chosen **deliberately** over the simpler
+in-transaction delete+insert — for tiny attr sets the simpler form is defensible, but the
+conflict-surface win matches the DSQL/OCC posture; the 3,000-row mutation limit is a secondary bound,
+not the reason.
+
+**Generation = the snapshot version.** Attribute rows are written at
+`generation = (authority_epoch, source_transition_seq)` — the version of the snapshot being applied.
+That is globally unique and monotonic per run, so two concurrent distinct snapshots write **distinct**
+generations (no collision — the `N = current+1` scheme would let both write the same generation and
+corrupt the winner's image), a retry of the same snapshot writes the **same** generation (idempotent
+`ON CONFLICT DO NOTHING`), and the apply-iff-newer pointer flip selects the winner. The pointer is the
+current row's own `(authority_epoch, source_transition_seq)`: advancing the row's version in the fenced
+apply transaction **is** the flip, and queries join attribute rows whose generation equals the current
+row's version.
+
+**Crash- and GC-safety.** A crash between the prior attribute write and the fenced apply leaves orphaned
+higher-generation rows that are never visible (the row's version still names the prior generation) and
+are reaped by an async GC that deletes generations **strictly below** the current pointer after a grace
+window. The pointer read and the attribute join run in **one Repeatable-Read snapshot transaction** (the
+CTE), so a concurrent pointer advance + GC cannot pull rows out from under an in-flight join.
 
 ### Idempotent rollups
 
 Counts (by status/type/task-queue, archetype-scoped) come from **striped** counters
-(`(namespace_id, archetype_id, dimension, value, stripe)`, `stripe = hash(run_key)`) guarded by an
-applied-version so a retry cannot double-count, with a `rollup_delta` keyed by version when an atomic
-multi-row update is not possible. Rollups are derived and rebuildable from `current`.
+(`(namespace_id, archetype_id, dimension, value, stripe)`, `stripe = hash(run_key)`). The counter
+deltas (`-1` old value, `+1` new value) are applied in the **same fenced apply-iff-newer transaction**
+as the current-row upsert, so the row's `(authority_epoch, source_transition_seq)` version gate makes a
+retried or duplicate apply a no-op on the counters too. Striping only spreads writes to avoid a hot
+counter row — it is not the idempotency mechanism; the row gate is. Because DSQL admits the atomic
+multi-table update, no separate `rollup_delta` ledger is needed. Rollups are derived and rebuildable
+from `current`.
 
 ### Pipeline, checkpoints, isolation
 
@@ -479,6 +504,46 @@ partitioned (`projection_checkpoint(partition, last_applied_version)`), processi
 source shard / run-key hash, so high-volume activity churn cannot starve workflow visibility.
 Per-archetype operational controls (retention, projection priority/concurrency, rollup striping,
 search-attribute quotas, default UI inclusion) are first-class.
+
+### DSQL physical schema
+
+The physical layer for the logical contract above. Full rationale and the resolved hazards
+(build-phase assumption, DDL-subset compliance, rollup idempotency, generation GC/crash-safety,
+sequencing) are in `reference/DECISION-visibility-dsql-schema.md`.
+
+**Tables** (replacing the workflow-only `vis_execution` / `sa_*` / `vis_rollup` /
+`projector_checkpoint`):
+
+- `execution_visibility_current` — the current row, keyed `(namespace_id, archetype_id, run_key)`.
+  Generic columns (`status_keyword`, `lifecycle_state`, start/update/close time, `execution_type`,
+  `task_queue`, `transition_count`, `memo_blob`) plus **nullable archetype-fidelity columns** for the
+  workflow archetype (`execution_time`, `execution_duration`, `history_length`, `history_size_bytes`,
+  parent/root ids) so workflow List/Describe is unchanged (Requirement 10.13). The row's
+  `(authority_epoch, source_transition_seq)` **is** the search-attribute generation pointer — there is
+  no separate `search_attr_generation` column.
+- `execution_visibility_attr_index` — one typed inverted-index table whose generation is
+  `(gen_authority_epoch, gen_source_transition_seq)` (the snapshot version that wrote the rows) plus a
+  typed value column per type, replacing `sa_current` + every `sa_*_idx`. `sa_registry` is kept for SA
+  name → `(attr_id, attr_type)` resolution (orthogonal to value storage).
+- `execution_visibility_rollup` — striped counters keyed `(namespace_id, archetype_id, dimension,
+  value, stripe)`, `stripe = hash(run_key) % 16`. `count_from_rollup` fans in the 16 stripes per value.
+- `projection_checkpoint` — `(partition_id, last_applied_version)`, partitioned so activity churn
+  cannot starve workflow-visibility progress.
+
+**The apply transaction** is one fenced, apply-iff-newer, OCC-retryable transaction: gate on the stored
+`(authority_epoch, source_transition_seq)`; if strictly newer, upsert the current row (advancing its
+version — and therefore the generation pointer — to the snapshot's) and apply the striped rollup
+`-old/+new` counter deltas — all in one commit (a handful of rows, well under the 3,000-row limit). The
+typed-attr rows for this version are written in a prior narrow transaction at `generation = (epoch,
+seq)`; the fenced row-version advance is the atomic flip. The row version gate is the single idempotency
+point for row, rollup, and generation pointer. Queries are CTE-based, archetype-scoped, and join
+attribute rows at the current generation in one Repeatable-Read snapshot.
+
+**Migrations.** This is a **build-phase** change (no baseline cut — storage `AGENTS.md`), so the old
+workflow-only migrations are retired and the schema recreated under the DSQL DDL subset: one DDL
+statement per file, secondary indexes `CREATE INDEX ASYNC` in their own files (e.g. the list index
+`(namespace_id, archetype_id, status_keyword, start_time DESC, run_key)`), no `CHECK`, no `BIGSERIAL`,
+columns folded into the base `CREATE TABLE`.
 
 ### Archetype scoping at the edge
 

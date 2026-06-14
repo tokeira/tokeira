@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use sqlx::Connection;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    ActivityOp, BasicKernel, DispatchOp, HistoryEvent, LoadedRun, ProjectionOp, ReplayContext,
-    TimerOp, Transition, WorkflowState,
+    ActivityOp, BasicKernel, DispatchOp, HistoryEvent, LoadedRun, ReplayContext, TimerOp,
+    Transition, WorkflowState,
 };
 use tokeira_types::{
     ArchetypeId, BuildId, DeploymentId, ExecutionRef, ExecutionStatus, NamespaceId, Payloads,
@@ -646,9 +646,10 @@ mod tests {
         ProjectionOp, TimerState, Transition, WorkflowState,
     };
     use tokeira_types::{
-        BuildId, DeploymentId, ExecutionRef, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId,
-        Payloads, QueueKey, RequestId, RunId, RunKey, SearchAttributes, ShardEpoch, StickyAffinity,
-        TaskKind, TaskQueueName, TransitionSeq, WorkerIdentity, WorkflowId, WorkflowType,
+        ArchetypeId, BuildId, DeploymentId, ExecutionRef, ExecutionStatus, LogicalTaskSeq, Memo,
+        NamespaceId, Payloads, QueueKey, RequestId, RunId, RunKey, SearchAttributes, ShardEpoch,
+        StickyAffinity, TaskKind, TaskQueueName, TransitionSeq, VisibilityLifecycleState,
+        WorkerIdentity, WorkflowId, WorkflowType,
     };
 
     use super::{

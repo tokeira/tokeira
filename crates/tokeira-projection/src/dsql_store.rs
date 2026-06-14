@@ -21,7 +21,7 @@ use tokeira_storage::{
 };
 use tokeira_types::{
     ArchetypeId, ExecutionStatus, Memo, NamespaceId, ProjectionCursor, RunKey, SearchAttrValue,
-    SearchAttributes, TransitionSeq, VisibilityLifecycleState, dsql_spread_uuid,
+    SearchAttributes, TransitionSeq, dsql_spread_uuid,
 };
 use tracing::{instrument, warn};
 use uuid::Uuid;
@@ -493,7 +493,15 @@ impl ProjectionSink for DsqlVisibilityStore {
         ) {
             return Ok(());
         }
-        let mut row = previous.clone().unwrap_or_else(|| ExecutionRow {
+        // Visibility rows are full post-transition snapshots, not deltas: every
+        // column is taken from the context image, so the row is built directly
+        // from `record.context` rather than cloned from `previous` and patched
+        // field-by-field. Constructing from context makes it structurally
+        // impossible to leave a column (e.g. the typed `status`, `close_time`)
+        // frozen at its prior value across a superseding transition — the omission
+        // failure mode Property 12 exercises. `previous` is still used below to
+        // retire dropped search-attribute index rows and to compute rollup deltas.
+        let mut row = ExecutionRow {
             run_key: record.run_key,
             namespace_id: record.context.namespace_id,
             archetype_id: record.context.archetype_id,
@@ -528,40 +536,8 @@ impl ProjectionSink for DsqlVisibilityStore {
             transition_count: record.context.transition_count,
             search_attr_generation: record.context.search_attr_generation,
             search_attr_version: 0,
-        });
+        };
         let search_patch = record.context.search_attributes.clone();
-
-        row.namespace_id = record.context.namespace_id;
-        row.archetype_id = record.context.archetype_id;
-        row.business_id = record.context.business_id.clone();
-        row.workflow_id = record.context.workflow_id.clone();
-        row.run_id = record.context.run_id;
-        row.authority_epoch = record.context.authority_epoch;
-        row.source_transition_seq = record.transition_seq;
-        row.status_keyword = record.context.status_keyword.clone();
-        row.lifecycle_state = record.context.lifecycle_state;
-        row.workflow_type = record.context.workflow_type.clone();
-        row.task_queue = record.context.task_queue.clone();
-        row.start_time = record.context.start_time;
-        row.update_time = record.context.update_time;
-        row.execution_time = record.context.execution_time;
-        row.history_length = record.context.history_length;
-        row.execution_duration = record.context.execution_duration;
-        row.state_transition_count = record.context.state_transition_count;
-        row.transition_count = record.context.transition_count;
-        row.history_size_bytes = record.context.history_size_bytes;
-        row.parent_workflow_id = record.context.parent_workflow_id.clone();
-        row.parent_run_id = record.context.parent_run_id;
-        row.root_workflow_id = record
-            .context
-            .root_workflow_id
-            .clone()
-            .unwrap_or_else(|| record.context.workflow_id.clone());
-        row.root_run_id = record.context.root_run_id.unwrap_or(record.context.run_id);
-        row.memo = record.context.memo.clone();
-        row.search_attributes = record.context.search_attributes.clone();
-        row.search_attr_generation = record.context.search_attr_generation;
-        row.search_attr_version = 0;
 
         let mut resolved_search_attrs = Vec::new();
         for (name, value) in &search_patch.0 {
@@ -1874,7 +1850,10 @@ fn row_to_execution(row: sqlx::postgres::PgRow) -> Result<ExecutionRow> {
     let status = ExecutionStatus::try_from(status)?;
     let workflow_id: String = row.try_get("workflow_id")?;
     let start_time = row.try_get("start_time")?;
-    let close_time = row.try_get("close_time")?;
+    // Annotate explicitly: `close_time` is consumed by `close_time.unwrap_or(..)`
+    // below, and a method call on an unannotated `try_get` result leaves the
+    // decode type unresolved (E0282) before the struct field can pin it.
+    let close_time: Option<time::OffsetDateTime> = row.try_get("close_time")?;
     let state_transition_count = row.try_get("state_transition_count")?;
     Ok(ExecutionRow {
         run_key: RunKey(row.try_get::<Uuid, _>("run_key")?),
@@ -2010,7 +1989,10 @@ mod tests {
     use proptest::prelude::*;
     use time::OffsetDateTime;
     use tokeira_storage::ProjectionContext;
-    use tokeira_types::{Payload, RunId, SearchAttrValue, TaskQueueName, WorkflowId, WorkflowType};
+    use tokeira_types::{
+        Payload, RunId, SearchAttrValue, TaskQueueName, VisibilityLifecycleState, WorkflowId,
+        WorkflowType,
+    };
 
     use super::*;
 

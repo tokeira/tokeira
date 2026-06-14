@@ -161,7 +161,16 @@ where
         ) {
             return Ok(());
         }
-        let mut row = previous.clone().unwrap_or(ExecutionRow {
+        // Visibility rows are full post-transition snapshots, not deltas: every
+        // column is taken from the context image, so the row is constructed
+        // directly from `record.context` rather than cloned from `previous` and
+        // patched field-by-field. Building from context makes it structurally
+        // impossible to leave a column frozen at its prior value across a
+        // superseding transition — the omission failure mode Property 12 (and the
+        // earlier stale `status`/`close_time`) exercised. `previous` is still
+        // consulted below to retire search-attribute index entries this snapshot
+        // dropped and to compute rollup deltas.
+        let mut row = ExecutionRow {
             run_key: record.run_key,
             namespace_id: record.context.namespace_id,
             archetype_id: record.context.archetype_id,
@@ -196,40 +205,8 @@ where
             transition_count: record.context.transition_count,
             search_attr_generation: record.context.search_attr_generation,
             search_attr_version: 0,
-        });
+        };
         let search_patch = record.context.search_attributes.clone();
-
-        row.namespace_id = record.context.namespace_id;
-        row.archetype_id = record.context.archetype_id;
-        row.business_id = record.context.business_id.clone();
-        row.workflow_id = record.context.workflow_id.clone();
-        row.run_id = record.context.run_id;
-        row.authority_epoch = record.context.authority_epoch;
-        row.source_transition_seq = record.transition_seq;
-        row.workflow_type = record.context.workflow_type.clone();
-        row.task_queue = record.context.task_queue.clone();
-        row.status_keyword = record.context.status_keyword.clone();
-        row.lifecycle_state = record.context.lifecycle_state;
-        row.start_time = record.context.start_time;
-        row.update_time = record.context.update_time;
-        row.execution_time = record.context.execution_time;
-        row.history_length = record.context.history_length;
-        row.execution_duration = record.context.execution_duration;
-        row.state_transition_count = record.context.state_transition_count;
-        row.transition_count = record.context.transition_count;
-        row.history_size_bytes = record.context.history_size_bytes;
-        row.parent_workflow_id = record.context.parent_workflow_id.clone();
-        row.parent_run_id = record.context.parent_run_id;
-        row.root_workflow_id = record
-            .context
-            .root_workflow_id
-            .clone()
-            .unwrap_or_else(|| record.context.workflow_id.clone());
-        row.root_run_id = record.context.root_run_id.unwrap_or(record.context.run_id);
-        row.memo = record.context.memo.clone();
-        row.search_attributes = record.context.search_attributes.clone();
-        row.search_attr_generation = record.context.search_attr_generation;
-        row.search_attr_version = 0;
 
         self.store.upsert_execution(&row).await?;
         if let Some(previous) = previous.as_ref() {
@@ -727,5 +704,219 @@ mod tests {
             .await
             .unwrap();
         assert!(result.rows.is_empty());
+    }
+
+    /// Build a projection record whose entire content is a deterministic
+    /// function of its version `(authority_epoch, transition_seq)`.
+    ///
+    /// Because content depends only on the version, two records that tie on
+    /// version are byte-identical, so "the newest version's image" is
+    /// unambiguous regardless of apply order, retries, or ties — which is
+    /// exactly the convergence target Properties 12 and 13 assert against.
+    /// `transition_seq` selects the status from a table spanning open and
+    /// terminal statuses, so a stale (older, possibly-open) snapshot applied
+    /// after a newer terminal one must be rejected by the version gate, not
+    /// allowed to reopen the row. `workflow_type`/`task_queue` derive from the
+    /// run key (stable across an execution's versions), so the rollup
+    /// dimensions partition executions the way a real producer would.
+    fn record_for(
+        run_key: RunKey,
+        namespace_id: NamespaceId,
+        authority_epoch: i64,
+        seq: u64,
+    ) -> ProjectionRecord {
+        const STATUSES: [ExecutionStatus; 8] = [
+            ExecutionStatus::Running,
+            ExecutionStatus::Paused,
+            ExecutionStatus::Completed,
+            ExecutionStatus::Failed,
+            ExecutionStatus::Cancelled,
+            ExecutionStatus::Terminated,
+            ExecutionStatus::ContinuedAsNew,
+            ExecutionStatus::TimedOut,
+        ];
+        let status = STATUSES[(seq % 8) as usize];
+        let h = run_key.0.as_u128();
+        let business = format!("wf-{}", run_key.0);
+        let start = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+        let close = if status.is_open() {
+            None
+        } else {
+            Some(OffsetDateTime::from_unix_timestamp(1_000 + seq as i64).unwrap())
+        };
+        let context = ProjectionContext {
+            archetype_id: ArchetypeId::WORKFLOW,
+            namespace_id,
+            business_id: business.clone(),
+            authority_epoch,
+            status_keyword: crate::types::workflow_status_keyword(status),
+            lifecycle_state: crate::types::workflow_lifecycle_state(status),
+            workflow_id: WorkflowId(business.clone()),
+            run_id: RunId(run_key.0),
+            workflow_type: WorkflowType(format!("Type{}", h % 3)),
+            task_queue: TaskQueueName(format!("queue-{}", h % 2)),
+            execution_status: status,
+            start_time: start,
+            update_time: close.unwrap_or(start),
+            execution_time: Some(start),
+            close_time: close,
+            history_length: seq as i64,
+            execution_duration: None,
+            state_transition_count: seq as i64,
+            transition_count: seq as i64,
+            history_size_bytes: 0,
+            parent_workflow_id: None,
+            parent_run_id: None,
+            root_workflow_id: Some(WorkflowId(business)),
+            root_run_id: Some(RunId(run_key.0)),
+            search_attr_generation: seq,
+            memo: Memo::default(),
+            search_attributes: SearchAttributes::default(),
+        };
+        ProjectionRecord {
+            partition_id: 0,
+            fanout: 1,
+            run_key,
+            transition_seq: TransitionSeq(seq),
+            context,
+        }
+    }
+
+    /// Collapse a count result into a value→count map, dropping zero buckets.
+    ///
+    /// `accumulate_rollup` leaves a `0` counter behind when an execution leaves
+    /// a status/type/queue bucket (the `-1` is not GC'd), whereas a fresh scan
+    /// only reports buckets with live rows. Treating "absent" and "zero" as
+    /// equal is the right comparison: both mean "no live execution here".
+    fn nonzero_map(result: &CountResult) -> std::collections::BTreeMap<String, i64> {
+        result
+            .groups
+            .iter()
+            .filter(|g| g.count != 0)
+            .map(|g| (g.value.clone(), g.count))
+            .collect()
+    }
+
+    // Feature: chasm-foundation, Property 12: Monotonic snapshot apply.
+    // For any interleaving/retry/out-of-order set of versioned snapshots for one
+    // execution, the sink converges to the newest-version image and the stored
+    // version never regresses — so a stale (older) snapshot can neither revert
+    // the status nor reopen a closed execution.
+    // **Validates: Requirements 10.3**
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+        #[test]
+        fn prop_monotonic_snapshot_apply(
+            versions in proptest::collection::vec((0i64..3, 1u64..40), 1..12),
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let ns = NamespaceId(Uuid::from_u128(1));
+                let run_key = RunKey(Uuid::from_u128(7));
+                let store = InMemoryVisibilityStore::default();
+                let sink = VisibilitySink::new(store.clone(), "s");
+
+                // Apply each version in the generated (arbitrary) order, with
+                // duplicates standing in for retries. After every apply the
+                // stored row must equal the image of the highest version seen
+                // so far — a step-wise non-regression invariant that also proves
+                // final convergence on the last iteration.
+                let mut applied_max: Option<(i64, u64)> = None;
+                for &(epoch, seq) in &versions {
+                    sink.apply(&record_for(run_key, ns, epoch, seq), 0)
+                        .await
+                        .unwrap();
+                    applied_max = Some(match applied_max {
+                        Some(m) => m.max((epoch, seq)),
+                        None => (epoch, seq),
+                    });
+                    let (max_epoch, max_seq) = applied_max.unwrap();
+                    let expected = record_for(run_key, ns, max_epoch, max_seq);
+                    let row = store.get_row(run_key).await.unwrap();
+
+                    prop_assert_eq!(row.authority_epoch, max_epoch);
+                    prop_assert_eq!(row.source_transition_seq, TransitionSeq(max_seq));
+                    prop_assert_eq!(row.status, expected.context.execution_status);
+                    prop_assert_eq!(row.status_keyword, expected.context.status_keyword);
+                    prop_assert_eq!(row.lifecycle_state, expected.context.lifecycle_state);
+                    prop_assert_eq!(row.close_time, expected.context.close_time);
+                    prop_assert_eq!(row.history_length, expected.context.history_length);
+                    prop_assert_eq!(row.transition_count, expected.context.transition_count);
+                }
+                Ok(())
+            })?;
+        }
+    }
+
+    // Feature: chasm-foundation, Property 13: Idempotent rollups.
+    // For any replayed/superseded/out-of-order stream of versioned snapshots
+    // across many executions, the maintained striped rollup never double-counts:
+    // for every dimension it equals a fresh rebuild scanned from the current
+    // rows, and its total equals the live execution count.
+    // **Validates: Requirements 10.8**
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+        #[test]
+        fn prop_rollup_idempotent_rebuildable(
+            // (execution, authority_epoch, transition_seq) applied in order;
+            // repeated triples model retries, arbitrary ordering models the
+            // interleaving of independent executions' transitions.
+            ops in proptest::collection::vec((0u128..5, 0i64..3, 1u64..30), 1..40),
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let ns = NamespaceId(Uuid::from_u128(1));
+                let store = InMemoryVisibilityStore::default();
+                let sink = VisibilitySink::new(store.clone(), "s");
+
+                for &(exec, epoch, seq) in &ops {
+                    let run_key = RunKey(Uuid::from_u128(exec + 1));
+                    sink.apply(&record_for(run_key, ns, epoch, seq), 0)
+                        .await
+                        .unwrap();
+                }
+
+                for (dimension, group_by) in [
+                    (
+                        RollupDimension::ExecutionStatus,
+                        GroupByField::System(crate::types::SystemField::ExecutionStatus),
+                    ),
+                    (
+                        RollupDimension::WorkflowType,
+                        GroupByField::System(crate::types::SystemField::WorkflowType),
+                    ),
+                    (
+                        RollupDimension::TaskQueue,
+                        GroupByField::System(crate::types::SystemField::TaskQueue),
+                    ),
+                ] {
+                    let rollup = store.count_from_rollup(ns, dimension).await.unwrap();
+                    let scan = store
+                        .count_executions(ns, &CompiledFilter::default(), Some(group_by))
+                        .await
+                        .unwrap();
+                    prop_assert_eq!(
+                        nonzero_map(&rollup),
+                        nonzero_map(&scan),
+                        "maintained rollup must equal the rebuild for {:?}",
+                        dimension
+                    );
+                    // Every live row falls in exactly one bucket of a
+                    // partitioning dimension, so the rollup total equals the
+                    // scanned live count.
+                    let live: i64 = scan.groups.iter().map(|g| g.count).sum();
+                    let rollup_total: i64 =
+                        rollup.groups.iter().filter(|g| g.count != 0).map(|g| g.count).sum();
+                    prop_assert_eq!(rollup_total, live);
+                }
+                Ok(())
+            })?;
+        }
     }
 }

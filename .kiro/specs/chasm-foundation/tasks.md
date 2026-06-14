@@ -358,7 +358,7 @@ verify against `../temporal @ v1.31.0` before finalizing.
 > "Visibility Generalization: One Logical Index for All Archetypes". Each stage compiles + tests; the
 > workflow list/count/UI stays green throughout.
 
-- [ ] 23. Stage 1 — Generalize the visibility store, record, and sink; migrate the workflow producer to snapshots
+- [x] 23. Stage 1 — Generalize the visibility store, record, and sink; migrate the workflow producer to snapshots
   - [x] 23.1 Generalize the projection record + store model to the versioned-snapshot / archetype shape
     - Replace the delta `ProjectionOp` contract with a versioned `VisibilitySnapshot` record carrying
       `(namespace_id, archetype_id, run_key, authority_epoch, source_transition_seq)` plus the full
@@ -393,14 +393,14 @@ verify against `../temporal @ v1.31.0` before finalizing.
     - **Ground-truth**: the workflow `ExecutionStatus` → `status_keyword`/`lifecycle_state` mapping must
       keep `v1.31.0` list/count semantics (OPEN vs CLOSED, terminal statuses).
     - _Requirements: 10.13, 10.2, 10.14_
-  - [ ]* 23.5 Write property test for monotonic idempotent snapshot apply
+  - [x]* 23.5 Write property test for monotonic idempotent snapshot apply
     - **Property 12: Monotonic snapshot apply**
     - **Validates: Requirements 10.3**
     - `prop_monotonic_snapshot_apply`: arbitrary interleaving/retry/out-of-order of snapshots converges
       to the newest-version image and never regresses status nor revives a closed execution; ≥100
       iterations; `// Feature: chasm-foundation, Property 12` tag
     - _Requirements: 12.3_
-  - [ ]* 23.6 Write property test for rollup idempotence + rebuildability
+  - [x]* 23.6 Write property test for rollup idempotence + rebuildability
     - **Property 13: Idempotent rollups**
     - **Validates: Requirements 10.8**
     - `prop_rollup_idempotent_rebuildable`: replayed snapshots never double-count; striped rollups equal

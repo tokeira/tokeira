@@ -517,8 +517,18 @@ impl TryFrom<i16> for RollupDimension {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RollupDelta {
     pub namespace_id: NamespaceId,
+    /// The archetype this count belongs to. Rollups are archetype-scoped so a
+    /// `status = "Running"` count never mixes workflows and activities
+    /// (Requirement 10.1; see reference/DECISION-visibility-dsql-schema.md).
+    pub archetype_id: ArchetypeId,
     pub dimension: RollupDimension,
     pub value: String,
+    /// Counter stripe = `hash(run_key) % ROLLUP_STRIPES`, so concurrent applies for
+    /// different executions spread across counter rows (DSQL hot-key avoidance). A
+    /// `+1`/`-1` pair for the same execution shares a stripe and cancels. The
+    /// in-memory store ignores it (it aggregates per `(archetype, dimension, value)`);
+    /// the DSQL store keys counter rows by it.
+    pub stripe: i32,
     pub delta: i64,
 }
 

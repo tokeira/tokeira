@@ -301,6 +301,10 @@ impl VisibilityStore for DsqlVisibilityStore {
     async fn count_from_rollup(
         &self,
         namespace_id: NamespaceId,
+        // Archetype scoping lands with the `execution_visibility_rollup` migration
+        // (step 3 of the DSQL port); the legacy `vis_rollup` table is workflow-only,
+        // so the parameter is accepted but not yet keyed on here.
+        _archetype_id: ArchetypeId,
         dimension: RollupDimension,
     ) -> Result<CountResult> {
         let mut permit = self.director.acquire(DbClass::Projection).await?;

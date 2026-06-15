@@ -6,7 +6,19 @@
 //! the previous and next row states. The conservation invariant (net delta
 //! is zero for transitions, +1 for inserts) is validated by property tests.
 
+use tokeira_types::RunKey;
+
 use crate::types::{ExecutionRow, RollupDelta, RollupDimension};
+
+/// Number of stripes a rollup counter is spread across to avoid a hot counter row
+/// under DSQL's OCC (Requirement 10.8; reference/DECISION-visibility-dsql-schema.md).
+pub const ROLLUP_STRIPES: u128 = 16;
+
+/// The deterministic counter stripe for a run key. Stable per `run_key`, so a
+/// `+1`/`-1` pair for one execution always lands on the same stripe and cancels.
+pub fn stripe_for(run_key: RunKey) -> i32 {
+    (run_key.0.as_u128() % ROLLUP_STRIPES) as i32
+}
 
 /// Compute the rollup counter deltas between a previous and next row state.
 ///
@@ -18,6 +30,8 @@ pub fn compute_rollup_deltas(
     next: &ExecutionRow,
 ) -> Vec<RollupDelta> {
     let mut out = Vec::new();
+    let archetype_id = next.archetype_id;
+    let stripe = stripe_for(next.run_key);
 
     for (dimension, next_value) in [
         // The status dimension keys off the generic `status_keyword` (archetype-
@@ -43,16 +57,20 @@ pub fn compute_rollup_deltas(
             }
             out.push(RollupDelta {
                 namespace_id: next.namespace_id,
+                archetype_id,
                 dimension,
                 value: previous_value,
+                stripe,
                 delta: -1,
             });
         }
 
         out.push(RollupDelta {
             namespace_id: next.namespace_id,
+            archetype_id,
             dimension,
             value: next_value,
+            stripe,
             delta: 1,
         });
     }

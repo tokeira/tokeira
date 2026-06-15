@@ -477,9 +477,12 @@ mod tests {
         async fn count_from_rollup(
             &self,
             namespace_id: NamespaceId,
+            archetype_id: tokeira_types::ArchetypeId,
             dimension: crate::types::RollupDimension,
         ) -> Result<crate::types::CountResult> {
-            self.store.count_from_rollup(namespace_id, dimension).await
+            self.store
+                .count_from_rollup(namespace_id, archetype_id, dimension)
+                .await
         }
         async fn load_checkpoint(&self, sink_id: &str) -> Result<Option<ProjectionCursor>> {
             self.store.load_checkpoint(sink_id).await

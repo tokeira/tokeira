@@ -1,6 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use tokeira_types::{NamespaceId, ProjectionCursor, RunKey, SearchAttrValue};
+use tokeira_types::{ArchetypeId, NamespaceId, ProjectionCursor, RunKey, SearchAttrValue};
 
 use crate::types::{
     AttrDescriptor, AttrId, CompiledFilter, CountResult, ExecutionRow, GroupByField, ListResult,
@@ -57,6 +57,7 @@ pub trait VisibilityStore: Send + Sync {
     async fn count_from_rollup(
         &self,
         namespace_id: NamespaceId,
+        archetype_id: ArchetypeId,
         dimension: RollupDimension,
     ) -> Result<CountResult>;
 

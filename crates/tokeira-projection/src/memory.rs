@@ -42,7 +42,7 @@ struct VisibilityState {
     sa_double_idx: HashMap<(NamespaceId, AttrId, String), HashSet<RunKey>>,
     sa_datetime_idx: HashMap<(NamespaceId, AttrId, i128), HashSet<RunKey>>,
     sa_text_idx: HashMap<(NamespaceId, AttrId, String), HashSet<RunKey>>,
-    rollups: HashMap<(NamespaceId, RollupDimension, String), i64>,
+    rollups: HashMap<(NamespaceId, ArchetypeId, RollupDimension, String), i64>,
     registry: HashMap<(NamespaceId, String), AttrDescriptor>,
     checkpoints: HashMap<String, ProjectionCursor>,
     next_attr_id: u64,
@@ -176,7 +176,7 @@ impl VisibilityStore for InMemoryVisibilityStore {
             (RollupDimension::WorkflowType, row.workflow_type.0),
             (RollupDimension::TaskQueue, row.task_queue.0),
         ] {
-            let key = (row.namespace_id, dimension, value);
+            let key = (row.namespace_id, row.archetype_id, dimension, value);
             if let Some(count) = inner.rollups.get_mut(&key) {
                 *count -= 1;
                 if *count <= 0 {
@@ -331,9 +331,16 @@ impl VisibilityStore for InMemoryVisibilityStore {
     async fn accumulate_rollup(&self, entries: &[RollupDelta]) -> Result<()> {
         let mut inner = self.inner.lock().await;
         for entry in entries {
+            // The in-memory store aggregates per `(namespace, archetype, dimension,
+            // value)` and ignores `stripe` — striping is a DSQL hot-row concern.
             *inner
                 .rollups
-                .entry((entry.namespace_id, entry.dimension, entry.value.clone()))
+                .entry((
+                    entry.namespace_id,
+                    entry.archetype_id,
+                    entry.dimension,
+                    entry.value.clone(),
+                ))
                 .or_insert(0) += entry.delta;
         }
         Ok(())
@@ -411,13 +418,14 @@ impl VisibilityStore for InMemoryVisibilityStore {
     async fn count_from_rollup(
         &self,
         namespace_id: NamespaceId,
+        archetype_id: ArchetypeId,
         dimension: RollupDimension,
     ) -> Result<CountResult> {
         let inner = self.inner.lock().await;
         let mut groups = Vec::new();
         let mut total_count = 0;
-        for ((ns, dim, value), count) in &inner.rollups {
-            if *ns == namespace_id && *dim == dimension {
+        for ((ns, arch, dim, value), count) in &inner.rollups {
+            if *ns == namespace_id && *arch == archetype_id && *dim == dimension {
                 total_count += *count;
                 groups.push(RollupCounter {
                     value: value.clone(),
@@ -1810,6 +1818,7 @@ mod tests {
                 let rollup_result = store
                     .count_from_rollup(
                         ns,
+                        ArchetypeId::WORKFLOW,
                         RollupDimension::ExecutionStatus,
                     )
                     .await

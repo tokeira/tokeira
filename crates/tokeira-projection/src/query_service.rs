@@ -13,7 +13,7 @@ use crate::visibility_api::{
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use tokeira_types::{NamespaceId, SearchAttributes};
+use tokeira_types::{ArchetypeId, NamespaceId, SearchAttributes};
 use uuid::Uuid;
 
 use crate::{
@@ -69,19 +69,33 @@ where
         let filter = compile_filter(req.query.as_deref(), namespace_id, &self.store).await?;
         let group_by = parse_group_by(req.group_by.as_deref(), namespace_id, &self.store).await?;
         let result = match (&filter.expr, &group_by) {
+            // This service answers the workflow visibility endpoints, so the
+            // rollup is scoped to the workflow archetype.
             (None, Some(GroupByField::System(SystemField::ExecutionStatus))) => {
                 self.store
-                    .count_from_rollup(namespace_id, RollupDimension::ExecutionStatus)
+                    .count_from_rollup(
+                        namespace_id,
+                        ArchetypeId::WORKFLOW,
+                        RollupDimension::ExecutionStatus,
+                    )
                     .await?
             }
             (None, Some(GroupByField::System(SystemField::WorkflowType))) => {
                 self.store
-                    .count_from_rollup(namespace_id, RollupDimension::WorkflowType)
+                    .count_from_rollup(
+                        namespace_id,
+                        ArchetypeId::WORKFLOW,
+                        RollupDimension::WorkflowType,
+                    )
                     .await?
             }
             (None, Some(GroupByField::System(SystemField::TaskQueue))) => {
                 self.store
-                    .count_from_rollup(namespace_id, RollupDimension::TaskQueue)
+                    .count_from_rollup(
+                        namespace_id,
+                        ArchetypeId::WORKFLOW,
+                        RollupDimension::TaskQueue,
+                    )
                     .await?
             }
             _ => {

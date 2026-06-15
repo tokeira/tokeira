@@ -107,9 +107,12 @@ where
     async fn count_from_rollup(
         &self,
         namespace_id: tokeira_types::NamespaceId,
+        archetype_id: tokeira_types::ArchetypeId,
         dimension: RollupDimension,
     ) -> Result<CountResult> {
-        self.store.count_from_rollup(namespace_id, dimension).await
+        self.store
+            .count_from_rollup(namespace_id, archetype_id, dimension)
+            .await
     }
     async fn load_checkpoint(
         &self,
@@ -896,7 +899,10 @@ mod tests {
                         GroupByField::System(crate::types::SystemField::TaskQueue),
                     ),
                 ] {
-                    let rollup = store.count_from_rollup(ns, dimension).await.unwrap();
+                    let rollup = store
+                        .count_from_rollup(ns, ArchetypeId::WORKFLOW, dimension)
+                        .await
+                        .unwrap();
                     let scan = store
                         .count_executions(ns, &CompiledFilter::default(), Some(group_by))
                         .await

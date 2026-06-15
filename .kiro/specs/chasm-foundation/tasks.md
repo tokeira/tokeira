@@ -468,17 +468,32 @@ verify against `../temporal @ v1.31.0` before finalizing.
     - _Requirements: 10.9_
 
 - [ ] 24. Stage 2 — CHASM `VisibilitySnapshot` contract + engine→projection adapter + bootstrap wiring
-  - [ ] 24.1 Define the typed `VisibilitySnapshot` contribution interface in `tokeira-chasm`
-    - Replace the thin `record(key, Vec<(String, String)>)` hook with a typed `VisibilitySnapshot`
-      (archetype, business_id, run_id, status, lifecycle, lifecycle timestamps, execution_type/
-      task_queue, **typed** search attributes, memo) a component produces on transition close; reserved
-      system fields cannot be spoofed by component-declared SAs.
+  - [x] 24.1 Define the typed `VisibilitySnapshot` contribution interface in `tokeira-chasm`
+    - `tokeira_chasm::VisibilitySnapshot` + the `VisibilityContributor` hook carry the typed
+      post-transition image (status_keyword, lifecycle, lifecycle timestamps, execution_type/task_queue,
+      **typed** search attributes, memo); the version/namespace/run_key/archetype the component cannot
+      know are stamped by the runtime adapter (24.2). Reserved system fields are structurally separate
+      from `search_attributes` and the adapter rejects any reserved name appearing there (Req 10.10).
+      The interface is now consumed end-to-end by the engine hook + adapter (24.2).
     - _Requirements: 10.2, 10.10_
-  - [ ] 24.2 Implement the engine→projection adapter and replace `NoopVisibilitySink` at bootstrap
-    - Adapter holds the engine + registry, reads component state by `ExecutionKey` on close, builds the
-      snapshot, and writes it post-commit (off the correctness path). Wire it into `tokeirad` bootstrap
-      (`apps/tokeirad/src/lib.rs`) in place of `NoopVisibilitySink`. Read
-      `crates/tokeira-runtime/AGENTS.md` first.
+  - [x] 24.2 Implement the engine→projection adapter and replace `NoopVisibilitySink` at bootstrap
+    - Widened the engine's `VisibilitySink` hook from `record(key, Vec<(String,String)>)` to
+      `record(key, archetype_id, version, snapshot)`; the typed layer (`chasm/typed.rs`) builds the
+      `VisibilitySnapshot` from the live component on start **and** update (mirroring how it already
+      builds string `search_attributes`) and threads it through `Start`/`UpdateRequest`. New
+      `ProjectionVisibilitySink` (in `tokeira-runtime`) converts the snapshot to a `ProjectionRecord`
+      and applies it through the **same** projection `ProjectionSink::apply` the workflow worker uses —
+      so activities and workflows land in one logical index. Wired into `tokeirad` bootstrap in place of
+      `NoopVisibilitySink`. The post-commit visibility write is best-effort (logged, not propagated) so a
+      failed projection cannot fail the committed transition (Req 10.15).
+    - **Settled by spec**: writes to the shared visibility store directly (not `projection_log`),
+      design.md:562-564; the "one log, two producers" soundness (design.md:403-416) licenses the second
+      store writer under apply-iff-newer fencing. Mapping/threading recorded in
+      `reference/DECISION-visibility-engine-adapter.md`.
+    - **Verified.** `tokeira-runtime` lib compiles clean (0 warnings); 290 lib tests pass + 4 new
+      `visibility_adapter` mapping tests (run_key=run_id, lifecycle/version mapping, reserved-field
+      rejection, non-UUID rejection); `tokeirad`/edge/activity compile; `--features dsql` clean;
+      `grpc_roundtrip` 6/7 (the 1 failure is pre-existing on clean HEAD, unrelated).
     - _Requirements: 10.2, 10.11, 10.15_
   - [ ] 24.3 Implement the activity component's `VisibilitySnapshot` contribution
     - Contribute `ActivityType`/`ExecutionStatus`/`TaskQueue` plus status/lifecycle/timestamps/

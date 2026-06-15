@@ -19,8 +19,8 @@ use std::{
 use async_trait::async_trait;
 use tokeira_chasm::{
     ChasmError, Context, DispatchableTask, ExecutionInfo, ExecutionKey, LifecycleState,
-    MutableContext, NodeTree, Registry, RetainAllValidator, SearchAttributes, Staleness,
-    TransitionResult, VersionedTransition,
+    MutableContext, NodeTree, Registry, RetainAllValidator, Staleness, TransitionResult,
+    VersionedTransition, VisibilitySnapshot,
 };
 use tokeira_storage::{ChasmNodeRepository, ExpectedVersion, NodePersistOutcome, NodeWrite};
 use tokio::sync::Notify;
@@ -54,10 +54,21 @@ pub trait DispatchSink: Send + Sync {
 
 /// The sink for derived visibility writes (Requirement 10.3). The real
 /// implementation writes to `tokeira-projection`; it is off the correctness path.
+///
+/// The hook carries the component's typed [`VisibilitySnapshot`] (produced on
+/// transition close) plus the fields only the engine knows — the `archetype_id`
+/// and the committed [`VersionedTransition`] — which the projection adapter stamps
+/// onto the record before writing (`reference/DECISION-visibility-engine-adapter.md`).
 #[async_trait]
 pub trait VisibilitySink: Send + Sync {
-    /// Record the search attributes a transition contributed for an execution.
-    async fn record(&self, key: &ExecutionKey, attributes: SearchAttributes) -> anyhow::Result<()>;
+    /// Record a component's typed visibility snapshot for a committed transition.
+    async fn record(
+        &self,
+        key: &ExecutionKey,
+        archetype_id: u32,
+        version: VersionedTransition,
+        snapshot: VisibilitySnapshot,
+    ) -> anyhow::Result<()>;
 }
 
 /// A [`DispatchSink`] that collects dispatched tasks in memory for tests.
@@ -88,17 +99,23 @@ impl DispatchSink for CollectingDispatchSink {
 /// A [`VisibilitySink`] that collects emitted attributes in memory for tests.
 #[derive(Debug, Default)]
 pub struct CollectingVisibilitySink {
-    /// Every `(execution, attributes)` pair recorded, in commit order.
-    pub recorded: Mutex<Vec<(ExecutionKey, SearchAttributes)>>,
+    /// Every `(execution, snapshot)` pair recorded, in commit order.
+    pub recorded: Mutex<Vec<(ExecutionKey, VisibilitySnapshot)>>,
 }
 
 #[async_trait]
 impl VisibilitySink for CollectingVisibilitySink {
-    async fn record(&self, key: &ExecutionKey, attributes: SearchAttributes) -> anyhow::Result<()> {
+    async fn record(
+        &self,
+        key: &ExecutionKey,
+        _archetype_id: u32,
+        _version: VersionedTransition,
+        snapshot: VisibilitySnapshot,
+    ) -> anyhow::Result<()> {
         self.recorded
             .lock()
             .map_err(|_| anyhow::anyhow!("visibility sink mutex poisoned"))?
-            .push((key.clone(), attributes));
+            .push((key.clone(), snapshot));
         Ok(())
     }
 }
@@ -115,7 +132,9 @@ impl VisibilitySink for NoopVisibilitySink {
     async fn record(
         &self,
         _key: &ExecutionKey,
-        _attributes: SearchAttributes,
+        _archetype_id: u32,
+        _version: VersionedTransition,
+        _snapshot: VisibilitySnapshot,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -363,7 +382,9 @@ impl ChasmEngine {
         &self,
         key: &ExecutionKey,
         result: TransitionResult,
-        search_attributes: SearchAttributes,
+        archetype_id: u32,
+        version: VersionedTransition,
+        visibility: Option<VisibilitySnapshot>,
     ) -> Result<(), ChasmError> {
         if !result.side_effect_tasks.is_empty() {
             self.dispatch
@@ -372,11 +393,19 @@ impl ChasmEngine {
                 .map_err(|e| ChasmError::Internal(format!("dispatch side-effect tasks: {e}")))?;
         }
         self.arm_timer(key, result.earliest_pure_deadline_unix_nanos);
-        if !search_attributes.is_empty() {
-            self.visibility
-                .record(key, search_attributes)
-                .await
-                .map_err(|e| ChasmError::Internal(format!("record visibility: {e}")))?;
+        if let Some(snapshot) = visibility {
+            // Visibility is a derived read model strictly off the correctness path
+            // (Requirement 10.15): the authoritative transition has already
+            // committed, so a failed projection write must not fail the operation.
+            // It is best-effort here; the task-26 repair/outbox makes it durable
+            // (Requirement 10.11).
+            if let Err(error) = self.visibility.record(key, archetype_id, version, snapshot).await {
+                tracing::warn!(
+                    ?error,
+                    ?key,
+                    "visibility projection write failed (off correctness path)"
+                );
+            }
         }
         self.wake_pollers(key);
         Ok(())
@@ -485,7 +514,8 @@ impl Engine for ChasmEngine {
                 return Err(ChasmError::BusinessIdConflict(reason));
             }
         }
-        self.post_commit(&req.key, result, Vec::new()).await?;
+        self.post_commit(&req.key, result, req.archetype_id, committed_vt, req.visibility)
+            .await?;
         Ok(self.root_ref(&req.key, req.archetype_id, committed_vt, committed_vt))
     }
 
@@ -528,7 +558,7 @@ impl Engine for ChasmEngine {
             NodePersistOutcome::Conflict { .. } => return Ok(CommitOutcome::Conflict),
         }
         let closed = req.new_lifecycle.is_closed();
-        self.post_commit(&req.key, result, req.search_attributes)
+        self.post_commit(&req.key, result, archetype_id, committed_vt, req.visibility)
             .await?;
         Ok(CommitOutcome::Applied(UpdateOutcome {
             reference: self.root_ref(&req.key, archetype_id, committed_vt, initial_vt),

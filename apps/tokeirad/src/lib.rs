@@ -822,11 +822,19 @@ where
             .context("failed to register the activity CHASM library")?;
         let registry = Arc::new(registry_builder.build());
         let dispatch_queue = Arc::new(tokeira_edge::chasm_activity::ActivityDispatchQueue::new());
+        // Standalone activities flow into the shared visibility index via the
+        // engine→projection adapter, post-commit and off the correctness path
+        // (spec task 24.2). It reuses the same projection apply path as the workflow
+        // visibility worker, so both archetypes land in one logical index.
+        let chasm_visibility_sink = Arc::new(tokeira_runtime::chasm::ProjectionVisibilitySink::new(
+            Arc::new(projection_sink()),
+            effective_config.infrastructure.placement.partition_count,
+        ));
         let chasm_engine = Arc::new(tokeira_runtime::chasm::ChasmEngine::new(
             chasm_node_repo,
             registry,
             dispatch_queue.clone(),
-            Arc::new(tokeira_runtime::chasm::NoopVisibilitySink),
+            chasm_visibility_sink,
         ));
         let activity_config = tokeira_chasm_activity::ActivityConfig {
             enable_standalone: effective_config

@@ -16,7 +16,7 @@ use std::marker::PhantomData;
 use prost::Message as _;
 use tokeira_chasm::{
     ChasmError, ComponentRef, Context, EngineComponent, ExecutionKey, MutableContext,
-    RootComponent, SearchAttributeProvider, VersionedTransition,
+    RootComponent, SearchAttributeProvider, VersionedTransition, VisibilityContributor,
 };
 
 use super::{
@@ -36,7 +36,7 @@ pub struct TypedEngine<'e, C> {
 
 impl<'e, C> TypedEngine<'e, C>
 where
-    C: EngineComponent + RootComponent + SearchAttributeProvider,
+    C: EngineComponent + RootComponent + SearchAttributeProvider + VisibilityContributor,
 {
     /// Wrap an engine for component-typed access.
     pub fn new(engine: &'e ChasmEngine) -> Self {
@@ -56,12 +56,19 @@ where
         let archetype_id = self.engine.registry().archetype_id(C::FQN).ok_or_else(|| {
             ChasmError::Internal(format!("archetype `{}` is not registered", C::FQN))
         })?;
+        // Capture the creating transition's visibility snapshot from the initial
+        // component before encoding, so a started-but-not-yet-updated execution is
+        // still listable (Requirement 10.2).
+        let component = C::from_data(data);
+        let visibility = component.visibility_snapshot();
+        let data = component.into_data().encode_to_vec();
         self.engine
             .start_execution(StartRequest {
                 key,
                 archetype_id,
-                data: data.encode_to_vec(),
+                data,
                 request_id,
+                visibility,
             })
             .await
     }
@@ -96,6 +103,7 @@ where
             // Compute derived outputs before consuming the component for its data.
             let lifecycle = component.lifecycle_state(&ctx);
             let search_attributes = component.search_attributes();
+            let visibility = component.visibility_snapshot();
             let new_root_data = component.into_data().encode_to_vec();
             let tasks = ctx.take_staged_tasks();
 
@@ -106,6 +114,7 @@ where
                 new_lifecycle: lifecycle,
                 tasks,
                 search_attributes,
+                visibility,
             };
             match self.engine.update_component(request).await? {
                 CommitOutcome::Applied(outcome) => return Ok((returned, outcome)),
@@ -176,7 +185,7 @@ mod tests {
     use tokeira_chasm::{
         ChasmError, Component, Context, ContextMetadata, ExecutionKey, FieldRegistry, Lifecycle,
         LifecycleState, MutableContext, Registry, RootComponent, SearchAttributeProvider,
-        SearchAttributes, TaskKind, TerminateReason,
+        SearchAttributes, TaskKind, TerminateReason, VisibilityContributor, VisibilitySnapshot,
     };
     use tokeira_storage::InMemoryChasmNodeStore;
 
@@ -260,6 +269,26 @@ mod tests {
                 }
                 .to_owned(),
             )]
+        }
+    }
+
+    impl VisibilityContributor for Counter {
+        fn visibility_snapshot(&self) -> Option<VisibilitySnapshot> {
+            let (status, lifecycle) = if self.data.done {
+                ("Completed", LifecycleState::Completed)
+            } else {
+                ("Running", LifecycleState::Running)
+            };
+            Some(VisibilitySnapshot {
+                status_keyword: status.to_owned(),
+                lifecycle_state: lifecycle,
+                execution_type: Some(Counter::FQN.to_owned()),
+                task_queue: None,
+                start_time_unix_nanos: None,
+                close_time_unix_nanos: None,
+                search_attributes: Default::default(),
+                memo: Default::default(),
+            })
         }
     }
 

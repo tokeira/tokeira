@@ -31,15 +31,20 @@
 
 mod engine;
 mod typed;
+mod visibility_adapter;
 
 pub use engine::{
     ChasmEngine, ChasmEngineConfig, CollectingDispatchSink, CollectingVisibilitySink, DispatchSink,
     NoopVisibilitySink, ROOT_PATH, VisibilitySink,
 };
 pub use typed::TypedEngine;
+pub use visibility_adapter::ProjectionVisibilitySink;
 // Re-exported from the pure crate: these are component-level contracts, not engine
 // internals, so component crates depend on `tokeira-chasm` for them (Requirement 1.4).
-pub use tokeira_chasm::{EngineComponent, SearchAttributeProvider, SearchAttributes};
+pub use tokeira_chasm::{
+    EngineComponent, SearchAttributeProvider, SearchAttributes, VisibilityContributor,
+    VisibilitySnapshot,
+};
 
 use async_trait::async_trait;
 use tokeira_chasm::{ChasmError, ComponentRef, ExecutionKey, LifecycleState, VersionedTransition};
@@ -71,6 +76,10 @@ pub struct StartRequest {
     pub data: Vec<u8>,
     /// Originating request id, recorded as context metadata.
     pub request_id: Option<String>,
+    /// The component's typed visibility contribution for the creating transition,
+    /// or `None` if it contributes nothing. Forwarded to the visibility sink
+    /// post-commit (Requirement 10.2), off the correctness path.
+    pub visibility: Option<VisibilitySnapshot>,
 }
 
 /// A precomputed mutation to apply as one fenced transition (Requirement 6.1,
@@ -98,6 +107,11 @@ pub struct UpdateRequest {
     /// Search attributes contributed by the mutation, emitted to visibility on
     /// commit (Requirement 10).
     pub search_attributes: SearchAttributes,
+    /// The component's typed visibility contribution for this transition, or `None`
+    /// if it contributes nothing. Forwarded to the visibility sink post-commit
+    /// (Requirement 10.2), off the correctness path. Supersedes the string
+    /// `search_attributes` above as the typed visibility migration completes.
+    pub visibility: Option<VisibilitySnapshot>,
 }
 
 /// The outcome of a successful transition (Requirement 6.1).

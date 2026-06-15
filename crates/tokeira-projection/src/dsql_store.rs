@@ -21,7 +21,7 @@ use tokeira_storage::{
 };
 use tokeira_types::{
     ArchetypeId, ExecutionStatus, Memo, NamespaceId, ProjectionCursor, RunKey, SearchAttrValue,
-    SearchAttributes, TransitionSeq, dsql_spread_uuid,
+    SearchAttributes, TransitionSeq, VisibilityLifecycleState, dsql_spread_uuid,
 };
 use tracing::{instrument, warn};
 use uuid::Uuid;
@@ -33,8 +33,7 @@ use crate::{
         AttrDescriptor, AttrId, CompareOp, CompiledFilter, CountResult, ExecutionRow, FieldRef,
         FilterExpr, FilterValue, GroupByField, ListResult, PageBounds, PageToken, RollupCounter,
         RollupDelta, RollupDimension, SearchAttrType, SortOrder, SystemField, search_attr_type_of,
-        text_search_tokens, visibility_version_is_newer, workflow_lifecycle_state,
-        workflow_status_keyword,
+        text_search_tokens, visibility_version_is_newer, workflow_status_from_keyword,
     },
 };
 
@@ -142,7 +141,7 @@ impl VisibilityStore for DsqlVisibilityStore {
     #[instrument(skip_all, fields(run_key = %run_key.0))]
     async fn delete_execution(&self, run_key: RunKey) -> Result<()> {
         let mut permit = self.director.acquire(DbClass::Projection).await?;
-        sqlx::query("DELETE FROM vis_execution WHERE run_key = $1")
+        sqlx::query("DELETE FROM execution_visibility_current WHERE run_key = $1")
             .bind(run_key.0)
             .execute(permit.connection()?)
             .await?;
@@ -196,24 +195,29 @@ impl VisibilityStore for DsqlVisibilityStore {
             SELECT
                 run_key,
                 namespace_id,
-                workflow_id,
+                archetype_id,
+                business_id,
                 run_id,
-                workflow_type,
-                task_queue,
-                execution_status,
+                authority_epoch,
+                source_transition_seq,
+                status_keyword,
+                lifecycle_state,
                 start_time,
-                execution_time,
+                update_time,
                 close_time,
-                history_length,
+                execution_type,
+                task_queue,
+                transition_count,
+                memo_blob,
+                execution_time,
                 execution_duration,
-                state_transition_count,
+                history_length,
                 history_size_bytes,
                 parent_workflow_id,
                 parent_run_id,
                 root_workflow_id,
-                root_run_id,
-                memo
-            FROM vis_execution
+                root_run_id
+            FROM execution_visibility_current
             WHERE namespace_id = $1
               {filter_sql}
               {cursor_sql}
@@ -661,64 +665,93 @@ async fn upsert_execution_row(
     row: &ExecutionRow,
     memo: Option<Vec<u8>>,
 ) -> Result<()> {
+    // Apply-iff-newer at the SQL level: the `ON CONFLICT ... DO UPDATE ... WHERE`
+    // guard makes the upsert a no-op unless the incoming `(authority_epoch,
+    // source_transition_seq)` is strictly newer than the stored one, so a retried
+    // or out-of-order snapshot can neither regress the row nor double-apply
+    // (reference/DECISION-visibility-dsql-schema.md). The row's version columns are
+    // also the search-attribute generation pointer.
     sqlx::query(
         r#"
-        INSERT INTO vis_execution (
-            run_key,
+        INSERT INTO execution_visibility_current (
             namespace_id,
-            workflow_id,
+            archetype_id,
+            run_key,
+            business_id,
             run_id,
-            workflow_type,
-            task_queue,
-            execution_status,
+            authority_epoch,
+            source_transition_seq,
+            status_keyword,
+            lifecycle_state,
             start_time,
-            execution_time,
+            update_time,
             close_time,
-            history_length,
+            execution_type,
+            task_queue,
+            transition_count,
+            memo_blob,
+            execution_time,
             execution_duration,
-            state_transition_count,
+            history_length,
             history_size_bytes,
             parent_workflow_id,
             parent_run_id,
             root_workflow_id,
-            root_run_id,
-            memo
+            root_run_id
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
-        ON CONFLICT (run_key) DO UPDATE
-        SET execution_status = EXCLUDED.execution_status,
-            execution_time = EXCLUDED.execution_time,
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+        ON CONFLICT (namespace_id, archetype_id, run_key) DO UPDATE
+        SET business_id = EXCLUDED.business_id,
+            run_id = EXCLUDED.run_id,
+            authority_epoch = EXCLUDED.authority_epoch,
+            source_transition_seq = EXCLUDED.source_transition_seq,
+            status_keyword = EXCLUDED.status_keyword,
+            lifecycle_state = EXCLUDED.lifecycle_state,
+            start_time = EXCLUDED.start_time,
+            update_time = EXCLUDED.update_time,
             close_time = EXCLUDED.close_time,
-            history_length = EXCLUDED.history_length,
+            execution_type = EXCLUDED.execution_type,
+            task_queue = EXCLUDED.task_queue,
+            transition_count = EXCLUDED.transition_count,
+            memo_blob = COALESCE(EXCLUDED.memo_blob, execution_visibility_current.memo_blob),
+            execution_time = EXCLUDED.execution_time,
             execution_duration = EXCLUDED.execution_duration,
-            state_transition_count = EXCLUDED.state_transition_count,
+            history_length = EXCLUDED.history_length,
             history_size_bytes = EXCLUDED.history_size_bytes,
             parent_workflow_id = EXCLUDED.parent_workflow_id,
             parent_run_id = EXCLUDED.parent_run_id,
             root_workflow_id = EXCLUDED.root_workflow_id,
-            root_run_id = EXCLUDED.root_run_id,
-            memo = COALESCE(EXCLUDED.memo, vis_execution.memo)
+            root_run_id = EXCLUDED.root_run_id
+        WHERE execution_visibility_current.authority_epoch < EXCLUDED.authority_epoch
+           OR (execution_visibility_current.authority_epoch = EXCLUDED.authority_epoch
+               AND execution_visibility_current.source_transition_seq
+                   < EXCLUDED.source_transition_seq)
         "#,
     )
-    .bind(row.run_key.0)
     .bind(row.namespace_id.0)
-    .bind(&row.workflow_id.0)
+    .bind(i64::from(row.archetype_id.0))
+    .bind(row.run_key.0)
+    .bind(&row.business_id)
     .bind(row.run_id.0)
+    .bind(row.authority_epoch)
+    .bind(row.source_transition_seq.0 as i64)
+    .bind(&row.status_keyword)
+    .bind(row.lifecycle_state.to_db_smallint())
+    .bind(row.start_time)
+    .bind(row.update_time)
+    .bind(row.close_time)
     .bind(&row.workflow_type.0)
     .bind(&row.task_queue.0)
-    .bind(row.status.to_db_smallint())
-    .bind(row.start_time)
+    .bind(row.transition_count)
+    .bind(memo)
     .bind(row.execution_time)
-    .bind(row.close_time)
-    .bind(row.history_length)
     .bind(row.execution_duration)
-    .bind(row.state_transition_count)
+    .bind(row.history_length)
     .bind(row.history_size_bytes)
     .bind(row.parent_workflow_id.as_ref().map(|value| value.0.as_str()))
     .bind(row.parent_run_id.map(|value| value.0))
     .bind(&row.root_workflow_id.0)
     .bind(row.root_run_id.0)
-    .bind(memo)
     .execute(connection)
     .await?;
     Ok(())
@@ -1073,7 +1106,6 @@ enum SqlValue {
     Float(f64),
     Int(i64),
     OptionalTimestamp(Option<time::OffsetDateTime>),
-    Smallint(i16),
     Text(String),
     Timestamp(time::OffsetDateTime),
     Uuid(Uuid),
@@ -1268,7 +1300,7 @@ fn compile_multi_value_compare(
             )?));
             let value = compiler.push(value);
             Ok(format!(
-                "NOT EXISTS (SELECT 1 FROM {table} idx WHERE idx.namespace_id = vis_execution.namespace_id AND idx.run_key = vis_execution.run_key AND idx.attr_id = {attr} AND idx.value = {value})"
+                "NOT EXISTS (SELECT 1 FROM {table} idx WHERE idx.namespace_id = execution_visibility_current.namespace_id AND idx.run_key = execution_visibility_current.run_key AND idx.attr_id = {attr} AND idx.value = {value})"
             ))
         }
         CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge => {
@@ -1450,7 +1482,6 @@ fn sql_value_from_filter(value: &FilterValue) -> Result<SqlValue> {
         FilterValue::Float(value) => SqlValue::Float(*value),
         FilterValue::Bool(value) => SqlValue::Bool(*value),
         FilterValue::Datetime(value) => SqlValue::Timestamp(*value),
-        FilterValue::Status(value) => SqlValue::Smallint(value.to_db_smallint()),
     })
 }
 
@@ -1514,18 +1545,22 @@ fn compare_operator(op: CompareOp) -> &'static str {
 }
 
 fn system_column(field: SystemField) -> &'static str {
+    // Maps a queryable system field to its `execution_visibility_current` column.
+    // The generalized table uses generic names (`business_id`/`execution_type`/
+    // `status_keyword`/`transition_count`) where the workflow-only table used
+    // workflow-shaped ones; the workflow query surface keeps the same field names.
     match field {
-        SystemField::WorkflowId => "workflow_id",
+        SystemField::WorkflowId => "business_id",
         SystemField::RunId => "run_id::TEXT",
-        SystemField::WorkflowType => "workflow_type",
+        SystemField::WorkflowType => "execution_type",
         SystemField::TaskQueue => "task_queue",
-        SystemField::ExecutionStatus => "execution_status",
+        SystemField::ExecutionStatus => "status_keyword",
         SystemField::StartTime => "start_time",
         SystemField::ExecutionTime => "execution_time",
         SystemField::CloseTime => "close_time",
         SystemField::HistoryLength => "history_length",
         SystemField::ExecutionDuration => "execution_duration",
-        SystemField::StateTransitionCount => "state_transition_count",
+        SystemField::StateTransitionCount => "transition_count",
         SystemField::HistorySizeBytes => "history_size_bytes",
         SystemField::ParentWorkflowId => "parent_workflow_id",
         SystemField::ParentRunId => "parent_run_id::TEXT",
@@ -1615,7 +1650,6 @@ fn bind_sql_values<'q>(
             SqlValue::Float(value) => query.bind(*value),
             SqlValue::Int(value) => query.bind(*value),
             SqlValue::OptionalTimestamp(value) => query.bind(*value),
-            SqlValue::Smallint(value) => query.bind(*value),
             SqlValue::Text(value) => query.bind(value.clone()),
             SqlValue::Timestamp(value) => query.bind(*value),
             SqlValue::Uuid(value) => query.bind(*value),
@@ -1633,7 +1667,7 @@ async fn count_without_group(
     let sql = format!(
         r#"
         SELECT COUNT(*) AS total_count
-        FROM vis_execution
+        FROM execution_visibility_current
         WHERE namespace_id = $1
           {filter_sql}
         "#
@@ -1659,7 +1693,7 @@ async fn count_system_group(
     let sql = format!(
         r#"
         SELECT {group_column} AS group_value, COUNT(*) AS group_count
-        FROM vis_execution
+        FROM execution_visibility_current
         WHERE namespace_id = $1
           {filter_sql}
         GROUP BY {group_column}
@@ -1708,7 +1742,7 @@ async fn count_custom_group(
         SELECT idx.value AS group_value, COUNT(*) AS group_count
         FROM (
             SELECT *
-            FROM vis_execution
+            FROM execution_visibility_current
             WHERE namespace_id = $1
               {filter_sql}
         ) ve
@@ -1740,10 +1774,8 @@ async fn count_custom_group(
 
 fn system_group_value(field: SystemField, row: &PgRow) -> Result<String> {
     Ok(match field {
-        SystemField::ExecutionStatus => {
-            let value: i16 = row.try_get("group_value")?;
-            format!("{:?}", ExecutionStatus::try_from(value)?)
-        }
+        // `ExecutionStatus` now groups by the generic `status_keyword` TEXT column,
+        // so it falls through to the string branch below (no enum decode).
         SystemField::StartTime | SystemField::ExecutionTime | SystemField::CloseTime => row
             .try_get::<Option<time::OffsetDateTime>, _>("group_value")?
             .map(|value| value.to_string())
@@ -1814,24 +1846,29 @@ async fn get_execution_row(
         SELECT
             run_key,
             namespace_id,
-            workflow_id,
+            archetype_id,
+            business_id,
             run_id,
-            workflow_type,
-            task_queue,
-            execution_status,
+            authority_epoch,
+            source_transition_seq,
+            status_keyword,
+            lifecycle_state,
             start_time,
-            execution_time,
+            update_time,
             close_time,
-            history_length,
+            execution_type,
+            task_queue,
+            transition_count,
+            memo_blob,
+            execution_time,
             execution_duration,
-            state_transition_count,
+            history_length,
             history_size_bytes,
             parent_workflow_id,
             parent_run_id,
             root_workflow_id,
-            root_run_id,
-            memo
-        FROM vis_execution
+            root_run_id
+        FROM execution_visibility_current
         WHERE run_key = $1
         "#,
     )
@@ -1843,49 +1880,62 @@ async fn get_execution_row(
 }
 
 fn row_to_execution(row: sqlx::postgres::PgRow) -> Result<ExecutionRow> {
-    let memo = decode_optional_memo(row.try_get("memo")?)?.unwrap_or_default();
-    let status: i16 = row.try_get("execution_status")?;
-    let status = ExecutionStatus::try_from(status)?;
-    let workflow_id: String = row.try_get("workflow_id")?;
-    let start_time = row.try_get("start_time")?;
-    // Annotate explicitly: `close_time` is consumed by `close_time.unwrap_or(..)`
-    // below, and a method call on an unannotated `try_get` result leaves the
-    // decode type unresolved (E0282) before the struct field can pin it.
+    let memo = decode_optional_memo(row.try_get("memo_blob")?)?.unwrap_or_default();
+    let business_id: String = row.try_get("business_id")?;
+    let run_id_uuid = row.try_get::<Uuid, _>("run_id")?;
+    let status_keyword: String = row.try_get("status_keyword")?;
+    let lifecycle_state =
+        VisibilityLifecycleState::try_from(row.try_get::<i16, _>("lifecycle_state")?)?;
+    let source_transition_seq = row.try_get::<i64, _>("source_transition_seq")?;
+    let transition_count: i64 = row.try_get("transition_count")?;
     let close_time: Option<time::OffsetDateTime> = row.try_get("close_time")?;
-    let state_transition_count = row.try_get("state_transition_count")?;
+    // The index queries by `status_keyword`; the typed `status` is derived for the
+    // workflow archetype's ListInfo view only and is not the query key (Req 10.5).
+    let status = workflow_status_from_keyword(&status_keyword).unwrap_or(ExecutionStatus::Running);
     Ok(ExecutionRow {
         run_key: RunKey(row.try_get::<Uuid, _>("run_key")?),
         namespace_id: NamespaceId(row.try_get::<Uuid, _>("namespace_id")?),
-        archetype_id: ArchetypeId::WORKFLOW,
-        business_id: workflow_id.clone(),
-        workflow_id: tokeira_types::WorkflowId(workflow_id.clone()),
-        run_id: tokeira_types::RunId(row.try_get::<Uuid, _>("run_id")?),
-        authority_epoch: 0,
-        source_transition_seq: TransitionSeq(state_transition_count as u64),
-        status_keyword: workflow_status_keyword(status),
-        lifecycle_state: workflow_lifecycle_state(status),
-        workflow_type: tokeira_types::WorkflowType(row.try_get("workflow_type")?),
+        archetype_id: ArchetypeId(u32::try_from(row.try_get::<i64, _>("archetype_id")?)?),
+        business_id: business_id.clone(),
+        workflow_id: tokeira_types::WorkflowId(business_id.clone()),
+        run_id: tokeira_types::RunId(run_id_uuid),
+        authority_epoch: row.try_get("authority_epoch")?,
+        source_transition_seq: TransitionSeq(source_transition_seq as u64),
+        status_keyword,
+        lifecycle_state,
+        workflow_type: tokeira_types::WorkflowType(
+            row.try_get::<Option<String>, _>("execution_type")?
+                .unwrap_or_default(),
+        ),
         task_queue: tokeira_types::TaskQueueName(row.try_get("task_queue")?),
         status,
-        start_time,
-        update_time: close_time.unwrap_or(start_time),
+        start_time: row.try_get("start_time")?,
+        update_time: row.try_get("update_time")?,
         execution_time: row.try_get("execution_time")?,
         close_time,
         history_length: row.try_get("history_length")?,
         execution_duration: row.try_get("execution_duration")?,
-        state_transition_count,
-        history_size_bytes: row.try_get("history_size_bytes")?,
+        state_transition_count: transition_count,
+        history_size_bytes: row
+            .try_get::<Option<i64>, _>("history_size_bytes")?
+            .unwrap_or(0),
         parent_workflow_id: row
             .try_get::<Option<String>, _>("parent_workflow_id")?
             .map(tokeira_types::WorkflowId),
         parent_run_id: row
             .try_get::<Option<Uuid>, _>("parent_run_id")?
             .map(tokeira_types::RunId),
-        root_workflow_id: tokeira_types::WorkflowId(row.try_get("root_workflow_id")?),
-        root_run_id: tokeira_types::RunId(row.try_get::<Uuid, _>("root_run_id")?),
+        root_workflow_id: tokeira_types::WorkflowId(
+            row.try_get::<Option<String>, _>("root_workflow_id")?
+                .unwrap_or(business_id),
+        ),
+        root_run_id: tokeira_types::RunId(
+            row.try_get::<Option<Uuid>, _>("root_run_id")?
+                .unwrap_or(run_id_uuid),
+        ),
         memo,
         search_attributes: SearchAttributes::default(),
-        transition_count: state_transition_count,
+        transition_count,
         search_attr_generation: 0,
         search_attr_version: 0,
     })
@@ -1993,6 +2043,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::types::{workflow_lifecycle_state, workflow_status_keyword};
 
     #[test]
     fn memo_patch_extends_existing_memo() {

@@ -781,9 +781,6 @@ fn compare(left: Option<FilterValue>, op: CompareOp, right: &FilterValue) -> boo
         (FilterValue::Float(a), FilterValue::Float(b)) => cmp_partial(a, *b, op),
         (FilterValue::Bool(a), FilterValue::Bool(b)) => cmp_ord(&a, b, op),
         (FilterValue::Datetime(a), FilterValue::Datetime(b)) => cmp_ord(&a, b, op),
-        (FilterValue::Status(a), FilterValue::Status(b)) => {
-            cmp_ord(&format!("{a:?}"), &format!("{b:?}"), op)
-        }
         _ => false,
     }
 }

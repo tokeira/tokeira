@@ -404,7 +404,6 @@ pub enum FilterValue {
     Float(f64),
     Bool(bool),
     Datetime(OffsetDateTime),
-    Status(ExecutionStatus),
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]

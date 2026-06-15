@@ -66,11 +66,7 @@ impl DsqlVisibilityStore {
         tokio::time::Duration::from_millis(10 * u64::from(attempt) + jitter)
     }
 
-    async fn accumulate_rollup_partitioned(
-        &self,
-        partition_id: u32,
-        entries: &[RollupDelta],
-    ) -> Result<()> {
+    async fn accumulate_rollup_striped(&self, entries: &[RollupDelta]) -> Result<()> {
         for entry in entries {
             let mut attempts = 0u32;
             loop {
@@ -78,16 +74,18 @@ impl DsqlVisibilityStore {
                 let started = Instant::now();
                 let result = sqlx::query(
                     r#"
-                    INSERT INTO vis_rollup (namespace_id, dimension, value, partition_id, counter)
-                    VALUES ($1, $2, $3, $4, $5)
-                    ON CONFLICT (namespace_id, dimension, value, partition_id) DO UPDATE
-                    SET counter = vis_rollup.counter + EXCLUDED.counter
+                    INSERT INTO execution_visibility_rollup
+                        (namespace_id, archetype_id, dimension, value, stripe, counter)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    ON CONFLICT (namespace_id, archetype_id, dimension, value, stripe) DO UPDATE
+                    SET counter = execution_visibility_rollup.counter + EXCLUDED.counter
                     "#,
                 )
                 .bind(entry.namespace_id.0)
+                .bind(i64::from(entry.archetype_id.0))
                 .bind(entry.dimension.to_db_smallint())
                 .bind(&entry.value)
-                .bind(i32_from_u32(partition_id, "vis_rollup.partition_id")?)
+                .bind(entry.stripe)
                 .bind(entry.delta)
                 .execute(permit.connection()?)
                 .await
@@ -178,7 +176,7 @@ impl VisibilityStore for DsqlVisibilityStore {
     }
 
     async fn accumulate_rollup(&self, entries: &[RollupDelta]) -> Result<()> {
-        self.accumulate_rollup_partitioned(0, entries).await
+        self.accumulate_rollup_striped(entries).await
     }
 
     async fn list_executions(
@@ -301,22 +299,21 @@ impl VisibilityStore for DsqlVisibilityStore {
     async fn count_from_rollup(
         &self,
         namespace_id: NamespaceId,
-        // Archetype scoping lands with the `execution_visibility_rollup` migration
-        // (step 3 of the DSQL port); the legacy `vis_rollup` table is workflow-only,
-        // so the parameter is accepted but not yet keyed on here.
-        _archetype_id: ArchetypeId,
+        archetype_id: ArchetypeId,
         dimension: RollupDimension,
     ) -> Result<CountResult> {
         let mut permit = self.director.acquire(DbClass::Projection).await?;
+        // Fan in the stripes for each value (`stripe = hash(run_key) % 16`).
         let rows = sqlx::query(
             r#"
             SELECT value, SUM(counter) AS counter
-            FROM vis_rollup
-            WHERE namespace_id = $1 AND dimension = $2
+            FROM execution_visibility_rollup
+            WHERE namespace_id = $1 AND archetype_id = $2 AND dimension = $3
             GROUP BY value
             "#,
         )
         .bind(namespace_id.0)
+        .bind(i64::from(archetype_id.0))
         .bind(dimension.to_db_smallint())
         .fetch_all(permit.connection()?)
         .await?;
@@ -647,10 +644,7 @@ impl ProjectionSink for DsqlVisibilityStore {
         }
 
         let deltas = compute_rollup_deltas(previous.as_ref(), &row);
-        if let Err(error) = self
-            .accumulate_rollup_partitioned(partition_id, &deltas)
-            .await
-        {
+        if let Err(error) = self.accumulate_rollup_striped(&deltas).await {
             projection_metrics::record_sink_error_with_kind(
                 partition_id,
                 tokeira_observability::ProjectionErrorKindLabel::Storage,

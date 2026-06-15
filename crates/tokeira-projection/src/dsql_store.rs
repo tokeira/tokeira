@@ -762,30 +762,85 @@ async fn clear_search_attr_index_rows(
     run_key: RunKey,
     namespace_id: NamespaceId,
 ) -> Result<()> {
-    // Snapshot application replaces the visible search-attribute generation.
-    // Clearing all old rows first prevents a removed attribute from remaining
-    // queryable after a newer snapshot omits it.
-    for table in [
-        "sa_keyword_idx",
-        "sa_keyword_list_idx",
-        "sa_int_idx",
-        "sa_bool_idx",
-        "sa_double_idx",
-        "sa_datetime_idx",
-        "sa_text_token_idx",
-    ] {
-        let sql = format!("DELETE FROM {table} WHERE namespace_id = $1 AND run_key = $2");
-        sqlx::query(&sql)
-            .bind(namespace_id.0)
-            .bind(run_key.0)
-            .execute(&mut *connection)
-            .await?;
-    }
-    sqlx::query("DELETE FROM sa_current WHERE run_key = $1")
-        .bind(run_key.0)
-        .execute(&mut *connection)
-        .await?;
+    // Snapshot application replaces a run's whole attribute set (the deliberate
+    // in-transaction-replace deviation; V052). Deleting all the run's rows first
+    // means a removed attribute does not stay queryable after a newer snapshot
+    // omits it, and only the current image is ever present (so queries need no
+    // generation join).
+    sqlx::query(
+        "DELETE FROM execution_visibility_attr_index WHERE namespace_id = $1 AND run_key = $2",
+    )
+    .bind(namespace_id.0)
+    .bind(run_key.0)
+    .execute(connection)
+    .await?;
     Ok(())
+}
+
+/// One inverted-index row: a canonical `discriminator` (the PK component that makes
+/// multi-value attributes unique) plus the single populated typed column.
+#[derive(Default)]
+struct AttrCell {
+    discriminator: String,
+    keyword_value: Option<String>,
+    int_value: Option<i64>,
+    bool_value: Option<bool>,
+    double_value: Option<f64>,
+    datetime_value: Option<time::OffsetDateTime>,
+    text_token: Option<String>,
+}
+
+/// The inverted-index rows for a search-attribute value: one per single-valued
+/// attribute, one per element/token for `KeywordList`/`Text`.
+fn attr_cells(attr_type: SearchAttrType, value: &SearchAttrValue) -> Result<Vec<AttrCell>> {
+    Ok(match (attr_type, value) {
+        (SearchAttrType::Keyword, SearchAttrValue::Keyword(v)) => vec![AttrCell {
+            discriminator: v.clone(),
+            keyword_value: Some(v.clone()),
+            ..AttrCell::default()
+        }],
+        (SearchAttrType::KeywordList, SearchAttrValue::KeywordList(values)) => values
+            .iter()
+            .map(|v| AttrCell {
+                discriminator: v.clone(),
+                keyword_value: Some(v.clone()),
+                ..AttrCell::default()
+            })
+            .collect(),
+        (SearchAttrType::Int, SearchAttrValue::Int(v)) => vec![AttrCell {
+            discriminator: v.to_string(),
+            int_value: Some(*v),
+            ..AttrCell::default()
+        }],
+        (SearchAttrType::Bool, SearchAttrValue::Bool(v)) => vec![AttrCell {
+            discriminator: v.to_string(),
+            bool_value: Some(*v),
+            ..AttrCell::default()
+        }],
+        (SearchAttrType::Double, SearchAttrValue::Double(v)) => vec![AttrCell {
+            discriminator: format!("{v:.17}"),
+            double_value: Some(*v),
+            ..AttrCell::default()
+        }],
+        (SearchAttrType::Datetime, SearchAttrValue::Datetime(v)) => vec![AttrCell {
+            discriminator: v.unix_timestamp_nanos().to_string(),
+            datetime_value: Some(*v),
+            ..AttrCell::default()
+        }],
+        (SearchAttrType::Text, SearchAttrValue::Text(v)) => text_search_tokens(v)
+            .into_iter()
+            .map(|token| AttrCell {
+                discriminator: token.clone(),
+                text_token: Some(token),
+                ..AttrCell::default()
+            })
+            .collect(),
+        (expected, actual) => bail!(
+            "search attribute type mismatch: expected {:?}, got {:?}",
+            expected,
+            search_attr_type_of(actual)
+        ),
+    })
 }
 
 async fn upsert_search_attr_index_row(
@@ -798,125 +853,32 @@ async fn upsert_search_attr_index_row(
 ) -> Result<()> {
     let attr_id = i64_from_u64(attr_id.0, "search attribute id")?;
     let value_data = codec::encode(value)?;
-    sqlx::query(
-        r#"
-        INSERT INTO sa_current (run_key, attr_id, value_data)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (run_key, attr_id) DO UPDATE
-        SET value_data = EXCLUDED.value_data
-        "#,
-    )
-    .bind(run_key.0)
-    .bind(attr_id)
-    .bind(value_data)
-    .execute(&mut *connection)
-    .await?;
-
-    match (attr_type, value) {
-        (SearchAttrType::Keyword, SearchAttrValue::Keyword(value)) => {
-            insert_text_index(
-                connection,
-                "sa_keyword_idx",
-                namespace_id,
-                attr_id,
-                value,
-                run_key,
+    for cell in attr_cells(attr_type, value)? {
+        sqlx::query(
+            r#"
+            INSERT INTO execution_visibility_attr_index (
+                namespace_id, run_key, attr_id, attr_type, value_discriminator,
+                keyword_value, int_value, bool_value, double_value, datetime_value,
+                text_token, value_data
             )
-            .await?;
-        }
-        (SearchAttrType::KeywordList, SearchAttrValue::KeywordList(values)) => {
-            for value in values {
-                insert_text_index(
-                    connection,
-                    "sa_keyword_list_idx",
-                    namespace_id,
-                    attr_id,
-                    value,
-                    run_key,
-                )
-                .await?;
-            }
-        }
-        (SearchAttrType::Int, SearchAttrValue::Int(value)) => {
-            sqlx::query(
-                r#"
-                INSERT INTO sa_int_idx (namespace_id, attr_id, value, run_key)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT DO NOTHING
-                "#,
-            )
-            .bind(namespace_id.0)
-            .bind(attr_id)
-            .bind(*value)
-            .bind(run_key.0)
-            .execute(&mut *connection)
-            .await?;
-        }
-        (SearchAttrType::Bool, SearchAttrValue::Bool(value)) => {
-            sqlx::query(
-                r#"
-                INSERT INTO sa_bool_idx (namespace_id, attr_id, value, run_key)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT DO NOTHING
-                "#,
-            )
-            .bind(namespace_id.0)
-            .bind(attr_id)
-            .bind(*value)
-            .bind(run_key.0)
-            .execute(&mut *connection)
-            .await?;
-        }
-        (SearchAttrType::Double, SearchAttrValue::Double(value)) => {
-            sqlx::query(
-                r#"
-                INSERT INTO sa_double_idx (namespace_id, attr_id, value, run_key)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT DO NOTHING
-                "#,
-            )
-            .bind(namespace_id.0)
-            .bind(attr_id)
-            .bind(*value)
-            .bind(run_key.0)
-            .execute(&mut *connection)
-            .await?;
-        }
-        (SearchAttrType::Datetime, SearchAttrValue::Datetime(value)) => {
-            sqlx::query(
-                r#"
-                INSERT INTO sa_datetime_idx (namespace_id, attr_id, value, run_key)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT DO NOTHING
-                "#,
-            )
-            .bind(namespace_id.0)
-            .bind(attr_id)
-            .bind(*value)
-            .bind(run_key.0)
-            .execute(&mut *connection)
-            .await?;
-        }
-        (SearchAttrType::Text, SearchAttrValue::Text(value)) => {
-            for token in text_search_tokens(value) {
-                insert_text_index(
-                    connection,
-                    "sa_text_token_idx",
-                    namespace_id,
-                    attr_id,
-                    &token,
-                    run_key,
-                )
-                .await?;
-            }
-        }
-        (expected, actual) => {
-            bail!(
-                "search attribute type mismatch: expected {:?}, got {:?}",
-                expected,
-                search_attr_type_of(actual)
-            );
-        }
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(namespace_id.0)
+        .bind(run_key.0)
+        .bind(attr_id)
+        .bind(attr_type.to_db_smallint())
+        .bind(&cell.discriminator)
+        .bind(cell.keyword_value.as_deref())
+        .bind(cell.int_value)
+        .bind(cell.bool_value)
+        .bind(cell.double_value)
+        .bind(cell.datetime_value)
+        .bind(cell.text_token.as_deref())
+        .bind(&value_data)
+        .execute(&mut *connection)
+        .await?;
     }
     Ok(())
 }
@@ -929,174 +891,18 @@ async fn remove_search_attr_index_row(
     attr_type: SearchAttrType,
 ) -> Result<()> {
     let attr_id = i64_from_u64(attr_id.0, "search attribute id")?;
-    let row = sqlx::query("SELECT value_data FROM sa_current WHERE run_key = $1 AND attr_id = $2")
-        .bind(run_key.0)
-        .bind(attr_id)
-        .fetch_optional(&mut *connection)
-        .await?;
-    let Some(row) = row else {
-        return Ok(());
-    };
-    let data: Vec<u8> = row.try_get("value_data")?;
-    let value = codec::decode::<SearchAttrValue>(&data)?;
-
-    match (attr_type, value) {
-        (SearchAttrType::Keyword, SearchAttrValue::Keyword(value)) => {
-            delete_text_index(
-                connection,
-                "sa_keyword_idx",
-                namespace_id,
-                attr_id,
-                &value,
-                run_key,
-            )
-            .await?;
-        }
-        (SearchAttrType::KeywordList, SearchAttrValue::KeywordList(values)) => {
-            for value in values {
-                delete_text_index(
-                    connection,
-                    "sa_keyword_list_idx",
-                    namespace_id,
-                    attr_id,
-                    &value,
-                    run_key,
-                )
-                .await?;
-            }
-        }
-        (SearchAttrType::Int, SearchAttrValue::Int(value)) => {
-            sqlx::query(
-                r#"
-                DELETE FROM sa_int_idx
-                WHERE namespace_id = $1 AND attr_id = $2 AND value = $3 AND run_key = $4
-                "#,
-            )
-            .bind(namespace_id.0)
-            .bind(attr_id)
-            .bind(value)
-            .bind(run_key.0)
-            .execute(&mut *connection)
-            .await?;
-        }
-        (SearchAttrType::Bool, SearchAttrValue::Bool(value)) => {
-            sqlx::query(
-                r#"
-                DELETE FROM sa_bool_idx
-                WHERE namespace_id = $1 AND attr_id = $2 AND value = $3 AND run_key = $4
-                "#,
-            )
-            .bind(namespace_id.0)
-            .bind(attr_id)
-            .bind(value)
-            .bind(run_key.0)
-            .execute(&mut *connection)
-            .await?;
-        }
-        (SearchAttrType::Double, SearchAttrValue::Double(value)) => {
-            sqlx::query(
-                r#"
-                DELETE FROM sa_double_idx
-                WHERE namespace_id = $1 AND attr_id = $2 AND value = $3 AND run_key = $4
-                "#,
-            )
-            .bind(namespace_id.0)
-            .bind(attr_id)
-            .bind(value)
-            .bind(run_key.0)
-            .execute(&mut *connection)
-            .await?;
-        }
-        (SearchAttrType::Datetime, SearchAttrValue::Datetime(value)) => {
-            sqlx::query(
-                r#"
-                DELETE FROM sa_datetime_idx
-                WHERE namespace_id = $1 AND attr_id = $2 AND value = $3 AND run_key = $4
-                "#,
-            )
-            .bind(namespace_id.0)
-            .bind(attr_id)
-            .bind(value)
-            .bind(run_key.0)
-            .execute(&mut *connection)
-            .await?;
-        }
-        (SearchAttrType::Text, SearchAttrValue::Text(value)) => {
-            for token in text_search_tokens(&value) {
-                delete_text_index(
-                    connection,
-                    "sa_text_token_idx",
-                    namespace_id,
-                    attr_id,
-                    &token,
-                    run_key,
-                )
-                .await?;
-            }
-        }
-        (expected, actual) => {
-            bail!(
-                "stored search attribute type mismatch: expected {:?}, got {:?}",
-                expected,
-                search_attr_type_of(&actual)
-            );
-        }
-    }
-
-    sqlx::query("DELETE FROM sa_current WHERE run_key = $1 AND attr_id = $2")
-        .bind(run_key.0)
-        .bind(attr_id)
-        .execute(connection)
-        .await?;
-    Ok(())
-}
-
-async fn insert_text_index(
-    connection: &mut PgConnection,
-    table: &str,
-    namespace_id: NamespaceId,
-    attr_id: i64,
-    value: &str,
-    run_key: RunKey,
-) -> Result<()> {
-    let sql = format!(
+    sqlx::query(
         r#"
-        INSERT INTO {table} (namespace_id, attr_id, value, run_key)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT DO NOTHING
-        "#
-    );
-    sqlx::query(&sql)
-        .bind(namespace_id.0)
-        .bind(attr_id)
-        .bind(value)
-        .bind(run_key.0)
-        .execute(connection)
-        .await?;
-    Ok(())
-}
-
-async fn delete_text_index(
-    connection: &mut PgConnection,
-    table: &str,
-    namespace_id: NamespaceId,
-    attr_id: i64,
-    value: &str,
-    run_key: RunKey,
-) -> Result<()> {
-    let sql = format!(
-        r#"
-        DELETE FROM {table}
-        WHERE namespace_id = $1 AND attr_id = $2 AND value = $3 AND run_key = $4
-        "#
-    );
-    sqlx::query(&sql)
-        .bind(namespace_id.0)
-        .bind(attr_id)
-        .bind(value)
-        .bind(run_key.0)
-        .execute(connection)
-        .await?;
+        DELETE FROM execution_visibility_attr_index
+        WHERE namespace_id = $1 AND run_key = $2 AND attr_id = $3 AND attr_type = $4
+        "#,
+    )
+    .bind(namespace_id.0)
+    .bind(run_key.0)
+    .bind(attr_id)
+    .bind(attr_type.to_db_smallint())
+    .execute(connection)
+    .await?;
     Ok(())
 }
 
@@ -1250,7 +1056,7 @@ fn compile_custom_compare(
     if attr_type == SearchAttrType::KeywordList {
         let value = expect_string_filter(value, attr_type)?;
         return compile_multi_value_compare(
-            "sa_keyword_list_idx",
+            SearchAttrType::KeywordList,
             attr_id,
             op,
             SqlValue::Text(value),
@@ -1267,7 +1073,7 @@ fn compile_text_token_compare(
     compiler: &mut SqlCompiler,
 ) -> Result<String> {
     compile_multi_value_compare(
-        "sa_text_token_idx",
+        SearchAttrType::Text,
         attr_id,
         op,
         SqlValue::Text(value),
@@ -1276,12 +1082,14 @@ fn compile_text_token_compare(
 }
 
 fn compile_multi_value_compare(
-    table: &str,
+    attr_type: SearchAttrType,
     attr_id: AttrId,
     op: CompareOp,
     value: SqlValue,
     compiler: &mut SqlCompiler,
 ) -> Result<String> {
+    let column = attr_value_column(attr_type);
+    let type_id = attr_type.to_db_smallint();
     match op {
         CompareOp::Eq => {
             let attr = compiler.push(SqlValue::Int(i64_from_u64(
@@ -1290,7 +1098,7 @@ fn compile_multi_value_compare(
             )?));
             let value = compiler.push(value);
             Ok(format!(
-                "run_key IN (SELECT run_key FROM {table} WHERE namespace_id = $1 AND attr_id = {attr} AND value = {value})"
+                "run_key IN (SELECT run_key FROM {ATTR_INDEX_TABLE} WHERE namespace_id = $1 AND attr_id = {attr} AND attr_type = {type_id} AND {column} = {value})"
             ))
         }
         CompareOp::Ne => {
@@ -1300,7 +1108,7 @@ fn compile_multi_value_compare(
             )?));
             let value = compiler.push(value);
             Ok(format!(
-                "NOT EXISTS (SELECT 1 FROM {table} idx WHERE idx.namespace_id = execution_visibility_current.namespace_id AND idx.run_key = execution_visibility_current.run_key AND idx.attr_id = {attr} AND idx.value = {value})"
+                "NOT EXISTS (SELECT 1 FROM {ATTR_INDEX_TABLE} idx WHERE idx.namespace_id = execution_visibility_current.namespace_id AND idx.run_key = execution_visibility_current.run_key AND idx.attr_id = {attr} AND idx.attr_type = {type_id} AND idx.{column} = {value})"
             ))
         }
         CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge => {
@@ -1317,13 +1125,15 @@ fn compile_scalar_custom_compare(
     compiler: &mut SqlCompiler,
 ) -> Result<String> {
     let table = index_table(attr_type)?;
+    let column = attr_value_column(attr_type);
+    let type_id = attr_type.to_db_smallint();
     let attr = compiler.push(SqlValue::Int(i64_from_u64(
         attr_id.0,
         "search attribute id",
     )?));
     let value = compiler.push(sql_value_for_attr(attr_type, value)?);
     Ok(format!(
-        "run_key IN (SELECT run_key FROM {table} WHERE namespace_id = $1 AND attr_id = {attr} AND value {} {value})",
+        "run_key IN (SELECT run_key FROM {table} WHERE namespace_id = $1 AND attr_id = {attr} AND attr_type = {type_id} AND {column} {} {value})",
         compare_operator(op)
     ))
 }
@@ -1361,6 +1171,8 @@ fn compile_custom_in(
     compiler: &mut SqlCompiler,
 ) -> Result<String> {
     let table = index_table(attr_type)?;
+    let column = attr_value_column(attr_type);
+    let type_id = attr_type.to_db_smallint();
     let sql_values = if attr_type == SearchAttrType::Text {
         values
             .iter()
@@ -1389,7 +1201,7 @@ fn compile_custom_in(
         .map(|value| compiler.push(value))
         .collect::<Vec<_>>();
     Ok(format!(
-        "run_key IN (SELECT run_key FROM {table} WHERE namespace_id = $1 AND attr_id = {attr} AND value IN ({}))",
+        "run_key IN (SELECT run_key FROM {table} WHERE namespace_id = $1 AND attr_id = {attr} AND attr_type = {type_id} AND {column} IN ({}))",
         placeholders.join(", ")
     ))
 }
@@ -1422,6 +1234,8 @@ fn compile_between(
             attr_id, attr_type, ..
         } => {
             let table = index_table(*attr_type)?;
+            let column = attr_value_column(*attr_type);
+            let type_id = attr_type.to_db_smallint();
             let attr = compiler.push(SqlValue::Int(i64_from_u64(
                 attr_id.0,
                 "search attribute id",
@@ -1429,7 +1243,7 @@ fn compile_between(
             let low = compiler.push(sql_value_for_attr(*attr_type, low)?);
             let high = compiler.push(sql_value_for_attr(*attr_type, high)?);
             Ok(format!(
-                "run_key IN (SELECT run_key FROM {table} WHERE namespace_id = $1 AND attr_id = {attr} AND value BETWEEN {low} AND {high})"
+                "run_key IN (SELECT run_key FROM {table} WHERE namespace_id = $1 AND attr_id = {attr} AND attr_type = {type_id} AND {column} BETWEEN {low} AND {high})"
             ))
         }
     }
@@ -1458,6 +1272,8 @@ fn compile_starts_with(
                 bail!("{attr_type:?} does not support STARTS_WITH");
             }
             let table = index_table(*attr_type)?;
+            let column = attr_value_column(*attr_type);
+            let type_id = attr_type.to_db_smallint();
             let attr = compiler.push(SqlValue::Int(i64_from_u64(
                 attr_id.0,
                 "search attribute id",
@@ -1469,7 +1285,7 @@ fn compile_starts_with(
             };
             let pattern = compiler.push(SqlValue::Text(like_prefix(&prefix)));
             Ok(format!(
-                "run_key IN (SELECT run_key FROM {table} WHERE namespace_id = $1 AND attr_id = {attr} AND value LIKE {pattern} ESCAPE '\\')"
+                "run_key IN (SELECT run_key FROM {table} WHERE namespace_id = $1 AND attr_id = {attr} AND attr_type = {type_id} AND {column} LIKE {pattern} ESCAPE '\\')"
             ))
         }
     }
@@ -1569,16 +1385,27 @@ fn system_column(field: SystemField) -> &'static str {
     }
 }
 
-fn index_table(attr_type: SearchAttrType) -> Result<&'static str> {
+/// The single generalized inverted-index table that replaces the per-type `sa_*`
+/// tables; `run_key` correlates each row to its execution.
+const ATTR_INDEX_TABLE: &str = "execution_visibility_attr_index";
+
+/// The typed value column an attribute type is queried through in
+/// [`ATTR_INDEX_TABLE`]. `Keyword`/`KeywordList` share the keyword column.
+fn attr_value_column(attr_type: SearchAttrType) -> &'static str {
     match attr_type {
-        SearchAttrType::Keyword => Ok("sa_keyword_idx"),
-        SearchAttrType::KeywordList => Ok("sa_keyword_list_idx"),
-        SearchAttrType::Int => Ok("sa_int_idx"),
-        SearchAttrType::Bool => Ok("sa_bool_idx"),
-        SearchAttrType::Double => Ok("sa_double_idx"),
-        SearchAttrType::Datetime => Ok("sa_datetime_idx"),
-        SearchAttrType::Text => Ok("sa_text_token_idx"),
+        SearchAttrType::Keyword | SearchAttrType::KeywordList => "keyword_value",
+        SearchAttrType::Int => "int_value",
+        SearchAttrType::Bool => "bool_value",
+        SearchAttrType::Double => "double_value",
+        SearchAttrType::Datetime => "datetime_value",
+        SearchAttrType::Text => "text_token",
     }
+}
+
+/// The table a custom-attribute predicate scans (one shared table now); retained so
+/// the per-query scan metric still has a stable label.
+fn index_table(_attr_type: SearchAttrType) -> Result<&'static str> {
+    Ok(ATTR_INDEX_TABLE)
 }
 
 fn sort_clause(sort: SortOrder) -> &'static str {
@@ -1731,6 +1558,8 @@ async fn count_custom_group(
         bail!("group-by is not supported for KeywordList or Text search attributes");
     }
     let table = index_table(attr_type)?;
+    let column = attr_value_column(attr_type);
+    let type_id = attr_type.to_db_smallint();
     let (filter_sql, mut values, next_param) = compile_filter(filter, 2)?;
     let attr_placeholder = format!("${next_param}");
     values.push(SqlValue::Int(i64_from_u64(
@@ -1739,7 +1568,7 @@ async fn count_custom_group(
     )?));
     let sql = format!(
         r#"
-        SELECT idx.value AS group_value, COUNT(*) AS group_count
+        SELECT idx.{column} AS group_value, COUNT(*) AS group_count
         FROM (
             SELECT *
             FROM execution_visibility_current
@@ -1749,7 +1578,8 @@ async fn count_custom_group(
         LEFT JOIN {table} idx ON idx.run_key = ve.run_key
             AND idx.namespace_id = ve.namespace_id
             AND idx.attr_id = {attr_placeholder}
-        GROUP BY idx.value
+            AND idx.attr_type = {type_id}
+        GROUP BY idx.{column}
         "#
     );
     let mut query = sqlx::query(&sql).bind(namespace_id.0);
@@ -2137,7 +1967,8 @@ mod tests {
         let (sql, values, _) = compile_filter(&filter, 2).unwrap();
 
         assert!(sql.contains("NOT EXISTS"));
-        assert!(sql.contains("sa_keyword_list_idx"));
+        assert!(sql.contains("execution_visibility_attr_index"));
+        assert!(sql.contains("keyword_value"));
         assert!(!sql.contains("value <>"));
         assert_eq!(
             values,
@@ -2168,7 +1999,8 @@ mod tests {
         };
 
         let (sql, values, _) = compile_filter(&single, 2).unwrap();
-        assert!(sql.contains("sa_text_token_idx"));
+        assert!(sql.contains("execution_visibility_attr_index"));
+        assert!(sql.contains("text_token"));
         assert_eq!(
             values,
             vec![SqlValue::Int(9), SqlValue::Text("hello".to_owned())]
@@ -2196,7 +2028,8 @@ mod tests {
 
         let (sql, values, _) = compile_filter(&filter, 2).unwrap();
 
-        assert!(sql.contains("sa_text_token_idx"));
+        assert!(sql.contains("execution_visibility_attr_index"));
+        assert!(sql.contains("text_token"));
         assert_eq!(
             values,
             vec![SqlValue::Int(9), SqlValue::Text("hello".to_owned())]

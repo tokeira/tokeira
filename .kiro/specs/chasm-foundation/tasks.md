@@ -436,12 +436,22 @@ verify against `../temporal @ v1.31.0` before finalizing.
     - _Requirements: 10.5, 10.13_
   - [ ] 23.8 Port the DSQL projection checkpoint onto `projection_checkpoint` (V055)
     - The projection worker's progress cursor still reads/writes the legacy workflow-only
-      `projector_checkpoint`. V055 `projection_checkpoint` is keyed by `partition_id` (Req 10.9:
-      per-partition progress so activity churn cannot starve workflow visibility), but the current
-      `VisibilityStore` checkpoint methods are keyed by `sink_id`. Porting requires reshaping the
-      checkpoint trait (sink_id → partition_id) and the worker's checkpoint read/write.
-    - **Escalate before implementing**: a `VisibilityStore` trait / wire-contract change falls on the
-      escalate side of the autonomy boundary (schema/architecture/kernel/wire-contract decisions).
+      `projector_checkpoint`. V055 `projection_checkpoint` (committed `31c6ca7c`, keyed by
+      `partition_id`) is the already-decided target: Req 10.9 mandates per-partition progress so
+      activity churn cannot starve workflow visibility. The internal `VisibilityStore` checkpoint
+      methods are still keyed by `sink_id: &str`; this task reshapes them to `partition_id` and updates
+      the worker's read/write to conform to the settled schema. The legacy `projector_checkpoint` table
+      is then retired alongside the other `vis_*`/`sa_*` cleanup.
+    - **Classification: Standard** (root `AGENTS.md` § Change Classification). It conforms an internal
+      Rust trait to an already-decided requirement (Req 10.9) + committed migration (V055). It is *not* a
+      wire-contract change — "wire contract" is reserved for the vendored Temporal protos under
+      `proto/upstream/` (§8); `VisibilityStore` is plumbing between the projection/runtime/storage crates.
+      It is *not* an open architectural decision: the Architectural tier's "spec update **or** approval"
+      is already satisfied by Req 10.9 + V055, and build-phase schema is malleable until a baseline is cut
+      (`AGENTS.md` migration rules). Proceed without escalation; tests pass + follow existing patterns.
+    - Implementation-design point to settle and record (DECISION record, per the autonomy boundary — not
+      an escalation): how `partition_id` is derived (source shard / run-key hash, Req 10.9) and how a
+      worker claims its partition(s), since the sink currently runs a single `sink_id`.
     - _Requirements: 10.9_
 
 - [ ] 24. Stage 2 — CHASM `VisibilitySnapshot` contract + engine→projection adapter + bootstrap wiring

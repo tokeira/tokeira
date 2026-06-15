@@ -406,18 +406,43 @@ verify against `../temporal @ v1.31.0` before finalizing.
     - `prop_rollup_idempotent_rebuildable`: replayed snapshots never double-count; striped rollups equal
       a fresh rebuild from `current`; ≥100 iterations; `// Feature: chasm-foundation, Property 13` tag
     - _Requirements: 12.3_
-  - [ ] 23.7 Migrate the projection read paths off the workflow status enum onto `status_keyword`
-    - The store/record/sink were generalized in 23.1/23.3, but the in-memory and DSQL **query**
-      layer still keys status off the workflow-typed `ExecutionStatus` enum (the `ExecutionStatus`
-      list filter via `FilterValue::Status(row.status)`, the `group_by` value, and the rollup
-      dimension all read `format!("{:?}", row.status)`). Migrate them to the generic, archetype-
-      scoped `status_keyword` column so a non-workflow archetype (activity) whose status has no
-      `ExecutionStatus` variant can be listed/counted/rolled-up. The typed `ExecutionRow.status`
-      becomes workflow-internal only (or is removed) and is no longer the index query key. Workflow
-      List/Count/UI behaviour stays unchanged (existing edge/projection tests + Properties 12/13).
+  - [x] 23.7 Migrate the projection read paths to `status_keyword` and port the DSQL visibility store onto the generalized schema
+    - **Read-path status migration.** The store/record/sink were generalized in 23.1/23.3, but the
+      in-memory and DSQL **query** layer still keyed status off the workflow-typed `ExecutionStatus`
+      enum (the list filter via `FilterValue::Status(row.status)`, the `group_by` value, and the
+      rollup dimension all read `format!("{:?}", row.status)`). Migrated them to the generic,
+      archetype-scoped `status_keyword` column so a non-workflow archetype (activity) whose status
+      has no `ExecutionStatus` variant can be listed/counted/rolled-up. The typed `ExecutionRow.status`
+      is now workflow-facing output only (the `ExecutionSummary`), not an index query key.
+    - **DSQL store port.** Ported the DSQL visibility store off the workflow-only `vis_execution`/
+      `vis_rollup`/`sa_current`/`sa_*_idx` tables onto the generalized schema: rows →
+      `execution_visibility_current` (apply-iff-newer version guard), rollups →
+      `execution_visibility_rollup` (archetype-scoped, 16-way striped), custom-SA index →
+      `execution_visibility_attr_index` (single-table delete+insert replace, typed value columns +
+      `value_discriminator`). The attr index deliberately deviates from 23.3's generation pattern —
+      recorded in `V052` + `reference/DECISION-visibility-dsql-schema.md` (tiny attr sets make the
+      generation pattern's conflict-surface win marginal versus its query-side cost). Workflows and
+      activities now share one DSQL index.
+    - **Verified.** Workflow List/Count/group-by/rollup behaviour unchanged: 47 in-memory projection
+      tests pass incl. Properties 12/13; the pure `compile_filter` SQL tests pass under
+      `--features dsql`; default + edge + storage compile clean (0 warnings).
+    - **Carved out** (now 23.8 / cleanup): the projection **checkpoint** table port (needs a
+      `VisibilityStore` trait-shape change → 23.8) and retiring the now-unused legacy `vis_*`/`sa_*`
+      migrations (blocked by the build-phase no-gap constraint — separate cleanup).
+    - Commits: `1f71cce0` (in-memory read path + types), `e7946c45` (DSQL row + read path),
+      `68ef7501` (DSQL rollup), `26af4204` (DSQL attr index).
     - **Ground-truth**: status is a low-cardinality keyword SA in `v1.31.0`, not an enum column;
       see `reference/DECISION-visibility-status-keyword.md` (`activity.go:40,594,932 @ v1.31.0`).
     - _Requirements: 10.5, 10.13_
+  - [ ] 23.8 Port the DSQL projection checkpoint onto `projection_checkpoint` (V055)
+    - The projection worker's progress cursor still reads/writes the legacy workflow-only
+      `projector_checkpoint`. V055 `projection_checkpoint` is keyed by `partition_id` (Req 10.9:
+      per-partition progress so activity churn cannot starve workflow visibility), but the current
+      `VisibilityStore` checkpoint methods are keyed by `sink_id`. Porting requires reshaping the
+      checkpoint trait (sink_id → partition_id) and the worker's checkpoint read/write.
+    - **Escalate before implementing**: a `VisibilityStore` trait / wire-contract change falls on the
+      escalate side of the autonomy boundary (schema/architecture/kernel/wire-contract decisions).
+    - _Requirements: 10.9_
 
 - [ ] 24. Stage 2 — CHASM `VisibilitySnapshot` contract + engine→projection adapter + bootstrap wiring
   - [ ] 24.1 Define the typed `VisibilitySnapshot` contribution interface in `tokeira-chasm`
@@ -522,7 +547,7 @@ verify against `../temporal @ v1.31.0` before finalizing.
     { "id": 20, "tasks": ["22.1", "22.2", "22.3"] },
     { "id": 21, "tasks": ["23.1", "23.2"] },
     { "id": 22, "tasks": ["23.3", "23.4"] },
-    { "id": 23, "tasks": ["23.5", "23.6"] },
+    { "id": 23, "tasks": ["23.5", "23.6", "23.7", "23.8"] },
     { "id": 24, "tasks": ["24.1"] },
     { "id": 25, "tasks": ["24.2", "24.3"] },
     { "id": 26, "tasks": ["25.1", "25.2", "25.4"] },

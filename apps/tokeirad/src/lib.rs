@@ -537,7 +537,7 @@ async fn build_and_serve(
                 visibility_store.clone(),
                 {
                     let visibility_store = visibility_store.clone();
-                    move |sink_id| VisibilitySink::new(visibility_store.clone(), sink_id)
+                    move || VisibilitySink::new(visibility_store.clone())
                 },
                 None,
                 Arc::new(tokeira_storage::InMemoryChasmNodeStore::new()),
@@ -576,7 +576,7 @@ async fn build_and_serve(
                 visibility_store.clone(),
                 {
                     let visibility_store = visibility_store.clone();
-                    move |_sink_id| visibility_store.clone()
+                    move || visibility_store.clone()
                 },
                 Some(endpoint),
                 chasm_node_repo,
@@ -602,7 +602,7 @@ where
     L: ProjectionLog + Clone + 'static,
     S: ProjectionSink + VisibilityStore + 'static,
     V: VisibilityStore + Clone + 'static,
-    F: Fn(String) -> S + Clone + Send + Sync + 'static,
+    F: Fn() -> S + Clone + Send + Sync + 'static,
 {
     // Build the authoritative store first, then wrap it with the
     // history-notifying repository used by edge long-poll.
@@ -766,14 +766,13 @@ where
     for partition_id in 0..effective_config.infrastructure.placement.partition_count {
         let projection_worker = ProjectionWorker {
             log: projection_log.clone(),
-            sink: projection_sink(format!("visibility-{partition_id}")),
+            sink: projection_sink(),
             batch_size: 256,
         };
         let projection_cancel = background_cancel.clone();
         tokio::spawn(async move {
             if let Err(error) = projection_worker
                 .run_from_cursor(
-                    &format!("visibility-{partition_id}"),
                     projection_cancel,
                     ProjectionCursor::beginning(partition_id, 1),
                 )

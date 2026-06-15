@@ -287,7 +287,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let sink = VisibilitySink::new(store.clone(), "sink");
+        let sink = VisibilitySink::new(store.clone());
         sink.apply(
             &projection_record(
                 namespace_id,

@@ -94,15 +94,20 @@ where
     /// progress after each successfully applied batch.
     pub async fn run_from_cursor(
         &self,
-        sink_id: &str,
         cancel: CancellationToken,
         initial_cursor: ProjectionCursor,
     ) -> Result<()> {
-        let mut cursor = self
-            .sink
-            .load_checkpoint(sink_id)
-            .await?
-            .unwrap_or(initial_cursor);
+        // Resume from the stored checkpoint for this partition, but only if it was
+        // written under the same `fanout`. V055 keys checkpoints by `partition_id`
+        // alone, so a re-partitioning leaves a stale cursor under the same key;
+        // detecting the fanout mismatch and restarting the partition from the
+        // beginning is safe because snapshot apply is idempotent + monotonic
+        // (Properties 12/13) — re-scanning applied transitions is a no-op. See
+        // reference/DECISION-visibility-checkpoint-partition.md.
+        let mut cursor = match self.sink.load_checkpoint(initial_cursor.partition_id).await? {
+            Some(stored) if stored.fanout == initial_cursor.fanout => stored,
+            _ => initial_cursor,
+        };
         let mut backoff = tokio::time::Duration::from_millis(100);
         let max_backoff = tokio::time::Duration::from_secs(5);
         let mut last_checkpoint = Instant::now();
@@ -110,7 +115,7 @@ where
 
         loop {
             if cancel.is_cancelled() {
-                self.save_checkpoint_with_metrics(sink_id, &cursor, &mut last_checkpoint)
+                self.save_checkpoint_with_metrics(&cursor, &mut last_checkpoint)
                     .await?;
                 return Ok(());
             }
@@ -123,7 +128,7 @@ where
                 debug!("projection substream idle");
                 tokio::select! {
                     _ = cancel.cancelled() => {
-                        self.save_checkpoint_with_metrics(sink_id, &cursor, &mut last_checkpoint).await?;
+                        self.save_checkpoint_with_metrics(&cursor, &mut last_checkpoint).await?;
                         return Ok(());
                     }
                     _ = tokio::time::sleep(backoff) => {}
@@ -157,7 +162,7 @@ where
                 projection_metrics::record_checkpoint_lag(last_checkpoint.elapsed());
                 tokio::select! {
                     _ = cancel.cancelled() => {
-                        self.save_checkpoint_with_metrics(sink_id, &cursor, &mut last_checkpoint).await?;
+                        self.save_checkpoint_with_metrics(&cursor, &mut last_checkpoint).await?;
                         return Ok(());
                     }
                     _ = tokio::time::sleep(backoff) => {}
@@ -168,7 +173,7 @@ where
             projection_metrics::record_records_processed(cursor.partition_id, batch.records.len());
             cursor = batch.next_cursor;
             projection_metrics::set_projection_lag(cursor.partition_id, 0);
-            self.save_checkpoint_with_metrics(sink_id, &cursor, &mut last_checkpoint)
+            self.save_checkpoint_with_metrics(&cursor, &mut last_checkpoint)
                 .await?;
             info!(
                 partition = cursor.partition_id,
@@ -178,18 +183,16 @@ where
         }
     }
 
-    pub async fn run(&self, sink_id: &str, cancel: CancellationToken) -> Result<()> {
-        self.run_from_cursor(sink_id, cancel, beginning_cursor())
-            .await
+    pub async fn run(&self, cancel: CancellationToken) -> Result<()> {
+        self.run_from_cursor(cancel, beginning_cursor()).await
     }
 
     async fn save_checkpoint_with_metrics(
         &self,
-        sink_id: &str,
         cursor: &ProjectionCursor,
         last_checkpoint: &mut Instant,
     ) -> Result<()> {
-        if let Err(error) = self.sink.save_checkpoint(sink_id, cursor).await {
+        if let Err(error) = self.sink.save_checkpoint(cursor).await {
             projection_metrics::record_sink_error_with_kind(
                 cursor.partition_id,
                 ProjectionErrorKindLabel::Checkpoint,
@@ -311,7 +314,7 @@ mod tests {
         };
         let worker = ProjectionWorker {
             log: log.clone(),
-            sink: VisibilitySink::new(InMemoryVisibilityStore::default(), "sink"),
+            sink: VisibilitySink::new(InMemoryVisibilityStore::default()),
             batch_size: 10,
         };
         let cancel = CancellationToken::new();
@@ -320,7 +323,7 @@ mod tests {
             tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
             cloned.cancel();
         });
-        worker.run("sink", cancel).await.unwrap();
+        worker.run(cancel).await.unwrap();
 
         let seen = log.seen.lock().await;
         assert_eq!(seen[0], ProjectionCursor::beginning(0, 1));
@@ -344,7 +347,7 @@ mod tests {
         let store = InMemoryVisibilityStore::default();
         let worker = ProjectionWorker {
             log,
-            sink: VisibilitySink::new(store.clone(), "sink"),
+            sink: VisibilitySink::new(store.clone()),
             batch_size: 10,
         };
         let cancel = CancellationToken::new();
@@ -354,9 +357,9 @@ mod tests {
             cloned.cancel();
         });
 
-        worker.run("sink", cancel).await.unwrap();
+        worker.run(cancel).await.unwrap();
 
-        let saved = store.load_checkpoint("sink").await.unwrap().unwrap();
+        let saved = store.load_checkpoint(0).await.unwrap().unwrap();
         assert_eq!(saved, next_cursor);
         assert!(store.get_row(RunKey(Uuid::from_u128(9))).await.is_some());
     }
@@ -484,11 +487,11 @@ mod tests {
                 .count_from_rollup(namespace_id, archetype_id, dimension)
                 .await
         }
-        async fn load_checkpoint(&self, sink_id: &str) -> Result<Option<ProjectionCursor>> {
-            self.store.load_checkpoint(sink_id).await
+        async fn load_checkpoint(&self, partition_id: u32) -> Result<Option<ProjectionCursor>> {
+            self.store.load_checkpoint(partition_id).await
         }
-        async fn save_checkpoint(&self, sink_id: &str, cursor: &ProjectionCursor) -> Result<()> {
-            self.store.save_checkpoint(sink_id, cursor).await
+        async fn save_checkpoint(&self, cursor: &ProjectionCursor) -> Result<()> {
+            self.store.save_checkpoint(cursor).await
         }
         async fn resolve_attr(
             &self,
@@ -550,9 +553,9 @@ mod tests {
             cloned.cancel();
         });
 
-        worker.run("sink", cancel).await.unwrap();
+        worker.run(cancel).await.unwrap();
 
-        let saved = sink.load_checkpoint("sink").await.unwrap().unwrap();
+        let saved = sink.load_checkpoint(0).await.unwrap().unwrap();
         assert_eq!(saved, next_cursor);
         assert_eq!(*sink.applied.lock().await, 1);
     }
@@ -622,13 +625,13 @@ mod tests {
                     cloned.cancel();
                 });
                 worker
-                    .run("sink", cancel)
+                    .run(cancel)
                     .await
                     .unwrap();
                 // After failures + 1 success, checkpoint
                 // should be at next_cursor
                 let saved = sink
-                    .load_checkpoint("sink")
+                    .load_checkpoint(0)
                     .await
                     .unwrap();
                 // Checkpoint should exist (at least one

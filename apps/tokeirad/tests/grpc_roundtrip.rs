@@ -801,20 +801,13 @@ async fn spawn_test_server() -> Result<(
     for partition_id in 0..16 {
         let projection_worker = ProjectionWorker {
             log: store.clone(),
-            sink: VisibilitySink::new(
-                visibility_store.clone(),
-                format!("visibility-{partition_id}"),
-            ),
+            sink: VisibilitySink::new(visibility_store.clone()),
             batch_size: 256,
         };
         tokio::spawn(async move {
             let cancel = CancellationToken::new();
             let _ = projection_worker
-                .run_from_cursor(
-                    &format!("visibility-{partition_id}"),
-                    cancel,
-                    ProjectionCursor::beginning(partition_id, 1),
-                )
+                .run_from_cursor(cancel, ProjectionCursor::beginning(partition_id, 1))
                 .await;
         });
     }

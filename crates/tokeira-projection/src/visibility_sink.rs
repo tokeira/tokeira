@@ -27,19 +27,11 @@ use crate::{
 
 pub struct VisibilitySink<S> {
     store: S,
-    sink_id: String,
 }
 
 impl<S> VisibilitySink<S> {
-    pub fn new(store: S, sink_id: impl Into<String>) -> Self {
-        Self {
-            store,
-            sink_id: sink_id.into(),
-        }
-    }
-
-    pub fn sink_id(&self) -> &str {
-        &self.sink_id
+    pub fn new(store: S) -> Self {
+        Self { store }
     }
 }
 
@@ -116,16 +108,15 @@ where
     }
     async fn load_checkpoint(
         &self,
-        sink_id: &str,
+        partition_id: u32,
     ) -> Result<Option<tokeira_types::ProjectionCursor>> {
-        self.store.load_checkpoint(sink_id).await
+        self.store.load_checkpoint(partition_id).await
     }
     async fn save_checkpoint(
         &self,
-        sink_id: &str,
         cursor: &tokeira_types::ProjectionCursor,
     ) -> Result<()> {
-        self.store.save_checkpoint(sink_id, cursor).await
+        self.store.save_checkpoint(cursor).await
     }
     async fn resolve_attr(
         &self,
@@ -450,7 +441,7 @@ mod tests {
                 let store =
                     InMemoryVisibilityStore::default();
                 let sink =
-                    VisibilitySink::new(store.clone(), "s");
+                    VisibilitySink::new(store.clone());
                 sink.apply(&record, 0).await.unwrap();
                 let row =
                     store.get_row(record.run_key).await.unwrap();
@@ -515,7 +506,7 @@ mod tests {
                 let store =
                     InMemoryVisibilityStore::default();
                 let sink =
-                    VisibilitySink::new(store.clone(), "s");
+                    VisibilitySink::new(store.clone());
                 sink.apply(&record, 0).await.unwrap();
                 let row1 =
                     store.get_row(record.run_key).await.unwrap();
@@ -562,7 +553,7 @@ mod tests {
     async fn apply_rejects_unknown_search_attribute() {
         let namespace_id = NamespaceId(Uuid::from_u128(1));
         let store = InMemoryVisibilityStore::default();
-        let sink = VisibilitySink::new(store, "sink");
+        let sink = VisibilitySink::new(store);
 
         let error = sink
             .apply(
@@ -590,7 +581,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let sink = VisibilitySink::new(store, "sink");
+        let sink = VisibilitySink::new(store);
 
         let error = sink
             .apply(
@@ -618,7 +609,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let sink = VisibilitySink::new(store.clone(), "sink");
+        let sink = VisibilitySink::new(store.clone());
         let record =
             record_with_search_attr(namespace_id, SearchAttrValue::Keyword("blue".to_string()));
 
@@ -667,7 +658,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let sink = VisibilitySink::new(store.clone(), "sink");
+        let sink = VisibilitySink::new(store.clone());
         let first =
             record_with_search_attr(namespace_id, SearchAttrValue::Keyword("blue".to_string()));
         let mut second_context = context(namespace_id);
@@ -820,7 +811,7 @@ mod tests {
                 let ns = NamespaceId(Uuid::from_u128(1));
                 let run_key = RunKey(Uuid::from_u128(7));
                 let store = InMemoryVisibilityStore::default();
-                let sink = VisibilitySink::new(store.clone(), "s");
+                let sink = VisibilitySink::new(store.clone());
 
                 // Apply each version in the generated (arbitrary) order, with
                 // duplicates standing in for retries. After every apply the
@@ -876,7 +867,7 @@ mod tests {
             rt.block_on(async {
                 let ns = NamespaceId(Uuid::from_u128(1));
                 let store = InMemoryVisibilityStore::default();
-                let sink = VisibilitySink::new(store.clone(), "s");
+                let sink = VisibilitySink::new(store.clone());
 
                 for &(exec, epoch, seq) in &ops {
                     let run_key = RunKey(Uuid::from_u128(exec + 1));

@@ -358,7 +358,7 @@ verify against `../temporal @ v1.31.0` before finalizing.
 > "Visibility Generalization: One Logical Index for All Archetypes". Each stage compiles + tests; the
 > workflow list/count/UI stays green throughout.
 
-- [ ] 23. Stage 1 — Generalize the visibility store, record, and sink; migrate the workflow producer to snapshots
+- [x] 23. Stage 1 — Generalize the visibility store, record, and sink; migrate the workflow producer to snapshots
   - [x] 23.1 Generalize the projection record + store model to the versioned-snapshot / archetype shape
     - Replace the delta `ProjectionOp` contract with a versioned `VisibilitySnapshot` record carrying
       `(namespace_id, archetype_id, run_key, authority_epoch, source_transition_seq)` plus the full
@@ -434,14 +434,25 @@ verify against `../temporal @ v1.31.0` before finalizing.
     - **Ground-truth**: status is a low-cardinality keyword SA in `v1.31.0`, not an enum column;
       see `reference/DECISION-visibility-status-keyword.md` (`activity.go:40,594,932 @ v1.31.0`).
     - _Requirements: 10.5, 10.13_
-  - [ ] 23.8 Port the DSQL projection checkpoint onto `projection_checkpoint` (V055)
-    - The projection worker's progress cursor still reads/writes the legacy workflow-only
-      `projector_checkpoint`. V055 `projection_checkpoint` (committed `31c6ca7c`, keyed by
-      `partition_id`) is the already-decided target: Req 10.9 mandates per-partition progress so
-      activity churn cannot starve workflow visibility. The internal `VisibilityStore` checkpoint
-      methods are still keyed by `sink_id: &str`; this task reshapes them to `partition_id` and updates
-      the worker's read/write to conform to the settled schema. The legacy `projector_checkpoint` table
-      is then retired alongside the other `vis_*`/`sa_*` cleanup.
+  - [x] 23.8 Port the DSQL projection checkpoint onto `projection_checkpoint` (V055)
+    - Reshaped the `VisibilityStore` checkpoint methods from `sink_id: &str` to
+      `load_checkpoint(partition_id: u32)` / `save_checkpoint(&cursor)` (partition from
+      `cursor.partition_id`), and ported the DSQL impl onto V055 `projection_checkpoint`
+      (`partition_id` PK, `last_applied_version` BYTEA). The redundant `sink_id` is gone: the bootstrap
+      already runs one worker per partition and smuggled the partition through the sink-id string while
+      the cursor already carried the real `partition_id`. Removed `VisibilitySink`'s now-dead `sink_id`
+      field / ctor param / unused `sink_id()` getter and the bootstrap factory's `String` argument.
+    - **fanout guard.** V055 keys by `partition_id` alone, so the worker resumes a stored checkpoint
+      only when `stored.fanout == expected.fanout`, else restarts the partition from the beginning —
+      safe because apply is idempotent + monotonic (Properties 12/13). See
+      `reference/DECISION-visibility-checkpoint-partition.md`.
+    - **Verified.** projection lib+tests compile clean (default + `--features dsql`, 0 warnings);
+      47 in-memory tests pass incl. `prop_checkpoint_round_trip` (now partition-keyed) and the worker
+      checkpoint tests; `tokeirad` + `grpc_roundtrip` compile and 6/7 pass (the 1 failure,
+      `..._update_completed_through_protocol_messages`, is pre-existing on clean HEAD — unrelated).
+    - The legacy `projector_checkpoint` (V011) is now unused but its migration file stays: deleting a
+      non-highest build-phase migration would gap the versions. Retiring it is the separate `vis_*`/
+      `sa_*` migration cleanup.
     - **Classification: Standard** (root `AGENTS.md` § Change Classification). It conforms an internal
       Rust trait to an already-decided requirement (Req 10.9) + committed migration (V055). It is *not* a
       wire-contract change — "wire contract" is reserved for the vendored Temporal protos under
@@ -449,9 +460,11 @@ verify against `../temporal @ v1.31.0` before finalizing.
       It is *not* an open architectural decision: the Architectural tier's "spec update **or** approval"
       is already satisfied by Req 10.9 + V055, and build-phase schema is malleable until a baseline is cut
       (`AGENTS.md` migration rules). Proceed without escalation; tests pass + follow existing patterns.
-    - Implementation-design point to settle and record (DECISION record, per the autonomy boundary — not
-      an escalation): how `partition_id` is derived (source shard / run-key hash, Req 10.9) and how a
-      worker claims its partition(s), since the sink currently runs a single `sink_id`.
+    - Design point (resolved in `reference/DECISION-visibility-checkpoint-partition.md`, not escalated):
+      `partition_id` was already a first-class field on `ProjectionCursor` and the projection log already
+      partitions by it, so no new derivation was invented — the port just keys the checkpoint on the
+      `partition_id` the cursor already carries; `fanout` rides inside `last_applied_version` with the
+      resume-time guard above.
     - _Requirements: 10.9_
 
 - [ ] 24. Stage 2 — CHASM `VisibilitySnapshot` contract + engine→projection adapter + bootstrap wiring

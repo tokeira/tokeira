@@ -61,8 +61,13 @@ pub trait VisibilityStore: Send + Sync {
         dimension: RollupDimension,
     ) -> Result<CountResult>;
 
-    async fn load_checkpoint(&self, sink_id: &str) -> Result<Option<ProjectionCursor>>;
-    async fn save_checkpoint(&self, sink_id: &str, cursor: &ProjectionCursor) -> Result<()>;
+    /// Load the resume cursor for `partition_id`, or `None` if this partition
+    /// has never checkpointed. Keyed by `partition_id` alone (V055
+    /// `projection_checkpoint`); the persisted `fanout` rides inside the cursor
+    /// so a re-partitioning can be detected by the worker on resume.
+    async fn load_checkpoint(&self, partition_id: u32) -> Result<Option<ProjectionCursor>>;
+    /// Persist `cursor` as the progress of `cursor.partition_id`.
+    async fn save_checkpoint(&self, cursor: &ProjectionCursor) -> Result<()>;
 
     async fn resolve_attr(
         &self,

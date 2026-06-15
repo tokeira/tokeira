@@ -324,57 +324,52 @@ impl VisibilityStore for DsqlVisibilityStore {
         rows_to_count_result(rows)
     }
 
-    // The trait takes only sink_id. The runtime must ensure sink_id is unique
-    // per (partition_id, fanout) substream. When multi-partition-per-sink is
-    // added, the trait signature will need to accept partition/fanout.
-    #[instrument(skip_all, fields(sink_id))]
-    async fn load_checkpoint(&self, sink_id: &str) -> Result<Option<ProjectionCursor>> {
+    // Checkpoints are keyed by `partition_id` alone (V055 `projection_checkpoint`,
+    // Req 10.9). The serialized cursor in `last_applied_version` still carries
+    // `fanout`, so a re-partitioning is detected by the worker on resume; see
+    // reference/DECISION-visibility-checkpoint-partition.md.
+    #[instrument(skip_all, fields(partition_id))]
+    async fn load_checkpoint(&self, partition_id: u32) -> Result<Option<ProjectionCursor>> {
+        let partition_id = i32_from_u32(partition_id, "projection cursor partition_id")?;
         let mut permit = self.director.acquire(DbClass::Projection).await?;
         let row = sqlx::query(
             r#"
-            SELECT last_applied_cursor
-            FROM projector_checkpoint
-            WHERE sink_id = $1
-            ORDER BY updated_at DESC
-            LIMIT 1
+            SELECT last_applied_version
+            FROM projection_checkpoint
+            WHERE partition_id = $1
             "#,
         )
-        .bind(sink_id)
+        .bind(partition_id)
         .fetch_optional(permit.connection()?)
         .await?;
 
         row.map(|row| {
-            let data: Vec<u8> = row.try_get("last_applied_cursor")?;
+            let data: Vec<u8> = row.try_get("last_applied_version")?;
             codec::decode_projection_cursor(&data)
         })
         .transpose()
     }
 
-    #[instrument(skip_all, fields(sink_id, partition_id = cursor.partition_id, fanout = cursor.fanout))]
-    async fn save_checkpoint(&self, sink_id: &str, cursor: &ProjectionCursor) -> Result<()> {
+    #[instrument(skip_all, fields(partition_id = cursor.partition_id, fanout = cursor.fanout))]
+    async fn save_checkpoint(&self, cursor: &ProjectionCursor) -> Result<()> {
         let partition_id = i32_from_u32(cursor.partition_id, "projection cursor partition_id")?;
-        let fanout = i16_from_u16(cursor.fanout, "projection cursor fanout")?;
         let data = codec::encode_projection_cursor(cursor)?;
         let mut permit = self.director.acquire(DbClass::Projection).await?;
         let started = Instant::now();
         let result = sqlx::query(
             r#"
-            INSERT INTO projector_checkpoint (
-                sink_id,
+            INSERT INTO projection_checkpoint (
                 partition_id,
-                fanout,
-                last_applied_cursor,
+                last_applied_version,
                 updated_at
             )
-            VALUES ($1, $2, $3, $4, now())
-            ON CONFLICT (sink_id, partition_id, fanout) DO UPDATE
-            SET last_applied_cursor = EXCLUDED.last_applied_cursor,
+            VALUES ($1, $2, now())
+            ON CONFLICT (partition_id) DO UPDATE
+            SET last_applied_version = EXCLUDED.last_applied_version,
                 updated_at = now()
             "#,
         )
-        .bind(sink_id)
         .bind(partition_id)
-        .bind(fanout)
         .bind(data)
         .execute(permit.connection()?)
         .await;
@@ -1846,10 +1841,6 @@ fn resolve_final_vis_state(
         search_attr_generation: context.search_attr_generation,
         search_attr_version: 0,
     }
-}
-
-fn i16_from_u16(value: u16, field: &str) -> Result<i16> {
-    i16::try_from(value).map_err(|_| anyhow::anyhow!("{field} {value} exceeds i16 range"))
 }
 
 fn i32_from_u32(value: u32, field: &str) -> Result<i32> {

@@ -44,7 +44,7 @@ struct VisibilityState {
     sa_text_idx: HashMap<(NamespaceId, AttrId, String), HashSet<RunKey>>,
     rollups: HashMap<(NamespaceId, ArchetypeId, RollupDimension, String), i64>,
     registry: HashMap<(NamespaceId, String), AttrDescriptor>,
-    checkpoints: HashMap<String, ProjectionCursor>,
+    checkpoints: HashMap<u32, ProjectionCursor>,
     next_attr_id: u64,
 }
 
@@ -439,16 +439,16 @@ impl VisibilityStore for InMemoryVisibilityStore {
         })
     }
 
-    async fn load_checkpoint(&self, sink_id: &str) -> Result<Option<ProjectionCursor>> {
-        Ok(self.inner.lock().await.checkpoints.get(sink_id).cloned())
+    async fn load_checkpoint(&self, partition_id: u32) -> Result<Option<ProjectionCursor>> {
+        Ok(self.inner.lock().await.checkpoints.get(&partition_id).cloned())
     }
 
-    async fn save_checkpoint(&self, sink_id: &str, cursor: &ProjectionCursor) -> Result<()> {
+    async fn save_checkpoint(&self, cursor: &ProjectionCursor) -> Result<()> {
         self.inner
             .lock()
             .await
             .checkpoints
-            .insert(sink_id.to_string(), cursor.clone());
+            .insert(cursor.partition_id, cursor.clone());
         Ok(())
     }
 
@@ -1209,7 +1209,6 @@ mod tests {
         #[test]
         fn prop_checkpoint_round_trip(
             cursor in arb_projection_cursor(),
-            sink_id in "[a-z]{1,10}",
         ) {
             let rt =
                 tokio::runtime::Builder::new_current_thread()
@@ -1220,11 +1219,11 @@ mod tests {
                 let store =
                     InMemoryVisibilityStore::default();
                 store
-                    .save_checkpoint(&sink_id, &cursor)
+                    .save_checkpoint(&cursor)
                     .await
                     .unwrap();
                 let loaded = store
-                    .load_checkpoint(&sink_id)
+                    .load_checkpoint(cursor.partition_id)
                     .await
                     .unwrap()
                     .unwrap();

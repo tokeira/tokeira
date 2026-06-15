@@ -57,30 +57,34 @@ async fn read_from_paginates_projection_log_rows() -> Result<()> {
 }
 
 #[tokio::test]
-async fn checkpoint_persists_and_resumes_by_sink_id() -> Result<()> {
+async fn checkpoint_persists_and_resumes_by_partition_id() -> Result<()> {
     let Some(context) = TestContext::connect().await? else {
         return Ok(());
     };
     let store = context.visibility_store().await?;
-    let sink_id = format!("visibility-persistence-test-{}", Uuid::new_v4());
+    // Both cursors are for the same partition, so the second save upserts the
+    // first: V055 `projection_checkpoint` is keyed by `partition_id` alone. Pick a
+    // fresh partition per run (positive i32 range) so the initial `None` assertion
+    // is isolated from prior runs against a shared cluster.
+    let partition_id = (Uuid::new_v4().as_u128() as u32) & 0x7fff_ffff;
     let first = ProjectionCursor {
-        partition_id: 2,
+        partition_id,
         fanout: 8,
         last_run_key: Some(RunKey(Uuid::from_u128(1))),
         last_transition_seq: Some(TransitionSeq(3)),
     };
     let second = ProjectionCursor {
-        partition_id: 2,
+        partition_id,
         fanout: 8,
         last_run_key: Some(RunKey(Uuid::from_u128(2))),
         last_transition_seq: Some(TransitionSeq(9)),
     };
 
-    assert_eq!(store.load_checkpoint(&sink_id).await?, None);
-    store.save_checkpoint(&sink_id, &first).await?;
-    assert_eq!(store.load_checkpoint(&sink_id).await?, Some(first));
-    store.save_checkpoint(&sink_id, &second).await?;
-    assert_eq!(store.load_checkpoint(&sink_id).await?, Some(second));
+    assert_eq!(store.load_checkpoint(partition_id).await?, None);
+    store.save_checkpoint(&first).await?;
+    assert_eq!(store.load_checkpoint(partition_id).await?, Some(first));
+    store.save_checkpoint(&second).await?;
+    assert_eq!(store.load_checkpoint(partition_id).await?, Some(second));
     Ok(())
 }
 

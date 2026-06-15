@@ -136,12 +136,12 @@ impl VisibilityContributor for ActivityExecution {
             // generic `execution_type`/`task_queue` columns the edge exposes under
             // those SA names (design "Record shape"). `search_attributes` therefore
             // carries no user EAV rows for this archetype.
-            status_keyword: execution_status_name(status).to_owned(),
+            status_keyword: api_status_name(status).to_owned(),
             lifecycle_state: lifecycle_for(status),
             execution_type: (!state.activity_type.is_empty()).then(|| state.activity_type.clone()),
             task_queue: (!state.task_queue.is_empty()).then(|| state.task_queue.clone()),
-            // The activity persists no close timestamp; the adapter stamps the
-            // transition time when the lifecycle closes.
+            // The activity persists no close timestamp; the runtime stamps the
+            // transition's wall-clock when the lifecycle closes (engine post-commit).
             start_time_unix_nanos: (state.scheduled_time_nanos != 0)
                 .then_some(state.scheduled_time_nanos),
             close_time_unix_nanos: None,
@@ -151,8 +151,7 @@ impl VisibilityContributor for ActivityExecution {
     }
 }
 
-/// The visibility `ExecutionStatus` string for an activity status, matching the
-/// names the targeted release surfaces.
+/// The fine-grained internal activity-status name (legacy string SA hook).
 fn execution_status_name(status: ActivityStatus) -> &'static str {
     match status {
         ActivityStatus::Unspecified => "Unspecified",
@@ -164,6 +163,29 @@ fn execution_status_name(status: ActivityStatus) -> &'static str {
         ActivityStatus::Canceled => "Canceled",
         ActivityStatus::Terminated => "Terminated",
         ActivityStatus::TimedOut => "TimedOut",
+    }
+}
+
+/// The **collapsed API status** name stored in the shared index's `status_keyword`,
+/// so list/count filtering by `ExecutionStatus` matches Temporal's semantics
+/// (Requirement 10.5; `reference/DECISION-visibility-status-keyword.md`).
+///
+/// Ground-truth: `chasm/lib/activity/activity.go:932 @ v1.31.0` stores
+/// `InternalStatusToAPIStatus(status).String()`, where `InternalStatusToAPIStatus`
+/// (`activity.go:594 @ v1.31.0`) collapses `SCHEDULED`/`STARTED`/`CANCEL_REQUESTED`
+/// → `RUNNING` and passes the terminal statuses through. Querying `ExecutionStatus =
+/// Running` must therefore match a scheduled or started activity.
+fn api_status_name(status: ActivityStatus) -> &'static str {
+    match status {
+        ActivityStatus::Scheduled
+        | ActivityStatus::Started
+        | ActivityStatus::CancelRequested => "Running",
+        ActivityStatus::Completed => "Completed",
+        ActivityStatus::Failed => "Failed",
+        ActivityStatus::Canceled => "Canceled",
+        ActivityStatus::Terminated => "Terminated",
+        ActivityStatus::TimedOut => "TimedOut",
+        ActivityStatus::Unspecified => "Unspecified",
     }
 }
 
@@ -257,5 +279,34 @@ mod tests {
         assert_eq!(snap.start_time_unix_nanos, Some(42));
         assert_eq!(snap.close_time_unix_nanos, None);
         assert!(snap.search_attributes.0.is_empty());
+    }
+
+    #[test]
+    fn visibility_status_keyword_collapses_to_api_status() {
+        // The index stores the collapsed API status so `ExecutionStatus = Running`
+        // matches scheduled/started/cancel-requested activities (v1.31.0
+        // InternalStatusToAPIStatus; reference/DECISION-visibility-status-keyword.md).
+        for (internal, expected) in [
+            (ActivityStatus::Scheduled, "Running"),
+            (ActivityStatus::Started, "Running"),
+            (ActivityStatus::CancelRequested, "Running"),
+            (ActivityStatus::Completed, "Completed"),
+            (ActivityStatus::Failed, "Failed"),
+            (ActivityStatus::Canceled, "Canceled"),
+            (ActivityStatus::Terminated, "Terminated"),
+            (ActivityStatus::TimedOut, "TimedOut"),
+        ] {
+            let mut state = ActivityState {
+                activity_type: "T".to_owned(),
+                task_queue: "q".to_owned(),
+                scheduled_time_nanos: 1,
+                ..ActivityState::default()
+            };
+            state.set_status(internal);
+            let snap = ActivityExecution::new(state)
+                .visibility_snapshot()
+                .expect("materialized activity contributes a snapshot");
+            assert_eq!(snap.status_keyword, expected, "status {internal:?}");
+        }
     }
 }

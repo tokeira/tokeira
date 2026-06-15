@@ -393,12 +393,23 @@ impl ChasmEngine {
                 .map_err(|e| ChasmError::Internal(format!("dispatch side-effect tasks: {e}")))?;
         }
         self.arm_timer(key, result.earliest_pure_deadline_unix_nanos);
-        if let Some(snapshot) = visibility {
-            // Visibility is a derived read model strictly off the correctness path
-            // (Requirement 10.15): the authoritative transition has already
+        if let Some(mut snapshot) = visibility {
+            // A component persists no close timestamp of its own (it delegates this
+            // to the runtime), so stamp the transition's wall-clock when the
+            // lifecycle closes — otherwise a closed execution would have no close
+            // time. Visibility is a derived read model strictly off the correctness
+            // path (Requirement 10.15): the authoritative transition has already
             // committed, so a failed projection write must not fail the operation.
             // It is best-effort here; the task-26 repair/outbox makes it durable
             // (Requirement 10.11).
+            if snapshot.close_time_unix_nanos.is_none()
+                && matches!(
+                    snapshot.lifecycle_state,
+                    LifecycleState::Completed | LifecycleState::Failed
+                )
+            {
+                snapshot.close_time_unix_nanos = Some(self.now());
+            }
             if let Err(error) = self.visibility.record(key, archetype_id, version, snapshot).await {
                 tracing::warn!(
                     ?error,

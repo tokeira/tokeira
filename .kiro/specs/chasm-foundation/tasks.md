@@ -467,7 +467,7 @@ verify against `../temporal @ v1.31.0` before finalizing.
       resume-time guard above.
     - _Requirements: 10.9_
 
-- [ ] 24. Stage 2 — CHASM `VisibilitySnapshot` contract + engine→projection adapter + bootstrap wiring
+- [x] 24. Stage 2 — CHASM `VisibilitySnapshot` contract + engine→projection adapter + bootstrap wiring
   - [x] 24.1 Define the typed `VisibilitySnapshot` contribution interface in `tokeira-chasm`
     - `tokeira_chasm::VisibilitySnapshot` + the `VisibilityContributor` hook carry the typed
       post-transition image (status_keyword, lifecycle, lifecycle timestamps, execution_type/task_queue,
@@ -495,10 +495,20 @@ verify against `../temporal @ v1.31.0` before finalizing.
       rejection, non-UUID rejection); `tokeirad`/edge/activity compile; `--features dsql` clean;
       `grpc_roundtrip` 6/7 (the 1 failure is pre-existing on clean HEAD, unrelated).
     - _Requirements: 10.2, 10.11, 10.15_
-  - [ ] 24.3 Implement the activity component's `VisibilitySnapshot` contribution
-    - Contribute `ActivityType`/`ExecutionStatus`/`TaskQueue` plus status/lifecycle/timestamps/
-      transition_count; `status_keyword` from `ActivityStatus`, `lifecycle_state` from the LifecycleState
-      mapping. Standalone activities now flow into the shared index.
+  - [x] 24.3 Implement the activity component's `VisibilitySnapshot` contribution
+    - `ActivityExecution::visibility_snapshot` contributes `ActivityType`/`TaskQueue` as the generic
+      `execution_type`/`task_queue` system fields, `lifecycle_state` from the activity status, the
+      scheduled time as `start_time`, and **no** user EAV rows (reserved fields stay system fields).
+    - **status_keyword is the collapsed API status** — `Scheduled`/`Started`/`CancelRequested` →
+      `Running`, terminals pass through (new `api_status_name`), so list/count filtering by
+      `ExecutionStatus = Running` matches a scheduled/started activity. Ground-truth:
+      `InternalStatusToAPIStatus` (`activity.go:594,932 @ v1.31.0`);
+      `reference/DECISION-visibility-status-keyword.md`. (The legacy string `search_attributes()` hook,
+      no longer read by the engine, still emits the fine-grained name; it is phasing out per 24.1.)
+    - **close_time on close**: a component persists no close timestamp, so the engine stamps the
+      transition wall-clock into the snapshot when the lifecycle closes (`post_commit`), CHASM-only.
+    - Verified: 27 activity-crate tests pass incl. the collapse table (`Scheduled`→`Running`, …) and the
+      system-fields snapshot test; runtime lib tests green with the close-time stamp.
     - _Requirements: 10.4_
 
 - [ ] 25. Stage 3 — Edge `ListActivityExecutions`/`CountActivityExecutions` + scoping + capability flag

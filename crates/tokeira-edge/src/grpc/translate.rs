@@ -2413,8 +2413,9 @@ pub fn update_namespace_request_to_edge(
 /// `DescribeNamespace`, then project them onto the update response.
 pub fn update_namespace_response_to_proto(
     namespace: NamespaceDescription,
+    standalone_activities: bool,
 ) -> workflowservice::UpdateNamespaceResponse {
-    let described = namespace_to_proto(namespace);
+    let described = namespace_to_proto(namespace, standalone_activities);
     workflowservice::UpdateNamespaceResponse {
         namespace_info: described.namespace_info,
         config: described.config,
@@ -3064,6 +3065,7 @@ pub fn system_info_to_proto(resp: SystemInfo) -> workflowservice::GetSystemInfoR
 
 pub fn namespace_to_proto(
     namespace: NamespaceDescription,
+    standalone_activities: bool,
 ) -> workflowservice::DescribeNamespaceResponse {
     workflowservice::DescribeNamespaceResponse {
         namespace_info: Some(namespace_proto::NamespaceInfo {
@@ -3091,7 +3093,10 @@ pub fn namespace_to_proto(
                 // Workflow pause/unpause is implemented across the kernel,
                 // runtime, and edge; advertise it so SDKs surface the feature.
                 workflow_pause: true,
-                standalone_activities: false,
+                // Server-uniform: reported from the effective `activity.enableStandalone`
+                // (the gRPC layer derives it from the activity bridge), not hardcoded.
+                // Ground-truth: `service/frontend/namespace_handler.go:868 @ v1.31.0`.
+                standalone_activities,
                 worker_poll_complete_on_shutdown: false,
                 poller_autoscaling: false,
             }),
@@ -3128,12 +3133,13 @@ pub fn namespace_to_proto(
 
 pub fn list_namespaces_to_proto(
     resp: EdgeListNamespacesResponse,
+    standalone_activities: bool,
 ) -> workflowservice::ListNamespacesResponse {
     workflowservice::ListNamespacesResponse {
         namespaces: resp
             .namespaces
             .into_iter()
-            .map(namespace_to_proto)
+            .map(|n| namespace_to_proto(n, standalone_activities))
             .collect(),
         next_page_token: resp
             .next_page_token
@@ -5961,7 +5967,7 @@ mod tests {
                 reported_problems_search_attribute: false,
             },
             retention: time::Duration::hours(24),
-        });
+        }, false);
 
         let config = proto.config.expect("config");
         // Retention is echoed (regression: a `None` here renders as `undefined`
@@ -6000,12 +6006,45 @@ mod tests {
                 reported_problems_search_attribute: false,
             },
             retention: time::Duration::hours(24),
-        });
+        }, false);
 
         let replication = proto.replication_config.expect("replication");
         assert_eq!(replication.active_cluster_name, "local");
         assert_eq!(replication.clusters.len(), 1);
         assert_eq!(replication.clusters[0].cluster_name, "local");
+    }
+
+    #[test]
+    fn standalone_activities_capability_reflects_flag() {
+        let describe = |standalone: bool| {
+            namespace_to_proto(
+                NamespaceDescription {
+                    name: "default".to_string(),
+                    namespace_id: Some("ns-1".to_string()),
+                    is_global: false,
+                    visibility_enabled: true,
+                    deleted: false,
+                    description: String::new(),
+                    owner_email: String::new(),
+                    cluster_name: "local".to_string(),
+                    custom_search_attribute_aliases: std::collections::BTreeMap::new(),
+                    capabilities: crate::translate::NamespaceCapabilities {
+                        worker_heartbeats: true,
+                        reported_problems_search_attribute: false,
+                    },
+                    retention: time::Duration::hours(24),
+                },
+                standalone,
+            )
+            .namespace_info
+            .unwrap()
+            .capabilities
+            .unwrap()
+            .standalone_activities
+        };
+        // The capability tracks the server-uniform flag (Req 13.4), not a constant.
+        assert!(describe(true));
+        assert!(!describe(false));
     }
 
     #[test]

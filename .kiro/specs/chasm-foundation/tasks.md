@@ -543,10 +543,14 @@ verify against `../temporal @ v1.31.0` before finalizing.
     - Verified: edge translate unit tests (`activity_status_keyword_maps_to_wire_enum`,
       `activity_summary_translates_to_list_info`); 224 edge lib tests pass; tokeirad builds clean.
     - _Requirements: 13.3, 10.14_
-  - [ ] 25.4 Report the `standalone_activities` capability from `enableStandalone`
-    - `namespace_to_proto` sets `standalone_activities` from the effective `activity.enableStandalone`
-      (server-uniform), not hardcoded `false`.
-    - **Ground-truth**: `namespace_handler.go:868 @ v1.31.0`.
+  - [x] 25.4 Report the `standalone_activities` capability from `enableStandalone`
+    - `namespace_to_proto` takes a `standalone_activities` flag (no longer hardcoded `false`); the gRPC
+      layer derives the server-uniform value from the activity bridge
+      (`WorkflowServiceGrpc::standalone_activities_enabled()` = bridge present && `enableStandalone`) and
+      passes it through the describe/list/update-namespace paths. Ground-truth:
+      `service/frontend/namespace_handler.go:868 @ v1.31.0`.
+    - Verified: `standalone_activities_capability_reflects_flag` (the capability tracks the flag, not a
+      constant); 225 edge lib tests pass; tokeirad builds clean.
     - _Requirements: 13.4_
 
 - [ ] 26. Stage 4 — Hardening: repair scanner / outbox-in-commit

@@ -123,6 +123,15 @@ impl WorkflowServiceGrpc {
         WorkflowServiceServer::new(self)
     }
 
+    /// Whether standalone activities are available on this server (the
+    /// server-uniform `standalone_activities` namespace capability, Req 13.4): the
+    /// bridge is wired and its `enableStandalone` gate is on.
+    fn standalone_activities_enabled(&self) -> bool {
+        self.chasm_activity
+            .as_ref()
+            .is_some_and(|bridge| bridge.is_enabled())
+    }
+
     async fn resolve_namespace_id(&self, namespace: &str) -> Result<NamespaceId, Status> {
         self.inner
             .resolve_namespace_id(namespace)
@@ -796,7 +805,10 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             return Err(Status::invalid_argument("namespace or id is required"));
         };
         let edge_resp = self.inner.describe_namespace(&headers, &namespace).await?;
-        Ok(Response::new(translate::namespace_to_proto(edge_resp)))
+        Ok(Response::new(translate::namespace_to_proto(
+            edge_resp,
+            self.standalone_activities_enabled(),
+        )))
     }
     async fn list_namespaces(
         &self,
@@ -806,6 +818,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         let edge_resp = self.inner.list_namespaces(&headers).await?;
         Ok(Response::new(translate::list_namespaces_to_proto(
             edge_resp,
+            self.standalone_activities_enabled(),
         )))
     }
     async fn update_namespace(
@@ -817,7 +830,10 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             .map_err(proto_conversion_status)?;
         let edge_resp = self.inner.update_namespace(&headers, edge_req).await?;
         Ok(Response::new(
-            translate::update_namespace_response_to_proto(edge_resp),
+            translate::update_namespace_response_to_proto(
+                edge_resp,
+                self.standalone_activities_enabled(),
+            ),
         ))
     }
     async fn deprecate_namespace(

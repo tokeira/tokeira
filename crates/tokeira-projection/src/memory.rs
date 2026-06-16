@@ -525,6 +525,13 @@ fn matches_filter(
     row: &ExecutionRow,
     filter: &CompiledFilter,
 ) -> Result<bool> {
+    // Forced archetype scope (Requirement 13.1): a row outside the query's
+    // archetype is never visible, regardless of the user expression.
+    if let Some(archetype) = filter.archetype {
+        if row.archetype_id != archetype {
+            return Ok(false);
+        }
+    }
     match &filter.expr {
         Some(expr) => eval_expr(inner, row, expr),
         None => Ok(true),
@@ -992,6 +999,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_and_count_are_archetype_scoped() {
+        // The shared index holds multiple archetypes (workflows + activities). A
+        // scoped query must never see another archetype's rows (Requirement 13.1).
+        let store = InMemoryVisibilityStore::default();
+        let ns = NamespaceId(Uuid::from_u128(1));
+        let activity = ArchetypeId(7);
+
+        let wf = row(1);
+        let mut act = row(2);
+        act.archetype_id = activity;
+        store.upsert_execution(&wf).await.unwrap();
+        store.upsert_execution(&act).await.unwrap();
+
+        let scoped = |arch: Option<ArchetypeId>| CompiledFilter {
+            expr: None,
+            archetype: arch,
+        };
+
+        // Workflow scope sees only the workflow row, never the activity.
+        let wf_list = store
+            .list_executions(
+                ns,
+                &scoped(Some(ArchetypeId::WORKFLOW)),
+                SortOrder::Default,
+                &page(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wf_list.rows.len(), 1);
+        assert_eq!(wf_list.rows[0].archetype_id, ArchetypeId::WORKFLOW);
+
+        // Activity scope sees only the activity row.
+        let act_list = store
+            .list_executions(ns, &scoped(Some(activity)), SortOrder::Default, &page())
+            .await
+            .unwrap();
+        assert_eq!(act_list.rows.len(), 1);
+        assert_eq!(act_list.rows[0].archetype_id, activity);
+
+        // Unscoped (`None`, the store-mechanics default) spans both.
+        let all = store
+            .list_executions(ns, &scoped(None), SortOrder::Default, &page())
+            .await
+            .unwrap();
+        assert_eq!(all.rows.len(), 2);
+
+        // Count is scoped the same way.
+        let wf_count = store
+            .count_executions(ns, &scoped(Some(ArchetypeId::WORKFLOW)), None)
+            .await
+            .unwrap();
+        assert_eq!(wf_count.total_count, 1);
+    }
+
+    #[tokio::test]
     async fn keyword_list_filter_uses_element_membership() {
         let store = InMemoryVisibilityStore::default();
         let ns = NamespaceId(Uuid::from_u128(1));
@@ -1021,6 +1083,7 @@ mod tests {
             .list_executions(
                 ns,
                 &CompiledFilter {
+                archetype: None,
                     expr: Some(FilterExpr::Compare {
                         field: field.clone(),
                         op: CompareOp::Eq,
@@ -1038,6 +1101,7 @@ mod tests {
             .list_executions(
                 ns,
                 &CompiledFilter {
+                archetype: None,
                     expr: Some(FilterExpr::Compare {
                         field,
                         op: CompareOp::Ne,
@@ -1065,6 +1129,7 @@ mod tests {
         store.upsert_execution(&paused).await.unwrap();
 
         let status_filter = |status: ExecutionStatus| CompiledFilter {
+                archetype: None,
             expr: Some(FilterExpr::Compare {
                 field: FieldRef::System(SystemField::ExecutionStatus),
                 op: CompareOp::Eq,
@@ -1154,6 +1219,7 @@ mod tests {
             .list_executions(
                 ns,
                 &CompiledFilter {
+                archetype: None,
                     expr: Some(FilterExpr::Compare {
                         field: field.clone(),
                         op: CompareOp::Eq,
@@ -1171,6 +1237,7 @@ mod tests {
             .list_executions(
                 ns,
                 &CompiledFilter {
+                archetype: None,
                     expr: Some(FilterExpr::Compare {
                         field: field.clone(),
                         op: CompareOp::Eq,
@@ -1188,6 +1255,7 @@ mod tests {
             .list_executions(
                 ns,
                 &CompiledFilter {
+                archetype: None,
                     expr: Some(FilterExpr::In {
                         field,
                         values: vec![FilterValue::String("HEL".to_owned())],

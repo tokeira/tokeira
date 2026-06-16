@@ -24,10 +24,16 @@ pub async fn compile_filter<S: VisibilityStore + ?Sized>(
     store: &S,
 ) -> Result<CompiledFilter> {
     let Some(input) = input.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Ok(CompiledFilter { expr: None });
+        return Ok(CompiledFilter {
+            expr: None,
+            archetype: None,
+        });
     };
     let expr = compile_expr(input, namespace_id, store).await?;
-    Ok(CompiledFilter { expr: Some(expr) })
+    Ok(CompiledFilter {
+        expr: Some(expr),
+        archetype: None,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]

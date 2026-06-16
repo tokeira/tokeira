@@ -621,6 +621,7 @@ mod tests {
         assert_eq!(row.memo.0["note"], Payload::new("hello"));
 
         let filter = CompiledFilter {
+                archetype: None,
             expr: Some(FilterExpr::Compare {
                 field: FieldRef::Custom {
                     name: "CustomKeyword".to_string(),
@@ -675,6 +676,7 @@ mod tests {
         sink.apply(&second, 0).await.unwrap();
 
         let filter = CompiledFilter {
+                archetype: None,
             expr: Some(FilterExpr::Compare {
                 field: FieldRef::Custom {
                     name: "CustomKeyword".to_string(),

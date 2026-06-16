@@ -42,7 +42,11 @@ where
         req: ListWorkflowExecutionsRequest,
     ) -> Result<ListWorkflowExecutionsResponse> {
         let namespace_id = parse_namespace(&req.namespace)?;
-        let filter = compile_filter(req.query.as_deref(), namespace_id, &self.store).await?;
+        let mut filter = compile_filter(req.query.as_deref(), namespace_id, &self.store).await?;
+        // Scope to the workflow archetype so the shared index never lists
+        // activities (or other archetypes) through the workflow endpoint
+        // (Requirement 13.1). Set after compiling the user query — no escape.
+        filter.archetype = Some(ArchetypeId::WORKFLOW);
         let page = PageBounds {
             limit: req.page_size.clamp(1, crate::types::MAX_PAGE_SIZE),
             after: req
@@ -66,7 +70,11 @@ where
         req: CountWorkflowExecutionsRequest,
     ) -> Result<CountWorkflowExecutionsResponse> {
         let namespace_id = parse_namespace(&req.namespace)?;
-        let filter = compile_filter(req.query.as_deref(), namespace_id, &self.store).await?;
+        let mut filter = compile_filter(req.query.as_deref(), namespace_id, &self.store).await?;
+        // Workflow-scoped count: the unfiltered grouped paths below already pin
+        // `ArchetypeId::WORKFLOW` on the rollup; pin it on the filtered path too so
+        // a query-filtered count never spans archetypes (Requirement 13.1).
+        filter.archetype = Some(ArchetypeId::WORKFLOW);
         let group_by = parse_group_by(req.group_by.as_deref(), namespace_id, &self.store).await?;
         let result = match (&filter.expr, &group_by) {
             // This service answers the workflow visibility endpoints, so the

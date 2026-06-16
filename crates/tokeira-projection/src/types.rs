@@ -409,6 +409,14 @@ pub enum FilterValue {
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct CompiledFilter {
     pub expr: Option<FilterExpr>,
+    /// Forced archetype scope for the query, or `None` to span all archetypes.
+    ///
+    /// The visibility endpoints set this *after* compiling the user query
+    /// (workflow endpoints → [`ArchetypeId::WORKFLOW`], activity endpoints → the
+    /// activity archetype) so the shared index never leaks one archetype's rows
+    /// into another's list/count, and a user query cannot escape the scope
+    /// (Requirement 13.1). `None` (the default) is for store-mechanics tests.
+    pub archetype: Option<ArchetypeId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

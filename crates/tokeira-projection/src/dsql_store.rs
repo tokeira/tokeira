@@ -189,6 +189,7 @@ impl VisibilityStore for DsqlVisibilityStore {
         let (cursor_sql, cursor_values, next_param) =
             cursor_predicate(sort, page.after.as_ref(), next_param)?;
         values.extend(cursor_values);
+        let archetype_sql = archetype_clause(filter);
         let limit = page.limit.min(crate::types::MAX_PAGE_SIZE);
         let sql = format!(
             r#"
@@ -219,6 +220,7 @@ impl VisibilityStore for DsqlVisibilityStore {
                 root_run_id
             FROM execution_visibility_current
             WHERE namespace_id = $1
+              {archetype_sql}
               {filter_sql}
               {cursor_sql}
             ORDER BY {}
@@ -1486,11 +1488,13 @@ async fn count_without_group(
     filter: &CompiledFilter,
 ) -> Result<CountResult> {
     let (filter_sql, values, _next_param) = compile_filter(filter, 2)?;
+    let archetype_sql = archetype_clause(filter);
     let sql = format!(
         r#"
         SELECT COUNT(*) AS total_count
         FROM execution_visibility_current
         WHERE namespace_id = $1
+          {archetype_sql}
           {filter_sql}
         "#
     );
@@ -1511,12 +1515,14 @@ async fn count_system_group(
     field: SystemField,
 ) -> Result<CountResult> {
     let (filter_sql, values, _next_param) = compile_filter(filter, 2)?;
+    let archetype_sql = archetype_clause(filter);
     let group_column = system_column(field);
     let sql = format!(
         r#"
         SELECT {group_column} AS group_value, COUNT(*) AS group_count
         FROM execution_visibility_current
         WHERE namespace_id = $1
+          {archetype_sql}
           {filter_sql}
         GROUP BY {group_column}
         "#
@@ -1556,6 +1562,7 @@ async fn count_custom_group(
     let column = attr_value_column(attr_type);
     let type_id = attr_type.to_db_smallint();
     let (filter_sql, mut values, next_param) = compile_filter(filter, 2)?;
+    let archetype_sql = archetype_clause(filter);
     let attr_placeholder = format!("${next_param}");
     values.push(SqlValue::Int(i64_from_u64(
         attr_id.0,
@@ -1568,6 +1575,7 @@ async fn count_custom_group(
             SELECT *
             FROM execution_visibility_current
             WHERE namespace_id = $1
+              {archetype_sql}
               {filter_sql}
         ) ve
         LEFT JOIN {table} idx ON idx.run_key = ve.run_key
@@ -1843,6 +1851,17 @@ fn resolve_final_vis_state(
     }
 }
 
+/// SQL fragment that forces the query's archetype scope, or empty for an
+/// all-archetype query. The id is inlined because it is trusted (an `ArchetypeId`
+/// from our own code, never user input) — consistent with the other inlined
+/// system-column predicates in this module.
+fn archetype_clause(filter: &CompiledFilter) -> String {
+    filter
+        .archetype
+        .map(|a| format!("AND archetype_id = {}", i64::from(a.0)))
+        .unwrap_or_default()
+}
+
 fn i32_from_u32(value: u32, field: &str) -> Result<i32> {
     i32::try_from(value).map_err(|_| anyhow::anyhow!("{field} {value} exceeds i32 range"))
 }
@@ -1944,6 +1963,7 @@ mod tests {
     fn keyword_list_ne_uses_anti_join() {
         let attr_id = AttrId(7);
         let filter = CompiledFilter {
+                archetype: None,
             expr: Some(FilterExpr::Compare {
                 field: FieldRef::Custom {
                     name: "tags".to_owned(),
@@ -1975,6 +1995,7 @@ mod tests {
             attr_type: SearchAttrType::Text,
         };
         let single = CompiledFilter {
+                archetype: None,
             expr: Some(FilterExpr::Compare {
                 field: field.clone(),
                 op: CompareOp::Eq,
@@ -1982,6 +2003,7 @@ mod tests {
             }),
         };
         let multi = CompiledFilter {
+                archetype: None,
             expr: Some(FilterExpr::Compare {
                 field,
                 op: CompareOp::Eq,
@@ -2004,6 +2026,7 @@ mod tests {
     #[test]
     fn text_in_ignores_invalid_candidates() {
         let filter = CompiledFilter {
+                archetype: None,
             expr: Some(FilterExpr::In {
                 field: FieldRef::Custom {
                     name: "text".to_owned(),

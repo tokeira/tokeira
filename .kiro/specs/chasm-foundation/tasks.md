@@ -511,7 +511,7 @@ verify against `../temporal @ v1.31.0` before finalizing.
       system-fields snapshot test; runtime lib tests green with the close-time stamp.
     - _Requirements: 10.4_
 
-- [ ] 25. Stage 3 — Edge `ListActivityExecutions`/`CountActivityExecutions` + scoping + capability flag
+- [x] 25. Stage 3 — Edge `ListActivityExecutions`/`CountActivityExecutions` + scoping + capability flag
   - [x] 25.1 Implement archetype-scoped activity List/Count at the edge
     - **Scoping (no caller escape).** `CompiledFilter` carries a forced `archetype` the visibility
       endpoints set after compiling the user query; the workflow endpoints pin `ArchetypeId::WORKFLOW`
@@ -526,9 +526,22 @@ verify against `../temporal @ v1.31.0` before finalizing.
       `WorkflowService` to the visibility plane; they stay `UNIMPLEMENTED` when standalone activities
       are disabled (no bridge). New `Action::List/CountActivityExecutions` for the interceptor.
     - _Requirements: 13.1_
-  - [ ] 25.2 Implement `TemporalNamespaceDivision` as a virtual system SA compiling to `archetype_id`
-    - Accept it in visibility query syntax and compile it to `archetype_id`; never store or resolve it
-      as a generic string search attribute.
+  - [x] 25.2 Implement `TemporalNamespaceDivision` as a virtual system SA compiling to `archetype_id`
+    - A visibility query referencing `TemporalNamespaceDivision` (or the reserved `archetype`) now
+      resolves to the new `SystemField::Archetype` (the `archetype_id` column) instead of erroring as an
+      unknown SA or being looked up in `sa_registry` (Req 13.2). The filter compiler maps the division
+      *value* to the archetype id: empty/`default`/`workflow` → `ArchetypeId::WORKFLOW` (the universal
+      id 0), numeric → that id, any other name → a sentinel that matches no row.
+    - **Thin field-resolution shim only** (`reference/DECISION-temporal-namespace-division.md`): tokeira
+      does **not** model Temporal's NULL-default division hiding / mention-to-reveal — that legacy
+      retrofit is replaced by endpoint-forced archetype scope (25.1, Req 13.1), which stays authoritative;
+      the division predicate AND-s *under* it, so a contradiction yields empty, never a scope escape. The
+      compiler stays archetype-neutral (field name → column, plus only the universal `WORKFLOW` default —
+      consistent with how it already resolves `WorkflowType`/`ExecutionStatus`); naming non-default
+      archetypes is a documented non-requirement.
+    - Verified: `temporal_namespace_division_resolves_to_archetype` (the SA resolves to `archetype_id`;
+      default/`workflow`/empty → workflow rows; an unknown division → empty); default + `--features dsql`
+      compile clean.
     - _Requirements: 13.2_
   - [x] 25.3 Translate projected rows to `ActivityExecutionListInfo`
     - `activity_execution_list_info_from_summary` builds the wire shape: `activity_id`/`activity_type`

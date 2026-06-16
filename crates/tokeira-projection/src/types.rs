@@ -369,6 +369,10 @@ pub enum FieldRef {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SystemField {
+    /// The execution archetype (the `archetype_id` column). The visibility query
+    /// surfaces it via the `TemporalNamespaceDivision`/`archetype` virtual SA
+    /// (Req 13.2); it is compared as the integer archetype id.
+    Archetype,
     WorkflowId,
     RunId,
     WorkflowType,

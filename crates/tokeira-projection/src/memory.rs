@@ -716,6 +716,9 @@ fn field_value(
     field: &FieldRef,
 ) -> Option<FilterValue> {
     match field {
+        FieldRef::System(SystemField::Archetype) => {
+            Some(FilterValue::Int(i64::from(row.archetype_id.0)))
+        }
         FieldRef::System(SystemField::WorkflowId) => {
             Some(FilterValue::String(row.workflow_id.0.clone()))
         }
@@ -820,6 +823,7 @@ fn group_value(
     field: &GroupByField,
 ) -> Option<String> {
     match field {
+        GroupByField::System(SystemField::Archetype) => Some(row.archetype_id.0.to_string()),
         GroupByField::System(SystemField::ExecutionStatus) => Some(row.status_keyword.clone()),
         GroupByField::System(SystemField::WorkflowType) => Some(row.workflow_type.0.clone()),
         GroupByField::System(SystemField::TaskQueue) => Some(row.task_queue.0.clone()),
@@ -1051,6 +1055,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(wf_count.total_count, 1);
+    }
+
+    #[tokio::test]
+    async fn temporal_namespace_division_resolves_to_archetype() {
+        use crate::filter::compile_filter;
+        let store = InMemoryVisibilityStore::default();
+        let ns = NamespaceId(Uuid::from_u128(1));
+        let wf = row(1); // archetype WORKFLOW (0)
+        let mut act = row(2);
+        act.archetype_id = ArchetypeId(7);
+        store.upsert_execution(&wf).await.unwrap();
+        store.upsert_execution(&act).await.unwrap();
+
+        // TemporalNamespaceDivision and the reserved `archetype` resolve to the
+        // archetype_id column instead of erroring as an unknown SA (Req 13.2); the
+        // empty/default/workflow division selects the workflow archetype.
+        for query in [
+            "TemporalNamespaceDivision = 'workflow'",
+            "archetype = 'workflow'",
+            "TemporalNamespaceDivision = ''",
+        ] {
+            let filter = compile_filter(Some(query), ns, &store).await.unwrap();
+            let result = store
+                .list_executions(ns, &filter, SortOrder::Default, &page())
+                .await
+                .unwrap();
+            assert_eq!(result.rows.len(), 1, "{query}");
+            assert_eq!(result.rows[0].archetype_id, ArchetypeId::WORKFLOW);
+        }
+
+        // A division name with no tokeira archetype maps to a sentinel → matches
+        // nothing (a contradicting predicate yields empty, never a scope escape).
+        let filter = compile_filter(Some("TemporalNamespaceDivision = 'scheduler'"), ns, &store)
+            .await
+            .unwrap();
+        let result = store
+            .list_executions(ns, &filter, SortOrder::Default, &page())
+            .await
+            .unwrap();
+        assert!(result.rows.is_empty());
     }
 
     #[tokio::test]

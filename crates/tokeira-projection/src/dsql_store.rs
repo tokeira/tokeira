@@ -1363,6 +1363,7 @@ fn system_column(field: SystemField) -> &'static str {
     // `status_keyword`/`transition_count`) where the workflow-only table used
     // workflow-shaped ones; the workflow query surface keeps the same field names.
     match field {
+        SystemField::Archetype => "archetype_id",
         SystemField::WorkflowId => "business_id",
         SystemField::RunId => "run_id::TEXT",
         SystemField::WorkflowType => "execution_type",

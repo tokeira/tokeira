@@ -254,6 +254,12 @@ where
     ] {
         if let Some((field, value)) = input.split_once(needle) {
             let field = resolve_field(field.trim(), namespace_id, store).await?;
+            // `TemporalNamespaceDivision`/`archetype` compiles to the archetype id;
+            // the value is the division name, not a typed SA value.
+            if matches!(field, FieldRef::System(SystemField::Archetype)) {
+                let value = FilterValue::Int(archetype_division_to_id(value.trim()));
+                return Ok(FilterExpr::Compare { field, op, value });
+            }
             let value = parse_value(value.trim());
             ensure_value_type(&field, &value)?;
             return Ok(FilterExpr::Compare { field, op, value });
@@ -262,6 +268,25 @@ where
     Err(anyhow!("unsupported filter expression: {input}"))
 }
 
+/// Map a `TemporalNamespaceDivision`/`archetype` query value to the archetype id it
+/// compiles to (reference/DECISION-temporal-namespace-division.md). The empty/default
+/// division and the canonical `workflow` name map to the workflow archetype (the
+/// universal id 0); a numeric value is taken as the id; any other name has no tokeira
+/// archetype and maps to a sentinel that matches no row, so a contradicting predicate
+/// yields empty under the endpoint-forced scope — never a scope escape. Naming
+/// non-default archetypes (e.g. activity) is the edge's job and a non-requirement here.
+fn archetype_division_to_id(value: &str) -> i64 {
+    let v = value.trim().trim_matches('"').trim_matches('\'').trim();
+    match v.to_ascii_lowercase().as_str() {
+        "" | "default" | "workflow" => i64::from(tokeira_types::ArchetypeId::WORKFLOW.0),
+        other => other.parse::<i64>().unwrap_or(NO_ARCHETYPE_MATCH),
+    }
+}
+
+/// Sentinel archetype id used when a division name has no tokeira archetype; no real
+/// `archetype_id` is negative, so the predicate matches nothing.
+const NO_ARCHETYPE_MATCH: i64 = -1;
+
 async fn resolve_field<S: VisibilityStore + ?Sized>(
     field: &str,
     namespace_id: NamespaceId,
@@ -269,6 +294,12 @@ async fn resolve_field<S: VisibilityStore + ?Sized>(
 ) -> Result<FieldRef> {
     let trimmed = field.trim();
     let system = match trimmed {
+        // `TemporalNamespaceDivision` is Temporal's division SA; tokeira resolves it
+        // (and the reserved `archetype` name) to the first-class `archetype_id`
+        // column rather than a generic string SA (Req 13.2;
+        // reference/DECISION-temporal-namespace-division.md). Resolving it here is
+        // archetype-neutral — a field name → a column, no archetype-value knowledge.
+        "TemporalNamespaceDivision" | "archetype" => Some(SystemField::Archetype),
         "WorkflowId" => Some(SystemField::WorkflowId),
         "RunId" => Some(SystemField::RunId),
         "WorkflowType" => Some(SystemField::WorkflowType),
@@ -383,7 +414,10 @@ fn ensure_value_type(field: &FieldRef, value: &FilterValue) -> Result<()> {
         FieldRef::System(SystemField::HistoryLength)
         | FieldRef::System(SystemField::ExecutionDuration)
         | FieldRef::System(SystemField::StateTransitionCount)
-        | FieldRef::System(SystemField::HistorySizeBytes) => {
+        | FieldRef::System(SystemField::HistorySizeBytes)
+        // Archetype compiles to the integer archetype id (the division value is
+        // mapped to it in `compile_expr`).
+        | FieldRef::System(SystemField::Archetype) => {
             matches!(value, FilterValue::Int(_))
         }
         FieldRef::Custom { attr_type, .. } => match attr_type {

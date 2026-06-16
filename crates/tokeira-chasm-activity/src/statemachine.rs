@@ -232,6 +232,13 @@ pub fn apply(
     }
 
     state.set_status(to);
+    // Record the close time on the first terminal transition (`now` is the
+    // transition's logical clock). This persists it on the node so the visibility
+    // snapshot's close time is recomputable from state alone — the repair scanner's
+    // precondition (Req 10.11).
+    if to.is_terminal() && state.close_time_nanos == 0 {
+        state.close_time_nanos = now;
+    }
     Ok(())
 }
 
@@ -511,5 +518,34 @@ mod tests {
         .expect("completed");
         assert_eq!(state.status(), ActivityStatus::Completed);
         assert_eq!(state.result, vec![9, 9]);
+    }
+
+    #[test]
+    fn terminal_transition_records_close_time() {
+        // The close time is persisted on the terminal transition so the visibility
+        // snapshot is recomputable from node state (the repair scanner precondition,
+        // Req 10.11).
+        let mut state = scheduled_state();
+        let mut ctx = TestCtx::new(5_000);
+        apply(
+            &mut state,
+            ActivityEvent::Started {
+                started_time_nanos: 1,
+            },
+            &mut ctx,
+        )
+        .expect("started");
+        assert_eq!(state.close_time_nanos, 0, "an open activity has no close time");
+
+        apply(
+            &mut state,
+            ActivityEvent::Completed { result: vec![] },
+            &mut ctx,
+        )
+        .expect("completed");
+        assert_eq!(
+            state.close_time_nanos, 5_000,
+            "close time = the terminal transition's clock"
+        );
     }
 }

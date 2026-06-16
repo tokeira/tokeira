@@ -132,6 +132,12 @@ pub struct ActivityState {
     /// Last started time in Unix nanoseconds (`0` = not started).
     #[prost(int64, tag = "16")]
     pub started_time_nanos: i64,
+    /// Close time in Unix nanoseconds (`0` = not closed). Recorded when the activity
+    /// transitions to a terminal status so the visibility snapshot's close time is
+    /// recomputable from persisted node state alone — the Stage-4 repair scanner
+    /// depends on every snapshot input being node-resident (Req 10.11).
+    #[prost(int64, tag = "17")]
+    pub close_time_nanos: i64,
 }
 
 // `status()` and `set_status()` accessors for the `status` enumeration field are

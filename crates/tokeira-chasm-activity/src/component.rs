@@ -140,11 +140,12 @@ impl VisibilityContributor for ActivityExecution {
             lifecycle_state: lifecycle_for(status),
             execution_type: (!state.activity_type.is_empty()).then(|| state.activity_type.clone()),
             task_queue: (!state.task_queue.is_empty()).then(|| state.task_queue.clone()),
-            // The activity persists no close timestamp; the runtime stamps the
-            // transition's wall-clock when the lifecycle closes (engine post-commit).
             start_time_unix_nanos: (state.scheduled_time_nanos != 0)
                 .then_some(state.scheduled_time_nanos),
-            close_time_unix_nanos: None,
+            // Sourced from persisted state (recorded on the terminal transition) so
+            // the snapshot is fully recomputable from node state — the repair
+            // scanner's precondition (Req 10.11).
+            close_time_unix_nanos: (state.close_time_nanos != 0).then_some(state.close_time_nanos),
             search_attributes: Default::default(),
             memo: Default::default(),
         })

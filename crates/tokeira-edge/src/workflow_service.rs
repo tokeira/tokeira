@@ -50,8 +50,9 @@ use tokeira_storage::{
     ConflictToken, DeploymentKey, DeploymentName, DeploymentTaskQueueType, RunRepository,
 };
 use tokeira_types::{
-    ActivityTaskToken, ExecutionRef, ExecutionStatus, HeartbeatStore, Payload, Payloads, QueueKey,
-    RequestContext, RequestId, RunId, RunKey, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId,
+    ActivityTaskToken, ArchetypeId, ExecutionRef, ExecutionStatus, HeartbeatStore, Payload,
+    Payloads, QueueKey, RequestContext, RequestId, RunId, RunKey, TaskKind, TaskQueueName,
+    WorkerIdentity, WorkflowId,
 };
 use uuid::Uuid;
 
@@ -69,8 +70,10 @@ use crate::{
     poller_registry::{ActivePoller, PollerRegistry},
     routing::{EdgeRouter, ensure_local},
     translate::{
+        CountActivityExecutionsRequest, CountActivityExecutionsResponse,
         CountWorkflowExecutionsRequest, CountWorkflowExecutionsResponse,
         DeleteWorkflowExecutionRequest, DescribeTaskQueueRequest, DescribeTaskQueueResponse,
+        ListActivityExecutionsRequest, ListActivityExecutionsResponse,
         DescribeWorkflowExecutionRequest, ListNamespacesResponse as EdgeListNamespacesResponse,
         ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, NamespaceCapabilities,
         NamespaceDescription, NamespaceStateUpdate, PauseWorkflowExecutionRequest,
@@ -2894,6 +2897,74 @@ impl WorkflowService {
 
                 self.visibility
                     .count_workflows(req)
+                    .await
+                    .map_err(EdgeError::from)
+            },
+        )
+        .await
+    }
+
+    /// List standalone-activity executions, scoped to the `archetype_id` the gRPC
+    /// layer resolved from the activity bridge (the visibility plane is
+    /// archetype-neutral; Requirement 13.1).
+    pub async fn list_activity_executions(
+        &self,
+        headers: &HeaderMap,
+        archetype_id: ArchetypeId,
+        req: ListActivityExecutionsRequest,
+    ) -> EdgeResult<ListActivityExecutionsResponse> {
+        let namespace_label = req.namespace.clone();
+        self.observe_edge_call(
+            headers,
+            "list_activity_executions",
+            Some(namespace_label.as_str()),
+            None,
+            async move {
+                let _ctx = self
+                    .interceptors
+                    .begin(
+                        headers,
+                        Some(&req.namespace),
+                        Action::ListActivityExecutions,
+                        false,
+                    )
+                    .await?;
+
+                self.visibility
+                    .list_activities(archetype_id, req)
+                    .await
+                    .map_err(EdgeError::from)
+            },
+        )
+        .await
+    }
+
+    /// Count standalone-activity executions, scoped to the activity archetype.
+    pub async fn count_activity_executions(
+        &self,
+        headers: &HeaderMap,
+        archetype_id: ArchetypeId,
+        req: CountActivityExecutionsRequest,
+    ) -> EdgeResult<CountActivityExecutionsResponse> {
+        let namespace_label = req.namespace.clone();
+        self.observe_edge_call(
+            headers,
+            "count_activity_executions",
+            Some(namespace_label.as_str()),
+            None,
+            async move {
+                let _ctx = self
+                    .interceptors
+                    .begin(
+                        headers,
+                        Some(&req.namespace),
+                        Action::CountActivityExecutions,
+                        false,
+                    )
+                    .await?;
+
+                self.visibility
+                    .count_activities(archetype_id, req)
                     .await
                     .map_err(EdgeError::from)
             },

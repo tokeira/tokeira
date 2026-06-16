@@ -48,6 +48,7 @@ use tokeira_chasm_activity::{
 use tokeira_runtime::chasm::{
     ChasmEngine, DispatchSink, Engine, PollOutcome, PollRequest, TypedEngine,
 };
+use tokeira_types::ArchetypeId;
 
 use crate::errors::{EdgeError, EdgeResult};
 
@@ -286,6 +287,13 @@ impl ActivityBridge {
     /// Whether standalone activities are enabled.
     pub fn is_enabled(&self) -> bool {
         self.config.enable_standalone
+    }
+
+    /// The registry-assigned archetype id for the activity component. The
+    /// visibility plane is archetype-neutral, so the edge supplies this to scope
+    /// `ListActivityExecutions`/`CountActivityExecutions` to activities (Req 13.1).
+    pub fn archetype_id(&self) -> ArchetypeId {
+        ArchetypeId(self.archetype_id)
     }
 
     /// Whether `task_token` is one this bridge issued (a standalone-activity

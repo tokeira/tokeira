@@ -2182,18 +2182,47 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         let description = bridge.poll_outcome(key).await?;
         Ok(Response::new(chasm_poll_response(req.run_id, description)))
     }
-    deferred_unary!(
-        list_activity_executions,
-        ListActivityExecutionsRequest,
-        ListActivityExecutionsResponse,
-        "activity-executions-first-class"
-    );
-    deferred_unary!(
-        count_activity_executions,
-        CountActivityExecutionsRequest,
-        CountActivityExecutionsResponse,
-        "activity-executions-first-class"
-    );
+    async fn list_activity_executions(
+        &self,
+        request: Request<workflowservice::ListActivityExecutionsRequest>,
+    ) -> Result<Response<workflowservice::ListActivityExecutionsResponse>, Status> {
+        let Some(bridge) = &self.chasm_activity else {
+            return Err(Status::unimplemented(
+                "list_activity_executions is not implemented; tracked in spec activity-executions-first-class",
+            ));
+        };
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::list_activity_request_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let edge_resp = self
+            .inner
+            .list_activity_executions(&headers, bridge.archetype_id(), edge_req)
+            .await?;
+        Ok(Response::new(translate::list_activity_response_to_proto(
+            edge_resp,
+        )))
+    }
+
+    async fn count_activity_executions(
+        &self,
+        request: Request<workflowservice::CountActivityExecutionsRequest>,
+    ) -> Result<Response<workflowservice::CountActivityExecutionsResponse>, Status> {
+        let Some(bridge) = &self.chasm_activity else {
+            return Err(Status::unimplemented(
+                "count_activity_executions is not implemented; tracked in spec activity-executions-first-class",
+            ));
+        };
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::count_activity_request_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let edge_resp = self
+            .inner
+            .count_activity_executions(&headers, bridge.archetype_id(), edge_req)
+            .await?;
+        Ok(Response::new(translate::count_activity_response_to_proto(
+            edge_resp,
+        )))
+    }
     async fn request_cancel_activity_execution(
         &self,
         request: Request<workflowservice::RequestCancelActivityExecutionRequest>,

@@ -74,8 +74,9 @@ use tokeira_types::{
 use uuid::Uuid;
 
 use crate::translate::{
-    CompletionCallback as EdgeCompletionCallback, CountWorkflowExecutionsRequest,
-    CountWorkflowExecutionsResponse,
+    ActivityExecutionSummary, CompletionCallback as EdgeCompletionCallback,
+    CountActivityExecutionsRequest, CountActivityExecutionsResponse, CountWorkflowExecutionsRequest,
+    CountWorkflowExecutionsResponse, ListActivityExecutionsRequest, ListActivityExecutionsResponse,
     DeleteWorkflowExecutionRequest as EdgeDeleteWorkflowExecutionRequest,
     DescribeTaskQueueRequest as EdgeDescribeTaskQueueRequest,
     DescribeTaskQueueResponse as EdgeDescribeTaskQueueResponse, DescribeWorkflowExecutionRequest,
@@ -2326,6 +2327,31 @@ pub fn count_request_to_edge(
     })
 }
 
+pub fn list_activity_request_to_edge(
+    req: workflowservice::ListActivityExecutionsRequest,
+) -> Result<ListActivityExecutionsRequest, ProtoConversionError> {
+    Ok(ListActivityExecutionsRequest {
+        namespace: req.namespace,
+        query: non_empty(req.query),
+        page_size: req.page_size.max(0) as usize,
+        next_page_token: if req.next_page_token.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8_lossy(&req.next_page_token).into_owned())
+        },
+    })
+}
+
+pub fn count_activity_request_to_edge(
+    req: workflowservice::CountActivityExecutionsRequest,
+) -> Result<CountActivityExecutionsRequest, ProtoConversionError> {
+    Ok(CountActivityExecutionsRequest {
+        namespace: req.namespace,
+        query: non_empty(req.query),
+        group_by: None,
+    })
+}
+
 pub fn register_namespace_request_to_edge(
     req: workflowservice::RegisterNamespaceRequest,
 ) -> Result<EdgeRegisterNamespaceRequest, ProtoConversionError> {
@@ -2906,6 +2932,87 @@ pub fn count_response_to_proto(
                 count: group.count,
             })
             .collect(),
+    }
+}
+
+pub fn list_activity_response_to_proto(
+    resp: ListActivityExecutionsResponse,
+) -> workflowservice::ListActivityExecutionsResponse {
+    workflowservice::ListActivityExecutionsResponse {
+        executions: resp
+            .executions
+            .into_iter()
+            .map(activity_execution_list_info_from_summary)
+            .collect(),
+        next_page_token: resp
+            .next_page_token
+            .map(|token| token.into_bytes())
+            .unwrap_or_default(),
+    }
+}
+
+pub fn count_activity_response_to_proto(
+    resp: CountActivityExecutionsResponse,
+) -> workflowservice::CountActivityExecutionsResponse {
+    use workflowservice::count_activity_executions_response::AggregationGroup;
+    workflowservice::CountActivityExecutionsResponse {
+        count: resp.total_count,
+        groups: resp
+            .groups
+            .into_iter()
+            .map(|group| AggregationGroup {
+                group_values: vec![tokeira_proto::common::Payload {
+                    data: group.value.into_bytes(),
+                    ..Default::default()
+                }],
+                count: group.count,
+            })
+            .collect(),
+    }
+}
+
+/// Maps the collapsed API `status_keyword` the index stores (23.7/24.3) to the
+/// `ActivityExecutionStatus` wire enum. `Running` covers the non-terminal run states
+/// (SCHEDULED/STARTED/CANCEL_REQUESTED) — the enum's own RUNNING semantics
+/// (`enums/v1/activity.proto:ACTIVITY_EXECUTION_STATUS_RUNNING @ v1.31.0`); terminals
+/// map 1:1.
+fn activity_status_to_proto(status_keyword: &str) -> i32 {
+    use enums::ActivityExecutionStatus as Proto;
+    let proto = match status_keyword {
+        "Running" => Proto::Running,
+        "Completed" => Proto::Completed,
+        "Failed" => Proto::Failed,
+        "Canceled" => Proto::Canceled,
+        "Terminated" => Proto::Terminated,
+        "TimedOut" => Proto::TimedOut,
+        _ => Proto::Unspecified,
+    };
+    proto as i32
+}
+
+fn activity_execution_list_info_from_summary(
+    value: ActivityExecutionSummary,
+) -> activity_proto::ActivityExecutionListInfo {
+    // `execution_duration` is "close - schedule", populated only when closed (proto
+    // field doc); derive it here since the activity persists no duration of its own.
+    let execution_duration = match (value.schedule_time, value.close_time) {
+        (Some(schedule), Some(close)) => Some(to_proto_duration(close - schedule)),
+        _ => None,
+    };
+    activity_proto::ActivityExecutionListInfo {
+        activity_id: value.activity_id,
+        run_id: value.run_id.0.to_string(),
+        activity_type: Some(proto_common::ActivityType {
+            name: value.activity_type,
+        }),
+        schedule_time: value.schedule_time.map(to_proto_timestamp),
+        close_time: value.close_time.map(to_proto_timestamp),
+        status: activity_status_to_proto(&value.status_keyword),
+        search_attributes: Some(search_attributes_from_domain(&value.search_attributes)),
+        task_queue: value.task_queue,
+        state_transition_count: value.state_transition_count,
+        state_size_bytes: value.state_size_bytes,
+        execution_duration,
     }
 }
 
@@ -4988,6 +5095,49 @@ mod tests {
     use tokeira_kernel::state::WorkflowVersioningInfo;
     use tokeira_proto::public::temporal::api::{filter::v1 as filter, taskqueue::v1 as taskqueue};
     use tokeira_runtime::{RedirectRule, VersioningRules};
+
+    #[test]
+    fn activity_status_keyword_maps_to_wire_enum() {
+        use enums::ActivityExecutionStatus as P;
+        // Collapsed non-terminal -> RUNNING; terminals 1:1; unknown -> UNSPECIFIED.
+        assert_eq!(activity_status_to_proto("Running"), P::Running as i32);
+        assert_eq!(activity_status_to_proto("Completed"), P::Completed as i32);
+        assert_eq!(activity_status_to_proto("Failed"), P::Failed as i32);
+        assert_eq!(activity_status_to_proto("Canceled"), P::Canceled as i32);
+        assert_eq!(activity_status_to_proto("Terminated"), P::Terminated as i32);
+        assert_eq!(activity_status_to_proto("TimedOut"), P::TimedOut as i32);
+        assert_eq!(activity_status_to_proto("nonsense"), P::Unspecified as i32);
+    }
+
+    #[test]
+    fn activity_summary_translates_to_list_info() {
+        let schedule = time::OffsetDateTime::from_unix_timestamp(100).unwrap();
+        let close = time::OffsetDateTime::from_unix_timestamp(160).unwrap();
+        let summary = ActivityExecutionSummary {
+            namespace: "ns".to_string(),
+            activity_id: "act-1".to_string(),
+            run_id: RunId(Uuid::from_u128(9)),
+            activity_type: "MyActivity".to_string(),
+            task_queue: "tq".to_string(),
+            status_keyword: "Completed".to_string(),
+            schedule_time: Some(schedule),
+            close_time: Some(close),
+            state_transition_count: 7,
+            state_size_bytes: 0,
+            execution_duration: None,
+            search_attributes: Default::default(),
+        };
+        let info = activity_execution_list_info_from_summary(summary);
+        assert_eq!(info.activity_id, "act-1");
+        assert_eq!(info.run_id, Uuid::from_u128(9).to_string());
+        assert_eq!(info.activity_type.unwrap().name, "MyActivity");
+        assert_eq!(info.task_queue, "tq");
+        assert_eq!(info.state_transition_count, 7); // generic transition_count (Req 10.14)
+        assert_eq!(info.status, enums::ActivityExecutionStatus::Completed as i32);
+        // execution_duration is derived as close - schedule (60s), only when closed.
+        assert_eq!(info.execution_duration.unwrap().seconds, 60);
+        assert!(info.schedule_time.is_some() && info.close_time.is_some());
+    }
 
     #[test]
     fn validate_client_cron_schedule_matches_v131_messages() {

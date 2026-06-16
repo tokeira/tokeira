@@ -512,18 +512,36 @@ verify against `../temporal @ v1.31.0` before finalizing.
     - _Requirements: 10.4_
 
 - [ ] 25. Stage 3 — Edge `ListActivityExecutions`/`CountActivityExecutions` + scoping + capability flag
-  - [ ] 25.1 Implement archetype-scoped activity List/Count at the edge
-    - Route `ListActivityExecutions`/`CountActivityExecutions` to the visibility plane forcing
-      `archetype = activity`; force `archetype = workflow` on the workflow endpoints; no caller escape.
-      Read `crates/tokeira-edge/AGENTS.md` first.
+  - [x] 25.1 Implement archetype-scoped activity List/Count at the edge
+    - **Scoping (no caller escape).** `CompiledFilter` carries a forced `archetype` the visibility
+      endpoints set after compiling the user query; the workflow endpoints pin `ArchetypeId::WORKFLOW`
+      (fixing the Stage-2 leak where workflow List/Count returned activity rows) and the activity
+      endpoints pin the activity archetype. Both stores apply it (in-memory `matches_filter` gate; DSQL
+      inlined `archetype_id` clause). Commit `0330d2b1`.
+    - **Activity endpoints.** `VisibilityApi.list_activities`/`count_activities` (projection-side,
+      commit `49644670`) take the archetype id explicitly because the projection plane is
+      archetype-neutral. The gRPC `list_activity_executions`/`count_activity_executions` handlers
+      (previously `UNIMPLEMENTED`) resolve the activity archetype id from the activity bridge
+      (`ActivityBridge::archetype_id()`, the stable `archetype_id_for_fqn`) and route through the edge
+      `WorkflowService` to the visibility plane; they stay `UNIMPLEMENTED` when standalone activities
+      are disabled (no bridge). New `Action::List/CountActivityExecutions` for the interceptor.
     - _Requirements: 13.1_
   - [ ] 25.2 Implement `TemporalNamespaceDivision` as a virtual system SA compiling to `archetype_id`
     - Accept it in visibility query syntax and compile it to `archetype_id`; never store or resolve it
       as a generic string search attribute.
     - _Requirements: 13.2_
-  - [ ] 25.3 Translate projected rows to `ActivityExecutionListInfo`
-    - Map generic `transition_count` → `state_transition_count`; build the targeted-release wire shape.
-    - **Ground-truth**: `ActivityExecutionListInfo` shape and field semantics @ v1.31.0.
+  - [x] 25.3 Translate projected rows to `ActivityExecutionListInfo`
+    - `activity_execution_list_info_from_summary` builds the wire shape: `activity_id`/`activity_type`
+      from the generic business id / execution type, `state_transition_count` from the generic
+      `transition_count` (Req 10.14), `execution_duration` derived as `close - schedule` (populated only
+      when closed, per the proto), timestamps, search attributes.
+    - **status mapping (ground-truthed).** `activity_status_to_proto` maps the stored collapsed
+      `status_keyword` → `ActivityExecutionStatus`: `Running` (covering SCHEDULED/STARTED/
+      CANCEL_REQUESTED) → `RUNNING`, terminals 1:1. This is the enum's own RUNNING semantics
+      (`enums/v1/activity.proto:ACTIVITY_EXECUTION_STATUS_RUNNING @ v1.31.0`), confirming the 24.3
+      collapse — so the mapping is a clean 1:1 from the index value.
+    - Verified: edge translate unit tests (`activity_status_keyword_maps_to_wire_enum`,
+      `activity_summary_translates_to_list_info`); 224 edge lib tests pass; tokeirad builds clean.
     - _Requirements: 13.3, 10.14_
   - [ ] 25.4 Report the `standalone_activities` capability from `enableStandalone`
     - `namespace_to_proto` sets `standalone_activities` from the effective `activity.enableStandalone`

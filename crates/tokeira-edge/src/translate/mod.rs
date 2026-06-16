@@ -397,8 +397,10 @@ pub struct PendingNexusOperationDescription {
 
 // Visibility types re-exported from tokeira-projection (the authoritative owner).
 pub use tokeira_projection::{
+    ActivityExecutionSummary, CountActivityExecutionsRequest, CountActivityExecutionsResponse,
     CountWorkflowExecutionsRequest, CountWorkflowExecutionsResponse, GroupCount,
-    ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, WorkflowExecutionSummary,
+    ListActivityExecutionsRequest, ListActivityExecutionsResponse, ListWorkflowExecutionsRequest,
+    ListWorkflowExecutionsResponse, WorkflowExecutionSummary,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]

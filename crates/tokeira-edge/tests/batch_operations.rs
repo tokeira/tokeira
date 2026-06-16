@@ -330,6 +330,28 @@ impl VisibilityApi for ScriptedVisibility {
         })
     }
 
+    async fn list_activities(
+        &self,
+        _archetype_id: tokeira_types::ArchetypeId,
+        _req: tokeira_edge::ListActivityExecutionsRequest,
+    ) -> Result<tokeira_edge::ListActivityExecutionsResponse> {
+        Ok(tokeira_edge::ListActivityExecutionsResponse {
+            executions: Vec::new(),
+            next_page_token: None,
+        })
+    }
+
+    async fn count_activities(
+        &self,
+        _archetype_id: tokeira_types::ArchetypeId,
+        _req: tokeira_edge::CountActivityExecutionsRequest,
+    ) -> Result<tokeira_edge::CountActivityExecutionsResponse> {
+        Ok(tokeira_edge::CountActivityExecutionsResponse {
+            total_count: 0,
+            groups: Vec::new(),
+        })
+    }
+
     async fn delete_execution(&self, run_key: RunKey) -> Result<()> {
         self.deleted.lock().await.push(run_key);
         Ok(())

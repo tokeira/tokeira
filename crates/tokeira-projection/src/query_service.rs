@@ -7,9 +7,10 @@
 //! implementations stay purely mechanical.
 
 use crate::visibility_api::{
+    ActivityExecutionSummary, CountActivityExecutionsRequest, CountActivityExecutionsResponse,
     CountWorkflowExecutionsRequest, CountWorkflowExecutionsResponse, GroupCount,
-    ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, VisibilityApi,
-    WorkflowExecutionSummary,
+    ListActivityExecutionsRequest, ListActivityExecutionsResponse, ListWorkflowExecutionsRequest,
+    ListWorkflowExecutionsResponse, VisibilityApi, WorkflowExecutionSummary,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -125,6 +126,80 @@ where
         })
     }
 
+    async fn list_activities(
+        &self,
+        archetype_id: ArchetypeId,
+        req: ListActivityExecutionsRequest,
+    ) -> Result<ListActivityExecutionsResponse> {
+        let namespace_id = parse_namespace(&req.namespace)?;
+        let mut filter = compile_filter(req.query.as_deref(), namespace_id, &self.store).await?;
+        // Force the activity archetype the edge resolved; no caller escape (Req 13.1).
+        filter.archetype = Some(archetype_id);
+        let page = PageBounds {
+            limit: req.page_size.clamp(1, crate::types::MAX_PAGE_SIZE),
+            after: req
+                .next_page_token
+                .as_deref()
+                .map(PageToken::decode)
+                .transpose()?,
+        };
+        let result = self
+            .store
+            .list_executions(namespace_id, &filter, SortOrder::Default, &page)
+            .await?;
+        Ok(ListActivityExecutionsResponse {
+            executions: result.rows.into_iter().map(map_activity_summary).collect(),
+            next_page_token: result.next_page_token.map(|t| t.encode()).transpose()?,
+        })
+    }
+
+    async fn count_activities(
+        &self,
+        archetype_id: ArchetypeId,
+        req: CountActivityExecutionsRequest,
+    ) -> Result<CountActivityExecutionsResponse> {
+        let namespace_id = parse_namespace(&req.namespace)?;
+        let mut filter = compile_filter(req.query.as_deref(), namespace_id, &self.store).await?;
+        filter.archetype = Some(archetype_id);
+        let group_by = parse_group_by(req.group_by.as_deref(), namespace_id, &self.store).await?;
+        let result = match (&filter.expr, &group_by) {
+            // Unfiltered grouped counts read the archetype-scoped striped rollup,
+            // pinned to the activity archetype the edge resolved.
+            (None, Some(GroupByField::System(SystemField::ExecutionStatus))) => {
+                self.store
+                    .count_from_rollup(namespace_id, archetype_id, RollupDimension::ExecutionStatus)
+                    .await?
+            }
+            (None, Some(GroupByField::System(SystemField::WorkflowType))) => {
+                self.store
+                    .count_from_rollup(namespace_id, archetype_id, RollupDimension::WorkflowType)
+                    .await?
+            }
+            (None, Some(GroupByField::System(SystemField::TaskQueue))) => {
+                self.store
+                    .count_from_rollup(namespace_id, archetype_id, RollupDimension::TaskQueue)
+                    .await?
+            }
+            // The filtered path honours `filter.archetype` directly.
+            _ => {
+                self.store
+                    .count_executions(namespace_id, &filter, group_by)
+                    .await?
+            }
+        };
+        Ok(CountActivityExecutionsResponse {
+            total_count: result.total_count,
+            groups: result
+                .groups
+                .into_iter()
+                .map(|g| GroupCount {
+                    value: g.value,
+                    count: g.count,
+                })
+                .collect(),
+        })
+    }
+
     async fn delete_execution(&self, run_key: tokeira_types::RunKey) -> Result<()> {
         self.store.delete_execution(run_key).await
     }
@@ -201,6 +276,29 @@ fn map_summary(row: crate::types::ExecutionRow) -> WorkflowExecutionSummary {
         history_length: row.history_length,
         state_transition_count: row.state_transition_count,
         memo: row.memo,
+        search_attributes: SearchAttributes::default(),
+    }
+}
+
+fn map_activity_summary(row: crate::types::ExecutionRow) -> ActivityExecutionSummary {
+    ActivityExecutionSummary {
+        namespace: row.namespace_id.0.to_string(),
+        // Generic business identity / execution type carry the activity id / type.
+        activity_id: row.business_id,
+        run_id: row.run_id,
+        activity_type: row.workflow_type.0,
+        task_queue: row.task_queue.0,
+        // The index stores the collapsed API status (23.7/24.3); the edge maps it to
+        // the `ActivityExecutionStatus` wire enum.
+        status_keyword: row.status_keyword,
+        schedule_time: Some(row.start_time),
+        close_time: row.close_time,
+        // `transition_count` → `state_transition_count` (Requirement 10.14).
+        state_transition_count: row.transition_count,
+        state_size_bytes: row.history_size_bytes,
+        execution_duration: row.execution_duration,
+        // The list query does not load the SA index (same as the workflow summary);
+        // activities contribute no user search attributes anyway (24.3).
         search_attributes: SearchAttributes::default(),
     }
 }
@@ -321,6 +419,77 @@ mod tests {
         .await
         .unwrap();
         (namespace_id, VisibilityQueryService::new(store))
+    }
+
+    #[tokio::test]
+    async fn activity_endpoints_are_archetype_scoped_and_mapped() {
+        let namespace_id = NamespaceId(Uuid::from_u128(7));
+        let activity = tokeira_types::ArchetypeId(99);
+        let store = InMemoryVisibilityStore::default();
+        let sink = VisibilitySink::new(store.clone());
+
+        // One workflow and one activity share the index.
+        let mut wf = projection_record(namespace_id, RunKey(Uuid::from_u128(1)), "wf-a", "qa", None);
+        wf.context.search_attributes = SearchAttributes::default();
+        sink.apply(&wf, 0).await.unwrap();
+
+        let mut act =
+            projection_record(namespace_id, RunKey(Uuid::from_u128(2)), "act-1", "act-q", None);
+        act.context.search_attributes = SearchAttributes::default();
+        act.context.archetype_id = activity;
+        act.context.workflow_type = WorkflowType("MyActivity".to_string());
+        act.context.transition_count = 5;
+        sink.apply(&act, 0).await.unwrap();
+
+        let service = VisibilityQueryService::new(store);
+
+        // list_activities returns only the activity row, mapped to the activity shape.
+        let listed = service
+            .list_activities(
+                activity,
+                ListActivityExecutionsRequest {
+                    namespace: namespace_id.0.to_string(),
+                    query: None,
+                    page_size: 10,
+                    next_page_token: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.executions.len(), 1);
+        let a = &listed.executions[0];
+        assert_eq!(a.activity_id, "act-1");
+        assert_eq!(a.activity_type, "MyActivity"); // execution_type, not the workflow type
+        assert_eq!(a.task_queue, "act-q");
+        assert_eq!(a.status_keyword, "Running");
+        assert_eq!(a.state_transition_count, 5); // generic transition_count (Req 10.14)
+
+        // The workflow endpoint excludes the activity (the leak fix, end to end).
+        let workflows = service
+            .list_workflows(ListWorkflowExecutionsRequest {
+                namespace: namespace_id.0.to_string(),
+                query: None,
+                page_size: 10,
+                next_page_token: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(workflows.executions.len(), 1);
+        assert_eq!(workflows.executions[0].workflow_id, "wf-a");
+
+        // count_activities counts only activities.
+        let count = service
+            .count_activities(
+                activity,
+                CountActivityExecutionsRequest {
+                    namespace: namespace_id.0.to_string(),
+                    query: None,
+                    group_by: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(count.total_count, 1);
     }
 
     use proptest::prelude::*;

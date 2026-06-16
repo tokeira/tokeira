@@ -8,7 +8,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use time::OffsetDateTime;
-use tokeira_types::{ExecutionStatus, Memo, RunId, RunKey, SearchAttributes};
+use tokeira_types::{ArchetypeId, ExecutionStatus, Memo, RunId, RunKey, SearchAttributes};
 
 /// Summary of a single workflow execution for list/count responses.
 #[derive(Clone, Debug, PartialEq)]
@@ -60,11 +60,67 @@ pub struct CountWorkflowExecutionsResponse {
     pub groups: Vec<GroupCount>,
 }
 
+/// Summary of a single standalone-activity execution for list responses.
+///
+/// A projection of the same generic visibility row as [`WorkflowExecutionSummary`],
+/// shaped for the activity archetype: `activity_id`/`activity_type` are the generic
+/// `business_id`/`execution_type`, and `state_transition_count` is the generic
+/// `transition_count` (Requirement 10.14). `status_keyword` is the **collapsed** API
+/// status the index stores (23.7/24.3); the edge maps it to the
+/// `ActivityExecutionStatus` wire enum (Requirement 13.3).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActivityExecutionSummary {
+    pub namespace: String,
+    pub activity_id: String,
+    pub run_id: RunId,
+    pub activity_type: String,
+    pub task_queue: String,
+    pub status_keyword: String,
+    pub schedule_time: Option<OffsetDateTime>,
+    pub close_time: Option<OffsetDateTime>,
+    pub state_transition_count: i64,
+    pub state_size_bytes: i64,
+    pub execution_duration: Option<i64>,
+    pub search_attributes: SearchAttributes,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ListActivityExecutionsRequest {
+    pub namespace: String,
+    pub query: Option<String>,
+    pub page_size: usize,
+    pub next_page_token: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ListActivityExecutionsResponse {
+    pub executions: Vec<ActivityExecutionSummary>,
+    pub next_page_token: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CountActivityExecutionsRequest {
+    pub namespace: String,
+    pub query: Option<String>,
+    pub group_by: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CountActivityExecutionsResponse {
+    pub total_count: i64,
+    pub groups: Vec<GroupCount>,
+}
+
 /// Visibility query interface.
 ///
 /// Implemented by [`crate::VisibilityQueryService`] in the projection plane.
 /// The edge layer depends on this trait to dispatch list/count/delete requests
 /// without knowing the projection internals.
+///
+/// The activity endpoints take an explicit `archetype_id` because the projection
+/// plane is archetype-neutral: it does not know which id "activity" maps to. The
+/// edge (which holds the CHASM registry) resolves it and forces the scope here
+/// (Requirement 13.1).
 #[async_trait]
 pub trait VisibilityApi: Send + Sync + 'static {
     async fn list_workflows(
@@ -76,6 +132,18 @@ pub trait VisibilityApi: Send + Sync + 'static {
         &self,
         req: CountWorkflowExecutionsRequest,
     ) -> Result<CountWorkflowExecutionsResponse>;
+
+    async fn list_activities(
+        &self,
+        archetype_id: ArchetypeId,
+        req: ListActivityExecutionsRequest,
+    ) -> Result<ListActivityExecutionsResponse>;
+
+    async fn count_activities(
+        &self,
+        archetype_id: ArchetypeId,
+        req: CountActivityExecutionsRequest,
+    ) -> Result<CountActivityExecutionsResponse>;
 
     async fn delete_execution(&self, run_key: RunKey) -> Result<()>;
 }
@@ -101,6 +169,28 @@ impl VisibilityApi for EmptyVisibilityApi {
         _req: CountWorkflowExecutionsRequest,
     ) -> Result<CountWorkflowExecutionsResponse> {
         Ok(CountWorkflowExecutionsResponse {
+            total_count: 0,
+            groups: Vec::new(),
+        })
+    }
+
+    async fn list_activities(
+        &self,
+        _archetype_id: ArchetypeId,
+        _req: ListActivityExecutionsRequest,
+    ) -> Result<ListActivityExecutionsResponse> {
+        Ok(ListActivityExecutionsResponse {
+            executions: Vec::new(),
+            next_page_token: None,
+        })
+    }
+
+    async fn count_activities(
+        &self,
+        _archetype_id: ArchetypeId,
+        _req: CountActivityExecutionsRequest,
+    ) -> Result<CountActivityExecutionsResponse> {
+        Ok(CountActivityExecutionsResponse {
             total_count: 0,
             groups: Vec::new(),
         })

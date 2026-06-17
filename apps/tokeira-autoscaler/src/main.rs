@@ -587,8 +587,10 @@ mod tests {
 
     #[test]
     fn autoscaler_process_observability_config_validates() {
-        let mut config = AutoscalerServiceConfig::default();
-        config.metrics_addr = "127.0.0.1:0".to_string();
+        let config = AutoscalerServiceConfig {
+            metrics_addr: "127.0.0.1:0".to_string(),
+            ..Default::default()
+        };
 
         let observability = process_observability_config(&config).unwrap();
 

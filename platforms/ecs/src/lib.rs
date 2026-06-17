@@ -1,5 +1,9 @@
 //! ECS deployment platform scaffold.
 
+// Service construction mirrors the broad ECS/ELB API surface, which takes many
+// parameters.
+#![allow(clippy::too_many_arguments)]
+
 pub mod config;
 pub mod gates;
 pub mod images;
@@ -795,8 +799,7 @@ mod tests {
     fn dsql_hydration_and_writeback_use_state_properties() {
         let deployment = EcsDeployment::new();
         let config = EcsConfig::default();
-        let mut state = iac::InfraState::default();
-        state.resources = BTreeMap::from([
+        let resources = BTreeMap::from([
             resource(
                 "dsql:cluster",
                 "DsqlCluster",
@@ -833,6 +836,10 @@ mod tests {
                 }),
             ),
         ]);
+        let state = iac::InfraState {
+            resources,
+            ..Default::default()
+        };
 
         let hydrated = deployment.hydrate_config(&config, &state);
         let writeback = deployment.collect_writeback(&config, &state);

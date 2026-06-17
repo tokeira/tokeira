@@ -1,3 +1,7 @@
+// Nexus translation mirrors upstream's deprecated-but-still-on-wire `operation_id`
+// fields, required for v1.31.0 wire compatibility.
+#![allow(deprecated)]
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};

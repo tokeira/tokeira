@@ -1,3 +1,7 @@
+// Roundtrip tests construct prost messages with `..Default::default()` for
+// forward-compat against upstream proto field additions.
+#![allow(clippy::needless_update)]
+
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};

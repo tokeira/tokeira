@@ -6,6 +6,21 @@
 //! timer behavior, or task durability, that change almost certainly belongs in
 //! `tokeira-kernel`, `tokeira-runtime`, or `tokeira-storage` instead.
 
+// Advisory clippy lints accepted across this proto-translation crate:
+// - `too_many_arguments`: request translators thread many wire fields by design.
+// - `result_large_err`: fallible translators return tonic `Status`; boxing every
+//   `Result` is churn without a measured win.
+// - `type_complexity`: tower/tonic middleware and interceptor signatures are
+//   inherently nested.
+// - `needless_update`: `..Default::default()` on prost messages is deliberate
+//   forward-compat — an upstream proto field addition cannot then break the build.
+#![allow(
+    clippy::too_many_arguments,
+    clippy::result_large_err,
+    clippy::type_complexity,
+    clippy::needless_update
+)]
+
 pub mod batch_engine;
 pub mod chasm_activity;
 pub mod conformance;

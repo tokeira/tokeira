@@ -7,6 +7,19 @@
 //! The runtime deliberately does not assume that all runs are hot, that all work
 //! is poll-driven, or that a lane owns a run forever.
 
+// Advisory clippy lints accepted in the runtime: orchestration entry points thread
+// many context handles (stores, registries, clocks, keys) by design
+// (`too_many_arguments`); lane/publisher signatures are inherently nested
+// (`type_complexity`); and the command/effect enums carry one large authoritative
+// variant whose boxing is a deliberate hot-path perf decision, not a lint fix
+// (`large_enum_variant`, `enum_variant_names`).
+#![allow(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::large_enum_variant,
+    clippy::enum_variant_names
+)]
+
 pub mod activity_timeout;
 pub mod backlog;
 pub mod batch;

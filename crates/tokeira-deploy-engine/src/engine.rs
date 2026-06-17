@@ -283,19 +283,11 @@ mod tests {
     };
     use std::{
         future::Future,
-        sync::Arc,
-        task::{Context, Poll, Wake, Waker},
+        task::{Context, Poll, Waker},
     };
 
-    struct NoopWaker;
-
-    impl Wake for NoopWaker {
-        fn wake(self: Arc<Self>) {}
-    }
-
     fn block_on_ready<F: Future>(future: F) -> F::Output {
-        let waker = Waker::from(Arc::new(NoopWaker));
-        let mut context = Context::from_waker(&waker);
+        let mut context = Context::from_waker(Waker::noop());
         let mut future = Box::pin(future);
         match future.as_mut().poll(&mut context) {
             Poll::Ready(output) => output,

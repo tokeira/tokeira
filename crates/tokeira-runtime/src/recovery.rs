@@ -581,26 +581,15 @@ mod tests {
                 let worker =
                     WorkerIdentity("w".into());
                 let mut polled = Vec::new();
-                loop {
-                    match broker
-                        .poll_workflow_task(
-                            &queue,
-                            &worker,
-                            std::time::Duration::from_millis(
-                                1,
-                            ),
-                        )
-                        .await
-                        .unwrap()
-                    {
-                        Some(polled_task) => {
-                            let Some((task, _)) = polled_task.into_queued() else {
-                                continue;
-                            };
-                            polled.push(task.run_key)
-                        }
-                        None => break,
-                    }
+                while let Some(polled_task) = broker
+                    .poll_workflow_task(&queue, &worker, std::time::Duration::from_millis(1))
+                    .await
+                    .unwrap()
+                {
+                    let Some((task, _)) = polled_task.into_queued() else {
+                        continue;
+                    };
+                    polled.push(task.run_key)
                 }
                 polled.sort_by_key(|rk| rk.0);
                 let mut expected_sorted =
@@ -723,22 +712,12 @@ mod tests {
                     build_id: None,
                 };
                 let mut polled = Vec::new();
-                loop {
-                    match activity_broker
-                        .poll_activity_task(
-                            &queue,
-                            std::time::Duration::from_millis(
-                                1,
-                            ),
-                        )
-                        .await
-                        .unwrap()
-                    {
-                        Some((task, _)) => {
-                            polled.push(task.run_key)
-                        }
-                        None => break,
-                    }
+                while let Some((task, _)) = activity_broker
+                    .poll_activity_task(&queue, std::time::Duration::from_millis(1))
+                    .await
+                    .unwrap()
+                {
+                    polled.push(task.run_key)
                 }
                 polled.sort_by_key(|rk| rk.0);
                 let mut expected_sorted =

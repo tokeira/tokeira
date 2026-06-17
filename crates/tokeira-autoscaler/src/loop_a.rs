@@ -117,8 +117,10 @@ mod tests {
 
     #[test]
     fn scale_out_requires_configured_consecutive_samples() {
-        let mut config = AutoscalerServiceConfig::default();
-        config.scale_out_consecutive_samples = 2;
+        let config = AutoscalerServiceConfig {
+            scale_out_consecutive_samples: 2,
+            ..Default::default()
+        };
         let mut desired = DesiredState::default();
         let mut loop_a = ReplicaScalingLoop::default();
         let signal = ServiceSignal {
@@ -136,8 +138,10 @@ mod tests {
 
     #[test]
     fn hold_resets_hysteresis_counters() {
-        let mut config = AutoscalerServiceConfig::default();
-        config.scale_out_consecutive_samples = 2;
+        let config = AutoscalerServiceConfig {
+            scale_out_consecutive_samples: 2,
+            ..Default::default()
+        };
         let mut desired = DesiredState::default();
         let mut loop_a = ReplicaScalingLoop::default();
         let scale_out = ServiceSignal {

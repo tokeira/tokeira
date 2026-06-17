@@ -40,13 +40,9 @@ impl LocalBackend {
     }
 }
 
-/// Wrapper that embeds a content hash inside the persisted manifest.
-///
-/// The on-disk format is `{ "version": "<sha256>", "data": <raw bytes as base64> }`.
-/// We don't actually use this struct for the on-disk format — instead we
-/// compute the hash from the raw data bytes and store it alongside.
-/// The version returned to callers is the SHA-256 hex digest of the data.
-
+// Content hashing for the persisted manifest. The on-disk format is
+// `{ "version": "<sha256>", "data": <raw bytes as base64> }`; the version returned
+// to callers is the SHA-256 hex digest of the raw data bytes.
 fn content_hash(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();

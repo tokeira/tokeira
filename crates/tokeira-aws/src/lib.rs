@@ -5,6 +5,10 @@
 //! clients. Resource implementations are registered by the `project` crate;
 //! `AwsClients` is registered on `ProvisionContext` by the CLI.
 
+// Resource constructors mirror the underlying AWS API surface, which takes many
+// parameters.
+#![allow(clippy::too_many_arguments)]
+
 mod clients;
 mod context;
 mod iam_policy;

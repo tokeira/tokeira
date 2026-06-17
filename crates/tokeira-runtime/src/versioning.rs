@@ -214,10 +214,9 @@ impl VersioningRuleStore {
                 if build_id.is_empty() {
                     return Err(VersioningError::EmptyBuildId);
                 }
-                entry.assignment_rules.retain(|rule| {
-                    rule.target_build_id != build_id
-                        && !(is_unconditional(rule) && rule.target_build_id != build_id)
-                });
+                entry
+                    .assignment_rules
+                    .retain(|rule| rule.target_build_id != build_id && !is_unconditional(rule));
                 entry.assignment_rules.push(AssignmentRule {
                     target_build_id: build_id,
                     percentage_ramp: None,
@@ -544,10 +543,8 @@ mod tests {
                 Ok(mutation)
             }
             CrudOp::Commit { build_id } => {
-                assignments.retain(|rule| {
-                    rule.target_build_id != build_id
-                        && !(is_unconditional(rule) && rule.target_build_id != build_id)
-                });
+                assignments
+                    .retain(|rule| rule.target_build_id != build_id && !is_unconditional(rule));
                 assignments.push(assignment(&build_id));
                 Ok(VersioningMutation::CommitBuildId { build_id })
             }

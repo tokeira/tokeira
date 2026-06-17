@@ -18,6 +18,11 @@
 //! the `Any`-typed bodies into kernel `UpdateProtocolBody` variants before
 //! the workflow service layer ever sees them.
 
+// Translation mirrors fields Temporal has deprecated but still ships on the wire
+// (e.g. `worker_version_capabilities`, `PendingNexusOperationInfo::operation_id`);
+// reading/writing them is required for v1.31.0 wire compatibility.
+#![allow(deprecated)]
+
 use std::{collections::BTreeMap, time::Duration};
 
 use prost::Message as _;

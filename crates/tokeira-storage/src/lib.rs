@@ -14,6 +14,12 @@
 //! `RunRepository` implementation. It is feature-gated so most workspace tests
 //! can run without SQLx/DSQL dependencies.
 
+// Persistence entry points (commit, connection setup) thread many parameters by
+// design (`too_many_arguments`); folding them into parameter structs is churn
+// without a clarity win. The persistence-op enums carry one large variant whose
+// boxing is a deliberate decision, not a style fix (`large_enum_variant`).
+#![allow(clippy::too_many_arguments, clippy::large_enum_variant)]
+
 pub mod api;
 #[cfg(test)]
 mod bug_condition_exploration_tests;

@@ -827,8 +827,9 @@ impl DeploymentRegistry {
                 // A ramping version must differ from Current. v1.31.0 rejects ramp ==
                 // current with FAILED_PRECONDITION (`workflow.go:764 @ v1.31.0`), naming
                 // the version; unversioned ramp collides with an unversioned (nil) current.
-                if target.is_some() && target == record.routing_config.current_version {
-                    let version = target.as_ref().expect("target is Some in this branch");
+                if target == record.routing_config.current_version
+                    && let Some(version) = target.as_ref()
+                {
                     return Err(RegistryError::FailedPrecondition(format!(
                         "requested ramping version {} is already current",
                         format_legacy_version_string(

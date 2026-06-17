@@ -14,6 +14,8 @@
 //! reading it from `TokeiraConfig.infrastructure.network.grpc_addr`.
 
 #![deny(rust_2018_idioms)]
+// The bootstrap facade wires many subsystems and accepts them as parameters.
+#![allow(clippy::too_many_arguments)]
 
 use std::{
     collections::HashMap,

@@ -9,6 +9,11 @@
 //! `failure_info` variants). See `docs/proto-field-audit.md` §3 for the
 //! complete gap inventory.
 
+// History attribute structs carry fields Temporal has deprecated but still ships on
+// the wire (e.g. `*EventAttributes::control`, `ContinuedAsNew::failure`); mirroring
+// them is required for v1.31.0 history compatibility.
+#![allow(deprecated)]
+
 use prost::Message;
 use tokeira_kernel::{
     event::{HistoryEvent, HistoryEventKind},

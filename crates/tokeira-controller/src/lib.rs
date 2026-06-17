@@ -1,6 +1,9 @@
 //! Active-active placement controller primitives.
 
 #![allow(refining_impl_trait_internal, refining_impl_trait_reachable)]
+// Service methods return tonic `Status` errors; boxing every `Result` to satisfy
+// `result_large_err` is churn without a measured win.
+#![allow(clippy::result_large_err)]
 
 pub mod config;
 pub mod connect_service;

@@ -1394,18 +1394,18 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             .map_err(proto_conversion_status)?;
         if let Some(build_id) = &parsed.commit_build_id
             && !parsed.commit_force
-                && !self.inner.worker_registry().has_recent_poller_for_build_id(
-                    namespace_id,
-                    &task_queue,
-                    &BuildId(build_id.clone()),
-                    now,
-                    COMMIT_POLLER_RECENT_WINDOW,
-                )
-            {
-                return Err(Status::failed_precondition(
-                    "no recent poller observed for target build id",
-                ));
-            }
+            && !self.inner.worker_registry().has_recent_poller_for_build_id(
+                namespace_id,
+                &task_queue,
+                &BuildId(build_id.clone()),
+                now,
+                COMMIT_POLLER_RECENT_WINDOW,
+            )
+        {
+            return Err(Status::failed_precondition(
+                "no recent poller observed for target build id",
+            ));
+        }
         let rules = self
             .inner
             .versioning_rule_store()
@@ -2402,6 +2402,11 @@ fn update_lifecycle_stage_to_proto(stage: tokeira_runtime::UpdateLifecycleStage)
 
 #[cfg(test)]
 mod tests {
+    // Several tests construct/inspect proto messages with fields Temporal has
+    // deprecated but still ships on the wire (DescribeTaskQueue status,
+    // RespondNexusTaskFailed error); exercising them is required for v1.31.0.
+    #![allow(deprecated)]
+
     use std::sync::{Arc, Mutex};
 
     use anyhow::Result;

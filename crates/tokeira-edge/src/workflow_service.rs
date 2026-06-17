@@ -4553,7 +4553,7 @@ impl WorkflowService {
                             .unwrap_or(true)
                     })
                     .collect();
-                reversed.sort_by(|left, right| right.event_id.cmp(&left.event_id));
+                reversed.sort_by_key(|event| std::cmp::Reverse(event.event_id));
 
                 let page: Vec<_> = reversed.into_iter().take(limit).collect();
                 let next_page_token = page

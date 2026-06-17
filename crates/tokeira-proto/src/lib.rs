@@ -12,6 +12,14 @@
 //! The `internal` module retains the tonic/prost output for code that hasn't migrated.
 
 #![allow(refining_impl_trait_internal, refining_impl_trait_reachable)]
+// The tonic/prost-generated bindings (compiled from the upstream Temporal `.proto`s)
+// trip style lints that are not actionable on generated code: large message/oneof
+// enums, and doc-list formatting carried verbatim from the upstream proto comments.
+#![allow(
+    clippy::large_enum_variant,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items
+)]
 
 pub mod conversions;
 pub mod internal;

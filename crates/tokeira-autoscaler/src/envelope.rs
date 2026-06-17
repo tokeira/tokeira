@@ -53,11 +53,7 @@ impl ScalingEnvelope {
 }
 
 fn divide_or_unbounded(budget: u32, per_unit: u32) -> u32 {
-    if per_unit == 0 {
-        u32::MAX
-    } else {
-        budget / per_unit
-    }
+    budget.checked_div(per_unit).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]

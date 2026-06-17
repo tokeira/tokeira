@@ -586,6 +586,52 @@ async fn build_and_serve(
     }
 }
 
+/// How often the visibility repair scanner sweeps committed executions to repair any
+/// projection lost by the best-effort post-commit write (Req 10.11).
+const VISIBILITY_REPAIR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Spawn the background visibility repair scanner: it reconstructs each committed
+/// execution's snapshot from authoritative node state and re-applies it iff-newer, so
+/// a committed transition can never permanently lack a projection (Req 10.11). The
+/// snapshot rebuild decodes the per-archetype node bytes (only the activity archetype
+/// today); other archetypes are skipped. Runs immediately, then on an interval, until
+/// `cancel` fires.
+fn spawn_visibility_repair(
+    nodes: Arc<dyn tokeira_storage::ChasmNodeRepository>,
+    sink: Arc<dyn tokeira_projection::ProjectionSink>,
+    activity_archetype: Option<u32>,
+    partition_count: u32,
+    cancel: CancellationToken,
+) {
+    let rebuild: tokeira_runtime::chasm::SnapshotRebuilder = Arc::new(move |archetype_id, bytes| {
+        if Some(archetype_id) == activity_archetype {
+            tokeira_chasm_activity::rebuild_visibility_snapshot(bytes)
+        } else {
+            None
+        }
+    });
+    let scanner = tokeira_runtime::chasm::VisibilityRepairScanner::new(
+        nodes,
+        sink,
+        rebuild,
+        partition_count,
+    );
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(VISIBILITY_REPAIR_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    if let Err(error) = scanner.repair_once().await {
+                        tracing::warn!(?error, "visibility repair pass failed");
+                    }
+                }
+            }
+        }
+    });
+}
+
 async fn build_and_serve_with_storage<R, L, S, V, F>(
     addr: SocketAddr,
     effective_config: Arc<TokeiraConfig>,
@@ -821,6 +867,12 @@ where
         tokeira_chasm_activity::ActivityLibrary::register(&mut registry_builder)
             .context("failed to register the activity CHASM library")?;
         let registry = Arc::new(registry_builder.build());
+        // Capture what the visibility repair scanner needs before the engine consumes
+        // the node repo + registry: the activity archetype id (to dispatch the snapshot
+        // rebuild) and a clone of the authoritative node store (Req 10.11).
+        let repair_archetype = registry
+            .archetype_id(<tokeira_chasm_activity::ActivityExecution as tokeira_chasm::Component>::FQN);
+        let repair_nodes = chasm_node_repo.clone();
         let dispatch_queue = Arc::new(tokeira_edge::chasm_activity::ActivityDispatchQueue::new());
         // Standalone activities flow into the shared visibility index via the
         // engine→projection adapter, post-commit and off the correctness path
@@ -850,6 +902,18 @@ where
                 DEFAULT_MAX_ID_LENGTH,
             )
             .with_dispatch_queue(dispatch_queue),
+        );
+        // Spawn the visibility repair scanner (Req 10.11): a committed transition can
+        // never permanently lack a projection — the scanner rebuilds each execution's
+        // snapshot from authoritative node state and re-applies it iff-newer. This is
+        // the AGENTS-3 sweeper shape (derived effect reconstructed from authoritative
+        // state), the durability backstop for the best-effort post-commit write (24.2).
+        spawn_visibility_repair(
+            repair_nodes,
+            Arc::new(projection_sink()),
+            repair_archetype,
+            effective_config.infrastructure.placement.partition_count,
+            background_cancel.clone(),
         );
         WorkflowServiceGrpc::new(workflow_service).with_chasm_activity(activity_bridge)
     };

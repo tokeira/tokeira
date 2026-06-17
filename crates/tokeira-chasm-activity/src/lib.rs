@@ -42,7 +42,7 @@ pub mod statemachine;
 pub mod tasks;
 pub mod validator;
 
-pub use component::{ActivityExecution, ActivityLibrary};
+pub use component::{ActivityExecution, ActivityLibrary, rebuild_visibility_snapshot};
 pub use config::ActivityConfig;
 pub use state::{ActivityState, ActivityStatus, lifecycle_for};
 pub use statemachine::{ActivityEvent, TimeoutType, legal_target};

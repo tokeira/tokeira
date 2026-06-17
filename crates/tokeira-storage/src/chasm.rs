@@ -107,6 +107,16 @@ pub trait ChasmNodeRepository: Send + Sync {
     /// Range-delete the entire node subtree of an execution (Requirement 6.1,
     /// `DeleteExecution`). Idempotent: deleting an absent execution is a no-op.
     async fn delete_execution(&self, key: &ExecutionKey) -> Result<()>;
+
+    /// Enumerate every execution's **root component node** (the node at the empty
+    /// `ROOT_PATH`), in a deterministic `(namespace_id, business_id, run_id)` order.
+    ///
+    /// This is the read side of the visibility **repair scanner** (Req 10.11): the
+    /// scanner rebuilds each execution's visibility snapshot from its persisted root
+    /// state and re-applies it iff-newer, so a committed transition can never
+    /// permanently lack a projection. Ordered output is required — an unordered scan
+    /// is a determinism hazard (`tokeira-runtime/AGENTS.md`).
+    async fn scan_executions(&self) -> Result<Vec<(ExecutionKey, ChasmNode)>>;
 }
 
 /// In-memory [`ChasmNodeRepository`] for tests, examples, and the CHASM engine
@@ -226,6 +236,32 @@ impl ChasmNodeRepository for InMemoryChasmNodeStore {
             .map_err(|_| anyhow::anyhow!("chasm node store mutex poisoned"))?;
         executions.remove(key);
         Ok(())
+    }
+
+    async fn scan_executions(&self) -> Result<Vec<(ExecutionKey, ChasmNode)>> {
+        let executions = self
+            .executions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("chasm node store mutex poisoned"))?;
+        // The root component node is at the empty `ROOT_PATH` (b""), the minimum
+        // encoded path; the inner `BTreeMap`'s first entry.
+        let mut out: Vec<(ExecutionKey, ChasmNode)> = executions
+            .iter()
+            .filter_map(|(key, tree)| {
+                tree.get(b"".as_slice())
+                    .map(|node| (key.clone(), node.clone()))
+            })
+            .collect();
+        // `ExecutionKey` is not `Ord`; sort by its fields for deterministic output
+        // (the scanner must not emit in `HashMap` order — `AGENTS.md` determinism).
+        out.sort_by(|(a, _), (b, _)| {
+            (&a.namespace_id, &a.business_id, &a.run_id).cmp(&(
+                &b.namespace_id,
+                &b.business_id,
+                &b.run_id,
+            ))
+        });
+        Ok(out)
     }
 }
 

@@ -249,6 +249,35 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
         .await?;
         Ok(())
     }
+
+    async fn scan_executions(&self) -> Result<Vec<(ExecutionKey, ChasmNode)>> {
+        let mut permit = self.director.acquire(DbClass::Read).await?;
+        // Every execution's root component node (encoded_path = ROOT_PATH, b""),
+        // ordered deterministically for the repair scanner (Req 10.11; AGENTS
+        // determinism). The empty-bytea predicate hits the PK prefix.
+        let rows = sqlx::query(
+            "SELECT namespace_id, business_id, run_id, metadata, data
+             FROM chasm_node
+             WHERE encoded_path = $1
+             ORDER BY namespace_id ASC, business_id ASC, run_id ASC",
+        )
+        .bind(b"".as_slice())
+        .fetch_all(permit.connection()?)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let namespace_id: Uuid = row.try_get("namespace_id")?;
+                let business_id: String = row.try_get("business_id")?;
+                let run_id: Uuid = row.try_get("run_id")?;
+                let metadata_blob: Vec<u8> = row.try_get("metadata")?;
+                let data: Option<Vec<u8>> = row.try_get("data")?;
+                let metadata = codec::decode(&metadata_blob)?;
+                let key =
+                    ExecutionKey::new(namespace_id.to_string(), business_id, run_id.to_string());
+                Ok((key, ChasmNode { metadata, data }))
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]

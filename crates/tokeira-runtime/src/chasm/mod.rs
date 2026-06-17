@@ -30,6 +30,7 @@
 //! seam explicit. This is a deliberate, documented MVP boundary (`AGENTS §9`).
 
 mod engine;
+mod repair;
 mod typed;
 mod visibility_adapter;
 
@@ -37,6 +38,7 @@ pub use engine::{
     ChasmEngine, ChasmEngineConfig, CollectingDispatchSink, CollectingVisibilitySink, DispatchSink,
     NoopVisibilitySink, ROOT_PATH, VisibilitySink,
 };
+pub use repair::{RepairStats, SnapshotRebuilder, VisibilityRepairScanner};
 pub use typed::TypedEngine;
 pub use visibility_adapter::ProjectionVisibilitySink;
 // Re-exported from the pure crate: these are component-level contracts, not engine

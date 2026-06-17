@@ -152,6 +152,17 @@ impl VisibilityContributor for ActivityExecution {
     }
 }
 
+/// Rebuild an activity's [`VisibilitySnapshot`] from its persisted root-node `data`
+/// blob — the per-archetype decode the visibility repair scanner dispatches to
+/// (Req 10.11). Returns `None` if the bytes do not decode or the activity contributes
+/// no snapshot. Lives here (not in the runtime/bootstrap) so the prost decode stays
+/// in the crate that owns `ActivityState`.
+pub fn rebuild_visibility_snapshot(data: &[u8]) -> Option<VisibilitySnapshot> {
+    use prost::Message as _;
+    let state = ActivityState::decode(data).ok()?;
+    ActivityExecution::new(state).visibility_snapshot()
+}
+
 /// The fine-grained internal activity-status name (legacy string SA hook).
 fn execution_status_name(status: ActivityStatus) -> &'static str {
     match status {

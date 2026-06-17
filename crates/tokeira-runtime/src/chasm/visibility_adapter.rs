@@ -77,7 +77,11 @@ impl VisibilitySink for ProjectionVisibilitySink {
 /// projection record. See `reference/DECISION-visibility-engine-adapter.md` for the
 /// per-field rationale (e.g. `run_key = run_id`, `execution_status` is a workflow-
 /// internal placeholder while `status_keyword` is authoritative — 23.7).
-fn build_record(
+///
+/// Shared with the repair scanner ([`super::repair`]), which rebuilds the same record
+/// from persisted node state — so the post-commit and repair paths produce byte-identical
+/// projections.
+pub(crate) fn build_record(
     key: &ExecutionKey,
     archetype_id: u32,
     version: VersionedTransition,

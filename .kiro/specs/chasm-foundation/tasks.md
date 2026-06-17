@@ -566,18 +566,30 @@ verify against `../temporal @ v1.31.0` before finalizing.
       constant); 225 edge lib tests pass; tokeirad builds clean.
     - _Requirements: 13.4_
 
-- [ ] 26. Stage 4 — Hardening: repair scanner / outbox-in-commit
-  - [ ] 26.1 Guarantee a committed transition cannot permanently lack a projection
-    - Provide an outbox row written in the authoritative commit, or a repair scanner that finds
-      committed transitions whose visibility version is unprojected and re-emits the snapshot
-      (transition-derived, repairable — C2.5).
+- [x] 26. Stage 4 — Hardening: repair scanner / outbox-in-commit
+  - [x] 26.1 Guarantee a committed transition cannot permanently lack a projection
+    - Implemented as a **repair scanner** (not an in-commit outbox — that would make a queue write
+      load-bearing on the authoritative path, forbidden by `tokeira-runtime/AGENTS.md` §3; the scanner is
+      the sanctioned "authoritative state + sweeper reconstruction" shape).
+    - **Precondition (increment A, `9d2f180d`).** Every snapshot input must be recomputable from persisted
+      node state. The one gap — `close_time`, which the engine stamped from `self.now()` post-commit — is
+      now persisted: `ActivityState.close_time_nanos`, recorded on the terminal transition; the engine no
+      longer stamps it.
+    - **Scanner (increment B).** `ChasmNodeRepository::scan_executions` enumerates every execution's root
+      node in a deterministic `(namespace, business_id, run_id)` order (in-memory + DSQL); the runtime
+      `VisibilityRepairScanner` rebuilds each snapshot from node state via a per-archetype rebuilder
+      (the activity crate's `rebuild_visibility_snapshot`) and the shared 24.2 `build_record`, then
+      re-applies through the same `ProjectionSink` **iff-newer** — a no-op when already projected, a repair
+      when missing/behind. Wired into `tokeirad` bootstrap as a periodic background sweep
+      (`spawn_visibility_repair`, off the correctness path), the durability backstop for 24.2's
+      best-effort post-commit write. Scoped as **C2.5** (transition-derived, repairable), not full C3.
     - _Requirements: 10.11_
-  - [ ]* 26.2 Write property test for repair convergence
-    - **Property 14: Repair convergence**
+  - [x]* 26.2 Write property test for repair convergence
+    - **Property 14: Repair convergence** — `prop_repair_convergence` (runtime `chasm::repair`): seed
+      executions in the node store, project them, drop an arbitrary subset from the index, then repair —
+      and assert the index converges to the fold of the latest snapshots (idempotent on the survivors).
+      100 iterations; `// Feature: chasm-foundation, Property 14` tag.
     - **Validates: Requirements 10.11**
-    - `prop_repair_convergence`: after arbitrary dropped projections, repair drives the index to the
-      fold of the latest committed snapshots; ≥100 iterations; `// Feature: chasm-foundation, Property
-      14` tag
     - _Requirements: 12.3_
 
 - [ ] 27. Final checkpoint — full feature

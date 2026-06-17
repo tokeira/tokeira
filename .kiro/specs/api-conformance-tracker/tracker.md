@@ -1,5 +1,10 @@
 # API Conformance Tracker
 
+> **Reference only — not the progress tracker.** This is a static RPC-coverage index (which RPC is
+> owned by which spec). The single canonical progress doc for functional conformance is
+> `temporal-functional-conformance/reference/FINDINGS.md` (its **Status ledger**). Do not track
+> done/completed here. (Decided 2026-06-17.)
+
 **Target:** Temporal Server v1.31.0 (API v1.62.8) — 121 RPCs
 
 **Source audit:** `reference/temporal_api_audit.md`

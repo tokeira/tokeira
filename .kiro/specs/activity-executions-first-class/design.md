@@ -10,9 +10,31 @@ snapshot visibility plane, and (commit `5b5faddd`) the edge admission validation
 30 failures. The kernel is not extended; all work is edge + runtime/storage (the activity
 component and the CHASM engine), per the Implementer mandate.
 
-Design items, in dependency order. **Item 1 (current-run index) is foundational and must be
-agreed before any code** — it carries a storage-schema decision with compat implications
-(FINDINGS Implementer-mandate rule 3/4: raise config/schema, don't guess).
+Design items, in dependency order. **Item 1 (current-run index) is foundational.** Its schema and
+fencing decisions — which carried compat implications (FINDINGS Implementer-mandate rule 3/4) — are
+now **resolved and recorded below**: the Stage 0 design gate is closed. The one remaining
+externally-ground-truthed point (closed-run bare-id resolution) is a read-source-first step inside
+Stage 1, not a blocker.
+
+## Architecture
+
+This feature lives entirely in the **edge** and **runtime/storage** planes; `tokeira-kernel` is not
+extended (Implementer mandate). Placement:
+
+- **Edge** (`tokeira-edge`): empty-`run_id` resolution in `activity_execution_key`, id
+  reuse/conflict normalization, task-token validation on responses, the describe long-poll deadline,
+  and `Count`-by-id — all admission/translation concerns.
+- **Runtime** (`tokeira-runtime` CHASM engine + `tokeira-chasm-activity`): the authoritative
+  current-run pointer advance under the Start commit, reuse/conflict enforcement, and the
+  worker-identity / run-state tracking on the activity component.
+- **Storage** (`tokeira-storage`): the current-run pointer beside the `chasm_node` store (in-memory
+  map + DSQL `chasm_current_run` table), fenced with the node store's existing OCC/CAS.
+- **Projection** (`tokeira-projection`): unchanged for correctness; `Count`-by-id is a
+  visibility-query concern only.
+
+The current-run pointer is the CHASM analog of the workflow path's existing `current_execution`
+table (migration `V003`): authoritative, fenced at the Start commit, and **never** derived from the
+visibility projection.
 
 ---
 
@@ -41,10 +63,21 @@ by `BusinessIDReusePolicy`/`BusinessIDConflictPolicy` (mapped from the request's
 `ActivityIdReusePolicy`/`ActivityIdConflictPolicy`, `handler.go:19-25`); a conflict against a live
 current run yields `ActivityExecutionAlreadyStarted` carrying the `CurrentRunID` (`handler.go:91`).
 This is the direct analog of Temporal's workflow current-execution record + workflow-id
-reuse/conflict policy. **Ground-truth callout:** confirm, in `chasm/` framework source, (a) exactly
-when the current-run pointer is advanced (Start commit) and how it is fenced, and (b) how a *closed*
-entity resolves a bare-id read (does it return the most-recent terminal run?), before finalizing AC4
-below.
+reuse/conflict policy. **Ground-truth — CONFIRMED (task 1.0), verified against v1.31.0:** the
+framework keeps a dedicated `current_executions` row keyed `(shard, namespace_id, workflow_id,
+archetype_id)` — *no run_id* — carrying `(run_id, state, status, last_write_version)`, resolved on an
+empty run_id via `GetCurrentExecution` (`common/persistence/sql/execution.go:681 @ v1.31.0`).
+(a) **Fencing:** the row is written **co-transactionally** with the entity create
+(`createWorkflowExecutionTx` → `createOrUpdateCurrentExecution`) under an optimistic
+`last_write_version` conditional update; a lost race becomes `CurrentWorkflowConditionFailedError` →
+the activity's `ActivityExecutionAlreadyStarted(CurrentRunID)` (`chasm/lib/activity/handler.go:91`).
+(b) **Closed-run:** a terminal run's pointer **persists** — the row is updated to the terminal state,
+not deleted on close; a superseding reuse is admitted only when the current row is terminal
+(`CreateWorkflowModeUpdateCurrent` requires `state == COMPLETED`, `execution.go:126,155`); only an
+explicit `Delete` removes the row (`DeleteFromCurrentExecutions`, `execution.go:671`), after which a
+bare-id read is NotFound. **This confirms AC4/AC5 with no contradiction** and pins two design points:
+`vt_epoch` is the *active* fence (the `last_write_version` conditional-update analog — review-watch
+#2), and the pointer write is *co-transactional* with the root-node create (review-watch #1).
 
 ### Design
 
@@ -56,16 +89,21 @@ the derived projection would break read-your-write and violate the core invarian
 
 - **Mapping.** `(namespace_id, business_id) → CurrentRun { run_id, status, vt_epoch }`. `status`
   lets the engine apply the reuse/conflict policy without loading the run; `vt_epoch` (the run's
-  `VersionedTransition` at last advance) provides a fence. Minimum viable is `run_id` alone; carry
-  `status`/`epoch` only if the policy/fencing needs them (decide in review).
+  `VersionedTransition` at last advance) provides the fence. **Decided: carry all three** — Req 2
+  requires `status` to enforce the reuse/conflict policy without a run load, and `vt_epoch` is the
+  advance fence.
 - **Storage shape.**
   - In-memory (`InMemoryChasmNodeStore`): a second `Mutex<BTreeMap<(NamespaceId, BusinessId),
     CurrentRun>>` alongside `executions`, mutated under the same lock acquisition as the node write
     so the pointer and root node never tear.
-  - DSQL: a `chasm_current_run` table keyed `(namespace_id, business_id)`. **Migration shape is a
-    decision for review:** if no DSQL baseline has been cut, fold it into the node-table base
-    migration; otherwise add `VNNN` (additive — no destructive state-format break). Confirm the
-    baseline status against `tokeira-storage/src/dsql/` migrations before writing the migration.
+  - DSQL: a `chasm_current_run` table. **Decided: a new additive migration
+    `V056__chasm_current_run.sql`** (next free version after `V055`), modeled on the existing
+    workflow `current_execution` table (`V003`). It is its own one-statement migration — **not** a
+    fold into `V049__chasm_node`: the pointer is a distinct cardinality (one row per `activity_id`,
+    not per node), so it is a new table, not a column. DSQL-safe: spread-key
+    `PRIMARY KEY (namespace_id, business_id)`, UUID columns, no `BIGSERIAL` / `CHECK` / foreign keys;
+    any secondary index is a separate `CREATE INDEX ASYNC` in its own `VNNN` file. Confirm `V056` is
+    still the next free version when implementing (list `crates/tokeira-storage/migrations/`).
 - **Fencing (CAS/OCC).** The pointer advance is part of the Start commit and uses the node store's
   existing OCC discipline. On Start: read the current pointer; evaluate the reuse/conflict policy
   against `status`; if admitted, write the root node **and** CAS the pointer to the new `run_id`
@@ -73,7 +111,7 @@ the derived projection would break read-your-write and violate the core invarian
   observes the CAS failure and maps to the conflict error. This mirrors `commit`'s
   `NodePersistOutcome::Conflict` handling so there is one fencing model, not two.
 - **Run resolution.** Add `ChasmNodeRepository::current_run(namespace_id, business_id) ->
-  Option<RunId>` (and the engine method that wraps it). The edge's `activity_execution_key` resolves
+  Option<CurrentRun>` (and the engine method that wraps it; the edge takes `.run_id`). The edge's `activity_execution_key` resolves
   an empty `run_id` through it: `Some(run)` → build the key; `None` → `NotFound "activity not found
   for ID: <activity_id>"` (the message already exists via `map_activity_not_found`). A non-empty
   `run_id` bypasses the pointer (addresses the exact run), preserving today's behaviour.
@@ -145,3 +183,108 @@ Each item is verified by re-running the relevant `TestStandaloneActivityTestSuit
 a statically-SA-enabled `tokeirad` (the suite's `OverrideDynamicConfig(activity.Enabled)` does not
 reach an out-of-process server — see the FINDINGS runbook), and the C1 pass-rate in FINDINGS is
 updated as items land.
+---
+
+## Components and Interfaces
+
+Design Items 1–6 above carry the detailed narrative; this is the interface surface they touch.
+
+- **`ChasmNodeRepository::current_run(namespace_id, business_id) -> Option<CurrentRun>`** (new) —
+  authoritative bare-id resolution; in-memory and DSQL implementations. A wrapping `ChasmEngine`
+  method exposes it to the edge.
+- **`ChasmEngine::start_execution`** (`tokeira-runtime/src/chasm/engine.rs`) — advances/CAS-es the
+  pointer at the Start commit and enforces `IdReusePolicy`/`IdConflictPolicy` against the current
+  run's `status`.
+- **Edge `activity_execution_key`** (`tokeira-edge`) — resolves an empty `run_id` via `current_run`;
+  `None` → `NotFound`; a non-empty `run_id` bypasses the pointer and addresses the exact run
+  (today's behaviour preserved).
+- **`tokeira-chasm-activity`** — `ActivityState.last_worker_identity` and
+  `ActivityEvent::Started.identity`, threaded from `PollActivityTaskQueue.identity` through
+  `ActivityBridge::poll_activity_task` → `record_started` → `ActivityDescription` →
+  `ActivityExecutionInfo`.
+- **Edge respond path** — `ActivityTaskToken` validation (stale attempt stamp / mismatched component
+  ref / namespace mismatch) on `RespondActivityTaskCompleted`/`Failed`/`Canceled`.
+
+## Data Models
+
+- **`CurrentRun { run_id: RunId, status: ActivityLifecycleStatus, vt_epoch: VersionedTransition }`** —
+  the authoritative current-run pointer value (see Item 1 for the carry-all-three decision).
+- **DSQL `chasm_current_run`** — new migration `V056__chasm_current_run.sql`, modeled on the
+  workflow `current_execution` table (`V003`); spread-key `PRIMARY KEY (namespace_id, business_id)`,
+  UUID columns, one `CREATE TABLE` statement, DSQL-safe subset (no `BIGSERIAL`/`CHECK`/FK).
+- **`ActivityState`** — additive `last_worker_identity` (prost tag 18) and an `identity` field on
+  `ActivityEvent::Started` (the `CancelRequested` event already carries `identity`, so there is
+  precedent). Both are additive proto changes; no kernel change.
+
+## Correctness Properties
+
+Each property is verified by a `proptest` test (≥100 iterations) carrying a
+`// Feature: activity-executions-first-class, Property N` tag, plus the named conformance sub-tests.
+
+### Property 1: Current-run authority and read-your-write
+
+**Validates: Requirements 1.1, 1.5**
+
+A bare-`activity_id` Describe/Poll/RequestCancel/Terminate/Delete resolves through the authoritative
+current-run pointer, never the visibility projection; a `Delete` followed by a bare-id `Describe`
+observes the deletion immediately, with no eventual-consistency window.
+
+### Property 2: Pointer/node atomicity under concurrent Starts
+
+**Validates: Requirements 2.1**
+
+The current-run pointer and the root node advance in one fenced unit (same DSQL transaction /
+in-memory lock). Under concurrent Starts at most one wins the CAS; the loser maps to the conflict
+error. The pointer and node never tear.
+
+### Property 3: Id reuse/conflict fidelity
+
+**Validates: Requirements 2.2, 2.3**
+
+Reuse against a closed current run and conflict against a live current run match the v1.31.0
+`IdReusePolicy`/`IdConflictPolicy` outcomes; a rejected conflicting Start returns the v1.31.0
+already-started error naming `CurrentRunID`.
+
+### Property 4: Describe info fidelity
+
+**Validates: Requirements 3.1, 3.2**
+
+`DescribeActivityExecution.info` reports `last_worker_identity`, `run_state`, `attempt`,
+`last_started_time`, `last_failure`, and `heartbeat_details` matching v1.31.0 for each lifecycle
+state.
+
+### Property 5: Task-token validation safety
+
+**Validates: Requirements 4.1**
+
+A response carrying a stale, component-mismatched, or wrong-namespace task token is rejected with
+the v1.31.0 status, never applied.
+
+## Error Handling
+
+All messages are verbatim to v1.31.0 and cite their source per AGENTS §8.
+
+- **Bare id, no current run** → gRPC `NOT_FOUND` `activity not found for ID: <activity_id>`
+  (`map_activity_not_found`, mirrors `frontend.go @ v1.31.0`).
+- **Conflicting Start vs a live current run** → `ActivityExecutionAlreadyStarted` carrying
+  `CurrentRunID` (`chasm/lib/activity/handler.go:91 @ v1.31.0`).
+- **Stale / mismatched / wrong-namespace task token** → the v1.31.0 status (ground-truth the exact
+  codes against `chasm/lib/activity @ v1.31.0` while implementing Item 3).
+- **Describe long-poll past the caller deadline** → `DEADLINE_EXCEEDED` on the caller's gRPC
+  deadline (min of caller deadline and engine budget).
+- **CAS conflict on pointer advance** → mapped to the conflict error, reusing
+  `NodePersistOutcome::Conflict` handling so there is one fencing model.
+
+## Testing Strategy
+
+- **Conformance sub-tests (authoritative).** Each item is verified by re-running its named
+  `TestStandaloneActivityTestSuite` sub-tests against a **statically-SA-enabled** `tokeirad` — the
+  suite's `OverrideDynamicConfig(activity.Enabled)` does not reach an out-of-process server (FINDINGS
+  runbook). Item→sub-test mapping is in the Design Items and the tasks.
+- **Property tests.** Pointer/node atomicity (Property 2) and bare-id resolution across
+  reuse/conflict outcomes (Properties 1, 3), `proptest` ≥100 iterations, tagged as above.
+- **Unit tests.** Worker-identity threading, token validation, and the describe encoding fix carry
+  focused unit coverage alongside the conformance runs.
+- **Checkpoint.** Stage 5 re-runs the full suite and records the new C1 pass-rate in
+  `temporal-functional-conformance/reference/FINDINGS.md`; residual failures are triaged into new
+  tasks or cross-referenced to `runtime-activity-pump` / `runtime-activity-timeouts`.

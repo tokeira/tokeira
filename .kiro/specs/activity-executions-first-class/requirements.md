@@ -127,6 +127,9 @@ that completion/failure responses are safe.
 
 ### Requirement 5: Describe response proto fidelity
 
+**User Story:** As an SDK or UI client, I want `DescribeActivityExecution` to encode retry policy and
+payload fields exactly as v1.31.0, so that decoding succeeds and field values match.
+
 #### Acceptance Criteria
 
 1. THE `DescribeActivityExecution` response SHALL encode retry policy and payload fields exactly
@@ -135,6 +138,9 @@ that completion/failure responses are safe.
 
 ### Requirement 6: Describe long-poll honours the caller deadline
 
+**User Story:** As a client issuing a long-poll describe, I want the call to return on my own gRPC
+deadline, so that deadline-sensitive behaviour matches v1.31.0 rather than a server-fixed budget.
+
 #### Acceptance Criteria
 
 1. WHEN `DescribeActivityExecution` is a long-poll, THE Edge SHALL return on the caller's gRPC
@@ -142,6 +148,9 @@ that completion/failure responses are safe.
    correct deadline behaviour (`TestDescribeActivityExecution_DeadlineExceeded`).
 
 ### Requirement 7: List/Count by activity id
+
+**User Story:** As an operator, I want `CountActivityExecutions` to count correctly when the query
+constrains `ActivityId`, so that activity discovery and counts are accurate.
 
 #### Acceptance Criteria
 

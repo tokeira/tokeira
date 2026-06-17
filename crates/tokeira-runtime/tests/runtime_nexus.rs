@@ -882,6 +882,202 @@ async fn nexus_unknown_endpoint_delivers_failed_resolution() -> Result<()> {
     Ok(())
 }
 
+/// Feature: agentic-conductor (tokeira-odori task 0.1) — conformance proof for
+/// async, intra-cluster, **cross-namespace** Nexus. A parent workflow in the
+/// `control` namespace schedules an async Nexus operation on a worker-targeted
+/// endpoint in a **different** (`agents`) namespace; a handler polling the
+/// agents-namespace broker responds `Started`, then later `Completed`, and the
+/// completion routes back to the originator in the `control` namespace. Also
+/// asserts a long schedule-to-close timeout (>= the 3600s agent wall budget) is
+/// honored, so a long agent turn is never killed by a short default.
+///
+/// This exercises the path Odori's `RunWorkflow` (control) → `AgentWorkflow`
+/// (agents) bridge depends on; the existing worker-targeted tests prove dispatch
+/// but never resolve an async op back across the namespace boundary.
+#[tokio::test]
+async fn cross_namespace_async_nexus_completes_back_to_originator() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let client = Arc::new(MockNexusClient::new(NexusStartResult::AsyncAccepted, true));
+    let ns_control = NamespaceId::new();
+    let ns_agents = NamespaceId::new();
+    assert!(
+        ns_control != ns_agents,
+        "control and agents namespaces must differ for a cross-namespace test"
+    );
+
+    // Endpoint lives in `control` but targets a worker task queue in `agents`.
+    let registry = NexusEndpointRegistry::new(HashMap::from([(
+        "odori-agent".to_string(),
+        NexusEndpointConfig {
+            target: EndpointTarget::Worker {
+                namespace_id: ns_agents,
+                task_queue: TaskQueueName("odori-agent-nexus-q".to_string()),
+            },
+        },
+    )]));
+    let mut runtime = runtime_with_registry(store.clone(), client.clone(), registry);
+
+    // Parent ("RunWorkflow") in the control namespace.
+    let workflow_id = WorkflowId("odori-run-xns".to_string());
+    let parent_run_key = applied_state(
+        &runtime
+            .start_workflow(start_request(ns_control, workflow_id, "req-start"))
+            .await?,
+    )
+    .run_key;
+
+    // Schedule the async Nexus op with a 1-hour schedule-to-close timeout
+    // (>= max_wall_seconds = 3600s); a short default would kill a long agent turn.
+    let task = poll_wft(&runtime, ns_control, "workflow-q").await?;
+    runtime
+        .complete_workflow_task(WorkflowTaskCompletedRequest {
+            token: task.token,
+            identity: WorkerIdentity("control-worker".to_string()),
+            sdk_metadata: None,
+            metering_metadata: None,
+            worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
+            sticky_ttl: None,
+            commands: vec![WorkflowCommand::ScheduleNexusOperation {
+                operation_id: "op-agent".to_string(),
+                endpoint: "odori-agent".to_string(),
+                service: "odori.agent".to_string(),
+                operation: "run_agent_turn".to_string(),
+                input: payloads("agent-request"),
+                schedule_to_close_timeout: Some(time::Duration::seconds(3600)),
+            }],
+            force_new_workflow_task: false,
+            now: OffsetDateTime::now_utc(),
+        })
+        .await?;
+
+    // The task is dispatched to the AGENTS-namespace broker (cross-namespace),
+    // while the token still carries the CONTROL-namespace originator run_key.
+    let broker_task = runtime
+        .nexus_task_broker()
+        .poll(
+            ns_agents,
+            TaskQueueName("odori-agent-nexus-q".to_string()),
+            tokio::time::Duration::from_millis(50),
+        )
+        .await
+        .expect("worker-targeted nexus task should publish to the agents-namespace broker");
+    assert_eq!(
+        broker_task.token.run_key, parent_run_key,
+        "the task token must carry the control-namespace originator run_key"
+    );
+    let scheduled_event_id = broker_task.token.scheduled_event_id;
+    match &broker_task.request {
+        NexusTaskRequest::StartOperation {
+            service,
+            operation,
+            request_id,
+            ..
+        } => {
+            assert_eq!(service, "odori.agent");
+            assert_eq!(operation, "run_agent_turn");
+            assert_eq!(request_id, "op-agent");
+        }
+        other => panic!("expected start operation task, got {other:?}"),
+    }
+    // A worker-targeted endpoint never calls the external HTTP client.
+    assert_eq!(client.snapshot(), (0, 0));
+    // The op is tracked for timeout, but its 1-hour deadline is far away.
+    assert_eq!(runtime.nexus_timeout_tracking().snapshot().len(), 1);
+
+    // Handler (in `agents`) accepts async: `Started` is non-terminal.
+    assert!(
+        runtime
+            .resolve_nexus_operation(
+                parent_run_key,
+                "op-agent".to_string(),
+                scheduled_event_id,
+                tokeira_kernel::NexusResolution::Started,
+            )
+            .await?,
+        "Started resolution should apply"
+    );
+    wait_for_history(&store, parent_run_key, |history| {
+        history.iter().any(|event| {
+            matches!(
+                &event.kind,
+                HistoryEventKind::NexusOperationStarted { operation_id, .. }
+                if operation_id == "op-agent"
+            )
+        })
+    })
+    .await?;
+    assert!(
+        !nexus_history_has_timeout(&store, parent_run_key, "op-agent").await?,
+        "long schedule-to-close must not time out a pending op"
+    );
+
+    // Later, the agent turn finishes: completion routes back to the control parent.
+    assert!(
+        runtime
+            .resolve_nexus_operation(
+                parent_run_key,
+                "op-agent".to_string(),
+                scheduled_event_id,
+                tokeira_kernel::NexusResolution::Completed {
+                    result: payloads("agent-turn-result"),
+                },
+            )
+            .await?,
+        "Completed resolution should apply"
+    );
+    wait_for_history(&store, parent_run_key, |history| {
+        history.iter().any(|event| {
+            matches!(
+                &event.kind,
+                HistoryEventKind::NexusOperationCompleted { operation_id, .. }
+                if operation_id == "op-agent"
+            )
+        })
+    })
+    .await?;
+
+    // The control-namespace parent is woken with a fresh workflow task, and the
+    // op never timed out (1-hour schedule-to-close honored).
+    assert!(
+        poll_wft(&runtime, ns_control, "workflow-q").await.is_ok(),
+        "completion should schedule a workflow task back in the control namespace"
+    );
+    assert!(
+        !nexus_history_has_timeout(&store, parent_run_key, "op-agent").await?,
+        "resolved op must show completion, never a timeout"
+    );
+    assert!(
+        runtime.nexus_timeout_tracking().snapshot().is_empty(),
+        "a terminally-resolved op should no longer be tracked for timeout"
+    );
+
+    runtime.shutdown_timer_scanner().await?;
+    runtime.shutdown_workflow_timeout_scanner().await?;
+    runtime.shutdown_nexus_timeout_scanner().await?;
+    Ok(())
+}
+
+async fn nexus_history_has_timeout(
+    store: &InMemoryStore,
+    run_key: RunKey,
+    operation_id: &str,
+) -> Result<bool> {
+    Ok(store
+        .read_history(run_key, 0, 256)
+        .await?
+        .iter()
+        .any(|event| {
+            matches!(
+                &event.kind,
+                HistoryEventKind::NexusOperationTimedOut { operation_id: oid, .. }
+                if oid == operation_id
+            )
+        }))
+}
+
 async fn poll_wft(
     runtime: &TokeiraRuntime<InMemoryStore>,
     namespace_id: NamespaceId,

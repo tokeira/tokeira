@@ -589,4 +589,4 @@ The architecture, requirements specification, and technical design of this proje
 
 ## License
 
-[MIT](LICENSE)
+[Apache-2.0](LICENSE)

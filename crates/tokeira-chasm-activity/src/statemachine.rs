@@ -535,7 +535,10 @@ mod tests {
             &mut ctx,
         )
         .expect("started");
-        assert_eq!(state.close_time_nanos, 0, "an open activity has no close time");
+        assert_eq!(
+            state.close_time_nanos, 0,
+            "an open activity has no close time"
+        );
 
         apply(
             &mut state,

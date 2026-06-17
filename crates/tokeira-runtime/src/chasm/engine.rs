@@ -401,7 +401,11 @@ impl ChasmEngine {
             // strictly off the correctness path (Requirement 10.15): the authoritative
             // transition has already committed, so a failed projection write must not
             // fail the operation. Best-effort here; the scanner makes it durable.
-            if let Err(error) = self.visibility.record(key, archetype_id, version, snapshot).await {
+            if let Err(error) = self
+                .visibility
+                .record(key, archetype_id, version, snapshot)
+                .await
+            {
                 tracing::warn!(
                     ?error,
                     ?key,
@@ -516,8 +520,14 @@ impl Engine for ChasmEngine {
                 return Err(ChasmError::BusinessIdConflict(reason));
             }
         }
-        self.post_commit(&req.key, result, req.archetype_id, committed_vt, req.visibility)
-            .await?;
+        self.post_commit(
+            &req.key,
+            result,
+            req.archetype_id,
+            committed_vt,
+            req.visibility,
+        )
+        .await?;
         Ok(self.root_ref(&req.key, req.archetype_id, committed_vt, committed_vt))
     }
 

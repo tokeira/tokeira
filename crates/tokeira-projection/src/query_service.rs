@@ -429,12 +429,18 @@ mod tests {
         let sink = VisibilitySink::new(store.clone());
 
         // One workflow and one activity share the index.
-        let mut wf = projection_record(namespace_id, RunKey(Uuid::from_u128(1)), "wf-a", "qa", None);
+        let mut wf =
+            projection_record(namespace_id, RunKey(Uuid::from_u128(1)), "wf-a", "qa", None);
         wf.context.search_attributes = SearchAttributes::default();
         sink.apply(&wf, 0).await.unwrap();
 
-        let mut act =
-            projection_record(namespace_id, RunKey(Uuid::from_u128(2)), "act-1", "act-q", None);
+        let mut act = projection_record(
+            namespace_id,
+            RunKey(Uuid::from_u128(2)),
+            "act-1",
+            "act-q",
+            None,
+        );
         act.context.search_attributes = SearchAttributes::default();
         act.context.archetype_id = activity;
         act.context.workflow_type = WorkflowType("MyActivity".to_string());

@@ -75,15 +75,15 @@ use uuid::Uuid;
 
 use crate::translate::{
     ActivityExecutionSummary, CompletionCallback as EdgeCompletionCallback,
-    CountActivityExecutionsRequest, CountActivityExecutionsResponse, CountWorkflowExecutionsRequest,
-    CountWorkflowExecutionsResponse, ListActivityExecutionsRequest, ListActivityExecutionsResponse,
+    CountActivityExecutionsRequest, CountActivityExecutionsResponse,
+    CountWorkflowExecutionsRequest, CountWorkflowExecutionsResponse,
     DeleteWorkflowExecutionRequest as EdgeDeleteWorkflowExecutionRequest,
     DescribeTaskQueueRequest as EdgeDescribeTaskQueueRequest,
     DescribeTaskQueueResponse as EdgeDescribeTaskQueueResponse, DescribeWorkflowExecutionRequest,
-    Link as EdgeLink, LinkWorkflowEventReference,
-    ListNamespacesResponse as EdgeListNamespacesResponse, ListWorkflowExecutionsRequest,
-    ListWorkflowExecutionsResponse, NamespaceDescription, NamespaceStateUpdate,
-    OnConflictOptions as EdgeOnConflictOptions, PollWorkflowTaskQueueRequest,
+    Link as EdgeLink, LinkWorkflowEventReference, ListActivityExecutionsRequest,
+    ListActivityExecutionsResponse, ListNamespacesResponse as EdgeListNamespacesResponse,
+    ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, NamespaceDescription,
+    NamespaceStateUpdate, OnConflictOptions as EdgeOnConflictOptions, PollWorkflowTaskQueueRequest,
     PollWorkflowTaskQueueResponse, Priority as EdgePriority, ProtocolMessageDto, QueryResultDto,
     RegisterNamespaceRequest as EdgeRegisterNamespaceRequest,
     ResetWorkflowExecutionRequest as EdgeResetWorkflowExecutionRequest,
@@ -5139,7 +5139,10 @@ mod tests {
         assert_eq!(info.activity_type.unwrap().name, "MyActivity");
         assert_eq!(info.task_queue, "tq");
         assert_eq!(info.state_transition_count, 7); // generic transition_count (Req 10.14)
-        assert_eq!(info.status, enums::ActivityExecutionStatus::Completed as i32);
+        assert_eq!(
+            info.status,
+            enums::ActivityExecutionStatus::Completed as i32
+        );
         // execution_duration is derived as close - schedule (60s), only when closed.
         assert_eq!(info.execution_duration.unwrap().seconds, 60);
         assert!(info.schedule_time.is_some() && info.close_time.is_some());
@@ -5952,22 +5955,25 @@ mod tests {
 
     #[test]
     fn namespace_archival_disabled() {
-        let proto = namespace_to_proto(NamespaceDescription {
-            name: "default".to_string(),
-            namespace_id: Some("ns-1".to_string()),
-            is_global: false,
-            visibility_enabled: true,
-            deleted: false,
-            description: String::new(),
-            owner_email: String::new(),
-            cluster_name: "local".to_string(),
-            custom_search_attribute_aliases: std::collections::BTreeMap::new(),
-            capabilities: crate::translate::NamespaceCapabilities {
-                worker_heartbeats: true,
-                reported_problems_search_attribute: false,
+        let proto = namespace_to_proto(
+            NamespaceDescription {
+                name: "default".to_string(),
+                namespace_id: Some("ns-1".to_string()),
+                is_global: false,
+                visibility_enabled: true,
+                deleted: false,
+                description: String::new(),
+                owner_email: String::new(),
+                cluster_name: "local".to_string(),
+                custom_search_attribute_aliases: std::collections::BTreeMap::new(),
+                capabilities: crate::translate::NamespaceCapabilities {
+                    worker_heartbeats: true,
+                    reported_problems_search_attribute: false,
+                },
+                retention: time::Duration::hours(24),
             },
-            retention: time::Duration::hours(24),
-        }, false);
+            false,
+        );
 
         let config = proto.config.expect("config");
         // Retention is echoed (regression: a `None` here renders as `undefined`
@@ -5991,22 +5997,25 @@ mod tests {
 
     #[test]
     fn namespace_clusters_populated() {
-        let proto = namespace_to_proto(NamespaceDescription {
-            name: "default".to_string(),
-            namespace_id: Some("ns-1".to_string()),
-            is_global: false,
-            visibility_enabled: true,
-            deleted: false,
-            description: String::new(),
-            owner_email: String::new(),
-            cluster_name: "local".to_string(),
-            custom_search_attribute_aliases: std::collections::BTreeMap::new(),
-            capabilities: crate::translate::NamespaceCapabilities {
-                worker_heartbeats: true,
-                reported_problems_search_attribute: false,
+        let proto = namespace_to_proto(
+            NamespaceDescription {
+                name: "default".to_string(),
+                namespace_id: Some("ns-1".to_string()),
+                is_global: false,
+                visibility_enabled: true,
+                deleted: false,
+                description: String::new(),
+                owner_email: String::new(),
+                cluster_name: "local".to_string(),
+                custom_search_attribute_aliases: std::collections::BTreeMap::new(),
+                capabilities: crate::translate::NamespaceCapabilities {
+                    worker_heartbeats: true,
+                    reported_problems_search_attribute: false,
+                },
+                retention: time::Duration::hours(24),
             },
-            retention: time::Duration::hours(24),
-        }, false);
+            false,
+        );
 
         let replication = proto.replication_config.expect("replication");
         assert_eq!(replication.active_cluster_name, "local");

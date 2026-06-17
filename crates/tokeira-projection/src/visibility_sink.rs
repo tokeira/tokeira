@@ -112,10 +112,7 @@ where
     ) -> Result<Option<tokeira_types::ProjectionCursor>> {
         self.store.load_checkpoint(partition_id).await
     }
-    async fn save_checkpoint(
-        &self,
-        cursor: &tokeira_types::ProjectionCursor,
-    ) -> Result<()> {
+    async fn save_checkpoint(&self, cursor: &tokeira_types::ProjectionCursor) -> Result<()> {
         self.store.save_checkpoint(cursor).await
     }
     async fn resolve_attr(
@@ -621,7 +618,7 @@ mod tests {
         assert_eq!(row.memo.0["note"], Payload::new("hello"));
 
         let filter = CompiledFilter {
-                archetype: None,
+            archetype: None,
             expr: Some(FilterExpr::Compare {
                 field: FieldRef::Custom {
                     name: "CustomKeyword".to_string(),
@@ -676,7 +673,7 @@ mod tests {
         sink.apply(&second, 0).await.unwrap();
 
         let filter = CompiledFilter {
-                archetype: None,
+            archetype: None,
             expr: Some(FilterExpr::Compare {
                 field: FieldRef::Custom {
                     name: "CustomKeyword".to_string(),

@@ -1282,6 +1282,7 @@ mod tests {
                         default_retention_days,
                         namespace_creation: NamespaceCreationPolicy::Open,
                         quotas: QuotasConfig::default(),
+                        compatibility: CompatibilityConfig::default(),
                     },
                     capacity: CapacityConfig {
                         performance: PerformanceConfig {

@@ -104,7 +104,11 @@ where
         // beginning is safe because snapshot apply is idempotent + monotonic
         // (Properties 12/13) — re-scanning applied transitions is a no-op. See
         // reference/DECISION-visibility-checkpoint-partition.md.
-        let mut cursor = match self.sink.load_checkpoint(initial_cursor.partition_id).await? {
+        let mut cursor = match self
+            .sink
+            .load_checkpoint(initial_cursor.partition_id)
+            .await?
+        {
             Some(stored) if stored.fanout == initial_cursor.fanout => stored,
             _ => initial_cursor,
         };

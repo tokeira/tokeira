@@ -440,7 +440,13 @@ impl VisibilityStore for InMemoryVisibilityStore {
     }
 
     async fn load_checkpoint(&self, partition_id: u32) -> Result<Option<ProjectionCursor>> {
-        Ok(self.inner.lock().await.checkpoints.get(&partition_id).cloned())
+        Ok(self
+            .inner
+            .lock()
+            .await
+            .checkpoints
+            .get(&partition_id)
+            .cloned())
     }
 
     async fn save_checkpoint(&self, cursor: &ProjectionCursor) -> Result<()> {
@@ -1127,7 +1133,7 @@ mod tests {
             .list_executions(
                 ns,
                 &CompiledFilter {
-                archetype: None,
+                    archetype: None,
                     expr: Some(FilterExpr::Compare {
                         field: field.clone(),
                         op: CompareOp::Eq,
@@ -1145,7 +1151,7 @@ mod tests {
             .list_executions(
                 ns,
                 &CompiledFilter {
-                archetype: None,
+                    archetype: None,
                     expr: Some(FilterExpr::Compare {
                         field,
                         op: CompareOp::Ne,
@@ -1173,7 +1179,7 @@ mod tests {
         store.upsert_execution(&paused).await.unwrap();
 
         let status_filter = |status: ExecutionStatus| CompiledFilter {
-                archetype: None,
+            archetype: None,
             expr: Some(FilterExpr::Compare {
                 field: FieldRef::System(SystemField::ExecutionStatus),
                 op: CompareOp::Eq,
@@ -1263,7 +1269,7 @@ mod tests {
             .list_executions(
                 ns,
                 &CompiledFilter {
-                archetype: None,
+                    archetype: None,
                     expr: Some(FilterExpr::Compare {
                         field: field.clone(),
                         op: CompareOp::Eq,
@@ -1281,7 +1287,7 @@ mod tests {
             .list_executions(
                 ns,
                 &CompiledFilter {
-                archetype: None,
+                    archetype: None,
                     expr: Some(FilterExpr::Compare {
                         field: field.clone(),
                         op: CompareOp::Eq,
@@ -1299,7 +1305,7 @@ mod tests {
             .list_executions(
                 ns,
                 &CompiledFilter {
-                archetype: None,
+                    archetype: None,
                     expr: Some(FilterExpr::In {
                         field,
                         values: vec![FilterValue::String("HEL".to_owned())],

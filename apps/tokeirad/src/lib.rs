@@ -603,19 +603,16 @@ fn spawn_visibility_repair(
     partition_count: u32,
     cancel: CancellationToken,
 ) {
-    let rebuild: tokeira_runtime::chasm::SnapshotRebuilder = Arc::new(move |archetype_id, bytes| {
-        if Some(archetype_id) == activity_archetype {
-            tokeira_chasm_activity::rebuild_visibility_snapshot(bytes)
-        } else {
-            None
-        }
-    });
-    let scanner = tokeira_runtime::chasm::VisibilityRepairScanner::new(
-        nodes,
-        sink,
-        rebuild,
-        partition_count,
-    );
+    let rebuild: tokeira_runtime::chasm::SnapshotRebuilder =
+        Arc::new(move |archetype_id, bytes| {
+            if Some(archetype_id) == activity_archetype {
+                tokeira_chasm_activity::rebuild_visibility_snapshot(bytes)
+            } else {
+                None
+            }
+        });
+    let scanner =
+        tokeira_runtime::chasm::VisibilityRepairScanner::new(nodes, sink, rebuild, partition_count);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(VISIBILITY_REPAIR_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -870,18 +867,20 @@ where
         // Capture what the visibility repair scanner needs before the engine consumes
         // the node repo + registry: the activity archetype id (to dispatch the snapshot
         // rebuild) and a clone of the authoritative node store (Req 10.11).
-        let repair_archetype = registry
-            .archetype_id(<tokeira_chasm_activity::ActivityExecution as tokeira_chasm::Component>::FQN);
+        let repair_archetype = registry.archetype_id(
+            <tokeira_chasm_activity::ActivityExecution as tokeira_chasm::Component>::FQN,
+        );
         let repair_nodes = chasm_node_repo.clone();
         let dispatch_queue = Arc::new(tokeira_edge::chasm_activity::ActivityDispatchQueue::new());
         // Standalone activities flow into the shared visibility index via the
         // engine→projection adapter, post-commit and off the correctness path
         // (spec task 24.2). It reuses the same projection apply path as the workflow
         // visibility worker, so both archetypes land in one logical index.
-        let chasm_visibility_sink = Arc::new(tokeira_runtime::chasm::ProjectionVisibilitySink::new(
-            Arc::new(projection_sink()),
-            effective_config.infrastructure.placement.partition_count,
-        ));
+        let chasm_visibility_sink =
+            Arc::new(tokeira_runtime::chasm::ProjectionVisibilitySink::new(
+                Arc::new(projection_sink()),
+                effective_config.infrastructure.placement.partition_count,
+            ));
         let chasm_engine = Arc::new(tokeira_runtime::chasm::ChasmEngine::new(
             chasm_node_repo,
             registry,

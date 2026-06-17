@@ -189,9 +189,9 @@ fn execution_status_name(status: ActivityStatus) -> &'static str {
 /// Running` must therefore match a scheduled or started activity.
 fn api_status_name(status: ActivityStatus) -> &'static str {
     match status {
-        ActivityStatus::Scheduled
-        | ActivityStatus::Started
-        | ActivityStatus::CancelRequested => "Running",
+        ActivityStatus::Scheduled | ActivityStatus::Started | ActivityStatus::CancelRequested => {
+            "Running"
+        }
         ActivityStatus::Completed => "Completed",
         ActivityStatus::Failed => "Failed",
         ActivityStatus::Canceled => "Canceled",

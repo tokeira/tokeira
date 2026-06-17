@@ -216,7 +216,10 @@ mod tests {
         assert_eq!(record.context.namespace_id, NamespaceId(ns));
         assert_eq!(record.context.archetype_id, ArchetypeId(7));
         assert_eq!(record.context.business_id, "activity-biz");
-        assert_eq!(record.context.workflow_id, WorkflowId("activity-biz".into()));
+        assert_eq!(
+            record.context.workflow_id,
+            WorkflowId("activity-biz".into())
+        );
         // status_keyword is authoritative; the typed enum is a placeholder (23.7).
         assert_eq!(record.context.status_keyword, "Running");
         assert_eq!(record.context.execution_status, ExecutionStatus::Running);
@@ -225,7 +228,10 @@ mod tests {
             VisibilityLifecycleState::Open
         );
         // execution_type rides the generic workflow_type column; task_queue carried.
-        assert_eq!(record.context.workflow_type, WorkflowType("MyActivity".into()));
+        assert_eq!(
+            record.context.workflow_type,
+            WorkflowType("MyActivity".into())
+        );
         assert_eq!(record.context.task_queue, TaskQueueName("tq-1".into()));
         // version stamping: (failover, transition_count) -> (authority_epoch, seq).
         assert_eq!(record.context.authority_epoch, 0);
@@ -240,7 +246,10 @@ mod tests {
         let mut snap = snapshot("Completed", LifecycleState::Completed);
         snap.close_time_unix_nanos = Some(500);
         let record = build_record(
-            &key(&Uuid::from_u128(1).to_string(), &Uuid::from_u128(2).to_string()),
+            &key(
+                &Uuid::from_u128(1).to_string(),
+                &Uuid::from_u128(2).to_string(),
+            ),
             7,
             version(9),
             snap,
@@ -258,10 +267,16 @@ mod tests {
     fn rejects_reserved_system_field_in_search_attributes() {
         let mut snap = snapshot("Running", LifecycleState::Running);
         let mut map = BTreeMap::new();
-        map.insert("status".to_owned(), SearchAttrValue::Keyword("spoof".into()));
+        map.insert(
+            "status".to_owned(),
+            SearchAttrValue::Keyword("spoof".into()),
+        );
         snap.search_attributes = SearchAttributes(map);
         let err = build_record(
-            &key(&Uuid::from_u128(1).to_string(), &Uuid::from_u128(2).to_string()),
+            &key(
+                &Uuid::from_u128(1).to_string(),
+                &Uuid::from_u128(2).to_string(),
+            ),
             7,
             version(1),
             snap,

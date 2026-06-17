@@ -1964,7 +1964,7 @@ mod tests {
     fn keyword_list_ne_uses_anti_join() {
         let attr_id = AttrId(7);
         let filter = CompiledFilter {
-                archetype: None,
+            archetype: None,
             expr: Some(FilterExpr::Compare {
                 field: FieldRef::Custom {
                     name: "tags".to_owned(),
@@ -1996,7 +1996,7 @@ mod tests {
             attr_type: SearchAttrType::Text,
         };
         let single = CompiledFilter {
-                archetype: None,
+            archetype: None,
             expr: Some(FilterExpr::Compare {
                 field: field.clone(),
                 op: CompareOp::Eq,
@@ -2004,7 +2004,7 @@ mod tests {
             }),
         };
         let multi = CompiledFilter {
-                archetype: None,
+            archetype: None,
             expr: Some(FilterExpr::Compare {
                 field,
                 op: CompareOp::Eq,
@@ -2027,7 +2027,7 @@ mod tests {
     #[test]
     fn text_in_ignores_invalid_candidates() {
         let filter = CompiledFilter {
-                archetype: None,
+            archetype: None,
             expr: Some(FilterExpr::In {
                 field: FieldRef::Custom {
                     name: "text".to_owned(),

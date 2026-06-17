@@ -61,12 +61,7 @@ fn capacity_provider_name(service: &str, project_name: &str) -> String {
 
 /// Map a service name to its Service Connect DNS endpoint.
 fn service_connect_host(service: &str, namespace: &str) -> String {
-    let name = match service {
-        "edge-api" => "edge-api",
-        "edge-poll" => "edge-poll",
-        "controller" => "controller",
-        _ => service,
-    };
+    let name = service;
     format!("{name}.{namespace}")
 }
 
@@ -211,11 +206,10 @@ async fn discover_instance(
         })?;
 
     for ci in describe_output.container_instances() {
-        if ci.capacity_provider_name().unwrap_or_default() == capacity_provider {
-            if let Some(ec2_id) = ci.ec2_instance_id() {
+        if ci.capacity_provider_name().unwrap_or_default() == capacity_provider
+            && let Some(ec2_id) = ci.ec2_instance_id() {
                 return Ok(ec2_id.to_owned());
             }
-        }
     }
 
     bail!(

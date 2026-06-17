@@ -66,7 +66,7 @@ async fn external_signal_delivery_signals_target_and_resolves_originator() -> Re
         })
         .await?;
 
-    wait_for_history(&*store, target_run_key, |history| {
+    wait_for_history(&store, target_run_key, |history| {
         history.iter().any(|event| matches!(
             &event.kind,
             HistoryEventKind::WorkflowExecutionSignaled { signal_name, .. } if signal_name == "poke"
@@ -74,7 +74,7 @@ async fn external_signal_delivery_signals_target_and_resolves_originator() -> Re
     })
     .await?;
 
-    wait_for_history(&*store, originator_run_key, |history| {
+    wait_for_history(&store, originator_run_key, |history| {
         history.iter().any(|event| {
             matches!(
                 &event.kind,
@@ -138,7 +138,7 @@ async fn external_cancel_delivery_requests_cancel_on_target_and_resolves_origina
         })
         .await?;
 
-    wait_for_history(&*store, target_run_key, |history| {
+    wait_for_history(&store, target_run_key, |history| {
         history.iter().any(|event| {
             matches!(
                 &event.kind,
@@ -151,7 +151,7 @@ async fn external_cancel_delivery_requests_cancel_on_target_and_resolves_origina
     })
     .await?;
 
-    wait_for_history(&*store, originator_run_key, |history| {
+    wait_for_history(&store, originator_run_key, |history| {
         history.iter().any(|event| matches!(
             &event.kind,
             HistoryEventKind::ExternalWorkflowExecutionCancelRequested { target_workflow_id, .. }
@@ -216,14 +216,14 @@ async fn external_signal_cross_namespace_uses_target_namespace() -> Result<()> {
         })
         .await?;
 
-    wait_for_history(&*store, target_run_key, |history| {
+    wait_for_history(&store, target_run_key, |history| {
         history.iter().any(|event| matches!(
             &event.kind,
             HistoryEventKind::WorkflowExecutionSignaled { signal_name, .. } if signal_name == "cross"
         ))
     }).await?;
 
-    wait_for_history(&*store, originator_run_key, |history| {
+    wait_for_history(&store, originator_run_key, |history| {
         history.iter().any(|event| {
             matches!(
                 &event.kind,
@@ -281,7 +281,7 @@ async fn external_signal_not_found_delivers_failed_resolution() -> Result<()> {
         })
         .await?;
 
-    wait_for_history(&*store, originator_run_key, |history| {
+    wait_for_history(&store, originator_run_key, |history| {
         history.iter().any(|event| {
             matches!(
                 &event.kind,

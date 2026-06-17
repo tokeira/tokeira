@@ -251,7 +251,7 @@ fn encode_routing_update(
             state: Some(bundle_ownership_entry::State::Owner(
                 BundleOwnerMessage {
                     owner_node_id: owner.node_id.0.to_string(),
-                    epoch: owner.epoch.0 as u64,
+                    epoch: owner.epoch.0,
                     ..Default::default()
                 }
                 .into(),
@@ -307,7 +307,7 @@ fn encode_lease_entry(
             state: Some(bundle_ownership_entry::State::Owner(
                 BundleOwnerMessage {
                     owner_node_id: owner.clone(),
-                    epoch: lease.epoch.0 as u64,
+                    epoch: lease.epoch.0,
                     ..Default::default()
                 }
                 .into(),

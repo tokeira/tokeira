@@ -1522,7 +1522,7 @@ mod tests {
     }
 
     fn arb_opt_duration() -> impl Strategy<Value = Option<time::Duration>> {
-        proptest::option::of((0i64..1_000_000).prop_map(|ms| time::Duration::milliseconds(ms)))
+        proptest::option::of((0i64..1_000_000).prop_map(time::Duration::milliseconds))
     }
 
     fn arb_duration() -> impl Strategy<Value = time::Duration> {
@@ -2115,13 +2115,12 @@ mod tests {
             Attributes::WorkflowExecutionStartedEventAttributes(attrs) => {
                 assert_eq!(attrs.first_workflow_task_backoff.unwrap().seconds, 9);
                 assert_eq!(attrs.completion_callbacks.len(), 1);
-                assert_eq!(
+                assert!(
                     attrs.completion_callbacks[0]
                         .links
                         .first()
                         .and_then(|link| link.variant.as_ref())
-                        .is_some(),
-                    true
+                        .is_some()
                 );
                 let priority = attrs.priority.unwrap();
                 assert_eq!(priority.priority_key, 2);
@@ -2880,7 +2879,7 @@ mod tests {
         ) {
             let event = make_started_event(
                 None, None, None, 0,
-                orig_rid.clone(), cont_failure.clone(), last_result.clone(),
+                orig_rid, cont_failure.clone(), last_result.clone(),
             );
             let proto = history_event_to_proto(&event);
             match proto.attributes.unwrap() {

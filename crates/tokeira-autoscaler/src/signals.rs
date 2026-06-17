@@ -50,7 +50,7 @@ pub async fn query_service_signals(
 ) -> Result<Vec<ServiceSignal>> {
     let mut signals = Vec::new();
 
-    for (service_name, _service_config) in &config.service_configs {
+    for service_name in config.service_configs.keys() {
         let pressure = classify_service_pressure(mimir, service_name).await?;
         signals.push(ServiceSignal {
             service: service_name.clone(),

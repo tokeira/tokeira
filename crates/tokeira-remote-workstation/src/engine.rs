@@ -372,11 +372,10 @@ impl Workstation {
         self.release_owned_eip(workstation_id).await?;
 
         for volume_id in [&handle.cache_volume_id, &handle.repo_volume_id] {
-            if !volume_id.is_empty() {
-                if let Err(err) = self.ec2.delete_volume().volume_id(volume_id).send().await {
+            if !volume_id.is_empty()
+                && let Err(err) = self.ec2.delete_volume().volume_id(volume_id).send().await {
                     warn!(volume_id, error = %err, "failed to delete workstation volume");
                 }
-            }
         }
 
         if !handle.security_group_id.is_empty()
@@ -1262,25 +1261,21 @@ chown tokeira:tokeira /home/tokeira/.ssh/config"#
         // to GetInstanceProfile before proceeding to RunInstances.
         info!(profile_name, "waiting for IAM instance profile propagation");
         for _ in 0..30 {
-            match self
+            if let Ok(output) = self
                 .iam
                 .get_instance_profile()
                 .instance_profile_name(profile_name)
                 .send()
-                .await
-            {
-                Ok(output) => {
-                    // Also verify the role is attached (not just the profile existing)
-                    let has_role = output
-                        .instance_profile()
-                        .map(|p| !p.roles().is_empty())
-                        .unwrap_or(false);
-                    if has_role {
-                        info!(profile_name, "IAM instance profile ready");
-                        return Ok(());
-                    }
+                .await {
+                // Also verify the role is attached (not just the profile existing)
+                let has_role = output
+                    .instance_profile()
+                    .map(|p| !p.roles().is_empty())
+                    .unwrap_or(false);
+                if has_role {
+                    info!(profile_name, "IAM instance profile ready");
+                    return Ok(());
                 }
-                Err(_) => {}
             }
             sleep(Duration::from_secs(2)).await;
         }

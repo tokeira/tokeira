@@ -994,7 +994,7 @@ mod tests {
     fn contents_for<'a>(files: &'a [RenderedConfigFile], path: &str) -> &'a str {
         files
             .iter()
-            .find(|file| file.relative_path == PathBuf::from(path))
+            .find(|file| file.relative_path == *path)
             .map(|file| file.contents.as_str())
             .unwrap()
     }

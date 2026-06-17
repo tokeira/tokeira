@@ -303,7 +303,7 @@ fn collect_admission_links(
     // derive structural `PartialEq`, which is the wire-equality v1.31.0 uses.
     let mut combined: Vec<proto_common::Link> = links
         .iter()
-        .filter(|link| !nexus_callback_links.iter().any(|cb_link| *cb_link == *link))
+        .filter(|link| !nexus_callback_links.contains(link))
         .cloned()
         .collect();
     for callback in callbacks {

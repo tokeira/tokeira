@@ -1674,7 +1674,7 @@ impl WorkflowService {
                 self.schedule_store
                     .update(namespace_id, schedule_id, &[], |entry| {
                         if policy == OverlapPolicy::BufferOne
-                            && entry.info.buffered_actions.len() >= 1
+                            && !entry.info.buffered_actions.is_empty()
                         {
                             entry.info.buffered_actions.pop_front();
                             entry.info.buffer_dropped += 1;

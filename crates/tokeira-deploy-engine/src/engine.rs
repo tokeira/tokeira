@@ -51,6 +51,12 @@ pub struct PlannedServiceManifest {
 /// application to the supplied [`Platform`].
 pub struct ServiceEngine;
 
+impl Default for ServiceEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ServiceEngine {
     pub fn new() -> Self {
         Self

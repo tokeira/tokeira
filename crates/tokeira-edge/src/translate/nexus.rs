@@ -141,7 +141,7 @@ pub fn nexus_task_to_proto_request(
             scheduled_time,
         } => Ok(nexus_v1::Request {
             header: BTreeMap::new(),
-            scheduled_time: scheduled_time.map(|value| to_proto_timestamp(value).into()),
+            scheduled_time: scheduled_time.map(to_proto_timestamp),
             capabilities: Some(nexus_v1::request::Capabilities {
                 temporal_failure_responses: true,
             }),

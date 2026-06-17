@@ -756,7 +756,7 @@ fn interval_matches(
         }
         let interval_ns = interval.interval.whole_nanoseconds();
         let phase_ns = interval.phase.whole_nanoseconds();
-        let start_ns = i128::from(start.unix_timestamp_nanos()) - phase_ns;
+        let start_ns = start.unix_timestamp_nanos() - phase_ns;
         let mut n = div_floor(start_ns, interval_ns);
         loop {
             let candidate_ns = n * interval_ns + phase_ns;
@@ -1005,7 +1005,7 @@ pub async fn handle_due_action<R>(
             let _ = store.update(namespace_id, schedule_id, &[], |current| {
                 // BufferOne keeps only the newest pending action: evict the
                 // existing one (counting it as dropped) before pushing this one.
-                if policy == OverlapPolicy::BufferOne && current.info.buffered_actions.len() >= 1 {
+                if policy == OverlapPolicy::BufferOne && !current.info.buffered_actions.is_empty() {
                     current.info.buffered_actions.pop_front();
                     current.info.buffer_dropped += 1;
                 }
@@ -1081,11 +1081,10 @@ where
             }
             // Only release a buffered action once the schedule is fully idle and
             // not paused, so buffering never lets two runs overlap.
-            if completed && current.info.running_workflows.is_empty() && !current.state.paused {
-                if let Some(buffered) = current.info.buffered_actions.pop_front() {
+            if completed && current.info.running_workflows.is_empty() && !current.state.paused
+                && let Some(buffered) = current.info.buffered_actions.pop_front() {
                     buffered_to_run.push(buffered);
                 }
-            }
         });
         for buffered in buffered_to_run {
             handle_due_action(

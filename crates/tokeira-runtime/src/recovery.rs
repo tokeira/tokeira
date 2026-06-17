@@ -421,7 +421,7 @@ mod tests {
             owner.mark_active(ShardId(0));
         }
         let lane = spawn_lane(
-            BasicKernel::default(),
+            BasicKernel,
             store.clone(),
             NoopPublisher,
             shard_owner,

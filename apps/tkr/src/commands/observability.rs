@@ -202,7 +202,7 @@ fn rendered_file<'a>(
 ) -> Result<&'a str> {
     files
         .iter()
-        .find(|file| file.relative_path == std::path::PathBuf::from(path))
+        .find(|file| file.relative_path == *path)
         .map(|file| file.contents.as_str())
         .with_context(|| format!("rendered observability file missing: {path}"))
 }

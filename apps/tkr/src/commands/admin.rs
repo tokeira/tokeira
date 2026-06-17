@@ -363,7 +363,7 @@ impl Drop for ScaleDownGuard {
                 .enable_all()
                 .build();
             if let Ok(rt) = rt {
-                let _ = rt.block_on(async {
+                rt.block_on(async {
                     let _ = client
                         .update_service()
                         .cluster(&cluster)

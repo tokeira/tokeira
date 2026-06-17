@@ -508,6 +508,24 @@ pub fn cancel_request(
     }
 }
 
+pub fn reset_request(req: ResetWorkflowExecutionRequest, request_id: &RequestId) -> ResetRequest {
+    let now = OffsetDateTime::now_utc();
+    ResetRequest {
+        fork_event_id: req.workflow_task_finish_event_id,
+        new_run_id: RunId::new(),
+        reason: req.reason,
+        request: RequestContext {
+            request_id: CoreRequestId(
+                req.request_id
+                    .unwrap_or_else(|| request_id.as_str().to_string()),
+            ),
+            caller_identity: None,
+            received_at: now,
+        },
+        now,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -1230,23 +1248,5 @@ mod tests {
 
         assert_eq!(internal.deployment, None);
         assert_eq!(internal.build_id, Some(BuildId("rule-build".to_string())));
-    }
-}
-
-pub fn reset_request(req: ResetWorkflowExecutionRequest, request_id: &RequestId) -> ResetRequest {
-    let now = OffsetDateTime::now_utc();
-    ResetRequest {
-        fork_event_id: req.workflow_task_finish_event_id,
-        new_run_id: RunId::new(),
-        reason: req.reason,
-        request: RequestContext {
-            request_id: CoreRequestId(
-                req.request_id
-                    .unwrap_or_else(|| request_id.as_str().to_string()),
-            ),
-            caller_identity: None,
-            received_at: now,
-        },
-        now,
     }
 }

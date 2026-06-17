@@ -2080,20 +2080,18 @@ mod tests {
             let result = evaluate_workflow_timeout(&entry, now);
             let execution_origin =
                 entry.first_run_started_at.unwrap_or(entry.started_at);
-            if let Some(exec) = entry.workflow_execution_timeout {
-                if now - execution_origin > exec
-                    || (exec.is_zero() && now >= execution_origin)
+            if let Some(exec) = entry.workflow_execution_timeout
+                && (now - execution_origin > exec
+                    || (exec.is_zero() && now >= execution_origin))
                 {
                     prop_assert_eq!(result, Some(WorkflowTimeoutViolation::ExecutionTimeout));
                     return Ok(());
                 }
-            }
-            if let Some(run) = entry.workflow_run_timeout {
-                if now - started_at > run || (run.is_zero() && now >= started_at) {
+            if let Some(run) = entry.workflow_run_timeout
+                && (now - started_at > run || (run.is_zero() && now >= started_at)) {
                     prop_assert_eq!(result, Some(WorkflowTimeoutViolation::RunTimeout));
                     return Ok(());
                 }
-            }
             prop_assert_eq!(result, None);
         }
     }

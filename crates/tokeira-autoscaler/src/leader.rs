@@ -46,63 +46,6 @@ pub struct AutoscalerLeader {
     pub renewal_interval: Duration,
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use tokeira_storage::InMemoryStore;
-    use tokeira_types::ShardId;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn leader_acquires_renews_and_reverts_on_epoch_rejection() {
-        let lease_repo = Arc::new(InMemoryStore::default());
-        let mut leader = AutoscalerLeader::new(
-            lease_repo.clone(),
-            "leader-a".to_owned(),
-            "127.0.0.1:1".to_owned(),
-            Duration::seconds(30),
-            Duration::seconds(10),
-        )
-        .with_bundle(ShardId(42));
-
-        assert!(leader.try_acquire().await.expect("acquire succeeds"));
-        assert!(leader.is_leader());
-        assert_eq!(leader.current_epoch(), Some(ShardEpoch(1)));
-        assert!(leader.renew().await.expect("renew succeeds"));
-
-        let stolen = lease_repo
-            .renew_bundle(
-                ShardId(42),
-                "other-owner".to_owned(),
-                ShardEpoch(99),
-                "127.0.0.1:2".to_owned(),
-            )
-            .await
-            .expect("external renewal attempt succeeds");
-        assert!(matches!(stolen, LeaseOutcome::Rejected { .. }));
-
-        let mut stale_leader = AutoscalerLeader::new(
-            lease_repo,
-            "stale-leader".to_owned(),
-            "127.0.0.1:3".to_owned(),
-            Duration::seconds(30),
-            Duration::seconds(10),
-        )
-        .with_bundle(ShardId(42));
-        stale_leader.current_epoch = Some(ShardEpoch(99));
-
-        assert!(
-            !stale_leader
-                .renew()
-                .await
-                .expect("renew rejection is not fatal")
-        );
-        assert!(!stale_leader.is_leader());
-    }
-}
-
 impl fmt::Debug for AutoscalerLeader {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AutoscalerLeader")
@@ -198,5 +141,62 @@ impl AutoscalerLeader {
 
     pub fn current_epoch(&self) -> Option<ShardEpoch> {
         self.current_epoch
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tokeira_storage::InMemoryStore;
+    use tokeira_types::ShardId;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn leader_acquires_renews_and_reverts_on_epoch_rejection() {
+        let lease_repo = Arc::new(InMemoryStore::default());
+        let mut leader = AutoscalerLeader::new(
+            lease_repo.clone(),
+            "leader-a".to_owned(),
+            "127.0.0.1:1".to_owned(),
+            Duration::seconds(30),
+            Duration::seconds(10),
+        )
+        .with_bundle(ShardId(42));
+
+        assert!(leader.try_acquire().await.expect("acquire succeeds"));
+        assert!(leader.is_leader());
+        assert_eq!(leader.current_epoch(), Some(ShardEpoch(1)));
+        assert!(leader.renew().await.expect("renew succeeds"));
+
+        let stolen = lease_repo
+            .renew_bundle(
+                ShardId(42),
+                "other-owner".to_owned(),
+                ShardEpoch(99),
+                "127.0.0.1:2".to_owned(),
+            )
+            .await
+            .expect("external renewal attempt succeeds");
+        assert!(matches!(stolen, LeaseOutcome::Rejected { .. }));
+
+        let mut stale_leader = AutoscalerLeader::new(
+            lease_repo,
+            "stale-leader".to_owned(),
+            "127.0.0.1:3".to_owned(),
+            Duration::seconds(30),
+            Duration::seconds(10),
+        )
+        .with_bundle(ShardId(42));
+        stale_leader.current_epoch = Some(ShardEpoch(99));
+
+        assert!(
+            !stale_leader
+                .renew()
+                .await
+                .expect("renew rejection is not fatal")
+        );
+        assert!(!stale_leader.is_leader());
     }
 }

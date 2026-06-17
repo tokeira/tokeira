@@ -787,7 +787,7 @@ mod tests {
             "admin",
         ] {
             reject_observability_scale(service)
-                .expect(&format!("{service} should not be rejected"));
+                .unwrap_or_else(|_| panic!("{service} should not be rejected"));
         }
     }
 

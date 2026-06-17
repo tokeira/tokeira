@@ -41,7 +41,7 @@ pub fn scan(command: &[String]) -> Option<SecretMatch> {
     SECRET_PATTERNS.iter().find_map(|(pattern, regex)| {
         let found = regex.find(&joined)?;
         Some(SecretMatch {
-            pattern: *pattern,
+            pattern,
             start: found.start(),
             end: found.end(),
         })

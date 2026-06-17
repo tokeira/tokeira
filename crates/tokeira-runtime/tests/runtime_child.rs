@@ -76,7 +76,7 @@ async fn child_workflow_happy_path_delivers_start_and_completion_back_to_parent(
         .await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
-    wait_for_history(&*store, parent_run_key, |history| {
+    wait_for_history(&store, parent_run_key, |history| {
         history.iter().any(|event| {
             matches!(
                 event.kind,
@@ -116,7 +116,7 @@ async fn child_workflow_happy_path_delivers_start_and_completion_back_to_parent(
         .await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
-    wait_for_history(&*store, parent_run_key, |history| {
+    wait_for_history(&store, parent_run_key, |history| {
         history.iter().any(|event| {
             matches!(
                 &event.kind,
@@ -157,7 +157,7 @@ async fn parent_close_policy_terminate_closes_started_child() -> Result<()> {
 
     let _parent_run_key = start_parent_with_child(
         &runtime,
-        &*store,
+        &store,
         namespace_id,
         &parent_workflow_id,
         &child_workflow_id,
@@ -195,7 +195,7 @@ async fn parent_close_policy_terminate_closes_started_child() -> Result<()> {
         .await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
-    wait_for_history(&*store, child_run_key, |history| {
+    wait_for_history(&store, child_run_key, |history| {
         history.iter().any(|event| {
             matches!(
                 event.kind,
@@ -224,7 +224,7 @@ async fn parent_close_policy_request_cancel_requests_cancel_on_child() -> Result
 
     start_parent_with_child(
         &runtime,
-        &*store,
+        &store,
         namespace_id,
         &parent_workflow_id,
         &child_workflow_id,
@@ -262,7 +262,7 @@ async fn parent_close_policy_request_cancel_requests_cancel_on_child() -> Result
         .await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
-    wait_for_history(&*store, child_run_key, |history| {
+    wait_for_history(&store, child_run_key, |history| {
         history.iter().any(|event| {
             matches!(
                 event.kind,
@@ -346,7 +346,7 @@ async fn duplicate_child_start_delivers_failed_confirmation_to_parent() -> Resul
         .await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
-    wait_for_history(&*store, parent_run_key, |history| {
+    wait_for_history(&store, parent_run_key, |history| {
         history.iter().any(|event| {
             matches!(
                 &event.kind,

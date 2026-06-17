@@ -156,7 +156,7 @@ async fn nexus_schedule_sync_complete_delivers_completed_resolution() -> Result<
         })
         .await?;
 
-    wait_for_history(&*store, run_key, |history| {
+    wait_for_history(&store, run_key, |history| {
         history.iter().any(|event| {
             matches!(
                 &event.kind,
@@ -213,7 +213,7 @@ async fn nexus_async_started_times_out_via_scanner() -> Result<()> {
         })
         .await?;
 
-    wait_for_history(&*store, run_key, |history| {
+    wait_for_history(&store, run_key, |history| {
         let started = history.iter().any(|event| {
             matches!(
                 &event.kind,
@@ -282,7 +282,7 @@ async fn nexus_cancel_success_delivers_canceled_resolution() -> Result<()> {
         })
         .await?;
 
-    wait_for_history(&*store, run_key, |history| {
+    wait_for_history(&store, run_key, |history| {
         history.iter().any(|event| {
             matches!(
                 &event.kind,
@@ -347,7 +347,7 @@ async fn nexus_cancel_success_delivers_canceled_resolution() -> Result<()> {
         })
         .await?;
 
-    wait_for_history(&*store, run_key, |history| {
+    wait_for_history(&store, run_key, |history| {
         history.iter().any(|event| {
             matches!(
                 &event.kind,
@@ -864,7 +864,7 @@ async fn nexus_unknown_endpoint_delivers_failed_resolution() -> Result<()> {
         })
         .await?;
 
-    wait_for_history(&*store, run_key, |history| {
+    wait_for_history(&store, run_key, |history| {
         history.iter().any(|event| {
             matches!(
                 &event.kind,

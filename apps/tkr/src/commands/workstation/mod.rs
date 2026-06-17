@@ -435,11 +435,10 @@ fn read_latest() -> Result<String> {
 }
 
 fn clear_latest_if_matches(id: &str) -> Result<()> {
-    if let Ok(current) = read_latest() {
-        if current == id {
+    if let Ok(current) = read_latest()
+        && current == id {
             let _ = fs::remove_file(state_root()?.join(".latest"));
         }
-    }
     Ok(())
 }
 

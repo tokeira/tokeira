@@ -292,7 +292,7 @@ fn pending_activity_state(status: ActivityStatus) -> tokeira_proto::enums::Pendi
 /// Convert whole nanoseconds to an optional proto `Duration`; `None` for unset
 /// (`<= 0`).
 fn nanos_to_proto_duration(nanos: i64) -> Option<prost_types::Duration> {
-    (nanos > 0).then(|| prost_types::Duration {
+    (nanos > 0).then_some(prost_types::Duration {
         seconds: nanos / 1_000_000_000,
         nanos: (nanos % 1_000_000_000) as i32,
     })
@@ -301,7 +301,7 @@ fn nanos_to_proto_duration(nanos: i64) -> Option<prost_types::Duration> {
 /// Convert whole nanoseconds to an optional proto `Timestamp`; `None` for unset
 /// (`<= 0`).
 fn nanos_to_proto_timestamp(nanos: i64) -> Option<prost_types::Timestamp> {
-    (nanos > 0).then(|| prost_types::Timestamp {
+    (nanos > 0).then_some(prost_types::Timestamp {
         seconds: nanos / 1_000_000_000,
         nanos: (nanos % 1_000_000_000) as i32,
     })
@@ -1392,8 +1392,8 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         let now = OffsetDateTime::now_utc();
         let parsed = translate::versioning_mutation_from_proto(req.operation, now)
             .map_err(proto_conversion_status)?;
-        if let Some(build_id) = &parsed.commit_build_id {
-            if !parsed.commit_force
+        if let Some(build_id) = &parsed.commit_build_id
+            && !parsed.commit_force
                 && !self.inner.worker_registry().has_recent_poller_for_build_id(
                     namespace_id,
                     &task_queue,
@@ -1406,7 +1406,6 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                     "no recent poller observed for target build id",
                 ));
             }
-        }
         let rules = self
             .inner
             .versioning_rule_store()
@@ -4398,7 +4397,7 @@ mod tests {
             reserved_poller_identity: None,
         };
 
-        let transition = BasicKernel::default()
+        let transition = BasicKernel
             .apply(LoadedRun::Absent, Command::Start(start))
             .expect("start transition");
         let result = repo
@@ -4413,7 +4412,7 @@ mod tests {
         run_key: RunKey,
     ) {
         let loaded = repo.load_run(run_key).await.expect("load run");
-        let transition = BasicKernel::default()
+        let transition = BasicKernel
             .apply(
                 loaded,
                 Command::Signal(SignalRequest {

@@ -112,52 +112,6 @@ pub fn poll_activity_response(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use proptest::prelude::*;
-    use time::OffsetDateTime;
-    use tokeira_runtime::StartedWorkflowTask;
-    use tokeira_types::{
-        LogicalTaskSeq, RunKey, ShardEpoch, TaskQueueName, WorkflowId, WorkflowTaskToken,
-    };
-
-    use super::workflow_task_history_after_event_id;
-
-    fn started_task(previous_started_event_id: i64, is_sticky_match: bool) -> StartedWorkflowTask {
-        let run_key = RunKey::new();
-        StartedWorkflowTask {
-            token: WorkflowTaskToken {
-                run_key,
-                logical_seq: LogicalTaskSeq::ONE,
-                started_event_id: 2,
-                attempt: 1,
-                shard_epoch: ShardEpoch(1),
-            },
-            run_key,
-            workflow_id: WorkflowId("workflow".to_string()),
-            task_queue: TaskQueueName("queue".to_string()),
-            previous_started_event_id,
-            is_sticky_match,
-            scheduled_time: OffsetDateTime::UNIX_EPOCH,
-            started_time: OffsetDateTime::UNIX_EPOCH,
-        }
-    }
-
-    proptest! {
-        #[test]
-        fn partial_history_offset_requires_sticky_match(previous_started_event_id in -10i64..10_000, is_sticky_match in any::<bool>()) {
-            let started = started_task(previous_started_event_id, is_sticky_match);
-            let expected = if previous_started_event_id > 0 && is_sticky_match {
-                previous_started_event_id
-            } else {
-                0
-            };
-
-            prop_assert_eq!(workflow_task_history_after_event_id(&started), expected);
-        }
-    }
-}
-
 pub fn terminate_response(
     _outcome: WorkflowMutationOutcome,
 ) -> crate::translate::TerminateWorkflowExecutionResponse {
@@ -247,5 +201,51 @@ pub fn update_response(
             }
         },
         outcome,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+    use time::OffsetDateTime;
+    use tokeira_runtime::StartedWorkflowTask;
+    use tokeira_types::{
+        LogicalTaskSeq, RunKey, ShardEpoch, TaskQueueName, WorkflowId, WorkflowTaskToken,
+    };
+
+    use super::workflow_task_history_after_event_id;
+
+    fn started_task(previous_started_event_id: i64, is_sticky_match: bool) -> StartedWorkflowTask {
+        let run_key = RunKey::new();
+        StartedWorkflowTask {
+            token: WorkflowTaskToken {
+                run_key,
+                logical_seq: LogicalTaskSeq::ONE,
+                started_event_id: 2,
+                attempt: 1,
+                shard_epoch: ShardEpoch(1),
+            },
+            run_key,
+            workflow_id: WorkflowId("workflow".to_string()),
+            task_queue: TaskQueueName("queue".to_string()),
+            previous_started_event_id,
+            is_sticky_match,
+            scheduled_time: OffsetDateTime::UNIX_EPOCH,
+            started_time: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn partial_history_offset_requires_sticky_match(previous_started_event_id in -10i64..10_000, is_sticky_match in any::<bool>()) {
+            let started = started_task(previous_started_event_id, is_sticky_match);
+            let expected = if previous_started_event_id > 0 && is_sticky_match {
+                previous_started_event_id
+            } else {
+                0
+            };
+
+            prop_assert_eq!(workflow_task_history_after_event_id(&started), expected);
+        }
     }
 }

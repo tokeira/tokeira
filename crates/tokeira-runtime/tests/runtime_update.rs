@@ -43,7 +43,7 @@ async fn update_completed_notifies_waiting_caller() -> Result<()> {
             .await
     });
 
-    wait_for_pending_update(&*store, run_key, "update-1").await?;
+    wait_for_pending_update(&store, run_key, "update-1").await?;
     let task = poll_wft(&runtime, workflow_queue(namespace_id, "queue-a")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
@@ -115,7 +115,7 @@ async fn update_rejected_notifies_waiting_caller() -> Result<()> {
             .await
     });
 
-    wait_for_pending_update(&*store, run_key, "update-1").await?;
+    wait_for_pending_update(&store, run_key, "update-1").await?;
     let task = poll_wft(&runtime, workflow_queue(namespace_id, "queue-a")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
@@ -187,7 +187,7 @@ async fn update_accepted_wait_returns_stage_without_outcome() -> Result<()> {
             .await
     });
 
-    wait_for_pending_update(&*store, run_key, "update-1").await?;
+    wait_for_pending_update(&store, run_key, "update-1").await?;
     let task = poll_wft(&runtime, workflow_queue(namespace_id, "queue-a")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
@@ -319,7 +319,7 @@ async fn poll_update_waits_for_history_stage_or_returns_reached_stage() -> Resul
             .await
     });
 
-    wait_for_pending_update(&*store, run_key, "update-1").await?;
+    wait_for_pending_update(&store, run_key, "update-1").await?;
     let task = poll_wft(&runtime, workflow_queue(namespace_id, "queue-a")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
@@ -561,7 +561,7 @@ async fn update_timeout_does_not_block_late_completion_commit() -> Result<()> {
     assert_eq!(snapshot.stage, UpdateLifecycleStage::Admitted);
     assert!(snapshot.outcome.is_none());
 
-    wait_for_pending_update(&*store, run_key, "update-1").await?;
+    wait_for_pending_update(&store, run_key, "update-1").await?;
     let task = poll_wft(&runtime, workflow_queue(namespace_id, "queue-a")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
@@ -593,7 +593,7 @@ async fn update_timeout_does_not_block_late_completion_commit() -> Result<()> {
         })
         .await?;
 
-    wait_for_history(&*store, run_key, |history| {
+    wait_for_history(&store, run_key, |history| {
         history.iter().any(|event| {
             matches!(
                 &event.kind,
@@ -637,7 +637,7 @@ async fn run_close_notifies_waiting_update_callers() -> Result<()> {
             .await
     });
 
-    wait_for_pending_update(&*store, run_key, "update-1").await?;
+    wait_for_pending_update(&store, run_key, "update-1").await?;
     let task = poll_wft(&runtime, workflow_queue(namespace_id, "queue-a")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
@@ -714,8 +714,8 @@ async fn multiple_updates_resolved_in_single_wft() -> Result<()> {
     });
 
     // Wait for both updates to be pending.
-    wait_for_pending_update(&*store, run_key, "update-1").await?;
-    wait_for_pending_update(&*store, run_key, "update-2").await?;
+    wait_for_pending_update(&store, run_key, "update-1").await?;
+    wait_for_pending_update(&store, run_key, "update-2").await?;
 
     // Poll the WFT (may need to poll twice if the
     // kernel scheduled separate WFTs for each update).

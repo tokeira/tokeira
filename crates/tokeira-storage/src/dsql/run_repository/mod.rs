@@ -306,11 +306,10 @@ impl DsqlRunRepository {
             }
         }
         if let Err(error) = result {
-            if outcome == "conflict" {
-                if let Some(operation) = dsql_retry_operation_label(operation) {
+            if outcome == "conflict"
+                && let Some(operation) = dsql_retry_operation_label(operation) {
                     metrics::record_dsql_occ_conflict(operation);
                 }
-            }
             if let Some(sqlstate) = extract_sqlstate(error) {
                 metrics::record_dsql_error_code(&sqlstate);
             }
@@ -350,11 +349,10 @@ impl DsqlRunRepository {
                 metrics::record_dsql_shard_conflict(shard_id.0);
             }
         }
-        if outcome == "conflict" {
-            if let Some(operation) = dsql_retry_operation_label(operation) {
+        if outcome == "conflict"
+            && let Some(operation) = dsql_retry_operation_label(operation) {
                 metrics::record_dsql_occ_conflict(operation);
             }
-        }
         if let Err(error) = result {
             if let Some(sqlstate) = extract_sqlstate(error) {
                 metrics::record_dsql_error_code(&sqlstate);

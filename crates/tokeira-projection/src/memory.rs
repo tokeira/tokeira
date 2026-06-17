@@ -533,11 +533,10 @@ fn matches_filter(
 ) -> Result<bool> {
     // Forced archetype scope (Requirement 13.1): a row outside the query's
     // archetype is never visible, regardless of the user expression.
-    if let Some(archetype) = filter.archetype {
-        if row.archetype_id != archetype {
+    if let Some(archetype) = filter.archetype
+        && row.archetype_id != archetype {
             return Ok(false);
         }
-    }
     match &filter.expr {
         Some(expr) => eval_expr(inner, row, expr),
         None => Ok(true),

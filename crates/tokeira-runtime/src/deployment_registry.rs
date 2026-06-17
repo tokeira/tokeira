@@ -416,7 +416,7 @@ impl DeploymentRegistry {
                     .routing_config
                     .current_version
                     .as_ref()
-                    .is_some_and(|version| version_polls_queue(version));
+                    .is_some_and(version_polls_queue);
             let ramping_active = ramping_version.is_some() || ramping_to_unversioned;
             let ramping_percentage = if ramping_active {
                 record.routing_config.ramping_version_percentage
@@ -2652,7 +2652,7 @@ mod tests {
             cron_schedule: None,
             reserved_poller_identity: None,
         };
-        let transition = BasicKernel::default()
+        let transition = BasicKernel
             .apply(LoadedRun::Absent, Command::Start(start))
             .unwrap();
         assert!(matches!(
@@ -2678,7 +2678,7 @@ mod tests {
             },
             now: OffsetDateTime::UNIX_EPOCH,
         };
-        let transition = BasicKernel::default()
+        let transition = BasicKernel
             .apply(loaded, Command::Terminate(terminate))
             .unwrap();
         assert!(matches!(
@@ -3497,11 +3497,10 @@ mod tests {
                     WorkerDeploymentVersionStatus::Current | WorkerDeploymentVersionStatus::Ramping
                 ));
 
-                if close_before_refresh {
-                    if let Some(run_key) = run_key {
+                if close_before_refresh
+                    && let Some(run_key) = run_key {
                         close_workflow(&store, run_key, "terminate-drainage").await;
                     }
-                }
                 let refreshed = registry
                     .refresh_version_drainage(
                         namespace_id,

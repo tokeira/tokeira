@@ -234,15 +234,14 @@ impl InMemoryBroker {
         worker: Option<&WorkerIdentity>,
     ) -> Option<(DispatchableWorkflowTask, Instant)> {
         let mut inner = self.inner.lock().await;
-        if let Some(worker) = worker {
-            if inner.denied_workers.contains(&(
+        if let Some(worker) = worker
+            && inner.denied_workers.contains(&(
                 queue.namespace_id,
                 queue.task_queue.clone(),
                 worker.clone(),
             )) {
                 return None;
             }
-        }
 
         let now = OffsetDateTime::now_utc();
         let mut promote_to_general = Vec::new();

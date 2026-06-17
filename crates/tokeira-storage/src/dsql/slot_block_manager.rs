@@ -330,11 +330,10 @@ impl SlotBlockManager {
 
 impl Drop for SlotBlockManager {
     fn drop(&mut self) {
-        if let Ok(mut renewer) = self.renewer.lock() {
-            if let Some(handle) = renewer.take() {
+        if let Ok(mut renewer) = self.renewer.lock()
+            && let Some(handle) = renewer.take() {
                 handle.abort();
             }
-        }
     }
 }
 

@@ -289,8 +289,7 @@ where
         ) && self
             .update_registry
             .contains_registered_update(run_key, &update_id)
-        {
-            if self
+            && self
                 .update_registry
                 .attach_waiter(run_key, &update_id, wait_policy.clone(), tx)
             {
@@ -305,7 +304,6 @@ where
                     )
                     .await;
             }
-        }
 
         self.wait_for_history_stage(
             run_key,

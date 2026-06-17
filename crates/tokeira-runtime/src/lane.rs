@@ -2415,8 +2415,7 @@ mod tests {
                 let state = sample_state(run_key);
                 let repo = MockRepo::new(
                     LoadedRun::Existing(state.clone()),
-                    std::iter::repeat(CommitBehavior::Conflict)
-                        .take(conflicts as usize)
+                    std::iter::repeat_n(CommitBehavior::Conflict, conflicts as usize)
                         .chain(std::iter::once(CommitBehavior::Applied))
                         .collect(),
                 );
@@ -2444,8 +2443,7 @@ mod tests {
                 let state = sample_state(run_key);
                 let repo = MockRepo::new(
                     LoadedRun::Existing(state.clone()),
-                    std::iter::repeat(CommitBehavior::Conflict)
-                        .take(conflicts as usize)
+                    std::iter::repeat_n(CommitBehavior::Conflict, conflicts as usize)
                         .chain(std::iter::once(CommitBehavior::Applied))
                         .collect(),
                 );
@@ -2471,8 +2469,7 @@ mod tests {
                 let state = sample_state(run_key);
                 let repo = MockRepo::new(
                     LoadedRun::Existing(state.clone()),
-                    std::iter::repeat(CommitBehavior::Conflict)
-                        .take(max_retries as usize + 1)
+                    std::iter::repeat_n(CommitBehavior::Conflict, max_retries as usize + 1)
                         .collect(),
                 );
                 let kernel = MockKernel::new(sample_dispatch_ops(state.namespace_id));

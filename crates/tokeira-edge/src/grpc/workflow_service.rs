@@ -362,6 +362,54 @@ fn chasm_activity_info(
     }
 }
 
+/// Validate the activity id on a standalone-activity request, mirroring v1.31.0's
+/// per-RPC admission validators (`chasm/lib/activity/validator.go @ v1.31.0`). The
+/// Describe/Poll/Delete/Cancel/Terminate paths use the spaced "activity ID" message
+/// form (the Start path uses a distinct "activityId" message and is validated on its
+/// own path). Length is compared in bytes, matching the Go `len(string)` check.
+fn validate_sa_activity_id(activity_id: &str, max_id_length: usize) -> Result<(), Status> {
+    if activity_id.is_empty() {
+        return Err(Status::invalid_argument("activity ID is required"));
+    }
+    if activity_id.len() > max_id_length {
+        return Err(Status::invalid_argument(format!(
+            "activity ID exceeds length limit. Length={} Limit={}",
+            activity_id.len(),
+            max_id_length
+        )));
+    }
+    Ok(())
+}
+
+/// Validate an optional run id on a standalone-activity request: empty is allowed
+/// (the server resolves the activity's current run), but a non-empty run id must be
+/// a valid UUID (`chasm/lib/activity/validator.go @ v1.31.0`).
+fn validate_sa_run_id(run_id: &str) -> Result<(), Status> {
+    if !run_id.is_empty() && uuid::Uuid::parse_str(run_id).is_err() {
+        return Err(Status::invalid_argument(
+            "invalid run id: must be a valid UUID",
+        ));
+    }
+    Ok(())
+}
+
+/// Run the shared activity-id + run-id validators for a standalone-activity request,
+/// but only when the feature is enabled. A present-but-disabled bridge must answer
+/// `UNIMPLEMENTED` (the v1.31.0 baseline) regardless of request shape, so admission
+/// validation deliberately does not run ahead of the enable gate.
+fn validate_sa_ids(
+    enabled: bool,
+    max_id_length: usize,
+    activity_id: &str,
+    run_id: &str,
+) -> Result<(), Status> {
+    if enabled {
+        validate_sa_activity_id(activity_id, max_id_length)?;
+        validate_sa_run_id(run_id)?;
+    }
+    Ok(())
+}
+
 /// Build a `DescribeActivityExecutionResponse`. The long-poll token is the current
 /// execution VT (so a follow-on describe blocks until the next change), and is
 /// absent once the activity is terminal (proto: "Absent only if the activity is
@@ -2155,6 +2203,17 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             ));
         };
         let req = request.into_inner();
+        if bridge.is_enabled() {
+            validate_sa_activity_id(&req.activity_id, bridge.max_id_length())?;
+            validate_sa_run_id(&req.run_id)?;
+            // A long-poll token needs a concrete run id to anchor the wait
+            // (`chasm/lib/activity/validator.go @ v1.31.0`).
+            if !req.long_poll_token.is_empty() && req.run_id.is_empty() {
+                return Err(Status::invalid_argument(
+                    "run id is required when long poll token is provided",
+                ));
+            }
+        }
         let key = self
             .activity_execution_key(&req.namespace, req.activity_id.clone(), req.run_id.clone())
             .await?;
@@ -2191,6 +2250,12 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             ));
         };
         let req = request.into_inner();
+        validate_sa_ids(
+            bridge.is_enabled(),
+            bridge.max_id_length(),
+            &req.activity_id,
+            &req.run_id,
+        )?;
         let key = self
             .activity_execution_key(&req.namespace, req.activity_id.clone(), req.run_id.clone())
             .await?;
@@ -2248,6 +2313,12 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             ));
         };
         let req = request.into_inner();
+        validate_sa_ids(
+            bridge.is_enabled(),
+            bridge.max_id_length(),
+            &req.activity_id,
+            &req.run_id,
+        )?;
         let key = self
             .activity_execution_key(&req.namespace, req.activity_id, req.run_id)
             .await?;
@@ -2266,6 +2337,12 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             ));
         };
         let req = request.into_inner();
+        validate_sa_ids(
+            bridge.is_enabled(),
+            bridge.max_id_length(),
+            &req.activity_id,
+            &req.run_id,
+        )?;
         let key = self
             .activity_execution_key(&req.namespace, req.activity_id, req.run_id)
             .await?;
@@ -2284,6 +2361,12 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             ));
         };
         let req = request.into_inner();
+        validate_sa_ids(
+            bridge.is_enabled(),
+            bridge.max_id_length(),
+            &req.activity_id,
+            &req.run_id,
+        )?;
         let key = self
             .activity_execution_key(&req.namespace, req.activity_id, req.run_id)
             .await?;
@@ -3120,6 +3203,36 @@ mod tests {
                 Arc::new(tokeira_runtime::BatchOperationStore::default()),
             );
         WorkflowServiceGrpc::new(service)
+    }
+
+    #[test]
+    fn standalone_activity_id_validation_matches_v131_messages() {
+        // Mirrors `chasm/lib/activity/validator.go @ v1.31.0` and the conformance
+        // `TestStandaloneActivityTestSuite/TestDelete/RequestValidations` expectations.
+        let empty = validate_sa_activity_id("", 1000).unwrap_err();
+        assert_eq!(empty.code(), tonic::Code::InvalidArgument);
+        assert_eq!(empty.message(), "activity ID is required");
+
+        let long = "x".repeat(1001);
+        let too_long = validate_sa_activity_id(&long, 1000).unwrap_err();
+        assert_eq!(too_long.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            too_long.message(),
+            "activity ID exceeds length limit. Length=1001 Limit=1000"
+        );
+        assert!(validate_sa_activity_id("act-1", 1000).is_ok());
+
+        // Run id: empty is allowed; a non-empty run id must be a valid UUID.
+        assert!(validate_sa_run_id("").is_ok());
+        assert!(validate_sa_run_id(&Uuid::new_v4().to_string()).is_ok());
+        let bad_run = validate_sa_run_id("invalid-run-id").unwrap_err();
+        assert_eq!(bad_run.code(), tonic::Code::InvalidArgument);
+        assert_eq!(bad_run.message(), "invalid run id: must be a valid UUID");
+
+        // The enable gate: validation is skipped when disabled so a present-but-off
+        // bridge still answers UNIMPLEMENTED (baseline) rather than InvalidArgument.
+        assert!(validate_sa_ids(false, 1000, "", "invalid-run-id").is_ok());
+        assert!(validate_sa_ids(true, 1000, "act-1", "").is_ok());
     }
 
     #[tokio::test]

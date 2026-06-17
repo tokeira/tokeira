@@ -289,6 +289,13 @@ impl ActivityBridge {
         self.config.enable_standalone
     }
 
+    /// The configured max length for user-supplied ids (activity id, run id),
+    /// used by the edge admission validators. Mirrors v1.31.0's
+    /// `MaxIDLengthLimit` (`chasm/lib/activity/validator.go @ v1.31.0`).
+    pub fn max_id_length(&self) -> usize {
+        self.max_id_length
+    }
+
     /// The registry-assigned archetype id for the activity component. The
     /// visibility plane is archetype-neutral, so the edge supplies this to scope
     /// `ListActivityExecutions`/`CountActivityExecutions` to activities (Req 13.1).
@@ -377,7 +384,7 @@ impl ActivityBridge {
             .engine
             .read_component(&key)
             .await
-            .map_err(map_chasm_err)?;
+            .map_err(|e| map_activity_not_found(e, &key))?;
         description_from(snapshot.data, snapshot.execution_vt)
     }
 
@@ -442,6 +449,13 @@ impl ActivityBridge {
     /// Delete an activity execution's node subtree (Requirement 11.8).
     pub async fn delete(&self, key: ExecutionKey) -> EdgeResult<()> {
         self.ensure_enabled()?;
+        // A missing activity is a NotFound, not a silent no-op: confirm the activity
+        // exists before deleting so DeleteActivityExecution mirrors v1.31.0
+        // (`chasm/lib/activity/frontend.go @ v1.31.0`).
+        self.engine
+            .read_component(&key)
+            .await
+            .map_err(|e| map_activity_not_found(e, &key))?;
         self.engine
             .delete_execution(&key)
             .await
@@ -630,6 +644,19 @@ fn description_from(
 
 /// Map a [`ChasmError`] to the edge's [`EdgeError`] (which the gRPC layer maps to a
 /// `tonic::Status`).
+/// Map an engine error for an activity lookup, rendering a missing activity as the
+/// v1.31.0 NotFound message that names the activity id ("activity not found for ID:
+/// <id>", `chasm/lib/activity/frontend.go @ v1.31.0`). Other errors fall through to
+/// [`map_chasm_err`].
+fn map_activity_not_found(error: ChasmError, key: &ExecutionKey) -> EdgeError {
+    match error {
+        ChasmError::ExecutionNotFound => {
+            EdgeError::NotFound(format!("activity not found for ID: {}", key.business_id))
+        }
+        other => map_chasm_err(other),
+    }
+}
+
 fn map_chasm_err(error: ChasmError) -> EdgeError {
     match error {
         ChasmError::Validation(message) => EdgeError::BadRequest(message),
@@ -796,8 +823,19 @@ mod tests {
         assert_eq!(polled.unwrap().status, ActivityStatus::Started);
 
         bridge.delete(key.clone()).await.expect("delete");
-        let err = bridge.describe(key).await.unwrap_err();
-        assert!(matches!(err, EdgeError::NotFound(_)));
+        // Describe and a repeat delete on the now-missing activity both surface the
+        // v1.31.0 NotFound message that names the activity id (map_activity_not_found),
+        // and a delete on a missing activity is a NotFound, not a silent no-op.
+        let describe_err = bridge.describe(key.clone()).await.unwrap_err();
+        assert!(
+            matches!(&describe_err, EdgeError::NotFound(msg) if msg.contains("activity not found for ID")),
+            "describe after delete: {describe_err:?}"
+        );
+        let delete_err = bridge.delete(key).await.unwrap_err();
+        assert!(
+            matches!(&delete_err, EdgeError::NotFound(msg) if msg.contains("activity not found for ID")),
+            "delete on missing: {delete_err:?}"
+        );
     }
 
     /// A bridge whose engine routes dispatch tasks into a shared

@@ -1,1 +1,67 @@
-# add cargo-deny configuration here
+# cargo-deny — Tokeira supply-chain and license posture.
+#
+# Run locally with `cargo deny check`; enforced in CI (.github/workflows/ci.yml).
+# Schema reference: https://embarkstudios.github.io/cargo-deny/
+#
+# Tokeira is a from-scratch durable-execution engine specialised for Aurora DSQL.
+# Its correctness and isolation guarantees rest on a large transitive tree (tonic,
+# prost, sqlx, the AWS SDK, connectrpc). We fail the build on known
+# vulnerabilities, untrusted sources, and any license outside an explicit allowlist.
+
+[advisories]
+# RustSec advisory DB (default source). An active vulnerability fails the check.
+# The entries below are transitive advisories with no upstream fix available; each
+# is a non-vulnerability (unmaintained crate, or a niche unsoundness Tokeira's code
+# does not exercise) pulled in deep in the tree. Revisit when the upstream
+# dependency updates.
+ignore = [
+    "RUSTSEC-2023-0089", # `atomic-polyfill` unmaintained (transitive)
+    "RUSTSEC-2024-0384", # `instant` unmaintained (transitive, via `backoff`)
+    "RUSTSEC-2025-0012", # `backoff` unmaintained (transitive, via temporalio)
+    "RUSTSEC-2025-0119", # `number_prefix` unmaintained (transitive, via indicatif)
+    "RUSTSEC-2026-0097", # `rand` unsoundness in a custom-logger pattern Tokeira does not use
+    # rustls-webpki 0.101.7, transitive via aws-smithy-http-client's rustls 0.21
+    # stack (aws-config -> aurora-dsql-sqlx-connector). These affect certificate
+    # name-constraint validation and CRL parsing — paths not reachable when
+    # connecting to AWS service endpoints. No fix without an upstream AWS SDK
+    # rustls upgrade; revisit when aws-smithy moves to rustls 0.23+.
+    "RUSTSEC-2026-0098", # rustls-webpki: name constraints for URI names
+    "RUSTSEC-2026-0099", # rustls-webpki: name constraints for wildcard certs
+    "RUSTSEC-2026-0104", # rustls-webpki: reachable panic in CRL parsing
+]
+
+[licenses]
+# Deny-by-default: every crate in the tree must resolve to one of these SPDX ids.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "0BSD",
+]
+confidence-threshold = 0.9
+# Per-crate license exceptions, each justified, go here as the tree requires them.
+exceptions = [
+    # webpki-roots bundles Mozilla's CA certificate set under the data-only
+    # CDLA-Permissive-2.0 license; the crate's own code is permissive.
+    { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
+]
+
+[bans]
+# Large async trees legitimately carry duplicate versions — warn, don't fail.
+multiple-versions = "warn"
+# Wildcard ("*") version requirements are forbidden; we pin every external dep.
+wildcards = "deny"
+# ...except internal `path` deps, which legitimately have no version requirement.
+allow-wildcard-paths = true
+
+[sources]
+# Only crates.io and explicitly-allowed git sources; anything else fails.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

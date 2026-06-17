@@ -1,7 +1,9 @@
 [package]
 name = "tokeira-aws"
+publish = false
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 tokeira-iac = { workspace = true }

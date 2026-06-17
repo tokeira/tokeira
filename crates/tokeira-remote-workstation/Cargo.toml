@@ -1,7 +1,9 @@
 [package]
 name = "tokeira-remote-workstation"
+publish = false
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 rust-version = "1.95"
 description = "Remote workstation lifecycle — module composition, bootstrap, and operational methods"
 

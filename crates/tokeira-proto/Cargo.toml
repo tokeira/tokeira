@@ -1,5 +1,6 @@
 [package]
 name = "tokeira-proto"
+publish = false
 version = "0.1.0"
 edition = "2024"
 description = "Temporal-compatible and Tokeira-internal protobuf bindings"

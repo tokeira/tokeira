@@ -1,5 +1,6 @@
 [package]
 name = "tokeira-bench"
+publish = false
 edition.workspace = true
 license.workspace = true
 version.workspace = true

@@ -8,7 +8,11 @@
 
 /// Connection + identity settings for the driver.
 pub struct ScenarioConfig {
-    /// Server address (`TEMPORAL_ADDRESS`, default `http://[::1]:7233`).
+    /// Server address (`TEMPORAL_ADDRESS`, default `http://127.0.0.1:7233`).
+    ///
+    /// The default is IPv4 loopback on purpose: `tokeirad` binds `0.0.0.0:7233`
+    /// (IPv4 wildcard), which does not accept IPv6 `[::1]` connections on macOS, so
+    /// an IPv6 default would fail to connect against a default server.
     pub address: String,
     /// Namespace name the activities live in (`TEMPORAL_NAMESPACE`, default
     /// `default`). The server resolves this name to its internal namespace id.
@@ -24,7 +28,7 @@ impl ScenarioConfig {
     /// Resolve configuration from the environment, applying defaults.
     pub fn from_env() -> Self {
         Self {
-            address: env_or("TEMPORAL_ADDRESS", "http://[::1]:7233"),
+            address: env_or("TEMPORAL_ADDRESS", "http://127.0.0.1:7233"),
             namespace: env_or("TEMPORAL_NAMESPACE", "default"),
             task_queue: env_or("SCENARIO_TASK_QUEUE", "standalone-activities"),
             identity: env_or("SCENARIO_IDENTITY", "standalone-activities-scenario"),

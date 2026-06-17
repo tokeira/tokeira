@@ -53,19 +53,27 @@ the resolved value any time with
 
 ## Running
 
-Two terminals, against a local `tokeirad` (defaults to `http://[::1]:7233`; override
-with `TEMPORAL_ADDRESS`). Run from the repository root:
+Two terminals, against a local `tokeirad`. The driver defaults to
+`http://127.0.0.1:7233` (IPv4 loopback, to match `tokeirad`'s `0.0.0.0:7233` bind —
+an IPv6 `[::1]` default fails to connect on macOS); override with `TEMPORAL_ADDRESS`.
+Run from the repository root:
 
 ```bash
 # 1. server, with standalone activities enabled via the shipped --config
 cargo run -p tokeirad -- --config scenarios/standalone-activities/standalone-activities.toml
 
-# 2. the scenario driver
+# 2. the scenario driver (start → poll/respond → describe, asserting each outcome)
 cargo run --manifest-path scenarios/standalone-activities/Cargo.toml --bin driver
+
+# inspect what's in standalone-activity visibility — the surface an SA-aware UI would
+# read via ListActivityExecutions (the standard Temporal UI has no activities view yet)
+cargo run --manifest-path scenarios/standalone-activities/Cargo.toml --bin list
 ```
 
-Environment overrides: `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE` (default `default`),
-`SCENARIO_TASK_QUEUE` (default `standalone-activities`), `SCENARIO_IDENTITY`.
+Environment overrides: `TEMPORAL_ADDRESS` (default `http://127.0.0.1:7233`),
+`TEMPORAL_NAMESPACE` (default `default`), `SCENARIO_TASK_QUEUE` (default
+`standalone-activities`), `SCENARIO_IDENTITY`. The `list` bin additionally reads
+`QUERY` for a visibility filter (e.g. `ExecutionStatus="Completed"`).
 
 ## Ground truth
 

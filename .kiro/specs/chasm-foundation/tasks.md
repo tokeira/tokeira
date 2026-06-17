@@ -592,10 +592,20 @@ verify against `../temporal @ v1.31.0` before finalizing.
     - **Validates: Requirements 10.11**
     - _Requirements: 12.3_
 
-- [ ] 27. Final checkpoint — full feature
-  - Ensure `cargo +nightly fmt --all --check`, `cargo lint`, `cargo test-lint`, and
-    `cargo test --workspace` pass across all three new crates and the touched runtime/storage/edge/
-    projection surfaces. Ensure all tests pass, ask the user if questions arise.
+- [x] 27. Final checkpoint — full feature
+  - `cargo +nightly fmt --all --check` clean (this feature's files normalized in `e31fa5b1`);
+    `cargo lint` and `cargo test-lint` (`clippy --workspace --all-targets [--tests]`) report **no
+    errors** across the three new crates + the touched runtime/storage/edge/projection/edge surfaces
+    (remaining warnings are pre-existing project noise — large-variant-size, doc-list formatting — in
+    files this feature did not touch).
+  - `cargo test --workspace`: 30 suites pass, covering every chasm-foundation surface (Properties
+    12/13/14, the adapter/scanner/translation/scoping unit tests, storage enumeration). The **one**
+    failure — `grpc_new_endpoints::worker_deployment_registry_roundtrip_via_grpc` (a worker-deployment
+    *drainage* assertion) — is **pre-existing and unrelated**: it fails on `26af4204~1` (before this
+    session's first commit), no commit here touched that test or the worker-deployment code, and
+    drainage is orthogonal to visibility/activities. Flagged for a separate fix; it does not gate this
+    feature. (A known-flaky `grpc_roundtrip` update-protocol test also predates this work; it passed
+    this run.)
 
 ## Notes
 

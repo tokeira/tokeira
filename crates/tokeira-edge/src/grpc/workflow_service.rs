@@ -149,20 +149,35 @@ impl WorkflowServiceGrpc {
     /// run; clients pass the `run_id` returned by `StartActivityExecution`.
     async fn activity_execution_key(
         &self,
+        bridge: &crate::chasm_activity::ActivityBridge,
         namespace: &str,
         activity_id: String,
         run_id: String,
     ) -> Result<tokeira_chasm::ExecutionKey, Status> {
-        if run_id.is_empty() {
-            return Err(Status::invalid_argument(
-                "run_id is required for standalone activity cancel/terminate/delete",
-            ));
-        }
         let namespace_id = self.resolve_namespace_id(namespace).await?;
+        let resolved_run_id = if run_id.is_empty() {
+            // Bare-id request: resolve the current run via the authoritative
+            // current-run pointer (`activity-executions-first-class` Req 1). No current
+            // run names the activity id in a NotFound, mirroring v1.31.0's
+            // `frontend.go` (the message already lands via `map_activity_not_found`).
+            match bridge
+                .current_run(&namespace_id.0.to_string(), &activity_id)
+                .await?
+            {
+                Some(run) => run,
+                None => {
+                    return Err(Status::not_found(format!(
+                        "activity not found for ID: {activity_id}"
+                    )));
+                }
+            }
+        } else {
+            run_id
+        };
         Ok(tokeira_chasm::ExecutionKey::new(
             namespace_id.0.to_string(),
             activity_id,
-            run_id,
+            resolved_run_id,
         ))
     }
 }
@@ -358,6 +373,7 @@ fn chasm_activity_info(
             ..Default::default()
         }),
         state_transition_count: description.execution_vt.transition_count,
+        last_worker_identity: description.worker_identity.clone(),
         ..Default::default()
     }
 }
@@ -639,7 +655,10 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 .as_ref()
                 .map(|q| q.name.clone())
                 .unwrap_or_default();
-            if let Some(task) = bridge.poll_activity_task(&task_queue).await? {
+            if let Some(task) = bridge
+                .poll_activity_task(&task_queue, &req.identity)
+                .await?
+            {
                 debug!(%task_queue, "poll_activity_task_queue served standalone activity");
                 return Ok(Response::new(chasm_activity_poll_response(
                     &req.namespace,
@@ -2215,7 +2234,12 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             }
         }
         let key = self
-            .activity_execution_key(&req.namespace, req.activity_id.clone(), req.run_id.clone())
+            .activity_execution_key(
+                bridge,
+                &req.namespace,
+                req.activity_id.clone(),
+                req.run_id.clone(),
+            )
             .await?;
         // A present long_poll_token turns this into a long-poll for any state change
         // (`frontend.go @ v1.31.0`: "optionally as a long-poll that waits for any
@@ -2257,7 +2281,12 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             &req.run_id,
         )?;
         let key = self
-            .activity_execution_key(&req.namespace, req.activity_id.clone(), req.run_id.clone())
+            .activity_execution_key(
+                bridge,
+                &req.namespace,
+                req.activity_id.clone(),
+                req.run_id.clone(),
+            )
             .await?;
         let description = bridge.poll_outcome(key).await?;
         Ok(Response::new(chasm_poll_response(req.run_id, description)))
@@ -2320,7 +2349,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             &req.run_id,
         )?;
         let key = self
-            .activity_execution_key(&req.namespace, req.activity_id, req.run_id)
+            .activity_execution_key(bridge, &req.namespace, req.activity_id, req.run_id)
             .await?;
         bridge.request_cancel(key, req.identity).await?;
         Ok(Response::new(
@@ -2344,7 +2373,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             &req.run_id,
         )?;
         let key = self
-            .activity_execution_key(&req.namespace, req.activity_id, req.run_id)
+            .activity_execution_key(bridge, &req.namespace, req.activity_id, req.run_id)
             .await?;
         bridge.terminate(key, req.reason).await?;
         Ok(Response::new(
@@ -2368,7 +2397,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             &req.run_id,
         )?;
         let key = self
-            .activity_execution_key(&req.namespace, req.activity_id, req.run_id)
+            .activity_execution_key(bridge, &req.namespace, req.activity_id, req.run_id)
             .await?;
         bridge.delete(key).await?;
         Ok(Response::new(

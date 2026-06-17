@@ -31,7 +31,7 @@ use std::{collections::HashMap, sync::Mutex};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use tokeira_chasm::{ChasmNode, ExecutionKey, VersionedTransition};
+use tokeira_chasm::{ChasmNode, ExecutionKey, LifecycleState, VersionedTransition};
 
 /// The compare-and-set precondition for persisting one dirty node (Requirement
 /// 9.4). It fences a write on the node's prior last-update [`VersionedTransition`]
@@ -73,6 +73,23 @@ pub enum NodePersistOutcome {
     },
 }
 
+/// The authoritative current-run pointer value for one `(namespace_id, business_id)`
+/// — the CHASM analog of the workflow `current_execution` row (migration `V003`;
+/// `activity-executions-first-class` design Item 1). Resolves a bare-id (empty
+/// `run_id`) request to a concrete run. `status` lets the Start path apply the id
+/// reuse/conflict policy without loading the run; `vt_epoch` is the run's committing
+/// `VersionedTransition` — the optimistic fence for a superseding advance, the analog
+/// of v1.31.0's `last_write_version` conditional update on the current-execution row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentRun {
+    /// The current run's id.
+    pub run_id: String,
+    /// The current run's lifecycle status (live vs terminal — see [`LifecycleState`]).
+    pub status: LifecycleState,
+    /// The current run's committing VersionedTransition (the advance fence).
+    pub vt_epoch: VersionedTransition,
+}
+
 /// The durable store for CHASM execution node trees (Requirement 9).
 ///
 /// Implementations persist nodes keyed by `(ExecutionKey, encoded_path)`, support
@@ -90,6 +107,31 @@ pub trait ChasmNodeRepository: Send + Sync {
         key: &ExecutionKey,
         batch: Vec<NodeWrite>,
     ) -> Result<NodePersistOutcome>;
+
+    /// Persist the dirty-node batch for a **new run** and set the
+    /// `(namespace_id, business_id)` current-run pointer to it, in one atomic unit
+    /// (`activity-executions-first-class` Req 1, 2). The pointer write is
+    /// co-transactional with the node batch — the analog of v1.31.0 writing the
+    /// `current_executions` row inside the entity-create transaction — so a run's
+    /// nodes and its current-run pointer never tear. Node fences behave exactly as in
+    /// [`persist_dirty`](Self::persist_dirty); on a node conflict nothing is written
+    /// and the pointer is left unchanged.
+    async fn persist_new_execution(
+        &self,
+        key: &ExecutionKey,
+        batch: Vec<NodeWrite>,
+        current: CurrentRun,
+    ) -> Result<NodePersistOutcome>;
+
+    /// Resolve the current run for `(namespace_id, business_id)` — the run a bare-id
+    /// (empty `run_id`) request addresses (Req 1). `None` when the id has never had a
+    /// run or its run was deleted. Authoritative; never derived from the visibility
+    /// projection (a bare-id read is a read-your-write against authoritative state).
+    async fn current_run(
+        &self,
+        namespace_id: &str,
+        business_id: &str,
+    ) -> Result<Option<CurrentRun>>;
 
     /// Load every node of an execution, in encoded-path order (a whole-tree range
     /// scan). Empty when the execution does not exist.
@@ -132,6 +174,11 @@ pub struct InMemoryChasmNodeStore {
     // the inner per-execution map is a `BTreeMap` so encoded-path range scans are
     // contiguous and ordered.
     executions: Mutex<HashMap<ExecutionKey, std::collections::BTreeMap<Vec<u8>, ChasmNode>>>,
+    // The current-run pointer: `(namespace_id, business_id) -> CurrentRun`. Held under
+    // its own lock; the only path that writes nodes and the pointer together
+    // (`persist_new_execution`) acquires `executions` first, then `current_runs`, so
+    // the two never tear and the consistent lock order rules out deadlock.
+    current_runs: Mutex<HashMap<(String, String), CurrentRun>>,
 }
 
 impl InMemoryChasmNodeStore {
@@ -139,6 +186,47 @@ impl InMemoryChasmNodeStore {
     pub fn new() -> Self {
         Self::default()
     }
+}
+
+/// Check every node fence, then apply the batch to `tree`, all-or-nothing
+/// (Requirement 9.6). Returns `Some(reason)` on the first failed fence (no write),
+/// `None` once the whole batch is applied. Shared by `persist_dirty` and
+/// `persist_new_execution` so both have one fence-then-apply implementation.
+fn check_and_apply_node_batch(
+    tree: &mut std::collections::BTreeMap<Vec<u8>, ChasmNode>,
+    batch: Vec<NodeWrite>,
+) -> Option<String> {
+    for write in &batch {
+        match write.expected {
+            ExpectedVersion::Absent => {
+                if tree.contains_key(&write.encoded_path) {
+                    return Some(format!(
+                        "node at {:?} expected absent but already exists",
+                        write.encoded_path
+                    ));
+                }
+            }
+            ExpectedVersion::Vt(expected) => match tree.get(&write.encoded_path) {
+                Some(existing) if existing.metadata.versioned_transition == expected => {}
+                Some(existing) => {
+                    return Some(format!(
+                        "node at {:?} VT {:?} does not match expected {expected:?}",
+                        write.encoded_path, existing.metadata.versioned_transition
+                    ));
+                }
+                None => {
+                    return Some(format!(
+                        "node at {:?} expected VT {expected:?} but is absent",
+                        write.encoded_path
+                    ));
+                }
+            },
+        }
+    }
+    for write in batch {
+        tree.insert(write.encoded_path, write.node);
+    }
+    None
 }
 
 #[async_trait]
@@ -153,49 +241,49 @@ impl ChasmNodeRepository for InMemoryChasmNodeStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("chasm node store mutex poisoned"))?;
         let tree = executions.entry(key.clone()).or_default();
+        Ok(match check_and_apply_node_batch(tree, batch) {
+            Some(reason) => NodePersistOutcome::Conflict { reason },
+            None => NodePersistOutcome::Applied,
+        })
+    }
 
-        // Phase 1 — check every fence before mutating anything, so the batch is
-        // all-or-nothing (Requirement 9.6). A failed fence yields Conflict with no
-        // partial write.
-        for write in &batch {
-            match write.expected {
-                ExpectedVersion::Absent => {
-                    if tree.contains_key(&write.encoded_path) {
-                        return Ok(NodePersistOutcome::Conflict {
-                            reason: format!(
-                                "node at {:?} expected absent but already exists",
-                                write.encoded_path
-                            ),
-                        });
-                    }
-                }
-                ExpectedVersion::Vt(expected) => match tree.get(&write.encoded_path) {
-                    Some(existing) if existing.metadata.versioned_transition == expected => {}
-                    Some(existing) => {
-                        return Ok(NodePersistOutcome::Conflict {
-                            reason: format!(
-                                "node at {:?} VT {:?} does not match expected {expected:?}",
-                                write.encoded_path, existing.metadata.versioned_transition
-                            ),
-                        });
-                    }
-                    None => {
-                        return Ok(NodePersistOutcome::Conflict {
-                            reason: format!(
-                                "node at {:?} expected VT {expected:?} but is absent",
-                                write.encoded_path
-                            ),
-                        });
-                    }
-                },
-            }
+    async fn persist_new_execution(
+        &self,
+        key: &ExecutionKey,
+        batch: Vec<NodeWrite>,
+        current: CurrentRun,
+    ) -> Result<NodePersistOutcome> {
+        // Lock order: `executions` first, then `current_runs`. This is the only path
+        // that holds both, so the node batch and the pointer write land as one atomic
+        // unit and the consistent order rules out deadlock.
+        let mut executions = self
+            .executions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("chasm node store mutex poisoned"))?;
+        let tree = executions.entry(key.clone()).or_default();
+        if let Some(reason) = check_and_apply_node_batch(tree, batch) {
+            return Ok(NodePersistOutcome::Conflict { reason });
         }
-
-        // Phase 2 — every fence held; apply the whole batch.
-        for write in batch {
-            tree.insert(write.encoded_path, write.node);
-        }
+        let mut current_runs = self
+            .current_runs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("chasm node store mutex poisoned"))?;
+        current_runs.insert((key.namespace_id.clone(), key.business_id.clone()), current);
         Ok(NodePersistOutcome::Applied)
+    }
+
+    async fn current_run(
+        &self,
+        namespace_id: &str,
+        business_id: &str,
+    ) -> Result<Option<CurrentRun>> {
+        let current_runs = self
+            .current_runs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("chasm node store mutex poisoned"))?;
+        Ok(current_runs
+            .get(&(namespace_id.to_owned(), business_id.to_owned()))
+            .cloned())
     }
 
     async fn load_execution(&self, key: &ExecutionKey) -> Result<Vec<(Vec<u8>, ChasmNode)>> {
@@ -235,6 +323,20 @@ impl ChasmNodeRepository for InMemoryChasmNodeStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("chasm node store mutex poisoned"))?;
         executions.remove(key);
+        // Clear the current-run pointer iff it points at the deleted run, so a
+        // subsequent bare-id read is NotFound (read-your-write; Req 1.5). Deleting a
+        // superseded (non-current) run leaves the pointer untouched.
+        let mut current_runs = self
+            .current_runs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("chasm node store mutex poisoned"))?;
+        let ptr_key = (key.namespace_id.clone(), key.business_id.clone());
+        if current_runs
+            .get(&ptr_key)
+            .is_some_and(|c| c.run_id == key.run_id)
+        {
+            current_runs.remove(&ptr_key);
+        }
         Ok(())
     }
 

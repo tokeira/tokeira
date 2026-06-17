@@ -112,6 +112,9 @@ pub struct ActivityDescription {
     pub scheduled_time_nanos: i64,
     /// Last started time in Unix nanoseconds (`0` = not started).
     pub started_time_nanos: i64,
+    /// Identity of the worker that polled/started the current attempt (empty until
+    /// pickup) — `DescribeActivityExecution.info.last_worker_identity`.
+    pub worker_identity: String,
     /// The execution clock, used as the caller's long-poll token.
     pub execution_vt: VersionedTransition,
 }
@@ -446,6 +449,24 @@ impl ActivityBridge {
             .await
     }
 
+    /// Resolve the current run for `activity_id` in `namespace_id` — the run a bare-id
+    /// (empty `run_id`) request addresses (`activity-executions-first-class` Req 1).
+    /// `None` when there is no current run for the id. Authoritative (engine
+    /// current-run pointer), never the visibility projection.
+    pub async fn current_run(
+        &self,
+        namespace_id: &str,
+        activity_id: &str,
+    ) -> EdgeResult<Option<String>> {
+        self.ensure_enabled()?;
+        Ok(self
+            .engine
+            .current_run(namespace_id, activity_id)
+            .await
+            .map_err(map_chasm_err)?
+            .map(|current| current.run_id))
+    }
+
     /// Delete an activity execution's node subtree (Requirement 11.8).
     pub async fn delete(&self, key: ExecutionKey) -> EdgeResult<()> {
         self.ensure_enabled()?;
@@ -469,9 +490,16 @@ impl ActivityBridge {
         &self,
         key: ExecutionKey,
         started_time_nanos: i64,
+        identity: String,
     ) -> EdgeResult<()> {
-        self.apply_event(key, ActivityEvent::Started { started_time_nanos })
-            .await
+        self.apply_event(
+            key,
+            ActivityEvent::Started {
+                started_time_nanos,
+                identity,
+            },
+        )
+        .await
     }
 
     /// Worker-facing: record successful completion.
@@ -498,6 +526,7 @@ impl ActivityBridge {
     pub async fn poll_activity_task(
         &self,
         task_queue: &str,
+        worker_identity: &str,
     ) -> EdgeResult<Option<PolledActivityTask>> {
         self.ensure_enabled()?;
         let queue = self.dispatch_queue.as_ref().ok_or_else(|| {
@@ -522,7 +551,8 @@ impl ActivityBridge {
             // pickup even if the worker never responds (the start-to-close timer
             // then fences the lost attempt).
             let started_at = self.engine.now();
-            self.record_started(entry.key.clone(), started_at).await?;
+            self.record_started(entry.key.clone(), started_at, worker_identity.to_owned())
+                .await?;
             let token = ActivityTaskToken {
                 namespace_id: entry.key.namespace_id.clone(),
                 activity_id: entry.key.business_id.clone(),
@@ -638,6 +668,7 @@ fn description_from(
         heartbeat_nanos: state.heartbeat_nanos,
         scheduled_time_nanos: state.scheduled_time_nanos,
         started_time_nanos: state.started_time_nanos,
+        worker_identity: state.last_worker_identity,
         execution_vt,
     })
 }
@@ -772,7 +803,7 @@ mod tests {
         bridge.start(req).await.expect("start");
 
         bridge
-            .record_started(key.clone(), 5 * SEC)
+            .record_started(key.clone(), 5 * SEC, "worker-1".to_owned())
             .await
             .expect("started");
         assert_eq!(
@@ -815,7 +846,7 @@ mod tests {
 
         // Advance (start), then a poll since the scheduled VT resolves.
         bridge
-            .record_started(key.clone(), SEC)
+            .record_started(key.clone(), SEC, "worker-1".to_owned())
             .await
             .expect("started");
         let polled = bridge.poll(key.clone(), since).await.expect("poll");
@@ -835,6 +866,33 @@ mod tests {
         assert!(
             matches!(&delete_err, EdgeError::NotFound(msg) if msg.contains("activity not found for ID")),
             "delete on missing: {delete_err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_run_resolves_bare_id_then_clears_on_delete() {
+        // Stage 1 (activity-executions-first-class Req 1): the current-run pointer is
+        // set on start, resolves a bare id (empty run_id) to the started run, and is
+        // cleared when the current run is deleted (read-your-write).
+        let bridge = bridge(true);
+        let req = start_request();
+        let key = key_of(&req);
+        bridge.start(req).await.expect("start");
+
+        let resolved = bridge
+            .current_run(&key.namespace_id, &key.business_id)
+            .await
+            .expect("current_run");
+        assert_eq!(resolved.as_deref(), Some(key.run_id.as_str()));
+
+        bridge.delete(key.clone()).await.expect("delete");
+        let after = bridge
+            .current_run(&key.namespace_id, &key.business_id)
+            .await
+            .expect("current_run after delete");
+        assert_eq!(
+            after, None,
+            "pointer must clear when the current run is deleted"
         );
     }
 
@@ -873,7 +931,7 @@ mod tests {
         // The committed dispatch task is queued; a worker poll picks it up, which
         // records the start (Scheduled → Started) before returning the task.
         let task = bridge
-            .poll_activity_task(&task_queue)
+            .poll_activity_task(&task_queue, "worker-1")
             .await
             .expect("poll")
             .expect("a queued task");
@@ -895,7 +953,7 @@ mod tests {
         // The queue is drained — a second poll finds nothing.
         assert!(
             bridge
-                .poll_activity_task(&task_queue)
+                .poll_activity_task(&task_queue, "worker-1")
                 .await
                 .expect("poll empty")
                 .is_none()
@@ -911,7 +969,7 @@ mod tests {
         bridge.start(req).await.expect("start");
 
         let task = bridge
-            .poll_activity_task(&task_queue)
+            .poll_activity_task(&task_queue, "worker-1")
             .await
             .expect("poll")
             .expect("a queued task");
@@ -935,7 +993,7 @@ mod tests {
         let bridge = worker_bridge();
         assert!(
             bridge
-                .poll_activity_task("idle-queue")
+                .poll_activity_task("idle-queue", "worker-1")
                 .await
                 .expect("poll")
                 .is_none()

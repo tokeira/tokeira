@@ -138,6 +138,12 @@ pub struct ActivityState {
     /// depends on every snapshot input being node-resident (Req 10.11).
     #[prost(int64, tag = "17")]
     pub close_time_nanos: i64,
+    /// Identity of the worker that polled/started the current attempt (empty until a
+    /// worker picks the activity up). Surfaced as
+    /// `DescribeActivityExecution.info.last_worker_identity`
+    /// (`activity-executions-first-class` Req 3; `standalone_activity_test.go:4831`).
+    #[prost(string, tag = "18")]
+    pub last_worker_identity: String,
 }
 
 // `status()` and `set_status()` accessors for the `status` enumeration field are

@@ -22,7 +22,9 @@ use tokeira_chasm::{
     MutableContext, NodeTree, Registry, RetainAllValidator, Staleness, TransitionResult,
     VersionedTransition, VisibilitySnapshot,
 };
-use tokeira_storage::{ChasmNodeRepository, ExpectedVersion, NodePersistOutcome, NodeWrite};
+use tokeira_storage::{
+    ChasmNodeRepository, CurrentRun, ExpectedVersion, NodePersistOutcome, NodeWrite,
+};
 use tokio::sync::Notify;
 
 use super::{
@@ -325,6 +327,21 @@ impl ChasmEngine {
     /// next commit. The execution clock is reconstructed as the maximum node VT
     /// (every committed transition stamps at least one node with the committing
     /// VT, so the max equals the execution clock).
+    /// Resolve the current run for `(namespace_id, business_id)` — the run a bare-id
+    /// (empty `run_id`) request addresses (`activity-executions-first-class` Req 1).
+    /// Authoritative: delegates to the node store's current-run pointer, never the
+    /// visibility projection.
+    pub async fn current_run(
+        &self,
+        namespace_id: &str,
+        business_id: &str,
+    ) -> Result<Option<CurrentRun>, ChasmError> {
+        self.repo
+            .current_run(namespace_id, business_id)
+            .await
+            .map_err(|e| ChasmError::Internal(format!("resolve current run: {e}")))
+    }
+
     async fn load_tree(
         &self,
         key: &ExecutionKey,
@@ -500,12 +517,11 @@ impl Engine for ChasmEngine {
         req: StartRequest,
     ) -> Result<tokeira_chasm::ComponentRef, ChasmError> {
         let (mut tree, baseline) = self.load_tree(&req.key).await?;
-        if !tree.is_empty() {
-            return Err(ChasmError::BusinessIdConflict(format!(
-                "execution {:?} already exists",
-                req.key
-            )));
-        }
+        // The current-run pointer is the by-id conflict authority now; a fresh run_id
+        // means the node tree is empty, so the Absent node fences below also reject a
+        // same-(namespace, business, run) collision. The pointer advance is
+        // co-transactional with the root-node create (`activity-executions-first-class`
+        // Req 1, 2).
         tree.create_node(
             ROOT_PATH.to_vec(),
             req.archetype_id,
@@ -514,7 +530,29 @@ impl Engine for ChasmEngine {
         )?;
         let committed_vt = next_vt(tree.execution_vt());
         let result = tree.close_transaction(committed_vt, &RetainAllValidator)?;
-        match self.commit(&req.key, &baseline, &result).await? {
+        let batch: Vec<NodeWrite> = result
+            .dirty_nodes
+            .iter()
+            .map(|(path, node)| NodeWrite {
+                encoded_path: path.clone(),
+                node: node.clone(),
+                expected: match baseline.get(path) {
+                    Some(vt) => ExpectedVersion::Vt(*vt),
+                    None => ExpectedVersion::Absent,
+                },
+            })
+            .collect();
+        let current = CurrentRun {
+            run_id: req.key.run_id.clone(),
+            status: LifecycleState::Running,
+            vt_epoch: committed_vt,
+        };
+        match self
+            .repo
+            .persist_new_execution(&req.key, batch, current)
+            .await
+            .map_err(|e| ChasmError::Internal(format!("persist new execution: {e}")))?
+        {
             NodePersistOutcome::Applied => {}
             NodePersistOutcome::Conflict { reason } => {
                 return Err(ChasmError::BusinessIdConflict(reason));

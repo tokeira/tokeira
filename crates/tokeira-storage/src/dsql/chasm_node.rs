@@ -31,10 +31,12 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use sqlx::{Connection, Row};
-use tokeira_chasm::{ChasmNode, ExecutionKey, VersionedTransition};
+use tokeira_chasm::{ChasmNode, ExecutionKey, LifecycleState, VersionedTransition};
 use uuid::Uuid;
 
-use crate::{ChasmNodeRepository, DbClass, ExpectedVersion, NodePersistOutcome, NodeWrite};
+use crate::{
+    ChasmNodeRepository, CurrentRun, DbClass, ExpectedVersion, NodePersistOutcome, NodeWrite,
+};
 
 use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, DsqlRunRepository, codec};
 
@@ -77,6 +79,29 @@ impl DsqlChasmNodeRepository {
         let data: Option<Vec<u8>> = row.try_get("data")?;
         let metadata = codec::decode(&metadata_blob)?;
         Ok((encoded_path, ChasmNode { metadata, data }))
+    }
+
+    /// Encode a [`LifecycleState`] as the `chasm_current_run.status` SMALLINT
+    /// (0=Running, 1=Completed, 2=Failed). Stable on-disk encoding — extend, never
+    /// renumber.
+    fn encode_status(status: LifecycleState) -> i16 {
+        match status {
+            LifecycleState::Running => 0,
+            LifecycleState::Completed => 1,
+            LifecycleState::Failed => 2,
+        }
+    }
+
+    /// Decode a `chasm_current_run.status` SMALLINT back to a [`LifecycleState`].
+    fn decode_status(value: i16) -> Result<LifecycleState> {
+        match value {
+            0 => Ok(LifecycleState::Running),
+            1 => Ok(LifecycleState::Completed),
+            2 => Ok(LifecycleState::Failed),
+            other => Err(anyhow::anyhow!(
+                "chasm_current_run.status `{other}` is not a known LifecycleState"
+            )),
+        }
     }
 }
 
@@ -193,6 +218,179 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
         }
     }
 
+    async fn persist_new_execution(
+        &self,
+        key: &ExecutionKey,
+        batch: Vec<NodeWrite>,
+        current: CurrentRun,
+    ) -> Result<NodePersistOutcome> {
+        let (namespace_id, business_id, run_id) = Self::key_parts(key)?;
+        let mut permit = self.director.acquire(DbClass::Commit).await?;
+        let mut tx = permit.connection()?.begin().await?;
+
+        // Phase 1 — node fences (all-or-nothing), identical to `persist_dirty`.
+        for write in &batch {
+            let stored = sqlx::query(
+                "SELECT failover_version, transition_count
+                 FROM chasm_node
+                 WHERE namespace_id = $1 AND business_id = $2 AND run_id = $3
+                   AND encoded_path = $4",
+            )
+            .bind(namespace_id)
+            .bind(business_id)
+            .bind(run_id)
+            .bind(write.encoded_path.as_slice())
+            .fetch_optional(&mut *tx)
+            .await?;
+            let conflict_reason = match (&write.expected, stored) {
+                (ExpectedVersion::Absent, Some(_)) => Some(format!(
+                    "node at {:?} expected absent but already exists",
+                    write.encoded_path
+                )),
+                (ExpectedVersion::Absent, None) => None,
+                (ExpectedVersion::Vt(expected), Some(row)) => {
+                    let failover: i64 = row.try_get("failover_version")?;
+                    let count: i64 = row.try_get("transition_count")?;
+                    let stored_vt = VersionedTransition::new(failover, count);
+                    if &stored_vt == expected {
+                        None
+                    } else {
+                        Some(format!(
+                            "node at {:?} VT {stored_vt:?} does not match expected {expected:?}",
+                            write.encoded_path
+                        ))
+                    }
+                }
+                (ExpectedVersion::Vt(expected), None) => Some(format!(
+                    "node at {:?} expected VT {expected:?} but is absent",
+                    write.encoded_path
+                )),
+            };
+            if let Some(reason) = conflict_reason {
+                tx.rollback().await?;
+                return Ok(NodePersistOutcome::Conflict { reason });
+            }
+        }
+
+        // Phase 2 — upsert the node batch.
+        for write in &batch {
+            let metadata_blob = codec::encode(&write.node.metadata)?;
+            let vt = write.node.metadata.versioned_transition;
+            let initial_vt = write.node.metadata.initial_versioned_transition;
+            let result = sqlx::query(
+                "INSERT INTO chasm_node
+                   (namespace_id, business_id, run_id, encoded_path, archetype_id,
+                    failover_version, transition_count,
+                    initial_failover_version, initial_transition_count,
+                    metadata, data, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
+                 ON CONFLICT (namespace_id, business_id, run_id, encoded_path) DO UPDATE SET
+                    archetype_id = EXCLUDED.archetype_id,
+                    failover_version = EXCLUDED.failover_version,
+                    transition_count = EXCLUDED.transition_count,
+                    initial_failover_version = EXCLUDED.initial_failover_version,
+                    initial_transition_count = EXCLUDED.initial_transition_count,
+                    metadata = EXCLUDED.metadata,
+                    data = EXCLUDED.data,
+                    updated_at = EXCLUDED.updated_at",
+            )
+            .bind(namespace_id)
+            .bind(business_id)
+            .bind(run_id)
+            .bind(write.encoded_path.as_slice())
+            .bind(i64::from(write.node.metadata.component_type_id))
+            .bind(vt.namespace_failover_version)
+            .bind(vt.transition_count)
+            .bind(initial_vt.namespace_failover_version)
+            .bind(initial_vt.transition_count)
+            .bind(metadata_blob)
+            .bind(write.node.data.clone())
+            .execute(&mut *tx)
+            .await;
+            if let Err(err) = result {
+                if DsqlRunRepository::is_serialization_failure(&err) {
+                    tx.rollback().await?;
+                    return Ok(NodePersistOutcome::Conflict {
+                        reason: "dsql serialization failure during node write".to_owned(),
+                    });
+                }
+                return Err(err.into());
+            }
+        }
+
+        // Phase 3 — advance the current-run pointer in the SAME transaction (the
+        // analog of v1.31.0's current_executions write inside the entity-create tx),
+        // so the run's root node and its current-run pointer never tear.
+        let current_run_id = Self::parse_uuid("current run_id", &current.run_id)?;
+        let pointer = sqlx::query(
+            "INSERT INTO chasm_current_run
+               (namespace_id, business_id, run_id, status,
+                failover_version, transition_count, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, now())
+             ON CONFLICT (namespace_id, business_id) DO UPDATE SET
+                run_id = EXCLUDED.run_id,
+                status = EXCLUDED.status,
+                failover_version = EXCLUDED.failover_version,
+                transition_count = EXCLUDED.transition_count,
+                updated_at = EXCLUDED.updated_at",
+        )
+        .bind(namespace_id)
+        .bind(business_id)
+        .bind(current_run_id)
+        .bind(Self::encode_status(current.status))
+        .bind(current.vt_epoch.namespace_failover_version)
+        .bind(current.vt_epoch.transition_count)
+        .execute(&mut *tx)
+        .await;
+        if let Err(err) = pointer {
+            if DsqlRunRepository::is_serialization_failure(&err) {
+                tx.rollback().await?;
+                return Ok(NodePersistOutcome::Conflict {
+                    reason: "dsql serialization failure during current-run write".to_owned(),
+                });
+            }
+            return Err(err.into());
+        }
+
+        match tx.commit().await {
+            Ok(()) => Ok(NodePersistOutcome::Applied),
+            Err(err) if DsqlRunRepository::is_serialization_failure(&err) => {
+                Ok(NodePersistOutcome::Conflict {
+                    reason: "dsql serialization failure at commit".to_owned(),
+                })
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    async fn current_run(
+        &self,
+        namespace_id: &str,
+        business_id: &str,
+    ) -> Result<Option<CurrentRun>> {
+        let namespace_uuid = Self::parse_uuid("namespace_id", namespace_id)?;
+        let mut permit = self.director.acquire(DbClass::Read).await?;
+        let row = sqlx::query(
+            "SELECT run_id, status, failover_version, transition_count
+             FROM chasm_current_run
+             WHERE namespace_id = $1 AND business_id = $2",
+        )
+        .bind(namespace_uuid)
+        .bind(business_id)
+        .fetch_optional(permit.connection()?)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let run_id: Uuid = row.try_get("run_id")?;
+        let status: i16 = row.try_get("status")?;
+        let failover: i64 = row.try_get("failover_version")?;
+        let count: i64 = row.try_get("transition_count")?;
+        Ok(Some(CurrentRun {
+            run_id: run_id.to_string(),
+            status: Self::decode_status(status)?,
+            vt_epoch: VersionedTransition::new(failover, count),
+        }))
+    }
+
     async fn load_execution(&self, key: &ExecutionKey) -> Result<Vec<(Vec<u8>, ChasmNode)>> {
         let (namespace_id, business_id, run_id) = Self::key_parts(key)?;
         let mut permit = self.director.acquire(DbClass::Read).await?;
@@ -238,6 +436,7 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
     async fn delete_execution(&self, key: &ExecutionKey) -> Result<()> {
         let (namespace_id, business_id, run_id) = Self::key_parts(key)?;
         let mut permit = self.director.acquire(DbClass::Commit).await?;
+        let mut tx = permit.connection()?.begin().await?;
         sqlx::query(
             "DELETE FROM chasm_node
              WHERE namespace_id = $1 AND business_id = $2 AND run_id = $3",
@@ -245,8 +444,20 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
         .bind(namespace_id)
         .bind(business_id)
         .bind(run_id)
-        .execute(permit.connection()?)
+        .execute(&mut *tx)
         .await?;
+        // Clear the current-run pointer iff it still points at the deleted run
+        // (read-your-write; a superseded run leaves a newer pointer intact).
+        sqlx::query(
+            "DELETE FROM chasm_current_run
+             WHERE namespace_id = $1 AND business_id = $2 AND run_id = $3",
+        )
+        .bind(namespace_id)
+        .bind(business_id)
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 

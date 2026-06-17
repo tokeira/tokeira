@@ -66,6 +66,9 @@ pub enum ActivityEvent {
     Started {
         /// Worker pickup time, Unix nanoseconds.
         started_time_nanos: i64,
+        /// Identity of the worker that picked up the attempt (recorded as the
+        /// activity's `last_worker_identity`).
+        identity: String,
     },
     /// The activity completed successfully.
     Completed {
@@ -185,13 +188,17 @@ pub fn apply(
             state.started_time_nanos = 0;
             schedule_attempt_timers(state, ctx, now)?;
         }
-        ActivityEvent::Started { started_time_nanos } => {
+        ActivityEvent::Started {
+            started_time_nanos,
+            identity,
+        } => {
             let started = if *started_time_nanos > 0 {
                 *started_time_nanos
             } else {
                 now
             };
             state.started_time_nanos = started;
+            state.last_worker_identity = identity.clone();
             if state.start_to_close_nanos > 0 {
                 schedule_pure(
                     ctx,
@@ -415,6 +422,7 @@ mod tests {
             &mut state,
             ActivityEvent::Started {
                 started_time_nanos: 5_000,
+                identity: "worker-1".to_owned(),
             },
             &mut ctx,
         )
@@ -506,6 +514,7 @@ mod tests {
             &mut state,
             ActivityEvent::Started {
                 started_time_nanos: 1,
+                identity: "worker-1".to_owned(),
             },
             &mut ctx,
         )
@@ -531,6 +540,7 @@ mod tests {
             &mut state,
             ActivityEvent::Started {
                 started_time_nanos: 1,
+                identity: "worker-1".to_owned(),
             },
             &mut ctx,
         )

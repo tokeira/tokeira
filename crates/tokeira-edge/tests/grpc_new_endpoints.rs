@@ -509,9 +509,15 @@ async fn worker_deployment_registry_roundtrip_via_grpc() {
         .worker_deployment_version_info
         .expect("version info");
     let drainage = version.drainage_info.expect("drainage info");
+    // A just-demoted version is `Draining`, not `Drained`: v1.31.0 marks it draining on
+    // the routing change and only transitions it to `Drained` later, via the version
+    // entity workflow's delayed drainage check / `sync-drainage-status` signal — never
+    // synchronously at the routing mutation (see `apply_version_drainage_status` /
+    // `refresh_version_routing_state` in `tokeira-runtime/src/deployment_registry.rs`,
+    // `version_workflow.go:127 @ v1.31.0`). Reporting `Drained` here would be premature.
     assert_eq!(
         drainage.status,
-        enums::VersionDrainageStatus::Drained as i32
+        enums::VersionDrainageStatus::Draining as i32
     );
 }
 

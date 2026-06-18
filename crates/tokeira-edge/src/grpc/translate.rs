@@ -124,6 +124,18 @@ fn proto_duration_to_time(value: Option<&prost_types::Duration>) -> Option<time:
     })
 }
 
+/// Translate a workflow **execution/run** timeout, applying Temporal's
+/// "zero means unlimited" convention: a zero (or absent) duration yields `None`
+/// (no timeout, no timer). v1.31.0 generates a timeout timer only when the
+/// expiration is non-zero (`service/history/workflow/task_generator.go:153-185 @
+/// v1.31.0`). Without this, the SDK's encoding of an unset timeout as `0s` would be
+/// read as `Some(ZERO)` and reaped as an immediately-due deadline by the workflow
+/// timeout scanner. NB: this is only for the execution/run timeouts — the
+/// workflow-task timeout has its own non-zero default and must not pass through here.
+fn workflow_timeout_to_time(value: Option<&prost_types::Duration>) -> Option<time::Duration> {
+    proto_duration_to_time(value).filter(|duration| !duration.is_zero())
+}
+
 fn valid_non_negative_duration(
     value: Option<&prost_types::Duration>,
     field: &'static str,
@@ -680,8 +692,10 @@ pub fn start_request_to_edge(
             req.eager_worker_deployment_options.as_ref(),
             "StartWorkflowExecutionRequest.eager_worker_deployment_options",
         )?,
-        workflow_execution_timeout: proto_duration_to_time(req.workflow_execution_timeout.as_ref()),
-        workflow_run_timeout: proto_duration_to_time(req.workflow_run_timeout.as_ref()),
+        workflow_execution_timeout: workflow_timeout_to_time(
+            req.workflow_execution_timeout.as_ref(),
+        ),
+        workflow_run_timeout: workflow_timeout_to_time(req.workflow_run_timeout.as_ref()),
         workflow_task_timeout: proto_duration_to_time(req.workflow_task_timeout.as_ref()),
         retry_policy: req.retry_policy.as_ref().map(retry_policy_to_domain),
         conflict_policy,
@@ -3508,8 +3522,10 @@ pub fn signal_with_start_request_to_edge(
             .transpose()?
             .unwrap_or_default(),
         identity: non_empty(req.identity),
-        workflow_execution_timeout: proto_duration_to_time(req.workflow_execution_timeout.as_ref()),
-        workflow_run_timeout: proto_duration_to_time(req.workflow_run_timeout.as_ref()),
+        workflow_execution_timeout: workflow_timeout_to_time(
+            req.workflow_execution_timeout.as_ref(),
+        ),
+        workflow_run_timeout: workflow_timeout_to_time(req.workflow_run_timeout.as_ref()),
         workflow_task_timeout: proto_duration_to_time(req.workflow_task_timeout.as_ref()),
         retry_policy: req.retry_policy.as_ref().map(retry_policy_to_domain),
         conflict_policy,
@@ -3917,7 +3933,7 @@ pub fn proto_command_to_workflow_command(
                     .transpose()?
                     .unwrap_or_default(),
                 workflow_execution_timeout: None,
-                workflow_run_timeout: proto_duration_to_time(attrs.workflow_run_timeout.as_ref()),
+                workflow_run_timeout: workflow_timeout_to_time(attrs.workflow_run_timeout.as_ref()),
                 workflow_task_timeout: proto_duration_to_time(attrs.workflow_task_timeout.as_ref())
                     .unwrap_or(time::Duration::seconds(10)),
                 retry_policy: attrs.retry_policy.as_ref().map(retry_policy_to_domain),
@@ -3956,10 +3972,10 @@ pub fn proto_command_to_workflow_command(
                     .map(search_attributes_to_domain)
                     .transpose()?
                     .unwrap_or_default(),
-                workflow_execution_timeout: proto_duration_to_time(
+                workflow_execution_timeout: workflow_timeout_to_time(
                     attrs.workflow_execution_timeout.as_ref(),
                 ),
-                workflow_run_timeout: proto_duration_to_time(attrs.workflow_run_timeout.as_ref()),
+                workflow_run_timeout: workflow_timeout_to_time(attrs.workflow_run_timeout.as_ref()),
                 workflow_task_timeout: proto_duration_to_time(attrs.workflow_task_timeout.as_ref())
                     .unwrap_or(time::Duration::seconds(10)),
                 retry_policy: attrs.retry_policy.as_ref().map(retry_policy_to_domain),
@@ -5106,6 +5122,30 @@ mod tests {
     use tokeira_kernel::state::WorkflowVersioningInfo;
     use tokeira_proto::public::temporal::api::{filter::v1 as filter, taskqueue::v1 as taskqueue};
     use tokeira_runtime::{RedirectRule, VersioningRules};
+
+    #[test]
+    fn workflow_timeout_zero_maps_to_unlimited() {
+        // v1.31.0 treats a zero execution/run timeout as no-timeout (no timer is
+        // generated — `service/history/workflow/task_generator.go:153-185 @ v1.31.0`).
+        // The SDK encodes an unset timeout as `0s`, so a `Some(0)` proto duration MUST
+        // become `None`, or the workflow timeout scanner reaps an idle workflow as an
+        // immediately-due deadline. A positive duration is preserved; absent stays None.
+        assert_eq!(
+            workflow_timeout_to_time(Some(&prost_types::Duration {
+                seconds: 0,
+                nanos: 0
+            })),
+            None
+        );
+        assert_eq!(workflow_timeout_to_time(None), None);
+        assert_eq!(
+            workflow_timeout_to_time(Some(&prost_types::Duration {
+                seconds: 60,
+                nanos: 0
+            })),
+            Some(time::Duration::seconds(60))
+        );
+    }
 
     #[test]
     fn activity_status_keyword_maps_to_wire_enum() {

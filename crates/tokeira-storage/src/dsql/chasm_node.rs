@@ -324,11 +324,12 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
         let current_run_id = Self::parse_uuid("current run_id", &current.run_id)?;
         let pointer = sqlx::query(
             "INSERT INTO chasm_current_run
-               (namespace_id, business_id, run_id, status,
+               (namespace_id, business_id, run_id, request_id, status,
                 failover_version, transition_count, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, now())
+             VALUES ($1, $2, $3, $4, $5, $6, $7, now())
              ON CONFLICT (namespace_id, business_id) DO UPDATE SET
                 run_id = EXCLUDED.run_id,
+                request_id = EXCLUDED.request_id,
                 status = EXCLUDED.status,
                 failover_version = EXCLUDED.failover_version,
                 transition_count = EXCLUDED.transition_count,
@@ -337,6 +338,7 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
         .bind(namespace_id)
         .bind(business_id)
         .bind(current_run_id)
+        .bind(current.request_id.as_str())
         .bind(Self::encode_status(current.status))
         .bind(current.vt_epoch.namespace_failover_version)
         .bind(current.vt_epoch.transition_count)
@@ -371,7 +373,7 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
         let namespace_uuid = Self::parse_uuid("namespace_id", namespace_id)?;
         let mut permit = self.director.acquire(DbClass::Read).await?;
         let row = sqlx::query(
-            "SELECT run_id, status, failover_version, transition_count
+            "SELECT run_id, request_id, status, failover_version, transition_count
              FROM chasm_current_run
              WHERE namespace_id = $1 AND business_id = $2",
         )
@@ -381,11 +383,13 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
         .await?;
         let Some(row) = row else { return Ok(None) };
         let run_id: Uuid = row.try_get("run_id")?;
+        let request_id: String = row.try_get("request_id")?;
         let status: i16 = row.try_get("status")?;
         let failover: i64 = row.try_get("failover_version")?;
         let count: i64 = row.try_get("transition_count")?;
         Ok(Some(CurrentRun {
             run_id: run_id.to_string(),
+            request_id,
             status: Self::decode_status(status)?,
             vt_epoch: VersionedTransition::new(failover, count),
         }))

@@ -6,12 +6,15 @@
 --
 -- DSQL-safe: composite spread-key PK, UUID/TEXT/SMALLINT/BIGINT/TIMESTAMPTZ columns,
 -- one CREATE statement, no BIGSERIAL / CHECK / foreign keys. `status` encodes
--- `LifecycleState` (0=Running, 1=Completed, 2=Failed); `failover_version` +
--- `transition_count` are the run's committing VersionedTransition (the advance fence).
+-- `LifecycleState` (0=Running, 1=Completed, 2=Failed); `request_id` is the run's
+-- create request id (for id-reuse idempotency + the AlreadyStarted StartRequestId);
+-- `failover_version` + `transition_count` are the run's committing VersionedTransition
+-- (the advance fence).
 CREATE TABLE IF NOT EXISTS chasm_current_run (
     namespace_id      UUID        NOT NULL,
     business_id       TEXT        NOT NULL,
     run_id            UUID        NOT NULL,
+    request_id        TEXT        NOT NULL,
     status            SMALLINT    NOT NULL,
     failover_version  BIGINT      NOT NULL,
     transition_count  BIGINT      NOT NULL,

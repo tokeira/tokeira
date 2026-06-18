@@ -84,7 +84,18 @@ pub enum NodePersistOutcome {
 pub struct CurrentRun {
     /// The current run's id.
     pub run_id: String,
+    /// The current run's **create** request id — the request id of the Start that
+    /// created this run. Immutable for the run's lifetime. Used by the Start path to
+    /// (a) idempotently return the existing run when a retried Start carries the same
+    /// request id, and (b) populate the `StartRequestId` of the targeted release's
+    /// `ActivityExecutionAlreadyStarted` error on a rejected conflicting Start
+    /// (the analog of v1.31.0's `currentExecutionInfo.createRequestID`,
+    /// `service/history/chasm_engine.go` @ v1.31.0).
+    pub request_id: String,
     /// The current run's lifecycle status (live vs terminal — see [`LifecycleState`]).
+    /// Advisory: it records the status at the time the pointer was last written, not
+    /// maintained on close. The Start path reads the run's live root lifecycle for
+    /// the authoritative reuse/conflict decision rather than trusting this field.
     pub status: LifecycleState,
     /// The current run's committing VersionedTransition (the advance fence).
     pub vt_epoch: VersionedTransition,

@@ -544,6 +544,9 @@ impl Engine for ChasmEngine {
             .collect();
         let current = CurrentRun {
             run_id: req.key.run_id.clone(),
+            // The create request id pins id-reuse idempotency and the AlreadyStarted
+            // `StartRequestId`; an absent originating id records as empty (no idempotency key).
+            request_id: req.request_id.clone().unwrap_or_default(),
             status: LifecycleState::Running,
             vt_epoch: committed_vt,
         };

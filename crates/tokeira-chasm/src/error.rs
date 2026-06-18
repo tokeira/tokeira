@@ -73,6 +73,26 @@ pub enum ChasmError {
     #[error("business id conflict: {0}")]
     BusinessIdConflict(String),
 
+    /// A `StartExecution` was rejected because a current run for the same business
+    /// id already exists and the id reuse/conflict policy did not admit a new run
+    /// (Requirement 1, 2). Carries the *current* run's id and its create request id
+    /// so the edge can surface the targeted release's typed
+    /// `ActivityExecutionAlreadyStarted` error with `RunId`/`StartRequestId` details
+    /// (`chasm/lib/activity/handler.go:91`; `service/history/chasm_engine.go` →
+    /// `NewExecutionAlreadyStartedErr` @ v1.31.0). Distinct from
+    /// [`BusinessIdConflict`](Self::BusinessIdConflict) (an opaque message) because
+    /// the conformance contract requires the structured run/request ids, not a
+    /// string.
+    #[error("{message}")]
+    BusinessIdAlreadyStarted {
+        /// The current run's id (the run the new Start collided with).
+        run_id: String,
+        /// The current run's create request id (`StartRequestId` in the detail).
+        request_id: String,
+        /// The v1.31.0-faithful human-readable message.
+        message: String,
+    },
+
     /// The fenced commit was retried after optimistic-concurrency conflicts up to
     /// the bound without succeeding (Requirement 9.5). Surfaced only when retries
     /// are exhausted; ordinary conflicts reload and re-run transparently.

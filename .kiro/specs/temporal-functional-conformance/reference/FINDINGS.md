@@ -25,7 +25,7 @@ v1.31.0 source.
 
 | Cluster | Area | Status | Measured | Next action |
 |---|---|:--:|:--:|---|
-| C1 | Standalone / first-class activity RPCs | 🟡 | 1/31 | `activity-executions-first-class` Stage 1 — current-run index |
+| C1 | Standalone / first-class activity RPCs | 🟡 | 42/129 | reuse/conflict (1.3), describe proto fidelity (4.1), count-by-id (4.3); cross-spec blockers: retry re-dispatch / heartbeat / timeouts (~20, `runtime-activity-*`) |
 | C3 | Visibility list/query + search attributes | 🟡 | — | run `TestAdvancedVisibilitySuite`/`…Legacy` (query surface) |
 | C2 | Worker deployment / versioning | 🟡 | 19/19 (1 suite) | triage `TestVersioningFunctionalSuite` (+3 suites) |
 | C4 | Nexus endpoint / admin RPCs | ⬜ | 0 | `api-conformance-nexus-admin` |
@@ -36,8 +36,49 @@ v1.31.0 source.
 | C7 | Lifecycle / describe `NotFound` | ⏸ | — | re-triage after C1–C4 |
 | C8 | Internal-surface / admin-service tests | ⛔ | — | out of public scope |
 
-**Now:** C1 — `activity-executions-first-class`, Stage 1 (current-run index). Task 1.0 (v1.31.0
-ground-truth) ✅ confirmed; implementing the pointer next.
+**Now:** C1 — fresh-server full-suite measure (2026-06-18): **42/129 leaf pass**. Landed this session
+(uncommitted): Stage 4.2 describe long-poll deadline (+ unblocked the suite panic), request-field
+validation on cancel/terminate (request_id/identity length, +4), and respond-token validation
+(StaleToken + MismatchedTokenNamespace on Complete/Fail, +4). Next in-scope: 1.3 reuse/conflict
+enforcement, 4.1 describe proto fidelity, 4.3 count-by-id. Blocked cross-spec (~20): retry re-dispatch
+(`StaleAttemptToken`, retry/timeout suites) and heartbeat → `runtime-activity-pump` /
+`runtime-activity-timeouts`. Deferred: `MismatchedTokenComponentRef` needs SA tokens in Temporal's
+`tasktoken` proto format. NB: restart `tokeirad` between full measures — in-memory state accumulates
+and reused activity IDs perturb counts.
+
+---
+
+## Conformance run recipe (exact — don't rediscover this)
+
+The corpus lives in the sibling `../temporal` checkout on branch `tokeira/conformance-v1.31.0`.
+The suite's in-process `OverrideDynamicConfig(activity.Enabled)` does **not** reach an out-of-process
+`tokeirad`, so feature gates MUST be set in the server's **static config**.
+
+```bash
+# 1. Build the server (from tokeira repo root)
+cargo build -p tokeirad
+
+# 2. One-time: generate a config, pin the address, enable standalone activities
+./target/debug/tokeirad --dump-config > /tmp/tokeira-c1.toml
+#   then set, in /tmp/tokeira-c1.toml:
+#     [infrastructure.network]  grpc_addr = "127.0.0.1:7233"
+#     [policy.compatibility]    enable_standalone_activities = true
+# (default storage backend is in-memory — correct for the corpus)
+
+# 3. Start tokeirad (background; restart it after every rebuild to load new code)
+./target/debug/tokeirad --config /tmp/tokeira-c1.toml
+#   expect: "storage backend: in-memory" + "gRPC server listening on 127.0.0.1:7233"
+
+# 4. Run a targeted suite/sub-test from ../temporal (seconds–minutes after first Go compile)
+cd ../temporal
+TOKEIRA_CONFORMANCE_FRONTEND_ADDR=127.0.0.1:7233 \
+  go test -tags test_dep -run '^TestStandaloneActivityTestSuite$' ./tests/ -v
+#   sub-test: -run '^TestStandaloneActivityTestSuite$/TestDelete'
+#   full corpus (~2h): tests/tokeira_conformance_runall + tests/tokeira_conformance_ledger
+```
+
+Loop: edit → `cargo build -p tokeirad` → restart the server (step 3) → re-run the suite (step 4) →
+update the Status ledger. Go toolchain: `go1.22.4` confirmed in this environment.
 
 ---
 

@@ -299,6 +299,19 @@ impl ActivityBridge {
         self.max_id_length
     }
 
+    /// Server-side describe/poll long-poll timeout (`activity.longPollTimeout`,
+    /// default 20s @ v1.31.0). The wait returns an empty response when it elapses.
+    pub fn long_poll_timeout(&self) -> std::time::Duration {
+        self.config.long_poll_timeout
+    }
+
+    /// Slack subtracted from the caller's deadline so an empty long-poll response
+    /// is sent before the caller times out (`activity.longPollBuffer`, default 1s
+    /// @ v1.31.0).
+    pub fn long_poll_buffer(&self) -> std::time::Duration {
+        self.config.long_poll_buffer
+    }
+
     /// The registry-assigned archetype id for the activity component. The
     /// visibility plane is archetype-neutral, so the edge supplies this to scope
     /// `ListActivityExecutions`/`CountActivityExecutions` to activities (Req 13.1).
@@ -575,11 +588,12 @@ impl ActivityBridge {
     pub async fn respond_activity_task_completed(
         &self,
         task_token: &[u8],
+        request_namespace_id: &str,
         result: Vec<u8>,
     ) -> EdgeResult<()> {
         self.ensure_enabled()?;
         let token = ActivityTaskToken::decode(task_token)?;
-        self.fence_token(&token).await?;
+        self.validate_token(&token, request_namespace_id).await?;
         self.record_completed(token.execution_key(), result).await
     }
 
@@ -587,31 +601,49 @@ impl ActivityBridge {
     pub async fn respond_activity_task_failed(
         &self,
         task_token: &[u8],
+        request_namespace_id: &str,
         failure: String,
     ) -> EdgeResult<()> {
         self.ensure_enabled()?;
         let token = ActivityTaskToken::decode(task_token)?;
-        self.fence_token(&token).await?;
+        self.validate_token(&token, request_namespace_id).await?;
         self.record_failed(token.execution_key(), failure).await
     }
 
-    /// Reject a worker response whose token names a superseded attempt (a retry has
-    /// moved the live stamp past the one the dispatch was issued for).
-    async fn fence_token(&self, token: &ActivityTaskToken) -> EdgeResult<()> {
-        let snapshot = self
-            .engine
-            .read_component(&token.execution_key())
-            .await
-            .map_err(map_chasm_err)?;
-        let bytes = snapshot
-            .data
-            .ok_or_else(|| EdgeError::NotFound("activity execution not found".to_owned()))?;
+    /// Validate a worker response token before applying it (token validation,
+    /// `chasm/lib/activity @ v1.31.0`):
+    ///
+    /// - a token whose namespace differs from the request's is rejected
+    ///   `InvalidArgument` ("Operation requested with a token from a different
+    ///   namespace.");
+    /// - a token naming a superseded attempt (a retry advanced the live stamp), a
+    ///   terminal activity (the attempt already resolved), or a missing execution is
+    ///   rejected `NotFound "activity not found for ID: <id>"` — the active attempt
+    ///   the token named no longer exists.
+    async fn validate_token(
+        &self,
+        token: &ActivityTaskToken,
+        request_namespace_id: &str,
+    ) -> EdgeResult<()> {
+        if token.namespace_id != request_namespace_id {
+            return Err(EdgeError::BadRequest(
+                "Operation requested with a token from a different namespace.".to_owned(),
+            ));
+        }
+        let not_found =
+            || EdgeError::NotFound(format!("activity not found for ID: {}", token.activity_id));
+        let snapshot = match self.engine.read_component(&token.execution_key()).await {
+            Ok(snapshot) => snapshot,
+            Err(ChasmError::ExecutionNotFound) => return Err(not_found()),
+            Err(error) => return Err(map_chasm_err(error)),
+        };
+        let bytes = snapshot.data.ok_or_else(not_found)?;
         let state = ActivityState::decode(bytes.as_slice())
             .map_err(|e| EdgeError::Internal(format!("decode activity state: {e}")))?;
-        if state.stamp != token.stamp {
-            return Err(EdgeError::FailedPrecondition(
-                "activity attempt superseded".to_owned(),
-            ));
+        // The token names a specific attempt: a retry that advanced the stamp, or a
+        // terminal activity, means that attempt is no longer the live one.
+        if state.stamp != token.stamp || state.status().is_terminal() {
+            return Err(not_found());
         }
         Ok(())
     }
@@ -943,7 +975,7 @@ mod tests {
         );
 
         bridge
-            .respond_activity_task_completed(&task.task_token, vec![7, 7])
+            .respond_activity_task_completed(&task.task_token, &key.namespace_id, vec![7, 7])
             .await
             .expect("complete");
         let done = bridge.describe(key).await.unwrap();
@@ -977,15 +1009,18 @@ mod tests {
         // Terminate the activity (now terminal); a late worker completion for the
         // dispatched attempt must be rejected, not applied — `Completed` is illegal
         // from `Terminated`.
+        let namespace_id = key.namespace_id.clone();
         bridge
             .terminate(key, "operator stop".to_owned())
             .await
             .expect("terminate");
+        // A response to a terminal activity is rejected NotFound — the attempt the
+        // token named no longer exists (token validation, v1.31.0).
         let err = bridge
-            .respond_activity_task_completed(&task.task_token, vec![1])
+            .respond_activity_task_completed(&task.task_token, &namespace_id, vec![1])
             .await
             .unwrap_err();
-        assert!(matches!(err, EdgeError::FailedPrecondition(_)));
+        assert!(matches!(err, EdgeError::NotFound(_)));
     }
 
     #[tokio::test]

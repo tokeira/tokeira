@@ -409,6 +409,38 @@ fn validate_sa_run_id(run_id: &str) -> Result<(), Status> {
     Ok(())
 }
 
+/// Validate the optional `request_id` and `identity` fields on a standalone-activity
+/// mutating request (cancel/terminate) against the id-length limit, with the
+/// verbatim v1.31.0 messages (`chasm/lib/activity/frontend.go @ v1.31.0`). Length is
+/// compared in bytes (Go `len(string)`). Skipped when standalone activities are
+/// disabled — the RPC then returns `Unimplemented` downstream. (`reason` is bound by
+/// `BlobSizeLimitError`, validated separately where that limit is available.)
+fn validate_sa_request_metadata(
+    enabled: bool,
+    max_id_length: usize,
+    request_id: &str,
+    identity: &str,
+) -> Result<(), Status> {
+    if !enabled {
+        return Ok(());
+    }
+    if request_id.len() > max_id_length {
+        return Err(Status::invalid_argument(format!(
+            "request ID exceeds length limit. Length={} Limit={}",
+            request_id.len(),
+            max_id_length
+        )));
+    }
+    if identity.len() > max_id_length {
+        return Err(Status::invalid_argument(format!(
+            "identity exceeds length limit. Length={} Limit={}",
+            identity.len(),
+            max_id_length
+        )));
+    }
+    Ok(())
+}
+
 /// Run the shared activity-id + run-id validators for a standalone-activity request,
 /// but only when the feature is enabled. A present-but-disabled bridge must answer
 /// `UNIMPLEMENTED` (the v1.31.0 baseline) regardless of request shape, so admission
@@ -424,6 +456,42 @@ fn validate_sa_ids(
         validate_sa_run_id(run_id)?;
     }
     Ok(())
+}
+
+/// Parse the caller's `grpc-timeout` header into a wait budget, if present. gRPC wire
+/// format is `<value><unit>` with unit ∈ {H,M,S,m,u,n}
+/// (grpc HTTP/2 protocol: hours/minutes/seconds/millis/micros/nanos). Absent or
+/// malformed → `None` (the long-poll then uses the full server timeout).
+fn parse_grpc_timeout(metadata: &tonic::metadata::MetadataMap) -> Option<std::time::Duration> {
+    let raw = metadata.get("grpc-timeout")?.to_str().ok()?;
+    let split = raw.len().checked_sub(1)?;
+    let (digits, unit) = raw.split_at(split);
+    let value: u64 = digits.parse().ok()?;
+    let nanos = match unit {
+        "H" => value.checked_mul(3_600_000_000_000)?,
+        "M" => value.checked_mul(60_000_000_000)?,
+        "S" => value.checked_mul(1_000_000_000)?,
+        "m" => value.checked_mul(1_000_000)?,
+        "u" => value.checked_mul(1_000)?,
+        "n" => value,
+        _ => return None,
+    };
+    Some(std::time::Duration::from_nanos(nanos))
+}
+
+/// Effective describe long-poll wait: `Min(caller_deadline - buffer, long_poll_timeout)`
+/// (`chasm/lib/activity/handler.go` → `contextutil.WithDeadlineBuffer` @ v1.31.0). With no
+/// caller deadline, the full server timeout. A non-positive result means the caller's
+/// deadline is within the buffer, so the wait returns empty immediately.
+fn describe_long_poll_budget(
+    caller: Option<std::time::Duration>,
+    timeout: std::time::Duration,
+    buffer: std::time::Duration,
+) -> std::time::Duration {
+    match caller {
+        Some(caller) => caller.saturating_sub(buffer).min(timeout),
+        None => timeout,
+    }
 }
 
 /// Build a `DescribeActivityExecutionResponse`. The long-poll token is the current
@@ -693,9 +761,14 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         if let Some(bridge) = &self.chasm_activity
             && bridge.owns_task_token(&req.task_token)
         {
+            let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
             let result = req.result.map(|p| p.encode_to_vec()).unwrap_or_default();
             bridge
-                .respond_activity_task_completed(&req.task_token, result)
+                .respond_activity_task_completed(
+                    &req.task_token,
+                    &namespace_id.0.to_string(),
+                    result,
+                )
                 .await?;
             debug!("respond_activity_task_completed (standalone) success");
             return Ok(Response::new(
@@ -724,13 +797,14 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         if let Some(bridge) = &self.chasm_activity
             && bridge.owns_task_token(&req.task_token)
         {
+            let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
             let failure = req
                 .failure
                 .as_ref()
                 .map(|f| f.message.clone())
                 .unwrap_or_default();
             bridge
-                .respond_activity_task_failed(&req.task_token, failure)
+                .respond_activity_task_failed(&req.task_token, &namespace_id.0.to_string(), failure)
                 .await?;
             return Ok(Response::new(translate::respond_activity_failed_to_proto()));
         }
@@ -2221,6 +2295,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 "describe_activity_execution is not implemented; tracked in spec activity-executions-first-class",
             ));
         };
+        let caller_timeout = parse_grpc_timeout(request.metadata());
         let req = request.into_inner();
         if bridge.is_enabled() {
             validate_sa_activity_id(&req.activity_id, bridge.max_id_length())?;
@@ -2241,28 +2316,50 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 req.run_id.clone(),
             )
             .await?;
-        // A present long_poll_token turns this into a long-poll for any state change
-        // (`frontend.go @ v1.31.0`: "optionally as a long-poll that waits for any
-        // state change"); absent, it returns the current state immediately.
-        let description = if req.long_poll_token.is_empty() {
-            bridge.describe(key).await?
+        // Absent a token, return the current state immediately. With a token, this is a
+        // long-poll for any state change (`frontend.go @ v1.31.0`).
+        if req.long_poll_token.is_empty() {
+            let description = bridge.describe(key).await?;
+            return Ok(Response::new(chasm_describe_response(
+                req.activity_id,
+                req.run_id,
+                req.include_input,
+                req.include_outcome,
+                description,
+            )));
+        }
+        let since = tokeira_chasm::VersionedTransition::decode(&req.long_poll_token)
+            .map_err(|_| Status::invalid_argument("malformed long_poll_token"))?;
+        // Time the wait out at Min(caller_deadline - buffer, long_poll_timeout) and return an
+        // empty, non-error response on elapse so the caller resubmits — never letting the
+        // caller's gRPC deadline fire (`chasm/lib/activity/handler.go` →
+        // `contextutil.WithDeadlineBuffer` @ v1.31.0).
+        let budget = describe_long_poll_budget(
+            caller_timeout,
+            bridge.long_poll_timeout(),
+            bridge.long_poll_buffer(),
+        );
+        let advanced = if budget.is_zero() {
+            None
         } else {
-            let since = tokeira_chasm::VersionedTransition::decode(&req.long_poll_token)
-                .map_err(|_| Status::invalid_argument("malformed long_poll_token"))?;
-            match bridge.poll(key.clone(), since).await? {
-                Some(advanced) => advanced,
-                // No change within the long-poll budget; return current state so the
-                // caller can resubmit with the same token.
-                None => bridge.describe(key).await?,
+            match tokio::time::timeout(budget, bridge.poll(key, since)).await {
+                Ok(result) => result?,
+                Err(_elapsed) => None,
             }
         };
-        Ok(Response::new(chasm_describe_response(
-            req.activity_id,
-            req.run_id,
-            req.include_input,
-            req.include_outcome,
-            description,
-        )))
+        match advanced {
+            Some(description) => Ok(Response::new(chasm_describe_response(
+                req.activity_id,
+                req.run_id,
+                req.include_input,
+                req.include_outcome,
+                description,
+            ))),
+            // Empty non-error response: an invitation to resubmit the long-poll.
+            None => Ok(Response::new(
+                workflowservice::DescribeActivityExecutionResponse::default(),
+            )),
+        }
     }
     async fn poll_activity_execution(
         &self,
@@ -2348,6 +2445,12 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             &req.activity_id,
             &req.run_id,
         )?;
+        validate_sa_request_metadata(
+            bridge.is_enabled(),
+            bridge.max_id_length(),
+            &req.request_id,
+            &req.identity,
+        )?;
         let key = self
             .activity_execution_key(bridge, &req.namespace, req.activity_id, req.run_id)
             .await?;
@@ -2371,6 +2474,12 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             bridge.max_id_length(),
             &req.activity_id,
             &req.run_id,
+        )?;
+        validate_sa_request_metadata(
+            bridge.is_enabled(),
+            bridge.max_id_length(),
+            &req.request_id,
+            &req.identity,
         )?;
         let key = self
             .activity_execution_key(bridge, &req.namespace, req.activity_id, req.run_id)

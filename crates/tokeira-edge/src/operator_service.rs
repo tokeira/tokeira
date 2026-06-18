@@ -42,6 +42,18 @@ pub trait OperatorApi: Send + Sync + 'static {
     ) -> Result<()>;
 
     async fn remove_search_attribute(&self, namespace: &str, attr_name: &str) -> Result<()>;
+
+    /// Seed a namespace's system/predefined search attributes so visibility
+    /// queries in it resolve the map-backed predefined fields. Invoked when a
+    /// namespace is registered; must be idempotent. Predefined attributes are
+    /// registered only in the visibility store's registry, never the user catalog,
+    /// so they never surface as user-defined attributes in `list_search_attributes`
+    /// (`common/searchattribute/sadefs/constants.go @ v1.31.0`). The default is a
+    /// no-op for implementations without a visibility store (e.g. test/in-memory
+    /// catalogs); the store-backed implementation overrides it.
+    async fn seed_predefined_search_attributes(&self, _namespace: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// A compact in-memory implementation that makes the service easy to exercise in tests.

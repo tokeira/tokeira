@@ -3118,8 +3118,17 @@ impl WorkflowService {
                 self.namespaces
                     .insert(ResolvedNamespace {
                         retention: req.retention,
-                        ..ResolvedNamespace::active(req.namespace)
+                        ..ResolvedNamespace::active(req.namespace.clone())
                     })
+                    .await
+                    .map_err(EdgeError::from)?;
+
+                // Seed the namespace's predefined search attributes so visibility
+                // queries in it resolve the map-backed predefined fields, matching the
+                // bootstrapped `default` namespace. Without this, list/count in a
+                // runtime-created namespace rejects predefined attributes as unknown.
+                self.operator_api
+                    .seed_predefined_search_attributes(&req.namespace)
                     .await
                     .map_err(EdgeError::from)
             },

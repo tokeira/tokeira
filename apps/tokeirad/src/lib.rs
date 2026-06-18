@@ -75,8 +75,8 @@ use tokeira_storage::{
     dsql::{DsqlAuthConfig, DsqlCoordinationConfig, DsqlPoolConfig, DsqlStore},
 };
 use tokeira_types::{
-    ExecutionRef, IncarnationId, NamespaceId, NodeEndpoint, PlacementConfig, ProjectionCursor,
-    ShardId, WorkflowId,
+    ExecutionRef, IncarnationId, NodeEndpoint, PlacementConfig, ProjectionCursor, ShardId,
+    WorkflowId,
 };
 
 /// Nexus-endpoint bootstrap target used by the dev startup path. Kept in the
@@ -145,6 +145,19 @@ where
         self.inner
             .remove_search_attribute(namespace, attr_name)
             .await
+    }
+
+    /// Register the predefined search-attribute set into the visibility store for
+    /// this namespace (idempotent upserts), so visibility queries in a runtime-
+    /// created namespace resolve predefined fields exactly as the bootstrapped
+    /// `default` namespace does. Routed to the store, not `self.inner`, so the
+    /// predefined set stays out of the user-visible catalog.
+    async fn seed_predefined_search_attributes(&self, namespace: &str) -> Result<()> {
+        tokeira_projection::seed_predefined_search_attributes(
+            &self.visibility_store,
+            namespace_id_for(namespace),
+        )
+        .await
     }
 }
 
@@ -790,10 +803,7 @@ where
     let worker_registry = runtime.worker_registry();
     let nexus_task_broker = runtime.nexus_task_broker();
     let runtime_adapter = Arc::new(RuntimeAdapter::new(runtime.clone()));
-    let resolver = Arc::new(StoreExecutionResolver::new(
-        repo.clone(),
-        default_namespace_id,
-    ));
+    let resolver = Arc::new(StoreExecutionResolver::new(repo.clone()));
     tokeira_projection::seed_predefined_search_attributes(
         &visibility_query_store,
         default_namespace_id,
@@ -1213,14 +1223,18 @@ impl ConnectionBudgetApplier for NoopConnectionBudgetApplier {
     }
 }
 
+/// Resolves executions and builds describe responses straight from the run
+/// repository. The namespace is taken from each request (via `namespace_id_for`),
+/// not bound at construction — a single server serves every namespace, so freezing
+/// it to one (e.g. `default`) would make query/describe miss every other namespace's
+/// runs while history (which derives the namespace per request) still found them.
 struct StoreExecutionResolver<R> {
     repo: Arc<R>,
-    namespace_id: NamespaceId,
 }
 
 impl<R> StoreExecutionResolver<R> {
-    fn new(repo: Arc<R>, namespace_id: NamespaceId) -> Self {
-        Self { repo, namespace_id }
+    fn new(repo: Arc<R>) -> Self {
+        Self { repo }
     }
 }
 
@@ -1231,13 +1245,14 @@ where
 {
     async fn current_run_key(
         &self,
-        _namespace: &str,
+        namespace: &str,
         workflow_id: &str,
     ) -> Result<Option<tokeira_types::RunKey>> {
+        let namespace_id = namespace_id_for(namespace);
         let result = self
             .repo
             .resolve_execution(&ExecutionRef {
-                namespace_id: self.namespace_id,
+                namespace_id,
                 workflow_id: WorkflowId(workflow_id.to_string()),
                 run_id: None,
             })
@@ -1246,20 +1261,21 @@ where
             return Ok(result);
         }
         self.repo
-            .find_latest_run(self.namespace_id, &WorkflowId(workflow_id.to_string()))
+            .find_latest_run(namespace_id, &WorkflowId(workflow_id.to_string()))
             .await
     }
 
     async fn describe_execution(
         &self,
-        _namespace: &str,
+        namespace: &str,
         workflow_id: &str,
         run_id: Option<tokeira_types::RunId>,
     ) -> Result<Option<WorkflowExecutionDescription>> {
+        let namespace_id = namespace_id_for(namespace);
         let run_key = match self
             .repo
             .resolve_execution(&ExecutionRef {
-                namespace_id: self.namespace_id,
+                namespace_id,
                 workflow_id: WorkflowId(workflow_id.to_string()),
                 run_id,
             })
@@ -1269,7 +1285,7 @@ where
             None if run_id.is_none() => {
                 match self
                     .repo
-                    .find_latest_run(self.namespace_id, &WorkflowId(workflow_id.to_string()))
+                    .find_latest_run(namespace_id, &WorkflowId(workflow_id.to_string()))
                     .await?
                 {
                     Some(rk) => rk,
@@ -1281,7 +1297,7 @@ where
 
         match self.repo.load_run(run_key).await? {
             LoadedRun::Existing(state) => Ok(Some(WorkflowExecutionDescription {
-                namespace: "default".to_string(),
+                namespace: namespace.to_string(),
                 workflow_id: state.workflow_id.0,
                 run_key: state.run_key,
                 run_id: state.run_id,

@@ -106,4 +106,11 @@ pub enum ChasmError {
     /// in the substrate or its callers rather than bad input.
     #[error("internal CHASM error: {0}")]
     Internal(String),
+
+    /// A requested behaviour is recognised but not implemented in this release,
+    /// mirroring a targeted-release `Unimplemented` (e.g. the `TerminateExisting`
+    /// id-conflict policy, which `service/history/chasm_engine.go:1041 @ v1.31.0`
+    /// also answers `Unimplemented`). The edge maps this to gRPC `Unimplemented`.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
 }

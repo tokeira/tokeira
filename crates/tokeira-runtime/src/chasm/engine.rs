@@ -18,9 +18,9 @@ use std::{
 
 use async_trait::async_trait;
 use tokeira_chasm::{
-    ChasmError, Context, DispatchableTask, ExecutionInfo, ExecutionKey, LifecycleState,
-    MutableContext, NodeTree, Registry, RetainAllValidator, Staleness, TransitionResult,
-    VersionedTransition, VisibilitySnapshot,
+    BusinessIdConflictPolicy, BusinessIdReusePolicy, ChasmError, Context, DispatchableTask,
+    ExecutionInfo, ExecutionKey, LifecycleState, MutableContext, NodeTree, Registry,
+    RetainAllValidator, Staleness, TransitionResult, VersionedTransition, VisibilitySnapshot,
 };
 use tokeira_storage::{
     ChasmNodeRepository, CurrentRun, ExpectedVersion, NodePersistOutcome, NodeWrite,
@@ -29,7 +29,7 @@ use tokio::sync::Notify;
 
 use super::{
     CommitOutcome, Engine, NotifyEvent, PollOutcome, PollRequest, ReadOutcome, StagedTask,
-    StartRequest, UpdateOutcome, UpdateRequest,
+    StartOutcome, StartRequest, UpdateOutcome, UpdateRequest,
 };
 
 /// The encoded path of an execution's root component node. The MVP materializes a
@@ -491,6 +491,19 @@ impl ChasmEngine {
     }
 }
 
+/// Build the typed already-started error from the current run, carrying its run id
+/// and create request id so the edge can surface the targeted release's
+/// `ActivityExecutionAlreadyStarted` with `RunId`/`StartRequestId`
+/// (`chasm/lib/activity/handler.go:91 @ v1.31.0`). The message mirrors the
+/// serviceerror's fixed text; the structured ids are the load-bearing detail.
+fn already_started(current: &CurrentRun) -> ChasmError {
+    ChasmError::BusinessIdAlreadyStarted {
+        run_id: current.run_id.clone(),
+        request_id: current.request_id.clone(),
+        message: "activity execution already started".to_owned(),
+    }
+}
+
 /// Compute the next execution VT: same failover version, transition count + 1. The
 /// MVP keeps `namespace_failover_version` constant; namespace-failover bumps ride
 /// the same clock when wired (Requirement 5.4).
@@ -512,16 +525,92 @@ fn default_now_unix_nanos() -> i64 {
 
 #[async_trait]
 impl Engine for ChasmEngine {
-    async fn start_execution(
-        &self,
-        req: StartRequest,
-    ) -> Result<tokeira_chasm::ComponentRef, ChasmError> {
+    async fn start_execution(&self, req: StartRequest) -> Result<StartOutcome, ChasmError> {
+        // Business-id reuse/conflict enforcement against the current run for this id
+        // (`service/history/chasm_engine.go:1014-1090 @ v1.31.0`). The current-run
+        // pointer is the authority; the run's *live* root lifecycle — not the
+        // advisory pointer status — decides live-vs-terminal, so a just-closed run is
+        // governed by the reuse policy rather than the conflict policy.
+        if let Some(current) = self
+            .current_run(&req.key.namespace_id, &req.key.business_id)
+            .await?
+        {
+            let current_key = ExecutionKey::new(
+                req.key.namespace_id.clone(),
+                req.key.business_id.clone(),
+                current.run_id.clone(),
+            );
+            let current_root = self.read_root(&current_key).await?;
+            let current_lifecycle = current_root.as_ref().and_then(|r| r.lifecycle);
+            let current_vt = current_root
+                .as_ref()
+                .map(|r| r.execution_vt)
+                .unwrap_or_default();
+            let live = matches!(current_lifecycle, Some(LifecycleState::Running));
+            // Idempotent retry: a Start carrying the same request id as the run that
+            // created the current run returns that run unchanged, ahead of any policy
+            // branch (`Fail/SecondStartWithSameRequestIdReturnsExistingRun @ v1.31.0`).
+            let same_request_id = req
+                .request_id
+                .as_deref()
+                .is_some_and(|id| !id.is_empty() && id == current.request_id);
+
+            let mut return_existing = same_request_id;
+            if !same_request_id {
+                if live {
+                    match req.policy.conflict {
+                        BusinessIdConflictPolicy::Fail => {
+                            return Err(already_started(&current));
+                        }
+                        BusinessIdConflictPolicy::UseExisting => return_existing = true,
+                        BusinessIdConflictPolicy::TerminateExisting => {
+                            // The targeted release also answers Unimplemented here
+                            // (`chasm_engine.go:1041 @ v1.31.0`); the activity edge never
+                            // maps a request to this variant, so it is unreachable in
+                            // practice but kept faithful.
+                            return Err(ChasmError::Unsupported(
+                                "ID Conflict Policy Terminate Existing is not yet supported"
+                                    .to_owned(),
+                            ));
+                        }
+                    }
+                } else {
+                    match req.policy.reuse {
+                        // Terminal current run: a fresh run is admitted (fall through).
+                        BusinessIdReusePolicy::AllowDuplicate => {}
+                        BusinessIdReusePolicy::AllowDuplicateFailedOnly => {
+                            // Reject only if the terminal run completed *successfully*;
+                            // a failed/canceled/terminated/timed-out run (mapped to
+                            // `Failed`) may be retried (`chasm_engine.go:1070 @ v1.31.0`).
+                            if matches!(current_lifecycle, Some(LifecycleState::Completed)) {
+                                return Err(already_started(&current));
+                            }
+                        }
+                        BusinessIdReusePolicy::RejectDuplicate => {
+                            return Err(already_started(&current));
+                        }
+                    }
+                }
+            }
+
+            if return_existing {
+                return Ok(StartOutcome {
+                    reference: self.root_ref(
+                        &current_key,
+                        req.archetype_id,
+                        current_vt,
+                        current_vt,
+                    ),
+                    created: false,
+                });
+            }
+        }
+
         let (mut tree, baseline) = self.load_tree(&req.key).await?;
-        // The current-run pointer is the by-id conflict authority now; a fresh run_id
-        // means the node tree is empty, so the Absent node fences below also reject a
-        // same-(namespace, business, run) collision. The pointer advance is
-        // co-transactional with the root-node create (`activity-executions-first-class`
-        // Req 1, 2).
+        // A fresh run_id means the node tree is empty, so the Absent node fences
+        // below also reject a same-(namespace, business, run) collision. The pointer
+        // advance is co-transactional with the root-node create
+        // (`activity-executions-first-class` Req 1, 2).
         tree.create_node(
             ROOT_PATH.to_vec(),
             req.archetype_id,
@@ -569,7 +658,10 @@ impl Engine for ChasmEngine {
             req.visibility,
         )
         .await?;
-        Ok(self.root_ref(&req.key, req.archetype_id, committed_vt, committed_vt))
+        Ok(StartOutcome {
+            reference: self.root_ref(&req.key, req.archetype_id, committed_vt, committed_vt),
+            created: true,
+        })
     }
 
     async fn update_component(&self, req: UpdateRequest) -> Result<CommitOutcome, ChasmError> {

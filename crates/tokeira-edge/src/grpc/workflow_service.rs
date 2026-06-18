@@ -2288,11 +2288,11 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             request_id: (!req.request_id.is_empty()).then_some(req.request_id),
             policy,
         };
-        let reference = bridge.start(start).await?;
+        let outcome = bridge.start(start).await?;
         Ok(Response::new(
             workflowservice::StartActivityExecutionResponse {
-                run_id: reference.execution_key.run_id,
-                started: true,
+                run_id: outcome.reference.execution_key.run_id,
+                started: outcome.started,
                 link: None,
             },
         ))

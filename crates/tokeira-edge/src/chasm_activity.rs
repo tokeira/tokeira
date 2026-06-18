@@ -87,6 +87,20 @@ pub struct StartActivity {
     pub policy: BusinessIdPolicy,
 }
 
+/// Outcome of [`ActivityBridge::start`].
+///
+/// `started` mirrors the targeted release's `StartActivityExecutionResponse.started`
+/// (`result.Created` @ v1.31.0): `true` when a fresh run was created and scheduled,
+/// `false` when the reuse/conflict policy (`UseExisting`) or request-id idempotency
+/// returned an already-live run.
+#[derive(Debug, Clone)]
+pub struct StartActivityOutcome {
+    /// Reference to the created — or existing — activity run.
+    pub reference: ComponentRef,
+    /// Whether a new run was created (vs an existing run returned).
+    pub started: bool,
+}
+
 /// A read view of an activity execution (the source for `Describe`/`Poll`
 /// responses).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -349,7 +363,7 @@ impl ActivityBridge {
     /// request first (Requirement 11.9), then creates the root and runs the initial
     /// `Scheduled` transition (which enqueues the dispatch task and the relevant
     /// timers).
-    pub async fn start(&self, req: StartActivity) -> EdgeResult<ComponentRef> {
+    pub async fn start(&self, req: StartActivity) -> EdgeResult<StartActivityOutcome> {
         self.ensure_enabled()?;
 
         let normalized = validate_and_normalize(&ActivityRequest {
@@ -383,19 +397,33 @@ impl ActivityBridge {
         };
 
         let typed = TypedEngine::<ActivityExecution>::new(&self.engine);
-        let reference = typed
+        let outcome = typed
             .start(key, state, req.request_id, req.policy)
             .await
             .map_err(map_chasm_err)?;
-        // The initial Scheduled transition bumps attempt/stamp and schedules the
-        // dispatch task + schedule-to-start/close timers.
-        let (_, outcome) = typed
-            .update(&reference, |activity, ctx| {
+        if !outcome.created {
+            // UseExisting / same-request-id idempotency: the policy returned an
+            // existing run, which is already scheduled — do NOT re-run the Scheduled
+            // transition (it would illegally re-schedule a live activity). `started`
+            // is false, mirroring `result.Created == false` →
+            // `StartActivityExecutionResponse.started` (`handler.go:101 @ v1.31.0`).
+            return Ok(StartActivityOutcome {
+                reference: outcome.reference,
+                started: false,
+            });
+        }
+        // A fresh run: the initial Scheduled transition bumps attempt/stamp and
+        // schedules the dispatch task + schedule-to-start/close timers.
+        let (_, scheduled) = typed
+            .update(&outcome.reference, |activity, ctx| {
                 activity.apply(ActivityEvent::Scheduled, ctx)
             })
             .await
             .map_err(map_chasm_err)?;
-        Ok(outcome.reference)
+        Ok(StartActivityOutcome {
+            reference: scheduled.reference,
+            started: true,
+        })
     }
 
     /// Describe an activity execution (Requirement 11.8).
@@ -735,6 +763,13 @@ fn map_chasm_err(error: ChasmError) -> EdgeError {
             EdgeError::FailedPrecondition("activity execution is closed".to_owned())
         }
         ChasmError::BusinessIdConflict(message) => EdgeError::AlreadyExists(message),
+        // Interim mapping: surfaces the rejection with the current run id in the
+        // message. The typed `ActivityExecutionAlreadyStarted` (carrying RunId +
+        // StartRequestId as structured details) is wired in step 3 of task 1.3.
+        ChasmError::BusinessIdAlreadyStarted {
+            run_id, message, ..
+        } => EdgeError::AlreadyExists(format!("{message} (run_id: {run_id})")),
+        ChasmError::Unsupported(message) => EdgeError::Unimplemented(message),
         ChasmError::IllegalTransition { from, event } => EdgeError::FailedPrecondition(format!(
             "illegal activity transition: {event} from {from}"
         )),
@@ -802,6 +837,148 @@ mod tests {
             request_id: Some("req-1".to_owned()),
             policy: BusinessIdPolicy::default(),
         }
+    }
+
+    /// Build a Start sharing a business id (`namespace_id` + `activity_id`) with a
+    /// fresh run id, so repeated calls collide on the current-run pointer the way
+    /// the id reuse/conflict matrix expects.
+    fn start_with(
+        namespace_id: &str,
+        activity_id: &str,
+        request_id: &str,
+        policy: BusinessIdPolicy,
+    ) -> StartActivity {
+        StartActivity {
+            namespace_id: namespace_id.to_owned(),
+            activity_id: activity_id.to_owned(),
+            run_id: uuid::Uuid::new_v4().to_string(),
+            activity_type: "PaymentActivity".to_owned(),
+            task_queue: "payments".to_owned(),
+            input: vec![1, 2, 3],
+            schedule_to_start_nanos: 0,
+            schedule_to_close_nanos: 0,
+            start_to_close_nanos: 10 * SEC,
+            heartbeat_nanos: 0,
+            run_timeout_nanos: 0,
+            request_id: Some(request_id.to_owned()),
+            policy,
+        }
+    }
+
+    // Feature: activity-executions-first-class, task 1.3 (conflict policy, live run):
+    // Fail rejects a second Start with AlreadyStarted naming the current run; the
+    // same request id is idempotent; UseExisting returns the live run without
+    // creating one. Ground truth: chasm_engine.go:1014-1045 + standalone_activity_test.go
+    // TestIDConflictPolicy @ v1.31.0.
+    #[tokio::test]
+    async fn conflict_policy_against_live_run() {
+        use tokeira_chasm::{BusinessIdConflictPolicy, BusinessIdReusePolicy};
+        let bridge = bridge(true);
+        let ns = uuid::Uuid::new_v4().to_string();
+        let first = bridge
+            .start(start_with(
+                &ns,
+                "act-c",
+                "req-first",
+                BusinessIdPolicy::default(),
+            ))
+            .await
+            .expect("first start");
+        assert!(first.started);
+        let first_run = first.reference.execution_key.run_id.clone();
+
+        // Default conflict policy is Fail: a different-request-id Start is rejected.
+        let err = bridge
+            .start(start_with(
+                &ns,
+                "act-c",
+                "req-other",
+                BusinessIdPolicy::default(),
+            ))
+            .await
+            .expect_err("Fail must reject a live run");
+        assert!(matches!(err, EdgeError::AlreadyExists(_)), "got {err:?}");
+
+        // Same request id as the current run is idempotent: existing run, not started.
+        let same = bridge
+            .start(start_with(
+                &ns,
+                "act-c",
+                "req-first",
+                BusinessIdPolicy::default(),
+            ))
+            .await
+            .expect("same request id returns existing");
+        assert!(!same.started);
+        assert_eq!(same.reference.execution_key.run_id, first_run);
+
+        // UseExisting returns the live run without creating a new one.
+        let use_existing = bridge
+            .start(start_with(
+                &ns,
+                "act-c",
+                "req-use",
+                BusinessIdPolicy {
+                    reuse: BusinessIdReusePolicy::AllowDuplicate,
+                    conflict: BusinessIdConflictPolicy::UseExisting,
+                },
+            ))
+            .await
+            .expect("UseExisting returns existing");
+        assert!(!use_existing.started);
+        assert_eq!(use_existing.reference.execution_key.run_id, first_run);
+    }
+
+    // Feature: activity-executions-first-class, task 1.3 (reuse policy, terminal run):
+    // against a completed run, RejectDuplicate rejects while AllowDuplicate creates a
+    // fresh run. Ground truth: chasm_engine.go:1063-1090 + TestIDReusePolicy @ v1.31.0.
+    #[tokio::test]
+    async fn reuse_policy_against_terminal_run() {
+        use tokeira_chasm::{BusinessIdConflictPolicy, BusinessIdReusePolicy};
+        let bridge = bridge(true);
+        let ns = uuid::Uuid::new_v4().to_string();
+        let first = start_with(&ns, "act-r", "req-1", BusinessIdPolicy::default());
+        let key = key_of(&first);
+        let first_run = bridge.start(first).await.expect("start").reference;
+        bridge
+            .record_started(key.clone(), SEC, "worker-1".to_owned())
+            .await
+            .expect("started");
+        bridge
+            .record_completed(key.clone(), vec![9, 9])
+            .await
+            .expect("completed");
+
+        // RejectDuplicate against a terminal run is rejected.
+        let err = bridge
+            .start(start_with(
+                &ns,
+                "act-r",
+                "req-2",
+                BusinessIdPolicy {
+                    reuse: BusinessIdReusePolicy::RejectDuplicate,
+                    conflict: BusinessIdConflictPolicy::Fail,
+                },
+            ))
+            .await
+            .expect_err("RejectDuplicate must reject a terminal run");
+        assert!(matches!(err, EdgeError::AlreadyExists(_)), "got {err:?}");
+
+        // AllowDuplicate (the default) creates a fresh run.
+        let again = bridge
+            .start(start_with(
+                &ns,
+                "act-r",
+                "req-3",
+                BusinessIdPolicy::default(),
+            ))
+            .await
+            .expect("AllowDuplicate creates a new run");
+        assert!(again.started);
+        assert_ne!(
+            again.reference.execution_key.run_id,
+            first_run.execution_key.run_id
+        );
     }
 
     fn key_of(req: &StartActivity) -> ExecutionKey {
@@ -879,7 +1056,7 @@ mod tests {
         let bridge = bridge(true);
         let req = start_request();
         let key = key_of(&req);
-        let scheduled_ref = bridge.start(req).await.expect("start");
+        let scheduled_ref = bridge.start(req).await.expect("start").reference;
         let since = scheduled_ref.execution_versioned_transition;
 
         // Advance (start), then a poll since the scheduled VT resolves.

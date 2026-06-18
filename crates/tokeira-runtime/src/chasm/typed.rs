@@ -21,7 +21,7 @@ use tokeira_chasm::{
 };
 
 use super::{
-    CommitOutcome, Engine, StartRequest, UpdateOutcome, UpdateRequest,
+    CommitOutcome, Engine, StartOutcome, StartRequest, UpdateOutcome, UpdateRequest,
     engine::{ChasmEngine, TransitionContext},
 };
 
@@ -54,7 +54,7 @@ where
         data: C::Data,
         request_id: Option<String>,
         policy: BusinessIdPolicy,
-    ) -> Result<ComponentRef, ChasmError> {
+    ) -> Result<StartOutcome, ChasmError> {
         let archetype_id = self.engine.registry().archetype_id(C::FQN).ok_or_else(|| {
             ChasmError::Internal(format!("archetype `{}` is not registered", C::FQN))
         })?;
@@ -354,7 +354,8 @@ mod tests {
                 BusinessIdPolicy::default(),
             )
             .await
-            .expect("start");
+            .expect("start")
+            .reference;
 
         let count = typed
             .read(&reference, |c, _ctx| Ok(c.data.counter))
@@ -390,7 +391,8 @@ mod tests {
                 BusinessIdPolicy::default(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .reference;
         typed
             .update(&reference, |c, ctx| {
                 c.data.counter += 1;
@@ -416,7 +418,8 @@ mod tests {
                 BusinessIdPolicy::default(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .reference;
         typed
             .update(&reference, |c, ctx| {
                 c.data.counter += 1;
@@ -440,7 +443,8 @@ mod tests {
                 BusinessIdPolicy::default(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .reference;
         let (_r, outcome) = typed
             .update(&reference, |c, _ctx| {
                 c.data.done = true;
@@ -472,7 +476,8 @@ mod tests {
                 BusinessIdPolicy::default(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .reference;
         let start_vt = reference.execution_versioned_transition;
 
         // An update advances the clock; a poll since the start VT resolves at once.
@@ -521,7 +526,8 @@ mod tests {
                 BusinessIdPolicy::default(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .reference;
         typed
             .update(&reference, |c, _ctx| {
                 c.data.counter += 1;

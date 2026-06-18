@@ -91,6 +91,24 @@ pub struct StartRequest {
     pub visibility: Option<VisibilitySnapshot>,
 }
 
+/// The result of [`Engine::start_execution`].
+///
+/// `created` distinguishes a freshly-created run from an existing run returned by
+/// the business-id policy (`UseExisting`, or same-`request_id` idempotent retry).
+/// It maps directly to the `started` field of the targeted release's
+/// `StartActivityExecutionResponse` (`chasm/lib/activity/handler.go:101` →
+/// `result.Created @ v1.31.0`): callers (e.g. the activity bridge) must NOT run the
+/// post-create `Scheduled` transition when `created` is `false`, since the returned
+/// run is already live.
+#[derive(Debug, Clone)]
+pub struct StartOutcome {
+    /// Reference to the created — or existing — run's root component.
+    pub reference: ComponentRef,
+    /// `true` iff this Start created a new run; `false` when an existing run was
+    /// returned per the reuse/conflict policy or request-id idempotency.
+    pub created: bool,
+}
+
 /// A precomputed mutation to apply as one fenced transition (Requirement 6.1,
 /// `UpdateComponent`).
 ///
@@ -190,9 +208,12 @@ pub enum NotifyEvent {
 /// concrete [`Component`](tokeira_chasm::Component).
 #[async_trait]
 pub trait Engine: Send + Sync {
-    /// Create a new execution rooted at an archetype's root component. Fails with
-    /// [`ChasmError::BusinessIdConflict`] if the execution already exists.
-    async fn start_execution(&self, req: StartRequest) -> Result<ComponentRef, ChasmError>;
+    /// Create a new execution rooted at an archetype's root component. Applies the
+    /// business-id reuse/conflict policy against the current run for the id; returns
+    /// a [`StartOutcome`] whose `created` flag is `false` when an existing run is
+    /// returned (`UseExisting` / same-`request_id`). Fails with
+    /// [`ChasmError::BusinessIdAlreadyStarted`] when the policy rejects the Start.
+    async fn start_execution(&self, req: StartRequest) -> Result<StartOutcome, ChasmError>;
 
     /// Apply one precomputed mutation as a fenced transition. Returns
     /// [`CommitOutcome::Conflict`] (not an error) when the fence fails so the caller

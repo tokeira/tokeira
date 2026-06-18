@@ -2256,6 +2256,12 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         };
         let req = request.into_inner();
         let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+        // Map the id reuse/conflict policy before minting a run id — an unsupported
+        // policy is rejected with InvalidArgument, mirroring the chasm activity
+        // handler's policy-map lookup (`handler.go:54-61 @ v1.31.0`).
+        let policy =
+            translate::activity_id_policy_to_chasm(req.id_reuse_policy, req.id_conflict_policy)
+                .map_err(proto_conversion_status)?;
         // The run id names this instance; the start request carries none, so the
         // server mints it (UUIDv4), mirroring run-id assignment for workflows.
         let run_id = uuid::Uuid::new_v4().to_string();
@@ -2280,6 +2286,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             // outer cap, applied during normalization.
             run_timeout_nanos: 0,
             request_id: (!req.request_id.is_empty()).then_some(req.request_id),
+            policy,
         };
         let reference = bridge.start(start).await?;
         Ok(Response::new(

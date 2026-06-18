@@ -568,6 +568,48 @@ fn extract_reuse_policy(value: i32) -> tokeira_kernel::WorkflowIdReusePolicy {
     }
 }
 
+/// Map the activity `ActivityIdReusePolicy`/`ActivityIdConflictPolicy` request
+/// fields onto the CHASM business-id policy, mirroring `businessIDReusePolicyMap`
+/// / `businessIDConflictPolicyMap` (`chasm/lib/activity/handler.go:19-27 @
+/// v1.31.0`). An unspecified policy is normalized to the v1.31.0 defaults
+/// (`AllowDuplicate`/`Fail`, `validator.go:210 @ v1.31.0`); any value outside the
+/// mapped set is rejected with `InvalidArgument`, matching the handler's
+/// "unsupported ID … policy" error. `TerminateExisting` is deliberately absent
+/// from the activity conflict map and so is rejected here.
+pub fn activity_id_policy_to_chasm(
+    reuse: i32,
+    conflict: i32,
+) -> Result<tokeira_chasm::BusinessIdPolicy, ProtoConversionError> {
+    use enums::{ActivityIdConflictPolicy as Conflict, ActivityIdReusePolicy as Reuse};
+    use tokeira_chasm::{BusinessIdConflictPolicy, BusinessIdPolicy, BusinessIdReusePolicy};
+
+    let reuse_policy = match Reuse::try_from(reuse).ok() {
+        Some(Reuse::Unspecified) | Some(Reuse::AllowDuplicate) => {
+            BusinessIdReusePolicy::AllowDuplicate
+        }
+        Some(Reuse::AllowDuplicateFailedOnly) => BusinessIdReusePolicy::AllowDuplicateFailedOnly,
+        Some(Reuse::RejectDuplicate) => BusinessIdReusePolicy::RejectDuplicate,
+        _ => {
+            return Err(ProtoConversionError::InvalidArgument(format!(
+                "unsupported ID reuse policy: {reuse}"
+            )));
+        }
+    };
+    let conflict_policy = match Conflict::try_from(conflict).ok() {
+        Some(Conflict::Unspecified) | Some(Conflict::Fail) => BusinessIdConflictPolicy::Fail,
+        Some(Conflict::UseExisting) => BusinessIdConflictPolicy::UseExisting,
+        _ => {
+            return Err(ProtoConversionError::InvalidArgument(format!(
+                "unsupported ID conflict policy: {conflict}"
+            )));
+        }
+    };
+    Ok(BusinessIdPolicy {
+        reuse: reuse_policy,
+        conflict: conflict_policy,
+    })
+}
+
 fn migrate_reuse_policy(
     reuse: &mut tokeira_kernel::WorkflowIdReusePolicy,
     conflict: &mut tokeira_kernel::WorkflowIdConflictPolicy,

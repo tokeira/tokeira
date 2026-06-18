@@ -15,8 +15,9 @@ use std::marker::PhantomData;
 
 use prost::Message as _;
 use tokeira_chasm::{
-    ChasmError, ComponentRef, Context, EngineComponent, ExecutionKey, MutableContext,
-    RootComponent, SearchAttributeProvider, VersionedTransition, VisibilityContributor,
+    BusinessIdPolicy, ChasmError, ComponentRef, Context, EngineComponent, ExecutionKey,
+    MutableContext, RootComponent, SearchAttributeProvider, VersionedTransition,
+    VisibilityContributor,
 };
 
 use super::{
@@ -52,6 +53,7 @@ where
         key: ExecutionKey,
         data: C::Data,
         request_id: Option<String>,
+        policy: BusinessIdPolicy,
     ) -> Result<ComponentRef, ChasmError> {
         let archetype_id = self.engine.registry().archetype_id(C::FQN).ok_or_else(|| {
             ChasmError::Internal(format!("archetype `{}` is not registered", C::FQN))
@@ -68,6 +70,7 @@ where
                 archetype_id,
                 data,
                 request_id,
+                policy,
                 visibility,
             })
             .await
@@ -138,7 +141,19 @@ where
         request_id: Option<String>,
         f: impl FnMut(&mut C, &mut dyn MutableContext) -> Result<R, ChasmError>,
     ) -> Result<(R, UpdateOutcome), ChasmError> {
-        match self.start(key.clone(), initial, request_id).await {
+        // MVP: update-with-start always starts with the default policy
+        // (AllowDuplicate/Fail). Per-request reuse/conflict plumbing for the
+        // UpdateWithStart operation is a separate refinement (Requirement 6.2); the
+        // activity Start path that consumes the request policy goes through `start`.
+        match self
+            .start(
+                key.clone(),
+                initial,
+                request_id,
+                BusinessIdPolicy::default(),
+            )
+            .await
+        {
             Ok(_) | Err(ChasmError::BusinessIdConflict(_)) => {}
             Err(other) => return Err(other),
         }
@@ -183,9 +198,10 @@ mod tests {
     use std::sync::Arc;
 
     use tokeira_chasm::{
-        ChasmError, Component, Context, ContextMetadata, ExecutionKey, FieldRegistry, Lifecycle,
-        LifecycleState, MutableContext, Registry, RootComponent, SearchAttributeProvider,
-        SearchAttributes, TaskKind, TerminateReason, VisibilityContributor, VisibilitySnapshot,
+        BusinessIdPolicy, ChasmError, Component, Context, ContextMetadata, ExecutionKey,
+        FieldRegistry, Lifecycle, LifecycleState, MutableContext, Registry, RootComponent,
+        SearchAttributeProvider, SearchAttributes, TaskKind, TerminateReason,
+        VisibilityContributor, VisibilitySnapshot,
     };
     use tokeira_storage::InMemoryChasmNodeStore;
 
@@ -331,7 +347,12 @@ mod tests {
         let fx = fixture();
         let typed = TypedEngine::<Counter>::new(&fx.engine);
         let reference = typed
-            .start(key(), CounterData::default(), Some("req-1".to_owned()))
+            .start(
+                key(),
+                CounterData::default(),
+                Some("req-1".to_owned()),
+                BusinessIdPolicy::default(),
+            )
             .await
             .expect("start");
 
@@ -362,7 +383,12 @@ mod tests {
         let fx = fixture();
         let typed = TypedEngine::<Counter>::new(&fx.engine);
         let reference = typed
-            .start(key(), CounterData::default(), None)
+            .start(
+                key(),
+                CounterData::default(),
+                None,
+                BusinessIdPolicy::default(),
+            )
             .await
             .unwrap();
         typed
@@ -383,7 +409,12 @@ mod tests {
         let fx = fixture();
         let typed = TypedEngine::<Counter>::new(&fx.engine);
         let reference = typed
-            .start(key(), CounterData::default(), None)
+            .start(
+                key(),
+                CounterData::default(),
+                None,
+                BusinessIdPolicy::default(),
+            )
             .await
             .unwrap();
         typed
@@ -402,7 +433,12 @@ mod tests {
         let fx = fixture();
         let typed = TypedEngine::<Counter>::new(&fx.engine);
         let reference = typed
-            .start(key(), CounterData::default(), None)
+            .start(
+                key(),
+                CounterData::default(),
+                None,
+                BusinessIdPolicy::default(),
+            )
             .await
             .unwrap();
         let (_r, outcome) = typed
@@ -429,7 +465,12 @@ mod tests {
         let fx = fixture();
         let typed = TypedEngine::<Counter>::new(&fx.engine);
         let reference = typed
-            .start(key(), CounterData::default(), None)
+            .start(
+                key(),
+                CounterData::default(),
+                None,
+                BusinessIdPolicy::default(),
+            )
             .await
             .unwrap();
         let start_vt = reference.execution_versioned_transition;
@@ -473,7 +514,12 @@ mod tests {
         let fx = fixture();
         let typed = TypedEngine::<Counter>::new(&fx.engine);
         let reference = typed
-            .start(key(), CounterData::default(), None)
+            .start(
+                key(),
+                CounterData::default(),
+                None,
+                BusinessIdPolicy::default(),
+            )
             .await
             .unwrap();
         typed

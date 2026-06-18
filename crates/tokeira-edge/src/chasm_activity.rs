@@ -39,7 +39,8 @@ use std::{
 use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use tokeira_chasm::{
-    ChasmError, Component as _, ComponentRef, DispatchableTask, ExecutionKey, VersionedTransition,
+    BusinessIdPolicy, ChasmError, Component as _, ComponentRef, DispatchableTask, ExecutionKey,
+    VersionedTransition,
 };
 use tokeira_chasm_activity::{
     ActivityConfig, ActivityEvent, ActivityExecution, ActivityRequest, ActivityState,
@@ -80,6 +81,10 @@ pub struct StartActivity {
     pub run_timeout_nanos: i64,
     /// Originating request id, if supplied.
     pub request_id: Option<String>,
+    /// Business-id reuse/conflict policy mapped from the request's
+    /// `ActivityIdReusePolicy`/`ActivityIdConflictPolicy` (`handler.go:19-25 @
+    /// v1.31.0`). Governs whether a new Start may supersede the current run.
+    pub policy: BusinessIdPolicy,
 }
 
 /// A read view of an activity execution (the source for `Describe`/`Poll`
@@ -379,7 +384,7 @@ impl ActivityBridge {
 
         let typed = TypedEngine::<ActivityExecution>::new(&self.engine);
         let reference = typed
-            .start(key, state, req.request_id)
+            .start(key, state, req.request_id, req.policy)
             .await
             .map_err(map_chasm_err)?;
         // The initial Scheduled transition bumps attempt/stamp and schedules the
@@ -795,6 +800,7 @@ mod tests {
             heartbeat_nanos: 0,
             run_timeout_nanos: 0,
             request_id: Some("req-1".to_owned()),
+            policy: BusinessIdPolicy::default(),
         }
     }
 

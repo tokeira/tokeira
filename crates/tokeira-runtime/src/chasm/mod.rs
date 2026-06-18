@@ -49,7 +49,9 @@ pub use tokeira_chasm::{
 };
 
 use async_trait::async_trait;
-use tokeira_chasm::{ChasmError, ComponentRef, ExecutionKey, LifecycleState, VersionedTransition};
+use tokeira_chasm::{
+    BusinessIdPolicy, ChasmError, ComponentRef, ExecutionKey, LifecycleState, VersionedTransition,
+};
 
 /// A task staged by a transition for persistence into the owning node's outbox.
 /// The type-erased shape the engine threads from a typed mutation to the pure
@@ -78,6 +80,11 @@ pub struct StartRequest {
     pub data: Vec<u8>,
     /// Originating request id, recorded as context metadata.
     pub request_id: Option<String>,
+    /// The business-id reuse/conflict policy governing whether this Start may
+    /// supersede an existing current run for `key`'s business id. Enforced by the
+    /// engine against the current-run pointer (`WithBusinessIDPolicy` analog,
+    /// `chasm_engine.go @ v1.31.0`); defaults to `AllowDuplicate`/`Fail`.
+    pub policy: BusinessIdPolicy,
     /// The component's typed visibility contribution for the creating transition,
     /// or `None` if it contributes nothing. Forwarded to the visibility sink
     /// post-commit (Requirement 10.2), off the correctness path.

@@ -55,6 +55,7 @@ pub mod error;
 pub mod field;
 pub mod node;
 pub mod path;
+pub mod policy;
 pub mod registry;
 pub mod task;
 pub mod versioned_transition;
@@ -73,6 +74,7 @@ pub use node::{
     TransitionResult,
 };
 pub use path::{PathEncoder, PathSegment, SegmentKind};
+pub use policy::{BusinessIdConflictPolicy, BusinessIdPolicy, BusinessIdReusePolicy};
 pub use registry::{
     ComponentEntry, LEGACY_WORKFLOW_ARCHETYPE_ID, Library, Registry, RegistryBuilder,
     archetype_id_for_fqn,

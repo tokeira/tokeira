@@ -4682,14 +4682,32 @@ impl WorkflowService {
             workflow_id: tokeira_types::WorkflowId(workflow_id.to_string()),
             run_id,
         };
-        self.repo
+        if let Some(run_key) = self
+            .repo
             .resolve_execution(&execution)
             .await
             .map_err(EdgeError::from)?
-            .ok_or(EdgeError::WorkflowNotFound {
-                namespace: namespace.to_string(),
-                workflow_id: workflow_id.to_string(),
-            })
+        {
+            return Ok(run_key);
+        }
+        // `resolve_execution(run_id=None)` is open-only by repo contract; history reads must
+        // resolve the current execution (open or latest-closed) like v1.31.0 history-by-
+        // workflow-id, which serves closed runs (`workflow_handler.go:898 @ v1.31.0`). This
+        // mirrors the fallback StoreExecutionResolver already applies to describe. An explicit
+        // run_id is an exact lookup and never falls back.
+        if execution.run_id.is_none()
+            && let Some(run_key) = self
+                .repo
+                .find_latest_run(execution.namespace_id, &execution.workflow_id)
+                .await
+                .map_err(EdgeError::from)?
+        {
+            return Ok(run_key);
+        }
+        Err(EdgeError::WorkflowNotFound {
+            namespace: namespace.to_string(),
+            workflow_id: workflow_id.to_string(),
+        })
     }
 
     fn execution_ref_from_batch(

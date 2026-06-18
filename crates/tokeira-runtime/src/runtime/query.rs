@@ -41,11 +41,21 @@ where
         query_args: Payloads,
         timeout_after: Duration,
     ) -> Result<QueryResult> {
-        let run_key = self
-            .repo
-            .resolve_execution(&execution)
-            .await?
-            .ok_or_else(|| anyhow!("execution not found"))?;
+        // A query resolves the *current* execution — the open run if one exists, else the
+        // latest closed run — matching v1.31.0, which serves queries against closed
+        // workflows by worker replay (`service/frontend/workflow_handler.go:3123 @ v1.31.0`).
+        // `resolve_execution(run_id=None)` is open-only by repo contract, so fall back to
+        // `find_latest_run`, mirroring the fallback `StoreExecutionResolver` already applies
+        // to describe. An explicit run_id is an exact lookup and never falls back.
+        let run_key = match self.repo.resolve_execution(&execution).await? {
+            Some(rk) => rk,
+            None if execution.run_id.is_none() => self
+                .repo
+                .find_latest_run(execution.namespace_id, &execution.workflow_id)
+                .await?
+                .ok_or_else(|| anyhow!("execution not found"))?,
+            None => return Err(anyhow!("execution not found")),
+        };
 
         let state = match self.repo.load_run(run_key).await? {
             LoadedRun::Existing(state) => state,
@@ -292,18 +302,18 @@ where
             && self
                 .update_registry
                 .attach_waiter(run_key, &update_id, wait_policy.clone(), tx)
-            {
-                return self
-                    .wait_for_update_stage_with_receiver(
-                        run_key,
-                        execution,
-                        update_id,
-                        wait_policy,
-                        timeout_after,
-                        rx,
-                    )
-                    .await;
-            }
+        {
+            return self
+                .wait_for_update_stage_with_receiver(
+                    run_key,
+                    execution,
+                    update_id,
+                    wait_policy,
+                    timeout_after,
+                    rx,
+                )
+                .await;
+        }
 
         self.wait_for_history_stage(
             run_key,

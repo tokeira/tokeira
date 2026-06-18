@@ -1297,11 +1297,11 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         request: Request<workflowservice::ShutdownWorkerRequest>,
     ) -> Result<Response<workflowservice::ShutdownWorkerResponse>, Status> {
         let req = request.into_inner();
-        if req.namespace.is_empty() || req.sticky_task_queue.is_empty() {
-            return Err(Status::invalid_argument(
-                "namespace and sticky_task_queue are required",
-            ));
-        }
+        // v1.31.0 (`service/frontend/workflow_handler.go:2983 @ v1.31.0`) does NOT pre-validate
+        // `sticky_task_queue`: it resolves the namespace and forwards the (possibly empty) sticky
+        // queue straight to `ForceUnloadTaskQueuePartition`. A worker that never cached a workflow
+        // (activity-only, or shut down before stickiness) sends an empty sticky queue on shutdown, so
+        // rejecting it with `InvalidArgument` is an over-rejection (C6-class) that breaks SDK shutdown.
         let namespace_id = crate::to_internal::namespace_id_for(&req.namespace);
         if let Some(proto) = req.worker_heartbeat {
             let heartbeat = worker_heartbeat::worker_heartbeat_from_proto(
@@ -1324,14 +1324,18 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 }
             }
         }
-        self.inner
-            .broker()
-            .deny_worker(
-                namespace_id,
-                TaskQueueName(req.sticky_task_queue),
-                WorkerIdentity(req.identity),
-            )
-            .await;
+        // An empty sticky queue has nothing to unload (the v1.31.0 unload would target an empty
+        // partition — effectively a no-op here), so only deny a worker when a sticky queue is named.
+        if !req.sticky_task_queue.is_empty() {
+            self.inner
+                .broker()
+                .deny_worker(
+                    namespace_id,
+                    TaskQueueName(req.sticky_task_queue),
+                    WorkerIdentity(req.identity),
+                )
+                .await;
+        }
         Ok(Response::new(workflowservice::ShutdownWorkerResponse {}))
     }
     async fn describe_task_queue(

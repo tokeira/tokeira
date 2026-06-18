@@ -1081,10 +1081,13 @@ where
             }
             // Only release a buffered action once the schedule is fully idle and
             // not paused, so buffering never lets two runs overlap.
-            if completed && current.info.running_workflows.is_empty() && !current.state.paused
-                && let Some(buffered) = current.info.buffered_actions.pop_front() {
-                    buffered_to_run.push(buffered);
-                }
+            if completed
+                && current.info.running_workflows.is_empty()
+                && !current.state.paused
+                && let Some(buffered) = current.info.buffered_actions.pop_front()
+            {
+                buffered_to_run.push(buffered);
+            }
         });
         for buffered in buffered_to_run {
             handle_due_action(

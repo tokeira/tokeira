@@ -521,9 +521,10 @@ async fn wait_for_state(
 ) {
     for _ in 0..100 {
         if let Ok(snapshot) = store.describe(namespace_id, job_id)
-            && snapshot.state == expected {
-                return;
-            }
+            && snapshot.state == expected
+        {
+            return;
+        }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("timed out waiting for state {expected:?}");

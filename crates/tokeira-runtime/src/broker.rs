@@ -239,9 +239,10 @@ impl InMemoryBroker {
                 queue.namespace_id,
                 queue.task_queue.clone(),
                 worker.clone(),
-            )) {
-                return None;
-            }
+            ))
+        {
+            return None;
+        }
 
         let now = OffsetDateTime::now_utc();
         let mut promote_to_general = Vec::new();

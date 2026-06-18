@@ -600,9 +600,10 @@ impl ComposePlatform {
         };
         for mapping in service.ports {
             if let Some((host, container)) = parse_port_mapping(&mapping)
-                && container == port {
-                    return Ok(Some(("127.0.0.1".into(), host)));
-                }
+                && container == port
+            {
+                return Ok(Some(("127.0.0.1".into(), host)));
+            }
         }
         Ok(None)
     }

@@ -207,9 +207,10 @@ async fn discover_instance(
 
     for ci in describe_output.container_instances() {
         if ci.capacity_provider_name().unwrap_or_default() == capacity_provider
-            && let Some(ec2_id) = ci.ec2_instance_id() {
-                return Ok(ec2_id.to_owned());
-            }
+            && let Some(ec2_id) = ci.ec2_instance_id()
+        {
+            return Ok(ec2_id.to_owned());
+        }
     }
 
     bail!(

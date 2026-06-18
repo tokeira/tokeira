@@ -28,7 +28,8 @@ v1.31.0 source.
 | C1 | Standalone / first-class activity RPCs | 🟡 | 42/129 | reuse/conflict (1.3), describe proto fidelity (4.1), count-by-id (4.3); cross-spec blockers: retry re-dispatch / heartbeat / timeouts (~20, `runtime-activity-*`) |
 | C3 | Visibility list/query + search attributes | 🟡 | — | run `TestAdvancedVisibilitySuite`/`…Legacy` (query surface) |
 | C2 | Worker deployment / versioning | 🟡 | 19/19 (1 suite) | triage `TestVersioningFunctionalSuite` (+3 suites) |
-| C4 | Nexus endpoint / admin RPCs | ⬜ | 0 | `api-conformance-nexus-admin` |
+| C4a | Nexus endpoint **admin CRUD** RPCs | ⬜ | 0/~17 | `api-conformance-nexus-admin` (spec ground-truthed 2026-06-18); clears `TestNexusEndpointsFunctionalSuite` (15) + `TestNexusAPIValidationTestSuite` (2). Prereq: runtime `NexusEndpointRegistry` is static — make it live/store-backed (task 4.2) |
+| C4b | Nexus **operation execution** / task transport | ⬜ | 0/~82 | `edge-nexus-task-transport` / `kernel-nexus-operations` / `runtime-nexus-dispatch`; `TestNexusApiTestSuiteWith{TemporalFailures,LegacyErrorPaths}` (80) + `TestNexusWorkflowTestSuite` (2) |
 | C9 | `unfinished` panic siblings | ⬜ | 0/267 | fix entrypoint panic; siblings re-resolve |
 | C5a | Completion-callback admission validation | ✅ | done | — |
 | C5b | Other admission validators (links, …) | ✅ | done | — |
@@ -36,10 +37,11 @@ v1.31.0 source.
 | C7 | Lifecycle / describe `NotFound` | ⏸ | — | re-triage after C1–C4 |
 | C8 | Internal-surface / admin-service tests | ⛔ | — | out of public scope |
 
-**Now:** C1 — fresh-server full-suite measure (2026-06-18): **42/129 leaf pass**. Landed this session
-(uncommitted): Stage 4.2 describe long-poll deadline (+ unblocked the suite panic), request-field
-validation on cancel/terminate (request_id/identity length, +4), and respond-token validation
-(StaleToken + MismatchedTokenNamespace on Complete/Fail, +4). Next in-scope: 1.3 reuse/conflict
+**Now:** C1 — fresh-server full-suite measure (2026-06-18, re-confirmed on a clean restart):
+**42/129 leaf pass**. Landed and **committed (`59546975`, pushed to `main`)**: Stage 4.2 describe
+long-poll deadline (+ unblocked the suite panic), request-field validation on cancel/terminate
+(request_id/identity length, +4), and respond-token validation (StaleToken + MismatchedTokenNamespace
+on Complete/Fail, +4). Next in-scope: 1.3 reuse/conflict
 enforcement, 4.1 describe proto fidelity, 4.3 count-by-id. Blocked cross-spec (~20): retry re-dispatch
 (`StaleAttemptToken`, retry/timeout suites) and heartbeat → `runtime-activity-pump` /
 `runtime-activity-timeouts`. Deferred: `MismatchedTokenComponentRef` needs SA tokens in Temporal's
@@ -80,6 +82,12 @@ TOKEIRA_CONFORMANCE_FRONTEND_ADDR=127.0.0.1:7233 \
 Loop: edit → `cargo build -p tokeirad` → restart the server (step 3) → re-run the suite (step 4) →
 update the Status ledger. Go toolchain: `go1.22.4` confirmed in this environment.
 
+> **The SA gate is C1-only.** `enable_standalone_activities` matters only for C1 (standalone
+> activities). For any other cluster, drop it: a config with just `grpc_addr` pinned is enough, and
+> step 4 runs that cluster's suite (e.g. C4a: `-run '^TestNexusEndpointsFunctionalSuite$'` /
+> `^TestNexusAPIValidationTestSuite$`). The harness wiring (`TOKEIRA_CONFORMANCE_FRONTEND_ADDR` +
+> suite name) is identical across clusters.
+
 ---
 
 ## Remaining work (snapshot — updated 2026-06-17)
@@ -95,36 +103,20 @@ fix loci) is in **Detailed findings** below. Legend: ✅ done · 🟡 partial ·
 | **C5b** | Other admission validators (links, versioning info, start fields) | ✅ | **Links complete on all 5 v1.31.0 paths**: Start (combined+deduped request/callback set) plus Signal, RequestCancel, Terminate, SignalWithStart (request links only) — `validateLinks` mirror with verbatim messages and source-cited constants. Versioning-info: the override path is already validated; the legacy `useVersioning`/build-id path is a C2 deliberate-deviation (rule-based replacement). No further concrete "other start field" gap is enumerated — any residual is to be driven by a corpus re-run. | edge |
 | **C3** | Visibility list/query + search attributes | 🟡 | List RPCs + projection wired ✅; system/predefined SA seeding + 7 `SystemField` variants (`f5d959d`) ✅; **custom-SA upsert now reaches the visibility-store registry** (`VisibilityRegistryOperatorApi`, `apps/tokeirad/src/lib.rs:128–142`) ✅; visibility plane generalized to versioned snapshots shared by workflows + activities (`chasm-foundation`) ✅. Remaining: run `TestAdvancedVisibilitySuite`/`…Legacy` for residual query-surface gaps (ORDER BY / BETWEEN / STARTS_WITH / keyword `IN` / null close-time). See `DIRECTION-c3-visibility.md`. | projection/edge |
 | **C1** | Standalone / first-class activity RPCs | 🟡 | **Substrate + edge RPCs landed via the `chasm-foundation` spec (complete).** All eight `*ActivityExecution` RPCs — start / poll / describe / list / count / request_cancel / terminate / delete — delegate to the `ActivityBridge` (`grpc/workflow_service.rs:2103–2294`; wired at `apps/tokeirad/src/lib.rs:899–919`), and SA executions project to the shared snapshot visibility plane (discoverable via `List`/`CountActivityExecutions`). Gated by `enable_standalone_activities` (**off by default** — matches v1.31.0's gated-off baseline; on = deliberate deviation ahead of baseline, `tokeira-config/src/lib.rs:234`). **Measured 2026-06-17** (`TestStandaloneActivityTestSuite` vs a statically-SA-enabled `tokeirad` — confirmed the suite's in-process `OverrideDynamicConfig(activity.Enabled)` is ignored out-of-process, as predicted): **1 pass / 31 fail**. Bridge serves the RPCs and the happy path works, but conformance is early. Root causes: (1) `DescribeActivityExecution` info under-populated (`last_worker_identity`, `run_state`, `last_started_time`, …); (2) **no SA admission validation** — bad requests (empty/too-long activity_id, invalid run_id, stale/mismatched tokens) hang to `DeadlineExceeded` instead of `InvalidArgument`/`NotFound`; (3) describe proto fidelity (retry-policy/payload `@invalid`); (4) describe long-poll deadline; (5) `CountActivityExecutions` by activity_id. This is `activity-executions-first-class` work; fixing in order, starting with (2). | chasm-foundation ✅ → activity-executions-first-class |
-| **C4** | Nexus endpoint / admin RPCs | ⬜ | Endpoint CRUD + Nexus task transport. Tracked spec `api-conformance-nexus-admin`. | api-conformance-nexus-admin |
+| **C4a** | Nexus endpoint **admin CRUD** RPCs | ⬜ | Endpoint registry CRUD/list only. Spec `api-conformance-nexus-admin` **ground-truthed against v1.31.0 (2026-06-18)**: corrected stale-version code (`FAILED_PRECONDITION`, not `ABORTED`), removed the invented `UNIMPLEMENTED`-on-unsupported-field path, added the full `validateUpsertSpec` rules + verbatim messages (`service/frontend/nexus_endpoint_client.go @ v1.31.0`), the matching-side error codes (`AlreadyExists`/`NotFound`/`FailedPrecondition`, `service/matching/nexus_endpoint_client.go @ v1.31.0`), the six config knobs with defaults, and the frontend/matching-collapse deviation note. Clears `TestNexusEndpointsFunctionalSuite` (15) + `TestNexusAPIValidationTestSuite` (2) ≈ 17. | api-conformance-nexus-admin |
+| **C4b** | Nexus **operation execution** / task transport | ⬜ | `PollNexusTaskQueue`, operation lifecycle, Nexus-in-workflow. **Not** in `api-conformance-nexus-admin` (explicit non-goal). `TestNexusApiTestSuiteWith{TemporalFailures,LegacyErrorPaths}` (80) + `TestNexusWorkflowTestSuite` (2). | edge-nexus-task-transport / kernel-nexus-operations / runtime-nexus-dispatch |
 | **C2** | Worker deployment / versioning | 🟡 | `TestWorkerDeploymentSuite` (19) done (`2d0f609` +follow-ups; 2 skipped — no dynamic-config injection). Outstanding & untriaged: `TestVersioningFunctionalSuite` (406), `TestDeploymentVersionSuite` (68), `TestVersioning3FunctionalSuite` (13), `TestWorkerRegistryTestSuite` (7). Legacy v0.x version-sets = deliberate-deviation (won't implement). | edge/runtime registry |
 | **C7** | Lifecycle / describe `NotFound` | ⏸ | Re-triage after C1–C6 — many are cascades that clear for free. | — |
 | **C8** | Internal-surface / admin-service tests | ⛔ | Out-of-public-scope by construction; classify via the scope report, no implementation. | ledger |
 | **C9** | `unfinished` panic siblings (267) | ⬜ | Fix the entrypoint panic (nil-deref on the shimmed `testBase`/persistence); siblings then resolve to real pass/fail. | harness/edge |
 
-**Suggested order (highest leverage first):** ~~C6~~ ✅ → ~~C5a~~ ✅ → ~~C5b~~ ✅ →
-~~C1~~ 🟡 (implemented via `chasm-foundation`; conformance re-run pending) → finish C3
-(#4 query-surface re-run) → C4 → C2 (remaining suites) → C7 (re-triage) → C8 (classify) →
-C9 (panic fix).
+**Order (single source — mirrors the Status-ledger `Next action` column):**
+C1 (in flight) → C3 (cheap re-run) → C2 (triage) → C4a (spec-ready, ~17) → C9 (panic fix —
+reclassifies 267 `unfinished` to real pass/fail) → C7 (re-triage) → C4b (far; multi-spec) →
+C8 (classify). Done: C5a, C5b, C6.
 
-**Recommended next step (2026-06-17).** Working cluster-by-cluster (no full `runall` — that is ~2h;
-targeted suites are seconds-to-minutes after the first Go compile): measure one suite, fix root causes,
-re-run, repeat. Loop status:
-
-1. ~~**Manual UI smoke.**~~ ✅ `tokeirad` with `enable_standalone_activities = true` serves the SA
-   lifecycle over the wire; all six scenario executions land in the visibility plane (verified via a
-   direct `ListActivityExecutions` probe), none leak into the workflow list. The stock `temporalio/ui`
-   has no activities view, so SAs are observable over the RPC, not the UI yet.
-2. ~~**Measure C1.**~~ ✅ `TestStandaloneActivityTestSuite` = **1 pass / 31 fail** against a
-   statically-SA-enabled `tokeirad` (the dynamic-config caveat held). Root causes catalogued in the C1
-   detailed section. **In progress:** fixing in order, starting with SA admission validation.
-3. **Measure C3** — `TestAdvancedVisibilitySuite`/`…Legacy` for residual query-surface gaps.
-4. **Then C4 (Nexus admin)** — next untouched ⬜ cluster, tracked spec `api-conformance-nexus-admin`.
-
-Targeted-run runbook: build `tokeirad`; write a config with `enable_standalone_activities = true` and a
-pinned `grpc_addr`; start it; then from `../temporal` run
-`TOKEIRA_CONFORMANCE_FRONTEND_ADDR=<addr> go test -tags test_dep -run '^<Suite>$' ./tests/ -v`. The
-suite's own `OverrideDynamicConfig` knobs are in-process and do **not** reach an out-of-process
-`tokeirad`, so feature gates must be set in the server's static config.
+Run one suite at a time per the **Conformance run recipe** above (no full `runall` — ~2h; targeted
+suites are seconds-to-minutes). Measure → fix root causes → re-run → update the ledger.
 
 All fixes remain bound by the **Implementer mandate** and v1.31.0 ground-truth rules in the Detailed
 findings below.
@@ -396,15 +388,40 @@ expose any residual query-surface gaps. Detailed Codex playbook:
 
 </details>
 
-### C4 — Nexus endpoint/admin RPCs unimplemented (real-gap)
+### C4 — Nexus RPCs unimplemented (real-gap) — split into admin CRUD (C4a) vs operation execution (C4b)
 
-- **Signature:** `Unimplemented desc = create_nexus_endpoint` (~44), plus other endpoint CRUD.
-- **Blast radius:** `TestNexusApiTestSuiteWithTemporalFailures` (40),
-  `TestNexusApiTestSuiteWithLegacyErrorPaths` (40), `TestNexusEndpointsFunctionalSuite` (15),
-  `TestNexusWorkflowTestSuite` (2), `TestNexusAPIValidationTestSuite` (2).
-- **Ground truth:** v1.31.0 `OperatorService` Nexus endpoint CRUD + Nexus task transport.
-- **Fix locus:** `api-conformance-nexus-admin` spec (exists).
+> **Update 2026-06-18 — scope split.** The original C4 conflated two unrelated bodies of work. They
+> are now tracked separately because endpoint admin CRUD (a registry) and Nexus operation execution
+> (task transport + in-workflow operations) share no implementation and land in different specs.
+
+- **Signature:** `Unimplemented desc = create_nexus_endpoint` (~44, the five OperatorService endpoint
+  RPCs), plus the operation-execution suites that depend on task transport.
+
+**C4a — Nexus endpoint admin CRUD (this spec):**
+- **Blast radius:** `TestNexusEndpointsFunctionalSuite` (15), `TestNexusAPIValidationTestSuite` (2) ≈ 17.
+- **Ground truth:** `service/frontend/nexus_endpoint_client.go @ v1.31.0` (validation, translation,
+  read-after-write, list/name-filter) and `service/matching/nexus_endpoint_client.go @ v1.31.0`
+  (server-authored id/version, duplicate detection, version CAS). Error codes pinned:
+  duplicate name → `AlreadyExists` (`:100`); missing id → `NotFound` (`:152`, `:218`); version
+  mismatch → **`FailedPrecondition`** (`:155-156`, **not `ABORTED`**); worker-target namespace missing
+  → `FailedPrecondition`; all spec/id validation → aggregated `InvalidArgument`. Six limit knobs with
+  defaults from `common/dynamicconfig/constants.go @ v1.31.0`.
+- **Fix locus:** `api-conformance-nexus-admin` — **spec ground-truthed 2026-06-18** (requirements +
+  design + tasks rewritten with citations; two factual errors in the prior draft corrected). Ready to
+  execute, with one prereq: the runtime `NexusEndpointRegistry` is a static construction-time
+  `Arc<HashMap>` (`nexus.rs:72-86`), so Req 3 includes making it live/store-backed and changing
+  `resolve` to return an owned value (task 4.2).
 - **Category:** real-gap (tracked).
+
+**C4b — Nexus operation execution / task transport (out of this spec):**
+- **Blast radius:** `TestNexusApiTestSuiteWithTemporalFailures` (40),
+  `TestNexusApiTestSuiteWithLegacyErrorPaths` (40), `TestNexusWorkflowTestSuite` (2) ≈ 82.
+- **Ground truth:** v1.31.0 Nexus task transport (`PollNexusTaskQueue` /
+  `RespondNexusTaskCompleted` / `RespondNexusTaskFailed`) + the in-workflow Nexus operation lifecycle.
+- **Fix locus:** `edge-nexus-task-transport` / `kernel-nexus-operations` / `runtime-nexus-dispatch`
+  (+ `nexus-retry-policy`, `nexus-multi-cluster`). **Explicit non-goal of `api-conformance-nexus-admin`.**
+- **Category:** real-gap (tracked across the runtime/edge Nexus specs).
+
 
 ### C5 — Missing admission-time validation (real-gap) — the "accept-and-proceed" pattern
 
@@ -528,21 +545,10 @@ The inverse of C5 and easy to miss: tokeira returns `InvalidArgument` where v1.3
 
 ---
 
-## Suggested order of attack (highest leverage first)
+## Suggested order of attack
 
-1. **C6 (over-rejection)** — smallest fixes, pure correctness, immediate green: cron parser + nil
-   search-attribute/memo filtering. ~dozen tests, no new infrastructure.
-2. **C5a (callback validation)** — self-contained edge helper + 4 config knobs; fully specced below
-   in C5a. Clears both callbacks suites (28 tests).
-3. **C1 (standalone activities)** — highest raw count (130+), but already has a tracked spec
-   (`activity-executions-first-class`); largely execution-engine work.
-4. **C3 (visibility list RPCs)** — `api-conformance-visibility-legacy` exists; unblocks memo +
-   visibility suites.
-5. **C4 (Nexus admin)** — `api-conformance-nexus-admin` exists.
-6. **C2 (worker deployment registry)** — wire the registry into the conformance runtime; large suite
-   (406) but mostly one root cause.
-7. **C7** — re-triage after 1–6; many will have cleared as cascades.
-8. **C8** — classify as out-of-public-scope using the scope report; no implementation.
+Single source: the **Status ledger `Next action` column** and the **Order** line beneath the ledger
+(top of this doc). This section intentionally holds no second ordering — keeping one avoids drift.
 
 ---
 

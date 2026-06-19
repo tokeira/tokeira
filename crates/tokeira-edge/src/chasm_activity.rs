@@ -37,7 +37,6 @@ use std::{
 };
 
 use prost::Message as _;
-use serde::{Deserialize, Serialize};
 use tokeira_chasm::{
     BusinessIdPolicy, ChasmError, Component as _, ComponentRef, DispatchableTask, ExecutionKey,
     VersionedTransition,
@@ -158,40 +157,150 @@ pub struct PolledActivityTask {
     pub attempt: i32,
 }
 
-/// The opaque worker task token: enough to re-address the execution and fence the
-/// completion against the attempt it was issued for. Serialized as JSON (the edge's
-/// existing serde stack) — it is internal, never on the public SDK wire as a typed
-/// message, so the encoding is ours to choose.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The worker task token: a wire-compatible mirror of Temporal's server-internal
+/// activity task token (`temporal.server.api.token.v1.Task`,
+/// `proto/internal/temporal/server/api/token/v1/message.proto @ v1.31.0`), carrying
+/// a serialized `ChasmComponentRef` in `component_ref` (field 14). This is the
+/// decoded, validated form; the wire form is the two `Proto*` mirrors below.
+///
+/// Wire compatibility is load-bearing, not cosmetic. The conformance corpus
+/// `Deserialize`s the issued token with Temporal's `tasktoken.Serializer`, swaps its
+/// `component_ref` for another namespace's, and re-`Serialize`s it
+/// (`MismatchedTokenComponentRef`, `standalone_activity_test.go:734 @ v1.31.0`); an
+/// SDK echoes the token verbatim on `RespondActivityTask*`. tokeira does not vendor
+/// the server-internal protos, so the subset the standalone path needs is
+/// hand-defined to the stable field numbers — the same approach as the typed-error
+/// encoding in `grpc/errors.rs`.
+#[derive(Debug, Clone)]
 struct ActivityTaskToken {
-    /// Namespace id the execution belongs to.
+    /// Top-level `Task.namespace_id` (field 1) — the namespace-validator
+    /// interceptor's check (`errTaskTokenNamespaceMismatch`,
+    /// `common/rpc/interceptor/namespace_validator.go:354 @ v1.31.0`). Issued equal
+    /// to the component ref's namespace; the corpus tampers them apart.
     namespace_id: String,
-    /// Application-level activity id (the execution business id).
+    /// The component ref's namespace (`ChasmComponentRef.namespace_id`) — the
+    /// `validateActivityTaskToken` check (`activity.go:804 @ v1.31.0`). The
+    /// activity is addressed by the ref, so this is also the addressed namespace.
+    ref_namespace_id: String,
+    /// The addressed activity id (`ChasmComponentRef.business_id`); also the id in
+    /// the `NotFound "activity not found for ID: <id>"` message (the engine's
+    /// `convertNotFoundError` uses `ref.BusinessID`, `chasm_engine.go:1320`).
     activity_id: String,
-    /// Run id of the dispatched instance.
+    /// Run id of the dispatched instance (`ChasmComponentRef.run_id`).
     run_id: String,
-    /// The attempt stamp the dispatch was issued for (fences a stale completion).
-    stamp: i64,
+    /// The attempt the dispatch was issued for (`Task.attempt`, field 5). The
+    /// v1.31.0 fence is `token.Attempt != LastAttempt.Count` (`activity.go:790`);
+    /// in tokeira `attempt` and `stamp` move together (both bump only on
+    /// Scheduled/Rescheduled), so this is the same fence the timers use.
+    attempt: i32,
 }
 
 impl ActivityTaskToken {
-    fn encode(&self) -> EdgeResult<Vec<u8>> {
-        serde_json::to_vec(self)
-            .map_err(|e| EdgeError::Internal(format!("encode activity task token: {e}")))
+    /// Encode the wire token a poll hands a worker: a marshaled `Task` whose
+    /// `component_ref` is a marshaled `ChasmComponentRef`. `namespace_id`,
+    /// `activity_id`, and `run_id` are written into both the top-level `Task` and
+    /// the embedded ref so the two namespace checks see consistent values until the
+    /// corpus deliberately diverges them.
+    fn encode(
+        namespace_id: &str,
+        activity_id: &str,
+        run_id: &str,
+        attempt: i32,
+        archetype_id: u32,
+    ) -> EdgeResult<Vec<u8>> {
+        let component_ref = ProtoComponentRef {
+            namespace_id: namespace_id.to_owned(),
+            business_id: activity_id.to_owned(),
+            run_id: run_id.to_owned(),
+            archetype_id,
+        }
+        .encode_to_vec();
+        Ok(ProtoTaskToken {
+            namespace_id: namespace_id.to_owned(),
+            run_id: run_id.to_owned(),
+            attempt,
+            activity_id: activity_id.to_owned(),
+            component_ref,
+        }
+        .encode_to_vec())
     }
 
+    /// Decode a wire token into the validated form. Fails `InvalidArgument` if the
+    /// bytes are not a `Task` carrying a well-formed `ChasmComponentRef` — the
+    /// `errDeserializingToken` / `malformed token` paths (`activity.go:797`).
     fn decode(bytes: &[u8]) -> EdgeResult<Self> {
-        serde_json::from_slice(bytes)
-            .map_err(|_| EdgeError::BadRequest("malformed activity task token".to_owned()))
+        let (task, component_ref) = Self::decode_proto(bytes)
+            .ok_or_else(|| EdgeError::BadRequest("malformed activity task token".to_owned()))?;
+        Ok(Self {
+            namespace_id: task.namespace_id,
+            ref_namespace_id: component_ref.namespace_id,
+            activity_id: component_ref.business_id,
+            run_id: component_ref.run_id,
+            attempt: task.attempt,
+        })
+    }
+
+    /// Parse the wire bytes into the `Task` and its embedded `ChasmComponentRef`,
+    /// or `None` if the bytes are not a standalone-activity token. A standalone
+    /// token is positively keyed on a present, well-formed `component_ref` with a
+    /// namespace and business id (mirrors Temporal's `len(GetComponentRef()) > 0`
+    /// routing, `service/frontend/workflow_handler.go:1402 @ v1.31.0`); this is what
+    /// distinguishes it from the workflow-activity token sharing the same RPC.
+    fn decode_proto(bytes: &[u8]) -> Option<(ProtoTaskToken, ProtoComponentRef)> {
+        let task = ProtoTaskToken::decode(bytes).ok()?;
+        if task.component_ref.is_empty() {
+            return None;
+        }
+        let component_ref = ProtoComponentRef::decode(task.component_ref.as_slice()).ok()?;
+        if component_ref.namespace_id.is_empty() || component_ref.business_id.is_empty() {
+            return None;
+        }
+        Some((task, component_ref))
     }
 
     fn execution_key(&self) -> ExecutionKey {
         ExecutionKey::new(
-            self.namespace_id.clone(),
+            self.ref_namespace_id.clone(),
             self.activity_id.clone(),
             self.run_id.clone(),
         )
     }
+}
+
+/// Minimal mirror of `temporal.server.api.token.v1.Task` (`message.proto @
+/// v1.31.0`). Only the fields the standalone-activity path reads or sets are
+/// declared, at their on-wire tags — protobuf is tag-keyed, so an unset field
+/// (e.g. `workflow_id`, `scheduled_event_id`) round-trips through the SDK and
+/// Temporal's serializer untouched.
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct ProtoTaskToken {
+    #[prost(string, tag = "1")]
+    namespace_id: String,
+    #[prost(string, tag = "3")]
+    run_id: String,
+    #[prost(int32, tag = "5")]
+    attempt: i32,
+    #[prost(string, tag = "6")]
+    activity_id: String,
+    #[prost(bytes = "vec", tag = "14")]
+    component_ref: Vec<u8>,
+}
+
+/// Minimal mirror of `temporal.server.api.persistence.v1.ChasmComponentRef`
+/// (`chasm.proto @ v1.31.0`), the value of the task token's `component_ref`. Only
+/// the identity fields are carried; the namespace is what `validateActivityTaskToken`
+/// checks, and `archetype_id` keeps the ref faithful to what `ComponentRef.Serialize`
+/// emits (`chasm/ref.go:99 @ v1.31.0`).
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct ProtoComponentRef {
+    #[prost(string, tag = "1")]
+    namespace_id: String,
+    #[prost(string, tag = "2")]
+    business_id: String,
+    #[prost(string, tag = "3")]
+    run_id: String,
+    #[prost(uint32, tag = "4")]
+    archetype_id: u32,
 }
 
 /// One queued dispatch: the execution to run and the attempt stamp it was scheduled
@@ -341,9 +450,11 @@ impl ActivityBridge {
     /// Whether `task_token` is one this bridge issued (a standalone-activity
     /// token). The gRPC layer uses this to route a worker response onto the CHASM
     /// path or fall through to the workflow-activity path — standalone and
-    /// workflow activities share the `RespondActivityTask*` RPCs.
+    /// workflow activities share the `RespondActivityTask*` RPCs. The discriminator
+    /// is a present, well-formed `component_ref` (`len(taskToken.GetComponentRef())
+    /// > 0`, `service/frontend/workflow_handler.go:1402 @ v1.31.0`).
     pub fn owns_task_token(&self, task_token: &[u8]) -> bool {
-        ActivityTaskToken::decode(task_token).is_ok()
+        ActivityTaskToken::decode_proto(task_token).is_some()
     }
 
     /// The enable gate (Requirement 11.10): when off, every operation is rejected
@@ -599,14 +710,18 @@ impl ActivityBridge {
             let started_at = self.engine.now();
             self.record_started(entry.key.clone(), started_at, worker_identity.to_owned())
                 .await?;
-            let token = ActivityTaskToken {
-                namespace_id: entry.key.namespace_id.clone(),
-                activity_id: entry.key.business_id.clone(),
-                run_id: entry.key.run_id.clone(),
-                stamp: entry.stamp,
-            };
+            // The token carries the attempt (== stamp here) as the fence and the
+            // activity archetype id in the embedded component ref, so it round-trips
+            // through the SDK / Temporal's tasktoken serializer (see ActivityTaskToken).
+            let task_token = ActivityTaskToken::encode(
+                &entry.key.namespace_id,
+                &entry.key.business_id,
+                &entry.key.run_id,
+                state.attempt,
+                self.archetype_id,
+            )?;
             return Ok(Some(PolledActivityTask {
-                task_token: token.encode()?,
+                task_token,
                 activity_id: state.activity_id,
                 run_id: entry.key.run_id.clone(),
                 activity_type: state.activity_type,
@@ -670,7 +785,10 @@ impl ActivityBridge {
     /// - a token whose namespace differs from the request's is rejected
     ///   `InvalidArgument` ("Operation requested with a token from a different
     ///   namespace.");
-    /// - a token naming a superseded attempt (a retry advanced the live stamp), a
+    /// - a token whose *component ref* namespace differs from the request's — a
+    ///   tampered or cross-namespace ref that slipped past the first check — is
+    ///   rejected `InvalidArgument` ("token does not match namespace");
+    /// - a token naming a superseded attempt (a retry advanced the live attempt), a
     ///   terminal activity (the attempt already resolved), or a missing execution is
     ///   rejected `NotFound "activity not found for ID: <id>"` — the active attempt
     ///   the token named no longer exists.
@@ -679,9 +797,21 @@ impl ActivityBridge {
         token: &ActivityTaskToken,
         request_namespace_id: &str,
     ) -> EdgeResult<()> {
+        // Check 1 — the namespace-validator interceptor: the request namespace must
+        // match the token's top-level namespace (`errTaskTokenNamespaceMismatch`,
+        // `common/rpc/interceptor/namespace_validator.go:354 @ v1.31.0`).
         if token.namespace_id != request_namespace_id {
             return Err(EdgeError::BadRequest(
                 "Operation requested with a token from a different namespace.".to_owned(),
+            ));
+        }
+        // Check 2 — `validateActivityTaskToken`: the request namespace must also
+        // match the *component ref's* namespace. This is what catches a token whose
+        // ref was swapped to another namespace while the top-level namespace still
+        // matches (`MismatchedTokenComponentRef`, `activity.go:804 @ v1.31.0`).
+        if token.ref_namespace_id != request_namespace_id {
+            return Err(EdgeError::BadRequest(
+                "token does not match namespace".to_owned(),
             ));
         }
         let not_found =
@@ -694,9 +824,11 @@ impl ActivityBridge {
         let bytes = snapshot.data.ok_or_else(not_found)?;
         let state = ActivityState::decode(bytes.as_slice())
             .map_err(|e| EdgeError::Internal(format!("decode activity state: {e}")))?;
-        // The token names a specific attempt: a retry that advanced the stamp, or a
-        // terminal activity, means that attempt is no longer the live one.
-        if state.stamp != token.stamp || state.status().is_terminal() {
+        // Attempt fence (`token.Attempt != LastAttempt.Count`, `activity.go:790`): a
+        // retry advanced the live attempt, or the activity is terminal, so the
+        // attempt the token named is no longer live. tokeira's `attempt` and `stamp`
+        // move together, so this is the same fence the dispatch/timers use.
+        if state.attempt != token.attempt || state.status().is_terminal() {
             return Err(not_found());
         }
         Ok(())
@@ -1337,6 +1469,52 @@ mod tests {
                     message,
                     "Operation requested with a token from a different namespace."
                 );
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_token_component_ref_tamper_is_rejected() {
+        // Wire-compatibility proof + `MismatchedTokenComponentRef @ v1.31.0`: the
+        // issued token decodes as a `tokenspb.Task` carrying a `ChasmComponentRef`
+        // (so the corpus's `tasktoken.Serializer` round-trip works). Swapping the
+        // ref's namespace while leaving the top-level namespace intact passes the
+        // interceptor check but fails `validateActivityTaskToken` ->
+        // InvalidArgument "token does not match namespace".
+        let bridge = worker_bridge();
+        let req = start_request();
+        let key = key_of(&req);
+        let task_queue = req.task_queue.clone();
+        bridge.start(req).await.expect("start");
+
+        let task = bridge
+            .poll_activity_task(&task_queue, "worker-1")
+            .await
+            .expect("poll")
+            .expect("a queued task");
+
+        // The token is a real tokenspb.Task with a populated component_ref.
+        let mut wire = ProtoTaskToken::decode(task.task_token.as_slice()).expect("decode Task");
+        assert_eq!(wire.namespace_id, key.namespace_id);
+        let mut component_ref =
+            ProtoComponentRef::decode(wire.component_ref.as_slice()).expect("decode ref");
+        assert_eq!(component_ref.namespace_id, key.namespace_id);
+        assert_eq!(component_ref.business_id, key.business_id);
+
+        // Tamper only the ref's namespace, re-serialize, and respond in the original
+        // namespace (so check 1 passes, check 2 fires).
+        component_ref.namespace_id = "tampered-namespace".to_owned();
+        wire.component_ref = component_ref.encode_to_vec();
+        let tampered = wire.encode_to_vec();
+
+        let err = bridge
+            .respond_activity_task_completed(&tampered, &key.namespace_id, vec![1])
+            .await
+            .unwrap_err();
+        match err {
+            EdgeError::BadRequest(message) => {
+                assert_eq!(message, "token does not match namespace");
             }
             other => panic!("expected BadRequest, got {other:?}"),
         }

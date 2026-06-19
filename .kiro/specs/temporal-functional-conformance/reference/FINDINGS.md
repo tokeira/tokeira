@@ -43,13 +43,15 @@ long-poll deadline (+ unblocked the suite panic), request-field validation on ca
 (request_id/identity length, +4), and respond-token validation (StaleToken + MismatchedTokenNamespace
 on Complete/Fail, +4). Since then (committed): 1.3 reuse/conflict enforcement (`ea0a7051`,
 `5b5a7a39`, `2362d7db` — incl. the typed `ActivityExecutionAlreadyStarted`) and 3.1 respond-token
-validation extended to the **canceled** path (StaleToken + MismatchedTokenNamespace now cover all
-three respond verbs). Next in-scope: 4.1 describe proto fidelity, 4.3 count-by-id. Blocked cross-spec
+validation extended to the **canceled** path, and the **standalone-activity task token is now
+wire-compatible** — a marshaled `tokenspb.Task` carrying a `ChasmComponentRef` (`component_ref`),
+hand-defined to the stable field numbers. This clears `MismatchedTokenComponentRef` (the corpus
+round-trips the issued token through Temporal's `tasktoken.Serializer`) and adds the second
+`token does not match namespace` check; `component_ref` presence is also the standalone-vs-workflow
+routing discriminator. Next in-scope: 4.1 describe proto fidelity, 4.3 count-by-id. Blocked cross-spec
 (~20): retry re-dispatch (`StaleAttemptToken`, retry/timeout suites) and heartbeat →
-`runtime-activity-pump` / `runtime-activity-timeouts`. Deferred: `MismatchedTokenComponentRef` needs
-SA tokens in Temporal's `tasktoken` proto format (the test client-side deserializes + re-serializes
-the issued token). NB: restart `tokeirad` between full measures — in-memory state accumulates
-and reused activity IDs perturb counts.
+`runtime-activity-pump` / `runtime-activity-timeouts`. NB: restart `tokeirad` between full measures —
+in-memory state accumulates and reused activity IDs perturb counts.
 
 ---
 

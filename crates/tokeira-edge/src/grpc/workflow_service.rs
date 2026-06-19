@@ -322,6 +322,18 @@ fn nanos_to_proto_timestamp(nanos: i64) -> Option<prost_types::Timestamp> {
     })
 }
 
+/// Decode an optional describe-echo proto from the bytes the activity component
+/// stored (empty → `None`). The stored bytes were encoded from the same proto type
+/// the `ActivityExecutionInfo` field expects, so a non-empty buffer round-trips; a
+/// corrupt buffer degrades to `None` rather than failing the read (the field is
+/// observational, not on the correctness path).
+fn decode_echo<T: prost::Message + Default>(bytes: &[u8]) -> Option<T> {
+    if bytes.is_empty() {
+        return None;
+    }
+    T::decode(bytes).ok()
+}
+
 /// The terminal outcome (`ActivityExecutionOutcome`) for a closed activity, or
 /// `None` while it is still running. A completed activity carries its result
 /// `Payloads`; any other terminal carries a failure with the recorded message.
@@ -368,12 +380,19 @@ fn chasm_activity_info(
         attempt: description.attempt,
         schedule_time: nanos_to_proto_timestamp(description.scheduled_time_nanos),
         last_started_time: nanos_to_proto_timestamp(description.started_time_nanos),
+        close_time: nanos_to_proto_timestamp(description.close_time_nanos),
         last_failure: (!description.failure.is_empty()).then(|| tokeira_proto::failure::Failure {
             message: description.failure.clone(),
             ..Default::default()
         }),
         state_transition_count: description.execution_vt.transition_count,
         last_worker_identity: description.worker_identity.clone(),
+        // Describe-echo fields stored opaque at Start and returned verbatim (Req 5).
+        retry_policy: decode_echo(&description.retry_policy),
+        priority: decode_echo(&description.priority),
+        search_attributes: decode_echo(&description.search_attributes),
+        header: decode_echo(&description.header),
+        user_metadata: decode_echo(&description.user_metadata),
         ..Default::default()
     }
 }
@@ -2302,6 +2321,23 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             run_timeout_nanos: 0,
             request_id: (!req.request_id.is_empty()).then_some(req.request_id),
             policy,
+            // Describe-echo fields: stored opaque and returned verbatim by
+            // DescribeActivityExecution (Req 5). Encoded here at the edge boundary so
+            // the component holds only bytes.
+            header: req.header.map(|h| h.encode_to_vec()).unwrap_or_default(),
+            retry_policy: req
+                .retry_policy
+                .map(|r| r.encode_to_vec())
+                .unwrap_or_default(),
+            priority: req.priority.map(|p| p.encode_to_vec()).unwrap_or_default(),
+            search_attributes: req
+                .search_attributes
+                .map(|s| s.encode_to_vec())
+                .unwrap_or_default(),
+            user_metadata: req
+                .user_metadata
+                .map(|u| u.encode_to_vec())
+                .unwrap_or_default(),
         };
         let outcome = bridge.start(start).await?;
         Ok(Response::new(

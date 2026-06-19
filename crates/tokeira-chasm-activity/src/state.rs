@@ -79,8 +79,12 @@ pub fn lifecycle_for(status: ActivityStatus) -> LifecycleState {
 /// token transitions and timers validate against — Requirement 11.6), the
 /// identifying fields and task queue, the normalized timeouts (in Unix-nanosecond
 /// durations; `0` means unset), the retry bound, and the input/result/failure
-/// payloads. Durations are nanos rather than a proto `Duration` so the type stays a
-/// plain prost message; the edge/runtime convert at their boundary.
+/// payloads. It also carries the Start request's describe-echo fields (header,
+/// retry policy, priority, search attributes, user metadata) as opaque encoded
+/// bytes so `DescribeActivityExecution` can return them verbatim without the
+/// component depending on the public API types. Durations are nanos rather than a
+/// proto `Duration` so the type stays a plain prost message; the edge/runtime
+/// convert at their boundary.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ActivityState {
     /// Current status.
@@ -144,6 +148,28 @@ pub struct ActivityState {
     /// (`activity-executions-first-class` Req 3; `standalone_activity_test.go:4831`).
     #[prost(string, tag = "18")]
     pub last_worker_identity: String,
+    /// Encoded `temporal.api.common.v1.Header` from the Start request, stored opaque
+    /// and surfaced verbatim on `DescribeActivityExecution.info.header` (Req 5;
+    /// `standalone_activity_test.go:3122` asserts `ProtoEqual`). Empty when unset.
+    #[prost(bytes = "vec", tag = "19")]
+    pub header: Vec<u8>,
+    /// Encoded `temporal.api.common.v1.RetryPolicy` from the Start request. Stored in
+    /// full (beyond the `maximum_attempts` the retry bound uses) so describe can
+    /// echo it exactly (`info.retry_policy`, Req 5). Empty when unset.
+    #[prost(bytes = "vec", tag = "20")]
+    pub retry_policy: Vec<u8>,
+    /// Encoded `temporal.api.common.v1.Priority` from the Start request, echoed on
+    /// `info.priority`. Empty when unset.
+    #[prost(bytes = "vec", tag = "21")]
+    pub priority: Vec<u8>,
+    /// Encoded `temporal.api.common.v1.SearchAttributes` from the Start request,
+    /// echoed on `info.search_attributes`. Empty when unset.
+    #[prost(bytes = "vec", tag = "22")]
+    pub search_attributes: Vec<u8>,
+    /// Encoded `temporal.api.sdk.v1.UserMetadata` from the Start request, echoed on
+    /// `info.user_metadata`. Empty when unset.
+    #[prost(bytes = "vec", tag = "23")]
+    pub user_metadata: Vec<u8>,
 }
 
 // `status()` and `set_status()` accessors for the `status` enumeration field are

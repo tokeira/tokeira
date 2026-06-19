@@ -84,6 +84,21 @@ pub struct StartActivity {
     /// `ActivityIdReusePolicy`/`ActivityIdConflictPolicy` (`handler.go:19-25 @
     /// v1.31.0`). Governs whether a new Start may supersede the current run.
     pub policy: BusinessIdPolicy,
+    /// Encoded `Header` from the Start request (opaque; echoed on describe). Empty
+    /// when unset.
+    pub header: Vec<u8>,
+    /// Encoded `RetryPolicy` from the Start request (opaque; echoed on describe).
+    /// Empty when unset.
+    pub retry_policy: Vec<u8>,
+    /// Encoded `Priority` from the Start request (opaque; echoed on describe). Empty
+    /// when unset.
+    pub priority: Vec<u8>,
+    /// Encoded `SearchAttributes` from the Start request (opaque; echoed on
+    /// describe). Empty when unset.
+    pub search_attributes: Vec<u8>,
+    /// Encoded `UserMetadata` from the Start request (opaque; echoed on describe).
+    /// Empty when unset.
+    pub user_metadata: Vec<u8>,
 }
 
 /// Outcome of [`ActivityBridge::start`].
@@ -133,6 +148,19 @@ pub struct ActivityDescription {
     /// Identity of the worker that polled/started the current attempt (empty until
     /// pickup) — `DescribeActivityExecution.info.last_worker_identity`.
     pub worker_identity: String,
+    /// Close time in Unix nanoseconds (`0` = not closed) — `info.close_time`.
+    pub close_time_nanos: i64,
+    /// Encoded `Header` echoed on `info.header` (empty when unset).
+    pub header: Vec<u8>,
+    /// Encoded `RetryPolicy` echoed on `info.retry_policy` (empty when unset).
+    pub retry_policy: Vec<u8>,
+    /// Encoded `Priority` echoed on `info.priority` (empty when unset).
+    pub priority: Vec<u8>,
+    /// Encoded `SearchAttributes` echoed on `info.search_attributes` (empty when
+    /// unset).
+    pub search_attributes: Vec<u8>,
+    /// Encoded `UserMetadata` echoed on `info.user_metadata` (empty when unset).
+    pub user_metadata: Vec<u8>,
     /// The execution clock, used as the caller's long-poll token.
     pub execution_vt: VersionedTransition,
 }
@@ -504,6 +532,11 @@ impl ActivityBridge {
             schedule_to_close_nanos: normalized.schedule_to_close_nanos,
             start_to_close_nanos: normalized.start_to_close_nanos,
             heartbeat_nanos: normalized.heartbeat_nanos,
+            header: req.header,
+            retry_policy: req.retry_policy,
+            priority: req.priority,
+            search_attributes: req.search_attributes,
+            user_metadata: req.user_metadata,
             ..ActivityState::default()
         };
 
@@ -887,6 +920,12 @@ fn description_from(
         scheduled_time_nanos: state.scheduled_time_nanos,
         started_time_nanos: state.started_time_nanos,
         worker_identity: state.last_worker_identity,
+        close_time_nanos: state.close_time_nanos,
+        header: state.header,
+        retry_policy: state.retry_policy,
+        priority: state.priority,
+        search_attributes: state.search_attributes,
+        user_metadata: state.user_metadata,
         execution_vt,
     })
 }
@@ -996,6 +1035,11 @@ mod tests {
             run_timeout_nanos: 0,
             request_id: Some("req-1".to_owned()),
             policy: BusinessIdPolicy::default(),
+            header: Vec::new(),
+            retry_policy: Vec::new(),
+            priority: Vec::new(),
+            search_attributes: Vec::new(),
+            user_metadata: Vec::new(),
         }
     }
 
@@ -1022,6 +1066,11 @@ mod tests {
             run_timeout_nanos: 0,
             request_id: Some(request_id.to_owned()),
             policy,
+            header: Vec::new(),
+            retry_policy: Vec::new(),
+            priority: Vec::new(),
+            search_attributes: Vec::new(),
+            user_metadata: Vec::new(),
         }
     }
 
@@ -1174,6 +1223,29 @@ mod tests {
         let described = bridge.describe(key).await.expect("describe");
         assert_eq!(described.status, ActivityStatus::Scheduled);
         assert_eq!(described.attempt, 1);
+    }
+
+    #[tokio::test]
+    async fn start_carries_describe_echo_fields() {
+        // The Start request's header / retry policy / priority / search attributes /
+        // user metadata are stored opaque and returned verbatim by describe (Req 5):
+        // DescribeActivityExecution must echo them (standalone_activity_test.go:3122).
+        let bridge = bridge(true);
+        let mut req = start_request();
+        req.header = vec![1, 2, 3];
+        req.retry_policy = vec![4, 5];
+        req.priority = vec![6];
+        req.search_attributes = vec![7, 8, 9, 10];
+        req.user_metadata = vec![11, 12];
+        let key = key_of(&req);
+        bridge.start(req).await.expect("start");
+
+        let described = bridge.describe(key).await.expect("describe");
+        assert_eq!(described.header, vec![1, 2, 3]);
+        assert_eq!(described.retry_policy, vec![4, 5]);
+        assert_eq!(described.priority, vec![6]);
+        assert_eq!(described.search_attributes, vec![7, 8, 9, 10]);
+        assert_eq!(described.user_metadata, vec![11, 12]);
     }
 
     #[tokio::test]

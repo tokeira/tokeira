@@ -1,5 +1,8 @@
 use tokeira_proto::conversions::ProtoConversionError;
-use tonic::{Status, metadata::MetadataValue};
+use tonic::{
+    Code, Status,
+    metadata::{MetadataMap, MetadataValue},
+};
 
 use crate::errors::EdgeError;
 
@@ -90,10 +93,80 @@ impl From<EdgeError> for Status {
                 }
                 status
             }
+            EdgeError::ActivityExecutionAlreadyStarted {
+                message,
+                run_id,
+                start_request_id,
+            } => activity_already_started_status(message, run_id, start_request_id),
             EdgeError::FailedPrecondition(message) => Status::failed_precondition(message),
             EdgeError::Internal(message) => Status::internal(message),
         }
     }
+}
+
+/// Build the typed `ActivityExecutionAlreadyStarted` gRPC status.
+///
+/// The targeted release returns this as code `AlreadyExists` carrying an
+/// `ActivityExecutionAlreadyStartedFailure` detail (`StartRequestId`/`RunId`)
+/// (`go.temporal.io/api serviceerror/activity_execution_already_started.go`). The
+/// client recovers the typed error by reading the `google.rpc.Status` from the
+/// `grpc-status-details-bin` trailer and matching code == AlreadyExists AND the
+/// first detail's type (`serviceerror/convert.go`). tonic 0.11 has no Temporal
+/// detail support, so we encode the `google.rpc.Status` wrapper by hand: the detail
+/// is wrapped in a protobuf `Any` whose `type_url` is the fully-qualified message
+/// name Go's `anypb.New` emits.
+fn activity_already_started_status(
+    message: String,
+    run_id: String,
+    start_request_id: String,
+) -> Status {
+    use prost::Message as _;
+    use tokeira_proto::public::temporal::api::errordetails::v1::ActivityExecutionAlreadyStartedFailure;
+
+    let failure = ActivityExecutionAlreadyStartedFailure {
+        start_request_id,
+        run_id,
+    };
+    let detail = ProtoAny {
+        type_url:
+            "type.googleapis.com/temporal.api.errordetails.v1.ActivityExecutionAlreadyStartedFailure"
+                .to_owned(),
+        value: failure.encode_to_vec(),
+    };
+    let rpc_status = RpcStatus {
+        code: Code::AlreadyExists as i32,
+        message: message.clone(),
+        details: vec![detail],
+    };
+    Status::with_details_and_metadata(
+        Code::AlreadyExists,
+        message,
+        rpc_status.encode_to_vec().into(),
+        MetadataMap::new(),
+    )
+}
+
+/// Minimal `google.rpc.Status` mirror for the `grpc-status-details-bin` trailer.
+/// Not generated (no temporal proto pulls `google/rpc/status.proto` into our
+/// build), so it is hand-defined to the stable field numbers.
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct RpcStatus {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+    #[prost(message, repeated, tag = "3")]
+    details: Vec<ProtoAny>,
+}
+
+/// Minimal `google.protobuf.Any` mirror (hand-defined to avoid a `prost-types`
+/// dependency for this single call site).
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct ProtoAny {
+    #[prost(string, tag = "1")]
+    type_url: String,
+    #[prost(bytes = "vec", tag = "2")]
+    value: Vec<u8>,
 }
 
 fn err_static(message: &'static str) -> &'static str {
@@ -233,5 +306,36 @@ mod tests {
             status.metadata().get("tokeira-current-epoch").unwrap(),
             "11"
         );
+    }
+
+    #[test]
+    fn activity_already_started_status_carries_typed_detail() {
+        use prost::Message as _;
+        use tokeira_proto::public::temporal::api::errordetails::v1::ActivityExecutionAlreadyStartedFailure;
+
+        // The SDK's serviceerror decode (convert.go) keys off code == AlreadyExists
+        // AND the first google.rpc.Status detail being an
+        // ActivityExecutionAlreadyStartedFailure. Assert both round-trip on the wire.
+        let status: Status = EdgeError::ActivityExecutionAlreadyStarted {
+            message: "activity execution already started".to_string(),
+            run_id: "run-123".to_string(),
+            start_request_id: "req-abc".to_string(),
+        }
+        .into();
+
+        assert_eq!(status.code(), Code::AlreadyExists);
+        assert_eq!(status.message(), "activity execution already started");
+
+        let rpc_status = RpcStatus::decode(status.details()).expect("decode google.rpc.Status");
+        assert_eq!(rpc_status.code, Code::AlreadyExists as i32);
+        let detail = &rpc_status.details[0];
+        assert_eq!(
+            detail.type_url,
+            "type.googleapis.com/temporal.api.errordetails.v1.ActivityExecutionAlreadyStartedFailure"
+        );
+        let failure = ActivityExecutionAlreadyStartedFailure::decode(detail.value.as_slice())
+            .expect("decode failure detail");
+        assert_eq!(failure.run_id, "run-123");
+        assert_eq!(failure.start_request_id, "req-abc");
     }
 }

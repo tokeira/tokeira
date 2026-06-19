@@ -763,12 +763,19 @@ fn map_chasm_err(error: ChasmError) -> EdgeError {
             EdgeError::FailedPrecondition("activity execution is closed".to_owned())
         }
         ChasmError::BusinessIdConflict(message) => EdgeError::AlreadyExists(message),
-        // Interim mapping: surfaces the rejection with the current run id in the
-        // message. The typed `ActivityExecutionAlreadyStarted` (carrying RunId +
-        // StartRequestId as structured details) is wired in step 3 of task 1.3.
+        // Surface the targeted release's typed ActivityExecutionAlreadyStarted: the
+        // edge encodes code AlreadyExists + the ActivityExecutionAlreadyStartedFailure
+        // detail (RunId/StartRequestId) so the SDK's ErrorAs recovers it
+        // (`chasm/lib/activity/handler.go:91 @ v1.31.0`).
         ChasmError::BusinessIdAlreadyStarted {
-            run_id, message, ..
-        } => EdgeError::AlreadyExists(format!("{message} (run_id: {run_id})")),
+            run_id,
+            request_id,
+            message,
+        } => EdgeError::ActivityExecutionAlreadyStarted {
+            message,
+            run_id,
+            start_request_id: request_id,
+        },
         ChasmError::Unsupported(message) => EdgeError::Unimplemented(message),
         ChasmError::IllegalTransition { from, event } => EdgeError::FailedPrecondition(format!(
             "illegal activity transition: {event} from {from}"
@@ -897,7 +904,10 @@ mod tests {
             ))
             .await
             .expect_err("Fail must reject a live run");
-        assert!(matches!(err, EdgeError::AlreadyExists(_)), "got {err:?}");
+        assert!(
+            matches!(err, EdgeError::ActivityExecutionAlreadyStarted { .. }),
+            "got {err:?}"
+        );
 
         // Same request id as the current run is idempotent: existing run, not started.
         let same = bridge
@@ -962,7 +972,10 @@ mod tests {
             ))
             .await
             .expect_err("RejectDuplicate must reject a terminal run");
-        assert!(matches!(err, EdgeError::AlreadyExists(_)), "got {err:?}");
+        assert!(
+            matches!(err, EdgeError::ActivityExecutionAlreadyStarted { .. }),
+            "got {err:?}"
+        );
 
         // AllowDuplicate (the default) creates a fresh run.
         let again = bridge

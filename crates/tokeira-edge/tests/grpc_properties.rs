@@ -516,6 +516,7 @@ fn expected_code(err: &EdgeError) -> Code {
         EdgeError::ActivityNotStarted { .. } => Code::FailedPrecondition,
         EdgeError::WorkflowAlreadyStarted { .. }
         | EdgeError::BatchOperationAlreadyExists { .. } => Code::AlreadyExists,
+        EdgeError::ActivityExecutionAlreadyStarted { .. } => Code::AlreadyExists,
         EdgeError::NamespaceDeleted(_) => Code::FailedPrecondition,
         EdgeError::NamespaceAlreadyExists(_) => Code::AlreadyExists,
         EdgeError::TooManyLongPolls => Code::ResourceExhausted,

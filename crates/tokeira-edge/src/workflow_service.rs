@@ -4775,6 +4775,7 @@ fn grpc_error_code(error: &EdgeError) -> &'static str {
         EdgeError::WorkflowAlreadyStarted { .. }
         | EdgeError::BatchOperationAlreadyExists { .. }
         | EdgeError::NamespaceAlreadyExists(_) => "already_exists",
+        EdgeError::ActivityExecutionAlreadyStarted { .. } => "already_exists",
         EdgeError::NamespaceDeleted(_) => "failed_precondition",
         EdgeError::TooManyLongPolls => "resource_exhausted",
         EdgeError::LongPollAdmissionTimeout => "deadline_exceeded",

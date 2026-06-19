@@ -57,17 +57,17 @@ may proceed in any order once Stage 1 lands. Stage 5 depends on all.
   Option<CurrentRun>` + atomic `persist_new_execution` (set-on-start under the node-write lock).
 - [x] 1.2 DSQL backing `V056__chasm_current_run.sql` (modeled on `current_execution`/`V003`, DSQL-safe
   spread-key PK); pointer written in the same transaction as the root node; `LifecycleState`↔SMALLINT.
-- [ ] 1.3 Enforce `IdReusePolicy`/`IdConflictPolicy` in `ChasmEngine::start_execution` — reject a
+- [x] 1.3 Enforce `IdReusePolicy`/`IdConflictPolicy` in `ChasmEngine::start_execution` — reject a
   conflict against a LIVE current run with `ActivityExecutionAlreadyStarted` (naming `RunId` +
   `StartRequestId`), `USE_EXISTING`/same-request-id return the existing run, and apply the reuse matrix
   (`REJECT_DUPLICATE`, `ALLOW_DUPLICATE_FAILED_ONLY`) against a terminal current run.
-  **Set-on-start is DONE (default `ALLOW_DUPLICATE` upsert); the enforcement remains.**
-  **REORDERED after Stage 2:** `TestIDReusePolicy`/`TestIDConflictPolicy` call
-  `startAndValidateActivity`/`pollActivityTaskAndValidate`, which assert `last_worker_identity`, so
-  they fail at setup until Stage 2 — 1.3 is unverifiable before it.
-  **New design point (record in `design.md` Item 1 before coding the matrix):** `CurrentRun` must also
-  carry the run's **`request_id`** (for `AlreadyStarted.StartRequestId` + same-request-id idempotency)
-  and the close-maintained **status** (Completed vs Failed for `ALLOW_DUPLICATE_FAILED_ONLY`).
+  **DONE** in three steps: (1) policy plumbed to the engine (`StartRequest.policy`); (2) the matrix in
+  `start_execution` returning `StartOutcome{reference, created}`, bridge skips `Scheduled` and sets
+  `started` for UseExisting/dedup; (3) typed `ActivityExecutionAlreadyStarted` at the edge — code
+  `AlreadyExists` + `ActivityExecutionAlreadyStartedFailure` detail (RunId/StartRequestId) in the
+  `grpc-status-details-bin` trailer, verified to round-trip. Covered by
+  `conflict_policy_against_live_run`, `reuse_policy_against_terminal_run`,
+  `activity_already_started_status_carries_typed_detail`.
 - [x] 1.4 Edge `activity_execution_key` resolves an empty `run_id` via the pointer (`None` →
   `NotFound "activity not found for ID: <id>"`); blanket "run_id required" rejection removed.
 - [x] 1.5 `delete_execution` clears the pointer iff it still points at the deleted run (read-your-write).

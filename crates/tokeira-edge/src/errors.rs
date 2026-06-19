@@ -77,6 +77,20 @@ pub enum EdgeError {
         run_id: String,
     },
 
+    /// A standalone-activity Start was rejected by the id reuse/conflict policy
+    /// against an existing run. Carries the current run's id and create request id
+    /// so the gRPC layer can emit the typed `ActivityExecutionAlreadyStarted`
+    /// serviceerror (code `AlreadyExists`, with an
+    /// `ActivityExecutionAlreadyStartedFailure` detail) the SDK decodes via
+    /// `ErrorAs` — `serviceerror/activity_execution_already_started.go` +
+    /// `serviceerror/convert.go` (go.temporal.io/api @ v1.62.x).
+    #[error("{message}")]
+    ActivityExecutionAlreadyStarted {
+        message: String,
+        run_id: String,
+        start_request_id: String,
+    },
+
     #[error("batch operation already exists: {namespace}/{job_id}")]
     BatchOperationAlreadyExists { namespace: String, job_id: String },
 
@@ -131,6 +145,7 @@ impl EdgeError {
             EdgeError::ActivityNotStarted { .. } => StatusCode::PRECONDITION_FAILED,
             EdgeError::WorkflowAlreadyStarted { .. }
             | EdgeError::BatchOperationAlreadyExists { .. } => StatusCode::CONFLICT,
+            EdgeError::ActivityExecutionAlreadyStarted { .. } => StatusCode::CONFLICT,
             EdgeError::NamespaceDeleted(_) => StatusCode::GONE,
             EdgeError::NamespaceAlreadyExists(_) => StatusCode::CONFLICT,
             EdgeError::TooManyLongPolls => StatusCode::TOO_MANY_REQUESTS,
@@ -158,6 +173,9 @@ impl EdgeError {
             EdgeError::ActivityNotFound { .. } => "activity_not_found",
             EdgeError::ActivityNotStarted { .. } => "activity_not_started",
             EdgeError::WorkflowAlreadyStarted { .. } => "workflow_already_started",
+            EdgeError::ActivityExecutionAlreadyStarted { .. } => {
+                "activity_execution_already_started"
+            }
             EdgeError::BatchOperationAlreadyExists { .. } => "batch_operation_already_exists",
             EdgeError::BatchOperationNotFound { .. } => "batch_operation_not_found",
             EdgeError::TooManyLongPolls => "too_many_long_polls",

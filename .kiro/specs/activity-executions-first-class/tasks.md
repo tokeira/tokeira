@@ -132,7 +132,14 @@ may proceed in any order once Stage 1 lands. Stage 5 depends on all.
   `grpc-timeout` header) and returns an empty non-error response on elapse so the caller resubmits and
   its own gRPC deadline never fires (`chasm/lib/activity/handler.go` → `contextutil.WithDeadlineBuffer
   @ v1.31.0`).
-- [ ] 4.3 Fix `CountActivityExecutions` by `ActivityId`; verify `TestCountActivityExecutions/CountByActivityId`.
+- [x] 4.3 Fix `CountActivityExecutions` by `ActivityId`; verify `TestCountActivityExecutions/CountByActivityId`.
+  **DONE:** the visibility filter parser now resolves `ActivityId` to the business-id column
+  (`SystemField::WorkflowId` → `business_id`), matching the chasm business-id alias
+  (`WithBusinessIDAlias("ActivityId")`, `chasm/lib/activity/library.go:66 @ v1.31.0`). The activity
+  count/list paths are archetype-scoped, so `ActivityId = '<id>'` counts the activity. Covered by
+  `compile_filter_resolves_activity_id_to_business_id_column`. (Sibling count sub-tests — by
+  ActivityType / ExecutionStatus / TaskQueue / GROUP BY / custom SA — are not in 4.3's scope;
+  `TaskQueue`/`ExecutionStatus` already resolve, `ActivityType` would need a `WorkflowType` alias.)
 
 ## Stage 5 — Checkpoint
 

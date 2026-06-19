@@ -301,6 +301,14 @@ async fn resolve_field<S: VisibilityStore + ?Sized>(
         // archetype-neutral — a field name → a column, no archetype-value knowledge.
         "TemporalNamespaceDivision" | "archetype" => Some(SystemField::Archetype),
         "WorkflowId" => Some(SystemField::WorkflowId),
+        // `ActivityId` is the standalone-activity business-id alias
+        // (`chasm.WithBusinessIDAlias("ActivityId")`, `chasm/lib/activity/library.go:66
+        // @ v1.31.0`). The business id is stored in the generic business-id column
+        // (`workflow_id`/`business_id`) for every archetype, so resolving the alias to
+        // `WorkflowId` here is the same field-name → column mapping the comment above
+        // describes — it scopes correctly because the activity count/list paths AND the
+        // query are archetype-scoped to the activity archetype.
+        "ActivityId" => Some(SystemField::WorkflowId),
         "RunId" => Some(SystemField::RunId),
         "WorkflowType" => Some(SystemField::WorkflowType),
         "TaskQueue" => Some(SystemField::TaskQueue),
@@ -595,6 +603,27 @@ mod tests {
                 assert_eq!(field, FieldRef::System(SystemField::ExecutionStatus));
                 assert_eq!(op, CompareOp::Eq);
                 assert_eq!(value, FilterValue::String("Paused".to_string()));
+            }
+            other => panic!("expected Compare, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn compile_filter_resolves_activity_id_to_business_id_column() {
+        // `ActivityId` is the standalone-activity business-id alias
+        // (`WithBusinessIDAlias("ActivityId") @ v1.31.0`); it must resolve to the same
+        // business-id column as `WorkflowId` so `CountActivityExecutions` with
+        // `ActivityId = '<id>'` matches (TestCountActivityExecutions/CountByActivityId).
+        let store = InMemoryVisibilityStore::default();
+        let namespace_id = NamespaceId(uuid::Uuid::from_u128(1));
+        let compiled = compile_filter(Some("ActivityId = \"act-1\""), namespace_id, &store)
+            .await
+            .unwrap();
+        match compiled.expr.expect("expr") {
+            FilterExpr::Compare { field, op, value } => {
+                assert_eq!(field, FieldRef::System(SystemField::WorkflowId));
+                assert_eq!(op, CompareOp::Eq);
+                assert_eq!(value, FilterValue::String("act-1".to_string()));
             }
             other => panic!("expected Compare, got {other:?}"),
         }

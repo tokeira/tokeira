@@ -25,7 +25,7 @@ v1.31.0 source.
 
 | Cluster | Area | Status | Measured | Next action |
 |---|---|:--:|:--:|---|
-| C1 | Standalone / first-class activity RPCs | 🟡 | 42/129 | describe proto fidelity (4.1), count-by-id (4.3); cross-spec blockers: retry re-dispatch / heartbeat / timeouts (~20, `runtime-activity-*`) |
+| C1 | Standalone / first-class activity RPCs | 🟡 | 42/129 | Stages 1/3/4 landed (reuse-conflict, wire-compat token, describe info+outcome fidelity, count-by-id); remeasure pending. Remaining cross-spec blockers: retry re-dispatch / heartbeat / timeouts (~20, `runtime-activity-*`) |
 | C3 | Visibility list/query + search attributes | 🟡 | — | run `TestAdvancedVisibilitySuite`/`…Legacy` (query surface) |
 | C2 | Worker deployment / versioning | 🟡 | 19/19 (1 suite) | triage `TestVersioningFunctionalSuite` (+3 suites) |
 | C4a | Nexus endpoint **admin CRUD** RPCs | ⬜ | 0/~17 | `api-conformance-nexus-admin` (spec ground-truthed 2026-06-18); clears `TestNexusEndpointsFunctionalSuite` (15) + `TestNexusAPIValidationTestSuite` (2). Prereq: runtime `NexusEndpointRegistry` is static — make it live/store-backed (task 4.2) |
@@ -48,9 +48,13 @@ wire-compatible** — a marshaled `tokenspb.Task` carrying a `ChasmComponentRef`
 hand-defined to the stable field numbers. This clears `MismatchedTokenComponentRef` (the corpus
 round-trips the issued token through Temporal's `tasktoken.Serializer`) and adds the second
 `token does not match namespace` check; `component_ref` presence is also the standalone-vs-workflow
-routing discriminator. Next in-scope: 4.1 describe proto fidelity, 4.3 count-by-id. Blocked cross-spec
-(~20): retry re-dispatch (`StaleAttemptToken`, retry/timeout suites) and heartbeat →
-`runtime-activity-pump` / `runtime-activity-timeouts`. NB: restart `tokeirad` between full measures —
+routing discriminator. **Stage 4 now landed too:** 4.1 describe fidelity — info echoes header /
+retry_policy / priority / search_attributes / user_metadata + close_time, and the outcome round-trips
+the structured `Failure` (Failed) / `TerminatedFailureInfo` / `CanceledFailureInfo`; 4.2 long-poll
+caller-deadline (`59546975`); 4.3 count-by-`ActivityId` (business-id alias). **Next: remeasure the
+full suite** (expect a jump from 42), then triage residuals. Blocked cross-spec (~20): retry
+re-dispatch (`StaleAttemptToken`, retry/timeout suites) and heartbeat → `runtime-activity-pump` /
+`runtime-activity-timeouts`. NB: restart `tokeirad` between full measures —
 in-memory state accumulates and reused activity IDs perturb counts.
 
 ---

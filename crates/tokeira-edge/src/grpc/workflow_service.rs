@@ -9,7 +9,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use prost::Message as _;
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, codec::CompressionEncoding};
 use tracing::debug;
 
 use time::OffsetDateTime;
@@ -120,7 +120,15 @@ impl WorkflowServiceGrpc {
     }
 
     pub fn into_service(self) -> WorkflowServiceServer<Self> {
+        // Accept (and send) gzip: the Temporal SDKs compress requests by default —
+        // the Python SDK defaults to GrpcCompression.GZIP — so a server that does not
+        // negotiate gzip rejects unmodified SDK traffic with "Content is compressed
+        // with 'gzip' which isn't supported". `send_compressed` only compresses a
+        // response when the caller advertises `grpc-accept-encoding`, matching
+        // Temporal's behaviour. Identity (uncompressed) callers are unaffected.
         WorkflowServiceServer::new(self)
+            .accept_compressed(CompressionEncoding::Gzip)
+            .send_compressed(CompressionEncoding::Gzip)
     }
 
     /// Whether standalone activities are available on this server (the

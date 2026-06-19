@@ -10,6 +10,7 @@ use tokeira_proto::{
         },
     },
 };
+use tonic::codec::CompressionEncoding;
 
 use crate::{
     grpc::metadata::metadata_to_header_map,
@@ -27,7 +28,10 @@ impl OperatorServiceGrpc {
     }
 
     pub fn into_service(self) -> OperatorServiceServer<Self> {
+        // Negotiate gzip for parity with the SDKs (see WorkflowServiceGrpc).
         OperatorServiceServer::new(self)
+            .accept_compressed(CompressionEncoding::Gzip)
+            .send_compressed(CompressionEncoding::Gzip)
     }
 }
 

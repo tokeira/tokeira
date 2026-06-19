@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use tokio::sync::oneshot;
 use tokio_stream::{StreamExt, wrappers::TcpListenerStream};
 use tokio_util::sync::CancellationToken;
-use tonic::{Code, Request, transport::Server};
+use tonic::{Code, Request, codec::CompressionEncoding, transport::Server};
 use tonic_reflection::pb::{
     ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
     server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
@@ -165,6 +165,49 @@ async fn grpc_roundtrip_start_describe_and_reflection() -> Result<()> {
     let _ = shutdown_tx.send(());
     server.await??;
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn grpc_roundtrip_gzip_compressed_request_is_accepted() -> Result<()> {
+    // The Temporal SDKs compress requests by default (the Python SDK defaults to
+    // GrpcCompression.GZIP). A server that does not negotiate gzip rejects unmodified
+    // SDK traffic with "Content is compressed with 'gzip' which isn't supported".
+    // Enabling gzip on the client here reproduces that SDK behaviour and proves the
+    // server accepts it (and may respond compressed).
+    let (addr, shutdown_tx, server) = spawn_test_server().await?;
+
+    let endpoint = format!("http://{addr}");
+    let mut workflow = WorkflowServiceClient::connect(endpoint)
+        .await?
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip);
+
+    let start = workflow
+        .start_workflow_execution(StartWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_id: "gzip-workflow".to_string(),
+            workflow_type: Some(tokeira_proto::common::WorkflowType {
+                name: "example".to_string(),
+            }),
+            task_queue: Some(TaskQueue {
+                name: "queue-a".to_string(),
+                ..Default::default()
+            }),
+            input: Some(Payloads::default()),
+            request_id: "gzip-req-1".to_string(),
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+
+    assert!(
+        !start.run_id.is_empty(),
+        "a gzip-compressed StartWorkflowExecution must be accepted"
+    );
+
+    shutdown_tx.send(()).ok();
+    server.await??;
     Ok(())
 }
 

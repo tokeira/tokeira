@@ -43,10 +43,11 @@ use tokeira_chasm::{
 };
 use tokeira_chasm_activity::{
     ActivityConfig, ActivityEvent, ActivityExecution, ActivityRequest, ActivityState,
-    ActivityStatus, DISPATCH_TASK_ID, DispatchTask, validate_and_normalize,
+    ActivityStatus, DISPATCH_TASK_ID, DispatchTask, RetryOutcome, TimeoutType, due_timeout,
+    next_timeout_deadline, retry_decision, validate_and_normalize,
 };
 use tokeira_runtime::chasm::{
-    ChasmEngine, DispatchSink, Engine, PollOutcome, PollRequest, TypedEngine,
+    ChasmEngine, DispatchSink, Engine, PollOutcome, PollRequest, TimeoutEvaluator, TypedEngine,
 };
 use tokeira_types::ArchetypeId;
 
@@ -90,6 +91,19 @@ pub struct StartActivity {
     /// Encoded `RetryPolicy` from the Start request (opaque; echoed on describe).
     /// Empty when unset.
     pub retry_policy: Vec<u8>,
+    /// Retry-policy initial interval in nanoseconds, with Temporal's defaults already
+    /// applied at the edge (`retrypolicy.EnsureDefaults @ v1.31.0`: `1s` when unset).
+    /// Folded out of `retry_policy` so the pure retry decision stays proto-free.
+    pub retry_initial_interval_nanos: i64,
+    /// Retry-policy backoff coefficient, defaulted to `2.0` when unset.
+    pub retry_backoff_coefficient: f64,
+    /// Retry-policy maximum interval cap in nanoseconds, defaulted to
+    /// `100 × initial_interval` when unset (`0` would mean "no cap", but the default
+    /// is always applied here).
+    pub retry_maximum_interval_nanos: i64,
+    /// Retry-policy maximum attempts (`0` = unlimited). The retry bound the pure
+    /// decision enforces.
+    pub maximum_attempts: i32,
     /// Encoded `Priority` from the Start request (opaque; echoed on describe). Empty
     /// when unset.
     pub priority: Vec<u8>,
@@ -367,13 +381,19 @@ struct ProtoComponentRef {
     archetype_id: u32,
 }
 
-/// One queued dispatch: the execution to run and the attempt stamp it was scheduled
-/// for. A worker poll reaps stale entries (stamp/status no longer current) rather
-/// than dispatching them.
+/// One queued dispatch: the execution to run, the attempt stamp it was scheduled
+/// for, and the time it becomes pollable (`None` = immediately). A worker poll reaps
+/// stale entries (stamp/status no longer current) and skips not-yet-due entries
+/// (a backoff-delayed retry dispatch) rather than dispatching them.
 #[derive(Debug, Clone)]
 struct DispatchEntry {
     key: ExecutionKey,
     stamp: i64,
+    /// Earliest Unix-nanosecond time this dispatch may be handed to a worker. A
+    /// retry stages this at `now + backoff` so the new attempt is not pollable until
+    /// its backoff elapses (`statemachine.go:119 @ v1.31.0`); the first attempt
+    /// carries `None` (immediate).
+    fire_at: Option<i64>,
 }
 
 /// The matching-side activity queue: a [`DispatchSink`] the CHASM engine hands
@@ -402,11 +422,19 @@ impl ActivityDispatchQueue {
         }
     }
 
-    fn dequeue(&self, task_queue: &str) -> Option<DispatchEntry> {
-        self.queues
-            .lock()
-            .ok()
-            .and_then(|mut queues| queues.get_mut(task_queue).and_then(VecDeque::pop_front))
+    /// Pop the first dispatch on `task_queue` that is due at `now` (its `fire_at` is
+    /// unset or `<= now`), preserving order for the rest. A not-yet-due retry
+    /// dispatch is left in place (skipped, not removed) so a later poll past its
+    /// backoff observes it; this is the pull-side of the backoff-delayed dispatch
+    /// (Stage 3.2), so the runtime sweeper does not need to "release" delayed
+    /// dispatches separately.
+    fn dequeue_due(&self, task_queue: &str, now: i64) -> Option<DispatchEntry> {
+        let mut queues = self.queues.lock().ok()?;
+        let queue = queues.get_mut(task_queue)?;
+        let pos = queue
+            .iter()
+            .position(|entry| entry.fire_at.is_none_or(|at| at <= now))?;
+        queue.remove(pos)
     }
 }
 
@@ -428,6 +456,9 @@ impl DispatchSink for ActivityDispatchQueue {
                     DispatchEntry {
                         key: key.clone(),
                         stamp: dispatch.stamp,
+                        // A retry dispatch carries its backoff release time as the
+                        // scheduled task's `fire_at`; the first attempt has none.
+                        fire_at: task.task.fire_at_unix_nanos,
                     },
                 );
             }
@@ -570,6 +601,10 @@ impl ActivityBridge {
             heartbeat_nanos: normalized.heartbeat_nanos,
             header: req.header,
             retry_policy: req.retry_policy,
+            retry_initial_interval_nanos: req.retry_initial_interval_nanos,
+            retry_backoff_coefficient: req.retry_backoff_coefficient,
+            retry_maximum_interval_nanos: req.retry_maximum_interval_nanos,
+            maximum_attempts: req.maximum_attempts,
             priority: req.priority,
             search_attributes: req.search_attributes,
             user_metadata: req.user_metadata,
@@ -806,15 +841,40 @@ impl ActivityBridge {
         failure_payload: Vec<u8>,
         last_heartbeat_details: Vec<u8>,
     ) -> EdgeResult<()> {
-        self.apply_event(
-            key,
-            ActivityEvent::Failed {
-                failure,
-                failure_payload,
-                last_heartbeat_details,
-            },
-        )
-        .await
+        self.ensure_enabled()?;
+        let reference = self.activity_ref(key);
+        let typed = TypedEngine::<ActivityExecution>::new(&self.engine);
+        // The retry-vs-terminal decision is made INSIDE the fenced closure so it runs
+        // against the committed live state and re-runs on a conflict. A worker failure
+        // is retryable iff it carries an `ApplicationFailureInfo` that is not marked
+        // non-retryable and whose type is not in the policy's non-retryable list
+        // (`HandleFailed @ v1.31.0`); a retryable failure then defers to the pure
+        // `retry_decision` (`shouldRetry`), honouring `NextRetryDelay` as the
+        // override interval. Non-retryable, or no retry budget, goes terminal.
+        typed
+            .update(&reference, move |activity, ctx| {
+                let state = activity.activity_state().cloned().unwrap_or_default();
+                let now = ctx.now_unix_nanos();
+                let (retryable, override_nanos) =
+                    classify_worker_failure(&failure_payload, &state.retry_policy);
+                let event = match retryable.then(|| retry_decision(&state, now, override_nanos)) {
+                    Some(RetryOutcome::Reschedule(interval)) => ActivityEvent::Rescheduled {
+                        failure: failure.clone(),
+                        last_heartbeat_details: last_heartbeat_details.clone(),
+                        interval_nanos: interval,
+                    },
+                    // Not retryable, or retryable but out of attempts/budget: terminal.
+                    _ => ActivityEvent::Failed {
+                        failure: failure.clone(),
+                        failure_payload: failure_payload.clone(),
+                        last_heartbeat_details: last_heartbeat_details.clone(),
+                    },
+                };
+                activity.apply(event, ctx)
+            })
+            .await
+            .map_err(map_chasm_err)?;
+        Ok(())
     }
 
     /// Worker-facing: record a heartbeat for the attempt named by `task_token`,
@@ -862,7 +922,11 @@ impl ActivityBridge {
         let queue = self.dispatch_queue.as_ref().ok_or_else(|| {
             EdgeError::Internal("activity dispatch queue not attached".to_owned())
         })?;
-        while let Some(entry) = queue.dequeue(task_queue) {
+        // Pull only dispatches that are due now: a backoff-delayed retry dispatch is
+        // skipped until its release time, so a worker cannot pick up the next attempt
+        // before its backoff elapses (Stage 3.2).
+        let now = self.engine.now();
+        while let Some(entry) = queue.dequeue_due(task_queue, now) {
             let snapshot = match self.engine.read_component(&entry.key).await {
                 Ok(snapshot) => snapshot,
                 // A deleted execution leaves a dangling dispatch; drop and continue.
@@ -1223,6 +1287,101 @@ impl ActivityBridge {
             VersionedTransition::default(),
         )
     }
+
+    /// Read the live [`ActivityState`] for `key`, or `None` if the execution does not
+    /// exist (a deleted/never-created activity). Shared by the timeout sweeper path.
+    async fn load_state(&self, key: &ExecutionKey) -> EdgeResult<Option<ActivityState>> {
+        match self.engine.read_component(key).await {
+            Ok(snapshot) => match snapshot.data {
+                Some(bytes) => ActivityState::decode(bytes.as_slice())
+                    .map(Some)
+                    .map_err(|e| EdgeError::Internal(format!("decode activity state: {e}"))),
+                None => Ok(None),
+            },
+            Err(ChasmError::ExecutionNotFound) => Ok(None),
+            Err(error) => Err(map_chasm_err(error)),
+        }
+    }
+
+    /// Fire any due activity timeout for `key` at `now`, returning the next timeout
+    /// deadline to re-arm (`None` when terminal/gone/no timeout). This is the edge
+    /// half of the runtime timer sweeper (`chasm-activity-timeouts-and-retry`): it
+    /// re-derives the due timeout from durable state (history is authority; the armed
+    /// timer is a derived hint), then applies it under one fenced transition with
+    /// schedule-to-close precedence:
+    ///
+    /// - schedule-to-start / schedule-to-close → `TimedOut` directly (these never
+    ///   retry — `activity_tasks.go` `scheduleToStart`/`scheduleToClose` `Execute @
+    ///   v1.31.0` apply `TransitionTimedOut`);
+    /// - start-to-close / heartbeat → `tryReschedule` first, falling back to
+    ///   `TimedOut` when no retry is possible (`startToClose`/`heartbeat` `Execute @
+    ///   v1.31.0`).
+    ///
+    /// The decision is recomputed inside the closure against committed state, so a
+    /// timeout that is no longer due (a heartbeat raced in, the attempt advanced) is a
+    /// validate-then-drop no-op. The fenced update is issued only when a timeout is
+    /// due, so a not-due sweep does not churn the execution's VT.
+    pub async fn evaluate_timeouts(&self, key: &ExecutionKey, now: i64) -> EdgeResult<Option<i64>> {
+        self.ensure_enabled()?;
+        let Some(state) = self.load_state(key).await? else {
+            return Ok(None);
+        };
+        if state.status().is_terminal() {
+            return Ok(None);
+        }
+        // Nothing due yet: re-arm to the earliest future deadline without a commit.
+        if due_timeout(&state, now).is_none() {
+            return Ok(next_timeout_deadline(&state));
+        }
+
+        let reference = self.activity_ref(key.clone());
+        let typed = TypedEngine::<ActivityExecution>::new(&self.engine);
+        typed
+            .update(&reference, move |activity, ctx| {
+                let state = activity.activity_state().cloned().unwrap_or_default();
+                let now = ctx.now_unix_nanos();
+                // Re-derive against committed state; a raced advance makes this a
+                // no-op (validate-then-drop) rather than a wrong timeout.
+                let Some(timeout_type) = due_timeout(&state, now) else {
+                    return Ok(());
+                };
+                let timed_out = |tt: TimeoutType| ActivityEvent::TimedOut {
+                    stamp: state.stamp,
+                    timeout_type: tt,
+                    failure_payload: build_timeout_failure(tt),
+                };
+                let event = match timeout_type {
+                    // schedule-to-start / schedule-to-close never retry.
+                    TimeoutType::ScheduleToStart | TimeoutType::ScheduleToClose => {
+                        timed_out(timeout_type)
+                    }
+                    // start-to-close / heartbeat reschedule when the retry budget
+                    // allows, else time out (`tryReschedule` @ v1.31.0).
+                    TimeoutType::StartToClose | TimeoutType::Heartbeat => {
+                        match retry_decision(&state, now, 0) {
+                            RetryOutcome::Reschedule(interval) => ActivityEvent::Rescheduled {
+                                failure: format!("activity {} timeout", timeout_type.as_str()),
+                                last_heartbeat_details: Vec::new(),
+                                interval_nanos: interval,
+                            },
+                            RetryOutcome::Terminal => timed_out(timeout_type),
+                        }
+                    }
+                };
+                activity.apply(event, ctx)
+            })
+            .await
+            .map_err(map_chasm_err)?;
+
+        // Re-arm to the post-transition next deadline (a retry's new attempt, or
+        // `None` once terminal).
+        let next = self
+            .load_state(key)
+            .await?
+            .filter(|s| !s.status().is_terminal())
+            .and_then(|s| next_timeout_deadline(&s));
+        Ok(next)
+    }
 }
 
 /// Decode an activity snapshot into an [`ActivityDescription`].
@@ -1321,6 +1480,88 @@ fn map_chasm_err(error: ChasmError) -> EdgeError {
     }
 }
 
+/// Classify a worker-reported failure for retry, returning `(retryable,
+/// override_nanos)`. Mirrors the retryability test in `HandleFailed @ v1.31.0`: a
+/// failure is retryable only if it carries an `ApplicationFailureInfo` that is not
+/// `non_retryable` and whose `type` is not in the policy's `non_retryable_error_types`.
+/// `override_nanos` is the failure's `NextRetryDelay` (0 when unset), which overrides
+/// the exponential interval. Decoding the failure and the retry policy is the edge's
+/// job (the pure crate stays proto-free), so this lives here.
+fn classify_worker_failure(failure_payload: &[u8], retry_policy_bytes: &[u8]) -> (bool, i64) {
+    use tokeira_proto::failure::{Failure, failure::FailureInfo};
+    if failure_payload.is_empty() {
+        // No structured failure → only ApplicationFailureInfo retries, so terminal.
+        return (false, 0);
+    }
+    let Ok(failure) = Failure::decode(failure_payload) else {
+        return (false, 0);
+    };
+    let Some(FailureInfo::ApplicationFailureInfo(app)) = failure.failure_info else {
+        // Timeout/cancellation/etc. failures are not application-retryable here.
+        return (false, 0);
+    };
+    if app.non_retryable {
+        return (false, 0);
+    }
+    // An empty policy blob decodes to an empty `RetryPolicy` (no excluded types).
+    let excluded = tokeira_proto::common::RetryPolicy::decode(retry_policy_bytes)
+        .map(|p| p.non_retryable_error_types)
+        .unwrap_or_default();
+    if excluded.iter().any(|t| t == &app.r#type) {
+        return (false, 0);
+    }
+    let override_nanos = app
+        .next_retry_delay
+        .map(|d| {
+            d.seconds
+                .saturating_mul(1_000_000_000)
+                .saturating_add(i64::from(d.nanos))
+        })
+        .unwrap_or(0);
+    (true, override_nanos)
+}
+
+/// Build the encoded `Failure` (with `TimeoutFailureInfo`) recorded when a timeout
+/// fires, so the describe/poll outcome surfaces the structured timeout type
+/// (`createStartToCloseTimeoutFailure` et al. `@ v1.31.0`). Built at the edge because
+/// the pure crate is proto-free.
+fn build_timeout_failure(timeout_type: TimeoutType) -> Vec<u8> {
+    use tokeira_proto::failure::{Failure, TimeoutFailureInfo, failure::FailureInfo};
+    Failure {
+        message: format!("activity {} timeout", timeout_type.as_str()),
+        failure_info: Some(FailureInfo::TimeoutFailureInfo(TimeoutFailureInfo {
+            timeout_type: timeout_type_to_proto(timeout_type) as i32,
+            ..Default::default()
+        })),
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
+
+/// Map the pure [`TimeoutType`] to the proto `enums.TimeoutType`.
+fn timeout_type_to_proto(timeout_type: TimeoutType) -> tokeira_proto::enums::TimeoutType {
+    use tokeira_proto::enums::TimeoutType as T;
+    match timeout_type {
+        TimeoutType::ScheduleToStart => T::ScheduleToStart,
+        TimeoutType::ScheduleToClose => T::ScheduleToClose,
+        TimeoutType::StartToClose => T::StartToClose,
+        TimeoutType::Heartbeat => T::Heartbeat,
+    }
+}
+
+/// The bridge is the runtime sweeper's [`TimeoutEvaluator`]: it owns the activity
+/// timeout semantics (over the pure crate), so the runtime fires timers without
+/// depending on the edge. Delegates to the inherent
+/// [`evaluate_timeouts`](ActivityBridge::evaluate_timeouts).
+#[async_trait::async_trait]
+impl TimeoutEvaluator for ActivityBridge {
+    async fn evaluate_timeouts(&self, key: &ExecutionKey, now: i64) -> anyhow::Result<Option<i64>> {
+        ActivityBridge::evaluate_timeouts(self, key, now)
+            .await
+            .map_err(|e| anyhow::anyhow!("evaluate activity timeouts: {e}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1371,6 +1612,10 @@ mod tests {
             policy: BusinessIdPolicy::default(),
             header: Vec::new(),
             retry_policy: Vec::new(),
+            retry_initial_interval_nanos: SEC,
+            retry_backoff_coefficient: 2.0,
+            retry_maximum_interval_nanos: 100 * SEC,
+            maximum_attempts: 0,
             priority: Vec::new(),
             search_attributes: Vec::new(),
             user_metadata: Vec::new(),
@@ -1402,6 +1647,10 @@ mod tests {
             policy,
             header: Vec::new(),
             retry_policy: Vec::new(),
+            retry_initial_interval_nanos: SEC,
+            retry_backoff_coefficient: 2.0,
+            retry_maximum_interval_nanos: 100 * SEC,
+            maximum_attempts: 0,
             priority: Vec::new(),
             search_attributes: Vec::new(),
             user_metadata: Vec::new(),

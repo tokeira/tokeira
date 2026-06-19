@@ -261,6 +261,35 @@ fn proto_duration_to_nanos(value: Option<&prost_types::Duration>) -> i64 {
     }
 }
 
+/// The retry-policy scalars the standalone activity needs, with Temporal's defaults
+/// applied — mirroring `retrypolicy.EnsureDefaults` over `DefaultDefaultRetrySettings`
+/// (`common/retrypolicy/retry_policy.go @ v1.31.0`), which the standalone Start path
+/// applies via `DefaultActivityRetryPolicy` before persisting
+/// (`chasm/lib/activity/frontend.go:362-419 @ v1.31.0`). tokeira is config-as-constant,
+/// so the constant defaults stand in for the dynamic-config default. Returns
+/// `(initial_interval_nanos, backoff_coefficient, maximum_interval_nanos, maximum_attempts)`.
+fn defaulted_retry_fields(
+    policy: Option<&tokeira_proto::common::RetryPolicy>,
+) -> (i64, f64, i64, i32) {
+    // EnsureDefaults: InitialInterval 1s, BackoffCoefficient 2.0, MaximumInterval
+    // 100 × InitialInterval, MaximumAttempts 0 (unlimited).
+    let mut initial = proto_duration_to_nanos(policy.and_then(|p| p.initial_interval.as_ref()));
+    if initial == 0 {
+        initial = 1_000_000_000;
+    }
+    let mut coefficient = policy.map(|p| p.backoff_coefficient).unwrap_or(0.0);
+    if coefficient == 0.0 {
+        coefficient = 2.0;
+    }
+    let mut maximum = proto_duration_to_nanos(policy.and_then(|p| p.maximum_interval.as_ref()));
+    if maximum == 0 {
+        // DefaultDefaultRetrySettings.MaximumIntervalCoefficient = 100.
+        maximum = initial.saturating_mul(100);
+    }
+    let maximum_attempts = policy.map(|p| p.maximum_attempts).unwrap_or(0);
+    (initial, coefficient, maximum, maximum_attempts)
+}
+
 /// Build a `PollActivityTaskQueueResponse` for a standalone-activity task served
 /// from the CHASM bridge. Only the fields meaningful for a standalone activity are
 /// populated; `activity_run_id` carries the run id (field 20, "only set for
@@ -372,8 +401,8 @@ fn decode_echo<T: prost::Message + Default>(bytes: &[u8]) -> Option<T> {
 ///   falls back to a message-only failure if none was captured).
 /// - `Terminated` → a `Failure` carrying `TerminatedFailureInfo` (`TransitionTerminated`).
 /// - `Canceled` → a `Failure` carrying `CanceledFailureInfo` (`TransitionCanceled`).
-/// - `TimedOut` → a message-only `Failure` (timeout-info fidelity is owned by
-///   `runtime-activity-timeouts`).
+/// - `TimedOut` → a `Failure` carrying `TimeoutFailureInfo` with the fired timeout
+///   type (built when the timeout fired; `chasm-activity-timeouts-and-retry`).
 fn chasm_activity_outcome(
     description: &crate::chasm_activity::ActivityDescription,
 ) -> Option<activity_v1::ActivityExecutionOutcome> {
@@ -412,10 +441,20 @@ fn chasm_activity_outcome(
             )),
             ..Default::default()
         }),
-        ActivityStatus::TimedOut => Value::Failure(Failure {
-            message: description.failure.clone(),
-            ..Default::default()
-        }),
+        // A timeout records a structured `Failure` (with `TimeoutFailureInfo`) as its
+        // failure_payload, built when the timeout fired; round-trip it so the outcome
+        // carries the timeout type (`standalone_activity_test.go:4509`). An empty or
+        // corrupt payload degrades to a message-only failure.
+        ActivityStatus::TimedOut => {
+            let failure = (!description.failure_payload.is_empty())
+                .then(|| Failure::decode(description.failure_payload.as_slice()).ok())
+                .flatten()
+                .unwrap_or_else(|| Failure {
+                    message: description.failure.clone(),
+                    ..Default::default()
+                });
+            Value::Failure(failure)
+        }
         _ => return None,
     };
     Some(activity_v1::ActivityExecutionOutcome { value: Some(value) })
@@ -2558,6 +2597,12 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         // The run id names this instance; the start request carries none, so the
         // server mints it (UUIDv4), mirroring run-id assignment for workflows.
         let run_id = uuid::Uuid::new_v4().to_string();
+        // Apply Temporal's retry-policy defaults once, here at the edge, and fold the
+        // result into scalar fields on the activity state (the pure crate is
+        // proto-free). Computed before `req.retry_policy` is moved into the opaque
+        // describe-echo bytes below.
+        let (retry_initial, retry_coefficient, retry_maximum, retry_max_attempts) =
+            defaulted_retry_fields(req.retry_policy.as_ref());
         let start = crate::chasm_activity::StartActivity {
             namespace_id: namespace_id.0.to_string(),
             activity_id: req.activity_id,
@@ -2586,8 +2631,15 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             header: req.header.map(|h| h.encode_to_vec()).unwrap_or_default(),
             retry_policy: req
                 .retry_policy
+                .as_ref()
                 .map(|r| r.encode_to_vec())
                 .unwrap_or_default(),
+            // Fold the (defaulted) retry policy into scalar fields so the pure retry
+            // decision needs no proto. Defaults match v1.31.0's `EnsureDefaults`.
+            retry_initial_interval_nanos: retry_initial,
+            retry_backoff_coefficient: retry_coefficient,
+            retry_maximum_interval_nanos: retry_maximum,
+            maximum_attempts: retry_max_attempts,
             priority: req.priority.map(|p| p.encode_to_vec()).unwrap_or_default(),
             search_attributes: req
                 .search_attributes

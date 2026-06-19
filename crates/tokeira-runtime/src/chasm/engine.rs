@@ -323,6 +323,31 @@ impl ChasmEngine {
             .and_then(|timers| timers.get(key).copied().flatten())
     }
 
+    /// Snapshot every execution that currently has an armed timer deadline, as
+    /// `(key, deadline)` pairs. The CHASM timer sweeper scans this each tick to find
+    /// due executions; it is a point-in-time copy so the sweeper never holds the
+    /// lock across an `await`. Engine-local, non-replicated state (Requirement 7.7).
+    pub fn armed_timers_snapshot(&self) -> Vec<(ExecutionKey, i64)> {
+        self.timers
+            .lock()
+            .map(|timers| {
+                timers
+                    .iter()
+                    .filter_map(|(key, deadline)| deadline.map(|d| (key.clone(), d)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Re-arm (or clear, with `None`) an execution's physical timer to `deadline`.
+    /// The sweeper calls this after evaluating timeouts so the next wake is the
+    /// state-derived next deadline rather than a stale pure-task deadline — firing
+    /// is a derived effect re-computable from node state (Requirement 7.6, 7.7;
+    /// `crates/tokeira-runtime/AGENTS.md`).
+    pub fn set_armed_timer(&self, key: &ExecutionKey, deadline: Option<i64>) {
+        self.arm_timer(key, deadline);
+    }
+
     /// Load an execution's node tree plus the per-node baseline VTs that fence the
     /// next commit. The execution clock is reconstructed as the maximum node VT
     /// (every committed transition stamps at least one node with the committing

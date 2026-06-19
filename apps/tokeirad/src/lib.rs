@@ -644,6 +644,39 @@ fn spawn_visibility_repair(
     });
 }
 
+/// The interval the CHASM timer sweeper ticks at. Activity timeouts (schedule-to-
+/// start/close, start-to-close, heartbeat) fire within roughly this cadence of their
+/// deadline; ~200ms is well below the smallest conformance timeout while keeping the
+/// sweep cheap (a snapshot of the armed-timer map plus a fenced update per due timer).
+const CHASM_TIMER_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Spawn the CHASM timer sweeper: it fires armed activity timeouts on a tick by
+/// delegating to the [`TimeoutEvaluator`](tokeira_runtime::chasm::TimeoutEvaluator)
+/// (the activity bridge), then re-arms each execution to its state-derived next
+/// deadline. Runtime-only (clock + loop); all timeout/retry semantics are pure
+/// (`tokeira-chasm-activity`) behind the evaluator, so the kernel-purity and
+/// history-authority invariants hold. Runs until `cancel` fires. Gated on standalone
+/// activities being enabled, since only they arm activity timers today.
+fn spawn_chasm_timer_sweeper(
+    engine: Arc<tokeira_runtime::chasm::ChasmEngine>,
+    evaluator: Arc<dyn tokeira_runtime::chasm::TimeoutEvaluator>,
+    cancel: CancellationToken,
+) {
+    let sweeper = tokeira_runtime::chasm::ChasmTimerSweeper::new(engine, evaluator);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(CHASM_TIMER_SWEEP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    sweeper.sweep_once().await;
+                }
+            }
+        }
+    });
+}
+
 async fn build_and_serve_with_storage<R, L, S, V, F>(
     addr: SocketAddr,
     effective_config: Arc<TokeiraConfig>,
@@ -906,6 +939,9 @@ where
                 .enable_standalone_activities,
             ..tokeira_chasm_activity::ActivityConfig::default()
         };
+        let standalone_enabled = activity_config.enable_standalone;
+        // Keep an engine handle for the timer sweeper before the bridge takes it.
+        let sweeper_engine = chasm_engine.clone();
         let activity_bridge = Arc::new(
             tokeira_edge::chasm_activity::ActivityBridge::new(
                 chasm_engine,
@@ -926,6 +962,17 @@ where
             effective_config.infrastructure.placement.partition_count,
             background_cancel.clone(),
         );
+        // Spawn the CHASM timer sweeper (`chasm-activity-timeouts-and-retry`): nothing
+        // else fires armed activity timeouts. The bridge is its `TimeoutEvaluator`, so
+        // the timeout/retry semantics stay pure behind the edge while the runtime owns
+        // only the clock+loop. Gated on standalone activities, the sole timer source.
+        if standalone_enabled {
+            spawn_chasm_timer_sweeper(
+                sweeper_engine,
+                activity_bridge.clone(),
+                background_cancel.clone(),
+            );
+        }
         WorkflowServiceGrpc::new(workflow_service).with_chasm_activity(activity_bridge)
     };
     let operator_grpc = OperatorServiceGrpc::new(operator_service);

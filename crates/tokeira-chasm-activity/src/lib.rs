@@ -28,6 +28,10 @@
 //! - [`state`] — the [`ActivityState`](state::ActivityState) proto, the
 //!   [`ActivityStatus`](state::ActivityStatus) enum, and the lifecycle mapping.
 //! - [`statemachine`] — the legal transition table and stamp-fenced `apply`.
+//! - [`backoff`] — exponential retry-interval computation (pure, proto-free).
+//! - [`retry`] — the [`retry_decision`](retry::retry_decision) (`shouldRetry` +
+//!   `hasEnoughTimeForRetry`).
+//! - [`timeouts`] — pure derivation of the due/next timeout from `ActivityState`.
 //! - [`tasks`] — the `dispatch` side-effect task and the pure timer tasks, with
 //!   their validators.
 //! - [`validator`] — request validation and timeout normalization.
@@ -35,15 +39,20 @@
 //! - [`component`] — the [`ActivityExecution`](component::ActivityExecution) root
 //!   component and the `activity` library registration.
 
+pub mod backoff;
 pub mod component;
 pub mod config;
+pub mod retry;
 pub mod state;
 pub mod statemachine;
 pub mod tasks;
+pub mod timeouts;
 pub mod validator;
 
+pub use backoff::exponential_retry_interval;
 pub use component::{ActivityExecution, ActivityLibrary, rebuild_visibility_snapshot};
 pub use config::ActivityConfig;
+pub use retry::{RetryOutcome, retry_decision};
 pub use state::{ActivityState, ActivityStatus, lifecycle_for};
 pub use statemachine::{ActivityEvent, TimeoutType, legal_target};
 pub use tasks::{
@@ -51,4 +60,5 @@ pub use tasks::{
     SCHEDULE_TO_START_TASK_ID, START_TO_CLOSE_TASK_ID, ScheduleToCloseTimer, ScheduleToStartTimer,
     StartToCloseTimer,
 };
+pub use timeouts::{due_timeout, next_timeout_deadline};
 pub use validator::{ActivityRequest, NormalizedTimeouts, validate_and_normalize};

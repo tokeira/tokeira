@@ -51,6 +51,20 @@ pub enum TimeoutType {
     Heartbeat,
 }
 
+impl TimeoutType {
+    /// The canonical timeout-type name, matching the v1.31.0 `enums.TimeoutType`
+    /// short string used in the timeout failure message (`createStartToCloseTimeoutFailure`
+    /// et al. `@ v1.31.0`). The edge maps this to the proto `TimeoutType` enum value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TimeoutType::ScheduleToStart => "ScheduleToStart",
+            TimeoutType::ScheduleToClose => "ScheduleToClose",
+            TimeoutType::StartToClose => "StartToClose",
+            TimeoutType::Heartbeat => "Heartbeat",
+        }
+    }
+}
+
 /// An event applied to an activity. Payloads are the minimum the MVP transition
 /// needs; richer provenance (worker identity, deployment) rides later.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +75,16 @@ pub enum ActivityEvent {
     Rescheduled {
         /// Recorded failure message from the prior attempt.
         failure: String,
+        /// Encoded `Payloads` of the prior attempt's last heartbeat details, carried
+        /// across the retry so the next attempt's poll observes them
+        /// (`HeartbeatDetailsAvailableOnRetry`). Empty when none; an empty value does
+        /// not clobber details a heartbeat already recorded.
+        last_heartbeat_details: Vec<u8>,
+        /// The backoff interval before the retry, in nanoseconds. The new attempt is
+        /// scheduled at `now + interval_nanos` (`attemptScheduleTimeForRetry @
+        /// v1.31.0`); the delayed dispatch and the re-anchored schedule-to-start
+        /// timer both fire from there.
+        interval_nanos: i64,
     },
     /// A worker picked up the activity.
     Started {
@@ -124,6 +148,12 @@ pub enum ActivityEvent {
         stamp: i64,
         /// Which timeout fired.
         timeout_type: TimeoutType,
+        /// Encoded `temporal.api.failure.v1.Failure` carrying the matching
+        /// `TimeoutFailureInfo`, built at the edge (the pure crate is proto-free) so
+        /// the describe/poll outcome surfaces the structured timeout type, not just a
+        /// message (`standalone_activity_test.go:4509` asserts `timeout type=
+        /// Heartbeat`). Empty falls back to a message-only failure.
+        failure_payload: Vec<u8>,
     },
 }
 
@@ -208,15 +238,37 @@ pub fn apply(
             state.attempt += 1;
             state.stamp += 1;
             state.scheduled_time_nanos = now;
-            schedule_attempt_timers(state, ctx, now)?;
+            // First attempt: the per-attempt anchor equals the original schedule
+            // time. schedule-to-start, schedule-to-close, and dispatch all key off
+            // `now` (`statemachine.go:42-74 @ v1.31.0`).
+            state.attempt_scheduled_time_nanos = now;
+            schedule_attempt_timers(state, ctx, now, true)?;
         }
-        ActivityEvent::Rescheduled { failure } => {
+        ActivityEvent::Rescheduled {
+            failure,
+            last_heartbeat_details,
+            interval_nanos,
+        } => {
             state.attempt += 1;
             state.stamp += 1;
-            state.scheduled_time_nanos = now;
+            // `scheduled_time_nanos` is the activity's ORIGINAL schedule time and is
+            // NOT advanced on retry: the schedule-to-close budget and `ScheduleTime`
+            // echo stay pinned to it (`activity.go:537,686 @ v1.31.0`;
+            // `TransitionRescheduled` does not re-add the schedule-to-close timer).
+            // The per-attempt anchor is the retry's start time.
+            let retry_scheduled = now + *interval_nanos;
+            state.attempt_scheduled_time_nanos = retry_scheduled;
             state.failure = failure.clone();
             state.started_time_nanos = 0;
-            schedule_attempt_timers(state, ctx, now)?;
+            // Carry the prior attempt's heartbeat details forward; an empty value
+            // must not clobber details already recorded (mirrors the Failed-path
+            // guard, `statemachine.go:220 @ v1.31.0`).
+            if !last_heartbeat_details.is_empty() {
+                state.last_heartbeat_details = last_heartbeat_details.clone();
+            }
+            // Re-arm schedule-to-start (anchored at the retry time) and the delayed
+            // dispatch; do NOT re-arm schedule-to-close (it spans attempts).
+            schedule_attempt_timers(state, ctx, retry_scheduled, false)?;
         }
         ActivityEvent::Started {
             started_time_nanos,
@@ -287,15 +339,34 @@ pub fn apply(
             state.failure = reason.clone();
             state.terminate_request_id = request_id.clone();
         }
-        // Record the latest heartbeat details; status is unchanged (the `to == from`
-        // target above), so no timers are rescheduled and the attempt is untouched.
-        // (Heartbeat-timer reset on heartbeat is owned by runtime-activity-timeouts;
-        // these tests do not set a heartbeat timeout.)
+        // Record the latest heartbeat details and time; status is unchanged (the
+        // `to == from` target above), so the attempt is untouched. The heartbeat
+        // does NOT schedule a fresh pure timer: the heartbeat-timeout deadline is
+        // re-derived from `max(last_heartbeat, started)` by the runtime sweeper
+        // (`timeouts::due_timeout`), so pushing `last_heartbeat_time_nanos` out is
+        // what keeps the activity alive between heartbeats. Re-deriving (rather than
+        // arming a new per-heartbeat task) keeps the node outbox bounded — a long
+        // run of heartbeats does not accumulate timer tasks. This mirrors the v1.31.0
+        // *effect* (`activity.go:577-585` re-anchors the heartbeat timeout), with the
+        // anchor carried on state instead of on a fresh task (a deliberate
+        // history-is-authority simplification; the timer is a derived effect).
         ActivityEvent::Heartbeat { details } => {
             state.last_heartbeat_details = details.clone();
+            state.last_heartbeat_time_nanos = now;
         }
-        ActivityEvent::TimedOut { timeout_type, .. } => {
-            state.failure = format!("activity timeout: {timeout_type:?}");
+        ActivityEvent::TimedOut {
+            timeout_type,
+            failure_payload,
+            ..
+        } => {
+            // `FailureReasonActivityTimeout = "activity %v timeout"`
+            // (`common/util.go:95 @ v1.31.0`) with the timeout type's enum name.
+            state.failure = format!("activity {} timeout", timeout_type.as_str());
+            // The edge supplies the structured `Failure` (with `TimeoutFailureInfo`);
+            // store it so the describe/poll outcome round-trips the timeout type.
+            if !failure_payload.is_empty() {
+                state.failure_payload = failure_payload.clone();
+            }
         }
     }
 
@@ -310,12 +381,21 @@ pub fn apply(
     Ok(())
 }
 
-/// Schedule the dispatch task and the schedule-to-start / schedule-to-close timers
-/// for a freshly scheduled attempt (shared by `Scheduled` and `Rescheduled`).
+/// Schedule the schedule-to-start timer and the dispatch task for a freshly
+/// scheduled attempt; on the first attempt (`initial`) also arm the schedule-to-close
+/// timer. Shared by `Scheduled` (initial) and `Rescheduled` (retry).
+///
+/// `anchor` is the attempt's scheduled-to-start anchor (`now` for the first attempt,
+/// the retry time for a reschedule). The dispatch fires immediately on the first
+/// attempt and is delayed to `anchor` on a retry, so a worker cannot poll the new
+/// attempt before its backoff elapses (`statemachine.go:103-122 @ v1.31.0`).
+/// Schedule-to-close spans attempts and is armed once on the first schedule, so it
+/// is NOT re-armed here on a retry (`TransitionRescheduled` does not re-add it).
 fn schedule_attempt_timers(
     state: &ActivityState,
     ctx: &mut dyn MutableContext,
-    now: i64,
+    anchor: i64,
+    initial: bool,
 ) -> Result<(), ChasmError> {
     if state.schedule_to_start_nanos > 0 {
         schedule_pure(
@@ -323,30 +403,34 @@ fn schedule_attempt_timers(
             SCHEDULE_TO_START_TASK_ID,
             &ScheduleToStartTimer {
                 stamp: state.stamp,
-                fire_at_nanos: now + state.schedule_to_start_nanos,
+                fire_at_nanos: anchor + state.schedule_to_start_nanos,
             },
         )?;
     }
-    if state.schedule_to_close_nanos > 0 {
+    if initial && state.schedule_to_close_nanos > 0 {
         schedule_pure(
             ctx,
             SCHEDULE_TO_CLOSE_TASK_ID,
             &ScheduleToCloseTimer {
                 stamp: state.stamp,
-                fire_at_nanos: now + state.schedule_to_close_nanos,
+                fire_at_nanos: state.scheduled_time_nanos + state.schedule_to_close_nanos,
             },
         )?;
     }
     // The dispatch side-effect task enqueues the attempt to matching post-commit.
+    // On a retry it carries the retry anchor as its `fire_at` so the dispatch sink /
+    // poll treats it as not pollable until the backoff elapses; the first attempt
+    // dispatches immediately (`fire_at = None`).
     let dispatch = DispatchTask {
         stamp: state.stamp,
         task_queue: state.task_queue.clone(),
     };
+    let fire_at = (!initial).then_some(anchor);
     ctx.add_task(
         TaskKind::SideEffect,
         DISPATCH_TASK_ID,
         encode_task(&dispatch)?,
-        None,
+        fire_at,
     )
 }
 
@@ -530,6 +614,7 @@ mod tests {
             ActivityEvent::TimedOut {
                 stamp: 0, // stale
                 timeout_type: TimeoutType::ScheduleToStart,
+                failure_payload: Vec::new(),
             },
             &mut ctx,
         )
@@ -546,6 +631,7 @@ mod tests {
             ActivityEvent::TimedOut {
                 stamp: 1,
                 timeout_type: TimeoutType::ScheduleToStart,
+                failure_payload: Vec::new(),
             },
             &mut ctx,
         )

@@ -206,6 +206,46 @@ pub struct ActivityState {
     /// no-op. Empty until a terminate is requested.
     #[prost(string, tag = "28")]
     pub terminate_request_id: String,
+    /// Retry-policy initial interval in nanoseconds (`RetryPolicy.initial_interval`).
+    /// Folded out of the opaque `retry_policy` blob into a scalar so the pure retry
+    /// decision can compute backoff without decoding the proto — the pure crate
+    /// stays proto-free (the edge parses the policy and applies Temporal's defaults
+    /// before Start, `retrypolicy.EnsureDefaults @ v1.31.0`). `0` is only seen on
+    /// states predating a retry policy (none in the build phase); the edge always
+    /// writes the defaulted `1s`.
+    #[prost(int64, tag = "29")]
+    pub retry_initial_interval_nanos: i64,
+    /// Retry-policy backoff coefficient (`RetryPolicy.backoff_coefficient`). Stored
+    /// as the proto's `double` so `exponential_retry_interval` reproduces
+    /// `backoff.ExponentialBackoffAlgorithm @ v1.31.0` exactly. The edge writes the
+    /// defaulted `2.0` when unset.
+    #[prost(double, tag = "30")]
+    pub retry_backoff_coefficient: f64,
+    /// Retry-policy maximum interval cap in nanoseconds (`RetryPolicy.maximum_interval`).
+    /// `0` means "no cap" — matching `CalculateExponentialRetryInterval @ v1.31.0`,
+    /// which only caps when the maximum is non-zero. The edge writes the defaulted
+    /// `100 × initial_interval` when unset.
+    #[prost(int64, tag = "31")]
+    pub retry_maximum_interval_nanos: i64,
+    /// The time of the most recent worker heartbeat, Unix nanoseconds (`0` = none
+    /// this attempt). The heartbeat-timeout deadline is
+    /// `max(last_heartbeat, started) + heartbeat`, mirroring `lastHbTime :=
+    /// MaxTime(lastHb.RecordedTime, attemptStartTime)` in the v1.31.0
+    /// heartbeat-timeout `Validate` (`activity_tasks.go @ v1.31.0`); a fresh
+    /// heartbeat pushes the deadline out.
+    #[prost(int64, tag = "32")]
+    pub last_heartbeat_time_nanos: i64,
+    /// The current attempt's scheduled-to-start anchor, Unix nanoseconds. On the
+    /// first `Scheduled` this equals [`scheduled_time_nanos`](Self::scheduled_time_nanos);
+    /// on a retry it is the retry's start time (`completeTime + retryInterval`,
+    /// `attemptScheduleTimeForRetry @ v1.31.0`), which is when the delayed dispatch
+    /// fires and from which the schedule-to-start timer is re-anchored
+    /// (`statemachine.go:109,119 @ v1.31.0`). It is distinct from
+    /// `scheduled_time_nanos` because the schedule-to-close budget stays pinned to
+    /// the original schedule time across retries while schedule-to-start tracks each
+    /// attempt.
+    #[prost(int64, tag = "33")]
+    pub attempt_scheduled_time_nanos: i64,
 }
 
 // `status()` and `set_status()` accessors for the `status` enumeration field are

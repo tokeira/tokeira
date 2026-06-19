@@ -25,7 +25,7 @@ v1.31.0 source.
 
 | Cluster | Area | Status | Measured | Next action |
 |---|---|:--:|:--:|---|
-| C1 | Standalone / first-class activity RPCs | 🟡 | 42/129 | Stages 1/3/4 landed (reuse-conflict, wire-compat token, describe info+outcome fidelity, count-by-id); remeasure pending. Remaining cross-spec blockers: retry re-dispatch / heartbeat / timeouts (~20, `runtime-activity-*`) |
+| C1 | Standalone / first-class activity RPCs | 🟡 | 42/129 | Stages 1/3/4 landed + this session: ByID complete/fail/cancel/heartbeat routing, describe ComponentRef long-poll token + validation, bare-id run_id echo, namespace-empty/not-found messages, expiration_time, heartbeat-details capture, request_id dedup + immediate-cancel, poll-task enrichment, **search-attribute admission**. Dynamic-config-override sub-tests skipped (out-of-scope). Remaining blockers: **chasm-activity timeouts + retry re-dispatch** — chasm-engine work, NOT the lane-model `runtime-activity-*` specs; needs a chasm-activity timeout/retry spec before impl (~20 tests) |
 | C3 | Visibility list/query + search attributes | 🟡 | — | run `TestAdvancedVisibilitySuite`/`…Legacy` (query surface) |
 | C2 | Worker deployment / versioning | 🟡 | 19/19 (1 suite) | triage `TestVersioningFunctionalSuite` (+3 suites) |
 | C4a | Nexus endpoint **admin CRUD** RPCs | ⬜ | 0/~17 | `api-conformance-nexus-admin` (spec ground-truthed 2026-06-18); clears `TestNexusEndpointsFunctionalSuite` (15) + `TestNexusAPIValidationTestSuite` (2). Prereq: runtime `NexusEndpointRegistry` is static — make it live/store-backed (task 4.2) |
@@ -59,43 +59,12 @@ in-memory state accumulates and reused activity IDs perturb counts.
 
 ---
 
-## Conformance run recipe (exact — don't rediscover this)
+## Conformance run recipe
 
-The corpus lives in the sibling `../temporal` checkout on branch `tokeira/conformance-v1.31.0`.
-The suite's in-process `OverrideDynamicConfig(activity.Enabled)` does **not** reach an out-of-process
-`tokeirad`, so feature gates MUST be set in the server's **static config**.
-
-```bash
-# 1. Build the server (from tokeira repo root)
-cargo build -p tokeirad
-
-# 2. One-time: generate a config, pin the address, enable standalone activities
-./target/debug/tokeirad --dump-config > /tmp/tokeira-c1.toml
-#   then set, in /tmp/tokeira-c1.toml:
-#     [infrastructure.network]  grpc_addr = "127.0.0.1:7233"
-#     [policy.compatibility]    enable_standalone_activities = true
-# (default storage backend is in-memory — correct for the corpus)
-
-# 3. Start tokeirad (background; restart it after every rebuild to load new code)
-./target/debug/tokeirad --config /tmp/tokeira-c1.toml
-#   expect: "storage backend: in-memory" + "gRPC server listening on 127.0.0.1:7233"
-
-# 4. Run a targeted suite/sub-test from ../temporal (seconds–minutes after first Go compile)
-cd ../temporal
-TOKEIRA_CONFORMANCE_FRONTEND_ADDR=127.0.0.1:7233 \
-  go test -tags test_dep -run '^TestStandaloneActivityTestSuite$' ./tests/ -v
-#   sub-test: -run '^TestStandaloneActivityTestSuite$/TestDelete'
-#   full corpus (~2h): tests/tokeira_conformance_runall + tests/tokeira_conformance_ledger
-```
-
-Loop: edit → `cargo build -p tokeirad` → restart the server (step 3) → re-run the suite (step 4) →
-update the Status ledger. Go toolchain: `go1.22.4` confirmed in this environment.
-
-> **The SA gate is C1-only.** `enable_standalone_activities` matters only for C1 (standalone
-> activities). For any other cluster, drop it: a config with just `grpc_addr` pinned is enough, and
-> step 4 runs that cluster's suite (e.g. C4a: `-run '^TestNexusEndpointsFunctionalSuite$'` /
-> `^TestNexusAPIValidationTestSuite$`). The harness wiring (`TOKEIRA_CONFORMANCE_FRONTEND_ADDR` +
-> suite name) is identical across clusters.
+How to build/run the harness lives in `docs/testing/functional-conformance-harness.md` (toolchain pin,
+run-all + single-suite commands, the out-of-scope skip registry). C1 only: enable standalone activities
+in the server's **static** config (`[policy.compatibility] enable_standalone_activities = true`) — the
+suite's in-process `OverrideDynamicConfig(activity.Enabled)` does not reach an out-of-process `tokeirad`.
 
 ---
 

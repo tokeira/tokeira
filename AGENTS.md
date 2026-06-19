@@ -304,6 +304,14 @@ what it proves, how it works, and the conventions binding any fix derived from a
 run (v1.31.0 ground truth, no kernel additions, config-as-constant, feature modes
 as independent runs, raise ambiguity).
 
+Runs pin the corpus's `go.mod` toolchain (`go1.26.2`) via `GOTOOLCHAIN`, set by the
+run-all runner. Tests that cannot run against an out-of-process `tokeirad` (e.g.
+those depending on `OverrideDynamicConfig`) are skipped by name through the fork's
+conformance skip registry (`tests/testcore/tokeira_conformance_skip.go`) — never by
+editing a corpus test body — applied via the `SetupTest`/`SetupSubTest` hooks and a
+runner-derived `go test -skip` regexp for raw `t.Run` sub-tests. Each skip carries a
+cited reason and still emits a classified `skip` outcome.
+
 ## Enforced Commands
 
 The following commands are enforced for each pull request:

@@ -99,6 +99,10 @@ impl RootComponent for ActivityExecution {
         self.apply(
             ActivityEvent::Terminated {
                 reason: reason.reason.clone(),
+                // The chasm root-component terminate hook (used by the engine's
+                // generic terminate path) carries no request_id; the standalone
+                // request_id-dedup path goes through the bridge's `terminate`.
+                request_id: String::new(),
             },
             ctx,
         )

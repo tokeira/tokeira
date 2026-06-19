@@ -65,6 +65,13 @@ Temporal's own functional Go test corpus, unmodified and pinned at the
 `docs/testing/functional-conformance-harness.md` for what it proves, how it
 works, and how to run and interpret a conformance run.
 
+Runs use the toolchain the corpus's `go.mod` pins (`go1.26.2`); the run-all
+runner sets `GOTOOLCHAIN` so the version is deterministic regardless of PATH.
+Tests that can't run against an out-of-process `tokeirad` (e.g. ones depending on
+`OverrideDynamicConfig`) are registered by name in the fork's conformance skip
+registry — never by editing a corpus test body — and skipped by leaf; they still
+emit a classified `skip` outcome.
+
 ## Architecture
 
 Tokeira is organized into three planes:

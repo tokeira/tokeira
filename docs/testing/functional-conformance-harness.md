@@ -53,6 +53,21 @@ outcomes against the compatibility matrix to produce the classified coverage rep
 All commands below run from the **fork** checkout unless noted. `<tokeira-workspace>` is the path to
 this repository; `<temporal-fork>` is the pinned Temporal fork checkout.
 
+**Go toolchain.** Runs use the version the corpus's `go.mod` requires (matching
+`TEMPORAL_SERVER_COMPAT`) — currently **`go1.26.2`** — not whatever `go` is first on PATH. The run-all
+runner pins it explicitly (`GOTOOLCHAIN=go1.26.2`) for every `go test` it spawns; set the same env for
+any manual command below.
+
+**Out-of-scope skips.** A small, curated set of corpus tests cannot run against an out-of-process
+`tokeirad` (they depend on `OverrideDynamicConfig`, which the harness cannot deliver to it) or touch an
+internal surface the Shape-2 onebox does not front. These are registered by name in
+`tests/testcore/tokeira_conformance_skip.go` with a cited reason — **never** by editing a corpus test
+body. The registry is applied two ways: the shared `SetupTest`/`SetupSubTest` hooks skip whole methods
+and `s.Run` sub-tests, and the run-all runner additionally derives a `go test -skip` regexp from the
+registry (`testcore.ConformanceSkipRegexp`) so raw `t.Run` sub-tests — which testify cannot intercept —
+are skipped too, by leaf only. Skipped tests still emit a `skip` outcome the ledger classifies; nothing
+is silently dropped.
+
 ```bash
 # 1. Build tokeirad (this Tokeira workspace)
 cargo build -p tokeirad   # binary: target/debug/tokeirad
@@ -69,10 +84,12 @@ go run -tags test_dep ./tests/tokeira_conformance_ledger/ \
 ```
 
 Run a single entrypoint in isolation (fast iteration while fixing one cluster), against an
-already-running `tokeirad`:
+already-running `tokeirad`. Pin the toolchain, and apply the registry's skips for that entrypoint so a
+manual run matches the run-all runner (omit `-skip` to see the out-of-scope tests fail):
 
 ```bash
 TOKEIRA_CONFORMANCE_FRONTEND_ADDR=127.0.0.1:7233 \
+GOTOOLCHAIN=go1.26.2 \
   go test -tags test_dep -count=1 -run '^TestCronTestSuite$' ./tests/ -v
 ```
 

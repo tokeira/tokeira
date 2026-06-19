@@ -203,6 +203,23 @@ where
     async fn delete_execution(&self, run_key: tokeira_types::RunKey) -> Result<()> {
         self.store.delete_execution(run_key).await
     }
+
+    async fn unknown_search_attribute(
+        &self,
+        namespace_id: NamespaceId,
+        keys: &[String],
+    ) -> Result<Option<String>> {
+        // A key is registered iff the store resolves it (system predefined keys are
+        // seeded at namespace registration; custom keys arrive via AddSearchAttributes).
+        // The query path uses the same resolution to compile filters, so admission and
+        // query agree on what "defined" means.
+        for key in keys {
+            if self.store.resolve_attr(namespace_id, key).await?.is_none() {
+                return Ok(Some(key.clone()));
+            }
+        }
+        Ok(None)
+    }
 }
 
 fn parse_namespace(input: &str) -> Result<NamespaceId> {
@@ -307,7 +324,8 @@ fn map_activity_summary(row: crate::types::ExecutionRow) -> ActivityExecutionSum
 mod tests {
     use super::*;
     use crate::{
-        memory::InMemoryVisibilityStore, sink::ProjectionSink, visibility_sink::VisibilitySink,
+        memory::InMemoryVisibilityStore, sink::ProjectionSink, store::VisibilityStore,
+        types::SearchAttrType, visibility_sink::VisibilitySink,
     };
     use time::OffsetDateTime;
     use tokeira_storage::{ProjectionContext, ProjectionRecord};
@@ -316,6 +334,39 @@ mod tests {
         TaskQueueName, TransitionSeq, WorkflowId, WorkflowType,
     };
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn unknown_search_attribute_rejects_only_unregistered_keys() {
+        // A registered key (system predefined or custom-added) is accepted; an
+        // unregistered key is returned so the edge can raise
+        // "search attribute <key> is not defined" (standalone_activity_test.go:521).
+        let store = InMemoryVisibilityStore::default();
+        let namespace_id = NamespaceId(Uuid::from_u128(7));
+        store
+            .register_attr(
+                namespace_id,
+                "CustomKeywordField".to_owned(),
+                SearchAttrType::Keyword,
+            )
+            .await
+            .expect("register custom SA");
+        let svc = VisibilityQueryService::new(store);
+
+        assert_eq!(
+            svc.unknown_search_attribute(namespace_id, &["CustomKeywordField".to_owned()])
+                .await
+                .unwrap(),
+            None,
+            "a registered key is accepted"
+        );
+        assert_eq!(
+            svc.unknown_search_attribute(namespace_id, &["InvalidSearchAttributeKey".to_owned()])
+                .await
+                .unwrap(),
+            Some("InvalidSearchAttributeKey".to_owned()),
+            "an unregistered key is reported"
+        );
+    }
 
     fn projection_record(
         namespace_id: NamespaceId,

@@ -84,11 +84,20 @@ pub enum ActivityEvent {
         /// describe outcome round-trips it exactly (empty when the caller has only a
         /// message).
         failure_payload: Vec<u8>,
+        /// Encoded `Payloads` of the worker's last heartbeat details supplied on the
+        /// fail request, recorded onto the activity so describe echoes them
+        /// (`statemachine.go:220 @ v1.31.0`). Empty when none were supplied.
+        last_heartbeat_details: Vec<u8>,
     },
     /// A cancel was requested.
     CancelRequested {
         /// Requesting identity.
         identity: String,
+        /// The cancel request's `request_id`, stored for idempotency/conflict
+        /// detection on a repeated cancel (`activity.go:402-409 @ v1.31.0`).
+        request_id: String,
+        /// The cancel reason, echoed on `info.canceled_reason`.
+        reason: String,
     },
     /// The cancel was acknowledged.
     Canceled,
@@ -96,6 +105,18 @@ pub enum ActivityEvent {
     Terminated {
         /// Termination reason.
         reason: String,
+        /// The terminate request's `request_id`, stored for idempotency/conflict
+        /// detection on a repeated terminate (`activity.go:359-370 @ v1.31.0`).
+        request_id: String,
+    },
+    /// A worker heartbeat: records the latest heartbeat details without changing
+    /// status (legal only while `Started`/`CancelRequested`). Status-preserving so a
+    /// heartbeat neither advances the attempt nor closes the activity
+    /// (`RecordActivityTaskHeartbeat` records onto `LastHeartbeat`,
+    /// `chasm/lib/activity/activity.go @ v1.31.0`).
+    Heartbeat {
+        /// Encoded `Payloads` of the worker's heartbeat details.
+        details: Vec<u8>,
     },
     /// A timeout fired; carries the firing timer's attempt `stamp` for fencing.
     TimedOut {
@@ -118,6 +139,7 @@ impl ActivityEvent {
             ActivityEvent::CancelRequested { .. } => "CancelRequested",
             ActivityEvent::Canceled => "Canceled",
             ActivityEvent::Terminated { .. } => "Terminated",
+            ActivityEvent::Heartbeat { .. } => "Heartbeat",
             ActivityEvent::TimedOut { .. } => "TimedOut",
         }
     }
@@ -143,6 +165,9 @@ pub fn legal_target(from: ActivityStatus, event: &ActivityEvent) -> Option<Activ
         ActivityEvent::Terminated { .. } => {
             legal(&[Scheduled, Started, CancelRequested], Terminated)
         }
+        // Status-preserving: a heartbeat keeps the activity in its current status
+        // (legal only while Started/CancelRequested), so the target is `from`.
+        ActivityEvent::Heartbeat { .. } => legal(&[Started, CancelRequested], from),
         ActivityEvent::TimedOut { .. } => legal(&[Scheduled, Started, CancelRequested], TimedOut),
     }
 }
@@ -231,16 +256,43 @@ pub fn apply(
         ActivityEvent::Failed {
             failure,
             failure_payload,
+            last_heartbeat_details,
         } => {
             state.failure = failure.clone();
             state.failure_payload = failure_payload.clone();
+            // Only overwrite when the worker supplied details, mirroring v1.31.0's
+            // `if details := req.GetLastHeartbeatDetails(); details != nil` guard
+            // (`statemachine.go:220`) — an empty field must not clobber details a
+            // prior heartbeat recorded.
+            if !last_heartbeat_details.is_empty() {
+                state.last_heartbeat_details = last_heartbeat_details.clone();
+            }
         }
-        ActivityEvent::CancelRequested { .. } => {}
+        ActivityEvent::CancelRequested {
+            identity: _,
+            request_id,
+            reason,
+        } => {
+            // Store cancel request_id/reason for idempotency + `info.canceled_reason`.
+            // The requester identity is NOT written to last_worker_identity (that
+            // names the polling worker, not the canceller) — it rides CancelState in
+            // v1.31.0, which tokeira does not yet surface.
+            state.cancel_request_id = request_id.clone();
+            state.cancel_reason = reason.clone();
+        }
         ActivityEvent::Canceled => {
             state.failure = "Activity canceled".to_owned();
         }
-        ActivityEvent::Terminated { reason } => {
+        ActivityEvent::Terminated { reason, request_id } => {
             state.failure = reason.clone();
+            state.terminate_request_id = request_id.clone();
+        }
+        // Record the latest heartbeat details; status is unchanged (the `to == from`
+        // target above), so no timers are rescheduled and the attempt is untouched.
+        // (Heartbeat-timer reset on heartbeat is owned by runtime-activity-timeouts;
+        // these tests do not set a heartbeat timeout.)
+        ActivityEvent::Heartbeat { details } => {
+            state.last_heartbeat_details = details.clone();
         }
         ActivityEvent::TimedOut { timeout_type, .. } => {
             state.failure = format!("activity timeout: {timeout_type:?}");

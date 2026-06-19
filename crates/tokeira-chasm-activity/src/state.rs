@@ -179,6 +179,33 @@ pub struct ActivityState {
     /// the reason at the edge).
     #[prost(bytes = "vec", tag = "24")]
     pub failure_payload: Vec<u8>,
+    /// Encoded `temporal.api.common.v1.Payloads` carrying the worker's last
+    /// heartbeat details. Set when a worker supplies `LastHeartbeatDetails` on
+    /// `RespondActivityTaskFailed` (`statemachine.go:220 @ v1.31.0` records it onto
+    /// `LastHeartbeat.Details`), echoed verbatim on
+    /// `DescribeActivityExecution.info.heartbeat_details`
+    /// (`activity.go:215,674 @ v1.31.0`; `standalone_activity_test.go:4908`). Empty
+    /// when no heartbeat details were captured.
+    #[prost(bytes = "vec", tag = "25")]
+    pub last_heartbeat_details: Vec<u8>,
+    /// The `request_id` of the cancel request that drove the activity into
+    /// `CANCEL_REQUESTED` (`ActivityCancelState.request_id`, `activity.go:290 @
+    /// v1.31.0`). A second `RequestCancelActivityExecution` with a different
+    /// request_id is `FailedPrecondition`; the same id is an idempotent no-op
+    /// (`activity.go:402-409`). Empty until a cancel is requested.
+    #[prost(string, tag = "26")]
+    pub cancel_request_id: String,
+    /// The cancel request's reason, echoed on `info.canceled_reason`
+    /// (`ActivityCancelState.reason`; `standalone_activity_test.go:1313`). Empty
+    /// until a cancel is requested.
+    #[prost(string, tag = "27")]
+    pub cancel_reason: String,
+    /// The `request_id` of the terminate request (`ActivityTerminateState.request_id`,
+    /// `activity.go:363 @ v1.31.0`). A second `TerminateActivityExecution` with a
+    /// different request_id is `FailedPrecondition`; the same id is an idempotent
+    /// no-op. Empty until a terminate is requested.
+    #[prost(string, tag = "28")]
+    pub terminate_request_id: String,
 }
 
 // `status()` and `set_status()` accessors for the `status` enumeration field are

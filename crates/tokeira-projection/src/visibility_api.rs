@@ -8,7 +8,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use time::OffsetDateTime;
-use tokeira_types::{ArchetypeId, ExecutionStatus, Memo, RunId, RunKey, SearchAttributes};
+use tokeira_types::{
+    ArchetypeId, ExecutionStatus, Memo, NamespaceId, RunId, RunKey, SearchAttributes,
+};
 
 /// Summary of a single workflow execution for list/count responses.
 #[derive(Clone, Debug, PartialEq)]
@@ -146,6 +148,25 @@ pub trait VisibilityApi: Send + Sync + 'static {
     ) -> Result<CountActivityExecutionsResponse>;
 
     async fn delete_execution(&self, run_key: RunKey) -> Result<()>;
+
+    /// Probe the namespace's registered search attributes (system predefined +
+    /// custom-registered) for any key in `keys` that is NOT registered, returning
+    /// the first such key (or `None` when all are known). The edge turns a returned
+    /// key into the v1.31.0 admission error `InvalidArgument "search attribute <key>
+    /// is not defined"` (`common/searchattribute/validator.go:101 @ v1.31.0`).
+    ///
+    /// The default is permissive — a deployment without a search-attribute registry
+    /// validates nothing — so only the store-backed query service enforces it. Note
+    /// this admits *registered* keys regardless of category; rejecting a user-set
+    /// *system* SA ("<name> attribute can't be set in SearchAttributes") is a
+    /// separate v1.31.0 rule not yet modelled here.
+    async fn unknown_search_attribute(
+        &self,
+        _namespace_id: NamespaceId,
+        _keys: &[String],
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 /// No-op visibility implementation for tests and minimal bootstraps.

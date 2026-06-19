@@ -167,6 +167,18 @@ pub struct ActivityDescription {
     pub user_metadata: Vec<u8>,
     /// The execution clock, used as the caller's long-poll token.
     pub execution_vt: VersionedTransition,
+    /// Encoded `Payloads` of the worker's last heartbeat details (empty when none) —
+    /// echoed on `info.heartbeat_details`.
+    pub heartbeat_details: Vec<u8>,
+    /// The cancel request's `request_id` (empty until cancel requested) — the
+    /// idempotency/conflict key for a repeated `RequestCancelActivityExecution`.
+    pub cancel_request_id: String,
+    /// The cancel request's reason (empty until cancel requested) — echoed on
+    /// `info.canceled_reason`.
+    pub cancel_reason: String,
+    /// The terminate request's `request_id` (empty until terminated) — the
+    /// idempotency/conflict key for a repeated `TerminateActivityExecution`.
+    pub terminate_request_id: String,
 }
 
 /// A worker-facing activity task: the dispatched attempt a polling worker receives,
@@ -187,6 +199,26 @@ pub struct PolledActivityTask {
     pub input: Vec<u8>,
     /// The attempt number this task is for (1-based).
     pub attempt: i32,
+    /// Schedule-to-close timeout in nanoseconds (`0` = unset) — echoed on the poll
+    /// response so the worker sees the same timeouts it started with
+    /// (`standalone_activity_test.go:326`).
+    pub schedule_to_close_nanos: i64,
+    /// Start-to-close timeout in nanoseconds (`0` = unset) — `poll.start_to_close_timeout`.
+    pub start_to_close_nanos: i64,
+    /// Heartbeat timeout in nanoseconds (`0` = unset) — `poll.heartbeat_timeout`.
+    pub heartbeat_nanos: i64,
+    /// Schedule time in Unix nanoseconds — `poll.scheduled_time`.
+    pub scheduled_time_nanos: i64,
+    /// Started time in Unix nanoseconds (the pickup time recorded by this poll) —
+    /// `poll.started_time`.
+    pub started_time_nanos: i64,
+    /// Encoded `Priority` from the Start request (empty when unset) — `poll.priority`.
+    pub priority: Vec<u8>,
+    /// Encoded `Header` from the Start request (empty when unset) — `poll.header`.
+    pub header: Vec<u8>,
+    /// Encoded `Payloads` of the prior attempt's last heartbeat details (empty when
+    /// none) — `poll.heartbeat_details`, so a retried attempt sees them.
+    pub heartbeat_details: Vec<u8>,
 }
 
 /// The worker task token: a wire-compatible mirror of Temporal's server-internal
@@ -631,15 +663,74 @@ impl ActivityBridge {
         }
     }
 
-    /// Request cancellation of an activity (Requirement 11.8).
-    pub async fn request_cancel(&self, key: ExecutionKey, identity: String) -> EdgeResult<()> {
-        self.apply_event(key, ActivityEvent::CancelRequested { identity })
-            .await
+    /// Request cancellation of an activity (Requirement 11.8), mirroring v1.31.0's
+    /// `handleCancellationRequested` (`chasm/lib/activity/activity.go:395-440`):
+    /// - already `CANCEL_REQUESTED`: a different `request_id` is `FailedPrecondition`
+    ///   ("cancellation already requested with request ID <id>"); the same id is an
+    ///   idempotent no-op.
+    /// - otherwise mark cancel-requested (storing request_id/reason); and if the
+    ///   activity was still `SCHEDULED` (no worker holds it), cancel it immediately
+    ///   (Scheduled → CancelRequested → Canceled).
+    ///
+    /// The status read and the transition are two commits, not one: a benign
+    /// TOCTOU window the single-client conformance path never exercises. The
+    /// dedup/immediate-cancel decision is correctness-critical and cited above.
+    pub async fn request_cancel(
+        &self,
+        key: ExecutionKey,
+        identity: String,
+        request_id: String,
+        reason: String,
+    ) -> EdgeResult<()> {
+        self.ensure_enabled()?;
+        let description = self.describe(key.clone()).await?;
+        if description.status == ActivityStatus::CancelRequested {
+            if description.cancel_request_id != request_id {
+                return Err(EdgeError::FailedPrecondition(format!(
+                    "cancellation already requested with request ID {}",
+                    description.cancel_request_id
+                )));
+            }
+            return Ok(());
+        }
+        let was_scheduled = description.status == ActivityStatus::Scheduled;
+        self.apply_event(
+            key.clone(),
+            ActivityEvent::CancelRequested {
+                identity,
+                request_id,
+                reason,
+            },
+        )
+        .await?;
+        if was_scheduled {
+            self.apply_event(key, ActivityEvent::Canceled).await?;
+        }
+        Ok(())
     }
 
-    /// Terminate an activity (Requirement 11.8).
-    pub async fn terminate(&self, key: ExecutionKey, reason: String) -> EdgeResult<()> {
-        self.apply_event(key, ActivityEvent::Terminated { reason })
+    /// Terminate an activity (Requirement 11.8), mirroring v1.31.0's `Terminate`
+    /// (`chasm/lib/activity/activity.go:359-381`): an already-`TERMINATED` activity
+    /// with a different `request_id` is `FailedPrecondition` ("already terminated
+    /// with request ID <id>"); the same id is an idempotent no-op.
+    pub async fn terminate(
+        &self,
+        key: ExecutionKey,
+        reason: String,
+        request_id: String,
+    ) -> EdgeResult<()> {
+        self.ensure_enabled()?;
+        let description = self.describe(key.clone()).await?;
+        if description.status == ActivityStatus::Terminated {
+            if description.terminate_request_id != request_id {
+                return Err(EdgeError::FailedPrecondition(format!(
+                    "already terminated with request ID {}",
+                    description.terminate_request_id
+                )));
+            }
+            return Ok(());
+        }
+        self.apply_event(key, ActivityEvent::Terminated { reason, request_id })
             .await
     }
 
@@ -704,21 +795,53 @@ impl ActivityBridge {
 
     /// Worker-facing: record a terminal failure. `failure` is the message (for
     /// `info.last_failure` and the quick outcome message); `failure_payload` is the
-    /// full encoded `Failure` proto so the describe outcome round-trips it exactly.
+    /// full encoded `Failure` proto so the describe outcome round-trips it exactly;
+    /// `last_heartbeat_details` is the encoded `Payloads` of the worker's last
+    /// heartbeat (empty when none), recorded so describe echoes them on
+    /// `info.heartbeat_details` (`statemachine.go:220 @ v1.31.0`).
     pub async fn record_failed(
         &self,
         key: ExecutionKey,
         failure: String,
         failure_payload: Vec<u8>,
+        last_heartbeat_details: Vec<u8>,
     ) -> EdgeResult<()> {
         self.apply_event(
             key,
             ActivityEvent::Failed {
                 failure,
                 failure_payload,
+                last_heartbeat_details,
             },
         )
         .await
+    }
+
+    /// Worker-facing: record a heartbeat for the attempt named by `task_token`,
+    /// returning whether cancellation has been requested
+    /// (`RecordActivityTaskHeartbeat.cancel_requested`). The details are recorded
+    /// onto the activity status-preservingly so a later describe (and, once retry
+    /// re-dispatch lands, the next attempt) observes them. The token is validated
+    /// exactly like the terminal responses (`validate_token`): a stale token on a
+    /// completed/superseded activity is `NotFound "activity not found for ID: <id>"`,
+    /// and a cross-namespace token is the same `InvalidArgument` the responds use.
+    pub async fn record_heartbeat(
+        &self,
+        task_token: &[u8],
+        request_namespace_id: &str,
+        details: Vec<u8>,
+    ) -> EdgeResult<bool> {
+        self.ensure_enabled()?;
+        let token = ActivityTaskToken::decode(task_token)?;
+        self.validate_token(&token, request_namespace_id).await?;
+        let key = token.execution_key();
+        self.apply_event(key.clone(), ActivityEvent::Heartbeat { details })
+            .await?;
+        // cancel_requested reflects a pending RequestCancelActivityExecution: the
+        // activity is in CANCEL_REQUESTED until the worker acknowledges
+        // (`standalone_activity_test.go:4406`).
+        let description = self.describe(key).await?;
+        Ok(description.status == ActivityStatus::CancelRequested)
     }
 
     /// Worker poll: hand the next dispatched attempt on `task_queue` to a worker,
@@ -777,6 +900,16 @@ impl ActivityBridge {
                 activity_type: state.activity_type,
                 input: state.input,
                 attempt: state.attempt,
+                schedule_to_close_nanos: state.schedule_to_close_nanos,
+                start_to_close_nanos: state.start_to_close_nanos,
+                heartbeat_nanos: state.heartbeat_nanos,
+                scheduled_time_nanos: state.scheduled_time_nanos,
+                // The pickup time this poll just recorded (state was read pre-start,
+                // so use the value handed to record_started, not state).
+                started_time_nanos: started_at,
+                priority: state.priority,
+                header: state.header,
+                heartbeat_details: state.last_heartbeat_details,
             }));
         }
         Ok(None)
@@ -797,19 +930,27 @@ impl ActivityBridge {
 
     /// Worker-facing: fail the activity attempt named by `task_token`. `failure` is
     /// the message; `failure_payload` is the full encoded `Failure` proto (so the
-    /// describe outcome round-trips the structured failure, not just the message).
+    /// describe outcome round-trips the structured failure, not just the message);
+    /// `last_heartbeat_details` is the encoded `Payloads` of the worker's last
+    /// heartbeat (empty when none).
     pub async fn respond_activity_task_failed(
         &self,
         task_token: &[u8],
         request_namespace_id: &str,
         failure: String,
         failure_payload: Vec<u8>,
+        last_heartbeat_details: Vec<u8>,
     ) -> EdgeResult<()> {
         self.ensure_enabled()?;
         let token = ActivityTaskToken::decode(task_token)?;
         self.validate_token(&token, request_namespace_id).await?;
-        self.record_failed(token.execution_key(), failure, failure_payload)
-            .await
+        self.record_failed(
+            token.execution_key(),
+            failure,
+            failure_payload,
+            last_heartbeat_details,
+        )
+        .await
     }
 
     /// Worker-facing: acknowledge cancellation of the activity attempt named by
@@ -830,6 +971,173 @@ impl ActivityBridge {
         self.validate_token(&token, request_namespace_id).await?;
         self.apply_event(token.execution_key(), ActivityEvent::Canceled)
             .await
+    }
+
+    /// Synthesize the worker token a `RespondActivityTask*ById` request implies.
+    ///
+    /// v1.31.0's by-id handlers do not carry a worker token; for a standalone
+    /// activity (empty workflow id) the frontend builds a `ChasmComponentRef` for
+    /// `(namespace, activity_id, run_id)`, wraps it in a task token whose attempt is
+    /// fixed at `1`, and routes that synthesized token through the normal
+    /// `RespondActivityTaskCompleted`/`Failed`/`Canceled` path
+    /// (`service/frontend/workflow_handler.go:1671-1702 @ v1.31.0`). We mirror that
+    /// exactly so the by-id and by-token paths share one validation/record path.
+    ///
+    /// Two deliberate consequences of matching v1.31.0:
+    /// - The attempt is hardcoded `1`, so by-id only addresses the first attempt;
+    ///   once a retry advances the live attempt the synthesized token is fenced
+    ///   stale by `validate_token` (this is Temporal's behaviour, not a tokeira
+    ///   limitation).
+    /// - tokeira addresses executions by explicit key, so a bare (empty) run id is
+    ///   resolved to the current run here, where Temporal defers that to the engine
+    ///   when it deserializes the ref. A missing current run is the same
+    ///   `NotFound "activity not found for ID: <id>"` the token path returns.
+    async fn by_id_token(
+        &self,
+        namespace_id: &str,
+        activity_id: &str,
+        run_id: &str,
+    ) -> EdgeResult<Vec<u8>> {
+        self.ensure_enabled()?;
+        let resolved_run = if run_id.is_empty() {
+            self.current_run(namespace_id, activity_id)
+                .await?
+                .ok_or_else(|| {
+                    EdgeError::NotFound(format!("activity not found for ID: {activity_id}"))
+                })?
+        } else {
+            run_id.to_owned()
+        };
+        ActivityTaskToken::encode(
+            namespace_id,
+            activity_id,
+            &resolved_run,
+            1,
+            self.archetype_id,
+        )
+    }
+
+    /// Complete a standalone activity addressed by id (the `RespondActivityTask
+    /// CompletedById` path). Synthesizes the by-id token and reuses the by-token
+    /// completion path; see [`by_id_token`](Self::by_id_token) for the v1.31.0
+    /// fidelity notes.
+    pub async fn complete_by_id(
+        &self,
+        namespace_id: &str,
+        activity_id: &str,
+        run_id: &str,
+        result: Vec<u8>,
+    ) -> EdgeResult<()> {
+        let token = self.by_id_token(namespace_id, activity_id, run_id).await?;
+        self.respond_activity_task_completed(&token, namespace_id, result)
+            .await
+    }
+
+    /// Fail a standalone activity addressed by id (the `RespondActivityTaskFailed
+    /// ById` path). `failure` is the message; `failure_payload` is the full encoded
+    /// `Failure` proto so the describe outcome round-trips the structured failure;
+    /// `last_heartbeat_details` is the encoded `Payloads` of the worker's last
+    /// heartbeat (empty when none).
+    pub async fn fail_by_id(
+        &self,
+        namespace_id: &str,
+        activity_id: &str,
+        run_id: &str,
+        failure: String,
+        failure_payload: Vec<u8>,
+        last_heartbeat_details: Vec<u8>,
+    ) -> EdgeResult<()> {
+        let token = self.by_id_token(namespace_id, activity_id, run_id).await?;
+        self.respond_activity_task_failed(
+            &token,
+            namespace_id,
+            failure,
+            failure_payload,
+            last_heartbeat_details,
+        )
+        .await
+    }
+
+    /// Acknowledge cancellation of a standalone activity addressed by id (the
+    /// `RespondActivityTaskCanceledById` path).
+    pub async fn cancel_by_id(
+        &self,
+        namespace_id: &str,
+        activity_id: &str,
+        run_id: &str,
+    ) -> EdgeResult<()> {
+        let token = self.by_id_token(namespace_id, activity_id, run_id).await?;
+        self.respond_activity_task_canceled(&token, namespace_id)
+            .await
+    }
+
+    /// Record a heartbeat for a standalone activity addressed by id (the
+    /// `RecordActivityTaskHeartbeatById` path), returning `cancel_requested`.
+    /// Synthesizes the by-id token and reuses the by-token heartbeat path; see
+    /// [`by_id_token`](Self::by_id_token) for the v1.31.0 fidelity notes.
+    pub async fn heartbeat_by_id(
+        &self,
+        namespace_id: &str,
+        activity_id: &str,
+        run_id: &str,
+        details: Vec<u8>,
+    ) -> EdgeResult<bool> {
+        let token = self.by_id_token(namespace_id, activity_id, run_id).await?;
+        self.record_heartbeat(&token, namespace_id, details).await
+    }
+
+    /// Encode the describe long-poll token: a serialized `ComponentRef` to the
+    /// activity root carrying the execution key and the current execution VT — the
+    /// shape `ctx.Ref(a)` produces in v1.31.0 (`chasm/lib/activity/activity.go:723`).
+    /// The embedded VT is the point a follow-on long-poll resumes waiting from; the
+    /// embedded key is what [`decode_describe_token`](Self::decode_describe_token)
+    /// validates the request against. This is deliberately NOT a bare
+    /// `VersionedTransition`: a bare clock cannot be validated against the requested
+    /// execution, which is what `LongPollTokenFromWrongExecution` /
+    /// `LongPollTokenFromDifferentNamespace` require (`standalone_activity_test.go:4068,4108`).
+    pub fn encode_describe_token(
+        &self,
+        key: &ExecutionKey,
+        execution_vt: VersionedTransition,
+    ) -> Vec<u8> {
+        // A root-component ref carries an empty `component_path`, the only input that
+        // could make `encode` fail (empty path segment). With no segments it cannot
+        // fail, so the `unwrap_or_default` is unreachable rather than a swallowed
+        // error path.
+        ComponentRef::new(
+            key.clone(),
+            self.archetype_id,
+            execution_vt,
+            Vec::new(),
+            VersionedTransition::default(),
+        )
+        .encode()
+        .unwrap_or_default()
+    }
+
+    /// Decode and validate a describe long-poll token against the requested
+    /// execution, returning the execution VT to resume the wait from. Mirrors the
+    /// two `chasm.ExecutionStateChanged` failure modes
+    /// (`chasm/lib/activity/handler.go:147-150 @ v1.31.0`):
+    /// - bytes that are not a well-formed `ComponentRef` → `InvalidArgument
+    ///   "invalid long poll token"` (`ErrMalformedComponentRef`);
+    /// - a ref whose execution key names a different execution than the request →
+    ///   `InvalidArgument "long poll token does not match execution"`
+    ///   (`ErrInvalidComponentRef`) — the cross-execution / cross-namespace token
+    ///   reuse guard.
+    pub fn decode_describe_token(
+        &self,
+        token: &[u8],
+        expected: &ExecutionKey,
+    ) -> EdgeResult<VersionedTransition> {
+        let reference = ComponentRef::decode(token)
+            .map_err(|_| EdgeError::BadRequest("invalid long poll token".to_owned()))?;
+        if &reference.execution_key != expected {
+            return Err(EdgeError::BadRequest(
+                "long poll token does not match execution".to_owned(),
+            ));
+        }
+        Ok(reference.execution_versioned_transition)
     }
 
     /// Validate a worker response token before applying it — shared by
@@ -949,6 +1257,10 @@ fn description_from(
         search_attributes: state.search_attributes,
         user_metadata: state.user_metadata,
         execution_vt,
+        heartbeat_details: state.last_heartbeat_details,
+        cancel_request_id: state.cancel_request_id,
+        cancel_reason: state.cancel_reason,
+        terminate_request_id: state.terminate_request_id,
     })
 }
 
@@ -1248,6 +1560,164 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_indexes_activity_for_count_by_activity_id() {
+        // Repro for TestCountActivityExecutions/CountByActivityId: a started activity
+        // must be queryable by `ActivityId = '<id>'` (the chasm business-id alias,
+        // `WithBusinessIDAlias("ActivityId")`, `chasm/lib/activity/library.go:66 @
+        // v1.31.0`). Wires the engine's post-commit ProjectionVisibilitySink to the
+        // same Arc-shared InMemoryVisibilityStore a VisibilityQueryService reads,
+        // mirroring the tokeirad bootstrap (apps/tokeirad/src/lib.rs).
+        use tokeira_projection::{
+            CountActivityExecutionsRequest, InMemoryVisibilityStore, VisibilityApi,
+            VisibilityQueryService, VisibilitySink as ProjStoreSink,
+        };
+        use tokeira_runtime::chasm::ProjectionVisibilitySink;
+
+        let store = InMemoryVisibilityStore::default();
+        let chasm_sink = Arc::new(ProjectionVisibilitySink::new(
+            Arc::new(ProjStoreSink::new(store.clone())),
+            1,
+        ));
+        let mut builder = Registry::builder();
+        ActivityLibrary::register(&mut builder).expect("register activity library");
+        let registry = Arc::new(builder.build());
+        let engine = Arc::new(ChasmEngine::new(
+            Arc::new(InMemoryChasmNodeStore::new()),
+            registry,
+            Arc::new(CollectingDispatchSink::default()),
+            chasm_sink,
+        ));
+        let bridge = ActivityBridge::new(
+            engine,
+            ActivityConfig {
+                enable_standalone: true,
+                ..ActivityConfig::default()
+            },
+            1000,
+        );
+
+        let namespace_id = uuid::Uuid::new_v4().to_string();
+        let mut req = start_request();
+        req.namespace_id = namespace_id.clone();
+        req.activity_id = "count-act".to_owned();
+        bridge.start(req).await.expect("start");
+
+        let query = VisibilityQueryService::new(store.clone());
+        let resp = query
+            .count_activities(
+                bridge.archetype_id(),
+                CountActivityExecutionsRequest {
+                    namespace: namespace_id,
+                    query: Some("ActivityId = 'count-act'".to_owned()),
+                    group_by: None,
+                },
+            )
+            .await
+            .expect("count");
+        assert_eq!(
+            resp.total_count, 1,
+            "a started activity must be counted by ActivityId"
+        );
+    }
+
+    #[tokio::test]
+    async fn describe_token_round_trips_and_validates_execution() {
+        // The describe long-poll token is a serialized ComponentRef (key + VT). A
+        // round-trip returns the embedded VT; a token for a different execution is
+        // rejected "long poll token does not match execution", and malformed bytes
+        // are rejected "invalid long poll token" — the two
+        // `chasm.ExecutionStateChanged` failure modes (handler.go:147-150 @ v1.31.0,
+        // standalone_activity_test.go:4068/4108/4029).
+        let bridge = bridge(true);
+        let key = ExecutionKey::new(
+            uuid::Uuid::new_v4().to_string(),
+            "act-1".to_owned(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        let vt = tokeira_chasm::VersionedTransition::new(3, 7);
+        let token = bridge.encode_describe_token(&key, vt);
+        assert!(!token.is_empty(), "token for a real execution is non-empty");
+        assert_eq!(
+            bridge.decode_describe_token(&token, &key).expect("valid"),
+            vt,
+            "round-trips the embedded execution VT"
+        );
+
+        let other = ExecutionKey::new(
+            uuid::Uuid::new_v4().to_string(),
+            "act-2".to_owned(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        match bridge.decode_describe_token(&token, &other) {
+            Err(EdgeError::BadRequest(m)) => {
+                assert_eq!(m, "long poll token does not match execution")
+            }
+            other => panic!("expected mismatch BadRequest, got {other:?}"),
+        }
+
+        match bridge.decode_describe_token(b"invalid-token", &key) {
+            Err(EdgeError::BadRequest(m)) => assert_eq!(m, "invalid long poll token"),
+            other => panic!("expected malformed BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fail_with_heartbeat_details_is_echoed_on_describe() {
+        // RespondActivityTaskFailed.LastHeartbeatDetails is recorded onto the activity
+        // and echoed on info.heartbeat_details (statemachine.go:220 / activity.go:215
+        // @ v1.31.0; standalone_activity_test.go:4908). A fail without details leaves
+        // the field empty (the `details != nil` guard).
+        let bridge = bridge(true);
+        let req = start_request();
+        let key = key_of(&req);
+        bridge.start(req).await.expect("start");
+        bridge
+            .record_started(key.clone(), 5 * SEC, "worker-1".to_owned())
+            .await
+            .expect("started");
+
+        let details = vec![1, 2, 3, 4];
+        bridge
+            .record_failed(key.clone(), "boom".to_owned(), Vec::new(), details.clone())
+            .await
+            .expect("failed");
+
+        let described = bridge.describe(key).await.expect("describe");
+        assert_eq!(described.status, ActivityStatus::Failed);
+        assert_eq!(
+            described.heartbeat_details, details,
+            "the worker's last heartbeat details are echoed on describe"
+        );
+
+        // A separate failure without details must not surface phantom heartbeat data.
+        let req2 = start_with(
+            &uuid::Uuid::new_v4().to_string(),
+            "no-hb",
+            "req-no-hb",
+            BusinessIdPolicy::default(),
+        );
+        let key2 = key_of(&req2);
+        bridge.start(req2).await.expect("start");
+        bridge
+            .record_started(key2.clone(), 5 * SEC, "worker-1".to_owned())
+            .await
+            .expect("started");
+        bridge
+            .record_failed(key2.clone(), "boom".to_owned(), Vec::new(), Vec::new())
+            .await
+            .expect("failed");
+        assert!(
+            bridge
+                .describe(key2)
+                .await
+                .expect("describe")
+                .heartbeat_details
+                .is_empty(),
+            "no heartbeat details supplied → field stays empty"
+        );
+    }
+
+    #[tokio::test]
     async fn start_carries_describe_echo_fields() {
         // The Start request's header / retry policy / priority / search attributes /
         // user metadata are stored opaque and returned verbatim by describe (Req 5):
@@ -1302,7 +1772,7 @@ mod tests {
         let key = key_of(&req);
         bridge.start(req).await.expect("start");
         bridge
-            .terminate(key.clone(), "operator stop".to_owned())
+            .terminate(key.clone(), "operator stop".to_owned(), String::new())
             .await
             .expect("terminate");
         assert_eq!(
@@ -1454,7 +1924,7 @@ mod tests {
         // from `Terminated`.
         let namespace_id = key.namespace_id.clone();
         bridge
-            .terminate(key, "operator stop".to_owned())
+            .terminate(key, "operator stop".to_owned(), String::new())
             .await
             .expect("terminate");
         // A response to a terminal activity is rejected NotFound — the attempt the
@@ -1479,6 +1949,253 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_heartbeat_records_details_and_reports_cancel_requested() {
+        // RecordActivityTaskHeartbeat records details (status-preserving) and reports
+        // cancel_requested once a cancel is pending (standalone_activity_test.go:4387,
+        // 4406). Poll to Started, heartbeat (false + details echoed), request cancel,
+        // heartbeat again (true).
+        let bridge = worker_bridge();
+        let req = start_request();
+        let key = key_of(&req);
+        let task_queue = req.task_queue.clone();
+        bridge.start(req).await.expect("start");
+
+        let task = bridge
+            .poll_activity_task(&task_queue, "worker-1")
+            .await
+            .expect("poll")
+            .expect("a queued task");
+
+        let details = vec![5, 6, 7];
+        let cancel_requested = bridge
+            .record_heartbeat(&task.task_token, &key.namespace_id, details.clone())
+            .await
+            .expect("heartbeat");
+        assert!(!cancel_requested, "no cancel pending before RequestCancel");
+        assert_eq!(
+            bridge
+                .describe(key.clone())
+                .await
+                .unwrap()
+                .heartbeat_details,
+            details,
+            "heartbeat details are recorded onto the activity"
+        );
+
+        bridge
+            .request_cancel(
+                key.clone(),
+                "operator".to_owned(),
+                String::new(),
+                String::new(),
+            )
+            .await
+            .expect("request cancel");
+        let cancel_requested = bridge
+            .record_heartbeat(&task.task_token, &key.namespace_id, details.clone())
+            .await
+            .expect("heartbeat after cancel");
+        assert!(
+            cancel_requested,
+            "cancel_requested is true once a cancel is pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_while_scheduled_is_immediate() {
+        // A cancel on a still-SCHEDULED activity (no worker holds it) drives it
+        // straight to CANCELED (`handleCancellationRequested` immediate-cancel,
+        // activity.go:413-430 @ v1.31.0; standalone_activity_test.go:1627).
+        let bridge = bridge(true);
+        let req = start_request();
+        let key = key_of(&req);
+        bridge.start(req).await.expect("start");
+        bridge
+            .request_cancel(
+                key.clone(),
+                "op".to_owned(),
+                "rid-1".to_owned(),
+                "because".to_owned(),
+            )
+            .await
+            .expect("cancel");
+        assert_eq!(
+            bridge.describe(key).await.unwrap().status,
+            ActivityStatus::Canceled
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_request_id_dedup() {
+        // Repeated cancel: same request_id is an idempotent no-op; a different one is
+        // FailedPrecondition (activity.go:402-409 @ v1.31.0;
+        // standalone_activity_test.go:1345). Poll to Started so the first cancel marks
+        // CANCEL_REQUESTED rather than cancelling immediately.
+        let bridge = worker_bridge();
+        let req = start_request();
+        let key = key_of(&req);
+        let task_queue = req.task_queue.clone();
+        bridge.start(req).await.expect("start");
+        bridge
+            .poll_activity_task(&task_queue, "w")
+            .await
+            .expect("poll")
+            .expect("task");
+        bridge
+            .request_cancel(
+                key.clone(),
+                "op".to_owned(),
+                "rid-1".to_owned(),
+                "r".to_owned(),
+            )
+            .await
+            .expect("first cancel");
+        bridge
+            .request_cancel(
+                key.clone(),
+                "op".to_owned(),
+                "rid-1".to_owned(),
+                "r".to_owned(),
+            )
+            .await
+            .expect("same request id is idempotent");
+        match bridge
+            .request_cancel(
+                key.clone(),
+                "op".to_owned(),
+                "rid-2".to_owned(),
+                "r".to_owned(),
+            )
+            .await
+        {
+            Err(EdgeError::FailedPrecondition(m)) => {
+                assert_eq!(m, "cancellation already requested with request ID rid-1")
+            }
+            other => panic!("expected FailedPrecondition, got {other:?}"),
+        }
+        assert_eq!(bridge.describe(key).await.unwrap().cancel_reason, "r");
+    }
+
+    #[tokio::test]
+    async fn terminate_request_id_dedup() {
+        // Repeated terminate: same request_id is an idempotent no-op; a different one
+        // is FailedPrecondition (activity.go:359-370 @ v1.31.0;
+        // standalone_activity_test.go:1983).
+        let bridge = bridge(true);
+        let req = start_request();
+        let key = key_of(&req);
+        bridge.start(req).await.expect("start");
+        bridge
+            .terminate(key.clone(), "stop".to_owned(), "t-1".to_owned())
+            .await
+            .expect("terminate");
+        bridge
+            .terminate(key.clone(), "stop".to_owned(), "t-1".to_owned())
+            .await
+            .expect("same request id is idempotent");
+        match bridge
+            .terminate(key.clone(), "stop".to_owned(), "t-2".to_owned())
+            .await
+        {
+            Err(EdgeError::FailedPrecondition(m)) => {
+                assert_eq!(m, "already terminated with request ID t-1")
+            }
+            other => panic!("expected FailedPrecondition, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_by_id_records_details_on_current_run() {
+        // RecordActivityTaskHeartbeatById resolves the run by id (attempt-1 token) and
+        // records details, returning cancel_requested (standalone_activity_test.go:4716).
+        let bridge = worker_bridge();
+        let req = start_request();
+        let key = key_of(&req);
+        let task_queue = req.task_queue.clone();
+        bridge.start(req).await.expect("start");
+        bridge
+            .poll_activity_task(&task_queue, "worker-1")
+            .await
+            .expect("poll")
+            .expect("a queued task");
+
+        let details = vec![8, 9];
+        let cancel_requested = bridge
+            .heartbeat_by_id(
+                &key.namespace_id,
+                &key.business_id,
+                &key.run_id,
+                details.clone(),
+            )
+            .await
+            .expect("heartbeat by id");
+        assert!(!cancel_requested);
+        assert_eq!(
+            bridge.describe(key).await.unwrap().heartbeat_details,
+            details
+        );
+    }
+
+    #[tokio::test]
+    async fn polled_task_carries_timeouts_and_times() {
+        // The dispatched task echoes the started activity's timeouts and times so the
+        // worker can honor them (standalone_activity_test.go:322-329).
+        let bridge = worker_bridge();
+        let mut req = start_request();
+        req.start_to_close_nanos = 7 * SEC;
+        req.priority = vec![1, 2];
+        req.header = vec![3, 4];
+        let task_queue = req.task_queue.clone();
+        bridge.start(req).await.expect("start");
+        let task = bridge
+            .poll_activity_task(&task_queue, "w")
+            .await
+            .expect("poll")
+            .expect("task");
+        assert_eq!(task.start_to_close_nanos, 7 * SEC);
+        assert!(task.scheduled_time_nanos > 0, "scheduled time is set");
+        assert!(
+            task.started_time_nanos > 0,
+            "started time is the pickup time"
+        );
+        assert_eq!(task.priority, vec![1, 2]);
+        assert_eq!(task.header, vec![3, 4]);
+        assert!(
+            task.heartbeat_details.is_empty(),
+            "no prior heartbeat on the first attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_heartbeat_on_terminal_activity_is_not_found() {
+        // A heartbeat with a stale token (the activity already completed) is the same
+        // NotFound the terminal responses give (standalone_activity_test.go:4179).
+        let bridge = worker_bridge();
+        let req = start_request();
+        let key = key_of(&req);
+        let task_queue = req.task_queue.clone();
+        bridge.start(req).await.expect("start");
+        let task = bridge
+            .poll_activity_task(&task_queue, "worker-1")
+            .await
+            .expect("poll")
+            .expect("a queued task");
+        bridge
+            .respond_activity_task_completed(&task.task_token, &key.namespace_id, Vec::new())
+            .await
+            .expect("complete");
+        match bridge
+            .record_heartbeat(&task.task_token, &key.namespace_id, vec![1])
+            .await
+        {
+            Err(EdgeError::NotFound(m)) => {
+                assert_eq!(m, format!("activity not found for ID: {}", key.business_id))
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn worker_respond_canceled_acknowledges_cancel_request() {
         // RespondActivityTaskCanceled drives CANCEL_REQUESTED → CANCELED
         // (`TransitionCanceled`, legal only from CANCEL_REQUESTED, `statemachine.go:307
@@ -1495,7 +2212,12 @@ mod tests {
             .expect("poll")
             .expect("a queued task");
         bridge
-            .request_cancel(key.clone(), "operator".to_owned())
+            .request_cancel(
+                key.clone(),
+                "operator".to_owned(),
+                String::new(),
+                String::new(),
+            )
             .await
             .expect("request cancel");
 

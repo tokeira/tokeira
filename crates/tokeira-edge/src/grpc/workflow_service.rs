@@ -133,6 +133,14 @@ impl WorkflowServiceGrpc {
     }
 
     async fn resolve_namespace_id(&self, namespace: &str) -> Result<NamespaceId, Status> {
+        // An empty namespace is rejected InvalidArgument "Namespace is empty." before
+        // any lookup, matching v1.31.0's namespace registry
+        // (`common/namespace/nsregistry/registry.go:313 @ v1.31.0`;
+        // `standalone_activity_test.go:3964`). Without this the empty name falls
+        // through to a NotFound, the wrong status class.
+        if namespace.is_empty() {
+            return Err(Status::invalid_argument("Namespace is empty."));
+        }
         self.inner
             .resolve_namespace_id(namespace)
             .await
@@ -220,7 +228,12 @@ fn nexus_translate_error_status(error: nexus::NexusTranslateError) -> Status {
 
 fn namespace_resolution_status(error: crate::errors::EdgeError) -> Status {
     match error {
-        crate::errors::EdgeError::NamespaceNotFound(_) => Status::not_found("namespace not found"),
+        // Mirror v1.31.0's `serviceerror.NamespaceNotFound`: "Namespace %s is not
+        // found." carrying the requested name (`go.temporal.io/api/serviceerror/
+        // namespace_not_found.go @ v1.31.0`; `standalone_activity_test.go:3882`).
+        crate::errors::EdgeError::NamespaceNotFound(name) => {
+            Status::not_found(format!("Namespace {name} is not found."))
+        }
         crate::errors::EdgeError::NamespaceDeleted(_) => {
             Status::failed_precondition("namespace is deleted")
         }
@@ -267,6 +280,23 @@ fn chasm_activity_poll_response(
         input: tokeira_proto::common::Payloads::decode(task.input.as_slice()).ok(),
         attempt: task.attempt,
         activity_run_id: task.run_id,
+        // Timeouts / priority / header / times the worker needs to honor the task,
+        // echoed verbatim from the started activity (`standalone_activity_test.go:322-329`).
+        schedule_to_close_timeout: nanos_to_proto_duration(task.schedule_to_close_nanos),
+        start_to_close_timeout: nanos_to_proto_duration(task.start_to_close_nanos),
+        heartbeat_timeout: nanos_to_proto_duration(task.heartbeat_nanos),
+        scheduled_time: nanos_to_proto_timestamp(task.scheduled_time_nanos),
+        started_time: nanos_to_proto_timestamp(task.started_time_nanos),
+        // current_attempt_scheduled_time mirrors scheduled_time for a single-attempt
+        // dispatch (no separate per-attempt schedule clock is tracked yet).
+        current_attempt_scheduled_time: nanos_to_proto_timestamp(task.scheduled_time_nanos),
+        priority: decode_echo(&task.priority),
+        header: decode_echo(&task.header),
+        heartbeat_details: (!task.heartbeat_details.is_empty())
+            .then(|| {
+                tokeira_proto::common::Payloads::decode(task.heartbeat_details.as_slice()).ok()
+            })
+            .flatten(),
         ..Default::default()
     }
 }
@@ -431,9 +461,36 @@ fn chasm_activity_info(
         heartbeat_timeout: nanos_to_proto_duration(description.heartbeat_nanos),
         attempt: description.attempt,
         schedule_time: nanos_to_proto_timestamp(description.scheduled_time_nanos),
+        // schedule_time + schedule_to_close_timeout, populated only when that timeout
+        // is set (`chasm/lib/activity/activity.go:656-658 @ v1.31.0`; FullResponse
+        // asserts it, `standalone_activity_test.go:2846`).
+        expiration_time: (description.schedule_to_close_nanos > 0)
+            .then(|| {
+                nanos_to_proto_timestamp(
+                    description.scheduled_time_nanos + description.schedule_to_close_nanos,
+                )
+            })
+            .flatten(),
         last_started_time: nanos_to_proto_timestamp(description.started_time_nanos),
         close_time: nanos_to_proto_timestamp(description.close_time_nanos),
+        // Populated only when the activity is closed: close − schedule, including all
+        // attempts and backoff (`chasm/lib/activity/activity.go:649-652 @ v1.31.0` —
+        // `CloseTime.Sub(ScheduleTime)`, set only when LifecycleState != Running).
+        // While running, close_time_nanos is 0, so the saturating subtraction yields
+        // 0 and `nanos_to_proto_duration` returns None — matching the "closed only"
+        // proto contract (activity/v1/message.proto field 16).
+        execution_duration: nanos_to_proto_duration(
+            description
+                .close_time_nanos
+                .saturating_sub(description.scheduled_time_nanos),
+        ),
         last_failure: chasm_last_failure(description),
+        // The worker's last heartbeat details, captured on a fail request and echoed
+        // verbatim (`activity.go:215 @ v1.31.0`; `standalone_activity_test.go:4908`).
+        heartbeat_details: decode_echo(&description.heartbeat_details),
+        // The reason recorded on the cancel request (`ActivityCancelState.reason`),
+        // echoed on a CANCEL_REQUESTED describe (`standalone_activity_test.go:1313`).
+        canceled_reason: description.cancel_reason.clone(),
         state_transition_count: description.execution_vt.transition_count,
         last_worker_identity: description.worker_identity.clone(),
         // Describe-echo fields stored opaque at Start and returned verbatim (Req 5).
@@ -562,19 +619,21 @@ fn describe_long_poll_budget(
     }
 }
 
-/// Build a `DescribeActivityExecutionResponse`. The long-poll token is the current
-/// execution VT (so a follow-on describe blocks until the next change), and is
-/// absent once the activity is terminal (proto: "Absent only if the activity is
-/// complete"). `input`/`outcome` are populated only when the request asked for
-/// them.
+/// Build a `DescribeActivityExecutionResponse`. `long_poll_token` is the caller-
+/// supplied serialized `ComponentRef` (execution key + VT) the follow-on long-poll
+/// resumes from; it is always present, even for a terminal activity (v1.31.0 sets
+/// `ctx.Ref(a)` unconditionally — `chasm/lib/activity/activity.go:723`; the suite
+/// asserts a non-nil token on a completed describe, `standalone_activity_test.go:4918`).
+/// `run_id` is the resolved run (a bare-id describe echoes the current run id).
+/// `input`/`outcome` are populated only when the request asked for them.
 fn chasm_describe_response(
     activity_id: String,
     run_id: String,
     include_input: bool,
     include_outcome: bool,
     description: crate::chasm_activity::ActivityDescription,
+    long_poll_token: Vec<u8>,
 ) -> workflowservice::DescribeActivityExecutionResponse {
-    let terminal = description.status.is_terminal();
     let input = include_input
         .then(|| tokeira_proto::common::Payloads::decode(description.input.as_slice()).ok())
         .flatten();
@@ -582,11 +641,6 @@ fn chasm_describe_response(
         chasm_activity_outcome(&description)
     } else {
         None
-    };
-    let long_poll_token = if terminal {
-        Vec::new()
-    } else {
-        description.execution_vt.encode()
     };
     let info = chasm_activity_info(activity_id, run_id.clone(), &description);
     workflowservice::DescribeActivityExecutionResponse {
@@ -878,12 +932,17 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 .as_ref()
                 .map(|f| f.encode_to_vec())
                 .unwrap_or_default();
+            let heartbeat_details = req
+                .last_heartbeat_details
+                .map(|p| p.encode_to_vec())
+                .unwrap_or_default();
             bridge
                 .respond_activity_task_failed(
                     &req.task_token,
                     &namespace_id.0.to_string(),
                     failure,
                     failure_payload,
+                    heartbeat_details,
                 )
                 .await?;
             return Ok(Response::new(translate::respond_activity_failed_to_proto()));
@@ -902,8 +961,36 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         request: Request<workflowservice::RecordActivityTaskHeartbeatRequest>,
     ) -> Result<Response<workflowservice::RecordActivityTaskHeartbeatResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
-        let edge_req = translate::record_heartbeat_to_edge(request.into_inner())
-            .map_err(proto_conversion_status)?;
+        let req = request.into_inner();
+        // Standalone-activity heartbeat: validate the worker token at the frontend
+        // boundary (Temporal's generic task-token errors) and route to the bridge.
+        // Deviation: on a standalone-enabled server a non-empty token that is not a
+        // standalone token is reported as a deserialize failure rather than handed to
+        // the inner workflow-activity heartbeat path — the conformance target serves
+        // only standalone activities, and v1.31.0 uses one task-token serializer for
+        // both (`standalone_activity_test.go:4126,4131`).
+        if let Some(bridge) = &self.chasm_activity
+            && bridge.is_enabled()
+        {
+            if req.task_token.is_empty() {
+                return Err(Status::invalid_argument("Task token not set on request"));
+            }
+            if bridge.owns_task_token(&req.task_token) {
+                let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+                let details = req.details.map(|p| p.encode_to_vec()).unwrap_or_default();
+                let cancel_requested = bridge
+                    .record_heartbeat(&req.task_token, &namespace_id.0.to_string(), details)
+                    .await?;
+                return Ok(Response::new(
+                    workflowservice::RecordActivityTaskHeartbeatResponse {
+                        cancel_requested,
+                        ..Default::default()
+                    },
+                ));
+            }
+            return Err(Status::invalid_argument("Error deserializing task token"));
+        }
+        let edge_req = translate::record_heartbeat_to_edge(req).map_err(proto_conversion_status)?;
         let edge_resp = self
             .inner
             .record_activity_task_heartbeat(&headers, edge_req)
@@ -1105,7 +1192,30 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         request: Request<workflowservice::RecordActivityTaskHeartbeatByIdRequest>,
     ) -> Result<Response<workflowservice::RecordActivityTaskHeartbeatByIdResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
-        let edge_req = translate::record_activity_heartbeat_by_id_to_edge(request.into_inner())
+        let req = request.into_inner();
+        // Empty workflow id discriminates a standalone activity, as on the other
+        // by-id RPCs (`workflow_handler.go:1671 @ v1.31.0`).
+        if let Some(bridge) = &self.chasm_activity
+            && req.workflow_id.is_empty()
+        {
+            let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+            let details = req.details.map(|p| p.encode_to_vec()).unwrap_or_default();
+            let cancel_requested = bridge
+                .heartbeat_by_id(
+                    &namespace_id.0.to_string(),
+                    &req.activity_id,
+                    &req.run_id,
+                    details,
+                )
+                .await?;
+            return Ok(Response::new(
+                workflowservice::RecordActivityTaskHeartbeatByIdResponse {
+                    cancel_requested,
+                    ..Default::default()
+                },
+            ));
+        }
+        let edge_req = translate::record_activity_heartbeat_by_id_to_edge(req)
             .map_err(proto_conversion_status)?;
         let edge_resp = self
             .inner
@@ -1120,7 +1230,29 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         request: Request<workflowservice::RespondActivityTaskCompletedByIdRequest>,
     ) -> Result<Response<workflowservice::RespondActivityTaskCompletedByIdResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
-        let edge_req = translate::respond_activity_completed_by_id_to_edge(request.into_inner())
+        let req = request.into_inner();
+        // An empty workflow id on a by-id respond is v1.31.0's discriminator for a
+        // standalone activity (`workflow_handler.go:1671 @ v1.31.0` — empty
+        // workflow_id ⇒ build a component-ref token). A present workflow id is a
+        // workflow activity and falls through to the inner path unchanged.
+        if let Some(bridge) = &self.chasm_activity
+            && req.workflow_id.is_empty()
+        {
+            let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+            let result = req.result.map(|p| p.encode_to_vec()).unwrap_or_default();
+            bridge
+                .complete_by_id(
+                    &namespace_id.0.to_string(),
+                    &req.activity_id,
+                    &req.run_id,
+                    result,
+                )
+                .await?;
+            return Ok(Response::new(
+                translate::respond_activity_completed_by_id_to_proto(),
+            ));
+        }
+        let edge_req = translate::respond_activity_completed_by_id_to_edge(req)
             .map_err(proto_conversion_status)?;
         let _edge_resp = self
             .inner
@@ -1135,7 +1267,42 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         request: Request<workflowservice::RespondActivityTaskFailedByIdRequest>,
     ) -> Result<Response<workflowservice::RespondActivityTaskFailedByIdResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
-        let edge_req = translate::respond_activity_failed_by_id_to_edge(request.into_inner())
+        let req = request.into_inner();
+        if let Some(bridge) = &self.chasm_activity
+            && req.workflow_id.is_empty()
+        {
+            let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+            let failure = req
+                .failure
+                .as_ref()
+                .map(|f| f.message.clone())
+                .unwrap_or_default();
+            // Carry the full structured Failure so the describe outcome round-trips
+            // it, not just the message (Req 5), matching the by-token path.
+            let failure_payload = req
+                .failure
+                .as_ref()
+                .map(|f| f.encode_to_vec())
+                .unwrap_or_default();
+            let heartbeat_details = req
+                .last_heartbeat_details
+                .map(|p| p.encode_to_vec())
+                .unwrap_or_default();
+            bridge
+                .fail_by_id(
+                    &namespace_id.0.to_string(),
+                    &req.activity_id,
+                    &req.run_id,
+                    failure,
+                    failure_payload,
+                    heartbeat_details,
+                )
+                .await?;
+            return Ok(Response::new(
+                translate::respond_activity_failed_by_id_to_proto(),
+            ));
+        }
+        let edge_req = translate::respond_activity_failed_by_id_to_edge(req)
             .map_err(proto_conversion_status)?;
         let _edge_resp = self
             .inner
@@ -1180,7 +1347,19 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         request: Request<workflowservice::RespondActivityTaskCanceledByIdRequest>,
     ) -> Result<Response<workflowservice::RespondActivityTaskCanceledByIdResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
-        let edge_req = translate::respond_activity_canceled_by_id_to_edge(request.into_inner())
+        let req = request.into_inner();
+        if let Some(bridge) = &self.chasm_activity
+            && req.workflow_id.is_empty()
+        {
+            let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+            bridge
+                .cancel_by_id(&namespace_id.0.to_string(), &req.activity_id, &req.run_id)
+                .await?;
+            return Ok(Response::new(
+                translate::respond_activity_canceled_by_id_to_proto(),
+            ));
+        }
+        let edge_req = translate::respond_activity_canceled_by_id_to_edge(req)
             .map_err(proto_conversion_status)?;
         let _edge_resp = self
             .inner
@@ -2350,7 +2529,26 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             ));
         };
         let req = request.into_inner();
+        // Validate request_id / identity length before any start work, so a length
+        // violation is InvalidArgument rather than colliding with the id dedup
+        // (`standalone_activity_test.go:447,467`). Same messages/limit as the
+        // cancel/terminate metadata validator.
+        validate_sa_request_metadata(
+            bridge.is_enabled(),
+            bridge.max_id_length(),
+            &req.request_id,
+            &req.identity,
+        )?;
         let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+        // Reject unregistered search-attribute keys before the start commits
+        // (`standalone_activity_test.go:521`). Keys are read here, before the
+        // SearchAttributes are encoded into the StartActivity below.
+        if let Some(sa) = req.search_attributes.as_ref() {
+            let keys: Vec<String> = sa.indexed_fields.keys().cloned().collect();
+            self.inner
+                .validate_search_attribute_keys(namespace_id, &keys)
+                .await?;
+        }
         // Map the id reuse/conflict policy before minting a run id — an unsupported
         // policy is rejected with InvalidArgument, mirroring the chasm activity
         // handler's policy-map lookup (`handler.go:54-61 @ v1.31.0`).
@@ -2439,20 +2637,34 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 req.run_id.clone(),
             )
             .await?;
+        // Echo the resolved run id (a bare-id describe resolves to the current run,
+        // and the response must carry that concrete run — `standalone_activity_test.go:2826`).
+        let resolved_run_id = key.run_id.clone();
         // Absent a token, return the current state immediately. With a token, this is a
         // long-poll for any state change (`frontend.go @ v1.31.0`).
         if req.long_poll_token.is_empty() {
-            let description = bridge.describe(key).await?;
+            let description = bridge.describe(key.clone()).await?;
+            let token = bridge.encode_describe_token(&key, description.execution_vt);
             return Ok(Response::new(chasm_describe_response(
                 req.activity_id,
-                req.run_id,
+                resolved_run_id,
                 req.include_input,
                 req.include_outcome,
                 description,
+                token,
             )));
         }
-        let since = tokeira_chasm::VersionedTransition::decode(&req.long_poll_token)
-            .map_err(|_| Status::invalid_argument("malformed long_poll_token"))?;
+        // Decode + validate the caller's token against the requested execution before
+        // waiting: a malformed token or one issued for a different execution/namespace
+        // is rejected up front (`chasm/lib/activity/handler.go:147-150 @ v1.31.0`).
+        // First, though, confirm the requested activity exists — v1.31.0 loads the
+        // component via the request's ref (NotFound if absent) inside PollComponent
+        // before `ExecutionStateChanged` runs, so a long-poll for a missing activity
+        // is NotFound, not a token error (`standalone_activity_test.go:3931`).
+        bridge.describe(key.clone()).await?;
+        let since = bridge
+            .decode_describe_token(&req.long_poll_token, &key)
+            .map_err(Status::from)?;
         // Time the wait out at Min(caller_deadline - buffer, long_poll_timeout) and return an
         // empty, non-error response on elapse so the caller resubmits — never letting the
         // caller's gRPC deadline fire (`chasm/lib/activity/handler.go` →
@@ -2465,19 +2677,23 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         let advanced = if budget.is_zero() {
             None
         } else {
-            match tokio::time::timeout(budget, bridge.poll(key, since)).await {
+            match tokio::time::timeout(budget, bridge.poll(key.clone(), since)).await {
                 Ok(result) => result?,
                 Err(_elapsed) => None,
             }
         };
         match advanced {
-            Some(description) => Ok(Response::new(chasm_describe_response(
-                req.activity_id,
-                req.run_id,
-                req.include_input,
-                req.include_outcome,
-                description,
-            ))),
+            Some(description) => {
+                let token = bridge.encode_describe_token(&key, description.execution_vt);
+                Ok(Response::new(chasm_describe_response(
+                    req.activity_id,
+                    resolved_run_id,
+                    req.include_input,
+                    req.include_outcome,
+                    description,
+                    token,
+                )))
+            }
             // Empty non-error response: an invitation to resubmit the long-poll.
             None => Ok(Response::new(
                 workflowservice::DescribeActivityExecutionResponse::default(),
@@ -2508,8 +2724,14 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 req.run_id.clone(),
             )
             .await?;
+        // Echo the resolved run id (a bare-id poll resolves to the current run —
+        // `standalone_activity_test.go:3274`).
+        let resolved_run_id = key.run_id.clone();
         let description = bridge.poll_outcome(key).await?;
-        Ok(Response::new(chasm_poll_response(req.run_id, description)))
+        Ok(Response::new(chasm_poll_response(
+            resolved_run_id,
+            description,
+        )))
     }
     async fn list_activity_executions(
         &self,
@@ -2577,7 +2799,9 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         let key = self
             .activity_execution_key(bridge, &req.namespace, req.activity_id, req.run_id)
             .await?;
-        bridge.request_cancel(key, req.identity).await?;
+        bridge
+            .request_cancel(key, req.identity, req.request_id, req.reason)
+            .await?;
         Ok(Response::new(
             workflowservice::RequestCancelActivityExecutionResponse {},
         ))
@@ -2607,7 +2831,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         let key = self
             .activity_execution_key(bridge, &req.namespace, req.activity_id, req.run_id)
             .await?;
-        bridge.terminate(key, req.reason).await?;
+        bridge.terminate(key, req.reason, req.request_id).await?;
         Ok(Response::new(
             workflowservice::TerminateActivityExecutionResponse {},
         ))
@@ -2845,6 +3069,77 @@ mod tests {
             }
             other => panic!("expected failure outcome, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn chasm_describe_response_sets_token_and_execution_duration_when_terminal() {
+        // A completed describe must carry a non-nil long-poll token and a positive
+        // execution_duration: the suite asserts both in validateCompletion via
+        // validateBaseActivityResponse (standalone_activity_test.go:4918 — NotNil
+        // token; the completion path also asserts ExecutionDuration > 0). Temporal
+        // sets the token unconditionally (ctx.Ref, activity.go:723) and the duration
+        // as close − schedule only when closed (activity.go:649-652 @ v1.31.0).
+        let scheduled = 1_700_000_000_000_000_000;
+        let description = crate::chasm_activity::ActivityDescription {
+            status: ActivityStatus::Completed,
+            scheduled_time_nanos: scheduled,
+            close_time_nanos: scheduled + 250_000_000,
+            execution_vt: tokeira_chasm::VersionedTransition::new(1, 5),
+            ..Default::default()
+        };
+        let response = chasm_describe_response(
+            "act-1".to_owned(),
+            "run-1".to_owned(),
+            false,
+            false,
+            description,
+            vec![7, 7, 7],
+        );
+        assert_eq!(
+            response.long_poll_token,
+            vec![7, 7, 7],
+            "the caller-supplied long-poll token is echoed verbatim"
+        );
+        let duration = response
+            .info
+            .expect("info present")
+            .execution_duration
+            .expect("execution_duration set when closed");
+        assert_eq!(duration.seconds, 0);
+        assert_eq!(duration.nanos, 250_000_000);
+    }
+
+    #[test]
+    fn chasm_describe_response_omits_execution_duration_while_running() {
+        // While running (close_time_nanos == 0) the field is absent — the proto
+        // contract is "populated only if the activity is closed" (activity/v1/
+        // message.proto field 16; activity.go:649-652 @ v1.31.0).
+        let description = crate::chasm_activity::ActivityDescription {
+            status: ActivityStatus::Started,
+            scheduled_time_nanos: 1_700_000_000_000_000_000,
+            execution_vt: tokeira_chasm::VersionedTransition::new(1, 2),
+            ..Default::default()
+        };
+        let response = chasm_describe_response(
+            "act-1".to_owned(),
+            "run-1".to_owned(),
+            false,
+            false,
+            description,
+            vec![9],
+        );
+        assert!(
+            !response.long_poll_token.is_empty(),
+            "running describe carries a long-poll token to block on"
+        );
+        assert!(
+            response
+                .info
+                .expect("info present")
+                .execution_duration
+                .is_none(),
+            "execution_duration must be unset while running"
+        );
     }
 
     struct PollNoneRuntime;

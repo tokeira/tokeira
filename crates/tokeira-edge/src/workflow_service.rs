@@ -1016,6 +1016,34 @@ impl WorkflowService {
         }
     }
 
+    /// Reject a Start request whose search attributes include any key not
+    /// registered for the namespace (system predefined or custom). Returns the
+    /// verbatim v1.31.0 admission error for the first unknown key
+    /// (`InvalidArgument "search attribute <key> is not defined"`,
+    /// `common/searchattribute/validator.go:101 @ v1.31.0`;
+    /// `standalone_activity_test.go:521`). A no-op when there are no keys or the
+    /// deployment has no search-attribute registry (permissive default).
+    pub async fn validate_search_attribute_keys(
+        &self,
+        namespace_id: tokeira_types::NamespaceId,
+        keys: &[String],
+    ) -> EdgeResult<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        if let Some(unknown) = self
+            .visibility
+            .unknown_search_attribute(namespace_id, keys)
+            .await
+            .map_err(EdgeError::from)?
+        {
+            return Err(EdgeError::BadRequest(format!(
+                "search attribute {unknown} is not defined"
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn poll_nexus_task_queue(
         &self,
         headers: &HeaderMap,

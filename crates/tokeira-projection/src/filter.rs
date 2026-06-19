@@ -311,6 +311,15 @@ async fn resolve_field<S: VisibilityStore + ?Sized>(
         "ActivityId" => Some(SystemField::WorkflowId),
         "RunId" => Some(SystemField::RunId),
         "WorkflowType" => Some(SystemField::WorkflowType),
+        // `ActivityType` is the standalone-activity type keyword SA
+        // (`TypeSearchAttribute = NewSearchAttributeKeyword("ActivityType", …)`,
+        // `chasm/lib/activity/activity.go:39 @ v1.31.0`). tokeira's activity
+        // visibility snapshot stores the activity type in the generic
+        // `execution_type`/`workflow_type` column (design.md "Record shape"), so the
+        // alias resolves there — the same field-name → column mapping `ActivityId`
+        // uses for the business id. Archetype-scoping of the count/list path keeps it
+        // matching only activities.
+        "ActivityType" => Some(SystemField::WorkflowType),
         "TaskQueue" => Some(SystemField::TaskQueue),
         "ExecutionStatus" => Some(SystemField::ExecutionStatus),
         "StartTime" => Some(SystemField::StartTime),
@@ -624,6 +633,33 @@ mod tests {
                 assert_eq!(field, FieldRef::System(SystemField::WorkflowId));
                 assert_eq!(op, CompareOp::Eq);
                 assert_eq!(value, FilterValue::String("act-1".to_string()));
+            }
+            other => panic!("expected Compare, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn compile_filter_resolves_activity_type_to_workflow_type_column() {
+        // `ActivityType` is the standalone-activity type keyword SA
+        // (`TypeSearchAttribute = NewSearchAttributeKeyword("ActivityType", …)`,
+        // `chasm/lib/activity/activity.go:39 @ v1.31.0`). tokeira stores the activity
+        // type in the generic execution_type/`WorkflowType` column, so the alias must
+        // resolve there for `CountActivityExecutions` with `ActivityType = '<name>'`
+        // to match (TestCountActivityExecutions/CountByActivityType).
+        let store = InMemoryVisibilityStore::default();
+        let namespace_id = NamespaceId(uuid::Uuid::from_u128(1));
+        let compiled = compile_filter(
+            Some("ActivityType = \"PaymentActivity\""),
+            namespace_id,
+            &store,
+        )
+        .await
+        .unwrap();
+        match compiled.expr.expect("expr") {
+            FilterExpr::Compare { field, op, value } => {
+                assert_eq!(field, FieldRef::System(SystemField::WorkflowType));
+                assert_eq!(op, CompareOp::Eq);
+                assert_eq!(value, FilterValue::String("PaymentActivity".to_string()));
             }
             other => panic!("expected Compare, got {other:?}"),
         }

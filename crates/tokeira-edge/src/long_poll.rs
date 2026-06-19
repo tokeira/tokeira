@@ -1,3 +1,17 @@
+//! Long-poll admission control.
+//!
+//! Long polls (workflow/activity/Nexus task polls, history waits) are a transport
+//! concern: they tie up sockets, memory, and scheduler slots while the caller
+//! blocks for work. The danger is letting that pressure reach down into the
+//! authoritative planes — a blocked poll must **not** pin durable runtime state or
+//! hold a DSQL session open. [`LongPollGate`] enforces that boundary with a
+//! semaphore bounding concurrent long polls *before* the request reaches the
+//! broker/runtime; admission beyond the bound fails fast with
+//! [`EdgeError::LongPollAdmissionTimeout`]
+//! rather than queueing unboundedly. The complementary "return empty just before
+//! the caller's deadline" budget lives at each poll call site; this module only
+//! caps concurrency.
+
 use std::{sync::Arc, time::Duration};
 
 use tokio::{

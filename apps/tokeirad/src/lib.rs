@@ -65,9 +65,10 @@ use tokeira_projection::{
     VisibilityQueryService, VisibilitySink, VisibilityStore,
 };
 use tokeira_runtime::{
-    ConnectionBudgetApplier, EndpointTarget, InMemoryTaskQueueConfigStore, MembershipConfig,
-    NexusEndpointConfig, NexusEndpointRegistry, NoopNexusHttpClient, RuntimeConfig,
-    ScheduleEngineConfig, ScheduleStore, TokeiraRuntime, VersioningRuleStore, run_schedule_engine,
+    ConnectionBudgetApplier, InMemoryNexusEndpointStore, InMemoryTaskQueueConfigStore,
+    MembershipConfig, NexusEndpointRegistry, NexusEndpointSpec, NexusEndpointSpecTarget,
+    NexusEndpointStore, NoopNexusHttpClient, RuntimeConfig, ScheduleEngineConfig, ScheduleStore,
+    TokeiraRuntime, VersioningRuleStore, run_schedule_engine,
 };
 use tokeira_storage::{
     InMemoryStore, LeaseOutcome, LeaseRepository, ProjectionLog, RunRepository,
@@ -710,11 +711,15 @@ where
     // Bootstrap edge-facing namespace/operator state.
     let namespaces = Arc::new(InMemoryNamespaceCache::new());
     namespaces.insert(default_namespace).await?;
-    let nexus_registry = build_nexus_endpoint_registry(
+    // The Nexus endpoint store is the single source of truth shared by runtime
+    // dispatch resolution and the OperatorService endpoint-admin CRUD. Seeded empty;
+    // endpoints are created at runtime via `CreateNexusEndpoint`.
+    let nexus_store = build_nexus_endpoint_store(
         namespaces.as_ref(),
         HashMap::<String, BootstrapNexusEndpointConfig>::new(),
     )
     .await?;
+    let nexus_registry = NexusEndpointRegistry::new(nexus_store.clone());
 
     // The runtime owns execution orchestration, scanners, brokers, and all
     // run-local in-memory coordination such as buffered consistent queries.
@@ -878,7 +883,7 @@ where
             visibility,
             repo.clone(),
             operator_api.clone(),
-            namespaces,
+            namespaces.clone(),
             interceptors.clone(),
             PollerRegistry::default(),
             PendingQueryStore::default(),
@@ -896,7 +901,30 @@ where
             Arc::new(tokeira_runtime::BatchOperationStore::default()),
         )
         .with_worker_deployment_runtime(runtime_adapter);
-    let operator_service = OperatorService::new(operator_api, interceptors);
+    // The Nexus endpoint admin shares the dispatch store, gated through the operator
+    // interceptor (create/update/delete = OperatorWrite, get/list = OperatorRead).
+    // Limits come from config (raise, never hardcode); the namespace resolver backs
+    // the Worker-target existence check.
+    let nexus_endpoint_limits = {
+        let cfg = &effective_config.policy.nexus_endpoint_limits;
+        tokeira_edge::nexus_endpoint::NexusEndpointLimits {
+            name_max_length: cfg.name_max_length,
+            external_url_max_length: cfg.external_url_max_length,
+            description_max_size: cfg.description_max_size,
+            task_queue_max_length: cfg.task_queue_max_length,
+            list_default_page_size: cfg.list_default_page_size,
+            list_max_page_size: cfg.list_max_page_size,
+        }
+    };
+    let nexus_endpoint_admin = Arc::new(tokeira_edge::nexus_endpoint::NexusEndpointAdmin::new(
+        nexus_store.clone(),
+        Arc::new(tokeira_edge::nexus_endpoint::CacheNamespaceResolver::new(
+            namespaces.clone(),
+        )),
+        nexus_endpoint_limits,
+    ));
+    let operator_service =
+        OperatorService::new(operator_api, interceptors).with_nexus_endpoints(nexus_endpoint_admin);
 
     // Wire the standalone-activity (CHASM) bridge onto the gRPC adapter: a CHASM
     // engine over the backend's node repository, an activity-library registry, and
@@ -1126,37 +1154,55 @@ fn wire_coverage_out_path() -> PathBuf {
     }
 }
 
-async fn build_nexus_endpoint_registry(
+/// Build the shared Nexus endpoint store, seeding any bootstrap-configured
+/// endpoints. The same store backs both runtime dispatch resolution (via
+/// [`NexusEndpointRegistry`]) and the OperatorService endpoint-admin CRUD, so a
+/// `CreateNexusEndpoint` at runtime is immediately resolvable for dispatch and a
+/// seeded endpoint is visible to admin reads. Worker targets resolve the namespace
+/// name to its id up front (failing if the namespace is unknown), storing both so
+/// reads echo the name and dispatch routes on the id.
+async fn build_nexus_endpoint_store(
     namespaces: &dyn NamespaceCache,
     configs: HashMap<String, BootstrapNexusEndpointConfig>,
-) -> Result<NexusEndpointRegistry> {
-    let mut resolved = HashMap::with_capacity(configs.len());
+) -> Result<Arc<InMemoryNexusEndpointStore>> {
+    let store = Arc::new(InMemoryNexusEndpointStore::new());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
     for (endpoint_name, config) in configs {
         let target = match config.target {
             BootstrapNexusEndpointTarget::External { address } => {
-                EndpointTarget::External { address }
+                NexusEndpointSpecTarget::External { url: address }
             }
             BootstrapNexusEndpointTarget::Worker {
                 namespace_name,
                 task_queue,
             } => {
-                let namespace = namespaces
-                    .get(&namespace_name)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "failed to register nexus worker endpoint `{endpoint_name}`: namespace `{namespace_name}` not found"
-                        )
-                    })?;
-                EndpointTarget::Worker {
-                    namespace_id: namespace_id_for(&namespace.name),
-                    task_queue: tokeira_types::TaskQueueName(task_queue),
+                let namespace = namespaces.get(&namespace_name).await?.ok_or_else(|| {
+                    anyhow!(
+                        "failed to register nexus worker endpoint `{endpoint_name}`: namespace `{namespace_name}` not found"
+                    )
+                })?;
+                NexusEndpointSpecTarget::Worker {
+                    namespace_name: namespace.name.clone(),
+                    namespace_id: namespace_id_for(&namespace.name).0.to_string(),
+                    task_queue,
                 }
             }
         };
-        resolved.insert(endpoint_name, NexusEndpointConfig { target });
+        store
+            .create(
+                NexusEndpointSpec {
+                    name: endpoint_name.clone(),
+                    description: Vec::new(),
+                    target,
+                },
+                now,
+            )
+            .map_err(|e| anyhow!("failed to seed nexus endpoint `{endpoint_name}`: {e}"))?;
     }
-    Ok(NexusEndpointRegistry::new(resolved))
+    Ok(store)
 }
 
 async fn self_assign_dsql_shards<R>(
@@ -1473,6 +1519,9 @@ pub fn __cli_parse() -> Cli {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Endpoint target/config types are referenced only by the Nexus endpoint store
+    // tests below; importing them here (not at crate scope) keeps the lib build clean.
+    use tokeira_runtime::{EndpointTarget, NexusEndpointConfig};
 
     #[test]
     fn version_renderer_is_deterministic() {
@@ -1487,13 +1536,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_nexus_endpoint_registry_resolves_worker_namespace_names() {
+    async fn build_nexus_endpoint_store_resolves_worker_namespace_names() {
         let cache = InMemoryNamespaceCache::new();
         let namespace = ResolvedNamespace::active("payments");
         let namespace_id = namespace_id_for("payments");
         cache.insert(namespace).await.expect("namespace insert");
 
-        let registry = build_nexus_endpoint_registry(
+        let store = build_nexus_endpoint_store(
             &cache,
             HashMap::from([(
                 "payments-endpoint".to_string(),
@@ -1506,12 +1555,13 @@ mod tests {
             )]),
         )
         .await
-        .expect("registry should build");
+        .expect("store should build");
 
+        let registry = NexusEndpointRegistry::new(store);
         let config = registry.resolve("payments-endpoint").expect("endpoint");
         assert_eq!(
             config,
-            &NexusEndpointConfig {
+            NexusEndpointConfig {
                 target: EndpointTarget::Worker {
                     namespace_id,
                     task_queue: tokeira_types::TaskQueueName("nexus-q".to_string()),
@@ -1521,10 +1571,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_nexus_endpoint_registry_rejects_unknown_worker_namespace() {
+    async fn build_nexus_endpoint_store_rejects_unknown_worker_namespace() {
         let cache = InMemoryNamespaceCache::new();
 
-        let result = build_nexus_endpoint_registry(
+        let result = build_nexus_endpoint_store(
             &cache,
             HashMap::from([(
                 "payments-endpoint".to_string(),

@@ -219,6 +219,66 @@ pub struct PolicyConfig {
     pub quotas: QuotasConfig,
     #[serde(default)]
     pub compatibility: CompatibilityConfig,
+    #[serde(default)]
+    pub nexus_endpoint_limits: NexusEndpointLimitsConfig,
+}
+
+/// The six Nexus endpoint admin limits, modelled as config (raise, never hardcode)
+/// with v1.31.0-faithful defaults. Sourced from `common/dynamicconfig/constants.go
+/// @ v1.31.0`: `NexusEndpointNameMaxLength` (200), `NexusEndpointExternalURLMaxLength`
+/// (`4*1024`), `NexusEndpointDescriptionMaxSize` (20000), `MaxIDLengthLimit` (1000,
+/// the task-queue bound), `NexusEndpointListDefaultPageSize` (100),
+/// `NexusEndpointListMaxPageSize` (1000). All global — the description-size knob is
+/// namespace-scoped upstream but the endpoint client ignores namespace because
+/// endpoints are global resources (`nexus_endpoint_client.go:60-62 @ v1.31.0`), so a
+/// global default is faithful.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NexusEndpointLimitsConfig {
+    #[serde(default = "default_endpoint_name_max_length")]
+    pub name_max_length: usize,
+    #[serde(default = "default_endpoint_external_url_max_length")]
+    pub external_url_max_length: usize,
+    #[serde(default = "default_endpoint_description_max_size")]
+    pub description_max_size: usize,
+    #[serde(default = "default_endpoint_task_queue_max_length")]
+    pub task_queue_max_length: usize,
+    #[serde(default = "default_endpoint_list_default_page_size")]
+    pub list_default_page_size: usize,
+    #[serde(default = "default_endpoint_list_max_page_size")]
+    pub list_max_page_size: usize,
+}
+
+impl Default for NexusEndpointLimitsConfig {
+    fn default() -> Self {
+        Self {
+            name_max_length: default_endpoint_name_max_length(),
+            external_url_max_length: default_endpoint_external_url_max_length(),
+            description_max_size: default_endpoint_description_max_size(),
+            task_queue_max_length: default_endpoint_task_queue_max_length(),
+            list_default_page_size: default_endpoint_list_default_page_size(),
+            list_max_page_size: default_endpoint_list_max_page_size(),
+        }
+    }
+}
+
+fn default_endpoint_name_max_length() -> usize {
+    200
+}
+fn default_endpoint_external_url_max_length() -> usize {
+    4 * 1024
+}
+fn default_endpoint_description_max_size() -> usize {
+    20_000
+}
+fn default_endpoint_task_queue_max_length() -> usize {
+    1000
+}
+fn default_endpoint_list_default_page_size() -> usize {
+    100
+}
+fn default_endpoint_list_max_page_size() -> usize {
+    1000
 }
 
 /// Operator overrides that intentionally diverge from the pinned Temporal
@@ -404,6 +464,7 @@ impl Default for PolicyConfig {
             namespace_creation: NamespaceCreationPolicy::Open,
             quotas: QuotasConfig::default(),
             compatibility: CompatibilityConfig::default(),
+            nexus_endpoint_limits: NexusEndpointLimitsConfig::default(),
         }
     }
 }
@@ -1283,6 +1344,7 @@ mod tests {
                         namespace_creation: NamespaceCreationPolicy::Open,
                         quotas: QuotasConfig::default(),
                         compatibility: CompatibilityConfig::default(),
+                        nexus_endpoint_limits: NexusEndpointLimitsConfig::default(),
                     },
                     capacity: CapacityConfig {
                         performance: PerformanceConfig {

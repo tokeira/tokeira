@@ -1,3 +1,22 @@
+//! The edge's authentication / authorization / observability seam.
+//!
+//! Every public RPC begins here: a domain-service method calls
+//! [`EdgeInterceptors::begin`] with the request headers, the target namespace (or
+//! `None` for cluster-global resources), the [`Action`] it intends, and whether it
+//! is a long poll. `begin` runs the configured interceptor chain (authn → authz),
+//! resolves the namespace, threads a request id, and returns an [`EdgeContext`] the
+//! handler holds for the duration of the call. A handler that does not call `begin`
+//! is unauthorized by construction — this is the single chokepoint, so the
+//! authorization decision is made once, consistently, for the *kind* of user intent
+//! rather than per low-level code path.
+//!
+//! [`Action`] names that intent at the API level (e.g. `StartWorkflowExecution`,
+//! `OperatorWrite`), deliberately decoupled from internal implementation detail so
+//! an authorizer reasons about what the caller is trying to do. The default
+//! interceptor is permissive (a deployment supplies a real authorizer); the
+//! load-bearing property is that the chain is *invoked*, so wiring a real policy
+//! gates every routed RPC without touching handlers.
+
 use std::sync::Arc;
 
 use async_trait::async_trait;

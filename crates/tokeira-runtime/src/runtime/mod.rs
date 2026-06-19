@@ -1157,9 +1157,9 @@ mod tests {
         drain::RuntimeDrainState,
         lane::DispatchPublisher,
         nexus::{
-            EndpointTarget, NexusEndpointConfig, NexusEndpointRegistry, NexusTaskBroker,
-            NexusTimeoutEntry, NexusTimeoutScannerConfig, NexusTimeoutTrackingState,
-            NoopNexusHttpClient, evaluate_nexus_timeout,
+            EndpointTarget, NexusEndpointRegistry, NexusTaskBroker, NexusTimeoutEntry,
+            NexusTimeoutScannerConfig, NexusTimeoutTrackingState, NoopNexusHttpClient,
+            evaluate_nexus_timeout,
         },
         publisher::RuntimeDispatchPublisher,
         retry::{RetryDecision, compute_retry_backoff, evaluate_activity_retry},
@@ -1171,7 +1171,6 @@ mod tests {
         },
         versioning::{RedirectRule, VersioningMutation},
     };
-    use std::collections::HashMap;
     use tokeira_kernel::{
         CallbackSpec, CallbackState, CallbackTrigger, CompletionCallback, Link, OnConflictOptions,
         RetryState,
@@ -1978,21 +1977,34 @@ mod tests {
 
     #[test]
     fn endpoint_registry_lookup_returns_registered_address() {
-        let registry = NexusEndpointRegistry::new(HashMap::from([(
-            "payments".to_string(),
-            NexusEndpointConfig {
-                target: EndpointTarget::External {
-                    address: "http://payments".to_string(),
+        use crate::nexus::{
+            InMemoryNexusEndpointStore, NexusEndpointSpec, NexusEndpointSpecTarget,
+            NexusEndpointStore,
+        };
+        // The registry now resolves against the live store; seed an endpoint through
+        // the store's create path (server-authored id/version) and resolve by name.
+        let store = std::sync::Arc::new(InMemoryNexusEndpointStore::new());
+        store
+            .create(
+                NexusEndpointSpec {
+                    name: "payments".to_string(),
+                    description: Vec::new(),
+                    target: NexusEndpointSpecTarget::External {
+                        url: "http://payments".to_string(),
+                    },
                 },
-            },
-        )]));
+                0,
+            )
+            .expect("create endpoint");
+        let registry = NexusEndpointRegistry::new(store);
         assert_eq!(
             registry
                 .resolve("payments")
                 .and_then(|config| match &config.target {
-                    EndpointTarget::External { address } => Some(address.as_str()),
+                    EndpointTarget::External { address } => Some(address.clone()),
                     EndpointTarget::Worker { .. } => None,
-                }),
+                })
+                .as_deref(),
             Some("http://payments")
         );
         assert!(registry.resolve("missing").is_none());

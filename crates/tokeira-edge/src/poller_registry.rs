@@ -1,3 +1,14 @@
+//! Per-task-queue active-poller bookkeeping.
+//!
+//! `DescribeTaskQueue` reports which workers are currently polling a queue. That is
+//! a transport-level observation — who holds a long poll open right now — not
+//! authoritative state, so it lives at the edge and is rebuilt from live
+//! connections rather than persisted. [`PollerRegistry::register`] records a poller
+//! keyed by queue and returns a [`PollerGuard`] whose `Drop` deregisters it, so the
+//! set tracks live polls without a separate reaper. It is intentionally ephemeral:
+//! losing it on restart costs only a momentarily empty `DescribeTaskQueue`, never
+//! correctness.
+
 use std::{
     collections::HashMap,
     sync::{

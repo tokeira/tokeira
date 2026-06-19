@@ -701,7 +701,7 @@ impl ActivityBridge {
     /// Request cancellation of an activity (Requirement 11.8), mirroring v1.31.0's
     /// `handleCancellationRequested` (`chasm/lib/activity/activity.go:395-440`):
     /// - already `CANCEL_REQUESTED`: a different `request_id` is `FailedPrecondition`
-    ///   ("cancellation already requested with request ID <id>"); the same id is an
+    ///   ("cancellation already requested with request ID `<id>`"); the same id is an
     ///   idempotent no-op.
     /// - otherwise mark cancel-requested (storing request_id/reason); and if the
     ///   activity was still `SCHEDULED` (no worker holds it), cancel it immediately
@@ -747,7 +747,7 @@ impl ActivityBridge {
     /// Terminate an activity (Requirement 11.8), mirroring v1.31.0's `Terminate`
     /// (`chasm/lib/activity/activity.go:359-381`): an already-`TERMINATED` activity
     /// with a different `request_id` is `FailedPrecondition` ("already terminated
-    /// with request ID <id>"); the same id is an idempotent no-op.
+    /// with request ID `<id>`"); the same id is an idempotent no-op.
     pub async fn terminate(
         &self,
         key: ExecutionKey,
@@ -1083,7 +1083,7 @@ impl ActivityBridge {
 
     /// Complete a standalone activity addressed by id (the `RespondActivityTask
     /// CompletedById` path). Synthesizes the by-id token and reuses the by-token
-    /// completion path; see [`by_id_token`](Self::by_id_token) for the v1.31.0
+    /// completion path; see `by_id_token` for the v1.31.0
     /// fidelity notes.
     pub async fn complete_by_id(
         &self,
@@ -1138,7 +1138,7 @@ impl ActivityBridge {
     /// Record a heartbeat for a standalone activity addressed by id (the
     /// `RecordActivityTaskHeartbeatById` path), returning `cancel_requested`.
     /// Synthesizes the by-id token and reuses the by-token heartbeat path; see
-    /// [`by_id_token`](Self::by_id_token) for the v1.31.0 fidelity notes.
+    /// `by_id_token` for the v1.31.0 fidelity notes.
     pub async fn heartbeat_by_id(
         &self,
         namespace_id: &str,

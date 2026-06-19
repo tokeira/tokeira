@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -14,8 +13,9 @@ use tokeira_kernel::{
     WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    ActivityTimeoutScannerConfig, BacklogConfig, EndpointTarget, LaneConfig, NexusEndpointConfig,
-    NexusEndpointRegistry, NexusHttpClient, NexusStartResult, NexusTaskRequest,
+    ActivityTimeoutScannerConfig, BacklogConfig, EndpointTarget, InMemoryNexusEndpointStore,
+    LaneConfig, NexusEndpointRegistry, NexusEndpointSpec, NexusEndpointSpecTarget,
+    NexusEndpointStore, NexusHttpClient, NexusStartResult, NexusTaskRequest,
     NexusTimeoutScannerConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
@@ -25,6 +25,40 @@ use tokeira_types::{
 };
 use tokio::runtime::Runtime;
 use uuid::Uuid;
+
+/// Build a store-backed [`NexusEndpointRegistry`] seeded with `(name, target)` pairs.
+/// Mirrors how the live endpoint admin populates the shared store, so dispatch tests
+/// resolve endpoints exactly as production does. The Worker target's namespace name
+/// is irrelevant to dispatch (only the id + task queue route), so it is left empty.
+fn seed_registry(endpoints: Vec<(&str, EndpointTarget)>) -> NexusEndpointRegistry {
+    let store = Arc::new(InMemoryNexusEndpointStore::new());
+    for (name, target) in endpoints {
+        let spec_target = match target {
+            EndpointTarget::External { address } => {
+                NexusEndpointSpecTarget::External { url: address }
+            }
+            EndpointTarget::Worker {
+                namespace_id,
+                task_queue,
+            } => NexusEndpointSpecTarget::Worker {
+                namespace_name: String::new(),
+                namespace_id: namespace_id.0.to_string(),
+                task_queue: task_queue.0,
+            },
+        };
+        store
+            .create(
+                NexusEndpointSpec {
+                    name: name.to_string(),
+                    description: Vec::new(),
+                    target: spec_target,
+                },
+                0,
+            )
+            .expect("seed nexus endpoint");
+    }
+    NexusEndpointRegistry::new(store)
+}
 
 #[derive(Clone)]
 struct MockNexusClient {
@@ -372,14 +406,12 @@ fn runtime_with_nexus(
     runtime_with_registry(
         store,
         client,
-        NexusEndpointRegistry::new(HashMap::from([(
-            "payments".to_string(),
-            NexusEndpointConfig {
-                target: EndpointTarget::External {
-                    address: "http://payments".to_string(),
-                },
+        seed_registry(vec![(
+            "payments",
+            EndpointTarget::External {
+                address: "http://payments".to_string(),
             },
-        )])),
+        )]),
     )
 }
 
@@ -410,15 +442,13 @@ async fn worker_targeted_nexus_schedule_publishes_to_broker() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
     let client = Arc::new(MockNexusClient::new(NexusStartResult::AsyncAccepted, true));
     let namespace_id = NamespaceId::new();
-    let registry = NexusEndpointRegistry::new(HashMap::from([(
-        "payments".to_string(),
-        NexusEndpointConfig {
-            target: EndpointTarget::Worker {
-                namespace_id,
-                task_queue: TaskQueueName("nexus-q".to_string()),
-            },
+    let registry = seed_registry(vec![(
+        "payments",
+        EndpointTarget::Worker {
+            namespace_id,
+            task_queue: TaskQueueName("nexus-q".to_string()),
         },
-    )]));
+    )]);
     let mut runtime = runtime_with_registry(store.clone(), client.clone(), registry);
     let workflow_id = WorkflowId("nexus-worker-schedule".to_string());
 
@@ -492,15 +522,13 @@ async fn worker_targeted_nexus_cancel_publishes_to_broker() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
     let client = Arc::new(MockNexusClient::new(NexusStartResult::AsyncAccepted, true));
     let namespace_id = NamespaceId::new();
-    let registry = NexusEndpointRegistry::new(HashMap::from([(
-        "payments".to_string(),
-        NexusEndpointConfig {
-            target: EndpointTarget::Worker {
-                namespace_id,
-                task_queue: TaskQueueName("nexus-q".to_string()),
-            },
+    let registry = seed_registry(vec![(
+        "payments",
+        EndpointTarget::Worker {
+            namespace_id,
+            task_queue: TaskQueueName("nexus-q".to_string()),
         },
-    )]));
+    )]);
     let mut runtime = runtime_with_registry(store.clone(), client.clone(), registry);
     let workflow_id = WorkflowId("nexus-worker-cancel".to_string());
 
@@ -646,15 +674,13 @@ proptest! {
             let store = Arc::new(InMemoryStore::default());
             let client = Arc::new(MockNexusClient::new(NexusStartResult::AsyncAccepted, true));
             let namespace_id = NamespaceId(Uuid::from_u128(namespace_seed));
-            let registry = NexusEndpointRegistry::new(HashMap::from([(
-                "payments".to_string(),
-                NexusEndpointConfig {
-                    target: EndpointTarget::Worker {
-                        namespace_id,
-                        task_queue: TaskQueueName("nexus-q".to_string()),
-                    },
+            let registry = seed_registry(vec![(
+                "payments",
+                EndpointTarget::Worker {
+                    namespace_id,
+                    task_queue: TaskQueueName("nexus-q".to_string()),
                 },
-            )]));
+            )]);
             let mut runtime = runtime_with_registry(store.clone(), client, registry);
             let workflow_id = WorkflowId(format!("wf-{operation_id}"));
             let input = Payloads(vec![Payload::new(input_bytes.clone())]);
@@ -906,15 +932,13 @@ async fn cross_namespace_async_nexus_completes_back_to_originator() -> Result<()
     );
 
     // Endpoint lives in `control` but targets a worker task queue in `agents`.
-    let registry = NexusEndpointRegistry::new(HashMap::from([(
-        "odori-agent".to_string(),
-        NexusEndpointConfig {
-            target: EndpointTarget::Worker {
-                namespace_id: ns_agents,
-                task_queue: TaskQueueName("odori-agent-nexus-q".to_string()),
-            },
+    let registry = seed_registry(vec![(
+        "odori-agent",
+        EndpointTarget::Worker {
+            namespace_id: ns_agents,
+            task_queue: TaskQueueName("odori-agent-nexus-q".to_string()),
         },
-    )]));
+    )]);
     let mut runtime = runtime_with_registry(store.clone(), client.clone(), registry);
 
     // Parent ("RunWorkflow") in the control namespace.

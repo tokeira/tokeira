@@ -28,6 +28,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tonic.workspace = true
 tracing = "0.1"
 tracing-opentelemetry.workspace = true
+url = "2"
 tokeira-build-info.workspace = true
 tokeira-compatibility.workspace = true
 uuid = { version = "1", features = ["v4", "serde"] }

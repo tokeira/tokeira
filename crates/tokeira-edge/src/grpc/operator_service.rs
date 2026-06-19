@@ -133,37 +133,62 @@ impl OperatorServiceGrpcApi for OperatorServiceGrpc {
 
     async fn get_nexus_endpoint(
         &self,
-        _request: Request<operatorservice::GetNexusEndpointRequest>,
+        request: Request<operatorservice::GetNexusEndpointRequest>,
     ) -> Result<Response<operatorservice::GetNexusEndpointResponse>, Status> {
-        Err(Status::unimplemented("get_nexus_endpoint"))
+        let headers = metadata_to_header_map(request.metadata());
+        let resp = self
+            .inner
+            .get_nexus_endpoint(&headers, request.into_inner())
+            .await?;
+        Ok(Response::new(resp))
     }
 
     async fn create_nexus_endpoint(
         &self,
-        _request: Request<operatorservice::CreateNexusEndpointRequest>,
+        request: Request<operatorservice::CreateNexusEndpointRequest>,
     ) -> Result<Response<operatorservice::CreateNexusEndpointResponse>, Status> {
-        Err(Status::unimplemented("create_nexus_endpoint"))
+        let headers = metadata_to_header_map(request.metadata());
+        let resp = self
+            .inner
+            .create_nexus_endpoint(&headers, request.into_inner())
+            .await?;
+        Ok(Response::new(resp))
     }
 
     async fn update_nexus_endpoint(
         &self,
-        _request: Request<operatorservice::UpdateNexusEndpointRequest>,
+        request: Request<operatorservice::UpdateNexusEndpointRequest>,
     ) -> Result<Response<operatorservice::UpdateNexusEndpointResponse>, Status> {
-        Err(Status::unimplemented("update_nexus_endpoint"))
+        let headers = metadata_to_header_map(request.metadata());
+        let resp = self
+            .inner
+            .update_nexus_endpoint(&headers, request.into_inner())
+            .await?;
+        Ok(Response::new(resp))
     }
 
     async fn delete_nexus_endpoint(
         &self,
-        _request: Request<operatorservice::DeleteNexusEndpointRequest>,
+        request: Request<operatorservice::DeleteNexusEndpointRequest>,
     ) -> Result<Response<operatorservice::DeleteNexusEndpointResponse>, Status> {
-        Err(Status::unimplemented("delete_nexus_endpoint"))
+        let headers = metadata_to_header_map(request.metadata());
+        let resp = self
+            .inner
+            .delete_nexus_endpoint(&headers, request.into_inner())
+            .await?;
+        Ok(Response::new(resp))
     }
 
     async fn list_nexus_endpoints(
         &self,
-        _request: Request<operatorservice::ListNexusEndpointsRequest>,
+        request: Request<operatorservice::ListNexusEndpointsRequest>,
     ) -> Result<Response<operatorservice::ListNexusEndpointsResponse>, Status> {
-        Err(Status::unimplemented("list_nexus_endpoints"))
+        let headers = metadata_to_header_map(request.metadata());
+        let resp = self
+            .inner
+            .list_nexus_endpoints(&headers, request.into_inner())
+            .await?;
+        Ok(Response::new(resp))
     }
 }
 

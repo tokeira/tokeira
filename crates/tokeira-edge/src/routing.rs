@@ -1,3 +1,16 @@
+//! Shard-ownership-aware request forwarding — a transport decision, not a
+//! correctness one.
+//!
+//! In a multi-node deployment a request can land on a node that does not own the
+//! target shard. [`EdgeRouter`] resolves whether the request is [`RouteTarget::Local`]
+//! or must be forwarded to the owning node ([`RouteTarget::Remote`]), using the
+//! controller-published placement snapshot (via [`CacheBackedRouter`] over
+//! [`RoutingCache`]). The critical invariant:
+//! "remote" means *forward the identical request elsewhere*, never *change how the
+//! workflow behaves* — shard ownership is authoritative below the edge, so the edge
+//! only chooses where to send the bytes. [`LocalOnlyRouter`] is the single-node
+//! default.
+
 use async_trait::async_trait;
 use tokeira_types::{
     IncarnationId, NodeEndpoint, QueuePartitionKey, TaskKind, TaskQueueName, WorkflowId,

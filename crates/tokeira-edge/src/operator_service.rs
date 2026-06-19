@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 use crate::{
     errors::{EdgeError, EdgeResult},
     interceptors::{Action, EdgeInterceptors},
+    nexus_endpoint::NexusEndpointAdmin,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +136,10 @@ impl OperatorApi for InMemoryOperatorApi {
 pub struct OperatorService {
     api: Arc<dyn OperatorApi>,
     interceptors: Arc<EdgeInterceptors>,
+    /// The Nexus endpoint admin, when standalone endpoint CRUD is wired. `None`
+    /// answers `UNIMPLEMENTED` (the pre-feature behaviour); `Some` serves the five
+    /// `*NexusEndpoint(s)` RPCs, each gated through the operator interceptor below.
+    nexus_endpoints: Option<Arc<NexusEndpointAdmin>>,
 }
 
 impl std::fmt::Debug for OperatorService {
@@ -145,7 +150,25 @@ impl std::fmt::Debug for OperatorService {
 
 impl OperatorService {
     pub fn new(api: Arc<dyn OperatorApi>, interceptors: Arc<EdgeInterceptors>) -> Self {
-        Self { api, interceptors }
+        Self {
+            api,
+            interceptors,
+            nexus_endpoints: None,
+        }
+    }
+
+    /// Attach the Nexus endpoint admin, enabling the `*NexusEndpoint(s)` RPCs.
+    pub fn with_nexus_endpoints(mut self, admin: Arc<NexusEndpointAdmin>) -> Self {
+        self.nexus_endpoints = Some(admin);
+        self
+    }
+
+    /// The admin, or the `UNIMPLEMENTED` error when endpoint CRUD is not wired. The
+    /// message matches the historical stub so the unconfigured surface is unchanged.
+    fn nexus_admin(&self, op: &str) -> EdgeResult<&Arc<NexusEndpointAdmin>> {
+        self.nexus_endpoints
+            .as_ref()
+            .ok_or_else(|| EdgeError::Unimplemented(op.to_owned()))
     }
 
     pub async fn cluster_info(&self, headers: &HeaderMap) -> EdgeResult<ClusterInfo> {
@@ -205,5 +228,71 @@ impl OperatorService {
             .remove_search_attribute(namespace, attr_name)
             .await
             .map_err(EdgeError::from)
+    }
+
+    // === Nexus endpoint admin (global resources; authz-gated like every other
+    // operator RPC). Create/Update/Delete require `OperatorWrite`; Get/List require
+    // `OperatorRead`. `namespace = None` because endpoints are cluster-global. Each
+    // first passes the operator interceptor, then delegates to the admin — closing
+    // the gap where the bare gRPC stubs bypassed authorization entirely. ===
+
+    pub async fn create_nexus_endpoint(
+        &self,
+        headers: &HeaderMap,
+        req: tokeira_proto::operatorservice::CreateNexusEndpointRequest,
+    ) -> EdgeResult<tokeira_proto::operatorservice::CreateNexusEndpointResponse> {
+        let _ctx = self
+            .interceptors
+            .begin(headers, None, Action::OperatorWrite, false)
+            .await?;
+        self.nexus_admin("create_nexus_endpoint")?.create(req).await
+    }
+
+    pub async fn get_nexus_endpoint(
+        &self,
+        headers: &HeaderMap,
+        req: tokeira_proto::operatorservice::GetNexusEndpointRequest,
+    ) -> EdgeResult<tokeira_proto::operatorservice::GetNexusEndpointResponse> {
+        let _ctx = self
+            .interceptors
+            .begin(headers, None, Action::OperatorRead, false)
+            .await?;
+        self.nexus_admin("get_nexus_endpoint")?.get(req).await
+    }
+
+    pub async fn update_nexus_endpoint(
+        &self,
+        headers: &HeaderMap,
+        req: tokeira_proto::operatorservice::UpdateNexusEndpointRequest,
+    ) -> EdgeResult<tokeira_proto::operatorservice::UpdateNexusEndpointResponse> {
+        let _ctx = self
+            .interceptors
+            .begin(headers, None, Action::OperatorWrite, false)
+            .await?;
+        self.nexus_admin("update_nexus_endpoint")?.update(req).await
+    }
+
+    pub async fn delete_nexus_endpoint(
+        &self,
+        headers: &HeaderMap,
+        req: tokeira_proto::operatorservice::DeleteNexusEndpointRequest,
+    ) -> EdgeResult<tokeira_proto::operatorservice::DeleteNexusEndpointResponse> {
+        let _ctx = self
+            .interceptors
+            .begin(headers, None, Action::OperatorWrite, false)
+            .await?;
+        self.nexus_admin("delete_nexus_endpoint")?.delete(req).await
+    }
+
+    pub async fn list_nexus_endpoints(
+        &self,
+        headers: &HeaderMap,
+        req: tokeira_proto::operatorservice::ListNexusEndpointsRequest,
+    ) -> EdgeResult<tokeira_proto::operatorservice::ListNexusEndpointsResponse> {
+        let _ctx = self
+            .interceptors
+            .begin(headers, None, Action::OperatorRead, false)
+            .await?;
+        self.nexus_admin("list_nexus_endpoints")?.list(req).await
     }
 }

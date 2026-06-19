@@ -1,3 +1,13 @@
+//! The Temporal-style HTTP API surface: transport plumbing only.
+//!
+//! Temporal exposes its gRPC services over HTTP at `/api/v1/{service}/{method}`.
+//! This module parses that path into a structured [`ProxyRoute`] and shapes
+//! transport-level responses. What it deliberately does **not** do is understand
+//! workflow semantics or decode request bodies into domain types — that belongs to
+//! the domain services above it. Keeping the proxy this thin is what lets the HTTP
+//! and gRPC fronts share one logic path: both decode to the same edge inputs and
+//! converge on the same [`EdgeError`] → status mapping.
+
 use http::{Response, StatusCode};
 
 use crate::errors::{EdgeError, EdgeResult};

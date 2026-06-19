@@ -1515,7 +1515,7 @@ pub fn is_worker_deployment_entity_workflow_id(workflow_id: &str) -> bool {
 /// `(deployment_name, build_id)`, or `None` if the id is not a version entity
 /// workflow. The suffix after the prefix is `<name>:<build_id>` (the `:`
 /// `WorkerDeploymentVersionDelimiter`); deployment names cannot contain ':'
-/// (enforced by [`validate_deployment_name`]), so the first ':' splits the parts.
+/// (enforced by `validate_deployment_name`), so the first ':' splits the parts.
 pub fn parse_worker_deployment_version_workflow_id(workflow_id: &str) -> Option<(String, String)> {
     let rest = workflow_id.strip_prefix(WORKER_DEPLOYMENT_VERSION_WORKFLOW_ID_PREFIX)?;
     let (deployment_name, build_id) = rest.split_once(':')?;

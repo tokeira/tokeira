@@ -1,3 +1,13 @@
+//! Request-id extraction and generation.
+//!
+//! A stable request id ties together ingress logs, downstream runtime logs, and the
+//! client's own logs across a distributed call. The edge preserves a caller-supplied
+//! [`REQUEST_ID_HEADER`] when present and mints a fresh one otherwise
+//! ([`extract_or_generate`]), so correlation survives whether or not the client set
+//! it. Generation is behind the small [`RequestIdGenerator`] trait because it can be
+//! security-sensitive or trace-propagation-tied in some deployments; the edge itself
+//! only needs "give me a fresh id".
+
 use http::HeaderMap;
 use uuid::Uuid;
 

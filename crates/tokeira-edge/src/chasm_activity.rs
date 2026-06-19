@@ -117,7 +117,7 @@ pub struct StartActivityOutcome {
 
 /// A read view of an activity execution (the source for `Describe`/`Poll`
 /// responses).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ActivityDescription {
     /// Current status.
     pub status: ActivityStatus,
@@ -133,6 +133,10 @@ pub struct ActivityDescription {
     pub result: Vec<u8>,
     /// Failure message (set on a terminal failure).
     pub failure: String,
+    /// Full encoded `Failure` proto recorded on a worker failure (empty unless the
+    /// activity failed with a structured failure) — the source for the describe
+    /// outcome's `failure`.
+    pub failure_payload: Vec<u8>,
     /// Schedule-to-close timeout in nanoseconds (`0` = unset).
     pub schedule_to_close_nanos: i64,
     /// Schedule-to-start timeout in nanoseconds (`0` = unset).
@@ -698,10 +702,23 @@ impl ActivityBridge {
             .await
     }
 
-    /// Worker-facing: record a terminal failure.
-    pub async fn record_failed(&self, key: ExecutionKey, failure: String) -> EdgeResult<()> {
-        self.apply_event(key, ActivityEvent::Failed { failure })
-            .await
+    /// Worker-facing: record a terminal failure. `failure` is the message (for
+    /// `info.last_failure` and the quick outcome message); `failure_payload` is the
+    /// full encoded `Failure` proto so the describe outcome round-trips it exactly.
+    pub async fn record_failed(
+        &self,
+        key: ExecutionKey,
+        failure: String,
+        failure_payload: Vec<u8>,
+    ) -> EdgeResult<()> {
+        self.apply_event(
+            key,
+            ActivityEvent::Failed {
+                failure,
+                failure_payload,
+            },
+        )
+        .await
     }
 
     /// Worker poll: hand the next dispatched attempt on `task_queue` to a worker,
@@ -778,17 +795,21 @@ impl ActivityBridge {
         self.record_completed(token.execution_key(), result).await
     }
 
-    /// Worker-facing: fail the activity attempt named by `task_token`.
+    /// Worker-facing: fail the activity attempt named by `task_token`. `failure` is
+    /// the message; `failure_payload` is the full encoded `Failure` proto (so the
+    /// describe outcome round-trips the structured failure, not just the message).
     pub async fn respond_activity_task_failed(
         &self,
         task_token: &[u8],
         request_namespace_id: &str,
         failure: String,
+        failure_payload: Vec<u8>,
     ) -> EdgeResult<()> {
         self.ensure_enabled()?;
         let token = ActivityTaskToken::decode(task_token)?;
         self.validate_token(&token, request_namespace_id).await?;
-        self.record_failed(token.execution_key(), failure).await
+        self.record_failed(token.execution_key(), failure, failure_payload)
+            .await
     }
 
     /// Worker-facing: acknowledge cancellation of the activity attempt named by
@@ -913,6 +934,7 @@ fn description_from(
         input: state.input,
         result: state.result,
         failure: state.failure,
+        failure_payload: state.failure_payload,
         schedule_to_close_nanos: state.schedule_to_close_nanos,
         schedule_to_start_nanos: state.schedule_to_start_nanos,
         start_to_close_nanos: state.start_to_close_nanos,

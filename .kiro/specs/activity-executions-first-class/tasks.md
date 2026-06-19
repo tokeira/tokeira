@@ -114,15 +114,18 @@ may proceed in any order once Stage 1 lands. Stage 5 depends on all.
 
 ## Stage 4 — Describe proto fidelity + long-poll + count (Requirements 5, 6, 7)
 
-- [ ] 4.1 Reconcile the `DescribeActivityExecution` response encoding (retry policy / payload)
+- [x] 4.1 Reconcile the `DescribeActivityExecution` response encoding (retry policy / payload)
   with v1.31.0; verify `TestDescribeActivityExecution_Completed`. **NB the test asserts the full
   `info` projection, not only retry-policy/payload** (the proto-diff stops at the first mismatch).
-  **Info-field fidelity DONE (step A):** the Start request's `header`, `retry_policy`, `priority`,
-  `search_attributes`, and `user_metadata` are now stored opaque on `ActivityState` (tags 19–23) and
-  echoed verbatim on `ActivityExecutionInfo`, plus `info.close_time`. Remaining (step B): structured
-  **outcome** fidelity — a Failed activity must round-trip the full `Failure` proto (the corpus
-  `defaultFailure` carries `ApplicationFailureInfo`), and Terminated/Canceled must carry
-  `TerminatedFailureInfo`/`CanceledFailureInfo`; today only a failure *message* is stored.
+  **DONE in two steps.** (A) Info-field fidelity: the Start request's `header`, `retry_policy`,
+  `priority`, `search_attributes`, and `user_metadata` are stored opaque on `ActivityState`
+  (tags 19–23) and echoed verbatim on `ActivityExecutionInfo`, plus `info.close_time`. (B) Outcome
+  fidelity: a Failed activity round-trips the full `Failure` proto (stored as `failure_payload`,
+  tag 24, from `RespondActivityTaskFailed`), Terminated carries `TerminatedFailureInfo` and Canceled
+  `CanceledFailureInfo` (`TransitionTerminated`/`TransitionCanceled @ v1.31.0`); `info.last_failure`
+  uses the same structured failure. Covered by `start_carries_describe_echo_fields`,
+  `chasm_activity_outcome_terminated_carries_terminated_failure_info`,
+  `chasm_activity_outcome_failed_round_trips_structured_failure`.
 - [x] 4.2 Honour the caller deadline in the describe long-poll; verify
   `TestDescribeActivityExecution_DeadlineExceeded`. **DONE** (`59546975`): `describe_long_poll_budget`
   waits `Min(caller_deadline − long_poll_buffer, long_poll_timeout)` (`parse_grpc_timeout` reads the

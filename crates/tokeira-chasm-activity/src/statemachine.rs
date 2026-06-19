@@ -77,8 +77,13 @@ pub enum ActivityEvent {
     },
     /// The activity failed terminally.
     Failed {
-        /// Failure message.
+        /// Failure message (surfaced as `info.last_failure.message` and the quick
+        /// outcome message).
         failure: String,
+        /// The full encoded `Failure` proto the worker reported, persisted so the
+        /// describe outcome round-trips it exactly (empty when the caller has only a
+        /// message).
+        failure_payload: Vec<u8>,
     },
     /// A cancel was requested.
     CancelRequested {
@@ -223,8 +228,12 @@ pub fn apply(
         ActivityEvent::Completed { result } => {
             state.result = result.clone();
         }
-        ActivityEvent::Failed { failure } => {
+        ActivityEvent::Failed {
+            failure,
+            failure_payload,
+        } => {
             state.failure = failure.clone();
+            state.failure_payload = failure_payload.clone();
         }
         ActivityEvent::CancelRequested { .. } => {}
         ActivityEvent::Canceled => {

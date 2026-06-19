@@ -170,6 +170,15 @@ pub struct ActivityState {
     /// `info.user_metadata`. Empty when unset.
     #[prost(bytes = "vec", tag = "23")]
     pub user_metadata: Vec<u8>,
+    /// Encoded `temporal.api.failure.v1.Failure` recorded on a worker
+    /// `RespondActivityTaskFailed` — the full structured failure (e.g. carrying
+    /// `ApplicationFailureInfo`), stored so `DescribeActivityExecution.outcome`
+    /// round-trips it exactly rather than only the `failure` message (Req 5;
+    /// `standalone_activity_test.go:3047` asserts `ProtoEqual` on the failure).
+    /// Empty for non-failure terminals (Terminated/Canceled build their failure from
+    /// the reason at the edge).
+    #[prost(bytes = "vec", tag = "24")]
+    pub failure_payload: Vec<u8>,
 }
 
 // `status()` and `set_status()` accessors for the `status` enumeration field are

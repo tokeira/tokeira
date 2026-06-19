@@ -335,27 +335,79 @@ fn decode_echo<T: prost::Message + Default>(bytes: &[u8]) -> Option<T> {
 }
 
 /// The terminal outcome (`ActivityExecutionOutcome`) for a closed activity, or
-/// `None` while it is still running. A completed activity carries its result
-/// `Payloads`; any other terminal carries a failure with the recorded message.
+/// `None` while it is still running. Mirrors the v1.31.0 outcomes
+/// (`chasm/lib/activity/statemachine.go @ v1.31.0`):
+/// - `Completed` → the result `Payloads`.
+/// - `Failed` → the worker's full `Failure` (round-tripped from the stored payload;
+///   falls back to a message-only failure if none was captured).
+/// - `Terminated` → a `Failure` carrying `TerminatedFailureInfo` (`TransitionTerminated`).
+/// - `Canceled` → a `Failure` carrying `CanceledFailureInfo` (`TransitionCanceled`).
+/// - `TimedOut` → a message-only `Failure` (timeout-info fidelity is owned by
+///   `runtime-activity-timeouts`).
 fn chasm_activity_outcome(
     description: &crate::chasm_activity::ActivityDescription,
 ) -> Option<activity_v1::ActivityExecutionOutcome> {
     use activity_v1::activity_execution_outcome::Value;
+    use tokeira_proto::failure::{
+        CanceledFailureInfo, Failure, TerminatedFailureInfo, failure::FailureInfo,
+    };
     let value = match description.status {
         ActivityStatus::Completed => Value::Result(
             tokeira_proto::common::Payloads::decode(description.result.as_slice())
                 .unwrap_or_default(),
         ),
-        ActivityStatus::Failed
-        | ActivityStatus::Canceled
-        | ActivityStatus::Terminated
-        | ActivityStatus::TimedOut => Value::Failure(tokeira_proto::failure::Failure {
+        // The worker reported a structured Failure; round-trip it verbatim. An empty
+        // or corrupt payload degrades to a message-only failure.
+        ActivityStatus::Failed => {
+            let failure = (!description.failure_payload.is_empty())
+                .then(|| Failure::decode(description.failure_payload.as_slice()).ok())
+                .flatten()
+                .unwrap_or_else(|| Failure {
+                    message: description.failure.clone(),
+                    ..Default::default()
+                });
+            Value::Failure(failure)
+        }
+        ActivityStatus::Terminated => Value::Failure(Failure {
+            message: description.failure.clone(),
+            failure_info: Some(FailureInfo::TerminatedFailureInfo(
+                TerminatedFailureInfo::default(),
+            )),
+            ..Default::default()
+        }),
+        ActivityStatus::Canceled => Value::Failure(Failure {
+            message: description.failure.clone(),
+            failure_info: Some(FailureInfo::CanceledFailureInfo(
+                CanceledFailureInfo::default(),
+            )),
+            ..Default::default()
+        }),
+        ActivityStatus::TimedOut => Value::Failure(Failure {
             message: description.failure.clone(),
             ..Default::default()
         }),
         _ => return None,
     };
     Some(activity_v1::ActivityExecutionOutcome { value: Some(value) })
+}
+
+/// The `info.last_failure` for a closed-with-failure activity: the worker's full
+/// `Failure` when one was captured, else a message-only failure, else `None` for an
+/// activity that has not recorded a failure. Keeps `last_failure` consistent with
+/// the outcome's failure (Req 5).
+fn chasm_last_failure(
+    description: &crate::chasm_activity::ActivityDescription,
+) -> Option<tokeira_proto::failure::Failure> {
+    if !description.failure_payload.is_empty()
+        && let Ok(failure) =
+            tokeira_proto::failure::Failure::decode(description.failure_payload.as_slice())
+    {
+        return Some(failure);
+    }
+    (!description.failure.is_empty()).then(|| tokeira_proto::failure::Failure {
+        message: description.failure.clone(),
+        ..Default::default()
+    })
 }
 
 /// Build the `ActivityExecutionInfo` projection of an activity description.
@@ -381,10 +433,7 @@ fn chasm_activity_info(
         schedule_time: nanos_to_proto_timestamp(description.scheduled_time_nanos),
         last_started_time: nanos_to_proto_timestamp(description.started_time_nanos),
         close_time: nanos_to_proto_timestamp(description.close_time_nanos),
-        last_failure: (!description.failure.is_empty()).then(|| tokeira_proto::failure::Failure {
-            message: description.failure.clone(),
-            ..Default::default()
-        }),
+        last_failure: chasm_last_failure(description),
         state_transition_count: description.execution_vt.transition_count,
         last_worker_identity: description.worker_identity.clone(),
         // Describe-echo fields stored opaque at Start and returned verbatim (Req 5).
@@ -822,8 +871,20 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 .as_ref()
                 .map(|f| f.message.clone())
                 .unwrap_or_default();
+            // Carry the full structured Failure (e.g. ApplicationFailureInfo) so the
+            // describe outcome round-trips it, not just the message (Req 5).
+            let failure_payload = req
+                .failure
+                .as_ref()
+                .map(|f| f.encode_to_vec())
+                .unwrap_or_default();
             bridge
-                .respond_activity_task_failed(&req.task_token, &namespace_id.0.to_string(), failure)
+                .respond_activity_task_failed(
+                    &req.task_token,
+                    &namespace_id.0.to_string(),
+                    failure,
+                    failure_payload,
+                )
                 .await?;
             return Ok(Response::new(translate::respond_activity_failed_to_proto()));
         }
@@ -2729,6 +2790,62 @@ mod tests {
         RunKey, SearchAttributes, ShardEpoch, TaskKind, TaskQueueName, WorkerIdentity,
         WorkerInstanceKey, WorkflowId, WorkflowType,
     };
+
+    #[test]
+    fn chasm_activity_outcome_terminated_carries_terminated_failure_info() {
+        // TransitionTerminated yields a Failure with TerminatedFailureInfo
+        // (statemachine.go:307 @ v1.31.0); the describe outcome must carry non-nil
+        // TerminatedFailureInfo (standalone_activity_test.go:3064).
+        use tokeira_proto::failure::failure::FailureInfo;
+        let description = crate::chasm_activity::ActivityDescription {
+            status: ActivityStatus::Terminated,
+            failure: "test termination".to_owned(),
+            ..Default::default()
+        };
+        let outcome = chasm_activity_outcome(&description).expect("terminal outcome");
+        match outcome.value {
+            Some(activity_v1::activity_execution_outcome::Value::Failure(failure)) => {
+                assert_eq!(failure.message, "test termination");
+                assert!(matches!(
+                    failure.failure_info,
+                    Some(FailureInfo::TerminatedFailureInfo(_))
+                ));
+            }
+            other => panic!("expected failure outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chasm_activity_outcome_failed_round_trips_structured_failure() {
+        // A worker's full Failure (here ApplicationFailureInfo) round-trips through
+        // the stored failure_payload to the describe outcome, not just the message
+        // (standalone_activity_test.go:3047 asserts ProtoEqual on the failure).
+        use tokeira_proto::failure::{ApplicationFailureInfo, Failure, failure::FailureInfo};
+        let original = Failure {
+            message: "Failed Activity".to_owned(),
+            failure_info: Some(FailureInfo::ApplicationFailureInfo(
+                ApplicationFailureInfo {
+                    r#type: "Test".to_owned(),
+                    non_retryable: true,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let description = crate::chasm_activity::ActivityDescription {
+            status: ActivityStatus::Failed,
+            failure: original.message.clone(),
+            failure_payload: original.encode_to_vec(),
+            ..Default::default()
+        };
+        let outcome = chasm_activity_outcome(&description).expect("terminal outcome");
+        match outcome.value {
+            Some(activity_v1::activity_execution_outcome::Value::Failure(failure)) => {
+                assert_eq!(failure, original);
+            }
+            other => panic!("expected failure outcome, got {other:?}"),
+        }
+    }
 
     struct PollNoneRuntime;
 

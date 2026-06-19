@@ -89,10 +89,32 @@ may proceed in any order once Stage 1 lands. Stage 5 depends on all.
 
 ## Stage 3 — Task-token validation on responses (Requirement 4)
 
-- [ ] 3.1 On `RespondActivityTaskCompleted`/`Failed`/`Canceled`, validate the decoded token
+- [x] 3.1 On `RespondActivityTaskCompleted`/`Failed`/`Canceled`, validate the decoded token
   (stale attempt stamp, mismatched component ref, namespace mismatch) → v1.31.0 status.
+  **DONE** (validation logic): the shared `validate_token` rejects a token whose namespace differs
+  from the request (`InvalidArgument "Operation requested with a token from a different namespace."`,
+  the namespace-validator interceptor's `errTaskTokenNamespaceMismatch @ v1.31.0`) and a token naming
+  a superseded attempt / terminal / missing run (`NotFound "activity not found for ID: <id>"`, the
+  chasm engine's `convertNotFoundError` rewrap of `validateActivityTaskToken`'s `NewNotFound @
+  v1.31.0`). The **canceled** respond path is now routed through the bridge with the same validation
+  (CANCEL_REQUESTED → CANCELED, `TransitionCanceled @ v1.31.0`); completed/failed were already routed.
+  Covered by `worker_respond_canceled_acknowledges_cancel_request`,
+  `worker_respond_canceled_with_stale_token_is_rejected`,
+  `worker_respond_token_from_other_namespace_is_rejected` (+ existing
+  `worker_respond_after_terminal_is_rejected`).
+  **CAVEAT — `MismatchedTokenComponentRef` is token-wire-format-bound, not validation-bound.** That
+  sub-test client-side `tasktoken.NewSerializer().Deserialize(pollResp.TaskToken)`s the issued token,
+  swaps its `ComponentRef`, and re-`Serialize`s it (`standalone_activity_test.go:734 @ v1.31.0`),
+  expecting `InvalidArgument "token does not match namespace"` (`activity.go:804 @ v1.31.0`). tokeira
+  issues an opaque JSON `ActivityTaskToken` (the design treats the encoding as internal/ours), so the
+  client deserialize fails before the respond call — this needs a Temporal-wire-compatible
+  `tokenspb.Task` token, tracked as a separate token-format-fidelity item (FINDINGS C1). The
+  single-field tokeira token also cannot represent "token namespace matches but component-ref
+  namespace doesn't", so this distinct second `InvalidArgument` is deferred with it.
 - [ ] 3.2 Verify: `TestComplete/StaleToken`, `StaleAttemptToken`, `MismatchedTokenComponentRef`,
-  `MismatchedTokenNamespace`.
+  `MismatchedTokenNamespace` (and the matching `TestFail`/`TestCancel` token sub-tests). Expect
+  StaleToken/StaleAttemptToken/MismatchedTokenNamespace green; `MismatchedTokenComponentRef` blocked
+  on the token-wire-format item above.
 
 ## Stage 4 — Describe proto fidelity + long-poll + count (Requirements 5, 6, 7)
 

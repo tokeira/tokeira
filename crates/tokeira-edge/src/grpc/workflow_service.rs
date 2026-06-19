@@ -1070,8 +1070,23 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         request: Request<workflowservice::RespondActivityTaskCanceledRequest>,
     ) -> Result<Response<workflowservice::RespondActivityTaskCanceledResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
-        let edge_req = translate::respond_activity_canceled_to_edge(request.into_inner())
-            .map_err(proto_conversion_status)?;
+        let req = request.into_inner();
+        // Standalone-activity token: route to the CHASM bridge for token validation
+        // and the CANCEL_REQUESTED → CANCELED transition; a workflow-activity token
+        // falls through unchanged (the two share this RPC).
+        if let Some(bridge) = &self.chasm_activity
+            && bridge.owns_task_token(&req.task_token)
+        {
+            let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+            bridge
+                .respond_activity_task_canceled(&req.task_token, &namespace_id.0.to_string())
+                .await?;
+            return Ok(Response::new(
+                translate::respond_activity_canceled_to_proto(),
+            ));
+        }
+        let edge_req =
+            translate::respond_activity_canceled_to_edge(req).map_err(proto_conversion_status)?;
         let _edge_resp = self
             .inner
             .respond_activity_task_canceled(&headers, edge_req)

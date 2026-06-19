@@ -25,7 +25,7 @@ v1.31.0 source.
 
 | Cluster | Area | Status | Measured | Next action |
 |---|---|:--:|:--:|---|
-| C1 | Standalone / first-class activity RPCs | 🟡 | 42/129 | reuse/conflict (1.3), describe proto fidelity (4.1), count-by-id (4.3); cross-spec blockers: retry re-dispatch / heartbeat / timeouts (~20, `runtime-activity-*`) |
+| C1 | Standalone / first-class activity RPCs | 🟡 | 42/129 | describe proto fidelity (4.1), count-by-id (4.3); cross-spec blockers: retry re-dispatch / heartbeat / timeouts (~20, `runtime-activity-*`) |
 | C3 | Visibility list/query + search attributes | 🟡 | — | run `TestAdvancedVisibilitySuite`/`…Legacy` (query surface) |
 | C2 | Worker deployment / versioning | 🟡 | 19/19 (1 suite) | triage `TestVersioningFunctionalSuite` (+3 suites) |
 | C4a | Nexus endpoint **admin CRUD** RPCs | ⬜ | 0/~17 | `api-conformance-nexus-admin` (spec ground-truthed 2026-06-18); clears `TestNexusEndpointsFunctionalSuite` (15) + `TestNexusAPIValidationTestSuite` (2). Prereq: runtime `NexusEndpointRegistry` is static — make it live/store-backed (task 4.2) |
@@ -41,11 +41,14 @@ v1.31.0 source.
 **42/129 leaf pass**. Landed and **committed (`59546975`, pushed to `main`)**: Stage 4.2 describe
 long-poll deadline (+ unblocked the suite panic), request-field validation on cancel/terminate
 (request_id/identity length, +4), and respond-token validation (StaleToken + MismatchedTokenNamespace
-on Complete/Fail, +4). Next in-scope: 1.3 reuse/conflict
-enforcement, 4.1 describe proto fidelity, 4.3 count-by-id. Blocked cross-spec (~20): retry re-dispatch
-(`StaleAttemptToken`, retry/timeout suites) and heartbeat → `runtime-activity-pump` /
-`runtime-activity-timeouts`. Deferred: `MismatchedTokenComponentRef` needs SA tokens in Temporal's
-`tasktoken` proto format. NB: restart `tokeirad` between full measures — in-memory state accumulates
+on Complete/Fail, +4). Since then (committed): 1.3 reuse/conflict enforcement (`ea0a7051`,
+`5b5a7a39`, `2362d7db` — incl. the typed `ActivityExecutionAlreadyStarted`) and 3.1 respond-token
+validation extended to the **canceled** path (StaleToken + MismatchedTokenNamespace now cover all
+three respond verbs). Next in-scope: 4.1 describe proto fidelity, 4.3 count-by-id. Blocked cross-spec
+(~20): retry re-dispatch (`StaleAttemptToken`, retry/timeout suites) and heartbeat →
+`runtime-activity-pump` / `runtime-activity-timeouts`. Deferred: `MismatchedTokenComponentRef` needs
+SA tokens in Temporal's `tasktoken` proto format (the test client-side deserializes + re-serializes
+the issued token). NB: restart `tokeirad` between full measures — in-memory state accumulates
 and reused activity IDs perturb counts.
 
 ---

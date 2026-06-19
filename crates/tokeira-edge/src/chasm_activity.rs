@@ -643,8 +643,29 @@ impl ActivityBridge {
         self.record_failed(token.execution_key(), failure).await
     }
 
-    /// Validate a worker response token before applying it (token validation,
-    /// `chasm/lib/activity @ v1.31.0`):
+    /// Worker-facing: acknowledge cancellation of the activity attempt named by
+    /// `task_token`. Like completed/failed, the worker echoes the dispatch token;
+    /// it is validated before the terminal transition (`HandleCanceled` validates
+    /// the same token and applies `TransitionCanceled`, `chasm/lib/activity/
+    /// activity.go:330 @ v1.31.0`). The transition is legal only from
+    /// `CANCEL_REQUESTED` (`statemachine.go:307 @ v1.31.0`); a token naming any
+    /// other live state surfaces the engine's illegal-transition error, and a stale
+    /// or cross-namespace token is rejected by `validate_token` first.
+    pub async fn respond_activity_task_canceled(
+        &self,
+        task_token: &[u8],
+        request_namespace_id: &str,
+    ) -> EdgeResult<()> {
+        self.ensure_enabled()?;
+        let token = ActivityTaskToken::decode(task_token)?;
+        self.validate_token(&token, request_namespace_id).await?;
+        self.apply_event(token.execution_key(), ActivityEvent::Canceled)
+            .await
+    }
+
+    /// Validate a worker response token before applying it — shared by
+    /// `RespondActivityTaskCompleted`/`Failed`/`Canceled` (token validation,
+    /// `validateActivityTaskToken`, `chasm/lib/activity/activity.go:782 @ v1.31.0`):
     ///
     /// - a token whose namespace differs from the request's is rejected
     ///   `InvalidArgument` ("Operation requested with a token from a different
@@ -1229,5 +1250,95 @@ mod tests {
                 .expect("poll")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn worker_respond_canceled_acknowledges_cancel_request() {
+        // RespondActivityTaskCanceled drives CANCEL_REQUESTED → CANCELED
+        // (`TransitionCanceled`, legal only from CANCEL_REQUESTED, `statemachine.go:307
+        // @ v1.31.0`): poll to Started, request cancel, then the worker acknowledges.
+        let bridge = worker_bridge();
+        let req = start_request();
+        let key = key_of(&req);
+        let task_queue = req.task_queue.clone();
+        bridge.start(req).await.expect("start");
+
+        let task = bridge
+            .poll_activity_task(&task_queue, "worker-1")
+            .await
+            .expect("poll")
+            .expect("a queued task");
+        bridge
+            .request_cancel(key.clone(), "operator".to_owned())
+            .await
+            .expect("request cancel");
+
+        bridge
+            .respond_activity_task_canceled(&task.task_token, &key.namespace_id)
+            .await
+            .expect("canceled");
+        assert_eq!(
+            bridge.describe(key).await.unwrap().status,
+            ActivityStatus::Canceled
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_respond_canceled_with_stale_token_is_rejected() {
+        // The cancel respond path shares `validate_token`: a token for an attempt
+        // that already resolved (here, completed) is NotFound — the attempt the
+        // token named no longer exists (`TestCancel/StaleToken @ v1.31.0`).
+        let bridge = worker_bridge();
+        let req = start_request();
+        let key = key_of(&req);
+        let task_queue = req.task_queue.clone();
+        bridge.start(req).await.expect("start");
+
+        let task = bridge
+            .poll_activity_task(&task_queue, "worker-1")
+            .await
+            .expect("poll")
+            .expect("a queued task");
+        bridge
+            .respond_activity_task_completed(&task.task_token, &key.namespace_id, vec![1])
+            .await
+            .expect("complete");
+
+        let err = bridge
+            .respond_activity_task_canceled(&task.task_token, &key.namespace_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EdgeError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn worker_respond_token_from_other_namespace_is_rejected() {
+        // A token whose namespace differs from the request's is rejected before any
+        // state change, mirroring the namespace-validator interceptor's
+        // `errTaskTokenNamespaceMismatch` (`MismatchedTokenNamespace @ v1.31.0`).
+        let bridge = worker_bridge();
+        let req = start_request();
+        let task_queue = req.task_queue.clone();
+        bridge.start(req).await.expect("start");
+
+        let task = bridge
+            .poll_activity_task(&task_queue, "worker-1")
+            .await
+            .expect("poll")
+            .expect("a queued task");
+
+        let err = bridge
+            .respond_activity_task_completed(&task.task_token, "some-other-namespace", vec![1])
+            .await
+            .unwrap_err();
+        match err {
+            EdgeError::BadRequest(message) => {
+                assert_eq!(
+                    message,
+                    "Operation requested with a token from a different namespace."
+                );
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
     }
 }

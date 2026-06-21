@@ -210,8 +210,16 @@ pub fn proto_start_response_to_resolution(
 ) -> Result<NexusResolution, NexusTranslateError> {
     match response.variant {
         Some(nexus_v1::start_operation_response::Variant::SyncSuccess(sync)) => {
+            // Worker-handler (gRPC) path: the SDK's `Sync.links` are Nexus links
+            // (url+type), distinct from the kernel's structured `common.v1.Link`.
+            // Converting them requires parsing the `temporal://` link scheme, which
+            // is out of scope here — this spec (runtime-nexus-http-client) covers the
+            // External HTTP path only. Pre-Wave-1 this path carried no links at all,
+            // so emitting empty preserves behaviour rather than regressing it; the
+            // worker-path link conversion is tracked separately.
             Ok(NexusResolution::Completed {
                 result: single_payload_to_payloads(sync.payload),
+                links: Vec::new(),
             })
         }
         Some(nexus_v1::start_operation_response::Variant::AsyncSuccess(async_success)) => {
@@ -222,7 +230,8 @@ pub fn proto_start_response_to_resolution(
                     "nexus async start returned mismatched operation_id"
                 );
             }
-            Ok(NexusResolution::Started)
+            // See the SyncSuccess arm: worker-path Nexus links are not converted here.
+            Ok(NexusResolution::Started { links: Vec::new() })
         }
         Some(nexus_v1::start_operation_response::Variant::OperationError(error)) => {
             Ok(NexusResolution::Failed {
@@ -409,7 +418,7 @@ mod tests {
                 )),
             };
             match proto_response_to_resolution(sync, &operation_id).expect("sync success") {
-                NexusResolution::Completed { result } => {
+                NexusResolution::Completed { result, .. } => {
                     prop_assert_eq!(result.0.len(), 1);
                     prop_assert_eq!(result.0[0].data.clone(), payload_bytes.clone());
                 }
@@ -431,7 +440,7 @@ mod tests {
             };
             prop_assert_eq!(
                 proto_response_to_resolution(async_response, &operation_id).expect("async success"),
-                NexusResolution::Started
+                NexusResolution::Started { links: Vec::new() }
             );
 
             let cancel = nexus_v1::Response {

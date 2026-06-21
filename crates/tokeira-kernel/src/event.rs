@@ -448,12 +448,17 @@ pub enum HistoryEventKind {
     NexusOperationStarted {
         operation_id: String,
         scheduled_event_id: i64,
+        /// Links the handler returned on the start response, recorded on the
+        /// event (`saveResult` sets `e.Links = links` @ v1.31.0).
+        links: Vec<Link>,
     },
     /// The Nexus operation completed successfully.
     NexusOperationCompleted {
         operation_id: String,
         scheduled_event_id: i64,
         result: Payloads,
+        /// Links the handler returned on the completion response.
+        links: Vec<Link>,
     },
     /// The Nexus operation failed.
     NexusOperationFailed {

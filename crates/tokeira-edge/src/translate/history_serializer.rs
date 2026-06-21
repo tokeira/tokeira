@@ -82,6 +82,12 @@ fn event_links(event: &HistoryEvent) -> Vec<proto_common::Link> {
             // (`service/history/historybuilder/event_factory.go @ v1.31.0`).
             links.iter().map(link_to_proto).collect()
         }
+        // Nexus start/completion links are handler-returned and recorded on the
+        // event, not the attributes (`saveResult` sets `e.Links = links` @ v1.31.0).
+        HistoryEventKind::NexusOperationStarted { links, .. }
+        | HistoryEventKind::NexusOperationCompleted { links, .. } => {
+            links.iter().map(link_to_proto).collect()
+        }
         _ => Vec::new(),
     }
 }
@@ -1211,6 +1217,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
         HistoryEventKind::NexusOperationStarted {
             operation_id,
             scheduled_event_id,
+            links: _,
         } => Attributes::NexusOperationStartedEventAttributes(
             history::NexusOperationStartedEventAttributes {
                 scheduled_event_id: *scheduled_event_id,
@@ -1222,6 +1229,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             operation_id,
             scheduled_event_id,
             result,
+            links: _,
         } => Attributes::NexusOperationCompletedEventAttributes(
             history::NexusOperationCompletedEventAttributes {
                 request_id: operation_id.clone(),

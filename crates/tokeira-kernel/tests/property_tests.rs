@@ -1151,8 +1151,11 @@ fn arb_workflow_execution_timed_out_request(
 
 fn arb_nexus_resolution() -> impl Strategy<Value = NexusResolution> {
     prop_oneof![
-        Just(NexusResolution::Started),
-        arb_payloads().prop_map(|result| NexusResolution::Completed { result }),
+        Just(NexusResolution::Started { links: Vec::new() }),
+        arb_payloads().prop_map(|result| NexusResolution::Completed {
+            result,
+            links: Vec::new(),
+        }),
         arb_failure_payload().prop_map(|failure| NexusResolution::Failed { failure }),
         Just(NexusResolution::Canceled),
         Just(NexusResolution::TimedOut {
@@ -3259,6 +3262,7 @@ proptest! {
                 scheduled_event_id: 12,
                 resolution: NexusResolution::Completed {
                     result: Payloads::default(),
+                    links: Vec::new(),
                 },
                 now,
             }),
@@ -4695,7 +4699,7 @@ proptest! {
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
                 operation_id: operation_id.clone(),
                 scheduled_event_id: 12,
-                resolution: NexusResolution::Started,
+                resolution: NexusResolution::Started { links: Vec::new() },
                 now,
             }),
         ).unwrap();
@@ -4718,7 +4722,7 @@ proptest! {
 
     #[test]
     fn property_68_terminal_resolution_removes_from_pending_and_schedules_wft(operation_id in arb_small_string(), resolution in prop_oneof![
-        arb_payloads().prop_map(|result| NexusResolution::Completed { result }),
+        arb_payloads().prop_map(|result| NexusResolution::Completed { result, links: Vec::new() }),
         arb_payload().prop_map(|failure| NexusResolution::Failed { failure }),
         Just(NexusResolution::Canceled),
         Just(NexusResolution::TimedOut {
@@ -4748,7 +4752,7 @@ proptest! {
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
                 operation_id: operation_id.clone(),
                 scheduled_event_id: 12,
-                resolution: NexusResolution::Started,
+                resolution: NexusResolution::Started { links: Vec::new() },
                 now,
             }),
         );
@@ -4759,7 +4763,7 @@ proptest! {
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
                 operation_id: operation_id.clone(),
                 scheduled_event_id: 99,
-                resolution: NexusResolution::Started,
+                resolution: NexusResolution::Started { links: Vec::new() },
                 now,
             }),
         );

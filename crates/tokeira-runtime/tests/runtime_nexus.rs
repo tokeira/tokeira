@@ -148,6 +148,7 @@ async fn nexus_schedule_sync_complete_delivers_completed_resolution() -> Result<
     let client = Arc::new(MockNexusClient::new(
         NexusStartResult::SyncCompleted {
             result: payloads("nexus-result"),
+            links: Vec::new(),
         },
         true,
     ));
@@ -213,7 +214,13 @@ async fn nexus_schedule_sync_complete_delivers_completed_resolution() -> Result<
 #[tokio::test]
 async fn nexus_async_started_times_out_via_scanner() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
-    let client = Arc::new(MockNexusClient::new(NexusStartResult::AsyncAccepted, true));
+    let client = Arc::new(MockNexusClient::new(
+        NexusStartResult::AsyncAccepted {
+            operation_token: "async-op-token".to_string(),
+            links: Vec::new(),
+        },
+        true,
+    ));
     let mut runtime = runtime_with_nexus(store.clone(), client);
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("nexus-timeout".to_string());
@@ -284,7 +291,13 @@ async fn nexus_async_started_times_out_via_scanner() -> Result<()> {
 #[tokio::test]
 async fn nexus_cancel_success_delivers_canceled_resolution() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
-    let client = Arc::new(MockNexusClient::new(NexusStartResult::AsyncAccepted, true));
+    let client = Arc::new(MockNexusClient::new(
+        NexusStartResult::AsyncAccepted {
+            operation_token: "async-op-token".to_string(),
+            links: Vec::new(),
+        },
+        true,
+    ));
     let mut runtime = runtime_with_nexus(store.clone(), client.clone());
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("nexus-cancel".to_string());
@@ -417,7 +430,13 @@ async fn nexus_schedule_to_start_times_out_via_scanner() -> Result<()> {
     // ScheduleToStartTimeoutTask (components/nexusoperations/statemachine.go @ v1.31.0).
     // Isolates schedule-to-start firing from the gRPC long-poll path.
     let store = Arc::new(InMemoryStore::default());
-    let client = Arc::new(MockNexusClient::new(NexusStartResult::AsyncAccepted, true));
+    let client = Arc::new(MockNexusClient::new(
+        NexusStartResult::AsyncAccepted {
+            operation_token: "async-op-token".to_string(),
+            links: Vec::new(),
+        },
+        true,
+    ));
     let namespace_id = NamespaceId::new();
     let registry = seed_registry(vec![(
         "payments",
@@ -521,7 +540,13 @@ fn runtime_with_registry(
 #[tokio::test]
 async fn worker_targeted_nexus_schedule_publishes_to_broker() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
-    let client = Arc::new(MockNexusClient::new(NexusStartResult::AsyncAccepted, true));
+    let client = Arc::new(MockNexusClient::new(
+        NexusStartResult::AsyncAccepted {
+            operation_token: "async-op-token".to_string(),
+            links: Vec::new(),
+        },
+        true,
+    ));
     let namespace_id = NamespaceId::new();
     let registry = seed_registry(vec![(
         "payments",
@@ -603,7 +628,13 @@ async fn worker_targeted_nexus_schedule_publishes_to_broker() -> Result<()> {
 #[tokio::test]
 async fn worker_targeted_nexus_cancel_publishes_to_broker() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
-    let client = Arc::new(MockNexusClient::new(NexusStartResult::AsyncAccepted, true));
+    let client = Arc::new(MockNexusClient::new(
+        NexusStartResult::AsyncAccepted {
+            operation_token: "async-op-token".to_string(),
+            links: Vec::new(),
+        },
+        true,
+    ));
     let namespace_id = NamespaceId::new();
     let registry = seed_registry(vec![(
         "payments",
@@ -757,7 +788,7 @@ proptest! {
         let rt = Runtime::new().expect("runtime");
         rt.block_on(async move {
             let store = Arc::new(InMemoryStore::default());
-            let client = Arc::new(MockNexusClient::new(NexusStartResult::AsyncAccepted, true));
+            let client = Arc::new(MockNexusClient::new(NexusStartResult::AsyncAccepted { operation_token: "async-op-token".to_string(), links: Vec::new() }, true));
             let namespace_id = NamespaceId(Uuid::from_u128(namespace_seed));
             let registry = seed_registry(vec![(
                 "payments",
@@ -937,7 +968,13 @@ proptest! {
 #[tokio::test]
 async fn nexus_unknown_endpoint_delivers_failed_resolution() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
-    let client = Arc::new(MockNexusClient::new(NexusStartResult::AsyncAccepted, true));
+    let client = Arc::new(MockNexusClient::new(
+        NexusStartResult::AsyncAccepted {
+            operation_token: "async-op-token".to_string(),
+            links: Vec::new(),
+        },
+        true,
+    ));
     let mut runtime = runtime_with_registry(
         store.clone(),
         client.clone(),
@@ -1012,7 +1049,13 @@ async fn nexus_unknown_endpoint_delivers_failed_resolution() -> Result<()> {
 #[tokio::test]
 async fn cross_namespace_async_nexus_completes_back_to_originator() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
-    let client = Arc::new(MockNexusClient::new(NexusStartResult::AsyncAccepted, true));
+    let client = Arc::new(MockNexusClient::new(
+        NexusStartResult::AsyncAccepted {
+            operation_token: "async-op-token".to_string(),
+            links: Vec::new(),
+        },
+        true,
+    ));
     let ns_control = NamespaceId::new();
     let ns_agents = NamespaceId::new();
     assert!(
@@ -1109,7 +1152,7 @@ async fn cross_namespace_async_nexus_completes_back_to_originator() -> Result<()
                 parent_run_key,
                 "op-agent".to_string(),
                 scheduled_event_id,
-                tokeira_kernel::NexusResolution::Started,
+                tokeira_kernel::NexusResolution::Started { links: Vec::new() },
             )
             .await?,
         "Started resolution should apply"
@@ -1138,6 +1181,7 @@ async fn cross_namespace_async_nexus_completes_back_to_originator() -> Result<()
                 scheduled_event_id,
                 tokeira_kernel::NexusResolution::Completed {
                     result: payloads("agent-turn-result"),
+                    links: Vec::new(),
                 },
             )
             .await?,

@@ -1782,7 +1782,7 @@ impl BasicKernel {
 
         let mut builder = TransitionBuilder::new(state, req.now);
         match req.resolution {
-            NexusResolution::Started => {
+            NexusResolution::Started { links } => {
                 if pending.started {
                     return Err(Reject::NexusOperationAlreadyStarted(
                         pending.operation_id.clone(),
@@ -1791,6 +1791,7 @@ impl BasicKernel {
                 builder.emit(HistoryEventKind::NexusOperationStarted {
                     operation_id: pending.operation_id.clone(),
                     scheduled_event_id: pending.scheduled_event_id,
+                    links,
                 });
                 if let Some(current) = builder
                     .state
@@ -1811,11 +1812,12 @@ impl BasicKernel {
                     builder.schedule_workflow_task();
                 }
             }
-            NexusResolution::Completed { result } => {
+            NexusResolution::Completed { result, links } => {
                 builder.emit(HistoryEventKind::NexusOperationCompleted {
                     operation_id: pending.operation_id.clone(),
                     scheduled_event_id: pending.scheduled_event_id,
                     result,
+                    links,
                 });
                 builder
                     .state

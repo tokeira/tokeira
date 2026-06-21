@@ -866,9 +866,16 @@ pub enum ExternalCancelResult {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum NexusResolution {
     /// The operation transitioned to async-started.
-    Started,
+    Started {
+        /// Links the handler returned on the start response.
+        links: Vec<Link>,
+    },
     /// The operation completed successfully.
-    Completed { result: Payloads },
+    Completed {
+        result: Payloads,
+        /// Links the handler returned on the completion response.
+        links: Vec<Link>,
+    },
     /// The operation failed.
     Failed { failure: Payload },
     /// The operation was canceled.

@@ -15,7 +15,7 @@ use opentelemetry::KeyValue;
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    Command, LoadedRun, NexusOperationResolvedRequest, NexusResolution, NexusTimeoutType,
+    Command, Link, LoadedRun, NexusOperationResolvedRequest, NexusResolution, NexusTimeoutType,
     PendingNexusOperation,
 };
 use tokeira_storage::RunRepository;
@@ -29,9 +29,20 @@ use crate::{
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum NexusStartResult {
-    SyncCompleted { result: Payloads },
-    SyncFailed { message: String },
-    AsyncAccepted,
+    SyncCompleted {
+        result: Payloads,
+        /// Links the handler returned on the sync-success response.
+        links: Vec<Link>,
+    },
+    SyncFailed {
+        message: String,
+    },
+    AsyncAccepted {
+        /// Handler-issued token identifying the running operation.
+        operation_token: String,
+        /// Links the handler returned on the async-start response.
+        links: Vec<Link>,
+    },
 }
 
 #[async_trait]

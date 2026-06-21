@@ -627,8 +627,8 @@ where
                         )
                         .await
                     {
-                        Ok(NexusStartResult::SyncCompleted { result }) => {
-                            tokeira_kernel::NexusResolution::Completed { result }
+                        Ok(NexusStartResult::SyncCompleted { result, links }) => {
+                            tokeira_kernel::NexusResolution::Completed { result, links }
                         }
                         Ok(NexusStartResult::SyncFailed { message }) => {
                             tokeira_kernel::NexusResolution::Failed {
@@ -647,8 +647,8 @@ where
                                 }),
                             }
                         }
-                        Ok(NexusStartResult::AsyncAccepted) => {
-                            tokeira_kernel::NexusResolution::Started
+                        Ok(NexusStartResult::AsyncAccepted { links, .. }) => {
+                            tokeira_kernel::NexusResolution::Started { links }
                         }
                         Err(error) => tokeira_kernel::NexusResolution::Failed {
                             failure: failure_to_payload(&failure_proto::Failure {

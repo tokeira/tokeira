@@ -5660,7 +5660,7 @@ fn nexus_operation_resolved_started() {
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
-                resolution: NexusResolution::Started,
+                resolution: NexusResolution::Started { links: Vec::new() },
                 now: now(),
             }),
         )
@@ -5700,7 +5700,7 @@ fn nexus_operation_resolved_started_duplicate() {
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
-                resolution: NexusResolution::Started,
+                resolution: NexusResolution::Started { links: Vec::new() },
                 now: now(),
             }),
         )
@@ -5720,6 +5720,7 @@ fn nexus_operation_resolved_completed() {
                 scheduled_event_id: 12,
                 resolution: NexusResolution::Completed {
                     result: payloads("done"),
+                    links: Vec::new(),
                 },
                 now: now(),
             }),
@@ -5754,6 +5755,7 @@ fn nexus_operation_resolved_completed_with_pending_wft() {
                 scheduled_event_id: 12,
                 resolution: NexusResolution::Completed {
                     result: payloads("done"),
+                    links: Vec::new(),
                 },
                 now: now(),
             }),
@@ -5854,7 +5856,7 @@ fn nexus_operation_resolved_unknown_operation() {
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
                 operation_id: "missing".into(),
                 scheduled_event_id: 12,
-                resolution: NexusResolution::Started,
+                resolution: NexusResolution::Started { links: Vec::new() },
                 now: now(),
             }),
         )
@@ -5871,7 +5873,7 @@ fn nexus_operation_resolved_stale() {
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
                 operation_id: "op-1".into(),
                 scheduled_event_id: 99,
-                resolution: NexusResolution::Started,
+                resolution: NexusResolution::Started { links: Vec::new() },
                 now: now(),
             }),
         )
@@ -5893,7 +5895,7 @@ fn nexus_operation_resolved_absent_run() {
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
-                resolution: NexusResolution::Started,
+                resolution: NexusResolution::Started { links: Vec::new() },
                 now: now(),
             }),
         )
@@ -5909,7 +5911,7 @@ fn nexus_operation_resolved_closed_run() {
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
-                resolution: NexusResolution::Started,
+                resolution: NexusResolution::Started { links: Vec::new() },
                 now: now(),
             }),
         )

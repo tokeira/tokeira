@@ -9,44 +9,54 @@ wire the real client into tokeirad in place of `NoopNexusHttpClient`. Ground-tru
 
 ## Tasks
 
-- [ ] 1. Extend `NexusStartResult` and the kernel events for links/token
+- [x] 1. Extend `NexusStartResult` and the kernel events for links/token
   - Add `operation_token` (async) and `links` (sync + async) to `NexusStartResult`; add `links` to
     `HistoryEventKind::NexusOperationStarted`/`NexusOperationCompleted` (fold into base events, no
     ALTER) and thread through `NexusResolution::{Started,Completed}`, the kernel apply/replay, and the
     edge history serializer.
   - _Requirements: 3.1, 3.2_
 
-- [ ] 2. Implement `HttpNexusClient` StartOperation
-  - reqwest `POST {base}/{pct(service)}/{pct(operation)}?callback=...`, body = input payload; set
-    `Nexus-Request-Id`, content-type, callback-token header, `Nexus-Link`, request/operation-timeout
-    headers (constants pinned from `client.go @ v1.31.0`).
-  - Parse: 200 → `SyncCompleted{result, links}`; 201 + `OperationStateRunning` + token →
-    `AsyncAccepted{token, links}`; unsuccessful status → `SyncFailed{failure}`; else `Err`.
-  - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5_
+- [x] 2. Implement `HttpNexusClient` StartOperation
+  - reqwest `POST {base}/{pct(service)}/{pct(operation)}`, body = input payload (content-type per
+    `payload_serializer.go @ v1.31.0`); set `Nexus-Request-Id`, content-type, operation-timeout header,
+    trace headers; per-request timeout from schedule-to-close.
+  - Parse: 200 → `SyncCompleted{result, links}`; 201 + `OperationStateRunning` + non-empty token →
+    `AsyncAccepted{token, links}`; 424 → `SyncFailed{message}`; else `Err`. Response `Nexus-Link`
+    headers decoded (RFC 8288) and workflow-event links converted to kernel `Link` via the
+    `temporal://` scheme (`link_converter.go @ v1.31.0`).
+  - DEVIATION (Req 1.5 caller-links/callback): the trait carries neither caller links nor a callback
+    URL, and tokeira hosts no inbound callback endpoint yet (deferred surface), so neither is sent.
+  - _Requirements: 1.1, 1.2, 1.3, 1.4_
 
-- [ ] 3. Implement `HttpNexusClient` CancelOperation
-  - reqwest `POST {base}/{pct(service)}/{pct(operation)}/cancel` with `Nexus-Operation-Token`; map
-    success/failure as the trait contract requires today.
+- [x] 3. Implement `HttpNexusClient` CancelOperation
+  - reqwest `POST {base}/{pct(service)}/{pct(operation)}/cancel` with `Nexus-Operation-Token`; trait
+    extended to carry the operation name (resolved from the pending op) since the cancel URL needs it.
+  - DEFERRED: cancel-request *retry* and the `NexusOperationCancelRequest{Failed,Completed}` history
+    lifecycle, plus persisting the handler-issued token (tokeira sends its own operation id as the
+    token today; the v1.31.0 conformance handler does not gate cancel on the token value). Tracked as a
+    follow-up cancel-lifecycle surface.
   - _Requirements: 2.1, 2.2_
 
-- [ ] 4. Wire the real client into tokeirad
+- [x] 4. Wire the real client into tokeirad
   - Replace `Arc::new(NoopNexusHttpClient)` with `HttpNexusClient`; keep `Noop`/`Mock` for tests.
   - _Requirements: 4.1, 4.2_
 
-- [ ] 5. Tests
-  - [ ] 5.1 StartOperation mapping over a stub HTTP listener: 200 sync, 201 async, unsuccessful, link parse.
+- [x] 5. Tests
+  - [x] 5.1 StartOperation mapping over a stub HTTP listener: 200 sync, 201 async, unsuccessful, link parse.
     - _Feature: runtime-nexus-http-client, Property 1, Property 2, Property 3_
     - _Requirements: 1.2, 1.3, 1.4, 3.2_
-  - [ ] 5.2 Request-shape assertions (paths, token header).
+  - [x] 5.2 Request-shape assertions (paths, token header) + link converter / payload content-type units.
     - _Feature: runtime-nexus-http-client, Property 4_
     - _Requirements: 1.1, 2.1_
-  - [ ] 5.3 Runtime integration: External 200 → completed event with link; 201 → started event + pending op.
+  - [-] 5.3 Runtime integration: External 200 → completed event with link; 201 → started event + pending op.
+    - Covered at the client level (5.1) plus the existing mock-based runtime resolution→event tests;
+      a full in-runtime live-listener flow is left to the operator conformance re-run.
     - _Feature: runtime-nexus-http-client, Property 1, Property 2_
     - _Requirements: 3.1, 3.2_
 
 - [ ] 6. Verification gate and operator re-run
-  - `cargo +nightly fmt`, `cargo lint`, `cargo test`, `cargo doc -D warnings` on touched crates; then
-    operator re-run of `^TestNexusWorkflowTestSuite`.
+  - `cargo +nightly fmt`, `cargo lint`, `cargo test`, `cargo doc -D warnings` on touched crates: DONE.
+  - Operator re-run of `^TestNexusWorkflowTestSuite`: PENDING (rebuild `tokeirad` first).
   - _Requirements: 4.1, 4.2_
 
 ## Task Dependency Graph

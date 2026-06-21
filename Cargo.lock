@@ -6637,9 +6637,11 @@ dependencies = [
  "metrics-util",
  "opentelemetry",
  "opentelemetry_sdk",
+ "percent-encoding",
  "proptest",
  "prost 0.12.6",
  "prost-types 0.12.6",
+ "reqwest",
  "serde",
  "serde_json",
  "smallvec",
@@ -6659,6 +6661,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 

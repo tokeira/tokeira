@@ -65,10 +65,10 @@ use tokeira_projection::{
     VisibilityQueryService, VisibilitySink, VisibilityStore,
 };
 use tokeira_runtime::{
-    ConnectionBudgetApplier, InMemoryNexusEndpointStore, InMemoryTaskQueueConfigStore,
-    MembershipConfig, NexusEndpointRegistry, NexusEndpointSpec, NexusEndpointSpecTarget,
-    NexusEndpointStore, NoopNexusHttpClient, RuntimeConfig, ScheduleEngineConfig, ScheduleStore,
-    TokeiraRuntime, VersioningRuleStore, run_schedule_engine,
+    ConnectionBudgetApplier, HttpNexusClient, InMemoryNexusEndpointStore,
+    InMemoryTaskQueueConfigStore, MembershipConfig, NexusEndpointRegistry, NexusEndpointSpec,
+    NexusEndpointSpecTarget, NexusEndpointStore, RuntimeConfig, ScheduleEngineConfig,
+    ScheduleStore, TokeiraRuntime, VersioningRuleStore, run_schedule_engine,
 };
 use tokeira_storage::{
     InMemoryStore, LeaseOutcome, LeaseRepository, ProjectionLog, RunRepository,
@@ -749,7 +749,7 @@ where
             runtime_config.activity_timeout_scanner,
             runtime_config.nexus_timeout_scanner,
             nexus_registry,
-            Arc::new(NoopNexusHttpClient),
+            Arc::new(HttpNexusClient::new()),
             effective_config.infrastructure.placement.shard_count,
             node_id.to_string(),
             node_endpoint.as_authority(),

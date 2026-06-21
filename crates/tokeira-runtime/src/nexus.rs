@@ -47,6 +47,11 @@ pub enum NexusStartResult {
 
 #[async_trait]
 pub trait NexusHttpClient: Send + Sync {
+    /// Start a Nexus operation on an External endpoint over HTTP.
+    ///
+    /// `operation_id` is tokeira's per-operation identifier, sent as the
+    /// `Nexus-Request-Id` for handler-side idempotency. The returned
+    /// [`NexusStartResult`] is mapped to a `NexusResolution` by the publisher.
     async fn start_operation(
         &self,
         address: &str,
@@ -58,11 +63,22 @@ pub trait NexusHttpClient: Send + Sync {
         trace_headers: &[KeyValue],
     ) -> Result<NexusStartResult>;
 
+    /// Cancel a started Nexus operation on an External endpoint.
+    ///
+    /// The cancel URL is `{address}/{service}/{operation}/cancel`, so the
+    /// operation **name** (not tokeira's operation id) is required — the caller
+    /// resolves it from the pending operation. `operation_token` is sent as the
+    /// `Nexus-Operation-Token` header (`handle.go @ v1.31.0`).
+    ///
+    /// NOTE (deferred): cancel-request *retry* and the `NexusOperationCancelRequest`
+    /// {Failed,Completed} history-event lifecycle are not modelled here yet; this
+    /// is a single best-effort attempt (Req 5.3 + the cancel-lifecycle follow-up).
     async fn cancel_operation(
         &self,
         address: &str,
-        operation_id: &str,
         service: &str,
+        operation: &str,
+        operation_token: &str,
         trace_headers: &[KeyValue],
     ) -> Result<()>;
 }
@@ -577,8 +593,9 @@ impl NexusHttpClient for NoopNexusHttpClient {
     async fn cancel_operation(
         &self,
         _address: &str,
-        _operation_id: &str,
         _service: &str,
+        _operation: &str,
+        _operation_token: &str,
         _trace_headers: &[KeyValue],
     ) -> Result<()> {
         Err(anyhow!("nexus http client not configured"))

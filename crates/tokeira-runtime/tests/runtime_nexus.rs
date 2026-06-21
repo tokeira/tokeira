@@ -124,15 +124,17 @@ impl NexusHttpClient for MockNexusClient {
     async fn cancel_operation(
         &self,
         address: &str,
-        operation_id: &str,
         service: &str,
+        operation: &str,
+        operation_token: &str,
         _trace_headers: &[KeyValue],
     ) -> Result<()> {
         let mut state = self.state.lock().unwrap();
+        let _ = service;
         state.cancel_calls.push((
             address.to_string(),
-            operation_id.to_string(),
-            service.to_string(),
+            operation.to_string(),
+            operation_token.to_string(),
         ));
         if state.cancel_ok {
             Ok(())

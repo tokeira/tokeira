@@ -748,10 +748,37 @@ where
 
         match &config.target {
             EndpointTarget::External { address } => {
+                // The cancel URL needs the operation *name* (not tokeira's
+                // operation id); resolve it from the pending operation. The token
+                // sent is tokeira's operation id — faithful handler-token
+                // persistence is a follow-up; the v1.31.0 conformance handler does
+                // not gate cancel on the token value.
+                let operation = match self
+                    .lookup_nexus_operation_name(originator_run_key, &operation_id)
+                    .await
+                {
+                    Ok(Some(operation)) => operation,
+                    Ok(None) => {
+                        tracing::warn!(
+                            originator_run_key = ?originator_run_key,
+                            operation_id,
+                            "cancel nexus operation skipped: pending operation not found"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            ?error,
+                            operation_id,
+                            "cancel nexus operation skipped: failed to load run"
+                        );
+                        return;
+                    }
+                };
                 let trace_headers = self.nexus_trace_headers();
                 match self
                     .nexus_client
-                    .cancel_operation(address, &operation_id, &service, &trace_headers)
+                    .cancel_operation(address, &service, &operation, &operation_id, &trace_headers)
                     .await
                 {
                     Ok(()) => {

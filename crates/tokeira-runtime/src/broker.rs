@@ -24,12 +24,26 @@
 //! silently suppressed so that scanner sweeps and retry paths can safely
 //! re-publish without creating phantom work items.
 //!
-//! ## Notify-based wake pattern
+//! ## Per-queue wake pattern
 //!
-//! Pollers register a `Notify` future *before* re-checking the queue. This
-//! closes the TOCTOU race between `try_take` returning `None` and a concurrent
-//! `publish` calling `notify_waiters`: if the publish fires in that gap, the
-//! already-registered future still fires and the poller retries.
+//! Wakeups are scoped to the **queue**, not the whole broker. Each queue has its
+//! own `Notify`; a `publish` wakes only pollers parked on that queue. This is a
+//! correctness property, not an optimisation: the broker is a *derived* delivery
+//! index over the authoritative transition log (see the type docs below), so a
+//! poll must reflect readiness of *its own* queue and nothing else. A global
+//! wake would let traffic on one queue end an unrelated poll empty, and would
+//! wake every idle poller on every publish.
+//!
+//! Two invariants the poll loops enforce:
+//!
+//! 1. **A wake is a hint to re-check, not a result.** On every wake a poller
+//!    re-derives readiness via `try_take` and keeps waiting until its deadline if
+//!    there is still nothing for it, returning empty only at the deadline. A
+//!    spurious wake therefore never produces a premature empty poll.
+//! 2. **Register before re-check (TOCTOU).** The per-queue `notified` future is
+//!    `enable()`d *before* the `try_take` re-check, so a `publish` racing the
+//!    check still wakes the poller. `notify_waiters` only signals already-enabled
+//!    waiters, so the `enable()` is what makes the race-close sound.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -42,7 +56,7 @@ use tokeira_storage::{DispatchableActivityTask, DispatchableWorkflowTask};
 use tokeira_types::{LogicalTaskSeq, NamespaceId, QueueKey, RunKey, TaskQueueName, WorkerIdentity};
 use tokio::{
     sync::{Mutex, Notify, oneshot},
-    time::{Duration, Instant, timeout},
+    time::{Duration, Instant},
 };
 
 use crate::{DeliveryMetrics, QueryTask, StartedWorkflowTask, metrics as runtime_metrics};
@@ -58,8 +72,6 @@ use crate::{DeliveryMetrics, QueryTask, StartedWorkflowTask, metrics as runtime_
 #[derive(Default, Clone)]
 pub struct InMemoryBroker {
     inner: Arc<Mutex<BrokerState>>,
-    wake: Arc<Notify>,
-    query_wake: Arc<Notify>,
 }
 
 /// In-memory activity-task broker.
@@ -69,7 +81,6 @@ pub struct InMemoryBroker {
 #[derive(Default, Clone)]
 pub struct InMemoryActivityBroker {
     inner: Arc<Mutex<ActivityBrokerState>>,
-    wake: Arc<Notify>,
 }
 
 #[derive(Default)]
@@ -77,6 +88,8 @@ struct ActivityBrokerState {
     ready: HashMap<QueueKey, VecDeque<TimestampedActivityTask>>,
     enqueued: HashSet<(RunKey, String, u32)>,
     waiter_counts: HashMap<QueueKey, usize>,
+    /// Per-queue wake handles (see the module's "Per-queue wake pattern").
+    wakes: HashMap<QueueKey, Arc<Notify>>,
 }
 
 #[derive(Default)]
@@ -90,6 +103,11 @@ struct BrokerState {
     query_ready: HashMap<QueueKey, VecDeque<QueryTask>>,
     query_waiter_counts: HashMap<QueueKey, usize>,
     denied_workers: HashSet<(NamespaceId, TaskQueueName, WorkerIdentity)>,
+    /// Per-queue wake handles, created on first use and shared by workflow and
+    /// query pollers on that queue (they share the poll path). Grows with
+    /// distinct queues seen, like the ready/waiter maps; the broker is
+    /// process-local and disposable, so this is bounded by live queues.
+    wakes: HashMap<QueueKey, Arc<Notify>>,
 }
 
 #[derive(Debug)]
@@ -318,19 +336,19 @@ impl InMemoryBroker {
 
     /// Publish a query task without deduplication or backlog participation.
     pub async fn publish_query_task(&self, task: QueryTask) {
+        let queue = task.queue.clone();
         let mut inner = self.inner.lock().await;
         inner
             .query_ready
-            .entry(task.queue.clone())
+            .entry(queue.clone())
             .or_default()
             .push_back(task);
-        drop(inner);
         // Direct queries are matched by workflow-task polls in Temporal
-        // (`service/matching/matching_engine.go:1084 @ v1.31.0`). Wake both
-        // legacy query waiters and workflow pollers while the old side-channel
-        // remains available for focused runtime tests.
-        self.wake.notify_waiters();
-        self.query_wake.notify_waiters();
+        // (`service/matching/matching_engine.go:1084 @ v1.31.0`); the queue-scoped
+        // wake covers both query and workflow pollers parked on this queue.
+        let wake = inner.wakes.entry(queue).or_default().clone();
+        drop(inner);
+        wake.notify_waiters();
     }
 
     /// Long-poll for a read-only query task on `queue`.
@@ -349,16 +367,36 @@ impl InMemoryBroker {
         }
 
         self.increment_query_waiter(queue).await;
-        let wait_for = self
-            .query_fallback_wait(queue)
-            .await
-            .unwrap_or(wait_for)
-            .min(wait_for);
-        let notified = timeout(wait_for, self.query_wake.notified()).await;
-        self.decrement_query_waiter(queue).await;
+        let wake = self.queue_wake(queue).await;
+        let deadline = Instant::now() + wait_for;
 
-        let _ = notified;
-        self.try_take_query(queue, worker).await
+        let result = loop {
+            // Enable before the re-check so a publish racing it still wakes us.
+            let notified = wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if let Some(task) = self.try_take_query(queue, worker).await {
+                break Some(task);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break None;
+            }
+            // A sticky-only query becomes takeable once its sticky window closes;
+            // bound the wait by that so we re-check then even with no new publish.
+            let wait = match self.query_fallback_wait(queue).await {
+                Some(fallback) if !fallback.is_zero() => fallback.min(remaining),
+                _ => remaining,
+            };
+            tokio::select! {
+                _ = notified.as_mut() => {}
+                _ = tokio::time::sleep(wait) => {}
+            }
+        };
+
+        self.decrement_query_waiter(queue).await;
+        result
     }
 
     /// Long-poll for the next workflow activation on `queue`.
@@ -373,60 +411,83 @@ impl InMemoryBroker {
         worker: &WorkerIdentity,
         wait_for: Duration,
     ) -> Result<Option<WorkflowPollResult>> {
+        self.poll_workflow_inner(queue, worker, wait_for, true)
+            .await
+    }
+
+    /// Shared workflow-task long-poll loop (see the module's per-queue wake
+    /// pattern). Holds until a task for `queue` is available or `wait_for`
+    /// elapses; a wake on this queue is a hint to re-derive readiness, never a
+    /// reason to return empty early. `include_query` mirrors the Temporal
+    /// contract that `PollWorkflowTaskQueue` also satisfies a ready direct query
+    /// (`service/matching/matching_engine.go:1084 @ v1.31.0`); the workflow-only
+    /// internal path passes `false`.
+    async fn poll_workflow_inner(
+        &self,
+        queue: &QueueKey,
+        worker: &WorkerIdentity,
+        wait_for: Duration,
+        include_query: bool,
+    ) -> Result<Option<WorkflowPollResult>> {
         if self.is_denied(queue, worker).await {
             return Ok(None);
         }
         if let Some(task) = self.try_take(queue, worker).await? {
             return Ok(Some(WorkflowPollResult::Queued(task.0, task.1)));
         }
-        if let Some(task) = self.try_take_query(queue, worker).await {
+        if include_query && let Some(task) = self.try_take_query(queue, worker).await {
             return Ok(Some(WorkflowPollResult::Query(task)));
         }
 
-        let (response_tx, response_rx) = oneshot::channel();
+        // The waiter is the sync-match target (reserved-poller / eager hand-off
+        // via `response_rx`); it stays registered for the whole call and is
+        // removed once on exit.
+        let deadline = Instant::now() + wait_for;
+        let (response_tx, mut response_rx) = oneshot::channel();
         let waiter_id = self
             .insert_workflow_waiter(queue, worker.clone(), response_tx)
             .await;
+        let wake = self.queue_wake(queue).await;
 
-        let notified = self.wake.notified();
-        if let Some(task) = self.try_take(queue, worker).await? {
-            self.remove_workflow_waiter(queue, waiter_id).await;
-            return Ok(Some(WorkflowPollResult::Queued(task.0, task.1)));
-        }
-        if let Some(task) = self.try_take_query(queue, worker).await {
-            self.remove_workflow_waiter(queue, waiter_id).await;
-            return Ok(Some(WorkflowPollResult::Query(task)));
-        }
+        let result = loop {
+            // Enable before the re-check so a publish racing it still wakes us.
+            let notified = wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
 
-        let wait_for = self
-            .query_fallback_wait(queue)
-            .await
-            .unwrap_or(wait_for)
-            .min(wait_for);
-        tokio::select! {
-            response = response_rx => {
-                self.remove_workflow_waiter(queue, waiter_id).await;
-                return match response {
-                    Ok(result) => result.map(|task| task.map(WorkflowPollResult::Started)),
-                    Err(_) => Ok(None),
-                };
+            if self.is_denied(queue, worker).await {
+                break Ok(None);
             }
-            _ = notified => {}
-            _ = tokio::time::sleep(wait_for) => {}
-        }
+            if let Some(task) = self.try_take(queue, worker).await? {
+                break Ok(Some(WorkflowPollResult::Queued(task.0, task.1)));
+            }
+            if include_query && let Some(task) = self.try_take_query(queue, worker).await {
+                break Ok(Some(WorkflowPollResult::Query(task)));
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break Ok(None);
+            }
+            let wait = match (include_query, self.query_fallback_wait(queue).await) {
+                (true, Some(fallback)) if !fallback.is_zero() => fallback.min(remaining),
+                _ => remaining,
+            };
+
+            tokio::select! {
+                response = &mut response_rx => {
+                    break match response {
+                        Ok(result) => result.map(|task| task.map(WorkflowPollResult::Started)),
+                        Err(_) => Ok(None),
+                    };
+                }
+                _ = notified.as_mut() => {}
+                _ = tokio::time::sleep(wait) => {}
+            }
+        };
 
         self.remove_workflow_waiter(queue, waiter_id).await;
-
-        if self.is_denied(queue, worker).await {
-            return Ok(None);
-        }
-        if let Some(task) = self.try_take(queue, worker).await? {
-            return Ok(Some(WorkflowPollResult::Queued(task.0, task.1)));
-        }
-        Ok(self
-            .try_take_query(queue, worker)
-            .await
-            .map(WorkflowPollResult::Query))
+        result
     }
 
     /// Enqueue a workflow task for delivery.
@@ -474,8 +535,9 @@ impl InMemoryBroker {
                 .push_back(timestamped);
         }
         Self::emit_queue_depths(&inner, &queue);
+        let wake = inner.wakes.entry(queue).or_default().clone();
         drop(inner);
-        self.wake.notify_waiters();
+        wake.notify_waiters();
     }
 
     /// Stop future workflow-task deliveries for a worker on one sticky queue.
@@ -493,8 +555,14 @@ impl InMemoryBroker {
         inner
             .denied_workers
             .insert((namespace_id, task_queue, worker));
+        // Deny carries only (namespace, task_queue, worker) — not a poller's full
+        // QueueKey — and is a rare shutdown path, so wake every queue's waiters;
+        // each re-checks `is_denied` on wake and the denied one returns empty.
+        let wakes: Vec<Arc<Notify>> = inner.wakes.values().cloned().collect();
         drop(inner);
-        self.wake.notify_waiters();
+        for wake in wakes {
+            wake.notify_waiters();
+        }
     }
 
     /// Long-poll for a workflow task on `queue`.
@@ -509,52 +577,8 @@ impl InMemoryBroker {
         worker: &WorkerIdentity,
         wait_for: Duration,
     ) -> Result<Option<WorkflowPollResult>> {
-        if self.is_denied(queue, worker).await {
-            return Ok(None);
-        }
-        if let Some(task) = self.try_take(queue, worker).await? {
-            return Ok(Some(WorkflowPollResult::Queued(task.0, task.1)));
-        }
-
-        let (response_tx, response_rx) = oneshot::channel();
-        let waiter_id = self
-            .insert_workflow_waiter(queue, worker.clone(), response_tx)
-            .await;
-
-        // Create the notified future first, then re-check. This
-        // closes the race between try_take and notify_waiters:
-        // if a task was published between our first try_take and
-        // registering the waiter, we catch it here.
-        let notified = self.wake.notified();
-        if let Some(task) = self.try_take(queue, worker).await? {
-            self.remove_workflow_waiter(queue, waiter_id).await;
-            return Ok(Some(WorkflowPollResult::Queued(task.0, task.1)));
-        }
-
-        tokio::select! {
-            response = response_rx => {
-                self.remove_workflow_waiter(queue, waiter_id).await;
-                return match response {
-                    Ok(result) => result.map(|task| task.map(WorkflowPollResult::Started)),
-                    Err(_) => Ok(None),
-                };
-            }
-            _ = notified => {}
-            _ = tokio::time::sleep(wait_for) => {
-                self.remove_workflow_waiter(queue, waiter_id).await;
-                return Ok(None);
-            }
-        }
-
-        self.remove_workflow_waiter(queue, waiter_id).await;
-
-        if self.is_denied(queue, worker).await {
-            return Ok(None);
-        }
-        Ok(self
-            .try_take(queue, worker)
-            .await?
-            .map(|(task, entered_at)| WorkflowPollResult::Queued(task, entered_at)))
+        self.poll_workflow_inner(queue, worker, wait_for, false)
+            .await
     }
 
     /// Pull one waiting poller off `queue`'s wait list for synchronous delivery.
@@ -606,8 +630,9 @@ impl InMemoryBroker {
             .waiter_counts
             .entry(reserved.queue.clone())
             .or_default() += 1;
+        let wake = inner.wakes.entry(reserved.queue).or_default().clone();
         drop(inner);
-        self.wake.notify_waiters();
+        wake.notify_waiters();
     }
 
     /// Queues that currently have at least one parked poller.
@@ -804,6 +829,19 @@ impl InMemoryBroker {
         ))
     }
 
+    /// Per-queue wake handle, created on first use (see the module's "Per-queue
+    /// wake pattern"). Wakeups are scoped to the queue so a publish elsewhere
+    /// never disturbs — or empties — a poll on this one.
+    async fn queue_wake(&self, queue: &QueueKey) -> Arc<Notify> {
+        self.inner
+            .lock()
+            .await
+            .wakes
+            .entry(queue.clone())
+            .or_default()
+            .clone()
+    }
+
     async fn insert_workflow_waiter(
         &self,
         queue: &QueueKey,
@@ -964,15 +1002,18 @@ impl InMemoryActivityBroker {
                 scheduled_at: OffsetDateTime::now_utc(),
             });
         Self::emit_queue_depth(&inner, &queue);
+        let wake = inner.wakes.entry(queue).or_default().clone();
         drop(inner);
-        self.wake.notify_waiters();
+        wake.notify_waiters();
         Ok(())
     }
 
     /// Long-poll for an activity task on `queue`.
     ///
-    /// Returns immediately if a task is available,
-    /// otherwise blocks up to `wait_for`.
+    /// Holds until a task for `queue` is available or `wait_for` elapses. As with
+    /// the workflow polls, wakeups are per-queue and a wake is a hint to
+    /// re-check, not a reason to return empty early (see the module's "Per-queue
+    /// wake pattern").
     pub async fn poll_activity_task(
         &self,
         queue: &QueueKey,
@@ -983,15 +1024,41 @@ impl InMemoryActivityBroker {
         }
 
         self.increment_waiter(queue).await;
+        let wake = self.queue_wake(queue).await;
+        let deadline = Instant::now() + wait_for;
 
-        let notified = timeout(wait_for, self.wake.notified()).await;
+        let result = loop {
+            // Enable before the re-check so a publish racing it still wakes us.
+            let notified = wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if let Some(task) = self.try_take(queue).await? {
+                break Ok(Some(task));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break Ok(None);
+            }
+            tokio::select! {
+                _ = notified.as_mut() => {}
+                _ = tokio::time::sleep(remaining) => {}
+            }
+        };
+
         self.decrement_waiter(queue).await;
+        result
+    }
 
-        if notified.is_err() {
-            return Ok(None);
-        }
-
-        self.try_take(queue).await
+    /// Per-queue wake handle, created on first use.
+    async fn queue_wake(&self, queue: &QueueKey) -> Arc<Notify> {
+        self.inner
+            .lock()
+            .await
+            .wakes
+            .entry(queue.clone())
+            .or_default()
+            .clone()
     }
 
     pub async fn queues_with_waiters(&self) -> HashSet<QueueKey> {
@@ -1134,6 +1201,100 @@ mod tests {
             logical_seq: LogicalTaskSeq::ONE,
             sticky_preferred: None,
             sticky_expires_at: None,
+        }
+    }
+
+    /// Spin (cooperatively) until a workflow poller is parked on `queue`, so
+    /// tests synchronise on observable broker state instead of a fixed sleep.
+    async fn await_workflow_waiter(broker: &InMemoryBroker, queue: &QueueKey) {
+        loop {
+            if broker
+                .inner
+                .lock()
+                .await
+                .waiter_counts
+                .get(queue)
+                .copied()
+                .unwrap_or(0)
+                > 0
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    // Property: queue isolation. A publish to queue B must not end an in-flight
+    // poll on queue A — wakeups are per-queue, so unrelated traffic neither wakes
+    // nor empties the poll. The poll completes only when queue A itself gets a
+    // task. (Regression guard for the broker-global-wake spurious-empty bug.)
+    #[tokio::test]
+    async fn poll_on_one_queue_is_not_ended_by_publish_to_another() {
+        let broker = InMemoryBroker::default();
+        let queue_a = workflow_queue("queue-a", None, None);
+        let queue_b = workflow_queue("queue-b", None, None);
+        let worker = WorkerIdentity("w".to_string());
+        let task_a = workflow_task(queue_a.clone());
+
+        let poll = {
+            let broker = broker.clone();
+            let queue_a = queue_a.clone();
+            let worker = worker.clone();
+            tokio::spawn(async move {
+                broker
+                    .poll_workflow_activation(&queue_a, &worker, std::time::Duration::from_secs(5))
+                    .await
+            })
+        };
+
+        await_workflow_waiter(&broker, &queue_a).await;
+
+        // A publish to an unrelated queue must not wake or empty the queue-A poll.
+        broker
+            .publish_workflow_task(workflow_task(queue_b.clone()), None)
+            .await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !poll.is_finished(),
+            "poll on queue-a was ended by a publish to queue-b"
+        );
+
+        // A publish to queue A delivers.
+        broker.publish_workflow_task(task_a.clone(), None).await;
+        match poll.await.unwrap().unwrap() {
+            Some(WorkflowPollResult::Queued(task, _)) => assert_eq!(task, task_a),
+            other => panic!("expected queued task from queue-a, got {other:?}"),
+        }
+    }
+
+    // Property: same-queue delivery. A task published to the polled queue after
+    // the poller has parked is delivered within the poll, promptly.
+    #[tokio::test]
+    async fn parked_poll_receives_a_later_same_queue_publish() {
+        let broker = InMemoryBroker::default();
+        let queue = workflow_queue("queue-a", None, None);
+        let worker = WorkerIdentity("w".to_string());
+        let task = workflow_task(queue.clone());
+
+        let poll = {
+            let broker = broker.clone();
+            let queue = queue.clone();
+            let worker = worker.clone();
+            tokio::spawn(async move {
+                broker
+                    .poll_workflow_activation(&queue, &worker, std::time::Duration::from_secs(5))
+                    .await
+            })
+        };
+
+        await_workflow_waiter(&broker, &queue).await;
+        broker.publish_workflow_task(task.clone(), None).await;
+
+        match poll.await.unwrap().unwrap() {
+            Some(WorkflowPollResult::Queued(delivered, _)) => assert_eq!(delivered, task),
+            other => panic!("expected queued task, got {other:?}"),
         }
     }
 

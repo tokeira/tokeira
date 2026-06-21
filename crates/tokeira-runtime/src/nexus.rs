@@ -460,12 +460,14 @@ pub struct NexusTask {
 #[derive(Default, Clone)]
 pub struct NexusTaskBroker {
     inner: Arc<AsyncMutex<NexusBrokerState>>,
-    wake: Arc<Notify>,
 }
 
 #[derive(Default)]
 struct NexusBrokerState {
     ready: HashMap<(NamespaceId, TaskQueueName), VecDeque<NexusTask>>,
+    /// Per-queue wake handles (see `tokeira-runtime::broker`'s per-queue wake
+    /// pattern): a publish wakes only pollers on that namespace+task-queue.
+    wakes: HashMap<(NamespaceId, TaskQueueName), Arc<Notify>>,
 }
 
 impl NexusTaskBroker {
@@ -475,14 +477,12 @@ impl NexusTaskBroker {
         task_queue: TaskQueueName,
         task: NexusTask,
     ) {
+        let key = (namespace_id, task_queue);
         let mut inner = self.inner.lock().await;
-        inner
-            .ready
-            .entry((namespace_id, task_queue))
-            .or_default()
-            .push_back(task);
+        inner.ready.entry(key.clone()).or_default().push_back(task);
+        let wake = inner.wakes.entry(key).or_default().clone();
         drop(inner);
-        self.wake.notify_waiters();
+        wake.notify_waiters();
     }
 
     pub async fn poll(
@@ -495,18 +495,42 @@ impl NexusTaskBroker {
             return Some(task);
         }
 
-        let notified = self.wake.notified();
-        tokio::pin!(notified);
+        // Per-queue wake + deadline loop: a publish on another nexus queue must
+        // not end this poll, and a wake is a hint to re-check, not a result (we
+        // wait until the deadline if there is still nothing for this queue).
+        let wake = self.queue_wake(namespace_id, &task_queue).await;
+        let deadline = tokio::time::Instant::now() + wait_for;
+        loop {
+            let notified = wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
 
-        if let Some(task) = self.try_take(namespace_id, &task_queue).await {
-            return Some(task);
+            if let Some(task) = self.try_take(namespace_id, &task_queue).await {
+                return Some(task);
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            tokio::select! {
+                _ = notified.as_mut() => {}
+                _ = tokio::time::sleep(remaining) => {}
+            }
         }
+    }
 
-        if tokio::time::timeout(wait_for, notified).await.is_err() {
-            return None;
-        }
-
-        self.try_take(namespace_id, &task_queue).await
+    async fn queue_wake(
+        &self,
+        namespace_id: NamespaceId,
+        task_queue: &TaskQueueName,
+    ) -> Arc<Notify> {
+        self.inner
+            .lock()
+            .await
+            .wakes
+            .entry((namespace_id, task_queue.clone()))
+            .or_default()
+            .clone()
     }
 
     async fn try_take(

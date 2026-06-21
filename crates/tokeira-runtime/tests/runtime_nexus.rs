@@ -409,6 +409,77 @@ async fn nexus_cancel_success_delivers_canceled_resolution() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn nexus_schedule_to_start_times_out_via_scanner() -> Result<()> {
+    // A Worker-target operation that no worker ever polls never starts, so the
+    // schedule-to-start deadline (scheduled time + timeout) must fire on its own
+    // and produce a NexusOperationTimedOut event — mirroring v1.31.0's
+    // ScheduleToStartTimeoutTask (components/nexusoperations/statemachine.go @ v1.31.0).
+    // Isolates schedule-to-start firing from the gRPC long-poll path.
+    let store = Arc::new(InMemoryStore::default());
+    let client = Arc::new(MockNexusClient::new(NexusStartResult::AsyncAccepted, true));
+    let namespace_id = NamespaceId::new();
+    let registry = seed_registry(vec![(
+        "payments",
+        EndpointTarget::Worker {
+            namespace_id,
+            task_queue: TaskQueueName("unreachable-nexus-q".to_string()),
+        },
+    )]);
+    let mut runtime = runtime_with_registry(store.clone(), client, registry);
+    let workflow_id = WorkflowId("nexus-s2s-timeout".to_string());
+
+    let run_key = applied_state(
+        &runtime
+            .start_workflow(start_request(namespace_id, workflow_id, "req-start"))
+            .await?,
+    )
+    .run_key;
+    let task = poll_wft(&runtime, namespace_id, "workflow-q").await?;
+    runtime
+        .complete_workflow_task(WorkflowTaskCompletedRequest {
+            token: task.token,
+            identity: WorkerIdentity("worker".to_string()),
+            sdk_metadata: None,
+            metering_metadata: None,
+            worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
+            sticky_ttl: None,
+            commands: vec![WorkflowCommand::ScheduleNexusOperation {
+                operation_id: "op-1".to_string(),
+                endpoint: "payments".to_string(),
+                service: "charge".to_string(),
+                operation: "authorize".to_string(),
+                input: payloads("input"),
+                schedule_to_close_timeout: None,
+                schedule_to_start_timeout: Some(time::Duration::milliseconds(20)),
+                start_to_close_timeout: None,
+            }],
+            force_new_workflow_task: false,
+            now: OffsetDateTime::now_utc(),
+        })
+        .await?;
+
+    wait_for_history(&store, run_key, |history| {
+        history.iter().any(|event| {
+            matches!(
+                &event.kind,
+                HistoryEventKind::NexusOperationTimedOut { operation_id, .. }
+                if operation_id == "op-1"
+            )
+        })
+    })
+    .await?;
+
+    assert!(runtime.nexus_timeout_tracking().snapshot().is_empty());
+    runtime.shutdown_timer_scanner().await?;
+    runtime.shutdown_workflow_timeout_scanner().await?;
+    runtime.shutdown_nexus_timeout_scanner().await?;
+    Ok(())
+}
+
 fn runtime_with_nexus(
     store: Arc<InMemoryStore>,
     client: Arc<dyn NexusHttpClient>,

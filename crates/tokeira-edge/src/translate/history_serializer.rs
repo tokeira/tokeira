@@ -1217,11 +1217,17 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
         HistoryEventKind::NexusOperationStarted {
             operation_id,
             scheduled_event_id,
+            operation_token,
             links: _,
         } => Attributes::NexusOperationStartedEventAttributes(
             history::NexusOperationStartedEventAttributes {
                 scheduled_event_id: *scheduled_event_id,
                 request_id: operation_id.clone(),
+                // operation_token (field 5) is the handler-issued token the caller
+                // reads; operation_id (field 3, deprecated) carries the same value
+                // for v0.4-era readers (`@ v1.31.0`).
+                operation_token: operation_token.clone(),
+                operation_id: operation_token.clone(),
                 ..Default::default()
             },
         ),

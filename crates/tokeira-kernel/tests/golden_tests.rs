@@ -5660,18 +5660,25 @@ fn nexus_operation_resolved_started() {
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
-                resolution: NexusResolution::Started { links: Vec::new() },
+                resolution: NexusResolution::Started {
+                    operation_token: "handler-token-xyz".into(),
+                    links: Vec::new(),
+                },
                 now: now(),
             }),
         )
         .unwrap();
 
+    // The handler-issued token is recorded verbatim on the started event so the
+    // caller can read it as NexusOperationExecution.OperationToken and a later
+    // cancel can send it back (`operation_token` field 5 @ v1.31.0).
     assert!(matches!(
-        transition.history_events[0].kind,
+        &transition.history_events[0].kind,
         HistoryEventKind::NexusOperationStarted {
             scheduled_event_id: 12,
+            operation_token,
             ..
-        }
+        } if operation_token == "handler-token-xyz"
     ));
     assert!(
         transition
@@ -5700,7 +5707,10 @@ fn nexus_operation_resolved_started_duplicate() {
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
-                resolution: NexusResolution::Started { links: Vec::new() },
+                resolution: NexusResolution::Started {
+                    operation_token: String::new(),
+                    links: Vec::new(),
+                },
                 now: now(),
             }),
         )
@@ -5856,7 +5866,10 @@ fn nexus_operation_resolved_unknown_operation() {
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
                 operation_id: "missing".into(),
                 scheduled_event_id: 12,
-                resolution: NexusResolution::Started { links: Vec::new() },
+                resolution: NexusResolution::Started {
+                    operation_token: String::new(),
+                    links: Vec::new(),
+                },
                 now: now(),
             }),
         )
@@ -5873,7 +5886,10 @@ fn nexus_operation_resolved_stale() {
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
                 operation_id: "op-1".into(),
                 scheduled_event_id: 99,
-                resolution: NexusResolution::Started { links: Vec::new() },
+                resolution: NexusResolution::Started {
+                    operation_token: String::new(),
+                    links: Vec::new(),
+                },
                 now: now(),
             }),
         )
@@ -5895,7 +5911,10 @@ fn nexus_operation_resolved_absent_run() {
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
-                resolution: NexusResolution::Started { links: Vec::new() },
+                resolution: NexusResolution::Started {
+                    operation_token: String::new(),
+                    links: Vec::new(),
+                },
                 now: now(),
             }),
         )
@@ -5911,7 +5930,10 @@ fn nexus_operation_resolved_closed_run() {
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
-                resolution: NexusResolution::Started { links: Vec::new() },
+                resolution: NexusResolution::Started {
+                    operation_token: String::new(),
+                    links: Vec::new(),
+                },
                 now: now(),
             }),
         )

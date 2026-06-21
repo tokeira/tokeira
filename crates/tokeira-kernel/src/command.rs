@@ -867,6 +867,10 @@ pub enum ExternalCancelResult {
 pub enum NexusResolution {
     /// The operation transitioned to async-started.
     Started {
+        /// Handler-issued token for the running async operation, surfaced to the
+        /// caller as `NexusOperationExecution.OperationToken` and recorded on the
+        /// `NexusOperationStarted` event (`operation_token` field 5 @ v1.31.0).
+        operation_token: String,
         /// Links the handler returned on the start response.
         links: Vec<Link>,
     },

@@ -1154,7 +1154,10 @@ async fn cross_namespace_async_nexus_completes_back_to_originator() -> Result<()
                 parent_run_key,
                 "op-agent".to_string(),
                 scheduled_event_id,
-                tokeira_kernel::NexusResolution::Started { links: Vec::new() },
+                tokeira_kernel::NexusResolution::Started {
+                    operation_token: String::new(),
+                    links: Vec::new()
+                },
             )
             .await?,
         "Started resolution should apply"

@@ -647,9 +647,13 @@ where
                                 }),
                             }
                         }
-                        Ok(NexusStartResult::AsyncAccepted { links, .. }) => {
-                            tokeira_kernel::NexusResolution::Started { links }
-                        }
+                        Ok(NexusStartResult::AsyncAccepted {
+                            operation_token,
+                            links,
+                        }) => tokeira_kernel::NexusResolution::Started {
+                            operation_token,
+                            links,
+                        },
                         Err(error) => tokeira_kernel::NexusResolution::Failed {
                             failure: failure_to_payload(&failure_proto::Failure {
                                 message: error.to_string(),

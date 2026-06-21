@@ -230,8 +230,20 @@ pub fn proto_start_response_to_resolution(
                     "nexus async start returned mismatched operation_id"
                 );
             }
+            // The handler's async token: v1.62 carries it in `operation_token`;
+            // fall back to the deprecated `operation_id` for v0.4-era handlers
+            // that only set the old field. This becomes the started event's
+            // operation_token (the caller's NexusOperationExecution.OperationToken).
+            let operation_token = if async_success.operation_token.is_empty() {
+                async_success.operation_id.clone()
+            } else {
+                async_success.operation_token.clone()
+            };
             // See the SyncSuccess arm: worker-path Nexus links are not converted here.
-            Ok(NexusResolution::Started { links: Vec::new() })
+            Ok(NexusResolution::Started {
+                operation_token,
+                links: Vec::new(),
+            })
         }
         Some(nexus_v1::start_operation_response::Variant::OperationError(error)) => {
             Ok(NexusResolution::Failed {
@@ -440,7 +452,10 @@ mod tests {
             };
             prop_assert_eq!(
                 proto_response_to_resolution(async_response, &operation_id).expect("async success"),
-                NexusResolution::Started { links: Vec::new() }
+                NexusResolution::Started {
+                    operation_token: operation_id.clone(),
+                    links: Vec::new()
+                }
             );
 
             let cancel = nexus_v1::Response {

@@ -448,6 +448,13 @@ pub enum HistoryEventKind {
     NexusOperationStarted {
         operation_id: String,
         scheduled_event_id: i64,
+        /// Handler-issued token identifying the running async operation
+        /// (`NexusOperationStartedEventAttributes.operation_token` field 5 @
+        /// v1.31.0). This is the token the caller reads as
+        /// `NexusOperationExecution.OperationToken` and that a later cancel sends
+        /// back to the handler — distinct from `operation_id`, which is tokeira's
+        /// own per-operation request id.
+        operation_token: String,
         /// Links the handler returned on the start response, recorded on the
         /// event (`saveResult` sets `e.Links = links` @ v1.31.0).
         links: Vec<Link>,

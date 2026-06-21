@@ -1151,7 +1151,10 @@ fn arb_workflow_execution_timed_out_request(
 
 fn arb_nexus_resolution() -> impl Strategy<Value = NexusResolution> {
     prop_oneof![
-        Just(NexusResolution::Started { links: Vec::new() }),
+        Just(NexusResolution::Started {
+            operation_token: String::new(),
+            links: Vec::new()
+        }),
         arb_payloads().prop_map(|result| NexusResolution::Completed {
             result,
             links: Vec::new(),
@@ -4699,7 +4702,7 @@ proptest! {
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
                 operation_id: operation_id.clone(),
                 scheduled_event_id: 12,
-                resolution: NexusResolution::Started { links: Vec::new() },
+                resolution: NexusResolution::Started { operation_token: String::new(), links: Vec::new() },
                 now,
             }),
         ).unwrap();
@@ -4752,7 +4755,7 @@ proptest! {
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
                 operation_id: operation_id.clone(),
                 scheduled_event_id: 12,
-                resolution: NexusResolution::Started { links: Vec::new() },
+                resolution: NexusResolution::Started { operation_token: String::new(), links: Vec::new() },
                 now,
             }),
         );
@@ -4763,7 +4766,7 @@ proptest! {
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
                 operation_id: operation_id.clone(),
                 scheduled_event_id: 99,
-                resolution: NexusResolution::Started { links: Vec::new() },
+                resolution: NexusResolution::Started { operation_token: String::new(), links: Vec::new() },
                 now,
             }),
         );

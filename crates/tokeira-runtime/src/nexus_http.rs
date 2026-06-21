@@ -278,6 +278,36 @@ fn failure_message(bytes: &[u8]) -> Option<String> {
         .filter(|m| !m.is_empty())
 }
 
+/// Map a Nexus link `eventType` query value to the kernel's i32 event type.
+///
+/// Mirrors `enumspb.EventTypeFromString` (`enums/v1/event_type.go-helpers.pb.go @
+/// api-go`), which `link_converter.go @ v1.31.0` uses to decode the link. The
+/// quirk: Temporal's `EventType.String()` is **custom** and emits the PascalCase
+/// shorthand (`WorkflowExecutionStarted`), not the protojson SCREAMING_CASE name,
+/// so that is what the link query actually carries. `EventTypeFromString` accepts
+/// *both* forms (two maps). prost's `from_str_name` only knows the SCREAMING_CASE
+/// name, so a shorthand value is expanded to `EVENT_TYPE_<SCREAMING_SNAKE>` and
+/// retried. Unknown values default to UNSPECIFIED (0): a cosmetic link must never
+/// fail the operation.
+fn event_type_from_link_value(s: &str) -> i32 {
+    use tokeira_proto::enums::EventType;
+    if let Some(e) = EventType::from_str_name(s) {
+        return e as i32;
+    }
+    // PascalCase shorthand -> EVENT_TYPE_SCREAMING_SNAKE: a separating underscore
+    // precedes every uppercase letter (the leading "EVENT_TYPE" supplies the first).
+    let mut screaming = String::from("EVENT_TYPE");
+    for ch in s.chars() {
+        if ch.is_ascii_uppercase() {
+            screaming.push('_');
+        }
+        screaming.push(ch.to_ascii_uppercase());
+    }
+    EventType::from_str_name(&screaming)
+        .map(|e| e as i32)
+        .unwrap_or(0)
+}
+
 /// `FormatDuration` = whole milliseconds + `ms` (`api.go:279 @ v1.31.0`).
 fn format_duration_ms(d: Duration) -> String {
     format!("{}ms", d.whole_milliseconds())
@@ -540,8 +570,7 @@ fn nexus_url_to_workflow_event_link(url_str: &str) -> Option<Link> {
     }
     let event_type = event_type_name
         .as_deref()
-        .and_then(tokeira_proto::enums::EventType::from_str_name)
-        .map(|e| e as i32)
+        .map(event_type_from_link_value)
         .unwrap_or(0);
 
     let reference = match reference_type.as_deref() {
@@ -578,8 +607,10 @@ mod tests {
     // handler link (`tests/nexus_workflow_test.go @ v1.31.0`): namespace
     // "handler-ns", workflow "handler-wf-id", run "handler-run-id", EventRef with
     // EVENT_TYPE_WORKFLOW_EXECUTION_STARTED and no event id. `url.Values.Encode`
-    // sorts keys, so `eventType` precedes `referenceType`.
-    const HANDLER_LINK_HEADER: &str = "<temporal:///namespaces/handler-ns/workflows/handler-wf-id/handler-run-id/history?eventType=EVENT_TYPE_WORKFLOW_EXECUTION_STARTED&referenceType=EventReference>; type=\"temporal.api.common.v1.Link.WorkflowEvent\"";
+    // sorts keys, so `eventType` precedes `referenceType`. The `eventType` value is
+    // the PascalCase shorthand `WorkflowExecutionStarted` because Temporal's
+    // `EventType.String()` is custom (NOT the SCREAMING_CASE protojson name).
+    const HANDLER_LINK_HEADER: &str = "<temporal:///namespaces/handler-ns/workflows/handler-wf-id/handler-run-id/history?eventType=WorkflowExecutionStarted&referenceType=EventReference>; type=\"temporal.api.common.v1.Link.WorkflowEvent\"";
 
     #[test]
     fn decodes_workflow_event_link_header() {
@@ -601,6 +632,29 @@ mod tests {
                 }),
             }
         );
+    }
+
+    #[test]
+    fn event_type_accepts_both_shorthand_and_canonical() {
+        let started = tokeira_proto::enums::EventType::WorkflowExecutionStarted as i32;
+        // Temporal's link writes the PascalCase shorthand; we must also accept the
+        // SCREAMING_CASE protojson name (EventTypeFromString accepts both).
+        assert_eq!(
+            event_type_from_link_value("WorkflowExecutionStarted"),
+            started
+        );
+        assert_eq!(
+            event_type_from_link_value("EVENT_TYPE_WORKFLOW_EXECUTION_STARTED"),
+            started
+        );
+        // A multi-word shorthand round-trips too.
+        let scheduled = tokeira_proto::enums::EventType::NexusOperationScheduled as i32;
+        assert_eq!(
+            event_type_from_link_value("NexusOperationScheduled"),
+            scheduled
+        );
+        // Unknown -> UNSPECIFIED (0), never a panic.
+        assert_eq!(event_type_from_link_value("NotAnEventType"), 0);
     }
 
     #[test]
@@ -695,7 +749,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_sync_200_yields_completed_with_link() {
-        let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nNexus-Link: <temporal:///namespaces/handler-ns/workflows/handler-wf-id/handler-run-id/history?eventType=EVENT_TYPE_WORKFLOW_EXECUTION_STARTED&referenceType=EventReference>; type=\"temporal.api.common.v1.Link.WorkflowEvent\"\r\nContent-Length: 8\r\n\r\n\"result\"";
+        let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nNexus-Link: <temporal:///namespaces/handler-ns/workflows/handler-wf-id/handler-run-id/history?eventType=WorkflowExecutionStarted&referenceType=EventReference>; type=\"temporal.api.common.v1.Link.WorkflowEvent\"\r\nContent-Length: 8\r\n\r\n\"result\"";
         let base = serve_once(response).await;
         let client = HttpNexusClient::new();
         let result = client
@@ -714,6 +768,20 @@ mod tests {
             NexusStartResult::SyncCompleted { result, links } => {
                 assert_eq!(result.0[0].data, b"\"result\"");
                 assert_eq!(links.len(), 1, "handler link must be carried through");
+                let started = tokeira_proto::enums::EventType::WorkflowExecutionStarted as i32;
+                assert_eq!(
+                    links[0],
+                    Link::WorkflowEvent {
+                        namespace: "handler-ns".to_owned(),
+                        workflow_id: "handler-wf-id".to_owned(),
+                        run_id: "handler-run-id".to_owned(),
+                        reference: Some(LinkWorkflowEventReference::Event {
+                            event_id: 0,
+                            event_type: started,
+                        }),
+                    },
+                    "handler link must round-trip with its event_type"
+                );
             }
             other => panic!("expected SyncCompleted, got {other:?}"),
         }

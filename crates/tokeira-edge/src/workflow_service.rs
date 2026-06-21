@@ -2592,48 +2592,35 @@ impl WorkflowService {
                 let task_token: tokeira_types::WorkflowTaskToken =
                     serde_json::from_slice(&req.task_token).map_err(EdgeError::from)?;
 
+                // Hydrate an Acceptance message's command body with the update's
+                // name/input from the registry (the worker echoes only the message
+                // id). We deliberately do NOT resolve Completed/Rejected waiters
+                // here: the update outcome must be published only after the
+                // `WorkflowExecutionUpdateCompleted`/`Rejected` event durably
+                // commits, which the lane does post-commit. v1.31.0 sets the
+                // outcome future in `OnAfterCommit` for exactly this reason — a
+                // waiter woken before the event is durable would re-read history
+                // and see only `Accepted` (`update.go:onResponseMsg @ v1.31.0`).
+                // Notifying here pre-commit removed the registry waiter and made
+                // the lane's correct post-commit notify a no-op, stranding the
+                // COMPLETED caller at the Accepted stage.
                 for cmd in &mut req.commands {
-                    if let tokeira_kernel::WorkflowCommand::ProtocolMessage { body, .. } = cmd {
-                        match body {
+                    if let tokeira_kernel::WorkflowCommand::ProtocolMessage {
+                        body:
                             tokeira_kernel::UpdateProtocolBody::Accepted {
                                 update_id,
                                 update_name,
                                 input,
-                            } => {
-                                if let Ok(Some((name, inp))) = self
-                                    .runtime
-                                    .peek_update_info(task_token.run_key, update_id.clone())
-                                    .await
-                                {
-                                    *update_name = name;
-                                    *input = inp;
-                                }
-                            }
-                            tokeira_kernel::UpdateProtocolBody::Completed { update_id, result } => {
-                                let _ = self
-                                    .runtime
-                                    .resolve_update_transport(
-                                        task_token.run_key,
-                                        update_id.clone(),
-                                        UpdateTransportResolution::Completed {
-                                            result: result.clone(),
-                                        },
-                                    )
-                                    .await;
-                            }
-                            tokeira_kernel::UpdateProtocolBody::Rejected { update_id, failure } => {
-                                let _ = self
-                                    .runtime
-                                    .resolve_update_transport(
-                                        task_token.run_key,
-                                        update_id.clone(),
-                                        UpdateTransportResolution::Rejected {
-                                            failure: failure.clone(),
-                                        },
-                                    )
-                                    .await;
-                            }
-                        }
+                            },
+                        ..
+                    } = cmd
+                        && let Ok(Some((name, inp))) = self
+                            .runtime
+                            .peek_update_info(task_token.run_key, update_id.clone())
+                            .await
+                    {
+                        *update_name = name;
+                        *input = inp;
                     }
                 }
 

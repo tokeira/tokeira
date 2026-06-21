@@ -190,7 +190,7 @@ impl DeploymentRegistry {
     /// v1.31.0 creates a Worker Deployment (and its Version) the first time a
     /// versioned worker polls a task queue: matching forwards the poll to the
     /// deployment/version entity workflows, which are created on demand with a
-    /// create request id carrying [`AUTO_CREATE_REQUEST_ID_PREFIX`]
+    /// create request id carrying `AUTO_CREATE_REQUEST_ID_PREFIX`
     /// (`service/worker/workerdeployment/client.go:1230 @ v1.31.0`). Tokeira holds
     /// the registry as durable single-document state rather than entity workflows
     /// (see module docs), so this method performs the same lazy registration over

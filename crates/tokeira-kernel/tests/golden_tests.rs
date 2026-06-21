@@ -5681,7 +5681,10 @@ fn nexus_operation_resolved_started() {
             .unwrap()
             .started
     );
-    assert!(transition.next_state.pending_workflow_task.is_none());
+    // NexusOperationStarted is a workflow-task trigger, so the started
+    // transition schedules a WFT to deliver the event to the worker
+    // (`StartedEventDefinition.IsWorkflowTaskTrigger() -> true`, v1.31.0).
+    assert!(transition.next_state.pending_workflow_task.is_some());
     assert!(transition.request_dedupe_ops.is_empty());
 }
 

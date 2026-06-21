@@ -4704,9 +4704,13 @@ proptest! {
             true
         );
         prop_assert!(transition.next_state.pending_nexus_operations.contains_key(&operation_id));
-        prop_assert!(transition.next_state.pending_workflow_task.is_none());
+        // Started is non-terminal (the operation stays pending) but IS a
+        // workflow-task trigger, so it schedules a WFT to deliver the started
+        // event to the worker (`StartedEventDefinition.IsWorkflowTaskTrigger()
+        // -> true`, components/nexusoperations/events.go @ v1.31.0).
+        prop_assert!(transition.next_state.pending_workflow_task.is_some());
         prop_assert_eq!(
-            transition.dispatch_ops.iter().all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. })),
+            transition.dispatch_ops.iter().any(|op| matches!(op, DispatchOp::EnqueueWorkflowTask { .. })),
             true
         );
         prop_assert!(transition.request_dedupe_ops.is_empty());

@@ -1802,6 +1802,14 @@ impl BasicKernel {
                     // this to fire start-to-close (`statemachine.go:159-167 @ v1.31.0`).
                     current.started_at = Some(builder.now);
                 }
+                // NexusOperationStarted is a workflow-task trigger
+                // (`StartedEventDefinition.IsWorkflowTaskTrigger() -> true`,
+                // components/nexusoperations/events.go @ v1.31.0): the async-started
+                // transition must deliver a task so the worker observes the started
+                // event, exactly like the terminal resolutions below.
+                if builder.state.pending_workflow_task.is_none() {
+                    builder.schedule_workflow_task();
+                }
             }
             NexusResolution::Completed { result } => {
                 builder.emit(HistoryEventKind::NexusOperationCompleted {

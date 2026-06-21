@@ -1191,6 +1191,8 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             input,
             nexus_header,
             schedule_to_close_timeout,
+            schedule_to_start_timeout,
+            start_to_close_timeout,
         } => Attributes::NexusOperationScheduledEventAttributes(
             history::NexusOperationScheduledEventAttributes {
                 endpoint: endpoint.clone(),
@@ -1200,6 +1202,8 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 input: input.0.first().map(payload_from_domain),
                 nexus_header: nexus_header.clone(),
                 schedule_to_close_timeout: to_opt_proto_duration(*schedule_to_close_timeout),
+                schedule_to_start_timeout: to_opt_proto_duration(*schedule_to_start_timeout),
+                start_to_close_timeout: to_opt_proto_duration(*start_to_close_timeout),
                 workflow_task_completed_event_id: *workflow_task_completed_event_id,
                 ..Default::default()
             },
@@ -1251,10 +1255,47 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
         HistoryEventKind::NexusOperationTimedOut {
             operation_id,
             scheduled_event_id,
+            endpoint,
+            service,
+            operation,
+            operation_token,
+            timeout_type,
         } => Attributes::NexusOperationTimedOutEventAttributes(
             history::NexusOperationTimedOutEventAttributes {
                 request_id: operation_id.clone(),
                 scheduled_event_id: *scheduled_event_id,
+                // v1.31.0 wraps a "operation timed out" TimeoutFailureInfo cause
+                // inside the outer NexusOperationExecutionFailureInfo
+                // (`createNexusOperationFailure` + `recordOperationTimeout` @ v1.31.0);
+                // the conformance suite reads `.GetCause().GetTimeoutFailureInfo()`.
+                failure: Some(proto_failure::Failure {
+                    message: "nexus operation completed unsuccessfully".to_string(),
+                    failure_info: Some(
+                        proto_failure::failure::FailureInfo::NexusOperationExecutionFailureInfo(
+                            proto_failure::NexusOperationFailureInfo {
+                                scheduled_event_id: *scheduled_event_id,
+                                endpoint: endpoint.clone(),
+                                service: service.clone(),
+                                operation: operation.clone(),
+                                operation_id: operation_token.clone(),
+                                operation_token: operation_token.clone(),
+                            },
+                        ),
+                    ),
+                    cause: Some(Box::new(proto_failure::Failure {
+                        message: "operation timed out".to_string(),
+                        failure_info: Some(
+                            proto_failure::failure::FailureInfo::TimeoutFailureInfo(
+                                proto_failure::TimeoutFailureInfo {
+                                    timeout_type: nexus_timeout_type_i32(timeout_type),
+                                    ..Default::default()
+                                },
+                            ),
+                        ),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         ),
@@ -1447,6 +1488,18 @@ fn activity_timeout_type_i32(timeout_type: &str) -> i32 {
         "SCHEDULE_TO_CLOSE" | "ScheduleToClose" | "schedule_to_close" => T::ScheduleToClose as i32,
         "HEARTBEAT" | "Heartbeat" | "heartbeat" => T::Heartbeat as i32,
         _ => T::Unspecified as i32,
+    }
+}
+
+/// Map the kernel's typed Nexus timeout to the proto `enums.TimeoutType` carried
+/// in the timeout failure's `TimeoutFailureInfo` (`executors.go:583-608 @ v1.31.0`).
+fn nexus_timeout_type_i32(timeout_type: &tokeira_kernel::NexusTimeoutType) -> i32 {
+    use tokeira_kernel::NexusTimeoutType as N;
+    use tokeira_proto::enums::TimeoutType as T;
+    match timeout_type {
+        N::ScheduleToClose => T::ScheduleToClose as i32,
+        N::ScheduleToStart => T::ScheduleToStart as i32,
+        N::StartToClose => T::StartToClose as i32,
     }
 }
 
@@ -1859,6 +1912,8 @@ mod tests {
                         input,
                         nexus_header: std::collections::BTreeMap::new(),
                         schedule_to_close_timeout: timeout,
+                        schedule_to_start_timeout: None,
+                        start_to_close_timeout: None,
                     }
                 }),
             ("[a-z]{1,6}", "[a-z]{1,6}", arb_payloads()).prop_map(|(uid, uname, input)| {

@@ -2888,6 +2888,8 @@ fn pending_nexus_operation_to_proto(
             enums::PendingNexusOperationState::Scheduled as i32
         },
         scheduled_event_id: op.scheduled_event_id,
+        schedule_to_start_timeout: op.schedule_to_start_timeout.map(to_proto_duration),
+        start_to_close_timeout: op.start_to_close_timeout.map(to_proto_duration),
         operation_token,
         ..Default::default()
     }
@@ -4078,6 +4080,12 @@ pub fn proto_command_to_workflow_command(
                 schedule_to_close_timeout: proto_duration_to_time(
                     attrs.schedule_to_close_timeout.as_ref(),
                 ),
+                schedule_to_start_timeout: proto_duration_to_time(
+                    attrs.schedule_to_start_timeout.as_ref(),
+                ),
+                start_to_close_timeout: proto_duration_to_time(
+                    attrs.start_to_close_timeout.as_ref(),
+                ),
             })
         }
         Some(Attributes::RequestCancelNexusOperationCommandAttributes(attrs)) => {
@@ -4337,6 +4345,8 @@ pub fn workflow_command_to_proto(
             operation,
             input,
             schedule_to_close_timeout,
+            schedule_to_start_timeout,
+            start_to_close_timeout,
             ..
         } => Some(Attributes::ScheduleNexusOperationCommandAttributes(
             command::ScheduleNexusOperationCommandAttributes {
@@ -4345,6 +4355,8 @@ pub fn workflow_command_to_proto(
                 operation: operation.clone(),
                 input: input.0.first().map(payload_from_domain),
                 schedule_to_close_timeout: schedule_to_close_timeout.map(to_proto_duration),
+                schedule_to_start_timeout: schedule_to_start_timeout.map(to_proto_duration),
+                start_to_close_timeout: start_to_close_timeout.map(to_proto_duration),
                 ..Default::default()
             },
         )),

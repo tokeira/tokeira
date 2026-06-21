@@ -1081,17 +1081,18 @@ impl RunRepository for InMemoryStore {
                 continue;
             }
             for op in state.pending_nexus_operations.values() {
-                // Only include operations that have a timeout
-                // configured — operations without a timeout
-                // don't need timeout tracking reconstruction.
-                let Some(timeout) = op.schedule_to_close_timeout else {
+                // Only include operations with at least one timeout configured —
+                // operations without any timeout don't need tracking reconstruction.
+                if op.schedule_to_close_timeout.is_none()
+                    && op.schedule_to_start_timeout.is_none()
+                    && op.start_to_close_timeout.is_none()
+                {
                     continue;
-                };
+                }
                 out.push(NexusSweepEntry {
                     run_key: state.run_key,
                     operation_id: op.operation_id.clone(),
                     scheduled_event_id: op.scheduled_event_id,
-                    schedule_to_close_timeout: timeout,
                     scheduled_at: op.scheduled_at,
                 });
                 if out.len() >= limit {

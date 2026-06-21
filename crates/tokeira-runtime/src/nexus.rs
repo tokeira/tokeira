@@ -14,7 +14,11 @@ use async_trait::async_trait;
 use opentelemetry::KeyValue;
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
-use tokeira_kernel::Command;
+use tokeira_kernel::{
+    Command, LoadedRun, NexusOperationResolvedRequest, NexusResolution, NexusTimeoutType,
+    PendingNexusOperation,
+};
+use tokeira_storage::RunRepository;
 use tokeira_types::{NamespaceId, Payload, Payloads, RunKey, ShardId, TaskQueueName};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
@@ -546,13 +550,20 @@ impl NexusHttpClient for NoopNexusHttpClient {
     }
 }
 
+/// Volatile index of which open Nexus operations to watch for timeouts.
+///
+/// This is a derived index, not authority: it lists *which* `(run, operation)`
+/// pairs the scanner must check. The timeout deadlines, `started`/`started_at`
+/// anchors, and current liveness are read from the durable `PendingNexusOperation`
+/// at scan time (history is authority, AGENTS §3). On shard takeover the index is
+/// rebuilt from durable state by [`crate::recovery::sweep_shard`]; losing it only
+/// delays firing until the rebuild, never changes the outcome.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NexusTimeoutEntry {
     pub run_key: RunKey,
     pub shard_id: ShardId,
     pub operation_id: String,
     pub scheduled_event_id: i64,
-    pub schedule_to_close_timeout: Duration,
     pub scheduled_at: OffsetDateTime,
 }
 
@@ -620,20 +631,72 @@ impl Default for NexusTimeoutScannerConfig {
     }
 }
 
-pub fn evaluate_nexus_timeout(entry: &NexusTimeoutEntry, now: OffsetDateTime) -> bool {
-    let elapsed = now - entry.scheduled_at;
-    elapsed > entry.schedule_to_close_timeout
-        || (entry.schedule_to_close_timeout.is_zero() && now >= entry.scheduled_at)
+/// Decide which Nexus timeout, if any, the live operation has breached at `now`.
+///
+/// Mirrors v1.31.0's three independent timeout tasks
+/// (`components/nexusoperations/statemachine.go:144-167 @ v1.31.0`):
+/// schedule-to-close is anchored at the scheduled time and applies in any state;
+/// schedule-to-start is anchored at the scheduled time but only while the
+/// operation has not started; start-to-close is anchored at the started time and
+/// only once started. A zero/unset timeout means "no deadline" (v1.31.0 only
+/// emits the task when `AsDuration() != 0`), which is the opposite of the
+/// activity scanner's zero-means-immediate convention — Nexus has no schedule
+/// command default, so an unset timeout must not fire. When more than one
+/// deadline has passed, the earliest-anchored applicable one is reported; since
+/// the conformance suite sets exactly one timeout per operation, precedence only
+/// affects the rare multi-timeout case and never suppresses a real firing.
+pub fn evaluate_nexus_timeout(
+    op: &PendingNexusOperation,
+    now: OffsetDateTime,
+) -> Option<NexusTimeoutType> {
+    let mut fired: Option<(OffsetDateTime, NexusTimeoutType)> = None;
+    let mut consider = |deadline: OffsetDateTime, kind: NexusTimeoutType| {
+        if now >= deadline {
+            match fired {
+                Some((existing, _)) if existing <= deadline => {}
+                _ => fired = Some((deadline, kind)),
+            }
+        }
+    };
+
+    if let Some(timeout) = op.schedule_to_close_timeout
+        && !timeout.is_zero()
+    {
+        consider(op.scheduled_at + timeout, NexusTimeoutType::ScheduleToClose);
+    }
+    if !op.started
+        && let Some(timeout) = op.schedule_to_start_timeout
+        && !timeout.is_zero()
+    {
+        consider(op.scheduled_at + timeout, NexusTimeoutType::ScheduleToStart);
+    }
+    if let Some(started_at) = op.started_at
+        && let Some(timeout) = op.start_to_close_timeout
+        && !timeout.is_zero()
+    {
+        consider(started_at + timeout, NexusTimeoutType::StartToClose);
+    }
+
+    fired.map(|(_, kind)| kind)
 }
 
-pub(crate) async fn scan_nexus_timeouts_once<F, Fut>(
+/// Evaluate the watched Nexus operations once and resolve any that have timed
+/// out, capped at `max_timeouts_per_scan`.
+///
+/// Each entry's run is reloaded from `repo` because the live `PendingNexusOperation`
+/// is the authority for the current timeouts, the started anchor, and whether the
+/// operation still exists (mirrors the activity scanner). An entry whose run is
+/// absent, or whose operation is no longer pending, is dropped (it resolved by
+/// another path); a load error is transient and leaves the entry for the next scan.
+pub(crate) async fn scan_nexus_timeouts_once<R>(
+    repo: &R,
     tracking: &NexusTimeoutTrackingState,
     shard_id: Option<ShardId>,
+    lanes: &[LaneHandle],
+    lane_count: usize,
     config: &NexusTimeoutScannerConfig,
-    mut submit_timeout: F,
 ) where
-    F: FnMut(NexusTimeoutEntry, OffsetDateTime) -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
+    R: RunRepository + 'static,
 {
     let now = OffsetDateTime::now_utc();
     let entries = match shard_id {
@@ -646,14 +709,58 @@ pub(crate) async fn scan_nexus_timeouts_once<F, Fut>(
         if submitted >= config.max_timeouts_per_scan {
             break;
         }
-        if !evaluate_nexus_timeout(&entry, now) {
-            continue;
-        }
 
-        match submit_timeout(entry.clone(), now).await {
+        let state = match repo.load_run(entry.run_key).await {
+            Ok(LoadedRun::Existing(state)) => state,
+            Ok(LoadedRun::Absent) => {
+                tracking.remove(entry.run_key, &entry.operation_id);
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    run_key = ?entry.run_key,
+                    operation_id = entry.operation_id,
+                    "nexus timeout scanner failed to load run"
+                );
+                continue;
+            }
+        };
+
+        let Some(operation) = state.pending_nexus_operations.get(&entry.operation_id) else {
+            tracking.remove(entry.run_key, &entry.operation_id);
+            continue;
+        };
+
+        let Some(timeout_type) = evaluate_nexus_timeout(operation, now) else {
+            continue;
+        };
+
+        runtime_metrics::record_scanner_dispatched(
+            "nexus_timeout",
+            shard_id.map(|s| s.0).unwrap_or(0),
+        );
+        let lane = pick_lane_for_run_key(lanes, lane_count, entry.run_key).clone();
+        let result = lane
+            .submit(
+                entry.run_key,
+                Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                    operation_id: entry.operation_id.clone(),
+                    scheduled_event_id: entry.scheduled_event_id,
+                    resolution: NexusResolution::TimedOut { timeout_type },
+                    now,
+                }),
+            )
+            .await
+            .map(|_| ());
+
+        match result {
             Ok(()) => tracking.remove(entry.run_key, &entry.operation_id),
             Err(error) => {
                 let message = error.to_string();
+                // Kernel rejection means the operation already resolved or advanced
+                // past the state this timeout was computed against, so the entry is
+                // stale: drop it. Other errors are transient and keep the entry.
                 if message.contains("kernel rejected") {
                     tracing::debug!(
                         ?error,
@@ -676,14 +783,17 @@ pub(crate) async fn scan_nexus_timeouts_once<F, Fut>(
     }
 }
 
-pub(crate) async fn run_nexus_timeout_scanner(
+pub(crate) async fn run_nexus_timeout_scanner<R>(
+    repo: Arc<R>,
     tracking: NexusTimeoutTrackingState,
     lanes: Vec<LaneHandle>,
     lane_count: usize,
     shard_owner: Arc<RwLock<ShardOwner>>,
     config: NexusTimeoutScannerConfig,
     cancel: CancellationToken,
-) {
+) where
+    R: RunRepository + 'static,
+{
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -693,25 +803,14 @@ pub(crate) async fn run_nexus_timeout_scanner(
         let active_shards: Vec<_> = shard_owner.read().unwrap().active_shards().collect();
         for shard_id in active_shards {
             runtime_metrics::record_scanner_tick("nexus_timeout", shard_id.0);
-            scan_nexus_timeouts_once(&tracking, Some(shard_id), &config, |entry, now| {
-                runtime_metrics::record_scanner_dispatched("nexus_timeout", shard_id.0);
-                let lane = pick_lane_for_run_key(&lanes, lane_count, entry.run_key).clone();
-                async move {
-                    lane.submit(
-                        entry.run_key,
-                        Command::NexusOperationResolved(
-                            tokeira_kernel::NexusOperationResolvedRequest {
-                                operation_id: entry.operation_id,
-                                scheduled_event_id: entry.scheduled_event_id,
-                                resolution: tokeira_kernel::NexusResolution::TimedOut,
-                                now,
-                            },
-                        ),
-                    )
-                    .await
-                    .map(|_| ())
-                }
-            })
+            scan_nexus_timeouts_once(
+                repo.as_ref(),
+                &tracking,
+                Some(shard_id),
+                &lanes,
+                lane_count,
+                &config,
+            )
             .await;
         }
     }

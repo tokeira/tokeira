@@ -1230,6 +1230,8 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
                     operation,
                     input,
                     schedule_to_close_timeout: None,
+                    schedule_to_start_timeout: None,
+                    start_to_close_timeout: None,
                 }
             }),
         (1i64..100i64).prop_map(|scheduled_event_id| {

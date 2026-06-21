@@ -211,14 +211,16 @@ pub(super) fn collect_nexus_sweep_entries(
             continue;
         }
         for operation in state.pending_nexus_operations.values() {
-            let Some(schedule_to_close_timeout) = operation.schedule_to_close_timeout else {
+            if operation.schedule_to_close_timeout.is_none()
+                && operation.schedule_to_start_timeout.is_none()
+                && operation.start_to_close_timeout.is_none()
+            {
                 continue;
-            };
+            }
             entries.push(NexusSweepEntry {
                 run_key: RunKey(run_key),
                 operation_id: operation.operation_id.clone(),
                 scheduled_event_id: operation.scheduled_event_id,
-                schedule_to_close_timeout,
                 scheduled_at: operation.scheduled_at,
             });
             if entries.len() == limit {

@@ -7,8 +7,8 @@ use tokeira_types::{
 
 use crate::{
     command::{
-        ContinueAsNewInitiator, ExternalWorkflowExecution, FieldChange, RetryState,
-        WorkflowTaskFailedCause, WorkflowTaskTimeoutType, WorkflowTimeoutType,
+        ContinueAsNewInitiator, ExternalWorkflowExecution, FieldChange, NexusTimeoutType,
+        RetryState, WorkflowTaskFailedCause, WorkflowTaskTimeoutType, WorkflowTimeoutType,
     },
     state::{
         CompletionCallback, Link, ParentClosePolicy, Priority, UserMetadata, VersioningBehavior,
@@ -438,6 +438,11 @@ pub enum HistoryEventKind {
         input: Payloads,
         nexus_header: std::collections::BTreeMap<String, String>,
         schedule_to_close_timeout: Option<Duration>,
+        /// Wire fields 10/11 on `NexusOperationScheduledEventAttributes`
+        /// (v1.31.0). Recorded in history so replay can rebuild the pending
+        /// operation's timeout deadlines without re-reading the command.
+        schedule_to_start_timeout: Option<Duration>,
+        start_to_close_timeout: Option<Duration>,
     },
     /// The Nexus operation transitioned to started (async).
     NexusOperationStarted {
@@ -465,6 +470,18 @@ pub enum HistoryEventKind {
     NexusOperationTimedOut {
         operation_id: String,
         scheduled_event_id: i64,
+        /// Endpoint/service/operation identity, carried so the edge can build
+        /// the outer `NexusOperationExecutionFailureInfo` whose cause is the
+        /// timeout failure (`createNexusOperationFailure` @ v1.31.0).
+        endpoint: String,
+        service: String,
+        operation: String,
+        /// Async operation token if the operation had started; empty otherwise,
+        /// matching v1.31.0's `op.OperationToken` (empty until started).
+        operation_token: String,
+        /// Which timeout fired, surfaced in the cause's `TimeoutFailureInfo`
+        /// (`executors.go:583-608 @ v1.31.0`).
+        timeout_type: NexusTimeoutType,
     },
     /// A cancel was requested for a pending Nexus operation.
     NexusOperationCancelRequested { scheduled_event_id: i64 },

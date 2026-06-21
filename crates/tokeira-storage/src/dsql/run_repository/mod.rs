@@ -1522,8 +1522,11 @@ mod tests {
             service: "service".to_owned(),
             operation: "operation".to_owned(),
             schedule_to_close_timeout: with_timeout.then_some(Duration::seconds(30)),
+            schedule_to_start_timeout: None,
+            start_to_close_timeout: None,
             scheduled_at: fixed_now(),
             started: false,
+            started_at: None,
         }
     }
 

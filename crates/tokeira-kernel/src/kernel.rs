@@ -1798,6 +1798,9 @@ impl BasicKernel {
                     .get_mut(&pending.operation_id)
                 {
                     current.started = true;
+                    // Anchor start-to-close at acceptance time; the scanner reads
+                    // this to fire start-to-close (`statemachine.go:159-167 @ v1.31.0`).
+                    current.started_at = Some(builder.now);
                 }
             }
             NexusResolution::Completed { result } => {
@@ -1841,10 +1844,21 @@ impl BasicKernel {
                     builder.schedule_workflow_task();
                 }
             }
-            NexusResolution::TimedOut => {
+            NexusResolution::TimedOut { timeout_type } => {
                 builder.emit(HistoryEventKind::NexusOperationTimedOut {
                     operation_id: pending.operation_id.clone(),
                     scheduled_event_id: pending.scheduled_event_id,
+                    endpoint: pending.endpoint.clone(),
+                    service: pending.service.clone(),
+                    operation: pending.operation.clone(),
+                    // v1.31.0 carries the async token only once started; tokeira
+                    // uses the operation id as that token (`NexusResolution::Started`).
+                    operation_token: if pending.started {
+                        pending.operation_id.clone()
+                    } else {
+                        String::new()
+                    },
+                    timeout_type,
                 });
                 builder
                     .state
@@ -2404,6 +2418,8 @@ impl BasicKernel {
                 service,
                 operation,
                 schedule_to_close_timeout,
+                schedule_to_start_timeout,
+                start_to_close_timeout,
                 ..
             } => {
                 state.pending_nexus_operations.insert(
@@ -2415,14 +2431,21 @@ impl BasicKernel {
                         service: service.clone(),
                         operation: operation.clone(),
                         schedule_to_close_timeout: *schedule_to_close_timeout,
+                        schedule_to_start_timeout: *schedule_to_start_timeout,
+                        start_to_close_timeout: *start_to_close_timeout,
                         scheduled_at: event.happened_at,
                         started: false,
+                        started_at: None,
                     },
                 );
             }
             HistoryEventKind::NexusOperationStarted { operation_id, .. } => {
                 if let Some(operation) = state.pending_nexus_operations.get_mut(operation_id) {
                     operation.started = true;
+                    // Anchor the start-to-close deadline at the started event's
+                    // time so replay reconstructs the same deadline the live
+                    // path set (`statemachine.go:159-167 @ v1.31.0`).
+                    operation.started_at = Some(event.happened_at);
                 }
             }
             HistoryEventKind::NexusOperationCompleted { operation_id, .. }
@@ -3047,6 +3070,8 @@ fn apply_workflow_command(
             operation,
             input,
             schedule_to_close_timeout,
+            schedule_to_start_timeout,
+            start_to_close_timeout,
         } => {
             if builder
                 .state
@@ -3065,6 +3090,8 @@ fn apply_workflow_command(
                 input: input.clone(),
                 nexus_header: BTreeMap::new(),
                 schedule_to_close_timeout,
+                schedule_to_start_timeout,
+                start_to_close_timeout,
             });
             builder.state.pending_nexus_operations.insert(
                 operation_id.clone(),
@@ -3075,8 +3102,11 @@ fn apply_workflow_command(
                     service: service.clone(),
                     operation: operation.clone(),
                     schedule_to_close_timeout,
+                    schedule_to_start_timeout,
+                    start_to_close_timeout,
                     scheduled_at: builder.now,
                     started: false,
+                    started_at: None,
                 },
             );
             builder
@@ -3088,6 +3118,8 @@ fn apply_workflow_command(
                     operation,
                     input,
                     schedule_to_close_timeout,
+                    schedule_to_start_timeout,
+                    start_to_close_timeout,
                     originator_run_key: builder.state.run_key,
                     scheduled_event_id,
                     scheduled_at: builder.now,

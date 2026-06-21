@@ -189,6 +189,8 @@ impl StoreExecutionResolver {
                             scheduled_time: operation.scheduled_at,
                             scheduled_event_id: operation.scheduled_event_id,
                             schedule_to_close_timeout: operation.schedule_to_close_timeout,
+                            schedule_to_start_timeout: operation.schedule_to_start_timeout,
+                            start_to_close_timeout: operation.start_to_close_timeout,
                             started: operation.started,
                             operation_token: operation
                                 .started

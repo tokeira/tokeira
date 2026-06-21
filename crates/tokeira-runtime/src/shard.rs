@@ -463,8 +463,6 @@ mod tests {
                     shard_id: shard_a,
                     operation_id: format!("n-{i}"),
                     scheduled_event_id: i as i64,
-                    schedule_to_close_timeout:
-                        Duration::minutes(1),
                     scheduled_at: now,
                 });
             }
@@ -496,8 +494,6 @@ mod tests {
                     shard_id: shard_b,
                     operation_id: format!("nb-{i}"),
                     scheduled_event_id: i as i64,
-                    schedule_to_close_timeout:
-                        Duration::minutes(1),
                     scheduled_at: now,
                 });
             }
@@ -599,8 +595,6 @@ mod tests {
                     shard_id: shard_a,
                     operation_id: format!("n-{i}"),
                     scheduled_event_id: i as i64,
-                    schedule_to_close_timeout:
-                        Duration::minutes(1),
                     scheduled_at: now,
                 });
             }
@@ -632,8 +626,6 @@ mod tests {
                     shard_id: shard_b,
                     operation_id: format!("nb-{i}"),
                     scheduled_event_id: i as i64,
-                    schedule_to_close_timeout:
-                        Duration::minutes(1),
                     scheduled_at: now,
                 });
             }

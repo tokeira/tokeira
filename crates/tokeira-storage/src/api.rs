@@ -789,12 +789,13 @@ pub struct ActivitySweepEntry {
 /// Sweep entry for reconstructing Nexus timeout tracking
 /// after shard acquisition.
 ///
-/// Only Nexus operations that have a `schedule_to_close_timeout`
-/// configured are included — operations without a timeout do
-/// not need timeout tracking reconstruction. This is why
-/// `schedule_to_close_timeout` is non-optional here even though
-/// `PendingNexusOperation.schedule_to_close_timeout` is
-/// `Option<Duration>`.
+/// Only Nexus operations with at least one timeout configured
+/// (schedule-to-close, schedule-to-start, or start-to-close)
+/// are included — operations without any timeout do not need
+/// timeout tracking reconstruction. The entry is a pure anchor:
+/// the scanner reloads the durable `PendingNexusOperation` to
+/// read the actual deadlines and the started state, so the
+/// timeout values are intentionally not carried here.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NexusSweepEntry {
     /// Durable storage key for the owning run.
@@ -803,8 +804,6 @@ pub struct NexusSweepEntry {
     pub operation_id: String,
     /// History event ID of the scheduled event.
     pub scheduled_event_id: i64,
-    /// Maximum time from schedule to completion.
-    pub schedule_to_close_timeout: time::Duration,
     /// When the operation was scheduled.
     pub scheduled_at: OffsetDateTime,
 }

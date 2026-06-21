@@ -1076,17 +1076,25 @@ where
                     operation,
                     input,
                     schedule_to_close_timeout,
+                    schedule_to_start_timeout,
+                    start_to_close_timeout,
                     originator_run_key,
                     scheduled_event_id,
                     scheduled_at,
                 } => {
-                    if let Some(timeout) = schedule_to_close_timeout {
+                    // Watch the operation if it has any timeout. start-to-close
+                    // only arms once started, but the entry must exist from
+                    // schedule so the scanner reloads durable state and notices
+                    // the started transition (the deadlines live in state, AGENTS §3).
+                    if schedule_to_close_timeout.is_some()
+                        || schedule_to_start_timeout.is_some()
+                        || start_to_close_timeout.is_some()
+                    {
                         self.nexus_timeout_tracking.insert(NexusTimeoutEntry {
                             run_key: *originator_run_key,
                             shard_id: shard_for(*originator_run_key, self.shard_count),
                             operation_id: operation_id.clone(),
                             scheduled_event_id: *scheduled_event_id,
-                            schedule_to_close_timeout: *timeout,
                             scheduled_at: *scheduled_at,
                         });
                     }

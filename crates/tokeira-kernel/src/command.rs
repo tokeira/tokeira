@@ -143,6 +143,28 @@ pub enum WorkflowTaskTimeoutType {
     StartToClose,
 }
 
+/// Which Nexus operation timeout fired.
+///
+/// The three timeouts are independent deadlines, mirroring v1.31.0's three
+/// `hsm.Task`s (`components/nexusoperations/statemachine.go:144-167 @ v1.31.0`):
+/// schedule-to-close is anchored at the scheduled time; schedule-to-start is
+/// anchored at the scheduled time but only applies while the operation has not
+/// yet started; start-to-close is anchored at the started time and only applies
+/// once the operation has started. The fired type is carried verbatim into the
+/// `NexusOperationTimedOut` event's `TimeoutFailureInfo` so the describe/poll
+/// outcome reports the correct timeout type (`executors.go:583-608 @ v1.31.0`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NexusTimeoutType {
+    /// Schedule-to-close deadline (scheduled time + timeout) was exceeded.
+    ScheduleToClose,
+    /// Schedule-to-start deadline (scheduled time + timeout) was exceeded
+    /// before the operation started.
+    ScheduleToStart,
+    /// Start-to-close deadline (started time + timeout) was exceeded after the
+    /// operation started.
+    StartToClose,
+}
+
 /// Which workflow-level timeout fired.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum WorkflowTimeoutType {
@@ -851,8 +873,11 @@ pub enum NexusResolution {
     Failed { failure: Payload },
     /// The operation was canceled.
     Canceled,
-    /// The operation exceeded its timeout.
-    TimedOut,
+    /// The operation exceeded one of its timeouts.
+    TimedOut {
+        /// Which of the three Nexus timeouts fired.
+        timeout_type: NexusTimeoutType,
+    },
 }
 
 /// Request from the runtime when a Nexus operation reaches a
@@ -1027,6 +1052,14 @@ pub enum WorkflowCommand {
         operation: String,
         input: Payloads,
         schedule_to_close_timeout: Option<Duration>,
+        /// Caller's tolerance for the handler to start (or synchronously
+        /// complete) the operation; only meaningful while not yet started.
+        /// Wire field 7, added in v1.31.0
+        /// (`command/v1/message.proto` → `ScheduleNexusOperationCommandAttributes`).
+        schedule_to_start_timeout: Option<Duration>,
+        /// Caller's tolerance for an async operation to complete after it has
+        /// started. Wire field 8, added in v1.31.0.
+        start_to_close_timeout: Option<Duration>,
     },
     /// Cancel a pending Nexus operation.
     CancelNexusOperation { scheduled_event_id: i64 },

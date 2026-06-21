@@ -203,7 +203,6 @@ where
             shard_id,
             operation_id: entry.operation_id,
             scheduled_event_id: entry.scheduled_event_id,
-            schedule_to_close_timeout: entry.schedule_to_close_timeout,
             scheduled_at: entry.scheduled_at,
         });
         result.nexus_timeout_entries_reconstructed += 1;
@@ -1204,8 +1203,11 @@ mod tests {
                     schedule_to_close_timeout: Some(
                         Duration::minutes(3),
                     ),
+                    schedule_to_start_timeout: None,
+                    start_to_close_timeout: None,
                     scheduled_at: fixed_now(),
                     started: false,
+                    started_at: None,
                 };
                 t.next_state
                     .pending_nexus_operations
@@ -1260,10 +1262,6 @@ mod tests {
                 prop_assert_eq!(
                     &entry.operation_id,
                     "nop-1",
-                );
-                prop_assert_eq!(
-                    entry.schedule_to_close_timeout,
-                    Duration::minutes(3),
                 );
                 prop_assert_eq!(
                     entry.scheduled_at,

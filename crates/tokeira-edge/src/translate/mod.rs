@@ -391,6 +391,8 @@ pub struct PendingNexusOperationDescription {
     pub scheduled_time: OffsetDateTime,
     pub scheduled_event_id: i64,
     pub schedule_to_close_timeout: Option<time::Duration>,
+    pub schedule_to_start_timeout: Option<time::Duration>,
+    pub start_to_close_timeout: Option<time::Duration>,
     pub started: bool,
     pub operation_token: Option<String>,
 }

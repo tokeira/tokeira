@@ -10,11 +10,11 @@ use tokeira_kernel::{
     Command, CompletionCallback, ContinueAsNewVersioningBehavior, DispatchOp,
     ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
     ExternalSignalResult, ExternalWorkflowExecution, FieldChange, Link, LoadedRun,
-    NexusOperationResolvedRequest, NexusResolution, ParentClosePolicy, PauseActivityRequest,
-    PauseInfo, PauseWorkflowRequest, PendingExternalCancel, PendingExternalSignal,
-    PendingNexusOperation, PendingUpdate, PendingWorkflowTask, Priority, ReplayContext,
-    RequestDedupeOp, ResetActivityRequest, ResetRequest, RetryState, SignalRequest, StartRequest,
-    StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerOp, TimerState,
+    NexusOperationResolvedRequest, NexusResolution, NexusTimeoutType, ParentClosePolicy,
+    PauseActivityRequest, PauseInfo, PauseWorkflowRequest, PendingExternalCancel,
+    PendingExternalSignal, PendingNexusOperation, PendingUpdate, PendingWorkflowTask, Priority,
+    ReplayContext, RequestDedupeOp, ResetActivityRequest, ResetRequest, RetryState, SignalRequest,
+    StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerOp, TimerState,
     UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
     UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, UserMetadata,
     VersioningBehavior, VersioningOverride, WorkerDeploymentVersionRef, WorkflowCommand,
@@ -353,8 +353,11 @@ fn with_pending_nexus_operation(mut state: WorkflowState, operation_id: &str) ->
             service: "service".into(),
             operation: "operation".into(),
             schedule_to_close_timeout: None,
+            schedule_to_start_timeout: None,
+            start_to_close_timeout: None,
             scheduled_at: OffsetDateTime::UNIX_EPOCH,
             started: false,
+            started_at: None,
         },
     );
     state
@@ -624,6 +627,8 @@ fn arb_schedule_nexus_operation_command() -> impl Strategy<Value = WorkflowComma
                     operation,
                     input,
                     schedule_to_close_timeout,
+                    schedule_to_start_timeout: None,
+                    start_to_close_timeout: None,
                 }
             },
         )
@@ -1150,7 +1155,9 @@ fn arb_nexus_resolution() -> impl Strategy<Value = NexusResolution> {
         arb_payloads().prop_map(|result| NexusResolution::Completed { result }),
         arb_failure_payload().prop_map(|failure| NexusResolution::Failed { failure }),
         Just(NexusResolution::Canceled),
-        Just(NexusResolution::TimedOut),
+        Just(NexusResolution::TimedOut {
+            timeout_type: NexusTimeoutType::ScheduleToClose,
+        }),
     ]
 }
 
@@ -4586,14 +4593,14 @@ proptest! {
         ).unwrap();
 
         match cmd {
-            WorkflowCommand::ScheduleNexusOperation { operation_id, endpoint, service, operation, input, schedule_to_close_timeout } => {
+            WorkflowCommand::ScheduleNexusOperation { operation_id, endpoint, service, operation, input, schedule_to_close_timeout, schedule_to_start_timeout: _, start_to_close_timeout: _ } => {
                 let pending = transition.next_state.pending_nexus_operations.get(&operation_id).unwrap();
                 prop_assert_eq!(&pending.endpoint, &endpoint);
                 prop_assert_eq!(&pending.service, &service);
                 prop_assert_eq!(&pending.operation, &operation);
                 prop_assert!(!pending.started);
                 prop_assert_eq!(
-                    transition.dispatch_ops.iter().any(|op| matches!(op, DispatchOp::ScheduleNexusOperation { operation_id: id, endpoint: ep, service: svc, operation: opn, input: inp, schedule_to_close_timeout: sto, originator_run_key, scheduled_event_id, scheduled_at } if id == &operation_id && ep == &endpoint && svc == &service && opn == &operation && inp == &input && sto == &schedule_to_close_timeout && originator_run_key == &state.run_key && *scheduled_event_id == pending.scheduled_event_id && *scheduled_at == now)),
+                    transition.dispatch_ops.iter().any(|op| matches!(op, DispatchOp::ScheduleNexusOperation { operation_id: id, endpoint: ep, service: svc, operation: opn, input: inp, schedule_to_close_timeout: sto, originator_run_key, scheduled_event_id, scheduled_at, .. } if id == &operation_id && ep == &endpoint && svc == &service && opn == &operation && inp == &input && sto == &schedule_to_close_timeout && originator_run_key == &state.run_key && *scheduled_event_id == pending.scheduled_event_id && *scheduled_at == now)),
                     true
                 );
             }
@@ -4630,6 +4637,8 @@ proptest! {
                     operation: "method".into(),
                     input: payloads("input"),
                     schedule_to_close_timeout: None,
+                    schedule_to_start_timeout: None,
+                    start_to_close_timeout: None,
                 }],
                 force_new_workflow_task: false,
                 now,
@@ -4708,7 +4717,9 @@ proptest! {
         arb_payloads().prop_map(|result| NexusResolution::Completed { result }),
         arb_payload().prop_map(|failure| NexusResolution::Failed { failure }),
         Just(NexusResolution::Canceled),
-        Just(NexusResolution::TimedOut),
+        Just(NexusResolution::TimedOut {
+            timeout_type: NexusTimeoutType::ScheduleToClose,
+        }),
     ]) {
         let now = fixed_now();
         let transition = kernel().apply(

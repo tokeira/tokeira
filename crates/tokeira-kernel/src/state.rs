@@ -565,10 +565,22 @@ pub struct PendingNexusOperation {
     pub operation: String,
     /// Maximum time from schedule to completion.
     pub schedule_to_close_timeout: Option<Duration>,
+    /// Caller's tolerance for the handler to start the operation; only applies
+    /// while `started` is false. v1.31.0 wire field 16 on
+    /// `PendingNexusOperationInfo`.
+    pub schedule_to_start_timeout: Option<Duration>,
+    /// Caller's tolerance for an async operation to complete after starting;
+    /// only applies once `started`. v1.31.0 wire field 17.
+    pub start_to_close_timeout: Option<Duration>,
     /// When the operation was scheduled.
     pub scheduled_at: OffsetDateTime,
     /// Whether the operation has transitioned to async-started.
     pub started: bool,
+    /// When the operation transitioned to started, anchoring the
+    /// start-to-close deadline. `None` until `started` flips true. This is the
+    /// authority the timeout scanner reads to fire start-to-close even across a
+    /// shard takeover (the derived tracking index is rebuilt from this state).
+    pub started_at: Option<OffsetDateTime>,
 }
 
 /// Stored form of `WorkflowExecutionVersioningInfo` for one run.

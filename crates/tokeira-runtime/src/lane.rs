@@ -559,8 +559,9 @@ where
                                 );
                             }
                             for nexus in successor_state.pending_nexus_operations.values() {
-                                if let Some(schedule_to_close_timeout) =
-                                    nexus.schedule_to_close_timeout
+                                if nexus.schedule_to_close_timeout.is_some()
+                                    || nexus.schedule_to_start_timeout.is_some()
+                                    || nexus.start_to_close_timeout.is_some()
                                 {
                                     nexus_timeout_tracking.insert(
                                         crate::nexus::NexusTimeoutEntry {
@@ -568,7 +569,6 @@ where
                                             shard_id,
                                             operation_id: nexus.operation_id.clone(),
                                             scheduled_event_id: nexus.scheduled_event_id,
-                                            schedule_to_close_timeout,
                                             scheduled_at: nexus.scheduled_at,
                                         },
                                     );
@@ -601,7 +601,7 @@ where
                                 tokeira_kernel::NexusResolution::Completed { .. }
                                     | tokeira_kernel::NexusResolution::Failed { .. }
                                     | tokeira_kernel::NexusResolution::Canceled
-                                    | tokeira_kernel::NexusResolution::TimedOut
+                                    | tokeira_kernel::NexusResolution::TimedOut { .. }
                             )
                         {
                             nexus_timeout_tracking.remove(message.run_key, &request.operation_id);

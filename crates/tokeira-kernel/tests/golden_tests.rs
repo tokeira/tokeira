@@ -7,7 +7,7 @@ use tokeira_kernel::{
     ChildResolvedRequest, ChildStartConfirmedRequest, ChildStartResult, ChildWorkflowState,
     Command, CompletionCallback, DispatchOp, ExternalCancelResolvedRequest, ExternalCancelResult,
     ExternalSignalResolvedRequest, ExternalSignalResult, ExternalWorkflowExecution, FieldChange,
-    LoadedRun, NexusOperationResolvedRequest, NexusResolution, ParentClosePolicy,
+    LoadedRun, NexusOperationResolvedRequest, NexusResolution, NexusTimeoutType, ParentClosePolicy,
     PauseActivityRequest, PauseInfo, PauseWorkflowRequest, PendingExternalCancel,
     PendingExternalSignal, PendingNexusOperation, PendingUpdate, PendingWorkflowTask, ProjectionOp,
     Reject, ReplayContext, ResetActivityRequest, ResetRequest, RetryState, SignalRequest,
@@ -848,8 +848,11 @@ fn with_pending_nexus_operation(mut state: WorkflowState, operation_id: &str) ->
             service: "service".into(),
             operation: "operation".into(),
             schedule_to_close_timeout: None,
+            schedule_to_start_timeout: None,
+            start_to_close_timeout: None,
             scheduled_at: OffsetDateTime::UNIX_EPOCH,
             started: false,
+            started_at: None,
         },
     );
     state
@@ -859,6 +862,7 @@ fn with_started_nexus_operation(mut state: WorkflowState, operation_id: &str) ->
     state = with_pending_nexus_operation(state, operation_id);
     if let Some(pending) = state.pending_nexus_operations.get_mut(operation_id) {
         pending.started = true;
+        pending.started_at = Some(OffsetDateTime::UNIX_EPOCH);
     }
     state
 }
@@ -5481,6 +5485,8 @@ fn schedule_nexus_operation_happy_path() {
                     operation: "method".into(),
                     input: payloads("input"),
                     schedule_to_close_timeout: Some(Duration::seconds(30)),
+                    schedule_to_start_timeout: None,
+                    start_to_close_timeout: None,
                 }],
                 force_new_workflow_task: false,
                 now: now(),
@@ -5536,6 +5542,8 @@ fn schedule_nexus_operation_duplicate_rejected() {
                     operation: "method".into(),
                     input: payloads("input"),
                     schedule_to_close_timeout: None,
+                    schedule_to_start_timeout: None,
+                    start_to_close_timeout: None,
                 }],
                 force_new_workflow_task: false,
                 now: now(),
@@ -5818,7 +5826,9 @@ fn nexus_operation_resolved_timed_out() {
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
-                resolution: NexusResolution::TimedOut,
+                resolution: NexusResolution::TimedOut {
+                    timeout_type: NexusTimeoutType::ScheduleToClose,
+                },
                 now: now(),
             }),
         )

@@ -606,6 +606,7 @@ where
         ));
         let nexus_timeout_scanner_cancel = CancellationToken::new();
         let nexus_timeout_scanner_handle = Some(tokio::spawn(run_nexus_timeout_scanner(
+            repo.clone(),
             nexus_timeout_tracking.clone(),
             lanes.clone(),
             lane_count,
@@ -1157,9 +1158,8 @@ mod tests {
         drain::RuntimeDrainState,
         lane::DispatchPublisher,
         nexus::{
-            EndpointTarget, NexusEndpointRegistry, NexusTaskBroker, NexusTimeoutEntry,
-            NexusTimeoutScannerConfig, NexusTimeoutTrackingState, NoopNexusHttpClient,
-            evaluate_nexus_timeout,
+            EndpointTarget, NexusEndpointRegistry, NexusTaskBroker, NexusTimeoutScannerConfig,
+            NexusTimeoutTrackingState, NoopNexusHttpClient, evaluate_nexus_timeout,
         },
         publisher::RuntimeDispatchPublisher,
         retry::{RetryDecision, compute_retry_backoff, evaluate_activity_retry},
@@ -2012,39 +2012,92 @@ mod tests {
 
     #[test]
     fn evaluate_nexus_timeout_cases() {
+        use tokeira_kernel::{NexusTimeoutType, PendingNexusOperation};
+
         let scheduled_at = OffsetDateTime::now_utc() - Duration::seconds(10);
-        let expired = NexusTimeoutEntry {
-            run_key: RunKey::new(),
-            shard_id: ShardId(0),
-            operation_id: "op-1".to_string(),
+        let base = PendingNexusOperation {
+            operation_id: "op".to_string(),
             scheduled_event_id: 11,
-            schedule_to_close_timeout: Duration::seconds(1),
+            endpoint: "ep".to_string(),
+            service: "svc".to_string(),
+            operation: "op".to_string(),
+            schedule_to_close_timeout: None,
+            schedule_to_start_timeout: None,
+            start_to_close_timeout: None,
             scheduled_at,
+            started: false,
+            started_at: None,
         };
-        assert!(evaluate_nexus_timeout(&expired, OffsetDateTime::now_utc()));
 
-        let zero = NexusTimeoutEntry {
-            run_key: RunKey::new(),
-            shard_id: ShardId(0),
-            operation_id: "op-2".to_string(),
-            scheduled_event_id: 12,
-            schedule_to_close_timeout: Duration::ZERO,
-            scheduled_at: OffsetDateTime::now_utc(),
+        // Schedule-to-close fires once scheduled_at + timeout has passed.
+        let stc = PendingNexusOperation {
+            schedule_to_close_timeout: Some(Duration::seconds(1)),
+            ..base.clone()
         };
-        assert!(evaluate_nexus_timeout(&zero, zero.scheduled_at));
+        assert_eq!(
+            evaluate_nexus_timeout(&stc, OffsetDateTime::now_utc()),
+            Some(NexusTimeoutType::ScheduleToClose)
+        );
 
-        let pending = NexusTimeoutEntry {
-            run_key: RunKey::new(),
-            shard_id: ShardId(0),
-            operation_id: "op-3".to_string(),
-            scheduled_event_id: 13,
-            schedule_to_close_timeout: Duration::seconds(30),
-            scheduled_at,
+        // An unset (None) timeout never fires; an unstarted op with no applicable
+        // deadline yields None.
+        assert_eq!(
+            evaluate_nexus_timeout(&base, OffsetDateTime::now_utc()),
+            None
+        );
+
+        // A zero timeout means "no deadline" for Nexus (v1.31.0 only emits the
+        // task when the duration is non-zero), so it must not fire.
+        let zero = PendingNexusOperation {
+            schedule_to_close_timeout: Some(Duration::ZERO),
+            ..base.clone()
         };
-        assert!(!evaluate_nexus_timeout(
-            &pending,
-            scheduled_at + Duration::seconds(5)
-        ));
+        assert_eq!(
+            evaluate_nexus_timeout(&zero, OffsetDateTime::now_utc()),
+            None
+        );
+
+        // Schedule-to-start only applies while not started.
+        let sts = PendingNexusOperation {
+            schedule_to_start_timeout: Some(Duration::seconds(1)),
+            ..base.clone()
+        };
+        assert_eq!(
+            evaluate_nexus_timeout(&sts, OffsetDateTime::now_utc()),
+            Some(NexusTimeoutType::ScheduleToStart)
+        );
+        let sts_started = PendingNexusOperation {
+            started: true,
+            started_at: Some(OffsetDateTime::now_utc()),
+            ..sts.clone()
+        };
+        assert_eq!(
+            evaluate_nexus_timeout(&sts_started, OffsetDateTime::now_utc()),
+            None
+        );
+
+        // Start-to-close is anchored at started_at and only applies once started.
+        let started_at = OffsetDateTime::now_utc() - Duration::seconds(5);
+        let stc2 = PendingNexusOperation {
+            start_to_close_timeout: Some(Duration::seconds(1)),
+            started: true,
+            started_at: Some(started_at),
+            ..base.clone()
+        };
+        assert_eq!(
+            evaluate_nexus_timeout(&stc2, OffsetDateTime::now_utc()),
+            Some(NexusTimeoutType::StartToClose)
+        );
+
+        // Not-yet-due deadline yields None.
+        let pending = PendingNexusOperation {
+            schedule_to_close_timeout: Some(Duration::seconds(30)),
+            ..base.clone()
+        };
+        assert_eq!(
+            evaluate_nexus_timeout(&pending, scheduled_at + Duration::seconds(5)),
+            None
+        );
     }
 
     #[test]

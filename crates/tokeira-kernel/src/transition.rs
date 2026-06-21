@@ -169,6 +169,8 @@ pub enum DispatchOp {
         operation: String,
         input: Payloads,
         schedule_to_close_timeout: Option<Duration>,
+        schedule_to_start_timeout: Option<Duration>,
+        start_to_close_timeout: Option<Duration>,
         originator_run_key: RunKey,
         scheduled_event_id: i64,
         scheduled_at: OffsetDateTime,

@@ -11,17 +11,22 @@ and surface it via `DescribeWorkflowExecution`. Ground-truthed to `workflow_id_d
 
 ## Tasks
 
-- [ ] 1. Storage: type the current-execution conflict
+- [x] 1. Storage: type the current-execution conflict
   - Add `CommitResult::CurrentExecutionConflict { existing_run_key, existing_status, request_ids }`;
     return it from `commit_transition` when a zero-seq start collides with an OPEN current execution.
     Keep `CommitResult::Conflict` for transient CAS/seq collisions. Retain the store-wide
     `CurrentExecutionConflictPolicy` only for the closed-execution reuse path.
   - _Requirements: 1.1, 2.3_
 
-- [ ] 2. Kernel: already-started reject + request-id map
+- [x] 2. Kernel: already-started reject + request-id map
   - Represent `WorkflowExecutionAlreadyStarted` as a terminal kernel `Reject` distinct from a
     transient conflict. Add `WorkflowState.request_id_infos` (build-phase fold) and `RequestIdInfo`;
     record the start request id → `WORKFLOW_EXECUTION_STARTED` on start.
+  - DONE (Wave 1): `RequestIdInfo` + `WorkflowState.request_id_infos` added; the start request id is
+    recorded → STARTED in both `apply_start` and cold `replay_from_history`. The lane now propagates
+    `CurrentExecutionConflict` terminally (no OCC retry) instead of exhausting retries. The terminal
+    already-started *Reject/error mapping* itself lands with the runtime resolution in Wave 2 (task 5),
+    where the policy is applied; until then the start path surfaces it as a clean error (no regression).
   - _Requirements: 2.1, 5.1, 5.2_
 
 - [ ] 3. Kernel: UseExisting attach transition

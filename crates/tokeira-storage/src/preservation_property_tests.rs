@@ -103,6 +103,7 @@ mod tests {
             closed_at: None,
             close_result: None,
             close_failure: None,
+            request_id_infos: std::collections::BTreeMap::new(),
         }
     }
 
@@ -789,6 +790,11 @@ mod tests {
                         }
                         CommitResult::Duplicate => {
                             final_result = Ok(());
+                            break;
+                        }
+                        CommitResult::CurrentExecutionConflict { .. } => {
+                            final_result =
+                                Err("unexpected current-execution conflict".to_string());
                             break;
                         }
                     }

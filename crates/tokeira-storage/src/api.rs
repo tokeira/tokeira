@@ -16,8 +16,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokeira_kernel::{
-    ActivityOp, DispatchOp, HistoryEvent, LoadedRun, ProjectionOp, TimerOp, Transition,
-    WorkflowState, state::VersioningBehavior,
+    ActivityOp, DispatchOp, HistoryEvent, LoadedRun, ProjectionOp, RequestIdInfo, TimerOp,
+    Transition, WorkflowState, state::VersioningBehavior,
 };
 use tokeira_types::{
     ArchetypeId, ExecutionRef, ExecutionStatus, GenerationCounter, Memo, NamespaceId, Payload,
@@ -41,6 +41,25 @@ pub enum CommitResult {
     /// `transition_seq` has moved past the expected
     /// value. The runtime should reload and retry.
     Conflict { reason: String },
+    /// A start collided with an existing OPEN current execution for the same
+    /// `(namespace, workflow_id)`. Unlike [`Conflict`](Self::Conflict) — a
+    /// transient OCC/CAS collision the runtime retries — this is a
+    /// **non-retryable** current-execution conflict: the runtime resolves it by
+    /// the request's `WorkflowIdConflictPolicy` (Fail → already-started;
+    /// UseExisting → attach; TerminateExisting → terminate+start). It carries the
+    /// incumbent's identity and its request-id map so the runtime/edge can build
+    /// the already-started error (and its request-id detail) without a second
+    /// load. This is an internal commit outcome; it MUST NOT reach a client.
+    CurrentExecutionConflict {
+        /// Run that currently owns the `(namespace, workflow_id)` pointer.
+        existing_run_key: RunKey,
+        /// Lifecycle status of the incumbent (always open here).
+        existing_status: ExecutionStatus,
+        /// The incumbent's request-id → authoring-event map, for the
+        /// already-started error detail (`WorkflowExecutionInfo.request_ids @
+        /// v1.31.0`).
+        request_ids: Vec<(String, RequestIdInfo)>,
+    },
     /// A request with the same dedupe key was already
     /// committed. The caller can short-circuit.
     Duplicate,

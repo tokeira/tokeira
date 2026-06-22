@@ -96,6 +96,7 @@ mod tests {
             closed_at: None,
             close_result: None,
             close_failure: None,
+            request_id_infos: std::collections::BTreeMap::new(),
         }
     }
 

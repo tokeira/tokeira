@@ -282,6 +282,18 @@ where
                 tracing::warn!(?child_workflow_id, %reason, "child workflow start conflict");
                 ChildStartResult::Failed { cause: reason }
             }
+            Ok(CommitResult::CurrentExecutionConflict {
+                existing_run_key, ..
+            }) => {
+                tracing::warn!(
+                    ?child_workflow_id,
+                    ?existing_run_key,
+                    "child workflow start hit an existing current execution"
+                );
+                ChildStartResult::Failed {
+                    cause: format!("current execution already exists: {existing_run_key:?}"),
+                }
+            }
             Ok(CommitResult::Duplicate) => ChildStartResult::Failed {
                 cause: "duplicate start request".to_string(),
             },
@@ -485,6 +497,13 @@ where
                     Ok(CommitResult::Conflict { reason }) => {
                         ExternalSignalResult::Failed { cause: reason }
                     }
+                    Ok(CommitResult::CurrentExecutionConflict { .. }) => {
+                        // Unreachable for a signal (not a zero-seq start); mapped
+                        // defensively rather than panicking.
+                        ExternalSignalResult::Failed {
+                            cause: "unexpected current-execution conflict".to_string(),
+                        }
+                    }
                     Err(error) => ExternalSignalResult::Failed {
                         cause: error.to_string(),
                     },
@@ -565,6 +584,13 @@ where
                     }
                     Ok(CommitResult::Conflict { reason }) => {
                         ExternalCancelResult::Failed { cause: reason }
+                    }
+                    Ok(CommitResult::CurrentExecutionConflict { .. }) => {
+                        // Unreachable for a cancel (not a zero-seq start); mapped
+                        // defensively rather than panicking.
+                        ExternalCancelResult::Failed {
+                            cause: "unexpected current-execution conflict".to_string(),
+                        }
                     }
                     Err(error) => ExternalCancelResult::Failed {
                         cause: error.to_string(),

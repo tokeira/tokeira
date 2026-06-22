@@ -34,9 +34,10 @@ use crate::{
     },
     event::{ActivityResolution, HistoryEvent, HistoryEventKind},
     state::{
-        ActivityPauseInfo, ActivityState, ChildWorkflowState, LoadedRun, ParentClosePolicy,
-        PauseInfo, PendingExternalCancel, PendingExternalSignal, PendingNexusOperation,
-        PendingUpdate, PendingWorkflowTask, TimerState, VersioningOverride, WorkflowState,
+        ActivityPauseInfo, ActivityState, ChildWorkflowState,
+        EVENT_TYPE_WORKFLOW_EXECUTION_STARTED, LoadedRun, ParentClosePolicy, PauseInfo,
+        PendingExternalCancel, PendingExternalSignal, PendingNexusOperation, PendingUpdate,
+        PendingWorkflowTask, RequestIdInfo, TimerState, VersioningOverride, WorkflowState,
         WorkflowVersioningInfo,
     },
     transition::{ActivityOp, DispatchOp, ProjectionOp, RequestDedupeOp, TimerOp, Transition},
@@ -193,6 +194,7 @@ impl BasicKernel {
             priority,
             versioning_info,
             worker_deployment_name,
+            request_id,
             ..
         } = &first.kind
         else {
@@ -260,7 +262,19 @@ impl BasicKernel {
             closed_at: None,
             close_result: None,
             close_failure: None,
+            request_id_infos: BTreeMap::new(),
         };
+        // Rebuild the start request id → WorkflowExecutionStarted mapping on cold
+        // replay (the hot-state path records it in `apply_start`); kept in sync so
+        // a reconstructed run reports the same request_id_infos.
+        state.request_id_infos.insert(
+            request_id.clone(),
+            RequestIdInfo {
+                event_id: first.event_id,
+                event_type: EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+                buffered: false,
+            },
+        );
         if let Some(delay) = positive_start_delay(*workflow_start_delay) {
             let timer = TimerState {
                 timer_id: WORKFLOW_START_DELAY_TIMER_ID.to_string(),
@@ -284,6 +298,8 @@ impl BasicKernel {
         if !matches!(loaded, LoadedRun::Absent) {
             return Err(Reject::RunAlreadyExists);
         }
+        // Captured before the started-event emit below moves the request id.
+        let start_request_id = req.request.request_id.0.clone();
 
         let canonical_root_workflow_id = req
             .root_workflow_id
@@ -352,6 +368,7 @@ impl BasicKernel {
             closed_at: None,
             close_result: None,
             close_failure: None,
+            request_id_infos: BTreeMap::new(),
         };
 
         let mut builder = TransitionBuilder::new(initial, req.now);
@@ -392,6 +409,20 @@ impl BasicKernel {
             versioning_info: initial_versioning_info,
             worker_deployment_name: None,
         });
+        // The starting request id authors the WorkflowExecutionStarted event
+        // (just emitted, so it is `last_event_id`). Recorded for
+        // DescribeWorkflowExecution.WorkflowExtendedInfo.request_id_infos and for
+        // the already-started error detail on a later conflicting start
+        // (`WorkflowExecutionInfo.request_ids @ v1.31.0`). The request id was
+        // moved into the started event above, so reuse the captured copy.
+        builder.state.request_id_infos.insert(
+            start_request_id,
+            RequestIdInfo {
+                event_id: builder.state.last_event_id,
+                event_type: EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+                buffered: false,
+            },
+        );
         builder.projection_ops.push(ProjectionOp::UpsertExecution {
             status: ExecutionStatus::Running,
             memo_patch: req.memo,
@@ -493,6 +524,7 @@ impl BasicKernel {
             closed_at: None,
             close_result: None,
             close_failure: None,
+            request_id_infos: BTreeMap::new(),
         };
 
         let mut builder = TransitionBuilder::new(initial, req.now);

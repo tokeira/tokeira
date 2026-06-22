@@ -413,7 +413,8 @@ where
             Ok(CommitResult::Applied { .. } | CommitResult::Duplicate) => {
                 runtime_metrics::record_workflow_task_completed(OutcomeLabel::Success);
             }
-            Ok(CommitResult::Conflict { .. }) | Err(_) => {
+            Ok(CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. })
+            | Err(_) => {
                 runtime_metrics::record_workflow_task_completed(OutcomeLabel::Failure);
             }
         }
@@ -540,6 +541,13 @@ where
                 runtime_metrics::record_workflow_task_started(OutcomeLabel::Failure);
                 return Err(anyhow!(
                     "failed to start workflow task due to conflict: {reason}"
+                ));
+            }
+            CommitResult::CurrentExecutionConflict { .. } => {
+                // Unreachable for a workflow-task start (not a zero-seq start).
+                runtime_metrics::record_workflow_task_started(OutcomeLabel::Failure);
+                return Err(anyhow!(
+                    "unexpected current-execution conflict while starting workflow task"
                 ));
             }
             CommitResult::Duplicate => {
@@ -759,6 +767,7 @@ mod tests {
             closed_at: None,
             close_result: None,
             close_failure: None,
+            request_id_infos: std::collections::BTreeMap::new(),
         }
     }
 

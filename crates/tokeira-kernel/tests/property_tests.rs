@@ -175,6 +175,7 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         closed_at: None,
         close_result: None,
         close_failure: None,
+        request_id_infos: std::collections::BTreeMap::new(),
     }
 }
 

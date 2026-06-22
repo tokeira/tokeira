@@ -156,12 +156,18 @@ impl DsqlRunRepository {
                         )
                     {
                         tx.rollback().await?;
-                        return Ok(CommitResult::Conflict {
-                            reason: format!(
-                                "current execution already exists for {}: {:?}",
-                                state.workflow_id.0,
-                                RunKey(existing_run_key)
-                            ),
+                        // Report the current-execution collision so the runtime
+                        // applies the request's WorkflowIdConflictPolicy (Fail /
+                        // UseExisting / TerminateExisting); distinct from a transient
+                        // `Conflict` so the lane does not OCC-retry it. The incumbent
+                        // is open here (is_open), so its status is Running; DSQL does
+                        // not eagerly load the incumbent's request-id map (the
+                        // already-started error's request-id detail is best-effort and
+                        // can be loaded by a follow-up if needed).
+                        return Ok(CommitResult::CurrentExecutionConflict {
+                            existing_run_key: RunKey(existing_run_key),
+                            existing_status: ExecutionStatus::Running,
+                            request_ids: Vec::new(),
                         });
                     }
                 }

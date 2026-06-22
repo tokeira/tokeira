@@ -242,6 +242,13 @@ where
                 self.update_registry.remove(run_key, &update_id);
                 return Err(anyhow!("update commit conflicted: {reason}"));
             }
+            CommitResult::CurrentExecutionConflict { .. } => {
+                // Unreachable for an update (not a zero-seq start).
+                self.update_registry.remove(run_key, &update_id);
+                return Err(anyhow!(
+                    "unexpected current-execution conflict on update commit"
+                ));
+            }
         };
 
         self.wait_for_update_stage_with_receiver(

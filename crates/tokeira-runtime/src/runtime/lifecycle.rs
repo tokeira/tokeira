@@ -108,6 +108,11 @@ where
                         request.run_key
                     )),
                     CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
+                    CommitResult::CurrentExecutionConflict {
+                        existing_run_key, ..
+                    } => Err(anyhow!(
+                        "current execution already exists: {existing_run_key:?}"
+                    )),
                 }
             }
             ConflictResolution::UseExisting { run_key, run_id } => {
@@ -134,6 +139,11 @@ where
                         request.run_key
                     )),
                     CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
+                    CommitResult::CurrentExecutionConflict {
+                        existing_run_key, ..
+                    } => Err(anyhow!(
+                        "current execution already exists: {existing_run_key:?}"
+                    )),
                 }
             }
             ConflictResolution::Rejected { run_key, run_id } => {
@@ -188,6 +198,11 @@ where
         {
             CommitResult::Applied { .. } | CommitResult::Duplicate => Ok(()),
             CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
+            CommitResult::CurrentExecutionConflict {
+                existing_run_key, ..
+            } => Err(anyhow!(
+                "current execution already exists: {existing_run_key:?}"
+            )),
         }
     }
 
@@ -228,6 +243,11 @@ where
                         request.run_key
                     )),
                     CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
+                    CommitResult::CurrentExecutionConflict {
+                        existing_run_key, ..
+                    } => Err(anyhow!(
+                        "current execution already exists: {existing_run_key:?}"
+                    )),
                 }
             }
             ConflictResolution::UseExisting { run_key, run_id } => {
@@ -254,6 +274,11 @@ where
                         Ok(SignalWithStartResult::Signaled { run_key, run_id })
                     }
                     CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
+                    CommitResult::CurrentExecutionConflict {
+                        existing_run_key, ..
+                    } => Err(anyhow!(
+                        "current execution already exists: {existing_run_key:?}"
+                    )),
                 }
             }
             ConflictResolution::TerminateAndStart { run_key } => {
@@ -277,6 +302,11 @@ where
                         request.run_key
                     )),
                     CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
+                    CommitResult::CurrentExecutionConflict {
+                        existing_run_key, ..
+                    } => Err(anyhow!(
+                        "current execution already exists: {existing_run_key:?}"
+                    )),
                 }
             }
             ConflictResolution::Rejected { run_key, run_id } => {
@@ -387,6 +417,11 @@ where
                 run_key
             )),
             CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
+            CommitResult::CurrentExecutionConflict {
+                existing_run_key, ..
+            } => Err(anyhow!(
+                "current execution already exists: {existing_run_key:?}"
+            )),
         }
     }
 
@@ -531,6 +566,11 @@ where
         {
             CommitResult::Applied { .. } | CommitResult::Duplicate => Ok(()),
             CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
+            CommitResult::CurrentExecutionConflict {
+                existing_run_key, ..
+            } => Err(anyhow!(
+                "current execution already exists: {existing_run_key:?}"
+            )),
         }
     }
 }

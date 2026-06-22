@@ -423,11 +423,18 @@ impl RunRepository for InMemoryStore {
                             started.elapsed(),
                         );
                         storage_metrics::record_storage_operation("commit_transition", "conflict");
-                        return Ok(CommitResult::Conflict {
-                            reason: format!(
-                                "current execution already exists for {}: {:?}",
-                                state.workflow_id.0, existing_run
-                            ),
+                        // Report the current-execution collision (not deny): the
+                        // runtime resolves it by the request's
+                        // WorkflowIdConflictPolicy. Distinct from a transient
+                        // `Conflict` so the lane does not OCC-retry it.
+                        return Ok(CommitResult::CurrentExecutionConflict {
+                            existing_run_key: *existing_run,
+                            existing_status: existing_state.status,
+                            request_ids: existing_state
+                                .request_id_infos
+                                .iter()
+                                .map(|(id, info)| (id.clone(), info.clone()))
+                                .collect(),
                         });
                     }
                 }
@@ -1949,6 +1956,7 @@ mod tests {
             closed_at: None,
             close_result: None,
             close_failure: None,
+            request_id_infos: std::collections::BTreeMap::new(),
         }
     }
 
@@ -2601,7 +2609,7 @@ mod tests {
                 t2.next_state.namespace_id = namespace_id;
                 t2.next_state.workflow_id = workflow_id;
                 let result = store.commit_transition(run_key_2, t2, ShardEpoch::ZERO).await.unwrap();
-                assert!(matches!(result, CommitResult::Conflict { .. }));
+                assert!(matches!(result, CommitResult::CurrentExecutionConflict { .. }));
             });
         }
 
@@ -2770,7 +2778,10 @@ mod tests {
             .commit_transition(run_key_2, t2, ShardEpoch::ZERO)
             .await
             .unwrap();
-        assert!(matches!(result, CommitResult::Conflict { .. }));
+        assert!(matches!(
+            result,
+            CommitResult::CurrentExecutionConflict { .. }
+        ));
     }
 
     #[tokio::test]

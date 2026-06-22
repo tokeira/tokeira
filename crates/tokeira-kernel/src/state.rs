@@ -162,6 +162,41 @@ pub struct WorkflowState {
     pub close_result: Option<Payloads>,
     /// Opaque failure payload retained for terminal failure.
     pub close_failure: Option<Payload>,
+    /// Maps each request id that authored an event on this run to the authoring
+    /// event (mirrors `persistencespb.RequestIDInfo`,
+    /// `WorkflowExecutionInfo.request_ids @ v1.31.0`). The start request id maps
+    /// to the `WorkflowExecutionStarted` event; each request that attaches via a
+    /// `UseExisting` conflict resolution maps to the `WorkflowExecutionOptionsUpdated`
+    /// event it authored. Surfaced through `DescribeWorkflowExecution`'s
+    /// `WorkflowExtendedInfo.request_id_infos`.
+    #[serde(default)]
+    pub request_id_infos: BTreeMap<String, RequestIdInfo>,
+}
+
+/// `EventType` wire numbers the kernel authors into [`RequestIdInfo::event_type`].
+/// These mirror `temporal.api.enums.v1.EventType @ v1.31.0`. The kernel already
+/// stores `EventType` i32 values in link references (see
+/// [`LinkWorkflowEventReference`]), so this keeps that convention rather than
+/// taking a `tokeira-proto` dependency (kernel purity, AGENTS §2).
+pub const EVENT_TYPE_WORKFLOW_EXECUTION_STARTED: i32 = 1;
+/// See [`EVENT_TYPE_WORKFLOW_EXECUTION_STARTED`]. `WorkflowExecutionOptionsUpdated`
+/// is the event an attaching `UseExisting` request authors.
+pub const EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED: i32 = 55;
+
+/// Per-run record of which event a request id authored (mirrors
+/// `persistencespb.RequestIDInfo`). `buffered` is always `false` in tokeira,
+/// which has no buffered-event model; it is retained for wire parity with the
+/// `DescribeWorkflowExecution` surface.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestIdInfo {
+    /// History event id that this request id authored.
+    pub event_id: i64,
+    /// Type of the authoring event (a `temporal.api.enums.v1.EventType` i32),
+    /// e.g. `WorkflowExecutionStarted` for the starting request or
+    /// `WorkflowExecutionOptionsUpdated` for an attached request.
+    pub event_type: i32,
+    /// Whether the authoring event is still buffered. Always `false` here.
+    pub buffered: bool,
 }
 
 impl WorkflowState {
@@ -872,6 +907,7 @@ mod tests {
             closed_at: None,
             close_result: None,
             close_failure: None,
+            request_id_infos: std::collections::BTreeMap::new(),
         }
     }
 

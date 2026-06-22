@@ -590,6 +590,16 @@ pub fn commit_result_to_outcome(result: CommitResult) -> Result<WorkflowMutation
             new_run_id: None,
         }),
         CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
+        CommitResult::CurrentExecutionConflict {
+            existing_run_key, ..
+        } => {
+            // Wave 2 maps this to a typed already-started EdgeError + the
+            // request-id detail; for now surface it as an error rather than
+            // silently dropping it.
+            Err(anyhow!(
+                "current execution already exists: {existing_run_key:?}"
+            ))
+        }
     }
 }
 

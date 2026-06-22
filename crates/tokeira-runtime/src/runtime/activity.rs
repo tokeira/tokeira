@@ -149,7 +149,7 @@ where
             CommitResult::Applied { .. } | CommitResult::Duplicate => {
                 runtime_metrics::record_activity_task_completed(OutcomeLabel::Success);
             }
-            CommitResult::Conflict { .. } => {
+            CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. } => {
                 runtime_metrics::record_activity_task_completed(OutcomeLabel::Failure);
             }
         }
@@ -222,7 +222,9 @@ where
             Ok(CommitResult::Applied { .. } | CommitResult::Duplicate) => {
                 runtime_metrics::record_activity_task_failed(OutcomeLabel::Success);
             }
-            Ok(CommitResult::Conflict { .. }) | Err(_) => {
+            Ok(CommitResult::Conflict { .. })
+            | Ok(CommitResult::CurrentExecutionConflict { .. })
+            | Err(_) => {
                 runtime_metrics::record_activity_task_failed(OutcomeLabel::Failure);
             }
         }
@@ -355,7 +357,7 @@ where
                         .unwrap_or(false);
                     return Ok(cancel_requested);
                 }
-                CommitResult::Conflict { .. } => {
+                CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. } => {
                     if attempts >= self.config.max_occ_retries {
                         return Err(anyhow!("activity heartbeat OCC exhausted"));
                     }
@@ -647,7 +649,7 @@ where
                         heartbeat_timeout: next_activity.heartbeat_timeout,
                     }));
                 }
-                CommitResult::Conflict { .. } => {
+                CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. } => {
                     if attempts >= self.config.max_occ_retries {
                         runtime_metrics::record_activity_task_started(OutcomeLabel::Failure);
                         if let Err(error) = self
@@ -846,7 +848,7 @@ where
                     );
                     return Ok(());
                 }
-                CommitResult::Conflict { .. } => {
+                CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. } => {
                     if attempts >= self.config.max_occ_retries {
                         return Err(anyhow!("activity retry OCC exhausted"));
                     }
@@ -994,6 +996,7 @@ mod tests {
             closed_at: None,
             close_result: None,
             close_failure: None,
+            request_id_infos: std::collections::BTreeMap::new(),
         }
     }
 

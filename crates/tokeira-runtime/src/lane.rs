@@ -904,6 +904,17 @@ where
                                                     "unexpected conflict when starting continue-as-new successor"
                                                 );
                                             }
+                                            Ok(CommitResult::CurrentExecutionConflict {
+                                                existing_run_key,
+                                                ..
+                                            }) => {
+                                                tracing::error!(
+                                                    predecessor_run_key = ?predecessor_run_key,
+                                                    successor_run_key = ?successor_run_key,
+                                                    ?existing_run_key,
+                                                    "unexpected current-execution conflict when starting continue-as-new successor"
+                                                );
+                                            }
                                             Err(error) => {
                                                 tracing::error!(
                                                     ?error,
@@ -1146,6 +1157,25 @@ where
             }
             CommitResult::Duplicate => {
                 return Ok((CommitResult::Duplicate, SmallVec::new(), SmallVec::new()));
+            }
+            CommitResult::CurrentExecutionConflict {
+                existing_run_key,
+                existing_status,
+                request_ids,
+            } => {
+                // A current-execution conflict is terminal, not a stale-base OCC
+                // collision: retrying re-runs the same losing start forever (this
+                // is the old `lane OCC retry exhausted` bug). Propagate it up so
+                // the start path resolves it by the request's conflict policy.
+                return Ok((
+                    CommitResult::CurrentExecutionConflict {
+                        existing_run_key,
+                        existing_status,
+                        request_ids,
+                    },
+                    SmallVec::new(),
+                    SmallVec::new(),
+                ));
             }
             CommitResult::Conflict { reason } => {
                 // A conflict means our loaded base state was stale relative to
@@ -2090,6 +2120,7 @@ mod tests {
             closed_at: None,
             close_result: None,
             close_failure: None,
+            request_id_infos: std::collections::BTreeMap::new(),
         }
     }
 

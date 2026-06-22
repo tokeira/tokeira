@@ -934,6 +934,7 @@ fn arb_description() -> impl Strategy<Value = WorkflowExecutionDescription> {
                     .unwrap_or(OffsetDateTime::UNIX_EPOCH),
                 versioning_info: None,
                 worker_deployment_name: None,
+                request_id_infos: std::collections::BTreeMap::new(),
             },
         )
 }

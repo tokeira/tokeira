@@ -5356,6 +5356,19 @@ fn update_execution_options_happy_path() {
         transition.next_state.completion_callbacks,
         expected_callbacks
     );
+    // The attached request id authors this options-updated event and is recorded
+    // in request_id_infos (UseExisting attach surfaces it on Describe, Req 5.3).
+    let info = transition
+        .next_state
+        .request_id_infos
+        .get("attached-1")
+        .expect("attached request id recorded");
+    assert_eq!(info.event_id, transition.next_state.last_event_id);
+    assert_eq!(
+        info.event_type,
+        tokeira_kernel::EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED
+    );
+    assert!(!info.buffered);
     assert!(transition.dispatch_ops.is_empty());
     assert!(transition.next_state.is_open());
 }

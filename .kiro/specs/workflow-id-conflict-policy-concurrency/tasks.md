@@ -29,51 +29,73 @@ and surface it via `DescribeWorkflowExecution`. Ground-truthed to `workflow_id_d
     where the policy is applied; until then the start path surfaces it as a clean error (no regression).
   - _Requirements: 2.1, 5.1, 5.2_
 
-- [ ] 3. Kernel: UseExisting attach transition
+- [x] 3. Kernel: UseExisting attach transition
   - Add an attach transition on the existing run that emits `WorkflowExecutionOptionsUpdated` carrying
     the attached request id / completion callbacks / links per `OnConflictOptions` flags, records the
     attached request id → `WORKFLOW_EXECUTION_OPTIONS_UPDATED` in `request_id_infos`, and schedules no
     workflow task. Verify the event's attributes/position match v1.31.0 (Risks in design.md).
+  - DONE: the attach already existed (`apply_start_on_conflict_options` → `UpdateExecutionOptions`);
+    Wave 2 adds the attached request id → OPTIONS_UPDATED recording (hot apply + cold replay).
   - _Requirements: 3.1, 3.2, 3.3, 3.4, 5.3_
 
-- [ ] 4. Kernel: TerminateExisting ordering
+- [x] 4. Kernel: TerminateExisting ordering
   - Resolve `TerminateExisting` as terminate-incumbent-then-start using the engine's existing
     current-execution transfer; no new two-run primitive. Raise a conformance defect if the per-run
     lane model cannot express it.
+  - DONE (pre-existing `terminate_existing_for_conflict` + the convergence loop re-runs it on a
+    commit-time race); no new primitive needed.
   - _Requirements: 4.1, 4.2_
 
-- [ ] 5. Runtime: resolve the conflict by policy, classify terminal vs transient
+- [x] 5. Runtime: resolve the conflict by policy, classify terminal vs transient
   - On `CurrentExecutionConflict`, apply the request `WorkflowIdConflictPolicy`: Fail → terminal
     already-started (no OCC retry); UseExisting → submit attach, return existing run id; Terminate →
     terminate+start. Retry only transient `Conflict`. Re-evaluate reuse policy if the incumbent closed
     during the window.
+  - DONE: `start_workflow_with_policy` is now a bounded re-resolution loop — a commit-time
+    `CurrentExecutionConflict` (the lost TOCTOU race) loops back to `resolve_conflict` against the
+    now-committed incumbent and applies the policy. The lane already propagates the conflict terminally
+    (Wave 1).
   - _Requirements: 1.2, 1.3, 1.4, 2.1, 3.5, 6.1, 6.2, 6.3_
 
-- [ ] 6. Edge: error mapping + Describe surface
+- [x] 6. Edge: error mapping + Describe surface
   - Map already-started → gRPC `ALREADY_EXISTS` with the v1.31.0 message shape; populate
     `DescribeWorkflowExecution.WorkflowExtendedInfo.RequestIdInfos` from `request_id_infos`.
+  - DONE: the Fail→`Rejected`→`WorkflowAlreadyStarted`→`ALREADY_EXISTS` mapping pre-existed; Wave 2
+    threads `request_id_infos` into `WorkflowExecutionDescription` and emits
+    `WorkflowExecutionExtendedInfo.request_id_infos`.
   - _Requirements: 2.2, 5.4_
 
-- [ ] 7. Tests
-  - [ ] 7.1 Kernel golden/unit: Fail reject, UseExisting attach event + request-id map,
+- [-] 7. Tests
+  - [x] 7.1 Kernel golden/unit: Fail reject, UseExisting attach event + request-id map,
     TerminateExisting order, closed-path unchanged.
+    - Added: started-event request-id map (golden), attach request-id map (options-updated golden),
+      runtime UseExisting attach request-id-map assertion, runtime Fail→Rejected (no attach).
     - _Feature: workflow-id-conflict-policy-concurrency, Property 2, Property 3, Property 5_
     - _Requirements: 2.1, 3.1, 3.2, 4.1, 1.5_
-  - [ ] 7.2 Property: single winner; request-id map shape for start + K attaches.
+  - [-] 7.2 Property: single winner; request-id map shape for start + K attaches.
     - _Feature: workflow-id-conflict-policy-concurrency, Property 1, Property 4_
     - _Requirements: 5.1, 6.1, 6.2_
-  - [ ] 7.3 Storage: CurrentExecutionConflict vs transient Conflict; CAS property preserved.
+  - [-] 7.3 Storage: CurrentExecutionConflict vs transient Conflict; CAS property preserved.
+    - Wave 1 updated the open-collision assertions to the new variant; the transient-conflict and CAS
+      tests are unchanged and still pass.
     - _Requirements: 1.1, 2.3_
-  - [ ] 7.4 Runtime: concurrent Fail (1 ok + N-1 already-started) and UseExisting (1 start + N-1
+  - [-] 7.4 Runtime: concurrent Fail (1 ok + N-1 already-started) and UseExisting (1 start + N-1
     attach) with no OCC-exhaustion; synchronize on observable state.
+    - The sequential pre-check path (Fail→Rejected, UseExisting→attach) is covered by runtime tests.
+      The true commit-time TOCTOU race needs a current-execution-lying store mock to drive
+      deterministically; that path is exercised by the operator conformance re-run (concurrent Nexus
+      callers). Tracked as a follow-up unit (deterministic race harness).
     - _Feature: workflow-id-conflict-policy-concurrency, Property 1_
     - _Requirements: 6.1, 6.2, 6.3_
-  - [ ] 7.5 Edge: already-started → ALREADY_EXISTS; RequestIdInfos reported.
+  - [x] 7.5 Edge: already-started → ALREADY_EXISTS; RequestIdInfos reported.
+    - already-started mapping pre-existed and is covered; RequestIdInfos surface added.
     - _Requirements: 2.2, 5.4_
 
 - [ ] 8. Verification gate and operator re-run
-  - `cargo +nightly fmt`, `cargo lint`, `cargo test`, `cargo doc -D warnings` on touched crates; then
-    operator re-run of `^TestNexusWorkflowTestSuite/TestNexusAsyncOperationWithMultipleCallers`.
+  - `cargo +nightly fmt`, `cargo lint`, `cargo test`, `cargo doc -D warnings` on touched crates: DONE
+    (kernel/runtime/edge/tokeirad).
+  - Operator re-run of `^TestNexusWorkflowTestSuite/TestNexusAsyncOperationWithMultipleCallers`: PENDING
+    (rebuild `tokeirad` first).
   - _Requirements: all_
 
 ## Task Dependency Graph

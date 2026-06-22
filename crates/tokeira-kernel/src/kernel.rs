@@ -35,10 +35,10 @@ use crate::{
     event::{ActivityResolution, HistoryEvent, HistoryEventKind},
     state::{
         ActivityPauseInfo, ActivityState, ChildWorkflowState,
-        EVENT_TYPE_WORKFLOW_EXECUTION_STARTED, LoadedRun, ParentClosePolicy, PauseInfo,
-        PendingExternalCancel, PendingExternalSignal, PendingNexusOperation, PendingUpdate,
-        PendingWorkflowTask, RequestIdInfo, TimerState, VersioningOverride, WorkflowState,
-        WorkflowVersioningInfo,
+        EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED, EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+        LoadedRun, ParentClosePolicy, PauseInfo, PendingExternalCancel, PendingExternalSignal,
+        PendingNexusOperation, PendingUpdate, PendingWorkflowTask, RequestIdInfo, TimerState,
+        VersioningOverride, WorkflowState, WorkflowVersioningInfo,
     },
     transition::{ActivityOp, DispatchOp, ProjectionOp, RequestDedupeOp, TimerOp, Transition},
 };
@@ -1147,6 +1147,10 @@ impl BasicKernel {
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
+        // Captured before the emit moves it; an attached request id (set when a
+        // UseExisting start attaches to this run) authors this options-updated
+        // event and must appear in request_id_infos (Req 5.3).
+        let attached_request_id_for_map = req.attached_request_id.clone();
         builder.emit(HistoryEventKind::WorkflowExecutionOptionsUpdated {
             versioning_override: req.versioning_override.clone(),
             completion_callbacks: completion_callbacks.clone(),
@@ -1154,6 +1158,16 @@ impl BasicKernel {
             attached_links: req.attached_links.clone(),
             attached_request_id: req.attached_request_id,
         });
+        if let Some(attached_request_id) = attached_request_id_for_map {
+            builder.state.request_id_infos.insert(
+                attached_request_id,
+                RequestIdInfo {
+                    event_id: builder.state.last_event_id,
+                    event_type: EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED,
+                    buffered: false,
+                },
+            );
+        }
 
         match req.versioning_override {
             FieldChange::Set(versioning_override) => {
@@ -2524,8 +2538,21 @@ impl BasicKernel {
                 completion_callbacks,
                 attached_completion_callbacks,
                 attached_links,
-                ..
+                attached_request_id,
             } => {
+                if let Some(attached_request_id) = attached_request_id {
+                    // Reconstruct the attached request id → options-updated mapping
+                    // on cold replay, matching the hot path in
+                    // apply_update_execution_options (Req 5.3).
+                    state.request_id_infos.insert(
+                        attached_request_id.clone(),
+                        RequestIdInfo {
+                            event_id: event.event_id,
+                            event_type: EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED,
+                            buffered: false,
+                        },
+                    );
+                }
                 match versioning_override {
                     FieldChange::Set(value) => {
                         state.set_versioning_override(Some(value.clone()));

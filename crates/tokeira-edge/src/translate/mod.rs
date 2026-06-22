@@ -343,6 +343,9 @@ pub struct WorkflowExecutionDescription {
     pub original_start_time: OffsetDateTime,
     pub versioning_info: Option<WorkflowVersioningInfo>,
     pub worker_deployment_name: Option<String>,
+    /// Per-request → authoring-event map for `WorkflowExtendedInfo.request_id_infos`
+    /// (the start request → STARTED, each UseExisting attach → OPTIONS_UPDATED).
+    pub request_id_infos: std::collections::BTreeMap<String, tokeira_kernel::RequestIdInfo>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

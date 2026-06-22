@@ -14,7 +14,7 @@
 //!   cargo build -p tokeirad --bin tokeira-rpc-probe
 //!
 //! Usage (point it at a workflow that is currently Running):
-//!   tokeira-rpc-probe <workflow-id> [query-type] [run-id]
+//!   `tokeira-rpc-probe <workflow-id> [query-type] [run-id]`
 //!
 //! An empty/omitted `run-id` sends Temporal's "resolve to the current run"
 //! convention; pass an explicit run-id to test exact-run resolution. The

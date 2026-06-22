@@ -1345,6 +1345,24 @@ mod tests {
             callback.last_attempt_failure
         );
         assert_eq!(state.links, vec![link]);
+        // request_id_infos maps the start request → STARTED and the attached
+        // request → OPTIONS_UPDATED (Req 5.2/5.3), surfaced on Describe.
+        let started_info = state
+            .request_id_infos
+            .get(&first.request.request_id.0)
+            .expect("start request id recorded");
+        assert_eq!(
+            started_info.event_type,
+            tokeira_kernel::EVENT_TYPE_WORKFLOW_EXECUTION_STARTED
+        );
+        let attached_info = state
+            .request_id_infos
+            .get("attach-req")
+            .expect("attached request id recorded");
+        assert_eq!(
+            attached_info.event_type,
+            tokeira_kernel::EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED
+        );
         let history = repo.read_history(first.run_key, 0, 10).await.unwrap();
         assert!(history.iter().any(|event| matches!(
             &event.kind,
@@ -1353,6 +1371,53 @@ mod tests {
                 ..
             } if id == "attach-req"
         )));
+    }
+
+    #[tokio::test]
+    async fn start_fail_conflict_rejects_without_attaching() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        );
+        let first = sample_start_request(None, None);
+        let started = runtime
+            .start_workflow_with_policy(first.clone())
+            .await
+            .unwrap();
+        assert!(matches!(started, StartWorkflowResult::Started { .. }));
+
+        // A second start for the same workflow id with Fail must resolve to the
+        // existing run as Rejected (→ WorkflowExecutionAlreadyStarted at the edge),
+        // not create a new run and not attach (Req 1.2, 2.x).
+        let mut second = sample_start_request(None, None);
+        second.namespace_id = first.namespace_id;
+        second.workflow_id = first.workflow_id.clone();
+        second.conflict_policy = WorkflowIdConflictPolicy::Fail;
+        second.request.request_id = RequestId("fail-req".to_string());
+        let rejected = runtime.start_workflow_with_policy(second).await.unwrap();
+        assert_eq!(
+            rejected,
+            StartWorkflowResult::Rejected {
+                run_key: first.run_key,
+                run_id: first.run_id
+            }
+        );
+
+        // Fail does not attach: the incumbent records only its own start request.
+        let LoadedRun::Existing(state) = repo.load_run(first.run_key).await.unwrap() else {
+            panic!("started run should still exist");
+        };
+        assert!(
+            state
+                .request_id_infos
+                .contains_key(&first.request.request_id.0)
+        );
+        assert!(!state.request_id_infos.contains_key("fail-req"));
     }
 
     #[test]

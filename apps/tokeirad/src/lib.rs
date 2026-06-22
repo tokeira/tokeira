@@ -1507,6 +1507,7 @@ where
                 original_start_time: state.first_run_started_at.unwrap_or(state.started_at),
                 versioning_info: state.versioning_info.clone(),
                 worker_deployment_name: state.worker_deployment_name.clone(),
+                request_id_infos: state.request_id_infos.clone(),
             })),
             LoadedRun::Absent => Err(anyhow!("resolved run missing from storage: {:?}", run_key)),
         }

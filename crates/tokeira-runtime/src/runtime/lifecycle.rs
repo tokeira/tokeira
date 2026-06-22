@@ -87,69 +87,92 @@ where
         &self,
         request: StartRequest,
     ) -> Result<StartWorkflowResult> {
-        let resolution = self
-            .resolve_conflict(
-                request.namespace_id,
-                &request.workflow_id,
-                request.conflict_policy,
-                request.reuse_policy,
-            )
-            .await?;
-        match resolution {
-            ConflictResolution::Absent | ConflictResolution::ClosedAllowReuse => {
-                match self.start_workflow(request.clone()).await? {
-                    CommitResult::Applied { new_state } => Ok(StartWorkflowResult::Started {
-                        run_key: request.run_key,
-                        run_id: request.run_id,
-                        mutation_metadata: mutation_metadata(&new_state),
-                    }),
-                    CommitResult::Duplicate => Err(anyhow!(
-                        "unexpected duplicate start commit for {:?}",
-                        request.run_key
-                    )),
-                    CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
-                    CommitResult::CurrentExecutionConflict {
-                        existing_run_key, ..
-                    } => Err(anyhow!(
-                        "current execution already exists: {existing_run_key:?}"
-                    )),
-                }
-            }
-            ConflictResolution::UseExisting { run_key, run_id } => {
-                self.apply_start_on_conflict_options(run_key, &request)
-                    .await?;
-                Ok(StartWorkflowResult::UsedExisting { run_key, run_id })
-            }
-            ConflictResolution::TerminateAndStart { run_key } => {
-                self.terminate_existing_for_conflict(
+        // Bounded re-resolution loop. `resolve_conflict` is a pre-check that can
+        // race a concurrent start: N starts for the same workflow id can all see
+        // "absent" and proceed, then collide at commit. The loser's commit returns
+        // `CurrentExecutionConflict` (the lane does not OCC-retry it); we loop and
+        // re-resolve, now seeing the committed incumbent, and apply the request's
+        // WorkflowIdConflictPolicy deterministically — exactly one start wins, the
+        // rest Fail→Rejected / UseExisting→attach / TerminateExisting→terminate+start
+        // (`ResolveWorkflowIDConflictPolicy @ v1.31.0`). The bound guards against a
+        // pathological churn of repeatedly-terminated incumbents.
+        const MAX_RESOLUTION_ATTEMPTS: usize = 5;
+        for _ in 0..MAX_RESOLUTION_ATTEMPTS {
+            let resolution = self
+                .resolve_conflict(
                     request.namespace_id,
-                    request.workflow_id.clone(),
-                    run_key,
-                    request.request.clone(),
+                    &request.workflow_id,
+                    request.conflict_policy,
+                    request.reuse_policy,
                 )
                 .await?;
-                match self.start_workflow(request.clone()).await? {
-                    CommitResult::Applied { new_state } => Ok(StartWorkflowResult::Started {
-                        run_key: request.run_key,
-                        run_id: request.run_id,
-                        mutation_metadata: mutation_metadata(&new_state),
-                    }),
-                    CommitResult::Duplicate => Err(anyhow!(
-                        "unexpected duplicate start commit for {:?}",
-                        request.run_key
-                    )),
-                    CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
-                    CommitResult::CurrentExecutionConflict {
-                        existing_run_key, ..
-                    } => Err(anyhow!(
-                        "current execution already exists: {existing_run_key:?}"
-                    )),
+            match resolution {
+                ConflictResolution::Absent | ConflictResolution::ClosedAllowReuse => {
+                    match self.start_workflow(request.clone()).await? {
+                        CommitResult::Applied { new_state } => {
+                            return Ok(StartWorkflowResult::Started {
+                                run_key: request.run_key,
+                                run_id: request.run_id,
+                                mutation_metadata: mutation_metadata(&new_state),
+                            });
+                        }
+                        CommitResult::Duplicate => {
+                            return Err(anyhow!(
+                                "unexpected duplicate start commit for {:?}",
+                                request.run_key
+                            ));
+                        }
+                        CommitResult::Conflict { reason } => {
+                            return Err(anyhow!("conflict: {reason}"));
+                        }
+                        // Lost the start race; the incumbent is now committed, so
+                        // re-resolve and apply the conflict policy against it.
+                        CommitResult::CurrentExecutionConflict { .. } => continue,
+                    }
+                }
+                ConflictResolution::UseExisting { run_key, run_id } => {
+                    self.apply_start_on_conflict_options(run_key, &request)
+                        .await?;
+                    return Ok(StartWorkflowResult::UsedExisting { run_key, run_id });
+                }
+                ConflictResolution::TerminateAndStart { run_key } => {
+                    self.terminate_existing_for_conflict(
+                        request.namespace_id,
+                        request.workflow_id.clone(),
+                        run_key,
+                        request.request.clone(),
+                    )
+                    .await?;
+                    match self.start_workflow(request.clone()).await? {
+                        CommitResult::Applied { new_state } => {
+                            return Ok(StartWorkflowResult::Started {
+                                run_key: request.run_key,
+                                run_id: request.run_id,
+                                mutation_metadata: mutation_metadata(&new_state),
+                            });
+                        }
+                        CommitResult::Duplicate => {
+                            return Err(anyhow!(
+                                "unexpected duplicate start commit for {:?}",
+                                request.run_key
+                            ));
+                        }
+                        CommitResult::Conflict { reason } => {
+                            return Err(anyhow!("conflict: {reason}"));
+                        }
+                        // Another start claimed the slot we just freed; re-resolve.
+                        CommitResult::CurrentExecutionConflict { .. } => continue,
+                    }
+                }
+                ConflictResolution::Rejected { run_key, run_id } => {
+                    return Ok(StartWorkflowResult::Rejected { run_key, run_id });
                 }
             }
-            ConflictResolution::Rejected { run_key, run_id } => {
-                Ok(StartWorkflowResult::Rejected { run_key, run_id })
-            }
         }
+        Err(anyhow!(
+            "workflow start for {:?} did not converge after {MAX_RESOLUTION_ATTEMPTS} conflict-resolution attempts",
+            request.run_key
+        ))
     }
 
     async fn apply_start_on_conflict_options(

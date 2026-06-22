@@ -4447,8 +4447,25 @@ fn workflow_extended_info_to_proto(
         run_expiration_time: value.run_expiration_time.map(to_proto_timestamp),
         cancel_requested: value.cancel_requested,
         original_start_time: Some(to_proto_timestamp(value.original_start_time)),
-        // Reset/request-id history linkage is not retained yet, so those fields
-        // remain default rather than fabricating reset metadata.
+        // request_id_infos maps each request id that authored an event (the start
+        // request → STARTED, each UseExisting attach → OPTIONS_UPDATED) to that
+        // event (`WorkflowExecutionExtendedInfo.request_id_infos @ v1.31.0`).
+        request_id_infos: value
+            .request_id_infos
+            .iter()
+            .map(|(id, info)| {
+                (
+                    id.clone(),
+                    workflow::RequestIdInfo {
+                        event_type: info.event_type,
+                        event_id: info.event_id,
+                        buffered: info.buffered,
+                    },
+                )
+            })
+            .collect(),
+        // Reset history linkage is not retained yet, so that field
+        // remains default rather than fabricating reset metadata.
         pause_info: value
             .pause_info
             .as_ref()
@@ -6431,6 +6448,7 @@ mod tests {
             original_start_time: OffsetDateTime::UNIX_EPOCH,
             versioning_info: case.versioning_info.clone(),
             worker_deployment_name: case.worker_deployment_name.clone(),
+            request_id_infos: std::collections::BTreeMap::new(),
         }
     }
 

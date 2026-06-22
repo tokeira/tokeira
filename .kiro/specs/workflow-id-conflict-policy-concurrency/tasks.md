@@ -94,8 +94,20 @@ and surface it via `DescribeWorkflowExecution`. Ground-truthed to `workflow_id_d
 - [ ] 8. Verification gate and operator re-run
   - `cargo +nightly fmt`, `cargo lint`, `cargo test`, `cargo doc -D warnings` on touched crates: DONE
     (kernel/runtime/edge/tokeirad).
-  - Operator re-run of `^TestNexusWorkflowTestSuite/TestNexusAsyncOperationWithMultipleCallers`: PENDING
-    (rebuild `tokeirad` first).
+  - Operator re-run of `^TestNexusWorkflowTestSuite/TestNexusAsyncOperationWithMultipleCallers`: DONE.
+    Result: the conflict-policy resolution is CORRECT — tokeira now returns
+    `WorkflowExecutionAlreadyStarted` ("already started as <run-id>") for the Fail case (no more
+    `lane OCC retry exhausted`). The test still fails, but for a SEPARATE downstream gap: the Nexus
+    task-failure response DTO. tokeira's `respond_nexus_task_failed` reads only the deprecated
+    `RespondNexusTaskFailedRequest.error` (field 4); the SDK (v1.41.1) sends the v1.62 `failure`
+    field (5, a `temporal.api.failure.v1.Failure` carrying `NexusHandlerFailureInfo`), so tokeira
+    rejects it with `error is required` and the handler-error never reaches the caller (20s timeout).
+    This is the deferred "Nexus DTO migration" (the in-code comment cites task 4.7 / 8.1), orthogonal
+    to conflict policy, and blocks any worker-targeted Nexus handler-error path. Tracked as a separate
+    fix: read field 5, validate `NexusHandlerFailureInfo` present (`workflow_handler.go:6096 @
+    v1.31.0`), and wrap it in a `NexusOperationFailureInfo` on the caller's `NexusOperationFailed`
+    event (api-go: "NexusOperationFailureInfo wrapping an ApplicationFailureInfo"). The kernel can
+    build the wrapper from `PendingNexusOperation` (endpoint/service/operation/scheduled_event_id).
   - _Requirements: all_
 
 ## Task Dependency Graph

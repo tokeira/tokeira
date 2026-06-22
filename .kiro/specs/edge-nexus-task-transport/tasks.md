@@ -145,13 +145,16 @@ Implement the Nexus Task Transport layer in 3 phases: (1) NexusTaskBroker + poll
   - **Verification status (reconciled 2026-06-22):** the schedule→broker hop is proven in-process by
     `crates/tokeira-runtime/tests/runtime_nexus.rs::worker_targeted_nexus_schedule_publishes_to_broker`
     (the "0.1 golden") and the edge poll/respond handlers have unit coverage with mock runtimes
-    (`grpc/workflow_service.rs::tests::{poll_nexus_task_queue_*, respond_nexus_task_*}`). What is **not**
-    yet covered: a full end-to-end **gRPC-edge** round-trip — external worker polls via
-    `PollNexusTaskQueue` and replies via `RespondNexusTaskCompleted`, with the result routing back to the
-    originator across namespaces. Token-carried `originator_run_key` makes that path cross-namespace by
-    construction (`publisher.rs handle_schedule_nexus_operation` Worker arm + `workflow_service.rs
-    respond_nexus_task_completed`), but an integration test asserting it is the outstanding verification
-    Odori depends on.
+    (`grpc/workflow_service.rs::tests::{poll_nexus_task_queue_*, respond_nexus_task_*}`). **The full
+    end-to-end gRPC-edge round-trip is now VERIFIED (2026-06-22):** Odori's `nexus-roundtrip-probe`
+    drove `CreateNexusEndpoint` (worker target, `odori-agents/odori-agent-rt-q`) → control workflow
+    in `odori-control` schedules the op → external raw-gRPC `PollNexusTaskQueue` receives the task →
+    `RespondNexusTaskCompleted` (SyncSuccess) → result `"pong"` routed back into the caller workflow
+    as its output. This confirms cross-namespace routing via the token-carried `originator_run_key`
+    (`publisher.rs handle_schedule_nexus_operation` Worker arm + `workflow_service.rs
+    respond_nexus_task_completed`). Outstanding: a **permanent in-repo regression test** under
+    `apps/tokeirad/tests/` driving the same path with raw prost clients (no external SDK), so tokeira's
+    own CI guards it — the probe itself stays in the Odori repo, uncommitted.
 
 ## Task Dependency Graph
 

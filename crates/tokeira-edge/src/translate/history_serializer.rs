@@ -49,8 +49,27 @@ pub fn history_event_to_proto(event: &HistoryEvent) -> history::HistoryEvent {
         attributes: Some(attributes_for_kind(event)),
         user_metadata: event_user_metadata(event),
         links: event_links(event),
+        worker_may_ignore: event_worker_may_ignore(event),
         ..Default::default()
     }
+}
+
+/// Whether the worker may skip this event during replay without failing.
+///
+/// The SDK's `ProcessEvent` switch fails with `ErrUnknownHistoryEvent` for any
+/// event type it does not explicitly handle *unless* `worker_may_ignore` is set
+/// (`internal_event_handlers.go` default arm @ sdk v1.41.1). `WorkflowExecutionOptionsUpdated`
+/// is such an event: the SDK has no handler for it, and it can land in worker-
+/// delivered history (e.g. a UseExisting Nexus-caller attach records an
+/// OPTIONS_UPDATED event against the running handler workflow). v1.31.0 marks the
+/// event ignorable at creation time so replay tolerates it; we mirror that exactly
+/// (`event.WorkerMayIgnore = true` in `CreateWorkflowExecutionOptionsUpdatedEvent`,
+/// service/history/historybuilder/event_factory.go @ v1.31.0).
+fn event_worker_may_ignore(event: &HistoryEvent) -> bool {
+    matches!(
+        event.kind,
+        HistoryEventKind::WorkflowExecutionOptionsUpdated { .. }
+    )
 }
 
 fn opt_run_id(r: &Option<tokeira_types::RunId>) -> String {
@@ -2020,6 +2039,54 @@ mod tests {
             }
             other => panic!("unexpected attributes: {other:?}"),
         }
+    }
+
+    // Conformance guard: `WorkflowExecutionOptionsUpdated` has no SDK `ProcessEvent`
+    // handler, so the worker fails replay with `ErrUnknownHistoryEvent` unless the
+    // event is flagged ignorable. A UseExisting Nexus-caller attach records this
+    // event against the running handler workflow, where it lands in worker-delivered
+    // history. v1.31.0 sets `WorkerMayIgnore = true` on it
+    // (CreateWorkflowExecutionOptionsUpdatedEvent, event_factory.go @ v1.31.0); we
+    // must too, or the handler workflow never completes.
+    #[test]
+    fn options_updated_event_is_worker_ignorable() {
+        let event = HistoryEvent {
+            event_id: 4,
+            happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
+            kind: HistoryEventKind::WorkflowExecutionOptionsUpdated {
+                versioning_override: tokeira_kernel::command::FieldChange::Unchanged,
+                completion_callbacks: tokeira_kernel::command::FieldChange::Unchanged,
+                attached_completion_callbacks: Vec::new(),
+                attached_links: Vec::new(),
+                attached_request_id: Some("req-attach".to_string()),
+            },
+        };
+
+        assert!(
+            history_event_to_proto(&event).worker_may_ignore,
+            "OptionsUpdated must set worker_may_ignore so SDK replay tolerates it"
+        );
+    }
+
+    // Negative control: ordinary events must not be ignorable, or workers would
+    // silently skip real workflow-affecting history.
+    #[test]
+    fn ordinary_event_is_not_worker_ignorable() {
+        let event = HistoryEvent {
+            event_id: 3,
+            happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
+            kind: HistoryEventKind::WorkflowTaskStarted {
+                logical_seq: LogicalTaskSeq(1),
+                scheduled_event_id: 2,
+                attempt: 1,
+                identity: WorkerIdentity("worker".to_string()),
+                request_id: "req-1".to_string(),
+                history_size_bytes: 0,
+                suggest_continue_as_new: false,
+            },
+        };
+
+        assert!(!history_event_to_proto(&event).worker_may_ignore);
     }
 
     #[test]

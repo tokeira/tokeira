@@ -2282,8 +2282,27 @@ impl WorkflowService {
                         }
                         Ok(response)
                     }
-                    StartWorkflowResult::UsedExisting { run_id, .. }
-                    | StartWorkflowResult::Rejected { run_id, .. } => {
+                    StartWorkflowResult::UsedExisting { run_key, run_id } => {
+                        // UseExisting attached to a running incumbent rather than
+                        // creating a new run. v1.31.0 returns success here — RunId =
+                        // the existing run, Started = false, Status = RUNNING — not an
+                        // AlreadyStarted error; only the Fail policy errors
+                        // (handleUseExistingWorkflowOnConflictOptions vs the Fail arm,
+                        // service/history/api/startworkflow/api.go @ v1.31.0). The Nexus
+                        // WorkflowRunOperation relies on this: with
+                        // WorkflowExecutionErrorWhenAlreadyStarted set, a UseExisting
+                        // caller must see success so its operation starts against the
+                        // attached run (temporalnexus/operation.go @ sdk v1.41.1).
+                        Ok(StartWorkflowExecutionResponse {
+                            run_key,
+                            run_id,
+                            transition_seq: 0,
+                            last_event_id: 0,
+                            started: false,
+                            eager_workflow_task: None,
+                        })
+                    }
+                    StartWorkflowResult::Rejected { run_id, .. } => {
                         Err(EdgeError::WorkflowAlreadyStarted {
                             namespace,
                             workflow_id,
@@ -5420,6 +5439,104 @@ mod tests {
             identity: Some("tester".to_string()),
             now: None,
         }
+    }
+
+    fn start_request_for(
+        workflow_id: &WorkflowId,
+        conflict_policy: tokeira_kernel::WorkflowIdConflictPolicy,
+        request_id: &str,
+    ) -> crate::translate::StartWorkflowExecutionRequest {
+        crate::translate::StartWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_id: workflow_id.0.clone(),
+            workflow_type: "workflow-type".to_string(),
+            task_queue: "queue-a".to_string(),
+            input: Payloads::default(),
+            request_id: Some(request_id.to_string()),
+            memo: Memo::default(),
+            search_attributes: SearchAttributes::default(),
+            identity: Some("tester".to_string()),
+            request_eager_execution: false,
+            workflow_start_delay: None,
+            completion_callbacks: Vec::new(),
+            user_metadata: None,
+            links: Vec::new(),
+            eager_worker_deployment_options: None,
+            workflow_execution_timeout: None,
+            workflow_run_timeout: None,
+            workflow_task_timeout: Some(Duration::seconds(10)),
+            retry_policy: None,
+            conflict_policy,
+            reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
+            header: None,
+            versioning_override: None,
+            on_conflict_options: None,
+            priority: None,
+            cron_schedule: None,
+            run_key: None,
+            run_id: None,
+            now: None,
+        }
+    }
+
+    // Conformance: a UseExisting start that attaches to a running incumbent
+    // returns success (existing run id, started=false), NOT AlreadyStarted; only
+    // the Fail policy errors (handleUseExistingWorkflowOnConflictOptions vs the
+    // Fail arm, service/history/api/startworkflow/api.go @ v1.31.0). The Nexus
+    // WorkflowRunOperation depends on this — with
+    // WorkflowExecutionErrorWhenAlreadyStarted set, a UseExisting caller must see
+    // success to count its operation as started (temporalnexus, sdk v1.41.1).
+    #[tokio::test]
+    async fn start_use_existing_attaches_without_already_started_error() -> Result<()> {
+        let (service, _runtime, _namespace_id, workflow_id, existing_run_id) =
+            update_test_service().await?;
+
+        let resp = service
+            .start_workflow_execution(
+                &HeaderMap::new(),
+                start_request_for(
+                    &workflow_id,
+                    tokeira_kernel::WorkflowIdConflictPolicy::UseExisting,
+                    "use-existing-attach",
+                ),
+            )
+            .await?;
+
+        assert!(
+            !resp.started,
+            "attach must report started=false, not a fresh start"
+        );
+        assert_eq!(
+            resp.run_id, existing_run_id,
+            "attach must return the running incumbent's run id"
+        );
+        Ok(())
+    }
+
+    // Negative control: the Fail policy against the same running incumbent must
+    // still surface AlreadyStarted (the conflict-policy-fail Nexus losers).
+    #[tokio::test]
+    async fn start_fail_policy_rejects_running_incumbent() -> Result<()> {
+        let (service, _runtime, _namespace_id, workflow_id, _existing_run_id) =
+            update_test_service().await?;
+
+        let err = service
+            .start_workflow_execution(
+                &HeaderMap::new(),
+                start_request_for(
+                    &workflow_id,
+                    tokeira_kernel::WorkflowIdConflictPolicy::Fail,
+                    "fail-policy-reject",
+                ),
+            )
+            .await
+            .expect_err("Fail policy must reject a running incumbent");
+
+        assert!(
+            matches!(err, EdgeError::WorkflowAlreadyStarted { .. }),
+            "got {err:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]

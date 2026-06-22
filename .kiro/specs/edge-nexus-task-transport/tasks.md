@@ -138,8 +138,39 @@ Implement the Nexus Task Transport layer in 3 phases: (1) NexusTaskBroker + poll
     - Test timeout tracking inserted for broker-dispatched task (Req 10.1)
     - _Requirements: 8.1, 8.2, 9.1, 9.3, 10.1, 11.3_
 
-- [ ] 6. Final checkpoint
-  - Ensure all tests pass, ask the user if questions arise.
+- [x] 6. Final checkpoint
+  - All edge/runtime unit + property tests pass. Phases 1–3 landed: `NexusTaskBroker`, task token,
+    poll handler, request/response translation, completion/failure handlers, and Worker-targeted
+    dispatch routing through the broker.
+  - **Verification status (reconciled 2026-06-22):** the schedule→broker hop is proven in-process by
+    `crates/tokeira-runtime/tests/runtime_nexus.rs::worker_targeted_nexus_schedule_publishes_to_broker`
+    (the "0.1 golden") and the edge poll/respond handlers have unit coverage with mock runtimes
+    (`grpc/workflow_service.rs::tests::{poll_nexus_task_queue_*, respond_nexus_task_*}`). What is **not**
+    yet covered: a full end-to-end **gRPC-edge** round-trip — external worker polls via
+    `PollNexusTaskQueue` and replies via `RespondNexusTaskCompleted`, with the result routing back to the
+    originator across namespaces. Token-carried `originator_run_key` makes that path cross-namespace by
+    construction (`publisher.rs handle_schedule_nexus_operation` Worker arm + `workflow_service.rs
+    respond_nexus_task_completed`), but an integration test asserting it is the outstanding verification
+    Odori depends on.
+
+## Task Dependency Graph
+
+```json
+{
+  "waves": [
+    { "wave": 1, "tasks": ["1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7"] },
+    { "wave": 2, "tasks": ["2"] },
+    { "wave": 3, "tasks": ["3.1", "3.2", "3.3", "3.4", "3.5"] },
+    { "wave": 4, "tasks": ["4"] },
+    { "wave": 5, "tasks": ["5.1", "5.2", "5.3", "5.4", "5.5"] },
+    { "wave": 6, "tasks": ["6"] }
+  ]
+}
+```
+
+Phase 1 (broker + poll + request translation) precedes its checkpoint (2); Phase 2 (completion/failure
+handlers + response translation) precedes its checkpoint (4); Phase 3 (Worker-targeted dispatch
+routing) precedes the final checkpoint (6).
 
 ## Notes
 

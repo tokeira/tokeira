@@ -54,9 +54,15 @@ wire the real client into tokeirad in place of `NoopNexusHttpClient`. Ground-tru
     - _Feature: runtime-nexus-http-client, Property 1, Property 2_
     - _Requirements: 3.1, 3.2_
 
-- [ ] 6. Verification gate and operator re-run
+- [x] 6. Verification gate and operator re-run
   - `cargo +nightly fmt`, `cargo lint`, `cargo test`, `cargo doc -D warnings` on touched crates: DONE.
-  - Operator re-run of `^TestNexusWorkflowTestSuite`: PENDING (rebuild `tokeirad` first).
+  - Operator re-run of `^TestNexusWorkflowTestSuite`: **DONE (2026-06-22).** The HTTP client itself is
+    confirmed working (sync 200 / async 201 / 424 mapping, link parse, op-token). The suite is not yet
+    green, but the residual blockers are **outside this spec**: (a) conflict-policy resolution + the
+    v1.62 `RespondNexusTaskFailed.failure` DTO + the `worker_may_ignore` replay flag + UseExisting→success
+    (all landed separately on `main`), and (b) **async Nexus completion-callback delivery** — the started
+    operation's result is never delivered back to the caller (`DispatchCompletionCallback` is a no-op
+    stub), tracked in the new `nexus-async-completion` spec. This HTTP-client spec's own scope is complete.
   - _Requirements: 4.1, 4.2_
 
 ## Task Dependency Graph

@@ -11,7 +11,7 @@ use tokeira_proto::{
     conversions::common::{
         failure_to_payload, payload_from_domain, payload_to_domain, to_proto_timestamp,
     },
-    public::temporal::api::nexus::v1 as nexus_v1,
+    public::temporal::api::{failure::v1 as failure_proto, nexus::v1 as nexus_v1},
     workflowservice,
 };
 use tokeira_runtime::NexusTaskRequest;
@@ -51,7 +51,14 @@ pub struct RespondNexusTaskFailedRequest {
     pub namespace: String,
     pub identity: String,
     pub task_token: Vec<u8>,
+    /// Deprecated v0.4-era handler error (`RespondNexusTaskFailedRequest.error`,
+    /// field 4). Read for wire-compat with old SDKs.
     pub error: Option<nexus_v1::HandlerError>,
+    /// v1.62 structured handler failure (`RespondNexusTaskFailedRequest.failure`,
+    /// field 5). A `temporal.api.failure.v1.Failure` that MUST contain a
+    /// `NexusHandlerFailureInfo` (`workflow_handler.go:6096 @ v1.31.0`). This is
+    /// what modern SDKs send; preferred over `error` when present.
+    pub failure: Option<failure_proto::Failure>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -109,10 +116,11 @@ pub fn completed_request_to_edge(
     })
 }
 
-// v1.62-sync: reads deprecated `RespondNexusTaskFailedRequest.error` for
-// wire-compat with v0.4-era SDK Nexus handlers. v1.62 replaces `error` with
-// a structured `handler_error` shape; migration is task 4.7 (Nexus DTO
-// family additions) + task 8.1 (Nexus decode translator).
+// v1.62-sync: prefers the structured `failure` field (5) that modern SDKs send;
+// falls back to the deprecated `error` field (4) for v0.4-era handlers. v1.31.0's
+// frontend requires one of them and that `failure`, if set, carries a
+// `NexusHandlerFailureInfo` (`workflow_handler.go:6096 @ v1.31.0`); that check is
+// enforced in `respond_nexus_task_failed`, not here, so the DTO stays neutral.
 #[allow(deprecated)]
 pub fn failed_request_to_edge(
     req: workflowservice::RespondNexusTaskFailedRequest,
@@ -125,6 +133,7 @@ pub fn failed_request_to_edge(
         identity: req.identity,
         task_token: req.task_token,
         error: req.error,
+        failure: req.failure,
     })
 }
 
@@ -272,6 +281,57 @@ pub fn proto_handler_error_to_resolution(
     })
 }
 
+/// True when a `temporal.api.failure.v1.Failure` carries a `NexusHandlerFailureInfo`.
+///
+/// v1.31.0's frontend rejects a `RespondNexusTaskFailedRequest.failure` that does
+/// not contain one (`workflow_handler.go:6096 @ v1.31.0`).
+pub fn failure_has_nexus_handler_info(failure: &failure_proto::Failure) -> bool {
+    matches!(
+        failure.failure_info,
+        Some(failure_proto::failure::FailureInfo::NexusHandlerFailureInfo(_))
+    )
+}
+
+/// Build the caller-facing `NexusResolution::Failed` for a worker handler failure,
+/// wrapping the handler's `failure` (the cause) in a `NexusOperationFailureInfo`,
+/// exactly as v1.31.0 records it on the `NexusOperationFailed` event
+/// (`createNexusOperationFailure`, `components/nexusoperations/executors.go @
+/// v1.31.0`: outer message "nexus operation completed unsuccessfully", a
+/// `NexusOperationFailureInfo{endpoint, service, operation, scheduled_event_id}`,
+/// and `cause` = the handler failure). The result is stored as the opaque
+/// `temporal/failure+proto` payload the history serializer round-trips verbatim,
+/// so the SDK caller decodes the full chain (NexusOperationError → HandlerError →
+/// ApplicationError). `operation_token` is empty: a start that failed never
+/// produced one.
+pub fn wrap_handler_failure_as_resolution(
+    cause: failure_proto::Failure,
+    endpoint: String,
+    service: String,
+    operation: String,
+    scheduled_event_id: i64,
+) -> NexusResolution {
+    let wrapped = failure_proto::Failure {
+        message: "nexus operation completed unsuccessfully".to_string(),
+        failure_info: Some(
+            failure_proto::failure::FailureInfo::NexusOperationExecutionFailureInfo(
+                failure_proto::NexusOperationFailureInfo {
+                    scheduled_event_id,
+                    endpoint,
+                    service,
+                    operation,
+                    operation_id: String::new(),
+                    operation_token: String::new(),
+                },
+            ),
+        ),
+        cause: Some(Box::new(cause)),
+        ..Default::default()
+    };
+    NexusResolution::Failed {
+        failure: failure_to_payload(&wrapped),
+    }
+}
+
 pub fn nexus_failure_to_kernel_payload(
     error_type: String,
     failure: Option<&nexus_v1::Failure>,
@@ -339,6 +399,96 @@ mod tests {
         Payload {
             data: bytes,
             metadata: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn failure_with_nexus_handler_info_is_recognized() {
+        let with = failure_proto::Failure {
+            failure_info: Some(
+                failure_proto::failure::FailureInfo::NexusHandlerFailureInfo(
+                    failure_proto::NexusHandlerFailureInfo {
+                        r#type: "INTERNAL".to_string(),
+                        retry_behavior: 0,
+                    },
+                ),
+            ),
+            ..Default::default()
+        };
+        assert!(failure_has_nexus_handler_info(&with));
+        // A bare failure (no NexusHandlerFailureInfo) must be rejected, matching
+        // v1.31.0's frontend validation.
+        let without = failure_proto::Failure {
+            message: "boom".to_string(),
+            ..Default::default()
+        };
+        assert!(!failure_has_nexus_handler_info(&without));
+    }
+
+    #[test]
+    fn handler_failure_wraps_into_nexus_operation_failure_info() {
+        use tokeira_proto::conversions::common::payload_to_failure;
+        // The handler's failure: NexusHandlerFailureInfo with an ApplicationFailureInfo
+        // cause typed WorkflowExecutionAlreadyStarted (the conflict-policy case).
+        let cause = failure_proto::Failure {
+            message: "already started".to_string(),
+            failure_info: Some(
+                failure_proto::failure::FailureInfo::NexusHandlerFailureInfo(
+                    failure_proto::NexusHandlerFailureInfo {
+                        r#type: "INTERNAL".to_string(),
+                        retry_behavior: 0,
+                    },
+                ),
+            ),
+            cause: Some(Box::new(failure_proto::Failure {
+                message: "already started".to_string(),
+                failure_info: Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(
+                    failure_proto::ApplicationFailureInfo {
+                        r#type: "WorkflowExecutionAlreadyStarted".to_string(),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let NexusResolution::Failed { failure } = wrap_handler_failure_as_resolution(
+            cause,
+            "endpoint-1".to_string(),
+            "service".to_string(),
+            "op".to_string(),
+            42,
+        ) else {
+            panic!("expected Failed");
+        };
+        // The stored payload round-trips (via payload_to_failure, as the history
+        // serializer does) to a NexusOperationFailureInfo wrapper carrying the
+        // operation metadata, whose cause preserves the handler chain so the SDK
+        // caller decodes ApplicationError "WorkflowExecutionAlreadyStarted".
+        let decoded = payload_to_failure(&failure);
+        let Some(failure_proto::failure::FailureInfo::NexusOperationExecutionFailureInfo(info)) =
+            &decoded.failure_info
+        else {
+            panic!(
+                "expected NexusOperationFailureInfo wrapper, got {:?}",
+                decoded.failure_info
+            );
+        };
+        assert_eq!(info.endpoint, "endpoint-1");
+        assert_eq!(info.service, "service");
+        assert_eq!(info.operation, "op");
+        assert_eq!(info.scheduled_event_id, 42);
+        let handler = decoded.cause.expect("handler cause present");
+        assert!(matches!(
+            handler.failure_info,
+            Some(failure_proto::failure::FailureInfo::NexusHandlerFailureInfo(_))
+        ));
+        let app = handler.cause.expect("application cause present");
+        match app.failure_info {
+            Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(a)) => {
+                assert_eq!(a.r#type, "WorkflowExecutionAlreadyStarted");
+            }
+            other => panic!("expected ApplicationFailureInfo, got {other:?}"),
         }
     }
 

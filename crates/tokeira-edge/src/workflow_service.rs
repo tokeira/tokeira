@@ -1179,11 +1179,54 @@ impl WorkflowService {
                 }
                 let token = NexusTaskToken::decode(&req.task_token)
                     .map_err(|error| EdgeError::BadRequest(error.to_string()))?;
-                let error = req
-                    .error
-                    .ok_or_else(|| EdgeError::BadRequest("error is required".to_string()))?;
-                let resolution = crate::translate::nexus::proto_handler_error_to_resolution(error)
-                    .map_err(|error| EdgeError::BadRequest(error.to_string()))?;
+                // Prefer the v1.62 structured `failure` (field 5) modern SDKs send;
+                // fall back to the deprecated `error` (field 4). v1.31.0 requires
+                // one of them, and a `failure` must carry a NexusHandlerFailureInfo
+                // (`workflow_handler.go:6096 @ v1.31.0`).
+                let resolution = if let Some(failure) = req.failure {
+                    if !crate::translate::nexus::failure_has_nexus_handler_info(&failure) {
+                        return Err(EdgeError::BadRequest(
+                            "request Failure must contain error or failure with NexusHandlerFailureInfo"
+                                .to_string(),
+                        ));
+                    }
+                    // The caller's NexusOperationFailed event wraps the handler
+                    // failure in a NexusOperationFailureInfo carrying the operation's
+                    // endpoint/service/operation; load the pending op for them. A
+                    // missing pending op (already resolved/raced) leaves them empty —
+                    // the cause chain the SDK decodes is still intact.
+                    let (endpoint, service, operation) = match self
+                        .repo
+                        .load_run(token.run_key)
+                        .await
+                        .map_err(EdgeError::from)?
+                    {
+                        LoadedRun::Existing(state) => state
+                            .pending_nexus_operations
+                            .get(&token.operation_id)
+                            .map(|op| {
+                                (op.endpoint.clone(), op.service.clone(), op.operation.clone())
+                            })
+                            .unwrap_or_default(),
+                        LoadedRun::Absent => Default::default(),
+                    };
+                    crate::translate::nexus::wrap_handler_failure_as_resolution(
+                        failure,
+                        endpoint,
+                        service,
+                        operation,
+                        token.scheduled_event_id,
+                    )
+                } else {
+                    let error = req.error.ok_or_else(|| {
+                        EdgeError::BadRequest(
+                            "request Failure must contain error or failure with NexusHandlerFailureInfo"
+                                .to_string(),
+                        )
+                    })?;
+                    crate::translate::nexus::proto_handler_error_to_resolution(error)
+                        .map_err(|error| EdgeError::BadRequest(error.to_string()))?
+                };
 
                 let applied = self
                     .runtime

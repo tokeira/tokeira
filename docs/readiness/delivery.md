@@ -4,6 +4,8 @@
 > entry point for "where are we, and what is left, to ship." Each workstream below has a
 > focused sibling doc in this folder; this page is the index and the at-a-glance status.
 > If another document disagrees with this one about *status*, this one wins — fix the other.
+>
+> For the at-a-glance **countdown checklist**, see [`tasks.md`](./tasks.md).
 
 **Last updated:** 2026-06-22 · **Maintained by:** Kiro (single contributor for status)
 

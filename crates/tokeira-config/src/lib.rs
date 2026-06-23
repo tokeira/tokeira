@@ -221,6 +221,73 @@ pub struct PolicyConfig {
     pub compatibility: CompatibilityConfig,
     #[serde(default)]
     pub nexus_endpoint_limits: NexusEndpointLimitsConfig,
+    #[serde(default)]
+    pub nexus_completion: NexusCompletionConfig,
+}
+
+/// Async Nexus operation completion-callback delivery (`nexus-async-completion` spec).
+///
+/// `http_addr` is the bind address of the inbound `POST /nexus/callback` HTTP listener;
+/// `system_callback_url` is the base URL the runtime POSTs to when firing a
+/// `temporal://system` callback — the loopback v1.31.0 performs by routing the system
+/// callback to the cluster's own frontend (`routeSystemCallbackRequest @ v1.31.0`); the
+/// `/nexus/callback` path is appended in code.
+///
+/// The retry policy mirrors v1.31.0's callbacks component
+/// (`components/callbacks/config.go @ v1.31.0`): exponential backoff with a 1s initial
+/// interval, a 1h maximum interval, and (by default) **no expiration** — v1.31.0 uses
+/// `backoff.NoInterval` for the expiration, i.e. no attempt cap; the operation's
+/// schedule-to-close timeout and eventual resolution bound it in practice.
+/// `retry_max_attempts == 0` encodes that unbounded default; a positive value is a
+/// tokeira-local safety cap with no v1.31.0 analog.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NexusCompletionConfig {
+    #[serde(default = "default_nexus_completion_http_addr")]
+    pub http_addr: String,
+    #[serde(default = "default_nexus_completion_system_callback_url")]
+    pub system_callback_url: String,
+    #[serde(default = "default_nexus_completion_retry_initial_interval_ms")]
+    pub retry_initial_interval_ms: u64,
+    #[serde(default = "default_nexus_completion_retry_max_interval_ms")]
+    pub retry_max_interval_ms: u64,
+    #[serde(default = "default_nexus_completion_retry_backoff_coefficient")]
+    pub retry_backoff_coefficient: f64,
+    /// `0` = unbounded (v1.31.0 `NoInterval` expiration); a positive value caps attempts.
+    #[serde(default = "default_nexus_completion_retry_max_attempts")]
+    pub retry_max_attempts: u32,
+}
+
+impl Default for NexusCompletionConfig {
+    fn default() -> Self {
+        Self {
+            http_addr: default_nexus_completion_http_addr(),
+            system_callback_url: default_nexus_completion_system_callback_url(),
+            retry_initial_interval_ms: default_nexus_completion_retry_initial_interval_ms(),
+            retry_max_interval_ms: default_nexus_completion_retry_max_interval_ms(),
+            retry_backoff_coefficient: default_nexus_completion_retry_backoff_coefficient(),
+            retry_max_attempts: default_nexus_completion_retry_max_attempts(),
+        }
+    }
+}
+
+fn default_nexus_completion_http_addr() -> String {
+    "0.0.0.0:7253".to_string()
+}
+fn default_nexus_completion_system_callback_url() -> String {
+    "http://127.0.0.1:7253".to_string()
+}
+fn default_nexus_completion_retry_initial_interval_ms() -> u64 {
+    1_000
+}
+fn default_nexus_completion_retry_max_interval_ms() -> u64 {
+    3_600_000
+}
+fn default_nexus_completion_retry_backoff_coefficient() -> f64 {
+    2.0
+}
+fn default_nexus_completion_retry_max_attempts() -> u32 {
+    0
 }
 
 /// The six Nexus endpoint admin limits, modelled as config (raise, never hardcode)
@@ -465,6 +532,7 @@ impl Default for PolicyConfig {
             quotas: QuotasConfig::default(),
             compatibility: CompatibilityConfig::default(),
             nexus_endpoint_limits: NexusEndpointLimitsConfig::default(),
+            nexus_completion: NexusCompletionConfig::default(),
         }
     }
 }
@@ -676,6 +744,38 @@ impl TokeiraConfig {
                     "not a valid socket address: {:?}",
                     self.infrastructure.network.metrics_addr
                 ),
+            });
+        }
+        let nexus_completion = &self.policy.nexus_completion;
+        if nexus_completion
+            .http_addr
+            .parse::<std::net::SocketAddr>()
+            .is_err()
+        {
+            errors.push(ValidationError::Field {
+                field: "policy.nexus_completion.http_addr".to_string(),
+                message: format!(
+                    "not a valid socket address: {:?}",
+                    nexus_completion.http_addr
+                ),
+            });
+        }
+        if nexus_completion.retry_initial_interval_ms == 0 {
+            errors.push(ValidationError::Field {
+                field: "policy.nexus_completion.retry_initial_interval_ms".to_string(),
+                message: "must be positive".to_string(),
+            });
+        }
+        if nexus_completion.retry_max_interval_ms < nexus_completion.retry_initial_interval_ms {
+            errors.push(ValidationError::Field {
+                field: "policy.nexus_completion.retry_max_interval_ms".to_string(),
+                message: "must be greater than or equal to retry_initial_interval_ms".to_string(),
+            });
+        }
+        if nexus_completion.retry_backoff_coefficient < 1.0 {
+            errors.push(ValidationError::Field {
+                field: "policy.nexus_completion.retry_backoff_coefficient".to_string(),
+                message: "must be greater than or equal to 1.0".to_string(),
             });
         }
         let placement = &self.infrastructure.placement;
@@ -945,6 +1045,60 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    // Defaults mirror v1.31.0's callbacks retry policy (1s initial, 1h max, 2x, no cap)
+    // and a co-located loopback HTTP listener for temporal://system firing.
+    #[test]
+    fn nexus_completion_defaults_match_v1_31_0_and_validate() {
+        let cfg = NexusCompletionConfig::default();
+        assert_eq!(cfg.http_addr, "0.0.0.0:7253");
+        assert_eq!(cfg.system_callback_url, "http://127.0.0.1:7253");
+        assert_eq!(cfg.retry_initial_interval_ms, 1_000);
+        assert_eq!(cfg.retry_max_interval_ms, 3_600_000);
+        assert!((cfg.retry_backoff_coefficient - 2.0).abs() < f64::EPSILON);
+        assert_eq!(
+            cfg.retry_max_attempts, 0,
+            "0 == unbounded (v1.31.0 NoInterval)"
+        );
+
+        // A default config is valid.
+        assert!(TokeiraConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn nexus_completion_rejects_invalid_values() {
+        let mut config = TokeiraConfig::default();
+        config.policy.nexus_completion.http_addr = "not-an-addr".to_string();
+        config.policy.nexus_completion.retry_initial_interval_ms = 5_000;
+        config.policy.nexus_completion.retry_max_interval_ms = 10;
+        config.policy.nexus_completion.retry_backoff_coefficient = 0.5;
+        let errors = config
+            .validate()
+            .expect_err("invalid nexus_completion must fail");
+        let blob = match errors {
+            ConfigError::Validation(errs) => errs
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            other => panic!("expected validation errors, got {other:?}"),
+        };
+        assert!(blob.contains("nexus_completion.http_addr"), "{blob}");
+        assert!(blob.contains("retry_max_interval_ms"), "{blob}");
+        assert!(blob.contains("retry_backoff_coefficient"), "{blob}");
+
+        // initial interval of 0 is independently rejected.
+        let mut zero = TokeiraConfig::default();
+        zero.policy.nexus_completion.retry_initial_interval_ms = 0;
+        let zero_err = zero
+            .validate()
+            .expect_err("zero initial interval must fail");
+        assert!(
+            matches!(&zero_err, ConfigError::Validation(errs)
+                if errs.iter().any(|e| e.to_string().contains("retry_initial_interval_ms"))),
+            "{zero_err:?}"
+        );
+    }
 
     #[test]
     fn parses_version_flags_without_config() {
@@ -1345,6 +1499,7 @@ mod tests {
                         quotas: QuotasConfig::default(),
                         compatibility: CompatibilityConfig::default(),
                         nexus_endpoint_limits: NexusEndpointLimitsConfig::default(),
+                        nexus_completion: NexusCompletionConfig::default(),
                     },
                     capacity: CapacityConfig {
                         performance: PerformanceConfig {

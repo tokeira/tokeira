@@ -13,12 +13,15 @@ is hand-rolled on `hyper` (no new dependency); the lockfile is bumped to `hyper 
 
 ## Tasks
 
-- [ ] 0. Configuration + dependency (raise, never hardcode — Implementer mandate rule 3)
-  - [ ] 0.1 Add config knobs to `crates/tokeira-config/src/lib.rs`
+- [x] 0. Configuration + dependency (raise, never hardcode — Implementer mandate rule 3)
+  - [x] 0.1 Add config knobs to `crates/tokeira-config/src/lib.rs`
     - `nexus_completion` section: HTTP listener address (bind + the address `temporal://system`
       resolves to for loopback firing) and callback retry policy (initial interval, max interval,
       backoff coefficient, max attempts) with v1.31.0 `components/callbacks` default values.
       `serde(deny_unknown_fields)`; all fields defaulted.
+    - Landed: `NexusCompletionConfig` (http_addr `0.0.0.0:7253`, system_callback_url
+      `http://127.0.0.1:7253`, retry 1s/1h/2.0, `retry_max_attempts = 0` = unbounded per v1.31.0
+      `NoInterval`), wired into `PolicyConfig`, with validation + 2 unit tests; fmt + workspace lint clean.
     - _Requirements: 2.4, 3.1_
 
 - [ ] 1. Kernel — outcome, lifecycle command, durable field

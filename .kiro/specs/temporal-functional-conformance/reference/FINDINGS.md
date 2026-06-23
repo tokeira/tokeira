@@ -1,5 +1,11 @@
 # Tier-2 Functional Conformance — Findings & Codex Hand-off
 
+> **Status authority moved (2026-06-22):** the canonical conformance status surface is now
+> [`docs/readiness/conformance.md`](../../../../docs/readiness/conformance.md). This file is the
+> **Tier-2 deep-investigation appendix** — the per-cluster signatures, ground-truth citations, fix
+> loci, and the Implementer Mandate. The Status-ledger table below is retained for provenance but is
+> mirrored (and kept current) in `conformance.md`; if they disagree, `conformance.md` wins.
+
 **Run date:** 2026-06-09
 **Corpus:** Temporal functional `tests/` @ `v1.31.0` (fork `tokeira/temporal`, branch
 `tokeira/conformance-v1.31.0`)

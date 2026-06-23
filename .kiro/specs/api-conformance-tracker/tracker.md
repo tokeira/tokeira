@@ -1,9 +1,11 @@
 # API Conformance Tracker
 
 > **Reference only — not the progress tracker.** This is a static RPC-coverage index (which RPC is
-> owned by which spec). The single canonical progress doc for functional conformance is
-> `temporal-functional-conformance/reference/FINDINGS.md` (its **Status ledger**). Do not track
-> done/completed here. (Decided 2026-06-17.)
+> owned by which spec). The single canonical **status/readiness** doc is now
+> [`docs/readiness/conformance.md`](../../../docs/readiness/conformance.md) (with the Tier-2
+> investigation detail in `temporal-functional-conformance/reference/FINDINGS.md`). Do not track
+> done/completed here. **The Progress table below is stale and retained only for its RPC counts —
+> ignore its status numbers; see `conformance.md`.** (Decided 2026-06-17; redirected 2026-06-22.)
 
 **Target:** Temporal Server v1.31.0 (API v1.62.8) — 121 RPCs
 

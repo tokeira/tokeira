@@ -16,7 +16,7 @@ against `tokeirad` and produce the coverage report. Tier 1 (`conformance-harness
 for its hermetic per-RPC gate. Neither downstream can produce a faithful report without the pieces
 defined here, so this is implemented first.
 
-It draws on the richer capability set captured in `temporal-compatibility/design-orig.md`
+It draws on the richer capability set captured in `temporal-compatibility/design.md`
 (`GetSystemInfo` handshake, `dispatch_rpc` policy, capability-flag mapping), exposing those as a
 coherent query surface rather than re-deriving matching logic in each consumer.
 

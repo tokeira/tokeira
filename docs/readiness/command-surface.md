@@ -1,11 +1,11 @@
 # Command Surface — Temporal v1.31.0 (definition)
 
-> Part of [the v1.31.0 compliance definition](./README.md). This page defines the **state-mutating
-> command and history-event surface** that full v1.31.0 command compliance comprises: every Temporal
+> Related to [the v1.31.0 conformance definition](../conformance/v1.31.0/README.md). This page maps the
+> **state-mutating command and history-event surface** to its engine realisation: every Temporal
 > history-service state mutation, the tokeira command that realises it, the history events emitted, and
-> the operations deliberately excluded (with rationale). It is **definitional** — it describes the
-> contract and the engine-core mapping, not project status. For measured progress see
-> [`../../readiness/conformance.md`](../../readiness/conformance.md).
+> the operations deliberately excluded (with rationale). It is engine-implementation-oriented (kernel
+> command/event mapping), which is why it lives here in readiness rather than in the (Temporal-only)
+> conformance definition. For measured progress see [`./conformance.md`](./conformance.md).
 >
 > The mappings below are verified at the kernel level (golden + property tests). The broader RPC
 > *behaviour* (errors, defaulting, lifecycle ordering) is defined per the README's ground-truth rule:

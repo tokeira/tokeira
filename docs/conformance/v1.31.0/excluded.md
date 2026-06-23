@@ -40,10 +40,10 @@ These are Temporal-internal RPC boundaries and operational tooling, not part of 
   internal to the engine, not a public API.
 - **Persistence / test-only inspection** used by Temporal's own test base.
 
-The kernel-internal axis of exclusion — public RPCs that are read-only or delivery-layer rather than
-state transitions (e.g. `QueryWorkflow`, `DescribeWorkflowExecution`, `RecordActivityTaskStarted`) — is a
-separate concern documented in [`command-surface.md`](./command-surface.md); a read-only RPC is part of
-the public surface even though it is not a state mutation.
+Read-only and delivery-layer RPCs (e.g. `QueryWorkflow`, `DescribeWorkflowExecution`,
+`RecordActivityTaskStarted`) are **not** excluded by being read-only — they are part of the public
+surface and belong to [`supported.md`](./supported.md). Exclusion here is about features outside the
+public conformance surface, not about whether an RPC mutates state.
 
 ## 3. RPCs absent from v1.31.0
 
@@ -62,4 +62,3 @@ README's two-pins note: the proto version and the targeted server version move i
 
 - [`supported.md`](./supported.md) — the v1.31.0 conformance surface.
 - [`decisions.md`](./decisions.md) — surfaces present in v1.31.0 that are still under decision.
-- [`command-surface.md`](./command-surface.md) — the kernel-internal command/event axis.

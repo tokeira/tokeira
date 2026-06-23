@@ -66,9 +66,6 @@ v1.31.0 would return for the same execution lineage?"
 - [`excluded.md`](./excluded.md) — what is outside the surface (experimental/pre-release, internal,
   absent from v1.31.0), with reasons.
 - [`decisions.md`](./decisions.md) — surfaces present in v1.31.0 that are still under decision.
-- [`command-surface.md`](./command-surface.md) — a command/event-level mapping of the workflow state
-  machine. **Under review:** this page is implementation-oriented rather than purely definitional, and
-  its place in this folder is being reconsidered.
 
 A **functional conformance report** — the measured outcome of replaying Temporal's functional suites
 against this surface — will join this folder once it exists. It is not present yet; until then, measured

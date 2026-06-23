@@ -5,7 +5,7 @@
 > focused sibling doc in this folder; this page is the index and the at-a-glance status.
 > If another document disagrees with this one about *status*, this one wins — fix the other.
 >
-> For the at-a-glance **countdown checklist**, see [`tasks.md`](./tasks.md).
+> For the at-a-glance **countdown checklist**, see [`checklist.md`](./checklist.md).
 
 **Last updated:** 2026-06-22 · **Maintained by:** Kiro (single contributor for status)
 

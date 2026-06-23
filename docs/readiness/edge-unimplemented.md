@@ -1,19 +1,22 @@
-# Edge UNIMPLEMENTED — current indicator
+# Edge UNIMPLEMENTED — work to be done
 
-> A flat, current list of public-edge RPCs that answer `UNIMPLEMENTED`, split into **should be
-> implemented** (in the v1.31.0 surface — see [`../conformance/v1.31.0/supported.md`](../conformance/v1.31.0/supported.md))
-> and **intentional** (excluded or under decision). Generated from ground truth, not from a tracker.
+> A flat, current list of public-edge RPCs **in the v1.31.0 surface**
+> ([`supported.md`](../conformance/v1.31.0/supported.md)) that answer `UNIMPLEMENTED` today — i.e. the
+> remaining edge work. Generated from ground truth, not from a tracker. Intentionally-unimplemented RPCs
+> (experimental, deprecated, internal, or absent from v1.31.0) are **not** work and are **not** here —
+> see [`excluded.md`](../conformance/v1.31.0/excluded.md) / [`decisions.md`](../conformance/v1.31.0/decisions.md).
 >
 > **Source of truth:** `Status::unimplemented(...)` and the `deferred_unary!` macro in
 > `crates/tokeira-edge/src/grpc/{workflow_service,operator_service}.rs`.
-> **Regenerate:** grep those two files for `unimplemented` and `deferred_unary!`.
+> **Regenerate:** grep those two files for `unimplemented` and `deferred_unary!`, then drop any RPC that
+> `excluded.md`/`decisions.md` classifies as out-of-surface.
 > **As of:** commit `69e27645` · 2026-06-23.
 
-## Should be implemented (in the v1.31.0 surface)
+## Work to be done
 
-These RPCs are GA or Public-Preview in v1.31.0 yet answer `UNIMPLEMENTED` today. **Spec implemented** is
-read from the owning spec's `tasks.md` (checkbox state at this commit): _No spec_ = no `tasks.md` /
-placeholder only; _No (n/N)_ = `tasks.md` exists, n of N tasks checked.
+GA or Public-Preview RPCs in the v1.31.0 surface that answer `UNIMPLEMENTED`. **Spec implemented** is read
+from the owning spec's `tasks.md` (checkbox state at this commit): _No spec_ = no `tasks.md` / placeholder
+only; _No (n/N)_ = `tasks.md` exists, n of N tasks checked.
 
 | RPC | Service | How it stubs | Owning spec | Spec implemented |
 |-----|---------|--------------|-------------|------------------|
@@ -36,42 +39,27 @@ placeholder only; _No (n/N)_ = `tasks.md` exists, n of N tasks checked.
 | `ListWorkflowRules` | Workflow | `deferred_unary!` | `workflow-rules` | No spec (placeholder) |
 | `TriggerWorkflowRule` | Workflow | `deferred_unary!` | `workflow-rules` | No spec (placeholder) |
 
-### Standalone Activities — implemented but gated off by default
+### Standalone Activities — substrate exists, gated off by default
 
-The 8 standalone-activity RPCs are bridged through the CHASM `ActivityBridge`, but the bridge is **off
-by default** (`enable_standalone_activities = false`); when absent they answer `UNIMPLEMENTED`. So at
-default config they read as unimplemented, even though the substrate exists. Public Preview in v1.31.0.
+The 8 standalone-activity RPCs are bridged through the CHASM `ActivityBridge`, but the bridge is **off by
+default** (`enable_standalone_activities = false`); when absent they answer `UNIMPLEMENTED`. So at default
+config they read as unimplemented, even though the substrate exists. Public Preview in v1.31.0.
 **Spec implemented: Partial** — `activity-executions-first-class` `tasks.md` shows 15/19 tasks checked.
 
 `StartActivityExecution`, `DescribeActivityExecution`, `PollActivityExecution`, `ListActivityExecutions`,
 `CountActivityExecutions`, `RequestCancelActivityExecution`, `TerminateActivityExecution`,
 `DeleteActivityExecution`.
 
-## Intentional — not gaps against the v1.31.0 surface
-
-These also answer `UNIMPLEMENTED`, by design. Listed so they are not mistaken for gaps.
-
-| RPC(s) | Reason | Reference |
-|--------|--------|-----------|
-| `StartNexusOperationExecution` + the 7 other `*NexusOperationExecution` RPCs | Absent from v1.31.0 (vendored `v1.62.11`-only) | [`excluded.md`](../conformance/v1.31.0/excluded.md) |
-| `DescribeDeployment`, `ListDeployments`, `GetDeploymentReachability`, `GetCurrentDeployment`, `SetCurrentDeployment` | Deprecated deployment v0 — replaced by GA Worker Deployments | [`excluded.md`](../conformance/v1.31.0/excluded.md) |
-| `UpdateWorkerBuildIdCompatibility`, `GetWorkerBuildIdCompatibility` | Legacy worker-versioning V1 (version sets) | [`decisions.md`](../conformance/v1.31.0/decisions.md) — TBD |
-| `PauseActivity`, `UnpauseActivity`, `ResetActivity` | Deprecated activity-control aliases | [`excluded.md`](../conformance/v1.31.0/excluded.md) §4 |
-
 ## Cross-reference with supported.md (minimality)
 
 This list is **minimal and complete** when:
 
-- **Complete** — it captures *every* public-edge RPC that answers `UNIMPLEMENTED`. That set is the
-  exhaustive grep of `Status::unimplemented` + `deferred_unary!` in the two grpc files (the source of
-  truth above). RPCs that respond with dropped fields are *not* whole-RPC unimplemented — they are
-  `Partial` and tracked in `UNSUPPORTED_FIELDS.md`, not here.
-- **Minimal** — every "should be implemented" entry maps to a feature area in
-  [`supported.md`](../conformance/v1.31.0/supported.md), and every "intentional" entry maps to
-  [`excluded.md`](../conformance/v1.31.0/excluded.md) or [`decisions.md`](../conformance/v1.31.0/decisions.md).
-  Nothing here is out-of-surface; nothing in-surface-and-unimplemented is missing.
-
-Should-be-implemented → supported.md feature area:
+- **Complete** — it captures *every* in-surface public-edge RPC that answers `UNIMPLEMENTED`. The raw set
+  is the exhaustive grep of `Status::unimplemented` + `deferred_unary!` in the two grpc files; the
+  out-of-surface ones (per `excluded.md`/`decisions.md`) are then removed. RPCs that respond with dropped
+  fields are *not* whole-RPC unimplemented — they are `Partial` and tracked in `UNSUPPORTED_FIELDS.md`.
+- **Minimal** — every row maps to a feature area in
+  [`supported.md`](../conformance/v1.31.0/supported.md). Nothing out-of-surface is here.
 
 | Entry | supported.md feature area |
 |-------|---------------------------|
@@ -85,19 +73,14 @@ Should-be-implemented → supported.md feature area:
 | Workflow-rule RPCs (×5) | Workflow rules |
 | Standalone-activity RPCs (×8) | Standalone Activities (Public Preview) |
 
-Intentional → reason doc: Nexus operation-execution → `excluded.md` §3; deployment v0 + activity
-aliases → `excluded.md` §4; legacy worker-versioning V1 → `decisions.md`.
-
-To re-verify minimality: confirm each "should be implemented" row still maps to a `supported.md` feature
-area, and that no `supported.md` area has an RPC answering `UNIMPLEMENTED` that is absent from this list.
+To re-verify: confirm each row still maps to a `supported.md` feature area, and that no `supported.md`
+area has an RPC answering `UNIMPLEMENTED` that is absent from this list.
 
 ## Notes
 
 - This is the **whole-RPC** view. Field-level gaps (RPCs that respond but drop fields) are in
   `crates/tokeira-edge/UNSUPPORTED_FIELDS.md`.
-- RPCs **not** listed here are either implemented or `Partial` (respond with gaps). For per-RPC
-  status detail see [`conformance.md`](./conformance.md) and the api-conformance tracker.
-- Worker Deployment RPCs are **not** here: they no longer answer `UNIMPLEMENTED` (the registry gates
-  them with `FailedPrecondition` when unconfigured); they are tracked under `worker-deployments`.
+- Worker Deployment RPCs are **not** here: they no longer answer `UNIMPLEMENTED` (the registry gates them
+  with `FailedPrecondition` when unconfigured); they are tracked under `worker-deployments`.
 - The activity by-ID RPCs (`RecordActivityTaskHeartbeatById`, etc.) are **not** here — they were
   implemented via `api-conformance-activity-by-id`.

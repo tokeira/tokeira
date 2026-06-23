@@ -58,6 +58,7 @@ v1.31.0 (release notes / proto). Areas Temporal labels experimental or pre-relea
 | Batch operations | Start/Stop/Describe/ListBatchOperations | GA |
 | Task queues | DescribeTaskQueue, ListTaskQueuePartitions, UpdateTaskQueueConfig | GA |
 | Cluster / system metadata | GetClusterInfo, GetSystemInfo | GA |
+| Remote-cluster registry | OperatorService AddOrUpdateRemoteCluster/RemoveRemoteCluster/ListClusters (metadata CRUD only; replication behaviour is in [`excluded.md`](./excluded.md)) | GA |
 | Worker inventory | RecordWorkerHeartbeat, ShutdownWorker, ListWorkers, DescribeWorker, Fetch/UpdateWorkerConfig | GA |
 | Workflow rules | Create/Describe/Delete/List/TriggerWorkflowRule | GA |
 | **Nexus** | PollNexusTaskQueue, RespondNexusTask{Completed,Failed}; OperatorService endpoint CRUD | **GA** — see [below](#nexus) |

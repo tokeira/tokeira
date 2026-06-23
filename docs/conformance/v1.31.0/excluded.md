@@ -58,6 +58,18 @@ present only in the newer proto are not part of v1.31.0. Today these are the 8 N
 They are absent from `v1.62.8`, so they are outside the v1.31.0 surface regardless of maturity. (See the
 README's two-pins note: the proto version and the targeted server version move independently.)
 
+## 4. Deprecated surfaces
+
+v1.31.0 ships these but marks them **deprecated**; the GA replacements are in [`supported.md`](./supported.md).
+
+| Surface | Replacement in v1.31.0 |
+|---------|------------------------|
+| Deployment v0 — `DescribeDeployment`, `ListDeployments`, `GetDeploymentReachability`, `GetCurrentDeployment`, `SetCurrentDeployment` | GA Worker Deployments |
+| Activity-control aliases — `PauseActivity`, `UnpauseActivity`, `ResetActivity` | the standalone-activity control verbs |
+
+(The deprecated worker-versioning V1/V2 surface is a TBD, not a settled exclusion — it is in
+[`decisions.md`](./decisions.md).)
+
 ## Related pages
 
 - [`supported.md`](./supported.md) — the v1.31.0 conformance surface.

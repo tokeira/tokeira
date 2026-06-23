@@ -56,7 +56,40 @@ These also answer `UNIMPLEMENTED`, by design. Listed so they are not mistaken fo
 | `StartNexusOperationExecution` + the 7 other `*NexusOperationExecution` RPCs | Absent from v1.31.0 (vendored `v1.62.11`-only) | [`excluded.md`](../conformance/v1.31.0/excluded.md) |
 | `DescribeDeployment`, `ListDeployments`, `GetDeploymentReachability`, `GetCurrentDeployment`, `SetCurrentDeployment` | Deprecated deployment v0 — replaced by GA Worker Deployments | [`excluded.md`](../conformance/v1.31.0/excluded.md) |
 | `UpdateWorkerBuildIdCompatibility`, `GetWorkerBuildIdCompatibility` | Legacy worker-versioning V1 (version sets) | [`decisions.md`](../conformance/v1.31.0/decisions.md) — TBD |
-| `PauseActivity`, `UnpauseActivity`, `ResetActivity` | Deprecated activity-control aliases | `activity-executions-first-class` |
+| `PauseActivity`, `UnpauseActivity`, `ResetActivity` | Deprecated activity-control aliases | [`excluded.md`](../conformance/v1.31.0/excluded.md) §4 |
+
+## Cross-reference with supported.md (minimality)
+
+This list is **minimal and complete** when:
+
+- **Complete** — it captures *every* public-edge RPC that answers `UNIMPLEMENTED`. That set is the
+  exhaustive grep of `Status::unimplemented` + `deferred_unary!` in the two grpc files (the source of
+  truth above). RPCs that respond with dropped fields are *not* whole-RPC unimplemented — they are
+  `Partial` and tracked in `UNSUPPORTED_FIELDS.md`, not here.
+- **Minimal** — every "should be implemented" entry maps to a feature area in
+  [`supported.md`](../conformance/v1.31.0/supported.md), and every "intentional" entry maps to
+  [`excluded.md`](../conformance/v1.31.0/excluded.md) or [`decisions.md`](../conformance/v1.31.0/decisions.md).
+  Nothing here is out-of-surface; nothing in-surface-and-unimplemented is missing.
+
+Should-be-implemented → supported.md feature area:
+
+| Entry | supported.md feature area |
+|-------|---------------------------|
+| `ExecuteMultiOperation` | Workflow lifecycle |
+| `UpdateWorkflowExecutionOptions` | Workflow options |
+| `ListTaskQueuePartitions` | Task queues |
+| `DeprecateNamespace`, `DeleteNamespace` | Namespaces |
+| `RemoveSearchAttributes` | Search attributes (operator) |
+| `AddOrUpdateRemoteCluster`, `RemoveRemoteCluster`, `ListClusters` | Remote-cluster registry |
+| `DescribeWorker`, `ListWorkers`, `FetchWorkerConfig`, `UpdateWorkerConfig` | Worker inventory |
+| Workflow-rule RPCs (×5) | Workflow rules |
+| Standalone-activity RPCs (×8) | Standalone Activities (Public Preview) |
+
+Intentional → reason doc: Nexus operation-execution → `excluded.md` §3; deployment v0 + activity
+aliases → `excluded.md` §4; legacy worker-versioning V1 → `decisions.md`.
+
+To re-verify minimality: confirm each "should be implemented" row still maps to a `supported.md` feature
+area, and that no `supported.md` area has an RPC answering `UNIMPLEMENTED` that is absent from this list.
 
 ## Notes
 

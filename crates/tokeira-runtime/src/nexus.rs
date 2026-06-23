@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, Mutex, RwLock},
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use opentelemetry::KeyValue;
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,25 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     lane::LaneHandle, metrics as runtime_metrics, scanner::pick_lane_for_run_key, shard::ShardOwner,
 };
+
+/// Currently-supported completion-callback token envelope version. Mirrors
+/// `TokenVersion = 1` (`common/nexus/callback_token.go:15 @ v1.31.0`); `decode`
+/// rejects any other value (the version check is the token's only validation —
+/// it is opaque + version-checked, not signed).
+pub const COMPLETION_TOKEN_VERSION: u8 = 1;
+
+/// HTTP header carrying the completion-callback token on the outbound
+/// `StartOperation` request and on the inbound completion `POST`. Verbatim from
+/// `CallbackTokenHeader = "Temporal-Callback-Token"`
+/// (`common/nexus/callback_token.go:17 @ v1.31.0`).
+pub const TEMPORAL_CALLBACK_TOKEN_HEADER: &str = "Temporal-Callback-Token";
+
+/// In-cluster callback URL sentinel attached to a Worker-target `StartOperation`.
+/// Verbatim from `SystemCallbackURL = "temporal://system"`
+/// (`common/nexus/constants.go @ v1.31.0`). The runtime resolves it to the
+/// configured local HTTP listener (`NexusCompletionConfig.system_callback_url`)
+/// when firing — the loopback v1.31.0 performs via `routeSystemCallbackRequest`.
+pub const SYSTEM_CALLBACK_URL: &str = "temporal://system";
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum NexusStartResult {
@@ -462,6 +481,176 @@ impl NexusTaskToken {
     }
 }
 
+/// Routes an async Nexus completion back to the originator's pending operation.
+///
+/// Mirrors the role of v1.31.0's `tokenspb.NexusOperationCompletion`
+/// (`proto/internal/temporal/server/api/token/v1/message.proto @ v1.31.0`), wrapped
+/// in the versioned `{v,d}` envelope of `CallbackToken`
+/// (`common/nexus/callback_token.go @ v1.31.0`): versioned + opaque, verified only by
+/// version on decode. It is **not** signed — v1.31.0's `CallbackTokenGenerator` is a
+/// zero-field struct and the source notes signing/encryption "will come later"; token
+/// integrity rests on op-fencing at resolution (`StaleNexusResolution`/
+/// `UnknownNexusOperation`), tokeira's analogue of v1.31.0's `StateMachineRef`
+/// staleness check (design.md "Requirement refinements", Req 1.5).
+///
+/// `originator_run_key` (a tokeira global handle) subsumes v1.31.0's deprecated
+/// `namespace_id`/`workflow_id`/`run_id` identity tuple and enables cross-namespace
+/// routing. `request_id` keeps wire-parity with `NexusOperationCompletion.request_id`.
+/// v1.31.0's `ref` (StateMachineRef) is intentionally not modelled: tokeira addresses
+/// the pending op directly via `(operation_id, scheduled_event_id)` and fences
+/// staleness in `apply_nexus_operation_resolved`.
+///
+/// The token version lives on the outer envelope only (matching `CallbackToken.Version`
+/// @ v1.31.0; the inner `NexusOperationCompletion` proto has no version field), so this
+/// struct carries no `version` of its own — one source of truth that cannot diverge.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NexusCompletionToken {
+    /// Global handle of the originator (caller) run that owns the pending operation.
+    pub originator_run_key: RunKey,
+    /// tokeira's per-operation identifier (the pending op key).
+    pub operation_id: String,
+    /// Event ID of the `NexusOperationScheduled` event — the fencing key.
+    pub scheduled_event_id: i64,
+    /// Originating request ID (wire-parity with `NexusOperationCompletion.request_id`).
+    pub request_id: String,
+}
+
+/// Outer `{v,d}` envelope. Mirrors `CallbackToken { Version int json:"v"; Data string
+/// json:"d" }` (`common/nexus/callback_token.go @ v1.31.0`): `d` is base64url of the
+/// serialized inner token.
+#[derive(Serialize, Deserialize)]
+struct CompletionTokenEnvelope {
+    #[serde(rename = "v")]
+    version: u8,
+    #[serde(rename = "d")]
+    data: String,
+}
+
+impl NexusCompletionToken {
+    /// Encode to the versioned `{v,d}` envelope JSON string carried in the
+    /// `Temporal-Callback-Token` header.
+    ///
+    /// `d = base64url(serde_json(inner))`; outer = `serde_json(envelope)`. Mirrors
+    /// `Tokenize` (`common/nexus/callback_token.go @ v1.31.0`) which is
+    /// `base64.URLEncoding(proto.Marshal(..))` then `json.Marshal({v,d})`. The inner
+    /// codec is `serde_json` rather than `proto.Marshal` (the inner type carries a
+    /// tokeira `RunKey`, not the proto identity tuple; matches the existing
+    /// `NexusTaskToken` convention). The outer envelope shape and the URL-safe base64
+    /// alphabet are matched so wire-parity with a Temporal peer is later a swap of the
+    /// inner codec only.
+    pub fn encode(&self) -> Result<String> {
+        use base64::Engine as _;
+        let inner = serde_json::to_vec(self)
+            .map_err(|error| anyhow!("encoding nexus completion token: {error}"))?;
+        let envelope = CompletionTokenEnvelope {
+            version: COMPLETION_TOKEN_VERSION,
+            data: base64::engine::general_purpose::URL_SAFE.encode(inner),
+        };
+        serde_json::to_string(&envelope)
+            .map_err(|error| anyhow!("encoding nexus completion token envelope: {error}"))
+    }
+
+    /// Decode and version-check the `{v,d}` envelope.
+    ///
+    /// Validates the envelope version before decoding the inner payload, matching
+    /// `DecodeCallbackToken`'s `status.Errorf(codes.InvalidArgument, "unsupported token
+    /// version: %d")` (`common/nexus/callback_token.go @ v1.31.0`). The
+    /// `InvalidArgument`→`BadRequest` mapping for the wire response lives at the inbound
+    /// `/nexus/callback` handler (Wave 5); here a wrong version is simply a decode
+    /// failure whose message contains `"unsupported nexus completion token version"`.
+    pub fn decode(s: &str) -> Result<Self> {
+        use base64::Engine as _;
+        let envelope: CompletionTokenEnvelope = serde_json::from_str(s)
+            .map_err(|error| anyhow!("invalid nexus completion token: {error}"))?;
+        if envelope.version != COMPLETION_TOKEN_VERSION {
+            bail!(
+                "unsupported nexus completion token version: {}",
+                envelope.version
+            );
+        }
+        let inner = base64::engine::general_purpose::URL_SAFE
+            .decode(envelope.data.as_bytes())
+            .map_err(|error| anyhow!("invalid nexus completion token data: {error}"))?;
+        serde_json::from_slice(&inner)
+            .map_err(|error| anyhow!("invalid nexus completion token payload: {error}"))
+    }
+}
+
+/// A terminal Nexus operation completion to deliver. The `Nexus-Operation-State` header
+/// value and the body are a **single discriminator** — mirroring `applyToHTTPRequest`'s
+/// `Error != nil` branch (`common/nexus/nexusrpc/completion.go @ v1.31.0`) — so an
+/// inconsistent state/body pair (e.g. `succeeded` carrying a failure body) is
+/// unrepresentable. There is no terminal `running` completion, so it is excluded.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NexusCompletion {
+    /// `Nexus-Operation-State: succeeded` — the result payloads (the payload serializer
+    /// picks the content-type; may be empty).
+    Succeeded(Payloads),
+    /// `Nexus-Operation-State: failed` — the JSON-marshaled Nexus failure body bytes
+    /// (built by the Wave 4 firing handler), sent with `Content-Type: application/json`.
+    Failed(Vec<u8>),
+    /// `Nexus-Operation-State: canceled` — the JSON-marshaled Nexus failure body, sent as
+    /// state `canceled` (NOT `failed`), per `GetNexusCompletion`'s canceled arm @ v1.31.0.
+    Canceled(Vec<u8>),
+}
+
+impl NexusCompletion {
+    /// The exact `Nexus-Operation-State` header value (lowercase, American spelling),
+    /// matching the nexus-rpc SDK `OperationState` consts used by `completion.go @ v1.31.0`.
+    pub fn operation_state(&self) -> &'static str {
+        match self {
+            NexusCompletion::Succeeded(_) => "succeeded",
+            NexusCompletion::Failed(_) => "failed",
+            NexusCompletion::Canceled(_) => "canceled",
+        }
+    }
+}
+
+/// Outcome of a single completion-callback `POST`. The Wave 4 firing handler maps this
+/// to a kernel `CallbackAttemptOutcome` (`Delivered`→`Succeeded`,
+/// `RetryableError`→`RetryableFailure`, `NonRetryableError`→`NonRetryableFailure`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum CompletionDeliveryOutcome {
+    /// HTTP 2xx — the completion was accepted by the endpoint.
+    Delivered,
+    /// Transport error, or a retryable status — the callback should back off and retry.
+    RetryableError { detail: String },
+    /// A non-retryable handler-error status — the callback is terminally failed.
+    NonRetryableError { detail: String },
+}
+
+/// Delivers an async Nexus operation completion to a callback URL over the Nexus
+/// completion HTTP protocol. Mirrors `nexusrpc.CompletionHTTPClient.CompleteOperation`
+/// (`common/nexus/nexusrpc/completion.go @ v1.31.0`).
+#[async_trait]
+pub trait NexusCompletionClient: Send + Sync {
+    /// `POST {url}` a Nexus operation `completion`.
+    ///
+    /// Sets `Nexus-Operation-State` (from `completion`), `Temporal-Callback-Token` (the
+    /// already-encoded `token` string, sent verbatim), and `User-Agent: temporalio/server`
+    /// (the inbound handler validates this). The body follows the `completion` variant:
+    /// `Succeeded` sends the result `Payloads` (payload-serializer content-type);
+    /// `Failed`/`Canceled` send the JSON Nexus failure with `Content-Type:
+    /// application/json`. The `url` is always a resolved `http(s)://` address — the runtime
+    /// resolves `SYSTEM_CALLBACK_URL` to the configured local listener before calling.
+    ///
+    /// `links` are best-effort `Nexus-Link` headers and are **not essential to
+    /// resolution** (design.md §5). Wave 3 carries them in the signature but does not
+    /// yet emit the headers — link encoding lands with its producer (the firing handler
+    /// that builds the workflow-event start link from the close event) in Wave 4/5.
+    ///
+    /// Returns the delivery outcome (never an `Err` for an HTTP/transport result — those
+    /// are folded into `RetryableError`/`NonRetryableError`); the outer `Err` is
+    /// reserved for un-classifiable pre-flight failures.
+    async fn complete_operation(
+        &self,
+        url: &str,
+        token: &str,
+        completion: NexusCompletion,
+        links: &[Link],
+    ) -> Result<CompletionDeliveryOutcome>;
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum NexusTaskRequest {
     StartOperation {
@@ -599,6 +788,30 @@ impl NexusHttpClient for NoopNexusHttpClient {
         _trace_headers: &[KeyValue],
     ) -> Result<()> {
         Err(anyhow!("nexus http client not configured"))
+    }
+}
+
+/// Test completion client: performs no I/O and reports every completion as
+/// `Delivered`, so firing-path tests advance to `CompletionCallbackAttempted(Succeeded)`
+/// without standing up an HTTP listener.
+///
+/// This is deliberately the opposite philosophy from [`NoopNexusHttpClient`] (which
+/// errors to surface a missing client loudly): it silently "succeeds". It is intended
+/// as an explicit **test** double — the production runtime must wire the real
+/// `HttpNexusCompletionClient`. The runtime-constructor default (loud-vs-silent) is
+/// decided when delivery is wired (Wave 4).
+pub struct NoopNexusCompletionClient;
+
+#[async_trait]
+impl NexusCompletionClient for NoopNexusCompletionClient {
+    async fn complete_operation(
+        &self,
+        _url: &str,
+        _token: &str,
+        _completion: NexusCompletion,
+        _links: &[Link],
+    ) -> Result<CompletionDeliveryOutcome> {
+        Ok(CompletionDeliveryOutcome::Delivered)
     }
 }
 

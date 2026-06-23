@@ -85,20 +85,51 @@ is hand-rolled on `hyper` (no new dependency); the lockfile is bumped to `hyper 
   - Done (2026-06-23): fmt clean; `cargo lint -p tokeira-kernel -p tokeira-runtime` exit 0 (`-D warnings`);
     `cargo test -p tokeira-kernel` 272 pass (8 lib + 182 golden + 82 property); `cargo check --workspace` clean.
 
-- [ ] 3. Runtime — completion token + completion HTTP client
-  - [ ] 3.1 Add `NexusCompletionToken` to `crates/tokeira-runtime/src/nexus.rs`
+- [x] 3. Runtime — completion token + completion HTTP client
+  - [x] 3.1 Add `NexusCompletionToken` to `crates/tokeira-runtime/src/nexus.rs`
     - `{ version, originator_run_key, operation_id, scheduled_event_id, request_id }`; `encode`/`decode`
       as a `{v,d}` base64 envelope (mirrors `callback_token.go @ v1.31.0`); `decode` rejects a version
       mismatch (`InvalidArgument`). Add `TEMPORAL_CALLBACK_TOKEN_HEADER` + `SYSTEM_CALLBACK_URL` consts.
+    - Landed: `NexusCompletionToken { originator_run_key, operation_id, scheduled_event_id, request_id }`
+      (the version lives on the outer `{v,d}` envelope only — matching `CallbackToken.Version`; the inner
+      proto has no version field, so no redundant inner field). `encode`/`decode` mirror
+      `Tokenize`/`DecodeCallbackToken`: outer `{v,d}` JSON, `d = URL_SAFE-base64(serde_json(inner))`;
+      `decode` version-checks before base64-decoding. URL-safe **padded** base64 = Go `base64.URLEncoding`.
+      Inner codec is `serde_json` not `proto.Marshal` (documented deviation — inner carries `RunKey`, not
+      the proto identity tuple; single-cluster opaque; outer envelope matched for future wire-parity).
+      Consts `COMPLETION_TOKEN_VERSION` / `TEMPORAL_CALLBACK_TOKEN_HEADER` / `SYSTEM_CALLBACK_URL` verbatim
+      from `common/nexus/{callback_token,constants}.go @ v1.31.0`. `base64.workspace` added.
     - _Requirements: 1.4, 1.5_
-  - [ ] 3.2 Property test P5 — completion token round-trip + version rejection
+  - [x] 3.2 Property test P5 — completion token round-trip + version rejection
+    - Landed (`tests/runtime_nexus.rs`): `property_p5_completion_token_round_trip` (256 cases, arbitrary
+      unicode op/request ids + i64 extremes; asserts `{v,d}` envelope shape + `decode(encode(t)) == t`),
+      plus unit tests for wrong-version, malformed (non-JSON / non-base64), and valid-envelope-with-garbage-
+      inner-payload rejections.
     - _Feature: nexus-async-completion, Property 5_
     - _Requirements: 1.4, 1.5_
-  - [ ] 3.3 Define `NexusCompletionClient` trait + `reqwest` impl + `NoopNexusCompletionClient`
+  - [x] 3.3 Define `NexusCompletionClient` trait + `reqwest` impl + `NoopNexusCompletionClient`
     - `complete_operation(url, token, state, body, links)` → POST per the Nexus completion wire shape
       (`Nexus-Operation-State`, `Temporal-Callback-Token`, payload/failure body, `Nexus-Link`);
       content-type per the payload serializer. 2xx→ok; retryable status/transport→retryable err;
       non-retryable 4xx→terminal err.
+    - Landed: trait `NexusCompletionClient` + `HttpNexusCompletionClient` (reqwest, in `nexus_http.rs`,
+      reusing `payload_to_body`) + `NoopNexusCompletionClient` (→ `Delivered` for tests). `state`+`body`
+      collapsed into one `NexusCompletion { Succeeded(Payloads) | Failed(Vec<u8>) | Canceled(Vec<u8>) }`
+      so an inconsistent state/body pair is unrepresentable (mirrors `applyToHTTPRequest`'s single
+      discriminator @ v1.31.0) — a deliberate refinement of the spec's separate-params sketch. Sets
+      `Nexus-Operation-State` / `Temporal-Callback-Token` / `User-Agent: temporalio/server`; succeeded→
+      payload body, failed/canceled→JSON failure (`application/json`). Retryability mirrors the firing path
+      (`nexus_invocation.go` + `client.go @ v1.31.0`): mapped handler-error statuses classified
+      (`408`/`429`/`5xx` retryable; `400`/`401`/`403`/`404`/`409`/`501` terminal), **unmapped statuses
+      retryable** (`UnexpectedResponseError`), transport errors retryable; `nexus-request-retryable` header
+      overrides only for mapped statuses. (`409`/`501` defaults follow the un-vendored nexus-rpc sdk-go
+      v0.6.0 convention — flagged for the Wave 8 conformance pass.) 9 client tests.
+    - **Deferred to Wave 4:** `Nexus-Link` header *emission* (the `links` param is in the signature but its
+      encoder lands with its producer — the firing handler — in Wave 4/5; links are best-effort,
+      non-essential to resolution per design §5). The production runtime-constructor default for the client
+      (loud-vs-silent vs the `Delivered` Noop) is also a Wave 4 wiring decision.
+    - Verified by a 3-reviewer adversarial workflow against v1.31.0 (caught + fixed the unmapped-4xx
+      retryability divergence and the redundant inner `version` field).
     - _Requirements: 2.1, 5.5_
 
 - [ ] 4. Runtime — outbound attachment, firing, retry scanner

@@ -13,10 +13,11 @@ use tokeira_kernel::{
     WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    ActivityTimeoutScannerConfig, BacklogConfig, EndpointTarget, InMemoryNexusEndpointStore,
-    LaneConfig, NexusEndpointRegistry, NexusEndpointSpec, NexusEndpointSpecTarget,
-    NexusEndpointStore, NexusHttpClient, NexusStartResult, NexusTaskRequest,
-    NexusTimeoutScannerConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
+    ActivityTimeoutScannerConfig, BacklogConfig, COMPLETION_TOKEN_VERSION, EndpointTarget,
+    InMemoryNexusEndpointStore, LaneConfig, NexusCompletionToken, NexusEndpointRegistry,
+    NexusEndpointSpec, NexusEndpointSpecTarget, NexusEndpointStore, NexusHttpClient,
+    NexusStartResult, NexusTaskRequest, NexusTimeoutScannerConfig, TimerScannerConfig,
+    TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -1347,4 +1348,88 @@ fn start_request(
 
 fn payloads(value: &str) -> Payloads {
     Payloads(vec![tokeira_types::Payload::new(value.as_bytes().to_vec())])
+}
+
+// Feature: nexus-async-completion, Property 5: completion token round-trip.
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 256, .. ProptestConfig::default() })]
+
+    /// For any `NexusCompletionToken`, `decode(encode(t)) == t`, and the encoding is the
+    /// versioned `{v,d}` envelope. **Validates: Requirements 1.4, 1.5**
+    #[test]
+    fn property_p5_completion_token_round_trip(
+        uuid_bytes in any::<[u8; 16]>(),
+        operation_id in ".{0,64}",
+        scheduled_event_id in any::<i64>(),
+        request_id in ".{0,64}",
+    ) {
+        let token = NexusCompletionToken {
+            originator_run_key: RunKey(Uuid::from_bytes(uuid_bytes)),
+            operation_id,
+            scheduled_event_id,
+            request_id,
+        };
+        let encoded = token.encode().expect("encode succeeds");
+        // The wire envelope is a `{v,d}` JSON object (mirrors callback_token.go @ v1.31.0).
+        prop_assert!(encoded.contains("\"v\":"), "envelope carries a version field: {encoded}");
+        prop_assert!(encoded.contains("\"d\":"), "envelope carries a data field: {encoded}");
+        let decoded = NexusCompletionToken::decode(&encoded).expect("decode succeeds");
+        prop_assert_eq!(decoded, token);
+    }
+}
+
+/// A `{v,d}` envelope whose version != `COMPLETION_TOKEN_VERSION` is rejected, mirroring
+/// `DecodeCallbackToken`'s `codes.InvalidArgument "unsupported token version"`
+/// (`common/nexus/callback_token.go @ v1.31.0`).
+#[test]
+fn completion_token_decode_rejects_wrong_version() {
+    use base64::Engine as _;
+    let token = NexusCompletionToken {
+        originator_run_key: RunKey(Uuid::from_u128(7)),
+        operation_id: "op".into(),
+        scheduled_event_id: 12,
+        request_id: "req".into(),
+    };
+    // Hand-roll an envelope with a bumped version but valid data.
+    let inner = serde_json::to_vec(&token).expect("serialize inner");
+    let bad = format!(
+        "{{\"v\":{},\"d\":\"{}\"}}",
+        COMPLETION_TOKEN_VERSION + 1,
+        base64::engine::general_purpose::URL_SAFE.encode(inner),
+    );
+    let err = NexusCompletionToken::decode(&bad).expect_err("wrong version is rejected");
+    assert!(
+        err.to_string()
+            .contains("unsupported nexus completion token version"),
+        "unexpected error: {err}"
+    );
+}
+
+/// A non-envelope string and a `{v,d}` envelope with undecodable data both fail to
+/// decode (the inbound handler maps these to a `BadRequest`, Wave 5).
+#[test]
+fn completion_token_decode_rejects_malformed() {
+    assert!(NexusCompletionToken::decode("not a token").is_err());
+    assert!(
+        NexusCompletionToken::decode("{\"v\":1,\"d\":\"!!! not base64 !!!\"}").is_err(),
+        "undecodable base64 data is rejected"
+    );
+}
+
+/// A correct `{v=1, d=valid-base64}` envelope whose decoded bytes are not a valid token
+/// JSON is rejected at the inner-payload step (distinct from the version/base64 paths).
+#[test]
+fn completion_token_decode_rejects_garbage_inner_payload() {
+    use base64::Engine as _;
+    let bad = format!(
+        "{{\"v\":{},\"d\":\"{}\"}}",
+        COMPLETION_TOKEN_VERSION,
+        base64::engine::general_purpose::URL_SAFE.encode(b"not a token json"),
+    );
+    let err = NexusCompletionToken::decode(&bad).expect_err("garbage inner payload is rejected");
+    assert!(
+        err.to_string()
+            .contains("invalid nexus completion token payload"),
+        "unexpected error: {err}"
+    );
 }

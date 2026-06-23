@@ -41,7 +41,10 @@ use tokeira_kernel::{Link, LinkWorkflowEventReference};
 use tokeira_types::{Payload, Payloads};
 use url::Url;
 
-use crate::nexus::{NexusHttpClient, NexusStartResult};
+use crate::nexus::{
+    CompletionDeliveryOutcome, NexusCompletion, NexusCompletionClient, NexusHttpClient,
+    NexusStartResult, TEMPORAL_CALLBACK_TOKEN_HEADER,
+};
 
 // Header names and the operation-unsuccessful status are lower-cased wire
 // constants from `common/nexus/nexusrpc/api.go @ v1.31.0` (HTTP header names are
@@ -50,6 +53,19 @@ const HEADER_REQUEST_ID: &str = "nexus-request-id";
 const HEADER_LINK: &str = "nexus-link";
 const HEADER_OPERATION_TOKEN: &str = "nexus-operation-token";
 const HEADER_OPERATION_TIMEOUT: &str = "operation-timeout";
+/// `Nexus-Operation-State` header on a completion `POST` (`headerOperationState =
+/// "nexus-operation-state"`, `common/nexus/nexusrpc/api.go:23 @ v1.31.0`).
+const HEADER_OPERATION_STATE: &str = "nexus-operation-state";
+/// `nexus-request-retryable` response header that overrides the status-derived
+/// retryability (`headerRetryable`, `common/nexus/nexusrpc/api.go:28 @ v1.31.0`).
+const HEADER_RETRYABLE: &str = "nexus-request-retryable";
+/// `User-Agent` value the completion handler requires (`userAgent =
+/// "temporalio/server"`, `common/nexus/nexusrpc/client.go:37 @ v1.31.0`); the inbound
+/// handler rejects a mismatching agent as `BadRequest`.
+const NEXUS_USER_AGENT: &str = "temporalio/server";
+/// Content type for a `failed`/`canceled` completion's JSON Nexus failure body
+/// (`completion.go` sets `Content-Type: application/json` @ v1.31.0).
+const CONTENT_TYPE_JSON: &str = "application/json";
 /// 424 Failed Dependency — `statusOperationUnsuccessful @ v1.31.0` (the
 /// operation completed as failed or canceled, distinct from a handler error).
 const STATUS_OPERATION_UNSUCCESSFUL: u16 = 424;
@@ -251,6 +267,137 @@ impl NexusHttpClient for HttpNexusClient {
             );
         }
         Ok(())
+    }
+}
+
+/// reqwest-backed [`NexusCompletionClient`]. Like [`HttpNexusClient`] the inner
+/// client connection-pools, so one instance is shared across all completion
+/// deliveries.
+pub struct HttpNexusCompletionClient {
+    http: reqwest::Client,
+}
+
+impl Default for HttpNexusCompletionClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HttpNexusCompletionClient {
+    pub fn new() -> Self {
+        Self {
+            http: reqwest::Client::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_client(http: reqwest::Client) -> Self {
+        Self { http }
+    }
+}
+
+/// Classify a completion-`POST` HTTP status the way the firing path does
+/// (`components/callbacks/nexus_invocation.go:105-110 @ v1.31.0`: `isRetryableCallError`
+/// → `HandlerError.Retryable()`, with a non-`HandlerError` error defaulting to retryable).
+///
+/// Returns `Some(retryable)` for a status v1.31.0 maps to a `HandlerError`
+/// (`httpStatusCodeToHandlerErrorType`, `common/nexus/nexusrpc/client.go:425-451 @
+/// v1.31.0`) — where the `nexus-request-retryable` header may override the default — or
+/// `None` for an **unmapped** status, which v1.31.0 surfaces as an
+/// `UnexpectedResponseError` (a non-`HandlerError`) and therefore always retries,
+/// ignoring the header.
+///
+/// `408`/`429` are the retryable 4xx (`retryable4xxErrorTypes`, `nexus_invocation.go:22 @
+/// v1.31.0`); `500`/`503`/`520` are retryable 5xx; `400`/`401`/`403`/`404`/`409`/`501`
+/// are terminal handler errors. NOTE: the per-type `HandlerError.Retryable()` default
+/// lives in the external `github.com/nexus-rpc/sdk-go v0.6.0` (not in the v1.31.0
+/// checkout); the `409`/`501` terminal classification follows the SDK's conventional
+/// permanent-error set and is flagged for reconfirmation in the Wave 8 conformance pass.
+fn mapped_handler_error_retryable(status: u16) -> Option<bool> {
+    match status {
+        408 | 429 => Some(true),
+        400 | 401 | 403 | 404 | 409 | 501 => Some(false),
+        500 | 503 | 520 => Some(true),
+        // Unmapped → UnexpectedResponseError (non-HandlerError) → always retryable.
+        _ => None,
+    }
+}
+
+#[async_trait]
+impl NexusCompletionClient for HttpNexusCompletionClient {
+    async fn complete_operation(
+        &self,
+        url: &str,
+        token: &str,
+        completion: NexusCompletion,
+        // Best-effort `Nexus-Link` headers are not essential to resolution (design.md
+        // §5); their encoder lands with the link producer in Wave 4/5.
+        _links: &[Link],
+    ) -> Result<CompletionDeliveryOutcome> {
+        let mut request = self
+            .http
+            .post(url)
+            .header(HEADER_OPERATION_STATE, completion.operation_state())
+            .header(TEMPORAL_CALLBACK_TOKEN_HEADER, token)
+            .header(reqwest::header::USER_AGENT, NEXUS_USER_AGENT);
+
+        let (bytes, content_type) = match completion {
+            // Reuse the exact payload→body content-type mapping the start path uses
+            // (`payloadSerializer.Serialize @ v1.31.0`).
+            NexusCompletion::Succeeded(payloads) => payload_to_body(&payloads),
+            // failed/canceled both carry a JSON Nexus failure body.
+            NexusCompletion::Failed(json) | NexusCompletion::Canceled(json) => {
+                (json, Some(CONTENT_TYPE_JSON.to_owned()))
+            }
+        };
+        if let Some(content_type) = &content_type {
+            request = request.header(reqwest::header::CONTENT_TYPE, content_type);
+        }
+        request = request.body(bytes);
+
+        let response = match request.send().await {
+            Ok(response) => response,
+            // No response: transport/connect/timeout error → retryable
+            // (`isRetryableCallError` non-HandlerError default, `nexus_invocation.go:110 @ v1.31.0`).
+            Err(error) => {
+                return Ok(CompletionDeliveryOutcome::RetryableError {
+                    detail: format!("nexus completion request failed: {error}"),
+                });
+            }
+        };
+
+        let status = response.status();
+        let code = status.as_u16();
+        // The `nexus-request-retryable` header overrides the per-type default, but only
+        // for a status v1.31.0 maps to a `HandlerError` (`retryBehaviorFromHeader`,
+        // `nexusrpc/client.go:455 @ v1.31.0`, read only in `defaultErrorFromResponse`).
+        let retry_override = response
+            .headers()
+            .get(HEADER_RETRYABLE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| match value.to_ascii_lowercase().as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            });
+
+        if (200..300).contains(&code) {
+            return Ok(CompletionDeliveryOutcome::Delivered);
+        }
+
+        let detail_body = response.text().await.unwrap_or_default();
+        let detail = format!("nexus completion status {code}: {detail_body}");
+        let retryable = match mapped_handler_error_retryable(code) {
+            // Mapped handler error: the header overrides the per-type default.
+            Some(default) => retry_override.unwrap_or(default),
+            // Unmapped status: always retryable; the header is not consulted.
+            None => true,
+        };
+        Ok(if retryable {
+            CompletionDeliveryOutcome::RetryableError { detail }
+        } else {
+            CompletionDeliveryOutcome::NonRetryableError { detail }
+        })
     }
 }
 
@@ -855,6 +1002,207 @@ mod tests {
                 .cancel_operation(&base, "service", "operation", "tok-1", &[])
                 .await
                 .is_err()
+        );
+    }
+
+    // ---- nexus-async-completion Wave 3: completion client ----
+
+    /// Like [`serve_once`] but also hands the captured raw request back to the caller
+    /// so a test can assert the wire shape (method, headers, body).
+    async fn serve_once_capture(
+        response: &'static str,
+    ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                let n = socket.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(header_end) = find_header_end(&buf) {
+                    let content_length = parse_content_length(&buf[..header_end]);
+                    if buf.len() >= header_end + content_length {
+                        break;
+                    }
+                }
+            }
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+            let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    #[test]
+    fn completion_status_classification_matches_v1_31_0() {
+        // Retryable 4xx (`retryable4xxErrorTypes`, `nexus_invocation.go:22 @ v1.31.0`).
+        assert_eq!(mapped_handler_error_retryable(408), Some(true));
+        assert_eq!(mapped_handler_error_retryable(429), Some(true));
+        // Terminal mapped handler errors.
+        for terminal in [400u16, 401, 403, 404, 409, 501] {
+            assert_eq!(
+                mapped_handler_error_retryable(terminal),
+                Some(false),
+                "{terminal} must be terminal"
+            );
+        }
+        // Retryable mapped 5xx.
+        for retry in [500u16, 503, 520] {
+            assert_eq!(
+                mapped_handler_error_retryable(retry),
+                Some(true),
+                "{retry} must be retryable"
+            );
+        }
+        // Unmapped → None: v1.31.0 makes these UnexpectedResponseError → always retryable.
+        for unmapped in [402u16, 405, 410, 418, 451, 599] {
+            assert_eq!(
+                mapped_handler_error_retryable(unmapped),
+                None,
+                "{unmapped} is unmapped"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_succeeded_posts_state_token_and_payload_body() {
+        let (base, rx) = serve_once_capture("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        let outcome = HttpNexusCompletionClient::new()
+            .complete_operation(
+                &base,
+                "tok-abc",
+                NexusCompletion::Succeeded(Payloads(vec![Payload {
+                    data: b"\"r\"".to_vec(),
+                    metadata: BTreeMap::from([("encoding".to_owned(), "json/plain".to_owned())]),
+                }])),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, CompletionDeliveryOutcome::Delivered);
+
+        let req = rx.await.unwrap();
+        assert!(req.starts_with("POST "), "must be a POST: {req}");
+        let lower = req.to_lowercase();
+        assert!(lower.contains("nexus-operation-state: succeeded"));
+        assert!(lower.contains("temporal-callback-token: tok-abc"));
+        assert!(lower.contains("user-agent: temporalio/server"));
+        assert!(lower.contains("content-type: application/json"));
+        assert!(req.contains("\"r\""), "result payload is the body: {req}");
+    }
+
+    #[tokio::test]
+    async fn completion_canceled_posts_json_failure_body() {
+        let (base, rx) = serve_once_capture("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        let outcome = HttpNexusCompletionClient::new()
+            .complete_operation(
+                &base,
+                "tok",
+                NexusCompletion::Canceled(b"{\"message\":\"operation canceled\"}".to_vec()),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, CompletionDeliveryOutcome::Delivered);
+
+        let req = rx.await.unwrap();
+        let lower = req.to_lowercase();
+        // Canceled is delivered as state=canceled with a JSON failure body, NOT failed
+        // (`GetNexusCompletion` canceled arm @ v1.31.0).
+        assert!(lower.contains("nexus-operation-state: canceled"));
+        assert!(lower.contains("content-type: application/json"));
+        assert!(req.contains("operation canceled"));
+    }
+
+    /// Drive `complete_operation` against a fixed response and return the outcome.
+    async fn deliver_against(response: &'static str) -> CompletionDeliveryOutcome {
+        let (base, _rx) = serve_once_capture(response).await;
+        HttpNexusCompletionClient::new()
+            .complete_operation(&base, "tok", NexusCompletion::Succeeded(empty_input()), &[])
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn completion_400_is_non_retryable() {
+        let outcome =
+            deliver_against("HTTP/1.1 400 Bad Request\r\nContent-Length: 3\r\n\r\nbad").await;
+        assert!(
+            matches!(outcome, CompletionDeliveryOutcome::NonRetryableError { .. }),
+            "got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_503_is_retryable() {
+        let outcome =
+            deliver_against("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n").await;
+        assert!(
+            matches!(outcome, CompletionDeliveryOutcome::RetryableError { .. }),
+            "got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_unmapped_4xx_is_retryable() {
+        // 418 is not a mapped handler-error status → UnexpectedResponseError → retryable
+        // (the bug the Wave 3 review caught: an unmapped 4xx must not be terminal).
+        let outcome = deliver_against("HTTP/1.1 418 Teapot\r\nContent-Length: 0\r\n\r\n").await;
+        assert!(
+            matches!(outcome, CompletionDeliveryOutcome::RetryableError { .. }),
+            "unmapped 4xx must be retryable: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_retryable_header_overrides_terminal_status() {
+        // 400 is normally terminal, but `nexus-request-retryable: true` forces a retry
+        // (`retryBehaviorFromHeader`, `nexusrpc/client.go:455 @ v1.31.0`).
+        let outcome = deliver_against(
+            "HTTP/1.1 400 Bad Request\r\nnexus-request-retryable: true\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(
+            matches!(outcome, CompletionDeliveryOutcome::RetryableError { .. }),
+            "got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_unmapped_status_ignores_retryable_false_header() {
+        // For an unmapped status v1.31.0 never consults the header (it is not a
+        // HandlerError), so it stays retryable even with `nexus-request-retryable: false`.
+        let outcome = deliver_against(
+            "HTTP/1.1 418 Teapot\r\nnexus-request-retryable: false\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(
+            matches!(outcome, CompletionDeliveryOutcome::RetryableError { .. }),
+            "header must be ignored for an unmapped status: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_transport_error_is_retryable() {
+        // An unroutable address yields a transport error → retryable (no response).
+        let outcome = HttpNexusCompletionClient::new()
+            .complete_operation(
+                "http://127.0.0.1:1",
+                "tok",
+                NexusCompletion::Succeeded(empty_input()),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, CompletionDeliveryOutcome::RetryableError { .. }),
+            "got {outcome:?}"
         );
     }
 }

@@ -74,6 +74,9 @@ percentage is **not** known — establishing real denominators is the next audit
 
 ## Active conformance specs (detail-by-reference)
 
+- [`functional-test-order.md`](./functional-test-order.md) — the order to drive Temporal's functional
+  suites (Tier-2) against `tokeirad`, in/deferred/out partition, plus the in-process metrics-capture
+  analysis.
 - [`edge-unimplemented.md`](./edge-unimplemented.md) — current flat indicator of public-edge RPCs
   answering `UNIMPLEMENTED`, split into in-scope gaps vs intentional. Generated from the edge handlers.
 - `nexus-async-completion` — async Nexus completion (C4b blocker for Odori's durable path); Wave 0 done,

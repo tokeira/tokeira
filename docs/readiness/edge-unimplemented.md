@@ -38,17 +38,18 @@ only; _No (n/N)_ = `tasks.md` exists, n of N tasks checked.
 | `DeleteWorkflowRule` | Workflow | `deferred_unary!` | `workflow-rules` | No spec (placeholder) |
 | `ListWorkflowRules` | Workflow | `deferred_unary!` | `workflow-rules` | No spec (placeholder) |
 | `TriggerWorkflowRule` | Workflow | `deferred_unary!` | `workflow-rules` | No spec (placeholder) |
+| `StartActivityExecution` | Workflow | `unimplemented` (off by default) | `activity-executions-first-class` | Partial (15/19) |
+| `DescribeActivityExecution` | Workflow | `unimplemented` (off by default) | `activity-executions-first-class` | Partial (15/19) |
+| `PollActivityExecution` | Workflow | `unimplemented` (off by default) | `activity-executions-first-class` | Partial (15/19) |
+| `ListActivityExecutions` | Workflow | `unimplemented` (off by default) | `activity-executions-first-class` | Partial (15/19) |
+| `CountActivityExecutions` | Workflow | `unimplemented` (off by default) | `activity-executions-first-class` | Partial (15/19) |
+| `RequestCancelActivityExecution` | Workflow | `unimplemented` (off by default) | `activity-executions-first-class` | Partial (15/19) |
+| `TerminateActivityExecution` | Workflow | `unimplemented` (off by default) | `activity-executions-first-class` | Partial (15/19) |
+| `DeleteActivityExecution` | Workflow | `unimplemented` (off by default) | `activity-executions-first-class` | Partial (15/19) |
 
-### Standalone Activities — substrate exists, gated off by default
-
-The 8 standalone-activity RPCs are bridged through the CHASM `ActivityBridge`, but the bridge is **off by
-default** (`enable_standalone_activities = false`); when absent they answer `UNIMPLEMENTED`. So at default
-config they read as unimplemented, even though the substrate exists. Public Preview in v1.31.0.
-**Spec implemented: Partial** — `activity-executions-first-class` `tasks.md` shows 15/19 tasks checked.
-
-`StartActivityExecution`, `DescribeActivityExecution`, `PollActivityExecution`, `ListActivityExecutions`,
-`CountActivityExecutions`, `RequestCancelActivityExecution`, `TerminateActivityExecution`,
-`DeleteActivityExecution`.
+The standalone-activity RPCs (Public Preview in v1.31.0) are bridged through the CHASM `ActivityBridge`
+but the bridge is **off by default** (`enable_standalone_activities = false`), so they answer
+`UNIMPLEMENTED` at default config even though the substrate is partly built (15/19 spec tasks).
 
 ## Cross-reference with supported.md (minimality)
 

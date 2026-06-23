@@ -88,6 +88,11 @@ dependency then cost.
 | 37 | `TestNexusWorkflowTestSuite` | In-workflow Nexus ops, conflict policy. | done |
 | 38 | Nexus operation execution (`tests/nexus_api_test.go`) | Task transport + async completion (C4b). | `nexus-async-completion` |
 
+> The Nexus suites assert server metrics (`nexus_requests`, `nexus_latency`, `nexus_completion_requests`,
+> `nexus_task_requests`, `nexus_outbound_requests`, `nexus_request_preprocess_errors`). Those assertions
+> are gated on the scrape-backed `CaptureMetricsHandler` shim (see
+> [In-process metrics capture](#in-process-metrics-capture-for-the-functional-tests)).
+
 ### Tier 8 — Worker Deployments (GA)
 
 | # | Suite | Exercises |
@@ -142,64 +147,76 @@ Reason in parentheses; see [`excluded.md`](../conformance/v1.31.0/excluded.md).
 
 ## In-process metrics capture for the functional tests
 
-### How Temporal does it
+### The problem: corpus metric assertions vs an out-of-process server
 
-Temporal's metric-asserting functional tests use an **in-process capturing `metrics.Handler`**:
+Several in-scope suites assert on **server metrics** through Temporal's in-process capturing
+`metrics.Handler` (`common/metrics/metricstest`): a test calls
+`s.GetTestCluster().Host().CaptureMetricsHandler().StartCapture()`, drives RPCs, then asserts on
+`capture.Snapshot()[name]`. This is installed at server construction in the test cluster
+(`tests/testcore/test_cluster.go`), so it captures the **in-process** server's emissions.
 
-- `common/metrics/metricstest/capture_handler.go` — `CaptureHandler` implements the server's
-  `metrics.Handler` (Counter / Gauge / Timer / Histogram + `WithTags`). When a capture is active it
-  records every emission into an in-memory snapshot keyed by metric name with tags; when no capture is
-  active it discards (an atomic `captureCount` gate → zero allocation off the test path).
-- The test cluster installs it at server construction (`tests/testcore/test_cluster.go` →
-  `temporalParams.CaptureMetricsHandler = metricstest.NewCaptureHandler()`; exposed via
-  `onebox.go`). A test calls `StartCapture()` → drives RPCs → `Snapshot()` and asserts on recordings.
-- `tests/testcore/metric_capture.go` wraps that with **Global** vs **Namespace-scoped** capture and
-  misuse detection (a namespace-scoped metric queried globally panics, and vice-versa).
+Our Tier-2 corpus runs over **real gRPC against an out-of-process `tokeirad`** (Rust). A Go in-process
+handler sees nothing tokeirad emits, so every metric-asserting test method fails — and the blast radius
+is concentrated where it hurts: `TestNexusWorkflowTestSuite` (8+ capture sites), `nexus_api_test.go`
+(C4b), `task_queue_test.go`, `http_api_test.go`. Skipping these forfeits real coverage in the Nexus
+suites. We make them pass instead, honestly.
 
-The load-bearing fact: **this captures the server's own metrics in-process** because the test cluster
-runs the Temporal server *in the same process* as the Go test.
+### The solution: a scrape-backed `CaptureMetricsHandler` shim
 
-### Why that does not transfer to Tier-2 as-is
+`tokeira-observability` exports metrics by **Prometheus scrape** (a process-global
+`metrics-exporter-prometheus` recorder + `/metrics` endpoint); OTLP metric *push* is deferred Phase 2 and
+not implemented. We exploit the pull model, which matches the corpus's synchronous
+`StartCapture → act → Snapshot` pattern exactly.
 
-Our Tier-2 corpus runs Temporal's Go tests over **real gRPC against an out-of-process `tokeirad`**
-(Rust). Temporal's Go `CaptureHandler` lives in the test process and sees **nothing** emitted by
-`tokeirad`. So any corpus assertion that reads server metrics via the in-process handler cannot observe
-tokeira's metrics — the snapshot is empty.
+In the conformance fork's `tokeirad` onebox override, provide a `CaptureMetricsHandler()` whose returned
+capture is backed by tokeira's `/metrics`, not an in-process Go handler:
 
-Two honest consequences:
+- `StartCapture()` → scrape `/metrics` once; keep as the **baseline**.
+- `Snapshot()` / `CollectMetric(name, …)` → scrape `/metrics` **now**, compute the **delta** since
+  baseline, and return `CapturedRecording`s keyed by the **Temporal** metric name the test expects.
+- Window semantics are reproduced from two scrapes: counters via delta, "≥1" via cumulative, histograms
+  (`nexus_latency`, `task_dispatch_latency`) via bucket-count delta. Tags are carried from the Prometheus
+  label set.
 
-1. **Most metric assertions are on Temporal-internal server metrics** (task latencies, shard counts,
-   persistence timers). These are **not part of the public API behaviour contract** (`supported.md` is
-   about RPC behaviour + history + errors, not internal metric names). They should be **skipped via the
-   skip registry with a cited reason** ("asserts Temporal-internal server metric; out of public
-   behaviour scope"), not made to pass artificially. `TestMetricCaptureSuite` itself is a harness
-   self-test and is already out of scope.
-2. Where a metric assertion is genuinely a **proxy for observable behaviour** (e.g. "a retry happened",
-   "a task timed out"), prefer asserting the **observable** instead — the resulting `HistoryEvent`
-   sequence or RPC response — which the corpus already has access to over the wire.
+Pull-on-snapshot is deterministic (no export interval, no batching, no force-flush) and needs **no OTLP
+and no Phase-2 work**. Do **not** embed an OTel Collector / OTLP receiver for this — async push fights the
+synchronous capture window and depends on unimplemented export.
 
-### What tokeira would need if we want true in-process metric assertions
+### Bounded Temporal → tokeira mapping
 
-This only applies to a future **Tier-1 in-process oracle** (the `conformance-harness` crate driving an
-*embedded* engine in the same process), not the out-of-process Tier-2 path:
+Only the metrics the corpus actually asserts need mapping (extend as more suites are attempted):
 
-- A **swappable metrics seam** in `tokeira-observability`: a handler trait
-  (`counter/gauge/timer/histogram` + tags) the engine emits through, with the concrete backend chosen at
-  construction. (Confirm whether `tokeira-observability` already exposes such a seam or binds a concrete
-  exporter — if the latter, that's the prerequisite change.)
-- A **Rust `CaptureHandler` analogue**: an in-memory recording impl with `start_capture` /
-  `snapshot` / `stop`, an atomic active-count gate for zero-cost-when-idle, and tag-keyed snapshots —
-  a near-direct port of Temporal's shape (shape only; not code).
-- Global vs namespace scoping only if our metric set has namespace-tagged metrics worth asserting.
+| Temporal metric (asserted) | Used by | tokeira source |
+|----------------------------|---------|----------------|
+| `nexus_requests` | nexus_workflow, nexus_api | inbound Nexus handler request counter |
+| `nexus_latency` (histogram) | nexus_workflow, nexus_api | inbound Nexus handler latency |
+| `nexus_task_requests` | nexus_api | Nexus task dispatch counter |
+| `nexus_outbound_requests` | nexus_workflow | caller-side Nexus op counter |
+| `nexus_completion_requests` | nexus_workflow | async completion delivery (`nexus-async-completion`) |
+| `nexus_request_preprocess_errors` | nexus_api | admission/preprocess error counter |
+| `task_dispatch_latency` (histogram) | task_queue | matching/dispatch latency |
+| `http_service_requests` (`metrics.HTTPServiceRequests`) | http_api | HTTP gateway request counter |
 
-### Recommendation
+Common tags to preserve: `namespace`, `nexus_endpoint`, and outcome/status.
 
-- **Tier-2 (now):** do not attempt in-process capture against `tokeirad`. Skip internal-metric
-  assertions via the registry with cited reasons; re-express behaviour-proxy assertions as history/
-  response assertions where the suite allows.
-- **Tier-1 (later):** if/when the in-process oracle is built and we want metric-level assertions, add the
-  observability seam + a capturing handler. Treat tokeira's own metric names as the contract there, not
-  Temporal's — our metrics are defined in `tokeira-observability`, and matching Temporal's internal
-  metric names is explicitly **not** a conformance goal.
-- Either way, **metric names are not part of the v1.31.0 API claim.** Keep them out of `supported.md`;
-  the conformance contract is RPC behaviour, history, and error mapping.
+### Honesty boundary (non-negotiable)
+
+A metric assertion passes **only where tokeira genuinely emits the equivalent signal**:
+
+- tokeira already emits it (check `PROCESS_METRIC_MANIFEST` / the manifest) → map name + tags, pass.
+- tokeira does not, but it is a real observable (e.g. `nexus_completion_requests` is exactly what the
+  in-flight `nexus-async-completion` path produces) → **add the metric to tokeira** under the manifest
+  discipline, then map it. Legitimate conformance work.
+- No honest equivalent, or a pure Temporal server-internal with no behavioural meaning → **skip that
+  assertion** via the skip registry with a cited reason. Never fabricate a value to turn a test green —
+  "a wrong guess behind a green check bakes in non-conformance."
+
+The mapping therefore grows in lockstep with real Nexus implementation; green means earned. `TestMetricCaptureSuite`
+and `TestFunctionalTestBaseSuite` remain harness self-tests and stay out of scope regardless.
+
+### Why not the Go OTel SDK `ManualReader`, and why not OTLP
+
+`ManualReader` only observes a Go `MeterProvider` in the same process; tokeirad is a separate Rust
+process, so the harness must observe tokeira's emissions, not Go's. The scrape shim is that observer. An
+OTLP collector would also observe out-of-process emissions, but it is async, depends on tokeira's deferred
+OTLP push, and bloats the fork — so it is the wrong tool for the synchronous capture contract.

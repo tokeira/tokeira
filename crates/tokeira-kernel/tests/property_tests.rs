@@ -5,9 +5,10 @@ use prost::Message;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     ActivityOp, ActivityPauseInfo, ActivityResolution, ActivityResolvedRequest, ActivityState,
-    BasicKernel, CallbackSpec, CallbackState, CallbackTrigger, CancelRequest, ChildResolution,
-    ChildResolvedRequest, ChildStartConfirmedRequest, ChildStartResult, ChildWorkflowState,
-    Command, CompletionCallback, ContinueAsNewVersioningBehavior, DispatchOp,
+    BasicKernel, CallbackAttemptOutcome, CallbackCompletionOutcome, CallbackSpec, CallbackState,
+    CallbackTrigger, CancelRequest, ChildResolution, ChildResolvedRequest,
+    ChildStartConfirmedRequest, ChildStartResult, ChildWorkflowState, Command, CompletionCallback,
+    CompletionCallbackAttemptedRequest, ContinueAsNewVersioningBehavior, DispatchOp,
     ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
     ExternalSignalResult, ExternalWorkflowExecution, FieldChange, Link, LoadedRun,
     NexusOperationResolvedRequest, NexusResolution, NexusTimeoutType, ParentClosePolicy,
@@ -15,7 +16,7 @@ use tokeira_kernel::{
     PendingExternalSignal, PendingNexusOperation, PendingUpdate, PendingWorkflowTask, Priority,
     ReplayContext, RequestDedupeOp, ResetActivityRequest, ResetRequest, RetryState, SignalRequest,
     StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerOp, TimerState,
-    UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
+    Transition, UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
     UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, UserMetadata,
     VersioningBehavior, VersioningOverride, WorkerDeploymentVersionRef, WorkflowCommand,
     WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
@@ -88,6 +89,7 @@ fn completion_callback() -> CompletionCallback {
         state: CallbackState::Standby,
         attempt: 0,
         last_attempt_failure: None,
+        next_attempt_at: None,
     }
 }
 
@@ -4495,6 +4497,147 @@ fn property_63_close_preserves_execution_options() {
     }
 }
 
+// ---- nexus-async-completion Wave 1 property helpers (P2, P4) ----
+
+/// One terminal close mechanism, paired with the `CallbackCompletionOutcome`
+/// variant the kernel must derive for it (mirrors `GetNexusCompletion @ v1.31.0`).
+#[derive(Clone, Debug)]
+enum CloseKind {
+    Completed(Vec<u8>),
+    Failed(Vec<u8>),
+    Canceled,
+    ContinuedAsNew,
+    Terminated,
+    TimedOut,
+}
+
+fn arb_close_kind() -> impl Strategy<Value = CloseKind> {
+    prop_oneof![
+        prop::collection::vec(any::<u8>(), 0..16).prop_map(CloseKind::Completed),
+        prop::collection::vec(any::<u8>(), 0..16).prop_map(CloseKind::Failed),
+        Just(CloseKind::Canceled),
+        Just(CloseKind::ContinuedAsNew),
+        Just(CloseKind::Terminated),
+        Just(CloseKind::TimedOut),
+    ]
+}
+
+/// Drive an open run carrying a single Standby `WorkflowClosed` completion callback
+/// to the terminal state described by `kind`, returning the resulting transition.
+fn drive_close(kind: &CloseKind, now: OffsetDateTime) -> Transition {
+    let mut state = with_pending_wft(make_open_state(now), 90, Some(40), 1);
+    let mut callback = completion_callback();
+    callback.registration_time = Some(now);
+    state.completion_callbacks = vec![callback];
+
+    let token = WorkflowTaskToken {
+        run_key: state.run_key,
+        logical_seq: LogicalTaskSeq(90),
+        started_event_id: 40,
+        attempt: 1,
+        shard_epoch: ShardEpoch::ZERO,
+    };
+    let wft = |commands: Vec<WorkflowCommand>| {
+        Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+            token,
+            identity: WorkerIdentity("worker".into()),
+            sdk_metadata: None,
+            metering_metadata: None,
+            worker_version: None,
+            versioning_behavior: VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
+            sticky_ttl: None,
+            commands,
+            force_new_workflow_task: false,
+            now,
+        })
+    };
+    let command = match kind {
+        CloseKind::Completed(bytes) => wft(vec![WorkflowCommand::CompleteWorkflow {
+            result: Payloads(vec![Payload::new(bytes.clone())]),
+        }]),
+        CloseKind::Failed(bytes) => wft(vec![WorkflowCommand::FailWorkflow {
+            failure: Payload::new(bytes.clone()),
+        }]),
+        CloseKind::Canceled => wft(vec![WorkflowCommand::CancelWorkflow]),
+        CloseKind::ContinuedAsNew => wft(vec![WorkflowCommand::ContinueAsNew {
+            new_run_id: RunId::new(),
+            workflow_type: WorkflowType("wf".into()),
+            task_queue: TaskQueueName("queue".into()),
+            input: payloads("can-input"),
+            memo: memo_with("memo"),
+            search_attributes: search_attrs_with("search"),
+            workflow_execution_timeout: None,
+            workflow_run_timeout: None,
+            workflow_task_timeout: default_workflow_task_timeout(),
+            retry_policy: None,
+        }]),
+        CloseKind::Terminated => Command::Terminate(TerminateRequest {
+            reason: "terminated".into(),
+            details: None,
+            identity: "operator".into(),
+            request: request_context("terminate-req", now),
+            now,
+        }),
+        CloseKind::TimedOut => {
+            Command::WorkflowExecutionTimedOut(WorkflowExecutionTimedOutRequest {
+                timeout_type: WorkflowTimeoutType::RunTimeout,
+                retry_state: RetryState::Timeout,
+                now,
+            })
+        }
+    };
+    kernel().apply(LoadedRun::Existing(state), command).unwrap()
+}
+
+/// All `DispatchCompletionCallback` outcomes carried on a transition.
+fn dispatched_outcomes(transition: &Transition) -> Vec<CallbackCompletionOutcome> {
+    transition
+        .dispatch_ops
+        .iter()
+        .filter_map(|op| match op {
+            DispatchOp::DispatchCompletionCallback { outcome, .. } => Some(outcome.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A closed run carrying a single non-terminal (`start_state`) completion callback,
+/// the durable shape a `CompletionCallbackAttempted` targets.
+fn closed_state_with_callback(
+    start_state: CallbackState,
+    start_attempt: u32,
+    now: OffsetDateTime,
+) -> WorkflowState {
+    let mut state = make_open_state(now);
+    state.status = ExecutionStatus::Completed;
+    state.closed_at = Some(now);
+    let mut callback = completion_callback();
+    callback.state = start_state;
+    callback.attempt = start_attempt;
+    callback.registration_time = Some(now);
+    state.completion_callbacks = vec![callback];
+    state
+}
+
+fn arb_attempt_outcome() -> impl Strategy<Value = CallbackAttemptOutcome> {
+    prop_oneof![
+        Just(CallbackAttemptOutcome::Succeeded),
+        (prop::collection::vec(any::<u8>(), 0..16), 1i64..3600).prop_map(|(bytes, secs)| {
+            CallbackAttemptOutcome::RetryableFailure {
+                failure: Payload::new(bytes),
+                next_attempt_at: fixed_now() + Duration::seconds(secs),
+            }
+        }),
+        prop::collection::vec(any::<u8>(), 0..16).prop_map(|bytes| {
+            CallbackAttemptOutcome::NonRetryableFailure {
+                failure: Payload::new(bytes),
+            }
+        }),
+    ]
+}
+
 proptest! {
     #[test]
     fn property_completion_callbacks_schedule_once_on_terminal_close(
@@ -4549,6 +4692,7 @@ proptest! {
                 DispatchOp::DispatchCompletionCallback {
                     callback_index,
                     callback,
+                    ..
                 } => Some((*callback_index, callback.clone())),
                 _ => None,
             })
@@ -4570,6 +4714,118 @@ proptest! {
                     .any(|(callback_index, _)| *callback_index == index));
             }
         }
+    }
+
+    /// Feature: nexus-async-completion, Property 2 (kernel half).
+    /// A closing workflow carrying a Standby completion callback dispatches exactly
+    /// one callback whose `outcome` matches the close kind — the variant the runtime
+    /// maps to a `NexusResolution`. **Validates: Requirements 2.2, 2.3, 4.1, 4.2, 4.3**
+    #[test]
+    fn property_p2_close_kind_yields_matching_outcome(kind in arb_close_kind()) {
+        let now = fixed_now();
+        let transition = drive_close(&kind, now);
+        let outcomes = dispatched_outcomes(&transition);
+        prop_assert_eq!(outcomes.len(), 1);
+        let expected = match &kind {
+            CloseKind::Completed(bytes) => CallbackCompletionOutcome::Success {
+                result: Some(Payload::new(bytes.clone())),
+            },
+            CloseKind::Failed(bytes) => CallbackCompletionOutcome::Failed {
+                failure: Payload::new(bytes.clone()),
+            },
+            CloseKind::Canceled => CallbackCompletionOutcome::Canceled { details: None },
+            CloseKind::ContinuedAsNew => CallbackCompletionOutcome::ContinuedAsNew,
+            CloseKind::Terminated => CallbackCompletionOutcome::Terminated,
+            CloseKind::TimedOut => CallbackCompletionOutcome::TimedOut,
+        };
+        prop_assert_eq!(&outcomes[0], &expected);
+    }
+
+    /// Feature: nexus-async-completion, Property 4.
+    /// A delivery attempt against a non-terminal callback advances its lifecycle to
+    /// exactly one well-formed state: `Succeeded`/`Failed` are terminal with no
+    /// `next_attempt_at`; `RetryableFailure` backs off with `attempt` incremented and
+    /// a future `next_attempt_at`. No history event or dispatch op is emitted, and the
+    /// state-only commit still bumps `transition_seq`. **Validates: Requirements 2.1, 2.4, 2.5**
+    #[test]
+    fn property_p4_attempt_advances_lifecycle_well_formed(
+        backing_off in any::<bool>(),
+        start_attempt in 0u32..10,
+        outcome in arb_attempt_outcome(),
+    ) {
+        let now = fixed_now();
+        let start_state = if backing_off {
+            CallbackState::BackingOff
+        } else {
+            CallbackState::Scheduled
+        };
+        let state = closed_state_with_callback(start_state, start_attempt, now);
+        let expected_seq = state.transition_seq;
+        let transition = kernel()
+            .apply(
+                LoadedRun::Existing(state),
+                Command::CompletionCallbackAttempted(CompletionCallbackAttemptedRequest {
+                    callback_index: 0,
+                    outcome: outcome.clone(),
+                    now,
+                }),
+            )
+            .unwrap();
+
+        // Lifecycle advances are mutable-state-only: no history, no dispatch.
+        prop_assert!(transition.history_events.is_empty());
+        prop_assert!(transition.dispatch_ops.is_empty());
+        prop_assert_eq!(transition.expected_seq, expected_seq);
+        prop_assert_eq!(transition.next_state.transition_seq, expected_seq.next());
+
+        let callback = &transition.next_state.completion_callbacks[0];
+        match outcome {
+            CallbackAttemptOutcome::Succeeded => {
+                prop_assert_eq!(&callback.state, &CallbackState::Succeeded);
+                prop_assert_eq!(callback.attempt, start_attempt);
+                prop_assert_eq!(callback.next_attempt_at, None);
+            }
+            CallbackAttemptOutcome::RetryableFailure { failure, next_attempt_at } => {
+                prop_assert_eq!(&callback.state, &CallbackState::BackingOff);
+                prop_assert_eq!(callback.attempt, start_attempt + 1);
+                prop_assert_eq!(callback.next_attempt_at, Some(next_attempt_at));
+                prop_assert!(next_attempt_at > now);
+                prop_assert_eq!(callback.last_attempt_failure.as_ref(), Some(&failure));
+            }
+            CallbackAttemptOutcome::NonRetryableFailure { failure } => {
+                prop_assert_eq!(&callback.state, &CallbackState::Failed);
+                prop_assert_eq!(callback.next_attempt_at, None);
+                prop_assert_eq!(callback.last_attempt_failure.as_ref(), Some(&failure));
+            }
+        }
+    }
+
+    /// Feature: nexus-async-completion, Property 4 (boundedness).
+    /// A terminal callback (`Succeeded`/`Failed`) is never re-attempted: a late
+    /// attempt is rejected rather than mutating durable state. **Validates: Requirement 2.5**
+    #[test]
+    fn property_p4_terminal_callback_never_reattempted(
+        succeeded in any::<bool>(),
+        outcome in arb_attempt_outcome(),
+    ) {
+        let now = fixed_now();
+        let terminal = if succeeded {
+            CallbackState::Succeeded
+        } else {
+            CallbackState::Failed
+        };
+        let state = closed_state_with_callback(terminal, 3, now);
+        let reject = kernel()
+            .apply(
+                LoadedRun::Existing(state),
+                Command::CompletionCallbackAttempted(CompletionCallbackAttemptedRequest {
+                    callback_index: 0,
+                    outcome,
+                    now,
+                }),
+            )
+            .unwrap_err();
+        prop_assert_eq!(reject, tokeira_kernel::Reject::CompletionCallbackAlreadyTerminal(0));
     }
 
     #[test]

@@ -758,6 +758,15 @@ pub struct CompletionCallback {
     /// Last failure payload observed while dispatching this callback.
     #[serde(default)]
     pub last_attempt_failure: Option<Payload>,
+    /// When a `BackingOff` callback is next eligible for a delivery retry.
+    ///
+    /// Set by `CompletionCallbackAttempted` on a retryable failure (the runtime
+    /// computes it from the configured backoff policy and the attempt count, so the
+    /// kernel stays free of backoff math and config). `None` for any non-backing-off
+    /// state. The runtime's completion-callback scanner re-fires a `BackingOff`
+    /// callback only once `now >= next_attempt_at`.
+    #[serde(default)]
+    pub next_attempt_at: Option<OffsetDateTime>,
 }
 
 /// Public callback target.

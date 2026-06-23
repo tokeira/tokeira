@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
-    ExecutionStatus, Memo, NamespaceId, Payloads, QueueKey, RequestId, RunId, RunKey,
+    ExecutionStatus, Memo, NamespaceId, Payload, Payloads, QueueKey, RequestId, RunId, RunKey,
     SearchAttributes, TaskQueueName, TransitionSeq, WorkflowId, WorkflowType,
 };
 
@@ -188,10 +188,49 @@ pub enum DispatchOp {
     /// Callback delivery is external I/O, so the kernel only records the
     /// durable scheduling decision and returns this derived effect. The runtime
     /// owns the actual delivery attempt after storage accepts the transition.
+    ///
+    /// `outcome` is the terminal result/failure the callback must convey, derived
+    /// from the run's completion event at close time — mirroring v1.31.0's
+    /// `GetNexusCompletion`, which reads the workflow completion event to build the
+    /// Nexus completion (`service/history/workflow/mutable_state_impl.go @ v1.31.0`).
+    /// Carrying it on the op keeps the runtime from having to re-read terminal
+    /// history; the kernel only forwards payloads it already holds, so failure
+    /// *synthesis* (terminated/timed-out/canceled → a Nexus failure body) stays in
+    /// the runtime, not the pure kernel.
     DispatchCompletionCallback {
         callback_index: usize,
         callback: CompletionCallback,
+        outcome: CallbackCompletionOutcome,
     },
+}
+
+/// The terminal outcome a completion callback conveys, derived from the run's
+/// completion event (`GetNexusCompletion @ v1.31.0`). The kernel forwards only the
+/// payloads it already has; the runtime maps each variant to the Nexus completion
+/// wire shape (`succeeded`/`failed`/`canceled` + body), synthesizing the failure
+/// for the terminated/timed-out/canceled/continued-as-new cases (a proto operation
+/// that must not live in the pure kernel).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum CallbackCompletionOutcome {
+    /// Workflow completed: the single result payload (v1.31.0 takes the first of the
+    /// result `Payloads`, or nil), → Nexus `succeeded`.
+    Success { result: Option<Payload> },
+    /// Workflow failed: the already-encoded application failure payload, → `failed`.
+    Failed { failure: Payload },
+    /// Workflow canceled: optional cancellation details, → `canceled` (runtime
+    /// synthesizes `CanceledFailureInfo` "operation canceled").
+    Canceled { details: Option<Payloads> },
+    /// Workflow terminated, → `failed` (runtime synthesizes `TerminatedFailureInfo`
+    /// "operation terminated").
+    Terminated,
+    /// Workflow timed out, → `failed` (runtime synthesizes `TimeoutFailureInfo`
+    /// "operation exceeded internal timeout").
+    TimedOut,
+    /// Workflow continued-as-new. v1.31.0 has no completion mapping for this
+    /// (`GetNexusCompletion` returns an internal error); tokeira deliberately maps it
+    /// to a `failed` completion so the caller is resolved rather than left to time
+    /// out — a documented deviation.
+    ContinuedAsNew,
 }
 
 /// Projection operations are the contract between the correctness path and the

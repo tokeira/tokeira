@@ -88,6 +88,41 @@ pub enum Command {
     /// Schedule a WFT so that a pending query can be delivered
     /// to a worker. Only schedules if no WFT is already pending.
     ScheduleQueryTask(ScheduleQueryTaskRequest),
+    /// Record the outcome of a completion-callback delivery attempt, advancing the
+    /// callback's durable lifecycle. Applies to a *closed* run (callbacks fire after
+    /// close), unlike most commands which require an open run.
+    CompletionCallbackAttempted(CompletionCallbackAttemptedRequest),
+}
+
+/// Outcome of one completion-callback delivery attempt, recorded durably so retries
+/// survive crashes and the `DescribeWorkflowExecution` callback surface is accurate.
+///
+/// The runtime computes `next_attempt_at` from the configured backoff policy and the
+/// attempt count and passes it in, so the kernel performs no backoff math and reads
+/// no config (purity). Mirrors the lifecycle the v1.31.0 callbacks component drives
+/// (`components/callbacks/statemachine.go @ v1.31.0`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum CallbackAttemptOutcome {
+    /// Delivery succeeded; the callback becomes terminal `Succeeded`.
+    Succeeded,
+    /// Delivery failed retryably; the callback backs off until `next_attempt_at`.
+    RetryableFailure {
+        failure: Payload,
+        next_attempt_at: OffsetDateTime,
+    },
+    /// Delivery failed non-retryably; the callback becomes terminal `Failed`.
+    NonRetryableFailure { failure: Payload },
+}
+
+/// Record a completion-callback delivery attempt against a (closed) run.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CompletionCallbackAttemptedRequest {
+    /// Index into the run's `completion_callbacks` (the callback that was attempted).
+    pub callback_index: usize,
+    /// What the delivery attempt produced.
+    pub outcome: CallbackAttemptOutcome,
+    /// Wall-clock time of the attempt.
+    pub now: OffsetDateTime,
 }
 
 /// Three-valued patch for optional fields in update commands.

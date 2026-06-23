@@ -19,16 +19,16 @@ use tokeira_types::{
 
 use crate::{
     command::{
-        ActivityResolvedRequest, CancelRequest, ChildResolution, ChildResolvedRequest,
-        ChildStartConfirmedRequest, ChildStartResult, Command, ContinueAsNewInitiator,
-        CronContinuation, ExternalCancelResolvedRequest, ExternalCancelResult,
-        ExternalSignalResolvedRequest, ExternalSignalResult, FieldChange,
-        NexusOperationResolvedRequest, NexusResolution, PauseActivityRequest, PauseWorkflowRequest,
-        ResetActivityRequest, ResetRequest, RetryState, ScheduleQueryTaskRequest, SignalRequest,
-        SignalWithStartRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest,
-        TimerDueRequest, UnpauseActivityRequest, UnpauseWorkflowRequest,
-        UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody,
-        UpdateRequest, WorkflowCommand, WorkflowExecutionTimedOutRequest,
+        ActivityResolvedRequest, CallbackAttemptOutcome, CancelRequest, ChildResolution,
+        ChildResolvedRequest, ChildStartConfirmedRequest, ChildStartResult, Command,
+        CompletionCallbackAttemptedRequest, ContinueAsNewInitiator, CronContinuation,
+        ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
+        ExternalSignalResult, FieldChange, NexusOperationResolvedRequest, NexusResolution,
+        PauseActivityRequest, PauseWorkflowRequest, ResetActivityRequest, ResetRequest, RetryState,
+        ScheduleQueryTaskRequest, SignalRequest, SignalWithStartRequest, StartRequest,
+        StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, UnpauseActivityRequest,
+        UnpauseWorkflowRequest, UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest,
+        UpdateProtocolBody, UpdateRequest, WorkflowCommand, WorkflowExecutionTimedOutRequest,
         WorkflowStartDelayElapsedRequest, WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
         WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
     },
@@ -40,8 +40,52 @@ use crate::{
         PendingNexusOperation, PendingUpdate, PendingWorkflowTask, RequestIdInfo, TimerState,
         VersioningOverride, WorkflowState, WorkflowVersioningInfo,
     },
-    transition::{ActivityOp, DispatchOp, ProjectionOp, RequestDedupeOp, TimerOp, Transition},
+    transition::{
+        ActivityOp, CallbackCompletionOutcome, DispatchOp, ProjectionOp, RequestDedupeOp, TimerOp,
+        Transition,
+    },
 };
+
+/// Derive the completion-callback outcome from a run's terminal event.
+///
+/// Mirrors v1.31.0's `GetNexusCompletion`, which switches on the workflow
+/// completion event type to build the Nexus completion
+/// (`service/history/workflow/mutable_state_impl.go @ v1.31.0`): completed → the
+/// first result payload; failed → the failure; canceled → cancellation details;
+/// terminated/timed-out → a synthesized failure (synthesis happens in the runtime,
+/// so the kernel only marks the variant); continued-as-new has no upstream mapping
+/// (v1.31.0 returns an internal error) and is forwarded as its own variant so the
+/// runtime can fail the operation rather than hang the caller. A non-terminal event
+/// yields `None` (the callback is not dispatched).
+fn callback_completion_outcome(kind: &HistoryEventKind) -> Option<CallbackCompletionOutcome> {
+    match kind {
+        HistoryEventKind::WorkflowExecutionCompleted { result, .. } => {
+            Some(CallbackCompletionOutcome::Success {
+                result: result.0.first().cloned(),
+            })
+        }
+        HistoryEventKind::WorkflowExecutionFailed { failure, .. } => {
+            Some(CallbackCompletionOutcome::Failed {
+                failure: failure.clone(),
+            })
+        }
+        HistoryEventKind::WorkflowExecutionCanceled { details, .. } => {
+            Some(CallbackCompletionOutcome::Canceled {
+                details: details.clone(),
+            })
+        }
+        HistoryEventKind::WorkflowExecutionTerminated { .. } => {
+            Some(CallbackCompletionOutcome::Terminated)
+        }
+        HistoryEventKind::WorkflowExecutionTimedOut { .. } => {
+            Some(CallbackCompletionOutcome::TimedOut)
+        }
+        HistoryEventKind::WorkflowExecutionContinuedAsNew { .. } => {
+            Some(CallbackCompletionOutcome::ContinuedAsNew)
+        }
+        _ => None,
+    }
+}
 
 fn stamp_callback_registration_times(
     callbacks: &mut [crate::state::CompletionCallback],
@@ -153,6 +197,9 @@ impl Kernel for BasicKernel {
                 self.apply_workflow_start_delay_elapsed(loaded, req)
             }
             Command::ScheduleQueryTask(req) => self.apply_schedule_query_task(loaded, req),
+            Command::CompletionCallbackAttempted(req) => {
+                self.apply_completion_callback_attempted(loaded, req)
+            }
         }
     }
 }
@@ -2141,6 +2188,68 @@ impl BasicKernel {
         Ok(builder.finish())
     }
 
+    /// Record the outcome of a completion-callback delivery attempt, advancing the
+    /// callback's durable lifecycle.
+    ///
+    /// Unlike most apply methods this **accepts a closed run**: completion callbacks
+    /// fire only after the workflow reaches a terminal state, so the lifecycle
+    /// advance is a state-only commit on an already-closed run (only an absent run is
+    /// rejected). It emits no history event — callback lifecycle is mutable state, not
+    /// history — and no dispatch op; re-firing a `BackingOff` callback is the runtime
+    /// scanner's job. The transition still bumps `transition_seq` so the durable
+    /// callback state is fenced like any other commit. Mirrors the lifecycle the
+    /// v1.31.0 callbacks component drives
+    /// (`components/callbacks/statemachine.go @ v1.31.0`).
+    fn apply_completion_callback_attempted(
+        &self,
+        loaded: LoadedRun,
+        req: CompletionCallbackAttemptedRequest,
+    ) -> Result<Transition, Reject> {
+        let state = match loaded {
+            LoadedRun::Absent => return Err(Reject::MissingRun),
+            LoadedRun::Existing(state) => state,
+        };
+
+        // Fence: the callback must exist and must not already be terminal. A
+        // terminal callback (`Succeeded`/`Failed`) is never re-attempted, so a late
+        // attempt against one is rejected rather than silently overwriting it.
+        if req.callback_index >= state.completion_callbacks.len() {
+            return Err(Reject::UnknownCompletionCallback(req.callback_index));
+        }
+        if matches!(
+            state.completion_callbacks[req.callback_index].state,
+            crate::state::CallbackState::Succeeded | crate::state::CallbackState::Failed
+        ) {
+            return Err(Reject::CompletionCallbackAlreadyTerminal(
+                req.callback_index,
+            ));
+        }
+
+        let mut builder = TransitionBuilder::new(state, req.now);
+        let callback = &mut builder.state.completion_callbacks[req.callback_index];
+        match req.outcome {
+            CallbackAttemptOutcome::Succeeded => {
+                callback.state = crate::state::CallbackState::Succeeded;
+                callback.next_attempt_at = None;
+            }
+            CallbackAttemptOutcome::RetryableFailure {
+                failure,
+                next_attempt_at,
+            } => {
+                callback.state = crate::state::CallbackState::BackingOff;
+                callback.attempt += 1;
+                callback.last_attempt_failure = Some(failure);
+                callback.next_attempt_at = Some(next_attempt_at);
+            }
+            CallbackAttemptOutcome::NonRetryableFailure { failure } => {
+                callback.state = crate::state::CallbackState::Failed;
+                callback.last_attempt_failure = Some(failure);
+                callback.next_attempt_at = None;
+            }
+        }
+        Ok(builder.finish())
+    }
+
     fn apply_replayed_event(&self, state: &mut WorkflowState, event: &HistoryEvent) {
         match &event.kind {
             HistoryEventKind::WorkflowExecutionStarted { .. } => {}
@@ -3480,18 +3589,34 @@ impl TransitionBuilder {
     }
 
     fn schedule_completion_callbacks(&mut self) {
+        // The completion event is the last event emitted in this closing transition
+        // (close() runs immediately after the terminal event). Derive the outcome
+        // once and convey it on every fired callback, mirroring v1.31.0's
+        // GetNexusCompletion reading the completion event (mutable_state_impl.go @ v1.31.0).
+        let outcome = self
+            .history_events
+            .last()
+            .and_then(|event| callback_completion_outcome(&event.kind));
         for (callback_index, callback) in self.state.completion_callbacks.iter_mut().enumerate() {
             if callback.trigger != crate::state::CallbackTrigger::WorkflowClosed
                 || callback.state != crate::state::CallbackState::Standby
             {
                 continue;
             }
+            // Defensive: a WorkflowClosed callback can only fire from a terminal
+            // event we can map. If the close path ever emits an unmapped final
+            // event, leave the callback Standby rather than dispatch without an
+            // outcome (it cannot be delivered meaningfully).
+            let Some(outcome) = outcome.clone() else {
+                continue;
+            };
 
             callback.state = crate::state::CallbackState::Scheduled;
             self.dispatch_ops
                 .push(DispatchOp::DispatchCompletionCallback {
                     callback_index,
                     callback: callback.clone(),
+                    outcome,
                 });
         }
     }
@@ -3658,6 +3783,14 @@ pub enum Reject {
     /// A Nexus operation was already marked as started.
     #[error("nexus operation already started: {0}")]
     NexusOperationAlreadyStarted(String),
+    /// A `CompletionCallbackAttempted` referenced a callback index that is not in
+    /// the run's `completion_callbacks`.
+    #[error("unknown completion callback index: {0}")]
+    UnknownCompletionCallback(usize),
+    /// A `CompletionCallbackAttempted` targeted a callback already in a terminal
+    /// state (`Succeeded`/`Failed`); a terminal callback is never re-attempted.
+    #[error("completion callback {0} already terminal")]
+    CompletionCallbackAlreadyTerminal(usize),
     /// The command requires the workflow to not be paused, but
     /// it is.
     #[error("workflow is paused")]

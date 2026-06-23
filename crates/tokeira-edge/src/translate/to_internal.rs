@@ -312,6 +312,7 @@ fn completion_callback_to_kernel(
         state: tokeira_kernel::state::CallbackState::Standby,
         attempt: 0,
         last_attempt_failure: None,
+        next_attempt_at: None,
     }
 }
 

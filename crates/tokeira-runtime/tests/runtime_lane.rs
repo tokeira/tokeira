@@ -838,6 +838,7 @@ fn completion_callback(url: &str) -> CompletionCallback {
         state: CallbackState::Standby,
         attempt: 0,
         last_attempt_failure: None,
+        next_attempt_at: None,
     }
 }
 

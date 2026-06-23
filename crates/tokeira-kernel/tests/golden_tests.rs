@@ -3,22 +3,24 @@ use std::collections::BTreeMap;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     ActivityOp, ActivityPauseInfo, ActivityResolvedRequest, ActivityState, BasicKernel,
-    CallbackSpec, CallbackState, CallbackTrigger, CancelRequest, ChildResolution,
-    ChildResolvedRequest, ChildStartConfirmedRequest, ChildStartResult, ChildWorkflowState,
-    Command, CompletionCallback, DispatchOp, ExternalCancelResolvedRequest, ExternalCancelResult,
-    ExternalSignalResolvedRequest, ExternalSignalResult, ExternalWorkflowExecution, FieldChange,
-    LoadedRun, NexusOperationResolvedRequest, NexusResolution, NexusTimeoutType, ParentClosePolicy,
-    PauseActivityRequest, PauseInfo, PauseWorkflowRequest, PendingExternalCancel,
-    PendingExternalSignal, PendingNexusOperation, PendingUpdate, PendingWorkflowTask, ProjectionOp,
-    Reject, ReplayContext, ResetActivityRequest, ResetRequest, RetryState, SignalRequest,
-    SignalWithStartRequest, StartDeploymentTransitionRequest, StartRequest,
-    StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerState,
-    UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
-    UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, VersioningBehavior,
-    VersioningOverride, WORKFLOW_START_DELAY_TIMER_ID, WorkerDeploymentVersionRef, WorkflowCommand,
-    WorkflowExecutionTimedOutRequest, WorkflowStartDelayElapsedRequest, WorkflowState,
-    WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
-    WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType, WorkflowTimeoutType,
+    CallbackAttemptOutcome, CallbackCompletionOutcome, CallbackSpec, CallbackState,
+    CallbackTrigger, CancelRequest, ChildResolution, ChildResolvedRequest,
+    ChildStartConfirmedRequest, ChildStartResult, ChildWorkflowState, Command, CompletionCallback,
+    CompletionCallbackAttemptedRequest, DispatchOp, ExternalCancelResolvedRequest,
+    ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult,
+    ExternalWorkflowExecution, FieldChange, LoadedRun, NexusOperationResolvedRequest,
+    NexusResolution, NexusTimeoutType, ParentClosePolicy, PauseActivityRequest, PauseInfo,
+    PauseWorkflowRequest, PendingExternalCancel, PendingExternalSignal, PendingNexusOperation,
+    PendingUpdate, PendingWorkflowTask, ProjectionOp, Reject, ReplayContext, ResetActivityRequest,
+    ResetRequest, RetryState, SignalRequest, SignalWithStartRequest,
+    StartDeploymentTransitionRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest,
+    TimerDueRequest, TimerState, Transition, UnpauseActivityRequest, UnpauseWorkflowRequest,
+    UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest,
+    VersioningBehavior, VersioningOverride, WORKFLOW_START_DELAY_TIMER_ID,
+    WorkerDeploymentVersionRef, WorkflowCommand, WorkflowExecutionTimedOutRequest,
+    WorkflowStartDelayElapsedRequest, WorkflowState, WorkflowTaskCompletedRequest,
+    WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
+    WorkflowTaskTimeoutType, WorkflowTimeoutType,
     event::{HistoryEvent, HistoryEventKind},
     kernel::Kernel,
 };
@@ -74,6 +76,7 @@ fn completion_callback() -> CompletionCallback {
         state: CallbackState::Standby,
         attempt: 0,
         last_attempt_failure: None,
+        next_attempt_at: None,
     }
 }
 
@@ -5467,6 +5470,293 @@ fn close_preserves_execution_options() {
             .count(),
         1
     );
+}
+
+// ---- nexus-async-completion Wave 1: completion-callback outcome + lifecycle ----
+
+/// An open run with a started WFT and a single Standby `WorkflowClosed` Nexus
+/// completion callback, ready to be driven to a terminal state.
+fn make_started_wft_with_standby_callback() -> WorkflowState {
+    let mut state = make_open_state_with_started_wft();
+    state.completion_callbacks = vec![completion_callback()];
+    state
+}
+
+/// Token matching `make_open_state_with_started_wft`'s pending WFT.
+fn started_wft_token(state: &WorkflowState) -> WorkflowTaskToken {
+    WorkflowTaskToken {
+        run_key: state.run_key,
+        logical_seq: LogicalTaskSeq(3),
+        started_event_id: 9,
+        attempt: 1,
+        shard_epoch: ShardEpoch::ZERO,
+    }
+}
+
+/// Drive `state` to close by completing its started WFT with `commands`.
+fn close_via_wft(state: WorkflowState, commands: Vec<WorkflowCommand>) -> Transition {
+    let token = started_wft_token(&state);
+    kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token,
+                identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                metering_metadata: None,
+                worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
+                sticky_ttl: None,
+                commands,
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap()
+}
+
+/// Extract the single `DispatchCompletionCallback` outcome from a transition,
+/// asserting exactly one callback was dispatched.
+fn single_dispatched_outcome(transition: &Transition) -> CallbackCompletionOutcome {
+    let mut dispatched = transition.dispatch_ops.iter().filter_map(|op| match op {
+        DispatchOp::DispatchCompletionCallback { outcome, .. } => Some(outcome.clone()),
+        _ => None,
+    });
+    let outcome = dispatched
+        .next()
+        .expect("a completion callback was dispatched on close");
+    assert!(
+        dispatched.next().is_none(),
+        "exactly one completion callback dispatched"
+    );
+    outcome
+}
+
+#[test]
+fn dispatch_completion_callback_outcome_completed() {
+    let transition = close_via_wft(
+        make_started_wft_with_standby_callback(),
+        vec![WorkflowCommand::CompleteWorkflow {
+            result: payloads("done"),
+        }],
+    );
+    assert_eq!(
+        single_dispatched_outcome(&transition),
+        CallbackCompletionOutcome::Success {
+            result: Some(payload("done")),
+        }
+    );
+}
+
+#[test]
+fn dispatch_completion_callback_outcome_failed() {
+    let transition = close_via_wft(
+        make_started_wft_with_standby_callback(),
+        vec![WorkflowCommand::FailWorkflow {
+            failure: payload("nope"),
+        }],
+    );
+    assert_eq!(
+        single_dispatched_outcome(&transition),
+        CallbackCompletionOutcome::Failed {
+            failure: payload("nope"),
+        }
+    );
+}
+
+#[test]
+fn dispatch_completion_callback_outcome_canceled() {
+    let transition = close_via_wft(
+        make_started_wft_with_standby_callback(),
+        vec![WorkflowCommand::CancelWorkflow],
+    );
+    assert_eq!(
+        single_dispatched_outcome(&transition),
+        CallbackCompletionOutcome::Canceled { details: None }
+    );
+}
+
+#[test]
+fn dispatch_completion_callback_outcome_continued_as_new() {
+    let WorkflowCommand::ContinueAsNew { .. } = make_continue_as_new_command() else {
+        unreachable!("make_continue_as_new_command builds a ContinueAsNew command");
+    };
+    let transition = close_via_wft(
+        make_started_wft_with_standby_callback(),
+        vec![make_continue_as_new_command()],
+    );
+    assert_eq!(
+        single_dispatched_outcome(&transition),
+        CallbackCompletionOutcome::ContinuedAsNew
+    );
+}
+
+#[test]
+fn dispatch_completion_callback_outcome_terminated() {
+    let mut state = make_open_state();
+    state.completion_callbacks = vec![completion_callback()];
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::Terminate(make_terminate_request()),
+        )
+        .unwrap();
+    assert_eq!(
+        single_dispatched_outcome(&transition),
+        CallbackCompletionOutcome::Terminated
+    );
+}
+
+#[test]
+fn dispatch_completion_callback_outcome_timed_out() {
+    let mut state = make_open_state();
+    state.completion_callbacks = vec![completion_callback()];
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::WorkflowExecutionTimedOut(WorkflowExecutionTimedOutRequest {
+                timeout_type: WorkflowTimeoutType::RunTimeout,
+                retry_state: RetryState::Timeout,
+                now: now(),
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        single_dispatched_outcome(&transition),
+        CallbackCompletionOutcome::TimedOut
+    );
+}
+
+/// A closed run carrying a single `Scheduled` completion callback — the state a
+/// `CompletionCallbackAttempted` command targets (callbacks fire post-close).
+fn make_closed_state_with_scheduled_callback() -> WorkflowState {
+    let mut state = make_open_state();
+    state.status = ExecutionStatus::Completed;
+    state.closed_at = Some(now());
+    let mut callback = completion_callback();
+    callback.state = CallbackState::Scheduled;
+    callback.registration_time = Some(now());
+    state.completion_callbacks = vec![callback];
+    state
+}
+
+fn attempt(outcome: CallbackAttemptOutcome) -> Command {
+    Command::CompletionCallbackAttempted(CompletionCallbackAttemptedRequest {
+        callback_index: 0,
+        outcome,
+        now: now(),
+    })
+}
+
+#[test]
+fn completion_callback_attempted_succeeded_is_terminal() {
+    let state = make_closed_state_with_scheduled_callback();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            attempt(CallbackAttemptOutcome::Succeeded),
+        )
+        .unwrap();
+
+    let callback = &transition.next_state.completion_callbacks[0];
+    assert_eq!(callback.state, CallbackState::Succeeded);
+    assert_eq!(callback.attempt, 0);
+    assert_eq!(callback.next_attempt_at, None);
+    assert_eq!(callback.last_attempt_failure, None);
+    // No history event and no dispatch op: callback lifecycle is mutable state only.
+    assert!(transition.history_events.is_empty());
+    assert!(transition.dispatch_ops.is_empty());
+    // The state-only commit still fences via transition_seq.
+    assert_eq!(transition.expected_seq, state.transition_seq);
+    assert_eq!(
+        transition.next_state.transition_seq,
+        state.transition_seq.next()
+    );
+}
+
+#[test]
+fn completion_callback_attempted_retryable_backs_off() {
+    let state = make_closed_state_with_scheduled_callback();
+    let retry_at = now() + Duration::seconds(1);
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            attempt(CallbackAttemptOutcome::RetryableFailure {
+                failure: payload("503"),
+                next_attempt_at: retry_at,
+            }),
+        )
+        .unwrap();
+
+    let callback = &transition.next_state.completion_callbacks[0];
+    assert_eq!(callback.state, CallbackState::BackingOff);
+    assert_eq!(callback.attempt, 1);
+    assert_eq!(callback.next_attempt_at, Some(retry_at));
+    assert_eq!(callback.last_attempt_failure, Some(payload("503")));
+    assert!(transition.history_events.is_empty());
+    assert!(transition.dispatch_ops.is_empty());
+}
+
+#[test]
+fn completion_callback_attempted_non_retryable_is_terminal() {
+    let state = make_closed_state_with_scheduled_callback();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            attempt(CallbackAttemptOutcome::NonRetryableFailure {
+                failure: payload("400"),
+            }),
+        )
+        .unwrap();
+
+    let callback = &transition.next_state.completion_callbacks[0];
+    assert_eq!(callback.state, CallbackState::Failed);
+    assert_eq!(callback.next_attempt_at, None);
+    assert_eq!(callback.last_attempt_failure, Some(payload("400")));
+    assert!(transition.history_events.is_empty());
+    assert!(transition.dispatch_ops.is_empty());
+}
+
+#[test]
+fn completion_callback_attempted_rejects_out_of_range_index() {
+    let state = make_closed_state_with_scheduled_callback();
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::CompletionCallbackAttempted(CompletionCallbackAttemptedRequest {
+                callback_index: 7,
+                outcome: CallbackAttemptOutcome::Succeeded,
+                now: now(),
+            }),
+        )
+        .unwrap_err();
+    assert_eq!(reject, Reject::UnknownCompletionCallback(7));
+}
+
+#[test]
+fn completion_callback_attempted_rejects_already_terminal() {
+    let mut state = make_closed_state_with_scheduled_callback();
+    state.completion_callbacks[0].state = CallbackState::Succeeded;
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            attempt(CallbackAttemptOutcome::Succeeded),
+        )
+        .unwrap_err();
+    assert_eq!(reject, Reject::CompletionCallbackAlreadyTerminal(0));
+}
+
+#[test]
+fn completion_callback_attempted_rejects_absent_run() {
+    let reject = kernel()
+        .apply(
+            LoadedRun::Absent,
+            attempt(CallbackAttemptOutcome::Succeeded),
+        )
+        .unwrap_err();
+    assert_eq!(reject, Reject::MissingRun);
 }
 
 #[test]

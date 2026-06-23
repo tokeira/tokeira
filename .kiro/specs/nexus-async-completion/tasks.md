@@ -24,41 +24,66 @@ is hand-rolled on `hyper` (no new dependency); the lockfile is bumped to `hyper 
       `NoInterval`), wired into `PolicyConfig`, with validation + 2 unit tests; fmt + workspace lint clean.
     - _Requirements: 2.4, 3.1_
 
-- [ ] 1. Kernel — outcome, lifecycle command, durable field
-  - [ ] 1.1 Add `CallbackCompletionOutcome` to the dispatch op (`transition.rs`, `event.rs`/`state.rs` as needed)
+- [x] 1. Kernel — outcome, lifecycle command, durable field
+  - [x] 1.1 Add `CallbackCompletionOutcome` to the dispatch op (`transition.rs`, `event.rs`/`state.rs` as needed)
     - `enum CallbackCompletionOutcome { Success { result: Option<Payload> }, Failure { failure: Payload }, Canceled { failure: Payload } }`.
     - Add `outcome: CallbackCompletionOutcome` to `DispatchOp::DispatchCompletionCallback`.
     - In `schedule_completion_callbacks` (`kernel.rs`), build the outcome from the closing event,
       mirroring `GetNexusCompletion @ v1.31.0`: completed→`Success` (first payload or nil);
       failed/timed-out/terminated→`Failure`; canceled→`Canceled` ("operation canceled").
+    - Landed: `CallbackCompletionOutcome { Success { result: Option<Payload> } | Failed { failure } |
+      Canceled { details: Option<Payloads> } | Terminated | TimedOut | ContinuedAsNew }` in
+      `transition.rs`; `schedule_completion_callbacks` derives the variant from the run's terminal event
+      via the free fn `callback_completion_outcome`. Terminated/timed-out/continued-as-new are forwarded
+      as bare variants so the runtime owns failure *synthesis* (kernel stays free of proto). ContinuedAsNew
+      is a documented deviation (v1.31.0 `GetNexusCompletion` errors; tokeira maps it to `failed`).
     - _Requirements: 2.2, 2.3, 4.1, 4.2, 4.3_
-  - [ ] 1.2 Add `next_attempt_at` to `CompletionCallback` (`state.rs`)
+  - [x] 1.2 Add `next_attempt_at` to `CompletionCallback` (`state.rs`)
     - `next_attempt_at: Option<OffsetDateTime>` (`serde(default)`; build-phase fold, no ALTER).
     - _Requirements: 2.4_
-  - [ ] 1.3 Add `CompletionCallbackAttempted` command + apply logic (`command.rs`, `kernel.rs`)
+  - [x] 1.3 Add `CompletionCallbackAttempted` command + apply logic (`command.rs`, `kernel.rs`)
     - `CompletionCallbackAttempted { callback_index: usize, outcome: CallbackAttemptOutcome }` where
       `CallbackAttemptOutcome { Succeeded | RetryableFailure { failure } | NonRetryableFailure { failure } }`.
     - Apply: `Succeeded`→`state=Succeeded`; `RetryableFailure`→`state=BackingOff`, `attempt+=1`,
       `last_attempt_failure`, `next_attempt_at=now+backoff(attempt)`; `NonRetryableFailure`→`state=Failed`.
       Fence: reject if `callback_index` out of range / callback already terminal.
+    - Landed: `RetryableFailure` carries `next_attempt_at: OffsetDateTime` (the runtime computes backoff;
+      kernel reads no config). `apply_completion_callback_attempted` **accepts a closed run** (callbacks
+      fire post-close), emits no history event and no dispatch op, and bumps `transition_seq` as a
+      state-only fenced commit. New rejects `UnknownCompletionCallback(idx)` /
+      `CompletionCallbackAlreadyTerminal(idx)`.
     - _Requirements: 2.4, 2.5_
-  - [ ] 1.4 Fix downstream exhaustive matches / construction sites for the new variants + field
+  - [x] 1.4 Fix downstream exhaustive matches / construction sites for the new variants + field
+    - Landed: six `CompletionCallback {…}` literals gained `next_attempt_at: None`; `publisher.rs`
+      `DispatchCompletionCallback` stub binds `outcome` (real delivery is Wave 4); `lane.rs`
+      `command_type_name` handles `CompletionCallbackAttempted`. `cargo check --workspace` clean (the
+      typed `Reject` is stringified across the lane boundary, so the two new rejects need no edge arm).
     - _Requirements: (compile integrity)_
-  - [ ] 1.5 Kernel golden tests
+  - [x] 1.5 Kernel golden tests
     - `DispatchCompletionCallback` carries the correct outcome per close kind (completed/failed/
       canceled/timed-out/terminated); `CompletionCallbackAttempted` transitions for each attempt outcome;
       out-of-range / terminal-callback rejection.
+    - Landed (`golden_tests.rs`): six `dispatch_completion_callback_outcome_*` (incl. continued-as-new);
+      `completion_callback_attempted_{succeeded,retryable_backs_off,non_retryable}`; rejection tests for
+      out-of-range index, already-terminal, and absent run.
     - _Requirements: 2.2, 2.3, 2.4, 2.5, 4.1, 4.2, 4.3_
-  - [ ] 1.6 Property test P4 — callback lifecycle is well-formed and bounded
+  - [x] 1.6 Property test P4 — callback lifecycle is well-formed and bounded
+    - Landed (`property_tests.rs`): `property_p4_attempt_advances_lifecycle_well_formed` (each attempt
+      outcome → one well-formed lifecycle state, attempt bump + future `next_attempt_at` on retry, no
+      history/dispatch, seq bumped) and `property_p4_terminal_callback_never_reattempted`.
     - _Feature: nexus-async-completion, Property 4_
     - _Requirements: 2.1, 2.4, 2.5_
-  - [ ] 1.7 Property test P2 — closed workflow yields the matching outcome→resolution mapping
+  - [x] 1.7 Property test P2 — closed workflow yields the matching outcome→resolution mapping
     - The kernel-side half: close kind → `CallbackCompletionOutcome` variant.
+    - Landed (`property_tests.rs`): `property_p2_close_kind_yields_matching_outcome` over all six close
+      kinds (completed/failed/canceled/continued-as-new/terminated/timed-out).
     - _Feature: nexus-async-completion, Property 2_
     - _Requirements: 2.2, 2.3, 4.1, 4.2, 4.3_
 
-- [ ] 2. Checkpoint — kernel
+- [x] 2. Checkpoint — kernel
   - `cargo +nightly fmt`, `cargo lint`, `cargo test -p tokeira-kernel`.
+  - Done (2026-06-23): fmt clean; `cargo lint -p tokeira-kernel -p tokeira-runtime` exit 0 (`-D warnings`);
+    `cargo test -p tokeira-kernel` 272 pass (8 lib + 182 golden + 82 property); `cargo check --workspace` clean.
 
 - [ ] 3. Runtime — completion token + completion HTTP client
   - [ ] 3.1 Add `NexusCompletionToken` to `crates/tokeira-runtime/src/nexus.rs`

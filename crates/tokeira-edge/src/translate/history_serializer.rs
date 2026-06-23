@@ -2201,6 +2201,7 @@ mod tests {
                     state: CallbackState::Standby,
                     attempt: 0,
                     last_attempt_failure: None,
+                    next_attempt_at: None,
                 }],
                 user_metadata: Some(UserMetadata {
                     summary: Some(Payload::new(b"summary".to_vec())),

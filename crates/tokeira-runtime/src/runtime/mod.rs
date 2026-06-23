@@ -1304,6 +1304,7 @@ mod tests {
             state: CallbackState::Standby,
             attempt: 0,
             last_attempt_failure: None,
+            next_attempt_at: None,
         };
         let link = Link::BatchJob {
             job_id: "batch-1".to_string(),

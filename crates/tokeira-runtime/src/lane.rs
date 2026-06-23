@@ -1251,6 +1251,7 @@ fn command_type_name(command: &Command) -> &'static str {
         Command::TimerDue(_) => "TimerDue",
         Command::WorkflowStartDelayElapsed(_) => "WorkflowStartDelayElapsed",
         Command::ScheduleQueryTask(_) => "ScheduleQueryTask",
+        Command::CompletionCallbackAttempted(_) => "CompletionCallbackAttempted",
     }
 }
 

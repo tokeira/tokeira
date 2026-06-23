@@ -1209,7 +1209,12 @@ where
                 DispatchOp::DispatchCompletionCallback {
                     callback_index,
                     callback,
+                    outcome,
                 } => {
+                    // Wave 1: the kernel now derives the terminal `outcome` and carries
+                    // it on the op, but real delivery (HTTP POST + lifecycle advance)
+                    // lands in Wave 4. Bind `outcome` so the match stays exhaustive.
+                    let _ = &outcome;
                     tracing::info!(
                         run_key = ?run_key,
                         callback_index,

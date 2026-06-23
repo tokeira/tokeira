@@ -74,6 +74,8 @@ percentage is **not** known — establishing real denominators is the next audit
 
 ## Active conformance specs (detail-by-reference)
 
+- [`edge-unimplemented.md`](./edge-unimplemented.md) — current flat indicator of public-edge RPCs
+  answering `UNIMPLEMENTED`, split into in-scope gaps vs intentional. Generated from the edge handlers.
 - `nexus-async-completion` — async Nexus completion (C4b blocker for Odori's durable path); Wave 0 done,
   Wave 1 handed to Claude (`docs/HANDOVER-nexus-async-completion.md`).
 - `workflow-id-conflict-policy-concurrency` — done (conflict-policy concurrency; `TestNexusWorkflowTestSuite`).

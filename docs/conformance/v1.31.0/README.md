@@ -25,27 +25,24 @@ unmodified.
 
 These move independently: proto is wire compatibility; server-compat is behavioural compatibility.
 
-## What is in scope of the claim
+## What "fully conforming at the API level" means
 
-- The **public gRPC API surface** Temporal SDKs and operators use — `WorkflowService` and
-  `OperatorService` — admitted and translated at tokeira's compatibility edge.
-- The **observable behaviour** of those RPCs: the history events they produce, the errors/status codes
-  they return, defaulting and validation, and lifecycle ordering — matched to what v1.31.0 does for the
-  same execution lineage.
-- The **state-mutating command + history-event surface** (the engine core) — see
-  [`command-surface.md`](./command-surface.md).
+Conformance is not "the RPC returns something". It is: a Temporal **SDK, operator, or tool** drives
+tokeira over the public gRPC surface and observes the **same behaviour** v1.31.0 would produce for the
+same input lineage — the same RPCs admitted, the same request-field semantics/defaulting/validation, the
+same `HistoryEvent` sequence and response shapes, and the same error/status mapping on failure paths.
+RPC presence is necessary but not sufficient; **field-level** fidelity is part of the bar.
 
-## What is out of scope (and why)
+The surface this comprises is defined in two companion pages, split by what is in vs. out of the claim:
 
-- **Internal/admin surfaces** tokeira does not front (`AdminService`, `HistoryService`,
-  `MatchingService` driven directly, persistence/`testBase` pokes). These are implementation-internal
-  to Temporal's topology; tokeira deliberately collapses that topology, so tests that drive them are
-  out of the public claim by construction.
-- **Legacy worker-versioning v0.x version-sets** — deliberately not implemented; rule-based worker
-  versioning is the replacement.
-- **Multi-cluster replication / failover / remote routing** beyond metadata CRUD.
-- RPCs that exist only in the newer vendored proto (`v1.62.11`) but not in server `1.31.0` (e.g. some
-  Nexus operation RPCs) — tracked separately, not part of the 1.31.0 behavioural claim.
+- **[`supported.md`](./supported.md)** — the **in-scope** surface (the *denominator*): the
+  `WorkflowService` + `OperatorService` RPCs (121 at API `v1.62.8`) by service and feature area, with
+  **Standalone Activities** and **Nexus** called out explicitly.
+- **[`excluded.md`](./excluded.md)** — the **out-of-scope** surface, with reasons: **auth** (not
+  supported), internal/admin services, multi-cluster replication, DLQ, legacy/deprecated surfaces, the
+  `v1.62.11`-only RPCs tracked ahead, and the `temporal` CLI commands that inherit those exclusions.
+- **[`command-surface.md`](./command-surface.md)** — the kernel-level state-mutating command and
+  history-event surface that realises the workflow state machine (the engine-core half of the claim).
 
 ## How the contract is established (ground truth)
 
@@ -72,9 +69,14 @@ Three complementary tiers (see `../../readiness/conformance.md` for the live sta
 
 ## Contents of this folder
 
+- [`supported.md`](./supported.md) — the **in-scope** API surface: the v1.31.0 conformance claim by
+  service and feature area, with Standalone Activities and Nexus called out. The denominator.
+- [`excluded.md`](./excluded.md) — the **out-of-scope** surface with reasons: auth, internal/admin
+  services, multi-cluster replication, DLQ, legacy/deprecated surfaces, `v1.62.11`-only RPCs, and the
+  affected `temporal` CLI commands.
 - [`command-surface.md`](./command-surface.md) — the state-mutating command set and history-event
   surface: every Temporal history-service state mutation and the tokeira command that realises it, the
-  emitted events, and the deliberate exclusions. This is the engine-core half of the definition.
+  emitted events, and the deliberate kernel-level exclusions. The engine-core half of the definition.
 
-_Further per-service definition pages (WorkflowService / OperatorService RPC behaviour, error mapping,
-visibility query surface) are added here as they are written; this README is the lead-through._
+These three pages together are the definition; this README is the lead-through. Measured progress
+against them is tracked in [`../../readiness/conformance.md`](../../readiness/conformance.md).

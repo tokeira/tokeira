@@ -1,17 +1,22 @@
-# Temporal Command Surface Compliance Check
+# Command Surface — Temporal v1.31.0 (definition)
 
-**Date:** 2026-04-02
-**Tokeira kernel version:** Features 1–11 (F10 committed, F11 implemented but not yet committed)
-**Temporal reference:** `temporal-dsql` repository (Temporal server with Aurora DSQL persistence)
-**Test count:** 221 tests (153 golden + 68 property)
+> Part of [the v1.31.0 compliance definition](./README.md). This page defines the **state-mutating
+> command and history-event surface** that full v1.31.0 command compliance comprises: every Temporal
+> history-service state mutation, the tokeira command that realises it, the history events emitted, and
+> the operations deliberately excluded (with rationale). It is **definitional** — it describes the
+> contract and the engine-core mapping, not project status. For measured progress see
+> [`../../readiness/conformance.md`](../../readiness/conformance.md).
+>
+> The mappings below are verified at the kernel level (golden + property tests). The broader RPC
+> *behaviour* (errors, defaulting, lifecycle ordering) is defined per the README's ground-truth rule:
+> the contract is whatever Temporal **v1.31.0** does, verified against `proto/upstream/` (wire) and the
+> v1.31.0 server source (behaviour).
 
-This document cross-references every state-mutating operation in Temporal's history service against the Tokeira kernel's command set to verify completeness and identify gaps.
+## Ground-truth sources
 
-## Methodology
-
-- **Temporal source of truth:** `service/history/interfaces/engine.go` (Engine interface), `service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go` (workflow command switch), `components/nexusoperations/workflow/commands.go` (Nexus command registration), `service/history/historybuilder/history_builder.go` (event factory methods), `service/history/interfaces/mutable_state.go` (MutableState interface)
-- **Tokeira source of truth:** `crates/tokeira-kernel/src/command.rs` (Command + WorkflowCommand enums), `crates/tokeira-kernel/src/event.rs` (HistoryEventKind enum), `crates/tokeira-kernel/src/kernel.rs` (BasicKernel::apply)
-- **Classification:** Each Temporal API is classified as either a kernel command (state-mutating, produces transitions), a runtime concern (no kernel involvement), or deliberately excluded with rationale.
+- **Temporal:** `service/history/interfaces/engine.go` (Engine interface), `service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go` (workflow command switch), `components/nexusoperations/workflow/commands.go` (Nexus command registration), `service/history/historybuilder/history_builder.go` (event factory), `service/history/interfaces/mutable_state.go` — all at tag `v1.31.0`.
+- **Tokeira:** `crates/tokeira-kernel/src/command.rs` (Command + WorkflowCommand), `crates/tokeira-kernel/src/event.rs` (HistoryEventKind), `crates/tokeira-kernel/src/kernel.rs` (BasicKernel::apply).
+- **Classification:** each Temporal API is a kernel command (state-mutating, produces transitions), a runtime concern (no kernel involvement), or a deliberate exclusion with rationale.
 
 ---
 

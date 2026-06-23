@@ -2,7 +2,7 @@
 
 ## Introduction
 
-This spec addresses the operational response completeness gaps identified in `docs/proto-field-audit.md` §2 — the `DescribeWorkflowExecution`, `DescribeNamespace`, `GetClusterInfo`, and `DescribeTaskQueue` responses that return hardcoded empty/zero values instead of real data. The Temporal UI and operational tooling depend on these fields for workflow inspection, namespace configuration display, and cluster health monitoring.
+This spec addresses the operational response completeness gaps identified in `../edge-complete-implementation/reference/proto-field-audit.md` §2 — the `DescribeWorkflowExecution`, `DescribeNamespace`, `GetClusterInfo`, and `DescribeTaskQueue` responses that return hardcoded empty/zero values instead of real data. The Temporal UI and operational tooling depend on these fields for workflow inspection, namespace configuration display, and cluster health monitoring.
 
 This is Feature 4 from the umbrella spec `edge-complete-implementation`. It has no dependencies on other features and is the lowest priority among the field fidelity gaps. The work divides into two categories:
 

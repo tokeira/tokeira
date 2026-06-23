@@ -8,7 +8,7 @@ Feature: Runtime Broker Tiered Delivery
 tasks through a sticky/general readiness model, and the broker module doc already flags the current
 shape as provisional: *"split this into explicit sticky/live/backlog tiers once the surrounding
 runtime grows"* (`broker.rs:61`). This is tracked as **P6 `runtime-broker-tiered-delivery`** in
-`docs/CODEX_START_HERE.md`.
+`docs/readiness/futures.md`.
 
 A live run of the OpenAI Agents SDK sandbox sample against `tokeirad` exposed a concrete, demo-blocking
 defect in the broker's **query** tier that this spec exists to fix as its first slice, alongside

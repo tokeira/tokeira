@@ -2,7 +2,7 @@
 
 ## Introduction
 
-This spec addresses the highest-priority SDK correctness gaps in the poll response and start response translation layer. The proto field audit (`docs/proto-field-audit.md`) identified four categories of missing fields that directly affect SDK behavior: `previous_started_event_id` (critical for sticky replay), the `started` field on `StartWorkflowExecutionResponse`, `WorkflowTaskScheduled` event attributes, and poll response timestamps. Without these fields, the SDK replays from the beginning of history on every workflow task, cannot distinguish new vs existing workflows, and lacks the data needed for latency computation and timeout enforcement.
+This spec addresses the highest-priority SDK correctness gaps in the poll response and start response translation layer. The proto field audit (`../edge-complete-implementation/reference/proto-field-audit.md`) identified four categories of missing fields that directly affect SDK behavior: `previous_started_event_id` (critical for sticky replay), the `started` field on `StartWorkflowExecutionResponse`, `WorkflowTaskScheduled` event attributes, and poll response timestamps. Without these fields, the SDK replays from the beginning of history on every workflow task, cannot distinguish new vs existing workflows, and lacks the data needed for latency computation and timeout enforcement.
 
 This is Feature 1 from the umbrella spec `edge-complete-implementation`. It has no dependencies on other features and is the highest priority among the field fidelity gaps.
 

@@ -2,7 +2,7 @@
 
 ## Introduction
 
-This spec addresses the loss of structured failure information as proto `Failure` objects flow through the Tokeira system. The proto field audit (`docs/proto-field-audit.md` §3) identified that every `proto_failure::Failure` construction in the history serializer uses `..Default::default()`, silently dropping `failure_info` variants, `cause` chains, `stack_trace`, `source`, and `encoded_attributes`. Without these fields, all failures appear as generic errors to the SDK — it cannot distinguish an application error from a timeout from a cancellation.
+This spec addresses the loss of structured failure information as proto `Failure` objects flow through the Tokeira system. The proto field audit (`../edge-complete-implementation/reference/proto-field-audit.md` §3) identified that every `proto_failure::Failure` construction in the history serializer uses `..Default::default()`, silently dropping `failure_info` variants, `cause` chains, `stack_trace`, `source`, and `encoded_attributes`. Without these fields, all failures appear as generic errors to the SDK — it cannot distinguish an application error from a timeout from a cancellation.
 
 This is Feature 2 from the umbrella spec `edge-complete-implementation`. It has no dependencies on other features.
 

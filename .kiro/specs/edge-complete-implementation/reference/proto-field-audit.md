@@ -1,5 +1,12 @@
 # Proto Field Propagation Audit
 
+> **Historical reference for the `edge-complete-implementation` spec family.** This is the original
+> audit the `edge-*` specs were derived from. It is a point-in-time snapshot and is **not kept current**
+> — for the live picture of unsupported fields see `crates/tokeira-edge/UNSUPPORTED_FIELDS.md`, and for
+> RPC-level status see [`../../api-conformance-tracker/reference/temporal_api_audit.md`](../../api-conformance-tracker/reference/temporal_api_audit.md)
+> and [`docs/readiness/conformance.md`](../../../../docs/readiness/conformance.md). Retained for the
+> provenance the edge specs cite.
+
 Comprehensive audit of the `tokeira-edge` and `tokeira-proto` crates for
 unimplemented handlers, silently dropped fields, and incomplete proto
 translation.

@@ -6,8 +6,9 @@
 //! message that SDKs expect. Many proto attribute structs use
 //! `..Default::default()` because the kernel does not yet carry the full set
 //! of upstream fields (e.g. chained `Failure.cause`, `stack_trace`,
-//! `failure_info` variants). See `docs/proto-field-audit.md` §3 for the
-//! complete gap inventory.
+//! `failure_info` variants). See
+//! `.kiro/specs/edge-complete-implementation/reference/proto-field-audit.md` §3
+//! for the complete gap inventory.
 
 // History attribute structs carry fields Temporal has deprecated but still ships on
 // the wire (e.g. `*EventAttributes::control`, `ContinuedAsNew::failure`); mirroring

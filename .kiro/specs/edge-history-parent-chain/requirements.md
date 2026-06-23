@@ -2,7 +2,7 @@
 
 ## Introduction
 
-This document captures the requirements for completing the history event field gaps identified in `docs/proto-field-audit.md` §3 that affect replay correctness and execution chain tracing. The kernel already carries parent metadata (`parent_run_key`, `parent_workflow_id`, `first_execution_run_id`) and execution chain fields (`continued_execution_run_id`) on `StartRequest` and `WorkflowState`, but these are not threaded into the `WorkflowExecutionStarted` event or serialized to proto. Similarly, `WorkflowExecutionContinuedAsNew` drops several fields the serializer has access to, and the `control` field on signal-external and cancel-external events is absent.
+This document captures the requirements for completing the history event field gaps identified in `../edge-complete-implementation/reference/proto-field-audit.md` §3 that affect replay correctness and execution chain tracing. The kernel already carries parent metadata (`parent_run_key`, `parent_workflow_id`, `first_execution_run_id`) and execution chain fields (`continued_execution_run_id`) on `StartRequest` and `WorkflowState`, but these are not threaded into the `WorkflowExecutionStarted` event or serialized to proto. Similarly, `WorkflowExecutionContinuedAsNew` drops several fields the serializer has access to, and the `control` field on signal-external and cancel-external events is absent.
 
 This is Feature 3 from the umbrella spec `edge-complete-implementation`. It depends on Feature 1 (poll response fidelity) for the `WorkflowTaskScheduled` attribute overlap, and on Feature 2 (failure objects) for the opaque `Payload` failure representation used by `continued_failure`.
 

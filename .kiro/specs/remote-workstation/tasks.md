@@ -305,7 +305,7 @@ Target crates and files:
   - `cargo +nightly fmt --all --check`, `cargo lint`, `cargo check --workspace`, `cargo test --workspace` all green.
   - `cargo test --package tokeira-aws --test remote_workstation_idempotence` (and siblings) green.
   - Live-AWS acceptance test from task 9 passes: `tkr workstation up && tkr workstation remote-exec "cargo build --workspace" && tkr workstation stop` produces a successful build with no infra orphans after stop.
-  - Update `docs/CODEX_START_HERE.md` if present to mention the new workstation surface.
+  - Update `docs/readiness/futures.md` if present to mention the new workstation surface.
 
 - [ ] 13. Feature 10 — GitHub credential policy tests
   - [x]* 13.1 Secret scanner coverage

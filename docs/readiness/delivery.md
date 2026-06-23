@@ -20,6 +20,9 @@ have different owners, cadences, and definitions of done:
 | 4 | **Odori** — agentic coding workflow on the tokeira spine | [`odori.md`](./odori.md) | Nexus dependency chain verified; 2.4 build in progress. |
 | 5 | **tokeira.io** — public site (Cloudflare Worker) | [`tokeira-io.md`](./tokeira-io.md) | Owner input needed (Claude Code + Design). |
 
+Forward-looking work (outstanding feature backlog, deferred items, and prospective features under
+evaluation) is held in [`futures.md`](./futures.md), pending triage.
+
 ## 1. Conformance (Temporal v1.31.0)
 
 tokeira claims behavioural compatibility with **Temporal server v1.31.0** (`TEMPORAL_SERVER_COMPAT`),

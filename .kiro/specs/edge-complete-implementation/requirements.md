@@ -2,7 +2,7 @@
 
 ## Introduction
 
-This document captures the full requirements for completing the `tokeira-edge` translation layer — both proto field fidelity and unimplemented gRPC handler categories. An audit (`docs/proto-field-audit.md`) identified ~100+ proto fields silently dropped via `..Default::default()`, 40+ `unwrap_or_default()` calls, incomplete history serialization, and 44 unimplemented gRPC handlers across major feature categories.
+This document captures the full requirements for completing the `tokeira-edge` translation layer — both proto field fidelity and unimplemented gRPC handler categories. An audit (`reference/proto-field-audit.md`) identified ~100+ proto fields silently dropped via `..Default::default()`, 40+ `unwrap_or_default()` calls, incomplete history serialization, and 44 unimplemented gRPC handlers across major feature categories.
 
 The initial `edge-proto-audit` spec addressed the first wave: command translation, activity data threading, history serializer basics, and long-poll for `GetWorkflowExecutionHistory`. This umbrella spec covers the **remaining gaps** — everything the audit identified that was not resolved by `edge-proto-audit`, plus the unimplemented handler categories that represent major feature areas.
 
@@ -35,7 +35,7 @@ The actual design and tasks for each feature will live in child specs:
 
 ## Audit Gap Traceability
 
-The table below maps every gap identified in `docs/proto-field-audit.md` to the feature that addresses it. Items already resolved by the `edge-proto-audit` spec are marked as such.
+The table below maps every gap identified in `reference/proto-field-audit.md` to the feature that addresses it. Items already resolved by the `edge-proto-audit` spec are marked as such.
 
 ### §1 — Unimplemented gRPC Handlers (44)
 
@@ -169,7 +169,7 @@ The table below maps every gap identified in `docs/proto-field-audit.md` to the 
 - **Poll_Response**: The proto `PollWorkflowTaskQueueResponse` or `PollActivityTaskQueueResponse` returned to SDK workers when they poll for tasks.
 - **Failure_Object**: The proto `temporal.api.failure.v1.Failure` message, which carries structured failure information including `failure_info` variants (ApplicationFailureInfo, TimeoutFailureInfo, CanceledFailureInfo, etc.), `cause` chains, `stack_trace`, and `encoded_attributes`.
 - **Upstream_Proto**: The Temporal API protobuf definitions at version 1.43.0.
-- **Proto_Field_Audit**: The comprehensive audit document at `docs/proto-field-audit.md` identifying all dropped, hardcoded, and missing proto fields.
+- **Proto_Field_Audit**: The comprehensive audit document at `reference/proto-field-audit.md` identifying all dropped, hardcoded, and missing proto fields.
 - **Describe_Response**: The proto `DescribeWorkflowExecutionResponse` returned by the `DescribeWorkflowExecution` gRPC endpoint.
 - **Pending_Info**: The proto `PendingActivityInfo`, `PendingChildExecutionInfo`, and `PendingWorkflowTaskInfo` sub-messages within `DescribeWorkflowExecutionResponse`.
 - **Worker_Versioning**: The Temporal feature allowing workers to register with version/deployment metadata, enabling task routing to compatible workers. Exposed via 6 gRPC handlers (`update_worker_build_id_compatibility`, `get_worker_build_id_compatibility`, `update_worker_versioning_rules`, `get_worker_versioning_rules`, `get_worker_task_reachability`, `shutdown_worker`).

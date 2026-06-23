@@ -1,11 +1,16 @@
 # Requirements Document
 
-> **Status (2026-06-22):** requirements drafted; **design.md and tasks.md not yet written.** This spec
+> **Status (2026-06-22):** requirements + design + **tasks complete** — spec ready to execute. This spec
 > captures the C4b "async Nexus completion-callback delivery" gap identified while driving
-> `TestNexusWorkflowTestSuite` — the started operation's result is never delivered back to the caller
-> because the runtime's `DispatchCompletionCallback` is a no-op stub (`crates/tokeira-runtime/src/publisher.rs`).
-> Tracked in `temporal-functional-conformance/reference/FINDINGS.md` (C4b). Approach approved (Option A,
-> complete/conformant — not a shortcut); awaiting design.
+> `TestNexusWorkflowTestSuite` and confirmed load-bearing for Odori 2.4 (the durable
+> `WorkflowRunOperation`/`AgentWorkflow` path) — the started operation's result is never delivered back
+> to the caller because the runtime's `DispatchCompletionCallback` is a no-op stub
+> (`crates/tokeira-runtime/src/publisher.rs`). Tracked in
+> `temporal-functional-conformance/reference/FINDINGS.md` (C4b). Approach approved (Option A,
+> complete/conformant). **Decisions resolved (2026-06-22):** the token is versioned/opaque +
+> version-checked, **not signed** — matching v1.31.0 (integrity via op-fencing, not a signature); the
+> real inbound `POST /nexus/callback` HTTP server **is in scope** (only cross-cluster routing of the
+> POST defers to `nexus-multi-cluster`). design.md updated accordingly.
 
 ## Introduction
 

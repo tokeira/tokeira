@@ -32,6 +32,15 @@ Headline: the core public API surface, admission validation, visibility, worker-
 Nexus endpoint admin + synchronous task transport are in place; versioning suites, much of Nexus
 operation execution, and a panic-truncated set of tests remain unmeasured. See `conformance.md`.
 
+### Research efforts ahead of delivery
+
+- **Task Queue Priority & Fairness.** Temporal v1.31.0 makes task-queue priority and fairness GA — a new
+  matcher component enabled by default, priority keys respected by default, and per-queue/namespace/
+  cluster fairness via `matching.enableFairness`. We need to understand what this means for the tokeira
+  architecture (the runtime broker / lane model and how priority and fairness map onto it) before
+  deciding how it enters the conformance surface. Tracked here as a pre-delivery research effort, not yet
+  a decision in [`../conformance/v1.31.0/decisions.md`](../conformance/v1.31.0/decisions.md).
+
 ## 2. Release / Infrastructure
 
 The release-process direction (build provenance, proto-version monotonicity, the compatibility-claim

@@ -11,38 +11,41 @@
 
 ## Should be implemented (in the v1.31.0 surface)
 
-These RPCs are GA or Public-Preview in v1.31.0 yet answer `UNIMPLEMENTED` today.
+These RPCs are GA or Public-Preview in v1.31.0 yet answer `UNIMPLEMENTED` today. **Spec implemented** is
+read from the owning spec's `tasks.md` (checkbox state at this commit): _No spec_ = no `tasks.md` /
+placeholder only; _No (n/N)_ = `tasks.md` exists, n of N tasks checked.
 
-| RPC | Service | How it stubs | Owning spec |
-|-----|---------|--------------|-------------|
-| `ExecuteMultiOperation` | Workflow | `unimplemented` | `api-conformance-multi-operation` |
-| `UpdateWorkflowExecutionOptions` | Workflow | `unimplemented` | `api-conformance-workflow-options` |
-| `ListTaskQueuePartitions` | Workflow | `unimplemented` | `api-conformance-task-queue` |
-| `DeprecateNamespace` | Workflow | `unimplemented` | `api-conformance-namespace-full` |
-| `DeleteNamespace` | Operator | `unimplemented` | `api-conformance-namespace-full` |
-| `RemoveSearchAttributes` | Operator | `unimplemented` | (search attributes) |
-| `AddOrUpdateRemoteCluster` | Operator | `unimplemented` | `api-conformance-remote-cluster` (registry only) |
-| `RemoveRemoteCluster` | Operator | `unimplemented` | `api-conformance-remote-cluster` (registry only) |
-| `ListClusters` | Operator | `unimplemented` | `api-conformance-remote-cluster` (registry only) |
-| `DescribeWorker` | Workflow | `deferred_unary!` | `worker-config` |
-| `ListWorkers` | Workflow | `deferred_unary!` | `worker-config` |
-| `FetchWorkerConfig` | Workflow | `deferred_unary!` | `worker-config-management` |
-| `UpdateWorkerConfig` | Workflow | `deferred_unary!` | `worker-config-management` |
-| `CreateWorkflowRule` | Workflow | `deferred_unary!` | `workflow-rules` |
-| `DescribeWorkflowRule` | Workflow | `deferred_unary!` | `workflow-rules` |
-| `DeleteWorkflowRule` | Workflow | `deferred_unary!` | `workflow-rules` |
-| `ListWorkflowRules` | Workflow | `deferred_unary!` | `workflow-rules` |
-| `TriggerWorkflowRule` | Workflow | `deferred_unary!` | `workflow-rules` |
+| RPC | Service | How it stubs | Owning spec | Spec implemented |
+|-----|---------|--------------|-------------|------------------|
+| `ExecuteMultiOperation` | Workflow | `unimplemented` | `api-conformance-multi-operation` | No (0/15) |
+| `UpdateWorkflowExecutionOptions` | Workflow | `unimplemented` | `api-conformance-workflow-options` | No (0/16) |
+| `ListTaskQueuePartitions` | Workflow | `unimplemented` | `api-conformance-task-queue` | No (0/11) |
+| `DeprecateNamespace` | Workflow | `unimplemented` | `api-conformance-namespace-full` | No (0/15) |
+| `DeleteNamespace` | Operator | `unimplemented` | `api-conformance-namespace-full` | No (0/15) |
+| `RemoveSearchAttributes` | Operator | `unimplemented` | — (no spec) | No spec |
+| `AddOrUpdateRemoteCluster` | Operator | `unimplemented` | `api-conformance-remote-cluster` (registry only) | No (0/14) |
+| `RemoveRemoteCluster` | Operator | `unimplemented` | `api-conformance-remote-cluster` (registry only) | No (0/14) |
+| `ListClusters` | Operator | `unimplemented` | `api-conformance-remote-cluster` (registry only) | No (0/14) |
+| `DescribeWorker` | Workflow | `deferred_unary!` | `worker-config-management` | No spec (placeholder) |
+| `ListWorkers` | Workflow | `deferred_unary!` | `worker-config-management` | No spec (placeholder) |
+| `FetchWorkerConfig` | Workflow | `deferred_unary!` | `worker-config-management` | No spec (placeholder) |
+| `UpdateWorkerConfig` | Workflow | `deferred_unary!` | `worker-config-management` | No spec (placeholder) |
+| `CreateWorkflowRule` | Workflow | `deferred_unary!` | `workflow-rules` | No spec (placeholder) |
+| `DescribeWorkflowRule` | Workflow | `deferred_unary!` | `workflow-rules` | No spec (placeholder) |
+| `DeleteWorkflowRule` | Workflow | `deferred_unary!` | `workflow-rules` | No spec (placeholder) |
+| `ListWorkflowRules` | Workflow | `deferred_unary!` | `workflow-rules` | No spec (placeholder) |
+| `TriggerWorkflowRule` | Workflow | `deferred_unary!` | `workflow-rules` | No spec (placeholder) |
 
 ### Standalone Activities — implemented but gated off by default
 
 The 8 standalone-activity RPCs are bridged through the CHASM `ActivityBridge`, but the bridge is **off
 by default** (`enable_standalone_activities = false`); when absent they answer `UNIMPLEMENTED`. So at
 default config they read as unimplemented, even though the substrate exists. Public Preview in v1.31.0.
+**Spec implemented: Partial** — `activity-executions-first-class` `tasks.md` shows 15/19 tasks checked.
 
 `StartActivityExecution`, `DescribeActivityExecution`, `PollActivityExecution`, `ListActivityExecutions`,
 `CountActivityExecutions`, `RequestCancelActivityExecution`, `TerminateActivityExecution`,
-`DeleteActivityExecution` — spec `activity-executions-first-class`.
+`DeleteActivityExecution`.
 
 ## Intentional — not gaps against the v1.31.0 surface
 

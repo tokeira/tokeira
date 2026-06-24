@@ -87,6 +87,8 @@ use crate::translate::{
     DescribeTaskQueueResponse as EdgeDescribeTaskQueueResponse, DescribeWorkflowExecutionRequest,
     Link as EdgeLink, LinkWorkflowEventReference, ListActivityExecutionsRequest,
     ListActivityExecutionsResponse, ListNamespacesResponse as EdgeListNamespacesResponse,
+    ListTaskQueuePartitionsRequest as EdgeListTaskQueuePartitionsRequest,
+    ListTaskQueuePartitionsResponse as EdgeListTaskQueuePartitionsResponse,
     ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, NamespaceDescription,
     NamespaceStateUpdate, OnConflictOptions as EdgeOnConflictOptions, PollWorkflowTaskQueueRequest,
     PollWorkflowTaskQueueResponse, Priority as EdgePriority, ProtocolMessageDto, QueryResultDto,
@@ -98,6 +100,7 @@ use crate::translate::{
     SignalWithStartWorkflowExecutionResponse as EdgeSignalWithStartWorkflowExecutionResponse,
     SignalWorkflowExecutionRequest, SignalWorkflowExecutionResponse, StartWorkflowExecutionRequest,
     StartWorkflowExecutionResponse, SystemInfo, TaskQueueConfig,
+    TaskQueuePartition as EdgeTaskQueuePartition,
     UpdateNamespaceRequest as EdgeUpdateNamespaceRequest, UserMetadata, VersioningOverride,
     WorkflowExecutionDescription, WorkflowExecutionSummary, to_internal::namespace_id_for,
 };
@@ -3325,6 +3328,67 @@ pub fn describe_task_queue_request_to_edge(
     })
 }
 
+/// Validate a `ListTaskQueuePartitions` request before any runtime lookup
+/// (api-conformance-task-queue Property 3): the namespace and task queue must be
+/// present and the task-queue kind must be a recognized enum. All failures surface as
+/// `INVALID_ARGUMENT` (via [`proto_conversion_status`]).
+pub fn list_task_queue_partitions_request_to_edge(
+    req: workflowservice::ListTaskQueuePartitionsRequest,
+) -> Result<EdgeListTaskQueuePartitionsRequest, ProtoConversionError> {
+    if req.namespace.trim().is_empty() {
+        return Err(ProtoConversionError::MissingField(
+            "ListTaskQueuePartitionsRequest.namespace",
+        ));
+    }
+    let task_queue = req.task_queue.ok_or(ProtoConversionError::MissingField(
+        "ListTaskQueuePartitionsRequest.task_queue",
+    ))?;
+    if task_queue.name.trim().is_empty() {
+        return Err(ProtoConversionError::MissingField(
+            "ListTaskQueuePartitionsRequest.task_queue.name",
+        ));
+    }
+    // Reject an unrecognized task-queue kind enum (Requirement 3.4). UNSPECIFIED /
+    // NORMAL / STICKY (and WORKER_COMMANDS) all decode; any other wire value is rejected.
+    if enums::TaskQueueKind::try_from(task_queue.kind).is_err() {
+        return Err(ProtoConversionError::InvalidArgument(format!(
+            "unrecognized task queue kind: {}",
+            task_queue.kind
+        )));
+    }
+    Ok(EdgeListTaskQueuePartitionsRequest {
+        namespace: req.namespace,
+        task_queue: task_queue.name,
+    })
+}
+
+/// Project the edge partition topology onto the wire `ListTaskQueuePartitionsResponse`.
+pub fn list_task_queue_partitions_response_to_proto(
+    resp: EdgeListTaskQueuePartitionsResponse,
+) -> workflowservice::ListTaskQueuePartitionsResponse {
+    workflowservice::ListTaskQueuePartitionsResponse {
+        activity_task_queue_partitions: resp
+            .activity_partitions
+            .into_iter()
+            .map(task_queue_partition_to_proto)
+            .collect(),
+        workflow_task_queue_partitions: resp
+            .workflow_partitions
+            .into_iter()
+            .map(task_queue_partition_to_proto)
+            .collect(),
+    }
+}
+
+fn task_queue_partition_to_proto(
+    partition: EdgeTaskQueuePartition,
+) -> taskqueue_proto::TaskQueuePartitionMetadata {
+    taskqueue_proto::TaskQueuePartitionMetadata {
+        key: partition.key,
+        owner_host_name: partition.owner_host_name,
+    }
+}
+
 // v1.62-sync: writes deprecated `PollerInfo.worker_version_capabilities` and
 // `DescribeTaskQueueResponse.task_queue_status` for wire-compat with v0.4-era
 // SDK readers. v1.62 replaces the former with `deployment_options` and the
@@ -5303,6 +5367,49 @@ mod tests {
         for (kernel, proto) in cases {
             assert_eq!(kernel_callback_state_to_proto(&kernel), proto);
         }
+    }
+
+    /// api-conformance-task-queue Property 3: `ListTaskQueuePartitions` validates the
+    /// namespace, task queue, and kind enum before any runtime lookup; all failures are
+    /// `INVALID_ARGUMENT` (the conversion error → [`proto_conversion_status`]).
+    #[test]
+    fn list_task_queue_partitions_validates_before_lookup() {
+        fn req(
+            namespace: &str,
+            task_queue: Option<(&str, i32)>,
+        ) -> workflowservice::ListTaskQueuePartitionsRequest {
+            workflowservice::ListTaskQueuePartitionsRequest {
+                namespace: namespace.to_string(),
+                task_queue: task_queue.map(|(name, kind)| taskqueue_proto::TaskQueue {
+                    name: name.to_string(),
+                    kind,
+                    ..Default::default()
+                }),
+            }
+        }
+
+        let normal = enums::TaskQueueKind::Normal as i32;
+        // Empty namespace, absent task queue, empty name, and an unrecognized kind all reject.
+        assert!(list_task_queue_partitions_request_to_edge(req("", Some(("q", normal)))).is_err());
+        assert!(list_task_queue_partitions_request_to_edge(req("ns", None)).is_err());
+        assert!(list_task_queue_partitions_request_to_edge(req("ns", Some(("", normal)))).is_err());
+        assert!(
+            list_task_queue_partitions_request_to_edge(req("ns", Some(("q", 9_999)))).is_err(),
+            "an unrecognized task-queue kind enum is rejected"
+        );
+
+        // NORMAL and STICKY are both accepted; the queue name is carried through.
+        let ok = list_task_queue_partitions_request_to_edge(req("ns", Some(("q", normal))))
+            .expect("a valid request converts");
+        assert_eq!(ok.namespace, "ns");
+        assert_eq!(ok.task_queue, "q");
+        assert!(
+            list_task_queue_partitions_request_to_edge(req(
+                "ns",
+                Some(("q", enums::TaskQueueKind::Sticky as i32))
+            ))
+            .is_ok()
+        );
     }
 
     #[test]

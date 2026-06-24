@@ -10,7 +10,7 @@
 > `crates/tokeira-edge/src/grpc/{workflow_service,operator_service}.rs`.
 > **Regenerate:** grep those two files for `unimplemented` and `deferred_unary!`, then drop any RPC that
 > `excluded.md`/`decisions.md` classifies as out-of-surface.
-> **As of:** commit `69e27645` · 2026-06-23.
+> **As of:** regenerated on top of commit `bf82d76e` · 2026-06-24.
 
 ## Work to be done
 
@@ -22,7 +22,6 @@ only; _No (n/N)_ = `tasks.md` exists, n of N tasks checked.
 |-----|---------|--------------|-------------|------------------|
 | `ExecuteMultiOperation` | Workflow | `unimplemented` | `api-conformance-multi-operation` | No (0/15) |
 | `UpdateWorkflowExecutionOptions` | Workflow | `unimplemented` | `api-conformance-workflow-options` | No (0/16) |
-| `ListTaskQueuePartitions` | Workflow | `unimplemented` | `api-conformance-task-queue` | No (0/11) |
 | `DeprecateNamespace` | Workflow | `unimplemented` | `api-conformance-namespace-full` | No (0/15) |
 | `DeleteNamespace` | Operator | `unimplemented` | `api-conformance-namespace-full` | No (0/15) |
 | `RemoveSearchAttributes` | Operator | `unimplemented` | — (no spec) | No spec |
@@ -66,7 +65,6 @@ This list is **minimal and complete** when:
 |-------|---------------------------|
 | `ExecuteMultiOperation` | Workflow lifecycle |
 | `UpdateWorkflowExecutionOptions` | Workflow options |
-| `ListTaskQueuePartitions` | Task queues |
 | `DeprecateNamespace`, `DeleteNamespace` | Namespaces |
 | `RemoveSearchAttributes` | Search attributes (operator) |
 | `AddOrUpdateRemoteCluster`, `RemoveRemoteCluster`, `ListClusters` | Remote-cluster registry |

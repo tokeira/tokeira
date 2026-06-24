@@ -1689,9 +1689,18 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     }
     async fn list_task_queue_partitions(
         &self,
-        _request: Request<workflowservice::ListTaskQueuePartitionsRequest>,
+        request: Request<workflowservice::ListTaskQueuePartitionsRequest>,
     ) -> Result<Response<workflowservice::ListTaskQueuePartitionsResponse>, Status> {
-        Err(Status::unimplemented("list_task_queue_partitions"))
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::list_task_queue_partitions_request_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        let edge_resp = self
+            .inner
+            .list_task_queue_partitions(&headers, edge_req)
+            .await?;
+        Ok(Response::new(
+            translate::list_task_queue_partitions_response_to_proto(edge_resp),
+        ))
     }
     async fn create_schedule(
         &self,
@@ -3875,6 +3884,36 @@ mod tests {
                 Arc::new(tokeira_runtime::BatchOperationStore::default()),
             );
         WorkflowServiceGrpc::new(service)
+    }
+
+    /// api-conformance-task-queue Property 1 (Single-Partition Compatibility): with
+    /// tokeira's single-partition model, `ListTaskQueuePartitions` returns exactly one
+    /// root partition per task type, keyed by the bare task-queue name — no invented
+    /// extra partitions.
+    #[tokio::test]
+    async fn list_task_queue_partitions_returns_one_root_partition_per_type() {
+        let grpc = worker_deployment_test_service();
+        let resp = grpc
+            .list_task_queue_partitions(Request::new(
+                workflowservice::ListTaskQueuePartitionsRequest {
+                    namespace: "default".to_string(),
+                    task_queue: Some(
+                        tokeira_proto::public::temporal::api::taskqueue::v1::TaskQueue {
+                            name: "queue".to_string(),
+                            kind: tokeira_proto::enums::TaskQueueKind::Normal as i32,
+                            ..Default::default()
+                        },
+                    ),
+                },
+            ))
+            .await
+            .expect("list partitions should succeed")
+            .into_inner();
+
+        assert_eq!(resp.activity_task_queue_partitions.len(), 1);
+        assert_eq!(resp.workflow_task_queue_partitions.len(), 1);
+        assert_eq!(resp.activity_task_queue_partitions[0].key, "queue");
+        assert_eq!(resp.workflow_task_queue_partitions[0].key, "queue");
     }
 
     #[test]

@@ -853,6 +853,29 @@ pub struct DescribeTaskQueueRequest {
     pub include_status: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListTaskQueuePartitionsRequest {
+    pub namespace: String,
+    pub task_queue: String,
+}
+
+/// One task-queue partition's metadata, mirroring `TaskQueuePartitionMetadata @
+/// v1.31.0`: `key` is the partition's RPC name and `owner_host_name` the matching
+/// host that owns it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskQueuePartition {
+    pub key: String,
+    pub owner_host_name: String,
+}
+
+/// Partition topology of a task queue, split by task type. tokeira runs a single
+/// (root) partition per type, so each list holds exactly one entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListTaskQueuePartitionsResponse {
+    pub activity_partitions: Vec<TaskQueuePartition>,
+    pub workflow_partitions: Vec<TaskQueuePartition>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PollerInfo {
     pub identity: String,

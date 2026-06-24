@@ -75,6 +75,7 @@ use crate::{
         DeleteWorkflowExecutionRequest, DescribeTaskQueueRequest, DescribeTaskQueueResponse,
         DescribeWorkflowExecutionRequest, ListActivityExecutionsRequest,
         ListActivityExecutionsResponse, ListNamespacesResponse as EdgeListNamespacesResponse,
+        ListTaskQueuePartitionsRequest, ListTaskQueuePartitionsResponse,
         ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, NamespaceCapabilities,
         NamespaceDescription, NamespaceStateUpdate, PauseWorkflowExecutionRequest,
         PauseWorkflowExecutionResponse, PollActivityTaskQueueRequest,
@@ -95,7 +96,7 @@ use crate::{
         SignalWithStartWorkflowExecutionResponse, SignalWorkflowExecutionRequest,
         SignalWorkflowExecutionResponse, StartWorkflowExecutionRequest,
         StartWorkflowExecutionResponse, SystemCapabilities, SystemInfo, TaskQueueConfig,
-        TerminateWorkflowExecutionRequest, TerminateWorkflowExecutionResponse,
+        TaskQueuePartition, TerminateWorkflowExecutionRequest, TerminateWorkflowExecutionResponse,
         UnpauseWorkflowExecutionRequest, UnpauseWorkflowExecutionResponse,
         UpdateActivityOptionsRequest, UpdateActivityOptionsResponse, UpdateNamespaceRequest,
         UpdateWorkflowExecutionRequest, UpdateWorkflowExecutionResponse,
@@ -3336,6 +3337,51 @@ impl WorkflowService {
                     backlog_count_hint: req.include_status.then_some(0),
                     config,
                     versioning_info,
+                })
+            },
+        )
+        .await
+    }
+
+    /// List the partition topology of a task queue.
+    ///
+    /// tokeira runs a single (root) partition per task queue per task type. v1.31.0's
+    /// matching engine returns one `TaskQueuePartitionMetadata` per partition for the
+    /// activity and workflow types (`matching_engine.go:1609 @ v1.31.0`); with a single
+    /// partition the root key is the bare task-queue name (no `/_sys/<name>/<n>` suffix,
+    /// which v1.31.0 only adds for partitions 1..N). `owner_host_name` is left empty: the
+    /// edge plane has no matching-host membership to attribute, and the field is purely
+    /// diagnostic — SDKs discover topology from `key`. Validation (namespace / task-queue
+    /// presence, recognized kind) runs at the gRPC translation boundary before this call.
+    pub async fn list_task_queue_partitions(
+        &self,
+        headers: &HeaderMap,
+        req: ListTaskQueuePartitionsRequest,
+    ) -> EdgeResult<ListTaskQueuePartitionsResponse> {
+        let namespace_label = req.namespace.clone();
+        self.observe_edge_call(
+            headers,
+            "list_task_queue_partitions",
+            Some(namespace_label.as_str()),
+            None,
+            async move {
+                let _ctx = self
+                    .interceptors
+                    .begin(
+                        headers,
+                        Some(&req.namespace),
+                        Action::ListTaskQueuePartitions,
+                        false,
+                    )
+                    .await?;
+
+                let root = TaskQueuePartition {
+                    key: req.task_queue,
+                    owner_host_name: String::new(),
+                };
+                Ok(ListTaskQueuePartitionsResponse {
+                    activity_partitions: vec![root.clone()],
+                    workflow_partitions: vec![root],
                 })
             },
         )

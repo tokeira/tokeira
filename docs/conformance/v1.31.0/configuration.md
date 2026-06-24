@@ -812,3 +812,6 @@ internal tuning tokeira auto-tunes or collapses) — is the follow-on. The expec
 close-to-zero-config thesis, is that the overwhelming majority is config-as-constant or irrelevant, and
 only a small set (e.g. retention bounds, size/count limits that drive admission validation, the Nexus
 callback reachability address) is genuine must-support deployment policy.
+
+tokeira's own configuration surface (the "after") and its release readiness are tracked in
+[`../../readiness/configuration.md`](../../readiness/configuration.md).

@@ -25,6 +25,9 @@ have different owners, cadences, and definitions of done:
 Forward-looking work (outstanding feature backlog, deferred items, and prospective features under
 evaluation) is held in [`futures.md`](./futures.md), pending triage.
 
+Configuration readiness — tokeira's own config surface and the close-to-zero-config claim — is tracked in
+[`configuration.md`](./configuration.md).
+
 ## 1. Conformance (Temporal v1.31.0)
 
 tokeira claims behavioural compatibility with **Temporal server v1.31.0** (`TEMPORAL_SERVER_COMPAT`),

@@ -57,7 +57,12 @@ use crate::{
 /// (v1.31.0 returns an internal error) and is forwarded as its own variant so the
 /// runtime can fail the operation rather than hang the caller. A non-terminal event
 /// yields `None` (the callback is not dispatched).
-fn callback_completion_outcome(kind: &HistoryEventKind) -> Option<CallbackCompletionOutcome> {
+///
+/// Public so the runtime's completion-callback retry scanner re-derives a re-fired
+/// callback's outcome from the *same* terminal event (read back from history) and the
+/// *same* function the close path used — keeping a retry byte-identical to the first
+/// attempt (incl. canceled details) without duplicating this mapping or persisting it.
+pub fn callback_completion_outcome(kind: &HistoryEventKind) -> Option<CallbackCompletionOutcome> {
     match kind {
         HistoryEventKind::WorkflowExecutionCompleted { result, .. } => {
             Some(CallbackCompletionOutcome::Success {

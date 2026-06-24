@@ -164,13 +164,17 @@ is hand-rolled on `hyper` (no new dependency); the lockfile is bumped to `hyper 
       bounded by `max_per_scan`; rebuild on shard takeover. Wire scanner config + lifecycle into
       `TokeiraRuntime`.
     - Landed: `CompletionCallbackTrackingState` + `scan_completion_callbacks_once` +
-      `run_completion_callback_scanner` (mirror the Nexus-timeout scanner), `outcome_for_closed_run`
-      re-derives the outcome from `WorkflowState`. **Recovery hardening (Wave-4 review B1):** the scanner
-      fires both `Scheduled` (first delivery lost to a crash) and `BackingOff` (past `next_attempt_at`)
-      callbacks, and the shard-takeover rebuild query
+      `run_completion_callback_scanner` (mirror the Nexus-timeout scanner). On re-fire the scanner reads
+      the run's **terminal history event** and derives the outcome with the kernel's own (now `pub`)
+      `callback_completion_outcome` — the exact event + fn the first attempt used — so a retry is identical
+      to the first attempt (incl. canceled details; this is the M2 fix, no `WorkflowState` field needed).
+      **Recovery hardening (review B1):** the scanner fires both `Scheduled` (first delivery lost to a
+      crash) and `BackingOff` (past `next_attempt_at`); the shard-takeover rebuild query
       (`list_runs_with_pending_completion_callbacks_for_shard`, **real DSQL** + InMemory + `sweep_shard` +
-      clear-on-shard-loss) surfaces both — mirroring v1.31.0 `RegenerateTasks`. Scanner lifecycle +
-      shutdown wired into `TokeiraRuntime`.
+      clear-on-shard-loss) surfaces both — mirroring v1.31.0 `RegenerateTasks`. Backoff
+      (`nexus_completion_backoff`) applies a deterministic per-callback jitter in `[0.8,1.0)` (review N2;
+      same anti-synchronized-storm goal as v1.31.0 `addJitter`, dependency-free + deterministic) and a hard
+      positive floor (review N1). Scanner lifecycle + shutdown wired into `TokeiraRuntime`.
     - _Requirements: 2.4, 2.5_
   - [x] 4.4 Property test P1 — outbound StartOperation carries a decodable, version-checked token
     - Landed: P1 folded into `property_dispatch_to_broker_field_preservation` — every Worker dispatch
@@ -188,8 +192,14 @@ is hand-rolled on `hyper` (no new dependency); the lockfile is bumped to `hyper 
       (true P3 idempotency via the kernel fence + P6 cross-namespace over the wire) lands with the inbound
       endpoint in Wave 5 and the Wave 7 integration test; the resolution leg itself is already covered by
       `cross_namespace_async_nexus_completes_back_to_originator`.
-    - Verified by a 3-reviewer adversarial workflow vs v1.31.0: fixed the `Scheduled`-recovery hole (B1)
-      and the timed-out failure shape (M1); cancel-details-on-retry (M2) deferred with a follow-up.
+    - Verified by a 3-reviewer adversarial workflow vs v1.31.0. All findings dispositioned: fixed B1
+      (`Scheduled`-recovery hole), M1 (timed-out failure shape), N3 (Failed-fallback mislabel — now moot:
+      the scanner reads the terminal event), N5 (added the max-attempts + non-retryable tests), M2
+      (cancel-details-on-retry — fixed via the terminal-event re-derivation), N1 (backoff positive floor),
+      and N2 (deterministic jitter). N4 (the `"kernel rejected"` string match) is a pre-existing
+      codebase-wide convention (~10 sites + a pinning test at `lane.rs:3184`, single producer at
+      `lane.rs:1078`); the completion scanner stays consistent with it, and the typed-`Reject` cleanup is
+      tracked as a separate cross-cutting follow-up rather than scoped into this feature.
     - _Feature: nexus-async-completion, Property 3, Property 6_
     - _Requirements: 4.1, 5.1, 5.3, 7.1_
 

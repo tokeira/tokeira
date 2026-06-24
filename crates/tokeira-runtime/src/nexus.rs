@@ -1078,16 +1078,49 @@ impl Default for NexusCompletionDeps {
 }
 
 /// Next backoff delay for a completion-callback retry: `initial * coefficient^(attempt-1)`,
-/// capped at `max_interval`. `attempt` is the 1-based number of the attempt that just
-/// failed (so the first failure backs off by `initial`). The kernel performs no backoff
-/// math (`command.rs` `CallbackAttemptOutcome` doc); the runtime computes this and passes
-/// `next_attempt_at` into `CompletionCallbackAttempted`.
-pub fn nexus_completion_backoff(config: &NexusCompletionRuntimeConfig, attempt: u32) -> Duration {
+/// capped at `max_interval`, then jittered. `attempt` is the 1-based number of the attempt
+/// that just failed (so the first failure backs off by ~`initial`). `jitter_seed` is a
+/// per-callback value (derived from the run key + callback index) that de-correlates
+/// different callbacks' retries. The kernel performs no backoff math (`command.rs`
+/// `CallbackAttemptOutcome` doc); the runtime computes this and passes `next_attempt_at`
+/// into `CompletionCallbackAttempted`.
+///
+/// Jitter: the interval is scaled by a factor in `[0.8, 1.0)`, mirroring v1.31.0's
+/// `addJitter` (`nextInterval*0.8 + rand(0..0.2*nextInterval)`,
+/// `common/backoff/retrypolicy.go:178-187 @ v1.31.0`) — same anti-synchronized-retry-storm
+/// goal. The factor is **deterministic** (a hash of `(jitter_seed, attempt)`), not random:
+/// tokeira has no `rand` dependency and a deterministic, sleep-free-testable scanner is
+/// preferred; different callbacks still de-correlate via distinct seeds. Mechanism
+/// deviation only (no randomness), not a goal or wire-contract deviation.
+///
+/// The result is floored at a strictly positive minimum so the scanner can never hot-loop
+/// on a zero/negative deadline (v1.31.0 stops retrying on a non-positive interval,
+/// `retrypolicy.go:154-170 @ v1.31.0`; tokeira returns a plain `Duration`, so a
+/// misconfigured non-positive `initial` degrades to retrying at the floor). Under the
+/// validated config (`tokeira_config::NexusCompletionConfig`: `initial > 0`,
+/// `coefficient >= 1.0`, `max >= initial`) the floor is a no-op.
+pub fn nexus_completion_backoff(
+    config: &NexusCompletionRuntimeConfig,
+    attempt: u32,
+    jitter_seed: u64,
+) -> Duration {
+    use std::hash::{Hash, Hasher};
+
     let exp = attempt.saturating_sub(1) as f64;
     let secs =
         config.retry_initial_interval.as_seconds_f64() * config.retry_backoff_coefficient.powf(exp);
     let capped = secs.min(config.retry_max_interval.as_seconds_f64());
-    Duration::seconds_f64(capped.max(0.0))
+
+    // Deterministic jitter factor in [0.8, 1.0) from a hash of (seed, attempt).
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    jitter_seed.hash(&mut hasher);
+    attempt.hash(&mut hasher);
+    let frac = (hasher.finish() >> 11) as f64 / ((1u64 << 53) as f64); // [0, 1)
+    let jittered = capped * (0.8 + 0.2 * frac);
+
+    // Hard positive floor: a degenerate (non-positive) config must not yield a zero
+    // deadline that hot-loops the scanner.
+    Duration::seconds_f64(jittered.max(0.001))
 }
 
 /// Decide which Nexus timeout, if any, the live operation has breached at `now`.
@@ -1300,6 +1333,47 @@ mod tests {
             let decoded = NexusTaskToken::decode(&encoded).expect("token should decode");
             prop_assert_eq!(decoded, token);
         }
+    }
+
+    #[test]
+    fn nexus_completion_backoff_jitters_deterministically_within_bounds() {
+        let config = NexusCompletionRuntimeConfig::default(); // 1s initial, 1h max, 2.0 coeff
+        // Deterministic: same (attempt, seed) -> same delay.
+        let a = nexus_completion_backoff(&config, 1, 42);
+        let b = nexus_completion_backoff(&config, 1, 42);
+        assert_eq!(a, b);
+        // Jitter keeps the first-attempt delay in [0.8s, 1.0s) of the 1s nominal interval.
+        assert!(
+            a.as_seconds_f64() >= 0.8 && a.as_seconds_f64() < 1.0,
+            "attempt-1 delay {a:?} must be jittered within [0.8s, 1.0s)"
+        );
+        // Distinct seeds de-correlate (different callbacks back off at different offsets).
+        let other = nexus_completion_backoff(&config, 1, 43);
+        assert_ne!(a, other, "different seeds should jitter differently");
+        // Exponential growth holds across attempts (attempt 3 ~ 4x attempt 1's nominal).
+        let third = nexus_completion_backoff(&config, 3, 42);
+        assert!(
+            third.as_seconds_f64() >= 3.2,
+            "attempt-3 delay {third:?} >= 0.8*4s"
+        );
+    }
+
+    #[test]
+    fn nexus_completion_backoff_floors_a_degenerate_config() {
+        // A non-positive initial interval must not yield a zero deadline (scanner hot-loop):
+        // the hard floor keeps it strictly positive.
+        let config = NexusCompletionRuntimeConfig {
+            retry_initial_interval: Duration::ZERO,
+            retry_max_interval: Duration::ZERO,
+            retry_backoff_coefficient: 2.0,
+            retry_max_attempts: 0,
+            system_callback_url: "http://127.0.0.1:7253".to_string(),
+        };
+        let delay = nexus_completion_backoff(&config, 1, 7);
+        assert!(
+            delay > Duration::ZERO,
+            "floor must keep the delay positive, got {delay:?}"
+        );
     }
 
     // Feature: edge-nexus-task-transport, Property 2: Broker queue isolation

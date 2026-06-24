@@ -20,7 +20,7 @@ use tokeira_kernel::{
     CompletionCallbackAttemptedRequest, DispatchOp, ExternalCancelResolvedRequest,
     ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult,
     ExternalWorkflowExecution, LoadedRun, SignalRequest, StartRequest, TerminateRequest,
-    WorkflowState,
+    callback_completion_outcome,
 };
 use tokeira_proto::{
     conversions::common::{failure_to_payload, payloads_from_domain},
@@ -30,8 +30,8 @@ use tokeira_storage::{
     CommitResult, DispatchableActivityTask, DispatchableWorkflowTask, RunRepository,
 };
 use tokeira_types::{
-    BuildId, ExecutionRef, ExecutionStatus, Memo, NamespaceId, Payload, Payloads, QueueKey,
-    RequestContext, RequestId, RunId, RunKey, SearchAttributes, ShardId, TaskQueueName, WorkflowId,
+    BuildId, ExecutionRef, Memo, NamespaceId, Payload, Payloads, QueueKey, RequestContext,
+    RequestId, RunId, RunKey, SearchAttributes, ShardId, TaskQueueName, WorkflowId,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -1053,8 +1053,16 @@ where
                         failure: attempt_failure_payload(&detail),
                     }
                 } else {
-                    let next_attempt_at =
-                        now + nexus_completion_backoff(&self.nexus_completion_config, next_attempt);
+                    // Per-callback jitter seed so distinct callbacks de-correlate their
+                    // retries (anti-synchronized-storm), derived from the run key + index.
+                    let jitter_seed =
+                        (run_key.0.as_u128() as u64) ^ (callback_index as u64).rotate_left(1);
+                    let next_attempt_at = now
+                        + nexus_completion_backoff(
+                            &self.nexus_completion_config,
+                            next_attempt,
+                            jitter_seed,
+                        );
                     self.completion_callback_tracking
                         .insert(CompletionCallbackTrackingEntry {
                             run_key,
@@ -1120,22 +1128,6 @@ fn attempt_failure_payload(detail: &str) -> Payload {
         failure_info: Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(
             failure_proto::ApplicationFailureInfo {
                 r#type: "NexusCompletionDeliveryFailure".to_string(),
-                non_retryable: false,
-                ..Default::default()
-            },
-        )),
-        ..Default::default()
-    })
-}
-
-/// A neutral operation-failure payload (used only as the unreachable fallback when a
-/// failed run somehow has no recorded `close_failure`).
-fn synth_operation_failure(message: &str) -> Payload {
-    failure_to_payload(&failure_proto::Failure {
-        message: message.to_string(),
-        failure_info: Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(
-            failure_proto::ApplicationFailureInfo {
-                r#type: "NexusOperationFailure".to_string(),
                 non_retryable: false,
                 ..Default::default()
             },
@@ -1541,42 +1533,6 @@ where
     }
 }
 
-/// Re-derive the terminal completion outcome from a closed run's durable state.
-///
-/// The kernel derives `CallbackCompletionOutcome` from the closing *event* at close time
-/// and carries it only on the (transient) dispatch op, not on the durable callback. The
-/// retry scanner therefore re-derives it from `WorkflowState` — mirroring the kernel's
-/// `callback_completion_outcome` but over the persisted close status/result/failure. A
-/// canceled run's cancel `details` are not preserved on `WorkflowState`, so a re-fire
-/// uses `Canceled { details: None }` (the synthesized "operation canceled" message is the
-/// load-bearing part); the first attempt off the dispatch op still carries full details.
-/// Returns `None` for a non-terminal run (defensive — a backing-off callback is always on
-/// a closed run).
-pub(crate) fn outcome_for_closed_run(state: &WorkflowState) -> Option<CallbackCompletionOutcome> {
-    match state.status {
-        ExecutionStatus::Completed => Some(CallbackCompletionOutcome::Success {
-            result: state
-                .close_result
-                .as_ref()
-                .and_then(|payloads| payloads.0.first().cloned()),
-        }),
-        ExecutionStatus::Failed => Some(CallbackCompletionOutcome::Failed {
-            // A failed run always carries its terminal failure; the fallback is a neutral
-            // operation-failure payload only for the unreachable `close_failure == None`
-            // case (NOT the delivery-failure type used for attempt bookkeeping).
-            failure: state
-                .close_failure
-                .clone()
-                .unwrap_or_else(|| synth_operation_failure("operation failed")),
-        }),
-        ExecutionStatus::Cancelled => Some(CallbackCompletionOutcome::Canceled { details: None }),
-        ExecutionStatus::Terminated => Some(CallbackCompletionOutcome::Terminated),
-        ExecutionStatus::TimedOut => Some(CallbackCompletionOutcome::TimedOut),
-        ExecutionStatus::ContinuedAsNew => Some(CallbackCompletionOutcome::ContinuedAsNew),
-        _ => None,
-    }
-}
-
 /// Re-fire `BackingOff` completion callbacks whose `next_attempt_at` has passed, capped at
 /// `max_per_scan`. Mirrors `scan_nexus_timeouts_once`: the durable `CompletionCallback` is
 /// the authority for the current lifecycle state and deadline, so each entry's run is
@@ -1643,7 +1599,37 @@ pub(crate) async fn scan_completion_callbacks_once<R>(
             // Standby (open run) / Blocked are not the scanner's to fire.
             _ => continue,
         }
-        let Some(outcome) = outcome_for_closed_run(&state) else {
+        // Re-derive the outcome from the run's terminal event — the *same* event and the
+        // *same* kernel fn the close path used for the first attempt — so a re-fire is
+        // byte-identical to the first attempt (incl. canceled details), with no
+        // re-derivation from `WorkflowState` and no persisted copy to drift. The terminal
+        // event is the run's last event; read a small tail and take the latest mapped one.
+        let events = match repo
+            .read_history(
+                entry.run_key,
+                state.last_event_id.saturating_sub(4).max(0),
+                16,
+            )
+            .await
+        {
+            Ok(events) => events,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    run_key = ?entry.run_key,
+                    callback_index = entry.callback_index,
+                    "completion callback scanner failed to read terminal history"
+                );
+                continue;
+            }
+        };
+        let Some(outcome) = events
+            .iter()
+            .rev()
+            .find_map(|event| callback_completion_outcome(&event.kind))
+        else {
+            // No mapped terminal event (a backing-off callback should always be on a
+            // closed run, so this is defensive) — skip without dropping the entry.
             continue;
         };
         runtime_metrics::record_scanner_dispatched(
